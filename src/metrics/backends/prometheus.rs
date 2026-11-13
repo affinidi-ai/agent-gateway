@@ -156,6 +156,19 @@ lazy_static! {
         counter
     };
 
+    /// Requests forwarded without a caller key because the surface's caller key secret could
+    /// not be read (labeled by surface and reason).
+    pub static ref CALLER_KEY_SECRET_UNREADABLE: IntCounterVec = {
+        let opts = Opts::new(
+            names::CALLER_KEY_SECRET_UNREADABLE_TOTAL,
+            "Requests forwarded without a caller key because its secret could not be read (reason = \
+             no_store|store_failed|missing|outside_tenant|too_short)",
+        );
+        let counter = IntCounterVec::new(opts, &["surface_id", "reason"]).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
     /// Managed identity resolution attempts (labeled by channel_id, mode, result)
     pub static ref MANAGED_IDENTITY_RESOLVE: IntCounterVec = {
         let opts = Opts::new(
@@ -179,6 +192,19 @@ lazy_static! {
         let h = HistogramVec::new(opts, &["channel_id", "mode"]).unwrap();
         REGISTRY.register(Box::new(h.clone())).unwrap();
         h
+    };
+
+    /// Consent links of providers with consent confirmation (labeled by
+    /// provider_id, surface_id, outcome, reason).
+    pub static ref CONSENT_CONFIRMATION_LINKS: IntCounterVec = {
+        let opts = Opts::new(
+            names::CONSENT_CONFIRMATION_LINKS_TOTAL,
+            "Consent links of providers with consent confirmation (outcome = confirmed|unconfirmed|refused; \
+             reason = none|<unconfirmed reason>)",
+        );
+        let counter = IntCounterVec::new(opts, &["provider_id", "surface_id", "outcome", "reason"]).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
     };
 
     /// Trust Check element outcomes (labeled by trust_registry_id, query_type, result).
@@ -694,6 +720,17 @@ pub fn track_a2a_protocol_version(
         .inc();
 }
 
+/// Count a request on `surface_id` forwarded without its caller key because the secret could
+/// not be read, for `reason`.
+pub fn track_caller_key_secret_unreadable(
+    surface_id: &str,
+    reason: &str,
+) {
+    CALLER_KEY_SECRET_UNREADABLE
+        .with_label_values(&[surface_id, reason])
+        .inc();
+}
+
 /// Track a managed-identity resolution outcome.
 ///
 /// `mode`   = `payload_extraction` | `from_mtls` | `from_api_key` | `static` | `from_jwt_claim`
@@ -800,6 +837,21 @@ pub fn payment_gate_totals() -> PaymentGateTotals {
         }
     }
     totals
+}
+
+/// Count one consent link of a provider with consent confirmation.
+///
+/// `outcome` = `confirmed` | `unconfirmed` | `refused`
+/// `reason`  = `none` for a confirmed link, else why it does not confirm its caller
+pub fn track_consent_confirmation_link(
+    provider_id: &str,
+    surface_id: &str,
+    outcome: &str,
+    reason: &str,
+) {
+    CONSENT_CONFIRMATION_LINKS
+        .with_label_values(&[provider_id, surface_id, outcome, reason])
+        .inc();
 }
 
 /// Track a Trust Check element outcome.
@@ -1108,6 +1160,22 @@ mod tests {
                 .contains("agent_gateway_fabric_forward_requests_received_total{surface_id=\"ut_surface_alpha\"} 1"),
             "expected fabric forward counter for ut_surface_alpha in exposition:\n{exposition}"
         );
+    }
+
+    #[test]
+    fn an_unreadable_caller_key_secret_is_counted_by_surface_and_reason() {
+        use super::{CALLER_KEY_SECRET_UNREADABLE, track_caller_key_secret_unreadable};
+        assert_eq!(names::CALLER_KEY_SECRET_UNREADABLE_TOTAL, "agent_gateway_caller_key_secret_unreadable_total");
+        let surface = format!("surface-{}", uuid::Uuid::new_v4());
+        track_caller_key_secret_unreadable(&surface, "missing");
+        track_caller_key_secret_unreadable(&surface, "missing");
+        track_caller_key_secret_unreadable(&surface, "too_short");
+        let count = |reason: &str| {
+            CALLER_KEY_SECRET_UNREADABLE
+                .with_label_values(&[surface.as_str(), reason])
+                .get()
+        };
+        assert_eq!((count("missing"), count("too_short"), count("no_store")), (2, 1, 0));
     }
 
     #[test]

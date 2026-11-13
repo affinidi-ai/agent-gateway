@@ -1,0 +1,50 @@
+branch: fix/a2a-public-card-without-managed-identity
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-11T12:00:00Z'
+      title: ⭐ Serve the public agent card when the managed agent publishes no identity
+      description: >-
+        A surface with managed identity refused its public agent card with 422
+        identity_extension_missing when the managed agent's card had no identity extension, as a
+        Microsoft Foundry agent's has not, so the agent could not be discovered. The gateway now
+        serves that card without an identity credential, with every other change applied, and logs
+        a warning once per surface. This applies to A2A and AP2 surfaces, and only to a JSON object
+        with a string name whose extensions list neither identity extension in any letter case. A
+        card whose identity is present but invalid, that carries an identity credential the gateway
+        cannot use, whose extensions are not a list, or that is not a named card is still refused,
+        and messages, streams and extended cards without an identity are still refused.
+    - timestamp: '2026-11-11T15:00:00Z'
+      title: Show a card served without a managed identity on the Agent Cards view
+      description: >-
+        The agent card preview reports a card served without an identity credential as fetch status
+        served_without_identity with cause identity_missing, and keeps it as the last good card.
+        The Agent Cards view shows "Served – No managed identity" with a warning that the managed
+        agent's card has no identity extension, and the Managed Agent panel's fetch line shows the
+        same status in the warning tone, so operators see why the card carries no identity
+        credential instead of a failure.
+    - timestamp: '2026-11-11T18:00:00Z'
+      title: Name why the gateway will not attach the managed identity to the agent card
+      description: >-
+        The agent card preview adds fetch.identity_error beside the identity_failed cause: the
+        identity error code the card route answers with, or credential_injection_failed when the
+        gateway could not sign or attach its own credential, and fetch.identity_slot, which names
+        the slot that failed (protected_identity or external_identity). The Agent Cards view names
+        that cause and what to do, pointing at the external Identity element when the external slot
+        failed, instead of only asking the operator to check the gateway logs.
+  removed: []
+  security: []
+  breaking:
+    - timestamp: '2026-11-11T00:00:00Z'
+      title: Report an invalid managed identity as identity_validation_failed
+      description: >-
+        An agent card, message response, stream event or MCP response whose managed identity is
+        present but invalid was refused with identity_extension_missing. It is now refused with
+        identity_validation_failed, still 422: an agent-identity/v1 declared without its payload,
+        an identity payload with no identity fields, and, on a public agent card, an
+        agent-identity-credential/v1 whose did is not its presentation's holder and subject or
+        whose presentation is missing or malformed. identity_extension_missing is kept for an
+        identity that was not sent, so callers and operators can tell a missing identity from a
+        bad one. A caller that matches on code identity_extension_missing to detect these cases
+        must also match identity_validation_failed.

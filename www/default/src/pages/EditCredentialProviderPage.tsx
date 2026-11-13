@@ -11,6 +11,7 @@ import { useSaveAction } from '../hooks/useSaveAction';
 import { deepLinks } from '../utils/deepLinks';
 import { DOCS_URL } from '../config/docs';
 import ClientAuthenticationSelect from './EditCredentialProviderPage/ClientAuthenticationSelect';
+import ConsentConfirmationSection from './EditCredentialProviderPage/ConsentConfirmationSection';
 import JwtAssertionSection from './EditCredentialProviderPage/JwtAssertionSection';
 import { SecretOption as Secret, SecretOptions } from './EditCredentialProviderPage/SecretSelect';
 import { splitByTenant, type OwnerTenant } from '../utils/tenantScope';
@@ -18,9 +19,15 @@ import { CONSENT_LIMIT_UNITS } from '../utils/consentLimit';
 import {
   CONSENT_LIMIT_RANGE_MESSAGE,
   ConsentLimitFields,
+  ConsentConfirmationFormFields,
   CredentialProviderType,
+  EMPTY_CONSENT_CONFIRMATION_FIELDS,
   EMPTY_JWT_FIELDS,
   NO_CONSENT_LIMIT,
+  consentConfirmationField,
+  consentConfirmationFieldsOf,
+  consentConfirmationRedirectUri,
+  missingConsentConfirmationField,
   clientAuthenticationOf,
   consentLimitOf,
   consentLimitSeconds,
@@ -38,7 +45,8 @@ import {
   isHttpsAddress,
 } from './EditCredentialProviderPage/credentialProviderForm';
 
-interface CredentialProviderForm extends JwtFormFields, ConsentLimitFields {
+interface CredentialProviderForm
+  extends JwtFormFields, ConsentLimitFields, ConsentConfirmationFormFields {
   name: string;
   provider_id: string;
   provider_type: CredentialProviderType;
@@ -92,6 +100,7 @@ const EMPTY_FORM: CredentialProviderForm = {
   send_resource: true,
   ...NO_CONSENT_LIMIT,
   ...EMPTY_JWT_FIELDS,
+  ...EMPTY_CONSENT_CONFIRMATION_FIELDS,
 };
 
 const EditCredentialProviderPage: React.FC = () => {
@@ -194,6 +203,7 @@ const EditCredentialProviderPage: React.FC = () => {
         ...consentLimitOf(data),
         client_authentication: clientAuthenticationOf(data),
         ...jwtFieldsOf(data),
+        ...consentConfirmationFieldsOf(data),
       });
     } catch (e: any) {
       setError(e.message ?? 'Unknown error');
@@ -252,7 +262,12 @@ const EditCredentialProviderPage: React.FC = () => {
         return;
       }
 
-      const missing = form.issuer ? null : missingProviderField(form);
+      const missing = form.issuer
+        ? null
+        : (missingProviderField(form) ??
+          (usesConsentFlow && form.consent_confirmation_enabled
+            ? missingConsentConfirmationField(form)
+            : null));
       if (missing) {
         setError(missing);
         return;
@@ -311,6 +326,9 @@ const EditCredentialProviderPage: React.FC = () => {
 
       if (takesCallbackUrl && callbackUrl) {
         body.callback_url = callbackUrl;
+      }
+      if (!form.issuer) {
+        body.consent_confirmation = consentConfirmationField(form, usesConsentFlow);
       }
 
       const send = async (url: string, method: string, payload: unknown) => {
@@ -748,6 +766,17 @@ const EditCredentialProviderPage: React.FC = () => {
                       </div>
                     )}
                   </div>
+                )}
+
+                {usesConsentFlow && (
+                  <ConsentConfirmationSection
+                    form={form}
+                    redirectUri={consentConfirmationRedirectUri(shownCallbackUrl)}
+                    secrets={secrets}
+                    ownerTenant={isNew ? null : ownerTenant}
+                    loadingSecrets={loadingSecrets}
+                    onChange={handleChange}
+                  />
                 )}
 
                 {form.provider_type === 'oauth2_jwt_bearer' && (

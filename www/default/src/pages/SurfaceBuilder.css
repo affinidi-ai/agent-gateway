@@ -3002,6 +3002,14 @@ body.dark-theme .agent-card-tab {
   color: #b91c1c;
 }
 
+.agent-card-fetch-line .agent-card-fetch-warning {
+  color: #92400e;
+}
+
+body.dark-theme .agent-card-fetch-line .agent-card-fetch-warning {
+  color: #fbbf24;
+}
+
 body.dark-theme .agent-card-fetch-line .agent-card-fetch-ok {
   color: #34d399;
 }

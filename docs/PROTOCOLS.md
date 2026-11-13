@@ -106,7 +106,7 @@ Every fetch result is a `200` with these fields, each always present:
 | `served_url` | The card URL callers use: the first external URL of the Access Point's listener, the route and `/.well-known/agent-card.json`. |
 | `source_url`, `source_url_query_hidden` | The card URL fetched from the Target, without user info, query or fragment; the flag says a query or user info was removed. |
 | `fetched_at`, `cached` | When the fetch started; `cached` is `true` when the answer is the last preview instead of a new fetch. |
-| `fetch` | `status` (`ok`, `failed`, `not_served`), `cause`, `http_status`, `duration_ms`. |
+| `fetch` | `status` (`ok`, `failed`, `not_served`, `served_without_identity`), `cause`, `http_status`, `duration_ms`, `identity_error`, `identity_slot`. |
 | `auth` | `kind` (`none`, `static_secret`, `credential_provider`, `credential_lookup`, `remote_gateway`), `result` (`not_configured`, `sent`, `not_sent`, `failed`) and `failure`; `provider_name` and `token_expires_at` are `null`. |
 | `before`, `before_bytes` | The agent's own card as fetched, and its size. |
 | `after`, `after_bytes` | The card the gateway serves, and its size. |
@@ -119,7 +119,18 @@ could not obtain), `forbidden` (403), `not_found` (404 or 410), `redirected` (3x
 `upstream_error`, `unreachable`, `timeout`, `too_large`, `invalid_card`, `compressed` (the agent
 compressed its card although `identity` was asked for), `blocked_by_egress`,
 `proxy_unavailable`, and, with status `not_served` and the agent's card in `before`,
-`identity_failed` and `rewrite_failed`. An `auth.failure` is `secret_unavailable`,
+`identity_failed` and `rewrite_failed`, and, with status `served_without_identity`,
+`identity_missing`: the surface reads the managed identity from the card, the agent's card
+carries none, and the gateway serves it without an identity credential (see
+[Generated agent cards](#generated-agent-cards)); `after` is then the served card and counts as
+the last good card. `identity_error` is `null` unless the cause is `identity_failed`, and then names
+why: the code of the identity error the card route answers with (`identity_extension_missing`,
+`identity_validation_failed`, `identity_invalid_response` or `identity_did_failed`), or
+`credential_injection_failed` when the gateway could not sign or attach its own identity
+credential. `identity_slot` is likewise `null` unless the cause is `identity_failed`, and then
+names the slot that failed with the card route's `slot` spelling: `protected_identity` (the
+managed agent's identity, and the gateway's own credential) or `external_identity`. An
+`auth.failure` is `secret_unavailable`,
 `provider_not_found` (a secret or provider of another tenant reports as missing too),
 `token_unavailable`, `unsupported`, `forbidden` (a `[credential_policy]` rule in `enforce`
 withholds the credential), or `invalid_header` (a stored Target authentication whose header
@@ -522,6 +533,38 @@ identity. When managed identity is on, an extended card with no
 response, public or extended. On inbound and fabric paths it skips response extension inspection, like
 the public card, so response validation rules do not apply to it; outbound transit points still
 validate response extensions on both kinds of card.
+
+When managed identity reads the identity from the response and cannot resolve it, a card or a
+message response (on MCP, a response whose `_meta` should carry `serverIdentity`) is refused with
+`422`. The code is `identity_extension_missing` when no identity is present: no `agent-identity/v1`
+extension on the card, and no identity payload in a message's metadata or an MCP response's
+`_meta`. It is `identity_validation_failed` when one is present but invalid: an `agent-identity/v1`
+declared without its payload, a payload with no identity fields, a payload the identity schema or
+rules reject, or, on a public card, an `agent-identity-credential/v1` whose `did` is not both the
+holder and the subject of its presentation, or whose presentation is missing or not JSON. On an
+extended card such a credential is ignored, so a card that carries only it is
+`identity_extension_missing`.
+
+A public card of an A2A or AP2 surface is the exception for a missing identity on the protected
+slot: when it is a JSON object with a string `name` that carries neither `agent-identity/v1` nor
+`agent-identity-credential/v1`, it is served without an identity credential, with its other
+changes (URL rewrite, `agentDid` and `agentDNA`) applied and no Trust Recorder write. Any other
+body keeps the `422`: one that is not a JSON object or has no `name`, one whose `capabilities` or
+`capabilities.extensions` has another shape, and one listing either identity extension URI in any
+letter case, so an identity the gateway did not check is never passed on. `agentDid` and
+`agentDNA` name the surface's own did:webvh identity, which the operator configures, not the
+agent's; the managed identity signal is the `agent-identity-credential/v1` extension, which such
+a card does not carry. The gateway logs a `WARN` naming the surface, the `protected_identity` slot
+and `identity_extension_missing` the first time a surface's card is built without an identity,
+and again only after that card carried one, after the surface is created, changed or deleted, or
+after a configuration reload or restart. This
+holds on the card route, the agent card preview, a well-known card answered through ordinary
+forwarding, a public card this gateway reads over Fabric, and a public card it serves to a peer
+over Fabric. An invalid identity on a public card is still refused on the first four of those
+paths. A missing identity on an extended card, a message, a stream or the external slot is still
+refused. A public card this gateway serves to a peer over Fabric is never refused for its
+identity: any identity error on it, an invalid identity included, serves the card without an
+identity credential, and the gateway logs the error.
 
 For the JSON-RPC binding, error responses and empty bodies are forwarded unchanged; a JSON-RPC error
 is an object `error` with no `result`, and a `null` member counts as absent, so `"error": null` next

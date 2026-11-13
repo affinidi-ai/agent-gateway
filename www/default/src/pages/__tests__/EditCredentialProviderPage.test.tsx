@@ -1026,3 +1026,265 @@ describe('EditCredentialProviderPage client authentication requests', () => {
     expect(body.client_secret_secret_ref).toBe('');
   });
 });
+
+describe('EditCredentialProviderPage consent confirmation', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  const SWITCH = 'credential-provider-consent-confirmation-switch';
+  const SECTION = 'credential-provider-consent-confirmation-section';
+  const REDIRECT_URI = 'credential-provider-consent-confirmation-redirect-uri';
+  const CALLBACK = 'https://gw.example/prefix/v1/identity/oauth/callback/p1';
+  const SETTING = {
+    client_id_secret_ref: 'LOGIN_CLIENT_ID',
+    client_secret_secret_ref: 'LOGIN_SECRET',
+    authorization_endpoint: 'https://idp.example/authorize',
+    token_endpoint: 'https://idp.example/token',
+    jwt_verification_strategy_id: 'strategy-1',
+  };
+
+  const legacy = (extra: Record<string, unknown> = {}) => ({
+    id: 'p1',
+    name: 'GitHub',
+    provider_id: 'github',
+    provider_type: 'oauth2_authorization_code',
+    authorization_endpoint: 'https://github.com/login/oauth/authorize',
+    token_endpoint: 'https://github.com/login/oauth/access_token',
+    client_id_secret_ref: 'CLIENT_ID',
+    client_secret_secret_ref: 'CLIENT_SECRET',
+    default_scopes: [],
+    token_refresh_enabled: true,
+    callback_path: '/v1/identity/oauth/callback/p1',
+    callback_url: CALLBACK,
+    ...extra,
+  });
+
+  const LOGIN_SECRETS = [
+    { id: 's1', secret_id: 'LOGIN_SECRET', name: 'Login secret', tenant_id: null },
+    {
+      id: 's2',
+      secret_id: 'LOGIN_CLIENT_ID',
+      name: 'Login client ID',
+      tenant_id: null,
+    },
+  ];
+
+  const setup = (
+    record: Record<string, unknown>,
+    strategies: () => Promise<unknown> = () =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve([{ id: 'strategy-1', name: 'Entra callers' }]),
+      }),
+    path = '/credential-providers/p1',
+    secrets: Record<string, unknown>[] = LOGIN_SECRETS
+  ) => {
+    mockFetch.mockImplementation((url: string, init?: { method?: string }) => {
+      if (init?.method === 'PUT') return Promise.resolve({ ok: true });
+      if (url.startsWith('/api/v1/credential-providers/')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve(record) });
+      }
+      if (url.startsWith('/api/v1/secrets/')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve(secrets),
+        });
+      }
+      if (url === '/api/v1/jwt-verification-strategies') return strategies();
+      return Promise.resolve({ ok: false, json: () => Promise.resolve([]) });
+    });
+    render(
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route path="/credential-providers/:id" element={<EditCredentialProviderPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+  };
+
+  const TENANT_STRATEGIES = () =>
+    Promise.resolve({
+      ok: true,
+      json: () =>
+        Promise.resolve([
+          { id: 'own', name: 'Own callers', tenant_id: 'tenant-a' },
+          { id: 'shared', name: 'Shared callers', tenant_id: null },
+          { id: 'other', name: 'Other callers', tenant_id: 'tenant-b' },
+        ]),
+    });
+
+  const savedBody = async () => {
+    fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
+    await waitFor(() =>
+      expect(mockFetch.mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(true)
+    );
+    const [, init] = mockFetch.mock.calls.find(([, options]) => options?.method === 'PUT')!;
+    return JSON.parse(init.body);
+  };
+
+  it('shows the section, switched off, only on a legacy authorization code provider', async () => {
+    setup(legacy());
+    expect(await screen.findByTestId(SWITCH)).not.toBeChecked();
+    expect(screen.queryByTestId(REDIRECT_URI)).not.toBeInTheDocument();
+    fireEvent.change(screen.getByTestId('credential-provider-type-select'), {
+      target: { value: 'oauth2_client_credentials' },
+    });
+    expect(screen.queryByTestId(SECTION)).not.toBeInTheDocument();
+  });
+
+  it('does not show the section on an external consent provider', async () => {
+    setup(legacy({ issuer: 'https://linear.example' }));
+    await screen.findByTestId('credential-provider-external-notice');
+    expect(screen.queryByTestId(SECTION)).not.toBeInTheDocument();
+  });
+
+  it('shows a stored setting switched on with the Callback URL plus /confirm', async () => {
+    setup(legacy({ consent_confirmation: SETTING }));
+    expect(await screen.findByTestId(SWITCH)).toBeChecked();
+    expect(screen.getByTestId(REDIRECT_URI)).toHaveValue(`${CALLBACK}/confirm`);
+    const where = screen.getByTestId('credential-provider-consent-confirmation-redirect-uri-where');
+    expect(where).toHaveTextContent(
+      `Add this URI to the allowed redirect URIs of the login client whose ID is in secret ${SETTING.client_id_secret_ref} at your identity provider.`
+    );
+    expect(where).toHaveTextContent('Callback URL above');
+    expect(where).toHaveTextContent(
+      'This URI follows the Callback URL, so register it again whenever the Callback URL changes.'
+    );
+    expect(await screen.findByRole('option', { name: 'Entra callers' })).toBeInTheDocument();
+    expect(
+      screen.getByTestId('credential-provider-consent-confirmation-strategy-select')
+    ).toHaveValue('strategy-1');
+  });
+
+  it('says the strategies could not be loaded, without calling the stored one not found', async () => {
+    setup(legacy({ consent_confirmation: SETTING }), () =>
+      Promise.resolve({ ok: false, status: 403, json: () => Promise.resolve({}) })
+    );
+    expect(
+      await screen.findByTestId('credential-provider-consent-confirmation-strategies-failed')
+    ).toHaveTextContent('Strategies could not be loaded');
+    const select = screen.getByTestId('credential-provider-consent-confirmation-strategy-select');
+    expect(select).toHaveValue('strategy-1');
+    expect(within(select).queryByText(/not found/)).not.toBeInTheDocument();
+  });
+
+  it("offers only the provider tenant's own and appliance-wide strategies", async () => {
+    setup(legacy({ tenant_id: 'tenant-a' }), () =>
+      Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve([
+            { id: 'own', name: 'Own callers', tenant_id: 'tenant-a' },
+            { id: 'shared', name: 'Shared callers', tenant_id: null },
+            { id: 'other', name: 'Other callers', tenant_id: 'tenant-b' },
+          ]),
+      })
+    );
+    fireEvent.click(await screen.findByTestId(SWITCH));
+    expect(await screen.findByRole('option', { name: 'Own callers' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'Shared callers' })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /Other callers/ })).not.toBeInTheDocument();
+  });
+
+  it('labels a stored strategy of another tenant as refused by the gateway', async () => {
+    setup(
+      legacy({
+        tenant_id: 'tenant-a',
+        consent_confirmation: { ...SETTING, jwt_verification_strategy_id: 'other' },
+      }),
+      TENANT_STRATEGIES
+    );
+    expect(
+      await screen.findByRole('option', {
+        name: 'Other callers (another tenant, refused by the gateway)',
+      })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByTestId('credential-provider-consent-confirmation-strategy-select')
+    ).toHaveValue('other');
+  });
+
+  it('offers a new provider, which the dashboard creates appliance-wide, only appliance-wide strategies', async () => {
+    setup(legacy(), TENANT_STRATEGIES, '/credential-providers/new');
+    fireEvent.change(await screen.findByTestId('credential-provider-type-select'), {
+      target: { value: 'oauth2_authorization_code' },
+    });
+    fireEvent.click(await screen.findByTestId(SWITCH));
+    expect(await screen.findByRole('option', { name: 'Shared callers' })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /Own callers/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /Other callers/ })).not.toBeInTheDocument();
+  });
+
+  it('offers a new provider, which the dashboard creates appliance-wide, only appliance-wide login secrets', async () => {
+    setup(legacy(), undefined, '/credential-providers/new', [
+      ...LOGIN_SECRETS,
+      { id: 's3', secret_id: 'ACME_LOGIN_ID', name: 'Acme login id', tenant_id: 'acme' },
+    ]);
+    fireEvent.change(await screen.findByTestId('credential-provider-type-select'), {
+      target: { value: 'oauth2_authorization_code' },
+    });
+    fireEvent.click(await screen.findByTestId(SWITCH));
+    const clientId = await screen.findByTestId(
+      'credential-provider-cc_client_id_secret_ref-select'
+    );
+    await waitFor(() =>
+      expect(within(clientId).getByRole('option', { name: /LOGIN_CLIENT_ID/ })).toBeInTheDocument()
+    );
+    expect(
+      within(clientId).queryByRole('option', { name: /ACME_LOGIN_ID/ })
+    ).not.toBeInTheDocument();
+  });
+
+  it('says where the redirect URI will show on a stored provider without a Callback URL', async () => {
+    setup(legacy({ consent_confirmation: SETTING, callback_url: null }));
+    expect(
+      await screen.findByTestId('credential-provider-consent-confirmation-redirect-uri-pending')
+    ).toHaveTextContent(
+      'The Confirmation redirect URI is shown once the provider has a Callback URL, since it is the Callback URL followed by /confirm.'
+    );
+    expect(screen.queryByTestId(REDIRECT_URI)).not.toBeInTheDocument();
+  });
+
+  it('sends the setting once switched on and filled in', async () => {
+    setup(legacy());
+    fireEvent.click(await screen.findByTestId(SWITCH));
+    const type = (testId: string, value: string) =>
+      fireEvent.change(screen.getByTestId(`credential-provider-consent-confirmation-${testId}`), {
+        target: { value },
+      });
+    type('authorization-endpoint-input', 'https://idp.example/authorize');
+    type('token-endpoint-input', 'https://idp.example/token');
+    await screen.findAllByRole('option', { name: /LOGIN_SECRET/ });
+    fireEvent.change(screen.getByTestId('credential-provider-cc_client_id_secret_ref-select'), {
+      target: { value: 'LOGIN_CLIENT_ID' },
+    });
+    fireEvent.change(screen.getByTestId('credential-provider-cc_client_secret_secret_ref-select'), {
+      target: { value: 'LOGIN_SECRET' },
+    });
+    await screen.findByRole('option', { name: 'Entra callers' });
+    type('strategy-select', 'strategy-1');
+    expect((await savedBody()).consent_confirmation).toEqual(SETTING);
+  });
+
+  it('refuses to save a switched-on setting with a required field empty', async () => {
+    setup(legacy());
+    fireEvent.click(await screen.findByTestId(SWITCH));
+    fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
+    expect(
+      await screen.findByText('Login Client ID is required for consent confirmation.')
+    ).toBeInTheDocument();
+    expect(mockFetch.mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(false);
+  });
+
+  it('sends null when a stored setting is switched off', async () => {
+    setup(legacy({ consent_confirmation: SETTING }));
+    fireEvent.click(await screen.findByTestId(SWITCH));
+    const body = await savedBody();
+    expect(body).toHaveProperty('consent_confirmation', null);
+  });
+
+  it('leaves the field out while the switch stays off', async () => {
+    setup(legacy());
+    await screen.findByTestId(SWITCH);
+    expect(await savedBody()).not.toHaveProperty('consent_confirmation');
+  });
+});

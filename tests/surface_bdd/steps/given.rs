@@ -25,10 +25,11 @@ use crate::bdd_support::policies::{
     build_transit_point_request_path_policy,
 };
 use crate::world::{
-    ApiKeyProviderSourceAuthConfig, ApiKeySourceAuthConfig, CredentialProviderKind, DelegatedCredentialInjection,
-    JwtSourceAuthConfig, RequestPolicyFixture, SurfaceCredentialDelegationConfig, SurfaceSourceAuthConfig,
-    SurfaceTargetAuthConfig, SurfaceTransitPointConfig, SurfaceWorld, TransitPointHeaderMetadataMappingRow,
-    TransitPointManagedIdentityConfig, mcp_identity_schema_with_field, select_identity_schema_field,
+    ApiKeyProviderSourceAuthConfig, ApiKeySourceAuthConfig, CallerKeyFixture, CredentialProviderKind,
+    DelegatedCredentialInjection, JwtSourceAuthConfig, RequestPolicyFixture, SurfaceCredentialDelegationConfig,
+    SurfaceSourceAuthConfig, SurfaceTargetAuthConfig, SurfaceTransitPointConfig, SurfaceWorld,
+    TransitPointHeaderMetadataMappingRow, TransitPointManagedIdentityConfig, mcp_identity_schema_with_field,
+    select_identity_schema_field,
 };
 use tracing::log::Level;
 
@@ -36,7 +37,8 @@ use crate::bdd_support::config::agent_surface::{
     AccessPointFixture, AgentSurfaceFixture, TargetFixture, TransitPointFixture,
 };
 
-const AGENT_IDENTITY_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity/v1";
+pub(crate) const AGENT_IDENTITY_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity/v1";
+const AGENT_IDENTITY_CREDENTIAL_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity-credential/v1";
 
 fn set_primary_target_response(
     world: &mut SurfaceWorld,
@@ -987,6 +989,22 @@ fn transit_point_requires_a_transit_token(
     transit_point_config_mut(world, &transit_point).require_transit_token = true;
 }
 
+/// The audience a Transit Point's JWT callers' tokens are issued for.
+pub(crate) const TRANSIT_AUDIENCE: &str = "bdd-transit-audience";
+
+#[given(expr = "Transit Point {string} authenticates its callers with JWT Bearer")]
+fn transit_point_authenticates_its_callers_with_jwt_bearer(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+) {
+    transit_point_config_mut(world, &transit_point).source_auth = Some(serde_json::json!({
+        "type": "jwt_bearer",
+        "jwt_verification_strategy_id": crate::steps::consent_confirmation::CALLERS_STRATEGY_ID,
+        "audiences": [TRANSIT_AUDIENCE],
+        "forward_header": false,
+    }));
+}
+
 #[given(expr = "Transit Point {string} admits {int} request(s) per minute from each caller")]
 fn transit_point_admits_requests_per_minute_from_each_caller(
     world: &mut SurfaceWorld,
@@ -1151,6 +1169,16 @@ fn transit_point_injects_api_key_delegated_credentials(
 ) {
     transit_point_config_mut(world, &transit_point).delegated_credentials = true;
     surface_requires_api_key_delegated_credentials(world, provider);
+}
+
+#[given(expr = "Transit Point {string} injects delegated credentials from OAuth provider {string}")]
+fn transit_point_injects_oauth_delegated_credentials(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    provider: String,
+) {
+    transit_point_config_mut(world, &transit_point).delegated_credentials = true;
+    surface_requires_oauth_delegated_credentials(world, provider);
 }
 
 #[given(
@@ -2515,6 +2543,50 @@ fn surface_is_stored_with_a_public_access_point(world: &mut SurfaceWorld) {
         .access_point_public = Some(true);
 }
 
+/// The value of the secret a caller key fixture stores: 32 bytes, the fewest a caller key
+/// secret may hold.
+pub(crate) const CALLER_KEY_SECRET_VALUE: &str = "bdd-caller-key-secret-0123456789";
+
+fn derive_caller_keys(
+    world: &mut SurfaceWorld,
+    secret_id: String,
+    secret_value: Option<&str>,
+    header: Option<String>,
+) {
+    world
+        .surface_config
+        .caller_key = Some(CallerKeyFixture {
+        secret_id,
+        secret_value: secret_value.map(str::to_string),
+        header,
+    });
+}
+
+#[given(expr = "the surface derives caller keys from secret {string}")]
+fn surface_derives_caller_keys(
+    world: &mut SurfaceWorld,
+    secret_id: String,
+) {
+    derive_caller_keys(world, secret_id, Some(CALLER_KEY_SECRET_VALUE), None);
+}
+
+#[given(expr = "the surface derives caller keys in header {string} from secret {string}")]
+fn surface_derives_caller_keys_in_header(
+    world: &mut SurfaceWorld,
+    header: String,
+    secret_id: String,
+) {
+    derive_caller_keys(world, secret_id, Some(CALLER_KEY_SECRET_VALUE), Some(header));
+}
+
+#[given(expr = "the surface derives caller keys from secret {string}, which is not stored")]
+fn surface_derives_caller_keys_from_a_missing_secret(
+    world: &mut SurfaceWorld,
+    secret_id: String,
+) {
+    derive_caller_keys(world, secret_id, None, None);
+}
+
 #[given(expr = "the surface accepts {string} and {string} source authentication")]
 fn surface_accepts_two_source_auth_methods(
     world: &mut SurfaceWorld,
@@ -3560,6 +3632,34 @@ async fn managed_agent_response_has_identity(
             }
         }
     });
+    set_managed_agent_message_response(world, response).await;
+}
+
+#[given(expr = "managed agent {string} responds without the agent-identity extension")]
+async fn managed_agent_response_has_no_identity(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "kind": "message",
+            "messageId": "msg-001",
+            "role": "agent",
+            "parts": [{"kind": "text", "text": "response"}]
+        }
+    });
+    set_managed_agent_message_response(world, response).await;
+}
+
+async fn set_managed_agent_message_response(
+    world: &mut SurfaceWorld,
+    response: serde_json::Value,
+) {
     // Surfaces created through the admin API start the mock before this step.
     if let Some(infra) = world.infra.as_ref() {
         infra
@@ -3632,6 +3732,26 @@ fn managed_agent_streams_a_task_claiming_identity(
     set_primary_target_response(world, streamed_task(Some(message)));
 }
 
+#[given(
+    expr = "managed agent {string} streams a task whose final status message declares its identity without the payload"
+)]
+fn managed_agent_streams_a_task_with_an_invalid_identity_claim(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let message = serde_json::json!({
+        "messageId": "bdd-agent-message",
+        "role": "ROLE_AGENT",
+        "parts": [{ "text": "done" }],
+        "extensions": [AGENT_IDENTITY_URI],
+        "metadata": {}
+    });
+    set_primary_target_response(world, streamed_task(Some(message)));
+}
+
 #[given(expr = "managed agent {string} streams the error {string}")]
 fn managed_agent_streams_an_error(
     world: &mut SurfaceWorld,
@@ -3667,6 +3787,54 @@ fn managed_agent_publishes_agent_card_with_identity(
                     }
                 }
             ]
+        }
+    });
+    set_primary_target_response(world, agent_card);
+}
+
+#[given(expr = "managed agent {string} publishes an agent card without the agent-identity extension")]
+fn managed_agent_publishes_agent_card_without_identity(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let agent_card = serde_json::json!({
+        "name": "test-agent",
+        "url": "http://mock.local",
+        "version": "1.0.0",
+        "capabilities": {"streaming": false}
+    });
+    set_primary_target_response(world, agent_card);
+}
+
+#[given(
+    expr = "managed agent {string} publishes an agent card whose identity credential names a different DID than its presentation"
+)]
+fn managed_agent_publishes_agent_card_with_mismatched_credential(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let presentation = serde_json::json!({
+        "holder": "did:key:z6MkPresentationHolder",
+        "verifiableCredential": {"credentialSubject": {"id": "did:key:z6MkPresentationHolder"}}
+    });
+    let agent_card = serde_json::json!({
+        "name": "test-agent",
+        "url": "http://mock.local",
+        "version": "1.0.0",
+        "capabilities": {
+            "extensions": [{
+                "uri": AGENT_IDENTITY_CREDENTIAL_URI,
+                "params": {
+                    "did": "did:key:z6MkClaimedAgent",
+                    "verifiablePresentation": presentation.to_string()
+                }
+            }]
         }
     });
     set_primary_target_response(world, agent_card);
@@ -3728,7 +3896,7 @@ fn mcp_server_returns_tool_result(
 }
 
 #[given(expr = "the surface requires delegated credentials from OAuth provider {string}")]
-fn surface_requires_oauth_delegated_credentials(
+pub(crate) fn surface_requires_oauth_delegated_credentials(
     world: &mut SurfaceWorld,
     provider: String,
 ) {
@@ -4999,6 +5167,28 @@ fn surface_accepts_mcp_origin(
     let mut origins = origins;
     origins.push(serde_json::json!(origin));
     mcp_http["allowed_origins"] = serde_json::Value::Array(origins);
+}
+
+#[given(expr = "the gateway's network CORS list allows origin {string}")]
+fn network_cors_allows_origin(
+    world: &mut SurfaceWorld,
+    origin: String,
+) {
+    world
+        .surface_config
+        .network_cors
+        .push(origin);
+}
+
+#[given(expr = "the surface allows browser origin {string}")]
+fn surface_allows_browser_origin(
+    world: &mut SurfaceWorld,
+    origin: String,
+) {
+    world
+        .surface_config
+        .browser_origins
+        .push(origin);
 }
 
 fn set_modern_tool_response(

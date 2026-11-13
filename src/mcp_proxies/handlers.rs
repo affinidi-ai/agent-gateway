@@ -2246,8 +2246,9 @@ pub(crate) async fn handle_modern_surface_request(
 
 /// Extract headers from an inbound request that should be forwarded to the
 /// upstream REST backend. Skips hop-by-hop, host, content-length, and
-/// internal gateway headers. Converts from axum `HeaderMap` to reqwest
-/// `HeaderMap`.
+/// internal gateway headers, and any header of the caller key family
+/// ([`crate::config::caller_key::is_caller_key_header`]), which only the gateway
+/// sets. Converts from axum `HeaderMap` to reqwest `HeaderMap`.
 fn extract_forwardable_headers(headers: &HeaderMap) -> ReqwestHeaderMap {
     let mut forwarded = ReqwestHeaderMap::new();
     for (key, value) in headers.iter() {
@@ -2269,7 +2270,8 @@ fn extract_forwardable_headers(headers: &HeaderMap) -> ReqwestHeaderMap {
                 | "content-type"
                 | "host"
                 | "accept"
-        ) {
+        ) || crate::config::caller_key::is_caller_key_header(&name)
+        {
             continue;
         }
         if let (Ok(header_name), Ok(header_value)) =
@@ -2739,6 +2741,9 @@ async fn call_legacy_tool(
     limits: &crate::config::McpHttpConfig,
     sent_token: Option<&crate::proxy::handler::SentServiceToken<'_>>,
 ) -> Result<rmcp::model::CallToolResult, String> {
+    if sets_a_caller_key_header(tool, arguments) {
+        return Err(super::modern_rest::RestError::Arguments.to_string());
+    }
     let Some((stored, credential_headers)) = credentialed else {
         return tool
             .call(arguments, rmcp_openapi::Authorization::None, None)
@@ -2759,6 +2764,25 @@ async fn call_legacy_tool(
     )
     .await
     .map_err(|error| error.to_string())
+}
+
+/// Whether `arguments` set a header of the caller key family through one of `tool`'s header
+/// parameters. No caller may supply one ([`crate::config::caller_key::is_caller_key_header`]),
+/// so such a call is refused on both legacy branches, as a 2026-07-28 call is.
+fn sets_a_caller_key_header(
+    tool: &rmcp_openapi::Tool,
+    arguments: &serde_json::Value,
+) -> bool {
+    tool.metadata
+        .parameter_mappings
+        .iter()
+        .any(|(argument, mapping)| {
+            mapping.location == "header"
+                && crate::config::caller_key::is_caller_key_header(&mapping.original_name)
+                && arguments
+                    .get(argument)
+                    .is_some_and(|value| !value.is_null())
+        })
 }
 
 /// An MCP request a proxy can serve, checked and with its MCP server built:
@@ -4786,6 +4810,63 @@ mod tests {
         assert!(!forwarded.contains_key("cookie"));
         assert_eq!(forwarded["x-api-key"], "backend-key");
         assert_eq!(forwarded["authorization"], "Bearer backend-token");
+    }
+
+    #[test]
+    fn the_rest_backend_never_receives_a_caller_key_the_caller_sent() {
+        let mut caller = axum::http::HeaderMap::new();
+        caller.insert("x-caller-key", axum::http::HeaderValue::from_static("forged"));
+        caller.insert("x_caller_key", axum::http::HeaderValue::from_static("forged"));
+        caller.insert("x-caller-key-memory", axum::http::HeaderValue::from_static("forged"));
+        caller.insert("x-api-key", axum::http::HeaderValue::from_static("backend-key"));
+
+        let forwarded = super::extract_forwardable_headers(&caller);
+
+        assert!(!forwarded.contains_key("x-caller-key"));
+        assert!(!forwarded.contains_key("x_caller_key"));
+        assert!(!forwarded.contains_key("x-caller-key-memory"));
+        assert_eq!(forwarded["x-api-key"], "backend-key");
+    }
+
+    /// A legacy tool call without a Target credential is sent by `rmcp_openapi`, which sets
+    /// each header parameter from the arguments as given; a caller key header argument is
+    /// refused before anything is sent, as on the credentialed branch.
+    #[tokio::test]
+    async fn a_legacy_tool_call_never_sends_a_caller_key_header_argument() {
+        let mut proxy = owned("vault", None);
+        proxy.base_url = "http://127.0.0.1:9/".to_string();
+        proxy.openapi_spec = serde_json::json!({
+            "openapi": "3.0.0", "info": {"title": "Vault", "version": "1"},
+            "paths": {"/items": {"get": {"operationId": "list_items",
+                "parameters": [
+                    {"name": "X-Caller-Key", "in": "header", "schema": {"type": "string"}},
+                    {"name": "x-trace", "in": "header", "schema": {"type": "string"}}
+                ],
+                "responses": {"200": {"description": "Items"}}}}}
+        })
+        .to_string();
+        let (server, _) = super::proxy_server(&proxy).expect("the spec loads");
+        let tool = server
+            .get_tool("list_items")
+            .expect("the tool exists");
+        let argument_of = |header: &str| {
+            tool.metadata
+                .parameter_mappings
+                .iter()
+                .find(|(_, mapping)| mapping.original_name == header)
+                .map(|(argument, _)| argument.clone())
+                .expect("the header is a parameter")
+        };
+        let forged = serde_json::json!({ argument_of("X-Caller-Key"): "forged" });
+        let traced = serde_json::json!({ argument_of("x-trace"): "kept" });
+
+        assert!(super::sets_a_caller_key_header(tool, &forged));
+        assert!(!super::sets_a_caller_key_header(tool, &traced));
+        assert!(!super::sets_a_caller_key_header(tool, &serde_json::json!({})));
+        let refused =
+            super::call_legacy_tool(tool, &forged, None, &crate::config::McpHttpConfig::default(), None).await;
+        let expected = super::super::modern_rest::RestError::Arguments.to_string();
+        assert!(matches!(&refused, Err(error) if *error == expected), "{refused:?}");
     }
 
     #[tokio::test]

@@ -207,8 +207,8 @@ mod tests {
         RejectionReason, RejectionStage, RequestFailureOutcome, TargetAuthLeg, TargetAuthMethodKind, TargetKind,
     };
     use crate::delegation_vault::audit::{
-        AuthorityForceDeleteDetails, McpProxyPinChangeDetails, PaymentEventDetails, PaymentRail, PaymentStage,
-        PolicyChangeDetails, SecretForceDeleteDetails, TargetAuthChangeDetails, audit_event,
+        AuthorityForceDeleteDetails, BrowserOriginsChangeDetails, McpProxyPinChangeDetails, PaymentEventDetails,
+        PaymentRail, PaymentStage, PolicyChangeDetails, SecretForceDeleteDetails, TargetAuthChangeDetails, audit_event,
     };
     use std::collections::HashSet;
 
@@ -251,9 +251,11 @@ mod tests {
         name: Option<&str>,
     ) -> AuditCallerContext {
         crate::delegation_vault::audit::build_caller_context(&crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: serde_json::json!({"iss": "https://idp.example.com", "email": email, "name": name}),
+            verification: Default::default(),
         })
     }
 
@@ -448,9 +450,11 @@ mod tests {
         assert_eq!(with(jwt_caller(Some(""), None)), "user-123", "an empty claim is skipped");
         let by_oid = crate::delegation_vault::audit::build_caller_context(
             &crate::source_auth::AuthenticatedIdentity::JwtBearer {
+                strategy_id: None,
                 principal_claim: "oid".to_string(),
                 subject: "person-1".to_string(),
                 claims: serde_json::json!({"iss": "https://idp.example.com", "sub": "pairwise", "oid": "person-1"}),
+                verification: Default::default(),
             },
         );
         assert_eq!(with(by_oid), "person-1", "the principal claim's value names the caller, not the token's sub");
@@ -568,7 +572,8 @@ mod tests {
             | DelegationAuditAction::TargetAuthChanged(_)
             | DelegationAuditAction::SecretForceDeleted(_)
             | DelegationAuditAction::AuthorityForceDeleted(_)
-            | DelegationAuditAction::McpProxyPinChanged(_) => {}
+            | DelegationAuditAction::McpProxyPinChanged(_)
+            | DelegationAuditAction::BrowserOriginsChanged(_) => {}
         }
     }
 
@@ -716,6 +721,11 @@ mod tests {
                 mcp_proxy_id: "drive".to_string(),
                 previous_pin: None,
                 pin: "sha256:00".to_string(),
+            })),
+            DelegationAuditAction::BrowserOriginsChanged(Box::new(BrowserOriginsChangeDetails {
+                actor: Actor::user("u-1"),
+                previous_origins: Vec::new(),
+                origins: vec!["https://chat.example.com".to_string()],
             })),
         ]
     }

@@ -133,15 +133,14 @@ class ChangelogTests(unittest.TestCase):
     def test_manual_bump_may_exceed_fragment_inference(self) -> None:
         self.assertEqual(self.next_version("added", "0.3.16", "major"), ("ok", "major 1.0.0"))
 
-    def test_manual_bump_below_fragment_inference_fails(self) -> None:
-        status, message = self.next_version("added", "0.3.16", "patch")
-        self.assertEqual(status, "exit")
-        self.assertIn("require at least a minor release, but a patch release was requested", message)
+    def test_manual_bump_below_fragment_inference_wins(self) -> None:
+        self.assertEqual(self.next_version("added", "0.3.16", "patch"), ("ok", "patch 0.3.17"))
 
-    def test_breaking_fragment_requires_major_after_one_zero_zero(self) -> None:
-        status, message = self.next_version("breaking", "1.0.0", "minor")
-        self.assertEqual(status, "exit")
-        self.assertIn("at least a major release", message)
+    def test_manual_patch_wins_over_breaking_fragment(self) -> None:
+        self.assertEqual(self.next_version("breaking", "1.0.8", "patch"), ("ok", "patch 1.0.9"))
+
+    def test_missing_bump_infers_major_from_breaking_fragment(self) -> None:
+        self.assertEqual(self.next_version("breaking", "1.0.8", None), ("ok", "major 2.0.0"))
 
     def test_missing_bump_uses_fragment_inference(self) -> None:
         self.assertEqual(self.next_version("added", "0.3.16", None), ("ok", "minor 0.4.0"))

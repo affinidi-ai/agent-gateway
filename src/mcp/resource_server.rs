@@ -641,6 +641,12 @@ impl McpResourceServerConfig {
             subject,
             principal_claim: crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM.to_string(),
             claims,
+            verification: crate::source_auth::JwtVerification::of(
+                &strategy,
+                std::slice::from_ref(&self.resource),
+                crate::jwt_bearer::models::AudienceClaim::Aud,
+            ),
+            strategy_id: None,
         })
     }
 
@@ -887,6 +893,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(identity.jwt_claims().unwrap()["sub"], "user");
+        let gateway_keys = crate::sts::handlers::gateway_self_trust_strategy(&profile.issuer, &jwks).unwrap();
+        let verification = identity
+            .jwt_verification()
+            .unwrap();
+        assert_eq!(
+            verification,
+            &crate::source_auth::JwtVerification::of(
+                &gateway_keys,
+                std::slice::from_ref(&config.resource),
+                crate::jwt_bearer::models::AudienceClaim::Aud,
+            ),
+            "a resource token is bound to the gateway's own signing keys and the resource"
+        );
+        assert!(
+            verification
+                .key_source
+                .starts_with("inline_jwks:sha256:")
+        );
+        assert_eq!(verification.audiences, std::slice::from_ref(&config.resource));
+        assert!(
+            matches!(&identity, crate::source_auth::AuthenticatedIdentity::JwtBearer { strategy_id: None, .. }),
+            "no Caller Context strategy verified a Resource Server token: {identity:?}"
+        );
+        let identity_claims = ["sub".to_string()];
+        let keyed = crate::proxy::caller_key::KeyedCaller::of(&identity, &identity_claims)
+            .expect("a resource token caller gets a caller key");
+        assert_eq!((keyed.issuer, keyed.claim, keyed.value), (profile.issuer.as_str(), "sub", "user"));
+        assert_eq!(keyed.verification, verification);
         headers.append(header::AUTHORIZATION, HeaderValue::from_static("Bearer second"));
         assert_eq!(
             config

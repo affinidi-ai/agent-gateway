@@ -1233,7 +1233,8 @@ type SavedSurface = (axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResp
 /// binding with external consent ([`inherited_target_binding_warnings`]),
 /// each enabled view that reaches that binding's vendor without it or a
 /// credential of its own ([`unbound_vendor_view_warnings`]), and each Target
-/// authentication that breaks a `target_https` or `target_source_auth` rule in `warn`.
+/// authentication that breaks a `target_https` or `target_source_auth` rule in `warn`,
+/// and a `caller_key` its Target never or only in clear receives ([`super::surface_caller_key::caller_key_warnings`]).
 async fn save_warnings(
     state: &IdentityApiState,
     surface: &AgentSurface,
@@ -1270,6 +1271,7 @@ async fn save_warnings(
         .chain(inherited_target_binding_warnings(surface))
         .chain(unbound_vendor_view_warnings(surface))
         .chain(super::surface_target_auth::target_rule_warnings(surface, &https_proxies))
+        .chain(super::surface_caller_key::caller_key_warnings(surface))
         .chain(stale_pins)
     {
         if let Some(value) = warning_header(&warning) {
@@ -3252,6 +3254,7 @@ pub async fn create_surface(
     // Re-run the shape check against every resolved variant so a
     // variant override can't blank out a required field unnoticed.
     validate_resolved_variants(&surface)?;
+    super::surface_caller_key::validate_caller_key(&surface)?;
 
     surface
         .validate()
@@ -3263,6 +3266,8 @@ pub async fn create_surface(
         .validate_mcp_metadata()
         .map_err(SurfaceApiError::BadRequest)?;
     normalize_a2a_settings(&mut surface, None).map_err(SurfaceApiError::BadRequest)?;
+    crate::config::agent_surface::normalize_browser_origins(&mut surface.browser_origins)
+        .map_err(SurfaceApiError::BadRequest)?;
     refuse_validation_off_by_scoped_caller(
         &surface,
         None,
@@ -3398,6 +3403,8 @@ pub async fn update_surface(
     retain_a2a_settings(&mut surface, &existing);
     retain_transit_token_lifetime(&mut surface, &existing);
     retain_transit_caller_authentication(&mut surface, &existing, &sent);
+    super::surface_caller_key::retain_caller_key(&mut surface, &existing, &sent);
+    retain_browser_origins(&mut surface, &existing, &sent);
 
     let (saved, warnings) = validate_and_save_surface(
         &state,
@@ -3455,6 +3462,24 @@ fn retain_transit_token_lifetime(
             });
         }
         None => {}
+    }
+}
+
+/// PUT carries the whole record, and the Surface Builder does not show
+/// `browser_origins`, so a PUT that leaves it out keeps the stored list.
+/// Removal is explicit: `[]` with PUT, or `[]` or `null` with PATCH.
+fn retain_browser_origins(
+    surface: &mut AgentSurface,
+    existing: &AgentSurface,
+    sent: &serde_json::Value,
+) {
+    if sent
+        .get("browser_origins")
+        .is_none()
+    {
+        surface.browser_origins = existing
+            .browser_origins
+            .clone();
     }
 }
 
@@ -4241,10 +4266,13 @@ async fn validate_and_save_surface(
     reject_target_trust_checks_unless_target_runs_them(&surface)?;
     validate_workload_binding_config(&surface)?;
     validate_source_auth(&surface, existing)?;
+    super::surface_caller_key::validate_caller_key(&surface)?;
     surface
         .validate_mcp_metadata()
         .map_err(SurfaceApiError::BadRequest)?;
     normalize_a2a_settings(&mut surface, existing).map_err(SurfaceApiError::BadRequest)?;
+    crate::config::agent_surface::normalize_browser_origins(&mut surface.browser_origins)
+        .map_err(SurfaceApiError::BadRequest)?;
     let stored_a2a = existing.and_then(|existing| {
         existing
             .access_point
@@ -4761,6 +4789,7 @@ async fn apply_surface_change_while_locked(
     // DashMap clear) and safe (worst case is the next few requests
     // re-fetch).
     crate::proxy::agent_card_cache::invalidate_all();
+    crate::proxy::backend_identity::forget_card_identity_warning(surface_id);
 
     let provider_key_gate = crate::identity::provider_key_gate::gate();
     let changed_id = match change {
@@ -8065,6 +8094,33 @@ mod validation_tests {
         assert_eq!(stored_lifetime(&fresh), None);
     }
 
+    #[test]
+    fn a_put_without_browser_origins_keeps_the_stored_ones_and_an_empty_list_clears_them() {
+        let mut stored = base_surface();
+        stored.browser_origins = vec!["https://chat.example.com".to_string()];
+
+        let mut omitted = base_surface();
+        retain_browser_origins(&mut omitted, &stored, &serde_json::json!({ "name": "surface" }));
+        assert_eq!(omitted.browser_origins, ["https://chat.example.com"]);
+
+        let mut cleared = base_surface();
+        retain_browser_origins(&mut cleared, &stored, &serde_json::json!({ "browser_origins": [] }));
+        assert!(
+            cleared
+                .browser_origins
+                .is_empty()
+        );
+
+        let mut replaced = base_surface();
+        replaced.browser_origins = vec!["https://app.example.com".to_string()];
+        retain_browser_origins(
+            &mut replaced,
+            &stored,
+            &serde_json::json!({ "browser_origins": ["https://app.example.com"] }),
+        );
+        assert_eq!(replaced.browser_origins, ["https://app.example.com"]);
+    }
+
     /// A PUT without `transit` keeps the lifetime a stored base block with no
     /// Transit Points carries, and removes a block that has Transit Points.
     #[test]
@@ -8510,8 +8566,10 @@ mod validation_tests {
             mcp_legacy_metadata_output: None,
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
+            caller_key: None,
             trust_check_split: false,
             transit_point_source_auth: false,
+            browser_origins: Vec::new(),
         }
     }
 

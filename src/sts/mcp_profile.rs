@@ -79,6 +79,38 @@ impl<State: Send + Sync> axum::extract::FromRequest<State> for McpTokenForm {
     }
 }
 
+pub(crate) fn validate_subject_claims(
+    claims: &serde_json::Value,
+    principal_claim: &str,
+    now: u64,
+) -> Result<u64, StsError> {
+    for field in ["iss", principal_claim] {
+        if claims
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err(StsError::InvalidGrant("MCP subject requires a verified issuer and subject".into()));
+        }
+    }
+    let expiry = claims
+        .get("exp")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|expiry| *expiry > now)
+        .ok_or_else(|| StsError::InvalidGrant("MCP subject requires a future expiry".into()))?;
+    if claims
+        .get("nbf")
+        .is_some_and(|value| {
+            value
+                .as_u64()
+                .is_none_or(|not_before| not_before > now)
+        })
+    {
+        return Err(StsError::InvalidGrant("MCP subject is not yet valid".into()));
+    }
+    Ok(expiry)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct McpIssuerProfile {
@@ -211,31 +243,7 @@ impl McpIssuerProfile {
         principal_claim: &str,
         now: u64,
     ) -> Result<u64, StsError> {
-        for field in ["iss", principal_claim] {
-            if claims
-                .get(field)
-                .and_then(serde_json::Value::as_str)
-                .is_none_or(str::is_empty)
-            {
-                return Err(StsError::InvalidGrant("MCP subject requires a verified issuer and subject".into()));
-            }
-        }
-        let expiry = claims
-            .get("exp")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|expiry| *expiry > now)
-            .ok_or_else(|| StsError::InvalidGrant("MCP subject requires a future expiry".into()))?;
-        if claims
-            .get("nbf")
-            .is_some_and(|value| {
-                value
-                    .as_u64()
-                    .is_none_or(|not_before| not_before > now)
-            })
-        {
-            return Err(StsError::InvalidGrant("MCP subject is not yet valid".into()));
-        }
-        Ok(expiry)
+        validate_subject_claims(claims, principal_claim, now)
     }
 
     pub fn validate(&self) -> Result<(), StsError> {

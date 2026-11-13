@@ -564,9 +564,11 @@ mod tests {
     #[test]
     fn did_source_fails_closed_on_non_did_identity() {
         let jwt = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: serde_json::json!({}),
+            verification: Default::default(),
         };
         let err = capture_from_did(&jwt, &[], None).unwrap_err();
         assert_eq!(err, CallerContextCaptureError::NotDidAuthenticated { actual: "jwt_bearer" });

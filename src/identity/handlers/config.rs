@@ -109,6 +109,7 @@ async fn reload(state: &IdentityApiState) -> anyhow::Result<(usize, usize, bool,
     // (new endpoint, new agent_card_path) never serves stale metadata
     // to `step_collect_trust_context`.
     crate::proxy::agent_card_cache::invalidate_all();
+    crate::proxy::backend_identity::forget_card_identity_warnings();
 
     // Rewrite any legacy `channel.policy` definition to `surface.policy` before
     // the surfaces recompile below, so a definition added since startup (or one

@@ -22,6 +22,11 @@ use crate::bdd_support::config::target_auth::{
     TARGET_AUTH_SIGNING_KEY_SECRET, credential_provider_target_auth_json, static_secret_target_auth_json,
     target_auth_service_account_key_file, target_auth_signing_key,
 };
+use crate::bdd_support::oidc::{OIDC_CLIENT_ID, OIDC_CLIENT_SECRET};
+
+/// The secret ID of the consent confirmation login client's secret.
+const CONSENT_CONFIRMATION_CLIENT_ID: &str = "bdd-consent-confirmation-client-id";
+const CONSENT_CONFIRMATION_CLIENT_SECRET: &str = "bdd-consent-confirmation-client-secret";
 
 struct SingleSurfaceOptions<'a> {
     outbound: Option<(u16, &'a HashMap<String, String>)>,
@@ -257,7 +262,7 @@ fn write_single_surface_config_inner(
         .unwrap_or("bdd-surface");
     let effective_target_url = effective_target_url(mock_url, surface_config);
     let mut surface_fixture = AgentSurfaceFixture::new(
-        "bdd-surface",
+        crate::bdd_support::config::single_surface_fixture::SEEDED_SURFACE_ID,
         surface_name,
         "BDD test surface",
         format!("http://localhost:{gateway_port}"),
@@ -328,6 +333,19 @@ fn write_single_surface_config_inner(
     }
     if let Some(mcp_http) = &surface_config.mcp_http {
         surface_fixture = surface_fixture.with_mcp_http(mcp_http.clone());
+    }
+    if let Some(caller_key) = &surface_config.caller_key {
+        let mut setting = serde_json::json!({ "secret_id": caller_key.secret_id });
+        if let Some(header) = &caller_key.header {
+            setting["header"] = serde_json::json!(header);
+        }
+        surface_fixture = surface_fixture.with_caller_key(setting);
+    }
+    if !surface_config
+        .browser_origins
+        .is_empty()
+    {
+        surface_fixture = surface_fixture.with_browser_origins(&surface_config.browser_origins);
     }
     if let Some(a2a) = &surface_config.a2a_settings {
         surface_fixture = surface_fixture.with_a2a_settings(a2a.clone());
@@ -684,6 +702,14 @@ fn write_single_surface_config_inner(
         serve_dashboard(base_dir);
     }
     add_gateway_prefixes(base_dir, &surface_config.gateway_prefixes);
+    if !surface_config
+        .network_cors
+        .is_empty()
+    {
+        edit_gateway_json(base_dir, |gateway| {
+            gateway["cors"] = serde_json::json!(surface_config.network_cors);
+        });
+    }
 }
 
 /// The text of the dashboard build's `index.html`, which every dashboard page serves.
@@ -943,6 +969,11 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
     if let Some(proxy) = &surface_config.a2a_proxy_target {
         secrets.push(SecretFixture::new(&proxy.secret_id, &proxy.secret_value));
     }
+    if let Some(caller_key) = &surface_config.caller_key
+        && let Some(secret_value) = &caller_key.secret_value
+    {
+        secrets.push(SecretFixture::new(&caller_key.secret_id, secret_value));
+    }
     if let Some(provider) = &surface_config.target_auth_provider {
         if provider.grant == TargetAuthProviderGrant::JwtBearer {
             let signing_key = if provider.signing_key_is_service_account_file {
@@ -969,6 +1000,10 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
                 {
                     secrets.push(SecretFixture::new(format!("bdd-{provider_id}-client-id"), "bdd-client-id"));
                     secrets.push(SecretFixture::new(format!("bdd-{provider_id}-client-secret"), "bdd-client-secret"));
+                }
+                if surface_config.consent_confirmation {
+                    secrets.push(SecretFixture::new(CONSENT_CONFIRMATION_CLIENT_ID, OIDC_CLIENT_ID));
+                    secrets.push(SecretFixture::new(CONSENT_CONFIRMATION_CLIENT_SECRET, OIDC_CLIENT_SECRET));
                 }
             }
             CredentialProviderKind::ApiKey { secret_id, secret_value } => {
@@ -1059,6 +1094,7 @@ fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) -> C
                     .map(|method| method.api_value()),
             })
         }),
+        consent_confirmation: None,
         created_at: now,
         updated_at: now,
     }
@@ -1108,6 +1144,7 @@ fn delegation_provider_fixture(surface_config: &SurfaceConfigBuilder) -> Vec<Cre
             authorization_response_issuer: None,
             max_consent_age_secs: None,
             jwt_settings: None,
+            consent_confirmation: None,
             created_at: now,
             updated_at: now,
         }],
@@ -1132,6 +1169,10 @@ fn oauth_provider_fixture(
         .as_ref()
         .filter(|delegation| delegation.provider_id == provider_id)
         .and_then(|delegation| delegation.tenant_id.clone());
+    let own = surface_config
+        .credential_delegation
+        .as_ref()
+        .is_some_and(|delegation| delegation.provider_id == provider_id);
     CredentialProviderFixture {
         id: record_id.clone(),
         tenant_id,
@@ -1153,9 +1194,28 @@ fn oauth_provider_fixture(
         authorization_response_issuer,
         max_consent_age_secs,
         jwt_settings: None,
+        consent_confirmation: (own && surface_config.consent_confirmation)
+            .then(|| consent_confirmation_json(surface_config)),
         created_at: now,
         updated_at: now,
     }
+}
+
+/// The `consent_confirmation` of a provider whose caller signs in at the callers' identity
+/// provider, verified by the strategy that verifies the surface's JWT callers.
+fn consent_confirmation_json(surface_config: &SurfaceConfigBuilder) -> serde_json::Value {
+    let endpoints = surface_config
+        .identity_provider_endpoints
+        .as_ref()
+        .expect("the identity provider must run before a provider that confirms its caller is written");
+    serde_json::json!({
+        "client_id_secret_ref": CONSENT_CONFIRMATION_CLIENT_ID,
+        "client_secret_secret_ref": CONSENT_CONFIRMATION_CLIENT_SECRET,
+        "authorization_endpoint": endpoints.authorization_endpoint,
+        "token_endpoint": endpoints.token_endpoint,
+        "jwt_verification_strategy_id": "bdd-jwt-strategy",
+        "require": surface_config.consent_confirmation_required,
+    })
 }
 
 fn policy_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<PolicyDefinitionFixture> {

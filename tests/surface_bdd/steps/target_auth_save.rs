@@ -20,7 +20,7 @@ fn static_secret(
     }}})
 }
 
-fn draft(world: &mut SurfaceWorld) -> &mut Value {
+pub(crate) fn draft(world: &mut SurfaceWorld) -> &mut Value {
     world
         .surface_draft
         .as_mut()
@@ -106,6 +106,11 @@ async fn surface_draft_checking_jwt_issued_to_client(
 #[given("the draft's Target is an https URL")]
 fn draft_target_is_https(world: &mut SurfaceWorld) {
     draft(world)["target"]["endpoint"] = json!(UNREACHABLE_HTTPS_TARGET);
+}
+
+#[given("the draft's Target is a plain http URL")]
+fn draft_target_is_plain_http(world: &mut SurfaceWorld) {
+    draft(world)["target"]["endpoint"] = json!(UNREACHABLE_HTTP_TARGET);
 }
 
 #[given(expr = "the draft's Access Point checks callers by the API key in secret {string}")]

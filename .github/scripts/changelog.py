@@ -26,7 +26,6 @@ WIP_DIR = ROOT / ".changelog" / "wip"
 HISTORY_DIR = ROOT / ".changelog" / "history"
 CHANGELOG = ROOT / "CHANGELOG.md"
 SECTIONS = ["breaking", "security", "added", "changed", "fixed", "removed"]
-BUMP_RANK = {"patch": 0, "minor": 1, "major": 2}
 
 
 def fragment_paths() -> list[Path]:
@@ -136,15 +135,7 @@ def cmd_next_version(args: argparse.Namespace) -> None:
     except ValueError:
         print(f"error: '{args.current}' is not a MAJOR.MINOR.PATCH version", file=sys.stderr)
         raise SystemExit(1)
-    implied = implied_bump(fragments, current)
-    kind = args.bump or implied
-    if BUMP_RANK[kind] < BUMP_RANK[implied]:
-        print(
-            f"error: the pending changelog fragments require at least a {implied} release, "
-            f"but a {kind} release was requested",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
+    kind = args.bump or implied_bump(fragments, current)
     print(f"{kind} {bump_version(current, kind)}")
 
 

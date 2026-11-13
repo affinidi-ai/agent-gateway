@@ -118,6 +118,7 @@ pub struct CredentialProviderFixture {
     pub max_consent_age_secs: Option<u64>,
     /// The `jwt_*` settings of a provider that signs a JWT, merged into the record.
     pub jwt_settings: Option<serde_json::Value>,
+    pub consent_confirmation: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -517,6 +518,9 @@ fn write_credential_provider_fixture(
     }
     if let Some(secs) = provider.max_consent_age_secs {
         value["max_consent_age_secs"] = serde_json::json!(secs);
+    }
+    if let Some(confirmation) = &provider.consent_confirmation {
+        value["consent_confirmation"] = confirmation.clone();
     }
     if let Some(serde_json::Value::Object(settings)) = &provider.jwt_settings {
         for (name, setting) in settings {

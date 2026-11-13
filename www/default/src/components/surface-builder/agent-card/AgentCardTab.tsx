@@ -9,6 +9,7 @@ import {
   describeFetchCause,
   describeFetchFailure,
   formatRelativeTime,
+  isCardServed,
   type AgentCardPreview,
   type CardUnsupportedReason,
   type SupportedAgentCardPreview,
@@ -156,6 +157,9 @@ const FailedFetch: React.FC<{
 function refreshAnnouncement(preview: AgentCardPreview): string {
   if (!preview.supported || preview.generated) return 'Card refreshed.';
   if (preview.fetch.status === 'ok') return 'Card refreshed. The card fetch is OK.';
+  if (preview.fetch.status === 'served_without_identity') {
+    return 'Card refreshed. The card is served without a managed identity.';
+  }
   if (preview.fetch.status === 'not_served') {
     return 'Card refreshed. The gateway will not serve the card.';
   }
@@ -201,7 +205,7 @@ const AgentCardTab: React.FC<AgentCardTabProps> = ({
   };
 
   const renderReady = (preview: SupportedAgentCardPreview): React.ReactNode => {
-    const ok = preview.fetch.status === 'ok';
+    const served = isCardServed(preview.fetch.status);
     const oversize = oversizeBytes(preview);
     const comparable = preview.after !== null && (preview.generated || preview.before !== null);
     const managedCard = preview.generated ? null : preview.before;
@@ -218,20 +222,25 @@ const AgentCardTab: React.FC<AgentCardTabProps> = ({
             This shows the base route. A Surface Variant may serve a different card.
           </Notice>
         )}
-        {!ok && <FailedFetch preview={preview} lastServed={lastServed} />}
-        {ok && oversize !== null && (
+        {!served && <FailedFetch preview={preview} lastServed={lastServed} />}
+        {preview.fetch.status === 'served_without_identity' && (
+          <Notice testId="agent-card-served-without-identity" variant="warning" role="status">
+            {describeFetchCause(preview.fetch, preview.auth)}
+          </Notice>
+        )}
+        {served && oversize !== null && (
           <Notice testId="agent-card-too-large" variant="warning">
             This card is {kb(oversize)} KB, more than the {kb(preview.display_limit_bytes)} KB the
             dashboard shows. Open the card URL to read it.
           </Notice>
         )}
-        {ok && preview.generated && (
+        {served && preview.generated && (
           <Notice testId="agent-card-generated">
             The gateway generates this card for an A2A proxy, so there is no agent card to compare.
           </Notice>
         )}
-        {ok && oversize === null && !comparable && <StatusUnavailable onRetry={handleRetry} />}
-        {ok && comparable && preview.after !== null && (
+        {served && oversize === null && !comparable && <StatusUnavailable onRetry={handleRetry} />}
+        {served && comparable && preview.after !== null && (
           <>
             <AgentCardCompare
               before={managedCard}

@@ -292,12 +292,10 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   Access Point and Caller Context elements carry `public` and `caller_authentication.on_failure`
   through a load and rebuild unchanged; `withCallerAccessSettled`
   (`access-point/publicAccess.ts`) settles the write. On a surface stored without `public`
-  (`legacyAccessPoint` in `SurfaceMetaContext`, set by the edit page), the panel shows the
-  legacy state under the switch: the gateway refuses its failed callers, and without a Caller
-  Context it admits every caller. A **Close Access Point** button
-  (`access-point-close-button`, hidden when read-only) sets `public: false`. Turning the
-  switch off there clears `public`, so turning it on and off again keeps the surface legacy. A
-  `public: false` the operator sets, in the panel or the JSON editor, is sent. Once `public` is
+  (`legacyAccessPoint` in `SurfaceMetaContext`, set by the edit page), turning the switch off
+  clears `public`, so turning it on and off again keeps `public` unset. A `public: false`
+  set in the JSON editor shows `access-point-closing-notice` under the switch until the save,
+  and is sent, like one set with the switch on a surface that has `public`. Once `public` is
   sent, `on_failure` is left out of the surface and its variants, because the gateway derives it.
 - **Access Point readiness.** A closed Access Point (`public: false`, which the gateway stamps on
   a new surface) with no caller authentication method and no `mcp_http.authorization` is not
@@ -331,9 +329,7 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   - Stored without `public` and no Caller Context: "This Access Point is neither closed nor
     public, and it admits callers without credentials. …".
   The dashboard shows none of these after a save (`shownSaveWarnings` in
-  `elements/saveWarnings.ts` drops them, a variant's prefix ignored): the canvas notice and the
-  Access Point panel already show the Access Point's state, and turning Public access on is the
-  operator's own choice. Every other `Warning` header is shown.
+  `elements/saveWarnings.ts` drops them, a variant's prefix ignored). Every other `Warning` header is shown.
   `showSurfaceSaveToast` (`elements/saveWarnings.ts`) shows a save in one toast, since a later
   toast replaces an earlier one: "<saved>" alone as `success`, or "<saved>, with warnings:"
   and one line per warning as a `warning` toast, the shown `Warning` headers first, then the
@@ -884,13 +880,30 @@ surface, never the unsaved form.
   happened and what to do, for example "Check that the agent is running, then Refresh."
   **Refresh** needs `surfaces.edit`; without it the button is disabled with the reason as its title
   and description. A successful Refresh replaces the failed state with the new cards and puts
-  "Card refreshed." with the fetch result (OK, failing or not served, never the cause, which the
-  alert gives) in a visually hidden status region (`agent-card-refresh-status`), cleared when the
+  "Card refreshed." with the fetch result (OK, served without a managed identity, failing or not
+  served, never the cause, which the alert gives) in a visually hidden status region (`agent-card-refresh-status`), cleared when the
   next Refresh starts; a 429 shows a warning toast and keeps the cards on screen; a refused or
   failed Refresh shows an error toast. The tab heading (`agent-card-heading`, `tabIndex=-1`) takes
   focus when **Retry** replaces itself with the loading status.
+- A card served without a managed identity (`served_without_identity`, cause `identity_missing`)
+  is a served card: the badge reads **Served – No managed identity** in the warning tone with no
+  `agent-card-fetch-cause` beside it (a served card names no cause in the header), a warning
+  alert (`agent-card-served-without-identity`, never danger) reads "The managed agent's card has no
+  identity extension, so the gateway serves it without an identity credential.", and the comparison
+  and raw panels show as for an OK fetch. `isCardServed` in `utils/agentCardPreview.ts` is the one
+  check for "the card is served"; the Managed Agent panel's fetch line reads "Card fetch: Served –
+  No managed identity" in the warning tone (`agent-card-fetch-warning`, icon
+  `fa-circle-exclamation`), and the card counts as the last served card (`lastServed`).
 - A failed or not-served fetch shows a danger alert with the cause text (`agent-card-failed`,
-  `agent-card-failed-cause`) and opens both raw panels. The managed panel reads "Not available:
+  `agent-card-failed-cause`) and opens both raw panels. For `identity_failed` the alert names
+  `fetch.identity_error` with its own text (`CARD_IDENTITY_ERROR_TEXT`: an identity extension the
+  gateway can use is missing, the extension is invalid, the card could not be read for its
+  identity, a DID could not be issued, or the gateway could not attach its credential), and keeps
+  the generic "Check the gateway logs, then Refresh." only when the gateway names none. When
+  `fetch.identity_slot` is `external_identity` the alert uses `CARD_EXTERNAL_IDENTITY_ERROR_TEXT`
+  instead, which points at the external Identity element rather than the managed agent's card. The
+  parser rejects an `identity_error` or `identity_slot` beside any other cause. The managed panel
+  reads "Not available:
   <cause — HTTP n>." (`agent-card-raw-before-missing`), or shows the managed card when the gateway
   fetched it but will not serve it. The served panel shows, in this order: the card the gateway
   returns in `after` whatever the fetch status, with "The card the gateway last served for this
@@ -923,12 +936,14 @@ surface, never the unsaved form.
   is the served card URL, and only when `safeHttpUrl` passes (http or https, no user info), opened
   with `rel="noopener noreferrer"`. The parser keeps no token, secret, secret id or upstream error
   body, so the view has nothing of that kind to show.
-- The Managed Agent panel shows one line, **Card fetch: OK**, **Card fetch: failing (<cause — HTTP
-  n>)** or **Card: generated by the gateway**, with an icon, and a **View agent cards** link button
+- The Managed Agent panel shows one line, **Card fetch: OK**, **Card fetch: Served – No managed
+  identity**, **Card fetch: failing (<cause — HTTP n>)** or **Card: generated by the gateway**, with
+  an icon, and a **View agent cards** link button
   (`managed-agent-card-fetch`, `managed-agent-card-fetch-status`, `managed-agent-card-fetch-icon`,
   `managed-agent-card-fetch-link`), through `agent-card/AgentCardFetchLine.tsx`. The status text
-  uses `agent-card-fetch-ok` and `agent-card-fetch-failing` (AA colours in both themes, scoped to
-  `.agent-card-fetch-line`), not `text-success` or `text-danger`. `AgentCardFetchLine` reads the
+  uses `agent-card-fetch-ok`, `agent-card-fetch-warning` and `agent-card-fetch-failing` (AA colours
+  in both themes, scoped to `.agent-card-fetch-line`), not `text-success`, `text-warning` or
+  `text-danger`. `AgentCardFetchLine` reads the
   preview with its own `useAgentCardPreview` call and never calls Refresh; it reads again when
   `SurfaceMetaContext.agentCardFetchRevision` changes, which the shell bumps on a save and on each
   successful Refresh in the Agent Cards view (`AgentCardTab` `onRefreshed`), so the line does not
@@ -1037,6 +1052,15 @@ sends the trimmed value only when it is not blank, so a blank field means `sub`.
 strategy the field shows the stored claim, is disabled, and is left out of the update, since the
 gateway refuses a change to it. A save's `Warning` headers, such as another strategy naming the
 same issuer's callers by a different claim, are shown in a warning toast that stays until closed.
+
+The Settings page's strategies tab (`SettingsPage/StrategiesTab.tsx`) shows a refused delete in
+its alert with the gateway's message, the credential providers a `409` lists as still using the
+strategy by name (else id), "and N you can't view" for its `hidden_references`, that a
+provider's consent confirmation is changed in its editor and its `consent_identity_strategy_id`
+through the API, and the status (`strategyDeleteError`). The delete's confirm dialog says
+credential providers that use the strategy block the delete. The strategy editor shows a `409`
+on save (an issuer change a provider using the strategy would refuse) with the same
+`strategyDeleteError` text, so it names those providers and where to change them.
 
 ## Credential Tokens and Delegated Access tabs
 
@@ -1169,6 +1193,47 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   was created and gives the gateway's reason, and the editor still opens the created provider, so
   saving again updates it instead of creating it a second time. The Provider ID input has no
   route prefix, since a new provider's callback path does not contain it.
+- An authorization code provider without an `issuer` (legacy consent) shows a **Consent
+  confirmation** section after the Callback URL (`ConsentConfirmationSection.tsx`,
+  `credential-provider-consent-confirmation-section`), with a switch
+  (`credential-provider-consent-confirmation-switch`) that is off by default and on when the
+  stored provider has `consent_confirmation`. While on it asks for Login Client ID and Login
+  Client Secret (each a `SecretSelect`, `credential-provider-cc_client_id_secret_ref-select` and
+  `credential-provider-cc_client_secret_secret_ref-select`), Login Authorization
+  Endpoint and Login Token Endpoint (`…-authorization-endpoint-input`, `…-token-endpoint-input`),
+  a JWT verification strategy from `GET /jwt-verification-strategies`
+  (`credential-provider-consent-confirmation-strategy-select`, loaded by `useJwtStrategyList`),
+  offering only strategies of the provider's tenant and appliance-wide ones, as the gateway's
+  reference rule allows; a new provider, which the dashboard creates appliance-wide, is offered
+  appliance-wide ones only. A stored strategy is listed by its id while the list loads, as
+  "(not found)" only once the list loaded without it, and with the other-tenant label when it is
+  another tenant's; a list that cannot be read shows "Strategies could not be loaded"
+  (`credential-provider-consent-confirmation-strategies-failed`). Then an optional ID-token principal claim
+  (`…-principal-claim-input`) and a **Refuse callers that can't be confirmed** switch
+(`credential-provider-consent-confirmation-require-switch`, writes `require`, off by default,
+sent only while on; its `FieldHelp` says it acts on new links only, so a stored grant is still
+used, and that JWT callers get no link while the setting confirms nobody, whether it is on or not).
+The Login Client ID and Login Client Secret pickers offer the same tenant's secrets as the
+strategy picker: on a new provider, appliance-wide ones only. The labels say "Login" so they never share a name with the
+  provider's own client and endpoints. Explanations sit behind each field's `FieldHelp`. A
+  read-only **Confirmation redirect URI**
+  (`credential-provider-consent-confirmation-redirect-uri`, copy button
+  `credential-provider-consent-confirmation-redirect-uri-copy`) is the Callback URL the editor
+  shows followed by `/confirm`, which is what the gateway registers. Under it a line
+  (`credential-provider-consent-confirmation-redirect-uri-where`) says to add it to the allowed
+  redirect URIs of the login client, naming the secret that holds its ID once one is picked, at the
+  identity provider, and not at the vendor, whose OAuth app keeps the Callback URL. The line and
+  the field's `FieldHelp` both say the URI follows the Callback URL and cannot be edited on its
+  own, so it is registered again whenever the Callback URL changes. Without a Callback URL to
+  show, new or stored, a notice stands in its place
+  (`credential-provider-consent-confirmation-redirect-uri-pending`) saying the URI is shown
+  once the provider has a Callback URL. The Login Client Secret's `FieldHelp` says to register
+  the login client with `client_secret_post`. Save
+  refuses a blank required field first (`missingConsentConfirmationField`) and sends
+  `consentConfirmationField`: the setting while on (a blank principal claim left out), `null`
+  when a stored setting is switched off or the provider is no longer legacy consent, and no field
+  otherwise, so the gateway keeps what it has. The gateway's `400` reason shows like any other
+  save error.
 - A provider with an `issuer` (external consent) shows a notice naming the issuer
   (`credential-provider-external-notice`) in place of the type, endpoint, client, callback and
   additional parameter inputs, which the gateway keeps fixed; Save sends only its name,

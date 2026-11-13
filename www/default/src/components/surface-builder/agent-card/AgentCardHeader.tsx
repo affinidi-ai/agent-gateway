@@ -9,6 +9,7 @@ import {
   describeFetchFailure,
   formatLocalTime,
   formatRelativeTime,
+  isCardServed,
   safeHttpUrl,
   type CardFetchStatus,
   type SupportedAgentCardPreview,
@@ -20,6 +21,7 @@ const STATUS_TONE: Record<CardFetchStatus, 'success' | 'danger' | 'warning'> = {
   ok: 'success',
   failed: 'danger',
   not_served: 'warning',
+  served_without_identity: 'warning',
 };
 
 interface AgentCardHeaderProps {
@@ -131,7 +133,7 @@ const AgentCardHeader: React.FC<AgentCardHeaderProps> = ({
             tone={STATUS_TONE[fetch.status]}
             data-testid="agent-card-fetch-status"
           />
-          {fetch.cause && (
+          {fetch.cause && !isCardServed(fetch.status) && (
             <span className="ms-2" data-testid="agent-card-fetch-cause" data-cause={fetch.cause}>
               {fetchFailure}
             </span>

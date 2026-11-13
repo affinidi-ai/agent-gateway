@@ -561,6 +561,15 @@ pub struct McpProxyPinChangeDetails {
     pub pin: String,
 }
 
+/// A management save that changed which browser origins a surface lets pages call it from
+/// (`browser_origins`): the list before the save, empty for a new surface, and after it.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct BrowserOriginsChangeDetails {
+    pub actor: Actor,
+    pub previous_origins: Vec<String>,
+    pub origins: Vec<String>,
+}
+
 /// A secret deleted with `force=true` through the management API. Names the secret by its id
 /// and each record that still used it by kind and id; never the secret's value or a record's
 /// name.
@@ -831,6 +840,8 @@ pub enum DelegationAuditAction {
     AuthorityForceDeleted(Box<AuthorityForceDeleteDetails>),
     /// A save changed the pin of a `proxy://` Transit Point's external consent binding.
     McpProxyPinChanged(Box<McpProxyPinChangeDetails>),
+    /// A save changed a surface's `browser_origins`.
+    BrowserOriginsChanged(Box<BrowserOriginsChangeDetails>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -888,6 +899,7 @@ impl DelegationAuditAction {
                 | Self::SecretForceDeleted(_)
                 | Self::AuthorityForceDeleted(_)
                 | Self::McpProxyPinChanged(_)
+                | Self::BrowserOriginsChanged(_)
         )
     }
 }
@@ -1379,6 +1391,7 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
             subject,
             principal_claim,
             claims,
+            ..
         } => {
             let named_by_sub = principal_claim == crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM;
             let (sub, principal) = if named_by_sub {
@@ -1774,6 +1787,7 @@ pub fn action_category(action: &DelegationAuditAction) -> &'static str {
         DelegationAuditAction::SecretForceDeleted(_) => "secret_force_deleted",
         DelegationAuditAction::AuthorityForceDeleted(_) => "authority_force_deleted",
         DelegationAuditAction::McpProxyPinChanged(_) => "mcp_proxy_pin_changed",
+        DelegationAuditAction::BrowserOriginsChanged(_) => "browser_origins_changed",
     }
 }
 
@@ -3303,6 +3317,7 @@ mod tests {
     #[test]
     fn caller_context_preserves_raw_jwt_identity_evidence() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: serde_json::json!({
@@ -3311,6 +3326,7 @@ mod tests {
                 "email": "alice@example.com",
                 "name": "Alice Example"
             }),
+            verification: Default::default(),
         };
 
         let caller = build_caller_context(&identity);
@@ -3334,23 +3350,29 @@ mod tests {
     #[test]
     fn caller_context_keeps_the_tokens_sub_beside_another_principal_claim() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "oid".to_string(),
             subject: "person-1".to_string(),
             claims: serde_json::json!({ "iss": "https://issuer.example", "sub": "pairwise-sub", "oid": "person-1" }),
+            verification: Default::default(),
         };
         let caller = build_caller_context(&identity);
         assert_eq!(caller.sub.as_deref(), Some("pairwise-sub"));
         assert_eq!(caller.principal.as_deref(), Some("person-1"));
         let without_sub = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "oid".to_string(),
             subject: "person-1".to_string(),
             claims: serde_json::json!({ "iss": "https://issuer.example", "oid": "person-1" }),
+            verification: Default::default(),
         };
         assert_eq!(build_caller_context(&without_sub).sub, None);
         let without_oid = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "oid".to_string(),
             subject: "<none>".to_string(),
             claims: serde_json::json!({ "iss": "https://issuer.example", "sub": "pairwise-sub" }),
+            verification: Default::default(),
         };
         let caller = build_caller_context(&without_oid);
         assert_eq!(caller.principal, None, "a token without the claim has no principal, not the placeholder");
@@ -3363,9 +3385,11 @@ mod tests {
     #[test]
     fn a_fabric_receive_caller_names_the_peer_and_a_direct_caller_none() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             subject: "alice".to_string(),
             claims: serde_json::json!({ "iss": "https://issuer.example", "sub": "alice" }),
             principal_claim: "sub".to_string(),
+            verification: Default::default(),
         };
 
         let received = fabric_receive_caller_context(&identity, Some("did:web:partner.example"), "partner-record");
@@ -4187,9 +4211,11 @@ mod tests {
     #[tokio::test]
     async fn audit_policy_decision_records_the_authenticated_caller() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: serde_json::json!({"email": "ada@example.com", "name": "Ada Lovelace"}),
+            verification: Default::default(),
         };
         let ((), events) = crate::audit::producer::capture(async {
             let decide = |caller| {
@@ -4440,9 +4466,11 @@ mod tests {
     #[test]
     fn a_vp_injection_record_has_the_full_field_set() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "user-1".to_string(),
             claims: serde_json::json!({}),
+            verification: Default::default(),
         };
         let event = vp_injected_event(injection(Some(build_caller_context(&identity))));
 
@@ -4471,9 +4499,11 @@ mod tests {
     #[tokio::test]
     async fn a_vp_injection_without_a_caller_takes_the_requests_caller() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "user-2".to_string(),
             claims: serde_json::json!({}),
+            verification: Default::default(),
         };
         let event = crate::audit::context::with_caller(Some(build_caller_context(&identity)), async {
             vp_injected_event(injection(None))

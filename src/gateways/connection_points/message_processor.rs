@@ -4404,6 +4404,27 @@ impl FabricPayment<'_> {
     }
 }
 
+/// The MCP HTTP policy a Fabric-received request to `surface` is admitted under. A framed
+/// stream checks the caller's browser `Origin` against the surface's allowlist and its
+/// `browser_origins`. A buffered `ForwardRequest` is not checked for it again: the sending
+/// gateway already checked it against its own surface.
+fn fabric_receive_http_policy(
+    surface: &crate::config::agent_surface::AgentSurface,
+    versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    framed: bool,
+) -> Result<crate::mcp::modern_http::EndpointHttpPolicy, String> {
+    let policy = crate::mcp::modern_http::EndpointHttpPolicy::framed_fabric_receive(
+        surface,
+        surface.mcp_http.as_ref(),
+        versions,
+    )?;
+    Ok(if framed {
+        policy
+    } else {
+        policy.without_origin_check()
+    })
+}
+
 async fn process_charged_forward_request(
     message: &ReceivedMessage,
     mut stream_request: Option<FabricStreamRequest>,
@@ -5039,15 +5060,7 @@ async fn process_charged_forward_request(
 
     let mut mcp_verified_binding = None;
     let (mcp_metadata_context, mut mcp_classification) = if surface.channel_protocol() == crate::config::ChannelProtocol::Mcp {
-        let http_policy = match crate::mcp::modern_http::EndpointHttpPolicy::with_versions(
-            surface.mcp_http.as_ref(),
-            std::slice::from_ref(&surface.access_point.listen_address),
-            mcp_versions,
-        ) {
-            // The sending gateway already checked the caller's browser Origin
-            // against its own surface, so a buffered ForwardRequest is not
-            // checked again against this surface's allowlist.
-            Ok(policy) if stream_request.is_none() => policy.without_origin_check(),
+        let http_policy = match fabric_receive_http_policy(&surface, mcp_versions, stream_request.is_some()) {
             Ok(policy) => policy,
             Err(error) => {
                 channel_warn!(config_id, "Invalid MCP HTTP configuration: {}", error);
@@ -5975,6 +5988,17 @@ async fn process_charged_forward_request(
         }
     }
 
+    if let Some((header_name, header_value)) = crate::proxy::caller_key::caller_key_header(
+        &surface,
+        surface.target_endpoint(),
+        authenticated_identity.as_ref(),
+        get_secrets_store().as_ref(),
+    )
+    .await
+    {
+        req = crate::proxy::handler::replace_request_header(req, &header_name, &header_value);
+    }
+
     // Inject custom metadata for MCP protocol
     if surface_protocol == crate::config::ChannelProtocol::Mcp
         && let Some(custom_metadata) = surface.custom_metadata()
@@ -6102,6 +6126,8 @@ async fn process_charged_forward_request(
                     &secrets_store,
                     &base_url,
                     true, // via_fabric = true (G2G path)
+                    // Transit and Fabric consent is not confirmed.
+                    crate::delegation_vault::consent_confirmation::ConsentCaller::TransitOrFabric,
                     Some(&delegation_audit_ctx),
                     // A Fabric request establishes no consent principal, so it never
                     // unlocks a modern consent record.
@@ -6348,9 +6374,7 @@ async fn process_charged_forward_request(
             };
             match store.get(proxy_id).await {
                 Ok(Some(proxy)) => Some(proxy),
-                Ok(None) => return axum_response_to_forward_result(crate::a2a::create_error_response(
-                    axum::http::StatusCode::NOT_FOUND, "MCP proxy was not found",
-                )).await,
+                Ok(None) => return axum_response_to_forward_result(crate::protocols::no_mcp_proxy_response()).await,
                 Err(_) => return axum_response_to_forward_result(crate::a2a::create_error_response(
                     axum::http::StatusCode::SERVICE_UNAVAILABLE, "MCP proxy storage is unavailable",
                 )).await,
@@ -9420,6 +9444,9 @@ mod mcp_receive_tests;
 mod fabric_transit_tests;
 
 #[cfg(test)]
+mod fabric_caller_key_tests;
+
+#[cfg(test)]
 mod variant_routing_tests;
 
 #[cfg(test)]
@@ -11544,6 +11571,9 @@ mod tests {
                 "x-gateway-did": "did:web:peer-sent-gateway.example",
                 "X-DID-Identity": "did:web:peer-sent-surface.example",
                 "X-Did-Signed-Identity": "{\"id\":\"did:web:peer-sent-surface.example\"}",
+                "X-Caller-Key": "peer-sent",
+                "x_caller_key": "peer-sent",
+                "X-Caller-Key-Memory": "peer-sent",
                 "Cookie": "__Host-session_token=peer-dashboard-session",
                 "Accept-Encoding": "gzip, br",
                 "x-peer-context": "kept"
@@ -11562,6 +11592,9 @@ mod tests {
             "x-gateway-did",
             "x-did-identity",
             "x-did-signed-identity",
+            "x-caller-key",
+            "x_caller_key",
+            "x-caller-key-memory",
             "cookie",
         ] {
             assert!(

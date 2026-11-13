@@ -70,6 +70,7 @@ pub async fn validate_surface_references(
         .provider_keys(&provider_key_ids(surface)?)
         .await?;
     validate_target_auth_methods(state, surface).await?;
+    super::surface_caller_key::validate_caller_key_secret(state, surface).await?;
     let https_proxies = super::surface_target_auth::https_mcp_proxies(state).await;
     super::surface_target_auth::validate_target_auth_rules(surface, stored, &https_proxies)
 }
@@ -1898,6 +1899,9 @@ fn collect_effective_surface_references(
     }
 
     collect_target_auth_reference(surface.target.auth.as_ref(), references);
+    if let Some(caller_key) = surface.caller_key.as_ref() {
+        push_reference_with_rule(references, ResourceKind::Secrets, &caller_key.secret_id, true);
+    }
     for metadata in std::iter::once(
         surface
             .target

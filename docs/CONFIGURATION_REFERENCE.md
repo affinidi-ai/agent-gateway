@@ -104,6 +104,54 @@ bucket for the point, and `per_caller_rate_limit` gives each caller the point id
 of their own. Both are counted on each gateway node. See
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point).
 
+## Browser origins of a surface
+
+A browser page can call a surface only from an allowed origin. `network.cors` in `gateway.json` lists
+origins allowed for every path the gateway serves and is read once, at startup. A surface owner who hosts
+a static page on their own domain, such as a chat page for an A2A agent, lists that origin on the surface
+instead, in `browser_origins`, with no `gateway.json` edit and no restart. On an MCP surface the same
+list also passes the MCP Origin check, so nothing else needs setting there either.
+
+| Field | Behaviour |
+| --- | --- |
+| `browser_origins` | A list of at most 20 exact origins, each at most 256 bytes: `https`, a host, an optional port, and nothing else. A wildcard, a path (a trailing `/` included), a query, a fragment, userinfo, any other scheme and a longer entry are refused with a `400` naming `browser_origins` and quoting the entry escaped. Each is stored in the form the URL parser normalises it to (the host in lower case, the default port `443` dropped), and a duplicate is dropped. Absent or empty, the surface behaves as before. A `PUT` that leaves it out keeps the stored list, so a Surface Builder save keeps it; `[]` clears it, with `PUT` or `PATCH`. Set it on the surface itself; a variant has no list of its own and uses its surface's. |
+
+The same rules hold for a surface stored on disk, such as one edited by hand under `_storage/`: on load
+each entry is normalised, and an invalid entry, a duplicate or one past the 20th is dropped and logged as
+a warning naming the surface, as is the whole field when it is not a list; the surface itself still loads, and its stored file is rewritten without the
+dropped entries. The drop is logged, not audited: no `browser_origins_changed` event is recorded for it.
+
+A cross-origin request, a preflight included, to a path that belongs to a surface is allowed when its
+`Origin` is in `network.cors` or in that surface's `browser_origins`. A path belongs to the surface whose
+route is the longest prefix of it, as when the gateway serves the request, under a `network.channels`
+prefix or a `network.routes` entry of type `proxy`. A path that belongs to no surface uses `network.cors`
+only, and the public discovery documents keep their any-origin rule for `GET` and `HEAD`. An origin on one
+surface's list gets nothing on another surface, and a disabled or deleted surface allows none, from the
+moment the gateway stops serving it. Protected resource metadata
+(`/.well-known/oauth-protected-resource`) is not a surface path: where a channel prefix of `/` or
+`/.well-known` also serves it, only `network.cors` applies to it, and elsewhere any origin may read it.
+
+On an MCP surface a request's `Origin`, when present, must also pass the MCP Origin check (see
+[`MCP_METADATA.md`](MCP_METADATA.md)): it admits the gateway's own external URLs,
+`mcp_http.allowed_origins` and the surface's `browser_origins`, and refuses any other with `403`. Over a
+framed Fabric stream the receiving surface's lists decide.
+
+Each save that changes the list records a `browser_origins_changed` audit event with the list before and
+after it, when the VP Audit Log or an integration selects that event (see
+[`OBSERVABILITY.md`](OBSERVABILITY.md)). A tenant-scoped PAT that may update the surface
+may set the list: whoever owns a surface decides which pages may call it, as they decide its other
+settings, and the list opens the surface to those pages only, never to another surface. An origin whose
+domain later changes hands keeps its access until it is removed from the list.
+
+`Access-Control-Allow-Credentials` is never sent, so a page's cookies and HTTP credentials do not go with
+the request; it authenticates the way any other caller does, with the credential the surface's Access Point
+checks. A saved change applies from the next request: the gateway reads the surface list on every request,
+and a reload or restart is not needed. A browser may reuse a preflight answer it already holds for a few
+seconds.
+
+A release that predates `browser_origins` refuses to load a surface that carries it (surfaces are read with
+unknown fields refused): before rolling back, clear it from every surface (`PATCH` `{"browser_origins": []}`).
+
 ## Secret references
 
 Any field documented as accepting a loader reference resolves through
@@ -127,7 +175,7 @@ explicit scheme, because a literal key in a shared repository is a leaked key.
 | --- | --- | --- |
 | `AG_BACKUP_ENCRYPTION_KEY` | Encrypts the whole `.agbak` archive, AES-256-GCM. Referenced from `backup_encryption_key`. | Yes, unless that field resolves another way |
 | `AG_MASTER_KEY` | Master key for encryption at rest when `encryption.key_source = "environment"`. Named by `encryption.key_env_var`. | When encryption at rest is enabled |
-| `AG_IDENTITY_HASH_PEPPER` | HMAC pepper for agent DIDs derived from a credential: the `from_mtls`, `from_api_key`, and `from_jwt_claim` managed identity modes, and A2A proxy identities other than Entra agents. Payload extraction does not use it. When encryption at rest is off, it also keys the seal on the OAuth delegation `state`. Hex, or a loader reference, decoding to at least 32 bytes. It also derives the ids of delegated grants by binding. Set the same value on every node of a multi-node gateway (see [`CAPABILITIES.md`](CAPABILITIES.md#high-availability)). | No, except for grants by binding. Without it, or with a value that is too short or cannot be resolved, an ephemeral pepper is used: those DIDs change on every restart, with encryption at rest off an OAuth consent started before a restart or on another replica fails at the callback, and the vault keeps no grant by binding, so a binding with `consent_mode: external`, a Transit Point's or the Access Point Target's, is refused (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#grants-by-binding)). |
+| `AG_IDENTITY_HASH_PEPPER` | HMAC pepper for agent DIDs derived from a credential: the `from_mtls`, `from_api_key`, and `from_jwt_claim` managed identity modes, and A2A proxy identities other than Entra agents. Payload extraction does not use it. When encryption at rest is off, it also keys the seal on the OAuth delegation `state`; the states of a [consent confirmation](CREDENTIAL_DELEGATION.md#consent-confirmation) are always sealed with a key derived from it. Hex, or a loader reference, decoding to at least 32 bytes. It also derives the ids of delegated grants by binding. Set the same value on every node of a multi-node gateway (see [`CAPABILITIES.md`](CAPABILITIES.md#high-availability)). | No, except for grants by binding and consent confirmation. A credential provider with `consent_confirmation` cannot be saved without it, and while it is missing such a provider gives JWT callers no consent link (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#who-is-confirmed)). Without it, or with a value that is too short or cannot be resolved, an ephemeral pepper is used: those DIDs change on every restart, with encryption at rest off an OAuth consent started before a restart or on another replica fails at the callback, and the vault keeps no grant by binding, so a binding with `consent_mode: external`, a Transit Point's or the Access Point Target's, is refused (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#grants-by-binding)). |
 | `AG_LEGACY_BACKUP_KEYS` | Up to four comma-separated previous backup keys, tried after the current one. Only read when `legacy_backup_encryption_keys` names it. | No, migration only |
 | `AFFINIDI_TERMS_REFRESH_INTERVAL_SECONDS` | How often the Affinidi Terms metadata is refreshed. Clamped to 60 to 3600 seconds in release builds. See [`TERMS_AND_CONSENT.md`](TERMS_AND_CONSENT.md#refresh-and-outage-behaviour). | No. Defaults to a random point between 55 and 60 minutes. |
 | `AG_EVENT_HOOK_URL` | Turns on the [event hook](INTEGRATIONS.md#event-hook) and sets the receiver endpoint it posts Connection Point events to. `http` is accepted only for a loopback host; any other host needs `https` and `AG_EVENT_HOOK_SECRET`, otherwise the hook is disabled. | No. Unset means no events. |
@@ -193,7 +241,7 @@ Network topology and the surfaces served. The largest configuration file; the ex
 | --- | --- |
 | `listeners` | Named bind addresses and ports. Access Points and Transit Points reference these. A `listener_type` must be `inbound` or `outbound`, in lower case, and is `inbound` when left out. A `bind_address` must be an IPv4 or IPv6 address such as `0.0.0.0`, `127.0.0.1`, `::` or `::1`, and an IPv6 address may be written in brackets, such as `[::1]`, which names the same socket as `::1`; a host name such as `localhost` is not accepted. Any other `listener_type` or `bind_address` stops the gateway from loading its network configuration. The gateway binds only configured addresses, never an address no listener names. Each port is served by one listener task, and the first listener configured on the port decides whether it is inbound or outbound, whether it uses TLS and, for an outbound port, the one address it binds; the other listeners on the port do not change these, so an inbound listener on an outbound port is not served. An inbound port binds the distinct `bind_address` of every inbound listener on it, each on its own address; one of them that an unspecified address on the same port already covers, such as `127.0.0.1` beside `0.0.0.0`, is served through that one, and a bind the operating system reports in use is skipped only when a listener already bound on the port accepts its connections: an IPv6 wildcard covers an IPv4 address only when its socket is dual-stack. An IPv4 caller accepted on an IPv6 address, such as `::` on a dual-stack host, is reported in IPv4 form (`a.b.c.d`, not `::ffff:a.b.c.d`) as the resolved client IP, which the login limits and request records use, and matches the IPv4 entries of `client_ip.trusted_proxies` and `tls.client_auth.trusted_proxies`; an IPv4-mapped address in `X-Forwarded-For` is read the same way. |
 | `channels` | Route prefixes. The legacy wire name for surface routes. The dashboard offers them as an Access Point's **Surface Prefix**, in this order, and preselects the first for a new surface. A prefix, an `mcp_proxies` prefix, a `proxy` route, or a `redirect` route with a `target`, whose first segment is a page of the dashboard is not served, since it would answer a reload of that page instead of the dashboard. The gateway still starts and serves everything else; it logs an error naming each prefix it skips and the page that prefix would hide, a configuration reload reports the same in its `warning`, and the dashboard does not offer a skipped prefix as a **Surface Prefix**. The whole first segment counts, so a prefix below a page, such as `/settings/old`, is skipped too, even where the dashboard has no route under it today. Rename such a prefix (for example to `/svc/<name>`) and the clients that call it, then reload. The dashboard pages are `/access-tokens`, `/api-keys`, `/apikeys`, `/audit`, `/authorities`, `/certificates`, `/cli-consent`, `/connections`, `/connection-points`, `/credential-providers`, `/credentials`, `/dashboard`, `/delegation-vault`, `/departments`, `/gateways`, `/identities`, `/integrations`, `/issuers`, `/jwt-verification-strategies`, `/logs`, `/mediators`, `/metrics`, `/notifications`, `/oidc-providers`, `/onboard`, `/payment-gateways`, `/policies`, `/policy-definitions`, `/profile`, `/proxies`, `/secrets`, `/settings`, `/sts-clients`, `/surfaces`, `/system-metrics`, `/tasks`, `/trust-registries`, `/users`, `/x402payments` (`SPA_RESERVED_TOP_LEVEL` in [`src/proxy/paths.rs`](../src/proxy/paths.rs)). `/payments` is not one of them. A channel prefix serves surfaces at and below it, and a `proxy` route below its prefix (an empty prefix, below `/`): these are the surface prefixes, except one the gateway does not serve because it hides a dashboard page. The admin API stores a new or changed Access Point route without a trailing `/`, and refuses one that is not a plain path (letters, digits and `-._~!&'()*+,;=:@` in segments that are not empty, `.` or `..`; no `$` or `%`, so a route cannot spell another surface's variant URL), that no surface prefix serves, or that a more specific entry here serves (an MCP proxy prefix serves the paths below it, a `redirect` only its own path), naming the entry or listing the surface prefixes. It reads this file as it is on disk, as the dashboard does for its **Surface Prefix** choices, which are the `channels` prefixes. The rule holds for a surface reached only over Fabric, or used only for its Transit Points, too, though Fabric finds a surface by id (see [`FABRIC.md`](FABRIC.md#fabric-receive-pipeline)). A disabled surface is not checked, and neither is the route an active surface already had, so a surface stored before these checks can still be edited. At startup the gateway logs a `WARN` for each stored active surface no surface prefix serves, or whose route is not a plain path once a trailing `/` is dropped; it keeps serving such a route as before, so move it or disable the surface. |
-| `routes` | Route categories and their types, prefixes, and fallbacks. A `proxy` route, or a `redirect` route with a `target`, whose first segment is a dashboard page is not served, as for `channels`. Every prefix but a `redirect`'s is read without a trailing `/`, so a channel at `/agents/` serves `/agents/foo`; a root prefix (`""` or `/`) is kept as written. No two entries of `channels`, `mcp_proxies` and `routes` may serve the same path: two entries on one prefix clash unless one is a `redirect`, which serves only its prefix, and the other a `proxy` route or an `mcp_proxies` prefix, which serve only the paths below theirs. An `identity_api`, `onboarding`, `static` or `connection_point` route at `/`, the static fallback, and an entry the gateway does not serve (one that hides a dashboard page, a `redirect` without a `target`, a `static` route without a `path`) are exempt. A `gateway.json` with a clashing pair stops the gateway from starting, and a reload refuses it, naming each pair; before upgrading, check for prefixes that become equal once a trailing `/` is dropped. |
+| `routes` | Route categories and their types, prefixes, and fallbacks. A `proxy` route, or a `redirect` route with a `target`, whose first segment is a dashboard page is not served, as for `channels`. Every prefix but a `redirect`'s is read without a trailing `/`, so a channel at `/agents/` serves `/agents/foo`; a root prefix (`""` or `/`) is kept as written. No two entries of `channels`, `mcp_proxies` and `routes` may serve the same path: two entries on one prefix clash unless one is a `redirect`, which serves only its prefix, and the other a `proxy` route or an `mcp_proxies` prefix, which serve only the paths below theirs. An `identity_api`, `onboarding`, `static` or `connection_point` route at `/`, the static fallback, and an entry the gateway does not serve (one that hides a dashboard page, a `redirect` without a `target`, a `static` route without a `path`) are exempt. A `gateway.json` with a clashing pair stops the gateway from starting, and a reload refuses it, naming each pair; before upgrading, check for prefixes that become equal once a trailing `/` is dropped. The static fallback serves the dashboard for every path no route matched, except a path at or below a non-root `identity_api` prefix, which is answered `404` with `{"error":"Not found"}` on every inbound listener, whether or not that listener serves the identity API. |
 | `mcp_proxies` | Route prefixes for MCP proxy endpoints. A prefix whose first segment is a dashboard page is not served, as for `channels`. |
 | `did` | The domain used when generating `did:web` and `did:webvh` identifiers |
 | `webauthn` | Relying-party ID and external origin for passkey registration |
@@ -205,10 +253,10 @@ Network topology and the surfaces served. The largest configuration file; the ex
 | `payment_ledger` | `retention_days` (default `7`, 1 to 400): how long the payments ledger keeps its hourly segments. `max_size_mb` (default `2048`, 16 to 1,048,576): the oldest segments are deleted early while the ledger is larger. Neither deletes a segment holding a payment still awaiting capture or void. Read at startup; a value out of range is clamped and logged as a warning. See [Taking the payment](#taking-the-payment). |
 | `client_ip` | `trusted_proxies`: proxy CIDRs whose `X-Forwarded-For` gives the client IP for the SAML and CLI login limits and the STS token endpoint throttle, and whose `X-Forwarded-Host` and `X-Forwarded-Proto` (or `Forwarded` `host` and `proto`) STS discovery may use when no inbound `external_urls` is set (default empty, so the TCP peer is the client and forwarded headers are ignored). Behind a load balancer, list it here: until then every caller it forwards counts as one client for these limits. A listed proxy that passes a caller's own `X-Forwarded-Host`, `X-Forwarded-Proto` or `Forwarded` through unchanged lets that caller choose the URLs STS discovery advertises, so have it set or strip them, or set inbound `external_urls`. Each listed proxy must append the address it saw to `X-Forwarded-For` or overwrite it; `Forwarded` is read only when `X-Forwarded-For` is absent. Separate from `tls.client_auth.trusted_proxies`. |
 | `facilitator_mode` | x402 facilitator behaviour. `facilitator_via_fabric`, `facilitator_via_http` and `enable_test_endpoints` are ignored, and a warning is logged when any is set: a peer's fabric x402 verify and settle requests are refused with `facilitator_disabled`, and `/api/x402/*` and the x402 test endpoints are not served. x402 payments already in the transaction store still settle. |
-| `cors` | Permitted dashboard origins |
+| `cors` | Exact origins whose pages may call the gateway from a browser: the dashboard, and any surface. Read once, at startup. A surface can allow more origins for itself alone with `browser_origins` (see [Browser origins of a surface](#browser-origins-of-a-surface)). |
 | `terms`, `affinidi_terms_url` | Whether Terms acceptance is enforced, and where metadata is fetched |
 | `logging` | Log redaction, for every configuration source. Only `redaction` is read here; level, JSON output, and directory come from `config.toml`. See [Log redaction](#log-redaction). |
-| `oauth_callback_route` | Where OAuth redirects land (`{route}/{segment}`), and the consent start page under it (`{route}/{segment}/start`). `{segment}` is the credential provider's id for a provider created now, and its `provider_id` for one created before callback paths ended in the id. A reverse proxy in front of the gateway must forward both. See [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#consent-flow). |
+| `oauth_callback_route` | Where OAuth redirects land (`{route}/{segment}`), the consent start page under it (`{route}/{segment}/start`), and the identity provider's redirect for consent confirmation (`{route}/{segment}/confirm`). `{segment}` is the credential provider's id for a provider created now, and its `provider_id` for one created before callback paths ended in the id. A reverse proxy in front of the gateway must forward all three. See [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#consent-flow). |
 | `external_consent_resource_origins` | Resource origins permitted for the credential providers of external consent of each issuer, beyond the issuer's own host and its subdomains: an issuer origin maps to a list of resource origins, all `https`, for example `{"https://accounts.google.com": ["https://www.googleapis.com"]}`. Entries are exact origins, with no wildcard (`https://*.googleapis.com` is not one), path or userinfo; an entry that is not one permits nothing and is named in an `ERROR` at startup. Read once, at startup: a configuration reload keeps the value the gateway started with and warns when the file differs, so a change takes a restart; no API changes it. See [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-providers). |
 | `external_consent_issuers` | When set, the only issuers the credential providers of external consent may name: an issuer identifier, compared exactly, maps to the origins its authorization, token and revocation endpoints and its metadata's `jwks_uri` may use beyond the issuer's own host, for example `{"https://mcp.linear.app": [], "https://accounts.google.com": ["https://oauth2.googleapis.com"]}`. An empty object permits no issuer other than those `external_consent_issuer_patterns` matches. Unset (the default) while `external_consent_issuer_patterns` is unset too, an operator's token may create a provider for any issuer whose metadata it matches, and a tenant's token cannot create a provider with an issuer at all (`400`, `external_consent_issuers_required`). Set it on any gateway whose providers another system or a tenant creates, such as a pool gateway. An entry that is not a plain `https` issuer or origin permits nothing and is named in an `ERROR` at startup. Read once, at startup: a configuration reload keeps the value the gateway started with and warns when the file differs, so a change takes a restart; no API changes it. See [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#permitted-issuers). |
 | `external_consent_issuer_patterns` | Issuers the credential providers of external consent may name besides those `external_consent_issuers` lists, for a vendor whose issuer carries the customer's tenant: a list of `{"issuer", "tenant", "endpoint_origins", "resource_origins"}`, for example `[{"issuer": "https://login.microsoftonline.com/{tenant}/v2.0", "tenant": "uuid", "resource_origins": ["https://graph.microsoft.com"]}]`. `issuer` is an `https` issuer as the URL parser writes it, with no credentials, query, fragment or `%`, and exactly one `{tenant}`, either a whole path segment after a fixed host or the whole leftmost label of a fixed host of at least two labels (`https://{tenant}.my.salesforce.com`); no wildcard. A host label pattern's fixed host must be one under which only the vendor creates labels, never a public suffix such as `co.uk` or a shared hosting suffix such as `github.io` or `herokuapp.com`: the gateway carries no public suffix list to tell them apart. `tenant` is `uuid` (the canonical 8-4-4-4-12 form, either case) or `label` (1 to 63 lower-case letters, digits and `-`, not at either end): what may stand for `{tenant}`, never a `/`, `.`, `:`, `@`, `?`, `#` or `%`. `endpoint_origins` and `resource_origins` (both empty by default) are exact origins, as in `external_consent_issuers` and `external_consent_resource_origins`, that count for an issuer the pattern matches. Set, even empty, it limits issuers as `external_consent_issuers` does, and a tenant's token may create a provider whose issuer matches a pattern. An entry that is not valid permits nothing and is named in an `ERROR` at startup, and while it is set each stored external consent provider neither key permits is named in a `WARN` by the credential policy report, at startup and on every reload. Read once, at startup: a configuration reload keeps the value the gateway started with and warns when the file differs, so a change takes a restart; no API changes it. See [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#permitted-issuers). |
@@ -302,7 +350,7 @@ The built-in rules, applied in this order:
 | Access and refresh tokens | The value of an `access_token`, `refresh_token` or `token` assignment |
 | Session identifiers | The value of a `session_id`, `sessionid`, `sid`, `jsessionid` or `connect.sid` assignment |
 | API key and secret assignments | The value after `api_key`, `api-key`, `apikey` or `secret` and an `=` or `:` |
-| Quoted credential fields | The JSON-quoted value of a key naming a credential, such as `"authorization": "Bearer …"`, `"x-api-key": "…"` or `"cookie": "…"`, also with escaped quotes |
+| Quoted credential fields | The JSON-quoted value of a key naming a credential, such as `"authorization": "Bearer …"`, `"x-api-key": "…"`, `"x-caller-key": "…"` or `"cookie": "…"`, also with escaped quotes |
 | Personal access tokens | `agpat_…` tokens |
 | Private key material (PEM) | PEM private key blocks |
 | Email addresses | Email addresses |
@@ -318,8 +366,9 @@ In OTLP exports, an attribute whose name is a credential name is replaced with
 `<redacted>` whatever its value, because a rule pattern cannot match a structured
 attribute by its name. The names, ignoring case, are `authorization`, `cookie`, `token`,
 `session_id`, `sessionid`, `jsessionid`, `password`, `passwd`, `secret`, `secret_key`,
-`api_key`, `apikey`, `private_key`, `credential` and `credentials`, alone or after a `.`,
-`_` or `-`: `http.request.header.authorization`, `x-api-key` and `mcp_session_id` match,
+`api_key`, `apikey`, `caller_key`, `private_key`, `credential` and `credentials`, alone or after
+a `.`, `_` or `-`: `http.request.header.authorization`, `x-api-key`, `x-caller-key` and
+`mcp_session_id` match,
 `token_count` and `secret_id` do not. Fields named like a credential lose the
 8-character prefix the gateway logs for correlation, in local logs as well as in OTLP
 exports.
@@ -975,6 +1024,58 @@ was deleted are dropped at startup, and their cases are `404`.
 - `target.mpp_auto_pay`, `target.mpp_auto_pay_max_amount` and
   `transit.points[*].payment_policy` are refused on save with the same code. A stored
   `mpp_auto_pay` is ignored: a `402` from a `fabric://` Target is passed back to the caller.
+
+## Surface caller keys
+
+A surface's optional `caller_key` gives its Target a stable key for each caller whose JWT the
+gateway verified on that request, so the Target can encrypt that caller's data with a key its
+own operator cannot derive. It is a surface field, not a configuration file, set through the
+admin API; a variant cannot override it.
+
+```json
+"caller_key": {
+  "secret_id": "agent-memory-keys",
+  "header": "x-caller-key",
+  "identity_claims": ["sub"]
+}
+```
+
+| Field | Default | Behaviour |
+| --- | --- | --- |
+| `secret_id` | Required | The `secret_id` of a secret in the secrets store, as `target.auth` `static_secret` names one. The value never appears in the surface, its API responses or the logs. A save refuses a secret that does not exist, one the surface's tenant may not use, and one of fewer than 32 bytes. The secret is the only thing that keeps anyone from deriving every caller's key, so make it at least 32 random bytes, such as the output of `openssl rand -base64 32`, never a typed passphrase. |
+| `header` | `x-caller-key` | The header the Target receives the key in: `x-caller-key`, or `x-caller-key-` followed by words of lower-case letters and digits joined by single hyphens, such as `x-caller-key-memory`, at most 64 characters. A save refuses any other name, and a header the surface or one of its variants already reads or sends: a source authentication credential header, a Target or delegated credential header, or a header metadata mapping header, compared ignoring case and `_` against `-`. |
+| `identity_claims` | `["sub"]` | The JWT claims that name the caller, in order: the first the token carries as a non-empty string is used. Each is 1 to 128 printable ASCII characters without spaces, named once, and not a claim that names the token, issuer, audience, client, tenant, session or lifetime (`iss`, `aud`, `tid`, `azp` and the others `principal_claim` refuses). |
+
+The key is HKDF-SHA256 with the secret's bytes as the input key, `agent-gateway-caller-key-v2`
+as the salt, 32 bytes, base64url without padding. Its info is seven fields, each preceded by
+its length in bytes as a 4-byte big-endian integer, so no field can be read as part of
+another: the surface id; the key source, `jwks_uri:` and the JWT verification strategy's JWKS
+URI as configured, or `inline_jwks:sha256:` and the lowercase hex SHA-256 of the RFC 8785
+canonical JSON of a key set configured inline (the gateway's own signing keys for an MCP
+Resource Server token); the audience claim (`aud`, `azp` or `client_id`; `aud` for a Resource
+Server token); the audiences the token was accepted against (the method's `audiences`, or the
+resource for a Resource Server token), sorted, without duplicates, each preceded by its own
+4-byte length; the token's `iss`; the claim's name; and its value. Binding the key to the key
+source and the audiences means whoever edits the strategy to trust another key set, or adds an
+audience to accept another application's tokens, cannot obtain an existing caller's key with
+a token claiming that caller's `iss` and subject. By design, changing the secret, the claims,
+the surface, the strategy's JWKS URI or inline keys (an inline key rotation included), the
+audience claim or the audiences changes every caller's key; the issuer rotating the keys
+behind a JWKS URI does not. Only a caller whose JWT was verified on
+that request gets a key: no caller with an API key, DID Auth or mTLS, no caller without a
+credential or whose credential failed on a public Access Point, and no token without a string
+`iss` or any of the claims. No header of the caller key family, `x-caller-key` or a name
+starting `x-caller-key-` once lower-cased with `_` read as `-`, that a caller, an agent or a peer
+gateway sends is forwarded, on any surface, whether or not it sets `caller_key`; a caller that
+used such a header for its own purposes can no longer send it through. The key follows
+`credential_policy.target_https` as a Target credential does: under `enforce` it goes only to an
+`https://` URL with a host, and under `warn` an `http` Target gets it with a logged warning. A save answers with a `Warning` when
+the surface's Target, or a variant's, is `http`, or is one that never receives a key
+(`fabric://`, `proxy://`, `a2a-proxy://`, or bound by external consent). Unlike a Target
+credential, which an enforced rule refuses at save, a `caller_key` on an `http` Target under
+`enforce` saves with that `Warning`, and its requests are forwarded without the key. A PUT that leaves
+`caller_key` out keeps the stored one, so a Surface Builder save keeps it; `null` removes it. See
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#caller-keys).
 
 ## Remote gateway records
 
