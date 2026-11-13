@@ -57,6 +57,13 @@ const PAUSED_GATEWAY = {
   role: "peer",
 };
 
+const PENDING_GATEWAY = {
+  ...PAUSED_GATEWAY,
+  id: "gw-pending",
+  name: "Partner sent",
+  status: "pending",
+};
+
 const PAUSED_CP = {
   id: "cp-paused",
   gateway_id: "gw-self",
@@ -186,6 +193,7 @@ test.describe("Mediator access step", () => {
     const step = page.getByTestId("wizard-step-mediator-access");
     await expect(step).toContainText("Allow these DIDs on the mediator");
     await expect(step).toContainText("Mediator X");
+    await expect(step.locator(".surface-info-panel")).toHaveCount(0);
     await expect(
       page.getByTestId("mediator-access-did-connection_point"),
     ).toContainText("Connection Point DID");
@@ -207,7 +215,7 @@ test.describe("Mediator access step", () => {
     await expect(page).toHaveURL(/\/connections\?tab=gateways$/);
   });
 
-  test("Add Gateway pauses on the step with the invitation's expiry and copies the DIDs", async ({
+  test("Add Gateway pauses on the same step as Create Connection Point and copies the DIDs", async ({
     page,
   }) => {
     const { posts } = await mockConnections(page);
@@ -223,12 +231,11 @@ test.describe("Mediator access step", () => {
     await page.getByTestId("wizard-next").click();
 
     const step = page.getByTestId("wizard-step-mediator-access");
-    await expect(step).toContainText(
-      "the mediator of the gateway that sent the invitation",
-    );
-    await expect(page.getByTestId("mediator-access-expiry")).toContainText(
-      "The invitation expires on",
-    );
+    await expect(step).toContainText("Allow these DIDs on the mediator");
+    await expect(step).toContainText("Mediator X");
+    await expect(step.locator(".surface-info-panel")).toHaveCount(0);
+    await expect(step).not.toContainText("sent the invitation");
+    await expect(step).not.toContainText("The invitation expires on");
     await expect(
       page.getByTestId("mediator-access-did-temporary"),
     ).toContainText("Temporary DID for the handshake");
@@ -288,6 +295,103 @@ test.describe("Mediator access step", () => {
     await expect(
       page.getByTestId("mediator-access-did-permanent"),
     ).toContainText(ACCEPTOR_PERMANENT_DID.slice(-16));
+  });
+
+  test("both Continue buttons share the per-row Edit button's style", async ({
+    page,
+  }) => {
+    await mockConnections(page);
+    await page.goto(`${BASE_URL}/connections?tab=gateways`);
+
+    const gatewayContinue = page.getByTestId(
+      "gateways-continue-button-gw-paused",
+    );
+    const cpContinue = page.getByTestId(
+      "connection-points-continue-button-cp-paused",
+    );
+    const cpEdit = page.getByTestId("connection-points-edit-button-cp-paused");
+    for (const button of [gatewayContinue, cpContinue, cpEdit]) {
+      await expect(button).toHaveClass(/btn-outline-primary/);
+      await expect(button).toHaveClass(/btn-sm/);
+    }
+    const colours = await Promise.all(
+      [gatewayContinue, cpContinue].map((button) =>
+        button.evaluate((el) => {
+          const style = getComputedStyle(el);
+          return `${style.color} ${style.backgroundColor} ${style.borderColor}`;
+        }),
+      ),
+    );
+    expect(colours[0]).toBe(colours[1]);
+  });
+
+  test("a pending gateway's row opens its details; a paused gateway's row does not", async ({
+    page,
+  }) => {
+    await mockConnections(page);
+    await page.route("**/api/v1/gateways", (route) =>
+      json(route, [SELF_GATEWAY, PAUSED_GATEWAY, PENDING_GATEWAY]),
+    );
+    await page.route("**/api/v1/gateways/gw-pending", (route) =>
+      json(route, PENDING_GATEWAY),
+    );
+    await page.route("**/api/v1/gateways/gw-pending/policy", (route) =>
+      json(route, { opa_policy_config: null }),
+    );
+    await page.goto(`${BASE_URL}/connections?tab=gateways`);
+
+    await expect(page.getByTestId("gateways-row-gw-paused")).toHaveCSS(
+      "cursor",
+      "default",
+    );
+    await expect(page.getByTestId("gateways-row-gw-pending")).toHaveCSS(
+      "cursor",
+      "pointer",
+    );
+    await page.getByTestId("gateways-row-gw-paused").click();
+    await expect(page).toHaveURL(/\/connections\?tab=gateways$/);
+
+    await page.getByTestId("gateways-row-gw-pending").click();
+    await expect(page).toHaveURL(/\/gateways\/gw-pending$/);
+    await expect(page.getByTestId("page-gateway-editor")).toContainText(
+      "Edit Gateway: Partner sent",
+    );
+    await expect(
+      page.getByTestId("gateway-editor-pending-notice"),
+    ).toContainText("This connection is pending");
+    await expect(page.locator("#status")).toBeDisabled();
+
+    await page.getByTestId("gateway-editor-remote-tab-trigger").click();
+    await expect(
+      page.getByTestId("gateway-editor-remote-pending"),
+    ).toContainText("once it accepts the connection");
+    await expect(page.getByTestId("gateway-editor-delete-button")).toBeEnabled();
+  });
+
+  test("the Add Gateway wizard's View Connection opens the pending gateway's details", async ({
+    page,
+  }) => {
+    await mockConnections(page);
+    await page.route("**/api/v1/gateways/gw-paused/continue", (route) =>
+      json(route, { gateway: { ...PENDING_GATEWAY, id: "gw-paused" } }),
+    );
+    await page.goto(`${BASE_URL}/gateways/connect?resume=gw-paused`);
+    await page.getByTestId("mediator-access-continue-button").click();
+    await expect(
+      page.getByTestId("wizard-progress-step-complete"),
+    ).toHaveAttribute("aria-current", "step");
+
+    await page.route("**/api/v1/gateways/gw-paused", (route) =>
+      json(route, { ...PENDING_GATEWAY, id: "gw-paused" }),
+    );
+    await page.route("**/api/v1/gateways/gw-paused/policy", (route) =>
+      json(route, { opa_policy_config: null }),
+    );
+    await page.getByTestId("wizard-oob-view-button").click();
+    await expect(page).toHaveURL(/\/gateways\/gw-paused$/);
+    await expect(
+      page.getByTestId("gateway-editor-pending-notice"),
+    ).toBeVisible();
   });
 
   test("a refused DID keeps the Connection Point step; an admitted one opens the invitation", async ({

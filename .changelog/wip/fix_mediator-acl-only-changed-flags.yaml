@@ -22,6 +22,18 @@ changes:
         (oob_connection.pending_expiry_hours), since the inviting administrator may approve days
         later. pending_expiry_hours now applies only to acceptances stored before the expiry was
         recorded.
+    - timestamp: '2026-11-13T15:00:00Z'
+      title: Drop the inviter's-mediator warning from Add Gateway's mediator access step
+      description: >-
+        The Add Gateway wizard's mediator access step showed a warning that the mediator belongs
+        to the gateway that sent the invitation, and when the invitation expires. The dashboard
+        cannot know whose mediator it is, since both gateways may use the same one, so the step
+        now looks exactly like the Create Connection Point step, with no warning.
+    - timestamp: '2026-11-13T15:05:00Z'
+      title: Style both Continue buttons on Connections like the per-row Edit button
+      description: >-
+        The Continue button of a gateway and of a Connection Point waiting for mediator access had
+        different styles. Both now use the outlined small style of the list's Edit button.
   fixed:
     - timestamp: '2026-11-12T16:00:00Z'
       title: ⭐ Pair gateways on an explicit_allow mediator without admin-only ACL rights
@@ -41,6 +53,24 @@ changes:
         When the mediator refuses to open a temporary listener's or Connection Point's inbox, the
         gateway now logs a warning with the mediator's reason and what it means for the pairing,
         instead of logging that the ACL was set to allow-all. The flow continues as before.
+    - timestamp: '2026-11-13T15:10:00Z'
+      title: Tell the acceptor when an invitation can't be used, so it stops waiting
+      description: >-
+        A gateway that accepted an invitation that was already used, expired, disabled or deleted
+        stayed pending for ever, because the inviting gateway only logged the refusal. The
+        inviting gateway now answers with connection-rejected and the reason "This invitation
+        can't be used any more. Ask for a new one.", without saying which, as it already did for
+        a wrong secret. The acceptor marks its gateway failed with that reason in its description,
+        and it can be deleted. A rejection is taken only from the inviter the setup went to, and
+        sending it is best effort.
+    - timestamp: '2026-11-13T15:15:00Z'
+      title: Open a pending gateway from the Gateways list, as the Add Gateway wizard does
+      description: >-
+        After Add Gateway sent its connection-setup, the wizard offered to open the new gateway,
+        but its pending row on Connections could not be opened. The row now opens the gateway's
+        page, which says the connection is pending, keeps Gateway Enabled off until the inviter
+        accepts, and shows the issuer DIDs and surfaces only once it does. Rows waiting for
+        approval or mediator access keep their own action.
   removed: []
   security: []
   breaking: []

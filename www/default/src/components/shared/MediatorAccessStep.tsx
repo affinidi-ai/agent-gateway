@@ -1,8 +1,7 @@
 import React from 'react';
 import { AppButton } from './AppButton';
 import { CopyButton } from './CopyButton';
-import InfoBanner from './InfoBanner';
-import { formatDateTime, topAndTail } from '../../utils/stringUtils';
+import { topAndTail } from '../../utils/stringUtils';
 
 /** One DID the mediator must admit before the pairing continues. */
 export interface MediatorAccessDid {
@@ -20,10 +19,6 @@ export interface MediatorAccessRefusal {
 interface MediatorAccessStepProps {
   dids: MediatorAccessDid[];
   mediatorName: string;
-  /** When the invitation expires; the step asks to continue before then. */
-  expiresAt?: string;
-  /** Shown above the DIDs, e.g. who administers the mediator. */
-  note?: string;
   refusal?: MediatorAccessRefusal | null;
   error?: string;
   continuing: boolean;
@@ -39,8 +34,6 @@ interface MediatorAccessStepProps {
 const MediatorAccessStep: React.FC<MediatorAccessStepProps> = ({
   dids,
   mediatorName,
-  expiresAt,
-  note,
   refusal,
   error,
   continuing,
@@ -70,17 +63,6 @@ const MediatorAccessStep: React.FC<MediatorAccessStepProps> = ({
           Connections.
         </li>
       </ul>
-
-      {(note || expiresAt) && (
-        <InfoBanner variant="warning" collapsible={false} icon="fa-exclamation-triangle">
-          {note && <p className="mb-1">{note}</p>}
-          {expiresAt && (
-            <p className="mb-0" data-testid="mediator-access-expiry">
-              The invitation expires on {formatDateTime(expiresAt, true)}. Continue before then.
-            </p>
-          )}
-        </InfoBanner>
-      )}
 
       <ul className="list-group mb-2">
         {dids.map(item => (
