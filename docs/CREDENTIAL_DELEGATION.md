@@ -1989,7 +1989,8 @@ A consent no request needs again is removed all the same. Once an hour, the firs
 minutes after startup and only while the node is active, the vault removes every ended consent
 it still holds ([`src/delegation_vault/sweep.rs`](../src/delegation_vault/sweep.rs)): an
 agent-keyed token is deleted, and a grant by binding is deleted under its surface's lock and
-revoked at the vendor. So a refresh token outlives its consent in the vault by an hour at most.
+revoked at the vendor. So while a node is active, a refresh token outlives its consent in the
+vault by about an hour at most.
 A binding's own shorter limit removes no agent-keyed token here either. A token whose provider
 was deleted ends at the end stored with it, and a service token is never touched. A grant the
 surface no longer serves is left to [the daily sweep](#the-daily-sweep), and no grant is removed
@@ -2822,7 +2823,11 @@ the `credential_providers.*` permissions. A provider a surface binds cannot be d
 ([Deleting a provider](#deleting-a-provider)).
 
 In the dashboard these live on the Credentials page, under the **Credential Providers**,
-**Credential Tokens**, and **Credential Delegation Audit** tabs.
+**Credential Tokens**, **Delegated Access**, and **Credential Delegation Audit** tabs. Credential
+Tokens lists every agent-keyed token, service tokens included, with when each consent was given
+and when it ends, and revokes one entry or every entry of a user. Delegated Access lists only
+the access a person gave that an agent can still use, by system, with when it ends; access that
+ended or was revoked is in the audit tab, which its **History** button opens.
 
 ## Related
 

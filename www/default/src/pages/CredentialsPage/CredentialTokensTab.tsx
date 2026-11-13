@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { usePermissions } from '../../context/PermissionsContext';
+import { useTwoStepDelete } from '../../hooks/useTwoStepDelete';
 import { AppButton } from '../../components/shared/AppButton';
 import { Badge } from '../../components/shared/Badge';
 import { DeleteButton } from '../../components/shared/DeleteButton';
@@ -9,34 +10,61 @@ import { showToast } from '../../utils/toaster';
 import { formatDateTime, topAndTail } from '../../utils/stringUtils';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { DOCS_URL } from '../../config/docs';
-
-interface DelegationToken {
-  id: string;
-  agent_did: string;
-  user_identity_hash: string;
-  credential_provider_id: string;
-  provider_id: string;
-  token_type: string;
-  scopes: string[];
-  expires_at: string | null;
-  consent_granted_at: string;
-  last_used_at: string | null;
-  created_at: string;
-  updated_at: string;
-  is_expired: boolean;
-  can_refresh: boolean;
-}
+import PaginationControls from './PaginationControls';
+import { DelegationToken, consentEnd, consentState, timeLeft } from './delegatedAccess';
 
 interface CredentialTokensTabProps {
   externalSearchTerm?: string;
   onFilteredCountChange?: (n: number) => void;
+  /** Opens the delegation audit of one user identity hash; no link is shown without it. */
+  onViewActivity?: (userHash: string) => void;
 }
 
 const PAGE_SIZE = 10;
 
+interface RevokeUserButtonProps {
+  token: DelegationToken;
+  onRevoke: () => Promise<void>;
+}
+
+/** Revokes every delegation of a row's user, on a second click that confirms the first. */
+const RevokeUserButton: React.FC<RevokeUserButtonProps> = ({ token, onRevoke }) => {
+  const { isConfirming, isProcessing, handleClick, buttonRef } = useTwoStepDelete(onRevoke);
+  const user = topAndTail(token.user_identity_hash, 8, 8);
+  const icon = isProcessing
+    ? 'fa-spinner fa-spin'
+    : isConfirming
+      ? 'fa-exclamation-triangle'
+      : 'fa-ban';
+  return (
+    <button
+      ref={buttonRef}
+      type="button"
+      className="btn btn-link btn-sm p-0 ms-1 border-0 text-warning text-decoration-none"
+      data-testid={`credential-token-revoke-user-button-${token.id}`}
+      title={
+        isConfirming
+          ? 'Click again to revoke every delegation of this user'
+          : 'Revoke all for this user'
+      }
+      aria-label={
+        isConfirming
+          ? `Click again to revoke all delegations for user ${user}`
+          : `Revoke all delegations for user ${user}`
+      }
+      disabled={isProcessing}
+      onClick={handleClick}
+    >
+      <i className={`fas ${icon} fa-xs`} aria-hidden="true" />
+      {isConfirming && <span className="ms-1 small">Click again to revoke all</span>}
+    </button>
+  );
+};
+
 const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
   externalSearchTerm,
   onFilteredCountChange,
+  onViewActivity,
 }) => {
   const { hasPermission } = usePermissions();
   const [tokens, setTokens] = useState<DelegationToken[]>([]);
@@ -88,7 +116,6 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
   };
 
   const handleRevokeByUser = async (userHash: string) => {
-    if (!window.confirm(`Revoke ALL delegations for user ${userHash.substring(0, 16)}…?`)) return;
     try {
       const response = await apiClient.fetch(
         `/api/v1/delegation-vault/by-user/${encodeURIComponent(userHash)}`,
@@ -104,16 +131,36 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
 
   const fmtDate = (d: string | null) => (d ? formatDateTime(d, true) : '—');
 
+  /** The end of a token's consent: as a sentence for the list, or as a value for the detail. */
+  const consentEndText = (token: DelegationToken, form: 'sentence' | 'value') => {
+    const end = consentEnd(token.consent_expires_at);
+    if (!end) return 'No time limit';
+    const date = formatDateTime(end, true);
+    if (consentState(end, new Date()) === 'ended') {
+      return form === 'sentence' ? `Ended ${date}` : `${date} (ended)`;
+    }
+    const left = timeLeft(end, new Date());
+    return form === 'sentence' ? `Ends ${date} (${left})` : `${date} (${left})`;
+  };
+
   const getStatusBadge = (token: DelegationToken) => {
+    const consent = consentState(consentEnd(token.consent_expires_at), new Date());
+    if (consent === 'ended') return <span className="badge text-bg-secondary">Consent ended</span>;
+    if (consent === 'ending_soon')
+      return <span className="badge text-bg-warning">Ending soon</span>;
     if (token.is_expired && token.can_refresh)
       return <span className="badge text-bg-warning">Expired (refreshable)</span>;
     if (token.is_expired) return <span className="badge text-bg-danger">Expired</span>;
     return <span className="badge text-bg-success">Active</span>;
   };
 
-  const activeTokens = tokens.filter(t => !t.is_expired).length;
-  const expiredRefreshable = tokens.filter(t => t.is_expired && t.can_refresh).length;
-  const expiredNoRefresh = tokens.filter(t => t.is_expired && !t.can_refresh).length;
+  const consentEnded = (t: DelegationToken) =>
+    consentState(consentEnd(t.consent_expires_at), new Date()) === 'ended';
+  const consentEndedTokens = tokens.filter(consentEnded).length;
+  const usable = tokens.filter(t => !consentEnded(t));
+  const activeTokens = usable.filter(t => !t.is_expired).length;
+  const expiredRefreshable = usable.filter(t => t.is_expired && t.can_refresh).length;
+  const expiredNoRefresh = usable.filter(t => t.is_expired && !t.can_refresh).length;
 
   const filteredTokens = tokens.filter(t => {
     const trimmedSearch = searchTerm.trim();
@@ -132,54 +179,7 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
     onFilteredCountChange?.(filteredTokens.length);
   }, [filteredTokens.length, onFilteredCountChange]);
 
-  const totalPages = Math.max(1, Math.ceil(filteredTokens.length / PAGE_SIZE));
   const pagedTokens = filteredTokens.slice((tokensPage - 1) * PAGE_SIZE, tokensPage * PAGE_SIZE);
-
-  const PaginationControls: React.FC = () => {
-    if (totalPages <= 1) return null;
-    return (
-      <div className="d-flex justify-content-between align-items-center mt-2 px-1">
-        <small className="text-muted">
-          {(tokensPage - 1) * PAGE_SIZE + 1}–
-          {Math.min(tokensPage * PAGE_SIZE, filteredTokens.length)} of {filteredTokens.length}
-        </small>
-        <nav>
-          <ul className="pagination pagination-sm mb-0">
-            <li className={`page-item ${tokensPage <= 1 ? 'disabled' : ''}`}>
-              <button className="page-link" onClick={() => setTokensPage(tokensPage - 1)}>
-                &lsaquo;
-              </button>
-            </li>
-            {Array.from({ length: totalPages }, (_, i) => i + 1)
-              .filter(p => p === 1 || p === totalPages || Math.abs(p - tokensPage) <= 1)
-              .reduce<(number | '...')[]>((acc, p, idx, arr) => {
-                if (idx > 0 && p - (arr[idx - 1] as number) > 1) acc.push('...');
-                acc.push(p);
-                return acc;
-              }, [])
-              .map((p, idx) =>
-                p === '...' ? (
-                  <li key={`ellipsis-${idx}`} className="page-item disabled">
-                    <span className="page-link">…</span>
-                  </li>
-                ) : (
-                  <li key={p} className={`page-item ${p === tokensPage ? 'active' : ''}`}>
-                    <button className="page-link" onClick={() => setTokensPage(p as number)}>
-                      {p}
-                    </button>
-                  </li>
-                )
-              )}
-            <li className={`page-item ${tokensPage >= totalPages ? 'disabled' : ''}`}>
-              <button className="page-link" onClick={() => setTokensPage(tokensPage + 1)}>
-                &rsaquo;
-              </button>
-            </li>
-          </ul>
-        </nav>
-      </div>
-    );
-  };
 
   return (
     <div className="card shadow mb-4">
@@ -205,6 +205,15 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
               {expiredNoRefresh > 0 && (
                 <span className="badge text-bg-danger ms-2" style={{ verticalAlign: 'middle' }}>
                   {expiredNoRefresh} expired
+                </span>
+              )}
+              {consentEndedTokens > 0 && (
+                <span
+                  className="badge text-bg-secondary ms-2"
+                  style={{ verticalAlign: 'middle' }}
+                  data-testid="credential-tokens-consent-ended-count"
+                >
+                  {consentEndedTokens} consent ended
                 </span>
               )}
             </>
@@ -240,7 +249,7 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                   <th>Status</th>
                   <th>Consented</th>
                   <th>Last Used</th>
-                  <th>Expires</th>
+                  <th>Token Expires</th>
                   <th>Actions</th>
                 </tr>
               </thead>
@@ -272,20 +281,9 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                           {topAndTail(token.user_identity_hash, 8, 8)}
                         </code>
                         {canEditTokens && (
-                          <AppButton
-                            variant="link"
-                            size="sm"
-                            className="p-0 ms-1 border-0"
-                            data-testid={`credential-token-revoke-user-button-${token.id}`}
-                            title="Revoke all for this user"
-                            onClick={e => {
-                              e.stopPropagation();
-                              handleRevokeByUser(token.user_identity_hash);
-                            }}
-                            aria-label={`Revoke all delegations for user ${topAndTail(token.user_identity_hash, 8, 8)}`}
-                            iconStart={
-                              <i className="fas fa-ban text-warning fa-xs" aria-hidden="true" />
-                            }
+                          <RevokeUserButton
+                            token={token}
+                            onRevoke={() => handleRevokeByUser(token.user_identity_hash)}
                           />
                         )}
                       </td>
@@ -299,6 +297,12 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                       <td>{getStatusBadge(token)}</td>
                       <td>
                         <small>{fmtDate(token.consent_granted_at)}</small>
+                        <div
+                          className="small text-muted"
+                          data-testid={`credential-token-consent-end-${token.id}`}
+                        >
+                          {consentEndText(token, 'sentence')}
+                        </div>
                       </td>
                       <td>
                         <small>{fmtDate(token.last_used_at)}</small>
@@ -475,7 +479,16 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                                         className="text-muted fw-semibold"
                                         style={{ whiteSpace: 'nowrap' }}
                                       >
-                                        Expires
+                                        Consent Ends
+                                      </td>
+                                      <td>{consentEndText(token, 'value')}</td>
+                                    </tr>
+                                    <tr>
+                                      <td
+                                        className="text-muted fw-semibold"
+                                        style={{ whiteSpace: 'nowrap' }}
+                                      >
+                                        Token Expires
                                       </td>
                                       <td>{fmtDate(token.expires_at)}</td>
                                     </tr>
@@ -508,6 +521,20 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                                     </tr>
                                   </tbody>
                                 </table>
+                                {onViewActivity && (
+                                  <AppButton
+                                    variant="link"
+                                    size="sm"
+                                    className="p-0 mt-2"
+                                    data-testid={`credential-token-view-activity-button-${token.id}`}
+                                    onClick={() => onViewActivity(token.user_identity_hash)}
+                                    iconStart={
+                                      <i className="fas fa-clipboard-list" aria-hidden="true" />
+                                    }
+                                  >
+                                    View this user's delegation audit
+                                  </AppButton>
+                                )}
                               </div>
                             </div>
                           </div>
@@ -518,7 +545,12 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                 ))}
               </tbody>
             </table>
-            <PaginationControls />
+            <PaginationControls
+              page={tokensPage}
+              pageSize={PAGE_SIZE}
+              total={filteredTokens.length}
+              onPageChange={setTokensPage}
+            />
           </div>
         )}
       </div>

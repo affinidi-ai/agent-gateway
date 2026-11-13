@@ -192,6 +192,13 @@ The JWT verification strategy editor's Caller identity claim is editable only on
 see _JWT verification strategy editor_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#jwt-verification-strategy-editor).
 
+The Credentials page keeps its **Credential Tokens** tab, which shows when each consent ends and
+confirms every revoke in place (two clicks, never a modal or a browser dialog), and has a
+**Delegated Access** tab beside it that lists only active access and opens the audit tab as its
+history. A new view is a new tab; an existing tab is never renamed or removed. See _Credential
+Tokens and Delegated Access tabs_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#credential-tokens-and-delegated-access-tabs).
+
 The Credentials audit tab shows a caller's Principal beside Subject when its strategy names a
 claim other than `sub`; see _Credentials audit tab_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credentials-audit-tab).

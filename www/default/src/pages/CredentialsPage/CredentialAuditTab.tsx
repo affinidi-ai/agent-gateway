@@ -75,6 +75,7 @@ const eventBadgeMap: Record<string, { color: string; label: string }> = {
   token_refreshed: { color: 'info', label: 'Refreshed' },
   consent_granted: { color: 'primary', label: 'Consent Granted' },
   consent_required: { color: 'warning', label: 'Consent Required' },
+  consent_expired: { color: 'secondary', label: 'Consent Expired' },
   refresh_failed: { color: 'danger', label: 'Refresh Failed' },
   token_revoked: { color: 'danger', label: 'Revoked' },
   user_tokens_revoked: { color: 'danger', label: 'User Revoked' },

@@ -48,6 +48,7 @@ const CREDENTIALS_TABS = tabs('credentials', [
     'jwt-verification',
     'credential-providers',
     'credential-tokens',
+    'delegated-access',
     'sts-clients',
     'credential-audit',
 ]);
@@ -157,6 +158,16 @@ const SIDEBAR_PAGES: LayoutPage[] = [
             ...CREDENTIALS,
             `credential-token-revoke-user-button-${FIXTURE_ID.delegationToken}`,
             `credential-token-revoke-button-${FIXTURE_ID.delegationToken}`,
+        ],
+    },
+    {
+        id: 'credentials-delegated-access',
+        route: '/credentials?tab=delegated-access',
+        testIds: ['page-credentials', `delegated-access-row-${FIXTURE_ID.delegationToken}`],
+        actions: [
+            ...CREDENTIALS,
+            'delegated-access-history-button',
+            `delegated-access-revoke-button-${FIXTURE_ID.delegationToken}`,
         ],
     },
     {

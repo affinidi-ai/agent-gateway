@@ -989,7 +989,7 @@ const EditCredentialProviderPage: React.FC = () => {
                     ends consents given earlier; a longer one never extends them.
                   </FieldHelp>
                 </div>
-                <div className="input-group">
+                <div className="input-group" style={{ maxWidth: '22rem' }}>
                   <input
                     id="consent_limit_amount"
                     name="consent_limit_amount"
@@ -1005,7 +1005,7 @@ const EditCredentialProviderPage: React.FC = () => {
                   <select
                     name="consent_limit_unit"
                     aria-label="Consent time limit unit"
-                    className="form-control dropdown-styling"
+                    className="form-select"
                     value={form.consent_limit_unit}
                     onChange={handleChange}
                     data-testid="credential-provider-consent-limit-unit-select"

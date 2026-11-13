@@ -5,6 +5,7 @@ import SearchInput from '../components/shared/SearchInput';
 import StrategiesTab from './SettingsPage/StrategiesTab';
 import CredentialProvidersTab from './SettingsPage/CredentialProvidersTab';
 import CredentialTokensTab from './CredentialsPage/CredentialTokensTab';
+import DelegatedAccessTab from './CredentialsPage/DelegatedAccessTab';
 import CredentialAuditTab from './CredentialsPage/CredentialAuditTab';
 import StsClientsTab from './CredentialsPage/StsClientsTab';
 import { usePermissions } from '../context/PermissionsContext';
@@ -13,12 +14,14 @@ type TabKey =
   | 'jwt-verification'
   | 'credential-providers'
   | 'credential-tokens'
+  | 'delegated-access'
   | 'credential-audit'
   | 'sts-clients';
 const VALID_TABS: TabKey[] = [
   'jwt-verification',
   'credential-providers',
   'credential-tokens',
+  'delegated-access',
   'credential-audit',
   'sts-clients',
 ];
@@ -37,6 +40,7 @@ const CredentialsPage: React.FC = () => {
   const [strategiesCount, setStrategiesCount] = useState(0);
   const [providersCount, setProvidersCount] = useState(0);
   const [tokensCount, setTokensCount] = useState(0);
+  const [delegationsCount, setDelegationsCount] = useState(0);
   const [auditCount, setAuditCount] = useState(0);
   const [stsClientsCount, setStsClientsCount] = useState(0);
 
@@ -49,6 +53,15 @@ const CredentialsPage: React.FC = () => {
       setSearchParams({ tab: 'jwt-verification' }, { replace: true });
     }
   }, [activeTab, canViewAudit, canViewSts, permissionsLoading, setSearchParams]);
+
+  const openAudit = () => {
+    setActiveTab('credential-audit');
+    setSearchParams({ tab: 'credential-audit' }, { replace: true });
+  };
+  const viewActivity = (userHash: string) => {
+    setSearchTerm(userHash);
+    openAudit();
+  };
 
   const filterActive = searchTerm.trim().length > 0;
   const tabBadge = (count: number) => {
@@ -68,7 +81,7 @@ const CredentialsPage: React.FC = () => {
             value={searchTerm}
             onChange={setSearchTerm}
             data-testid="credentials-search-input"
-            placeholder="Filter JWT Verification, Providers, Tokens, Audit..."
+            placeholder="Filter JWT Verification, Providers, Tokens, Access, Audit..."
             width="384px"
           />
         </div>
@@ -125,6 +138,23 @@ const CredentialsPage: React.FC = () => {
           <CredentialTokensTab
             externalSearchTerm={searchTerm}
             onFilteredCountChange={setTokensCount}
+            onViewActivity={canViewAudit ? viewActivity : undefined}
+          />
+        </Tab>
+
+        <Tab
+          eventKey="delegated-access"
+          tabAttrs={{ 'data-testid': 'credentials-delegated-access-tab-trigger' }}
+          title={
+            <>
+              <i className="fas fa-user-check"></i> Delegated Access {tabBadge(delegationsCount)}
+            </>
+          }
+        >
+          <DelegatedAccessTab
+            externalSearchTerm={searchTerm}
+            onFilteredCountChange={setDelegationsCount}
+            onViewHistory={canViewAudit ? openAudit : undefined}
           />
         </Tab>
 

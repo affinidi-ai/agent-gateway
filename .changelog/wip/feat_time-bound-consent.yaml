@@ -26,8 +26,8 @@ changes:
         A consent past its time limit is now removed even when no request needs it again. Once
         an hour, while the node is active, the gateway deletes every ended agent-keyed token and
         every ended grant by binding, revokes those grants at the vendor, and records each as
-        `consent_expired` with `source:sweep`, so a refresh token outlives its consent in the
-        vault by an hour at most. `GET /api/v1/delegation-vault`, `GET
+        `consent_expired` with `source:sweep`, so a refresh token does not stay in the vault
+        long after its consent ended. `GET /api/v1/delegation-vault`, `GET
         /api/v1/delegation-vault/{id}` and the grants report now show `consent_expires_at`, the
         end as the limits set now make it, and a `DelegationCredential` issued for a consent
         under a time limit carries it as `validUntil`.
@@ -39,7 +39,25 @@ changes:
         one minute to 365 days. The Surface Builder now shows a binding's own limit, which is set
         through the API, and keeps it when the surface is saved, so a dashboard save never
         removes it.
-  changed: []
+    - timestamp: '2026-11-13T16:00:00Z'
+      title: Add a Delegated Access tab that lists active delegated access
+      description: >-
+        The Credentials page has a Delegated Access tab beside Credential Tokens. It lists only
+        the access a person gave that an agent can still use: the user, the system, the agent,
+        the scopes, whether it ends within a day, when it ends and when it was last used, with a
+        revoke confirmed by a second click. Service tokens, ended consents and tokens that can
+        no longer be refreshed are left out, and a History button opens the Credential Delegation
+        Audit tab, where ended and revoked access is recorded.
+  changed:
+    - timestamp: '2026-11-13T15:00:00Z'
+      title: Show when each consent ends on the Credential Tokens tab
+      description: >-
+        Each entry of the Credentials page's Credential Tokens tab shows when its consent ends
+        and how long is left, or that it has no time limit, and is marked Ending soon within a
+        day of its end and Consent ended after it. Revoking every delegation of a user is
+        confirmed in place with a second click instead of a browser dialog, the expanded row
+        links to that user's records in the Credential Delegation Audit tab, and that tab labels
+        `consent_expired` records.
   fixed: []
   removed: []
   security: []

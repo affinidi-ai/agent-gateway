@@ -126,6 +126,7 @@ interface DelegationTokenFixture {
     scopes: string[];
     expires_at: string | null;
     consent_granted_at: string;
+    consent_expires_at?: string | null;
     last_used_at: string | null;
     created_at: string;
     updated_at: string;
@@ -399,6 +400,7 @@ const delegationTokens: DelegationTokenFixture[] = [
         scopes: ['purchase-orders.read', 'supplier-invoices.read', 'goods-receipts.read'],
         expires_at: iso(-60),
         consent_granted_at: iso(300),
+        consent_expires_at: new Date(Date.now() + 23 * 3_600_000).toISOString(),
         last_used_at: iso(5),
         created_at: iso(300),
         updated_at: iso(5),

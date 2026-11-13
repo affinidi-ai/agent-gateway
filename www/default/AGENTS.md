@@ -1038,6 +1038,49 @@ strategy the field shows the stored claim, is disabled, and is left out of the u
 gateway refuses a change to it. A save's `Warning` headers, such as another strategy naming the
 same issuer's callers by a different claim, are shown in a warning toast that stays until closed.
 
+## Credential Tokens and Delegated Access tabs
+
+The Credentials page keeps its **Credential Tokens** tab (`pages/CredentialsPage/CredentialTokensTab.tsx`,
+tab key `credential-tokens`) and has a **Delegated Access** tab beside it
+(`pages/CredentialsPage/DelegatedAccessTab.tsx`, tab key `delegated-access`, trigger
+`credentials-delegated-access-tab-trigger`). Both read `GET /api/v1/delegation-vault`; the shared
+rules live in `pages/CredentialsPage/delegatedAccess.ts` (`consentState`, `timeLeft`,
+`isActiveDelegation`) and the page links in `PaginationControls.tsx`. A new view of the vault is a
+new tab: an existing tab is never renamed or removed.
+
+Credential Tokens lists every agent-keyed token, service tokens included.
+
+- The **Consented** cell shows the consent time and, under it, the consent's end
+  (`credential-token-consent-end-<id>`): "Ends <date> (in 3 hours)", "Ended <date>", or "No time
+  limit" when the vault reports no `consent_expires_at`. The expanded row shows it as **Consent
+  Ends**, the date first. **Token Expires** is the access token's own expiry.
+- The status badge reads "Consent ended" once the end has passed and "Ending soon" within 24 hours
+  of it; otherwise it is the access token's status (Active, Expired (refreshable), Expired). The
+  header counts leave ended consents out of "active" and count them as "consent ended"
+  (`credential-tokens-consent-ended-count`).
+- No modal and no browser dialog confirms a revoke. The row's **Revoke delegation** is the two-step
+  `DeleteButton`. **Revoke all for this user** (`credential-token-revoke-user-button-<id>`) uses the
+  same `useTwoStepDelete`: the first click shows "Click again to revoke all", the second sends the
+  `DELETE`, and a click elsewhere cancels.
+- The expanded row links to the user's records in the Credential Delegation Audit tab
+  (`credential-token-view-activity-button-<id>`): the page puts the user identity hash in its search
+  and switches tabs. The link is shown only to a user with `audit.view`.
+
+Delegated Access lists only active access: a token of an Authorization Code provider whose consent
+has not ended and whose access token is valid or refreshable. It has no history of its own.
+
+- Columns: User, System (the provider's name, else its `provider_id`), Agent, Access (scopes),
+  Status (Active, or Ending soon within 24 hours of the end), Ends (`delegated-access-ends-<id>`: the
+  time left over the date, or "No time limit"), Last Used and, with `settings.edit`, the two-step
+  **Revoke access** `DeleteButton` (`delegated-access-revoke-button-<id>`). Rows are
+  `delegated-access-row-<id>`; the header counts those ending soon
+  (`delegated-access-ending-soon-count`).
+- **History** (`delegated-access-history-button`) opens the Credential Delegation Audit tab, where
+  ended and revoked access is recorded. It is shown only to a user with `audit.view`.
+- The list still loads when the providers cannot be read: every token then counts as a person's.
+
+The audit tab labels `consent_expired` records "Consent Expired".
+
 ## Credentials audit tab
 
 `pages/CredentialsPage/CredentialAuditTab.tsx` shows an expanded event's caller. **Subject** is
