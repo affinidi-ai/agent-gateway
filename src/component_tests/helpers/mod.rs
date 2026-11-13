@@ -7,6 +7,7 @@
 pub(crate) mod audit_events;
 pub(crate) mod formatted_logs;
 pub mod jwt;
+pub(crate) mod management_api;
 pub(crate) mod thread_subscriber;
 
 use std::collections::HashMap;
