@@ -22,6 +22,15 @@ pub trait DidLogStorage: Send + Sync {
         self.append(did, &entry).await
     }
 
+    /// Replace the whole log with these raw JSON lines, preserving their exact bytes.
+    async fn replace_raw(
+        &self,
+        _did: &str,
+        _raw_lines: &[&str],
+    ) -> Result<()> {
+        anyhow::bail!("this DID log storage cannot replace a log")
+    }
+
     async fn load_all(
         &self,
         did: &str,

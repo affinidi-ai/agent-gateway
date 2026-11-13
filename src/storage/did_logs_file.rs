@@ -71,6 +71,32 @@ impl DidLogStorage for FileDidLogStorage {
         Ok(())
     }
 
+    async fn replace_raw(
+        &self,
+        did: &str,
+        raw_lines: &[&str],
+    ) -> Result<()> {
+        let path = self.path_for(did);
+        if let Some(parent) = path.parent() {
+            create_dir_all(parent)
+                .await
+                .with_context(|| format!("create dir {:?}", parent))?;
+        }
+
+        let mut content = raw_lines.join("\n");
+        content.push('\n');
+        let temp_path = path.with_extension(format!("jsonl.{}.tmp", uuid::Uuid::new_v4()));
+        if let Err(e) = tokio::fs::write(&temp_path, content).await {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(e).with_context(|| format!("write {:?}", temp_path));
+        }
+        if let Err(e) = tokio::fs::rename(&temp_path, &path).await {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(e).with_context(|| format!("replace {:?}", path));
+        }
+        Ok(())
+    }
+
     async fn load_all(
         &self,
         did: &str,
@@ -349,5 +375,57 @@ mod tests {
                 .unwrap();
             assert_eq!(loaded.len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn replace_raw_swaps_the_whole_log_and_keeps_the_bytes() {
+        let dir = tempdir().unwrap();
+        let storage = FileDidLogStorage::new(dir.path());
+        let did = "did:webvh:example";
+        for line in ["old-1", "old-2", "old-2"] {
+            storage
+                .append_raw(did, line)
+                .await
+                .unwrap();
+        }
+
+        storage
+            .replace_raw(did, &[r#"{"versionId":"1-a"}"#, r#"{"versionId":"2-b"}"#])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .load_all_raw(did)
+                .await
+                .unwrap(),
+            vec![r#"{"versionId":"1-a"}"#, r#"{"versionId":"2-b"}"#]
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .count(),
+            1,
+            "the temporary file must be renamed into place"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_raw_creates_a_log_that_did_not_exist() {
+        let dir = tempdir().unwrap();
+        let storage = FileDidLogStorage::new(dir.path().join("nested"));
+
+        storage
+            .replace_raw("did:webvh:example", &["only"])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .load_all_raw("did:webvh:example")
+                .await
+                .unwrap(),
+            vec!["only"]
+        );
     }
 }
