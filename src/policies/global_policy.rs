@@ -430,6 +430,21 @@ impl GlobalPolicyManager {
         let Some(query) = plane_query(plane) else {
             return GlobalDecision::allow();
         };
+        let capture = super::input_capture::begin("appliance", plane, input);
+        let decision = Self::evaluate_set(set, plane, query, input);
+        if let Some(capture) = capture {
+            capture.finish(Ok((decision.allow, decision.reason.as_deref())));
+        }
+        decision
+    }
+
+    /// Evaluate `input` against a plane's compiled set, deny-overrides.
+    fn evaluate_set(
+        set: &GlobalSet,
+        plane: &str,
+        query: String,
+        input: &serde_json::Value,
+    ) -> GlobalDecision {
         let input_json = match serde_json::to_string(input) {
             Ok(j) => j,
             Err(_) => return GlobalDecision::deny("Failed to serialize policy input", None, None, None, None),

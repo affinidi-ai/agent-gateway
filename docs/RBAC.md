@@ -118,6 +118,12 @@ its own tenant: when only an appliance-wide surface could reach it, the answer i
 `available: false` with `operator_only` and nothing is fetched, as in the preview. See
 [`POLICY.md`](POLICY.md) for the egress rules it follows.
 
+## Policy input capture
+
+`PUT` and `DELETE /v1/surfaces/{id}/policy-input-capture` need both `surfaces.edit` and
+`policies.edit`; a caller missing either gets `403`. Only dashboard sessions whose user holds both
+receive the captured policy input on the dashboard WebSocket. See [`POLICY.md`](POLICY.md#policy-input-capture).
+
 ## Payments admin API
 
 The x402 (`/api/admin/x402/...`) and MPP (`/api/admin/mpp/...`) admin routers require

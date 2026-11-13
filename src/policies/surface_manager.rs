@@ -178,6 +178,7 @@ impl SurfacePolicyManager {
             .config_id()
             .map(|s| s.to_string())
             .ok_or_else(|| "Channel missing config_id".to_string())?;
+        super::input_capture::track(&config_id, surface.policy_input_capture_until);
 
         // Fail closed on any error from the update — a failed recompile *or* a
         // failed policy-definition resolve. `evaluate_policy_decision_for_variant`
@@ -1230,7 +1231,10 @@ impl SurfacePolicyManager {
 
         if let Some(engine) = engine {
             debug!(channel_id = %channel_id, lookup_key = %lookup_key, "Evaluating OPA policy");
-            engine.evaluate(input)
+            let capture = super::input_capture::begin("surface", &lookup_key, &input);
+            let result = engine.evaluate(input);
+            super::input_capture::finish(capture, &result);
+            result
         } else {
             debug!(channel_id = %channel_id, "Engine not found for channel, denying request");
             Ok(crate::policies::PolicyDecision {
@@ -1257,13 +1261,26 @@ impl SurfacePolicyManager {
             .read()
             .expect("opa_engines lock poisoned");
 
-        let engine = active_variant_alias
-            .and_then(|alias| engines.get(&format!("inbound:variant:{}:{}", channel_id, alias)))
-            .or_else(|| engines.get(&format!("inbound:{}", channel_id)));
+        let variant_key = active_variant_alias.map(|alias| format!("inbound:variant:{}:{}", channel_id, alias));
+        let base_key = format!("inbound:{}", channel_id);
+        let (lookup_key, engine) = match variant_key.and_then(|key| {
+            engines
+                .get(&key)
+                .map(|e| (key, e))
+        }) {
+            Some((key, engine)) => (key, Some(engine)),
+            None => {
+                let engine = engines.get(&base_key);
+                (base_key, engine)
+            }
+        };
 
         if let Some(engine) = engine {
             debug!(channel_id = %channel_id, variant_alias = ?active_variant_alias, "Evaluating inbound OPA policy");
-            engine.evaluate(input)
+            let capture = super::input_capture::begin("surface", &lookup_key, &input);
+            let result = engine.evaluate(input);
+            super::input_capture::finish(capture, &result);
+            result
         } else {
             debug!(channel_id = %channel_id, variant_alias = ?active_variant_alias, "No inbound OPA engine found for surface/variant, denying request");
             Ok(crate::policies::PolicyDecision {
@@ -1340,6 +1357,7 @@ impl SurfacePolicyManager {
             crate::mcp::subscriptions::AccessScope::Surface(channel_id.to_string()),
         );
         self.evict_all_opa_engines_for_config(channel_id);
+        super::input_capture::forget(channel_id);
         {
             // Drop base, per-variant and per-Transit-Point MCP tool gating for this channel.
             let mut gating = self
@@ -1420,6 +1438,46 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn installing_a_surface_tracks_its_policy_input_capture_and_removing_it_forgets_it() {
+        let manager = SurfacePolicyManager::new();
+        let now = chrono::Utc::now();
+        let mut surface = create_test_surface("input-capture-installed");
+        surface.policy_input_capture_until = Some(now + chrono::Duration::minutes(5));
+
+        manager
+            .update_channel_policy(&surface)
+            .await
+            .unwrap();
+        let captured_after_install = crate::policies::input_capture::is_captured_at("input-capture-installed", now);
+        manager
+            .remove_channel("input-capture-installed")
+            .await;
+
+        assert!(captured_after_install);
+        assert!(!crate::policies::input_capture::is_captured_at("input-capture-installed", now));
+    }
+
+    #[tokio::test]
+    async fn reinstalling_a_surface_without_policy_input_capture_stops_it() {
+        let manager = SurfacePolicyManager::new();
+        let now = chrono::Utc::now();
+        let mut surface = create_test_surface("input-capture-reinstalled");
+        surface.policy_input_capture_until = Some(now + chrono::Duration::minutes(5));
+        manager
+            .update_channel_policy(&surface)
+            .await
+            .unwrap();
+        surface.policy_input_capture_until = None;
+
+        manager
+            .update_channel_policy(&surface)
+            .await
+            .unwrap();
+
+        assert!(!crate::policies::input_capture::is_captured_at("input-capture-reinstalled", now));
     }
 
     #[tokio::test]

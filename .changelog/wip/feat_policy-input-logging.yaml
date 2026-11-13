@@ -1,0 +1,35 @@
+branch: feat/policy-input-logging
+changes:
+  added:
+    - timestamp: '2026-11-12T00:00:00Z'
+      title: ⭐ Capture a surface's OPA policy input on demand for up to 60 minutes
+      description: >-
+        PUT /v1/surfaces/{id}/policy-input-capture with {"minutes": 1-60} sends each request and response
+        policy evaluation on that surface (gateway, surface, Transit Point and appliance-wide planes,
+        on the direct, Fabric and MCP proxy paths) to the dashboard as a policy_input_captured WebSocket
+        update with its input and its allow, deny reason or error, until the stored
+        policy_input_capture_until passes or DELETE on the same path stops it. Credential-named
+        values, JWTs and Bearer or Basic values are masked first. Nothing is logged or stored, and
+        only dashboard sessions whose user holds surfaces.edit and policies.edit receive the
+        updates; both routes need the same two permissions. Policy authors can see the input
+        structure again without the gateway logging it. See docs/POLICY.md.
+    - timestamp: '2026-11-12T00:00:00Z'
+      title: Show captured policy input and decisions in a surface's Capture view
+      description: >-
+        The Surface Builder's Capture view has a Policy Input card with a Capture policy input
+        switch that turns capture on for 30 minutes, shows when it stops, and turns it
+        off again, for users with both surfaces.edit and policies.edit. While on, the card lists
+        each policy evaluation with its slot, decision and reason, and shows or copies its input
+        to try in the policy Test panel. It is for developing and testing policies only.
+  changed: []
+  fixed:
+    - timestamp: '2026-11-13T00:00:00Z'
+      title: Keep surface ids whole in redacted logs so their Monitoring log shows them
+      description: >-
+        Log redaction no longer masks part of a UUID. A broad rule such as the example phone
+        number pattern turned ids like bf983d36-0281-4579-... into bf983d[REDACTED-PHONE], so the
+        [CHANNEL:<id>] prefix no longer matched and that surface's Monitoring log stayed empty. A
+        rule that matches a whole UUID still masks it.
+  removed: []
+  security: []
+  breaking: []

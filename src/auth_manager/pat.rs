@@ -117,7 +117,7 @@ fn is_handler_enforced_nested_action(
     matches!(
         (kind, tail),
         (ResourceKind::Surfaces, ["variants"])
-            | (ResourceKind::Surfaces, ["trust-recorder-status" | "agent-card"])
+            | (ResourceKind::Surfaces, ["trust-recorder-status" | "agent-card" | "policy-input-capture"])
             | (ResourceKind::Surfaces, ["agent-card", "refresh"])
             | (ResourceKind::Surfaces, ["variants", _])
             | (ResourceKind::Surfaces, ["variants", _, "promote-to-default" | "resolved"])
@@ -261,7 +261,7 @@ mod tests {
             }
         );
         assert_eq!(classify_resource_path("/v1/surfaces/id/trust-recorder-status/future"), PathScope::DenyScoped);
-        for action in ["agent-card", "agent-card/refresh"] {
+        for action in ["agent-card", "agent-card/refresh", "policy-input-capture"] {
             assert_eq!(
                 classify_resource_path(&format!("/v1/surfaces/surface%2Fa/{action}")),
                 PathScope::EnforceId {

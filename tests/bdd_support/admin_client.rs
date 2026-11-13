@@ -487,6 +487,23 @@ impl AdminApiClient {
         Ok((url, response))
     }
 
+    /// The dashboard WebSocket URL of this gateway.
+    pub fn dashboard_socket_url(&self) -> String {
+        format!(
+            "{}/api/ws",
+            self.root_url
+                .replacen("http://", "ws://", 1)
+        )
+    }
+
+    /// The session token of the signed-in operator, if any.
+    pub fn session_token(&self) -> Option<String> {
+        self.session_token
+            .read()
+            .expect("session token read lock")
+            .clone()
+    }
+
     fn admin_url(
         &self,
         path: &str,

@@ -16,6 +16,7 @@ pub mod management_routes;
 pub mod names;
 pub mod passkey_sign_in_challenge;
 pub mod policy_changes;
+pub mod policy_input_capture;
 pub mod provider_token;
 pub mod secret_force_delete_audit;
 pub mod sign_in_events;

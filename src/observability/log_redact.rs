@@ -93,7 +93,7 @@ const CREDENTIAL_ATTRIBUTE_NAMES: &[&str] = &[
     "credentials",
 ];
 
-fn is_credential_attribute(name: &str) -> bool {
+pub(crate) fn is_credential_attribute(name: &str) -> bool {
     let normalized = name
         .to_ascii_lowercase()
         .replace(['.', '-'], "_");
@@ -104,6 +104,17 @@ fn is_credential_attribute(name: &str) -> bool {
                 .strip_suffix(credential)
                 .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('_'))
         })
+}
+
+static UUID: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b").expect("valid UUID pattern")
+});
+
+fn is_fragment_of(
+    found: &std::ops::Range<usize>,
+    uuid: &std::ops::Range<usize>,
+) -> bool {
+    uuid.start <= found.start && found.end <= uuid.end && found != uuid
 }
 
 // ── Compiled ruleset ────────────────────────────────────────────────
@@ -149,7 +160,9 @@ impl LogRedactor {
         }
     }
 
-    /// Apply all rules in order to the input string.
+    /// Apply all rules in order to the input string. A match that lies inside a UUID
+    /// without covering all of it is kept, so a rule such as a phone number pattern
+    /// cannot mangle surface ids or other identifiers.
     /// Returns the input borrowed when no rule matches.
     #[inline]
     pub fn redact<'a>(
@@ -159,11 +172,29 @@ impl LogRedactor {
         let mut output = Cow::Borrowed(input);
         for rule in &self.rules {
             if rule.regex.is_match(&output) {
-                output = Cow::Owned(
-                    rule.regex
-                        .replace_all(&output, rule.replacement.as_str())
-                        .into_owned(),
-                );
+                let uuids: Vec<std::ops::Range<usize>> = UUID
+                    .find_iter(&output)
+                    .map(|m| m.range())
+                    .collect();
+                let redacted = rule
+                    .regex
+                    .replace_all(&output, |caps: &regex::Captures<'_>| {
+                        let found = caps
+                            .get(0)
+                            .map_or(0..0, |m| m.range());
+                        if uuids
+                            .iter()
+                            .any(|uuid| is_fragment_of(&found, uuid))
+                        {
+                            return caps[0].to_string();
+                        }
+                        let mut replaced = String::new();
+                        caps.expand(&rule.replacement, &mut replaced);
+                        replaced
+                    });
+                if redacted != output {
+                    output = Cow::Owned(redacted.into_owned());
+                }
             }
         }
         output
@@ -828,6 +859,33 @@ mod tests {
         let input = "Fax: +44.20.7946.0958";
         let result = r.redact(input);
         assert!(result.contains("[REDACTED-PHONE]"), "Dotted phone not redacted: {result}");
+    }
+
+    #[test]
+    fn test_full_phone_rule_keeps_surface_ids_whole() {
+        let r = full_redactor();
+        for id in ["bf983d36-0281-4579-a1b2-c3d4e5f60718", "fb735810-d02c-4e7c-b555-123456789012"] {
+            let line = format!("[CHANNEL:{id}] Forwarding request {{\"config_id\":\"{id}\"}}");
+            assert_eq!(r.redact(&line).as_ref(), line);
+        }
+    }
+
+    #[test]
+    fn test_full_phone_beside_a_surface_id_is_still_redacted() {
+        let r = full_redactor();
+        let result = r.redact("[CHANNEL:bf983d36-0281-4579-a1b2-c3d4e5f60718] Contact: +1-555-123-4567");
+        assert_eq!(result.as_ref(), "[CHANNEL:bf983d36-0281-4579-a1b2-c3d4e5f60718] Contact: [REDACTED-PHONE]");
+    }
+
+    #[test]
+    fn test_rule_matching_a_whole_uuid_still_redacts_it() {
+        let r = LogRedactor::from_config(&make_config(vec![(
+            "UUIDs",
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            "[REDACTED-UUID]",
+        )]));
+        let result = r.redact("user bf983d36-0281-4579-a1b2-c3d4e5f60718 signed in");
+        assert_eq!(result.as_ref(), "user [REDACTED-UUID] signed in");
     }
 
     #[test]

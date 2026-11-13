@@ -50,6 +50,29 @@ pub enum WsUpdate {
         #[serde(skip_serializing_if = "Option::is_none")]
         surface_variant: Option<String>,
     },
+    /// A policy evaluation on a surface with policy input capture switched on: its input,
+    /// credentials masked, and its outcome. Sent only to connections whose user holds
+    /// `surfaces.edit` and `policies.edit`.
+    PolicyInputCaptured {
+        config_id: String,
+        timestamp: String,
+        /// `gateway`, `surface` or `appliance`.
+        plane: String,
+        /// The key of the evaluated policy engine.
+        engine: String,
+        /// The evaluated policy slot in words, such as `inbound` or `transit <alias>`.
+        slot: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        transit_point: Option<String>,
+        input: Box<serde_json::Value>,
+        /// `allow`, `deny` or `error`.
+        decision: String,
+        /// The deny reason, or the evaluation error.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        surface_variant: Option<String>,
+    },
     /// Temporary channel expired and was deleted
     ChannelExpired { config_id: String, channel_name: String },
     /// Onboarding attempt received
@@ -171,8 +194,13 @@ fn delta_for_connection(
 fn admits(
     update: &WsUpdate,
     logs_allowed: bool,
+    policy_input_allowed: bool,
 ) -> bool {
-    logs_allowed || !matches!(update, WsUpdate::LogEntry { .. })
+    match update {
+        WsUpdate::LogEntry { .. } => logs_allowed,
+        WsUpdate::PolicyInputCaptured { .. } => policy_input_allowed,
+        _ => true,
+    }
 }
 
 /// The user and session a connection serves and the guard that decides what
@@ -191,17 +219,39 @@ impl WsCaller {
     /// its user holds `logs.view`. A connection without a known user or an
     /// RBAC guard may not.
     async fn logs_allowed(caller: Option<&Self>) -> bool {
+        Self::allowed(caller, &[crate::rbac::Feature::LogsView]).await
+    }
+
+    /// Whether `caller` may receive captured policy input: its session is still live
+    /// and its user holds `surfaces.edit` and `policies.edit`.
+    async fn policy_input_allowed(caller: Option<&Self>) -> bool {
+        Self::allowed(caller, &[crate::rbac::Feature::SurfacesEdit, crate::rbac::Feature::PoliciesEdit]).await
+    }
+
+    async fn allowed(
+        caller: Option<&Self>,
+        features: &[crate::rbac::Feature],
+    ) -> bool {
         let Some(caller) = caller else {
             return false;
         };
-        caller
+        if !caller
             .sessions
             .is_live(&caller.session_token)
             .await
-            && caller
+        {
+            return false;
+        }
+        for feature in features {
+            if !caller
                 .guard
-                .allows(&caller.user_id, None, &crate::rbac::Feature::LogsView)
+                .allows(&caller.user_id, None, feature)
                 .await
+            {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -481,6 +531,7 @@ async fn handle_socket(
         let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut logs_allowed = WsCaller::logs_allowed(caller.as_ref()).await;
+        let mut policy_input_allowed = WsCaller::policy_input_allowed(caller.as_ref()).await;
 
         loop {
             tokio::select! {
@@ -488,7 +539,7 @@ async fn handle_socket(
                 update_result = rx.recv() => {
                     match update_result {
                         Ok(update) => {
-                            if !admits(&update, logs_allowed) {
+                            if !admits(&update, logs_allowed, policy_input_allowed) {
                                 continue;
                             }
                             // DashboardDelta is already serialized; apply per-client
@@ -520,6 +571,7 @@ async fn handle_socket(
                 // Send periodic pings to keep connection alive
                 _ = ping_interval.tick() => {
                     logs_allowed = WsCaller::logs_allowed(caller.as_ref()).await;
+                    policy_input_allowed = WsCaller::policy_input_allowed(caller.as_ref()).await;
                     if sender.send(Message::Ping("ping".into())).await.is_err() {
                         break;
                     }
@@ -918,9 +970,48 @@ mod tests {
             entry: "secret line".to_string(),
         };
 
-        assert!(!super::admits(&entry, false));
-        assert!(super::admits(&entry, true));
-        assert!(super::admits(&super::WsUpdate::RefreshDashboard, false));
+        assert!(!super::admits(&entry, false, true));
+        assert!(super::admits(&entry, true, false));
+        assert!(super::admits(&super::WsUpdate::RefreshDashboard, false, false));
+    }
+
+    #[test]
+    fn captured_policy_input_reaches_only_clients_allowed_to_read_it() {
+        let captured = super::WsUpdate::PolicyInputCaptured {
+            config_id: "alpha".to_string(),
+            timestamp: Utc::now().to_rfc3339(),
+            plane: "surface".to_string(),
+            engine: "alpha".to_string(),
+            slot: "target".to_string(),
+            transit_point: None,
+            input: Box::new(serde_json::json!({ "a2a": { "text": "hello" } })),
+            decision: "allow".to_string(),
+            reason: None,
+            surface_variant: None,
+        };
+
+        assert!(!super::admits(&captured, true, false));
+        assert!(super::admits(&captured, false, true));
+    }
+
+    #[tokio::test]
+    async fn a_connection_may_read_policy_input_only_when_its_user_may_edit_surfaces_and_policies() {
+        use crate::auth::types::UserRole;
+
+        let dir = TempDir::new().unwrap();
+        let admin = caller_for(guard_with_user(&dir, UserRole::Administrator).await, "user-1").await;
+        assert!(super::WsCaller::policy_input_allowed(Some(&admin)).await);
+
+        let dir = TempDir::new().unwrap();
+        let user = caller_for(guard_with_user(&dir, UserRole::User).await, "user-1").await;
+        assert!(!super::WsCaller::policy_input_allowed(Some(&user)).await);
+
+        admin
+            .sessions
+            .remove_sessions_for_user("user-1")
+            .await;
+        assert!(!super::WsCaller::policy_input_allowed(Some(&admin)).await);
+        assert!(!super::WsCaller::policy_input_allowed(None).await);
     }
 
     async fn guard_with_user(

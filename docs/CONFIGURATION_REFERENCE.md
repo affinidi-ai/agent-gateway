@@ -104,6 +104,12 @@ bucket for the point, and `per_caller_rate_limit` gives each caller the point id
 of their own. Both are counted on each gateway node. See
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point).
 
+## Policy input capture of a surface
+
+| Field | Behaviour |
+| --- | --- |
+| `policy_input_capture_until` | RFC 3339 time until which each request policy evaluation on the surface is sent, with its input and decision, to the dashboard's Capture view. Set and cleared only through `PUT` and `DELETE /v1/surfaces/{id}/policy-input-capture`, at most 60 minutes ahead; a surface write ignores it. Absent or past, nothing is captured. See [`POLICY.md`](POLICY.md#policy-input-capture). |
+
 ## Browser origins of a surface
 
 A browser page can call a surface only from an allowed origin. `network.cors` in `gateway.json` lists
@@ -364,6 +370,11 @@ also copy any built-in rules you still want from
 | `"enabled": false` | Redaction is off for every destination. |
 | No `rules` | The built-in rules below apply. |
 | `rules` | Your rules replace the built-in rules and run in order. An empty list applies no pattern. |
+
+A rule's match that lies inside a UUID without covering all of it is left as it is, so a
+broad pattern such as the example phone number rule does not mangle surface ids and the
+`[CHANNEL:<id>]` prefix a surface's Monitoring log filters on. A rule that matches a whole
+UUID still masks it.
 
 A rule whose pattern does not compile is skipped with a warning on stderr. At startup
 stderr reports the number of rules in use, or a warning when redaction is off, and the

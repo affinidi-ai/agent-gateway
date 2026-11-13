@@ -130,6 +130,8 @@ pub struct SurfaceWorld {
     pub gateway_issuer_did: Option<String>,
     pub operator_roles: HashMap<String, String>,
     pub operator_clients: HashMap<String, AdminApiClient>,
+    /// Policy input captures each operator's dashboard WebSocket received, by operator.
+    pub dashboard_captures: HashMap<String, std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>>,
     pub human_clients: HashMap<String, Vec<AdminApiClient>>,
     pub terms_enabled: bool,
     pub affinidi_cache_seeded: bool,
@@ -235,6 +237,7 @@ impl SurfaceWorld {
             gateway_issuer_did: None,
             operator_roles: HashMap::new(),
             operator_clients: HashMap::new(),
+            dashboard_captures: HashMap::new(),
             human_clients: HashMap::new(),
             terms_enabled: false,
             affinidi_cache_seeded: false,

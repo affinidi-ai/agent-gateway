@@ -51,7 +51,7 @@ pub(crate) async fn client(
     }
 }
 
-async fn send(
+pub(crate) async fn send(
     world: &mut SurfaceWorld,
     operator: Option<&str>,
     method: Method,
@@ -77,8 +77,16 @@ async fn add_policy_to_surface(
     world: &mut SurfaceWorld,
     surface_name: &str,
 ) {
+    add_policy_to_target(world, surface_name, "policy").await;
+}
+
+async fn add_policy_to_target(
+    world: &mut SurfaceWorld,
+    surface_name: &str,
+    field: &str,
+) {
     let mut surface = current_surface_body(world, "adding the policy definition");
-    surface["target"]["policy"] = json!({ "policy_definition_id": policy_id(world) });
+    surface["target"][field] = json!({ "policy_definition_id": policy_id(world) });
     update_named_surface(world, surface_name, surface, "adding the policy definition").await;
 }
 
@@ -106,6 +114,19 @@ async fn operator_has_added_policy_to_surface(
         .as_ref()
         .expect("the surface update has a response");
     require_success(response, "adding the policy definition to the surface");
+}
+
+#[given(expr = "the operator has added the policy definition to surface {string} as its response policy")]
+async fn operator_has_added_response_policy_to_surface(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+) {
+    add_policy_to_target(world, &surface_name, "response_policy").await;
+    let response = world
+        .admin_response
+        .as_ref()
+        .expect("the surface update has a response");
+    require_success(response, "adding the policy definition to the surface as its response policy");
 }
 
 #[when("the operator creates a surface policy definition")]

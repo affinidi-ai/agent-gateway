@@ -308,14 +308,29 @@ impl GatewayPolicyManager {
         };
 
         debug!(gateway_id = %gateway_id, member_count = members.len(), "Evaluating gateway-level OPA policy set");
+        let capture = super::input_capture::begin("gateway", gateway_id, &input);
+        let result = Self::evaluate_members(&members, &input);
+        if let Some(capture) = capture {
+            capture.finish(match &result {
+                Ok((decision, _)) => Ok((decision.allow, decision.reason.as_deref())),
+                Err(error) => Err(error.as_str()),
+            });
+        }
+        result
+    }
 
+    /// Evaluate `input` against a snapshot of a gateway's compiled set, deny-overrides.
+    fn evaluate_members(
+        members: &[(regorus::Engine, Option<String>, Option<u32>, String)],
+        input: &serde_json::Value,
+    ) -> Result<GatewayPolicyDecisionWithEvidence, String> {
         let input_json =
-            serde_json::to_string(&input).map_err(|e| format!("Failed to serialize gateway policy input: {}", e))?;
+            serde_json::to_string(input).map_err(|e| format!("Failed to serialize gateway policy input: {}", e))?;
         let first_evidence = members
             .first()
             .map(|(_, id, v, h)| (id.clone(), *v, h.clone()));
 
-        for (engine_tmpl, policy_definition_id, version, hash) in &members {
+        for (engine_tmpl, policy_definition_id, version, hash) in members {
             let mut engine = engine_tmpl.clone();
             engine
                 .set_input_json(&input_json)

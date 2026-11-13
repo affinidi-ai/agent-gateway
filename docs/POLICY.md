@@ -128,6 +128,64 @@ their tenant and within their resource pattern. `PUT /v1/policy-assignments`
 rejects any tenant-scoped PAT with 403. See
 [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#tenant-ownership).
 
+## Policy input capture
+
+The gateway does not log the policy input. To write a policy against real requests, an operator
+switches on policy input capture for one surface, for a bounded time, and watches the surface's
+Capture view in the dashboard:
+
+- `PUT /v1/surfaces/{id}/policy-input-capture` with `{"minutes": n}`, `n` from 1 to 60, captures
+  the surface's policy input until `n` minutes from now, replacing an earlier end. Any other `n` is
+  refused with `400`.
+- `DELETE /v1/surfaces/{id}/policy-input-capture` stops it.
+- Both need `surfaces.edit` and `policies.edit` ([`RBAC.md`](RBAC.md#policy-input-capture)), and a
+  tenant token may change only a surface it may write. Both answer
+  `{"surface_id", "policy_input_capture_until"}`.
+
+The end time is stored on the surface as `policy_input_capture_until` and shown in
+`GET /v1/surfaces/{id}`. A surface `POST`, `PUT` or `PATCH` ignores a value it sends and keeps the
+stored one while it lies in the future; a past one is dropped. Switching capture on or off reaches
+other nodes as any surface change does (within `cache_refresh_interval_secs`, or on reload or
+restart when it is `0`); capture stops by itself at the end time on every node, with no further
+write.
+
+While it is on, each evaluation of a request or response policy on the surface sends one
+`policy_input_captured` update on the dashboard WebSocket, once the policy has decided:
+
+| Field | Value |
+| --- | --- |
+| `config_id` | The surface id |
+| `timestamp` | When the policy decided, RFC 3339 |
+| `slot` | The policy, in words: `inbound` (the Access Point policy), `target` (the Target's request policy), `inbound variant <alias>`, `target variant <alias>`, `outbound`, `transit <alias>`, `response` (the Target's response policy), `transit <alias> response`, `gateway` (the gateway-level policy) or `appliance <plane>` (an appliance-wide plane) |
+| `transit_point` | The Transit Point alias, for a Transit Point request or response policy |
+| `plane` | `surface`, `gateway` or `appliance` |
+| `engine` | The compiled policy key: the surface id, `inbound:`, `outbound:`, `variant:` or `transit:<surface>:<alias>` for a surface request policy, `response:<policy definition id>` or `response:transit:<surface>:<alias>` for a response policy, the gateway id, or the appliance-wide plane |
+| `input` | The policy input, credentials masked: the request input of a request policy, `response`, `caller` and `surface` (with `transit` and `source_auth` on a Transit Point leg) for a response policy |
+| `decision` | `allow`, `deny` or `error` (an evaluation error, which denies) |
+| `reason` | The deny reason, or the evaluation error |
+| `surface_variant` | The surface variant of the request, when there is one |
+
+Policies run appliance-wide, gateway, Access Point, Target, and a deny ends the chain, so a slot
+after it sends nothing. Captures are sent on the direct, Fabric and MCP proxy paths alike. MCP tool
+policies and the `tools/list` filtering of a surface policy are not captured.
+
+Only a dashboard WebSocket opened with a session (`websocket_require_auth`, on by default) whose
+user holds `surfaces.edit` and `policies.edit` receives the updates; the permissions are checked
+again on each keep-alive ping. A socket without a session never receives them. Nothing is written
+to the log or stored, so a capture nobody watches is gone, and only the node that served the
+request sends it: a dashboard connected to another node of the appliance does not see it.
+
+Before a capture is sent, every credential in the input becomes `<redacted>`: the value of a key
+named like a credential (the [credential names](CONFIGURATION_REFERENCE.md#log-redaction) of log
+redaction, such as `token` or `api_key`), any JWT, and any `Bearer` or `Basic` value. Headers that
+carry credentials never reach the policy input. Message bodies, tool arguments and claims are sent
+as they are. Policy input capture is meant for writing and testing policies: the captures hold
+caller data.
+
+A release older than this one refuses to load a surface stored with `policy_input_capture_until`.
+Switch capture off with `DELETE` on every surface before rolling back, and do not switch it on while
+nodes of an older release share the storage.
+
 ## Appliance-wide (global) enforcement
 
 In `src/policies/global_policy.rs`: a policy can be assigned to a whole plane via

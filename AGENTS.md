@@ -391,6 +391,11 @@ which refuses the save), shown as "Not ready for external access" under the Acce
 with a **Configure Authentication** action; see
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
+A surface's Capture view has a **Policy Input** card listing the input and decision of each
+policy evaluation while its **Capture policy input** switch is on (30 minutes, for users
+with both `surfaces.edit` and `policies.edit`); see _Policy input capture_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#policy-input-capture).
+
 The Dashboard shows the metrics **Delete** button only to users with `settings.edit`; see
 _Maintenance actions_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#maintenance-actions).
 

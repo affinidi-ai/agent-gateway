@@ -627,6 +627,39 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
 | Selected method's settings (editor) | `caller-auth-editor-method-settings`                                                    |
 | JWT audience claim and its warnings | `caller-auth-jwt-audience-claim`, `-audience-claim-warning`, `caller-auth-audiences-missing-warning` |
 
+### Policy input capture
+
+- The surface's Capture view (`monitoring/capture/SurfaceCapturePanel.tsx`) has a **Policy Input**
+  card (`monitoring/capture/PolicyInputCaptureCard.tsx`) between the latest payload and the
+  payload history. Its header holds the **Capture policy input** switch
+  (`monitoring/PolicyInputCaptureControl.tsx`), shown only on a saved surface (never while
+  creating). Read-only mode shows the state with the controls disabled. The Monitoring view
+  itself has only the Capture button.
+- The switch needs both `surfaces.edit` and `policies.edit`; without either the controls are
+  disabled.
+- While off, "for 30 minutes" sits beside the switch; switching on sends
+  `PUT /v1/surfaces/{id}/policy-input-capture` with `{"minutes": 30}`. There is no duration
+  choice in the dashboard; the API still takes 1 to 60 minutes. While on, it shows "On until
+  HH:MM" (local time) in place of that text, and switching off sends `DELETE` to the same path.
+  It starts from the stored surface's `policy_input_capture_until`, shows off once that time
+  passes, and reports the new end time back to the Monitoring view so reopening Capture keeps it.
+- The card lists the last 20 `policy_input_captured` WebSocket updates of the surface (see
+  `monitoring/capture/usePolicyInputCaptureStream.ts`), newest first: time, policy slot with a
+  variant badge, a decision badge (Allow green, Deny red, Error yellow) with the reason, a
+  **Show input** toggle that opens the input JSON, and a copy button for the input. With none it
+  says to switch capture on and send a request. Pause and Clear Payloads apply to it too.
+- The note that captures hold request data with credentials masked, reach only users who may
+  edit surfaces and policies, are neither logged nor stored, are for developing and testing
+  policies only, and stop by themselves sits behind the switch's `FieldHelp`. A failed request
+  shows an inline error beside the switch.
+
+| Policy input capture element                    | Test id                                                                |
+| ----------------------------------------------- | ---------------------------------------------------------------------- |
+| Control, switch, duration, end time             | `policy-input-capture`, `policy-input-capture-switch`, `policy-input-capture-duration`, `policy-input-capture-until` |
+| Help and error                                  | `field-help-policy-input-capture`, `policy-input-capture-error`        |
+| Card, empty state, row                          | `policy-input-capture-card`, `policy-input-capture-empty`, `policy-input-capture-row` |
+| Reason, input toggle, input, copy               | `policy-input-capture-reason`, `policy-input-capture-toggle`, `policy-input-capture-input`, `policy-input-capture-copy` |
+
 ## Trust Check
 
 - A Trust Check on a Managed Agent → Transit Point arrow belongs to that Transit Point

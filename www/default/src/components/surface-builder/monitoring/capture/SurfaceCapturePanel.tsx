@@ -8,13 +8,17 @@ import CaptureDetailsModal from './CaptureDetailsModal';
 import CaptureHistoryTable from './CaptureHistoryTable';
 import CapturePipelineView from './CapturePipelineView';
 import CaptureSchemaModal from './CaptureSchemaModal';
+import PolicyInputCaptureCard from './PolicyInputCaptureCard';
 import { CapturedPayload } from './types';
 import { useSurfaceCaptureStream } from './useSurfaceCaptureStream';
+import { usePolicyInputCaptureStream } from './usePolicyInputCaptureStream';
 
 export interface SurfaceCapturePanelProps {
   surfaceId: string;
   surface: AgentSurface | null;
   onClose: () => void;
+  /** Called after policy input capture is switched on or off. */
+  onPolicyInputCaptureChange?: (until: string | null) => void;
 }
 
 const buildRouteDisplay = (surface: AgentSurface | null): string => {
@@ -28,9 +32,11 @@ const SurfaceCapturePanel: React.FC<SurfaceCapturePanelProps> = ({
   surfaceId,
   surface,
   onClose,
+  onPolicyInputCaptureChange,
 }) => {
   const { state, actions } = useApp();
   const stream = useSurfaceCaptureStream(surfaceId);
+  const policyInputs = usePolicyInputCaptureStream(surfaceId, stream.isPaused);
 
   const [selectedCapture, setSelectedCapture] = useState<CapturedPayload | null>(null);
   const [schemaModal, setSchemaModal] = useState<{
@@ -130,8 +136,11 @@ const SurfaceCapturePanel: React.FC<SurfaceCapturePanelProps> = ({
           </button>
           <button
             className="btn btn-sm btn-warning"
-            onClick={stream.clear}
-            disabled={stream.count === 0}
+            onClick={() => {
+              stream.clear();
+              policyInputs.clear();
+            }}
+            disabled={stream.count === 0 && policyInputs.captures.length === 0}
           >
             <i className="fas fa-trash"></i> Clear Payloads
           </button>
@@ -276,6 +285,12 @@ const SurfaceCapturePanel: React.FC<SurfaceCapturePanelProps> = ({
           />
         </div>
       </div>
+
+      <PolicyInputCaptureCard
+        captures={policyInputs.captures}
+        captureUntil={surface?.policy_input_capture_until}
+        onCaptureChange={onPolicyInputCaptureChange}
+      />
 
       <CaptureHistoryTable captured={stream.captured} onSelectRow={stream.loadCapture} />
 

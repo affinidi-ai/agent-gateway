@@ -223,6 +223,11 @@ const SurfaceMonitoringPanel: React.FC<SurfaceMonitoringPanelProps> = ({
           surfaceId={surfaceId}
           surface={surface}
           onClose={() => setCaptureMode(false)}
+          onPolicyInputCaptureChange={until =>
+            setSurface(current =>
+              current ? { ...current, policy_input_capture_until: until } : current
+            )
+          }
         />
       </div>
     );
@@ -265,7 +270,7 @@ const SurfaceMonitoringPanel: React.FC<SurfaceMonitoringPanelProps> = ({
           type="button"
           className="btn btn-sm btn-primary ms-auto"
           onClick={() => setCaptureMode(true)}
-          title="Live payload capture for this surface"
+          title="Live payload and policy input capture for this surface"
         >
           <i className="fas fa-eye me-1"></i> Capture
         </button>
