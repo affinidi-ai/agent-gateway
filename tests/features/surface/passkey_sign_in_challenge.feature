@@ -6,8 +6,8 @@ Feature: Passkey sign-in and registration do not tell whether an account exists
   Registering a username that already has an account, approved or awaiting approval, is answered
   as a new registration and changes nothing, and every registration is answered 25 ms after the
   username is checked, so neither the answer nor its timing tells whether it exists. A username
-  longer than 256 bytes is refused, so no challenge holds a larger one, and a client IP may start
-  at most 20 sign-ins and registrations a minute.
+  longer than 256 bytes is refused, so no challenge holds a larger one. Starts are not limited per
+  client IP unless passkey_login_throttle is enabled.
 
   Scenario: A sign-in for an unknown username names stable decoy credentials
     When passkey sign-ins are started twice for "bravo"
@@ -28,10 +28,9 @@ Feature: Passkey sign-in and registration do not tell whether an account exists
       | sign-in      |
       | registration |
 
-  Scenario: A client that starts more than 20 passkey sign-ins in a minute is refused
+  Scenario: Passkey sign-in starts are not limited per client IP by default
     When 21 passkey sign-ins are started for "bravo"
-    Then the response status is 429
-    And the response says when to retry
+    Then the response status is 200
 
   Scenario: A sign-in for an approved user names the user's passkey
     Given human user "alpha" is approved and has a passkey

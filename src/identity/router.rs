@@ -325,10 +325,9 @@ pub fn create_identity_api_router(
 
                 crate::source_auth::client_ip::warn_if_login_throttle_shares_one_limit(
                     "passkey_login_throttle",
-                    &(&state
+                    &state
                         .network_config
-                        .passkey_login_throttle)
-                        .into(),
+                        .passkey_login_throttle,
                     &state.network_config.client_ip,
                 );
                 let router = Router::new()
@@ -341,10 +340,9 @@ pub fn create_identity_api_router(
                             .route("/auth/login/start", post(crate::auth::handlers::login_start))
                             .route_layer(axum::middleware::from_fn_with_state(
                                 std::sync::Arc::new(crate::sts::throttle::TokenEndpointThrottle::per_client_ip(
-                                    &(&state
+                                    &state
                                         .network_config
-                                        .passkey_login_throttle)
-                                        .into(),
+                                        .passkey_login_throttle,
                                 )),
                                 crate::auth::handlers::throttle_passkey_start,
                             ))

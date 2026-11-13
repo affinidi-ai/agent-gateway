@@ -15,14 +15,14 @@ changes:
   removed: []
   security:
     - timestamp: '2026-11-13T00:00:00Z'
-      title: Limit passkey sign-in and registration starts per client IP
+      title: Add an optional per-client-IP limit on passkey sign-in and registration starts
       description: >-
         POST /auth/login/start and /auth/register/start need no sign-in and every call keeps a
         challenge, so one client could push other users' challenges out of the store before they
-        finished. A client IP may now start 20 a minute between them, and is answered 429 with
-        Retry-After beyond that. passkey_login_throttle in gateway.json sets the limit and is on
-        by default; behind a load balancer, list it in client_ip.trusted_proxies, or every user
-        shares the balancer's limit.
+        finished. passkey_login_throttle in gateway.json, off by default, now limits each client
+        IP (20 a minute between them by default) and answers 429 with Retry-After beyond that.
+        Behind a load balancer, list it in client_ip.trusted_proxies before enabling it, or every
+        user shares the balancer's limit.
     - timestamp: '2026-11-13T00:00:00Z'
       title: Update quinn-udp to 0.5.16 for RUSTSEC-2026-0538
       description: >-

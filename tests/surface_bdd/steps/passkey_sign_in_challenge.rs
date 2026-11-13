@@ -66,20 +66,6 @@ async fn passkey_sign_ins_started_for(
     }
 }
 
-#[then("the response says when to retry")]
-fn response_says_when_to_retry(world: &mut SurfaceWorld) {
-    let response = world
-        .caller_response
-        .as_ref()
-        .expect("a response");
-    let retry_after: u64 = response
-        .headers
-        .get("retry-after")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| panic!("no Retry-After seconds in {:?}", response.headers));
-    assert!((1..=60).contains(&retry_after), "Retry-After {retry_after}");
-}
-
 fn credential_ids(credentials: &[Value]) -> Vec<String> {
     credentials
         .iter()

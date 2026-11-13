@@ -149,9 +149,8 @@ you open any listener:
   is listed, the gateway sees every caller as the balancer's address, so the STS token
   endpoint throttle, which is on by default, counts them all as one source: a burst of
   failed client logins through the balancer locks every STS client out for
-  `lockout_secs`. The passkey sign-in limit, also on by default, shares one budget the same
-  way, so 20 sign-in starts a minute through the balancer refuse every other user's sign-in
-  with `429`; the SAML and CLI login limits, when enabled, do too. The
+  `lockout_secs`. The passkey, SAML and CLI login limits, when enabled, share one budget the
+  same way. The
   balancer must append the caller's address to `X-Forwarded-For` or overwrite it, and set
   or strip `X-Forwarded-Host` and `X-Forwarded-Proto` rather than pass a caller's through.
 - **Register the first administrator before anyone else can reach the gateway.** The

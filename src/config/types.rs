@@ -1374,7 +1374,8 @@ pub struct StsRuntimeConfig {
     pub mcp_replay: crate::sts::replay::McpReplayConfig,
 }
 
-/// Per-client-IP throttle for a sign-in endpoint (SAML login, CLI login). Off unless enabled. The
+/// Per-client-IP throttle for a sign-in endpoint (SAML login, CLI login, passkey sign-in and
+/// registration starts). Off unless enabled. The
 /// IP is resolved by [`crate::source_auth::client_ip`] from the proxies in [`ClientIpConfig`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoginThrottleConfig {
@@ -1393,41 +1394,6 @@ impl Default for LoginThrottleConfig {
             per_ip: default_login_throttle_per_ip(),
         }
     }
-}
-
-/// Per-client-IP throttle on starting a passkey sign-in or registration. Unlike the other login
-/// throttles it is on unless switched off: both routes are unauthenticated and every call keeps a
-/// challenge, so an unlimited client could push other users' challenges out.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PasskeyLoginThrottleConfig {
-    /// Master switch for the throttle. Defaults to `true`.
-    #[serde(default = "default_passkey_login_throttle_enabled")]
-    pub enabled: bool,
-    /// Per-client-IP limit, shared by both start routes.
-    #[serde(default = "default_login_throttle_per_ip")]
-    pub per_ip: RateLimitConfig,
-}
-
-impl Default for PasskeyLoginThrottleConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_passkey_login_throttle_enabled(),
-            per_ip: default_login_throttle_per_ip(),
-        }
-    }
-}
-
-impl From<&PasskeyLoginThrottleConfig> for LoginThrottleConfig {
-    fn from(config: &PasskeyLoginThrottleConfig) -> Self {
-        Self {
-            enabled: config.enabled,
-            per_ip: config.per_ip.clone(),
-        }
-    }
-}
-
-fn default_passkey_login_throttle_enabled() -> bool {
-    true
 }
 
 /// The delegated payment gate's circuit breaker: after `breaker_failures`
