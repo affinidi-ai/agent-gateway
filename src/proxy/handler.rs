@@ -2404,7 +2404,41 @@ async fn proxy_charged_request(
                     .await
             };
             match verified {
-                Ok(identity) => Some(identity),
+                Ok(identity) => {
+                    if let Some(reason) = state
+                        .surface
+                        .inbound_source_method_refusal(auth_config)
+                    {
+                        channel_warn!(config_id, "Caller refused: {}", reason);
+                        crate::metrics::backends::prometheus::track_managed_identity_resolve(
+                            &channel_name,
+                            state
+                                .surface
+                                .inbound_identity_mode_label(),
+                            "source_method_mismatch",
+                            0.0,
+                        );
+                        crate::audit::request_events::auth_failed(
+                            &audit_facts,
+                            crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
+                            "source_method_mismatch",
+                            true,
+                            client_ip,
+                        );
+                        connection_guard
+                            .decrement()
+                            .await;
+                        return Ok(refuse_failed_caller(
+                            &state.surface,
+                            &state.network_config,
+                            mcp_versions,
+                            &resolved_auth_config,
+                            req,
+                        )
+                        .await);
+                    }
+                    Some(identity)
+                }
                 // Caller-attributable failure (missing/invalid credential). An
                 // Access Point that publishes protected resource metadata answers
                 // it with its challenge, so the caller can fetch a token and

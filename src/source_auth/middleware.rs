@@ -1151,6 +1151,7 @@ pub(crate) mod tests {
 
     fn test_didauth_config(header_field: &str) -> DidAuthAuthConfig {
         DidAuthAuthConfig {
+            id: None,
             extraction: CredentialExtraction::HttpHeader {
                 field: header_field.to_string(),
             },
@@ -1174,6 +1175,7 @@ pub(crate) mod tests {
         let mw = build_middleware(Some(secrets_store), None, didauth_store, strategy_store, default_jwks_client());
 
         let config = SourceAuthConfig::ApiKey(ApiKeyAuthConfig {
+            id: None,
             extraction: CredentialExtraction::HttpHeader { field: "X-API-Key".to_string() },
             secret_id: "my-secret".to_string(),
         });
@@ -1204,6 +1206,7 @@ pub(crate) mod tests {
         let mw = build_middleware(Some(secrets_store), None, didauth_store, strategy_store, default_jwks_client());
 
         let config = SourceAuthConfig::ApiKey(ApiKeyAuthConfig {
+            id: None,
             extraction: CredentialExtraction::HttpHeader { field: "X-API-Key".to_string() },
             secret_id: "my-secret".to_string(),
         });
@@ -1231,6 +1234,7 @@ pub(crate) mod tests {
         let mw = build_middleware(Some(secrets_store), None, didauth_store, strategy_store, default_jwks_client());
 
         let config = SourceAuthConfig::ApiKey(ApiKeyAuthConfig {
+            id: None,
             extraction: CredentialExtraction::HttpHeader { field: "X-API-Key".to_string() },
             secret_id: "my-secret".to_string(),
         });
@@ -1253,6 +1257,7 @@ pub(crate) mod tests {
         let mw = build_middleware(Some(secrets_store), None, didauth_store, strategy_store, default_jwks_client());
 
         let config = SourceAuthConfig::ApiKey(ApiKeyAuthConfig {
+            id: None,
             extraction: CredentialExtraction::HttpHeader { field: "X-API-Key".to_string() },
             secret_id: "my-secret".to_string(),
         });
@@ -1280,6 +1285,7 @@ pub(crate) mod tests {
         let mw = build_middleware(None, Some(validator), didauth_store, strategy_store, default_jwks_client());
 
         let config = SourceAuthConfig::ApiKeyProvider(ApiKeyProviderAuthConfig {
+            id: None,
             extraction: CredentialExtraction::HttpHeader { field: "X-API-Key".to_string() },
             agent_id: "agent-1".to_string(),
         });
@@ -1308,6 +1314,7 @@ pub(crate) mod tests {
         let mw = build_middleware(None, Some(validator), didauth_store, strategy_store, default_jwks_client());
 
         let config = SourceAuthConfig::ApiKeyProvider(ApiKeyProviderAuthConfig {
+            id: None,
             extraction: CredentialExtraction::HttpHeader { field: "X-API-Key".to_string() },
             agent_id: "agent-1".to_string(),
         });
@@ -1652,6 +1659,7 @@ pub(crate) mod tests {
         let mw = build_middleware(Some(secrets_store), None, didauth_store, strategy_store, default_jwks_client());
 
         let config = SourceAuthConfig::Mtls(crate::source_auth::models::MtlsAuthConfig {
+            id: None,
             trust: crate::source_auth::models::MtlsTrust::Pinned {
                 certificate_ids: vec!["cert-1".to_string()],
             },

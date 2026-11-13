@@ -9,6 +9,7 @@ import {
   readProtectedResource,
   resourceMissesRoute,
 } from './protectedResource';
+import { referencedMethodId } from '../identity/placement';
 import {
   buildMethod,
   defaultMethodConfig,
@@ -17,6 +18,7 @@ import {
   methodIncompleteReason,
   methodSelectionProblems,
   readMethods,
+  withMethodIds,
 } from './methods';
 
 const usesDiscovery = (c: Record<string, unknown>): boolean =>
@@ -164,7 +166,8 @@ export const callerAuthDefinition: NodeDefinition = {
     const configured = readMethods(c);
     if (configured.length === 0) return undefined;
 
-    const methods = configured.map(m => buildMethod(m, ctx.surfaceMeta.surface_id));
+    const referenced = referencedMethodId(ctx.allNodes);
+    const methods = configured.map(m => buildMethod(m, ctx.surfaceMeta.surface_id, referenced));
     if (methods.some(m => m === undefined)) return undefined;
 
     const discovery =
@@ -193,7 +196,7 @@ export const callerAuthDefinition: NodeDefinition = {
     const stored = Array.isArray(slice?.methods) ? slice.methods : [];
     if (stored.length === 0) return slice ?? {};
     return {
-      methods: stored.map(methodConfigFromPayload),
+      methods: withMethodIds(stored.map(methodConfigFromPayload)),
       protected_resource:
         stored[0].type === 'jwt_bearer' ? readProtectedResource(slice.protected_resource) : null,
       on_failure: isOnFailure(slice.on_failure) ? slice.on_failure : undefined,

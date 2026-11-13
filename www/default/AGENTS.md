@@ -458,8 +458,8 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   "This surface is refusing requests" (`surface-refusing-requests`, `alert-warning`,
   `role="status"`); `serving` and `not_judged` show nothing. The gateway gives no reason, so the
   notice names none. An error-level dependency blocks
-  Save unless every Caller Context method is API Key or API Key Provider, with the gateway's
-  own message. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
+  Save unless every Caller Context method is API Key or API Key Provider (or the Identity names
+  the API key method it reads), with the gateway's own message. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
   apart. Rules only the gateway enforces (an MCP `proxy://` target, `mcp_http.authorization`)
   and rules on inactive variants show as the save-error banner.
 - **Caller Context methods**: the caller-auth element's config holds `methods`, saved as
@@ -481,6 +481,22 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   is on, JWT Bearer only as the first method), shown on each row and on the canvas. Removing the
   primary method also turns discovery off, since discovery belongs to it. With several methods an incomplete one marks the element
   unconfigured as `Method <n>: <reason>`.
+- **Method ids and the Identity source method**: every method has an `id` (`methods.ts`:
+  `newMethodId` for an added method, `withMethodIds` naming a stored one `method-<position>` on
+  load), kept when a method is edited, reordered or made primary. An id the dashboard made is
+  flagged `id_generated` and is saved only once the inbound Identity names the method
+  (`referencedMethodId`), so a surface that never needs one saves unchanged; a stored id is
+  always saved. With more than one Caller Context method, an inbound Identity of type From JWT
+  Claims or From API Key shows an **Identity source method** select
+  (`identity-panel-source-method-select`, `IdentitySourceMethodSelect.tsx`) listing only the
+  methods of the kind it reads, as "Method <n>: <kind>, reads <location>", and writes
+  `identity_slots.inbound_source_method`; choosing the type pre-selects the first such method,
+  choosing another type clears it, and with none the panel says so
+  (`identity-panel-source-method-none`). The all-JWT and all-API-key rules apply only while no
+  method is selected; a selection naming a removed method or one of the wrong kind is a Save
+  error. The select never shows on a single method, on the protected or external Identity, or on
+  a Transit Point Identity, and a template drops the selection and every method id
+  (`scrubVolatileTemplateFields`).
 - **JWT Bearer audiences**: Accepted Audiences is required; with none listed, discovery off and
   Audience Claim `aud`, the method shows `caller-auth-audiences-missing-warning`. Save is not
   blocked for it, since the gateway keeps a method stored without audiences unchanged and refuses

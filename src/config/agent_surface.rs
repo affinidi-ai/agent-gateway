@@ -284,6 +284,11 @@ fn normalize_stored_browser_origins(value: &mut serde_json::Value) -> bool {
 pub struct SurfaceIdentitySlots {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inbound: Option<crate::source_auth::ManagedIdentityConfig>,
+    /// The caller-authentication method (by `id`) an inbound `from_jwt_claim`
+    /// or `from_api_key` identity is derived from. Unset: any method of the
+    /// identity's kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbound_source_method: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protected: Option<crate::source_auth::ManagedIdentityConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

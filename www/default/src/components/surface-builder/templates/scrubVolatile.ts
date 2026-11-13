@@ -57,10 +57,12 @@ function dropApiKeyIds(view: unknown): void {
       ) {
         delete method.secret_id;
       }
+      if (isObject(method)) delete method.id;
     }
   }
   const slots = view.identity_slots;
   if (isObject(slots)) {
+    delete slots.inbound_source_method;
     for (const slot of ['inbound', 'protected', 'external']) dropApiKeyId(slots[slot]);
   }
   if (isObject(view.target)) dropApiKeyId(view.target.identity_injection);
@@ -77,7 +79,16 @@ function dropApiKeyIds(view: unknown): void {
 function dropCanvasApiKeyIds(canvas: unknown): void {
   if (!isObject(canvas) || !Array.isArray(canvas.nodes)) return;
   for (const node of canvas.nodes) {
-    if (isObject(node) && node.type === 'identity') dropApiKeyId(node.config);
+    if (isObject(node) && node.type === 'identity') {
+      dropApiKeyId(node.config);
+      if (isObject(node.config)) delete node.config.source_method;
+    }
+    if (isObject(node) && node.type === 'caller-auth' && isObject(node.config)) {
+      const methods = node.config.methods;
+      if (Array.isArray(methods)) {
+        for (const method of methods) if (isObject(method)) delete method.id;
+      }
+    }
   }
 }
 

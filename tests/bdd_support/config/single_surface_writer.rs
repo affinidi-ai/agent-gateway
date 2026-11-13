@@ -298,8 +298,21 @@ fn write_single_surface_config_inner(
         .iter()
         .chain(&surface_config.additional_source_auth)
     {
-        let method = crate::bdd_support::config::source_auth::caller_authentication_method_json(auth);
+        let mut method = crate::bdd_support::config::source_auth::caller_authentication_method_json(auth);
+        if surface_config
+            .inbound_source_method
+            .is_some()
+        {
+            method["id"] = serde_json::json!(crate::bdd_support::config::source_auth::source_method_id(
+                method["type"]
+                    .as_str()
+                    .unwrap_or("method")
+            ));
+        }
         surface_fixture = surface_fixture.with_caller_auth_method(method);
+    }
+    if let Some(selected) = &surface_config.inbound_source_method {
+        surface_fixture = surface_fixture.with_identity_slot("inbound_source_method", serde_json::json!(selected));
     }
     if let Some(protected) = &surface_config.protected_resource {
         surface_fixture = surface_fixture.with_caller_protected_resource(serde_json::json!({

@@ -2058,6 +2058,7 @@ mod tests {
         let mut s = base_surface();
         // Base surface has a configured `inbound` slot.
         s.identity_slots = SurfaceIdentitySlots {
+            inbound_source_method: None,
             inbound: Some(ManagedIdentityConfig::Static {
                 did: "did:web:base".to_string(),
             }),
@@ -2069,6 +2070,7 @@ mod tests {
         // does NOT inherit the base's `inbound`. Per-variant slots are
         // full bindings, not a sparse merge.
         let variant_slots = SurfaceIdentitySlots {
+            inbound_source_method: None,
             inbound: None,
             protected: None,
             external: Some(ManagedIdentityConfig::Static {
