@@ -129,10 +129,15 @@ fn is_handler_enforced_nested_action(
                     | "trusted-issuers"
                     | "surfaces"
                     | "exposed-surfaces"
-                    | "approve"],
+                    | "approve"
+                    | "continue"
+                    | "mediator-access"],
             )
             | (ResourceKind::Gateways, ["trusted-issuers", _])
-            | (ResourceKind::ConnectionPoints, ["use" | "exposed-surfaces" | "metrics" | "reconnect"])
+            | (
+                ResourceKind::ConnectionPoints,
+                ["use" | "exposed-surfaces" | "metrics" | "reconnect" | "continue" | "mediator-access"],
+            )
             | (ResourceKind::ConnectionPoints, ["messages"])
             | (ResourceKind::ConnectionPoints, ["messages", _])
             | (ResourceKind::ConnectionPoints, ["messages", _, "read"])

@@ -643,6 +643,13 @@ impl ConnectionPointListenerManager {
         if !self.is_active() {
             return Err("Connection point listeners are currently deactivated".to_string());
         }
+        if connection_point.awaiting_mediator_access {
+            info!(
+                "Not starting a listener for connection point '{}': it waits for mediator access",
+                connection_point.id
+            );
+            return Ok(());
+        }
 
         let cp_id = connection_point.id.clone();
         if let Err(e) = self
@@ -3148,17 +3155,70 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
                                         warn!("Cannot process OOB connection-setup: missing required stores");
                                     }
                                 }
+                                message_processor::ProcessingResult::OOBInvitationUnusable {
+                                    acceptor_temporary_did,
+                                    reason,
+                                } => {
+                                    warn!(
+                                        "connection-setup from {} refused on '{}': {}",
+                                        acceptor_temporary_did, connection_point.name, reason
+                                    );
+                                    send_pairing_rejection(
+                                        client,
+                                        connection_point_did,
+                                        &acceptor_temporary_did,
+                                        message_processor::INVITATION_UNUSABLE_REASON,
+                                    )
+                                    .await;
+                                }
                                 message_processor::ProcessingResult::OOBConnectionRejected { reason } => {
                                     error!("❌ OOB connection-rejected received! Reason: {}", reason);
 
                                     // This is the ACCEPTOR side receiving rejection from INVITER
-                                    // The message is not tied to the sender of the invitation, so it only
-                                    // logs; the pairing and its temporary connection point expire.
-                                    if let Some(_pend_store) = pending_connection_store {
-                                        error!("Connection rejected - pending connection left to expire");
-                                        error!("Rejection reason: {}", reason);
+                                    if let (Some(gw_store), Some(pend_store)) =
+                                        (gateway_store, pending_connection_store)
+                                    {
+                                        let outcome = fail_rejected_pairing(
+                                            connection_point,
+                                            received_msg
+                                                .from_did
+                                                .as_deref(),
+                                            &reason,
+                                            gw_store.as_ref(),
+                                            pend_store,
+                                        )
+                                        .await;
+                                        if outcome == RejectedPairing::Failed {
+                                            // The attempt is over: its temporary connection point has
+                                            // nothing left to receive. Stopping the listener ends this
+                                            // task, so it comes last.
+                                            if let Some(cps) = cp_store
+                                                && let Err(e) = cps
+                                                    .delete(&connection_point.id)
+                                                    .await
+                                            {
+                                                warn!("Failed to delete temporary connection point: {}", e);
+                                            }
+                                            delete_message_after_processing(
+                                                client,
+                                                &message_sha256_hash,
+                                                &connection_point.name,
+                                            )
+                                            .await;
+                                            if let Some(mgr) = manager_weak
+                                                .as_ref()
+                                                .and_then(|weak| weak.upgrade())
+                                                && let Err(e) = mgr
+                                                    .stop_listener(&connection_point.id)
+                                                    .await
+                                            {
+                                                warn!("Failed to stop temporary listener: {}", e);
+                                            }
+                                        }
                                     } else {
-                                        warn!("Cannot cleanup rejected connection: missing pending store");
+                                        warn!(
+                                            "Cannot mark the rejected pairing failed: missing gateway or pending store"
+                                        );
                                     }
                                 }
                                 message_processor::ProcessingResult::ProcessedNoResponse => {
@@ -3492,6 +3552,110 @@ fn resolve_recovered_expires_at(
         }),
         None => Ok(temp_connection_point.created_at + chrono::Duration::hours(pending_expiry_hours as i64)),
     }
+}
+
+/// Tell an acceptor its connection-setup was refused. Best effort: a failed send is logged and
+/// changes nothing else.
+async fn send_pairing_rejection(
+    client: &DIDCommClient,
+    our_did: &str,
+    acceptor_did: &str,
+    reason: &str,
+) {
+    match crate::comm::didcomm::gateway::send_connection_rejected(client, our_did, acceptor_did, reason).await {
+        Ok(()) => info!("Sent connection-rejected to acceptor {}", acceptor_did),
+        Err(e) => warn!("Could not send connection-rejected to acceptor {}: {}", acceptor_did, e),
+    }
+}
+
+/// The longest inviter reason kept in a rejected gateway's description.
+const MAX_REJECTION_REASON_CHARS: usize = 200;
+
+/// What a `connection-rejected` did to the acceptance waiting on the connection point it
+/// arrived on.
+#[derive(Debug, PartialEq)]
+enum RejectedPairing {
+    /// The pending gateway is now `failed`, its description giving the inviter's reason.
+    Failed,
+    /// Nothing changed: no acceptance waits there for that sender, or its gateway is not pending.
+    Ignored,
+}
+
+/// Mark the pending gateway of the acceptance waiting on `connection_point` failed with the
+/// inviter's reason, when `from_did` is the inviter its connection-setup went to. The sender is
+/// authcrypt-verified, so another DID cannot fail someone else's pairing.
+async fn fail_rejected_pairing<S: GatewayStore + ?Sized>(
+    connection_point: &GatewayConnectionPoint,
+    from_did: Option<&str>,
+    reason: &str,
+    gateway_store: &S,
+    pending_store: &crate::gateways::PendingConnectionStore,
+) -> RejectedPairing {
+    let Some(pending) = pending_store
+        .get_by_temporary_cp_id(&connection_point.id)
+        .await
+    else {
+        warn!("connection-rejected on '{}' ignored: no acceptance waits on it", connection_point.name);
+        return RejectedPairing::Ignored;
+    };
+    if pending.role != crate::gateways::ConnectionRole::Acceptor
+        || from_did
+            != Some(
+                pending
+                    .their_temporary_did
+                    .as_str(),
+            )
+    {
+        warn!(
+            "connection-rejected on '{}' ignored: sender {:?} is not the inviter {}",
+            connection_point.name, from_did, pending.their_temporary_did
+        );
+        return RejectedPairing::Ignored;
+    }
+    let mut gateway = match gateway_store
+        .get(&connection_point.gateway_id)
+        .await
+    {
+        Ok(Some(gateway))
+            if gateway.status == crate::gateways::types::GatewayStatus::Pending
+                && gateway.did == pending.their_temporary_did =>
+        {
+            gateway
+        }
+        Ok(_) => {
+            warn!(
+                "connection-rejected on '{}' ignored: gateway {} is not pending",
+                connection_point.name, connection_point.gateway_id
+            );
+            return RejectedPairing::Ignored;
+        }
+        Err(e) => {
+            warn!(
+                "connection-rejected on '{}': failed to load gateway {}: {}",
+                connection_point.name, connection_point.gateway_id, e
+            );
+            return RejectedPairing::Ignored;
+        }
+    };
+    let reason: String = reason
+        .chars()
+        .take(MAX_REJECTION_REASON_CHARS)
+        .collect();
+    gateway.status = crate::gateways::types::GatewayStatus::Failed;
+    gateway.description = format!("Connection rejected: {}", reason);
+    gateway.updated_at = Utc::now();
+    if let Err(e) = gateway_store
+        .update(&gateway)
+        .await
+    {
+        error!("Failed to mark gateway {} failed after its pairing was rejected: {}", gateway.id, e);
+        return RejectedPairing::Ignored;
+    }
+    pending_store
+        .remove(&pending.id)
+        .await;
+    info!("Gateway {} failed: its inviter rejected the pairing ({})", gateway.id, reason);
+    RejectedPairing::Failed
 }
 
 /// Finalize OOB connection as ACCEPTOR after receiving connection-accepted
@@ -4168,33 +4332,13 @@ async fn handle_oob_connection_setup_as_inviter<CS: super::ConnectionPointStore 
     .await
     {
         Ok(connection_point) => connection_point,
-        Err(super::message_processor::InvitationRefusal::Unavailable(reason)) => {
-            error!("❌ Invitation for {} not redeemed: {}", our_temporary_did, reason);
-            return Err(reason);
-        }
-        Err(super::message_processor::InvitationRefusal::InvalidSecret) => {
-            error!("❌ Secret validation failed for invitation {}", our_temporary_did);
-
-            // Send connection-rejected message back to acceptor
-            info!("📤 Sending connection-rejected message to acceptor...");
-
-            match crate::comm::didcomm::gateway::send_connection_rejected(
-                client,
-                our_temporary_did,
-                acceptor_temporary_did,
-                "Invalid connection secret",
-            )
-            .await
-            {
-                Ok(_) => {
-                    info!("✓ Connection-rejected message sent successfully");
-                }
-                Err(e) => {
-                    error!("❌ Failed to send connection-rejected message: {}", e);
-                }
+        Err(refusal) => {
+            let detail = refusal.detail();
+            error!("❌ Invitation for {} not redeemed: {}", our_temporary_did, detail);
+            if let Some(reason) = refusal.rejection_reason() {
+                send_pairing_rejection(client, our_temporary_did, acceptor_temporary_did, reason).await;
             }
-
-            return Err("Invalid connection secret".to_string());
+            return Err(detail);
         }
     };
     info!("  Redeemed invitation: {} (ID: {})", connection_point.name, connection_point.id);
@@ -4265,37 +4409,43 @@ async fn handle_oob_connection_setup_as_inviter<CS: super::ConnectionPointStore 
             .await
             .map_err(|e| format!("Inbound gateway connection refused (appliance limit): {}", e.message()))?;
 
-        // Step 2: Create our secure DID for the permanent connection
-        info!("🔑 Creating our secure DID for permanent connection...");
+        // Step 2: Our secure DID for the permanent connection: the one the
+        // connection point reserved, else a new one
+        let our_secure_did = if let Some(reserved) = &connection_point.reserved_permanent {
+            info!("✓ Using the permanent DID reserved with the connection point: {}", reserved.did);
+            reserved.did.clone()
+        } else {
+            info!("🔑 Creating our secure DID for permanent connection...");
 
-        // Get network_config from manager
-        let network_config = manager_weak
-            .as_ref()
-            .and_then(|w| w.upgrade())
-            .and_then(|m| m.network_config.clone())
-            .ok_or_else(|| "Network config not available in listener manager".to_string())?;
+            let network_config = manager_weak
+                .as_ref()
+                .and_then(|w| w.upgrade())
+                .and_then(|m| m.network_config.clone())
+                .ok_or_else(|| "Network config not available in listener manager".to_string())?;
 
-        let secure_cp_id = uuid::Uuid::new_v4().to_string();
-        let (our_secure_did, _secure_secrets, _secure_doc) =
-            crate::gateways::connection_points::handlers::generate_connection_point_identity(
-                &secure_cp_id,
-                &network_config.did.domain,
-                std::path::Path::new(
-                    &bootstrap_config
-                        .storage_paths
-                        .connection_points,
-                ),
-                mediator_url,
-                &connection_point.did_method,
-                #[cfg(feature = "didwebvh")]
-                None,
-                #[cfg(feature = "didwebvh")]
-                None,
-            )
-            .await
-            .map_err(|e| format!("Failed to generate secure DID: {}", e))?;
+            let secure_cp_id = uuid::Uuid::new_v4().to_string();
+            let (our_secure_did, _secure_secrets, _secure_doc) =
+                crate::gateways::connection_points::handlers::generate_connection_point_identity(
+                    &secure_cp_id,
+                    &network_config.did.domain,
+                    std::path::Path::new(
+                        &bootstrap_config
+                            .storage_paths
+                            .connection_points,
+                    ),
+                    mediator_url,
+                    &connection_point.did_method,
+                    #[cfg(feature = "didwebvh")]
+                    None,
+                    #[cfg(feature = "didwebvh")]
+                    None,
+                )
+                .await
+                .map_err(|e| format!("Failed to generate secure DID: {}", e))?;
 
-        info!("✓ Our secure DID created: {}", our_secure_did);
+            info!("✓ Our secure DID created: {}", our_secure_did);
+            our_secure_did
+        };
 
         // Step 3: Create the gateway record with AwaitingApproval status
         // Store the acceptor's information so admin can review and approve
@@ -5347,6 +5497,243 @@ mod tests {
             .as_str()
             .to_string();
         assert_eq!(super::mediator_account_loss(&not_a_report, MEDIATOR_DID), None);
+    }
+
+    const REJECTING_INVITER_DID: &str = "did:example:inviter-invitation";
+
+    struct RejectedAcceptance {
+        _directory: tempfile::TempDir,
+        gateways: crate::gateways::FileSystemGatewayStore,
+        pending: crate::gateways::PendingConnectionStore,
+        temporary_point: super::super::types::GatewayConnectionPoint,
+        gateway_id: String,
+    }
+
+    /// A pending acceptance as `connect-via-oob` leaves it: the pending gateway named by the
+    /// inviter's invitation DID, its temporary Connection Point and the pairing state.
+    async fn rejected_acceptance() -> RejectedAcceptance {
+        use super::super::types::{ConnectionPointType, GatewayConnectionPoint};
+        use crate::gateways::filesystem::GatewayStore;
+        use crate::gateways::types::{Gateway, GatewayStatus, GatewayType};
+
+        let directory = tempfile::tempdir().unwrap();
+        let gateways = crate::gateways::FileSystemGatewayStore::new(
+            directory
+                .path()
+                .join("gateways"),
+            None,
+        )
+        .await
+        .unwrap();
+        let pending = crate::gateways::PendingConnectionStore::new(
+            directory
+                .path()
+                .join("pending"),
+        )
+        .await
+        .unwrap();
+        let mut gateway =
+            Gateway::new("Partner".into(), "Partner gateway".into(), REJECTING_INVITER_DID.into(), GatewayType::Remote);
+        gateway.status = GatewayStatus::Pending;
+        gateways
+            .create(&gateway)
+            .await
+            .unwrap();
+        let temporary_point = GatewayConnectionPoint::new(
+            gateway.id.clone(),
+            "did:example:mediator".to_string(),
+            "did:example:acceptor-temporary".to_string(),
+            "Temporary listener".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            serde_json::json!({ "pending_gateway_id": gateway.id }),
+            None,
+            ConnectionPointType::System,
+            String::new(),
+        );
+        pending
+            .store(crate::gateways::PendingOOBConnection {
+                id: temporary_point.id.clone(),
+                our_temporary_did: temporary_point
+                    .connection_point_did
+                    .clone(),
+                our_secure_did: "did:example:acceptor-permanent".to_string(),
+                their_temporary_did: REJECTING_INVITER_DID.to_string(),
+                their_secure_did: None,
+                their_issuer_did: None,
+                mediator_did: "did:example:mediator".to_string(),
+                connection_point_id: String::new(),
+                invitation_id: "invitation-1".to_string(),
+                role: crate::gateways::ConnectionRole::Acceptor,
+                state: crate::gateways::ConnectionState::WaitingForResponse,
+                created_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::days(7),
+                secure_cp_id: None,
+                temporary_cp_id: Some(temporary_point.id.clone()),
+                mediator_record_id: None,
+            })
+            .await;
+        RejectedAcceptance {
+            _directory: directory,
+            gateways,
+            pending,
+            gateway_id: gateway.id,
+            temporary_point,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejection_from_the_inviter_marks_the_pending_gateway_failed_with_its_reason() {
+        use crate::gateways::filesystem::GatewayStore;
+        use crate::gateways::types::GatewayStatus;
+
+        let acceptance = rejected_acceptance().await;
+
+        let outcome = super::fail_rejected_pairing(
+            &acceptance.temporary_point,
+            Some(REJECTING_INVITER_DID),
+            crate::gateways::connection_points::message_processor::INVITATION_UNUSABLE_REASON,
+            &acceptance.gateways,
+            &acceptance.pending,
+        )
+        .await;
+
+        assert_eq!(outcome, super::RejectedPairing::Failed);
+        let gateway = acceptance
+            .gateways
+            .get(&acceptance.gateway_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(gateway.status, GatewayStatus::Failed);
+        assert_eq!(
+            gateway.description,
+            "Connection rejected: This invitation can't be used any more. Ask for a new one."
+        );
+        assert!(
+            acceptance
+                .pending
+                .get_by_temporary_cp_id(&acceptance.temporary_point.id)
+                .await
+                .is_none()
+        );
+        acceptance
+            .gateways
+            .delete(&acceptance.gateway_id)
+            .await
+            .unwrap();
+        assert!(
+            acceptance
+                .gateways
+                .get(&acceptance.gateway_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejection_from_another_sender_leaves_the_pending_gateway_pending() {
+        use crate::gateways::filesystem::GatewayStore;
+        use crate::gateways::types::GatewayStatus;
+
+        let acceptance = rejected_acceptance().await;
+
+        for from in [Some("did:example:someone-else"), None] {
+            let outcome = super::fail_rejected_pairing(
+                &acceptance.temporary_point,
+                from,
+                "Invalid connection secret",
+                &acceptance.gateways,
+                &acceptance.pending,
+            )
+            .await;
+            assert_eq!(outcome, super::RejectedPairing::Ignored, "{from:?}");
+        }
+
+        let gateway = acceptance
+            .gateways
+            .get(&acceptance.gateway_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(gateway.status, GatewayStatus::Pending);
+        assert_eq!(gateway.description, "Partner gateway");
+        assert!(
+            acceptance
+                .pending
+                .get_by_temporary_cp_id(&acceptance.temporary_point.id)
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejection_after_the_pairing_completed_changes_nothing() {
+        use crate::gateways::filesystem::GatewayStore;
+        use crate::gateways::types::GatewayStatus;
+
+        let acceptance = rejected_acceptance().await;
+        let mut gateway = acceptance
+            .gateways
+            .get(&acceptance.gateway_id)
+            .await
+            .unwrap()
+            .unwrap();
+        gateway.status = GatewayStatus::Active;
+        acceptance
+            .gateways
+            .update(&gateway)
+            .await
+            .unwrap();
+
+        let outcome = super::fail_rejected_pairing(
+            &acceptance.temporary_point,
+            Some(REJECTING_INVITER_DID),
+            "Invalid connection secret",
+            &acceptance.gateways,
+            &acceptance.pending,
+        )
+        .await;
+
+        assert_eq!(outcome, super::RejectedPairing::Ignored);
+        assert_eq!(
+            acceptance
+                .gateways
+                .get(&acceptance.gateway_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            GatewayStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn a_long_rejection_reason_is_cut_short() {
+        use crate::gateways::filesystem::GatewayStore;
+
+        let acceptance = rejected_acceptance().await;
+        let reason = "x".repeat(super::MAX_REJECTION_REASON_CHARS + 50);
+
+        super::fail_rejected_pairing(
+            &acceptance.temporary_point,
+            Some(REJECTING_INVITER_DID),
+            &reason,
+            &acceptance.gateways,
+            &acceptance.pending,
+        )
+        .await;
+
+        let description = acceptance
+            .gateways
+            .get(&acceptance.gateway_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .description;
+        assert_eq!(description, format!("Connection rejected: {}", "x".repeat(super::MAX_REJECTION_REASON_CHARS)));
     }
 
     #[tokio::test]

@@ -324,6 +324,7 @@ const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
                 size="md"
                 onClick={onBack}
                 iconStart={<i className="fas fa-arrow-left"></i>}
+                data-testid="wizard-back"
               >
                 Back
               </AppButton>
@@ -332,6 +333,7 @@ const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
                 variant="primary"
                 size="md"
                 iconEnd={<i className="fas fa-arrow-right"></i>}
+                data-testid="wizard-next"
               >
                 Next
               </AppButton>

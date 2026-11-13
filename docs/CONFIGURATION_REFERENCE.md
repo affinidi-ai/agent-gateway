@@ -206,7 +206,7 @@ The bootstrap file. Startup only; changes need a restart.
 | `[tls]` | Certificate and key paths, upstream verification |
 | `[mcp]` | Default MCP revision, validation, timeouts, SSE and stdio transports. Gateway-originated `2026-07-28` consent needs `[mcp.continuations]`; see [`MCP_METADATA.md`](MCP_METADATA.md#protected-continuations). |
 | `[reconnect_policy]` | Backoff for DIDComm connection points and for the background retry of a trust registry connection |
-| `[oob_connection]` | How long an out-of-band pairing invitation stays pending |
+| `[oob_connection]` | `pending_expiry_hours` (default 1): how long a pending acceptance whose temporary Connection Point recorded no expiry stays valid. An acceptance records its invitation's expiry (`expires_time`, else seven days), so this applies only to acceptances stored before that |
 | `[a2a]` | Default A2A revision, body size (`max_body_size`, at least 1 byte; `0` fails startup), timeouts, fabric timeouts and envelope lifetime, inbound cache sizing. See [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md). |
 | `[logging]` | Level, JSON output, log directory. Log redaction is not read here; see [Log redaction](#log-redaction). |
 | `[audit]` | How the VP Audit Log file is rotated: `vp_audit_log_max_bytes` (default 8388608) and `vp_audit_log_keep` (default 0, keep every rotated file), and the advisory `vp_audit_log_soft_cap_bytes` the Audit page shows the history against (default 1073741824). See [Governance audit forwarding](OBSERVABILITY.md#governance-audit-forwarding). |

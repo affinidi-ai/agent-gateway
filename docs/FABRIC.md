@@ -127,6 +127,16 @@ approval sends `connection-accepted` from its DID. System Connection Points (`oo
 `oobacceptor`, `system`) never accept a `connection-setup`. Invitations created before the gateway
 recorded the message id are refused and must be created again.
 
+A refused setup is answered with `connection-rejected` when the acceptor can act on it: a wrong
+secret with `Invalid connection secret`, and an invitation that is missing, disabled, expired or
+already used with `This invitation can't be used any more. Ask for a new one.`, which never says
+which. Other refusals get no reply. The answer is best effort: a failed send is logged as a
+warning and changes nothing else. The acceptor takes a rejection only from the inviter its
+setup went to, on that attempt's temporary Connection Point, and only while its gateway is
+`pending`; the gateway turns `failed` with `Connection rejected: <reason>` as its description,
+its temporary Connection Point and listener are removed, and it can be deleted. With no
+Connection Point left to derive a status from, the gateway list keeps showing it `failed`.
+
 The handshake always runs on the inviter's mediator. The acceptor's permanent connection point uses
 the inviter's mediator too, unless `connect-via-oob` names one of the acceptor's own mediators in
 `acceptor_mediator_id`. The field is refused with `400` unless the experimental `mediator_federation`
@@ -278,6 +288,47 @@ Connection Point (an invitation endpoint, a pairing's temporary listener, a lega
 to every sender, since it does not serve a single known peer. The mediator's own replies are not
 subject to the access list. The two Trust Tasks of an ACL change are serialized per DID. A failed
 change is logged and the listener continues; the account check below restores it.
+
+The account update names only the access-list mode and anonymous receipt; every other flag is
+left as the mediator stored it. A mediator lets only its administrator change `blocked`, `local`
+and the `selfManage*` flags, and refuses a whole update that names one of them at another value.
+So on an `explicit_allow` mediator the account needs, from its registration or the mediator's
+default ACL, the right to change its own access-list mode and anonymous receipt and the right to
+manage its own access list (the Affinidi Portal registers DIDs with `71000`, which carries the
+list right). Without them the update is refused with `not_self_manageable`, logged as a warning,
+and a peer's messages are refused with `e.p.delivery.refused`.
+
+## Pausing for mediator access
+
+A mediator in `explicit_allow` mode refuses every DID its administrator has not added, and the
+gateway cannot tell from any record whether a mediator works that way. So creating a Connection
+Point and adding a gateway can each stop after minting their DIDs and before their first mediator
+call, show the DIDs, and continue when the operator says they are allowed. The dashboard always
+asks for the pause; the API pauses only when the request sets `await_mediator_access: true`, and
+otherwise behaves as without it ([`mediator_access.rs`](../src/gateways/mediator_access.rs)).
+
+| Step | Mints | Continued by |
+| --- | --- | --- |
+| `POST /v1/connection-points` | The Connection Point DID and the permanent DID it reserves for the paired gateway (`reserved_permanent`) | `POST /v1/connection-points/{id}/continue`: opens the inbox, creates the invitation, starts the listener |
+| `POST /v1/gateways/connect-via-oob` | The temporary DID for the handshake and the permanent DID for the pairing | `POST /v1/gateways/{id}/continue`: sends the connection-setup and leaves the gateway `pending` |
+
+A paused Connection Point is stored with `awaiting_mediator_access: true`, no invitation and no
+listener. A paused acceptance is a gateway with status `awaiting-mediator-access` and a temporary
+Connection Point that keeps the invitation, its secret and the reserved permanent DID. Both keep
+their keys and state on disk, survive a restart, and last until the invitation expires: the
+Connection Point's own expiry, and for an acceptance the invitation's `expires_time`, else seven
+days. The same expiry bounds an acceptance's wait for approval, with or without the pause. A
+restart removes a paused gateway whose invitation has expired. `GET …/{id}/mediator-access`
+returns the DIDs of a pause again: their role (`connection_point`, `temporary`, `permanent`), the
+mediator that must admit each, and the expiry.
+
+Continue authenticates every DID and reads its own mediator account first. While the mediator
+refuses one (`403`, or an ACL denial) it answers `409` with `code: mediator_access_refused` and the
+refused DID's `role` and `did`, and the pause stays. Continuing twice is serialised, and a pairing
+that already went on is returned as it is. The inviter's connection-setup and approval use the
+reserved permanent DID and mint none, so once both gateways continued, every DID of the pairing is
+already admitted when approval completes it. A Connection Point created without the pause reserves
+nothing and mints its permanent DID at approval as before.
 
 ## Runtime health behavior
 

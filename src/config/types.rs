@@ -137,8 +137,9 @@ impl IntegrationConfig {
 /// OOB (Out-of-Band) connection configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OobConnectionConfig {
-    /// How long (in hours) a pending OOB connection request remains valid
-    /// After this time, the temporary listener will be stopped and cleaned up
+    /// How long (in hours) after its creation a pending acceptance whose temporary
+    /// connection point recorded no expiry remains valid. Acceptances record the
+    /// expiry of their invitation, so this applies only to older ones.
     #[serde(default = "default_pending_expiry_hours")]
     pub pending_expiry_hours: u64,
 }

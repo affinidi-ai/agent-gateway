@@ -1,7 +1,10 @@
-import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import React, { useEffect, useState } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import './OnboardWizard.css';
+import { apiClient } from '../api';
 import WizardProgress from '../components/shared/WizardProgress';
+import MediatorAccessStep, { MediatorAccessRefusal } from '../components/shared/MediatorAccessStep';
+import { ADD_GATEWAY_DID_LABELS, MediatorAccess, labelledDids } from '../utils/mediatorAccess';
 
 // Import step components
 import EnterDetailsStep from '../components/gateway-add-via-oob/EnterDetailsStep';
@@ -10,7 +13,7 @@ import ConnectStep from '../components/gateway-add-via-oob/ConnectStep';
 import CompleteStep from '../components/gateway-add-via-oob/CompleteStep';
 
 // Define wizard steps
-type WizardStep = 'enter-details' | 'enter-link' | 'connect' | 'complete';
+type WizardStep = 'enter-details' | 'enter-link' | 'mediator-access' | 'connect' | 'complete';
 
 interface WizardState {
   currentStep: WizardStep;
@@ -21,10 +24,13 @@ interface WizardState {
   oobLink: string | null;
   secret: string | null;
   gateway: any;
+  mediatorAccess: MediatorAccess | null;
 }
 
 const AddGatewayViaOOBWizardPage: React.FC = () => {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const resumeId = searchParams.get('resume');
 
   const [wizardState, setWizardState] = useState<WizardState>({
     currentStep: 'enter-details',
@@ -35,13 +41,43 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
     oobLink: null,
     secret: null,
     gateway: null,
+    mediatorAccess: null,
   });
 
   const [error, setError] = useState('');
+  const [pausing, setPausing] = useState(false);
+  const [refusal, setRefusal] = useState<MediatorAccessRefusal | null>(null);
+
+  useEffect(() => {
+    if (!resumeId) return;
+    const resume = async () => {
+      try {
+        setPausing(true);
+        const [gateway, access] = await Promise.all([
+          apiClient.get(`/gateways/${resumeId}`),
+          apiClient.get<MediatorAccess>(`/gateways/${resumeId}/mediator-access`),
+        ]);
+        setWizardState(prev => ({
+          ...prev,
+          name: gateway.data.name,
+          description: gateway.data.description,
+          gateway: gateway.data,
+          mediatorAccess: access.data,
+          currentStep: 'mediator-access',
+        }));
+      } catch (err: any) {
+        setError(err.message || 'Failed to load the gateway.');
+      } finally {
+        setPausing(false);
+      }
+    };
+    resume();
+  }, [resumeId]);
 
   const steps: { key: WizardStep; label: string }[] = [
     { key: 'enter-details', label: 'Enter Details' },
     { key: 'enter-link', label: 'Enter Connection Point Link' },
+    { key: 'mediator-access', label: 'Mediator Access' },
     { key: 'connect', label: 'Connect' },
     { key: 'complete', label: 'Complete' },
   ];
@@ -76,9 +112,43 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
     nextStep();
   };
 
-  const handleOOBLinkEntered = (link: string, secret: string) => {
+  /** Accepts the link up to the pause: the gateway mints its DIDs and waits for the mediator. */
+  const handleOOBLinkEntered = async (link: string, secret: string) => {
     setWizardState(prev => ({ ...prev, oobLink: link, secret }));
-    nextStep();
+    try {
+      setPausing(true);
+      setError('');
+      const response = await apiClient.post('/gateways/connect-via-oob', {
+        oob_url: link,
+        secret,
+        name: wizardState.name,
+        description: wizardState.description,
+        did_method: wizardState.didMethod || 'web',
+        acceptor_mediator_id: wizardState.acceptorMediatorId || undefined,
+        await_mediator_access: true,
+      });
+      const access: MediatorAccess | undefined = response.data.mediator_access;
+      setWizardState(prev => ({
+        ...prev,
+        gateway: response.data.gateway,
+        mediatorAccess: access ?? null,
+        currentStep: access ? 'mediator-access' : 'complete',
+      }));
+    } catch (err: any) {
+      setError(err.message || 'Failed to accept the connection point link.');
+    } finally {
+      setPausing(false);
+    }
+  };
+
+  const handleMediatorAccessConfirmed = () => {
+    setRefusal(null);
+    goToStep('connect');
+  };
+
+  const handleRefused = (refused: MediatorAccessRefusal) => {
+    setRefusal(refused);
+    goToStep('mediator-access');
   };
 
   const handleConnected = (gateway: any) => {
@@ -102,6 +172,19 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
 
   // Render current step
   const renderStep = () => {
+    if (pausing) {
+      return (
+        <div className="card shadow">
+          <div className="card-body text-center py-5">
+            <div className="spinner-border text-primary mb-3" role="status">
+              <span className="visually-hidden"></span>
+            </div>
+            <p className="text-muted">Preparing the connection...</p>
+          </div>
+        </div>
+      );
+    }
+
     switch (wizardState.currentStep) {
       case 'enter-details':
         return (
@@ -124,9 +207,22 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
             initialSecret={wizardState.secret || ''}
           />
         );
+      case 'mediator-access':
+        return wizardState.mediatorAccess ? (
+          <MediatorAccessStep
+            dids={labelledDids(wizardState.mediatorAccess, ADD_GATEWAY_DID_LABELS)}
+            mediatorName={wizardState.mediatorAccess.mediator_name}
+            refusal={refusal}
+            continuing={false}
+            onContinue={handleMediatorAccessConfirmed}
+            onLater={handleCancel}
+          />
+        ) : null;
       case 'connect':
         return (
           <ConnectStep
+            continueGatewayId={wizardState.gateway?.id}
+            onRefused={handleRefused}
             oobLink={wizardState.oobLink || ''}
             secret={wizardState.secret || ''}
             name={wizardState.name || ''}
@@ -134,7 +230,7 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
             didMethod={wizardState.didMethod}
             acceptorMediatorId={wizardState.acceptorMediatorId}
             onConnected={handleConnected}
-            onBack={prevStep}
+            onBack={() => goToStep('mediator-access')}
             onCancel={handleCancel}
           />
         );

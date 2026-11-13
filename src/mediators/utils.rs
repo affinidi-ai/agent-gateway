@@ -133,19 +133,12 @@ fn account_acl(
     access_list_mode: MediatorAclAccessListMode,
     anon_receive: bool,
 ) -> Result<MediatorAcl, String> {
+    // Only the flags this update changes: a mediator refuses a non-admin update that
+    // names an admin-only flag (`blocked`, `local`, `selfManage*`) at a value other
+    // than the stored one, and leaves absent flags unchanged.
     MediatorAcl::builder()
         .access_list_mode(access_list_mode)
         .anon_receive(anon_receive)
-        .blocked(false)
-        .create_invites(true)
-        .local(true)
-        .receive_forwarded(true)
-        .receive_messages(true)
-        .self_manage_list(true)
-        .self_manage_receive_queue_limit(true)
-        .self_manage_send_queue_limit(true)
-        .send_forwarded(true)
-        .send_messages(true)
         .try_into()
         .map_err(|e| format!("Failed to build ALLOW_ALL ACL: {}", e))
 }
@@ -648,13 +641,10 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn peer_only_acl_grants_delivery_but_admits_only_the_access_list() {
+    fn peer_only_acl_names_only_an_allowlist_without_anonymous_receipt() {
         let acl = serde_json::to_value(peer_only_acl().unwrap()).unwrap();
         assert_eq!(acl["accessListMode"], "explicitAllow");
-        assert_eq!(acl["anonReceive"], false);
-        assert_eq!(acl["receiveMessages"], true);
-        assert_eq!(acl["sendMessages"], true);
-        assert_eq!(acl["blocked"], false);
+        assert_eq!(acl, json!({"accessListMode": "explicitAllow", "anonReceive": false}));
     }
 
     #[test]
@@ -673,23 +663,13 @@ mod tests {
     }
 
     #[test]
-    fn allow_all_acl_grants_every_capability_in_explicit_deny_mode() {
+    fn allow_all_acl_names_only_a_denylist_with_anonymous_receipt() {
         let acl = serde_json::to_value(allow_all_acl().unwrap()).unwrap();
         assert_eq!(
             acl,
             json!({
                 "accessListMode": "explicitDeny",
                 "anonReceive": true,
-                "blocked": false,
-                "createInvites": true,
-                "local": true,
-                "receiveForwarded": true,
-                "receiveMessages": true,
-                "selfManageList": true,
-                "selfManageReceiveQueueLimit": true,
-                "selfManageSendQueueLimit": true,
-                "sendForwarded": true,
-                "sendMessages": true,
             })
         );
     }

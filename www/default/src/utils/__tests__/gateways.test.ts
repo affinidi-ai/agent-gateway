@@ -2,7 +2,13 @@
  * Gateway selection helper tests.
  */
 
-import { isSelectableRemoteGateway, filterSelectableGateways, exposureModeOf } from '../gateways';
+import {
+  isSelectableRemoteGateway,
+  filterSelectableGateways,
+  exposureModeOf,
+  isGatewayPending,
+  opensGatewayDetails,
+} from '../gateways';
 
 describe('isSelectableRemoteGateway', () => {
   it('accepts an active remote gateway', () => {
@@ -90,5 +96,23 @@ describe('exposureModeOf', () => {
 
   it('ignores an unknown mode', () => {
     expect(exposureModeOf({ exposure_mode: 'some', exposed_channels: ['alpha'] })).toBe('list');
+  });
+});
+
+describe('opensGatewayDetails', () => {
+  it('opens an active, failed, disabled or pending gateway', () => {
+    for (const status of ['active', 'failed', 'disabled', 'pending']) {
+      expect(opensGatewayDetails({ status })).toBe(true);
+    }
+  });
+
+  it('opens a pending gateway although it still counts as pending', () => {
+    expect(isGatewayPending({ status: 'pending' })).toBe(true);
+    expect(opensGatewayDetails({ status: 'pending' })).toBe(true);
+  });
+
+  it('does not open a gateway waiting for approval or for mediator access', () => {
+    expect(opensGatewayDetails({ status: 'awaiting-approval' })).toBe(false);
+    expect(opensGatewayDetails({ status: 'awaiting-mediator-access' })).toBe(false);
   });
 });

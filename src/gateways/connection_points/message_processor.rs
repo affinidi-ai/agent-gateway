@@ -664,6 +664,12 @@ pub enum ProcessingResult {
     OOBConnectionAccepted(Box<OobConnectionAccepted>),
     /// OOB connection-setup received - needs to send connection-accepted
     OOBConnectionSetup(Box<OobConnectionSetup>),
+    /// OOB connection-setup on an invitation that can't be used - the acceptor is told so with
+    /// `INVITATION_UNUSABLE_REASON`; `reason` is the detail kept for the log
+    OOBInvitationUnusable {
+        acceptor_temporary_did: String,
+        reason: String,
+    },
     /// OOB connection-rejected received - connection failed
     OOBConnectionRejected {
         reason: String,
@@ -853,7 +859,12 @@ async fn process_connection_setup(message: &ReceivedMessage) -> ProcessingResult
 
     let connection_point = match load_invited_connection_point(message).await {
         Ok(connection_point) => connection_point,
-        Err(reason) => {
+        Err(InvitationRefusal::Unusable(reason)) => {
+            warn!("connection-setup on connection point {} refused: {}", message.connection_point_id, reason);
+            return ProcessingResult::OOBInvitationUnusable { acceptor_temporary_did, reason };
+        }
+        Err(refusal) => {
+            let reason = refusal.detail();
             warn!("connection-setup on connection point {} refused: {}", message.connection_point_id, reason);
             return ProcessingResult::Failed { reason };
         }
@@ -1001,50 +1012,82 @@ async fn verify_channel_did_proof(
 /// running keeps accepting on its socket after the invitation expires.
 async fn load_invited_connection_point(
     message: &ReceivedMessage
-) -> Result<crate::gateways::connection_points::types::GatewayConnectionPoint, String> {
+) -> Result<crate::gateways::connection_points::types::GatewayConnectionPoint, InvitationRefusal> {
+    let unavailable = |reason: &str| InvitationRefusal::Unavailable(reason.to_string());
+    let unusable = |reason: &str| InvitationRefusal::Unusable(reason.to_string());
     let storage_root =
-        storage_root_from_context(message).ok_or_else(|| "storage path not found in message context".to_string())?;
+        storage_root_from_context(message).ok_or_else(|| unavailable("storage path not found in message context"))?;
     let store =
         crate::gateways::connection_points::FileSystemConnectionPointStore::new(storage_root.join("connection_points"))
             .await
-            .map_err(|e| format!("failed to open connection point store: {}", e))?;
+            .map_err(|e| InvitationRefusal::Unavailable(format!("failed to open connection point store: {}", e)))?;
     let connection_point = store
         .get(&message.connection_point_id)
         .await
-        .map_err(|e| format!("failed to load connection point: {}", e))?
-        .ok_or_else(|| "connection point not found".to_string())?;
+        .map_err(|e| InvitationRefusal::Unavailable(format!("failed to load connection point: {}", e)))?
+        .ok_or_else(|| unusable("connection point not found"))?;
     if connection_point.cp_type != crate::gateways::connection_points::types::ConnectionPointType::User {
-        return Err("connection point is not an invitation".to_string());
+        return Err(unavailable("connection point is not an invitation"));
     }
     if connection_point
         .secret
         .is_empty()
     {
-        return Err("invitation has no secret".to_string());
+        return Err(unavailable("invitation has no secret"));
     }
     if !connection_point.enabled {
-        return Err("connection point is disabled".to_string());
+        return Err(unusable("connection point is disabled"));
     }
     if connection_point
         .expires_at
         .is_some_and(|expires_at| expires_at < chrono::Utc::now())
     {
-        return Err("invitation has expired".to_string());
+        return Err(unusable("invitation has expired"));
     }
     if connection_point.use_count > 0 {
-        return Err("invitation has already been used".to_string());
+        return Err(unusable("invitation has already been used"));
     }
     match (connection_point.invitation_message_id(), message.pthid.as_deref()) {
         (Some(invitation_id), Some(pthid)) if invitation_id == pthid => Ok(connection_point),
-        _ => Err("connection-setup does not reference this invitation".to_string()),
+        _ => Err(unavailable("connection-setup does not reference this invitation")),
     }
 }
+
+/// What a refused acceptor is told when its invitation is missing, disabled, expired or already
+/// used. It never says which, so it reveals nothing about the invitation.
+pub(crate) const INVITATION_UNUSABLE_REASON: &str = "This invitation can't be used any more. Ask for a new one.";
+
+/// What a refused acceptor is told when the connection secret is wrong.
+pub(crate) const INVALID_SECRET_REASON: &str = "Invalid connection secret";
 
 /// Why an invitation was not redeemed for a connection-setup.
 #[derive(Debug, PartialEq)]
 pub(crate) enum InvitationRefusal {
     InvalidSecret,
+    /// The invitation is missing, disabled, expired or already used; the detail is for the log.
+    Unusable(String),
+    /// Anything else, such as a storage failure or a setup that is not for an invitation; the
+    /// acceptor is not answered.
     Unavailable(String),
+}
+
+impl InvitationRefusal {
+    /// The reason logged and returned for the refusal.
+    pub(crate) fn detail(&self) -> String {
+        match self {
+            Self::InvalidSecret => INVALID_SECRET_REASON.to_string(),
+            Self::Unusable(reason) | Self::Unavailable(reason) => reason.clone(),
+        }
+    }
+
+    /// The reason sent to the acceptor in a `connection-rejected`, when it is told at all.
+    pub(crate) fn rejection_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::InvalidSecret => Some(INVALID_SECRET_REASON),
+            Self::Unusable(_) => Some(INVITATION_UNUSABLE_REASON),
+            Self::Unavailable(_) => None,
+        }
+    }
 }
 
 /// Redeem the invitation whose DID a connection-setup was addressed to, returning the redeemed record.
@@ -1061,21 +1104,22 @@ pub(crate) async fn redeem_invitation<CS: ConnectionPointStore + ?Sized>(
     use subtle::ConstantTimeEq;
 
     let unavailable = |reason: &str| InvitationRefusal::Unavailable(reason.to_string());
+    let unusable = |reason: &str| InvitationRefusal::Unusable(reason.to_string());
     let mut invitation = store
         .list_all()
         .await
         .map_err(|e| InvitationRefusal::Unavailable(format!("failed to list connection points: {}", e)))?
         .into_iter()
         .find(|cp| cp.connection_point_did == connection_point_did)
-        .ok_or_else(|| unavailable("connection point not found"))?;
+        .ok_or_else(|| unusable("connection point not found"))?;
     if invitation.cp_type != crate::gateways::connection_points::types::ConnectionPointType::User {
         return Err(unavailable("connection point is not an invitation"));
     }
     if !invitation.enabled {
-        return Err(unavailable("connection point is disabled"));
+        return Err(unusable("connection point is disabled"));
     }
     if invitation.use_count > 0 {
-        return Err(unavailable("invitation has already been used"));
+        return Err(unusable("invitation has already been used"));
     }
     let secret_matches: bool = invitation
         .secret
@@ -1092,7 +1136,7 @@ pub(crate) async fn redeem_invitation<CS: ConnectionPointStore + ?Sized>(
         .await
         .map_err(|e| InvitationRefusal::Unavailable(format!("failed to mark invitation as used: {}", e)))?;
     if !written {
-        return Err(unavailable("connection point not found"));
+        return Err(unusable("connection point not found"));
     }
     Ok(invitation)
 }
@@ -11962,6 +12006,18 @@ mod tests {
         }
     }
 
+    /// The logged detail of a setup refused on an unusable invitation, checking the acceptor
+    /// it would tell is the setup's sender.
+    fn unusable_reason(result: &ProcessingResult) -> &str {
+        match result {
+            ProcessingResult::OOBInvitationUnusable { acceptor_temporary_did, reason } => {
+                assert_eq!(acceptor_temporary_did, ACCEPTOR_TMP_DID);
+                reason
+            }
+            other => panic!("expected OOBInvitationUnusable, got {other:?}"),
+        }
+    }
+
     #[test]
     fn channel_did_proof_verifies_against_the_signing_key_document() {
         let (did, key) = did_key_identity();
@@ -12087,7 +12143,7 @@ mod tests {
 
         let result = process_connection_setup(&msg).await;
 
-        assert_eq!(failure_reason(&result), "invitation has expired");
+        assert_eq!(unusable_reason(&result), "invitation has expired");
     }
 
     #[tokio::test]
@@ -12101,7 +12157,7 @@ mod tests {
 
         let result = process_connection_setup(&msg).await;
 
-        assert_eq!(failure_reason(&result), "connection point not found");
+        assert_eq!(unusable_reason(&result), "connection point not found");
     }
 
     #[tokio::test]
@@ -12174,12 +12230,12 @@ mod tests {
             1
         );
         let later = process_connection_setup(&proven_setup_msg(temp.path(), &connection_point.id).await).await;
-        assert_eq!(failure_reason(&later), "invitation has already been used");
+        assert_eq!(unusable_reason(&later), "invitation has already been used");
         assert_eq!(
             redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
                 .await
                 .unwrap_err(),
-            InvitationRefusal::Unavailable("invitation has already been used".to_string())
+            InvitationRefusal::Unusable("invitation has already been used".to_string())
         );
     }
 
@@ -12318,8 +12374,8 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(disabled, InvitationRefusal::Unavailable("connection point is disabled".to_string()));
-        assert_eq!(deleted, InvitationRefusal::Unavailable("connection point not found".to_string()));
+        assert_eq!(disabled, InvitationRefusal::Unusable("connection point is disabled".to_string()));
+        assert_eq!(deleted, InvitationRefusal::Unusable("connection point not found".to_string()));
         assert!(
             store
                 .get(&connection_point.id)
@@ -12408,7 +12464,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(refused, InvitationRefusal::Unavailable("connection point not found".to_string()));
+        assert_eq!(refused, InvitationRefusal::Unusable("connection point not found".to_string()));
         assert!(
             store
                 .inner
@@ -12470,6 +12526,75 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(refused, InvitationRefusal::Unavailable("connection point is not an invitation".to_string()));
+    }
+
+    #[tokio::test]
+    async fn connection_setup_on_a_disabled_invitation_tells_the_acceptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut connection_point = invitation(None);
+        connection_point.enabled = false;
+        save_connection_point(temp.path(), &connection_point).await;
+
+        let result = process_connection_setup(&proven_setup_msg(temp.path(), &connection_point.id).await).await;
+
+        assert_eq!(unusable_reason(&result), "connection point is disabled");
+    }
+
+    #[tokio::test]
+    async fn redeeming_a_used_disabled_or_deleted_invitation_tells_the_acceptor_it_cant_be_used() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut connection_point = store_invitation(temp.path(), None).await;
+        let store = invitation_store(temp.path()).await;
+        redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap();
+        let used = redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap_err();
+        connection_point.enabled = false;
+        store
+            .update(&connection_point)
+            .await
+            .unwrap();
+        let disabled = redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap_err();
+        store
+            .delete(&connection_point.id)
+            .await
+            .unwrap();
+        let deleted = redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap_err();
+
+        for refusal in [used, disabled, deleted] {
+            assert_eq!(refusal.rejection_reason(), Some(INVITATION_UNUSABLE_REASON), "{refusal:?}");
+        }
+    }
+
+    #[test]
+    fn every_unusable_invitation_gets_the_same_rejection_reason() {
+        for detail in [
+            "invitation has already been used",
+            "invitation has expired",
+            "connection point is disabled",
+            "connection point not found",
+        ] {
+            let refusal = InvitationRefusal::Unusable(detail.to_string());
+            assert_eq!(refusal.rejection_reason(), Some("This invitation can't be used any more. Ask for a new one."));
+            assert_eq!(refusal.detail(), detail);
+        }
+        assert_eq!(InvitationRefusal::InvalidSecret.rejection_reason(), Some("Invalid connection secret"));
+        assert_eq!(InvitationRefusal::InvalidSecret.detail(), "Invalid connection secret");
+    }
+
+    #[test]
+    fn a_refusal_that_is_not_about_the_invitation_is_not_answered() {
+        for detail in ["connection point is not an invitation", "failed to list connection points: disk"] {
+            let refusal = InvitationRefusal::Unavailable(detail.to_string());
+            assert_eq!(refusal.rejection_reason(), None);
+            assert_eq!(refusal.detail(), detail);
+        }
     }
 
     const NOT_THIS_INVITATION: &str = "connection-setup does not reference this invitation";
@@ -12559,7 +12684,7 @@ mod tests {
 
         let result = process_connection_setup(&msg).await;
 
-        assert_eq!(failure_reason(&result), "invitation has already been used");
+        assert_eq!(unusable_reason(&result), "invitation has already been used");
     }
 
     fn x402_requirement(pay_to: &str) -> crate::config::types::X402PaymentRequirement {

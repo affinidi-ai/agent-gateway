@@ -825,6 +825,24 @@ pub async fn ping_succeeds(
     assert!(success, "ping from gateway {from_gw} to gateway {to_gw} did not succeed");
 }
 
+#[then(regex = r#"^gateway (\d+) waited for the mediator to admit its DIDs "([^"]+)"$"#)]
+pub async fn gateway_waited_for_mediator_access(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    roles: String,
+) {
+    let expected: Vec<String> = roles
+        .split(',')
+        .map(|role| role.trim().to_string())
+        .collect();
+    let waited = world
+        .harness()
+        .mediator_access_pauses
+        .get(&gw_index)
+        .unwrap_or_else(|| panic!("gateway {gw_index} did not pause for mediator access"));
+    assert_eq!(waited, &expected, "the DIDs gateway {gw_index} waited for");
+}
+
 /// How long a Remote record may take to gain an issuer DID after a restart:
 /// the exchange runs in the background once the pairing listener registers.
 const ISSUER_RECONCILIATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -1029,6 +1047,61 @@ pub async fn agent_card_points_callers_at_surface(
             .and_then(Value::as_str),
         Some(format!("http://localhost:{port}/{surface_id}").as_str()),
         "agent card should point at gateway {gw_index} surface '{surface_name}': {body}"
+    );
+}
+
+#[then(regex = r#"^gateway (\d+) shows the gateway it accepted last as failed with "([^"]+)"$"#)]
+pub async fn accepted_gateway_failed_with(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    description: String,
+) {
+    let gateway_id = world
+        .accepted_gateway_id
+        .clone()
+        .expect("a When must accept an invitation before this Then");
+    let gateway = world
+        .harness()
+        .gw(gw_index)
+        .admin
+        .wait_for_gateway_status(
+            &gateway_id,
+            crate::bdd_support::admin_client::GatewayStatus::Failed,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("gateway {gw_index} never marked {gateway_id} failed: {error:#}"));
+    assert_eq!(gateway.description, description);
+}
+
+#[then(regex = r"^gateway (\d+) can delete the gateway it accepted last$")]
+pub async fn accepted_gateway_can_be_deleted(
+    world: &mut G2gWorld,
+    gw_index: usize,
+) {
+    let gateway_id = world
+        .accepted_gateway_id
+        .clone()
+        .expect("a When must accept an invitation before this Then");
+    let admin = world
+        .harness()
+        .gw(gw_index)
+        .admin
+        .clone();
+    let deleted = admin
+        .delete_gateway_recorded(&gateway_id)
+        .await
+        .expect("delete request completes at the transport layer");
+    assert!((200..300).contains(&deleted.status), "delete refused: {} {}", deleted.status, deleted.body);
+    let remaining = admin
+        .list_gateways()
+        .await
+        .expect("list gateways");
+    assert!(
+        remaining
+            .iter()
+            .all(|gateway| gateway.id != gateway_id),
+        "gateway {gateway_id} is still listed"
     );
 }
 

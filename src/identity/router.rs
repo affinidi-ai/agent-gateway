@@ -1032,6 +1032,30 @@ pub fn create_identity_api_router(
                 ),
             )
             .route(
+                "/v1/gateways/{id}/continue",
+                peer_gate(
+                    post(
+                        crate::gateways::handlers::continue_gateway::<
+                            crate::gateways::FileSystemGatewayStore,
+                            crate::gateways::FileSystemConnectionPointStore,
+                            crate::mediators::FileSystemMediatorStore,
+                        >,
+                    ),
+                    Feature::GatewaysEdit,
+                ),
+            )
+            .route(
+                "/v1/gateways/{id}/mediator-access",
+                peer_gate(
+                    get(crate::gateways::handlers::get_gateway_mediator_access::<
+                        crate::gateways::FileSystemGatewayStore,
+                        crate::gateways::FileSystemConnectionPointStore,
+                        crate::mediators::FileSystemMediatorStore,
+                    >),
+                    Feature::GatewaysView,
+                ),
+            )
+            .route(
                 "/v1/gateways/{id}",
                 peer_gate(
                     get(crate::gateways::handlers::get_gateway::<crate::gateways::FileSystemGatewayStore>),
@@ -1512,6 +1536,28 @@ pub fn create_identity_api_router(
                             >,
                         ),
                         crate::rbac::Feature::GatewaysDelete,
+                    ),
+                )
+                .route(
+                    "/v1/connection-points/{id}/continue",
+                    gate(
+                        post(
+                            crate::gateways::connection_points::handlers::continue_connection_point::<
+                                crate::gateways::FileSystemConnectionPointStore,
+                                crate::mediators::FileSystemMediatorStore,
+                            >,
+                        ),
+                        crate::rbac::Feature::GatewaysEdit,
+                    ),
+                )
+                .route(
+                    "/v1/connection-points/{id}/mediator-access",
+                    gate(
+                        get(crate::gateways::connection_points::handlers::get_connection_point_mediator_access::<
+                            crate::gateways::FileSystemConnectionPointStore,
+                            crate::mediators::FileSystemMediatorStore,
+                        >),
+                        crate::rbac::Feature::GatewaysView,
                     ),
                 )
                 .route(

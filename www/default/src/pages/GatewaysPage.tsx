@@ -7,7 +7,7 @@ import { usePermissions } from '../context/PermissionsContext';
 import { apiClient } from '../api';
 import { formatDateTime } from '../utils/stringUtils';
 import { ConnectionHealthBadge, ConnectionRuntimeStatus } from '../utils/connectionHealth';
-import type { GatewayListItem } from '../utils/gateways';
+import { isGatewayPending, opensGatewayDetails, type GatewayListItem } from '../utils/gateways';
 import { AppButton } from '../components/shared/AppButton';
 import { Badge } from '../components/shared/Badge';
 import { DeleteButton } from '../components/shared/DeleteButton';
@@ -48,6 +48,8 @@ interface ConnectionPoint {
   enabled?: boolean; // Whether the connection point is enabled
   did_method?: string;
   runtime_status?: ConnectionRuntimeStatus;
+  /** Waiting for its mediator to admit its DIDs; it has no invitation link yet. */
+  awaiting_mediator_access?: boolean;
 }
 
 interface Mediator {
@@ -434,18 +436,12 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                         data-testid={`gateways-row-${gateway.id}`}
                         key={gateway.id}
                         onClick={() => {
-                          if (
-                            gateway.status !== 'pending' &&
-                            gateway.status !== 'awaiting-approval'
-                          ) {
+                          if (opensGatewayDetails(gateway)) {
                             navigate(`/gateways/${gateway.id}`);
                           }
                         }}
                         style={{
-                          cursor:
-                            gateway.status === 'pending' || gateway.status === 'awaiting-approval'
-                              ? 'default'
-                              : 'pointer',
+                          cursor: opensGatewayDetails(gateway) ? 'pointer' : 'default',
                         }}
                       >
                         <td>{gateway.name}</td>
@@ -510,57 +506,70 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                     <i className="fas fa-check" aria-hidden="true"></i>
                                   </AppButton>
                                 )}
-                                {gateway.gateway_type !== 'self' &&
-                                  gateway.status !== 'awaiting-approval' &&
-                                  gateway.status !== 'pending' && (
-                                    <AppButton
-                                      style={{ marginLeft: '10px' }}
-                                      title="Ping Gateway - Test connectivity"
-                                      variant={
-                                        pingStatus[gateway.id] === 'pinging'
+                                {gateway.status === 'awaiting-mediator-access' && (
+                                  <AppButton
+                                    variant="outline-primary"
+                                    size="sm"
+                                    className="me-1"
+                                    title="Continue adding this gateway"
+                                    data-testid={`gateways-continue-button-${gateway.id}`}
+                                    aria-label={`Continue adding gateway ${gateway.name}`}
+                                    onClick={e => {
+                                      e.stopPropagation();
+                                      navigate(`/gateways/connect?resume=${gateway.id}`);
+                                    }}
+                                  >
+                                    Continue
+                                  </AppButton>
+                                )}
+                                {gateway.gateway_type !== 'self' && !isGatewayPending(gateway) && (
+                                  <AppButton
+                                    style={{ marginLeft: '10px' }}
+                                    title="Ping Gateway - Test connectivity"
+                                    variant={
+                                      pingStatus[gateway.id] === 'pinging'
+                                        ? 'secondary'
+                                        : pingStatus[gateway.id] === 'success'
                                           ? 'secondary'
-                                          : pingStatus[gateway.id] === 'success'
-                                            ? 'secondary'
-                                            : pingStatus[gateway.id] === 'failed'
-                                              ? 'danger'
-                                              : 'secondary'
-                                      }
-                                      size="sm"
-                                      onClick={e => handlePingGateway(gateway.id, gateway.name, e)}
-                                      disabled={pingStatus[gateway.id] === 'pinging'}
-                                      data-testid={`gateways-ping-button-${gateway.id}`}
-                                      aria-label={`Ping gateway ${gateway.name}`}
-                                    >
-                                      {pingStatus[gateway.id] === 'pinging' ? (
-                                        <span
-                                          className="spinner-border spinner-border-sm"
-                                          role="status"
-                                          aria-hidden="true"
-                                        ></span>
-                                      ) : pingStatus[gateway.id] === 'success' ? (
-                                        <i className="fas fa-check" aria-hidden="true"></i>
-                                      ) : pingStatus[gateway.id] === 'failed' ? (
-                                        <i className="fas fa-times" aria-hidden="true"></i>
-                                      ) : (
-                                        <i className="fas fa-heartbeat" aria-hidden="true"></i>
-                                      )}
-                                    </AppButton>
-                                  )}
-                                {gateway.status !== 'awaiting-approval' &&
-                                  gateway.status !== 'pending' && (
-                                    <AppButton
-                                      variant="outline-primary"
-                                      size="sm"
-                                      style={{ marginLeft: '10px' }}
-                                      title="Edit Gateway"
-                                      className="me-1"
-                                      data-testid={`gateways-edit-button-${gateway.id}`}
-                                      aria-label={`Edit gateway ${gateway.name}`}
-                                      onClick={() => navigate(`/gateways/${gateway.id}`)}
-                                    >
-                                      <i className="fas fa-edit" aria-hidden="true"></i>
-                                    </AppButton>
-                                  )}
+                                          : pingStatus[gateway.id] === 'failed'
+                                            ? 'danger'
+                                            : 'secondary'
+                                    }
+                                    size="sm"
+                                    onClick={e => handlePingGateway(gateway.id, gateway.name, e)}
+                                    disabled={pingStatus[gateway.id] === 'pinging'}
+                                    data-testid={`gateways-ping-button-${gateway.id}`}
+                                    aria-label={`Ping gateway ${gateway.name}`}
+                                  >
+                                    {pingStatus[gateway.id] === 'pinging' ? (
+                                      <span
+                                        className="spinner-border spinner-border-sm"
+                                        role="status"
+                                        aria-hidden="true"
+                                      ></span>
+                                    ) : pingStatus[gateway.id] === 'success' ? (
+                                      <i className="fas fa-check" aria-hidden="true"></i>
+                                    ) : pingStatus[gateway.id] === 'failed' ? (
+                                      <i className="fas fa-times" aria-hidden="true"></i>
+                                    ) : (
+                                      <i className="fas fa-heartbeat" aria-hidden="true"></i>
+                                    )}
+                                  </AppButton>
+                                )}
+                                {!isGatewayPending(gateway) && (
+                                  <AppButton
+                                    variant="outline-primary"
+                                    size="sm"
+                                    style={{ marginLeft: '10px' }}
+                                    title="Edit Gateway"
+                                    className="me-1"
+                                    data-testid={`gateways-edit-button-${gateway.id}`}
+                                    aria-label={`Edit gateway ${gateway.name}`}
+                                    onClick={() => navigate(`/gateways/${gateway.id}`)}
+                                  >
+                                    <i className="fas fa-edit" aria-hidden="true"></i>
+                                  </AppButton>
+                                )}
                               </>
                             )}
                             <UseAsPaymentGatewayButton
@@ -728,7 +737,14 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                             </small>
                           </td>
                           <td>
-                            {connectionPoint.enabled === false ? (
+                            {connectionPoint.awaiting_mediator_access ? (
+                              <span
+                                className="badge text-bg-warning"
+                                data-testid={`connection-points-status-${connectionPoint.id}`}
+                              >
+                                Waiting for mediator access
+                              </span>
+                            ) : connectionPoint.enabled === false ? (
                               <span className="badge text-bg-warning">
                                 <i className="fas fa-power-off"></i> DISABLED
                               </span>
@@ -760,6 +776,22 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                 </AppButton>
                               )}
                               {hasPermission('gateways.edit') &&
+                                connectionPoint.awaiting_mediator_access && (
+                                  <AppButton
+                                    variant="outline-primary"
+                                    size="sm"
+                                    onClick={e => {
+                                      e.stopPropagation();
+                                      navigate(`/gateways/publish?resume=${connectionPoint.id}`);
+                                    }}
+                                    title="Continue creating this connection point"
+                                    data-testid={`connection-points-continue-button-${connectionPoint.id}`}
+                                    aria-label={`Continue connection point ${connectionPoint.name}`}
+                                  >
+                                    Continue
+                                  </AppButton>
+                                )}
+                              {hasPermission('gateways.edit') &&
                                 connectionPoint.runtime_status &&
                                 connectionPoint.runtime_status.status !== 'connected' && (
                                   <AppButton
@@ -775,28 +807,31 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                     <i className="fas fa-sync-alt" aria-hidden="true"></i>
                                   </AppButton>
                                 )}
-                              <AppButton
-                                variant="secondary"
-                                size="sm"
-                                onClick={() => handleCopyUrl(connectionPoint.oob_url)}
-                                title="Copy Connection Point Link"
-                                data-testid={`connection-points-copy-link-button-${connectionPoint.id}`}
-                                aria-label={`Copy link for ${connectionPoint.name}`}
-                              >
-                                <i className="fas fa-link" aria-hidden="true"></i>
-                              </AppButton>
-                              {connectionPoint.secret && (
+                              {!connectionPoint.awaiting_mediator_access && (
                                 <AppButton
                                   variant="secondary"
                                   size="sm"
-                                  onClick={() => handleCopySecret(connectionPoint.secret!)}
-                                  title="Copy Connection Point Secret"
-                                  data-testid={`connection-points-copy-secret-button-${connectionPoint.id}`}
-                                  aria-label={`Copy secret for ${connectionPoint.name}`}
+                                  onClick={() => handleCopyUrl(connectionPoint.oob_url)}
+                                  title="Copy Connection Point Link"
+                                  data-testid={`connection-points-copy-link-button-${connectionPoint.id}`}
+                                  aria-label={`Copy link for ${connectionPoint.name}`}
                                 >
-                                  <i className="fas fa-key" aria-hidden="true"></i>
+                                  <i className="fas fa-link" aria-hidden="true"></i>
                                 </AppButton>
                               )}
+                              {connectionPoint.secret &&
+                                !connectionPoint.awaiting_mediator_access && (
+                                  <AppButton
+                                    variant="secondary"
+                                    size="sm"
+                                    onClick={() => handleCopySecret(connectionPoint.secret!)}
+                                    title="Copy Connection Point Secret"
+                                    data-testid={`connection-points-copy-secret-button-${connectionPoint.id}`}
+                                    aria-label={`Copy secret for ${connectionPoint.name}`}
+                                  >
+                                    <i className="fas fa-key" aria-hidden="true"></i>
+                                  </AppButton>
+                                )}
                               {hasPermission('gateways.delete') && (
                                 <DeleteButton
                                   data-testid={`connection-points-delete-button-${connectionPoint.id}`}

@@ -230,6 +230,13 @@ Points, but new Trust Checks can't be added there), and every surface write and 
 or update sends `trust_check_split: true`; see
 _Trust Check_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-check).
 
+Both peer pairing wizards stop on a shared **mediator access** step after the gateway mints its
+DIDs, so the administrator of an `explicit_allow` mediator can add them, and continue from it or
+later from Connections (**Continue**, `?resume=<id>`). A `pending` gateway's row on Connections
+opens its page, as the Add Gateway wizard's **View Connection** does; see _Mediator access step_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#mediator-access-step) and
+[`docs/FABRIC.md`](docs/FABRIC.md#pausing-for-mediator-access).
+
 The Gateways list shows, under a remote gateway's status, when its peer was last heard from
 (`peer_last_seen_at` on `GET /v1/gateways`), apart from this gateway's own mediator link; see
 _Elsewhere_ under remote gateway issuer DIDs in [`www/default/AGENTS.md`](www/default/AGENTS.md).
