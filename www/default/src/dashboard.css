@@ -1749,7 +1749,7 @@ html.dark-theme-fs:fullscreen::backdrop {
 }
 
 .topbar .topbar-avatar-fallback {
-  background: var(--accent-blue);
+  background: var(--primary-solid);
   font-size: 0.95rem;
 }
 
@@ -2883,7 +2883,7 @@ body.dark-theme .expanded-detail-row .table {
   margin-top: 0.15rem;
   font-family: var(--bs-font-monospace);
   font-size: 0.72rem;
-  color: var(--gray-500);
+  color: var(--muted-text);
 }
 
 .audit-item-arrow {
@@ -3409,7 +3409,7 @@ body.dark-theme .audit-kv-val {
 
 .audit-journey-time {
   font-size: 0.7rem;
-  color: var(--gray-500);
+  color: var(--muted-text);
   font-family: var(--bs-font-monospace);
 }
 
@@ -3927,13 +3927,13 @@ body.dark-theme .modal-body pre {
 
 /* Dark theme - Buttons */
 body.dark-theme .btn-primary {
-  background: var(--accent-blue);
-  border-color: var(--accent-blue);
+  background: var(--primary-solid);
+  border-color: var(--primary-solid);
 }
 
 body.dark-theme .btn-primary:hover {
-  background: var(--accent-blue-dark);
-  border-color: var(--accent-blue-dark);
+  background: var(--primary-solid-hover);
+  border-color: var(--primary-solid-hover);
 }
 
 body.dark-theme .btn-secondary {
@@ -5838,8 +5838,8 @@ body.dark-theme .list-group-item.active {
   --bs-pagination-focus-bg: var(--gray-100);
   --bs-pagination-focus-box-shadow: 0 0 0 0.2rem rgba(74, 144, 226, 0.25);
   --bs-pagination-active-color: #ffffff;
-  --bs-pagination-active-bg: var(--accent-blue);
-  --bs-pagination-active-border-color: var(--accent-blue);
+  --bs-pagination-active-bg: var(--primary-solid);
+  --bs-pagination-active-border-color: var(--primary-solid);
   --bs-pagination-disabled-color: var(--gray-400);
   --bs-pagination-disabled-bg: var(--gray-100);
   --bs-pagination-disabled-border-color: var(--gray-300);
@@ -5884,8 +5884,8 @@ body.dark-theme .pagination {
   --bs-pagination-focus-color: #ffffff;
   --bs-pagination-focus-bg: rgba(74, 144, 226, 0.2);
   --bs-pagination-active-color: #ffffff;
-  --bs-pagination-active-bg: var(--accent-blue);
-  --bs-pagination-active-border-color: var(--accent-blue);
+  --bs-pagination-active-bg: var(--primary-solid);
+  --bs-pagination-active-border-color: var(--primary-solid);
   --bs-pagination-disabled-color: var(--dark-text-muted);
   --bs-pagination-disabled-bg: rgba(30, 41, 59, 0.3);
   --bs-pagination-disabled-border-color: var(--dark-border);
