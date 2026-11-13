@@ -8,8 +8,9 @@ changes:
       description: >-
         A request under the identity API prefix (`/api` by default) that matches no endpoint
         was answered 200 with the dashboard's index.html, so API clients and scanners took a
-        wrong path for a working one. It is now answered 404 with {"error":"Not found"};
-        dashboard pages and static assets are served as before.
+        wrong path for a working one. It is now answered 404 with {"error":"Not found"} on
+        every inbound listener that serves the dashboard; dashboard pages and static assets
+        are served as before.
   removed: []
   security: []
   breaking: []

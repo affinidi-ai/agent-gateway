@@ -4,7 +4,7 @@ Feature: Dashboard pages win over gateway.json prefixes
   page still shows the dashboard. The gateway still starts, serves every other prefix and
   surface, and logs an error naming each prefix it skips and the page that prefix would
   hide. A configuration reload skips such a prefix in the same way and reports it. A path
-  under the management API that matches no endpoint is answered 404, not with the dashboard.
+  under the Admin API that matches no endpoint is answered 404, not with the dashboard.
 
   Background:
     Given an A2A surface targeting managed agent "bravo"
@@ -50,11 +50,11 @@ Feature: Dashboard pages win over gateway.json prefixes
     When a browser opens "/policies"
     Then the dashboard page is served
 
-  Scenario: A management API path that matches no endpoint is not the dashboard
+  Scenario: An Admin API path that matches no endpoint is not the dashboard
     When a browser opens "/api/v1/no-such-endpoint"
     Then the response status is 404
-    And the page says the API path was not found
+    And the page says the Admin API path was not found
 
-  Scenario: A dashboard page whose path starts like the management API is still served
+  Scenario: A dashboard page whose path starts like the Admin API is still served
     When a browser opens "/api-keys/new"
     Then the dashboard page is served

@@ -143,7 +143,7 @@ fn dashboard_page_is_served(world: &mut SurfaceWorld) {
     );
 }
 
-#[then("the page says the API path was not found")]
+#[then("the page says the Admin API path was not found")]
 fn page_says_api_path_not_found(world: &mut SurfaceWorld) {
     let response = page_response(world);
     assert_eq!(

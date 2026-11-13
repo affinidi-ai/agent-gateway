@@ -670,22 +670,30 @@ fn identity_api_prefixes(network_config: &crate::config::NetworkConfig) -> Vec<S
         .routes
         .values()
         .filter(|route| route.route_type == crate::config::RouteType::IdentityApi)
-        .map(|route| {
-            route
-                .prefix
-                .trim_end_matches('/')
-                .to_string()
-        })
-        .filter(|prefix| !prefix.is_empty())
+        .map(|route| crate::config::route_claims::normalize_route(&route.prefix))
+        .filter(|prefix| prefix != "/")
         .collect()
 }
 
-/// A static site at `static_path`, answering every path it has no file for with its
-/// `index.html`, under the dashboard's cache and security headers.
-fn static_site(static_path: &str) -> Router {
-    with_static_site_headers(static_files(static_path))
+fn log_static_route(
+    port: u16,
+    route_name: &str,
+    prefix: &str,
+    static_path: &str,
+) {
+    let resolved = std::fs::canonicalize(static_path)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|e| format!("<unresolved: {}>", e));
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "?".to_string());
+    info!(
+        "[WWW Hosting on port {}] static file server '{}' at prefix: {} (path: {} | cwd: {} | resolved: {})",
+        port, route_name, prefix, static_path, cwd, resolved
+    );
 }
 
+/// The files under `static_path`, answering every path it has no file for with its `index.html`.
 fn static_files(static_path: &str) -> Router {
     Router::new().fallback_service(
         tower_http::services::ServeDir::new(static_path)
@@ -759,6 +767,32 @@ fn dashboard_fallback(
             }
         },
     )))
+}
+
+fn is_static_fallback(route: &crate::config::network::RouteCategory) -> bool {
+    route.route_type == crate::config::RouteType::Static && route.fallback
+}
+
+/// `app` with the dashboard served for every path no route matched, from each static fallback
+/// route. A path under the identity API prefix gets the API's `404` on every port, whether or not
+/// the port serves the identity API, since it is never a dashboard page.
+fn with_dashboard_fallback(
+    mut app: Router,
+    port: u16,
+    network_config: &crate::config::NetworkConfig,
+) -> Router {
+    let api_prefixes = identity_api_prefixes(network_config);
+    for (route_name, route_config) in network_config
+        .routes
+        .iter()
+        .filter(|(_, route)| is_static_fallback(route))
+    {
+        if let Some(ref static_path) = route_config.path {
+            log_static_route(port, route_name, &route_config.prefix, static_path);
+            app = app.fallback_service(dashboard_fallback(static_path, api_prefixes.clone()));
+        }
+    }
+    app
 }
 
 /// Build the router of the inbound listener on `port`, which serves every
@@ -1146,8 +1180,8 @@ pub async fn build_port_router(
     // so it inherits the global `require_session_auth` layer. All /api/* data
     // calls go through the same protected pipeline — no special cases.
 
-    // Separate fallback routes from regular routes
-    let mut fallback_routes = Vec::new();
+    // Fallback routes are installed last, by `with_dashboard_fallback`, so they don't override
+    // specific routes
     let mut regular_routes = Vec::new();
 
     for (route_name, route_config) in &network_config.routes {
@@ -1156,9 +1190,7 @@ pub async fn build_port_router(
         {
             continue;
         }
-        if route_config.route_type == crate::config::RouteType::Static && route_config.fallback {
-            fallback_routes.push((route_name, route_config));
-        } else {
+        if !is_static_fallback(route_config) {
             regular_routes.push((route_name, route_config));
         }
     }
@@ -1257,18 +1289,8 @@ pub async fn build_port_router(
             }
             crate::config::RouteType::Static => {
                 if let Some(ref static_path) = route_config.path {
-                    let resolved = std::fs::canonicalize(static_path)
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|e| format!("<unresolved: {}>", e));
-                    let cwd = std::env::current_dir()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|_| "?".to_string());
-                    info!(
-                        "[WWW Hosting on port {}] static file server '{}' at prefix: {} (path: {} | cwd: {} | resolved: {})",
-                        port, route_name, route_config.prefix, static_path, cwd, resolved
-                    );
-
-                    let serve_dir = static_site(static_path);
+                    log_static_route(port, route_name, &route_config.prefix, static_path);
+                    let serve_dir = with_static_site_headers(static_files(static_path));
 
                     if route_config.prefix == "/" {
                         app = app.nest_service("/", serve_dir);
@@ -1497,28 +1519,7 @@ pub async fn build_port_router(
         warn!("facilitator_mode.facilitator_via_http is ignored: the /api/x402 facilitator is no longer served");
     }
 
-    // Process fallback routes last so they don't override specific routes
-    let api_prefixes = if identity_api_router.is_some() {
-        identity_api_prefixes(&network_config)
-    } else {
-        Vec::new()
-    };
-    for (route_name, route_config) in fallback_routes {
-        if let Some(ref static_path) = route_config.path {
-            let resolved = std::fs::canonicalize(static_path)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|e| format!("<unresolved: {}>", e));
-            let cwd = std::env::current_dir()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "?".to_string());
-            info!(
-                "[WWW Hosting on port {}] static file server '{}' at prefix: {} (path: {} | cwd: {} | resolved: {})",
-                port, route_name, route_config.prefix, static_path, cwd, resolved
-            );
-
-            app = app.fallback_service(dashboard_fallback(static_path, api_prefixes.clone()));
-        }
-    }
+    app = with_dashboard_fallback(app, port, &network_config);
 
     // The consent binding cookie is never forwarded and never set by an upstream.
     let app = app.layer(axum::middleware::from_fn(crate::delegation_vault::consent_cookie::guard));
@@ -2084,6 +2085,39 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("dashboard"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_port_without_the_identity_api_answers_unknown_api_paths_with_not_found() {
+        use tower::ServiceExt;
+        let www = tempfile::tempdir().expect("tempdir");
+        std::fs::write(www.path().join("index.html"), "<html>dashboard</html>").expect("write index.html");
+        let config: crate::config::NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.example.com" },
+            "webauthn": { "rp_id": "test", "external_origin": "https://test.example.com" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "routes": {
+                "api": {"type": "identity_api", "prefix": "/api"},
+                "dashboard": {"type": "static", "prefix": "/", "path": www.path(), "fallback": true}
+            }
+        }))
+        .expect("network config");
+        let app = with_dashboard_fallback(Router::new(), 8080, &config);
+
+        for (path, expected) in [("/api/v1/does-not-exist", StatusCode::NOT_FOUND), ("/settings", StatusCode::OK)] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("the port answers");
+            assert_eq!(response.status(), expected, "{path}");
+        }
     }
 
     #[test]
