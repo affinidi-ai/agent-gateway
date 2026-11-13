@@ -175,6 +175,113 @@ describe('EditCredentialProviderPage external consent provider', () => {
       name: 'Linear',
       default_scopes: ['read', 'write'],
       token_refresh_enabled: true,
+      max_consent_age_secs: 0,
+    });
+  });
+});
+
+describe('EditCredentialProviderPage consent time limit', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  const LIMIT = 'credential-provider-consent-limit-input';
+  const UNIT = 'credential-provider-consent-limit-unit-select';
+
+  const authorizationCode = (extra: Record<string, unknown> = {}) => ({
+    id: 'p1',
+    name: 'GitHub',
+    provider_id: 'github',
+    provider_type: 'oauth2_authorization_code',
+    authorization_endpoint: 'https://github.com/login/oauth/authorize',
+    token_endpoint: 'https://github.com/login/oauth/access_token',
+    client_id_secret_ref: 'CLIENT_ID',
+    client_secret_secret_ref: 'CLIENT_SECRET',
+    default_scopes: ['repo'],
+    token_refresh_enabled: true,
+    callback_path: '/v1/identity/oauth/callback/p1',
+    ...extra,
+  });
+
+  const renderProvider = async (record: Record<string, unknown>) => {
+    mockFetch.mockImplementation((url: string) =>
+      Promise.resolve(
+        url.startsWith('/api/v1/credential-providers/')
+          ? { ok: true, json: () => Promise.resolve(record), text: () => Promise.resolve('') }
+          : { ok: false, json: () => Promise.resolve([]) }
+      )
+    );
+    render(
+      <MemoryRouter initialEntries={['/credential-providers/p1']}>
+        <Routes>
+          <Route path="/credential-providers/:id" element={<EditCredentialProviderPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+    await screen.findByDisplayValue(record.name as string);
+  };
+
+  const puts = () => mockFetch.mock.calls.filter(([, options]) => options?.method === 'PUT');
+  const savedBody = async () => {
+    fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
+    await waitFor(() => expect(puts()).toHaveLength(1));
+    return JSON.parse(puts()[0][1].body);
+  };
+
+  it('shows a stored limit in its largest whole unit and saves a changed one in seconds', async () => {
+    await renderProvider(authorizationCode({ max_consent_age_secs: 21_600 }));
+    expect(screen.getByTestId(LIMIT)).toHaveValue(6);
+    expect(screen.getByTestId(UNIT)).toHaveValue('hours');
+
+    fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '30' } });
+    fireEvent.change(screen.getByTestId(UNIT), { target: { value: 'days' } });
+
+    expect((await savedBody()).max_consent_age_secs).toBe(2_592_000);
+  });
+
+  it('shows no limit as an empty field and saves 0, which removes a stored one', async () => {
+    await renderProvider(authorizationCode({ max_consent_age_secs: 3_600 }));
+    fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '' } });
+
+    expect((await savedBody()).max_consent_age_secs).toBe(0);
+  });
+
+  it('refuses a limit the gateway would refuse before saving anything', async () => {
+    await renderProvider(authorizationCode());
+    expect(screen.getByTestId(LIMIT)).toHaveValue(null);
+    fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '30' } });
+    fireEvent.change(screen.getByTestId(UNIT), { target: { value: 'seconds' } });
+    fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
+
+    expect(
+      await screen.findByText(
+        'Consent time limit must be a whole number from 1 minute to 365 days, or empty for no limit.'
+      )
+    ).toBeInTheDocument();
+    expect(puts()).toHaveLength(0);
+  });
+
+  it('offers no limit on a provider nobody consents to and saves 0 for it', async () => {
+    await renderProvider(provider(null));
+    expect(screen.queryByTestId(LIMIT)).not.toBeInTheDocument();
+
+    expect((await savedBody()).max_consent_age_secs).toBe(0);
+  });
+
+  it('offers the limit on an external consent provider and saves it', async () => {
+    await renderProvider(
+      authorizationCode({
+        issuer: 'https://linear.example',
+        token_endpoint_auth_method: 'none',
+        client_id: 'client-1',
+        resource: 'https://linear.example/mcp',
+      })
+    );
+    fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '12' } });
+
+    expect(await savedBody()).toEqual({
+      name: 'GitHub',
+      default_scopes: ['repo'],
+      token_refresh_enabled: true,
+      max_consent_age_secs: 43_200,
     });
   });
 });

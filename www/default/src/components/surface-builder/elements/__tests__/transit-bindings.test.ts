@@ -149,6 +149,16 @@ describe('transitCredentialsToApi', () => {
     }
   });
 
+  it('keeps a consent time limit set through the API in either shape', () => {
+    const limited = { ...api, max_consent_age_secs: 21_600 };
+    expect(transitCredentialsApiToForm(limited)!.max_consent_age_secs).toBe(21_600);
+    expect(transitCredentialsToApi(limited)).toEqual(limited);
+    expect(transitCredentialsToApi(transitCredentialsApiToForm(limited))).toEqual(limited);
+    expect(transitCredentialsFormToApi(transitCredentialsApiToForm(api)!)).not.toHaveProperty(
+      'max_consent_age_secs'
+    );
+  });
+
   it('returns undefined for missing, non-object or provider-less values', () => {
     expect(transitCredentialsToApi(undefined)).toBeUndefined();
     expect(transitCredentialsToApi(null)).toBeUndefined();

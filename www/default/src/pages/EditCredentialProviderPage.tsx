@@ -14,10 +14,16 @@ import ClientAuthenticationSelect from './EditCredentialProviderPage/ClientAuthe
 import JwtAssertionSection from './EditCredentialProviderPage/JwtAssertionSection';
 import { SecretOption as Secret, SecretOptions } from './EditCredentialProviderPage/SecretSelect';
 import { splitByTenant, type OwnerTenant } from '../utils/tenantScope';
+import { CONSENT_LIMIT_UNITS } from '../utils/consentLimit';
 import {
+  CONSENT_LIMIT_RANGE_MESSAGE,
+  ConsentLimitFields,
   CredentialProviderType,
   EMPTY_JWT_FIELDS,
+  NO_CONSENT_LIMIT,
   clientAuthenticationOf,
+  consentLimitOf,
+  consentLimitSeconds,
   JwtFormFields,
   entraRejectsResource,
   entraResourceMessage,
@@ -26,12 +32,13 @@ import {
   missingProviderField,
   providerCredentialFields,
   providerTypeFields,
+  takesConsentLimit,
   callbackUrlFor,
   callbackUrlToSave,
   isHttpsAddress,
 } from './EditCredentialProviderPage/credentialProviderForm';
 
-interface CredentialProviderForm extends JwtFormFields {
+interface CredentialProviderForm extends JwtFormFields, ConsentLimitFields {
   name: string;
   provider_id: string;
   provider_type: CredentialProviderType;
@@ -83,6 +90,7 @@ const EMPTY_FORM: CredentialProviderForm = {
   resource: '',
   issuer: '',
   send_resource: true,
+  ...NO_CONSENT_LIMIT,
   ...EMPTY_JWT_FIELDS,
 };
 
@@ -183,6 +191,7 @@ const EditCredentialProviderPage: React.FC = () => {
         resource: data.resource ?? '',
         issuer: data.issuer ?? '',
         send_resource: data.send_resource ?? true,
+        ...consentLimitOf(data),
         client_authentication: clientAuthenticationOf(data),
         ...jwtFieldsOf(data),
       });
@@ -266,6 +275,12 @@ const EditCredentialProviderPage: React.FC = () => {
         return;
       }
 
+      const consentLimit = consentLimitSeconds(form);
+      if (consentLimit === null) {
+        setError(CONSENT_LIMIT_RANGE_MESSAGE);
+        return;
+      }
+
       setError(null);
 
       const scopes = form.default_scopes
@@ -284,6 +299,8 @@ const EditCredentialProviderPage: React.FC = () => {
             description: form.description.trim() || undefined,
             ...providerCredentialFields(form),
           };
+
+      body.max_consent_age_secs = consentLimit;
 
       if (!form.issuer && form.authorization_endpoint.trim()) {
         body.authorization_endpoint = form.authorization_endpoint.trim();
@@ -959,6 +976,52 @@ const EditCredentialProviderPage: React.FC = () => {
                 </small>
               </div>
             </div>
+
+            {takesConsentLimit(form.provider_type) && (
+              <div className="mb-3">
+                <div className="field-label-with-help">
+                  <label htmlFor="consent_limit_amount" className="mb-0">
+                    Consent time limit
+                  </label>
+                  <FieldHelp ariaLabel="About Consent time limit" testId="field-help-consent-limit">
+                    How long an agent may use a person's consent. At the end the gateway removes the
+                    stored credential and asks the person to consent again. A shorter limit also
+                    ends consents given earlier; a longer one never extends them.
+                  </FieldHelp>
+                </div>
+                <div className="input-group">
+                  <input
+                    id="consent_limit_amount"
+                    name="consent_limit_amount"
+                    type="number"
+                    min={1}
+                    step={1}
+                    className="form-control"
+                    placeholder="No limit"
+                    value={form.consent_limit_amount}
+                    onChange={handleChange}
+                    data-testid="credential-provider-consent-limit-input"
+                  />
+                  <select
+                    name="consent_limit_unit"
+                    aria-label="Consent time limit unit"
+                    className="form-control dropdown-styling"
+                    value={form.consent_limit_unit}
+                    onChange={handleChange}
+                    data-testid="credential-provider-consent-limit-unit-select"
+                  >
+                    {CONSENT_LIMIT_UNITS.map(unit => (
+                      <option key={unit} value={unit}>
+                        {unit}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <small className="form-text text-muted">
+                  Empty for no limit. From 1 minute to 365 days.
+                </small>
+              </div>
+            )}
 
             {/* Additional Params */}
             <div className="mb-3" hidden={!!form.issuer}>

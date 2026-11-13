@@ -534,7 +534,11 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   option. An `external` binding is read-only: its provider, scopes, consent mode and injection
   inputs are disabled, and only the switch that removes it stays enabled, with a line saying
   whose grant it uses and that changing or removing it revokes its grants
-  (`transit-point-binding-subject`): such a binding is changed through the API. The Credential
+  (`transit-point-binding-subject`): such a binding is changed through the API. A binding's
+  own consent time limit (`max_consent_age_secs`) has no control either: it round-trips through
+  the form and is shown as a line under the consent select, in words from `describeConsentLimit`
+  (`transit-point-binding-consent-limit`, and `credential-delegation-binding-consent-limit` in the
+  Credential Delegation element), so a dashboard save never drops a limit set through the API. The Credential
   Delegation element (`_shared/OutboundCredentialsListSection.tsx`) does the same for the Access
   Point Target's binding with external consent in `outbound_credentials`
   (`credential-delegation-consent-mode-select`, `credential-delegation-binding-subject`), and asks
@@ -1126,6 +1130,16 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   (`credential-provider-external-notice`) in place of the type, endpoint, client, callback and
   additional parameter inputs, which the gateway keeps fixed; Save sends only its name,
   description, default scopes and token refresh (`externalProviderUpdate`).
+- An Authorization Code provider, external consent or not, has a **Consent time limit**: a whole
+  number (`credential-provider-consent-limit-input`, placeholder "No limit") and a unit select
+  (`credential-provider-consent-limit-unit-select`: seconds, minutes, hours or days, hours by
+  default), with its explanation behind `FieldHelp` (`field-help-consent-limit`). A stored
+  `max_consent_age_secs` loads in its largest whole unit (`consentLimitOf`). Save always sends
+  `max_consent_age_secs` (`consentLimitSeconds`): the limit in seconds, or `0`, which removes it,
+  for an empty field and for every other provider type, where the field is not shown. A limit
+  outside one minute to 365 days, or not a whole number, is refused before anything is sent
+  (`CONSENT_LIMIT_RANGE_MESSAGE`). The unit arithmetic and wording live in
+  `utils/consentLimit.ts`.
 - The Credential Providers tab labels the types from `PROVIDER_TYPE_LABELS` in the same module, and
   shows a secondary badge after the type of a JWT Bearer provider that has a
   `client_authentication` (`credential-provider-client-authentication-badge`: Client ID only,

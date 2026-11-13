@@ -1938,7 +1938,9 @@ lives in [`src/delegation_vault/consent_age.rs`](../src/delegation_vault/consent
 Each is a number of seconds from 60 to 31,536,000, one minute to 365 days. A value outside
 that is refused with `400` when the provider or the surface is saved, and fails startup in
 `config.toml`, as does a default above the ceiling. The two `[credential_policy]` keys are read
-once, at startup.
+once, at startup. In the dashboard, the credential provider editor sets a provider's limit as
+**Consent time limit**; a binding's limit is set through the API, and the Surface Builder shows
+it and keeps it when the surface is saved.
 
 The connection's limit is the provider's, else the default, else the ceiling, and never more
 than the ceiling. A consent given through a binding lasts the shorter of the binding's limit

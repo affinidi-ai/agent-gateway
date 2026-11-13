@@ -1,5 +1,10 @@
+import { ConsentLimitUnit } from '../../../utils/consentLimit';
 import {
+  CredentialProviderType,
   EMPTY_JWT_FIELDS,
+  NO_CONSENT_LIMIT,
+  consentLimitOf,
+  consentLimitSeconds,
   callbackUrlFor,
   callbackUrlToSave,
   isHttpsAddress,
@@ -281,6 +286,45 @@ describe('credential provider form', () => {
       jwt_issuer: '',
       jwt_signing_algorithm: undefined,
     });
+  });
+
+  it('reads a stored consent time limit in its largest whole unit', () => {
+    const limit = (amount: string, unit: ConsentLimitUnit) => ({
+      consent_limit_amount: amount,
+      consent_limit_unit: unit,
+    });
+    expect(consentLimitOf({ max_consent_age_secs: 21_600 })).toEqual(limit('6', 'hours'));
+    expect(consentLimitOf({ max_consent_age_secs: 2_592_000 })).toEqual(limit('30', 'days'));
+    expect(consentLimitOf({ max_consent_age_secs: 5_400 })).toEqual(limit('90', 'minutes'));
+    expect(consentLimitOf({ max_consent_age_secs: 90 })).toEqual(limit('90', 'seconds'));
+    expect(consentLimitOf({})).toEqual(NO_CONSENT_LIMIT);
+    expect(consentLimitOf({ max_consent_age_secs: 0 })).toEqual(NO_CONSENT_LIMIT);
+    expect(consentLimitOf({ max_consent_age_secs: '3600' })).toEqual(NO_CONSENT_LIMIT);
+  });
+
+  it('saves a consent time limit in seconds, 0 to remove it, and none out of range', () => {
+    const seconds = (
+      amount: string,
+      unit: ConsentLimitUnit,
+      provider_type: CredentialProviderType = 'oauth2_authorization_code'
+    ) =>
+      consentLimitSeconds({
+        provider_type,
+        consent_limit_amount: amount,
+        consent_limit_unit: unit,
+      });
+    expect(seconds('6', 'hours')).toBe(21_600);
+    expect(seconds(' 30 ', 'days')).toBe(2_592_000);
+    expect(seconds('1', 'minutes')).toBe(60);
+    expect(seconds('365', 'days')).toBe(31_536_000);
+    expect(seconds('', 'hours')).toBe(0);
+    expect(seconds('59', 'seconds')).toBeNull();
+    expect(seconds('366', 'days')).toBeNull();
+    expect(seconds('1.5', 'hours')).toBeNull();
+    expect(seconds('-1', 'hours')).toBeNull();
+    expect(seconds('0', 'hours')).toBeNull();
+    expect(seconds('6', 'hours', 'oauth2_client_credentials')).toBe(0);
+    expect(seconds('nonsense', 'hours', 'api_key')).toBe(0);
   });
 
   it('loads the JWT settings of a stored provider and drops an unknown algorithm', () => {

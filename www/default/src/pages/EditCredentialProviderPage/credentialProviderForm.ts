@@ -1,3 +1,12 @@
+import {
+  ConsentLimitUnit,
+  MAX_CONSENT_LIMIT_SECS,
+  MIN_CONSENT_LIMIT_SECS,
+  largestWholeUnit,
+  secondsIn,
+  storedConsentLimit,
+} from '../../utils/consentLimit';
+
 export type CredentialProviderType =
   | 'oauth2_authorization_code'
   | 'oauth2_client_credentials'
@@ -278,6 +287,47 @@ export function jwtFieldsOf(data: Record<string, unknown>): JwtFormFields {
     jwt_issuer: text('jwt_issuer'),
     jwt_subject: text('jwt_subject'),
   };
+}
+
+export const CONSENT_LIMIT_RANGE_MESSAGE =
+  'Consent time limit must be a whole number from 1 minute to 365 days, or empty for no limit.';
+
+export interface ConsentLimitFields {
+  /** The number as typed; empty for no limit. */
+  consent_limit_amount: string;
+  consent_limit_unit: ConsentLimitUnit;
+}
+
+export const NO_CONSENT_LIMIT: ConsentLimitFields = {
+  consent_limit_amount: '',
+  consent_limit_unit: 'hours',
+};
+
+/** Whether a person consents to a provider of this type, the only kind a time limit applies to. */
+export function takesConsentLimit(type: CredentialProviderType): boolean {
+  return type === 'oauth2_authorization_code';
+}
+
+/** The consent time limit of a loaded provider record, in its largest whole unit. */
+export function consentLimitOf(data: Record<string, unknown>): ConsentLimitFields {
+  const secs = storedConsentLimit(data.max_consent_age_secs);
+  if (secs === undefined) return NO_CONSENT_LIMIT;
+  const { count, unit } = largestWholeUnit(secs);
+  return { consent_limit_amount: String(count), consent_limit_unit: unit };
+}
+
+/**
+ * The `max_consent_age_secs` to save: the limit in seconds; `0`, which removes it, for an empty
+ * amount or a type nobody consents to; `null` for an amount the gateway would refuse.
+ */
+export function consentLimitSeconds(
+  form: ConsentLimitFields & { provider_type: CredentialProviderType }
+): number | null {
+  const amount = form.consent_limit_amount.trim();
+  if (!takesConsentLimit(form.provider_type) || !amount) return 0;
+  if (!/^\d+$/.test(amount)) return null;
+  const secs = Number(amount) * secondsIn(form.consent_limit_unit);
+  return secs >= MIN_CONSENT_LIMIT_SECS && secs <= MAX_CONSENT_LIMIT_SECS ? secs : null;
 }
 
 export const PROVIDER_TYPE_LABELS: Record<CredentialProviderType, string> = {
