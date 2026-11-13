@@ -2065,6 +2065,26 @@ mod tests {
         let evt = &events[0];
         assert!(matches!(evt.event, DelegationAuditAction::TokenRevoked));
         assert_eq!(evt.token_id.as_deref(), Some("t1"));
+        let revoked = seed_token("t1");
+        assert_eq!(evt.agent_did.as_deref(), Some(revoked.agent_did.as_str()), "whose agent lost the access");
+        assert_eq!(
+            evt.user_identity_hash
+                .as_deref(),
+            Some(
+                revoked
+                    .user_identity_hash
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            evt.provider_id.as_deref(),
+            Some(
+                revoked
+                    .credential_provider_id
+                    .as_str()
+            )
+        );
+        assert_eq!(evt.scopes.as_ref(), Some(&revoked.scopes));
         let caller = evt
             .caller
             .as_ref()

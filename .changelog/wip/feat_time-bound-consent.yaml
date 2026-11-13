@@ -58,6 +58,13 @@ changes:
         confirmed in place with a second click instead of a browser dialog, the expanded row
         links to that user's records in the Credential Delegation Audit tab, and that tab labels
         `consent_expired` records.
+    - timestamp: '2026-11-13T17:00:00Z'
+      title: Name whose access a vault revoke ended in its audit record
+      description: >-
+        The `token_revoked` audit record of `DELETE /api/v1/delegation-vault/{id}` now names the
+        agent, the user identity hash, the credential provider and the scopes of the entry that
+        was revoked, beside who revoked it. Before, it carried only the entry's id, so a search of
+        the delegation audit for a user did not find the revokes of that user's access.
   fixed: []
   removed: []
   security: []

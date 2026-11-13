@@ -268,6 +268,14 @@ pub async fn revoke_token(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    // Read for the audit record alone, which names whose access the revoke ended. A token
+    // that cannot be read is revoked all the same.
+    let revoked = state
+        .vault_store
+        .get(&id)
+        .await
+        .ok()
+        .flatten();
     match state
         .vault_store
         .delete(&id)
@@ -284,12 +292,25 @@ pub async fn revoke_token(
             super::audit::emit("token_revoked", || {
                 let mut evt = super::audit::audit_event(
                     super::audit::DelegationAuditAction::TokenRevoked,
-                    None,
-                    None,
-                    None,
+                    revoked
+                        .as_ref()
+                        .map(|token| token.agent_did.as_str()),
+                    revoked.as_ref().map(|token| {
+                        token
+                            .user_identity_hash
+                            .as_str()
+                    }),
+                    revoked.as_ref().map(|token| {
+                        token
+                            .credential_provider_id
+                            .as_str()
+                    }),
                     None,
                 );
                 evt.token_id = Some(id.to_string());
+                evt.scopes = revoked
+                    .as_ref()
+                    .map(|token| token.scopes.clone());
                 evt.caller = Some(caller_ctx);
                 evt
             });
