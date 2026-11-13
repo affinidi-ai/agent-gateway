@@ -26,7 +26,7 @@
   height: 36px;
   border-radius: 50%;
   background-color: var(--gray-200);
-  color: var(--gray-500);
+  color: var(--gray-700);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -39,16 +39,16 @@
 }
 
 .wizard-step.active .wizard-step-circle {
-  background-color: var(--accent-blue);
+  background-color: var(--primary-solid);
   color: white;
-  border-color: var(--accent-blue);
+  border-color: var(--primary-solid);
   box-shadow: 0 0 0 3px rgba(74, 144, 226, 0.2);
 }
 
 .wizard-step.completed .wizard-step-circle {
-  background-color: var(--success);
+  background-color: var(--success-solid);
   color: white;
-  border-color: var(--success);
+  border-color: var(--success-solid);
 }
 
 .wizard-step-label {
@@ -60,11 +60,11 @@
 }
 
 .wizard-step.active .wizard-step-label {
-  color: var(--accent-blue);
+  color: var(--accent-blue-text);
 }
 
 .wizard-step.completed .wizard-step-label {
-  color: var(--success);
+  color: var(--success-text);
 }
 
 .wizard-step-line {
@@ -188,7 +188,7 @@
 
 .commit-screen .success-icon {
   font-size: 60px;
-  color: var(--success);
+  color: var(--success-text);
   margin-bottom: 15px;
 }
 

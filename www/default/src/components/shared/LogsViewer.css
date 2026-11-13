@@ -46,7 +46,7 @@
 }
 
 .logs-audit-banner__icon {
-  color: #f59e0b;
+  color: var(--warning-text);
   font-size: 1rem;
   flex-shrink: 0;
 }
@@ -80,17 +80,16 @@
 }
 
 .logs-audit-banner__cta:hover {
-  background: #d97706;
+  background: var(--warning-solid);
   color: #fff;
 }
 
-@media (prefers-color-scheme: dark) {
-  .logs-audit-banner {
-    color: var(--dark-text, #e2e8f0);
-  }
-  .logs-audit-banner__text code {
-    background: rgba(255, 255, 255, 0.12);
-  }
+body.dark-theme .logs-audit-banner {
+  color: var(--dark-text, #e2e8f0);
+}
+
+body.dark-theme .logs-audit-banner__text code {
+  background: rgba(255, 255, 255, 0.12);
 }
 
 /* Per-line rows (enables match highlighting + scroll-to-match) */
@@ -169,10 +168,8 @@
 }
 
 /* Dark theme - Log Viewer */
-@media (prefers-color-scheme: dark) {
-  .log-viewer {
-    background: linear-gradient(135deg, rgba(26, 26, 46, 0.814) 0%, rgba(22, 33, 62, 0.6) 100%);
-  }
+body.dark-theme .log-viewer {
+  background: linear-gradient(135deg, rgba(26, 26, 46, 0.814) 0%, rgba(22, 33, 62, 0.6) 100%);
 }
 
 /* Auto-scroll indicator */
