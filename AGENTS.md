@@ -232,7 +232,8 @@ _Trust Check_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-check).
 
 Both peer pairing wizards stop on a shared **mediator access** step after the gateway mints its
 DIDs, so the administrator of an `explicit_allow` mediator can add them, and continue from it or
-later from Connections (**Continue**, `?resume=<id>`); see _Mediator access step_ in
+later from Connections (**Continue**, `?resume=<id>`). A `pending` gateway's row on Connections
+opens its page, as the Add Gateway wizard's **View Connection** does; see _Mediator access step_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#mediator-access-step) and
 [`docs/FABRIC.md`](docs/FABRIC.md#pausing-for-mediator-access).
 

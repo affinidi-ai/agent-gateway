@@ -1050,6 +1050,61 @@ pub async fn agent_card_points_callers_at_surface(
     );
 }
 
+#[then(regex = r#"^gateway (\d+) shows the gateway it accepted last as failed with "([^"]+)"$"#)]
+pub async fn accepted_gateway_failed_with(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    description: String,
+) {
+    let gateway_id = world
+        .accepted_gateway_id
+        .clone()
+        .expect("a When must accept an invitation before this Then");
+    let gateway = world
+        .harness()
+        .gw(gw_index)
+        .admin
+        .wait_for_gateway_status(
+            &gateway_id,
+            crate::bdd_support::admin_client::GatewayStatus::Failed,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("gateway {gw_index} never marked {gateway_id} failed: {error:#}"));
+    assert_eq!(gateway.description, description);
+}
+
+#[then(regex = r"^gateway (\d+) can delete the gateway it accepted last$")]
+pub async fn accepted_gateway_can_be_deleted(
+    world: &mut G2gWorld,
+    gw_index: usize,
+) {
+    let gateway_id = world
+        .accepted_gateway_id
+        .clone()
+        .expect("a When must accept an invitation before this Then");
+    let admin = world
+        .harness()
+        .gw(gw_index)
+        .admin
+        .clone();
+    let deleted = admin
+        .delete_gateway_recorded(&gateway_id)
+        .await
+        .expect("delete request completes at the transport layer");
+    assert!((200..300).contains(&deleted.status), "delete refused: {} {}", deleted.status, deleted.body);
+    let remaining = admin
+        .list_gateways()
+        .await
+        .expect("list gateways");
+    assert!(
+        remaining
+            .iter()
+            .all(|gateway| gateway.id != gateway_id),
+        "gateway {gateway_id} is still listed"
+    );
+}
+
 #[then(expr = "the response says {string}")]
 pub async fn response_says(
     world: &mut G2gWorld,

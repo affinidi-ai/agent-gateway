@@ -127,6 +127,16 @@ approval sends `connection-accepted` from its DID. System Connection Points (`oo
 `oobacceptor`, `system`) never accept a `connection-setup`. Invitations created before the gateway
 recorded the message id are refused and must be created again.
 
+A refused setup is answered with `connection-rejected` when the acceptor can act on it: a wrong
+secret with `Invalid connection secret`, and an invitation that is missing, disabled, expired or
+already used with `This invitation can't be used any more. Ask for a new one.`, which never says
+which. Other refusals get no reply. The answer is best effort: a failed send is logged as a
+warning and changes nothing else. The acceptor takes a rejection only from the inviter its
+setup went to, on that attempt's temporary Connection Point, and only while its gateway is
+`pending`; the gateway turns `failed` with `Connection rejected: <reason>` as its description,
+its temporary Connection Point and listener are removed, and it can be deleted. With no
+Connection Point left to derive a status from, the gateway list keeps showing it `failed`.
+
 The handshake always runs on the inviter's mediator. The acceptor's permanent connection point uses
 the inviter's mediator too, unless `connect-via-oob` names one of the acceptor's own mediators in
 `acceptor_mediator_id`. The field is refused with `400` unless the experimental `mediator_federation`

@@ -710,6 +710,15 @@ impl GatewayAdminClient {
         .await
     }
 
+    pub async fn delete_gateway_recorded(
+        &self,
+        gateway_id: &str,
+    ) -> Result<RecordedResponse> {
+        self.client
+            .send_recorded_json::<Value>(Method::DELETE, &format!("/v1/gateways/{gateway_id}"), None)
+            .await
+    }
+
     pub async fn list_gateways(&self) -> Result<Vec<GatewayRecord>> {
         self.send_json::<(), _>(Method::GET, "/v1/gateways", None)
             .await
@@ -1436,6 +1445,8 @@ pub struct GatewayRecord {
     pub id: String,
     pub gateway_type: GatewayType,
     pub status: GatewayStatus,
+    #[serde(default)]
+    pub description: String,
     /// The remote gateway's DID. Present on Remote records after federation;
     /// used to author per-caller gateway policies (for example, allow only gateway 1).
     #[serde(default)]

@@ -7,7 +7,7 @@ import { usePermissions } from '../context/PermissionsContext';
 import { apiClient } from '../api';
 import { formatDateTime } from '../utils/stringUtils';
 import { ConnectionHealthBadge, ConnectionRuntimeStatus } from '../utils/connectionHealth';
-import { isGatewayPending, type GatewayListItem } from '../utils/gateways';
+import { isGatewayPending, opensGatewayDetails, type GatewayListItem } from '../utils/gateways';
 import { AppButton } from '../components/shared/AppButton';
 import { Badge } from '../components/shared/Badge';
 import { DeleteButton } from '../components/shared/DeleteButton';
@@ -436,12 +436,12 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                         data-testid={`gateways-row-${gateway.id}`}
                         key={gateway.id}
                         onClick={() => {
-                          if (!isGatewayPending(gateway)) {
+                          if (opensGatewayDetails(gateway)) {
                             navigate(`/gateways/${gateway.id}`);
                           }
                         }}
                         style={{
-                          cursor: isGatewayPending(gateway) ? 'default' : 'pointer',
+                          cursor: opensGatewayDetails(gateway) ? 'pointer' : 'default',
                         }}
                       >
                         <td>{gateway.name}</td>
@@ -508,7 +508,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                 )}
                                 {gateway.status === 'awaiting-mediator-access' && (
                                   <AppButton
-                                    variant="primary"
+                                    variant="outline-primary"
                                     size="sm"
                                     className="me-1"
                                     title="Continue adding this gateway"
@@ -778,7 +778,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                               {hasPermission('gateways.edit') &&
                                 connectionPoint.awaiting_mediator_access && (
                                   <AppButton
-                                    variant="primary"
+                                    variant="outline-primary"
                                     size="sm"
                                     onClick={e => {
                                       e.stopPropagation();

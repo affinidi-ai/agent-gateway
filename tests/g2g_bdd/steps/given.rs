@@ -1197,6 +1197,52 @@ pub async fn gateway_has_published_an_oob_invitation_for_gateway(
     world.pending_oob_url = Some(connection_point.oob_url);
 }
 
+#[given(regex = r"^gateway (\d+) has accepted the invitation and gateway (\d+) holds it for approval$")]
+pub async fn gateway_has_accepted_the_invitation(
+    world: &mut G2gWorld,
+    acceptor: usize,
+    inviter: usize,
+) {
+    let inviter_admin = world
+        .harness()
+        .gw(inviter)
+        .admin
+        .clone();
+    let existing = inviter_admin
+        .remote_gateway_ids()
+        .await
+        .expect("list the inviter's remote gateways");
+    crate::steps::when::accept_pending_oob(world, acceptor, None).await;
+    assert_eq!(world.response_status, Some(200), "first acceptance: {:?}", world.response_body);
+    inviter_admin
+        .wait_for_new_remote_gateway_status(
+            &existing,
+            crate::bdd_support::admin_client::GatewayStatus::AwaitingApproval,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .expect("the inviter redeems the invitation and holds the acceptor for approval");
+}
+
+#[given(regex = r"^gateway (\d+) has deleted the gateway it accepted$")]
+pub async fn gateway_has_deleted_the_gateway_it_accepted(
+    world: &mut G2gWorld,
+    acceptor: usize,
+) {
+    let gateway_id = world
+        .accepted_gateway_id
+        .take()
+        .expect("a step must accept an invitation before this one");
+    let deleted = world
+        .harness()
+        .gw(acceptor)
+        .admin
+        .delete_gateway_recorded(&gateway_id)
+        .await
+        .expect("delete request completes at the transport layer");
+    assert!((200..300).contains(&deleted.status), "delete refused: {} {}", deleted.status, deleted.body);
+}
+
 #[given(expr = "the mediator has lost every account it held")]
 pub async fn mediator_lost_every_account(world: &mut G2gWorld) {
     world.start().await;

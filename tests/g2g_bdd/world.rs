@@ -327,6 +327,8 @@ pub struct G2gWorld {
     /// OOB invitation URL published by a `... has published an OOB
     /// invitation for gateway ...` step, awaiting a manual accept attempt.
     pub pending_oob_url: Option<String>,
+    /// The gateway the last accept attempt on `pending_oob_url` created, if it created one.
+    pub accepted_gateway_id: Option<String>,
     /// Identity providers that are also OAuth credential providers, by name.
     pub oauth_providers: HashMap<String, OidcProvider>,
     /// MCP access tokens callers obtained by token exchange, by caller.
@@ -375,6 +377,7 @@ impl G2gWorld {
             legacy_sse_exchange: Vec::new(),
             named_mediators: HashMap::new(),
             pending_oob_url: None,
+            accepted_gateway_id: None,
             oauth_providers: HashMap::new(),
             caller_access_tokens: HashMap::new(),
             consent_request: None,

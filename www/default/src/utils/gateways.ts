@@ -46,6 +46,15 @@ export function isGatewayPending(gw: { status?: string }): boolean {
 }
 
 /**
+ * Whether the gateway's row in the Gateways list opens its details page. A
+ * `pending` gateway does, as the Add Gateway wizard offers; one waiting for
+ * approval or for mediator access does not, since its row has its own action.
+ */
+export function opensGatewayDetails(gw: { status?: string }): boolean {
+  return gw.status !== 'awaiting-approval' && gw.status !== 'awaiting-mediator-access';
+}
+
+/**
  * A remote gateway that is currently usable as a fabric routing target from
  * the surface builder (Managed Agent / Transit Point gateway pickers).
  *
