@@ -222,6 +222,7 @@ mod tests {
     ) -> TrqpQueryParams {
         TrqpQueryParams {
             authority_id: authority.to_string(),
+            authority_ids: None,
             entity_id: entity.to_string(),
             action: action.map(str::to_string),
             resource: resource.map(str::to_string),

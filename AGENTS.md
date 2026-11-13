@@ -239,10 +239,15 @@ Authority and the surface has no Issuer or its Issuer no longer exists; see _Tru
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder).
 
 Trust Checks and Trust Recorder entries keep `authority_source` through every save and the
-Authority pickers set it. One whose Authority was deleted from the Authorities register is drawn
+Authority pickers set it. One whose Authority, or any Authority a query lists, was deleted from
+the Authorities register is drawn
 unconfigured with a "Configuration required" warning and blocks Save, and a refused Authority
 delete lists what uses the Authority in a dialog with no way to delete it anyway; see _Trust
 Check_ and _Authority delete_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#authority-delete).
+A Trust Check query that lists several authorities (`query.authority_ids`) keeps its list and
+`authority_sources` through every dashboard save, and the fullscreen editor picks that list in one
+multi-select of the Issuers and Authorities registers; see _Authority lists_ under _Trust Check_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#trust-check).
 
 The Audit Log names the surface variant of each request record and describes `request_rejected`
 records, and the Metrics page badges configured variant aliases only; see _Audit page: surface

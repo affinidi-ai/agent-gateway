@@ -22,6 +22,7 @@ use crate::trust_registry_verification::template::{self, TemplateError};
 use crate::trust_registry_verification::trqp_adapter::{RECOGNITION_DEFAULT_ACTION, RECOGNITION_DEFAULT_RESOURCE};
 use crate::trust_registry_verification::trust_check_element::{
     TrqpQueryParams, TrqpQueryType, TrustCheckElement, TrustCheckError, TrustCheckLeg, TrustCheckResult,
+    expand_authorities,
 };
 
 /// Stage failure code: outbound TRQP transport could not be established
@@ -46,11 +47,14 @@ pub const TRUST_REGISTRY_PROBLEM_REPORT: &str = "TRUST_REGISTRY_PROBLEM_REPORT";
 /// from a transport failure.
 pub const TRUST_REGISTRY_PARSE_ERROR: &str = "TRUST_REGISTRY_PARSE_ERROR";
 
-/// Stage failure code: the per-element `timeout_secs` override budget
-/// elapsed before a response was received. Only emitted when the element
-/// carries an explicit `Some(n)` timeout — elements that defer to the
-/// trust-registry transport's own timeout instead surface their failure
-/// via `TrqpClientError::QueryFailed` → [`QUERY_FAILED`].
+/// Stage failure code: the per-element `timeout_secs` budget elapsed before
+/// a response was received. Emitted when the element carries an explicit
+/// `Some(n)` timeout, and for each authority of a multi-authority element,
+/// which always waits
+/// [`crate::trust_registry_verification::trust_check_element::TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS`].
+/// Single-authority elements that defer to the trust-registry transport's
+/// own timeout instead surface their failure via
+/// `TrqpClientError::QueryFailed` → [`QUERY_FAILED`].
 pub const QUERY_TIMEOUT: &str = "QUERY_TIMEOUT";
 
 /// Stage failure code: a `{{path}}` in the configured query could not be
@@ -201,9 +205,11 @@ pub struct ExecutionContext<'a> {
 }
 
 /// Resolve templates and dispatch every element in `elements` concurrently,
-/// returning one [`TrustCheckResult`] per input element in the same order.
+/// returning one [`TrustCheckResult`] per input element and listed authority,
+/// in configuration order. Every dispatch runs to its answer or its timeout;
+/// none stops another.
 ///
-/// Audit + Prometheus sampling fire once per element from inside this
+/// Audit + Prometheus sampling fire once per result from inside this
 /// function — the caller installs nothing.
 pub async fn execute_list<'o, C: TrqpClient + ?Sized>(
     origin: impl Into<TrustCheckOrigin<'o>>,
@@ -213,6 +219,7 @@ pub async fn execute_list<'o, C: TrqpClient + ?Sized>(
     client: &C,
 ) -> Vec<TrustCheckResult> {
     let origin = origin.into();
+    let elements = expand_authorities(elements);
     let futures = elements
         .iter()
         .map(|elem| execute_one(origin, leg, elem, ctx, client));
@@ -227,9 +234,19 @@ async fn execute_one<C: TrqpClient + ?Sized>(
     client: &C,
 ) -> TrustCheckResult {
     let resolved = match resolve_params(&elem.query, ctx.input) {
-        Ok(params) => params,
-        Err(err) => {
-            let detail = err.to_string();
+        Ok(params)
+            if !params
+                .authority_id
+                .trim()
+                .is_empty() =>
+        {
+            params
+        }
+        resolution => {
+            let detail = match resolution {
+                Err(err) => err.to_string(),
+                Ok(_) => "query.authority_id resolved to an empty value".to_string(),
+            };
             let result = stage_failure(elem, TEMPLATE_RESOLUTION_FAILED, detail.clone());
             record_trust_check(TrustCheckAuditEvent {
                 surface_id: origin.surface_id,
@@ -348,6 +365,7 @@ fn resolve_params(
     };
     Ok(TrqpQueryParams {
         authority_id,
+        authority_ids: None,
         entity_id,
         action,
         resource,
@@ -415,8 +433,9 @@ fn resolved_failure(
 /// function is reached.
 /// Fails every target-leg element with `code` when the target cannot be
 /// checked at all (e.g. its agent card is unavailable), recording each one
-/// like an executed check. The two "unavailable" codes omit `authority_id` /
-/// `entity_id`, whose raw template strings would be noise.
+/// like an executed check, once per listed authority. The two "unavailable"
+/// codes omit `authority_id` / `entity_id`, whose raw template strings would
+/// be noise.
 pub fn synthesize_unavailable_target<'o>(
     origin: impl Into<TrustCheckOrigin<'o>>,
     elements: &[TrustCheckElement],
@@ -424,7 +443,7 @@ pub fn synthesize_unavailable_target<'o>(
     detail: &'static str,
 ) -> Vec<TrustCheckResult> {
     let origin = origin.into();
-    elements
+    expand_authorities(elements)
         .iter()
         .map(|elem| {
             record_trust_check(TrustCheckAuditEvent {
@@ -616,9 +635,11 @@ mod tests {
             id: id.to_string(),
             trust_registry_id: registry.to_string(),
             authority_source: None,
+            authority_sources: Default::default(),
             query_type: TrqpQueryType::Recognition,
             query: TrqpQueryParams {
                 authority_id: "{{input.caller.gateway.did}}".to_string(),
+                authority_ids: None,
                 entity_id: "{{input.caller.did}}".to_string(),
                 action: None,
                 resource: None,
@@ -844,6 +865,314 @@ mod tests {
         assert!(results[1].ok);
     }
 
+    #[derive(Clone)]
+    enum Answer {
+        Allow,
+        Deny,
+        Unreachable,
+        Slow(Duration),
+    }
+
+    struct AuthorityClient {
+        answers: std::collections::HashMap<String, Answer>,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl AuthorityClient {
+        fn new(answers: &[(&str, Answer)]) -> Self {
+            Self {
+                answers: answers
+                    .iter()
+                    .map(|(did, answer)| (did.to_string(), answer.clone()))
+                    .collect(),
+                asked: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn asked(&self) -> Vec<String> {
+            let mut asked = self
+                .asked
+                .lock()
+                .unwrap()
+                .clone();
+            asked.sort();
+            asked
+        }
+    }
+
+    #[async_trait]
+    impl TrqpClient for AuthorityClient {
+        async fn query(
+            &self,
+            _registry_id: &str,
+            _query_type: TrqpQueryType,
+            params: &TrqpQueryParams,
+        ) -> Result<TrqpOutcome, TrqpClientError> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push(params.authority_id.clone());
+            match self
+                .answers
+                .get(&params.authority_id)
+                .cloned()
+                .unwrap_or(Answer::Deny)
+            {
+                Answer::Allow => Ok(TrqpOutcome::Allowed),
+                Answer::Deny => Ok(TrqpOutcome::Denied {
+                    detail: "Registry answered `recognized: false`".to_string(),
+                }),
+                Answer::Unreachable => Err(TrqpClientError::Unreachable("no connection".to_string())),
+                Answer::Slow(delay) => {
+                    sleep(delay).await;
+                    Ok(TrqpOutcome::Allowed)
+                }
+            }
+        }
+    }
+
+    fn multi_elem(authorities: &[&str]) -> TrustCheckElement {
+        let mut e = elem("authority-recognised", "tr-main", None);
+        e.query.authority_id = String::new();
+        e.query.authority_ids = Some(
+            authorities
+                .iter()
+                .map(|a| a.to_string())
+                .collect(),
+        );
+        e
+    }
+
+    async fn run_multi(
+        elements: &[TrustCheckElement],
+        client: &AuthorityClient,
+    ) -> Vec<TrustCheckResult> {
+        let input = ctx();
+        execute_list("surf", TrustCheckLeg::Caller, elements, &ExecutionContext { input: &input }, client).await
+    }
+
+    fn summary(results: &[TrustCheckResult]) -> Vec<(String, Option<String>)> {
+        results
+            .iter()
+            .map(|r| {
+                (
+                    r.authority_id
+                        .clone()
+                        .unwrap_or_default(),
+                    r.error
+                        .as_ref()
+                        .map(|e| e.code.clone()),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn multi_authority_all_allow() {
+        let client =
+            AuthorityClient::new(&[("did:web:authority-a", Answer::Allow), ("did:web:authority-b", Answer::Allow)]);
+        let results = run_multi(&[multi_elem(&["did:web:authority-a", "did:web:authority-b"])], &client).await;
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .all(|r| r.ok && r.id == "authority-recognised")
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_authority_empty_list_fails_closed() {
+        let client = AuthorityClient::new(&[("", Answer::Allow)]);
+        let results = run_multi(&[multi_elem(&[])], &client).await;
+        assert_eq!(summary(&results), [(String::new(), Some(TEMPLATE_RESOLUTION_FAILED.to_string()))]);
+        assert!(client.asked().is_empty(), "a blank authority must not reach the registry");
+    }
+
+    #[tokio::test]
+    async fn multi_authority_one_allow_among_denials_keeps_configuration_order() {
+        let client = AuthorityClient::new(&[("did:web:authority-b", Answer::Allow)]);
+        let results =
+            run_multi(&[multi_elem(&["did:web:authority-a", "did:web:authority-b", "did:web:authority-c"])], &client)
+                .await;
+        assert_eq!(
+            summary(&results),
+            [
+                ("did:web:authority-a".to_string(), Some(NOT_RECOGNIZED.to_string())),
+                ("did:web:authority-b".to_string(), None),
+                ("did:web:authority-c".to_string(), Some(NOT_RECOGNIZED.to_string())),
+            ]
+        );
+        assert_eq!(
+            client.asked(),
+            ["did:web:authority-a", "did:web:authority-b", "did:web:authority-c"],
+            "one query per authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_authority_all_deny() {
+        let client = AuthorityClient::new(&[]);
+        let results = run_multi(&[multi_elem(&["did:web:authority-a", "did:web:authority-b"])], &client).await;
+        assert!(
+            results
+                .iter()
+                .all(|r| !r.ok && r.error.as_ref().unwrap().code == NOT_RECOGNIZED)
+        );
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn multi_authority_one_timeout_fails_only_that_authority_within_the_built_in_timeout() {
+        let budget = Duration::from_secs(
+            crate::trust_registry_verification::trust_check_element::TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS.into(),
+        );
+        let client = AuthorityClient::new(&[
+            ("did:web:authority-a", Answer::Slow(budget * 2)),
+            ("did:web:authority-b", Answer::Allow),
+        ]);
+        let started = tokio::time::Instant::now();
+        let results = run_multi(&[multi_elem(&["did:web:authority-a", "did:web:authority-b"])], &client).await;
+        let elapsed = started.elapsed();
+        assert!(elapsed >= budget && elapsed < budget * 2, "waited {elapsed:?}, timeout is {budget:?}");
+        assert_eq!(
+            summary(&results),
+            [
+                ("did:web:authority-a".to_string(), Some(QUERY_TIMEOUT.to_string())),
+                ("did:web:authority-b".to_string(), None)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_authority_one_transport_error_fails_only_that_authority() {
+        let client = AuthorityClient::new(&[
+            ("did:web:authority-a", Answer::Unreachable),
+            ("did:web:authority-b", Answer::Allow),
+        ]);
+        let results = run_multi(&[multi_elem(&["did:web:authority-a", "did:web:authority-b"])], &client).await;
+        assert_eq!(
+            summary(&results),
+            [
+                ("did:web:authority-a".to_string(), Some(TRUST_REGISTRY_UNREACHABLE.to_string())),
+                ("did:web:authority-b".to_string(), None)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_authority_template_failure_fails_only_that_authority() {
+        let client = AuthorityClient::new(&[("did:web:caller-gateway", Answer::Allow)]);
+        let results =
+            run_multi(&[multi_elem(&["{{input.missing.field}}", "{{input.caller.gateway.did}}"])], &client).await;
+        assert_eq!(
+            summary(&results),
+            [
+                ("{{input.missing.field}}".to_string(), Some(TEMPLATE_RESOLUTION_FAILED.to_string())),
+                ("did:web:caller-gateway".to_string(), None),
+            ]
+        );
+        assert_eq!(client.asked(), ["did:web:caller-gateway"]);
+    }
+
+    #[tokio::test]
+    async fn multi_authority_slow_authority_does_not_block_siblings_or_other_elements() {
+        let client = AuthorityClient::new(&[
+            ("did:web:authority-a", Answer::Slow(Duration::from_millis(300))),
+            ("did:web:authority-b", Answer::Slow(Duration::from_millis(300))),
+            ("did:web:caller-gateway", Answer::Slow(Duration::from_millis(300))),
+        ]);
+        let started = std::time::Instant::now();
+        let results = run_multi(
+            &[multi_elem(&["did:web:authority-a", "did:web:authority-b"]), elem("single", "tr-a", Some(5))],
+            &client,
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_millis(800), "dispatches ran serially: {:?}", started.elapsed());
+        let ids: Vec<&str> = results
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(ids, ["authority-recognised", "authority-recognised", "single"]);
+        assert!(results.iter().all(|r| r.ok));
+    }
+
+    #[tokio::test]
+    async fn multi_authority_records_one_audit_event_per_authority() {
+        let client = AuthorityClient::new(&[("did:web:authority-b", Answer::Allow)]);
+        let elements = [multi_elem(&["did:web:authority-a", "did:web:authority-b"])];
+        let (_, events) = crate::audit::producer::capture(run_multi(&elements, &client)).await;
+        let authorities: Vec<Option<String>> = events
+            .iter()
+            .map(|event| match &event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::TrustCheck { authority_id, .. } => {
+                    authority_id.clone()
+                }
+                other => panic!("expected a trust check, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(authorities.len(), 2);
+        assert!(authorities.contains(&Some("did:web:authority-a".to_string())));
+        assert!(authorities.contains(&Some("did:web:authority-b".to_string())));
+    }
+
+    #[tokio::test]
+    async fn multi_authority_samples_the_counter_once_per_authority() {
+        let registry = "tr-per-authority-counter";
+        let count = || {
+            ["ok", "denied", "error"]
+                .iter()
+                .map(|result| {
+                    crate::metrics::backends::prometheus::TRUST_CHECK
+                        .with_label_values(&[registry, "recognition", result])
+                        .get()
+                })
+                .sum::<u64>()
+        };
+        let mut element = multi_elem(&["did:web:authority-a", "did:web:authority-b"]);
+        element.trust_registry_id = registry.to_string();
+        let client = AuthorityClient::new(&[("did:web:authority-b", Answer::Allow)]);
+        let before = count();
+        run_multi(&[element], &client).await;
+        assert_eq!(count() - before, 2);
+    }
+
+    #[tokio::test]
+    async fn a_single_authority_resolving_to_an_empty_value_fails_before_dispatch() {
+        let element = elem("blank-authority", "tr-a", None);
+        let input = json!({
+            "input": {
+                "caller": {
+                    "did": "did:web:caller",
+                    "gateway": { "did": "" }
+                }
+            }
+        });
+        let client = AuthorityClient::new(&[("", Answer::Allow)]);
+        let results =
+            execute_list("surf", TrustCheckLeg::Caller, &[element], &ExecutionContext { input: &input }, &client).await;
+        assert_eq!(
+            summary(&results),
+            [("{{input.caller.gateway.did}}".to_string(), Some(TEMPLATE_RESOLUTION_FAILED.to_string()))]
+        );
+        assert!(client.asked().is_empty(), "a blank authority must not reach the registry");
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_target_fails_each_listed_authority() {
+        let elements = [multi_elem(&["did:web:authority-a", "did:web:authority-b"])];
+        let (results, events) = crate::audit::producer::capture(async {
+            synthesize_unavailable_target("surface-9", &elements, AGENT_CARD_UNAVAILABLE, "card unavailable")
+        })
+        .await;
+        assert_eq!(results.len(), 2);
+        assert_eq!(events.len(), 2);
+        assert!(
+            results
+                .iter()
+                .all(|r| r.id == "authority-recognised" && !r.ok)
+        );
+    }
+
     fn elem_with_action_resource(
         id: &str,
         registry: &str,
@@ -852,9 +1181,11 @@ mod tests {
             id: id.to_string(),
             trust_registry_id: registry.to_string(),
             authority_source: None,
+            authority_sources: Default::default(),
             query_type: TrqpQueryType::Authorization,
             query: TrqpQueryParams {
                 authority_id: "{{input.caller.gateway.did}}".to_string(),
+                authority_ids: None,
                 entity_id: "{{input.caller.did}}".to_string(),
                 action: Some("invoke".to_string()),
                 resource: Some("tool:payments.transfer".to_string()),
@@ -1205,9 +1536,11 @@ mod tests {
             id: id.to_string(),
             trust_registry_id: registry.to_string(),
             authority_source: None,
+            authority_sources: Default::default(),
             query_type: TrqpQueryType::Recognition,
             query: TrqpQueryParams {
                 authority_id: "{{input.caller.gateway.did}}".to_string(),
+                authority_ids: None,
                 entity_id: "{{input.caller.did}}".to_string(),
                 action: None,
                 resource: None,

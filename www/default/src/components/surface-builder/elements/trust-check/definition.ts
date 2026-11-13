@@ -456,8 +456,11 @@ export interface TrustCheckQueryConfig {
   name?: string;
   /** Where the literal `query.authority_id` came from; absent for a template. */
   authority_source?: AuthoritySource;
+  /** Where each literal DID of `query.authority_ids` came from, keyed by DID. */
+  authority_sources?: Record<string, AuthoritySource>;
   query?: {
     authority_id?: string;
+    authority_ids?: string[];
     action?: string;
     resource?: string;
     [k: string]: unknown;
@@ -497,8 +500,114 @@ function queryFromElement(e: any): TrustCheckQueryConfig {
     query_type: e.query_type === 'recognition' ? 'recognition' : 'authorization',
     name: typeof e.name === 'string' ? e.name : undefined,
     ...(source ? { authority_source: source } : {}),
+    ...(e.authority_sources && typeof e.authority_sources === 'object'
+      ? { authority_sources: e.authority_sources }
+      : {}),
     query,
   };
+}
+
+/**
+ * The authorities a query lists in `authority_ids`, or an empty list for a
+ * single-authority query.
+ */
+export function listedAuthorities(query: TrustCheckQueryConfig['query']): string[] {
+  const ids = query?.authority_ids;
+  return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : [];
+}
+
+/** True when the query checks several authorities (`query.authority_ids`), even while it lists none. */
+export function isMultiAuthorityQuery(q: TrustCheckQueryConfig): boolean {
+  return Array.isArray(q.query?.authority_ids);
+}
+
+function withoutAuthorityFields(q: TrustCheckQueryConfig): {
+  rest: Omit<TrustCheckQueryConfig, 'authority_source' | 'authority_sources'>;
+  query: NonNullable<TrustCheckQueryConfig['query']>;
+} {
+  const { authority_source: _source, authority_sources: _sources, ...rest } = q;
+  void _source;
+  void _sources;
+  const { authority_id: _id, authority_ids: _ids, ...query } = q.query || {};
+  void _id;
+  void _ids;
+  return { rest, query };
+}
+
+/** One Authority row of a query: the stored value and the register it was picked from. */
+export interface AuthorityRow {
+  did: string;
+  source?: AuthoritySource;
+}
+
+/**
+ * The Authority rows the editor shows: one row for `authority_id` (possibly empty or a
+ * template), or one row per entry of `authority_ids`, in order.
+ */
+export function authorityRows(q: TrustCheckQueryConfig): AuthorityRow[] {
+  if (!isMultiAuthorityQuery(q)) {
+    const did = typeof q.query?.authority_id === 'string' ? q.query.authority_id : '';
+    return [{ did, source: authoritySourceFor(did, q.authority_source) }];
+  }
+  return listedAuthorities(q.query).map(did => ({
+    did,
+    source: authoritySourceFor(did, q.authority_sources?.[did]),
+  }));
+}
+
+/**
+ * Write rows back: one row is `authority_id` with `authority_source`, the shape a single-authority
+ * query always had; two or more are `authority_ids` with `authority_sources` keyed by DID.
+ */
+function withAuthorityRows(q: TrustCheckQueryConfig, rows: AuthorityRow[]): TrustCheckQueryConfig {
+  const { rest, query } = withoutAuthorityFields(q);
+  if (rows.length === 1) {
+    const [{ did, source }] = rows;
+    return {
+      ...rest,
+      ...(source ? { authority_source: source } : {}),
+      query: { ...query, authority_id: did },
+    };
+  }
+  const sources: Record<string, AuthoritySource> = {};
+  for (const row of rows) if (row.source) sources[row.did] = row.source;
+  return {
+    ...rest,
+    ...(Object.keys(sources).length > 0 ? { authority_sources: sources } : {}),
+    query: { ...query, authority_ids: rows.map(r => r.did) },
+  };
+}
+
+/**
+ * Set the query's Authorities to `picks`, in order, as the multi-select picker leaves them. None
+ * is an empty `authority_id` (the caller leg's default), one is `authority_id`, two or more are
+ * `authority_ids`; each literal DID keeps the register it was picked from.
+ */
+export function pickAuthorities(
+  q: TrustCheckQueryConfig,
+  picks: readonly AuthorityRow[]
+): TrustCheckQueryConfig {
+  const rows = picks.map(p => ({ did: p.did, source: authoritySourceFor(p.did, p.source) }));
+  return withAuthorityRows(q, rows.length > 0 ? rows : [{ did: '' }]);
+}
+
+/**
+ * True when the query's Authority is not usable: a row of several left empty, or any Authority
+ * `authorityNeedsSelection` rejects on this leg.
+ */
+export function queryAuthorityMissing(q: TrustCheckQueryConfig, isApMa: boolean): boolean {
+  if (!isMultiAuthorityQuery(q))
+    return authorityNeedsSelection(q.query?.authority_id as string | undefined, isApMa);
+  const rows = authorityRows(q);
+  return (
+    rows.length === 0 ||
+    rows.some(r => r.did.trim() === '' || authorityNeedsSelection(r.did, isApMa))
+  );
+}
+
+/** "1 authority", "3 authorities". */
+export function authorityCountLabel(count: number): string {
+  return `${count} ${count === 1 ? 'authority' : 'authorities'}`;
 }
 
 /** Read a wire `trust_check_list` into the node's `queries[]` shape. */
@@ -507,16 +616,21 @@ export function queriesFromWire(raw: unknown): TrustCheckQueryConfig[] {
   return raw.filter((e: any) => e && typeof e === 'object').map(queryFromElement);
 }
 
-/** The queries of a Trust Check node whose Authority the loaded register no longer has. */
+/**
+ * The queries of a Trust Check node whose Authority, or any listed Authority, the loaded
+ * register no longer has: one entry per such Authority row.
+ */
 export function missingTrustCheckAuthorities(
   config: any,
   authorityDids: AuthorityDids
 ): MissingAuthority[] {
   if (!authorityDids) return [];
-  return readQueries(config).flatMap((q, index) => {
-    const did = missingAuthorityDid(q.query?.authority_id, q.authority_source, authorityDids);
-    return did ? [{ index, did }] : [];
-  });
+  return readQueries(config).flatMap((q, index) =>
+    authorityRows(q).flatMap(row => {
+      const did = missingAuthorityDid(row.did, row.source, authorityDids);
+      return did ? [{ index, did }] : [];
+    })
+  );
 }
 
 /**
@@ -602,6 +716,7 @@ function queryKey(q: TrustCheckQueryConfig): string {
     q.trust_registry_id ?? '',
     q.query_type === 'recognition' ? 'recognition' : 'authorization',
     String(query.authority_id ?? '').trim(),
+    listedAuthorities(query),
     String(query.entity_id ?? '').trim(),
     String(query.action ?? '').trim(),
     String(query.resource ?? '').trim(),
@@ -671,8 +786,11 @@ function buildEntry(
   const explicitAuthority =
     typeof stored.authority_id === 'string' ? stored.authority_id.trim() : '';
   const explicitEntity = typeof stored.entity_id === 'string' ? stored.entity_id.trim() : '';
-  const query: Record<string, string> = {
-    authority_id: explicitAuthority || defaultAuthorityIdTemplate(edge),
+  const authorities = explicitAuthority ? [] : listedAuthorities(stored);
+  const query: Record<string, string | string[]> = {
+    ...(authorities.length > 0
+      ? { authority_ids: authorities }
+      : { authority_id: explicitAuthority || defaultAuthorityIdTemplate(edge) }),
     entity_id: explicitEntity || defaultEntityIdTemplate(edge),
   };
   if (typeof stored.action === 'string' && stored.action) query.action = stored.action;
@@ -684,7 +802,16 @@ function buildEntry(
     query,
   };
   if (typeof q.name === 'string' && q.name.length > 0) entry.name = q.name;
-  const source = authoritySourceFor(query.authority_id, q.authority_source);
+  if (authorities.length > 0) {
+    if (q.authority_sources && Object.keys(q.authority_sources).length > 0) {
+      entry.authority_sources = q.authority_sources;
+    }
+    return entry;
+  }
+  const source = authoritySourceFor(
+    explicitAuthority || defaultAuthorityIdTemplate(edge),
+    q.authority_source
+  );
   if (source) entry.authority_source = source;
   return entry;
 }
@@ -775,8 +902,8 @@ export const trustCheckDefinition: NodeDefinition = {
     title: 'Trust Check',
     docLink: DOCS_URL.trustElements,
     bodyHtml: `
-      <p>Each Trust Check holds up to 10 TRQP queries, and each leg takes
-      one Trust Check. Every query result is surfaced to your policies on
+      <p>A Trust Check holds any number of TRQP queries, each checking one
+      or several Authorities, and each leg takes one Trust Check. Every query result is surfaced to your policies on
       every gateway and surface evaluation, which decide what to do with
       allow / deny / unreachable.</p>
       <p><strong>Placement determines which leg the query runs on:</strong></p>
@@ -809,15 +936,24 @@ export const trustCheckDefinition: NodeDefinition = {
         managedAgentTrustCheckTargetMessage(c, ctx.allNodes),
     },
   ],
-  incompleteReason: c => {
+  incompleteReason: (c, node) => {
     const queries = readQueries(c);
     if (queries.length === 0) return 'Needs at least one query';
-    const isTargetLeg = c?._edge === 'ma-tp';
+    // A newly dropped node has no `_edge` (set only on hydration), so its slot decides too.
+    const isTargetLeg = c?._edge === 'ma-tp' || (!!node && trustCheckLeg(node) !== 'caller');
     for (let i = 0; i < queries.length; i++) {
       const q = queries[i];
       const prefix = queries.length > 1 ? `Query ${i + 1}: ` : '';
       if (!q.trust_registry_id) return `${prefix}Trust registry must be selected`;
-      if (authorityNeedsSelection(q.query?.authority_id as string, !isTargetLeg)) {
+      if (isMultiAuthorityQuery(q)) {
+        if (queryAuthorityMissing(q, !isTargetLeg)) {
+          const rows = authorityRows(q);
+          const hasEmptyRow = rows.length === 0 || rows.some(r => r.did.trim() === '');
+          return hasEmptyRow || isTargetLeg
+            ? `${prefix}Select an Issuer or Authority for every Authority row`
+            : `${prefix}Replace the caller-leg Authority template with the agent identity credential issuer default or an explicit Issuer / Authority`;
+        }
+      } else if (authorityNeedsSelection(q.query?.authority_id as string, !isTargetLeg)) {
         return isTargetLeg
           ? `${prefix}Select an Issuer or Authority for the target-leg Authority`
           : `${prefix}Replace the caller-leg Authority template with the agent identity credential issuer default or an explicit Issuer / Authority`;
@@ -839,7 +975,10 @@ export const trustCheckDefinition: NodeDefinition = {
     const queries = readQueries(c);
     if (queries.length === 0) return 'no queries';
     if (queries.length === 1) {
-      return queries[0].query_type === 'recognition' ? 'recognition' : 'authorization';
+      const type = queries[0].query_type === 'recognition' ? 'recognition' : 'authorization';
+      return isMultiAuthorityQuery(queries[0])
+        ? `${type} · ${authorityCountLabel(listedAuthorities(queries[0].query).length)}`
+        : type;
     }
     return `${queries.length} queries`;
   },

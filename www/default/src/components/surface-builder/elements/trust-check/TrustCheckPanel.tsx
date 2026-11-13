@@ -106,38 +106,14 @@ const TrustCheckPanel: React.FC<ConfigPanelProps> = ({
           const queryType: TrustCheckRecordType =
             q.query_type === 'recognition' ? 'recognition' : 'authorization';
           const typeLabel = queryType === 'recognition' ? 'Recognition' : 'Authorization';
-          const nameValue = typeof q.name === 'string' && q.name ? q.name : '';
           return (
             <li
               key={q.id || `idx-${idx}`}
               className="d-flex justify-content-between align-items-baseline gap-2 py-1"
+              data-testid={`trust-check-panel-query-${idx}`}
             >
               <span className="text-muted fw-semibold">Query {idx + 1}</span>
-              <span
-                className="text-end"
-                style={{
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                  minWidth: 0,
-                }}
-              >
-                <span className="fw-semibold">{typeLabel}</span>
-                {nameValue && (
-                  <span
-                    className="d-block text-muted fst-italic"
-                    style={{
-                      fontSize: '10px',
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                    }}
-                    title={nameValue}
-                  >
-                    {nameValue}
-                  </span>
-                )}
-              </span>
+              <span className="fw-semibold text-end">{typeLabel}</span>
             </li>
           );
         })}

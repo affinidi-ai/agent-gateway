@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 use crate::steps::credential_references::{delete_with_scoped_token, references};
 use crate::steps::credential_save::{send, surface_id};
-use crate::steps::given::create_unconnected_trust_registry;
+use crate::steps::given::{authority_list, create_unconnected_trust_registry};
 use crate::steps::policy_changes::{client, user_id};
 use crate::steps::when::build_primary_target_surface_payload;
 use crate::world::SurfaceWorld;
@@ -204,6 +204,175 @@ async fn operator_creates_surface_with_trust_check(
     create_surface_with_trust_check(world, &route, &check_id, &did).await;
 }
 
+async fn create_surface_with_trust_check_query(
+    world: &mut SurfaceWorld,
+    route: &str,
+    query: Value,
+) {
+    create_surface_with_trust_check_element(world, route, json!({ "query": query })).await;
+}
+
+async fn create_surface_with_trust_check_element(
+    world: &mut SurfaceWorld,
+    route: &str,
+    fields: Value,
+) {
+    create_surface(world, route, |payload, trust_registry_id| {
+        let mut element = json!({
+            "id": "authority-recognised", "trust_registry_id": trust_registry_id, "query_type": "recognition"
+        });
+        for (key, value) in fields
+            .as_object()
+            .expect("the Trust Check fields are an object")
+        {
+            element[key] = value.clone();
+        }
+        payload["access_point"]["trust_check_list"] = json!([element]);
+    })
+    .await;
+}
+
+#[when(
+    expr = "the operator creates the surface for route {string} with a caller-leg Trust Check listing authorities {string} and a timeout of {int} seconds"
+)]
+async fn operator_creates_surface_with_authority_list_and_timeout(
+    world: &mut SurfaceWorld,
+    route: String,
+    authorities: String,
+    timeout_secs: u32,
+) {
+    let fields = json!({
+        "query": {"authority_ids": authority_list(&authorities), "entity_id": "{{ input.agent.did }}"},
+        "timeout_secs": timeout_secs
+    });
+    create_surface_with_trust_check_element(world, &route, fields).await;
+}
+
+#[when(
+    expr = "the operator creates the surface for route {string} with a caller-leg Trust Check listing authorities {string}"
+)]
+async fn operator_creates_surface_with_authority_list(
+    world: &mut SurfaceWorld,
+    route: String,
+    authorities: String,
+) {
+    let query = json!({"authority_ids": authority_list(&authorities), "entity_id": "{{ input.agent.did }}"});
+    create_surface_with_trust_check_query(world, &route, query).await;
+}
+
+#[when(
+    expr = "the operator creates the surface for route {string} with a caller-leg Trust Check listing authorities {string} that takes its single authority from the Authorities register"
+)]
+async fn operator_creates_surface_with_authority_list_and_single_source(
+    world: &mut SurfaceWorld,
+    route: String,
+    authorities: String,
+) {
+    let fields = json!({
+        "query": {"authority_ids": authority_list(&authorities), "entity_id": "{{ input.agent.did }}"},
+        "authority_source": "authority"
+    });
+    create_surface_with_trust_check_element(world, &route, fields).await;
+}
+
+#[when(
+    expr = "the operator creates the surface for route {string} with a caller-leg Trust Check listing {int} distinct authorities"
+)]
+async fn operator_creates_surface_with_counted_authority_list(
+    world: &mut SurfaceWorld,
+    route: String,
+    count: usize,
+) {
+    let authorities: Vec<String> = (0..count)
+        .map(|i| format!("did:web:authority-{i}"))
+        .collect();
+    let query = json!({"authority_ids": authorities, "entity_id": "{{ input.agent.did }}"});
+    create_surface_with_trust_check_query(world, &route, query).await;
+}
+
+#[when(expr = "the operator creates the surface for route {string} with {int} caller-leg Trust Checks")]
+async fn operator_creates_surface_with_counted_trust_checks(
+    world: &mut SurfaceWorld,
+    route: String,
+    count: usize,
+) {
+    create_surface(world, &route, |payload, trust_registry_id| {
+        let elements: Vec<Value> = (0..count)
+            .map(|i| {
+                json!({
+                    "id": format!("check-{i}"), "trust_registry_id": trust_registry_id, "query_type": "recognition",
+                    "query": {"authority_id": format!("did:web:authority-{i}"), "entity_id": "{{ input.agent.did }}"}
+                })
+            })
+            .collect();
+        payload["access_point"]["trust_check_list"] = json!(elements);
+    })
+    .await;
+}
+
+#[given(
+    expr = "the operator has created the surface for route {string} with a caller-leg Trust Check listing authorities {string}"
+)]
+async fn operator_has_created_surface_with_authority_list(
+    world: &mut SurfaceWorld,
+    route: String,
+    authorities: String,
+) {
+    operator_creates_surface_with_authority_list(world, route.clone(), authorities).await;
+    let response = world
+        .admin_response
+        .take()
+        .expect("the surface create was answered");
+    assert_eq!(response.status, 201, "creating surface {route}: {}", response.body);
+}
+
+#[when(
+    expr = "the operator creates the surface for route {string} with a caller-leg Trust Check against DID {string} that also lists authorities {string}"
+)]
+async fn operator_creates_surface_with_authority_and_list(
+    world: &mut SurfaceWorld,
+    route: String,
+    did: String,
+    authorities: String,
+) {
+    let query = json!({
+        "authority_id": did, "authority_ids": authority_list(&authorities), "entity_id": "{{ input.agent.did }}"
+    });
+    create_surface_with_trust_check_query(world, &route, query).await;
+}
+
+#[when(
+    expr = "the operator creates the surface for route {string} with a caller-leg Trust Check against DID {string} that takes listed authority {string} from the Authorities register"
+)]
+async fn operator_creates_surface_with_authority_and_listed_source(
+    world: &mut SurfaceWorld,
+    route: String,
+    did: String,
+    listed: String,
+) {
+    let fields = json!({
+        "query": {"authority_id": did, "entity_id": "{{ input.agent.did }}"},
+        "authority_sources": {listed: "authority"}
+    });
+    create_surface_with_trust_check_element(world, &route, fields).await;
+}
+
+#[then(expr = "the stored Trust Check {string} of the surface under test lists authorities {string}")]
+async fn stored_trust_check_lists_authorities(
+    world: &mut SurfaceWorld,
+    check_id: String,
+    authorities: String,
+) {
+    let check = stored_trust_check(world, &check_id).await;
+    assert_eq!(check["query"]["authority_ids"], json!(authority_list(&authorities)), "stored Trust Check: {check}");
+    assert!(
+        check["query"]
+            .get("authority_id")
+            .is_none(),
+        "stored Trust Check: {check}"
+    );
+}
+
 #[when(expr = "the operator deletes the Authority {string}")]
 async fn operator_deletes_authority(
     world: &mut SurfaceWorld,
@@ -255,11 +424,32 @@ async fn operator_has_created_sts_client_with_trust_check(
     client_id: String,
     did: String,
 ) {
+    create_sts_client_with_trust_check_query(world, &client_id, json!({"authority_id": did})).await;
+}
+
+#[given(
+    expr = "the operator has created the managed connection {string} with a Trust Check listing authorities {string}"
+)]
+async fn operator_has_created_sts_client_with_authority_list(
+    world: &mut SurfaceWorld,
+    client_id: String,
+    authorities: String,
+) {
+    let query = json!({"authority_ids": authority_list(&authorities)});
+    create_sts_client_with_trust_check_query(world, &client_id, query).await;
+}
+
+async fn create_sts_client_with_trust_check_query(
+    world: &mut SurfaceWorld,
+    client_id: &str,
+    mut query: Value,
+) {
+    query["entity_id"] = json!("{{ input.sts.client_id }}");
     let body = json!({
         "client_id": client_id, "name": client_id,
         "trust_check_list": [{
             "id": "sts-check", "trust_registry_id": "bdd-registry", "query_type": "recognition",
-            "query": {"authority_id": did, "entity_id": "{{ input.sts.client_id }}"}
+            "query": query
         }]
     });
     let response = send(world, Method::POST, "/v1/sts/clients", Some(&body)).await;
@@ -352,6 +542,35 @@ async fn stored_trust_check_is_not_linked(
     assert!(
         check
             .get("authority_source")
+            .is_none(),
+        "{check}"
+    );
+}
+
+#[then(
+    expr = "the stored Trust Check {string} of the surface under test takes listed authority {string} from the Authorities register"
+)]
+async fn stored_trust_check_takes_listed_authority_from_register(
+    world: &mut SurfaceWorld,
+    check_id: String,
+    did: String,
+) {
+    let check = stored_trust_check(world, &check_id).await;
+    assert_eq!(check["authority_sources"][did.as_str()], "authority", "{check}");
+}
+
+#[then(
+    expr = "the stored Trust Check {string} of the surface under test does not link listed authority {string} to any register"
+)]
+async fn stored_trust_check_does_not_link_listed_authority(
+    world: &mut SurfaceWorld,
+    check_id: String,
+    did: String,
+) {
+    let check = stored_trust_check(world, &check_id).await;
+    assert!(
+        check["authority_sources"]
+            .get(did.as_str())
             .is_none(),
         "{check}"
     );

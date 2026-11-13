@@ -214,8 +214,8 @@ wired in `build_sts_router` from `IdentityApiState.gateway_policy_manager`.
 In `src/sts/trust_check.rs`: an STS managed connection may carry a
 `trust_check_list` — the same `TrustCheckElement` vocabulary an Agent Surface
 uses on its caller leg (`StsClient.trust_check_list`, validated on the admin API
-via the shared `validate_trust_check_list` — cap `TRUST_CHECK_LIST_MAX`, unique
-ids, per-element `validate()`). Immediately **before** the policy gate, the list
+via the shared `validate_trust_check_list` — unique ids and per-element
+`validate()`). Immediately **before** the policy gate, the list
 is evaluated over TRQP via `run_trust_check_stage` (caller leg, over a
 `TrqpListenerClient`) and the verdict is merged into the OPA input at
 `input.trust_check_results.caller[]`, so the gateway policy can allow/deny on a
