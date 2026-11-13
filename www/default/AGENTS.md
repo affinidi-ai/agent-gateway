@@ -44,8 +44,9 @@ Applies to:
    lighter values; solid buttons and badges under white text use `--primary-solid`,
    `--success-solid`, `--warning-solid` and `--danger-solid`. The brand colours `--warning`,
    `--success`, `--danger` and `--accent-blue` stay for borders, tints and text on dark
-   surfaces. Normal text needs 4.5:1 and icons 3:1 in both themes; do not use `#9ca3af`, `--gray-400`
-   or an `opacity` below 1 for text.
+   surfaces. Normal text needs 4.5:1 and informational icons 3:1 in both themes; do not use
+   `#9ca3af`, `--gray-400`, `--gray-500` on a dark surface, or an `opacity` below 1 for text.
+   Purely decorative icons, such as the large stat card and empty state icons, are exempt.
 11. Mediator lists may contain directory entries (`directory:*` ids), and stored records
    created from them carry `provided: true`. The Create Connection Point wizard pre-selects the
    first `directory:` entry (else the only mediator, else nothing; never a stored provided
