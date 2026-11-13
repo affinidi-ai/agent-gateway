@@ -3639,6 +3639,39 @@ async fn another_site_confirms_consent_start_page(
     record_html_response(world, response).await;
 }
 
+#[when(expr = "caller {string} confirms the consent start page for provider {string} again")]
+async fn caller_confirms_consent_start_page_again(
+    world: &mut SurfaceWorld,
+    _caller: String,
+    provider: String,
+) {
+    let response = post_consent_start_again(world, &provider).await;
+    record_html_response(world, response).await;
+}
+
+/// Post the start state of the latest consent_required answer again from the
+/// start page's own origin, as a browser does when the person clicks Continue
+/// after the state was used.
+pub(crate) async fn post_consent_start_again(
+    world: &SurfaceWorld,
+    provider: &str,
+) -> reqwest::Response {
+    let start = latest_consent_start_url(world, provider);
+    let origin = start
+        .origin()
+        .ascii_serialization();
+    let state = query_value(&start, "state");
+    let mut action = start;
+    action.set_query(None);
+    no_redirect_client()
+        .post(action)
+        .header("origin", origin)
+        .form(&[("state", state.as_str())])
+        .send()
+        .await
+        .expect("confirm the consent start page again")
+}
+
 #[when(expr = "OAuth provider {string} redirects the caller back again with the same state")]
 async fn oauth_provider_redirects_back_again_with_the_same_state(
     world: &mut SurfaceWorld,
@@ -4483,6 +4516,20 @@ async fn start_gateways(world: &mut SurfaceWorld) {
             {
                 fixture.settings = Some(crate::bdd_support::admin_client::audit_log_keeping_every_event());
             }
+            if let Some(events) = &world
+                .surface_config
+                .stored_audit_events
+            {
+                fixture.settings = Some(serde_json::json!({ "audit_enabled": true, "audit_events": events }));
+            }
+            fixture.audit_events_added = world
+                .surface_config
+                .audit_events_added
+                .clone();
+            fixture.stored_event_set_events = world
+                .surface_config
+                .stored_event_set_events
+                .clone();
             fixture
         })
         .collect::<Vec<_>>();

@@ -1838,6 +1838,29 @@ pub(crate) fn seal_under_legacy_label(state: &OAuthState) -> String {
     tests::seal_under(state, OAUTH_STATE_KEY_LABEL)
 }
 
+static AUDITED_REFUSALS: std::sync::LazyLock<
+    moka::future::Cache<(String, crate::audit::events::DelegationFailureReason), ()>,
+> = std::sync::LazyLock::new(|| {
+    moka::future::Cache::builder()
+        .max_capacity(100_000)
+        .time_to_live(USED_STATE_NONCE_TTL)
+        .build()
+});
+
+/// Whether this is the first refusal for `reason` of the state with `nonce` on
+/// this process while the nonce is remembered, so a state is audited at most
+/// once per reason.
+pub async fn first_refusal(
+    nonce: &str,
+    reason: crate::audit::events::DelegationFailureReason,
+) -> bool {
+    AUDITED_REFUSALS
+        .entry((nonce.to_string(), reason))
+        .or_insert(())
+        .await
+        .is_fresh()
+}
+
 /// Whether `state`'s nonce was already claimed on this process.
 #[cfg(test)]
 pub(crate) async fn is_claimed(state: &OAuthState) -> bool {

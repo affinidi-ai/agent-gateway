@@ -3251,6 +3251,36 @@ async fn vp_audit_log_keeps_every_audit_event(world: &mut SurfaceWorld) {
     }
 }
 
+#[given(expr = "the VP Audit Log's stored selection holds only audit event {string}")]
+fn stored_vp_audit_log_selection_holds_only(
+    world: &mut SurfaceWorld,
+    event: String,
+) {
+    world
+        .surface_config
+        .stored_audit_events = Some(vec![event]);
+}
+
+#[given(expr = "a stored integration event set holds only audit event {string}")]
+fn stored_integration_event_set_holds_only(
+    world: &mut SurfaceWorld,
+    event: String,
+) {
+    world
+        .surface_config
+        .stored_event_set_events = Some(vec![event]);
+}
+
+#[given(expr = "audit event {string} was already added to the stored audit selections once")]
+fn audit_event_was_already_added_once(
+    world: &mut SurfaceWorld,
+    event: String,
+) {
+    world
+        .surface_config
+        .audit_events_added = Some(vec![event]);
+}
+
 /// The live VP Audit Log of the running gateway: beside its logs when the
 /// scenario configured a log directory, and under `_storage/audit` otherwise,
 /// which the gateway resolves against the base folder it runs in. The rotated
@@ -4203,6 +4233,16 @@ async fn caller_has_confirmed_consent_start_page(
     world.oauth_confirmed_state = Some(state);
 }
 
+#[given(expr = "caller {string} has confirmed the consent start page for provider {string} again")]
+async fn caller_has_confirmed_consent_start_page_again(
+    world: &mut SurfaceWorld,
+    _caller: String,
+    provider: String,
+) {
+    let response = crate::steps::when::post_consent_start_again(world, &provider).await;
+    assert_eq!(response.status().as_u16(), 400, "a used consent start state is refused");
+}
+
 #[given(expr = "caller {string} has been asked to complete OAuth consent for provider {string}")]
 async fn caller_has_been_asked_to_complete_oauth_consent(
     world: &mut SurfaceWorld,
@@ -4440,6 +4480,8 @@ fn a_gateway(
         terms_enabled: false,
         affinidi_terms_url: None,
         settings: None,
+        audit_events_added: None,
+        stored_event_set_events: None,
         identity_route_key: "api".to_string(),
         bootstrap_surfaces: vec![],
         agent_surfaces: HashMap::new(),
@@ -4495,6 +4537,8 @@ fn a_gateway_with_outbound_listener(
         terms_enabled: false,
         affinidi_terms_url: None,
         settings: None,
+        audit_events_added: None,
+        stored_event_set_events: None,
         identity_route_key: "api".to_string(),
         bootstrap_surfaces: vec![],
         agent_surfaces: HashMap::new(),

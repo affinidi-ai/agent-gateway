@@ -155,7 +155,10 @@ pub async fn update_settings(
     // RBAC: require settings.edit permission
     require_settings_edit(&user_id, &passkey_storage, &rbac_config).await?;
 
-    // Get current settings
+    let writing = state
+        .settings_store
+        .lock_writes()
+        .await;
     let mut settings = state.settings_store.get();
 
     // Update provided fields
@@ -252,6 +255,7 @@ pub async fn update_settings(
         .save()
         .await
         .map_err(|e| AppError::InternalError(format!("Failed to save settings: {}", e)))?;
+    drop(writing);
     crate::audit::sources::rebuild_sinks().await;
 
     info!(
@@ -289,6 +293,10 @@ pub async fn reset_settings(
     let default_settings = DashboardSettings::default();
 
     // Update and save
+    let writing = state
+        .settings_store
+        .lock_writes()
+        .await;
     state
         .settings_store
         .update(default_settings.clone())
@@ -299,6 +307,7 @@ pub async fn reset_settings(
         .save()
         .await
         .map_err(|e| AppError::InternalError(format!("Failed to save settings: {}", e)))?;
+    drop(writing);
     crate::audit::sources::rebuild_sinks().await;
 
     info!("Settings reset to defaults");

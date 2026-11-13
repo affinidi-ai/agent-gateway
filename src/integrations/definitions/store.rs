@@ -11,6 +11,7 @@ pub trait Definition: StorableEntity {
 /// One JSON file per definition.
 pub struct DefinitionStore<T: Definition> {
     storage: Box<dyn StorageBackend<T>>,
+    writes: tokio::sync::Mutex<()>,
 }
 
 impl<T: Definition> DefinitionStore<T> {
@@ -20,7 +21,15 @@ impl<T: Definition> DefinitionStore<T> {
     ) -> Result<Self> {
         Ok(Self {
             storage: uncached_storage(path, entity_name).await?,
+            writes: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Serialises changes to stored definitions on this process: a caller
+    /// that reads a definition and saves or deletes it holds the guard from
+    /// the read to the write, so no other change lands in between and is lost.
+    pub async fn lock_writes(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.writes.lock().await
     }
 
     /// The definition with `id`, or `None` when there is none. An error means the store could

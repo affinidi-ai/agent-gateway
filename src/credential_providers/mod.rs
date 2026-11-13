@@ -942,8 +942,9 @@ impl CredentialProvider {
     /// The authorization endpoint parsed, when the consent flow may build the
     /// vendor's authorization URL from it: an https URL with a host and no
     /// credentials or fragment, whose query and `additional_params` together
-    /// hold at most 32 parameters, none reserved or repeated, with names of at
-    /// most 128 bytes and values of at most 2048.
+    /// hold at most 32 parameters, none reserved or repeated, with names
+    /// compared without regard to ASCII case, of at most 128 bytes, and values
+    /// of at most 2048.
     pub fn consent_authorization_endpoint(&self) -> Result<url::Url, &'static str> {
         let url = self
             .authorization_endpoint
@@ -970,10 +971,12 @@ impl CredentialProvider {
             .enumerate()
         {
             if count >= MAX_AUTHORIZATION_PARAMS
-                || RESERVED_AUTHORIZATION_PARAMS.contains(&name.as_str())
+                || RESERVED_AUTHORIZATION_PARAMS
+                    .iter()
+                    .any(|reserved| reserved.eq_ignore_ascii_case(name))
                 || name.len() > 128
                 || value.len() > 2048
-                || !names.insert(name.as_str())
+                || !names.insert(name.to_ascii_lowercase())
             {
                 return Err(
                     "authorization_endpoint query and additional_params must not repeat a reserved or duplicate \
@@ -1671,6 +1674,37 @@ mod tests {
         for leaked in ["gw.example", "idp.example", "secret-param-value", "tenant-of-"] {
             assert!(!text.contains(leaked), "the log names no URL, parameter or tenant: {text}");
         }
+    }
+
+    /// Authorization parameter names are matched without regard to ASCII case:
+    /// a reserved name in any case, in the endpoint's query or in
+    /// `additional_params`, and two names differing only in case are refused;
+    /// other names in any case are accepted.
+    #[test]
+    fn authorization_parameters_are_matched_without_regard_to_case() {
+        let with = |endpoint: &str, params: &[(&str, &str)]| {
+            let mut provider = consent_provider("a", "a", None);
+            provider.authorization_endpoint = Some(endpoint.to_string());
+            provider.additional_params = params
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+            provider.consent_authorization_endpoint()
+        };
+        let refused = Err(
+            "authorization_endpoint query and additional_params must not repeat a reserved or duplicate parameter or \
+             exceed the limits",
+        );
+
+        assert_eq!(with("https://idp.example/authorize", &[("State", "x")]), refused);
+        assert_eq!(with("https://idp.example/authorize", &[("SCOPE", "x")]), refused);
+        assert_eq!(with("https://idp.example/authorize?Redirect_Uri=x", &[]), refused);
+        assert_eq!(with("https://idp.example/authorize?prompt=login", &[("PROMPT", "consent")]), refused);
+        assert_eq!(with("https://idp.example/authorize", &[("Prompt", "a"), ("prompt", "b")]), refused);
+        assert_eq!(
+            with("https://idp.example/authorize?Audience=api", &[("Allow_Signup", "true")]).map(String::from),
+            Ok("https://idp.example/authorize?Audience=api".to_string())
+        );
     }
 
     #[test]

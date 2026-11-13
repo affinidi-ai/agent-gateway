@@ -111,6 +111,24 @@ Feature: MCP credential delegation
     And the consent start response does not send the browser to OAuth provider "calendar"
     And the delegation audit trail records a refused consent for OAuth provider "calendar" with reason "cross_site_consent_start"
 
+  Scenario: A consent start posted again after it was used is recorded once
+    Given the surface requires delegated credentials from OAuth provider "calendar"
+    And caller "alice" has started OAuth consent for provider "calendar"
+    And caller "alice" has confirmed the consent start page for provider "calendar"
+    And caller "alice" has confirmed the consent start page for provider "calendar" again
+    And caller "alice" has confirmed the consent start page for provider "calendar" again
+    When a page on another site confirms the consent start page for OAuth provider "calendar"
+    Then the delegation audit trail records a refused consent for OAuth provider "calendar" with reason "cross_site_consent_start"
+    And the delegation audit trail records exactly 1 refused consent for OAuth provider "calendar" with reason "consent_state_reused"
+
+  Scenario: A refused consent start names the agent the consent was started for
+    Given the surface requires delegated credentials from OAuth provider "calendar"
+    And caller "alice" has started OAuth consent for provider "calendar"
+    And caller "alice" has confirmed the consent start page for provider "calendar"
+    When caller "alice" confirms the consent start page for provider "calendar" again
+    Then the consent start response status is 400
+    And the refused consent for OAuth provider "calendar" with reason "consent_state_reused" names the agent
+
   Scenario: Delegated credentials are injected into the MCP server request after consent
     Given the surface requires delegated credentials from OAuth provider "calendar"
     And caller "alice" has started OAuth consent for provider "calendar"
