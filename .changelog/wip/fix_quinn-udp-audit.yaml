@@ -1,0 +1,18 @@
+branch: fix/quinn-udp-audit
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-13T00:00:00Z'
+      title: Update quinn-udp to 0.5.16 to fix a QUIC receive-loop denial-of-service advisory
+      description: >-
+        Bumps the transitive quinn-udp dependency (pulled in through the Solana
+        client used by x402-chain-solana) from 0.5.14 to 0.5.16, which fixes
+        RUSTSEC-2026-0538. On macOS without the fast-apple-datapath feature and
+        on some BSD and Solaris targets, a remote sender could keep the socket
+        task spinning by sending a datagram larger than the receive buffer.
+        Linux, Android, FreeBSD and Windows were not affected. Restores a
+        passing cargo audit.
+  breaking: []
