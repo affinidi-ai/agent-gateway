@@ -783,9 +783,13 @@ pub struct GrantsQuery {
     pub principal: Option<String>,
 }
 
-/// A grant's metadata; never a token.
-fn grant_summary(grant: &DelegatedGrant) -> serde_json::Value {
-    serde_json::json!({
+/// A grant's metadata; never a token. `consent_expires_at` is when its
+/// consent ends, for one under a time limit.
+fn grant_summary(
+    grant: &DelegatedGrant,
+    consent_expires_at: Option<chrono::DateTime<Utc>>,
+) -> serde_json::Value {
+    let mut summary = serde_json::json!({
         "grant_id": grant.id,
         "principal": grant.principal,
         "scopes": grant.scopes,
@@ -794,7 +798,11 @@ fn grant_summary(grant: &DelegatedGrant) -> serde_json::Value {
         "last_used_at": grant.last_used_at,
         "expires_at": grant.expires_at,
         "state": grant.state(),
-    })
+    });
+    if let Some(end) = consent_expires_at {
+        summary["consent_expires_at"] = serde_json::json!(end);
+    }
+    summary
 }
 
 /// Report each `consent_mode: external` binding of a surface: its hop,
@@ -909,7 +917,24 @@ pub async fn list_grants(
                     if subject == GrantSubject::Owner {
                         entry["connected"] = serde_json::json!(true);
                     }
-                    entry["grant"] = grant_summary(&grant);
+                    let provider_limit = match state
+                        .provider_store
+                        .get(binding.credential_provider_id)
+                        .await
+                    {
+                        Ok(provider) => provider.and_then(|provider| provider.max_consent_age_secs),
+                        Err(error) => {
+                            warn!(target: "credential_delegation", error = %error, "Failed to read a binding's provider");
+                            return self::error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "grants_unavailable",
+                                "The vault cannot read grants now",
+                            );
+                        }
+                    };
+                    let consent_end = ConsentLimits::of(binding.max_consent_age_secs, provider_limit)
+                        .ends_for_binding_at(grant.created_at, grant.consent_expires_at);
+                    entry["grant"] = grant_summary(&grant, consent_end);
                 }
                 Ok(None) => {}
                 Err(error)
@@ -1640,6 +1665,12 @@ mod tests {
         assert_eq!(owner["connected"], true);
         assert_eq!(owner["grant"]["state"], "live");
         assert!(
+            owner["grant"]
+                .get("consent_expires_at")
+                .is_none(),
+            "a grant under no time limit has no end: {owner}"
+        );
+        assert!(
             !listed
                 .to_string()
                 .contains("access-1"),
@@ -1704,12 +1735,22 @@ mod tests {
                 .unwrap()
                 .unwrap()
         }
+        async fn reported_end(fixture: &Fixture) -> serde_json::Value {
+            fixture.grants(None).await["bindings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|binding| binding["hop"] == "owner-hop")
+                .unwrap()["grant"]["consent_expires_at"]
+                .clone()
+        }
 
         let (started, completed) = connect(&fixture).await;
         assert_eq!(started["max_consent_age_secs"], 21_600, "the provider's limit");
         let grant = stored(&fixture).await;
         assert_eq!(grant.consent_expires_at, Some(grant.created_at + chrono::Duration::seconds(21_600)));
         assert_eq!(completed["consent_expires_at"], json!(grant.consent_expires_at));
+        assert_eq!(reported_end(&fixture).await, json!(grant.consent_expires_at), "the report names the end");
 
         let surfaces = fixture
             .state
@@ -1737,6 +1778,11 @@ mod tests {
             .save(&surface)
             .await
             .unwrap();
+        assert_eq!(
+            reported_end(&fixture).await,
+            json!(grant.created_at + chrono::Duration::seconds(3_600)),
+            "a limit the binding set since ends the grant sooner"
+        );
         let (started, _) = connect(&fixture).await;
         assert_eq!(started["max_consent_age_secs"], 3_600, "the binding's shorter limit");
         let grant = stored(&fixture).await;

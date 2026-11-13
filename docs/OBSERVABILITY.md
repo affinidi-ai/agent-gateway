@@ -829,9 +829,11 @@ Trust); see [`POLICY.md`](POLICY.md#the-authority-of-a-trust-check).
   a revocation. The record names the agent (`agent_did`, absent for a grant by binding), the
   caller's identity hash or `owner` (`user_identity_hash`), the provider, the surface, the
   scopes and the token or grant id (`token_id`). Its `detail` is
-  `consent_granted_at:<time>,consent_expired_at:<time>,source:release`, the times in RFC 3339
+  `consent_granted_at:<time>,consent_expired_at:<time>,source:<source>`, the times in RFC 3339
   UTC and `source` what found the consent ended: `release` is a request that needed the
-  credential. One removal writes one record, whichever request finds the consent ended first.
+  credential, and `sweep` the hourly removal of ended consents, whose record names no surface
+  for an agent-keyed token. One removal writes one record, whichever finds the consent ended
+  first.
 
 **MCP Proxy pin change events.** Raised by management API writes to a surface (group
 Delegation); see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#through-an-mcp-proxy)

@@ -1915,7 +1915,8 @@ sets `oauth_callback_route`; a reverse proxy in front of the gateway must forwar
 `{route}/{segment}` and `{route}/{segment}/start`, where `{segment}` is the provider's id for a
 new provider and its `provider_id` for one stored before. On success the gateway stores the
 token and issues a `DelegationCredential`, a verifiable credential recording the
-delegation chain, kept with the token as `delegation_vc`.
+delegation chain, kept with the token as `delegation_vc`. For a consent under a
+[time limit](#consent-time-limit) its `validUntil` is the end of the consent.
 
 ## Consent time limit
 
@@ -1948,8 +1949,7 @@ and the connection's.
 The end is fixed when the person consents: the consent time plus the limit in force then. It
 is stored with the credential as `consent_expires_at`, beside the consent time
 (`consent_granted_at` of an agent-keyed token, `created_at` of a grant by binding). A refresh
-changes neither. The vault list and read (`GET /api/v1/delegation-vault` and
-`GET /api/v1/delegation-vault/{id}`) show `consent_expires_at` for a token that has one.
+changes neither.
 
 A consent has ended once its stored end has passed, or once it is older than the connection's
 limit as set now, whichever comes first. So:
@@ -1961,6 +1961,13 @@ limit as set now, whichever comes first. So:
 
 A consent time more than five minutes ahead of the gateway's clock counts as ended whenever a
 limit applies, and so does one that no limit can be added to.
+
+The vault list and read (`GET /api/v1/delegation-vault` and `GET /api/v1/delegation-vault/{id}`)
+and the grants report (`GET /api/v1/delegation-vault/grants`) show this end as
+`consent_expires_at`, as the limits set now make it, so a limit shortened since the consent
+shows the sooner end. The field is absent for a consent nothing limits, and for a service
+token, which nobody consented to. While the credential providers cannot be read, the vault list
+and read show the end stored with each token.
 
 ### What happens at the end
 
@@ -1975,6 +1982,17 @@ decision, on an Access Point, a Transit Point and Fabric receive alike.
 A removal that fails leaves the request refused all the same, and the next request tries it
 again. A request that read the credential a moment before its end finishes its call: the
 limit is checked when the credential is released, not while a response streams.
+
+A consent no request needs again is removed all the same. Once an hour, the first time ten
+minutes after startup and only while the node is active, the vault removes every ended consent
+it still holds ([`src/delegation_vault/sweep.rs`](../src/delegation_vault/sweep.rs)): an
+agent-keyed token is deleted, and a grant by binding is deleted under its surface's lock and
+revoked at the vendor. So a refresh token outlives its consent in the vault by an hour at most.
+A binding's own shorter limit removes no agent-keyed token here either. A token whose provider
+was deleted ends at the end stored with it, and a service token is never touched. A grant the
+surface no longer serves is left to [the daily sweep](#the-daily-sweep), and no grant is removed
+while the gateway does not derive the ids the grants were written under, as that sweep
+explains.
 
 ### A binding with a shorter limit
 
@@ -1998,7 +2016,9 @@ binding's limit. A grant by binding has one binding, so a consent too old for it
 An ended consent is recorded as `consent_expired`, never as `token_revoked` or
 `user_tokens_revoked`: the agent, the caller's identity hash (or `owner`), the provider, the
 surface, the scopes, the token or grant id, and in `detail`
-`consent_granted_at:<time>,consent_expired_at:<time>,source:release`. A request served by a
+`consent_granted_at:<time>,consent_expired_at:<time>,source:<source>`, where `source` is
+`release` for a request that needed the credential and `sweep` for the hourly removal, which
+names no surface for an agent-keyed token. A request served by a
 binding that only finds the consent too old records nothing but its usual `consent_required`.
 For a grant by binding the vendor revocation that follows is recorded as its own
 `token_revoked`, whose `detail` ends `,consent_expired`, so it reads as the outcome of the
@@ -2372,7 +2392,9 @@ number of callers connected, counted from file names, and, with `principal`, tha
 grant. A `principal` that is neither `owner` nor an identity hash is refused `400`
 `invalid_principal`, as on a connect or a removal. A grant is reported as metadata only: `grant_id`, `principal`, `scopes`, `created_at`,
 `refreshed_at`, `last_used_at`, `expires_at` and `state` (`live`, `refresh_failed`, or
-`unreadable`). Removing grants is described in [Removing grants](#removing-grants).
+`unreadable`), and `consent_expires_at` for a grant whose consent has an end
+([When a consent ends](#when-a-consent-ends)). Removing grants is described in
+[Removing grants](#removing-grants).
 
 Every refusal of a request names a fixed `code`: `surface_not_found` (`404`, also for a surface
 the caller may not manage), `binding_not_found` (`404`), `subject_mismatch`,
@@ -2727,7 +2749,7 @@ sweep, and the others are decided. The sweep goes binding by binding, found by
 file name: it reads one of the binding's grants to learn its surface, takes the surface's lock,
 and only then reads the binding's grants and decides, so a grant the person connected again
 while the sweep waited is the one it decides on. It finishes revoking one binding's removals
-before it goes on to the next, and stops between bindings once the node is no longer active. Every grant is decrypted once or twice a day. A
+before it goes on to the next, and stops between bindings once the node is no longer active. The daily sweep decrypts every grant once or twice, and the hourly removal of ended consents ([What happens at the end](#what-happens-at-the-end)) reads every grant and every agent-keyed token once each time. A
 grant that cannot be read is left, and counted, for an operator to remove. A binding whose
 surface or provider cannot be read is left as it is, and counted as skipped, until the next
 sweep: a provider store that fails is never taken for a provider that is gone. The log line

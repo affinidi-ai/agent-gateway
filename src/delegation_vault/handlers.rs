@@ -100,6 +100,19 @@ async fn caller_read_scope(
         })
 }
 
+/// The metadata of `token`, its consent ending as the limits set now make
+/// it: at the end stored with it, or sooner under a limit `provider` has set
+/// or shortened since.
+fn token_metadata(
+    token: &DelegationToken,
+    provider: Option<&crate::credential_providers::CredentialProvider>,
+) -> DelegationTokenListItem {
+    let mut item = DelegationTokenListItem::from(token);
+    item.consent_expires_at = super::consent_age::ConsentLimits::of_provider(provider)
+        .ends_at(token.consent_granted_at, token.consent_expires_at);
+    item
+}
+
 /// GET /api/v1/delegation-vault
 pub async fn list_tokens(
     State(state): State<DelegationVaultState>,
@@ -130,10 +143,31 @@ pub async fn list_tokens(
         .await
     {
         Ok(tokens) => {
+            // An appliance-wide caller reads the vault while the providers cannot be read: each
+            // token then shows the end stored with it.
+            let providers: std::collections::HashMap<String, _> = match state
+                .provider_store
+                .list()
+                .await
+            {
+                Ok(providers) => providers
+                    .into_iter()
+                    .map(|provider| (provider.id.clone(), provider))
+                    .collect(),
+                Err(e) => {
+                    warn!(
+                        target: "credential_delegation",
+                        action = "list",
+                        error = %e,
+                        "Credential providers could not be read; each consent end is shown as stored"
+                    );
+                    Default::default()
+                }
+            };
             let items: Vec<DelegationTokenListItem> = tokens
                 .iter()
                 .filter(|t| scope.reads(Some(&t.credential_provider_id)))
-                .map(|t| t.into())
+                .map(|t| token_metadata(t, providers.get(&t.credential_provider_id)))
                 .collect();
             (StatusCode::OK, Json(serde_json::to_value(items).unwrap())).into_response()
         }
@@ -175,8 +209,21 @@ pub async fn get_token(
         .await
     {
         Ok(Some(token)) if scope.reads(Some(&token.credential_provider_id)) => {
+            let provider = state
+                .provider_store
+                .get(&token.credential_provider_id)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(
+                        target: "credential_delegation",
+                        action = "get",
+                        error = %e,
+                        "Credential provider could not be read; the consent end is shown as stored"
+                    );
+                    None
+                });
             // Return metadata only — never expose access_token/refresh_token via API
-            let item: DelegationTokenListItem = (&token).into();
+            let item = token_metadata(&token, provider.as_ref());
             (StatusCode::OK, Json(serde_json::to_value(item).unwrap())).into_response()
         }
         Ok(_) => {
@@ -959,12 +1006,15 @@ pub async fn oauth_callback(
         .map(|domain| format!("did:web:{}", domain))
         .unwrap_or_else(|| "did:web:gateway.local".to_string());
 
+    let now = Utc::now();
+    let consent_expires_at = super::consent_age::end_of(now, oauth_state.max_consent_age_secs);
     let delegation_vc = oauth::build_delegation_vc(
         &gateway_did,
         &oauth_state.agent_did,
         &oauth_state.user_identity_hash,
         &provider,
         &granted_scopes,
+        consent_expires_at,
         state.vc_signer.as_ref(),
     )
     .await;
@@ -986,8 +1036,6 @@ pub async fn oauth_callback(
         .expires_in
         .map(|secs| Utc::now() + Duration::seconds(secs));
 
-    let now = Utc::now();
-    let consent_expires_at = super::consent_age::end_of(now, oauth_state.max_consent_age_secs);
     let delegation_token = DelegationToken {
         id: Uuid::new_v4().to_string(),
         agent_did: oauth_state.agent_did.clone(),
@@ -1309,6 +1357,52 @@ mod audit_response_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The vault list shows when a consent ends as the limits set now make
+    /// it: sooner than the end stored with it under a limit its provider has
+    /// shortened since, never later, and by the stored end alone once the
+    /// provider is gone. A service token, which nobody consented to, has none.
+    #[test]
+    fn a_tokens_metadata_shows_when_its_consent_ends_under_the_limits_set_now() {
+        let provider = |provider_type: &str, limit: Option<u64>| {
+            let mut provider: crate::credential_providers::CredentialProvider =
+                serde_json::from_value(serde_json::json!({
+                    "id": "cp-1", "name": "Provider", "provider_id": "github", "provider_type": provider_type,
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap();
+            provider.max_consent_age_secs = limit;
+            provider
+        };
+        let mut token = crate::delegation_vault::tests::make_token(Some(3600), true);
+        let granted = token.consent_granted_at;
+        let stored_end = granted + Duration::hours(6);
+        token.consent_expires_at = Some(stored_end);
+        let end = |token: &DelegationToken, provider: Option<&crate::credential_providers::CredentialProvider>| {
+            token_metadata(token, provider).consent_expires_at
+        };
+
+        let shortened = provider("oauth2_authorization_code", Some(3_600));
+        assert_eq!(end(&token, Some(&shortened)), Some(granted + Duration::hours(1)));
+        let lengthened = provider("oauth2_authorization_code", Some(86_400));
+        assert_eq!(end(&token, Some(&lengthened)), Some(stored_end));
+        assert_eq!(end(&token, None), Some(stored_end), "a provider that is gone");
+
+        token.consent_expires_at = None;
+        assert_eq!(end(&token, Some(&shortened)), Some(granted + Duration::hours(1)), "a limit set since");
+        let service = provider("oauth2_client_credentials", Some(3_600));
+        assert_eq!(end(&token, Some(&service)), None);
+        assert_eq!(end(&token, None), None);
+        let item = serde_json::to_value(token_metadata(&token, None)).unwrap();
+        assert!(
+            item.get("access_token")
+                .is_none()
+                && item
+                    .get("refresh_token")
+                    .is_none(),
+            "{item}"
+        );
+    }
 
     /// The binding cookie carries the attributes that keep it on the gateway's
     /// own host, and a name or value that cannot be sent in a header is an

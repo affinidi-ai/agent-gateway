@@ -404,7 +404,7 @@ impl ReleaseContext<'_> {
         if limits.judge(grant.created_at, grant.consent_expires_at, Utc::now()) == ConsentAge::Current {
             return Ok(grant);
         }
-        self.end_consent(provider, key, &grant, limits.ends_at(grant.created_at, grant.consent_expires_at))
+        self.end_consent(provider, key, &grant, limits.ends_for_binding_at(grant.created_at, grant.consent_expires_at))
             .await;
         Err(refused(GrantRefusal::consent_expired(key, subject), consent_age::CONSENT_EXPIRED))
     }
@@ -434,21 +434,7 @@ impl ReleaseContext<'_> {
                     grant_id = %grant_id,
                     "Consent ended at its time limit - removed the delegated grant; someone must connect again"
                 );
-                super::audit::emit("consent_expired", || {
-                    let mut event = super::audit::audit_event(
-                        super::audit::DelegationAuditAction::ConsentExpired,
-                        None,
-                        Some(&key.principal),
-                        Some(&provider.id),
-                        Some(&key.surface_id),
-                    );
-                    event.token_id = Some(grant_id.clone());
-                    event.provider_name = Some(provider.name.clone());
-                    event.scopes = Some(removed.scopes.clone());
-                    event.tenant_id = key.tenant_id.clone();
-                    event.detail = Some(consent_age::expiry_detail(removed.created_at, ended_at, "release"));
-                    event
-                });
+                consent_age::record_grant_expiry(&removed, Some(&provider.name), ended_at, "release");
                 crate::observability::policy_audit::spawn_in_request(super::revocation::revoke_expired(
                     vec![removed],
                     self.revoker(provider),

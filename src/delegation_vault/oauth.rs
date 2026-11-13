@@ -1415,19 +1415,21 @@ pub fn build_consent_required(
 ///
 /// Produces a W3C VC v2 credential with an EdDsaRdfc2022 Data Integrity Proof
 /// when a `vc_signer` is provided. Falls back to an unsigned VC if no signer
-/// is available (e.g. during tests or degraded mode).
+/// is available (e.g. during tests or degraded mode). A consent under a time
+/// limit ends at `valid_until`, which the credential names as `validUntil`.
 pub async fn build_delegation_vc(
     gateway_did: &str,
     agent_did: &str,
     user_identity_hash: &str,
     provider: &CredentialProvider,
     scopes: &[String],
+    valid_until: Option<chrono::DateTime<Utc>>,
     vc_signer: Option<&Arc<dyn VcSigner>>,
 ) -> Result<serde_json::Value> {
     let now = Utc::now();
     let vc_id = format!("urn:uuid:{}", Uuid::new_v4());
 
-    let credential = json!({
+    let mut credential = json!({
         "@context": [
             "https://www.w3.org/ns/credentials/v2",
             "https://fabric.affinidi.io/credentials/delegation/v1"
@@ -1451,6 +1453,9 @@ pub async fn build_delegation_vc(
             "consentedAt": now.to_rfc3339()
         }
     });
+    if let Some(valid_until) = valid_until {
+        credential["validUntil"] = json!(valid_until.to_rfc3339());
+    }
 
     match vc_signer {
         Some(signer) => signer
@@ -3338,9 +3343,25 @@ mod tests {
             &provider,
             &["repo".to_string(), "read:user".to_string()],
             None,
+            None,
         )
         .await
         .expect("build_delegation_vc should succeed without signer");
+
+        assert!(vc.get("validUntil").is_none(), "a consent under no time limit names no end");
+        let valid_until = Utc::now() + Duration::hours(6);
+        let limited = build_delegation_vc(
+            "did:web:gateway.example.com",
+            "did:web:agent.example.com",
+            "sha256:user123",
+            &provider,
+            &["repo".to_string()],
+            Some(valid_until),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(limited["validUntil"], valid_until.to_rfc3339());
 
         assert_eq!(vc["issuer"], "did:web:gateway.example.com");
         assert_eq!(vc["credentialSubject"]["id"], "did:web:agent.example.com");
@@ -3520,6 +3541,7 @@ mod tests {
             "sha256:user123",
             &provider,
             &["repo".to_string()],
+            None,
             Some(&signer),
         )
         .await

@@ -20,6 +20,17 @@ changes:
         credential for other bindings. The consent start page, the elicitation message and the
         `consent_required` entries say how long the new consent lasts. Without a limit nothing
         changes, and revocation works as before.
+    - timestamp: '2026-11-13T09:00:00Z'
+      title: Remove ended consents hourly and show when a consent ends
+      description: >-
+        A consent past its time limit is now removed even when no request needs it again. Once
+        an hour, while the node is active, the gateway deletes every ended agent-keyed token and
+        every ended grant by binding, revokes those grants at the vendor, and records each as
+        `consent_expired` with `source:sweep`, so a refresh token outlives its consent in the
+        vault by an hour at most. `GET /api/v1/delegation-vault`, `GET
+        /api/v1/delegation-vault/{id}` and the grants report now show `consent_expires_at`, the
+        end as the limits set now make it, and a `DelegationCredential` issued for a consent
+        under a time limit carries it as `validUntil`.
   changed: []
   fixed: []
   removed: []

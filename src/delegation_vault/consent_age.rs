@@ -7,8 +7,10 @@ use tracing::{info, warn};
 
 use super::DelegationToken;
 use super::audit::{self, DelegationAuditAction, DelegationAuditEvent};
+use super::grants::DelegatedGrant;
 use super::storage::{DelegationVaultStorage, access_token_fingerprint};
 use crate::config::credential_policy::{CredentialPolicyConfig, credential_policy};
+use crate::credential_providers::{CredentialProvider, CredentialProviderType};
 
 /// How far ahead of this gateway's clock a consent time may lie, as another
 /// node's clock may run, before a consent under a limit counts as ended.
@@ -74,13 +76,23 @@ impl ConsentLimits {
         }
     }
 
+    /// The limits on the consents given to `provider`, whichever binding uses
+    /// them: its own and the gateway's when a person consents to it. Any other
+    /// provider, and one that is gone, has none, so only the end stored with
+    /// a consent ends it.
+    pub fn of_provider(provider: Option<&CredentialProvider>) -> Self {
+        match provider {
+            Some(provider) if provider.provider_type == CredentialProviderType::OAuth2AuthorizationCode => {
+                Self::of(None, provider.max_consent_age_secs)
+            }
+            _ => Self::default(),
+        }
+    }
+
     /// Seconds a consent given now through the binding may be used: the
     /// shorter of the binding's limit and the connection's.
     pub fn lifetime_secs(&self) -> Option<u64> {
-        match (self.binding_secs, self.connection_secs) {
-            (Some(binding), Some(connection)) => Some(binding.min(connection)),
-            (binding, connection) => binding.or(connection),
-        }
+        earlier(self.binding_secs, self.connection_secs)
     }
 
     /// When a consent given at `granted_at` through the binding ends, which is
@@ -104,10 +116,26 @@ impl ConsentLimits {
         let by_connection = self
             .connection_secs
             .map(|secs| after(granted_at, secs));
-        match (stored_end, by_connection) {
-            (Some(stored), Some(connection)) => Some(stored.min(connection)),
-            (stored, connection) => stored.or(connection),
-        }
+        earlier(stored_end, by_connection)
+    }
+
+    /// When a stored consent stops serving this binding: [`Self::ends_at`], or
+    /// its consent time plus the binding's own limit when that comes first.
+    /// A grant by binding has one binding, so this is when its consent ends.
+    pub fn ends_for_binding_at(
+        &self,
+        granted_at: DateTime<Utc>,
+        stored_end: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        earlier(self.ends_at(granted_at, stored_end), self.binding_end(granted_at))
+    }
+
+    fn binding_end(
+        &self,
+        granted_at: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        self.binding_secs
+            .map(|secs| after(granted_at, secs))
     }
 
     /// Whether the consent given at `granted_at`, stored with the end
@@ -121,9 +149,7 @@ impl ConsentLimits {
         now: DateTime<Utc>,
     ) -> ConsentAge {
         let end = self.ends_at(granted_at, stored_end);
-        let binding_end = self
-            .binding_secs
-            .map(|secs| after(granted_at, secs));
+        let binding_end = self.binding_end(granted_at);
         if end.is_none() && binding_end.is_none() {
             return ConsentAge::Current;
         }
@@ -205,6 +231,32 @@ pub async fn end_consent(
     true
 }
 
+/// Audit, as `consent_expired`, that `removed`, a grant by binding whose
+/// consent ended at `ended_at`, was removed from the vault. `source` says what
+/// found it ended, and `provider_name` names its provider when it is known.
+pub fn record_grant_expiry(
+    removed: &DelegatedGrant,
+    provider_name: Option<&str>,
+    ended_at: Option<DateTime<Utc>>,
+    source: &'static str,
+) {
+    audit::emit("consent_expired", || {
+        let mut event = audit::audit_event(
+            DelegationAuditAction::ConsentExpired,
+            None,
+            Some(&removed.principal),
+            Some(&removed.credential_provider_id),
+            Some(&removed.surface_id),
+        );
+        event.token_id = Some(removed.id.clone());
+        event.provider_name = provider_name.map(str::to_string);
+        event.scopes = Some(removed.scopes.clone());
+        event.tenant_id = removed.tenant_id.clone();
+        event.detail = Some(expiry_detail(removed.created_at, ended_at, source));
+        event
+    });
+}
+
 /// The `detail` of a `consent_expired` audit record: when the consent was
 /// given, when it ended, and what found it ended: `release`, a request that
 /// needed the credential, or `sweep`.
@@ -216,6 +268,18 @@ pub fn expiry_detail(
     let stamp = |time: DateTime<Utc>| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let ended_at = ended_at.map_or_else(String::new, |time| format!(",consent_expired_at:{}", stamp(time)));
     format!("consent_granted_at:{}{ended_at},source:{source}", stamp(granted_at))
+}
+
+/// The earlier of two ends, or of two limits the shorter; the one there is
+/// when the other is absent.
+fn earlier<T: Ord>(
+    one: Option<T>,
+    other: Option<T>,
+) -> Option<T> {
+    match (one, other) {
+        (Some(one), Some(other)) => Some(one.min(other)),
+        (one, other) => one.or(other),
+    }
 }
 
 /// `secs` after `from`, or `from` itself when that is out of range, so a time
@@ -363,6 +427,43 @@ mod tests {
         let binding_alone = ConsentLimits::under(Some(600), None, &unlimited());
         assert_eq!(binding_alone.judge(at(0), None, at(600)), ConsentAge::TooOldForBinding, "given through another");
         assert_eq!(binding_alone.judge(at(0), Some(at(600)), at(600)), ConsentAge::Ended, "given through this one");
+    }
+
+    #[test]
+    fn a_grant_by_binding_ends_at_the_earliest_of_its_stored_end_and_both_limits() {
+        let stored_end = Some(at(3_600));
+        let end = |binding, provider| {
+            ConsentLimits::under(binding, provider, &unlimited()).ends_for_binding_at(at(0), stored_end)
+        };
+        assert_eq!(end(None, None), stored_end, "the stored end alone");
+        assert_eq!(end(Some(600), Some(3_600)), Some(at(600)), "the binding's limit, shortened since");
+        assert_eq!(end(Some(7_200), Some(1_800)), Some(at(1_800)), "the provider's limit, shortened since");
+        assert_eq!(end(Some(7_200), Some(86_400)), stored_end, "limits lengthened since");
+        assert_eq!(ConsentLimits::under(None, None, &unlimited()).ends_for_binding_at(at(0), None), None);
+    }
+
+    #[test]
+    fn only_a_provider_a_person_consents_to_limits_its_consents() {
+        let provider = |provider_type: &str, limit| {
+            let mut provider: CredentialProvider = serde_json::from_value(serde_json::json!({
+                "id": "cp", "name": "Provider", "provider_id": "provider", "provider_type": provider_type,
+                "callback_path": "/v1/identity/oauth/callback/provider",
+                "created_at": "2027-01-15T08:00:00Z", "updated_at": "2027-01-15T08:00:00Z"
+            }))
+            .unwrap();
+            provider.max_consent_age_secs = limit;
+            provider
+        };
+        let consented = provider("oauth2_authorization_code", Some(3_600));
+        assert_eq!(ConsentLimits::of_provider(Some(&consented)).lifetime_secs(), Some(3_600));
+        let service = provider("oauth2_client_credentials", Some(3_600));
+        assert_eq!(ConsentLimits::of_provider(Some(&service)), ConsentLimits::default());
+        assert_eq!(ConsentLimits::of_provider(None), ConsentLimits::default(), "a provider that is gone");
+        assert_eq!(
+            ConsentLimits::of_provider(None).judge(at(0), Some(at(3_600)), at(3_600)),
+            ConsentAge::Ended,
+            "the end stored with a consent still ends it"
+        );
     }
 
     #[test]

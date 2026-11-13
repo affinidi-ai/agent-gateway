@@ -18868,7 +18868,8 @@ mod tests {
                 .clone()
                 .unwrap();
             let mut grant = crate::delegation_vault::grants::tests::grant(&key, "access");
-            grant.created_at = chrono::Utc::now() - chrono::Duration::minutes(age_minutes);
+            let created_at = chrono::Utc::now() - chrono::Duration::minutes(age_minutes);
+            grant.created_at = created_at;
             vault
                 .store_grant(grant)
                 .await
@@ -18876,9 +18877,27 @@ mod tests {
             let surface = fixture_surface_with_limit(&vendor, "caller", 3_600);
             let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
 
-            let sent = send_with_grant(&state, &mut ctx).await;
+            let (sent, events) = crate::audit::producer::capture(send_with_grant(&state, &mut ctx)).await;
+            let expiries: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    matches!(event.event, crate::delegation_vault::audit::DelegationAuditAction::ConsentExpired)
+                })
+                .map(|event| event.detail.clone())
+                .collect();
 
             if ends {
+                let stamp =
+                    |time: chrono::DateTime<chrono::Utc>| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                assert_eq!(
+                    expiries,
+                    vec![Some(format!(
+                        "consent_granted_at:{},consent_expired_at:{},source:release",
+                        stamp(created_at),
+                        stamp(created_at + chrono::Duration::hours(1))
+                    ))],
+                    "the end is the one the binding's limit sets"
+                );
                 assert!(
                     matches!(
                         grant_refusal(&sent.unwrap_err()),
@@ -18899,6 +18918,7 @@ mod tests {
                 assert!(vendor.requests().is_empty());
             } else {
                 assert_eq!(sent.unwrap(), reqwest::StatusCode::OK, "{age_minutes} minutes");
+                assert!(expiries.is_empty(), "no expiry is recorded for a grant within its limit");
                 assert_eq!(vendor_bearers(&vendor), vec!["Bearer access".to_string()]);
                 assert!(
                     vault

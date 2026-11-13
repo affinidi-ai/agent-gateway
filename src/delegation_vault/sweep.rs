@@ -16,6 +16,10 @@
 //! it also tries when the gateway starts, and those that could not reach
 //! their vendor ([`super::revocation::revoke_pending_of`]).
 //!
+//! Every [`CONSENT_SWEEP_INTERVAL`] it also removes the consents past their
+//! time limit ([`super::consent_age`]) that no request has needed since:
+//! agent-keyed tokens, and grants by binding, which it revokes as well.
+//!
 //! Grants are found by their file names, one binding at a time: the sweep
 //! reads one of the binding's grants to learn its surface, takes that
 //! surface's lock, and only then reads the binding's grants it decides on, so
@@ -30,8 +34,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
+use super::consent_age::{self, ConsentAge, ConsentLimits};
 use super::grants::DelegatedGrant;
 use super::storage::DelegationVaultStorage;
+use crate::config::agent_surface::AgentSurface;
 use crate::credential_providers::CredentialProvider;
 use crate::credential_providers::storage::CredentialProviderStorage;
 use crate::secrets::SecretsStore;
@@ -41,6 +47,8 @@ use crate::surfaces::AgentSurfaceStore;
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// How long after startup the first sweep runs.
 pub const FIRST_SWEEP_DELAY: Duration = Duration::from_secs(10 * 60);
+/// How often the consents past their time limit are removed.
+pub const CONSENT_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// What the sweep needs.
 #[derive(Clone)]
@@ -71,6 +79,19 @@ pub struct SweepReport {
     /// Revocations deferred by a removal that could not tell whether the
     /// vendor account's authorization was in use, decided now.
     pub deferred_revocations: usize,
+    /// Agent-keyed tokens whose consent was past its time limit.
+    pub ended_consent_tokens: usize,
+    /// Grants by binding whose consent was past its time limit.
+    pub ended_consent_grants: usize,
+}
+
+/// One binding's grants, read under the lock of its surface, which is held
+/// while they are decided on.
+struct BindingGrants {
+    lock: tokio::sync::OwnedMutexGuard<()>,
+    /// The binding's surface, when it still exists.
+    surface: Option<AgentSurface>,
+    grants: Vec<DelegatedGrant>,
 }
 
 /// How many days after its access token expired a grant whose refresh keeps
@@ -108,13 +129,21 @@ impl Sweeper {
                 self.retry_pending_logged()
                     .await;
             }
-            let mut interval =
-                tokio::time::interval_at(tokio::time::Instant::now() + FIRST_SWEEP_DELAY, SWEEP_INTERVAL);
+            let first = tokio::time::Instant::now() + FIRST_SWEEP_DELAY;
+            let mut interval = tokio::time::interval_at(first, SWEEP_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut consent_interval = tokio::time::interval_at(first, CONSENT_SWEEP_INTERVAL);
+            consent_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut listening = true;
             loop {
                 tokio::select! {
                     _ = interval.tick() => {}
+                    _ = consent_interval.tick() => {
+                        if !crate::server::mode::is_standby() {
+                            self.end_consents_logged().await;
+                        }
+                        continue;
+                    }
                     change = mode_changes.recv(), if listening => {
                         listening = !matches!(change, Err(tokio::sync::broadcast::error::RecvError::Closed));
                         if became_active(&change) && !crate::server::mode::is_standby() {
@@ -212,16 +241,7 @@ impl Sweeper {
                 return report;
             }
         };
-        let mut bindings: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for id in ids {
-            if let Some(prefix) = binding_prefix(&id) {
-                bindings
-                    .entry(prefix.to_string())
-                    .or_default()
-                    .push(id);
-            }
-        }
-        for ids in bindings.into_values() {
+        for ids in by_binding(ids).into_values() {
             if !keep_going() {
                 break;
             }
@@ -229,6 +249,238 @@ impl Sweeper {
                 .await;
         }
         report
+    }
+
+    async fn end_consents_logged(&self) {
+        let report = self
+            .end_consents_while(Utc::now(), || !crate::server::mode::is_standby())
+            .await;
+        if report.ended_consent_tokens == 0 && report.ended_consent_grants == 0 {
+            return;
+        }
+        tracing::info!(
+            target: "credential_delegation",
+            ended_consent_tokens = report.ended_consent_tokens,
+            ended_consent_grants = report.ended_consent_grants,
+            "Removed the consents past their time limit"
+        );
+    }
+
+    /// Remove the consents past their time limit, as of `now`.
+    #[cfg(test)]
+    pub async fn end_consents(
+        &self,
+        now: DateTime<Utc>,
+    ) -> SweepReport {
+        self.end_consents_while(now, || true)
+            .await
+    }
+
+    /// Remove, as of `now`, the consents past their time limit that no
+    /// request has needed since: agent-keyed tokens, then grants by binding,
+    /// one binding at a time, each revoked at its authorization server,
+    /// stopping between them once `keep_going` says no. No grant is removed
+    /// while this gateway does not derive the ids the grants stored were
+    /// written under, which the daily sweep reports.
+    pub async fn end_consents_while(
+        &self,
+        now: DateTime<Utc>,
+        keep_going: impl Fn() -> bool,
+    ) -> SweepReport {
+        let mut report = SweepReport::default();
+        let mut providers = HashMap::new();
+        report.ended_consent_tokens = self
+            .end_token_consents(now, &mut providers, &keep_going)
+            .await;
+        let derives_ids = self
+            .vault
+            .derives_stored_grant_ids()
+            .await;
+        if !keep_going() || !matches!(derives_ids, Ok(true)) {
+            return report;
+        }
+        let ids = match self.vault.grant_ids().await {
+            Ok(ids) => ids,
+            Err(error) => {
+                tracing::warn!(
+                    target: "credential_delegation",
+                    error = %error,
+                    "Failed to list grants to end their consents"
+                );
+                return report;
+            }
+        };
+        for ids in by_binding(ids).into_values() {
+            if !keep_going() {
+                break;
+            }
+            self.end_binding_consents(ids, now, &mut providers, &mut report)
+                .await;
+        }
+        report
+    }
+
+    /// Remove the agent-keyed tokens whose consent is past the time limit of
+    /// their provider and the gateway, as of `now`, and audit each as
+    /// `consent_expired`. A binding's own shorter limit only asks its callers
+    /// for consent again, so it removes nothing here. The pass stops at a
+    /// provider that cannot be read, and the next takes it up.
+    async fn end_token_consents(
+        &self,
+        now: DateTime<Utc>,
+        providers: &mut HashMap<String, Option<CredentialProvider>>,
+        keep_going: &impl Fn() -> bool,
+    ) -> usize {
+        let tokens = match self.vault.list_all().await {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                tracing::warn!(
+                    target: "credential_delegation",
+                    error = %error,
+                    "Failed to list delegation tokens to end their consents"
+                );
+                return 0;
+            }
+        };
+        let mut ended = 0;
+        for token in tokens {
+            if !keep_going() {
+                break;
+            }
+            let provider = match self
+                .provider(&token.credential_provider_id, providers)
+                .await
+            {
+                Ok(provider) => provider,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "credential_delegation",
+                        error = %error,
+                        "Failed to read a provider to end its consents; they wait for the next pass"
+                    );
+                    break;
+                }
+            };
+            let limits = ConsentLimits::of_provider(provider.as_ref());
+            if limits.judge(token.consent_granted_at, token.consent_expires_at, now) != ConsentAge::Ended {
+                continue;
+            }
+            let ended_at = limits.ends_at(token.consent_granted_at, token.consent_expires_at);
+            let removed = consent_age::end_consent(self.vault.as_ref(), &token, ended_at, "sweep", None, |event| {
+                event.provider_name = provider
+                    .as_ref()
+                    .map(|provider| provider.name.clone());
+            })
+            .await;
+            ended += usize::from(removed);
+        }
+        ended
+    }
+
+    /// Remove the grants of one binding whose consent is past the time limit
+    /// of the binding, their provider and the gateway, as of `now`: each is
+    /// deleted under its surface's lock while it is still the connection
+    /// read, audited as `consent_expired` and then revoked. A grant the
+    /// surface no longer serves, or written under an earlier pepper, is the
+    /// daily sweep's to remove.
+    async fn end_binding_consents(
+        &self,
+        ids: Vec<String>,
+        now: DateTime<Utc>,
+        providers: &mut HashMap<String, Option<CredentialProvider>>,
+        report: &mut SweepReport,
+    ) {
+        let Some(BindingGrants { lock, surface, grants }) = self
+            .read_binding(ids, report)
+            .await
+        else {
+            return;
+        };
+        let Some(surface) = surface else {
+            return;
+        };
+        let mut ended = Vec::new();
+        let mut revocation_providers = HashMap::new();
+        for grant in grants {
+            let provider = match self
+                .provider(&grant.credential_provider_id, providers)
+                .await
+            {
+                Ok(provider) => provider,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "credential_delegation",
+                        error = %error,
+                        "Failed to read a provider to end its grants' consents; the binding is left until the next pass"
+                    );
+                    report.skipped_bindings += 1;
+                    return;
+                }
+            };
+            let default_scopes = provider
+                .as_ref()
+                .map_or(&[][..], |provider| &provider.default_scopes);
+            if grant.key().record_id() != grant.id
+                || !crate::identity::handlers::surface_grants::serves_grant(&surface, &grant, default_scopes)
+            {
+                continue;
+            }
+            let limits = ConsentLimits::of(
+                crate::identity::handlers::surface_grants::binding_max_consent_age(&surface, &grant),
+                provider
+                    .as_ref()
+                    .and_then(|provider| provider.max_consent_age_secs),
+            );
+            if limits.judge(grant.created_at, grant.consent_expires_at, now) == ConsentAge::Current {
+                continue;
+            }
+            let ended_at = limits.ends_for_binding_at(grant.created_at, grant.consent_expires_at);
+            if let Some(provider) = provider {
+                revocation_providers.insert(provider.id.clone(), provider);
+            }
+            ended.push((grant, ended_at));
+        }
+        let mut removed = Vec::with_capacity(ended.len());
+        for (grant, ended_at) in ended {
+            match self
+                .vault
+                .delete_grant_of_connection(&grant.id, grant.created_at)
+                .await
+            {
+                Ok(Some(grant)) => {
+                    let provider_name = revocation_providers
+                        .get(&grant.credential_provider_id)
+                        .map(|provider| provider.name.as_str());
+                    consent_age::record_grant_expiry(&grant, provider_name, ended_at, "sweep");
+                    removed.push(grant);
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    target: "credential_delegation",
+                    grant_id = %grant.id,
+                    error = %error,
+                    "Failed to remove a delegated grant whose consent ended at its time limit"
+                ),
+            }
+        }
+        drop(lock);
+        report.ended_consent_grants += removed.len();
+        super::revocation::revoke_expired(removed, self.revoker(revocation_providers)).await;
+    }
+
+    /// The revoker of grants the sweep removed, made with `providers`, on no
+    /// management caller's behalf.
+    fn revoker(
+        &self,
+        providers: HashMap<String, CredentialProvider>,
+    ) -> super::revocation::Revoker {
+        super::revocation::Revoker {
+            providers,
+            secrets: self.secrets.clone(),
+            exact_allowlist: self.exact_allowlist.clone(),
+            actor: None,
+            vault: Some(self.vault.clone()),
+        }
     }
 
     async fn retry_pending_logged(&self) {
@@ -335,16 +587,7 @@ impl Sweeper {
         if decidable.is_empty() {
             return None;
         }
-        Some((
-            super::revocation::Revoker {
-                providers: known,
-                secrets: self.secrets.clone(),
-                exact_allowlist: self.exact_allowlist.clone(),
-                actor: None,
-                vault: Some(self.vault.clone()),
-            },
-            decidable,
-        ))
+        Some((self.revoker(known), decidable))
     }
 
     /// The provider `id`, read once per sweep. A provider store that cannot
@@ -365,15 +608,14 @@ impl Sweeper {
         Ok(provider)
     }
 
-    /// Sweep the grants of one binding, reading them, and deciding, under its
-    /// surface's lock. One grant is read first to learn the surface.
-    async fn sweep_binding(
+    /// Read the grants of one binding under its surface's lock. One grant is
+    /// read first to learn the surface. `None` when no grant of the binding
+    /// can be read, or its surface cannot, which `report` counts.
+    async fn read_binding(
         &self,
         ids: Vec<String>,
-        now: DateTime<Utc>,
-        providers: &mut HashMap<String, Option<CredentialProvider>>,
         report: &mut SweepReport,
-    ) {
+    ) -> Option<BindingGrants> {
         let mut unreadable = 0;
         let mut surface_id = None;
         for id in &ids {
@@ -392,7 +634,7 @@ impl Sweeper {
         }
         let Some(surface_id) = surface_id else {
             report.unreadable_grants += unreadable;
-            return;
+            return None;
         };
         let lock = crate::identity::handlers::surface_grants::lock_surface(&surface_id).await;
         let surface = match self
@@ -404,7 +646,7 @@ impl Sweeper {
             Err(error) => {
                 tracing::warn!(target: "credential_delegation", error = %error, "Failed to read a surface to sweep its grants");
                 report.skipped_bindings += 1;
-                return;
+                return None;
             }
         };
         let mut grants = Vec::with_capacity(ids.len());
@@ -419,6 +661,24 @@ impl Sweeper {
                 Err(_) => report.unreadable_grants += 1,
             }
         }
+        Some(BindingGrants { lock, surface, grants })
+    }
+
+    /// Sweep the grants of one binding, read and decided on under its
+    /// surface's lock.
+    async fn sweep_binding(
+        &self,
+        ids: Vec<String>,
+        now: DateTime<Utc>,
+        providers: &mut HashMap<String, Option<CredentialProvider>>,
+        report: &mut SweepReport,
+    ) {
+        let Some(BindingGrants { lock, surface, grants }) = self
+            .read_binding(ids, report)
+            .await
+        else {
+            return;
+        };
         let mut removals = Vec::new();
         let mut revocation_providers = HashMap::new();
         for grant in grants {
@@ -470,13 +730,7 @@ impl Sweeper {
             .iter()
             .map(|(grant, _)| grant.clone())
             .collect();
-        let revoker = super::revocation::Revoker {
-            providers: revocation_providers,
-            secrets: self.secrets.clone(),
-            exact_allowlist: self.exact_allowlist.clone(),
-            actor: None,
-            vault: Some(self.vault.clone()),
-        };
+        let revoker = self.revoker(revocation_providers);
         match super::revocation::delete_then_revoke(&self.vault, removed, revoker, lock, None).await {
             Ok(revocations) => {
                 for (_, removal) in removals {
@@ -498,6 +752,20 @@ impl Sweeper {
             }
         }
     }
+}
+
+/// The record ids of grants, by the binding each is kept for.
+fn by_binding(ids: Vec<String>) -> BTreeMap<String, Vec<String>> {
+    let mut bindings: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for id in ids {
+        if let Some(prefix) = binding_prefix(&id) {
+            bindings
+                .entry(prefix.to_string())
+                .or_default()
+                .push(id);
+        }
+    }
+    bindings
 }
 
 /// Whether a mode change, as received, may have made the node active: a
@@ -1269,6 +1537,8 @@ mod tests {
                 unreadable_grants: 0,
                 skipped_bindings: 0,
                 deferred_revocations: 0,
+                ended_consent_tokens: 0,
+                ended_consent_grants: 0,
             }
         );
         let left = vault
@@ -1385,5 +1655,329 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Set the consent time limit of the sweeper's provider `vendor`.
+    async fn limit_provider(
+        sweeper: &Sweeper,
+        secs: u64,
+    ) {
+        let mut provider = sweeper
+            .providers
+            .get("vendor")
+            .await
+            .unwrap()
+            .unwrap();
+        provider.max_consent_age_secs = Some(secs);
+        sweeper
+            .providers
+            .update(provider)
+            .await
+            .unwrap();
+    }
+
+    /// Set the consent time limit of the binding the sweeper's surface serves.
+    async fn limit_binding(
+        sweeper: &Sweeper,
+        secs: u64,
+    ) {
+        let surface = sweeper
+            .surfaces
+            .get_checked("surface")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut surface = serde_json::to_value(surface).unwrap();
+        surface["transit"]["points"][0]["transit_credentials"]["max_consent_age_secs"] = json!(secs);
+        sweeper
+            .surfaces
+            .save(&serde_json::from_value(surface).unwrap())
+            .await
+            .unwrap();
+    }
+
+    /// The `consent_expired` records among `events`, as the token or grant
+    /// id and the detail of each.
+    fn expiries(events: &[crate::delegation_vault::audit::DelegationAuditEvent]) -> Vec<(String, String)> {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(event.event, crate::delegation_vault::audit::DelegationAuditAction::ConsentExpired)
+            })
+            .map(|event| {
+                (
+                    event
+                        .token_id
+                        .clone()
+                        .unwrap(),
+                    event.detail.clone().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn stamp(time: DateTime<Utc>) -> String {
+        time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    /// The hourly pass removes a grant whose consent is past its provider's
+    /// time limit though no request needed it, audits it as `consent_expired`
+    /// found by the sweep, and revokes it. A grant within the limit is kept,
+    /// and so is one the surface no longer serves, which the daily sweep
+    /// removes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_hourly_pass_removes_and_revokes_a_grant_whose_consent_ended() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = RecordingServer::start(200).await;
+        let sweeper = sweeper(&directory, &server, true).await;
+        limit_provider(&sweeper, 3_600).await;
+        let now = Utc::now();
+        let key = GrantKey::owner(Some("tenant-a"), "surface", "served", "vendor");
+        let connected = |key: &GrantKey, access: &str, minutes_ago: i64| {
+            let mut grant = crate::delegation_vault::grants::tests::grant(key, access);
+            grant.created_at = now - chrono::Duration::minutes(minutes_ago);
+            grant.consent_expires_at = Some(grant.created_at + chrono::Duration::hours(1));
+            grant
+        };
+        let unbound = GrantKey::owner(Some("tenant-a"), "surface", "removed-hop", "vendor");
+        for grant in [connected(&key, "current", 30), connected(&unbound, "unbound", 120)] {
+            sweeper
+                .vault
+                .store_grant(grant)
+                .await
+                .unwrap();
+        }
+
+        let (report, events) = crate::audit::producer::capture(sweeper.end_consents(now)).await;
+        assert_eq!(report, SweepReport::default(), "nothing has ended that the surface serves");
+        assert!(expiries(&events).is_empty());
+        assert!(server.requests().is_empty());
+
+        let ended = connected(&key, "ended", 120);
+        sweeper
+            .vault
+            .store_grant(ended.clone())
+            .await
+            .unwrap();
+        let (report, events) = crate::audit::producer::capture(sweeper.end_consents(now)).await;
+
+        assert_eq!(report.ended_consent_grants, 1, "{report:?}");
+        assert_eq!(report.ended_consent_tokens, 0, "{report:?}");
+        assert!(
+            sweeper
+                .vault
+                .grant(&key)
+                .await
+                .unwrap()
+                .is_none(),
+            "the grant is removed"
+        );
+        assert_eq!(
+            expiries(&events),
+            vec![(
+                key.record_id(),
+                format!(
+                    "consent_granted_at:{},consent_expired_at:{},source:sweep",
+                    stamp(ended.created_at),
+                    stamp(ended.created_at + chrono::Duration::hours(1))
+                )
+            )]
+        );
+        revoked(&server, &["ended", "ended-refresh"]).await;
+        assert!(
+            sweeper
+                .vault
+                .grant(&unbound)
+                .await
+                .unwrap()
+                .is_some(),
+            "a grant the surface no longer serves is the daily sweep's"
+        );
+    }
+
+    /// A binding's own limit, set after a grant was connected, ends it at
+    /// that limit, which the record names as its end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_hourly_pass_ends_a_grant_older_than_its_bindings_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = RecordingServer::start(200).await;
+        let sweeper = sweeper(&directory, &server, true).await;
+        let now = Utc::now();
+        let key = GrantKey::owner(Some("tenant-a"), "surface", "served", "vendor");
+        let mut grant = crate::delegation_vault::grants::tests::grant(&key, "older");
+        grant.created_at = now - chrono::Duration::minutes(20);
+        sweeper
+            .vault
+            .store_grant(grant.clone())
+            .await
+            .unwrap();
+
+        let report = sweeper
+            .end_consents(now)
+            .await;
+        assert_eq!(report, SweepReport::default(), "no limit applies yet");
+
+        limit_binding(&sweeper, 600).await;
+        let (report, events) = crate::audit::producer::capture(sweeper.end_consents(now)).await;
+
+        assert_eq!(report.ended_consent_grants, 1, "{report:?}");
+        assert_eq!(
+            expiries(&events),
+            vec![(
+                key.record_id(),
+                format!(
+                    "consent_granted_at:{},consent_expired_at:{},source:sweep",
+                    stamp(grant.created_at),
+                    stamp(grant.created_at + chrono::Duration::minutes(10))
+                )
+            )]
+        );
+        revoked(&server, &["older", "older-refresh"]).await;
+    }
+
+    /// An agent-keyed token with the consent given `minutes_ago` to
+    /// `credential_provider_id`, ending an hour after it when `with_end`.
+    fn token(
+        id: &str,
+        credential_provider_id: &str,
+        now: DateTime<Utc>,
+        minutes_ago: i64,
+        with_end: bool,
+    ) -> crate::delegation_vault::DelegationToken {
+        let mut token = crate::delegation_vault::tests::make_token(Some(3_600), true);
+        token.id = id.to_string();
+        token.user_identity_hash = format!("sha256:{id}");
+        token.credential_provider_id = credential_provider_id.to_string();
+        token.access_token = format!("{id}-access");
+        token.consent_granted_at = now - chrono::Duration::minutes(minutes_ago);
+        token.consent_expires_at = with_end.then(|| token.consent_granted_at + chrono::Duration::hours(1));
+        token
+    }
+
+    async fn stored_token_ids(sweeper: &Sweeper) -> Vec<String> {
+        let mut ids: Vec<String> = sweeper
+            .vault
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|token| token.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// The hourly pass removes an agent-keyed token whose consent is past
+    /// the end stored with it, or older than the limit its provider sets
+    /// now, and audits each as `consent_expired` found by the sweep. It keeps
+    /// a consent within its limit, a service token, which nobody consented
+    /// to, and a token of a deleted provider that has no stored end. No
+    /// vendor is called.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_hourly_pass_removes_agent_keyed_tokens_whose_consent_ended() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = RecordingServer::start(200).await;
+        let sweeper = sweeper(&directory, &server, true).await;
+        limit_provider(&sweeper, 3_600).await;
+        let mut service = crate::delegation_vault::revocation::tests::provider(None, "none", None);
+        service.id = "service".into();
+        service.provider_id = "service-0123456789ab".into();
+        service.provider_type = crate::credential_providers::CredentialProviderType::OAuth2ClientCredentials;
+        sweeper
+            .providers
+            .create(service)
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let ended = token("ended", "vendor", now, 120, true);
+        let stored = [
+            ended.clone(),
+            token("current", "vendor", now, 30, true),
+            token("limited-since", "vendor", now, 120, false),
+            token("service", "service", now, 60 * 24 * 400, false),
+            token("gone-ended", "gone", now, 120, true),
+            token("gone-unlimited", "gone", now, 120, false),
+        ];
+        for token in stored {
+            sweeper
+                .vault
+                .store(token)
+                .await
+                .unwrap();
+        }
+
+        let (report, events) = crate::audit::producer::capture(sweeper.end_consents(now)).await;
+
+        assert_eq!(report.ended_consent_tokens, 3, "{report:?}");
+        assert_eq!(stored_token_ids(&sweeper).await, vec!["current", "gone-unlimited", "service"]);
+        let mut expired = expiries(&events);
+        expired.sort();
+        let granted = stamp(ended.consent_granted_at);
+        let end = stamp(ended.consent_granted_at + chrono::Duration::hours(1));
+        assert_eq!(
+            expired,
+            ["ended", "gone-ended", "limited-since"].map(|id| (
+                id.to_string(),
+                format!("consent_granted_at:{granted},consent_expired_at:{end},source:sweep")
+            ))
+        );
+        let record = events
+            .iter()
+            .find(|event| event.token_id.as_deref() == Some("ended"))
+            .unwrap();
+        assert_eq!(record.agent_did.as_deref(), Some(ended.agent_did.as_str()));
+        assert_eq!(
+            record
+                .user_identity_hash
+                .as_deref(),
+            Some("sha256:ended")
+        );
+        assert_eq!(record.provider_id.as_deref(), Some("vendor"));
+        assert_eq!(
+            record
+                .provider_name
+                .as_deref(),
+            Some("Vendor")
+        );
+        assert!(server.requests().is_empty(), "an agent-keyed token is revoked at no vendor");
+    }
+
+    /// A pass told to stop, as when the node is demoted, removes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_consent_pass_told_to_stop_removes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = RecordingServer::start(200).await;
+        let sweeper = sweeper(&directory, &server, true).await;
+        limit_provider(&sweeper, 3_600).await;
+        let now = Utc::now();
+        sweeper
+            .vault
+            .store(token("ended", "vendor", now, 120, true))
+            .await
+            .unwrap();
+        let key = GrantKey::owner(Some("tenant-a"), "surface", "served", "vendor");
+        let mut grant = crate::delegation_vault::grants::tests::grant(&key, "ended");
+        grant.created_at = now - chrono::Duration::hours(2);
+        sweeper
+            .vault
+            .store_grant(grant)
+            .await
+            .unwrap();
+
+        let report = sweeper
+            .end_consents_while(now, || false)
+            .await;
+
+        assert_eq!(report, SweepReport::default());
+        assert_eq!(stored_token_ids(&sweeper).await, vec!["ended"]);
+        assert!(
+            sweeper
+                .vault
+                .grant(&key)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(server.requests().is_empty());
     }
 }
