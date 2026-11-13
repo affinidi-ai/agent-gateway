@@ -2206,6 +2206,58 @@ mod tests {
         assert_eq!(fixture.vault_records(), 1);
     }
 
+    /// A deactivated provider takes no new consent: a link minted before it
+    /// was deactivated opens no start page and starts nothing, and a consent
+    /// already on its way to the vendor is not completed. Activated again, it
+    /// consents as before.
+    #[tokio::test]
+    async fn a_deactivated_provider_starts_and_completes_no_consent() {
+        let fixture = consent::Fixture::new().await;
+        let origin = [("origin", "https://198.51.100.7")];
+        let start_url = fixture.start_url();
+        let (under_way, cookie) = fixture.begin().await;
+        let set_active = |active: bool| {
+            let fixture = &fixture;
+            async move {
+                let mut provider = fixture.provider();
+                provider.deactivated_at = (!active).then(Utc::now);
+                fixture
+                    .providers
+                    .update(provider)
+                    .await
+                    .unwrap();
+            }
+        };
+
+        set_active(false).await;
+        let (refused, events) = capture(async {
+            fixture
+                .start_post(&consent::start_state(&start_url), &origin)
+                .await
+        })
+        .await;
+        consent::assert_refused(&refused, StatusCode::BAD_REQUEST, None);
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ProviderDeactivated]);
+        let (completed, events) = capture(async {
+            fixture
+                .callback("github", &format!("code=vendor-code&state={under_way}"), Some(&cookie))
+                .await
+        })
+        .await;
+        assert_eq!(completed.status, StatusCode::BAD_REQUEST, "{}", completed.body);
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ProviderDeactivated]);
+        assert_eq!(fixture.vault_records(), 0, "nothing is stored");
+        assert_eq!(fixture.token_calls(), 0, "and the vendor's token endpoint is not called");
+
+        set_active(true).await;
+        let (callback_state, cookie) = fixture.begin().await;
+        let done = fixture
+            .callback("github", &format!("code=vendor-code&state={callback_state}"), Some(&cookie))
+            .await;
+        assert_eq!(done.status, StatusCode::OK, "{}", done.body);
+        assert_eq!(fixture.vault_records(), 1);
+    }
+
     /// A consent confirmed at the identity provider first keeps its time
     /// limit through both redirects, so the stored consent ends when the
     /// start page said it would.

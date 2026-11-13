@@ -219,6 +219,13 @@ shows a caller's Principal beside Subject when its strategy names a claim other 
 _Credential delegation audit_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-delegation-audit).
 
+A credential provider a person consents to is deactivated, never deleted, from the dashboard:
+**Deactivate** (two clicks, in place) and **Activate** on the Credential Providers tab stop and
+restore new consent only, and the provider's row, its tokens and its audit records stay; see
+_Credential provider editor_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor) and
+[`docs/CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md#deactivating-a-provider).
+
 The credential provider editor's **Consent time limit** (Authorization Code providers only)
 writes `max_consent_age_secs`, `0` when empty, and the Surface Builder keeps and shows a
 binding's own limit, which is set through the API; see _Credential provider editor_ and _Surface

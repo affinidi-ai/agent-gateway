@@ -173,7 +173,8 @@ async fn authorize_ticket(
         .await
         .map_err(|_| ContinuationError::Unavailable)?
         .ok_or(ContinuationError::NotFound)?;
-    if provider_digest(&provider)? != ticket.provider_digest
+    if provider.is_deactivated()
+        || provider_digest(&provider)? != ticket.provider_digest
         || !crate::tenancy::can_reference(surface.tenant_id.as_deref(), provider.tenant_id.as_deref())
     {
         return Err(ContinuationError::BindingMismatch);

@@ -195,8 +195,8 @@ async fn managed_surface(
     }
 }
 
-/// The external consent provider `id` of `tenant_id`, if it is one and the
-/// operator's rules still permit it.
+/// The external consent provider `id` of `tenant_id`, if it is one, takes
+/// new consent and the operator's rules still permit it.
 async fn permitted_provider(
     state: &DelegationVaultState,
     id: &str,
@@ -209,6 +209,9 @@ async fn permitted_provider(
         .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "provider_unavailable"))?
         .filter(|provider| provider.is_external_consent() && provider.tenant_id.as_deref() == tenant_id)
         .ok_or((StatusCode::CONFLICT, "provider_unavailable"))?;
+    if provider.is_deactivated() {
+        return Err((StatusCode::CONFLICT, "provider_deactivated"));
+    }
     let issuers = state.issuers.rules();
     if crate::credential_providers::external::issuer_permitted(&provider, issuers).is_err() {
         warn!(
@@ -1695,6 +1698,65 @@ mod tests {
                 .contains("access-1"),
             "no token is listed"
         );
+    }
+
+    /// A deactivated provider takes no new connect: one is refused at its
+    /// start, and one started before the deactivation is refused when it is
+    /// completed, before any code is redeemed. Activated again, it connects.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deactivated_provider_starts_and_completes_no_connect() {
+        let fixture = Fixture::new(vec![token_answer("access-1")]).await;
+        let (status, under_way) = fixture
+            .start(Some("tenant-a"), owner_start())
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{under_way}");
+        let set_active = |active: bool| {
+            let providers = fixture
+                .state
+                .provider_store
+                .clone();
+            async move {
+                let mut provider = providers
+                    .get("vendor")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                provider.deactivated_at = (!active).then(Utc::now);
+                providers
+                    .update(provider)
+                    .await
+                    .unwrap();
+            }
+        };
+
+        set_active(false).await;
+        let (status, refused) = fixture
+            .start(Some("tenant-a"), owner_start())
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "provider_deactivated", "{refused}");
+        let (status, completed) = fixture
+            .complete(
+                under_way["connect_id"]
+                    .as_str()
+                    .unwrap(),
+                json!({"code": "the-code", "iss": fixture.issuer()}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{completed}");
+        assert_eq!(completed["reason"], "provider_deactivated", "{completed}");
+        assert!(
+            fixture
+                .token_requests()
+                .is_empty(),
+            "no code is redeemed for a deactivated provider"
+        );
+
+        set_active(true).await;
+        let (status, started) = fixture
+            .start(Some("tenant-a"), owner_start())
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{started}");
     }
 
     /// Under a consent time limit a connect says how long the grant will last

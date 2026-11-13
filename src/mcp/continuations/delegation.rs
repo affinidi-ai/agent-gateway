@@ -94,8 +94,16 @@ fn authorization_digest(
     }))
 }
 
+/// The digest of the provider record a consent is bound to. Whether the
+/// provider is deactivated is left out of it: deactivating a provider stops
+/// new consent and must not end the consents it already has.
 pub fn provider_digest(provider: &CredentialProvider) -> Result<[u8; 32], ContinuationError> {
-    digest(provider)
+    if !provider.is_deactivated() {
+        return digest(provider);
+    }
+    let mut active = provider.clone();
+    active.deactivated_at = None;
+    digest(&active)
 }
 
 pub fn surface_digest(surface: &AgentSurface) -> Result<[u8; 32], ContinuationError> {

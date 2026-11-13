@@ -147,7 +147,7 @@ const SIDEBAR_PAGES: LayoutPage[] = [
         actions: [
             ...CREDENTIALS,
             'credential-providers-add-button',
-            `credential-provider-delete-button-${FIXTURE_ID.credentialProvider}`,
+            `credential-provider-deactivate-button-${FIXTURE_ID.credentialProvider}`,
         ],
     },
     {

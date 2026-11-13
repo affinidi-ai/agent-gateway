@@ -4107,6 +4107,22 @@ fn caller_has_no_delegated_credentials(
 ) {
 }
 
+#[given(expr = "an operator has deactivated OAuth provider {string}")]
+async fn operator_has_deactivated_oauth_provider(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    crate::steps::when::set_oauth_provider_active(world, &provider, false).await;
+}
+
+#[given(expr = "an operator has activated OAuth provider {string} again")]
+async fn operator_has_activated_oauth_provider_again(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    crate::steps::when::set_oauth_provider_active(world, &provider, true).await;
+}
+
 #[given(expr = "OAuth provider {string} is ready to exchange an authorization code for delegated credentials")]
 async fn oauth_provider_ready_to_exchange_code(
     world: &mut SurfaceWorld,

@@ -1941,6 +1941,7 @@ provider's tenant ([`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-audit-record
 | `consent_state_invalid` | The state is missing, not sealed by this gateway, expired, or of another stage, or the start POST's binding cookie cannot be sent; or the provider's [`consent_confirmation`](#consent-confirmation) or its strategy changed since the link was minted, or, at `/confirm`, the surface it was minted on is gone or now another tenant's |
 | `consent_state_reused` | The start state or callback state was already used on this process |
 | `consent_provider_mismatch` | The path's last segment is not that of the state's provider's `callback_path`, or that provider is gone or changed |
+| `provider_deactivated` | The state's provider was [deactivated](#deactivating-a-provider) and takes no new consent |
 | `browser_binding_mismatch` | The callback or the confirmation callback has no binding cookie, or another browser's (`403`) |
 | `iss_missing`, `iss_mismatch` | The callback lacks, or differs from, the provider's `authorization_response_issuer`; or the confirmation callback carries an `iss` other than its strategy's `expected_issuer` |
 | `consent_response_invalid` | The callback is malformed, carries no code, or an `error` outside `[A-Za-z0-9_]{1,128}` |
@@ -2770,6 +2771,7 @@ out. The connect's log line names the same, and a refresh refused for a wider gr
 | `400` | `iss_mismatch`, `iss_missing` | `iss` is not the provider's, or is missing for an issuer that sends it; the connect is not claimed, and stays open |
 | `502` | `invalid_client`, `invalid_grant`, `token_endpoint_refused`, `token_endpoint_unreachable`, `invalid_token_response`, `client_unavailable`, `scope_widened`, `no_refresh_token` | The token endpoint refused the client (re-register it) or the code, refused otherwise, could not be reached or failed, answered something that is not a `Bearer` token, the client's secret cannot be resolved, more scopes were granted than asked for, or an access token that expires came without a refresh token for a provider with `token_refresh_enabled` (ask the vendor for offline access, or turn the provider's refresh off) |
 | `409` | `binding_removed`, `binding_changed`, `provider_unavailable` | The binding or the provider went away, or the binding was narrowed below the scopes asked for, while the person consented |
+| `409` | `provider_deactivated` | The provider was [deactivated](#deactivating-a-provider) and takes no new connect; the connect is not claimed, and stays open |
 | `403` | `issuer_not_permitted`, `resource_not_permitted` | The operator's rules no longer permit the provider |
 
 `GET /api/v1/delegation-vault/grants?surface_id=[&hop=][&principal=]` reports each
@@ -2998,6 +3000,28 @@ unavailable, or the grants stored were written under another identity hash peppe
 secrets store a change still removes its grants; a client that needs a secret is then not
 revoked (`skipped`, `no_secrets_store`).
 
+### Deactivating a provider
+
+A provider a person consents to, an `oauth2_authorization_code` one with an `issuer` or
+without, can be deactivated instead of deleted. `POST /api/v1/credential-providers/{id}/deactivate`
+sets `deactivated_at`, and `POST /api/v1/credential-providers/{id}/activate` clears it; both
+need `credential_providers.edit`, answer with the provider, and change nothing when it is
+already in that state. Any other provider type answers `400` `provider_takes_no_consent`:
+nobody consents to it, so there is nothing to stop.
+
+A deactivated provider takes no new consent, and nothing else changes:
+
+| | While the provider is deactivated |
+| --- | --- |
+| The provider's record | Kept whole, and still editable: an edit keeps the provider deactivated, also one saved at the same moment as the deactivation. Retyped to a type nobody consents to, it is no longer deactivated. Tokens, grants, bindings and audit records keep pointing to it |
+| Credentials people already consented to | Injected and refreshed as before, until they end at their [time limit](#consent-time-limit) or are revoked. A `2026-07-28` consent stays bound to its provider: the deactivation is left out of the provider digest, and `updated_at` is not changed. An edit of the provider still ends its `2026-07-28` consents, as it does while the provider is active, and nobody can give a new one until the provider is activated |
+| A caller with no stored credential, or one whose consent ended | No consent is asked for. The binding records `provider_unavailable` with detail `provider_deactivated` and the request is refused `503`; on the `2026-07-28` path it is refused as unavailable, with no input request |
+| A consent link minted earlier, or a consent on its way to the vendor | Refused at the start page, the start POST, the confirmation and the callback with `provider_deactivated` (`400`); nothing is stored and no code is exchanged |
+| The connect API | `POST .../connects` and `.../complete` answer `409` `provider_deactivated`; a refused completion leaves the connect open |
+
+The dashboard offers **Deactivate** and **Activate** in place of Delete for these providers.
+`DELETE` still deletes one through the API, as described next.
+
 ### Deleting a provider
 
 `DELETE /api/v1/credential-providers/{id}` is refused with `409` and `code`
@@ -3203,7 +3227,8 @@ instance runs the new release, as an instance still on the old one writes the ol
 
 Credential providers have their own management routes in
 [`src/credential_providers/router.rs`](../src/credential_providers/router.rs), gated on
-the `credential_providers.*` permissions. A provider a surface binds cannot be deleted
+the `credential_providers.*` permissions. A provider a person consents to can be
+[deactivated](#deactivating-a-provider), which stops new consent and keeps everything else. A provider a surface binds cannot be deleted
 ([Deleting a provider](#deleting-a-provider)).
 
 In the dashboard these live on the Credentials page, under the **Credential Providers**,

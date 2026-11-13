@@ -48,6 +48,18 @@ changes:
         revoke confirmed by a second click. Service tokens, ended consents and tokens that can
         no longer be refreshed are left out, and a History button opens the Audit Log on the
         records of access that ended or was revoked.
+    - timestamp: '2026-11-13T20:00:00Z'
+      title: Deactivate a credential provider instead of deleting it
+      description: >-
+        A credential provider a person consents to can be deactivated with `POST
+        /api/v1/credential-providers/{id}/deactivate` and activated again with `.../activate`. A
+        deactivated provider takes no new consent: a caller without a stored credential is refused
+        instead of being asked, earlier consent links and consents under way are refused with
+        `provider_deactivated`, and the connect API answers `409 provider_deactivated`. Nothing
+        else changes: the provider's record stays, and the credentials people already consented
+        to are used and refreshed until they end or are revoked. The dashboard offers Deactivate
+        and Activate in place of Delete for these providers, marks a deactivated one, and keeps
+        it in the list. Other provider types, and `DELETE` through the API, are unchanged.
   changed:
     - timestamp: '2026-11-13T15:00:00Z'
       title: Show when each consent ends on the Credential Tokens tab

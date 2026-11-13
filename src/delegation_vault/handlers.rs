@@ -602,7 +602,8 @@ fn refused_provider<'a>(
 /// The provider a consent state names, checked against the path: the stored
 /// provider still has the state's id and slug, is an authorization code
 /// provider without an issuer, and its `callback_path` ends in the path's
-/// segment.
+/// segment. A provider deactivated since the link was minted is refused at
+/// every stage, so a consent under way is not completed.
 async fn consent_provider(
     state: &DelegationVaultState,
     path_segment: &str,
@@ -623,7 +624,11 @@ async fn consent_provider(
                     .next()
                     == Some(path_segment) =>
         {
-            Ok(provider)
+            if provider.is_deactivated() {
+                Err(ConsentRefusal::bad_request(DelegationFailureReason::ProviderDeactivated))
+            } else {
+                Ok(provider)
+            }
         }
         Ok(_) => Err(ConsentRefusal::bad_request(DelegationFailureReason::ConsentProviderMismatch)),
         Err(e) => {

@@ -1086,6 +1086,16 @@ pub async fn resolve_delegation_credentials(
                     user_hash = %user_identity_hash,
                     "No valid delegation token — consent required"
                 );
+                if provider.is_deactivated() {
+                    results.push(DelegationResolution::new(
+                        binding,
+                        Some(&provider.name),
+                        DelegationActionOutcome::ProviderUnavailable,
+                        Some(PROVIDER_DEACTIVATED.to_string()),
+                        DelegationLookupResult::Unavailable,
+                    ));
+                    continue;
+                }
                 // NOTE: the per-binding `ConsentRequired` audit event used to
                 // be emitted here, but that produced two audit rows per
                 // request (one per binding + one request-level summary from
@@ -1319,6 +1329,10 @@ pub fn inject_delegated_credential_into_mcp_meta(
     metadata.insert(field.to_string(), serde_json::Value::String(access_token.to_string()));
     Ok(serde_json::to_vec(&json_body)?)
 }
+
+/// Why a binding with no stored credential is refused without asking for
+/// consent: its provider was deactivated and takes no new consent.
+const PROVIDER_DEACTIVATED: &str = "provider_deactivated";
 
 /// What ends a stored consent that is past its time limit, and tells one a
 /// binding finds too old from one it may use.
@@ -2148,6 +2162,7 @@ mod tests {
     ) -> CredentialProvider {
         let now = Utc::now();
         CredentialProvider {
+            deactivated_at: None,
             max_consent_age_secs: None,
             id: id.to_string(),
             tenant_id: None,
@@ -4700,6 +4715,17 @@ mod tests {
         binding: OutboundCredentialBinding,
         provider_secs: Option<u64>,
     ) -> (Vec<DelegationResolution>, Vec<audit::DelegationAuditEvent>, Option<DelegationToken>) {
+        let mut provider = make_credential_provider("cp-1", CredentialProviderType::OAuth2AuthorizationCode);
+        provider.max_consent_age_secs = provider_secs;
+        resolve_with_provider(token, binding, provider).await
+    }
+
+    /// [`resolve_with_stored_consent`], for `provider` as it is stored.
+    async fn resolve_with_provider(
+        token: DelegationToken,
+        binding: OutboundCredentialBinding,
+        provider: CredentialProvider,
+    ) -> (Vec<DelegationResolution>, Vec<audit::DelegationAuditEvent>, Option<DelegationToken>) {
         let directory = tempfile::tempdir().unwrap();
         let vault: Arc<dyn DelegationVaultStorage> = Arc::new(
             crate::delegation_vault::storage::FileSystemDelegationVaultStore::new(directory.path().into())
@@ -4710,8 +4736,6 @@ mod tests {
             .store(token)
             .await
             .unwrap();
-        let mut provider = make_credential_provider("cp-1", CredentialProviderType::OAuth2AuthorizationCode);
-        provider.max_consent_age_secs = provider_secs;
         let providers: Arc<dyn CredentialProviderStorage> = MockProviderStore::with_stored(provider);
         let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let (results, events) = crate::audit::producer::capture(resolve_delegation_credentials(
@@ -4855,6 +4879,75 @@ mod tests {
         assert_eq!(results[0].action.outcome, DelegationActionOutcome::TokenInjected);
         assert!(kept.is_some());
         assert_eq!(categories(&events), vec!["token_injected"]);
+    }
+
+    fn deactivated_provider() -> CredentialProvider {
+        let mut provider = make_credential_provider("cp-1", CredentialProviderType::OAuth2AuthorizationCode);
+        provider.deactivated_at = Some(Utc::now());
+        provider
+    }
+
+    /// A deactivated provider keeps serving the consent a caller already
+    /// gave: its record and its stored credentials are untouched.
+    #[tokio::test]
+    async fn a_deactivated_provider_keeps_serving_the_consent_it_has() {
+        let token = consented(Duration::minutes(10), None, false, true);
+        let (results, events, kept) = resolve_with_provider(token, make_binding("cp-1"), deactivated_provider()).await;
+
+        assert_eq!(result_tag(&results[0].result), "Inject");
+        assert_eq!(results[0].action.outcome, DelegationActionOutcome::TokenInjected);
+        assert!(kept.is_some());
+        assert_eq!(categories(&events), vec!["token_injected"]);
+    }
+
+    /// A caller with no credential of a deactivated provider is not asked for
+    /// consent: the request is refused, and no consent link is minted. The
+    /// same caller of an active provider is asked.
+    #[tokio::test]
+    async fn a_deactivated_provider_asks_for_no_new_consent() {
+        let someone_else = || {
+            let mut token = consented(Duration::minutes(10), None, false, true);
+            token.user_identity_hash = "sha256:someone-else".to_string();
+            token
+        };
+        let (results, events, kept) =
+            resolve_with_provider(someone_else(), make_binding("cp-1"), deactivated_provider()).await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(result_tag(&results[0].result), "Unavailable");
+        assert_eq!(results[0].action.outcome, DelegationActionOutcome::ProviderUnavailable);
+        assert_eq!(
+            results[0]
+                .action
+                .detail
+                .as_deref(),
+            Some("provider_deactivated")
+        );
+        assert!(kept.is_some(), "another caller's consent is left alone");
+        assert!(events.is_empty(), "{:?}", categories(&events));
+
+        let active = make_credential_provider("cp-1", CredentialProviderType::OAuth2AuthorizationCode);
+        let (results, _, _) = resolve_with_provider(someone_else(), make_binding("cp-1"), active).await;
+        assert_start_url(&results[0].result);
+    }
+
+    /// A consent of a deactivated provider that reaches its time limit is
+    /// removed as any other, and is not asked for again.
+    #[tokio::test]
+    async fn an_ended_consent_of_a_deactivated_provider_is_removed_and_not_asked_for_again() {
+        let token = consented(Duration::hours(2), Some(-Duration::hours(1)), false, true);
+        let (results, events, kept) = resolve_with_provider(token, make_binding("cp-1"), deactivated_provider()).await;
+
+        assert_eq!(result_tag(&results[0].result), "Unavailable");
+        assert_eq!(
+            results[0]
+                .action
+                .detail
+                .as_deref(),
+            Some("provider_deactivated")
+        );
+        assert!(kept.is_none(), "the ended consent is removed");
+        assert_eq!(categories(&events), vec!["consent_expired"]);
     }
 
     #[tokio::test]

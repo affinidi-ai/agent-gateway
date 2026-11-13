@@ -275,6 +275,72 @@ test.describe("Credentials page Credential Delegation Audit tab", () => {
   });
 });
 
+test.describe("Credential Providers tab deactivation", () => {
+  test("deactivates a consent provider on a second click, keeps it listed and activates it again", async ({
+    page,
+  }) => {
+    const provider = {
+      id: "p1",
+      name: "GitHub",
+      provider_id: "github",
+      provider_type: "oauth2_authorization_code",
+      token_endpoint: "https://github.com/login/oauth/access_token",
+      default_scopes: ["repo"],
+      token_refresh_enabled: true,
+      created_at: "2026-10-30T00:00:00Z",
+      updated_at: "2026-10-30T00:00:00Z",
+    };
+    const calls: string[] = [];
+    let dialogs = 0;
+    page.on("dialog", async (dialog) => {
+      dialogs += 1;
+      await dialog.dismiss();
+    });
+    await page.route("**/api/v1/credential-providers", async (route) => {
+      await route.fulfill({ json: [provider] });
+    });
+    await page.route("**/api/v1/credential-providers/p1/*", async (route) => {
+      const path = new URL(route.request().url()).pathname;
+      calls.push(path);
+      await route.fulfill({
+        json: path.endsWith("/deactivate")
+          ? { ...provider, deactivated_at: "2026-11-13T10:00:00Z" }
+          : provider,
+      });
+    });
+    await page.goto(`${BASE_URL}/credentials?tab=credential-providers`);
+    const deactivate = page.getByTestId(
+      "credential-provider-deactivate-button-p1",
+    );
+    await expect(
+      page.getByTestId("credential-provider-delete-button-p1"),
+    ).toHaveCount(0);
+
+    await deactivate.click();
+    await expect(deactivate).toContainText("Click again to deactivate");
+    expect(calls).toEqual([]);
+
+    await deactivate.click();
+    await expect(
+      page.getByTestId("credential-provider-deactivated-badge-p1"),
+    ).toHaveText("Deactivated");
+    await expect(page.getByTestId("credential-provider-row-p1")).toBeVisible();
+    expect(calls).toEqual(["/api/v1/credential-providers/p1/deactivate"]);
+
+    await page.getByTestId("credential-provider-activate-button-p1").click();
+    await expect(
+      page.getByTestId("credential-provider-deactivated-badge-p1"),
+    ).toHaveCount(0);
+    await expect(deactivate).toBeVisible();
+    expect(calls).toEqual([
+      "/api/v1/credential-providers/p1/deactivate",
+      "/api/v1/credential-providers/p1/activate",
+    ]);
+    expect(dialogs).toBe(0);
+    await expect(page.locator('[role="dialog"]')).toHaveCount(0);
+  });
+});
+
 test.describe("Credential provider editor consent time limit", () => {
   const LIMIT = "credential-provider-consent-limit-input";
   const UNIT = "credential-provider-consent-limit-unit-select";

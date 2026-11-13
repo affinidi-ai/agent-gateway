@@ -644,6 +644,12 @@ pub struct CredentialProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consent_confirmation: Option<ConsentConfirmation>,
 
+    /// When the provider was deactivated. From then on it takes no new
+    /// consent, while the credentials people already consented to are used
+    /// and refreshed as before. An authorization code provider only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deactivated_at: Option<DateTime<Utc>>,
+
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -861,6 +867,18 @@ impl CredentialProvider {
     /// delegation vault by binding.
     pub fn is_external_consent(&self) -> bool {
         self.issuer.is_some()
+    }
+
+    /// Whether a person consents to this provider's credential: an
+    /// authorization code provider, with an `issuer` or without.
+    pub fn takes_consent(&self) -> bool {
+        self.provider_type == CredentialProviderType::OAuth2AuthorizationCode
+    }
+
+    /// Whether the provider takes no new consent: it was deactivated, and
+    /// only the credentials people already consented to are still used.
+    pub fn is_deactivated(&self) -> bool {
+        self.deactivated_at.is_some()
     }
 
     /// Whether a person grants this provider's credential through the gateway's
@@ -1336,6 +1354,8 @@ pub struct CredentialProviderListItem {
     pub send_resource: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_consent_age_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deactivated_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1381,6 +1401,7 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
             revocation_ends_authorization: p.revocation_ends_authorization,
             send_resource: p.send_resource,
             max_consent_age_secs: p.max_consent_age_secs,
+            deactivated_at: p.deactivated_at,
             created_at: p.created_at,
             updated_at: p.updated_at,
         }
@@ -1913,6 +1934,7 @@ mod tests {
     ) -> CredentialProvider {
         let now = Utc::now();
         CredentialProvider {
+            deactivated_at: None,
             max_consent_age_secs: None,
             id: uuid::Uuid::new_v4().to_string(),
             tenant_id: None,
@@ -2047,6 +2069,7 @@ mod tests {
     fn test_api_key_provider_no_oauth_fields() {
         let now = Utc::now();
         let provider = CredentialProvider {
+            deactivated_at: None,
             max_consent_age_secs: None,
             id: "cp-api".to_string(),
             tenant_id: None,

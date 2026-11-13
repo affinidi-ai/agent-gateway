@@ -303,8 +303,11 @@ export const NO_CONSENT_LIMIT: ConsentLimitFields = {
   consent_limit_unit: 'hours',
 };
 
-/** Whether a person consents to a provider of this type, the only kind a time limit applies to. */
-export function takesConsentLimit(type: CredentialProviderType): boolean {
+/**
+ * Whether a person consents to a provider of this type. Only such a provider takes a consent
+ * time limit, and only such a provider can be deactivated.
+ */
+export function takesConsent(type: CredentialProviderType): boolean {
   return type === 'oauth2_authorization_code';
 }
 
@@ -324,7 +327,7 @@ export function consentLimitSeconds(
   form: ConsentLimitFields & { provider_type: CredentialProviderType }
 ): number | null {
   const amount = form.consent_limit_amount.trim();
-  if (!takesConsentLimit(form.provider_type) || !amount) return 0;
+  if (!takesConsent(form.provider_type) || !amount) return 0;
   if (!/^\d+$/.test(amount)) return null;
   const secs = Number(amount) * secondsIn(form.consent_limit_unit);
   return secs >= MIN_CONSENT_LIMIT_SECS && secs <= MAX_CONSENT_LIMIT_SECS ? secs : null;

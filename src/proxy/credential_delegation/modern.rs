@@ -691,6 +691,12 @@ impl ModernDelegationContext<'_> {
             };
             let credential = credential.filter(|credential| verified_credential(credential, &provider, now));
             let Some(credential) = credential else {
+                if provider
+                    .provider
+                    .is_deactivated()
+                {
+                    return Err(ContinuationError::Unavailable.into());
+                }
                 if !starts_consent {
                     return Err(ModernDelegationError::ConsentNotAvailableForPartners);
                 }
@@ -2864,6 +2870,25 @@ mod tests {
                 .unwrap();
         }
 
+        /// Deactivates the fixture's provider, or makes it active again, as
+        /// the management API does: its `updated_at` is left alone.
+        async fn set_provider_active(
+            &self,
+            active: bool,
+        ) {
+            let mut provider = self
+                .providers
+                .get("provider")
+                .await
+                .unwrap()
+                .unwrap();
+            provider.deactivated_at = (!active).then(chrono::Utc::now);
+            self.providers
+                .update(provider)
+                .await
+                .unwrap();
+        }
+
         /// The message of the consent the preparation of a tool call asks
         /// for, the audit records it wrote and whether the vault still holds
         /// the stored credential; `None` for a call prepared with it.
@@ -2907,6 +2932,39 @@ mod tests {
                 .is_some();
             (message, categories, kept)
         }
+    }
+
+    /// Deactivating a provider leaves the consent a caller already gave in
+    /// use on the 2026-07-28 path, and activating it again changes nothing
+    /// for that consent. A caller without one is refused and not asked.
+    #[tokio::test]
+    async fn a_deactivated_provider_serves_its_modern_consents_and_asks_for_no_new_one() {
+        let minutes = chrono::Duration::minutes;
+        let fixture = ConsentFixture::new(None).await;
+        fixture
+            .store_consent(minutes(10), None)
+            .await;
+        fixture
+            .set_provider_active(false)
+            .await;
+        assert_eq!(fixture.prepare().await, (None, vec![], true), "the consent it has is still used");
+        fixture
+            .set_provider_active(true)
+            .await;
+        assert_eq!(fixture.prepare().await, (None, vec![], true), "and again once the provider is active");
+
+        let without = ConsentFixture::new(None).await;
+        without
+            .set_provider_active(false)
+            .await;
+        let refused = without
+            .context()
+            .prepare(&ConsentFixture::tool_call(), 10)
+            .await;
+        assert!(
+            matches!(refused, Err(ModernDelegationError::Continuation(ContinuationError::Unavailable))),
+            "a caller without a consent is refused, not asked"
+        );
     }
 
     /// A consent past its time limit is removed on the 2026-07-28 path, and

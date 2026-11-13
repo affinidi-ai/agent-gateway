@@ -116,6 +116,9 @@ pub async fn mint_consent_link(
     provider_store: &dyn crate::credential_providers::storage::CredentialProviderStorage,
     max_consent_age_secs: Option<u64>,
 ) -> Result<String> {
+    if provider.is_deactivated() {
+        return Err(anyhow!("Provider '{}' is deactivated and takes no new consent", provider.provider_id));
+    }
     provider
         .consent_redirect_uri(gateway_base_url)
         .map_err(|reason| anyhow!("Provider '{}': {reason}", provider.provider_id))?;
@@ -3792,6 +3795,7 @@ mod tests {
     #[test]
     fn test_build_consent_required_format() {
         let provider = CredentialProvider {
+            deactivated_at: None,
             max_consent_age_secs: None,
             id: "cp-1".to_string(),
             tenant_id: None,
@@ -3847,6 +3851,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_delegation_vc_structure() {
         let provider = CredentialProvider {
+            deactivated_at: None,
             max_consent_age_secs: None,
             id: "cp-1".to_string(),
             tenant_id: None,
@@ -4050,6 +4055,7 @@ mod tests {
         let signer: Arc<dyn VcSigner> = Arc::new(LocalVcSigner::new(config));
 
         let provider = CredentialProvider {
+            deactivated_at: None,
             max_consent_age_secs: None,
             id: "cp-1".to_string(),
             tenant_id: None,

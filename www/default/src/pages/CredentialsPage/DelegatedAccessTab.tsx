@@ -21,6 +21,8 @@ interface ProviderSummary {
   id: string;
   name: string;
   provider_type?: string;
+  /** Set once the provider takes no new consent. */
+  deactivated_at?: string | null;
 }
 
 interface DelegatedAccessTabProps {
@@ -111,9 +113,9 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
       );
       if (!response.ok) throw new Error(`Revoke failed: ${response.statusText}`);
       setTokens(prev => prev.filter(t => t.id !== token.id));
-      showToast('Access revoked', 'success');
+      showToast('success', 'Access revoked');
     } catch (e: any) {
-      showToast(`Failed to revoke: ${e.message}`, 'error');
+      showToast('error', `Failed to revoke: ${e.message}`);
     }
   };
 
@@ -199,6 +201,15 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
                       </td>
                       <td>
                         <strong>{systemOf(token)}</strong>
+                        {providers[token.credential_provider_id]?.deactivated_at && (
+                          <span
+                            className="badge text-bg-secondary ms-2"
+                            title="This provider is deactivated. Access already given keeps working; nobody can consent to it again."
+                            data-testid={`delegated-access-provider-deactivated-${token.id}`}
+                          >
+                            No new consent
+                          </span>
+                        )}
                       </td>
                       <td>
                         <code className="text-muted" title={token.agent_did}>

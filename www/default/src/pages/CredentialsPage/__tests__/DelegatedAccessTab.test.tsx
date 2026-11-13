@@ -2,6 +2,7 @@ import React from 'react';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { apiClient } from '../../../api';
+import { showToast } from '../../../utils/toaster';
 import DelegatedAccessTab from '../DelegatedAccessTab';
 
 jest.mock('../../../api', () => ({
@@ -130,6 +131,7 @@ describe('Delegated Access tab', () => {
     await waitFor(() => expect(deletes()).toHaveLength(1), WAIT);
     expect(deletes()[0][0]).toBe('/api/v1/delegation-vault/t1');
     await waitFor(() => expect(rowIds()).toEqual(['t2']), WAIT);
+    expect(showToast).toHaveBeenCalledWith('success', 'Access revoked');
   });
 
   it('offers no revoke to a user who may not edit', async () => {
@@ -167,6 +169,23 @@ describe('Delegated Access tab', () => {
 
     expect(rowIds()).toEqual(['t2']);
     await waitFor(() => expect(onFilteredCountChange).toHaveBeenLastCalledWith(1), WAIT);
+  });
+
+  it('keeps showing the access of a deactivated provider, marked as taking no new consent', async () => {
+    await renderTab(
+      [token('t1'), token('t2', { credential_provider_id: 'cp-other', provider_id: 'other' })],
+      {},
+      [
+        { ...PROVIDERS[0], deactivated_at: '2026-11-13T10:00:00Z' },
+        { id: 'cp-other', name: 'Other', provider_type: 'oauth2_authorization_code' },
+      ]
+    );
+
+    expect(rowIds()).toEqual(['t1', 't2']);
+    expect(screen.getByTestId('delegated-access-provider-deactivated-t1')).toHaveTextContent(
+      'No new consent'
+    );
+    expect(screen.queryByTestId('delegated-access-provider-deactivated-t2')).toBeNull();
   });
 
   it('keeps listing access while the providers cannot be read', async () => {

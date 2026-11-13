@@ -66,5 +66,13 @@ pub fn create_credential_providers_router(
             "/api/v1/credential-providers/{id}",
             maybe_gate(gate, delete(handlers::delete_provider), Feature::CredentialProvidersDelete),
         )
+        .route(
+            "/api/v1/credential-providers/{id}/deactivate",
+            maybe_gate(gate, post(handlers::deactivate_provider), Feature::CredentialProvidersEdit),
+        )
+        .route(
+            "/api/v1/credential-providers/{id}/activate",
+            maybe_gate(gate, post(handlers::activate_provider), Feature::CredentialProvidersEdit),
+        )
         .with_state(state)
 }

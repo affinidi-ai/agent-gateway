@@ -1,9 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import { usePermissions } from '../../context/PermissionsContext';
-import { useTwoStepDelete } from '../../hooks/useTwoStepDelete';
 import { AppButton } from '../../components/shared/AppButton';
 import { Badge } from '../../components/shared/Badge';
 import { DeleteButton } from '../../components/shared/DeleteButton';
+import { TwoStepButton } from '../../components/shared/TwoStepButton';
 import { CopyButton } from '../../components/shared/CopyButton';
 import { apiClient } from '../../api';
 import { showToast } from '../../utils/toaster';
@@ -21,45 +21,6 @@ interface CredentialTokensTabProps {
 }
 
 const PAGE_SIZE = 10;
-
-interface RevokeUserButtonProps {
-  token: DelegationToken;
-  onRevoke: () => Promise<void>;
-}
-
-/** Revokes every delegation of a row's user, on a second click that confirms the first. */
-const RevokeUserButton: React.FC<RevokeUserButtonProps> = ({ token, onRevoke }) => {
-  const { isConfirming, isProcessing, handleClick, buttonRef } = useTwoStepDelete(onRevoke);
-  const user = topAndTail(token.user_identity_hash, 8, 8);
-  const icon = isProcessing
-    ? 'fa-spinner fa-spin'
-    : isConfirming
-      ? 'fa-exclamation-triangle'
-      : 'fa-ban';
-  return (
-    <button
-      ref={buttonRef}
-      type="button"
-      className="btn btn-link btn-sm p-0 ms-1 border-0 text-warning text-decoration-none"
-      data-testid={`credential-token-revoke-user-button-${token.id}`}
-      title={
-        isConfirming
-          ? 'Click again to revoke every delegation of this user'
-          : 'Revoke all for this user'
-      }
-      aria-label={
-        isConfirming
-          ? `Click again to revoke all delegations for user ${user}`
-          : `Revoke all delegations for user ${user}`
-      }
-      disabled={isProcessing}
-      onClick={handleClick}
-    >
-      <i className={`fas ${icon} fa-xs`} aria-hidden="true" />
-      {isConfirming && <span className="ms-1 small">Click again to revoke all</span>}
-    </button>
-  );
-};
 
 const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
   externalSearchTerm,
@@ -109,9 +70,9 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
       );
       if (!response.ok) throw new Error(`Revoke failed: ${response.statusText}`);
       setTokens(prev => prev.filter(t => t.id !== token.id));
-      showToast('Delegation revoked', 'success');
+      showToast('success', 'Delegation revoked');
     } catch (e: any) {
-      showToast(`Failed to revoke: ${e.message}`, 'error');
+      showToast('error', `Failed to revoke: ${e.message}`);
     }
   };
 
@@ -123,9 +84,9 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
       );
       if (!response.ok) throw new Error(`Bulk revoke failed: ${response.statusText}`);
       setTokens(prev => prev.filter(t => t.user_identity_hash !== userHash));
-      showToast('All delegations for user revoked', 'success');
+      showToast('success', 'All delegations for user revoked');
     } catch (e: any) {
-      showToast(`Failed to revoke: ${e.message}`, 'error');
+      showToast('error', `Failed to revoke: ${e.message}`);
     }
   };
 
@@ -281,9 +242,16 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                           {topAndTail(token.user_identity_hash, 8, 8)}
                         </code>
                         {canEditTokens && (
-                          <RevokeUserButton
-                            token={token}
-                            onRevoke={() => handleRevokeByUser(token.user_identity_hash)}
+                          <TwoStepButton
+                            icon="fa-ban"
+                            confirmLabel="Click again to revoke all"
+                            title="Revoke all for this user"
+                            confirmTitle="Click again to revoke every delegation of this user"
+                            ariaLabel={`Revoke all delegations for user ${topAndTail(token.user_identity_hash, 8, 8)}`}
+                            confirmAriaLabel={`Click again to revoke all delegations for user ${topAndTail(token.user_identity_hash, 8, 8)}`}
+                            className="btn btn-link btn-sm p-0 ms-1 border-0 text-warning text-decoration-none"
+                            data-testid={`credential-token-revoke-user-button-${token.id}`}
+                            onConfirm={() => handleRevokeByUser(token.user_identity_hash)}
                           />
                         )}
                       </td>

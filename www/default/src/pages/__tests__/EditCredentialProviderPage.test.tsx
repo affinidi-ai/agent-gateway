@@ -259,6 +259,20 @@ describe('EditCredentialProviderPage consent time limit', () => {
     expect(puts()).toHaveLength(0);
   });
 
+  it('says a deactivated provider takes no new consent, and never sends that state on save', async () => {
+    await renderProvider(authorizationCode({ deactivated_at: '2026-11-13T10:00:00Z' }));
+    expect(screen.getByTestId('credential-provider-deactivated-notice')).toHaveTextContent(
+      'nobody can consent to it again'
+    );
+
+    expect(await savedBody()).not.toHaveProperty('deactivated_at');
+  });
+
+  it('shows no deactivation notice on an active provider', async () => {
+    await renderProvider(authorizationCode());
+    expect(screen.queryByTestId('credential-provider-deactivated-notice')).toBeNull();
+  });
+
   it('offers no limit on a provider nobody consents to and saves 0 for it', async () => {
     await renderProvider(provider(null));
     expect(screen.queryByTestId(LIMIT)).not.toBeInTheDocument();

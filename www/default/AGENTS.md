@@ -1083,9 +1083,10 @@ Credential Tokens lists every agent-keyed token, service tokens included.
   header counts leave ended consents out of "active" and count them as "consent ended"
   (`credential-tokens-consent-ended-count`).
 - No modal and no browser dialog confirms a revoke. The row's **Revoke delegation** is the two-step
-  `DeleteButton`. **Revoke all for this user** (`credential-token-revoke-user-button-<id>`) uses the
-  same `useTwoStepDelete`: the first click shows "Click again to revoke all", the second sends the
-  `DELETE`, and a click elsewhere cancels.
+  `DeleteButton`. **Revoke all for this user** (`credential-token-revoke-user-button-<id>`) is the
+  shared `components/shared/TwoStepButton`, for a two-step action that is not a delete: the first
+  click shows "Click again to revoke all", the second sends the `DELETE`, and a click elsewhere
+  cancels.
 - The expanded row links to the user's delegation records in the Audit Log
   (`credential-token-view-activity-button-<id>`): the Audit Log opens with the user identity hash
   as its text filter and the delegation categories selected. The link is shown only to a user
@@ -1257,6 +1258,18 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   outside one minute to 365 days, or not a whole number, is refused before anything is sent
   (`CONSENT_LIMIT_RANGE_MESSAGE`). The unit arithmetic and wording live in
   `utils/consentLimit.ts`.
+- A provider a person consents to (`takesConsent`: Authorization Code, external consent or not)
+  is deactivated, never deleted, from the dashboard. Its row on the Credential Providers tab has
+  **Deactivate** (`credential-provider-deactivate-button-<id>`, the shared two-step
+  `TwoStepButton`: the first click shows "Click again to deactivate", the second sends
+  `POST /credential-providers/{id}/deactivate`) in place of the delete button, which only the
+  other provider types keep. A deactivated row shows a "Deactivated" badge
+  (`credential-provider-deactivated-badge-<id>`) and **Activate**
+  (`credential-provider-activate-button-<id>`, one click). The row stays in the list either way.
+  The editor shows a warning (`credential-provider-deactivated-notice`) that nobody can consent
+  again while access already given keeps working, and never sends `deactivated_at` on save. The
+  Delegated Access tab marks the access of a deactivated provider "No new consent"
+  (`delegated-access-provider-deactivated-<id>`). Success and failure are toasts.
 - The Credential Providers tab labels the types from `PROVIDER_TYPE_LABELS` in the same module, and
   shows a secondary badge after the type of a JWT Bearer provider that has a
   `client_authentication` (`credential-provider-client-authentication-badge`: Client ID only,

@@ -2,6 +2,7 @@ import React from 'react';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { apiClient } from '../../../api';
+import { showToast } from '../../../utils/toaster';
 import CredentialTokensTab from '../CredentialTokensTab';
 
 jest.mock('../../../api', () => ({
@@ -111,6 +112,7 @@ describe('Credential Tokens tab', () => {
     );
     expect(screen.queryByTestId('credential-token-row-t2')).not.toBeInTheDocument();
     expect(screen.getByTestId('credential-token-row-t3')).toBeInTheDocument();
+    expect(showToast).toHaveBeenCalledWith('success', 'All delegations for user revoked');
     expect(confirm).not.toHaveBeenCalled();
     confirm.mockRestore();
   });

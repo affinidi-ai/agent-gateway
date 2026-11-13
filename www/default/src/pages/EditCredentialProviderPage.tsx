@@ -18,6 +18,7 @@ import { splitByTenant, type OwnerTenant } from '../utils/tenantScope';
 import { CONSENT_LIMIT_UNITS } from '../utils/consentLimit';
 import {
   CONSENT_LIMIT_RANGE_MESSAGE,
+  ClientAuthentication,
   ConsentLimitFields,
   ConsentConfirmationFormFields,
   CredentialProviderType,
@@ -39,7 +40,7 @@ import {
   missingProviderField,
   providerCredentialFields,
   providerTypeFields,
-  takesConsentLimit,
+  takesConsent,
   callbackUrlFor,
   callbackUrlToSave,
   isHttpsAddress,
@@ -70,6 +71,9 @@ interface CredentialProviderForm
   issuer: string;
   /** Whether an external consent provider's token requests send its resource; never sent on save. */
   send_resource: boolean;
+  client_authentication: ClientAuthentication;
+  /** When the provider was deactivated; empty while it takes consent. Never sent on save. */
+  deactivated_at: string;
 }
 
 interface RoutingConfig {
@@ -98,6 +102,7 @@ const EMPTY_FORM: CredentialProviderForm = {
   resource: '',
   issuer: '',
   send_resource: true,
+  deactivated_at: '',
   ...NO_CONSENT_LIMIT,
   ...EMPTY_JWT_FIELDS,
   ...EMPTY_CONSENT_CONFIRMATION_FIELDS,
@@ -200,6 +205,7 @@ const EditCredentialProviderPage: React.FC = () => {
         resource: data.resource ?? '',
         issuer: data.issuer ?? '',
         send_resource: data.send_resource ?? true,
+        deactivated_at: data.deactivated_at ?? '',
         ...consentLimitOf(data),
         client_authentication: clientAuthenticationOf(data),
         ...jwtFieldsOf(data),
@@ -515,6 +521,19 @@ const EditCredentialProviderPage: React.FC = () => {
                 Shown alongside this provider's name in lists.
               </small>
             </div>
+
+            {form.deactivated_at && (
+              <div
+                className="alert alert-warning"
+                data-testid="credential-provider-deactivated-notice"
+                role="status"
+              >
+                <i className="fas fa-ban me-2"></i>
+                This provider is deactivated: nobody can consent to it again. Access people already
+                gave keeps working until it ends or is revoked. Activate it again on the Credential
+                Providers tab.
+              </div>
+            )}
 
             {form.issuer && (
               <div
@@ -1006,7 +1025,7 @@ const EditCredentialProviderPage: React.FC = () => {
               </div>
             </div>
 
-            {takesConsentLimit(form.provider_type) && (
+            {takesConsent(form.provider_type) && (
               <div className="mb-3">
                 <div className="field-label-with-help">
                   <label htmlFor="consent_limit_amount" className="mb-0">
