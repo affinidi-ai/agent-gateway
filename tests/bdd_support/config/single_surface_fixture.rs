@@ -84,6 +84,8 @@ pub struct SurfaceConfigBuilder {
     pub access_point_public: Option<bool>,
     /// Store no `access_point.public`, as a legacy surface does.
     pub legacy_access_point: bool,
+    /// The stored `target.networking.mirror.endpoint`, mirroring every request and waiting for the copy.
+    pub mirror_endpoint: Option<String>,
     /// Requests the Access Point admits per minute.
     pub rate_limit_per_minute: Option<u32>,
     /// The gateway starts with the VP Audit Log keeping every audit event.
@@ -221,6 +223,7 @@ impl Default for SurfaceConfigBuilder {
             agent_card_path: None,
             access_point_public: None,
             legacy_access_point: false,
+            mirror_endpoint: None,
             transit_points: Vec::new(),
             transit_source_auth: false,
             transit_token_lifetime_secs: None,

@@ -19,6 +19,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+/// `User-Agent` the gateway sends on its own outbound requests.
+pub const GATEWAY_USER_AGENT: &str = "Affinidi-Fabric-Agent-Gateway/1.0";
+
 pub const EXTERNAL_TIMEOUT_SECS: u64 = 30;
 pub const SHORT_TIMEOUT_SECS: u64 = 10;
 
@@ -67,7 +70,7 @@ pub fn proxy_with_timeout(timeout: Duration) -> Result<reqwest::Client> {
         .pool_max_idle_per_host(10)
         .pool_idle_timeout(Duration::from_secs(30))
         .tcp_keepalive(Duration::from_secs(60))
-        .user_agent("Affinidi-Fabric-Agent-Gateway/1.0")
+        .user_agent(GATEWAY_USER_AGENT)
         .build()
         .context("Failed to build proxy HTTP client")
 }
@@ -88,7 +91,7 @@ pub fn shared_host_hop(read_idle: Duration) -> Result<reqwest::Client> {
         .pool_max_idle_per_host(10)
         .pool_idle_timeout(Duration::from_secs(30))
         .tcp_keepalive(Duration::from_secs(60))
-        .user_agent("Affinidi-Fabric-Agent-Gateway/1.0")
+        .user_agent(GATEWAY_USER_AGENT)
         .build()
         .context("Failed to build shared-host hop HTTP client")
 }

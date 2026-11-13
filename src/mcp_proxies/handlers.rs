@@ -3164,7 +3164,7 @@ pub async fn execute_mcp_request(
                     Ok(payload) => {
                         let mirror_request = mirror::MirrorRequest::new(mirror_config, reqwest::Method::POST, payload)
                             .header("Content-Type", "application/json")
-                            .header("X-Mirrored-Request", "true");
+                            .mirrored(None);
                         let mirror_endpoint = loggable::url(&mirror_config.endpoint);
                         let channel_name_clone = channel_name.to_string();
 

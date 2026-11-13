@@ -7452,20 +7452,11 @@ async fn proxy_charged_request(
         && mirror::selected(mirror_config.percentage)
     {
         let mirror_endpoint_for_log = loggable::url(&mirror_config.endpoint);
-        let mut mirror_request = mirror::MirrorRequest::new(mirror_config, method.clone(), body_bytes.clone());
-        for (key, value) in headers.iter() {
-            if should_forward_ap_request_header_with_mapping(
-                key.as_str(),
-                &source_cred_headers,
-                header_metadata_mapping,
-                None,
-            ) {
-                mirror_request = mirror_request.header(key.as_str(), value.as_bytes());
-            }
-        }
-        let mirror_request = mirror_request
-            .header("X-Gateway-Trace-Id", format!("{}-mirror", trace_id))
-            .header("X-Mirrored-Request", "true");
+        let mirror_request = mirror::MirrorRequest::new(mirror_config, method.clone(), body_bytes.clone())
+            .headers_from(&headers, |name| {
+                should_forward_ap_request_header_with_mapping(name, &source_cred_headers, header_metadata_mapping, None)
+            })
+            .mirrored(Some(&trace_id));
 
         if mirror_config.wait_for_response {
             match mirror::send(mirror_request).await {
@@ -11965,20 +11956,16 @@ async fn handle_fabric_request_inner(
                 .surface
                 .access_point
                 .header_metadata_mapping_if_supported();
-            let mut mirror_request = mirror::MirrorRequest::new(mirror_config, method.clone(), body_bytes.to_vec());
-            for (key, value) in headers.iter() {
-                if should_forward_ap_request_header_with_mapping(
-                    key.as_str(),
-                    &source_cred_headers,
-                    header_metadata_mapping,
-                    None,
-                ) {
-                    mirror_request = mirror_request.header(key.as_str(), value.as_bytes());
-                }
-            }
-            let mirror_request = mirror_request
-                .header("X-Gateway-Trace-Id", format!("{}-mirror", trace_id))
-                .header("X-Mirrored-Request", "true")
+            let mirror_request = mirror::MirrorRequest::new(mirror_config, method.clone(), body_bytes.to_vec())
+                .headers_from(&headers, |name| {
+                    should_forward_ap_request_header_with_mapping(
+                        name,
+                        &source_cred_headers,
+                        header_metadata_mapping,
+                        None,
+                    )
+                })
+                .mirrored(Some(&trace_id))
                 .header("X-Fabric-Gateway", gateway_id)
                 .header("X-Fabric-Channel", channel_id);
 
@@ -12009,7 +11996,7 @@ async fn handle_fabric_request_inner(
                             .await;
                         return Err(create_error_response(
                             StatusCode::SERVICE_UNAVAILABLE,
-                            &format!("Traffic mirroring failed ({error_type}): the mirror endpoint is unreachable"),
+                            &format!("Traffic mirroring failed ({error_type}): the mirror request did not complete"),
                         ));
                     }
                 }

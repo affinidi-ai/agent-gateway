@@ -288,6 +288,10 @@ fn write_single_surface_config_inner(
     if surface_config.legacy_access_point {
         surface_fixture = surface_fixture.with_legacy_access_point();
     }
+    if let Some(endpoint) = &surface_config.mirror_endpoint {
+        surface_fixture = surface_fixture
+            .with_mirror(serde_json::json!({ "endpoint": endpoint, "percentage": 100, "wait_for_response": true }));
+    }
     for auth in surface_config
         .source_auth
         .iter()

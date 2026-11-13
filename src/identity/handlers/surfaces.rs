@@ -8721,15 +8721,21 @@ mod validation_tests {
         ] {
             let msg = bad_request(validate_mirror_endpoint(&mirrored_surface(endpoint), ""));
             assert!(msg.starts_with("target.networking.mirror.endpoint: "), "{msg}");
+            assert!(msg.contains("cloud-provider metadata"), "{endpoint}: {msg}");
             assert!(!msg.contains("secret-path"), "{msg}");
         }
     }
 
     #[test]
     fn mirror_endpoint_refuses_non_http_relative_and_credentialed_urls() {
-        for endpoint in ["ftp://mirror.example.com/copy", "/relative/copy", "http://user:pw@mirror.example.com/copy"] {
+        for (endpoint, reason) in [
+            ("ftp://mirror.example.com/copy", "http"),
+            ("/relative/copy", "URL"),
+            ("http://user:pw@mirror.example.com/copy", "embedded credentials"),
+        ] {
             let msg = bad_request(validate_mirror_endpoint(&mirrored_surface(endpoint), ""));
             assert!(msg.starts_with("target.networking.mirror.endpoint: "), "{endpoint}: {msg}");
+            assert!(msg.contains(reason), "{endpoint}: {msg}");
             assert!(!msg.contains("pw@"), "{msg}");
         }
     }

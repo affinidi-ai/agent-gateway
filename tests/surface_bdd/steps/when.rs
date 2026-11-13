@@ -641,7 +641,7 @@ fn record_caller_response(
     });
 }
 
-fn record_admin_response(
+pub(crate) fn record_admin_response(
     world: &mut SurfaceWorld,
     response: crate::world::RecordedResponse,
 ) {
@@ -692,7 +692,7 @@ pub(crate) async fn fetch_surface_by_id(
     world.surface_lookup_response = Some(response);
 }
 
-fn get_tracked_surface_id(
+pub(crate) fn get_tracked_surface_id(
     world: &SurfaceWorld,
     action: &str,
 ) -> String {
@@ -707,7 +707,7 @@ fn get_tracked_surface_id(
         .unwrap_or_else(|| panic!("surface id must be set before {}", action))
 }
 
-fn get_current_admin_surface_body(
+pub(crate) fn get_current_admin_surface_body(
     world: &SurfaceWorld,
     action: &str,
 ) -> serde_json::Value {
@@ -719,7 +719,7 @@ fn get_current_admin_surface_body(
         .clone()
 }
 
-async fn update_created_surface(
+pub(crate) async fn update_created_surface(
     world: &mut SurfaceWorld,
     payload: serde_json::Value,
     action: &str,
