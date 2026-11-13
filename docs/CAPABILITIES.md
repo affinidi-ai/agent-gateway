@@ -107,8 +107,9 @@ their credentials and presentations (`#key-2`) under `assertionMethod`, so stric
 Integrity verifiers accept them. A gateway whose published DID document leaves the Multikey out
 of `assertionMethod` adds it when it starts Active: a `did:webvh` DID gets a new log version
 signed with the gateway key, so the DID and its earlier versions stay as they are, and a
-`did:web` DID gets its document rewritten. A log that does not verify is left as it is and the
-gateway logs a warning.
+`did:web` DID gets its document rewritten. A log that does not verify, or whose latest version
+is dated more than a second or two ahead of the node's clock, is left as it is and the gateway
+logs a warning; the repair runs again on the next start.
 
 ## Federation across organisations
 
