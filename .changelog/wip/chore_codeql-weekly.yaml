@@ -1,0 +1,15 @@
+branch: chore/codeql-weekly
+changes:
+  added:
+    - timestamp: '2026-11-13T00:00:00Z'
+      title: Add weekly CodeQL scan of main for Rust, JavaScript/TypeScript and Python
+      description: >-
+        CodeQL now runs once a week (Mondays 02:00 UTC) against main and can be
+        started on demand from the Actions tab. It does not run on pull requests
+        or pushes, so the slow Rust analysis adds no time to PR CI.
+        Repo-level CodeQL default setup stays disabled.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

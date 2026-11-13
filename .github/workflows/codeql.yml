@@ -1,0 +1,52 @@
+name: CodeQL
+
+# Weekly-only CodeQL scan of main. PR and push scans are intentionally off:
+# the Rust codebase made per-PR scans too slow. Repo-level CodeQL "default
+# setup" must stay disabled, or GitHub rejects results from this workflow.
+on:
+  schedule:
+    # Mondays 02:00 UTC. Scheduled runs always use the default branch (main).
+    - cron: '0 2 * * 1'
+  # On-demand run from the Actions tab.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: javascript-typescript
+            build-mode: none
+          - language: python
+            build-mode: none
+          # Rust analysis is the slow part; acceptable because this runs weekly.
+          - language: rust
+            build-mode: none
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: /language:${{ matrix.language }}
