@@ -664,6 +664,103 @@ pub(crate) fn open_transit_points(
         .collect()
 }
 
+/// The non-root prefixes the identity API is mounted at, without a trailing `/`.
+fn identity_api_prefixes(network_config: &crate::config::NetworkConfig) -> Vec<String> {
+    network_config
+        .routes
+        .values()
+        .filter(|route| route.route_type == crate::config::RouteType::IdentityApi)
+        .map(|route| {
+            route
+                .prefix
+                .trim_end_matches('/')
+                .to_string()
+        })
+        .filter(|prefix| !prefix.is_empty())
+        .collect()
+}
+
+/// A static site at `static_path`, answering every path it has no file for with its
+/// `index.html`, under the dashboard's cache and security headers.
+fn static_site(static_path: &str) -> Router {
+    with_static_site_headers(static_files(static_path))
+}
+
+fn static_files(static_path: &str) -> Router {
+    Router::new().fallback_service(
+        tower_http::services::ServeDir::new(static_path)
+            .append_index_html_on_directories(true)
+            .fallback(tower_http::services::ServeFile::new(format!("{}/index.html", static_path))),
+    )
+}
+
+/// `router` under the cache and security headers of the dashboard's static files, each set only
+/// where the response has none.
+fn with_static_site_headers(router: Router) -> Router {
+    use hyper::header::CACHE_CONTROL;
+    use hyper::http::HeaderValue;
+    use tower_http::set_header::SetResponseHeaderLayer;
+
+    router
+        .layer(SetResponseHeaderLayer::if_not_present(
+            CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=3600, must-revalidate"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            axum::http::header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("frame-ancestors 'none'"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            axum::http::header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            axum::http::header::REFERRER_POLICY,
+            HeaderValue::from_static("strict-origin-when-cross-origin"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            axum::http::header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        ))
+}
+
+/// The dashboard SPA, served for every path no route matched, except a path at or below an
+/// identity API prefix: no API route answers it, so it is a `404`, not the dashboard page.
+fn dashboard_fallback(
+    static_path: &str,
+    api_prefixes: Vec<String>,
+) -> Router {
+    let api_prefixes = Arc::new(api_prefixes);
+    with_static_site_headers(static_files(static_path).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let api_prefixes = api_prefixes.clone();
+            async move {
+                use axum::response::IntoResponse;
+                let path = request.uri().path();
+                let under_api = api_prefixes
+                    .iter()
+                    .any(|prefix| {
+                        path.strip_prefix(prefix.as_str())
+                            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+                    });
+                if under_api {
+                    return (
+                        axum::http::StatusCode::NOT_FOUND,
+                        [(axum::http::header::CACHE_CONTROL, "no-store")],
+                        axum::Json(serde_json::json!({"error": "Not found"})),
+                    )
+                        .into_response();
+                }
+                next.run(request).await
+            }
+        },
+    )))
+}
+
 /// Build the router of the inbound listener on `port`, which serves every
 /// surface on that port, with the MultiSurfaceProxyState its routes share so
 /// those surfaces can be updated in place. Binding the port is left to the
@@ -1171,46 +1268,9 @@ pub async fn build_port_router(
                         port, route_name, route_config.prefix, static_path, cwd, resolved
                     );
 
-                    use hyper::header::CACHE_CONTROL;
-                    use hyper::http::HeaderValue;
-                    use tower_http::services::ServeDir;
-                    use tower_http::set_header::SetResponseHeaderLayer;
+                    let serve_dir = static_site(static_path);
 
-                    let serve_dir = Router::new()
-                        .fallback_service(
-                            ServeDir::new(static_path)
-                                .append_index_html_on_directories(true)
-                                .fallback(tower_http::services::ServeFile::new(format!("{}/index.html", static_path))),
-                        )
-                        .layer(SetResponseHeaderLayer::if_not_present(
-                            CACHE_CONTROL,
-                            HeaderValue::from_static("public, max-age=3600, must-revalidate"),
-                        ))
-                        .layer(SetResponseHeaderLayer::if_not_present(
-                            axum::http::header::X_FRAME_OPTIONS,
-                            HeaderValue::from_static("DENY"),
-                        ))
-                        .layer(SetResponseHeaderLayer::if_not_present(
-                            axum::http::header::CONTENT_SECURITY_POLICY,
-                            HeaderValue::from_static("frame-ancestors 'none'"),
-                        ))
-                        .layer(SetResponseHeaderLayer::if_not_present(
-                            axum::http::header::X_CONTENT_TYPE_OPTIONS,
-                            HeaderValue::from_static("nosniff"),
-                        ))
-                        .layer(SetResponseHeaderLayer::if_not_present(
-                            axum::http::header::REFERRER_POLICY,
-                            HeaderValue::from_static("strict-origin-when-cross-origin"),
-                        ))
-                        .layer(SetResponseHeaderLayer::if_not_present(
-                            axum::http::header::STRICT_TRANSPORT_SECURITY,
-                            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
-                        ));
-
-                    if route_config.fallback {
-                        info!("Setting '{}' as fallback static handler", route_name);
-                        app = app.fallback_service(serve_dir);
-                    } else if route_config.prefix == "/" {
+                    if route_config.prefix == "/" {
                         app = app.nest_service("/", serve_dir);
                     } else {
                         app = app.nest_service(&route_config.prefix, serve_dir);
@@ -1438,6 +1498,11 @@ pub async fn build_port_router(
     }
 
     // Process fallback routes last so they don't override specific routes
+    let api_prefixes = if identity_api_router.is_some() {
+        identity_api_prefixes(&network_config)
+    } else {
+        Vec::new()
+    };
     for (route_name, route_config) in fallback_routes {
         if let Some(ref static_path) = route_config.path {
             let resolved = std::fs::canonicalize(static_path)
@@ -1451,44 +1516,7 @@ pub async fn build_port_router(
                 port, route_name, route_config.prefix, static_path, cwd, resolved
             );
 
-            use hyper::header::CACHE_CONTROL;
-            use hyper::http::HeaderValue;
-            use tower::ServiceBuilder;
-            use tower_http::services::ServeDir;
-            use tower_http::set_header::SetResponseHeaderLayer;
-
-            let serve_dir = ServiceBuilder::new()
-                .layer(SetResponseHeaderLayer::if_not_present(
-                    CACHE_CONTROL,
-                    HeaderValue::from_static("public, max-age=3600, must-revalidate"),
-                ))
-                .layer(SetResponseHeaderLayer::if_not_present(
-                    axum::http::header::X_FRAME_OPTIONS,
-                    HeaderValue::from_static("DENY"),
-                ))
-                .layer(SetResponseHeaderLayer::if_not_present(
-                    axum::http::header::CONTENT_SECURITY_POLICY,
-                    HeaderValue::from_static("frame-ancestors 'none'"),
-                ))
-                .layer(SetResponseHeaderLayer::if_not_present(
-                    axum::http::header::X_CONTENT_TYPE_OPTIONS,
-                    HeaderValue::from_static("nosniff"),
-                ))
-                .layer(SetResponseHeaderLayer::if_not_present(
-                    axum::http::header::REFERRER_POLICY,
-                    HeaderValue::from_static("strict-origin-when-cross-origin"),
-                ))
-                .layer(SetResponseHeaderLayer::if_not_present(
-                    axum::http::header::STRICT_TRANSPORT_SECURITY,
-                    HeaderValue::from_static("max-age=31536000; includeSubDomains"),
-                ))
-                .service(
-                    ServeDir::new(static_path)
-                        .append_index_html_on_directories(true)
-                        .fallback(tower_http::services::ServeFile::new(format!("{}/index.html", static_path))),
-                );
-
-            app = app.fallback_service(serve_dir);
+            app = app.fallback_service(dashboard_fallback(static_path, api_prefixes.clone()));
         }
     }
 
@@ -1978,6 +2006,103 @@ mod tests {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use futures::StreamExt;
+
+    async fn dashboard_answer(
+        api_prefixes: &[&str],
+        path: &str,
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        use tower::ServiceExt;
+        let www = tempfile::tempdir().expect("tempdir");
+        std::fs::write(www.path().join("index.html"), "<html>dashboard</html>").expect("write index.html");
+        let response = dashboard_fallback(
+            www.path()
+                .to_str()
+                .expect("utf-8 path"),
+            api_prefixes
+                .iter()
+                .map(|prefix| prefix.to_string())
+                .collect(),
+        )
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("dashboard fallback answers");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn an_unmatched_path_under_the_identity_api_is_not_found_not_the_dashboard() {
+        for path in ["/api", "/api/", "/api/v1/does-not-exist", "/api/v1/secrets/x/y?z=1"] {
+            let (status, headers, body) = dashboard_answer(&["/api"], path).await;
+
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+            for (header, value) in [
+                ("content-type", "application/json"),
+                ("cache-control", "no-store"),
+                ("x-content-type-options", "nosniff"),
+                ("x-frame-options", "DENY"),
+                ("content-security-policy", "frame-ancestors 'none'"),
+            ] {
+                assert_eq!(
+                    headers
+                        .get(header)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(value),
+                    "{path} {header}"
+                );
+            }
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body).expect("json body"),
+                serde_json::json!({"error": "Not found"}),
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dashboard_pages_outside_the_identity_api_still_get_the_dashboard() {
+        for path in ["/", "/settings/general", "/apiary", "/api-keys/new", "/apikeys", "/surfaces/api"] {
+            let (status, _, body) = dashboard_answer(&["/api"], path).await;
+
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert!(body.contains("dashboard"), "{path}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn without_an_identity_api_prefix_every_path_gets_the_dashboard() {
+        let (status, _, body) = dashboard_answer(&[], "/api/v1/does-not-exist").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("dashboard"), "{body}");
+    }
+
+    #[test]
+    fn identity_api_prefixes_skip_a_root_mount_and_drop_trailing_slashes() {
+        let config: crate::config::NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.example.com" },
+            "webauthn": { "rp_id": "test", "external_origin": "https://test.example.com" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "routes": {
+                "api": {"type": "identity_api", "prefix": "/api/"},
+                "root": {"type": "identity_api", "prefix": "/"},
+                "dashboard": {"type": "static", "prefix": "/", "path": "www", "fallback": true}
+            }
+        }))
+        .expect("network config");
+
+        assert_eq!(identity_api_prefixes(&config), vec!["/api".to_string()]);
+    }
 
     #[test]
     fn parse_cors_origins_keeps_valid_origins() {

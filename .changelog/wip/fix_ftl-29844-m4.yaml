@@ -1,0 +1,15 @@
+branch: fix/ftl-29844-m4
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-12T00:00:00Z'
+      title: Answer unknown management API paths with 404 instead of the dashboard
+      description: >-
+        A request under the identity API prefix (`/api` by default) that matches no endpoint
+        was answered 200 with the dashboard's index.html, so API clients and scanners took a
+        wrong path for a working one. It is now answered 404 with {"error":"Not found"};
+        dashboard pages and static assets are served as before.
+  removed: []
+  security: []
+  breaking: []
