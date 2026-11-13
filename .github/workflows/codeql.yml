@@ -27,6 +27,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # GitHub Actions workflows under .github/workflows.
+          - language: actions
+            build-mode: none
           - language: javascript-typescript
             build-mode: none
           - language: python
