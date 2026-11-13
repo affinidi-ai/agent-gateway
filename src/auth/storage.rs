@@ -134,31 +134,17 @@ impl PasskeyStorage {
             .await
     }
 
-    /// Prepare a user with their initial passkey for persistence after consent succeeds.
-    pub(crate) async fn prepare_user_with_passkey(
+    /// A new user holding their initial passkey, to be stored once consent succeeds. The first
+    /// user is the Primary Administrator; any other awaits approval. The caller checks that the
+    /// username is free and the user limit allows another user.
+    pub(crate) fn prepare_user_with_passkey(
         &self,
         username: &str,
         passkey: Passkey,
-    ) -> Result<UserData> {
-        // Check if this is the first user
-        let users = self.list_users().await?;
-        let is_first_user = users.is_empty();
-
-        if self
-            .load_user(username)
-            .await?
-            .is_some()
-        {
-            anyhow::bail!("User already exists");
-        }
-
-        if !is_first_user && let Err(e) = crate::config::global_limits().check_can_add("users", users.len()) {
-            crate::config::log_limit_reached("users", &e);
-            return Err(anyhow::Error::new(e));
-        }
-
+        is_first_user: bool,
+    ) -> UserData {
         let now = chrono::Utc::now();
-        let user_data = UserData {
+        UserData {
             user_id: uuid::Uuid::new_v4().to_string(),
             username: username.to_string(),
             passkeys: vec![passkey],
@@ -183,8 +169,7 @@ impl PasskeyStorage {
             avatar_path: Some("avatars/default.png".to_string()),
             last_logged_in: None,
             saml_id: None,
-        };
-        Ok(user_data)
+        }
     }
 
     /// Update user role and status
@@ -251,29 +236,6 @@ impl PasskeyStorage {
             .await
     }
 
-    /// Check if user is approved to sign in
-    pub async fn is_user_approved(
-        &self,
-        username: &str,
-    ) -> Result<bool> {
-        Ok(self
-            .load_user(username)
-            .await?
-            .is_some_and(|user_data| user_data.status == UserStatus::Approved))
-    }
-
-    /// Get all passkeys for a user
-    pub async fn get_passkeys(
-        &self,
-        username: &str,
-    ) -> Result<Vec<Passkey>> {
-        Ok(self
-            .load_user(username)
-            .await?
-            .map(|data| data.passkeys)
-            .unwrap_or_default())
-    }
-
     /// List all user_ids from cache
     #[allow(dead_code)]
     pub async fn list_users(&self) -> Result<Vec<String>> {
@@ -325,32 +287,6 @@ impl PasskeyStorage {
 mod tests {
     use super::{PasskeyStorage, UserData, UserRole, UserStatus};
     use tempfile::tempdir;
-
-    #[tokio::test]
-    async fn missing_user_is_not_approved() {
-        let temp_dir = tempdir().unwrap();
-        let storage = PasskeyStorage::new(
-            temp_dir
-                .path()
-                .join("users")
-                .to_string_lossy()
-                .into_owned(),
-            temp_dir
-                .path()
-                .join("avatars")
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            !storage
-                .is_user_approved("missing-user")
-                .await
-                .unwrap()
-        );
-    }
 
     #[tokio::test]
     async fn deleting_a_user_logs_its_user_id_but_not_its_username() {

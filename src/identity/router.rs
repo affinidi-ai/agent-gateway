@@ -323,6 +323,13 @@ pub fn create_identity_api_router(
                 #[cfg(not(debug_assertions))]
                 let test_support_router = Router::new();
 
+                crate::source_auth::client_ip::warn_if_login_throttle_shares_one_limit(
+                    "passkey_login_throttle",
+                    &state
+                        .network_config
+                        .passkey_login_throttle,
+                    &state.network_config.client_ip,
+                );
                 let router = Router::new()
                     // Auth mode endpoint (unauthenticated)
                     .route("/v1/auth/mode", get(crate::auth::mode_handler::get_auth_mode))
@@ -330,8 +337,16 @@ pub fn create_identity_api_router(
                     .merge(
                         Router::new()
                             .route("/auth/register/start", post(crate::auth::handlers::register_start))
-                            .route("/auth/register/finish", post(crate::auth::handlers::register_finish))
                             .route("/auth/login/start", post(crate::auth::handlers::login_start))
+                            .route_layer(axum::middleware::from_fn_with_state(
+                                std::sync::Arc::new(crate::sts::throttle::TokenEndpointThrottle::per_client_ip(
+                                    &state
+                                        .network_config
+                                        .passkey_login_throttle,
+                                )),
+                                crate::auth::handlers::throttle_passkey_start,
+                            ))
+                            .route("/auth/register/finish", post(crate::auth::handlers::register_finish))
                             .route("/auth/login/finish", post(crate::auth::handlers::login_finish))
                             .route("/auth/check", get(crate::auth::handlers::check_auth))
                             .route("/auth/logout", post(crate::auth::handlers::logout))
