@@ -152,10 +152,23 @@ pub struct AgentSurface {
 /// The most `browser_origins` a surface may list.
 pub const MAX_BROWSER_ORIGINS: usize = 20;
 
+/// The longest `browser_origins` entry, in bytes.
+pub const MAX_BROWSER_ORIGIN_BYTES: usize = 256;
+
 /// Parses one `browser_origins` entry into the serialisation a browser sends in
-/// `Origin`: `https`, a host, an optional non-default port, and nothing else.
+/// `Origin`: `https`, a host, an optional non-default port, and nothing else. An
+/// entry is named in a refusal only as [`crate::observability::loggable::untrusted`]
+/// renders it.
 pub fn normalize_browser_origin(origin: &str) -> Result<String, String> {
-    let invalid = |why: &str| format!("browser_origins: '{origin}' is not an allowed origin: {why}");
+    let invalid = |why: &str| {
+        format!(
+            "browser_origins: {} is not an allowed origin: {why}",
+            crate::observability::loggable::untrusted(origin)
+        )
+    };
+    if origin.len() > MAX_BROWSER_ORIGIN_BYTES {
+        return Err(invalid(&format!("it is longer than {MAX_BROWSER_ORIGIN_BYTES} bytes")));
+    }
     if origin.contains('*') {
         return Err(invalid("wildcards are not allowed"));
     }
@@ -193,6 +206,72 @@ pub fn normalize_browser_origins(origins: &mut Vec<String>) -> Result<(), String
     }
     *origins = normalized;
     Ok(())
+}
+
+/// Normalises a stored surface's `browser_origins` as it is loaded, so a surface
+/// file written outside the admin API follows the same rules: each entry as
+/// [`normalize_browser_origin`] renders it, an entry it refuses, a duplicate, or
+/// one past [`MAX_BROWSER_ORIGINS`] dropped with a warning naming the surface. A
+/// value that is not a list, `null` included, is removed the same way. The
+/// surface itself is never refused. Returns whether the record changed.
+fn normalize_stored_browser_origins(value: &mut serde_json::Value) -> bool {
+    let surface_id = value
+        .get("surface_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let Some(field) = value.get_mut("browser_origins") else {
+        return false;
+    };
+    if !field.is_array() {
+        tracing::warn!(
+            surface_id = %surface_id,
+            origin = %crate::observability::loggable::untrusted(&field.to_string()),
+            reason = "not a list",
+            "Dropping a stored browser_origins entry"
+        );
+        if let Some(record) = value.as_object_mut() {
+            record.remove("browser_origins");
+        }
+        return true;
+    }
+    let Some(stored) = field.as_array_mut() else {
+        return false;
+    };
+    let drop = |entry: &str, reason: &str| {
+        tracing::warn!(
+            surface_id = %surface_id,
+            origin = %crate::observability::loggable::untrusted(entry),
+            reason,
+            "Dropping a stored browser_origins entry"
+        );
+    };
+    let mut kept: Vec<serde_json::Value> = Vec::new();
+    for entry in stored.iter() {
+        let Some(entry) = entry.as_str() else {
+            drop(&entry.to_string(), "not a string");
+            continue;
+        };
+        match normalize_browser_origin(entry) {
+            Err(why) => drop(entry, &why),
+            Ok(origin)
+                if kept
+                    .iter()
+                    .any(|kept| kept.as_str() == Some(origin.as_str())) =>
+            {
+                drop(entry, "a duplicate");
+            }
+            Ok(_) if kept.len() == MAX_BROWSER_ORIGINS => {
+                drop(entry, &format!("more than {MAX_BROWSER_ORIGINS} origins"));
+            }
+            Ok(origin) => kept.push(serde_json::Value::String(origin)),
+        }
+    }
+    if *stored == kept {
+        return false;
+    }
+    *stored = kept;
+    true
 }
 
 /// Three independent identity slots covering the proxy pipeline edges.
@@ -2459,7 +2538,8 @@ impl StorableEntity for AgentSurface {
         let embedded = rewrite_reference_transit_tokens(value);
         let marked = mark_transit_point_source_auth(value);
         let migrated = migrate_legacy_agent_pay_policies(value);
-        Ok(stripped || split || embedded || marked || migrated)
+        let origins = normalize_stored_browser_origins(value);
+        Ok(stripped || split || embedded || marked || migrated || origins)
     }
 }
 
@@ -4534,6 +4614,123 @@ mod tests {
         assert_eq!(normalize_browser_origins(&mut twenty), Ok(()));
         let mut twenty_one = origins(MAX_BROWSER_ORIGINS + 1);
         assert_eq!(normalize_browser_origins(&mut twenty_one), Err("browser_origins: at most 20 origins".into()));
+    }
+
+    #[test]
+    fn a_browser_origin_longer_than_256_bytes_is_refused_before_it_is_parsed() {
+        let host = "a".repeat(MAX_BROWSER_ORIGIN_BYTES - "https://.com".len());
+        let longest = format!("https://{host}.com");
+        assert_eq!(longest.len(), MAX_BROWSER_ORIGIN_BYTES);
+        assert_eq!(normalize_browser_origin(&longest), Ok(longest.clone()));
+        let too_long = format!("https://{host}a.com");
+        assert_eq!(too_long.len(), MAX_BROWSER_ORIGIN_BYTES + 1);
+        let error = normalize_browser_origin(&too_long).expect_err("257 bytes");
+        assert!(error.ends_with("it is longer than 256 bytes"), "{error}");
+    }
+
+    #[test]
+    fn a_refused_browser_origin_is_named_escaped_and_quoted_once() {
+        let error = normalize_browser_origin("https://chat.example.com\r\nforged: line").expect_err("CR/LF");
+        assert!(!error.contains('\r') && !error.contains('\n'), "{error:?}");
+        assert_eq!(
+            error,
+            r#"browser_origins: "https://chat.example.com\r\nforged: line" is not an allowed origin: not a valid URL"#
+        );
+        assert_eq!(
+            normalize_browser_origin("http://chat.example.com"),
+            Err(r#"browser_origins: "http://chat.example.com" is not an allowed origin: the scheme must be https"#
+                .to_string())
+        );
+    }
+
+    fn stored_origins(origins: serde_json::Value) -> (bool, serde_json::Value) {
+        let mut stored = serde_json::json!({ "surface_id": "s-1", "browser_origins": origins });
+        let changed = normalize_stored_browser_origins(&mut stored);
+        (changed, stored["browser_origins"].clone())
+    }
+
+    #[test]
+    fn a_stored_browser_origin_is_normalised_on_load_and_an_invalid_one_dropped() {
+        assert_eq!(
+            stored_origins(serde_json::json!([
+                "https://Chat.Example.COM",
+                "http://plain.example.com",
+                "https://chat.example.com:443",
+                "https://*.example.com",
+                7,
+                "https://app.example.com"
+            ])),
+            (true, serde_json::json!(["https://chat.example.com", "https://app.example.com"]))
+        );
+    }
+
+    #[test]
+    fn stored_browser_origins_past_twenty_are_dropped_on_load() {
+        let origins: Vec<String> = (0..MAX_BROWSER_ORIGINS + 2)
+            .map(|index| format!("https://page{index}.example.com"))
+            .collect();
+        let (changed, kept) = stored_origins(serde_json::json!(origins));
+        assert!(changed);
+        assert_eq!(kept, serde_json::json!(origins[..MAX_BROWSER_ORIGINS]));
+    }
+
+    #[test]
+    fn a_valid_stored_list_or_none_is_left_as_it_is() {
+        let valid = serde_json::json!(["https://chat.example.com", "https://app.example.com:8443"]);
+        assert_eq!(stored_origins(valid.clone()), (false, valid));
+        let mut without = serde_json::json!({ "surface_id": "s-1" });
+        assert!(!normalize_stored_browser_origins(&mut without));
+        assert_eq!(without, serde_json::json!({ "surface_id": "s-1" }));
+    }
+
+    #[test]
+    fn loading_a_stored_surface_normalises_its_browser_origins() {
+        let mut stored = serde_json::json!({
+            "surface_id": "s-1",
+            "name": "s-1",
+            "access_point": { "listen_address": "0.0.0.0:9000", "route": "/agent", "protocol": "a2a" },
+            "target": { "endpoint": "https://agent.example" },
+            "browser_origins": ["https://Chat.Example.com", "http://plain.example.com"],
+        });
+        assert!(AgentSurface::migrate_raw_json(&mut stored).unwrap(), "re-persisted");
+        let surface: AgentSurface = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(surface.browser_origins, ["https://chat.example.com"]);
+        assert!(!AgentSurface::migrate_raw_json(&mut stored).unwrap(), "normalised once");
+    }
+
+    /// A hand-edited `browser_origins` that is not a list would fail to deserialise; it is
+    /// removed instead, so the surface still loads, without browser origins.
+    #[test]
+    fn a_stored_browser_origins_that_is_not_a_list_is_removed_and_the_surface_loads() {
+        for value in [
+            serde_json::json!("https://chat.example.com"),
+            serde_json::Value::Null,
+            serde_json::json!({ "origin": "https://chat.example.com" }),
+            serde_json::json!(7),
+        ] {
+            let mut stored = serde_json::json!({
+                "surface_id": "s-1",
+                "name": "s-1",
+                "access_point": { "listen_address": "0.0.0.0:9000", "route": "/agent", "protocol": "a2a" },
+                "target": { "endpoint": "https://agent.example" },
+                "browser_origins": value,
+            });
+            assert!(AgentSurface::migrate_raw_json(&mut stored).unwrap(), "re-persisted: {value}");
+            assert!(
+                stored
+                    .get("browser_origins")
+                    .is_none(),
+                "{value}"
+            );
+            let surface: AgentSurface = serde_json::from_value(stored.clone()).expect("the surface loads");
+            assert!(
+                surface
+                    .browser_origins
+                    .is_empty(),
+                "{value}"
+            );
+            assert!(!AgentSurface::migrate_raw_json(&mut stored).unwrap(), "normalised once: {value}");
+        }
     }
 
     #[test]

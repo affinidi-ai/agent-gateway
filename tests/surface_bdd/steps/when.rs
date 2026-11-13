@@ -1873,15 +1873,32 @@ async fn web_page_sends_preflight_to_surface(
     world: &mut SurfaceWorld,
     origin: String,
 ) {
+    let path = format!("{}/foo", world.surface_config.route);
+    send_preflight_for_post(world, &origin, &path).await;
+}
+
+#[when(expr = "a web page at origin {string} sends a preflight for a POST to path {string}")]
+async fn web_page_sends_preflight_to_path(
+    world: &mut SurfaceWorld,
+    origin: String,
+    path: String,
+) {
+    send_preflight_for_post(world, &origin, &path).await;
+}
+
+async fn send_preflight_for_post(
+    world: &mut SurfaceWorld,
+    origin: &str,
+    path: &str,
+) {
     ensure_gateway_running(world).await;
     let url = format!(
-        "http://127.0.0.1:{}{}/foo",
+        "http://127.0.0.1:{}{path}",
         world
             .infra
             .as_ref()
             .unwrap()
-            .gateway_port,
-        world.surface_config.route
+            .gateway_port
     );
     let response = reqwest::Client::new()
         .request(reqwest::Method::OPTIONS, &url)
@@ -3417,6 +3434,19 @@ async fn mcp_tool_call_with_city_argument_and_valid_api_key(
     let header = build_valid_api_key_source_auth_header(world);
     let body = build_mcp_tool_call_body(&tool_name, serde_json::json!({ "city": city }));
     send_json_request_and_record(world, body, vec![header]).await;
+}
+
+#[when(expr = "the caller invokes the MCP tool {string} for city {string} with a valid token")]
+async fn mcp_tool_call_with_city_argument_and_valid_token(
+    world: &mut SurfaceWorld,
+    tool_name: String,
+    city: String,
+) {
+    ensure_gateway_running(world).await;
+    let token =
+        create_valid_jwt_for_issuer_with_audience(get_jwt_source_auth_issuer(world), caller_token_audience(world));
+    let body = build_mcp_tool_call_body(&tool_name, serde_json::json!({ "city": city }));
+    send_json_request_and_record(world, body, vec![("authorization".to_string(), format!("Bearer {token}"))]).await;
 }
 
 #[when(expr = "the caller invokes the MCP tool {string} for city {string} using protocol version {string}")]

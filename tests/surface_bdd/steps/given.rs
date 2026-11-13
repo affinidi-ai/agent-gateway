@@ -5104,6 +5104,17 @@ fn surface_accepts_mcp_origin(
     mcp_http["allowed_origins"] = serde_json::Value::Array(origins);
 }
 
+#[given(expr = "the gateway's network CORS list allows origin {string}")]
+fn network_cors_allows_origin(
+    world: &mut SurfaceWorld,
+    origin: String,
+) {
+    world
+        .surface_config
+        .network_cors
+        .push(origin);
+}
+
 #[given(expr = "the surface allows browser origin {string}")]
 fn surface_allows_browser_origin(
     world: &mut SurfaceWorld,

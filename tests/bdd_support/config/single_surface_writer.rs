@@ -702,6 +702,14 @@ fn write_single_surface_config_inner(
         serve_dashboard(base_dir);
     }
     add_gateway_prefixes(base_dir, &surface_config.gateway_prefixes);
+    if !surface_config
+        .network_cors
+        .is_empty()
+    {
+        edit_gateway_json(base_dir, |gateway| {
+            gateway["cors"] = serde_json::json!(surface_config.network_cors);
+        });
+    }
 }
 
 /// The text of the dashboard build's `index.html`, which every dashboard page serves.
