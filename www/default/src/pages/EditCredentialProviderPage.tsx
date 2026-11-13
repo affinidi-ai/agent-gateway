@@ -13,7 +13,7 @@ import { DOCS_URL } from '../config/docs';
 import ClientAuthenticationSelect from './EditCredentialProviderPage/ClientAuthenticationSelect';
 import ConsentConfirmationSection from './EditCredentialProviderPage/ConsentConfirmationSection';
 import JwtAssertionSection from './EditCredentialProviderPage/JwtAssertionSection';
-import { SecretOption as Secret, SecretOptions } from './EditCredentialProviderPage/SecretSelect';
+import { SecretOption as Secret, SecretOptions } from '../components/shared/SecretOptions';
 import { splitByTenant, type OwnerTenant } from '../utils/tenantScope';
 import {
   ConsentConfirmationFormFields,

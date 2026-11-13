@@ -79,6 +79,15 @@ export function newTransitPointId(): string {
   return `${hex(8)}-${hex(4)}-4${hex(3)}-${(8 + Math.floor(Math.random() * 4)).toString(16)}${hex(3)}-${hex(12)}`;
 }
 
+const STATIC_SECRET_AUTH_TYPES = ['bearer', 'api_key', 'custom_header'];
+
+/** Why a static-secret target authentication can't be saved, or null; an empty secret would drop it silently. */
+function targetAuthSecretProblem(config: Record<string, unknown>): string | null {
+  if (!STATIC_SECRET_AUTH_TYPES.includes(String(config.auth_type))) return null;
+  const secret = typeof config.auth_secret === 'string' ? config.auth_secret.trim() : '';
+  return secret ? null : 'Pick the secret whose value authenticates this Transit Point.';
+}
+
 interface TransitPointVariantOpts {
   type: SurfaceNodeType;
   protocol: Protocol;
@@ -211,6 +220,8 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
       for (const message of callerAuthProblems(c)) {
         errs.push({ field: 'caller_authentication', message });
       }
+      const secretMessage = targetAuthSecretProblem(c);
+      if (secretMessage) errs.push({ field: 'auth_secret', message: secretMessage });
       return errs;
     },
     // A transit point's listen address must be an actual outbound listener

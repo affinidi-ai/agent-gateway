@@ -221,6 +221,10 @@ authentication on a Managed Agent or Transit
 Point can take its credential from a credential provider; see _Credential provider editor_ and
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
 
+A Transit Point's static-secret target authentication picks its secret from a tenant-aware list
+with a refresh button beside it, and Save is blocked while no secret is picked; see _Surface
+Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
 A Trust Check on a Managed Agent → Transit Point arrow belongs to that Transit Point and saves
 to `transit.points[i].trust_check_list` (new ones on A2A and AP2 Transit Points only); the
 Managed Agent's own Trust Check is offered only for `a2a-proxy://` and `fabric://` targets (on
