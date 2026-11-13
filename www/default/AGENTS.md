@@ -689,8 +689,8 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   list and its `authority_sources` map through every load and save (`listedAuthorities`,
   `queryFromElement`, `buildEntry`), on every leg and in variants; the save never adds
   `authority_id` or `authority_source` beside it. In the fullscreen editor a query's **Authority
-  ID** is one multi-select (`IssuerAuthorityPicker` on the shared `FormMultiSelect`): each Issuer
-  and Authority has a checkbox, a click toggles it and keeps the menu open, and the toggle lists
+  ID** is one multi-select (`IssuerAuthorityPicker` on the shared `FormMultiSelect`): a picked Issuer
+  or Authority shows a check on the right, as in `FormSelect`; a click toggles it and keeps the menu open, and the toggle lists
   the picked names in order. One pick is the single `authority_id` with `authority_source`,
   exactly as before; two or more are `authority_ids` in the order picked, each DID recorded in
   `authority_sources` as `issuer` or `authority` by the register it was picked from

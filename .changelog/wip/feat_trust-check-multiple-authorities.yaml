@@ -23,7 +23,7 @@ changes:
     - timestamp: '2026-11-12T00:00:00Z'
       title: Pick several Authorities for one Trust Check query in the dashboard
       description: >-
-        In the Trust Check editor, a query's Authority ID is one checkbox multi-select of the
+        In the Trust Check editor, a query's Authority ID is one multi-select of the
         Issuers and Authorities, plus on the caller leg the agent identity credential issuer and the
         sending gateway DID, and keeps the picks in the order picked. The editor's card header
         shows how many authorities each query names. A query with several saves

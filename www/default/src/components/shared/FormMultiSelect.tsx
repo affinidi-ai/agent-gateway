@@ -33,8 +33,8 @@ function nextEnabledIndex<T extends string>(
 }
 
 /**
- * `FormSelect`'s multi-select sibling: the same Bootstrap look and two-line options, each with a
- * checkbox. Clicking an option (or Enter/Space on the highlighted one) toggles it and keeps the
+ * `FormSelect`'s multi-select sibling: the same Bootstrap look and two-line options, with the same
+ * right-hand check on each selected one. Clicking an option (or Enter/Space on the highlighted one) toggles it and keeps the
  * menu open; Escape, Tab or a click outside closes it. The toggle lists the selected labels in
  * `values` order. The menu opens in the page flow under the toggle, at most 320px tall, and
  * scrolls when the options are longer.
@@ -218,13 +218,6 @@ function FormMultiSelect<T extends string>({
                   onClick={() => toggle(idx)}
                 >
                   <div className={`d-flex align-items-start gap-2 ${opt.indent ? 'ps-3' : ''}`}>
-                    {!opt.disabled || isSelected ? (
-                      <i
-                        className={`${isSelected ? 'fas fa-check-square' : 'far fa-square'} mt-1`}
-                        style={{ fontSize: '12px' }}
-                        aria-hidden="true"
-                      />
-                    ) : null}
                     <div className="flex-grow-1" style={{ minWidth: 0 }}>
                       <div className="fw-semibold" style={{ fontSize: '12px' }}>
                         {opt.label}
@@ -238,6 +231,14 @@ function FormMultiSelect<T extends string>({
                         </div>
                       )}
                     </div>
+                    {isSelected && (
+                      <i
+                        className="fas fa-check mt-1"
+                        style={{ fontSize: '10px' }}
+                        aria-hidden="true"
+                        data-testid={testid ? `${testid}-option-${opt.value}-check` : undefined}
+                      />
+                    )}
                   </div>
                 </button>
               </li>
