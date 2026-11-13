@@ -192,6 +192,27 @@ pub async fn register_start(
 /// a new account starts, such as notifying administrators, runs after the answer.
 const REGISTRATION_ANSWER_TIME: std::time::Duration = std::time::Duration::from_millis(25);
 
+/// Refuses a passkey sign-in or registration start from a client IP over its
+/// `passkey_login_throttle` limit with `429` and `Retry-After`; other requests pass.
+pub async fn throttle_passkey_start(
+    State(throttle): State<Arc<crate::sts::throttle::TokenEndpointThrottle>>,
+    client_ip: Option<Extension<crate::source_auth::client_ip::ClientIp>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some(retry_after) =
+        throttle.record_client_attempt(client_ip.map(|Extension(crate::source_auth::client_ip::ClientIp(ip))| ip))
+    {
+        warn!("Throttling passkey sign-in or registration starts from a source over its limit");
+        let mut response = (StatusCode::TOO_MANY_REQUESTS, "Too many sign-in attempts; retry later").into_response();
+        let headers = response.headers_mut();
+        headers.insert(axum::http::header::RETRY_AFTER, HeaderValue::from(retry_after));
+        headers.insert(axum::http::header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
+    next.run(request).await
+}
+
 /// The longest username, in bytes, that sign-in and registration accept. Every challenge keeps
 /// its username until it is finished or expires, so this bounds what an unfinished one holds.
 const MAX_USERNAME_BYTES: usize = 256;
@@ -962,6 +983,88 @@ mod tests {
                 .await
                 .len()
                 == 2
+        );
+    }
+
+    async fn passkey_start_statuses(
+        enabled: bool,
+        sources: &[[u8; 4]],
+    ) -> Vec<(StatusCode, Option<String>, Option<String>)> {
+        use tower::ServiceExt;
+        let throttle =
+            crate::sts::throttle::TokenEndpointThrottle::per_client_ip(&crate::config::types::LoginThrottleConfig {
+                enabled,
+                per_ip: crate::config::types::RateLimitConfig {
+                    requests: 2,
+                    window_secs: 60,
+                    burst: None,
+                },
+            });
+        let app = axum::Router::new()
+            .route("/auth/login/start", axum::routing::post(|| async { StatusCode::OK }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                std::sync::Arc::new(throttle),
+                super::throttle_passkey_start,
+            ));
+        let mut statuses = Vec::new();
+        for source in sources {
+            let request = axum::http::Request::post("/auth/login/start")
+                .extension(crate::source_auth::client_ip::ClientIp(std::net::IpAddr::from(*source)))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app
+                .clone()
+                .oneshot(request)
+                .await
+                .unwrap();
+            let header = |name| {
+                response
+                    .headers()
+                    .get(name)
+                    .map(|value: &axum::http::HeaderValue| {
+                        value
+                            .to_str()
+                            .unwrap()
+                            .to_string()
+                    })
+            };
+            statuses.push((
+                response.status(),
+                header(axum::http::header::RETRY_AFTER),
+                header(axum::http::header::CACHE_CONTROL),
+            ));
+        }
+        statuses
+    }
+
+    #[tokio::test]
+    async fn a_source_over_its_passkey_start_limit_is_refused_until_its_window_rolls_off() {
+        let statuses =
+            passkey_start_statuses(true, &[[10, 0, 0, 1], [10, 0, 0, 1], [10, 0, 0, 1], [10, 0, 0, 2]]).await;
+
+        assert_eq!(statuses[0], (StatusCode::OK, None, None));
+        assert_eq!(statuses[1], (StatusCode::OK, None, None));
+        assert_eq!(statuses[2].0, StatusCode::TOO_MANY_REQUESTS);
+        let retry_after: u64 = statuses[2]
+            .1
+            .as_deref()
+            .expect("a Retry-After header")
+            .parse()
+            .unwrap();
+        assert!((1..=60).contains(&retry_after), "{retry_after}");
+        assert_eq!(statuses[2].2.as_deref(), Some("no-store"));
+        assert_eq!(statuses[3], (StatusCode::OK, None, None));
+    }
+
+    #[tokio::test]
+    async fn a_disabled_passkey_start_throttle_limits_no_source() {
+        let statuses = passkey_start_statuses(false, &[[10, 0, 0, 1]; 4]).await;
+
+        assert!(
+            statuses
+                .iter()
+                .all(|status| *status == (StatusCode::OK, None, None)),
+            "{statuses:?}"
         );
     }
 

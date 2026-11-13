@@ -29,17 +29,17 @@ async fn passkey_sign_in_started_for(
     start_passkey_sign_in(world, username).await;
 }
 
-#[when(expr = "a passkey {word} is started for a username of {int} bytes")]
+#[when(regex = r"^a passkey (sign-in|registration) is started for a username of (\d+) bytes$")]
 async fn passkey_ceremony_started_for_username_of_length(
     world: &mut SurfaceWorld,
     ceremony: String,
     length: usize,
 ) {
     ensure_admin_session(world).await;
-    let path = match ceremony.as_str() {
-        "sign-in" => "/auth/login/start",
-        "registration" => "/auth/register/start",
-        other => panic!("no passkey ceremony {other:?}"),
+    let path = if ceremony == "sign-in" {
+        "/auth/login/start"
+    } else {
+        "/auth/register/start"
     };
     let started = post_json(world, path, &json!({"username": "a".repeat(length)})).await;
     world.caller_response = Some(
@@ -47,6 +47,37 @@ async fn passkey_ceremony_started_for_username_of_length(
             .await
             .expect("record the start response"),
     );
+}
+
+#[when(expr = "{int} passkey sign-ins are started for {string}")]
+async fn passkey_sign_ins_started_for(
+    world: &mut SurfaceWorld,
+    count: usize,
+    username: String,
+) {
+    ensure_admin_session(world).await;
+    for _ in 0..count {
+        let started = post_json(world, "/auth/login/start", &json!({"username": username})).await;
+        world.caller_response = Some(
+            recorded_response(started)
+                .await
+                .expect("record the start response"),
+        );
+    }
+}
+
+#[then("the response says when to retry")]
+fn response_says_when_to_retry(world: &mut SurfaceWorld) {
+    let response = world
+        .caller_response
+        .as_ref()
+        .expect("a response");
+    let retry_after: u64 = response
+        .headers
+        .get("retry-after")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("no Retry-After seconds in {:?}", response.headers));
+    assert!((1..=60).contains(&retry_after), "Retry-After {retry_after}");
 }
 
 fn credential_ids(credentials: &[Value]) -> Vec<String> {
@@ -129,7 +160,7 @@ async fn another_passkey_registers_username(
     world.other_passkey = Some(passkey);
 }
 
-#[when(expr = "a passkey is registered for the new username {string}")]
+#[when(expr = "a passkey is registered for the username {string}")]
 async fn passkey_registers_new_username(
     world: &mut SurfaceWorld,
     username: String,

@@ -1395,6 +1395,41 @@ impl Default for LoginThrottleConfig {
     }
 }
 
+/// Per-client-IP throttle on starting a passkey sign-in or registration. Unlike the other login
+/// throttles it is on unless switched off: both routes are unauthenticated and every call keeps a
+/// challenge, so an unlimited client could push other users' challenges out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PasskeyLoginThrottleConfig {
+    /// Master switch for the throttle. Defaults to `true`.
+    #[serde(default = "default_passkey_login_throttle_enabled")]
+    pub enabled: bool,
+    /// Per-client-IP limit, shared by both start routes.
+    #[serde(default = "default_login_throttle_per_ip")]
+    pub per_ip: RateLimitConfig,
+}
+
+impl Default for PasskeyLoginThrottleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_passkey_login_throttle_enabled(),
+            per_ip: default_login_throttle_per_ip(),
+        }
+    }
+}
+
+impl From<&PasskeyLoginThrottleConfig> for LoginThrottleConfig {
+    fn from(config: &PasskeyLoginThrottleConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            per_ip: config.per_ip.clone(),
+        }
+    }
+}
+
+fn default_passkey_login_throttle_enabled() -> bool {
+    true
+}
+
 /// The delegated payment gate's circuit breaker: after `breaker_failures`
 /// consecutive failed calls to one agent-pay gateway it refuses calls to it for
 /// `breaker_open_secs`.
