@@ -152,7 +152,9 @@ async fn refuse_removal_in_use(
 /// Precedence: explicit workflow / manual states (AwaitingMediatorAccess,
 /// AwaitingApproval, Disabled, Pending) are preserved as-is; otherwise a live listener or a `Connected`
 /// connection point means Active, any connection point with recorded-but-
-/// unhealthy runtime means Failed, and no runtime information yet means Pending.
+/// unhealthy runtime means Failed, and no runtime information yet means Pending. A stored Failed
+/// with no connection points (a pairing its inviter refused) has nothing to derive from and stays
+/// Failed.
 fn effective_remote_gateway_status(
     current: GatewayStatus,
     has_active_listener: bool,
@@ -171,6 +173,9 @@ fn effective_remote_gateway_status(
 
     if has_active_listener {
         return GatewayStatus::Active;
+    }
+    if current == GatewayStatus::Failed && connection_points.is_empty() {
+        return GatewayStatus::Failed;
     }
 
     // No live listener (broken, or this Standby node holds none): fall
@@ -902,6 +907,16 @@ mod tests {
         );
         // No runtime recorded yet -> Pending (still connecting / never attempted).
         assert_eq!(effective_remote_gateway_status(GatewayStatus::Active, false, &[cp(None)]), GatewayStatus::Pending);
+
+        // A refused pairing keeps no connection point and stays Failed; one with a
+        // connection point is derived as before.
+        assert_eq!(effective_remote_gateway_status(GatewayStatus::Failed, false, &[]), GatewayStatus::Failed);
+        assert_eq!(effective_remote_gateway_status(GatewayStatus::Active, false, &[]), GatewayStatus::Pending);
+        assert_eq!(effective_remote_gateway_status(GatewayStatus::Failed, true, &[]), GatewayStatus::Active);
+        assert_eq!(
+            effective_remote_gateway_status(GatewayStatus::Failed, false, &[cp(Some(ConnectionStatus::Connected))]),
+            GatewayStatus::Active
+        );
     }
 
     #[test]

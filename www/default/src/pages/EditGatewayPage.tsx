@@ -67,6 +67,7 @@ const EditGatewayPage: React.FC = () => {
   const [gatewayMetadata, setGatewayMetadata] = useState<GatewayMetadata | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<ConnectionRuntimeStatus | null>(null);
   const [issuerDids, setIssuerDids] = useState<GatewayIssuerDids>(issuerDidsFromGateway({}));
+  const isPending = gatewayMetadata?.status === 'pending';
 
   // Handle /gateways/self - look up the actual self gateway ID and redirect
   useEffect(() => {
@@ -221,7 +222,9 @@ const EditGatewayPage: React.FC = () => {
           description: form.description,
           did: form.did,
           gateway_type: form.gateway_type,
-          status: form.status,
+          ...(form.status === 'active' || form.status === 'disabled'
+            ? { status: form.status }
+            : {}),
         };
         if (isEditMode) {
           await apiClient.put(`/gateways/${id}`, gatewayData);
@@ -430,6 +433,7 @@ const EditGatewayPage: React.FC = () => {
                 runtimeStatus={runtimeStatus}
                 isEditMode={isEditMode}
                 isSelfGateway={isSelfGateway}
+                isPending={isPending}
                 saving={saving}
                 id={id}
                 handleSubmit={handleSubmit}
@@ -473,13 +477,22 @@ const EditGatewayPage: React.FC = () => {
                   </>
                 }
               >
-                <IssuerDidsCard gatewayId={id!} value={issuerDids} onChange={setIssuerDids} />
-                <RemoteTab
-                  remoteSurfaces={remoteChannels}
-                  loadingSurfaces={loadingChannels}
-                  surfacesError={channelsError}
-                  fetchRemoteSurfaces={fetchRemoteChannels}
-                />
+                {isPending ? (
+                  <p className="text-muted py-3 mb-0" data-testid="gateway-editor-remote-pending">
+                    The issuer DIDs and surfaces of {form.name || 'this gateway'} show here once it
+                    accepts the connection.
+                  </p>
+                ) : (
+                  <>
+                    <IssuerDidsCard gatewayId={id!} value={issuerDids} onChange={setIssuerDids} />
+                    <RemoteTab
+                      remoteSurfaces={remoteChannels}
+                      loadingSurfaces={loadingChannels}
+                      surfacesError={channelsError}
+                      fetchRemoteSurfaces={fetchRemoteChannels}
+                    />
+                  </>
+                )}
               </Tab>
             )}
 
