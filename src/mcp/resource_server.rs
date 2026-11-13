@@ -916,6 +916,11 @@ mod tests {
             matches!(&identity, crate::source_auth::AuthenticatedIdentity::JwtBearer { strategy_id: None, .. }),
             "no Caller Context strategy verified a Resource Server token: {identity:?}"
         );
+        let identity_claims = ["sub".to_string()];
+        let keyed = crate::proxy::caller_key::KeyedCaller::of(&identity, &identity_claims)
+            .expect("a resource token caller gets a caller key");
+        assert_eq!((keyed.issuer, keyed.claim, keyed.value), (profile.issuer.as_str(), "sub", "user"));
+        assert_eq!(keyed.verification, verification);
         headers.append(header::AUTHORIZATION, HeaderValue::from_static("Bearer second"));
         assert_eq!(
             config

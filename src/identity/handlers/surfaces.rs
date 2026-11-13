@@ -1233,7 +1233,8 @@ type SavedSurface = (axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResp
 /// binding with external consent ([`inherited_target_binding_warnings`]),
 /// each enabled view that reaches that binding's vendor without it or a
 /// credential of its own ([`unbound_vendor_view_warnings`]), and each Target
-/// authentication that breaks a `target_https` or `target_source_auth` rule in `warn`.
+/// authentication that breaks a `target_https` or `target_source_auth` rule in `warn`,
+/// and a `caller_key` its Target never or only in clear receives ([`super::surface_caller_key::caller_key_warnings`]).
 async fn save_warnings(
     state: &IdentityApiState,
     surface: &AgentSurface,
@@ -1270,6 +1271,7 @@ async fn save_warnings(
         .chain(inherited_target_binding_warnings(surface))
         .chain(unbound_vendor_view_warnings(surface))
         .chain(super::surface_target_auth::target_rule_warnings(surface, &https_proxies))
+        .chain(super::surface_caller_key::caller_key_warnings(surface))
         .chain(stale_pins)
     {
         if let Some(value) = warning_header(&warning) {
@@ -3402,6 +3404,7 @@ pub async fn update_surface(
     retain_transit_token_lifetime(&mut surface, &existing);
     retain_transit_caller_authentication(&mut surface, &existing, &sent);
     super::surface_caller_key::retain_caller_key(&mut surface, &existing, &sent);
+    retain_browser_origins(&mut surface, &existing, &sent);
 
     let (saved, warnings) = validate_and_save_surface(
         &state,
@@ -3459,6 +3462,24 @@ fn retain_transit_token_lifetime(
             });
         }
         None => {}
+    }
+}
+
+/// PUT carries the whole record, and the Surface Builder does not show
+/// `browser_origins`, so a PUT that leaves it out keeps the stored list.
+/// Removal is explicit: `[]` with PUT, or `[]` or `null` with PATCH.
+fn retain_browser_origins(
+    surface: &mut AgentSurface,
+    existing: &AgentSurface,
+    sent: &serde_json::Value,
+) {
+    if sent
+        .get("browser_origins")
+        .is_none()
+    {
+        surface.browser_origins = existing
+            .browser_origins
+            .clone();
     }
 }
 
@@ -8071,6 +8092,33 @@ mod validation_tests {
         let mut fresh = surface_with_transit_lifetime(None);
         retain_transit_token_lifetime(&mut fresh, &surface_with_transit_lifetime(None));
         assert_eq!(stored_lifetime(&fresh), None);
+    }
+
+    #[test]
+    fn a_put_without_browser_origins_keeps_the_stored_ones_and_an_empty_list_clears_them() {
+        let mut stored = base_surface();
+        stored.browser_origins = vec!["https://chat.example.com".to_string()];
+
+        let mut omitted = base_surface();
+        retain_browser_origins(&mut omitted, &stored, &serde_json::json!({ "name": "surface" }));
+        assert_eq!(omitted.browser_origins, ["https://chat.example.com"]);
+
+        let mut cleared = base_surface();
+        retain_browser_origins(&mut cleared, &stored, &serde_json::json!({ "browser_origins": [] }));
+        assert!(
+            cleared
+                .browser_origins
+                .is_empty()
+        );
+
+        let mut replaced = base_surface();
+        replaced.browser_origins = vec!["https://app.example.com".to_string()];
+        retain_browser_origins(
+            &mut replaced,
+            &stored,
+            &serde_json::json!({ "browser_origins": ["https://app.example.com"] }),
+        );
+        assert_eq!(replaced.browser_origins, ["https://app.example.com"]);
     }
 
     /// A PUT without `transit` keeps the lifetime a stored base block with no

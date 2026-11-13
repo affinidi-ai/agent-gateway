@@ -85,29 +85,56 @@ fn proxy_cors_layer(cors_origins: &[String]) -> CorsLayer {
     cors_layer(cors_origins, false, None)
 }
 
+/// Where the CORS layer of surface routes reads each surface's `browser_origins`
+/// on every request, so a saved change applies at once: the routed surfaces, and
+/// the resolved-surface cache, which knows the surfaces disabled or deleted since
+/// they were routed.
+#[derive(Clone)]
+struct SurfaceOrigins {
+    surfaces: Arc<RwLock<Vec<SurfaceInfo>>>,
+    resolved: Arc<crate::surfaces::ResolvedSurfaceCache>,
+}
+
 /// CORS for the routes of surfaces: `network.cors` plus, for a path that
-/// belongs to a surface, that surface's `browser_origins`, read from `surfaces`
-/// on every request so a saved change applies at once.
+/// belongs to a surface, that surface's `browser_origins`.
 fn surface_cors_layer(
     cors_origins: &[String],
-    surfaces: &Arc<RwLock<Vec<SurfaceInfo>>>,
+    state: &MultiSurfaceProxyState,
 ) -> CorsLayer {
-    cors_layer(cors_origins, false, Some(Arc::clone(surfaces)))
+    cors_layer(
+        cors_origins,
+        false,
+        Some(SurfaceOrigins {
+            surfaces: Arc::clone(&state.channels),
+            resolved: Arc::clone(&state.resolved_surface_cache),
+        }),
+    )
 }
 
 /// Whether `origin` is one of the `browser_origins` of the active surface that
-/// `path` belongs to.
+/// `path` belongs to. A surface the resolved-surface cache retired, because it
+/// was disabled or deleted, allows none, as the handler then serves it to no one.
 async fn is_surface_browser_origin(
-    surfaces: &RwLock<Vec<SurfaceInfo>>,
+    origins: &SurfaceOrigins,
     origin: &HeaderValue,
     path: &str,
 ) -> bool {
     let Ok(origin) = origin.to_str() else {
         return false;
     };
-    let surfaces = surfaces.read().await;
+    let surfaces = origins.surfaces.read().await;
+    if surfaces.iter().all(|info| {
+        info.surface
+            .browser_origins
+            .is_empty()
+    }) {
+        return false;
+    }
     super::handler::match_surface_route(&surfaces, path).is_some_and(|(info, ..)| {
         info.surface.status == crate::config::agent_surface::SurfaceStatus::Active
+            && !origins
+                .resolved
+                .is_retired(&info.surface.surface_id)
             && info
                 .surface
                 .browser_origins
@@ -139,7 +166,7 @@ fn metadata_cors_layer(cors_origins: &[String]) -> CorsLayer {
 fn cors_layer(
     cors_origins: &[String],
     any_origin_reads: bool,
-    surfaces: Option<Arc<RwLock<Vec<SurfaceInfo>>>>,
+    surfaces: Option<SurfaceOrigins>,
 ) -> CorsLayer {
     let origins = parse_cors_origins(cors_origins);
 
@@ -1236,7 +1263,7 @@ pub async fn build_port_router(
                         axum::routing::any(super::handler::multi_channel_proxy_handler),
                     )
                     .layer(axum::middleware::map_response(withhold_target_cookies))
-                    .layer(proxy_cors_layer(&network_config.cors))
+                    .layer(surface_cors_layer(&network_config.cors, &state))
                     .with_state(state.as_ref().clone());
 
                 app = app.merge(proxy_router);
@@ -1295,7 +1322,7 @@ pub async fn build_port_router(
         let proxy_router = proxy_router
             .layer(axum::middleware::map_response(withhold_target_cookies))
             .layer(axum::middleware::from_fn(crate::observability::trace_http_request))
-            .layer(surface_cors_layer(&network_config.cors, &state.channels))
+            .layer(surface_cors_layer(&network_config.cors, &state))
             .with_state(state.as_ref().clone());
 
         app = app.merge(proxy_router);
@@ -2134,6 +2161,21 @@ mod tests {
         path: &str,
         preflight_for: Option<&str>,
     ) -> axum::response::Response {
+        let origins = SurfaceOrigins {
+            surfaces: Arc::clone(surfaces),
+            resolved: Arc::default(),
+        };
+        browser_origin_response_through(origins, cors, origin, method, path, preflight_for).await
+    }
+
+    async fn browser_origin_response_through(
+        origins: SurfaceOrigins,
+        cors: &[&str],
+        origin: &str,
+        method: &str,
+        path: &str,
+        preflight_for: Option<&str>,
+    ) -> axum::response::Response {
         use axum::http::{Request, header};
         use tower::ServiceExt;
         let cors: Vec<String> = cors
@@ -2162,7 +2204,7 @@ mod tests {
                     ([(header::CONTENT_TYPE, content_type)], "{}")
                 }),
             )
-            .layer(surface_cors_layer(&cors, surfaces))
+            .layer(cors_layer(&cors, false, Some(origins)))
             .oneshot(
                 request
                     .body(axum::body::Body::empty())
@@ -2279,6 +2321,40 @@ mod tests {
         let surfaces = Arc::new(RwLock::new(vec![disabled]));
         let call = browser_origin_response(&surfaces, &[], page, "POST", "/agents/alpha/rpc", None).await;
         assert_eq!(allow_origin(&call), None);
+    }
+
+    #[tokio::test]
+    async fn a_surface_retired_since_it_was_routed_opens_no_browser_origin() {
+        let page = "https://chat.example.com";
+        let mut routed = browser_origin_surface("/agents/alpha", &[page]);
+        let mut surface = (*routed.surface).clone();
+        surface.surface_id = "alpha".to_string();
+        routed.surface = Arc::new(surface);
+        let origins = SurfaceOrigins {
+            surfaces: Arc::new(RwLock::new(vec![routed])),
+            resolved: Arc::default(),
+        };
+        let call = browser_origin_response_through(origins.clone(), &[], page, "POST", "/agents/alpha/rpc", None).await;
+        assert_eq!(allow_origin(&call).as_deref(), Some(page), "while the surface is served");
+
+        origins
+            .resolved
+            .remove("alpha");
+        let call = browser_origin_response_through(origins, &[], page, "POST", "/agents/alpha/rpc", None).await;
+        assert_eq!(allow_origin(&call), None, "once the cache retired it");
+    }
+
+    #[tokio::test]
+    async fn a_port_where_no_surface_lists_browser_origins_matches_no_route() {
+        let page = "https://chat.example.com";
+        let origins = SurfaceOrigins {
+            surfaces: Arc::new(RwLock::new(vec![browser_origin_surface("/agents/alpha", &[])])),
+            resolved: Arc::default(),
+        };
+        let header = HeaderValue::from_static("https://chat.example.com");
+        assert!(!is_surface_browser_origin(&origins, &header, "/agents/alpha/rpc").await);
+        *origins.surfaces.write().await = vec![browser_origin_surface("/agents/alpha", &[page])];
+        assert!(is_surface_browser_origin(&origins, &header, "/agents/alpha/rpc").await);
     }
 
     #[tokio::test]

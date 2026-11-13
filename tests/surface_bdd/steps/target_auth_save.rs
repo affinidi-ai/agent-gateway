@@ -108,6 +108,11 @@ fn draft_target_is_https(world: &mut SurfaceWorld) {
     draft(world)["target"]["endpoint"] = json!(UNREACHABLE_HTTPS_TARGET);
 }
 
+#[given("the draft's Target is a plain http URL")]
+fn draft_target_is_plain_http(world: &mut SurfaceWorld) {
+    draft(world)["target"]["endpoint"] = json!(UNREACHABLE_HTTP_TARGET);
+}
+
 #[given(expr = "the draft's Access Point checks callers by the API key in secret {string}")]
 fn draft_access_point_checks_callers(
     world: &mut SurfaceWorld,
