@@ -223,7 +223,9 @@ test.describe("Mediator access step", () => {
     await page.getByTestId("wizard-next").click();
 
     const step = page.getByTestId("wizard-step-mediator-access");
-    await expect(step).toContainText("another organisation");
+    await expect(step).toContainText(
+      "the mediator of the gateway that sent the invitation",
+    );
     await expect(page.getByTestId("mediator-access-expiry")).toContainText(
       "The invitation expires on",
     );

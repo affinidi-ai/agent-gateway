@@ -149,8 +149,8 @@ async fn refuse_removal_in_use(
 /// Derive the effective status of a remote gateway from its connection points'
 /// persisted runtime health (proposal section F — status precedence).
 ///
-/// Precedence: explicit workflow / manual states (AwaitingApproval, Disabled,
-/// Pending) are preserved as-is; otherwise a live listener or a `Connected`
+/// Precedence: explicit workflow / manual states (AwaitingMediatorAccess,
+/// AwaitingApproval, Disabled, Pending) are preserved as-is; otherwise a live listener or a `Connected`
 /// connection point means Active, any connection point with recorded-but-
 /// unhealthy runtime means Failed, and no runtime information yet means Pending.
 fn effective_remote_gateway_status(
@@ -159,7 +159,13 @@ fn effective_remote_gateway_status(
     connection_points: &[crate::gateways::connection_points::types::GatewayConnectionPoint],
 ) -> GatewayStatus {
     // Preserve explicit workflow / manual states.
-    if matches!(current, GatewayStatus::AwaitingApproval | GatewayStatus::Disabled | GatewayStatus::Pending) {
+    if matches!(
+        current,
+        GatewayStatus::AwaitingMediatorAccess
+            | GatewayStatus::AwaitingApproval
+            | GatewayStatus::Disabled
+            | GatewayStatus::Pending
+    ) {
         return current;
     }
 
@@ -872,6 +878,10 @@ mod tests {
             GatewayStatus::AwaitingApproval
         );
         assert_eq!(effective_remote_gateway_status(GatewayStatus::Pending, false, &[]), GatewayStatus::Pending);
+        assert_eq!(
+            effective_remote_gateway_status(GatewayStatus::AwaitingMediatorAccess, false, &[]),
+            GatewayStatus::AwaitingMediatorAccess
+        );
         assert_eq!(effective_remote_gateway_status(GatewayStatus::Disabled, true, &[]), GatewayStatus::Disabled);
 
         // A live listener means Active.
@@ -5349,7 +5359,10 @@ mod pause_tests {
                     >,
                 ),
             )
+            .route("/v1/gateways", axum::routing::get(list_gateways::<crate::gateways::FileSystemGatewayStore>))
+            .route("/v1/gateways/{id}", axum::routing::get(get_gateway::<crate::gateways::FileSystemGatewayStore>))
             .layer(Extension(gateways.clone()))
+            .layer(Extension(Some(points.clone())))
             .layer(Extension(points))
             .layer(Extension(mediators))
             .layer(Extension(Arc::new(vc_issuer)))
@@ -5402,6 +5415,25 @@ mod pause_tests {
         assert_eq!(access["dids"][1]["role"], "permanent");
         assert_eq!(access["dids"][1]["did"], paused.permanent_did.as_str());
         assert!(access["expires_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn a_paused_gateway_is_listed_and_read_as_awaiting_mediator_access() {
+        let paused = paused_acceptance().await;
+
+        let (status, list) = call(&paused.router, "GET", "/v1/gateways").await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        let listed = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|gateway| gateway["id"] == "gw-paused")
+            .expect("the paused gateway is listed");
+        assert_eq!(listed["status"], "awaiting-mediator-access");
+
+        let (status, gateway) = call(&paused.router, "GET", "/v1/gateways/gw-paused").await;
+        assert_eq!(status, StatusCode::OK, "{gateway}");
+        assert_eq!(gateway["status"], "awaiting-mediator-access");
     }
 
     #[tokio::test]
