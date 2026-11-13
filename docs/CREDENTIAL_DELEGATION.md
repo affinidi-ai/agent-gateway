@@ -1559,7 +1559,9 @@ its own, so no field can be read as part of another. The claim is the first of
 without a string `iss`, or without any of the claims as such a string, gets no key. The same
 caller on the same surface gets the same key on every request, every variant of the surface
 included; another caller, another issuer, another surface, another secret, another key source
-or another audience set gives another key. The setting and its rules
+or another audience set gives another key. The gateway's own agent card fetch is not a
+caller's request and carries no caller key, over Fabric at a configured card location
+included (see [`FABRIC.md`](FABRIC.md#agent-card-fetch-over-fabric)). The setting and its rules
 are in [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#surface-caller-keys), and the
 derivation in [`proxy/caller_key.rs`](../src/proxy/caller_key.rs).
 

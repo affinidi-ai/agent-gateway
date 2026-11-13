@@ -10,7 +10,8 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::fabric_transit_tests::{
-    CALLER_KEY, SURFACE_ID, forward_request, forward_response, header_values, ran_in_child, receiver, surface,
+    CALLER_KEY, JWT_AUDIENCE, SURFACE_ID, forward_request, forward_response, header_values, ran_in_child, receiver,
+    receiver_with_strategies, surface,
 };
 use crate::audit::request_events::RejectionReason;
 use crate::config::agent_surface::AgentSurface;
@@ -284,6 +285,99 @@ async fn a_card_fetch_at_a_configured_location_carries_no_transit_token() {
             .is_some(),
         "a caller's request carries a transit token"
     );
+}
+
+/// The gateway's own card fetch at a configured card location carries no caller
+/// key, even for a caller whose JWT the surface verified on that request; that
+/// caller's own request still gets its key.
+#[tokio::test]
+async fn a_card_fetch_at_a_configured_location_carries_no_caller_key() {
+    if ran_in_child("ATG_FABRIC_CARD_CALLER_KEY_CHILD").await {
+        return;
+    }
+    use crate::component_tests::helpers::jwt::{JwksFixture, now_secs, sign_jwt};
+    use crate::jwt_bearer::storage::JwtVerificationStrategyStorage;
+    use crate::secrets::SecretsStore;
+
+    let fixture = JwksFixture::start().await;
+    let target = ProtectedTarget::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let strategies = Arc::new(
+        crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore::new(root.path().join("strategies"))
+            .await
+            .unwrap(),
+    );
+    let strategy = strategies
+        .create(
+            serde_json::from_value(json!({
+                "id": "partner-idp", "name": "Partner IdP", "expected_issuer": fixture.issuer,
+                "jwks_source": {"type": "remote", "jwks_uri": format!("{}/.well-known/jwks.json", fixture.issuer)},
+                "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut value = serde_json::to_value(protected_surface(&target.url, "target-key", Some("/cards/me"))).unwrap();
+    value["access_point"]["caller_authentication"] = json!({ "methods": [{ "type": "jwt_bearer",
+        "jwt_verification_strategy_id": strategy.id, "audiences": [JWT_AUDIENCE] }] });
+    value["caller_key"] = json!({ "secret_id": "caller-keys" });
+    let _receiver = receiver_with_strategies(root.path(), &serde_json::from_value(value).unwrap(), strategies).await;
+    store_target_key(&root.path().join("secrets")).await;
+    let secrets = crate::secrets::FilesystemSecretsStore::new_async(
+        root.path()
+            .join("secrets")
+            .to_str()
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    secrets
+        .create(crate::secrets::CreateSecretRequest {
+            tenant_id: None,
+            name: "Caller keys".to_string(),
+            secret_id: "caller-keys".to_string(),
+            description: None,
+            value: "caller-key-secret-of-thirty-two-bytes-or-more".to_string(),
+            secret_type: "General".to_string(),
+            tags: vec![],
+        })
+        .await
+        .unwrap();
+    super::init_secrets_store(Arc::new(secrets)).await;
+    let jwt = sign_jwt(
+        json!({ "iss": fixture.issuer, "sub": "user-123", "aud": JWT_AUDIENCE, "exp": now_secs() + 300 }),
+        &fixture.kid,
+    );
+    let from_the_jwt_caller = |method: &str, path: &str| {
+        let mut message = peer_request(root.path(), method, path);
+        message.message_body["headers"]["Authorization"] = json!(format!("Bearer {jwt}"));
+        message
+    };
+
+    let response = forward_response(&from_the_jwt_caller("GET", "/cards/me")).await;
+    assert_eq!(response["status"], 200, "{response}");
+    let request = target
+        .received()
+        .pop()
+        .unwrap();
+    assert_eq!(request.path, "/cards/me");
+    assert_eq!(header_values(&request.headers, TARGET_KEY_HEADER), [TARGET_KEY]);
+    assert!(
+        request
+            .headers
+            .get("x-caller-key")
+            .is_none(),
+        "the card fetch carried the caller's key"
+    );
+
+    let response = forward_response(&from_the_jwt_caller("POST", "/rpc")).await;
+    assert_eq!(response["status"], 200, "{response}");
+    let request = target
+        .received()
+        .pop()
+        .unwrap();
+    assert_eq!(header_values(&request.headers, "x-caller-key").len(), 1, "a caller's request carries its key");
 }
 
 /// Other public reads skip caller authentication and so reach the Target without

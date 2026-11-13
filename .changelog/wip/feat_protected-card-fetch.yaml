@@ -26,8 +26,8 @@ changes:
         a GET of exactly /.well-known/agent-card.json or the configured card location, now
         follows the direct path's header, body and failure rules. It is a new GET with no body
         that carries the Target credential and keeps only Accept, Accept-Language and User-Agent
-        from the peer, with no delegated credential, transit token or trace id. Its answer
-        reaches the peer with only the headers that describe the card. A redirect answers 502
+        from the peer, with no delegated credential, caller key, transit token or trace id. Its
+        answer reaches the peer with only the headers that describe the card. A redirect answers 502
         Upstream redirected, as on the direct path, and any other refusal only its status.
         Without Target authentication the fetch is still forwarded as the peer sent it and a
         Target redirect is relayed. Any other public read, a HEAD of the card path or the legacy

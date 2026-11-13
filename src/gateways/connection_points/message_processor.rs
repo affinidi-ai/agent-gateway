@@ -5846,7 +5846,7 @@ async fn process_charged_forward_request(
     // A card fetch on a surface with Target authentication is the gateway's own
     // request, as on the direct path: a bodiless GET of the card path that keeps
     // only content-negotiation headers from the peer, and carries no caller's
-    // delegated credential or transit token.
+    // delegated credential, caller key or transit token.
     let credentialed_card_fetch =
         surface.target_auth().is_some() && crate::proxy::handler::is_fabric_card_fetch(&surface, method, path);
     if credentialed_card_fetch {
@@ -6066,12 +6066,13 @@ async fn process_charged_forward_request(
         }
     }
 
-    if let Some((header_name, header_value)) = crate::proxy::caller_key::caller_key_header(
-        &surface,
-        authenticated_identity.as_ref(),
-        get_secrets_store().as_ref(),
-    )
-    .await
+    if !credentialed_card_fetch
+        && let Some((header_name, header_value)) = crate::proxy::caller_key::caller_key_header(
+            &surface,
+            authenticated_identity.as_ref(),
+            get_secrets_store().as_ref(),
+        )
+        .await
     {
         req = crate::proxy::handler::replace_request_header(req, &header_name, &header_value);
     }

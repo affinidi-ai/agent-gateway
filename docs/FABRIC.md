@@ -469,8 +469,10 @@ the configured location on the Target's origin), carrying `target.auth`, the gat
 `Accept-Encoding: identity` and, from the peer, only `Accept`, `Accept-Language` and `User-Agent`.
 The peer's `Authorization`, `Cookie`, other headers
 and body are dropped, and the fetch carries no caller's material: no delegated credential from
-`outbound_credentials` (so it never answers `consent_required`), no transit token, even at a
-configured card location, and no `X-Gateway-Trace-Id`.
+`outbound_credentials` (so it never answers `consent_required`), no
+[caller key](CREDENTIAL_DELEGATION.md#caller-keys), even for a caller whose JWT the surface verified
+at a configured card location, no transit token, even at a configured card location, and no
+`X-Gateway-Trace-Id`.
 
 The Target's answer to that fetch reaches the peer with only `Content-Type`, `Content-Language`,
 `Cache-Control`, `ETag`, `Last-Modified` and `Vary`, so a session cookie or authentication header
