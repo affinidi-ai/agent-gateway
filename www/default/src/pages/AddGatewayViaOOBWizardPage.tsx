@@ -213,7 +213,7 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
             dids={labelledDids(wizardState.mediatorAccess, ADD_GATEWAY_DID_LABELS)}
             mediatorName={wizardState.mediatorAccess.mediator_name}
             expiresAt={wizardState.mediatorAccess.expires_at}
-            note="This is the inviting gateway's mediator, so its administrator may be in another organisation."
+            note="This is the mediator of the gateway that sent the invitation."
             refusal={refusal}
             continuing={false}
             onContinue={handleMediatorAccessConfirmed}
