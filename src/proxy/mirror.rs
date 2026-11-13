@@ -10,10 +10,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use reqwest::Method;
 use reqwest::StatusCode;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 
 use crate::config::MirrorConfig;
-use crate::egress::{self, EgressError};
+use crate::egress::{self, EgressError, PinnedTarget};
+use crate::http_client::GATEWAY_USER_AGENT;
 
 /// One copy of a live request, addressed to a surface's mirror endpoint.
 pub(crate) struct MirrorRequest {
@@ -55,13 +56,41 @@ impl MirrorRequest {
         }
         self
     }
+
+    /// Copy every header of `source` that `keep` accepts.
+    pub(crate) fn headers_from(
+        mut self,
+        source: &HeaderMap,
+        keep: impl Fn(&str) -> bool,
+    ) -> Self {
+        for (name, value) in source {
+            if keep(name.as_str()) {
+                self = self.header(name.as_str(), value.as_bytes());
+            }
+        }
+        self
+    }
+
+    /// Mark the copy as a mirror, and tie it to the live request's trace when there is one.
+    pub(crate) fn mirrored(
+        self,
+        trace_id: Option<&str>,
+    ) -> Self {
+        let marked = self.header("X-Mirrored-Request", "true");
+        match trace_id {
+            Some(trace_id) => marked.header("X-Gateway-Trace-Id", format!("{trace_id}-mirror")),
+            None => marked,
+        }
+    }
 }
 
-/// Why a mirror request did not complete. Neither variant carries the endpoint URL.
+/// Why a mirror request did not complete. No variant carries the endpoint URL.
 #[derive(Debug)]
 pub(crate) enum MirrorError {
     /// The egress guard refused the endpoint; nothing was sent.
     Refused(EgressError),
+    /// The gateway failed before it could vet the endpoint; nothing was sent.
+    Internal(String),
     /// The request was sent and failed.
     Send(reqwest::Error),
 }
@@ -72,6 +101,7 @@ impl MirrorError {
         match self {
             MirrorError::Refused(EgressError::Dns(_)) => "DNS resolution failed",
             MirrorError::Refused(_) => "blocked by egress policy",
+            MirrorError::Internal(_) => "internal error",
             MirrorError::Send(e) if e.is_timeout() => "timeout",
             MirrorError::Send(e) if e.is_connect() => "connection refused",
             MirrorError::Send(e) if e.is_request() => "invalid request",
@@ -87,6 +117,7 @@ impl std::fmt::Display for MirrorError {
     ) -> std::fmt::Result {
         match self {
             MirrorError::Refused(e) => write!(f, "{e}"),
+            MirrorError::Internal(reason) => write!(f, "mirror could not be vetted: {reason}"),
             MirrorError::Send(e) => write!(f, "mirror request failed: {e}"),
         }
     }
@@ -106,19 +137,20 @@ pub(crate) fn selected(percentage: u8) -> bool {
 
 /// Send `request` to its endpoint through the egress guard and return the status.
 ///
-/// DNS is resolved once, here; the response body is discarded.
+/// DNS is resolved once, here, and shares the request's timeout; the response
+/// body is discarded.
 pub(crate) async fn send(request: MirrorRequest) -> Result<StatusCode, MirrorError> {
     let MirrorRequest {
         endpoint,
         method,
-        headers,
+        mut headers,
         body,
         timeout,
     } = request;
-    let (client, target) = tokio::task::spawn_blocking(move || egress::pinned_forward_client(&endpoint, timeout))
-        .await
-        .map_err(|e| MirrorError::Refused(EgressError::Blocked(format!("egress task failed: {e}"))))?
-        .map_err(MirrorError::Refused)?;
+    let (client, target) = vet(move || egress::pinned_forward_client(&endpoint, timeout), timeout).await?;
+    headers
+        .entry(USER_AGENT)
+        .or_insert(HeaderValue::from_static(GATEWAY_USER_AGENT));
     let response = client
         .request(method, target.url)
         .headers(headers)
@@ -128,6 +160,23 @@ pub(crate) async fn send(request: MirrorRequest) -> Result<StatusCode, MirrorErr
         .await
         .map_err(|e| MirrorError::Send(e.without_url()))?;
     Ok(response.status())
+}
+
+/// Run the blocking vetting step off the async runtime, giving up after `timeout`.
+///
+/// A resolver that does not answer in time refuses the mirror, as a failed lookup does. The
+/// lookup itself cannot be cancelled and holds its blocking thread until the OS resolver returns.
+async fn vet(
+    vetting: impl FnOnce() -> Result<(reqwest::Client, PinnedTarget), EgressError> + Send + 'static,
+    timeout: Duration,
+) -> Result<(reqwest::Client, PinnedTarget), MirrorError> {
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(vetting)).await {
+        Err(_) => Err(MirrorError::Refused(EgressError::Dns(format!("no answer within {}s", timeout.as_secs())))),
+        Ok(Err(e)) => Err(MirrorError::Internal(format!("egress task failed: {e}"))),
+        Ok(Ok(Err(EgressError::Http(e)))) => Err(MirrorError::Internal(format!("egress client not built: {e}"))),
+        Ok(Ok(Err(refusal))) => Err(MirrorError::Refused(refusal)),
+        Ok(Ok(Ok(vetted))) => Ok(vetted),
+    }
 }
 
 #[cfg(test)]
@@ -221,6 +270,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn each_refusal_names_the_rule_that_refused_the_endpoint() {
+        for (endpoint, reason) in [
+            ("http://169.254.169.254/latest/meta-data/", "cloud-provider metadata"),
+            ("http://[fd00:ec2::254]/", "cloud-provider metadata"),
+            ("http://user:pass@example.com/mirror", "embedded credentials"),
+            ("ftp://example.com/mirror", "scheme"),
+        ] {
+            let error = send(request(endpoint))
+                .await
+                .expect_err("refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains(reason),
+                "{endpoint}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn send_identifies_the_gateway_unless_the_caller_names_a_user_agent() {
+        let (addr, seen) = serve_once("HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n".into()).await;
+        send(request(&format!("http://{addr}/mirror")))
+            .await
+            .expect("sent");
+        let raw = seen
+            .await
+            .expect("request seen")
+            .to_ascii_lowercase();
+        assert!(raw.contains("user-agent: affinidi-fabric-agent-gateway/1.0"), "{raw}");
+
+        let (addr, seen) = serve_once("HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n".into()).await;
+        send(request(&format!("http://{addr}/mirror")).header("User-Agent", "caller-agent/2"))
+            .await
+            .expect("sent");
+        let raw = seen
+            .await
+            .expect("request seen")
+            .to_ascii_lowercase();
+        assert!(raw.contains("user-agent: caller-agent/2"), "{raw}");
+        assert!(!raw.contains("affinidi-fabric-agent-gateway"), "{raw}");
+    }
+
+    #[tokio::test]
     async fn send_reports_an_unresolvable_host_as_dns() {
         match send(request("http://mirror.invalid/")).await {
             Err(MirrorError::Refused(EgressError::Dns(_))) => {}
@@ -301,5 +394,91 @@ mod tests {
             .expect_err("nothing listens");
         assert!(matches!(err, MirrorError::Send(_)), "{err:?}");
         assert_eq!(err.kind(), "connection refused");
+    }
+
+    #[test]
+    fn an_internal_failure_is_not_called_a_policy_refusal() {
+        let error = MirrorError::Internal("egress task failed".into());
+        assert_eq!(error.kind(), "internal error");
+        assert!(
+            error
+                .to_string()
+                .contains("egress task failed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resolver_that_outlives_the_timeout_refuses_the_mirror_as_dns() {
+        let slow = || -> Result<(reqwest::Client, PinnedTarget), EgressError> {
+            std::thread::sleep(Duration::from_millis(400));
+            Err(EgressError::Dns("late".into()))
+        };
+        match vet(slow, Duration::from_millis(50)).await {
+            Err(error @ MirrorError::Refused(EgressError::Dns(_))) => assert_eq!(error.kind(), "DNS resolution failed"),
+            other => panic!("expected a DNS refusal, got {:?}", other.err()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_vetting_task_that_panics_fails_closed_as_internal() {
+        let panics = || -> Result<(reqwest::Client, PinnedTarget), EgressError> { panic!("resolver crashed") };
+        match vet(panics, Duration::from_secs(5)).await {
+            Err(error @ MirrorError::Internal(_)) => assert_eq!(error.kind(), "internal error"),
+            other => panic!("expected Internal, got {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn headers_from_copies_only_the_headers_the_filter_keeps() {
+        let mut source = HeaderMap::new();
+        source.insert("x-keep", HeaderValue::from_static("yes"));
+        source.insert("authorization", HeaderValue::from_static("Bearer secret"));
+        let request = request("http://127.0.0.1:1/").headers_from(&source, |name| name != "authorization");
+        assert_eq!(
+            request
+                .headers
+                .get("x-keep")
+                .map(HeaderValue::as_bytes),
+            Some(&b"yes"[..])
+        );
+        assert!(
+            request
+                .headers
+                .get("authorization")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mirrored_marks_the_copy_and_ties_it_to_the_live_trace() {
+        let traced = request("http://127.0.0.1:1/").mirrored(Some("trace-1"));
+        assert_eq!(
+            traced
+                .headers
+                .get("x-mirrored-request")
+                .map(HeaderValue::as_bytes),
+            Some(&b"true"[..])
+        );
+        assert_eq!(
+            traced
+                .headers
+                .get("x-gateway-trace-id")
+                .map(HeaderValue::as_bytes),
+            Some(&b"trace-1-mirror"[..])
+        );
+        let untraced = request("http://127.0.0.1:1/").mirrored(None);
+        assert!(
+            untraced
+                .headers
+                .get("x-mirrored-request")
+                .is_some()
+        );
+        assert!(
+            untraced
+                .headers
+                .get("x-gateway-trace-id")
+                .is_none()
+        );
     }
 }

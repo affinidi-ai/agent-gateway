@@ -447,6 +447,31 @@ impl AdminApiClient {
             .with_context(|| format!("decode PATCH response from {url}: {response_body}"))
     }
 
+    /// PATCH a surface with `application/merge-patch+json` and keep the response whatever its status.
+    pub async fn patch_surface_recorded(
+        &self,
+        surface_id: &str,
+        patch: &Value,
+    ) -> Result<RecordedResponse> {
+        let url = self.admin_url(&format!("/v1/surfaces/{surface_id}"));
+        let mut request = self.http.patch(&url);
+        if let Some(token) = self
+            .session_token
+            .read()
+            .expect("session token read lock")
+            .clone()
+        {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        let response = request
+            .header("Content-Type", "application/merge-patch+json")
+            .json(patch)
+            .send()
+            .await
+            .with_context(|| format!("PATCH {url}"))?;
+        recorded_response(response).await
+    }
+
     fn admin_url(
         &self,
         path: &str,

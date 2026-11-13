@@ -1,8 +1,9 @@
 Feature: Traffic mirroring endpoints
   A surface that mirrors traffic copies each request to its mirror endpoint. The
-  endpoint is held to the rule the Target is held to: an http or https URL that
-  does not name a cloud provider's metadata service, whether the surface or one
-  of its variants sets it. Loopback and private addresses stay allowed.
+  endpoint gets the Target's cloud-metadata guard: an http or https URL with no
+  credentials that does not name a cloud provider's metadata service, whether the
+  surface or one of its variants sets it. The copy is not redirected. Loopback
+  and private addresses stay allowed.
 
   Background:
     Given the operator can use the admin API and no surface is configured for route "/example"
@@ -37,9 +38,35 @@ Feature: Traffic mirroring endpoints
     And the admin API error response mentions "target.networking.mirror.endpoint"
 
   Scenario: A mirrored request reaches both the Target and the mirror
-    Given managed agent "sink" is available as the traffic mirror
-    And a surface for route "/example" mirrors every request to managed agent "sink"
+    Given a mirror endpoint "sink" is available
+    And a surface for route "/example" mirrors every request to the mirror endpoint "sink"
     When the caller sends a request to the surface path "/example"
     Then the response status is 200
     And managed agent "bravo" received the forwarded request
-    And managed agent "sink" received the forwarded request
+    And the mirror endpoint "sink" received the forwarded request
+
+  Scenario: A redirect from the mirror endpoint is not followed
+    Given a mirror endpoint "sink" is available
+    And the mirror endpoint "sink" answers every request with a redirect to managed agent "bravo"
+    And a surface for route "/example" mirrors every request to the mirror endpoint "sink"
+    When the caller sends a request to the surface path "/example"
+    Then the response status is 200
+    And the mirror endpoint "sink" received the forwarded request
+    And managed agent "bravo" received the forwarded request
+
+  Scenario: A surface updated to mirror traffic to a cloud metadata service is refused
+    Given the operator has created the surface for route "/example"
+    When the operator updates the surface to mirror traffic to "http://169.254.169.254/latest/meta-data/"
+    Then the admin API response status is 400
+    And the admin API error response mentions "target.networking.mirror.endpoint"
+
+  Scenario: A surface patched to mirror traffic to a cloud metadata service is refused
+    Given the operator has created the surface for route "/example"
+    When the operator patches the surface to mirror traffic to "http://metadata.google.internal/computeMetadata/v1/"
+    Then the admin API response status is 400
+    And the admin API error response mentions "target.networking.mirror.endpoint"
+
+  Scenario: A surface patched to mirror traffic to a private network address is saved
+    Given the operator has created the surface for route "/example"
+    When the operator patches the surface to mirror traffic to "http://10.1.2.3/copy"
+    Then the admin API response status is 200
