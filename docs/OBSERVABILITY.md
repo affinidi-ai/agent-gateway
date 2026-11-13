@@ -629,7 +629,7 @@ answers an unreadable log with an empty page, which would assert that the admini
 at all of the evidence.
 
 A page read with `truncated: true` or a non-zero `dropped_records` shows every number that came
-from the walk as a lower bound: the Audit page and the Credentials → Audit tab render the record
+from the walk as a lower bound: the Audit page renders the record
 total, the pager's page count and each category chip's count with a trailing `+` (`1243+`,
 `Page 5 of 687+`), and nothing else about them changes. A partial count is therefore never
 presented as a complete one, and an empty page of such a read says that the records searched held

@@ -3207,11 +3207,13 @@ the `credential_providers.*` permissions. A provider a surface binds cannot be d
 ([Deleting a provider](#deleting-a-provider)).
 
 In the dashboard these live on the Credentials page, under the **Credential Providers**,
-**Credential Tokens**, **Delegated Access**, and **Credential Delegation Audit** tabs. Credential
+**Credential Tokens** and **Delegated Access** tabs. Credential
 Tokens lists every agent-keyed token, service tokens included, with when each consent was given
 and when it ends, and revokes one entry or every entry of a user. Delegated Access lists only
-the access a person gave that an agent can still use, by system, with when it ends; access that
-ended or was revoked is in the audit tab, which its **History** button opens.
+the access a person gave that an agent can still use, by system, with when it ends. The
+delegation records are read in the Audit Log, with the rest of the audit: the **Credential
+Delegation Audit** tab opens it on the delegation categories, and the **History** button of
+Delegated Access on the records of access that ended or was revoked.
 
 ## Related
 

@@ -208,14 +208,16 @@ see _JWT verification strategy editor_ in
 
 The Credentials page keeps its **Credential Tokens** tab, which shows when each consent ends and
 confirms every revoke in place (two clicks, never a modal or a browser dialog), and has a
-**Delegated Access** tab beside it that lists only active access and opens the audit tab as its
+**Delegated Access** tab beside it that lists only active access and opens the Audit Log as its
 history. A new view is a new tab; an existing tab is never renamed or removed. See _Credential
 Tokens and Delegated Access tabs_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-tokens-and-delegated-access-tabs).
 
-The Credentials audit tab shows a caller's Principal beside Subject when its strategy names a
-claim other than `sub`; see _Credentials audit tab_ in
-[`www/default/AGENTS.md`](www/default/AGENTS.md#credentials-audit-tab).
+The credential delegation records are read in the Audit Log; the Credentials page's **Credential
+Delegation Audit** tab is a link to it, filtered to the delegation categories. The Audit Log
+shows a caller's Principal beside Subject when its strategy names a claim other than `sub`; see
+_Credential delegation audit_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#credential-delegation-audit).
 
 The credential provider editor's **Consent time limit** (Authorization Code providers only)
 writes `max_consent_age_secs`, `0` when empty, and the Surface Builder keeps and shows a
@@ -262,10 +264,10 @@ variants and refusals_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#audit-
 
 An audit response says what a read did not return in two fields: `truncated` (it stopped before
 the end of the history) and `dropped_records` (the history holds records it could not read).
-Either makes the counts lower bounds, so the Audit Log and the Credentials audit tab render every
+Either makes the counts lower bounds, so the Audit Log renders every
 number from that read with a trailing `+`, an empty page of such a read says the records searched
 held none rather than that the log is empty, and nothing else changes. A read the gateway could
-not make at all is answered with `500`, and both views show that failure — the Audit Log as an
+not make at all is answered with `500`, and the Audit Log shows that failure as an
 error panel with a Retry in place of its empty state, never as an empty log. The Audit Log also shows the size of the history against the advisory
 `[audit] vp_audit_log_soft_cap_bytes`, which enforces nothing, formatted by the one shared
 `utils/formatBytes.ts`; see _Audit page: partial reads and

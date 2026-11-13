@@ -1086,9 +1086,10 @@ Credential Tokens lists every agent-keyed token, service tokens included.
   `DeleteButton`. **Revoke all for this user** (`credential-token-revoke-user-button-<id>`) uses the
   same `useTwoStepDelete`: the first click shows "Click again to revoke all", the second sends the
   `DELETE`, and a click elsewhere cancels.
-- The expanded row links to the user's records in the Credential Delegation Audit tab
-  (`credential-token-view-activity-button-<id>`): the page puts the user identity hash in its search
-  and switches tabs. The link is shown only to a user with `audit.view`.
+- The expanded row links to the user's delegation records in the Audit Log
+  (`credential-token-view-activity-button-<id>`): the Audit Log opens with the user identity hash
+  as its text filter and the delegation categories selected. The link is shown only to a user
+  with `audit.view`.
 
 Delegated Access lists only active access: a token of an Authorization Code provider whose consent
 has not ended and whose access token is valid or refreshable. It has no history of its own.
@@ -1099,18 +1100,26 @@ has not ended and whose access token is valid or refreshable. It has no history 
   **Revoke access** `DeleteButton` (`delegated-access-revoke-button-<id>`). Rows are
   `delegated-access-row-<id>`; the header counts those ending soon
   (`delegated-access-ending-soon-count`).
-- **History** (`delegated-access-history-button`) opens the Credential Delegation Audit tab, where
-  ended and revoked access is recorded. It is shown only to a user with `audit.view`.
+- **History** (`delegated-access-history-button`) opens the Audit Log on the records of access
+  that ended: `consent_expired`, `token_revoked` and `user_tokens_revoked`. It is shown only to a
+  user with `audit.view`.
 - The list still loads when the providers cannot be read: every token then counts as a person's.
 
-The audit tab labels `consent_expired` records "Consent Expired".
+## Credential delegation audit
 
-## Credentials audit tab
+The credential delegation records are read in the Audit Log (`pages/AuditPage`), not on the
+Credentials page. The **Credential Delegation Audit** tab stays in the Credentials tab row
+(`credentials-credential-audit-tab-trigger`, shown with `audit.view`) as a link: selecting it, or
+opening `/credentials?tab=credential-audit`, goes to the Audit Log with the delegation categories
+selected. Every link from the Credentials page into the audit is built by `auditLogPath` from
+`DELEGATION_CATEGORIES` or `DELEGATION_ENDED_CATEGORIES` (`pages/AuditPage/auditHelpers.ts`).
 
-`pages/CredentialsPage/CredentialAuditTab.tsx` shows an expanded event's caller. **Subject** is
-the token's own `sub`; a **Principal** row (`credential-audit-caller-principal`) shows the value
-the caller's grants are keyed by, `caller.principal`, only when the JWT strategy names a claim
-other than `sub`.
+- The Audit Log offers each delegation category in its Category filter, labels and narrates
+  `consent_expired` ("Consent expired", a warning, apart from a revocation), and shows it with
+  the other delegation events.
+- Its Identity group shows **Subject**, the token's own `sub`, and a **Principal** row with the
+  value the caller's grants are keyed by, `caller.principal`, only when the JWT strategy names a
+  claim other than `sub`.
 
 ## Credential provider editor
 
@@ -1405,9 +1414,7 @@ only that.
   empty state, saying no records could be read and that this is not the log holding none. The
   toast stays, for the moment the read fails; the panel is what is still there after it fades.
   Refresh stays enabled while `error` is set, since a failed read leaves `total` at `0` and
-  Refresh is the way back. `CredentialAuditTab` shows the same failure as its own error line.
-- `pages/CredentialsPage/CredentialAuditTab.tsx` reads the same two fields from
-  `/v1/delegation-audit` and appends the same `+` to its badge and its `n–m of t` line.
+  Refresh is the way back.
 - `AuditLogSize.tsx` shows one line above the list, `Audit log: 312 MiB of 1 GiB`, with a thin
   bar: neutral under the configured size, amber over it, and over it a line naming the two
   things an operator can do. It is **usage against a mark, never a quota**: nothing is enforced

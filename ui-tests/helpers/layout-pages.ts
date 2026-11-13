@@ -182,18 +182,6 @@ const SIDEBAR_PAGES: LayoutPage[] = [
         ],
     },
     {
-        id: 'credentials-credential-audit',
-        route: '/credentials?tab=credential-audit',
-        testIds: ['page-credentials', 'credential-audit-row-0'],
-        actions: [
-            ...CREDENTIALS,
-            'credential-audit-event-filter',
-            'credential-audit-refresh-button',
-            'credential-audit-row-0',
-            'credential-audit-provider-link-0',
-        ],
-    },
-    {
         id: 'policies',
         route: '/policies',
         testIds: ['page-policies', `policies-gateway-row-${FIXTURE_ID.gatewayPolicy}`],

@@ -129,6 +129,8 @@ export type AuditEventField =
 export interface AuditCaller {
   did?: string;
   auth_method?: string;
+  /** The value of the JWT strategy's principal claim, when it is not `sub`. */
+  principal?: string;
   email?: string;
   name?: string;
   email_redacted?: string;

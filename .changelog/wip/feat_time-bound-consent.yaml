@@ -46,8 +46,8 @@ changes:
         the access a person gave that an agent can still use: the user, the system, the agent,
         the scopes, whether it ends within a day, when it ends and when it was last used, with a
         revoke confirmed by a second click. Service tokens, ended consents and tokens that can
-        no longer be refreshed are left out, and a History button opens the Credential Delegation
-        Audit tab, where ended and revoked access is recorded.
+        no longer be refreshed are left out, and a History button opens the Audit Log on the
+        records of access that ended or was revoked.
   changed:
     - timestamp: '2026-11-13T15:00:00Z'
       title: Show when each consent ends on the Credential Tokens tab
@@ -55,9 +55,17 @@ changes:
         Each entry of the Credentials page's Credential Tokens tab shows when its consent ends
         and how long is left, or that it has no time limit, and is marked Ending soon within a
         day of its end and Consent ended after it. Revoking every delegation of a user is
-        confirmed in place with a second click instead of a browser dialog, the expanded row
-        links to that user's records in the Credential Delegation Audit tab, and that tab labels
-        `consent_expired` records.
+        confirmed in place with a second click instead of a browser dialog, and the expanded
+        row links to that user's delegation records in the Audit Log.
+    - timestamp: '2026-11-13T18:00:00Z'
+      title: Read the credential delegation audit in the Audit Log
+      description: >-
+        The credential delegation records are now read on the Audit page, with the rest of the
+        audit, instead of in a separate list on the Credentials page. The Audit Log offers every
+        delegation category as a filter, describes an expired consent apart from a revocation,
+        and shows a caller's Principal beside Subject. The Credential Delegation Audit tab stays
+        in the Credentials tab row as a link that opens the Audit Log on the delegation
+        categories, and `/credentials?tab=credential-audit` leads there too.
     - timestamp: '2026-11-13T17:00:00Z'
       title: Name whose access a vault revoke ended in its audit record
       description: >-

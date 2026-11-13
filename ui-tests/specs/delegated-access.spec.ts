@@ -82,7 +82,7 @@ test.describe("Credentials page tabs", () => {
 });
 
 test.describe("Credentials page Delegated Access tab", () => {
-  test("lists only active access and opens the audit as its history", async ({
+  test("lists only active access and opens the Audit Log as its history", async ({
     page,
   }) => {
     await page.route("**/api/v1/credential-providers", async (route) => {
@@ -121,9 +121,10 @@ test.describe("Credentials page Delegated Access tab", () => {
 
     await page.getByTestId("delegated-access-history-button").click();
 
-    await expect(
-      page.getByTestId("credentials-credential-audit-tab-trigger"),
-    ).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByTestId("page-audit")).toBeVisible();
+    expect(new URL(page.url()).searchParams.get("category")).toBe(
+      "consent_expired,token_revoked,user_tokens_revoked",
+    );
   });
 
   test("revokes one access on a second click, with no dialog", async ({
@@ -229,14 +230,14 @@ test.describe("Credentials page Credential Tokens tab", () => {
     expect(revoked).toEqual([]);
   });
 
-  test("opens a user's delegation audit from the expanded row", async ({
+  test("opens a user's delegation records in the Audit Log from the expanded row", async ({
     page,
   }) => {
     const filters: (string | null)[] = [];
-    await page.route("**/api/v1/delegation-audit**", async (route) => {
+    await page.route("**/api/v1/audit?**", async (route) => {
       filters.push(new URL(route.request().url()).searchParams.get("filter"));
       await route.fulfill({
-        json: { events: [], total: 0, page: 1, page_size: 25, total_pages: 1 },
+        json: { events: [], total: 0, page: 1, limit: 50, category_counts: {} },
       });
     });
     await openCredentialTokens(page, [token("t1", ALICE)]);
@@ -244,13 +245,33 @@ test.describe("Credentials page Credential Tokens tab", () => {
     await row(page, "t1").click();
     await page.getByTestId("credential-token-view-activity-button-t1").click();
 
-    await expect(
-      page.getByTestId("credentials-credential-audit-tab-trigger"),
-    ).toHaveAttribute("aria-selected", "true");
-    await expect(page.getByTestId("credentials-search-input")).toHaveValue(
-      ALICE,
+    await expect(page.getByTestId("page-audit")).toBeVisible();
+    await expect(page.getByTestId("audit-search")).toHaveValue(ALICE);
+    expect(new URL(page.url()).searchParams.get("category")).toContain(
+      "consent_expired",
     );
     await expect.poll(() => filters).toContain(ALICE);
+  });
+});
+
+test.describe("Credentials page Credential Delegation Audit tab", () => {
+  test("is a link to the Audit Log, filtered to credential delegation", async ({
+    page,
+  }) => {
+    await page.goto(`${BASE_URL}/credentials`);
+
+    await page.getByTestId("credentials-credential-audit-tab-trigger").click();
+
+    await expect(page.getByTestId("page-audit")).toBeVisible();
+    const categories = new URL(page.url()).searchParams.get("category") ?? "";
+    expect(categories.split(",")).toEqual(
+      expect.arrayContaining([
+        "token_injected",
+        "consent_granted",
+        "consent_expired",
+        "token_revoked",
+      ]),
+    );
   });
 });
 
