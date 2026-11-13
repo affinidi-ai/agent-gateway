@@ -958,6 +958,103 @@ mod tests {
         assert!(matches!(manager.applicable().await, Err(TermsError::Operational(_))));
     }
 
+    async fn manager_for_appliance(
+        directory: &TempDir,
+        appliance_id: &str,
+    ) -> TermsManager {
+        TermsManager::open(
+            true,
+            appliance_id.to_string(),
+            directory.path().to_path_buf(),
+            Some(affinidi("affinidi-v1", false)),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reacceptance_after_appliance_did_rotation_survives_restart() {
+        let directory = TempDir::new().unwrap();
+        for appliance_id in ["did:webvh:old:appliance.example", "did:webvh:new:appliance.example"] {
+            let manager = manager_for_appliance(&directory, appliance_id).await;
+            let status = manager
+                .status("user-1", AcceptanceContext::Login)
+                .await
+                .unwrap();
+            assert!(status.consent_required);
+            manager
+                .accept("user-1", AcceptanceContext::Login, acceptance(&status))
+                .await
+                .unwrap();
+        }
+
+        let restarted = manager_for_appliance(&directory, "did:webvh:new:appliance.example").await;
+        assert!(
+            restarted
+                .applicable()
+                .await
+                .is_ok()
+        );
+        assert!(
+            !restarted
+                .status("user-1", AcceptanceContext::Login)
+                .await
+                .unwrap()
+                .consent_required
+        );
+        let batches = restarted
+            .storage()
+            .await
+            .unwrap()
+            .acceptance_batches()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_acceptance_for_same_appliance() {
+        let directory = TempDir::new().unwrap();
+        let acceptance_dir = directory
+            .path()
+            .join("acceptances");
+        tokio::fs::create_dir_all(&acceptance_dir)
+            .await
+            .unwrap();
+        let version = affinidi("affinidi-v1", false);
+        for index in 1..=2 {
+            let batch = AcceptanceBatch {
+                id: format!("batch-{index}"),
+                records: vec![AcceptanceRecord {
+                    id: format!("acceptance-{index}"),
+                    user_id: "user-1".to_string(),
+                    appliance_id: "did:web:appliance.example".to_string(),
+                    terms_type: version.terms_type,
+                    document_id: version.document_id.clone(),
+                    version_id: version.version_id.clone(),
+                    version: version.version.clone(),
+                    title: version.title.clone(),
+                    url: version.url.clone(),
+                    accepted_at: Utc::now(),
+                    context: AcceptanceContext::Login,
+                }],
+            };
+            tokio::fs::write(
+                acceptance_dir.join(format!("batch-{index}.json")),
+                serde_json::to_vec_pretty(&batch).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let manager = manager_for_appliance(&directory, "did:web:appliance.example").await;
+        let error = manager
+            .applicable()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TermsError::Operational(message) if message == "duplicate Terms acceptance record"));
+    }
+
     #[tokio::test]
     async fn rejects_orphan_customer_acceptance() {
         let directory = TempDir::new().unwrap();
