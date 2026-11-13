@@ -1,20 +1,19 @@
 import React, { useEffect, useState } from 'react';
 import { Form } from 'react-bootstrap';
+import { apiClient } from '../../../../api';
+import type { TrustRegistry } from '../../../../types';
 import { getAuthorities } from '../../../../utils/authoritiesCache';
 import { getIssuers } from '../../../../utils/issuersCache';
 import { topAndTail } from '../../../../utils/stringUtils';
-import { AppButton } from '../../../shared/AppButton';
 import { managedAgentTargetLegTrustCheckAllowed } from '../edges/archetypes';
 import InfoBanner from '../../../shared/InfoBanner';
 import type { ConfigPanelProps } from '../types';
 import { useOptionalSurfaceMeta } from '../../SurfaceMetaContext';
 import MissingAuthorityWarning from '../_shared/MissingAuthorityWarning';
 import MigratedTrustCheckWarning from './MigratedTrustCheckWarning';
+import TrustCheckQueryList from './TrustCheckQueryList';
+import { describeTrustCheckLeg } from './legContext';
 import {
-  authorityCountLabel,
-  isMultiAuthorityQuery,
-  listedAuthorities,
-  type TrustCheckQueryConfig,
   MANAGED_AGENT_TRUST_CHECK_DUPLICATED_NOTE,
   managedAgentTrustCheckRunsOnTransitPoints,
   readOnlyTrustCheckMessage,
@@ -24,46 +23,15 @@ import {
   missingTrustCheckAuthorities,
   readQueries,
   trustCheckLeg,
-  type TrustCheckLeg,
-  type TrustCheckRecordType,
 } from './definition';
 
 const PREVIEW_MAX = 5;
 
-const AUTHORITY_DELETION_NOTE =
-  'When it is an Authority, the gateway also remembers that, and fails the check with AUTHORITY_NOT_FOUND once that Authority is deleted.';
-
-interface TrustCheckLegContext {
-  title: string;
-  summary: string;
-  where: string;
-  when: string;
-  example: string;
-}
-
-function describeLeg(leg: TrustCheckLeg): TrustCheckLegContext {
-  if (leg === 'caller') {
-    return {
-      title: 'How can you trust the sender of an incoming request using Trust Check?',
-      summary:
-        'Verify the CALLER identity against a trust registry before the request reaches the agent.',
-      where: 'Access Point → Managed Agent (request leg).',
-      when: 'When policy needs to know that the caller is recognised or authorised by an authority in a trust registry (e.g. only accept requests from agents recognised by a partner ecosystem).',
-      example: `Pick the trust anchor to check against: an Issuer (Department) or an Authority. Its DID is stored directly, so the gateway never derives the authority from the caller’s request payload. ${AUTHORITY_DELETION_NOTE}`,
-    };
-  }
-  return {
-    title: 'How can you trust a destination entity before sending requests using Trust Check?',
-    summary: 'Verify the TARGET identity (upstream agent) before the request leaves the gateway.',
-    where:
-      leg === 'transit-point'
-        ? 'Managed Agent → Transit Point (target leg). Runs only for requests through this Transit Point.'
-        : 'Managed Agent → its A2A Proxy or gateway target (target leg).',
-    when: 'When policy needs to confirm the upstream you are about to call is recognised or authorised (e.g. only forward payment requests to issuers recognised by a payment authority).',
-    example: `Pick the trust anchor to check against: an Issuer (Department) or an Authority. Its DID is stored directly, so the gateway never derives the authority from the target’s own agent card. ${AUTHORITY_DELETION_NOTE}`,
-  };
-}
-
+/**
+ * Compact sidebar panel for the Trust Check element: one row per query with
+ * its status, type, registry and Authorities, and a link to the fullscreen
+ * editor, laid out like the Caller Context panel.
+ */
 const TrustCheckPanel: React.FC<ConfigPanelProps> = ({
   node,
   config,
@@ -72,9 +40,8 @@ const TrustCheckPanel: React.FC<ConfigPanelProps> = ({
   openFullscreenEditor,
 }) => {
   const leg = trustCheckLeg(node, allNodes);
-  const isApMa = leg === 'caller';
-  const legLabel = isApMa ? 'caller' : 'target';
-  const legContext = describeLeg(leg);
+  const legLabel = leg === 'caller' ? 'caller' : 'target';
+  const legContext = describeTrustCheckLeg(leg);
   const managedAgentEndpoint = allNodes?.find(n => n.type === 'target')?.config?.endpoint;
   const notSavedForTarget =
     allNodes !== undefined &&
@@ -84,117 +51,33 @@ const TrustCheckPanel: React.FC<ConfigPanelProps> = ({
   const queries = readQueries(config);
   const authorityDids = useOptionalSurfaceMeta()?.authorityDids;
   const missingAuthorities = missingTrustCheckAuthorities(config, authorityDids);
-  const shown = queries.slice(0, PREVIEW_MAX);
-  const remaining = queries.length - shown.length;
-  const hasAuthorityList = queries.some(isMultiAuthorityQuery);
+  const hasQueries = queries.length > 0;
+  const [registryNameById, setRegistryNameById] = useState<ReadonlyMap<string, string>>(
+    () => new Map()
+  );
   const [authorityNameByDid, setAuthorityNameByDid] = useState<ReadonlyMap<string, string>>(
     () => new Map()
   );
   useEffect(() => {
-    if (!hasAuthorityList) return undefined;
+    if (!hasQueries) return undefined;
     let alive = true;
-    // Best effort: without a register the list shows DIDs instead of names.
-    Promise.all([getIssuers().catch(() => []), getAuthorities().catch(() => [])]).then(
-      ([issuers, authorities]) => {
-        if (!alive) return;
-        // Issuers win on a DID in both registers, as in the picker.
-        setAuthorityNameByDid(
-          new Map([...authorities, ...issuers].map(entry => [entry.did, entry.name] as const))
-        );
-      }
-    );
+    // Best effort: without a register the rows show shortened ids instead of names.
+    Promise.all([
+      apiClient.listTrustRegistries().catch((): TrustRegistry[] => []),
+      getIssuers().catch(() => []),
+      getAuthorities().catch(() => []),
+    ]).then(([registries, issuers, authorities]) => {
+      if (!alive) return;
+      setRegistryNameById(new Map(registries.map(r => [r.id, r.name] as const)));
+      // Issuers win on a DID in both registers, as in the picker.
+      setAuthorityNameByDid(
+        new Map([...authorities, ...issuers].map(entry => [entry.did, entry.name] as const))
+      );
+    });
     return () => {
       alive = false;
     };
-  }, [hasAuthorityList]);
-  const authorityNames = (q: TrustCheckQueryConfig): string[] =>
-    listedAuthorities(q.query).map(did => authorityNameByDid.get(did) ?? topAndTail(did, 16, 12));
-  const renderEmptyState = () => (
-    <div className="py-2 text-center" data-testid="trust-check-panel-empty-state">
-      <div className="fw-semibold small mb-2" style={{ fontSize: '12px' }}>
-        <i
-          className="fas fa-certificate me-2 text-muted"
-          style={{ opacity: 0.6 }}
-          aria-hidden="true"
-        />
-        No trust checks yet
-      </div>
-      <Form.Text className="d-block text-muted mb-2 mx-4 text-center" style={{ fontSize: '11px' }}>
-        Configure queries to have OPA verify the {isApMa ? 'caller' : 'upstream agent'} against a
-        trust registry before the request {isApMa ? 'reaches the agent' : 'leaves the gateway'}.
-      </Form.Text>
-    </div>
-  );
-
-  const renderQueriesList = () => (
-    <div data-testid="trust-check-panel-list">
-      <div className="fw-bold small text-muted mb-1" style={{ fontSize: '12px' }}>
-        Queries
-      </div>
-      <ul className="list-unstyled mb-2" style={{ fontSize: '11px' }}>
-        {shown.map((q, idx) => {
-          const queryType: TrustCheckRecordType =
-            q.query_type === 'recognition' ? 'recognition' : 'authorization';
-          const typeLabel = queryType === 'recognition' ? 'Recognition' : 'Authorization';
-          const nameValue = typeof q.name === 'string' && q.name ? q.name : '';
-          return (
-            <li
-              key={q.id || `idx-${idx}`}
-              className="d-flex justify-content-between align-items-baseline gap-2 py-1"
-            >
-              <span className="text-muted fw-semibold">Query {idx + 1}</span>
-              <span
-                className="text-end"
-                style={{
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                  minWidth: 0,
-                }}
-              >
-                <span className="fw-semibold">{typeLabel}</span>
-                {isMultiAuthorityQuery(q) && (
-                  <span
-                    className="d-block text-muted"
-                    style={{
-                      fontSize: '10px',
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                    }}
-                    title={authorityNames(q).join(', ')}
-                    data-testid={`trust-check-panel-query-${idx}-authorities`}
-                  >
-                    {authorityCountLabel(listedAuthorities(q.query).length)}
-                    {listedAuthorities(q.query).length > 0 && `: ${authorityNames(q).join(', ')}`}
-                  </span>
-                )}
-                {nameValue && (
-                  <span
-                    className="d-block text-muted fst-italic"
-                    style={{
-                      fontSize: '10px',
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                    }}
-                    title={nameValue}
-                  >
-                    {nameValue}
-                  </span>
-                )}
-              </span>
-            </li>
-          );
-        })}
-        {remaining > 0 && (
-          <li className="text-muted fst-italic pt-1" style={{ fontSize: '11px' }}>
-            +{remaining} more
-          </li>
-        )}
-      </ul>
-    </div>
-  );
+  }, [hasQueries]);
 
   return (
     <>
@@ -227,65 +110,67 @@ const TrustCheckPanel: React.FC<ConfigPanelProps> = ({
         </div>
       )}
 
-      <div className="config-section">
+      <Form.Text className="text-muted d-block mb-1" data-testid="trust-check-panel-results-ref">
+        {legContext.intro} Results land on OPA at{' '}
+        <code>input.trust_check_results.{legLabel}[]</code>; OPA decides allow or deny.
         {leg === 'transit-point' && (
-          <Form.Text
-            className="text-muted d-block mb-1"
-            style={{ fontSize: '11px' }}
-            data-testid="trust-check-panel-transit-point-scope"
-          >
+          <span data-testid="trust-check-panel-transit-point-scope">
+            {' '}
             Applies to this Transit Point only.
-          </Form.Text>
+          </span>
         )}
-        {readOnlyProtocol && (
-          <Form.Text
-            className="d-block mb-1"
-            style={{ fontSize: '11px' }}
-            data-testid="trust-check-panel-read-only"
-          >
-            {readOnlyTrustCheckMessage(readOnlyProtocol)}
-          </Form.Text>
-        )}
-        <Form.Text
-          className="text-muted d-block"
-          style={{ fontSize: '11px' }}
-          data-testid="trust-check-panel-results-ref"
-        >
-          Results land on OPA at <code>input.trust_check_results.{legLabel}[]</code>: OPA decides
-          allow / deny.
+      </Form.Text>
+      {readOnlyProtocol && (
+        <Form.Text className="d-block mb-1" data-testid="trust-check-panel-read-only">
+          {readOnlyTrustCheckMessage(readOnlyProtocol)}
         </Form.Text>
-      </div>
+      )}
 
       <InfoBanner
-        title={legContext.title}
-        icon="fa-certificate"
+        title="How does OPA use the result?"
+        icon="fa-circle-info"
         testIdPrefix="trust-check-panel"
         summary={legContext.summary}
-      >
-        <dl>
-          <dt>Where</dt>
-          <dd>{legContext.where}</dd>
-          <dt>When</dt>
-          <dd>{legContext.when}</dd>
-          <dt>Example</dt>
-          <dd style={{ fontStyle: 'italic' }}>{legContext.example}</dd>
-        </dl>
-      </InfoBanner>
+      />
 
       <div className="config-section">
-        {queries.length === 0 ? renderEmptyState() : renderQueriesList()}
-
-        <AppButton
-          variant="primary"
-          size="sm"
-          className="w-100 mt-2"
+        <label>Trust Check Queries</label>
+        {hasQueries ? (
+          <TrustCheckQueryList
+            queries={queries}
+            isTargetLeg={leg !== 'caller'}
+            area="trust-check-panel"
+            limit={PREVIEW_MAX}
+            registryName={id => registryNameById.get(id) ?? topAndTail(id, 8, 4)}
+            authorityName={did => authorityNameByDid.get(did) ?? topAndTail(did, 16, 12)}
+          />
+        ) : (
+          <div
+            className="border rounded text-center py-3 px-2 mb-2"
+            data-testid="trust-check-panel-empty-state"
+          >
+            <div className="fw-bold small mb-1">
+              <i className="fas fa-certificate me-2 text-muted" aria-hidden="true" />
+              No trust checks yet
+            </div>
+            <Form.Text className="d-block text-muted">
+              Add a query to have OPA verify {legContext.subject} against a trust registry.
+            </Form.Text>
+          </div>
+        )}
+        <button
+          type="button"
+          className="btn btn-sm btn-link px-0"
           onClick={() => openFullscreenEditor?.()}
           disabled={!openFullscreenEditor}
-          iconStart={<i className="fas fa-pen-to-square me-1" aria-hidden="true" />}
           data-testid="trust-check-panel-configure"
         >
-          {readOnlyProtocol ? 'View Queries…' : 'Configure Queries…'}
-        </AppButton>
+          <i className={`fas ${readOnlyProtocol ? 'fa-eye' : 'fa-pen-to-square'} me-1`} />{' '}
+          {readOnlyProtocol ? 'View queries' : 'Configure queries'}
+        </button>
+        <Form.Text className="text-muted d-block mt-1">
+          Every query runs; OPA sees one result per query and per listed Authority.
+        </Form.Text>
       </div>
     </>
   );

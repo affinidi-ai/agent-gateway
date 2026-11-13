@@ -1127,6 +1127,163 @@ body.dark-theme .surface-builder-palette .form-control::placeholder {
   width: 100%;
 }
 
+/* Trust Check editor: the card fills the editor tab, and the query list and
+   the selected query's settings scroll in their own panes, so adding queries
+   or Authorities never grows the page. Below 720px wide the list sits on top. */
+.surface-builder-fullscreen-body:has(> .trust-check-editor) {
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 24px;
+}
+
+.trust-check-editor {
+  flex: 1 1 auto;
+  min-height: 0;
+  container-type: inline-size;
+}
+
+.trust-check-editor-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
+
+.trust-check-editor-queries {
+  width: 280px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--bs-border-color);
+}
+
+.trust-check-editor-queries-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.trust-check-editor-settings {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.trust-check-editor-settings-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px;
+}
+
+@container (max-width: 720px) {
+  .trust-check-editor-body {
+    flex-direction: column;
+  }
+
+  .trust-check-editor-queries {
+    width: auto;
+    height: 172px;
+    border-right: 0;
+    border-bottom: 1px solid var(--bs-border-color);
+  }
+
+  .trust-check-registry-field {
+    flex: 1 0 100%;
+  }
+}
+
+.trust-check-authority-list {
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.trust-check-authority-list > li:last-child {
+  border-bottom: 0 !important;
+}
+
+.trust-check-authority-row.is-invalid {
+  box-shadow: inset 3px 0 0 var(--bs-danger);
+}
+
+.trust-check-authority-index {
+  width: 1.5rem;
+  flex-shrink: 0;
+}
+
+/* In flow, not floating: the settings pane scrolls, so a floating menu would be clipped there. */
+.trust-check-authority-menu.dropdown-menu {
+  position: static;
+}
+
+.trust-check-authority-menu .dropdown-item {
+  font-size: 0.8125rem;
+  padding: 0.3rem 0.75rem;
+  white-space: normal;
+}
+
+.trust-check-authority-option-detail {
+  font-size: 0.75rem;
+}
+
+/* The dropdown's search box and the Authority table's filter: the same size as the options. */
+.trust-check-authority-search {
+  font-size: 0.8125rem;
+}
+
+/* A fixed box, so the truncating text beside it can't squeeze the checkbox away. */
+.trust-check-authority-option-check {
+  width: 1rem;
+  height: 1rem;
+  flex: 0 0 1rem;
+  border: 1px solid var(--bs-border-color);
+}
+
+/* The dashboard's dark theme is `body.dark-theme`, which Bootstrap's subtle colours ignore. */
+
+/* Borders: Bootstrap's `.border*` utilities and these rules read `--bs-border-color`, which the
+   dark theme leaves at its light-mode grey. Use the dashboard's dark border, as the Caller Context
+   editor's list rows do. */
+body.dark-theme .trust-check-editor {
+  --bs-border-color: var(--dark-border);
+}
+
+body.dark-theme .trust-check-editor .card-footer {
+  border-top-color: var(--dark-border);
+}
+body.dark-theme .trust-check-editor .list-group-item-primary {
+  background: rgba(78, 115, 223, 0.25);
+  color: inherit;
+}
+
+body.dark-theme .trust-check-editor .bg-primary-subtle {
+  background: rgba(78, 115, 223, 0.25) !important;
+}
+
+body.dark-theme .trust-check-editor .bg-success-subtle {
+  background: rgba(28, 200, 138, 0.18) !important;
+}
+
+body.dark-theme .trust-check-editor .bg-danger-subtle {
+  background: rgba(231, 74, 59, 0.2) !important;
+}
+
+body.dark-theme .trust-check-editor .bg-body-tertiary {
+  background: rgba(255, 255, 255, 0.04) !important;
+}
+
+body.dark-theme .trust-check-editor .text-bg-light {
+  background: rgba(255, 255, 255, 0.1) !important;
+  color: inherit !important;
+}
+
+.trust-check-authority-menu-options {
+  max-height: 280px;
+  overflow-y: auto;
+}
+
 body.dark-theme .surface-builder-fullscreen {
   background: transparent;
   border: none;

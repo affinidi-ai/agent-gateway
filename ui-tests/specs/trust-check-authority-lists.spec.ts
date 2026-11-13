@@ -2,8 +2,7 @@
  * Trust Check authority list tests
  *
  * Asserts the Trust Check editor saves a query that names several Authorities
- * as `query.authority_ids` with `authority_sources`, and stops adding
- * Authorities at the gateway's limit.
+ * as `query.authority_ids` with `authority_sources`.
  */
 
 import type {Page, Request} from '@playwright/test';
@@ -14,7 +13,6 @@ const BASE_URL = process.env.AG_BASE_URL || 'http://localhost:8080';
 const SURFACE_ID = 'ui-test-trust-check-authority-lists';
 const AUTHORITY_A = {id: 'authority-a', name: 'Authority A', did: 'did:web:authority-a.example', created_at: '2026-01-01T00:00:00Z'};
 const AUTHORITY_B = {id: 'authority-b', name: 'Authority B', did: 'did:web:authority-b.example', created_at: '2026-01-01T00:00:00Z'};
-const TRUST_CHECK_AUTHORITIES_MAX = 25;
 
 function trustCheck(query: Record<string, unknown>, sources: Record<string, unknown>) {
     return {
@@ -101,8 +99,9 @@ test.describe('Trust Check — several Authorities in one query', () => {
         );
 
         await page.getByTestId('trust-check-query-0-add-authority').click();
-        await page.getByTestId('trust-check-query-0-authority-1').click();
-        await page.getByText(AUTHORITY_B.name, {exact: true}).click();
+        await page.getByTestId(`trust-check-query-0-add-authority-option-${AUTHORITY_B.did}`).check();
+        await page.getByTestId('trust-check-query-0-add-authority-confirm').click();
+        await expect(page.getByTestId('trust-check-query-0-authority-1')).toContainText(AUTHORITY_B.name);
         await captureFullPage(page, 'trust-check-two-authorities');
         await page.getByTestId('trust-check-save').click();
 
@@ -116,14 +115,5 @@ test.describe('Trust Check — several Authorities in one query', () => {
             [AUTHORITY_B.did]: 'authority',
         });
         expect(check).not.toHaveProperty('authority_source');
-    });
-
-    test('disables Add Authority once the query names the most Authorities a Trust Check checks', async ({page}) => {
-        const authorities = Array.from({length: TRUST_CHECK_AUTHORITIES_MAX}, (_, i) => `did:web:authority-${i}.example`);
-        await openTrustCheckEditor(page, trustCheck({authority_ids: authorities}, {}));
-
-        await expect(page.getByTestId('trust-check-query-0-add-authority')).toBeDisabled();
-        await expect(page.getByTestId('trust-check-add-query')).toBeDisabled();
-        await captureFullPage(page, 'trust-check-authority-limit');
     });
 });

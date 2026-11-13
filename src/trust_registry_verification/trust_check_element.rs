@@ -37,9 +37,6 @@ pub const TRUST_CHECK_NAME_MAX_CODE_POINTS: usize = 64;
 /// a free display label — even though today both caps are the same value.
 pub const TRUST_CHECK_ID_MAX_CODE_POINTS: usize = 64;
 
-/// Maximum number of entries in `query.authority_ids`.
-pub const TRUST_CHECK_AUTHORITIES_MAX: usize = 25;
-
 /// Per-authority timeout of a multi-authority element. Fixed: such an
 /// element cannot set `timeout_secs`.
 pub const TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS: u32 = 5;
@@ -174,8 +171,6 @@ pub enum TrustCheckElementValidationError {
     AuthorityBothSet,
     #[error("query.authority_ids must not be empty")]
     AuthoritiesEmpty,
-    #[error("query.authority_ids has {got} entries (max {max})")]
-    AuthoritiesTooMany { got: usize, max: usize },
     #[error("query.authority_ids[{index}] must not be blank")]
     AuthoritiesEntryBlank { index: usize },
     #[error("query.authority_ids[{index}] repeats an earlier entry")]
@@ -254,12 +249,6 @@ impl TrustCheckElement {
         }
         if authorities.is_empty() {
             return Err(TrustCheckElementValidationError::AuthoritiesEmpty);
-        }
-        if authorities.len() > TRUST_CHECK_AUTHORITIES_MAX {
-            return Err(TrustCheckElementValidationError::AuthoritiesTooMany {
-                got: authorities.len(),
-                max: TRUST_CHECK_AUTHORITIES_MAX,
-            });
         }
         let mut seen = HashSet::with_capacity(authorities.len());
         for (index, authority) in authorities.iter().enumerate() {
@@ -820,8 +809,8 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_authority_list_up_to_the_limit() {
-        let dids: Vec<String> = (0..TRUST_CHECK_AUTHORITIES_MAX)
+    fn validate_accepts_a_long_authority_list() {
+        let dids: Vec<String> = (0..100)
             .map(|i| format!("did:web:authority-{i}"))
             .collect();
         let refs: Vec<&str> = dids
@@ -829,24 +818,6 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(multi(&refs).validate(), Ok(()));
-    }
-
-    #[test]
-    fn validate_rejects_authority_list_over_the_limit() {
-        let dids: Vec<String> = (0..=TRUST_CHECK_AUTHORITIES_MAX)
-            .map(|i| format!("did:web:authority-{i}"))
-            .collect();
-        let refs: Vec<&str> = dids
-            .iter()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(
-            multi(&refs).validate(),
-            Err(TrustCheckElementValidationError::AuthoritiesTooMany {
-                got: TRUST_CHECK_AUTHORITIES_MAX + 1,
-                max: TRUST_CHECK_AUTHORITIES_MAX,
-            })
-        );
     }
 
     #[test]

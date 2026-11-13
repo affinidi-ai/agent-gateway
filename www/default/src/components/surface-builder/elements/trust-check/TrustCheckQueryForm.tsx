@@ -1,20 +1,14 @@
 import React from 'react';
 import { Form } from 'react-bootstrap';
-import type { Authority, AuthoritySource, Issuer, TrustRegistry } from '../../../../types';
+import type { Authority, Issuer, TrustRegistry } from '../../../../types';
 import { topAndTail } from '../../../../utils/stringUtils';
 import { deepLinks } from '../../../../utils/deepLinks';
 import AddResourceLink from '../../../shared/AddResourceLink';
 import FormSelect, { type FormSelectOption } from '../../../shared/FormSelect';
-import MissingAuthorityWarning from '../_shared/MissingAuthorityWarning';
-import { AGENT_IDENTITY_ISSUER_DID_TEMPLATE, INPUT_GATEWAY_SOURCE_ID_TEMPLATE } from './templates';
+import AuthorityListEditor from './AuthorityListEditor';
+import { RECORD_TYPE } from './TrustCheckQueryList';
 import {
-  authorityNeedsSelection,
-  authorityRows,
-  canAddAuthorityRow,
-  classifyTargetAuthoritySelection,
-  isMultiAuthorityQuery,
   readSubjectPickerState,
-  TRUST_CHECK_AUTHORITIES_MAX,
   subjectDescription,
   subjectForTemplate,
   subjectLabel,
@@ -25,18 +19,16 @@ import {
   type TrustCheckRecordType,
 } from './definition';
 
-const QUERY_TYPES: ReadonlyArray<FormSelectOption<TrustCheckRecordType>> = [
-  {
-    value: 'authorization',
-    label: 'Authorization',
-    description: 'Query an authorization record from the Trust Registry',
-  },
-  {
-    value: 'recognition',
-    label: 'Recognition',
-    description: 'Query a recognition record from the Trust Registry',
-  },
-];
+const RECORD_TYPES: ReadonlyArray<{
+  value: TrustCheckRecordType;
+  label: string;
+  icon: string;
+  description: string;
+}> = (['recognition', 'authorization'] as const).map(value => ({
+  value,
+  ...RECORD_TYPE[value],
+  description: `Query a ${value} record from the Trust Registry`,
+}));
 
 // Named subjects surfaced by the Entity ID dropdown on the CALLER leg.
 // `authority-did` and `provider` are intentionally omitted. Asking a
@@ -71,18 +63,6 @@ const CALLER_ENTITY_SUBJECT_ORDER: readonly NamedSubject[] = [
 // subject here surfaces via the locked "Custom (from JSON API)" slot.
 const TARGET_ENTITY_SUBJECT_ORDER: readonly NamedSubject[] = ['agent-did'];
 
-// Disabled `<option>` sentinels used as group headers in the target-leg
-// Authority picker. `FormSelect` skips disabled options in keyboard nav
-// and never commits them (the native `<button disabled>` blocks the
-// click), so they read as non-selectable section labels.
-const GRP_ISSUERS = '__grp_issuers__';
-const GRP_AUTHORITIES = '__grp_authorities__';
-
-const CALLER_TEMPLATES: ReadonlySet<string> = new Set([
-  AGENT_IDENTITY_ISSUER_DID_TEMPLATE,
-  INPUT_GATEWAY_SOURCE_ID_TEMPLATE,
-]);
-
 // Sentinel value for the inline "Custom (from JSON API)" `<option>` that
 // surfaces a stored value that isn't one of the four named subjects.
 // Picking it is a no-op (the option preserves the current stored value);
@@ -104,16 +84,10 @@ interface TrustCheckQueryFormProps {
   loadError: string | null;
   updateQueryAt: (index: number, patch: Partial<TrustCheckQueryConfig>) => void;
   updateQuerySubField: (index: number, field: string, value: string) => void;
-  /** `source` is where a literal DID was picked from; absent for a template, which removes it. */
-  updateAuthorityAt: (index: number, value: string, source?: AuthoritySource) => void;
-  /** Append an Authority row to the query; omit to hide **Add Authority**. */
-  addAuthorityRowAt?: (index: number) => void;
-  /** Set one row of a query that lists several Authorities. */
-  setAuthorityRowAt?: (index: number, row: number, did: string, source?: AuthoritySource) => void;
-  /** Remove one row of a query that lists several Authorities. */
-  removeAuthorityRowAt?: (index: number, row: number) => void;
-  /** Authorities the whole Trust Check list names (`listAuthorityCount`); defaults to this query's. */
-  listAuthorityTotal?: number;
+  /** Replace the whole query, for an Authority change that also drops fields. */
+  replaceQueryAt: (index: number, next: TrustCheckQueryConfig) => void;
+  /** Values the query held when the editor opened; any other listed Authority is marked New. */
+  baselineDids?: ReadonlySet<string>;
   updateEntityAt: (index: number, value: string) => void;
   handleQueryTypeChangeAt: (index: number, next: TrustCheckRecordType) => void;
   /**
@@ -136,11 +110,8 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
   loadError,
   updateQueryAt,
   updateQuerySubField,
-  updateAuthorityAt,
-  addAuthorityRowAt,
-  setAuthorityRowAt,
-  removeAuthorityRowAt,
-  listAuthorityTotal,
+  replaceQueryAt,
+  baselineDids,
   updateEntityAt,
   handleQueryTypeChangeAt,
   saveAttempted = false,
@@ -152,10 +123,37 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
   const tid = (suffix: string) => `trust-check-query-${index}-${suffix}`;
 
   return (
-    <div className="p-3" data-testid={tid('form')}>
+    <div data-testid={tid('form')}>
       <div className="row g-3">
-        <div className="col-12">
-          <Form.Label className="fw-semibold small mb-1">Trust Registry</Form.Label>
+        <div className="col-auto">
+          <div className="form-label fw-bold" id={tid('type-label')}>
+            Record type
+          </div>
+          <div
+            className="btn-group btn-group-sm"
+            role="group"
+            aria-labelledby={tid('type-label')}
+            data-testid={tid('type')}
+          >
+            {RECORD_TYPES.map(option => (
+              <button
+                key={option.value}
+                type="button"
+                className={`btn btn-outline-primary${queryType === option.value ? ' active' : ''}`}
+                aria-pressed={queryType === option.value}
+                title={option.description}
+                onClick={() => handleQueryTypeChangeAt(index, option.value)}
+                data-testid={tid(`type-${option.value}`)}
+              >
+                <i className={`fas ${option.icon} me-1`} aria-hidden="true" />
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="col trust-check-registry-field">
+          <Form.Label className="fw-bold">Trust registry</Form.Label>
           <FormSelect<string>
             value={queryConfig.trust_registry_id || ''}
             options={registries.map(r => {
@@ -176,13 +174,9 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
             placeholder="Select a trust registry"
             testid={tid('registry')}
           />
-          {loadError && (
-            <Form.Text className="text-danger" style={{ fontSize: '10px' }}>
-              {loadError}
-            </Form.Text>
-          )}
+          {loadError && <Form.Text className="text-danger">{loadError}</Form.Text>}
           {!loadError && (
-            <Form.Text className="text-muted d-block" style={{ fontSize: '11px' }}>
+            <Form.Text className="text-muted d-block">
               {registries.length === 0
                 ? 'No trust registries configured yet. '
                 : "Don't see the one you need? "}
@@ -194,18 +188,7 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
         </div>
 
         <div className="col-12">
-          <Form.Label className="fw-semibold small mb-1">Record Type</Form.Label>
-          <FormSelect<TrustCheckRecordType>
-            value={queryType}
-            options={QUERY_TYPES}
-            onChange={next => handleQueryTypeChangeAt(index, next)}
-            testid={tid('type')}
-          />
-        </div>
-
-        <div className="col-12">
-          <Form.Label className="fw-semibold small mb-1">Authority ID</Form.Label>
-          <AuthorityRows
+          <AuthorityListEditor
             tidPrefix={`trust-check-query-${index}`}
             isApMa={isApMa}
             queryConfig={queryConfig}
@@ -213,20 +196,13 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
             authorities={authorities}
             authoritiesLoaded={authoritiesLoaded}
             saveAttempted={saveAttempted}
-            listTotal={listAuthorityTotal}
-            onSingleChange={(did, source) => updateAuthorityAt(index, did, source)}
-            onRowChange={
-              setAuthorityRowAt
-                ? (row, did, source) => setAuthorityRowAt(index, row, did, source)
-                : undefined
-            }
-            onAddRow={addAuthorityRowAt ? () => addAuthorityRowAt(index) : undefined}
-            onRemoveRow={removeAuthorityRowAt ? row => removeAuthorityRowAt(index, row) : undefined}
+            baselineDids={baselineDids}
+            onChange={next => replaceQueryAt(index, next)}
           />
         </div>
 
         <div className="col-12">
-          <Form.Label className="fw-semibold small mb-1">Entity ID</Form.Label>
+          <Form.Label className="fw-bold">Entity ID</Form.Label>
           <SubjectPickerSelect
             testid={tid('entity')}
             storedValue={entityValue}
@@ -238,12 +214,11 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
 
         {queryType === 'authorization' ? (
           <>
-            <div className="col-12">
-              <Form.Label className="fw-semibold small mb-1">
+            <div className="col-12 col-md-6">
+              <Form.Label className="fw-bold">
                 Action <span className="text-danger">*</span>
               </Form.Label>
               <Form.Control
-                size="sm"
                 type="text"
                 required
                 value={sq.action || ''}
@@ -257,12 +232,11 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
               </Form.Control.Feedback>
             </div>
 
-            <div className="col-12">
-              <Form.Label className="fw-semibold small mb-1">
+            <div className="col-12 col-md-6">
+              <Form.Label className="fw-bold">
                 Resource <span className="text-danger">*</span>
               </Form.Label>
               <Form.Control
-                size="sm"
                 type="text"
                 required
                 value={sq.resource || ''}
@@ -278,10 +252,9 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
           </>
         ) : (
           <>
-            <div className="col-12">
-              <Form.Label className="fw-semibold small mb-1">Action (optional)</Form.Label>
+            <div className="col-12 col-md-6">
+              <Form.Label className="fw-bold">Action (optional)</Form.Label>
               <Form.Control
-                size="sm"
                 type="text"
                 value={sq.action || ''}
                 placeholder="is (default)"
@@ -290,10 +263,9 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
               />
             </div>
 
-            <div className="col-12">
-              <Form.Label className="fw-semibold small mb-1">Resource (optional)</Form.Label>
+            <div className="col-12 col-md-6">
+              <Form.Label className="fw-bold">Resource (optional)</Form.Label>
               <Form.Control
-                size="sm"
                 type="text"
                 value={sq.resource || ''}
                 placeholder="ownedAgent (default)"
@@ -322,16 +294,15 @@ interface SubjectPickerSelectProps {
 }
 
 /**
- * Subject-picker dropdown shared by Entity ID and the target-leg
- * Authority. Renders one FormSelect option per named subject (index 0
- * marked as default) with the short subject label as the header and a
- * plain-English explanation as the subheader. When the stored value is
- * not one of the named subjects, an additional disabled option
- * surfaces the JSON-API-authored custom value (the raw template / DID
+ * Subject-picker dropdown for Entity ID. Renders one FormSelect option per
+ * named subject (index 0 marked as default) with the short subject label as
+ * the header and a plain-English explanation as the subheader. When the
+ * stored value is not one of the named subjects, an additional disabled
+ * option surfaces the JSON-API-authored custom value (the raw template / DID
  * as the subheader) so the operator can see what's stored but cannot
- * re-select it; picking a named subject overwrites it. The selected
- * option's description also renders on the FormSelect toggle, so no
- * separate below-field caption is required.
+ * re-select it; picking a named subject overwrites it. The selected option's
+ * description also renders on the FormSelect toggle, so no separate
+ * below-field caption is required.
  */
 const SubjectPickerSelect: React.FC<SubjectPickerSelectProps> = ({
   testid,
@@ -397,383 +368,5 @@ function subjectLabelFromTemplate(template: string, isApMa: boolean): string | n
 function capitalize(s: string): string {
   return s.length === 0 ? s : s[0].toUpperCase() + s.slice(1);
 }
-
-interface IssuerAuthorityPickerProps {
-  testid: string;
-  isApMa: boolean;
-  storedValue: string;
-  storedSource?: AuthoritySource;
-  issuers: Issuer[];
-  authorities: Authority[];
-  authoritiesLoaded: boolean;
-  invalid?: boolean;
-  /** False for a row of several Authorities: the caller-leg templates are not offered. */
-  allowTemplates?: boolean;
-  /** DIDs picked in other rows, not offered here. */
-  excludeDids?: ReadonlySet<string>;
-  /** False to leave out the explanation under the picker. */
-  showHint?: boolean;
-  onChange: (did: string, source?: AuthoritySource) => void;
-}
-
-/**
- * Authority picker shared by both legs. The operator chooses an explicit
- * trust anchor — an **Issuer** (a configured Department) or an
- * **Authority** (a record from the Authorities register) — whose literal
- * DID is written verbatim into `query.authority_id`.
- *
- * Storing a literal DID (rather than a `{{ input.agent.provider_did }}`
- * template) means the runtime never resolves provider metadata off an
- * agent card / request payload. On the caller leg that avoids depending
- * on the caller's trust-registry extension (which may be absent when the
- * payload carries only an identity credential); on the target leg it is
- * both a trust-model requirement (the called party must not assert who
- * vouches for it) and the fix for the `TRUST_REGISTRY_METADATA_UNAVAILABLE`
- * gate that blocked checks whenever the card carried no trust-registry
- * metadata.
- *
- * Issuers and Authorities are grouped under disabled header rows
- * (`FormSelect` skips disabled options in nav and never commits them). A
- * DID present in both registers is shown only under Issuers (issuers win
- * on collision). A legacy `{{ … }}` template or a JSON-API-authored DID
- * outside both registers surfaces as a locked "… (from JSON API)" option
- * so the operator sees the stored value and can replace it. When neither
- * register has entries and nothing custom is stored, a locked read-only
- * textbox prompts the operator to configure a Department or Authority.
- *
- * Picking an Issuer writes `authority_source: 'issuer'`, an Authority
- * `'authority'`, and a caller-leg template removes it. A stored DID picked
- * from the Authorities register that the loaded register no longer has
- * shows as a locked "Deleted Authority" option, marked invalid, with the
- * Configuration required warning under the picker.
- */
-const IssuerAuthorityPicker: React.FC<IssuerAuthorityPickerProps> = ({
-  testid,
-  isApMa,
-  storedValue,
-  storedSource,
-  issuers,
-  authorities,
-  authoritiesLoaded,
-  invalid = false,
-  allowTemplates = true,
-  excludeDids,
-  showHint = true,
-  onChange,
-}) => {
-  const offered = (did: string) => did === storedValue || !excludeDids?.has(did);
-  const issuerDids = new Set(issuers.map(i => i.did));
-  const shownIssuers = issuers.filter(i => offered(i.did));
-  const authorityList = authorities
-    .filter(a => !issuerDids.has(a.did) && offered(a.did))
-    .map(a => ({ did: a.did, name: a.name, description: a.description }));
-  const templates = isApMa && allowTemplates;
-  const trimmed = storedValue.trim();
-  const isVerifiedIssuerDefault =
-    templates && (trimmed === '' || trimmed === AGENT_IDENTITY_ISSUER_DID_TEMPLATE);
-  // Known caller-leg templates that appear as first-class picker options —
-  // treated as valid selections rather than "custom (from JSON API)".
-  const isKnownCallerTemplate =
-    templates &&
-    (trimmed === AGENT_IDENTITY_ISSUER_DID_TEMPLATE ||
-      trimmed === INPUT_GATEWAY_SOURCE_ID_TEMPLATE);
-  const effectiveValue =
-    templates && trimmed === '' ? AGENT_IDENTITY_ISSUER_DID_TEMPLATE : storedValue;
-  const selection = classifyTargetAuthoritySelection(
-    storedValue,
-    issuers,
-    authorities,
-    storedSource,
-    authoritiesLoaded
-  );
-  const missingAuthority = selection.kind === 'missing-authority' ? selection.did : null;
-  const hasCustom =
-    !isVerifiedIssuerDefault &&
-    !isKnownCallerTemplate &&
-    (selection.kind === 'legacy-template' || selection.kind === 'custom-did');
-
-  if (
-    !templates &&
-    shownIssuers.length === 0 &&
-    authorityList.length === 0 &&
-    !hasCustom &&
-    !missingAuthority
-  ) {
-    return (
-      <>
-        <Form.Control
-          size="sm"
-          type="text"
-          readOnly
-          disabled
-          value="No Issuers or Authorities configured"
-          data-testid={`${testid}-locked`}
-        />
-        <Form.Text
-          className="text-muted d-block mt-1"
-          style={{ fontSize: '11px', wordBreak: 'break-all' }}
-        >
-          Add an{' '}
-          <AddResourceLink to={deepLinks.issuer} testid={`${testid}-add-issuer-link`}>
-            Issuer
-          </AddResourceLink>{' '}
-          or an{' '}
-          <AddResourceLink to={deepLinks.authority} testid={`${testid}-add-authority-link`}>
-            Authority
-          </AddResourceLink>{' '}
-          to select a trust anchor for the {isApMa ? 'caller' : 'target'}-leg Authority.
-        </Form.Text>
-      </>
-    );
-  }
-
-  const options: Array<FormSelectOption<string>> = [];
-
-  if (templates) {
-    options.push({
-      value: AGENT_IDENTITY_ISSUER_DID_TEMPLATE,
-      label: 'Agent identity credential issuer (default)',
-      description: "The verified issuer of the caller's agent identity credential.",
-    });
-    options.push({
-      value: INPUT_GATEWAY_SOURCE_ID_TEMPLATE,
-      label: 'Sending gateway DID (fabric-inbound)',
-      description:
-        'The DID of the sending gateway on the fabric-inbound path. Only populated when the request arrived via `fabric://`; on direct inbound the query denies fail-safe.',
-    });
-  }
-  // Group headers only earn their keep when BOTH categories are present —
-  // a lone "Issuers" (or "Authorities") label above a single flat list
-  // adds no information, so with one category we drop the header and the
-  // per-item indent entirely.
-  const showGroupHeaders = shownIssuers.length > 0 && authorityList.length > 0;
-  if (shownIssuers.length > 0) {
-    if (showGroupHeaders) {
-      options.push({ value: GRP_ISSUERS, label: 'Issuers', disabled: true });
-    }
-    for (const issuer of shownIssuers) {
-      options.push({
-        value: issuer.did,
-        label: issuer.name,
-        description: issuer.description || topAndTail(issuer.did, 16, 12),
-        indent: showGroupHeaders,
-      });
-    }
-  }
-  if (authorityList.length > 0) {
-    if (showGroupHeaders) {
-      options.push({ value: GRP_AUTHORITIES, label: 'Authorities', disabled: true });
-    }
-    for (const authority of authorityList) {
-      options.push({
-        value: authority.did,
-        label: authority.name,
-        description: authority.description || topAndTail(authority.did, 16, 12),
-        indent: showGroupHeaders,
-      });
-    }
-  }
-  if (missingAuthority && !options.some(o => o.value === missingAuthority)) {
-    options.push({
-      value: missingAuthority,
-      label: 'Deleted Authority',
-      description: topAndTail(missingAuthority, 16, 12),
-      disabled: true,
-      indent: showGroupHeaders,
-    });
-  }
-  if (hasCustom) {
-    options.push({
-      value: storedValue,
-      label:
-        selection.kind === 'legacy-template'
-          ? 'Legacy template (from JSON API)'
-          : 'Custom DID (from JSON API)',
-      description:
-        selection.kind === 'legacy-template' ? selection.template : topAndTail(storedValue, 16, 12),
-      disabled: true,
-      indent: showGroupHeaders,
-    });
-  }
-
-  const handleChange = (next: string) => {
-    if (next === GRP_ISSUERS || next === GRP_AUTHORITIES) return;
-    if (CALLER_TEMPLATES.has(next)) onChange(next);
-    else onChange(next, issuerDids.has(next) ? 'issuer' : 'authority');
-  };
-
-  return (
-    <>
-      <FormSelect<string>
-        value={effectiveValue}
-        options={options}
-        onChange={handleChange}
-        isInvalid={invalid || !!missingAuthority}
-        placeholder="Select an Issuer or Authority…"
-        testid={testid}
-      />
-      {missingAuthority && (
-        <MissingAuthorityWarning
-          testid={`${testid}-missing`}
-          element="trust-check"
-          missing={[{ index: 0, did: missingAuthority }]}
-        />
-      )}
-      {showHint && (
-        <Form.Text className="text-muted d-block mt-1" style={{ fontSize: '11px' }}>
-          {isApMa
-            ? 'Pick the trust anchor the caller is checked against. The default resolves to the cryptographically-verified issuer of the caller’s agent identity credential; pick an Issuer or Authority to pin an explicit DID instead.'
-            : 'Pick the trust anchor the target is checked against. Its DID is stored directly, so the gateway never derives the authority from the target’s own agent card. If you pick an Authority and it is deleted later, the check fails until you pick another.'}
-        </Form.Text>
-      )}
-    </>
-  );
-};
-
-interface AuthorityRowsProps {
-  /** `trust-check-query-<n>` */
-  tidPrefix: string;
-  isApMa: boolean;
-  queryConfig: TrustCheckQueryConfig;
-  issuers: Issuer[];
-  authorities: Authority[];
-  authoritiesLoaded: boolean;
-  saveAttempted: boolean;
-  /** Authorities the whole Trust Check list names; defaults to this query's rows. */
-  listTotal?: number;
-  /** Single-row change, the existing `authority_id` write. */
-  onSingleChange: (did: string, source?: AuthoritySource) => void;
-  onRowChange?: (row: number, did: string, source?: AuthoritySource) => void;
-  onAddRow?: () => void;
-  onRemoveRow?: (row: number) => void;
-}
-
-/**
- * The query's Authority as a list of rows, like the Trust Recorder's custom resources: each row is
- * an Issuer / Authority picker, **Add Authority** appends a row, and each row of several has a
- * remove button. One row is the single `authority_id`, saved exactly as before; two or more are
- * `authority_ids`, each recorded in `authority_sources` as picked from the Issuers or the
- * Authorities register, and OPA gets one result per row in this order. Templates are offered
- * only while there is one row, and a DID picked in one row is not offered in another.
- */
-const AuthorityRows: React.FC<AuthorityRowsProps> = ({
-  tidPrefix,
-  isApMa,
-  queryConfig,
-  issuers,
-  authorities,
-  authoritiesLoaded,
-  saveAttempted,
-  listTotal,
-  onSingleChange,
-  onRowChange,
-  onAddRow,
-  onRemoveRow,
-}) => {
-  const rows = authorityRows(queryConfig);
-  const multi = isMultiAuthorityQuery(queryConfig);
-  const atCap = rows.length >= TRUST_CHECK_AUTHORITIES_MAX;
-  const total = listTotal ?? rows.length;
-  const listAtCap = !atCap && total >= TRUST_CHECK_AUTHORITIES_MAX;
-  const canAdd = canAddAuthorityRow(queryConfig, total);
-
-  const addButton = onAddRow && (
-    <button
-      type="button"
-      className="btn btn-outline-secondary btn-sm mt-2"
-      onClick={onAddRow}
-      disabled={!canAdd}
-      title={
-        atCap
-          ? `A query checks at most ${TRUST_CHECK_AUTHORITIES_MAX} Authorities`
-          : listAtCap
-            ? `A Trust Check checks at most ${TRUST_CHECK_AUTHORITIES_MAX} Authorities in total`
-            : canAdd
-              ? undefined
-              : 'Pick an Issuer or Authority in every row first'
-      }
-      data-testid={`${tidPrefix}-add-authority`}
-    >
-      <i className="fas fa-plus me-1" /> Add Authority
-    </button>
-  );
-
-  if (!multi) {
-    const [{ did, source }] = rows;
-    return (
-      <>
-        <IssuerAuthorityPicker
-          testid={`${tidPrefix}-authority`}
-          isApMa={isApMa}
-          storedValue={did}
-          storedSource={source}
-          issuers={issuers}
-          authorities={authorities}
-          authoritiesLoaded={authoritiesLoaded}
-          invalid={saveAttempted && authorityNeedsSelection(did, isApMa)}
-          onChange={onSingleChange}
-        />
-        {addButton}
-      </>
-    );
-  }
-
-  return (
-    <div data-testid={`${tidPrefix}-authorities`}>
-      {rows.map((row, r) => {
-        const others = new Set(rows.filter((_, i) => i !== r).map(o => o.did));
-        return (
-          <div key={r} className="d-flex gap-2 mb-2 align-items-start">
-            <div style={{ flex: '1 1 0', minWidth: 0 }}>
-              <IssuerAuthorityPicker
-                testid={`${tidPrefix}-authority-${r}`}
-                isApMa={isApMa}
-                allowTemplates={false}
-                excludeDids={others}
-                showHint={false}
-                storedValue={row.did}
-                storedSource={row.source}
-                issuers={issuers}
-                authorities={authorities}
-                authoritiesLoaded={authoritiesLoaded}
-                invalid={saveAttempted && row.did.trim() === ''}
-                onChange={(did, src) => onRowChange?.(r, did, src)}
-              />
-            </div>
-            {onRemoveRow && rows.length > 1 && (
-              <button
-                type="button"
-                className="btn btn-outline-danger btn-sm"
-                onClick={() => onRemoveRow(r)}
-                title="Remove Authority"
-                data-testid={`${tidPrefix}-authority-${r}-remove`}
-              >
-                <i className="fas fa-times" />
-              </button>
-            )}
-          </div>
-        );
-      })}
-      <Form.Text
-        className="text-muted d-block"
-        style={{ fontSize: '11px' }}
-        data-testid={`${tidPrefix}-authority-count`}
-      >
-        {rows.length}/{TRUST_CHECK_AUTHORITIES_MAX} Authorities, one result each, in this order
-      </Form.Text>
-      {atCap && (
-        <Form.Text
-          className="text-warning d-block"
-          style={{ fontSize: '11px' }}
-          data-testid={`${tidPrefix}-authority-limit`}
-        >
-          A query checks at most {TRUST_CHECK_AUTHORITIES_MAX} Authorities. Remove one to add
-          another.
-        </Form.Text>
-      )}
-      {addButton}
-    </div>
-  );
-};
 
 export default TrustCheckQueryForm;

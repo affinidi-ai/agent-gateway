@@ -175,7 +175,9 @@ describe('migrated Trust Check copy on an MCP Transit Point', () => {
     const props = panelProps(hydrate(migratedMcp()), MCP_TC);
     render(<TrustCheckPanel {...(props as any)} />);
     expect(screen.getByTestId('trust-check-panel-read-only')).toHaveTextContent(READ_ONLY_LINE);
-    expect(screen.getByTestId('trust-check-panel-configure')).toHaveTextContent('View Queries…');
+    const view = screen.getByTestId('trust-check-panel-configure');
+    expect(view).toHaveTextContent('View queries');
+    expect(view).toContainHTML('<i class="fas fa-eye me-1"></i>');
     expect(screen.getByTestId('trust-check-panel-migrated-warning')).toBeInTheDocument();
     fireEvent.click(screen.getByTestId('trust-check-panel-migrated-warning-keep'));
     expect(props.updateField).toHaveBeenCalledWith('trust_check_migrated', false);
@@ -187,12 +189,13 @@ describe('migrated Trust Check copy on an MCP Transit Point', () => {
     expect(screen.getByTestId('trust-check-fullscreen-read-only')).toHaveTextContent(
       READ_ONLY_LINE
     );
-    const queries = within(screen.getByTestId('trust-check-fullscreen-queries'));
-    const controls = [...queries.getAllByRole('button'), ...queries.queryAllByRole('textbox')];
+    const settings = within(screen.getByTestId('trust-check-editor-query-settings'));
+    const controls = [...settings.getAllByRole('button'), ...settings.queryAllByRole('textbox')];
     expect(controls.length).toBeGreaterThan(2);
     controls.forEach(control => expect(control).toBeDisabled());
     expect(screen.getByTestId('trust-check-add-query')).toBeDisabled();
-    expect(screen.getByTestId('trust-check-query-0-remove')).toBeDisabled();
+    expect(screen.getByTestId('trust-check-editor-remove-query-button')).toBeDisabled();
+    expect(screen.getByTestId('trust-check-editor-query-0')).toBeEnabled();
     expect(screen.queryByTestId('trust-check-save')).toBeNull();
     fireEvent.click(screen.getByTestId('trust-check-fullscreen-migrated-warning-keep'));
     expect(props.updateField).toHaveBeenCalledWith('trust_check_migrated', false);
@@ -207,13 +210,13 @@ describe('migrated Trust Check copy on an MCP Transit Point', () => {
     const { unmount } = render(<TrustCheckPanel {...(props as any)} />);
     expect(screen.queryByTestId('trust-check-panel-read-only')).toBeNull();
     expect(screen.getByTestId('trust-check-panel-configure')).toHaveTextContent(
-      'Configure Queries…'
+      'Configure queries'
     );
     unmount();
     render(<TrustCheckFullscreenPanel {...(props as any)} />);
     expect(screen.queryByTestId('trust-check-fullscreen-read-only')).toBeNull();
     expect(screen.getByTestId('trust-check-add-query')).toBeEnabled();
-    expect(screen.getByTestId('trust-check-query-0-remove')).toBeEnabled();
+    expect(screen.getByTestId('trust-check-editor-remove-query-button')).toBeEnabled();
     fireEvent.click(screen.getByTestId('trust-check-add-query'));
     expect(screen.getByTestId('trust-check-save')).toBeEnabled();
   });

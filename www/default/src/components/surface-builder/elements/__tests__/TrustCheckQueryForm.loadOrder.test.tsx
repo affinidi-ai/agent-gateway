@@ -7,22 +7,21 @@ import type { TrustCheckQueryConfig } from '../trust-check/definition';
 
 const AUTHORITY = { id: 'a-1', name: 'Payments Authority', did: 'did:web:auth.example' };
 
-const storedQuery = {
+const emptyQuery = {
   id: 'q-1',
   trust_registry_id: 'tr-1',
   query_type: 'recognition',
-  authority_source: 'authority',
-  query: { authority_id: AUTHORITY.did },
+  query: {},
 } as TrustCheckQueryConfig;
 
 describe('TrustCheckQueryForm loaded after the Trust Check definition', () => {
-  it('still writes no authority_source when the caller-leg template default is picked', () => {
+  it('still writes no authority_source when the agent identity credential issuer is added', () => {
     expect(trustCheckDefinition.type).toBe('trust-check');
-    const updateAuthorityAt = jest.fn();
+    const replaceQueryAt = jest.fn();
     render(
       <MemoryRouter>
         <TrustCheckQueryForm
-          queryConfig={storedQuery}
+          queryConfig={emptyQuery}
           index={0}
           isApMa
           registries={[]}
@@ -31,20 +30,21 @@ describe('TrustCheckQueryForm loaded after the Trust Check definition', () => {
           loadError={null}
           updateQueryAt={jest.fn()}
           updateQuerySubField={jest.fn()}
-          updateAuthorityAt={updateAuthorityAt}
+          replaceQueryAt={replaceQueryAt}
           updateEntityAt={jest.fn()}
           handleQueryTypeChangeAt={jest.fn()}
         />
       </MemoryRouter>
     );
 
-    fireEvent.click(screen.getByTestId('trust-check-query-0-authority'));
-    fireEvent.click(screen.getByText('Agent identity credential issuer (default)'));
-
-    expect(updateAuthorityAt).toHaveBeenCalledWith(
-      0,
-      '{{ input.agent.identity_issuer_did }}',
-      undefined
+    fireEvent.click(screen.getByTestId('trust-check-query-0-add-authority'));
+    fireEvent.click(
+      screen.getByTestId('trust-check-query-0-add-authority-option-agent-identity-issuer')
     );
+    fireEvent.click(screen.getByTestId('trust-check-query-0-add-authority-confirm'));
+
+    const [, next] = replaceQueryAt.mock.calls[0];
+    expect(next.query).toEqual({ authority_id: '{{ input.agent.identity_issuer_did }}' });
+    expect(next).not.toHaveProperty('authority_source');
   });
 });

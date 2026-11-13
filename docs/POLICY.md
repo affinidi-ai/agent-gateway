@@ -156,11 +156,9 @@ for trust, no identity verification, no TRQP query. A request through a Transit 
 only that Transit Point's results, at `input.trust_check_results.target`, in all three
 outbound OPA scopes (gateway, surface, Transit Point).
 
-A list holds at most `TRUST_CHECK_LIST_MAX` (10) elements
-([`src/config/agent_surface.rs`](../src/config/agent_surface.rs)) and queries at most
-`TRUST_CHECK_AUTHORITIES_MAX` (25) authorities in total, counting each entry of a
-`query.authority_ids` list and one for every other element; a longer list is rejected with
-`400`. A surface variant
+A list has no limit on its elements or on the authorities they query
+([`src/config/agent_surface.rs`](../src/config/agent_surface.rs)). The gateway queries every
+listed authority of a leg at once, so each authority adds one TRQP message per request. A surface variant
 override replaces the whole list verbatim, never element by element; a variant gives its
 Transit Points their own lists through its `transit.points` override.
 
@@ -263,7 +261,7 @@ Element validation is in
 | `id` | Required, unique within the leg, at most `TRUST_CHECK_ID_MAX_CODE_POINTS` (64) code points. Rego-addressable and audit-visible. |
 | `name` | Optional display label, at most `TRUST_CHECK_NAME_MAX_CODE_POINTS` (64) code points. |
 | `id` and `name` | Control, DEL, C1, and bidi-override codepoints are rejected. |
-| `query.authority_id` / `query.authority_ids` | Exactly one is set. `authority_ids` holds 1 to `TRUST_CHECK_AUTHORITIES_MAX` (25) distinct, non-blank DIDs or templates. `authority_sources` is refused without `authority_ids`. |
+| `query.authority_id` / `query.authority_ids` | Exactly one is set. `authority_ids` holds one or more distinct, non-blank DIDs or templates. `authority_sources` is refused without `authority_ids`. |
 | `timeout_secs` | Optional on a single-authority element; without it the element waits for the trust registry transport's own timeout. Refused on a multi-authority element, where each authority always waits `TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS` (5). |
 
 The two caps are separate constants that happen to share a value today, because `id` is

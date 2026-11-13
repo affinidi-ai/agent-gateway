@@ -4,9 +4,8 @@ changes:
     - timestamp: '2026-11-12T00:00:00Z'
       title: ⭐ Let one Trust Check query list several authorities
       description: >-
-        A Trust Check query can list up to 25 authorities in query.authority_ids instead of one
-        authority_id, and the Trust Checks of one leg query at most 25 authorities in total. The
-        gateway queries every listed authority in parallel, waits for each to answer or time out
+        A Trust Check query can list several authorities in query.authority_ids instead of one
+        authority_id, with no limit on how many. The gateway queries every listed authority in parallel, waits for each to answer or time out
         (a built-in 5 seconds per authority; timeout_secs is refused on such a query), and gives
         policy one result per authority under the element's id, so a surface can accept callers
         that any participating organisation recognises. A gateway older than this feature skips any
@@ -23,20 +22,57 @@ changes:
     - timestamp: '2026-11-12T00:00:00Z'
       title: Pick several Authorities for one Trust Check query in the dashboard
       description: >-
-        In the Trust Check editor, Add Authority adds another Issuer or Authority to a query, up
-        to 25, and the editor stops adding Authorities or queries once the Trust Check names 25
-        in total, the gateway's limit, so Save is not refused. A query with several saves query.authority_ids with authority_sources recording
+        In the Trust Check editor, Add Issuers or Authorities opens a searchable multi-select of
+        the Issuers and Authorities, plus on the caller leg the agent identity credential issuer and
+        the sending gateway DID, and adds the ticked ones in the order ticked. The query's
+        Authorities show as a compact table in result order, with the ones added since the editor
+        opened marked New. A
+        query with several saves query.authority_ids with authority_sources recording
         the register each was picked from; a query with one keeps authority_id as before. The
-        sidebar shows how many authorities each query checks and names them. A listed Authority
+        sidebar shows how many authorities each query checks, with their names on hover. A listed Authority
         that was deleted blocks Save, as a single one does.
   changed:
+    - timestamp: '2026-11-13T00:00:00Z'
+      title: Remove the limits on Trust Check queries and authorities
+      description: >-
+        A Trust Check list is no longer refused for holding more than 10 queries, and there is no
+        limit on the authorities its queries name. The gateway sends one TRQP query per listed
+        authority, all at once, so each one adds a DIDComm message to the trust registry on every
+        request but no latency. The dashboard's count line shows the number of queries and
+        authorities. A gateway older than this release refuses a list of more than 10 queries, so
+        trim such lists to 10 before rolling back.
     - timestamp: '2026-11-12T00:00:00Z'
       title: Fail a Trust Check whose authority resolves to a blank value
       description: >-
         A Trust Check whose query.authority_id template resolves to a blank value now fails with
         TEMPLATE_RESOLUTION_FAILED without querying its trust registry, instead of sending a query
         with no authority.
-  fixed: []
+    - timestamp: '2026-11-12T00:00:00Z'
+      title: Show each Trust Check query's status in the sidebar
+      description: >-
+        The Trust Check sidebar matches the Caller Context sidebar: a short intro, one banner on
+        how OPA uses the result, and a Trust Check Queries list with one row per query showing
+        whether it is ready (or what it is missing), its record type, its trust registry, and its
+        Authority or how many Authorities it lists. A Configure
+        queries link below the list opens the editor.
+    - timestamp: '2026-11-12T00:00:00Z'
+      title: Edit Trust Check queries one at a time from a list
+      description: >-
+        The Trust Check editor is one card that fills the editor tab, with the leg, an
+        unsaved-changes marker and a count of queries and Authorities. The query list and the
+        selected query's settings scroll in their own panes side by side (stacked below 720px
+        wide), so adding queries or Authorities never pushes the page down. Selecting a row opens
+        its settings, which hold Remove query, and each row shows whether the query is ready before
+        Save; a blocked Save opens the first query that blocks it. Record type is a two-option
+        toggle, and one line under the header says what the leg checks and where OPA finds the
+        results.
+  fixed:
+    - timestamp: '2026-11-12T00:00:00Z'
+      title: Block Save on a new target-leg Trust Check with no Authority
+      description: >-
+        A Trust Check just dropped on a Transit Point or Managed Agent target arrow with no Issuer
+        or Authority picked now shows as incomplete on the canvas and blocks Save, as one loaded
+        from a saved surface already did, instead of saving a query the gateway cannot run.
   removed: []
   security: []
   breaking: []

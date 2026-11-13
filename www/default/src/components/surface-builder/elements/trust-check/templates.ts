@@ -1,4 +1,4 @@
-// Imports nothing: TrustCheckQueryForm reads these when it loads, which can happen while
+// Imports nothing: AuthorityListEditor reads these when it loads, which can happen while
 // definition.ts is still loading, since definition.ts imports the panels that render the form.
 
 /**
