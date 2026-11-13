@@ -12,7 +12,7 @@
     "pretest:ui": "mkdir -p test_results/.auth"
   },
   "devDependencies": {
-    "@axe-core/playwright": "^4.10.0",
+    "@axe-core/playwright": "^4.14.0",
     "@playwright/test": "^1.48.0",
     "@types/node": "^22.0.0",
     "typescript": "^5.6.0"
