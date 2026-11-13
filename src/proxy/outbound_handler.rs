@@ -5404,6 +5404,8 @@ async fn step_inject_credentials(
         secrets_store,
         base_url,
         false,
+        // Transit and Fabric consent is not confirmed.
+        crate::delegation_vault::consent_confirmation::ConsentCaller::TransitOrFabric,
         Some(&audit_ctx),
         // Transit resolves callers to an identity hash only, which carries no
         // issuer, so it can never unlock a modern consent record.
@@ -14866,6 +14868,7 @@ mod tests {
         surface.outbound_credentials =
             vec![serde_json::from_value(json!({ "credential_provider_id": "provider" })).unwrap()];
         let alice = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "alice" }),
@@ -14957,6 +14960,7 @@ mod tests {
         .principal_hash(None)
         .unwrap();
         let direct_client = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "dave".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "dave" }),
@@ -15106,6 +15110,7 @@ mod tests {
             .insert(axum::http::header::AUTHORIZATION, unverified_bearer(json!({ "tid": "forged" })));
 
         ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "alice", "tid": "contoso" }),
@@ -15141,6 +15146,7 @@ mod tests {
     fn outbound_policy_input_carries_a_client_the_transit_points_source_auth_verified() {
         let mut ctx = test_pipeline_context();
         ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "alice", "tid": "tenant-1" }),
@@ -15167,6 +15173,7 @@ mod tests {
         assert_eq!(transit_caller_json(&ctx)["verification"], "anonymous", "the client is not the caller");
 
         ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "<none>".to_string(),
             claims: json!({ "iss": "https://idp.example", "client_id": "no-subject" }),
@@ -15185,6 +15192,7 @@ mod tests {
         authenticate_by_resource_token(
             &mut ctx,
             crate::source_auth::AuthenticatedIdentity::JwtBearer {
+                strategy_id: None,
                 principal_claim: "sub".to_string(),
                 subject: "alice".to_string(),
                 claims: json!({ "iss": "https://idp.example", "sub": "alice" }),
@@ -15615,6 +15623,7 @@ mod tests {
         authenticate_by_resource_token(
             &mut resource_caller,
             crate::source_auth::AuthenticatedIdentity::JwtBearer {
+                strategy_id: None,
                 principal_claim: "sub".to_string(),
                 subject: "alice".to_string(),
                 claims: json!({ "sub": "alice", "tid": "tenant-1" }),
@@ -17744,6 +17753,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let state = delegation_state(directory.path(), &[("provider", "token-caller-access")]).await;
         let jwt_caller = |subject: &str| crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: subject.to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": subject }),
@@ -21409,6 +21419,7 @@ mod tests {
         assert!(vendor.requests().is_empty());
 
         let oid_caller = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             subject: "00000000-0000-0000-0000-0000000000aa".to_string(),
             principal_claim: "oid".to_string(),
             claims: json!({ "iss": "https://login.example.com", "sub": "pairwise",
@@ -22187,6 +22198,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let state = delegation_state(directory.path(), &[("provider", "token-caller-access")]).await;
         let jwt = |claims: serde_json::Value| AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: claims["sub"]
                 .as_str()
@@ -22306,6 +22318,7 @@ mod tests {
         let named_by = |principal_claim: &str, sub: &str| {
             let claims = json!({ "iss": "https://idp.example", "sub": sub, "oid": "person-1" });
             AuthenticatedIdentity::JwtBearer {
+                strategy_id: None,
                 subject: claims[principal_claim]
                     .as_str()
                     .unwrap()
@@ -22362,6 +22375,7 @@ mod tests {
             );
         }
         let without_oid = AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             subject: "<none>".to_string(),
             principal_claim: "oid".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "sub-in-the-first-app" }),
@@ -22400,6 +22414,7 @@ mod tests {
         };
         let mut no_agent = no_caller();
         no_agent.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "alice" }),
@@ -23862,6 +23877,7 @@ mod tests {
         .principal_hash(Some("tenant-a"))
         .unwrap();
         let direct_client = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "dave".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "dave" }),

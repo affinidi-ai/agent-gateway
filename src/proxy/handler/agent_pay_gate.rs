@@ -4630,6 +4630,7 @@ pub(crate) mod tests {
 
     fn jwt_identity(claims: Value) -> crate::source_auth::AuthenticatedIdentity {
         crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: claims["sub"]
                 .as_str()

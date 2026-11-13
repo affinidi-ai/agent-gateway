@@ -374,6 +374,7 @@ async fn async_main() -> Result<()> {
     // Initialize logging
     // before this point consider using println
     let _guard: Option<WorkerGuard> = init_logging(&config, &bootstrap_config, otlp_auth_header)?;
+    storage::start_logging_warnings();
 
     let retired_a2a_switches =
         surfaces::RetiredA2aSwitches::read(&bootstrap_config).unwrap_or(surfaces::RetiredA2aSwitches {

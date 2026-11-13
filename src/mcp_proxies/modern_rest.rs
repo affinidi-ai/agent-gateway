@@ -469,6 +469,7 @@ fn request_headers(
         let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| RestError::Arguments)?;
         let value = HeaderValue::from_str(&text(value)).map_err(|_| RestError::Arguments)?;
         if protected_header(&name)
+            || crate::config::caller_key::is_caller_key_header(name.as_str())
             || headers
                 .get(&name)
                 .is_some_and(|current| current != value)
@@ -1260,7 +1261,8 @@ mod tests {
         assert_eq!(request_headers(&parameters, &target).unwrap()["x-api-key-hint"], "kept");
         parameters.headers.clear();
         target.remove("x-api-key");
-        for name in ["host", "content-length", "mcp-param-header", "connection"] {
+        for name in ["host", "content-length", "mcp-param-header", "connection", "x-caller-key", "X_Caller_Key_Memory"]
+        {
             parameters
                 .headers
                 .insert(name.into(), json!("override"));

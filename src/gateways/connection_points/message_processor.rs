@@ -4503,6 +4503,27 @@ impl FabricPayment<'_> {
     }
 }
 
+/// The MCP HTTP policy a Fabric-received request to `surface` is admitted under. A framed
+/// stream checks the caller's browser `Origin` against the surface's allowlist and its
+/// `browser_origins`. A buffered `ForwardRequest` is not checked for it again: the sending
+/// gateway already checked it against its own surface.
+fn fabric_receive_http_policy(
+    surface: &crate::config::agent_surface::AgentSurface,
+    versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    framed: bool,
+) -> Result<crate::mcp::modern_http::EndpointHttpPolicy, String> {
+    let policy = crate::mcp::modern_http::EndpointHttpPolicy::framed_fabric_receive(
+        surface,
+        surface.mcp_http.as_ref(),
+        versions,
+    )?;
+    Ok(if framed {
+        policy
+    } else {
+        policy.without_origin_check()
+    })
+}
+
 async fn process_charged_forward_request(
     message: &ReceivedMessage,
     mut stream_request: Option<FabricStreamRequest>,
@@ -5138,15 +5159,7 @@ async fn process_charged_forward_request(
 
     let mut mcp_verified_binding = None;
     let (mcp_metadata_context, mut mcp_classification) = if surface.channel_protocol() == crate::config::ChannelProtocol::Mcp {
-        let http_policy = match crate::mcp::modern_http::EndpointHttpPolicy::with_versions(
-            surface.mcp_http.as_ref(),
-            std::slice::from_ref(&surface.access_point.listen_address),
-            mcp_versions,
-        ) {
-            // The sending gateway already checked the caller's browser Origin
-            // against its own surface, so a buffered ForwardRequest is not
-            // checked again against this surface's allowlist.
-            Ok(policy) if stream_request.is_none() => policy.without_origin_check(),
+        let http_policy = match fabric_receive_http_policy(&surface, mcp_versions, stream_request.is_some()) {
             Ok(policy) => policy,
             Err(error) => {
                 channel_warn!(config_id, "Invalid MCP HTTP configuration: {}", error);
@@ -6069,6 +6082,7 @@ async fn process_charged_forward_request(
     if !credentialed_card_fetch
         && let Some((header_name, header_value)) = crate::proxy::caller_key::caller_key_header(
             &surface,
+            surface.target_endpoint(),
             authenticated_identity.as_ref(),
             get_secrets_store().as_ref(),
         )
@@ -6204,6 +6218,8 @@ async fn process_charged_forward_request(
                     &secrets_store,
                     &base_url,
                     true, // via_fabric = true (G2G path)
+                    // Transit and Fabric consent is not confirmed.
+                    crate::delegation_vault::consent_confirmation::ConsentCaller::TransitOrFabric,
                     Some(&delegation_audit_ctx),
                     // A Fabric request establishes no consent principal, so it never
                     // unlocks a modern consent record.
@@ -9545,6 +9561,9 @@ mod fabric_transit_tests;
 
 #[cfg(test)]
 mod fabric_card_fetch_tests;
+
+#[cfg(test)]
+mod fabric_caller_key_tests;
 
 #[cfg(test)]
 mod variant_routing_tests;

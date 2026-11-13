@@ -2617,7 +2617,8 @@ async fn proxy_charged_request(
             .map_err(|error| {
                 channel_warn!(config_id, "Invalid MCP HTTP configuration: {}", error);
                 create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid MCP HTTP configuration")
-            })?,
+            })?
+            .with_browser_origins(&state.surface.browser_origins),
         )
     } else {
         None
@@ -6749,6 +6750,7 @@ async fn proxy_charged_request(
     if !bound_target
         && let Some((header_name, header_value)) = crate::proxy::caller_key::caller_key_header(
             &state.surface,
+            &state.surface.target.endpoint,
             authenticated_identity.as_ref(),
             state.secrets_store.as_ref(),
         )
@@ -6902,6 +6904,10 @@ async fn proxy_charged_request(
                 mcp_session_id: validated_mcp_session_id.clone(),
             };
 
+            let consent_strategies = state
+                .source_auth_middleware
+                .as_ref()
+                .map(|middleware| middleware.provider_store());
             let delegation_results = deferred_audit
                 .scope(crate::proxy::credential_delegation::resolve_delegation_credentials(
                     &outbound_credentials,
@@ -6920,6 +6926,16 @@ async fn proxy_charged_request(
                     secrets_store,
                     base_url,
                     false, // via_fabric = false (direct HTTP path)
+                    crate::delegation_vault::consent_confirmation::ConsentCaller::AccessPoint {
+                        identity: authenticated_identity.as_ref(),
+                        strategies: consent_strategies.as_deref(),
+                        gateway_issuer: state
+                            .network_config
+                            .sts
+                            .mcp_issuer
+                            .as_ref()
+                            .map(|profile| profile.issuer.as_str()),
+                    },
                     Some(&delegation_audit_ctx),
                     delegation_consent_principal.as_deref(),
                 ))
@@ -9927,16 +9943,8 @@ pub(crate) fn match_surface_route<'a>(
                 normalized_route.as_str()
             };
 
-            crate::proxy::route_variant::parse_route_with_variant(path, prefix).map(|m| {
-                debug!(
-                    "Route matched: surface='{}' route='{}' alias={} tail={}",
-                    ch.surface.name,
-                    normalized_route,
-                    loggable::untrusted(m.alias.unwrap_or_default()),
-                    loggable::untrusted(&loggable::path(m.tail))
-                );
-                (*ch, normalized_route, m.alias.map(|s| s.to_string()), m.tail.to_string())
-            })
+            crate::proxy::route_variant::parse_route_with_variant(path, prefix)
+                .map(|m| (*ch, normalized_route, m.alias.map(|s| s.to_string()), m.tail.to_string()))
         })
 }
 
@@ -9970,6 +9978,19 @@ async fn multi_channel_proxy_handler_in_request_scope(
     // Sort channels by route length (descending) so the most specific route wins.
     let channels = state.channels.read().await;
     let matched_channel = match_surface_route(&channels, &path);
+    if let Some((ch, route, alias, tail)) = &matched_channel {
+        debug!(
+            "Route matched: surface='{}' route='{}' alias={} tail={}",
+            ch.surface.name,
+            route,
+            loggable::untrusted(
+                alias
+                    .as_deref()
+                    .unwrap_or_default()
+            ),
+            loggable::untrusted(&loggable::path(tail))
+        );
+    }
 
     // Surface the alias as `virtual_channel_alias` for the downstream resolver
     // (which still operates on `ChannelMapping.virtual_channels` until the
@@ -23007,6 +23028,7 @@ allow if {
             let (issuer, _dir) = test_vc_issuer().await;
             let state = state_with(inbound_from_api_key("pak-wrong-auth"), Some(issuer));
             let jwt = AuthenticatedIdentity::JwtBearer {
+                strategy_id: None,
                 principal_claim: "sub".to_string(),
                 subject: "user-1".into(),
                 claims: serde_json::json!({"sub": "user-1"}),
@@ -24337,6 +24359,7 @@ mod fabric_send_tests {
                 "metadata": {"https://fabric.affinidi.io/extensions/agent-identity/v1": {"cloudProvider": "local", "model": "gpt-4"}}}}
         });
         let caller = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: json!({"iss": "https://idp.example.com", "email": "ada@example.com"}),

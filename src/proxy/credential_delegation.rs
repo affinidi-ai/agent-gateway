@@ -11,6 +11,7 @@ use crate::credential_providers::CredentialProvider;
 use crate::credential_providers::CredentialProviderType;
 use crate::credential_providers::storage::CredentialProviderStorage;
 use crate::delegation_vault::audit::{self, AuditCallerContext, DelegationAuditAction};
+use crate::delegation_vault::consent_confirmation::ConsentCaller;
 use crate::delegation_vault::service_token::{
     self, Freshness, IssuedToken, ServiceTokenContext, ServiceTokenError, ServiceTokenKey,
 };
@@ -333,6 +334,9 @@ fn enrich_audit_event(
 /// * `secrets_store` — secrets storage (for refreshing tokens)
 /// * `gateway_base_url` — for building OAuth authorization URLs
 /// * `via_fabric` — true when this resolution is happening on the GW2 side of a fabric request
+/// * `caller` — who a consent link is minted for: an Access Point caller, with the
+///   strategies that may confirm it at its identity provider, or a Transit or Fabric
+///   request, whose consent is not confirmed
 /// * `consent_principal` — the authenticated caller's consent principal, when this request
 ///   carries one. A vault record created by modern consent is released only to its own
 ///   principal; callers that cannot establish one (Transit, fabric) pass `None` and are
@@ -349,9 +353,14 @@ pub async fn resolve_delegation_credentials(
     secrets_store: &Arc<dyn SecretsStore>,
     gateway_base_url: &str,
     via_fabric: bool,
+    caller: ConsentCaller<'_>,
     audit_ctx: Option<&DelegationAuditContext>,
     consent_principal: Option<&str>,
 ) -> Vec<DelegationResolution> {
+    let consent_caller = ConsentLinkFor {
+        caller,
+        tenant_id: surface_tenancy.tenant_id,
+    };
     let mut results: Vec<DelegationResolution> = Vec::new();
     let surface_variant = crate::observability::policy_audit::current_request_variant();
     let surface_variant = surface_variant.as_deref();
@@ -963,6 +972,7 @@ pub async fn resolve_delegation_credentials(
                                     user_identity_hash,
                                     agent_did,
                                     channel_id,
+                                    consent_caller,
                                     provider_store,
                                     secrets_store,
                                     gateway_base_url,
@@ -991,6 +1001,7 @@ pub async fn resolve_delegation_credentials(
                             user_identity_hash,
                             agent_did,
                             channel_id,
+                            consent_caller,
                             provider_store,
                             secrets_store,
                             gateway_base_url,
@@ -1038,6 +1049,7 @@ pub async fn resolve_delegation_credentials(
                         user_identity_hash,
                         agent_did,
                         channel_id,
+                        consent_caller,
                         &provider,
                         vault_store,
                         provider_store,
@@ -1060,6 +1072,7 @@ pub async fn resolve_delegation_credentials(
                         user_identity_hash,
                         agent_did,
                         channel_id,
+                        consent_caller,
                         provider_store,
                         secrets_store,
                         gateway_base_url,
@@ -1240,12 +1253,22 @@ pub fn inject_delegated_credential_into_mcp_meta(
     Ok(serde_json::to_vec(&json_body)?)
 }
 
+/// Who a consent link is minted for, and the tenant of the surface their
+/// `user_identity_hash` was computed under.
+#[derive(Clone, Copy)]
+struct ConsentLinkFor<'a> {
+    caller: ConsentCaller<'a>,
+    tenant_id: Option<&'a str>,
+}
+
 /// Build a consent_required response for a binding that has no valid token
+#[allow(clippy::too_many_arguments)]
 async fn build_consent_required(
     binding: &OutboundCredentialBinding,
     user_identity_hash: &str,
     agent_did: &str,
     channel_id: &str,
+    caller: ConsentLinkFor<'_>,
     provider_store: &Arc<dyn CredentialProviderStorage>,
     secrets_store: &Arc<dyn SecretsStore>,
     gateway_base_url: &str,
@@ -1269,6 +1292,8 @@ async fn build_consent_required(
                 agent_did,
                 user_identity_hash,
                 channel_id,
+                caller.tenant_id,
+                caller.caller,
                 &scopes,
                 gateway_base_url,
                 secrets_store,
@@ -1324,6 +1349,7 @@ async fn try_elicit_flow(
     user_identity_hash: &str,
     agent_did: &str,
     channel_id: &str,
+    caller: ConsentLinkFor<'_>,
     provider: &CredentialProvider,
     vault_store: &Arc<dyn DelegationVaultStorage>,
     provider_store: &Arc<dyn CredentialProviderStorage>,
@@ -1375,6 +1401,8 @@ async fn try_elicit_flow(
         agent_did,
         user_identity_hash,
         channel_id,
+        caller.tenant_id,
+        caller.caller,
         &scopes,
         gateway_base_url,
         secrets_store,
@@ -1632,7 +1660,21 @@ mod tests {
     use crate::config::types::{ConsentMode, CredentialInjection, CredentialRequirement, OutboundCredentialBinding};
     use crate::credential_providers::CredentialProvider;
     use crate::delegation_vault::{DelegationToken, VaultLookupResult};
+    use crate::jwt_bearer::JwtVerificationStrategyStorage;
     use crate::secrets::{CreateSecretRequest, Secret, SecretListItem, UpdateSecretRequest};
+    use crate::source_auth::AuthenticatedIdentity;
+
+    /// An Access Point caller of a gateway with no STS issuer.
+    fn access_point<'a>(
+        identity: Option<&'a AuthenticatedIdentity>,
+        strategies: Option<&'a dyn JwtVerificationStrategyStorage>,
+    ) -> ConsentCaller<'a> {
+        ConsentCaller::AccessPoint {
+            identity,
+            strategies,
+            gateway_issuer: None,
+        }
+    }
 
     // ── Mock vault store ──────────────────────────────────────────────────
 
@@ -1974,6 +2016,7 @@ mod tests {
             api_key_secret_ref: None,
             jwt: Default::default(),
             description: None,
+            consent_confirmation: None,
             created_at: now,
             updated_at: now,
             callback_url: None,
@@ -2158,6 +2201,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             false,
+            access_point(None, None),
             None,
             Some("verified-user"),
         )
@@ -2209,6 +2253,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             false,
+            access_point(None, None),
             None,
             consent_principal,
         )
@@ -2269,6 +2314,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             false,
+            access_point(None, None),
             None,
             None,
         )
@@ -2335,6 +2381,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             false,
+            access_point(None, None),
             None,
             None,
         )
@@ -2373,6 +2420,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             false,
+            access_point(None, None),
             None,
             None,
         )
@@ -2467,6 +2515,7 @@ mod tests {
                 &secrets,
                 "https://gw.example.com",
                 false,
+                access_point(None, None),
                 None,
                 None,
             ))
@@ -2518,6 +2567,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             false,
+            access_point(None, None),
             None,
             None,
         )
@@ -2575,6 +2625,7 @@ mod tests {
                 &secrets,
                 "https://gw.example.com",
                 false,
+                access_point(None, None),
                 None,
                 None,
             )
@@ -2645,6 +2696,7 @@ mod tests {
                 &secrets,
                 "https://gw.example.com",
                 false,
+                access_point(None, None),
                 None,
                 None,
             )
@@ -2738,6 +2790,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             false,
+            access_point(None, None),
             None,
             None,
         )))
@@ -2807,6 +2860,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             false,
+            access_point(None, None),
             None,
             None,
         )
@@ -2916,6 +2970,7 @@ mod tests {
                 &secrets,
                 "https://gw.example.com",
                 false,
+                access_point(None, None),
                 None,
                 None,
             )
@@ -2953,6 +3008,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             false,
+            access_point(None, None),
             None,
             None,
         )
@@ -2993,6 +3049,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             false,
+            access_point(None, None),
             None,
             None,
         )
@@ -3023,6 +3080,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             false,
+            access_point(None, None),
             None,
             None,
         )
@@ -3060,6 +3118,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             false,
+            access_point(None, None),
             None,
             None,
         )
@@ -3100,6 +3159,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             false,
+            access_point(None, None),
             None,
             None,
         )
@@ -3145,6 +3205,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             false,
+            access_point(None, None),
             None,
             None,
         )
@@ -3229,6 +3290,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             false,
+            access_point(None, None),
             None,
             None,
         )
@@ -3260,6 +3322,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             true, // via_fabric
+            ConsentCaller::TransitOrFabric,
             None,
             None,
         )
@@ -3291,6 +3354,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             false,
+            access_point(None, None),
             None,
             None,
         )
@@ -3353,6 +3417,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             false,
+            access_point(None, None),
             None, // audit_ctx = None → no mcp_session_id
             None,
         )
@@ -3388,6 +3453,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             false,
+            access_point(None, None),
             Some(&ctx),
             None,
         ))
@@ -3438,6 +3504,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             false,
+            access_point(None, None),
             Some(&ctx),
             None,
         )
@@ -3489,6 +3556,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             false,
+            access_point(None, None),
             Some(&ctx),
             None,
         )
@@ -3546,6 +3614,7 @@ mod tests {
                     &secrets,
                     "https://gw.example.com",
                     false,
+                    access_point(None, None),
                     None,
                     None,
                 )
@@ -3562,6 +3631,523 @@ mod tests {
         .await;
         assert_eq!(result_tag(&shared[0].result), "Unavailable");
         assert_eq!(shared[0].action.outcome, DelegationActionOutcome::ProviderUnavailable);
+    }
+
+    /// The start state a consent link minted for `caller` seals.
+    async fn minted_start_state(
+        provider: &CredentialProvider,
+        caller: Option<&AuthenticatedIdentity>,
+        user_identity_hash: &str,
+        strategies: Option<&dyn JwtVerificationStrategyStorage>,
+    ) -> crate::delegation_vault::OAuthState {
+        let result = consent_lookup(provider, caller, user_identity_hash, strategies).await;
+        let DelegationLookupResult::ConsentRequired { authorization_url, .. } = &result else {
+            panic!("expected a consent result, got {}", result_tag(&result));
+        };
+        let state = url::Url::parse(authorization_url)
+            .unwrap()
+            .query_pairs()
+            .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+            .unwrap();
+        crate::delegation_vault::oauth::decode_start_state(&state).unwrap()
+    }
+
+    async fn consent_lookup(
+        provider: &CredentialProvider,
+        caller: Option<&AuthenticatedIdentity>,
+        user_identity_hash: &str,
+        strategies: Option<&dyn JwtVerificationStrategyStorage>,
+    ) -> DelegationLookupResult {
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
+        let results = resolve_delegation_credentials(
+            &[make_binding(&provider.id)],
+            user_identity_hash,
+            "did:web:agent.example",
+            "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(None),
+            None,
+            &(MockVaultStore::new(VaultLookupResult::NotFound) as Arc<dyn DelegationVaultStorage>),
+            &(MockProviderStore::with_stored(provider.clone()) as Arc<dyn CredentialProviderStorage>),
+            &secrets,
+            "https://gw.example.com",
+            false,
+            access_point(caller, strategies),
+            None,
+            None,
+        )
+        .await;
+        results
+            .into_iter()
+            .next()
+            .unwrap()
+            .result
+    }
+
+    /// A consent link confirms its caller only when the provider's
+    /// `consent_confirmation` strategy recomputes the caller's vault key. A
+    /// caller the setting does not cover gets the link the provider mints
+    /// without the setting; a setting that confirms no caller mints no link.
+    #[tokio::test]
+    async fn a_consent_link_confirms_only_a_caller_its_strategy_recomputes() {
+        use crate::delegation_vault::{ConsentConfirmBinding, ConsentStage, OAuthState};
+        use crate::jwt_bearer::models::{JwksSource, JwtVerificationStrategy};
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::jwt_bearer::FileSystemJwtVerificationStrategyStore::new(
+            directory
+                .path()
+                .join("strategies"),
+        )
+        .await
+        .unwrap();
+        let create = |issuer: &str, tenant_id: Option<&str>| JwtVerificationStrategy {
+            id: String::new(),
+            tenant_id: tenant_id.map(String::from),
+            name: "Callers".to_string(),
+            expected_issuer: issuer.to_string(),
+            jwks_source: JwksSource::Remote {
+                jwks_uri: format!("{issuer}/jwks"),
+            },
+            principal_claim: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let issuer = "https://idp.example";
+        let entra = "https://login.microsoftonline.com/tenant/v2.0";
+        let strategy = store
+            .create(create(issuer, None))
+            .await
+            .unwrap();
+        let other_tenant = store
+            .create(create(issuer, Some("tenant-b")))
+            .await
+            .unwrap();
+        let entra_by_sub = store
+            .create(create(entra, None))
+            .await
+            .unwrap();
+        let confirming = |strategy_id: &str| {
+            let mut provider = make_credential_provider("cp-1", CredentialProviderType::OAuth2AuthorizationCode);
+            provider.consent_confirmation = Some(
+                serde_json::from_value(serde_json::json!({
+                    "client_id_secret_ref": "LOGIN_CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+                    "authorization_endpoint": "https://idp.example/authorize",
+                    "token_endpoint": "https://idp.example/token",
+                    "jwt_verification_strategy_id": strategy_id
+                }))
+                .unwrap(),
+            );
+            provider
+        };
+        let without_setting = make_credential_provider("cp-1", CredentialProviderType::OAuth2AuthorizationCode);
+        let jwt = |iss: &str, principal_claim: &str| AuthenticatedIdentity::JwtBearer {
+            subject: "alice".to_string(),
+            principal_claim: principal_claim.to_string(),
+            claims: serde_json::json!({"iss": iss, principal_claim: "alice"}),
+            strategy_id: Some(strategy.id.clone()),
+            verification: Default::default(),
+        };
+        let alice = jwt(issuer, "sub");
+        let alice_hash = alice
+            .principal_hash(None)
+            .unwrap();
+
+        let confirmed = minted_start_state(&confirming(&strategy.id), Some(&alice), &alice_hash, Some(&store)).await;
+        assert_eq!(
+            confirmed.stage,
+            Some(ConsentStage::ConfirmStart(ConsentConfirmBinding {
+                strategy_id: strategy.id.clone(),
+                strategy_digest: strategy
+                    .verification_digest()
+                    .unwrap(),
+                tenant_id: None,
+            }))
+        );
+        assert_eq!(confirmed.user_identity_hash, alice_hash);
+
+        let api_key = AuthenticatedIdentity::ApiKey {
+            key_name: "key".to_string(),
+            provider_agent_id: None,
+        };
+        let api_key_hash = api_key
+            .principal_hash(None)
+            .unwrap();
+        let other_issuer = jwt("https://other.example", "sub");
+        let other_claim = jwt(issuer, "email");
+        let entra_alice = jwt(entra, "sub");
+        let hash = |identity: &AuthenticatedIdentity| {
+            identity
+                .principal_hash(None)
+                .unwrap()
+        };
+        let unconfirmed: [(&str, CredentialProvider, Option<&AuthenticatedIdentity>, String); 6] = [
+            ("an API key caller", confirming(&strategy.id), Some(&api_key), api_key_hash.clone()),
+            ("no caller", confirming(&strategy.id), None, "sha256:user1".to_string()),
+            ("another issuer", confirming(&strategy.id), Some(&other_issuer), hash(&other_issuer)),
+            ("another principal claim", confirming(&strategy.id), Some(&other_claim), hash(&other_claim)),
+            ("another vault key", confirming(&strategy.id), Some(&alice), "sha256:someone-else".to_string()),
+            ("an API key caller of a deleted strategy", confirming("gone"), Some(&api_key), api_key_hash.clone()),
+        ];
+        let as_minted_today = |state: OAuthState| OAuthState {
+            nonce: String::new(),
+            expires_at: chrono::DateTime::<Utc>::UNIX_EPOCH,
+            ..state
+        };
+        for (case, provider, caller, user_hash) in &unconfirmed {
+            let minted = minted_start_state(provider, *caller, user_hash, Some(&store)).await;
+            let today = minted_start_state(&without_setting, *caller, user_hash, Some(&store)).await;
+            assert_eq!(minted.stage, None, "{case}");
+            assert!(as_minted_today(minted) == as_minted_today(today), "{case}");
+        }
+
+        let confirms_nobody: [(&str, CredentialProvider, &AuthenticatedIdentity, String, bool); 4] = [
+            ("a deleted strategy", confirming("gone"), &alice, alice_hash.clone(), true),
+            ("a strategy of another tenant", confirming(&other_tenant.id), &alice, alice_hash.clone(), true),
+            (
+                "an Entra strategy naming callers by sub",
+                confirming(&entra_by_sub.id),
+                &entra_alice,
+                hash(&entra_alice),
+                true,
+            ),
+            ("no strategy store", confirming(&strategy.id), &alice, alice_hash.clone(), false),
+        ];
+        for (case, provider, caller, user_hash, with_store) in &confirms_nobody {
+            let strategies = with_store.then_some(&store as &dyn JwtVerificationStrategyStorage);
+            let refused = consent_lookup(provider, Some(*caller), user_hash, strategies).await;
+            assert!(matches!(refused, DelegationLookupResult::Unavailable), "{case}: {}", result_tag(&refused));
+        }
+
+        crate::identity::credential_identity::configure_pepper_for_tests(false);
+        let refused = consent_lookup(&confirming(&strategy.id), Some(&alice), &alice_hash, Some(&store)).await;
+        assert!(
+            matches!(refused, DelegationLookupResult::Unavailable),
+            "without a configured pepper: {}",
+            result_tag(&refused)
+        );
+        let today = minted_start_state(&without_setting, Some(&alice), &alice_hash, Some(&store)).await;
+        assert_eq!(today.stage, None, "a provider without the setting still mints without a pepper");
+        let minted = minted_start_state(&confirming(&strategy.id), Some(&api_key), &api_key_hash, Some(&store)).await;
+        let today = minted_start_state(&without_setting, Some(&api_key), &api_key_hash, Some(&store)).await;
+        assert_eq!(minted.stage, None, "an API key caller without a configured pepper");
+        assert!(
+            as_minted_today(minted) == as_minted_today(today),
+            "an API key caller is minted a link as before without a configured pepper"
+        );
+    }
+
+    /// A strategy store whose every read fails.
+    struct UnreadableStrategies;
+
+    #[async_trait]
+    impl JwtVerificationStrategyStorage for UnreadableStrategies {
+        async fn create(
+            &self,
+            _strategy: crate::jwt_bearer::models::JwtVerificationStrategy,
+        ) -> Result<crate::jwt_bearer::models::JwtVerificationStrategy> {
+            anyhow::bail!("strategy store unavailable")
+        }
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> Result<Option<crate::jwt_bearer::models::JwtVerificationStrategy>> {
+            anyhow::bail!("strategy store unavailable")
+        }
+        async fn list(&self) -> Result<Vec<crate::jwt_bearer::models::JwtVerificationStrategy>> {
+            anyhow::bail!("strategy store unavailable")
+        }
+        async fn update(
+            &self,
+            _strategy: crate::jwt_bearer::models::JwtVerificationStrategy,
+        ) -> Result<crate::jwt_bearer::models::JwtVerificationStrategy> {
+            anyhow::bail!("strategy store unavailable")
+        }
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> Result<()> {
+            anyhow::bail!("strategy store unavailable")
+        }
+    }
+
+    /// A store holding one strategy for `https://idp.example` under
+    /// `tenant_id`, a provider of `tenant_id` whose `consent_confirmation`
+    /// names it, and Alice, a caller that strategy verified.
+    async fn confirming_fixture(
+        directory: &std::path::Path,
+        tenant_id: Option<&str>,
+    ) -> (
+        crate::jwt_bearer::FileSystemJwtVerificationStrategyStore,
+        crate::jwt_bearer::models::JwtVerificationStrategy,
+        CredentialProvider,
+        AuthenticatedIdentity,
+    ) {
+        let store = crate::jwt_bearer::FileSystemJwtVerificationStrategyStore::new(directory.join("strategies"))
+            .await
+            .unwrap();
+        let strategy = store
+            .create(crate::jwt_bearer::models::JwtVerificationStrategy {
+                id: String::new(),
+                tenant_id: tenant_id.map(String::from),
+                name: "Callers".to_string(),
+                expected_issuer: "https://idp.example".to_string(),
+                jwks_source: crate::jwt_bearer::models::JwksSource::Remote {
+                    jwks_uri: "https://idp.example/jwks".to_string(),
+                },
+                principal_claim: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        let mut provider = make_credential_provider("cp-1", CredentialProviderType::OAuth2AuthorizationCode);
+        provider.tenant_id = tenant_id.map(String::from);
+        provider.consent_confirmation = Some(
+            serde_json::from_value(serde_json::json!({
+                "client_id_secret_ref": "LOGIN_CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+                "authorization_endpoint": "https://idp.example/authorize",
+                "token_endpoint": "https://idp.example/token",
+                "jwt_verification_strategy_id": strategy.id
+            }))
+            .unwrap(),
+        );
+        let alice = AuthenticatedIdentity::JwtBearer {
+            subject: "alice".to_string(),
+            principal_claim: "sub".to_string(),
+            claims: serde_json::json!({"iss": "https://idp.example", "sub": "alice"}),
+            strategy_id: Some(strategy.id.clone()),
+            verification: Default::default(),
+        };
+        (store, strategy, provider, alice)
+    }
+
+    /// Resolve `provider`'s binding for `caller` on a surface of `tenant_id`,
+    /// with the vault answering `vault`.
+    async fn resolve_for_caller(
+        provider: &CredentialProvider,
+        caller: &AuthenticatedIdentity,
+        tenant_id: Option<&str>,
+        strategies: &dyn JwtVerificationStrategyStorage,
+        vault: VaultLookupResult,
+    ) -> DelegationResolution {
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
+        resolve_delegation_credentials(
+            &[make_binding(&provider.id)],
+            &caller
+                .principal_hash(tenant_id)
+                .unwrap(),
+            "did:web:agent.example",
+            "ch-1",
+            crate::tenancy::SurfaceTenancy::configured(tenant_id),
+            None,
+            &(MockVaultStore::new(vault) as Arc<dyn DelegationVaultStorage>),
+            &(MockProviderStore::with_stored(provider.clone()) as Arc<dyn CredentialProviderStorage>),
+            &secrets,
+            "https://gw.example.com",
+            false,
+            access_point(Some(caller), Some(strategies)),
+            None,
+            None,
+        )
+        .await
+        .remove(0)
+    }
+
+    /// The stage of the start state a consent result's link seals.
+    fn start_stage(result: &DelegationLookupResult) -> Option<crate::delegation_vault::ConsentStage> {
+        let DelegationLookupResult::ConsentRequired { authorization_url, .. } = result else {
+            panic!("expected a consent result, got {}", result_tag(result));
+        };
+        let state = url::Url::parse(authorization_url)
+            .unwrap()
+            .query_pairs()
+            .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+            .unwrap();
+        crate::delegation_vault::oauth::decode_start_state(&state)
+            .unwrap()
+            .stage
+    }
+
+    /// The consent link that follows a failed refresh confirms its caller like
+    /// the one minted when the vault holds nothing.
+    #[tokio::test]
+    async fn the_consent_link_after_a_failed_refresh_confirms_its_caller() {
+        use crate::delegation_vault::{ConsentConfirmBinding, ConsentStage};
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        let directory = tempfile::tempdir().unwrap();
+        let (store, strategy, mut provider, alice) = confirming_fixture(directory.path(), None).await;
+        let app = axum::Router::new().fallback(axum::routing::post(|| async {
+            (axum::http::StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "invalid_grant"})))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let mut server = tokio::task::JoinSet::new();
+        server.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        provider.token_endpoint = Some(token_endpoint.clone());
+        let egress = oauth::TokenEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: Some(token_endpoint),
+            policy: Default::default(),
+        };
+
+        let refreshed = egress
+            .scope(resolve_for_caller(
+                &provider,
+                &alice,
+                None,
+                &store,
+                VaultLookupResult::ExpiredRefreshable(make_token(true, true)),
+            ))
+            .await;
+
+        assert_eq!(refreshed.action.outcome, DelegationActionOutcome::RefreshFailed);
+        assert_eq!(
+            start_stage(&refreshed.result),
+            Some(ConsentStage::ConfirmStart(ConsentConfirmBinding {
+                strategy_id: strategy.id.clone(),
+                strategy_digest: strategy
+                    .verification_digest()
+                    .unwrap(),
+                tenant_id: None,
+            }))
+        );
+    }
+
+    /// A strategy that cannot be read refuses the consent link of a provider
+    /// with `consent_confirmation` rather than minting one that does not
+    /// confirm its caller; a provider without the setting never reads it.
+    #[tokio::test]
+    async fn an_unreadable_strategy_refuses_only_a_confirming_consent_link() {
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        let directory = tempfile::tempdir().unwrap();
+        let (_store, _strategy, provider, alice) = confirming_fixture(directory.path(), None).await;
+
+        let refused =
+            resolve_for_caller(&provider, &alice, None, &UnreadableStrategies, VaultLookupResult::NotFound).await;
+        assert_eq!(refused.action.outcome, DelegationActionOutcome::ProviderUnavailable);
+        assert!(matches!(refused.result, DelegationLookupResult::Unavailable), "{}", result_tag(&refused.result));
+
+        let without_setting = CredentialProvider {
+            consent_confirmation: None,
+            ..provider
+        };
+        let minted =
+            resolve_for_caller(&without_setting, &alice, None, &UnreadableStrategies, VaultLookupResult::NotFound)
+                .await;
+        assert_eq!(minted.action.outcome, DelegationActionOutcome::ConsentRequired);
+        assert_eq!(start_stage(&minted.result), None);
+    }
+
+    /// A provider whose consent confirmation sets `require` mints no consent
+    /// link for a caller it cannot confirm, and still confirms one it can.
+    #[tokio::test]
+    async fn a_provider_requiring_confirmation_refuses_a_caller_it_cannot_confirm() {
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        let directory = tempfile::tempdir().unwrap();
+        let (store, _strategy, mut provider, alice) = confirming_fixture(directory.path(), None).await;
+        provider
+            .consent_confirmation
+            .as_mut()
+            .unwrap()
+            .require = true;
+        let api_key = AuthenticatedIdentity::ApiKey {
+            key_name: "key".to_string(),
+            provider_agent_id: None,
+        };
+        let api_key_hash = api_key
+            .principal_hash(None)
+            .unwrap();
+        let refused = consent_lookup(&provider, Some(&api_key), &api_key_hash, Some(&store)).await;
+        assert!(matches!(refused, DelegationLookupResult::Unavailable), "{}", result_tag(&refused));
+
+        let alice_hash = alice
+            .principal_hash(None)
+            .unwrap();
+        let refused = consent_lookup(&provider, Some(&alice), "sha256:someone-else", Some(&store)).await;
+        assert!(matches!(refused, DelegationLookupResult::Unavailable), "{}", result_tag(&refused));
+        let confirmed = minted_start_state(&provider, Some(&alice), &alice_hash, Some(&store)).await;
+        assert!(matches!(confirmed.stage, Some(crate::delegation_vault::ConsentStage::ConfirmStart(_))));
+    }
+
+    /// On a surface of a tenant the caller's vault key is computed under that
+    /// tenant, and the confirm binding records it.
+    #[tokio::test]
+    async fn a_tenant_surfaces_consent_link_confirms_its_caller_under_its_tenant() {
+        use crate::delegation_vault::ConsentStage;
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        let directory = tempfile::tempdir().unwrap();
+        let (store, strategy, provider, alice) = confirming_fixture(directory.path(), Some("tenant-a")).await;
+
+        let minted = resolve_for_caller(&provider, &alice, Some("tenant-a"), &store, VaultLookupResult::NotFound).await;
+
+        assert!(
+            matches!(
+                start_stage(&minted.result),
+                Some(ConsentStage::ConfirmStart(binding))
+                    if binding.strategy_id == strategy.id && binding.tenant_id.as_deref() == Some("tenant-a")
+            ),
+            "the start state confirms the caller under tenant-a"
+        );
+    }
+
+    /// Transit and Fabric consent is not confirmed: the caller a confirming
+    /// strategy verified gets a link that does not confirm them there.
+    #[tokio::test]
+    async fn a_transit_or_fabric_consent_link_does_not_confirm_its_caller() {
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        let directory = tempfile::tempdir().unwrap();
+        let (_store, _strategy, provider, alice) = confirming_fixture(directory.path(), None).await;
+        let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
+        for via_fabric in [false, true] {
+            let resolved = resolve_delegation_credentials(
+                &[make_binding(&provider.id)],
+                &alice
+                    .principal_hash(None)
+                    .unwrap(),
+                "did:web:agent.example",
+                "ch-1",
+                crate::tenancy::SurfaceTenancy::configured(None),
+                None,
+                &(MockVaultStore::new(VaultLookupResult::NotFound) as Arc<dyn DelegationVaultStorage>),
+                &(MockProviderStore::with_stored(provider.clone()) as Arc<dyn CredentialProviderStorage>),
+                &secrets,
+                "https://gw.example.com",
+                via_fabric,
+                ConsentCaller::TransitOrFabric,
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(resolved[0].action.outcome, DelegationActionOutcome::ConsentRequired, "via_fabric {via_fabric}");
+            assert_eq!(start_stage(&resolved[0].result), None, "via_fabric {via_fabric}");
+        }
+    }
+
+    /// An `iss` that differs from the strategy's only by a trailing slash is
+    /// another issuer, so its caller gets a link that does not confirm them.
+    #[tokio::test]
+    async fn a_caller_whose_issuer_has_a_trailing_slash_is_not_confirmed() {
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        let directory = tempfile::tempdir().unwrap();
+        let (store, _strategy, provider, _alice) = confirming_fixture(directory.path(), None).await;
+        let slashed = AuthenticatedIdentity::JwtBearer {
+            subject: "alice".to_string(),
+            principal_claim: "sub".to_string(),
+            claims: serde_json::json!({"iss": "https://idp.example/", "sub": "alice"}),
+            strategy_id: None,
+            verification: Default::default(),
+        };
+
+        let minted = resolve_for_caller(&provider, &slashed, None, &store, VaultLookupResult::NotFound).await;
+
+        assert_eq!(minted.action.outcome, DelegationActionOutcome::ConsentRequired);
+        assert_eq!(start_stage(&minted.result), None);
     }
 
     /// A consent result carries the gateway's consent start page for the
@@ -3586,6 +4172,81 @@ mod tests {
         assert_eq!(
             (state.provider_id.as_str(), state.scopes.as_slice()),
             ("test-cp-1", ["repo".to_string()].as_slice())
+        );
+    }
+
+    /// The consent start page an elicitation carries confirms its caller like
+    /// any other consent link.
+    #[tokio::test]
+    async fn an_elicitation_carries_a_start_page_that_confirms_its_caller() {
+        use crate::delegation_vault::ConsentStage;
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::jwt_bearer::FileSystemJwtVerificationStrategyStore::new(
+            directory
+                .path()
+                .join("strategies"),
+        )
+        .await
+        .unwrap();
+        let strategy = store
+            .create(crate::jwt_bearer::models::JwtVerificationStrategy {
+                id: String::new(),
+                tenant_id: None,
+                name: "Callers".to_string(),
+                expected_issuer: "https://idp.example".to_string(),
+                jwks_source: crate::jwt_bearer::models::JwksSource::Remote {
+                    jwks_uri: "https://idp.example/jwks".to_string(),
+                },
+                principal_claim: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        let mut provider = make_credential_provider("cp-1", CredentialProviderType::OAuth2AuthorizationCode);
+        provider.consent_confirmation = Some(
+            serde_json::from_value(serde_json::json!({
+                "client_id_secret_ref": "LOGIN_CLIENT_ID", "client_secret_secret_ref": "CLIENT_ID",
+                "authorization_endpoint": "https://idp.example/authorize",
+                "token_endpoint": "https://idp.example/token",
+                "jwt_verification_strategy_id": strategy.id
+            }))
+            .unwrap(),
+        );
+        let alice = AuthenticatedIdentity::JwtBearer {
+            subject: "alice".to_string(),
+            principal_claim: "sub".to_string(),
+            claims: serde_json::json!({"iss": "https://idp.example", "sub": "alice"}),
+            strategy_id: Some(strategy.id.clone()),
+            verification: Default::default(),
+        };
+        let (results, elicitation) = resolve_with_elicitation_reply_for(
+            "session-confirming",
+            crate::config::types::ElicitFallback::Fail,
+            Some(crate::mcp::elicitation::ElicitationResult::Accept {
+                content: serde_json::Value::Null,
+            }),
+            Some((&provider, &alice, &store)),
+        )
+        .await;
+
+        assert_eq!(results[0].action.outcome, DelegationActionOutcome::ElicitationAcceptedPending);
+        let message = elicitation["params"]["message"]
+            .as_str()
+            .unwrap();
+        let start_url = &message[message
+            .find("https://gw.example.com/")
+            .unwrap()..];
+        let state = url::Url::parse(start_url)
+            .unwrap()
+            .query_pairs()
+            .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+            .unwrap();
+        let start = crate::delegation_vault::oauth::decode_start_state(&state).unwrap();
+        assert!(
+            matches!(&start.stage, Some(ConsentStage::ConfirmStart(binding)) if binding.strategy_id == strategy.id),
+            "the start state confirms the caller"
         );
     }
 
@@ -3621,6 +4282,17 @@ mod tests {
         session_id: &str,
         fallback: crate::config::types::ElicitFallback,
         reply: Option<crate::mcp::elicitation::ElicitationResult>,
+    ) -> (Vec<DelegationResolution>, serde_json::Value) {
+        resolve_with_elicitation_reply_for(session_id, fallback, reply, None).await
+    }
+
+    /// [`resolve_with_elicitation_reply`] for `caller`, under a provider and
+    /// strategies of its own when given, rather than `cp-1` and none.
+    async fn resolve_with_elicitation_reply_for(
+        session_id: &str,
+        fallback: crate::config::types::ElicitFallback,
+        reply: Option<crate::mcp::elicitation::ElicitationResult>,
+        caller: Option<(&CredentialProvider, &AuthenticatedIdentity, &dyn JwtVerificationStrategyStorage)>,
     ) -> (Vec<DelegationResolution>, serde_json::Value) {
         use axum::response::IntoResponse;
         use http_body_util::BodyExt;
@@ -3699,7 +4371,13 @@ mod tests {
             .unwrap();
         let secrets: Arc<dyn SecretsStore> = Arc::new(secrets);
         let vault = MockVaultStore::new(VaultLookupResult::NotFound);
-        let providers = MockProviderStore::with_oauth_provider("cp-1");
+        let providers = match caller {
+            Some((provider, ..)) => MockProviderStore::with_stored(provider.clone()),
+            None => MockProviderStore::with_oauth_provider("cp-1"),
+        };
+        let user_hash = caller
+            .and_then(|(_, identity, _)| identity.principal_hash(None))
+            .unwrap_or_else(|| "sha256:user1".to_string());
         let ctx = DelegationAuditContext {
             mcp_session_id: Some(session_id.to_string()),
             ..Default::default()
@@ -3707,7 +4385,7 @@ mod tests {
 
         let results = resolve_delegation_credentials(
             &[elicit_binding("cp-1", fallback)],
-            "sha256:user1",
+            &user_hash,
             "did:web:agent.example",
             "ch-1",
             crate::tenancy::SurfaceTenancy::configured(None),
@@ -3717,6 +4395,7 @@ mod tests {
             &secrets,
             "https://gw.example.com",
             false,
+            access_point(caller.map(|(_, identity, _)| identity), caller.map(|(.., strategies)| strategies)),
             Some(&ctx),
             None,
         )

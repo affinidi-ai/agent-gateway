@@ -10,6 +10,7 @@
 
 pub mod audit_log_sink;
 pub mod authority_force_deletes;
+pub mod browser_origin_changes;
 pub mod catalog;
 pub mod context;
 pub mod cursors;

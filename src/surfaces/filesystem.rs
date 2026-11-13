@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use tracing::info;
 
 use crate::audit::context::current_actor;
-use crate::audit::{mcp_proxy_pin_changes, policy_changes, target_auth_changes};
+use crate::audit::{browser_origin_changes, mcp_proxy_pin_changes, policy_changes, target_auth_changes};
 use crate::config::agent_surface::AgentSurface;
 use crate::storage::filesystem::{StorageBackend, cached_storage};
 
@@ -91,6 +91,7 @@ impl AgentSurfaceStore for FileSystemAgentSurfaceStore {
         policy_changes::surface_written(before.as_ref(), Some(surface)).await;
         target_auth_changes::surface_written(before.as_ref(), Some(surface));
         mcp_proxy_pin_changes::surface_written(before.as_ref(), Some(surface));
+        browser_origin_changes::surface_written(before.as_ref(), Some(surface));
         drop(write);
         crate::mcp::subscriptions::invalidate_access(crate::mcp::subscriptions::AccessScope::Surface(
             surface.surface_id.clone(),

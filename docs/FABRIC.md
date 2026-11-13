@@ -557,7 +557,9 @@ exception is the caller-info and `did:webvh` identity headers (`x-caller-did`,
 `x-did-signed-identity`) and the caller key family (`x-caller-key` and every name starting
 `x-caller-key-`): the receiving gateway drops every copy the peer sent, so the agent
 behind it never takes a peer's value for one. A receiving surface with `caller_key` derives its
-own key for a JWT it verified on the request; see
+own key for a JWT it verified on the request. That token is usually not the one the caller sent
+the first gateway, and the key is bound to the token's issuer and how it was verified, so the
+same user gets a different key through a peer than directly; see
 [Caller keys](CREDENTIAL_DELEGATION.md#caller-keys).
 
 ### Which variant serves a request over Fabric

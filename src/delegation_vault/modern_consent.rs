@@ -844,6 +844,7 @@ mod tests {
             .bound_subject(&json!({"iss": strategy.expected_issuer, "sub": "alice"}), "sub")
             .unwrap();
         let caller = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: subject.clone(),
             claims: json!({"iss": profile.issuer, "sub": subject, "scope": "read", "exp": now + 300}),
@@ -886,6 +887,8 @@ mod tests {
             .unwrap(),
             Arc::new(EmbeddedContinuations::new(32).unwrap()),
         ));
+        let verifier =
+            Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(Arc::new(crate::jwt_bearer::JwksClient::new())));
         let app = router(ModernConsentState {
             vault: super::super::handlers::DelegationVaultState {
                 vault_store: vault.clone(),
@@ -901,12 +904,15 @@ mod tests {
                 resource_origins: Default::default(),
                 issuers: Default::default(),
                 mcp_proxy_store: None,
+                identity_strategies: strategies.clone(),
+                verifier: verifier.clone(),
+                provider_egress: provider_egress.clone(),
+                gateway_mcp_issuer: None,
+                config_surfaces: None,
             },
             network: Arc::new(network),
             identity_strategies: strategies,
-            verifier: Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(Arc::new(
-                crate::jwt_bearer::JwksClient::new(),
-            ))),
+            verifier,
             continuations: service.clone(),
             provider_egress,
         });

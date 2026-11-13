@@ -63,6 +63,22 @@ async fn operator_changes_description(
     save_surface(world, &id, surface).await;
 }
 
+/// Disables the stored surface under test with a PUT of its stored record, as the operator
+/// does from the dashboard.
+#[given("the operator has disabled the stored surface")]
+async fn operator_has_disabled_the_stored_surface(world: &mut SurfaceWorld) {
+    crate::steps::when::ensure_gateway_running(world).await;
+    let id = crate::steps::credential_save::surface_id(world);
+    let mut surface = stored_surface(world, &id).await;
+    surface["status"] = serde_json::json!("disabled");
+    save_surface(world, &id, surface).await;
+    let saved = world
+        .admin_response
+        .take()
+        .expect("the operator saved the surface");
+    assert_eq!(saved.status, 200, "disable surface {id}: {saved:?}");
+}
+
 #[when(expr = "the operator enables surface {string}")]
 async fn operator_enables_surface(
     world: &mut SurfaceWorld,

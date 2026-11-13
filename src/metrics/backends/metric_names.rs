@@ -26,10 +26,16 @@ pub mod prom {
     // A2A protocol version negotiation (which era callers actually speak).
     pub const A2A_PROTOCOL_VERSION_TOTAL: &str = "agent_gateway_a2a_protocol_version_total";
 
+    // Caller keys: requests forwarded without one because the surface's secret could not be read.
+    pub const CALLER_KEY_SECRET_UNREADABLE_TOTAL: &str = "agent_gateway_caller_key_secret_unreadable_total";
+
     // Managed identity resolution (FromMtls / FromApiKey / Static / PayloadExtraction)
     pub const MANAGED_IDENTITY_RESOLVE_TOTAL: &str = "agent_gateway_managed_identity_resolve_total";
     pub const MANAGED_IDENTITY_RESOLVE_DURATION_SECONDS: &str =
         "agent_gateway_managed_identity_resolve_duration_seconds";
+
+    // Consent links minted or refused for providers with consent confirmation
+    pub const CONSENT_CONFIRMATION_LINKS_TOTAL: &str = "agent_gateway_consent_confirmation_links_total";
 
     // Trust Check element execution (TRQP authorization/recognition queries)
     pub const TRUST_CHECK_TOTAL: &str = "agent_gateway_trust_check_total";

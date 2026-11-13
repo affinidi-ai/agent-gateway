@@ -12,6 +12,7 @@ use crate::bdd_support::config::api_keys::UnreadableKeyFolders;
 use crate::bdd_support::gateway_process::GatewayProcess;
 use crate::bdd_support::jwt::JwksServer;
 use crate::bdd_support::mock_server::{MockResponse, MockServer, ReceivedRequest};
+use crate::bdd_support::oidc::OidcProvider;
 use crate::bdd_support::passkey::SoftPasskey;
 use crate::bdd_support::redis_stream::RedisStreamStandIn;
 use crate::bdd_support::temp::TempDirGuard;
@@ -164,6 +165,8 @@ pub struct SurfaceWorld {
     pub oauth_binding_cookie: Option<String>,
     /// The state the vendor got after the caller confirmed the consent start page.
     pub oauth_confirmed_state: Option<String>,
+    /// Where the identity provider sends the caller back to the gateway after they signed in.
+    pub consent_confirmation_callback: Option<String>,
     /// The transit token the managed agent sends on its Transit Point calls.
     pub transit_token: Option<String>,
     /// The ids of the credential providers the operator created, by `provider_id` slug.
@@ -256,6 +259,7 @@ impl SurfaceWorld {
             oauth_callback_query: None,
             oauth_binding_cookie: None,
             oauth_confirmed_state: None,
+            consent_confirmation_callback: None,
             transit_token: None,
             credential_provider_ids: HashMap::new(),
             surface_draft: None,
@@ -556,6 +560,8 @@ pub struct ScenarioInfra {
     pub transit_point_mocks: HashMap<String, MockServer>,
     pub affinidi_well: Option<MockServer>,
     pub _jwks_server: Option<JwksServer>,
+    /// The callers' identity provider, where a consent confirmation signs the person in.
+    pub identity_provider: Option<OidcProvider>,
     pub gateway_port: u16,
     pub outbound_port: u16,
 }
