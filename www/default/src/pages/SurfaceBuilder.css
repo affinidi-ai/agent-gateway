@@ -369,7 +369,12 @@ body.dark-theme .surface-access-point-url-widget .alert {
 .access-point-readiness__action:focus-visible {
   color: var(--warning-text);
   background: rgba(245, 158, 11, 0.12);
-  border-color: var(--warning);
+  border-color: var(--warning-text);
+}
+
+.access-point-readiness__action:focus-visible {
+  outline: 2px solid var(--warning-text);
+  outline-offset: 1px;
 }
 
 /* Public access switch under the Entry point URL in the Access Point panel.
@@ -471,14 +476,14 @@ body.dark-theme .surface-access-point-url-widget .access-point-readiness {
 }
 
 .surface-toolbar-btn.active {
-  background: rgba(59, 91, 219, 0.95);
-  border-color: rgba(59, 91, 219, 1);
+  background: var(--primary-solid);
+  border-color: var(--primary-solid);
   color: #ffffff;
   box-shadow: 0 1px 4px rgba(78, 115, 223, 0.35);
 }
 
 .surface-toolbar-btn.active:hover:not(:disabled) {
-  background: rgba(78, 115, 223, 0.95);
+  background: var(--primary-solid-hover);
 }
 
 body.dark-theme .surface-toolbar-btn {
@@ -949,13 +954,6 @@ body.dark-theme .surface-variants-widget-add {
 .surface-builder-config .form-control::placeholder,
 .surface-builder-palette .form-control::placeholder {
   color: var(--muted-text);
-  opacity: 1;
-  font-style: italic;
-}
-
-body.dark-theme .surface-builder-config .form-control::placeholder,
-body.dark-theme .surface-builder-palette .form-control::placeholder {
-  color: #94a3b8;
   opacity: 1;
   font-style: italic;
 }
@@ -2283,6 +2281,17 @@ body.dark-theme .surface-form-sidebar-title {
   background: #f8f9fc;
   color: var(--accent-blue-text);
   border-color: #4e73df;
+}
+
+body.dark-theme .surface-form-sidebar-toggle {
+  background: rgba(30, 41, 59, 0.55);
+  border-color: rgba(255, 255, 255, 0.06);
+  color: #f1f5f9;
+}
+
+body.dark-theme .surface-form-sidebar-toggle:hover {
+  background: rgba(30, 41, 59, 0.92);
+  border-color: rgba(255, 255, 255, 0.12);
 }
 
 .surface-form-shell.sidebar-collapsed .surface-form-sidebar-toggle {

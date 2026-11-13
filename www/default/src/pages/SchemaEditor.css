@@ -107,16 +107,6 @@
 }
 
 /* Validation indicators */
-.text-bg-danger {
-  background-color: var(--danger-solid);
-  color: white;
-}
-
-.text-bg-success {
-  background-color: var(--success-solid);
-  color: white;
-}
-
 .border-danger {
   border-color: var(--danger) !important;
   border-width: 2px !important;

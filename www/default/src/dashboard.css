@@ -1059,7 +1059,7 @@ h3.mb-0.text-gray-800 {
 .app-badge.text-bg-warning {
   background-color: rgba(245, 158, 11, 0.14) !important;
   border-color: rgba(245, 158, 11, 0.3) !important;
-  color: #a16207 !important;
+  color: #92400e !important;
 }
 
 .app-badge.text-bg-danger {
@@ -1136,25 +1136,25 @@ body.dark-theme .app-badge.text-bg-dark {
 
 /* Semantic Badges — !important needed to override Bootstrap 5's text-bg-* utilities */
 .text-bg-primary {
-  background-color: var(--accent-blue) !important;
+  background-color: var(--primary-solid) !important;
   box-shadow: 0 2px 8px rgba(74, 144, 226, 0.3);
   color: white !important;
 }
 
 .text-bg-success {
-  background-color: var(--success) !important;
+  background-color: var(--success-solid) !important;
   box-shadow: 0 2px 8px rgba(16, 185, 129, 0.3);
   color: white !important;
 }
 
 .text-bg-warning {
-  background-color: var(--warning) !important;
+  background-color: var(--warning-solid) !important;
   box-shadow: 0 2px 8px rgba(245, 158, 11, 0.3);
   color: white !important;
 }
 
 .text-bg-danger {
-  background-color: var(--danger) !important;
+  background-color: var(--danger-solid) !important;
   box-shadow: 0 2px 8px rgba(239, 68, 68, 0.3);
   color: white !important;
 }
@@ -1501,23 +1501,23 @@ select.dropdown-styling option {
 }
 
 .text-primary {
-  color: var(--accent-blue) !important;
+  color: var(--accent-blue-text) !important;
 }
 
 .text-success {
-  color: var(--success) !important;
+  color: var(--success-text) !important;
 }
 
 .text-warning {
-  color: var(--warning) !important;
+  color: var(--warning-text) !important;
 }
 
 .text-danger {
-  color: var(--danger) !important;
+  color: var(--danger-text) !important;
 }
 
 .text-info {
-  color: var(--info) !important;
+  color: var(--accent-blue-text) !important;
 }
 
 .btn-outline-primary {
@@ -4179,7 +4179,7 @@ body.dark-theme .section-title {
 /* Dark theme - Badges */
 /* Dark theme — Semantic Badges (stronger glow on dark backgrounds) */
 body.dark-theme .text-bg-primary {
-  background-color: var(--accent-blue) !important;
+  background-color: var(--primary-solid) !important;
   box-shadow: 0 2px 8px rgba(74, 144, 226, 0.4);
   color: white !important;
 }
@@ -4189,19 +4189,19 @@ body.dark-theme .app-badge {
 }
 
 body.dark-theme .text-bg-success {
-  background-color: var(--success) !important;
+  background-color: var(--success-solid) !important;
   box-shadow: 0 2px 8px rgba(16, 185, 129, 0.4);
   color: white !important;
 }
 
 body.dark-theme .text-bg-warning {
-  background-color: var(--warning) !important;
+  background-color: var(--warning-solid) !important;
   box-shadow: 0 2px 8px rgba(245, 158, 11, 0.4);
   color: white !important;
 }
 
 body.dark-theme .text-bg-danger {
-  background-color: var(--danger) !important;
+  background-color: var(--danger-solid) !important;
   box-shadow: 0 2px 8px rgba(239, 68, 68, 0.4);
   color: white !important;
 }
