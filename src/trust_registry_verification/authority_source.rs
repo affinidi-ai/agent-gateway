@@ -1044,7 +1044,13 @@ mod tests {
 
         registers(vec![authority(ACME, None)]).classify_surface(&mut surface, None);
 
-        assert_eq!(surface.access_point.trust_check_list[0].authority_source, None);
+        assert_eq!(
+            surface
+                .access_point
+                .trust_check_list[0]
+                .authority_source,
+            None
+        );
     }
 
     #[test]
@@ -1083,8 +1089,11 @@ mod tests {
 
     #[test]
     fn check_refuses_a_listed_authority_another_tenant_owns_as_it_refuses_a_missing_one() {
-        let references =
-            trust_check_references(&[element(listed("authority-recognised", &[TYPED, ACME], json!({ ACME: "authority" })))]);
+        let references = trust_check_references(&[element(listed(
+            "authority-recognised",
+            &[TYPED, ACME],
+            json!({ ACME: "authority" }),
+        ))]);
         let other_tenants = registers(vec![authority(ACME, Some("tenant-b"))]);
 
         let refusal = other_tenants
@@ -1101,7 +1110,8 @@ mod tests {
     #[test]
     fn check_refuses_a_source_on_a_listed_template() {
         let template = "{{ input.agent.authority_did }}";
-        let surface = surface(vec![listed("authority-recognised", &[ACME, template], json!({ template: "issuer" }))], BILLING);
+        let surface =
+            surface(vec![listed("authority-recognised", &[ACME, template], json!({ template: "issuer" }))], BILLING);
 
         assert_eq!(
             registers(Vec::new()).check(&surface_references(&surface), None),

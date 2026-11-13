@@ -7721,7 +7721,10 @@ mod tests {
         assert_eq!(s.validate(), Ok(()));
     }
 
-    fn multi_authority_elem(id: &str, count: usize) -> TrustCheckElement {
+    fn multi_authority_elem(
+        id: &str,
+        count: usize,
+    ) -> TrustCheckElement {
         let mut e = elem(id);
         e.query.authority_id = String::new();
         e.query.authority_ids = Some(
@@ -7734,11 +7737,7 @@ mod tests {
 
     #[test]
     fn validate_passes_many_authorities_across_a_list() {
-        let list = vec![
-            multi_authority_elem("tc-a", 40),
-            multi_authority_elem("tc-b", 2),
-            elem("tc-c"),
-        ];
+        let list = vec![multi_authority_elem("tc-a", 40), multi_authority_elem("tc-b", 2), elem("tc-c")];
         assert_eq!(validate_trust_check_list("target", &list), Ok(()));
     }
 

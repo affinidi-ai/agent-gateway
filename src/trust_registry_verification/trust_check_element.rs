@@ -235,7 +235,10 @@ impl TrustCheckElement {
         let Some(authorities) = &self.query.authority_ids else {
             return if !single_set {
                 Err(TrustCheckElementValidationError::AuthorityBlank)
-            } else if !self.authority_sources.is_empty() {
+            } else if !self
+                .authority_sources
+                .is_empty()
+            {
                 Err(TrustCheckElementValidationError::AuthoritySourcesWithoutList)
             } else {
                 Ok(())
