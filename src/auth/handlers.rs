@@ -119,6 +119,9 @@ pub async fn register_start(
     State(auth_state): State<Arc<AuthState>>,
     Json(req): Json<RegisterStartRequest>,
 ) -> Result<Json<RegisterStartResponse>, (StatusCode, String)> {
+    if !is_username_length_allowed(&req.username) {
+        return Err((StatusCode::BAD_REQUEST, "Username is too long".to_string()));
+    }
     let existing_user = auth_state
         .storage
         .load_user(&req.username)
@@ -188,6 +191,14 @@ pub async fn register_start(
 /// writes on all but very slow storage, so neither answers sooner than the other. The other work
 /// a new account starts, such as notifying administrators, runs after the answer.
 const REGISTRATION_ANSWER_TIME: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// The longest username, in bytes, that sign-in and registration accept. Every challenge keeps
+/// its username until it is finished or expires, so this bounds what an unfinished one holds.
+const MAX_USERNAME_BYTES: usize = 256;
+
+fn is_username_length_allowed(username: &str) -> bool {
+    username.len() <= MAX_USERNAME_BYTES
+}
 
 /// Complete passkey registration
 pub async fn register_finish(
@@ -403,6 +414,9 @@ pub async fn login_start(
     State(auth_state): State<Arc<AuthState>>,
     Json(req): Json<LoginStartRequest>,
 ) -> Result<Json<LoginStartResponse>, StatusCode> {
+    if !is_username_length_allowed(&req.username) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let user = auth_state
         .storage
         .load_user(&req.username)
@@ -411,22 +425,13 @@ pub async fn login_start(
             error!("Failed to load the user signing in: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    let is_approved = user
-        .as_ref()
-        .is_some_and(|user| user.status == crate::auth::UserStatus::Approved);
     let passkeys = user
+        .filter(|user| user.status == crate::auth::UserStatus::Approved)
         .map(|user| user.passkeys)
         .unwrap_or_default();
-
-    let passkeys = if !is_approved {
-        error!("Sign-in requested for a user that is not approved");
-        Vec::new()
-    } else if passkeys.is_empty() {
-        error!("Sign-in requested for a user without passkeys");
-        Vec::new()
-    } else {
-        passkeys
-    };
+    if passkeys.is_empty() {
+        warn!("Sign-in requested for a username without an approved account that has passkeys");
+    }
 
     let (mut rcr, auth_state_data) = auth_state
         .webauthn
@@ -649,8 +654,8 @@ pub async fn logout(
 #[cfg(test)]
 mod tests {
     use super::{
-        LoginFinishRequest, LoginFinishResponse, LoginStartRequest, RegisterStartRequest, login_finish, login_start,
-        register_start,
+        LoginFinishRequest, LoginFinishResponse, LoginStartRequest, MAX_USERNAME_BYTES, RegisterStartRequest,
+        login_finish, login_start, register_start,
     };
     use crate::auth::{
         AuthState,
@@ -659,7 +664,7 @@ mod tests {
         types::{UserRole, UserStatus},
     };
     use crate::integrations::delivery::dispatch::dispatched;
-    use axum::{Json, extract::State, response::IntoResponse};
+    use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
 
@@ -922,6 +927,42 @@ mod tests {
             );
         }
         assert_ne!(named_credentials(&state, "missing-user").await, named_credentials(&state, "pending-user").await);
+    }
+
+    #[tokio::test]
+    async fn a_username_longer_than_the_limit_is_refused_by_sign_in_and_registration() {
+        let (_temp_dir, state) = test_auth_state().await;
+        let longest = "a".repeat(MAX_USERNAME_BYTES);
+        let too_long = "a".repeat(MAX_USERNAME_BYTES + 1);
+
+        let sign_in = |username: String| login_start(State(state.clone()), Json(LoginStartRequest { username }));
+        let register = |username: String| register_start(State(state.clone()), Json(RegisterStartRequest { username }));
+
+        assert!(
+            sign_in(longest.clone())
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            sign_in(too_long.clone())
+                .await
+                .err(),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        assert!(
+            register(longest)
+                .await
+                .is_ok()
+        );
+        assert_eq!(register(too_long).await.err(), Some((StatusCode::BAD_REQUEST, "Username is too long".to_string())));
+        assert!(
+            state
+                .challenges
+                .read()
+                .await
+                .len()
+                == 2
+        );
     }
 
     #[tokio::test]

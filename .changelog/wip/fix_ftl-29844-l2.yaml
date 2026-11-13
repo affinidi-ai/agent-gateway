@@ -10,7 +10,8 @@ changes:
         until the gateway restarted, and a challenge could be finished at any later time, so
         repeated unauthenticated requests grew memory without limit. A challenge can now be
         finished for 6 minutes, the browser's 5 minutes and a minute for the answer to arrive,
-        and at most 10,000 are kept: when full, expired ones are dropped, then the oldest.
+        and at most 10,000 are kept: when full, expired ones are dropped, then the oldest. A
+        username longer than 256 bytes is refused with 400, so no challenge holds a larger one.
   removed: []
   security:
     - timestamp: '2026-11-13T00:00:00Z'

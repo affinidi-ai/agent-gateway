@@ -343,7 +343,8 @@ administrators are notified of a new account after it is answered.
 A sign-in or registration challenge can be finished for 6 minutes, the 5 minutes the browser
 gives the user and a minute for the answer to arrive; after that the finish is refused with `400`
 and the passkey ceremony starts again. At most 10,000 unfinished challenges are kept; when full,
-the expired ones are dropped, and then the oldest.
+the expired ones are dropped, and then the oldest. Sign-in and registration refuse a username
+longer than 256 bytes with `400`, so no challenge holds a larger one.
 
 ### Log redaction
 

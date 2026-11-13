@@ -29,6 +29,26 @@ async fn passkey_sign_in_started_for(
     start_passkey_sign_in(world, username).await;
 }
 
+#[when(expr = "a passkey {word} is started for a username of {int} bytes")]
+async fn passkey_ceremony_started_for_username_of_length(
+    world: &mut SurfaceWorld,
+    ceremony: String,
+    length: usize,
+) {
+    ensure_admin_session(world).await;
+    let path = match ceremony.as_str() {
+        "sign-in" => "/auth/login/start",
+        "registration" => "/auth/register/start",
+        other => panic!("no passkey ceremony {other:?}"),
+    };
+    let started = post_json(world, path, &json!({"username": "a".repeat(length)})).await;
+    world.caller_response = Some(
+        recorded_response(started)
+            .await
+            .expect("record the start response"),
+    );
+}
+
 fn credential_ids(credentials: &[Value]) -> Vec<String> {
     credentials
         .iter()
