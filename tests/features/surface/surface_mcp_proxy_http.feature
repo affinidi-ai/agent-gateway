@@ -165,6 +165,13 @@ Feature: Routing through a proxy:// MCP target
     Then the response status is 401
     And REST API "bravo" was not called
 
+  Scenario: A missing Target credential refuses a tool call on a proxy:// MCP target when fallback is reject
+    Given the gateway authenticates to the managed agent with missing secret "bdd-missing-target-secret" in header "x-target-api-key", falling back to "reject"
+    When the caller invokes the MCP tool "get_weather" for city "Paris"
+    Then the response status is 502
+    And the response mentions "Target authentication failed"
+    And REST API "bravo" was not called
+
   Scenario: An authenticated caller gets the target credential on a proxy:// MCP target
     Given the surface requires "API Key" source authentication
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"

@@ -219,7 +219,7 @@ fn fabric_route_probe_stage(
 ) -> Option<FabricRouteProbeStage> {
     let target = surface_spec(topology, link.to_gw, &link.to_surface);
 
-    if target
+    let target_credential_unavailable = target
         .target_auth
         .as_ref()
         .is_some_and(|target_auth| {
@@ -228,7 +228,11 @@ fn fabric_route_probe_stage(
                 .is_none()
                 && target_auth.fallback == "reject"
         })
-    {
+        || target
+            .target_auth_provider
+            .as_ref()
+            .is_some_and(|provider| provider.token_status != 200 && provider.fallback == "reject");
+    if target_credential_unavailable {
         return None;
     }
 
@@ -294,6 +298,8 @@ pub struct G2gWorld {
     pub response_status: Option<u16>,
     pub response_body: Option<Value>,
     pub response_content_type: Option<String>,
+    /// Headers of the last surface response, for steps that record them.
+    pub response_headers: HashMap<String, String>,
     /// How long the caller waited for the last surface response.
     pub response_elapsed: Option<std::time::Duration>,
     pub concurrent_requests: Vec<Value>,
@@ -360,6 +366,7 @@ impl G2gWorld {
             response_status: None,
             response_body: None,
             response_content_type: None,
+            response_headers: HashMap::new(),
             response_elapsed: None,
             concurrent_requests: Vec::new(),
             concurrent_responses: Vec::new(),

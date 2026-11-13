@@ -3085,7 +3085,7 @@ async fn closed_access_point_fabric_flow() {
 }
 
 #[derive(Clone, Default)]
-struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+pub(super) struct CapturedLogs(pub(super) std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
 impl std::io::Write for CapturedLogs {
     fn write(
@@ -4575,7 +4575,7 @@ async fn unresolvable_mcp_proxy_credential_flow() {
     assert_eq!(
         problem,
         json!({"type": "about:blank", "title": "Bad Gateway", "status": 502,
-            "detail": "Target authentication configuration error"}),
+            "detail": "Target authentication failed"}),
         "{response_body}"
     );
 }

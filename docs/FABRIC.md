@@ -437,9 +437,8 @@ request received by the destination gateway:
    Points (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A public discovery `GET`, such as
    an agent card fetch, carries none, nor does a request relayed to an MCP Target over the legacy
    HTTP+SSE transport. The surface's `target.auth` goes only with a request whose caller was
-   vetted, and with a `GET` of exactly `/.well-known/agent-card.json` or the surface's configured
-   card location, the sending gateway's own card fetch; any other discovery read, the
-   `/.well-known/agent.json` fallback included, gets none (see
+   vetted, and with the gateway's own agent card fetch, which follows the
+   [direct path's rules](#agent-card-fetch-over-fabric); any other discovery read gets none (see
    [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#target-authentication-from-a-credential-provider)).
    The Target's answer travels back as text, so the request, a framed stream's included, asks
    for an uncompressed one (`Accept-Encoding: identity`) in place of whatever the sender accepts;
@@ -458,6 +457,81 @@ only over Fabric, or used only for its Transit Points, still needs a route a sur
 the admin API refuses to save a new or changed route that none serves (see `channels` in
 [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md)). Moving the route changes nothing a peer
 calls, but it moves the default paths of the surface's Transit Points, which follow the route.
+
+### Agent card fetch over Fabric
+
+On a surface with `target.auth`, the receiving gateway fetches the local Target's agent card with
+the [direct path](PROTOCOLS.md#agent-card-fetch)'s header, body and failure rules. Only a `GET` whose
+path is exactly `/.well-known/agent-card.json` or the surface's configured card location, the paths
+a sending gateway's card fetch asks for, is a card fetch
+([`is_fabric_card_fetch`](../src/proxy/handler.rs)). That fetch is the gateway's own request: a `GET` with no body, sent to the card path under the Target endpoint (or
+the configured location on the Target's origin), carrying `target.auth`, the gateway's own
+`Accept-Encoding: identity` and, from the peer, only `Accept`, `Accept-Language` and `User-Agent`.
+The peer's `Authorization`, `Cookie`, other headers
+and body are dropped, and the fetch carries no caller's material: no delegated credential from
+`outbound_credentials` (so it never answers `consent_required`), no
+[caller key](CREDENTIAL_DELEGATION.md#caller-keys), even for a caller whose JWT the surface verified
+at a configured card location, no transit token, even at a configured card location, and no
+`X-Gateway-Trace-Id`.
+
+The Target's answer to that fetch reaches the peer with only `Content-Type`, `Content-Language`,
+`Cache-Control`, `ETag`, `Last-Modified` and `Vary`, so a session cookie or authentication header
+the Target sets for the credential stays on the receiving gateway, and a card is processed as an
+agent card response. The client does not follow redirects: a 3xx answers the peer `502` "Upstream
+redirected", as on the direct path, without the Target's `Location`. Any other non-2xx answer
+reaches the peer as its status with the body "Upstream error: <status>", so nothing the Target says
+about the credential reaches the peer.
+
+Without `target.auth` none of these rules apply: the card fetch is forwarded as the peer sent it,
+body included, with the header rules of any other forwarded request, and the Target's answer is
+relayed as for any other request. A Target redirect is relayed with its status, so the sending
+gateway's caller gets that 3xx status with the body "Upstream error: <status>" and no `Location`.
+
+Every other public read skips caller authentication and is forwarded without the credential:
+another discovery path such as `/discovery` or `/.well-known/ucp`, a `HEAD` of the card path, the
+legacy `/.well-known/agent.json`, and a card path with a query, dot segments or percent-escapes.
+Without a configured card location it is forwarded as the peer sent it. On a surface with a
+configured card location, every `GET` or `HEAD` of a discovery path is sent to that location on the
+Target's origin, still without the credential. A card path in another case, such as
+`/.well-known/Agent-Card.json`, is not a public read, because the discovery path match is
+case-sensitive: it is a caller's request, source authentication runs on it, and it carries the
+credential when the caller authenticated. A credential that cannot be resolved under
+`target.auth.fallback: reject` answers `502` "Target authentication failed", the same text as the
+direct path and the MCP proxy path.
+
+The sending gateway's agent card route gives its caller the same answer: a peer's `502` whose
+detail is exactly "Target authentication failed" or "Upstream redirected", the gateway's own fixed
+texts, is answered with that text, and any other refusal with its status and "Upstream error:
+<status>", never the peer's words. The sending gateway asks for `/.well-known/agent-card.json`, or
+the configured card location of its own surface, so give both surfaces the same `agent_card_path`:
+a location only the sending gateway configures is not a card fetch at the receiving gateway and
+gets no `target.auth`.
+
+Two things differ from the direct path:
+
+- The direct path answers a request of any method to `/.well-known/agent-card.json` or the legacy
+  `/.well-known/agent.json` with its card fetch. Over Fabric only a `GET` of
+  `/.well-known/agent-card.json` or the configured card location is the card fetch; any other read
+  of a card path is a public read without `target.auth`, or a caller's request as described above.
+- Over Fabric a `GET` at the configured card location is the card fetch: the gateway sends it as
+  its own request with `target.auth` and returns the card. When that location is not a public
+  discovery path, such as `/cards/me`, source authentication still runs on it first. A caller who
+  failed source authentication gets the card on a public Access Point (`access_point.public: true`),
+  which hands failed callers to policy. Every other Access Point answers `401`: a closed one, a
+  legacy one stored without `public`, and a public one whose inbound identity is `from_jwt_claim`
+  or whose `caller_authentication.on_failure` is `reject`. The sending gateway's own card fetch
+  carries no caller credential, so on such a surface it gets `401` at the configured location.
+
+The card read for the receiving gateway's policy input also presents `target.auth` as the gateway,
+resolving it from the gateway's secrets store rather than opening one per request, and drops a
+provider token the Target refuses as `invalid_token`, as the forward does. Under
+`target.auth.fallback: passthrough` a credential that cannot be resolved reads the card without it.
+A Target that is not an `http(s)` URL, such as a `proxy://` MCP proxy, has no card to read, so no
+credential is resolved for it.
+The outcome, card or none, is cached per surface and `target.auth` (so a variant with its own
+`target.auth` reads its own card) for 60 seconds (10 seconds for none) and cleared on
+configuration reload or a surface save; see
+[`POLICY.md`](POLICY.md#other-pinned-egress-sinks).
 
 ### Modern MCP activation
 

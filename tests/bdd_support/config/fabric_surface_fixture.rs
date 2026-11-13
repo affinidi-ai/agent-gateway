@@ -1,5 +1,7 @@
 use crate::bdd_support::config::mcp_proxy::McpProxyFixture;
-use crate::bdd_support::config::single_surface_fixture::{McpToolPolicyFixture, SurfaceTargetAuthConfig};
+use crate::bdd_support::config::single_surface_fixture::{
+    McpToolPolicyFixture, SurfaceTargetAuthConfig, SurfaceTargetAuthProviderConfig,
+};
 
 #[derive(Debug, Clone)]
 pub enum SourceAuthSpec {
@@ -21,8 +23,14 @@ pub struct SurfaceSpec {
     /// `proxy://{id}`. May be rewritten post-federation.
     pub target_endpoint: String,
     pub target_auth: Option<TargetAuthSpec>,
+    /// Target Authentication with a credential provider's token. The harness serves the
+    /// provider's token endpoint and sets `token_endpoint` before the gateway starts; one
+    /// surface per gateway may use it.
+    pub target_auth_provider: Option<SurfaceTargetAuthProviderConfig>,
     pub source_auth: Option<SourceAuthSpec>,
     pub inbound_policy_rego: Option<String>,
+    /// Surface-level request policy (`target.policy`) written into the config at boot.
+    pub target_policy_rego: Option<String>,
     pub transit_policy_rego: Option<String>,
     /// Surface-level managed identity derived from the managed agent's
     /// `agent-identity/v1` payload; Transit Points inherit it and mint a VP.
@@ -39,6 +47,8 @@ pub struct SurfaceSpec {
     pub legacy_access_point: bool,
     /// The stored `access_point.public`; `None` stores what the admin API writes.
     pub access_point_public: Option<bool>,
+    /// The Access Point's configured agent card location on the Target's origin.
+    pub agent_card_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,8 +117,10 @@ impl SurfaceSpec {
             protocol: protocol.to_string(),
             target_endpoint: target_endpoint.to_string(),
             target_auth: None,
+            target_auth_provider: None,
             source_auth: None,
             inbound_policy_rego: None,
+            target_policy_rego: None,
             transit_policy_rego: None,
             managed_identity: false,
             mcp_tool_policy: None,
@@ -118,6 +130,7 @@ impl SurfaceSpec {
             delegated_credentials: None,
             legacy_access_point: false,
             access_point_public: None,
+            agent_card_path: None,
         }
     }
 }

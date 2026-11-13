@@ -117,6 +117,7 @@ Feature: Source authentication and target authentication over fabric
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     When the caller asks gateway 1 MCP surface "charlie" for available tools
     Then the response status is 502
+    And the response says "Target authentication failed"
     And MCP server "bravo" was not called
 
   Scenario: gateway 2 forwards over fabric when missing target authentication fallback is passthrough

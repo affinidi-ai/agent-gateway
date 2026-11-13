@@ -23,6 +23,18 @@ There are exactly two policy planes — **Gateway** (appliance-to-appliance) and
 `surface.policy` at boot. Deny reason: `data.surface.policy.deny_reason` /
 `data.gateway.policy.deny_reason`.
 
+A surface's own policy is skipped only for a public discovery read: a `GET` or `HEAD` of a path
+ending in `/agent-card.json`, `/agent.json`, `/.well-known/agent-card`, `/.well-known/ucp` or
+`/discovery` (`paths::is_public_request`). This holds on the direct path, Fabric receive, and the
+sending gateway of a `fabric://` Target, so a `POST` to a path that merely ends in
+`/agent-card.json` or `/agent.json` is evaluated like any other call, and the sending gateway
+skips its policy for a `GET` of `/discovery` or `/.well-known/ucp` as the direct path does.
+
+On the direct path and the sending gateway, a request of any method whose path ends in
+`/.well-known/agent-card.json` or `/.well-known/agent.json` is answered by the gateway's own agent
+card fetch, a `GET` to the Target, before policy runs (`handle_agent_card`), so that request never
+reaches the Target as sent.
+
 ### MCP request context (`input.mcp`)
 
 On an MCP surface, gateway and surface policies get `input.mcp` on the direct
@@ -714,7 +726,20 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
 - Fabric receive's **agent-card hop** to the local Target, made for the GW2
   policy context, uses the forward's `forward_client_for`
   (`egress::pinned_forward_client` for an `http(s)` Target), so it is pinned
-  and does not follow redirects. A blocked target or a redirect yields no card.
+  and does not follow redirects, and reads the card within `a2a.max_body_size`.
+  It presents the surface's `target.auth` as the gateway's own request, so the
+  policy input sees the card of a protected Target, and drops a provider token
+  the Target refuses as `invalid_token`, as the forward does. A blocked target, a
+  redirect, a non-success answer or a `target.auth` credential that cannot be
+  resolved yields no card in the policy input; the failure is logged as a
+  warning without the credential. Under `target.auth.fallback: passthrough` a
+  credential that cannot be resolved reads the card without it. A Target that is
+  not an `http(s)` URL, such as a `proxy://` MCP proxy, has no card to read, so
+  no credential is resolved for it. The outcome is
+  cached per surface and `target.auth` for 60 seconds (10 seconds for no card),
+  is not cleared when a secret or credential provider changes, and is cleared on
+  configuration reload or a surface save, so the policy input may see a card up
+  to a minute old.
 - The Transit Point's **agent-card fetch** for target-leg Trust Check and
   agent context (`src/proxy/outbound_handler.rs::fetch_agent_card`) pins each
   well-known URL with `egress::pinned_forward_client`, the forward step's

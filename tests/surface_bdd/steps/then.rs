@@ -273,13 +273,12 @@ fn named_non_a2a_managed_agent_did_not_receive_header(
 ) {
     let target = get_observed_target_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
     let requests = get_observed_target_requests(target, &agent_name);
-    let header_name = header_name.to_ascii_lowercase();
+    assert!(!requests.is_empty(), "non-A2A managed agent '{agent_name}' received no request to inspect");
     for request in requests {
-        assert!(
-            !request
-                .headers
-                .contains_key(&header_name),
-            "non-A2A managed agent '{agent_name}' should not receive header '{header_name}'; observed request was {request:?}"
+        assert_collaborator_header_absent(
+            &request.headers,
+            &header_name,
+            &format!("non-A2A managed agent '{agent_name}'"),
         );
     }
 }
@@ -2976,8 +2975,8 @@ fn assert_actor_received_header(
     expected_value: &str,
 ) {
     let request = get_observed_request_for_actor(world, actor_name, expected_kind);
-    assert_collaborator_header_value(
-        &request.headers,
+    crate::bdd_support::collaborators::assert_single_header_value(
+        request,
         header_name,
         expected_value,
         &format!("{expected_kind:?} '{}'", actor_name),
@@ -4284,6 +4283,49 @@ fn managed_agent_received_agent_card_at_path(
         request.path_and_query, expected_path,
         "agent card request to managed agent '{}' must hit configured path '{}', got '{}'",
         agent_name, expected_path, request.path_and_query
+    );
+}
+
+#[then(expr = "managed agent {string} received a {word} request at path {string}")]
+fn managed_agent_received_method_request_at_path(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    method: String,
+    expected_path: String,
+) {
+    let request = get_observed_request_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
+    assert_eq!(
+        request.method, method,
+        "request to managed agent '{}' must be a {}, got '{}'",
+        agent_name, method, request.method
+    );
+    assert_eq!(
+        request.path_and_query, expected_path,
+        "request to managed agent '{}' must hit path '{}', got '{}'",
+        agent_name, expected_path, request.path_and_query
+    );
+}
+
+#[then(expr = "managed agent {string} did not receive a {word} request at path {string}")]
+fn managed_agent_did_not_receive_method_request_at_path(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    method: String,
+    path: String,
+) {
+    let requests = get_observed_target_requests(
+        get_observed_target_for_actor(world, &agent_name, TargetActorKind::ManagedAgent),
+        &format!("managed agent '{agent_name}'"),
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.method == method && request.path_and_query == path),
+        "managed agent '{agent_name}' must not receive {method} {path}, got {:?}",
+        requests
+            .iter()
+            .map(|request| format!("{} {}", request.method, request.path_and_query))
+            .collect::<Vec<_>>()
     );
 }
 
