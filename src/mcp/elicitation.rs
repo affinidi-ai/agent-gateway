@@ -664,8 +664,7 @@ mod tests {
                     "GitHub access is required. Your earlier access ended at its time limit. The agent may use \
                      this access for 6 hours.\n\nOpen this URL"
                 ),
-            "{}",
-            asked_again.params.message
+            "the notice follows the first sentence"
         );
         let first_time = build_oauth_consent_elicitation(json!(1), "GitHub", None, &[], "https://x", None);
         assert!(
@@ -673,8 +672,7 @@ mod tests {
                 .params
                 .message
                 .starts_with("GitHub access is required.\n\nOpen this URL"),
-            "{}",
-            first_time.params.message
+            "without a notice the instructions follow at once"
         );
     }
 
