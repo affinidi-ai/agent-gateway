@@ -629,6 +629,27 @@ async fn surface_has_caller_trust_check_using_a2a_metadata_field(
     surface_name: String,
     field: String,
 ) {
+    attach_caller_trust_check_on_a2a_metadata_field(world, &surface_name, &field, "entity_id").await;
+}
+
+#[given(expr = "surface {string} has caller Trust Check whose authority is A2A metadata field {string}")]
+async fn surface_has_caller_trust_check_with_authority_from_a2a_metadata_field(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+    field: String,
+) {
+    attach_caller_trust_check_on_a2a_metadata_field(world, &surface_name, &field, "authority_id").await;
+}
+
+/// Gives surface `surface_name` one caller Trust Check whose `query_field` is a template on
+/// mapped A2A metadata field `field`, and a policy that denies only when a caller Trust Check
+/// fails with TEMPLATE_RESOLUTION_FAILED.
+async fn attach_caller_trust_check_on_a2a_metadata_field(
+    world: &mut SurfaceWorld,
+    surface_name: &str,
+    field: &str,
+    query_field: &str,
+) {
     let trust_registry_id = create_unconnected_trust_registry(world).await;
     let policy_id = format!("bdd-header-metadata-trust-check-policy-{}", uuid::Uuid::new_v4());
     let rego = r#"package surface.policy
@@ -657,26 +678,28 @@ allow := false if {
         response.status, response.body
     );
 
-    let field_literal = serde_json::to_string(&field).expect("field should serialize");
-    let entity_template = format!(
+    let field_literal = serde_json::to_string(field).expect("field should serialize");
+    let template = format!(
         "{{{{ input.a2a.message.metadata[\"https://fabric.affinidi.io/extensions/header-metadata/v1\"][{field_literal}] }}}}"
     );
+    let mut query = serde_json::json!({
+        "authority_id": "did:example:authority",
+        "entity_id": "did:example:entity"
+    });
+    query[query_field] = serde_json::json!(template);
     let mut surface = current_surface_body(world, "attaching header metadata Trust Check");
     surface["access_point"]["trust_check_list"] = serde_json::json!([
         {
             "id": "caller-header-metadata-template",
             "trust_registry_id": trust_registry_id,
             "query_type": "recognition",
-            "query": {
-                "authority_id": "did:example:authority",
-                "entity_id": entity_template
-            }
+            "query": query
         }
     ]);
     surface["target"]["policy"] = serde_json::json!({
         "policy_definition_id": policy_id,
     });
-    update_named_surface(world, &surface_name, surface, "attaching header metadata Trust Check").await;
+    update_named_surface(world, surface_name, surface, "attaching header metadata Trust Check").await;
 }
 
 #[given(expr = "the caller has DID {string}")]

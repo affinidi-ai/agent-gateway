@@ -275,26 +275,22 @@ async fn operator_creates_surface_with_counted_authority_list(
     create_surface_with_trust_check_query(world, &route, query).await;
 }
 
-#[when(
-    expr = "the operator creates the surface for route {string} with two caller-leg Trust Checks listing {int} and {int} distinct authorities"
-)]
-async fn operator_creates_surface_with_two_counted_authority_lists(
+#[when(expr = "the operator creates the surface for route {string} with {int} caller-leg Trust Checks")]
+async fn operator_creates_surface_with_counted_trust_checks(
     world: &mut SurfaceWorld,
     route: String,
-    first: usize,
-    second: usize,
+    count: usize,
 ) {
     create_surface(world, &route, |payload, trust_registry_id| {
-        let element = |id: &str, count: usize| {
-            let authorities: Vec<String> = (0..count)
-                .map(|i| format!("did:web:{id}-{i}"))
-                .collect();
-            json!({
-                "id": id, "trust_registry_id": trust_registry_id, "query_type": "recognition",
-                "query": {"authority_ids": authorities, "entity_id": "{{ input.agent.did }}"}
+        let elements: Vec<Value> = (0..count)
+            .map(|i| {
+                json!({
+                    "id": format!("check-{i}"), "trust_registry_id": trust_registry_id, "query_type": "recognition",
+                    "query": {"authority_id": format!("did:web:authority-{i}"), "entity_id": "{{ input.agent.did }}"}
+                })
             })
-        };
-        payload["access_point"]["trust_check_list"] = json!([element("first", first), element("second", second)]);
+            .collect();
+        payload["access_point"]["trust_check_list"] = json!(elements);
     })
     .await;
 }

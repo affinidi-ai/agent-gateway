@@ -6,7 +6,7 @@ import { deepLinks } from '../../../../utils/deepLinks';
 import AddResourceLink from '../../../shared/AddResourceLink';
 import FormSelect, { type FormSelectOption } from '../../../shared/FormSelect';
 import AuthorityListEditor from './AuthorityListEditor';
-import { RECORD_TYPE } from './TrustCheckQueryList';
+import { RECORD_TYPE } from './recordType';
 import {
   readSubjectPickerState,
   subjectDescription,

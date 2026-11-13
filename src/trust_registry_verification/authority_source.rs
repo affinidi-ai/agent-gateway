@@ -123,9 +123,12 @@ pub struct AuthorityReference {
     pub did: String,
     pub source: Option<AuthoritySource>,
     pub used_by: AuthorityUse,
+    /// The field that records `source`: `authority_source`, or `authority_sources` for a DID
+    /// of `query.authority_ids`.
+    pub source_field: &'static str,
 }
 
-type Visit<'v> = dyn FnMut(&str, &mut Option<AuthoritySource>, AuthorityUse) + 'v;
+type Visit<'v> = dyn FnMut(&str, &mut Option<AuthoritySource>, AuthorityUse, &'static str) + 'v;
 
 /// Calls `visit` with every authority DID of `surface`, on its base and in each variant's
 /// overrides, its source, and where it is set.
@@ -227,7 +230,7 @@ fn visit_legs(
         .unwrap_or_default()
     {
         let used_by = AuthorityUse::trust_recorder(entry, variant);
-        visit(&entry.authority_did, &mut entry.authority_source, used_by);
+        visit(&entry.authority_did, &mut entry.authority_source, used_by, "authority_source");
     }
 }
 
@@ -243,7 +246,7 @@ fn visit_trust_check(
         element
             .authority_sources
             .clear();
-        visit(&element.query.authority_id, &mut element.authority_source, used_by);
+        visit(&element.query.authority_id, &mut element.authority_source, used_by, "authority_source");
         return;
     };
     element.authority_source = None;
@@ -253,7 +256,7 @@ fn visit_trust_check(
             .authority_sources
             .get(did)
             .copied();
-        visit(did, &mut source, used_by.clone());
+        visit(did, &mut source, used_by.clone(), "authority_sources");
         if let Some(source) = source {
             sources.insert(did.clone(), source);
         }
@@ -265,11 +268,12 @@ fn visit_trust_check(
 pub fn surface_references(surface: &AgentSurface) -> Vec<AuthorityReference> {
     let mut surface = surface.clone();
     let mut references = Vec::new();
-    visit_surface(&mut surface, &mut |did, source, used_by| {
+    visit_surface(&mut surface, &mut |did, source, used_by, source_field| {
         references.push(AuthorityReference {
             did: did.to_string(),
             source: *source,
             used_by,
+            source_field,
         });
     });
     references
@@ -280,11 +284,12 @@ pub fn trust_check_references(elements: &[TrustCheckElement]) -> Vec<AuthorityRe
     let mut references = Vec::new();
     for element in elements {
         let used_by = AuthorityUse::trust_check(element, None, None, None);
-        visit_trust_check(&mut element.clone(), used_by, &mut |did, source, used_by| {
+        visit_trust_check(&mut element.clone(), used_by, &mut |did, source, used_by, source_field| {
             references.push(AuthorityReference {
                 did: did.to_string(),
                 source: *source,
                 used_by,
+                source_field,
             });
         });
     }
@@ -372,7 +377,7 @@ impl AuthorityRegisters {
             .unwrap_or_default();
         let tenant_id = surface.tenant_id.clone();
         let mut changed = false;
-        visit_surface(surface, &mut |did, source, _| {
+        visit_surface(surface, &mut |did, source, _, _| {
             changed |= self.classify(did, source, tenant_id.as_deref(), &kept);
         });
         changed
@@ -391,7 +396,7 @@ impl AuthorityRegisters {
         let mut changed = false;
         for element in elements {
             let used_by = AuthorityUse::trust_check(element, None, None, None);
-            visit_trust_check(element, used_by, &mut |did, source, _| {
+            visit_trust_check(element, used_by, &mut |did, source, _, _| {
                 changed |= self.classify(did, source, tenant_id, &kept);
             });
         }
@@ -409,8 +414,9 @@ impl AuthorityRegisters {
         for reference in references {
             if reference.source.is_some() && is_template(&reference.did) {
                 return Err(format!(
-                    "{}: authority_source cannot be set on a template; remove it or use a DID",
-                    reference.used_by.label()
+                    "{}: {} cannot be set on a template; remove it or use a DID",
+                    reference.used_by.label(),
+                    reference.source_field
                 ));
             }
             if requires_authority(&reference.did, reference.source)
@@ -1099,7 +1105,7 @@ mod tests {
 
         assert_eq!(
             registers(Vec::new()).check(&surface_references(&surface), None),
-            Err("Trust Check 'authority-recognised': authority_source cannot be set on a template; remove it or use a DID"
+            Err("Trust Check 'authority-recognised': authority_sources cannot be set on a template; remove it or use a DID"
                 .to_string())
         );
     }

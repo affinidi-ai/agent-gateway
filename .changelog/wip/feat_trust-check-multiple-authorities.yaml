@@ -5,7 +5,7 @@ changes:
       title: ⭐ Let one Trust Check query list several authorities
       description: >-
         A Trust Check query can list several authorities in query.authority_ids instead of one
-        authority_id, with no limit on how many. The gateway queries every listed authority in parallel, waits for each to answer or time out
+        authority_id. The gateway queries every listed authority in parallel, waits for each to answer or time out
         (a built-in 5 seconds per authority; timeout_secs is refused on such a query), and gives
         policy one result per authority under the element's id, so a surface can accept callers
         that any participating organisation recognises. A gateway older than this feature skips any
@@ -33,14 +33,14 @@ changes:
         that was deleted blocks Save, as a single one does.
   changed:
     - timestamp: '2026-11-13T00:00:00Z'
-      title: Remove the limits on Trust Check queries and authorities
+      title: Remove the 10-query limit on a Trust Check list
       description: >-
         A Trust Check list is no longer refused for holding more than 10 queries, and there is no
         limit on the authorities its queries name. The gateway sends one TRQP query per listed
         authority, all at once, so each one adds a DIDComm message to the trust registry on every
-        request but no latency. The dashboard's count line shows the number of queries and
-        authorities. A gateway older than this release refuses a list of more than 10 queries, so
-        trim such lists to 10 before rolling back.
+        request. The dashboard's count line shows the number of queries and authorities. A gateway
+        older than this release still loads and runs a list of more than 10 queries, but refuses
+        to save that surface or managed connection (400) until the list is trimmed to 10.
     - timestamp: '2026-11-12T00:00:00Z'
       title: Fail a Trust Check whose authority resolves to a blank value
       description: >-

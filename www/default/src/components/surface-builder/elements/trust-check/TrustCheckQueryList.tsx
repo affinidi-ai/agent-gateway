@@ -10,6 +10,7 @@ import {
   subjectLabel,
   type TrustCheckQueryConfig,
 } from './definition';
+import { RECORD_TYPE } from './recordType';
 
 interface TrustCheckQueryListProps {
   queries: TrustCheckQueryConfig[];
@@ -29,13 +30,20 @@ interface TrustCheckQueryListProps {
   onSelect?: (index: number) => void;
 }
 
-/** Label and badge icon of each record type, shared with the editor's record type toggle. */
-export const RECORD_TYPE = {
-  recognition: { label: 'Recognition', icon: 'fa-id-badge' },
-  authorization: { label: 'Authorization', icon: 'fa-user-shield' },
-} as const;
+/** An Authority's label: a picked DID's name, or what a template resolves to. */
+function authorityLabel(
+  value: string,
+  isTargetLeg: boolean,
+  authorityName: (did: string) => string
+): string {
+  if (!isTemplateValue(value)) return authorityName(value);
+  const subject = subjectForTemplate(value);
+  if (!subject) return value;
+  const label = subjectLabel(subject, !isTargetLeg);
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
 
-/** The single Authority of a query: a picked DID's name, or what a template resolves to. */
+/** The single Authority of a query, or the leg's default template when none is stored. */
 function singleAuthorityLabel(
   q: TrustCheckQueryConfig,
   isTargetLeg: boolean,
@@ -43,11 +51,7 @@ function singleAuthorityLabel(
 ): string {
   const stored = typeof q.query?.authority_id === 'string' ? q.query.authority_id.trim() : '';
   const value = stored || defaultAuthorityIdTemplate(isTargetLeg ? 'ma-tp' : 'ap-ma');
-  if (!isTemplateValue(value)) return authorityName(value);
-  const subject = subjectForTemplate(value);
-  if (!subject) return value;
-  const label = subjectLabel(subject, !isTargetLeg);
-  return label.charAt(0).toUpperCase() + label.slice(1);
+  return authorityLabel(value, isTargetLeg, authorityName);
 }
 
 /**
@@ -73,7 +77,7 @@ const TrustCheckQueryList: React.FC<TrustCheckQueryListProps> = ({
     const type = RECORD_TYPE[q.query_type === 'recognition' ? 'recognition' : 'authorization'];
     const rowId = `${area}-query-${idx}`;
     const names = isMultiAuthorityQuery(q)
-      ? listedAuthorities(q.query).map(authorityName)
+      ? listedAuthorities(q.query).map(value => authorityLabel(value, isTargetLeg, authorityName))
       : [singleAuthorityLabel(q, isTargetLeg, authorityName)];
     const authorities = names.length === 1 ? names[0] : `${names.length} Authorities`;
     const registry = registryName(q.trust_registry_id ?? '');

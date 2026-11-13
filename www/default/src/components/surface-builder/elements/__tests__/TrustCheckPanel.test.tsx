@@ -126,7 +126,6 @@ describe('TrustCheckPanel — intro and banner', () => {
     fireEvent.click(toggle);
     const body = screen.getByTestId('trust-check-panel-context-body');
     expect(body).toHaveTextContent(summary);
-    // The Where / When / Example list is not in the sidebar.
     expect(body).not.toHaveTextContent(/Where|When|Example/);
   });
 });
@@ -449,23 +448,21 @@ describe('TrustCheckFullscreenPanel — Authority source', () => {
     expect(updateFields).not.toHaveBeenCalled();
   });
 
-  it('saves queries naming more than 25 Authorities in total', async () => {
+  it('saves more than 10 queries', async () => {
     const listOf = (id: string, count: number) => ({
       id,
       trust_registry_id: 'tr-1',
       query_type: 'recognition',
       query: { authority_ids: Array.from({ length: count }, (_, i) => `did:web:${id}-${i}`) },
     });
-    const { updateFields } = await openEditor([
-      listOf('first', 20),
-      listOf('second', 6),
-      stored('did:web:authority-a', 'authority'),
-    ]);
-    fireEvent.click(screen.getByTestId('trust-check-editor-query-2'));
+    const { updateFields } = await openEditor(
+      Array.from({ length: 12 }, (_, i) => listOf(`q-${i}`, 2))
+    );
+    fireEvent.click(screen.getByTestId('trust-check-editor-query-11'));
     fireEvent.click(screen.getByTestId('trust-check-editor-remove-query-button'));
     expect(screen.getByTestId('trust-check-add-query')).toBeEnabled();
     fireEvent.click(screen.getByTestId('trust-check-save'));
-    expect(updateFields.mock.calls[0][0].queries).toHaveLength(2);
+    expect(updateFields.mock.calls[0][0].queries).toHaveLength(11);
   });
 
   it('flags a deleted Authority once the register has loaded', async () => {

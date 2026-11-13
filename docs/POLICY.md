@@ -158,7 +158,8 @@ outbound OPA scopes (gateway, surface, Transit Point).
 
 A list has no limit on its elements or on the authorities they query
 ([`src/config/agent_surface.rs`](../src/config/agent_surface.rs)). The gateway queries every
-listed authority of a leg at once, so each authority adds one TRQP message per request. A surface variant
+listed authority of a leg at once, so each authority adds one TRQP message per request (see
+the accepted risk under [_Several authorities in one query_](#several-authorities-in-one-query)). A surface variant
 override replaces the whole list verbatim, never element by element; a variant gives its
 Transit Points their own lists through its `transit.points` override.
 
@@ -323,12 +324,26 @@ result with `AUTHORITY_NOT_FOUND`, and the other authorities are queried as usua
 Builder's fullscreen editor builds the list row by row; see _Authority lists_ in
 [`www/default/AGENTS.md`](../www/default/AGENTS.md).
 
+Accepted risk: nothing bounds how many authorities a leg queries. Every request sends one TRQP
+message per listed authority, all at once, through the trust registry's connection and its
+mediator, and writes one audit record and one `agent_gateway_trust_check_total` sample per
+authority, so the lists an operator configures set the load each request puts on the registry,
+the mediator and the audit sinks. A connection remembers only its latest 256 timed-out query
+threads (`TIMED_OUT_QUERIES_KEPT` in
+[`src/trust_registries/communication.rs`](../src/trust_registries/communication.rs)). If more
+than 256 queries to one registry time out before the registry answers an earlier one with a
+problem report, that late report no longer matches a remembered thread and is taken as the
+registry rejecting the gateway, which marks the registry connection `Failed`. Keep lists to the
+authorities a policy needs.
+
 A gateway older than this feature cannot read `query.authority_ids`. It skips any stored surface
 or managed connection with a Trust Check that lists several authorities, and logs a parse error.
 Requests to that surface fail as unknown, and that client cannot authenticate. Before rolling
 back, or before a standby on an older version takes over, change each such query to a single
 `authority_id`. Surfaces and managed connections whose queries name one authority load as
-before.
+before. Such a gateway also caps a leg's list at 10 Trust Checks, but only when saving: it loads
+and runs a longer list, and refuses to save that surface or managed connection (`400`) until
+the list is trimmed to 10.
 
 ### The authority of a Trust Check
 

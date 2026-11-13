@@ -961,7 +961,7 @@ async fn caller_sends_a2a_message_send_with_mapped_identity_headers(
 }
 
 #[when(
-    regex = r#"^the caller sends an A2A message/send request to surface "([^"]+)" with header "([^"]+)" set to "([^"]+)"$"#
+    regex = r#"^the caller sends an A2A message/send request to surface "([^"]+)" with header "([^"]+)" set to "([^"]*)"$"#
 )]
 async fn caller_sends_a2a_message_send_with_header(
     world: &mut SurfaceWorld,

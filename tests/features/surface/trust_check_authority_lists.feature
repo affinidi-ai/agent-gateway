@@ -34,12 +34,12 @@ Feature: Trust Checks that list several authorities
     Then the admin API response status is 400
     And the admin API error response mentions "query.authority_ids[1] repeats an earlier entry"
 
-  Scenario: A Trust Check that lists more than 25 authorities is saved
+  Scenario: A Trust Check that lists many authorities is saved
     When the operator creates the surface for route "/orders" with a caller-leg Trust Check listing 26 distinct authorities
     Then the admin API response status is 201
 
-  Scenario: Trust Checks of one leg that list more than 25 authorities in total are saved
-    When the operator creates the surface for route "/orders" with two caller-leg Trust Checks listing 20 and 6 distinct authorities
+  Scenario: A leg with more than 10 Trust Checks is saved
+    When the operator creates the surface for route "/orders" with 11 caller-leg Trust Checks
     Then the admin API response status is 201
 
   Scenario: A Trust Check that lists a blank authority is refused
