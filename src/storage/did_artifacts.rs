@@ -45,6 +45,36 @@ pub async fn write_did_log_raw(
         .with_context(|| format!("writing DID log {}", path.display()))
 }
 
+/// Append one entry to `{dir}/did.jsonl`, whose content the caller read as `current`.
+///
+/// Refuses when the log no longer holds `current`, so a version is never appended to a log
+/// that changed after the caller built that version from it. The new log is written to a
+/// temporary file of its own and renamed into place, so a reader never sees a partial entry
+/// and two writers sharing the directory never write the same temporary file.
+#[cfg(feature = "didwebvh")]
+pub async fn append_did_log_raw(
+    dir: &Path,
+    current: &str,
+    raw_json: &str,
+) -> Result<()> {
+    let path = dir.join(DID_LOG_FILE);
+    let on_disk = tokio::fs::read_to_string(&path)
+        .await
+        .with_context(|| format!("reading DID log {}", path.display()))?;
+    anyhow::ensure!(on_disk == current, "DID log {} changed while a version was added", path.display());
+
+    let temp_path = dir.join(format!("{}.{}.tmp", DID_LOG_FILE, uuid::Uuid::new_v4()));
+    if let Err(e) = tokio::fs::write(&temp_path, format!("{}\n{}\n", current.trim_end(), raw_json)).await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(e).with_context(|| format!("writing DID log {}", temp_path.display()));
+    }
+    if let Err(e) = tokio::fs::rename(&temp_path, &path).await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(e).with_context(|| format!("replacing DID log {}", path.display()));
+    }
+    Ok(())
+}
+
 /// Write the `did:web` current document to `{dir}/did.json`, replacing any
 /// existing content.
 pub async fn write_did_document(
@@ -117,6 +147,95 @@ mod tests {
 
         let on_disk = std::fs::read_to_string(dir.path().join("did.jsonl")).unwrap();
         assert_eq!(on_disk, "second\n");
+    }
+
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn append_did_log_adds_one_entry_after_the_existing_ones() {
+        let dir = tempdir().unwrap();
+        write_did_log_raw(dir.path(), "first")
+            .await
+            .unwrap();
+
+        append_did_log_raw(dir.path(), "first\n", "second")
+            .await
+            .unwrap();
+
+        let on_disk = std::fs::read_to_string(dir.path().join("did.jsonl")).unwrap();
+        assert_eq!(on_disk, "first\nsecond\n");
+        let files: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(files, vec!["did.jsonl"], "the temporary log must be renamed into place");
+    }
+
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn append_did_log_never_writes_another_writers_temporary_file() {
+        let dir = tempdir().unwrap();
+        write_did_log_raw(dir.path(), "first")
+            .await
+            .unwrap();
+        let other_writer = dir
+            .path()
+            .join("did.jsonl.tmp");
+        std::fs::write(&other_writer, "first\nhalf-written").unwrap();
+
+        append_did_log_raw(dir.path(), "first\n", "second")
+            .await
+            .unwrap();
+
+        let on_disk = std::fs::read_to_string(dir.path().join("did.jsonl")).unwrap();
+        assert_eq!(on_disk, "first\nsecond\n");
+        assert_eq!(std::fs::read_to_string(&other_writer).unwrap(), "first\nhalf-written");
+    }
+
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn append_did_log_refuses_a_log_that_changed() {
+        let dir = tempdir().unwrap();
+        write_did_log_raw(dir.path(), "first")
+            .await
+            .unwrap();
+        append_did_log_raw(dir.path(), "first\n", "second")
+            .await
+            .unwrap();
+
+        let err = append_did_log_raw(dir.path(), "first\n", "other")
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("changed while a version was added"),
+            "unexpected error: {err}"
+        );
+        let on_disk = std::fs::read_to_string(dir.path().join("did.jsonl")).unwrap();
+        assert_eq!(on_disk, "first\nsecond\n");
+    }
+
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn append_did_log_requires_an_existing_log() {
+        let dir = tempdir().unwrap();
+
+        assert!(
+            append_did_log_raw(dir.path(), "", "entry")
+                .await
+                .is_err()
+        );
+        assert!(
+            !dir.path()
+                .join("did.jsonl")
+                .exists()
+        );
     }
 
     #[tokio::test]

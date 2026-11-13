@@ -104,8 +104,12 @@ issuers, trust registries, and Connection Points each at their own path. Each do
 carries the verification methods and service endpoints another system needs to check a
 signature. The gateway's DID and newly created managed agent DIDs list the Multikey that signs
 their credentials and presentations (`#key-2`) under `assertionMethod`, so strict Data
-Integrity verifiers accept them. The gateway writes its DID log when it first starts, so a gateway that
-already has one keeps publishing the document it was created with.
+Integrity verifiers accept them. A gateway whose published DID document leaves the Multikey out
+of `assertionMethod` adds it when it starts Active: a `did:webvh` DID gets a new log version
+signed with the gateway key, so the DID and its earlier versions stay as they are, and a
+`did:web` DID gets its document rewritten. A log that does not verify, or whose latest version
+is dated more than a second or two ahead of the node's clock, is left as it is and the gateway
+logs a warning; the repair runs again on the next start.
 
 ## Federation across organisations
 

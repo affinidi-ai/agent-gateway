@@ -77,7 +77,9 @@ fn format_did_domain(base_url: &str) -> String {
 /// The library requires the `Secret.id` to be a `did:key:` URI matching one of the
 /// DID log's `update_keys`.  We derive the multibase public key from the JWK,
 /// construct the canonical `did:key:<mb>#<mb>` identifier, and build the secret.
-fn build_signing_secret(private_key_jwk: &serde_json::Value) -> Result<didwebvh_rs::prelude::Secret, String> {
+pub(crate) fn build_signing_secret(
+    private_key_jwk: &serde_json::Value
+) -> Result<didwebvh_rs::prelude::Secret, String> {
     let temp_id = "did:key:temp#temp";
     let raw = didwebvh_rs::prelude::Secret::from_str(temp_id, private_key_jwk)
         .map_err(|e| format!("Failed to build key Secret: {e}"))?;
@@ -108,7 +110,7 @@ async fn load_raw_and_build_state(
 }
 
 /// Build a validated `DIDWebVHState` from already loaded raw log entries.
-async fn build_webvh_state(
+pub(crate) async fn build_webvh_state(
     did: &str,
     raw_entries: &[String],
 ) -> Result<didwebvh_rs::DIDWebVHState, String> {

@@ -238,6 +238,14 @@ held. The node then revokes the API keys of surfaces that no longer exist, as it
 boots Active; a Standby node and a configuration reload revoke none (see
 [Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live)).
 
+The gateway DID log is shared storage too, so only an Active node adds the gateway signing key to
+the gateway DID document's `assertionMethod` when the document leaves it out: a node that boots
+Active does it at startup, and a Standby node when it becomes Active (see
+[Resolvable identities](CAPABILITIES.md#resolvable-identities)). After that repair the same
+Active node brings the `/v1/resolve` index up to the gateway DID log; a Standby node writes
+neither. An index that does not match the start of the log is rebuilt from the log and logged as
+a warning.
+
 Both modes build the source authentication middleware at startup, so a node whose JWT
 verification strategy store cannot be opened refuses to start in either mode (see
 [Source authentication](SOURCE_AUTH.md#source-authentication)).
