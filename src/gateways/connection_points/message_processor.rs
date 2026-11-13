@@ -4413,17 +4413,13 @@ fn fabric_receive_http_policy(
     versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
     framed: bool,
 ) -> Result<crate::mcp::modern_http::EndpointHttpPolicy, String> {
-    let policy = crate::mcp::modern_http::EndpointHttpPolicy::with_versions(
+    let policy = crate::mcp::modern_http::EndpointHttpPolicy::framed_fabric_receive(
+        surface,
         surface.mcp_http.as_ref(),
-        std::slice::from_ref(
-            &surface
-                .access_point
-                .listen_address,
-        ),
         versions,
     )?;
     Ok(if framed {
-        policy.with_browser_origins(&surface.browser_origins)
+        policy
     } else {
         policy.without_origin_check()
     })

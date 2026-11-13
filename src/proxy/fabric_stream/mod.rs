@@ -970,16 +970,11 @@ fn open_http_policy(
     surface: &crate::config::agent_surface::AgentSurface,
     limits: &crate::config::McpHttpConfig,
 ) -> Result<crate::mcp::modern_http::EndpointHttpPolicy, String> {
-    Ok(crate::mcp::modern_http::EndpointHttpPolicy::new(
+    crate::mcp::modern_http::EndpointHttpPolicy::framed_fabric_receive(
+        surface,
         Some(limits),
-        std::slice::from_ref(
-            &surface
-                .access_point
-                .listen_address,
-        ),
-        crate::mcp::request_validation::McpPathKind::FabricReceive,
-    )?
-    .with_browser_origins(&surface.browser_origins))
+        crate::mcp::request_validation::runtime_policy_for(crate::mcp::request_validation::McpPathKind::FabricReceive),
+    )
 }
 
 #[cfg(test)]

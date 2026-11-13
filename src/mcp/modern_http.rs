@@ -76,6 +76,27 @@ impl EndpointHttpPolicy {
         self
     }
 
+    /// The policy a framed Fabric receive to `surface` admits a caller under, with `config`
+    /// and `versions`: the caller's browser `Origin` must be the surface's Access Point URL, in
+    /// its allowlist or in its `browser_origins`. The framed stream Open and the request it
+    /// carries both use it, so they admit the same origins.
+    pub(crate) fn framed_fabric_receive(
+        surface: &crate::config::agent_surface::AgentSurface,
+        config: Option<&crate::config::McpHttpConfig>,
+        versions: McpVersionPolicy<'static>,
+    ) -> Result<Self, String> {
+        Ok(Self::with_versions(
+            config,
+            std::slice::from_ref(
+                &surface
+                    .access_point
+                    .listen_address,
+            ),
+            versions,
+        )?
+        .with_browser_origins(&surface.browser_origins))
+    }
+
     /// Skips the Origin allowlist while keeping the header and body limits.
     /// Only for buffered Fabric `ForwardRequest` receive, whose Origin the
     /// sending gateway already checked; never for a browser-reachable route.

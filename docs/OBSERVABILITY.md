@@ -141,7 +141,8 @@ incremented once for each request on a surface with `caller_key` that would have
 key but is forwarded without one because the surface's secret could not be read. Each such request
 also logs a warning naming the surface and the reason. Alert on any increase: the Target then gets
 requests with no key it can encrypt with. A request withheld its key by
-`credential_policy.target_https` is not counted. See
+`credential_policy.target_https` is not counted, nor is one to a Target that never receives a key
+(`fabric://`, `proxy://` or `a2a-proxy://`): its secret is not read. See
 [Caller keys](CREDENTIAL_DELEGATION.md#caller-keys).
 
 | Label | Value |
