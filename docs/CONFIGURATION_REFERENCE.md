@@ -323,8 +323,8 @@ A passkey sign-in challenge (`POST /auth/login/start` under the `identity_api` p
 (unknown, not approved, or without passkeys) it names decoy credentials instead, with no
 transports: usually one 20-byte ID, sometimes one of 16, 32 or 64 bytes, sometimes two or
 three. They are derived from the username with the key in `login_decoy_credential_key.json`
-under `[storage_paths] vc_keys`, which the gateway creates on its first start the way it creates
-the transit token key, so a username gets the same decoys on every challenge and the answer
+under `[storage_paths] vc_keys`, which the gateway creates on its first start in passkey sign-in
+mode the way it creates the transit token key, so a username gets the same decoys on every challenge and the answer
 does not tell whether it has an account. No authenticator holds a decoy, so the browser finds
 no passkey for it and offers another device or a security key instead, and the sign-in goes no
 further. An approved account whose passkeys differ in count or length from what decoys take can
@@ -336,12 +336,14 @@ decoys. The `.atgx` export leaves the key file out.
 Registering a passkey (`POST /auth/register/finish`) for a username that already has an
 account, approved or awaiting approval, checks the passkey and the accepted Terms as for a new
 account and is answered `200` like one, but stores nothing: the existing account and its
-passkeys are unchanged, and the new passkey cannot sign in. Since storing nothing is faster
-than creating an account, that answer waits a random 1 to 10 ms first, so its timing does not
-tell the username is taken.
+passkeys are unchanged, and the new passkey cannot sign in. Both answers are sent 25 ms after the
+username is checked, so the time saved by storing nothing does not tell the username is taken;
+administrators are notified of a new account after it is answered.
 
-A sign-in or registration challenge can be finished for 5 minutes; after that the finish is
-refused with `400` and the passkey ceremony starts again.
+A sign-in or registration challenge can be finished for 6 minutes, the 5 minutes the browser
+gives the user and a minute for the answer to arrive; after that the finish is refused with `400`
+and the passkey ceremony starts again. At most 10,000 unfinished challenges are kept; when full,
+the expired ones are dropped, and then the oldest.
 
 ### Log redaction
 

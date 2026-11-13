@@ -44,7 +44,6 @@ pub struct ChallengeState {
     pub username: String,
 
     /// Timestamp when this challenge was created
-    #[allow(dead_code)]
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -84,16 +83,27 @@ impl AuthState {
         })
     }
 
-    /// Stores a new sign-in or registration challenge and returns its id. Challenges older than
-    /// [`CHALLENGE_LIFETIME`] are dropped first, so unfinished ones do not pile up.
+    /// Stores a new sign-in or registration challenge and returns its id. Once the store holds
+    /// [`MAX_PENDING_CHALLENGES`], challenges older than [`CHALLENGE_LIFETIME`] are dropped, and
+    /// then the oldest one if it is still full, so a flood of unfinished ones stays bounded.
     pub async fn store_challenge(
         &self,
         challenge: ChallengeState,
     ) -> String {
         let challenge_id = uuid::Uuid::new_v4().to_string();
-        let now = chrono::Utc::now();
         let mut challenges = self.challenges.write().await;
-        challenges.retain(|_, stored| is_fresh(stored, now));
+        if challenges.len() >= MAX_PENDING_CHALLENGES {
+            let now = chrono::Utc::now();
+            challenges.retain(|_, stored| is_fresh(stored, now));
+        }
+        if challenges.len() >= MAX_PENDING_CHALLENGES
+            && let Some(oldest) = challenges
+                .iter()
+                .min_by_key(|(_, stored)| stored.created_at)
+                .map(|(id, _)| id.clone())
+        {
+            challenges.remove(&oldest);
+        }
         challenges.insert(challenge_id.clone(), challenge);
         challenge_id
     }
@@ -112,8 +122,12 @@ impl AuthState {
     }
 }
 
-/// How long a sign-in or registration challenge can be finished.
-pub const CHALLENGE_LIFETIME: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
+/// How long a sign-in or registration challenge can be finished: the 5 minutes the browser is
+/// given to use the passkey, and a minute for the answer to reach the gateway.
+pub const CHALLENGE_LIFETIME: chrono::TimeDelta = chrono::TimeDelta::minutes(6);
+
+/// The most unfinished challenges kept at once.
+pub const MAX_PENDING_CHALLENGES: usize = 10_000;
 
 fn is_fresh(
     challenge: &ChallengeState,

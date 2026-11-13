@@ -4,14 +4,20 @@ changes:
   changed: []
   fixed:
     - timestamp: '2026-11-13T00:00:00Z'
-      title: Expire unfinished passkey sign-in and registration challenges after 5 minutes
+      title: Expire unfinished passkey sign-in and registration challenges after 6 minutes
       description: >-
         Every POST /auth/login/start and /auth/register/start kept its challenge in memory
         until the gateway restarted, and a challenge could be finished at any later time, so
         repeated unauthenticated requests grew memory without limit. A challenge can now be
-        finished for 5 minutes, and expired ones are dropped as new ones are stored.
+        finished for 6 minutes, the browser's 5 minutes and a minute for the answer to arrive,
+        and at most 10,000 are kept: when full, expired ones are dropped, then the oldest.
   removed: []
   security:
+    - timestamp: '2026-11-13T00:00:00Z'
+      title: Update quinn-udp to 0.5.16 for RUSTSEC-2026-0538
+      description: >-
+        quinn-udp 0.5.14 could keep its receive loop busy after dropping a truncated datagram on
+        Apple, BSD and illumos targets. 0.5.16 rebuilds the message header before every receive.
     - timestamp: '2026-11-13T00:00:00Z'
       title: Stop passkey sign-in and registration from revealing which accounts exist
       description: >-
@@ -22,8 +28,8 @@ changes:
         gateway creates under vc_keys on its first start, the same on every request: usually
         one 20-byte ID, sometimes another common length, sometimes two or three. Registering a
         taken username, approved or awaiting approval, is answered 200 like a new registration
-        and stores nothing, after a random 1 to 10 ms pause so it takes about as long as
-        creating an account. Signing in to an approved account with its passkeys is unchanged.
+        and stores nothing. Both answers are sent 25 ms after the username check, and administrators
+        are notified of a new account after it is answered, so the timing does not tell either. Signing in to an approved account with its passkeys is unchanged.
         A user awaiting approval no longer picks a passkey and is refused with 401; the browser
-        finds none for the decoy and offers another device or a security key instead.
+        finds none for the decoy and offers another device or a security key instead, so user.login_failed with not_approved is rarely raised.
   breaking: []

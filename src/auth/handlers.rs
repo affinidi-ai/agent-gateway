@@ -178,22 +178,16 @@ pub async fn register_start(
     }))
 }
 
-/// The shortest and longest pause before a registration for the username of an existing account
-/// is answered.
-const EXISTING_USERNAME_ANSWER_DELAY: std::ops::RangeInclusive<std::time::Duration> =
-    std::time::Duration::from_millis(1)..=std::time::Duration::from_millis(10);
-
-/// How long a registration for the username of an existing account waits before it is answered.
+/// How long after the username check a finished registration is answered, whether it created an
+/// account or found the username taken.
 ///
-/// That registration stores nothing, while a new account is answered only after its user record,
-/// its Terms acceptance and the administrators' notifications are written: about 1.3 ms more on
-/// a local SSD, and more on slower volumes. Without a pause the faster answer would tell that the
-/// username is taken. The pause is drawn afresh each time from a range that covers that work, so
-/// a single answer's timing overlaps a new account's. Averaging many attempts can still tell them
-/// apart; rate limiting registrations is what bounds that.
-fn existing_username_answer_delay() -> std::time::Duration {
-    rand::random_range(EXISTING_USERNAME_ANSWER_DELAY)
-}
+/// A taken username stores nothing, while a new account is answered only after its user record
+/// and its Terms acceptance are written: about 1.3 ms more on a local SSD, and more on slower
+/// volumes. If each answered as soon as its work was done, the faster answer would tell that the
+/// username is taken. Both instead wait until this long after the check, which covers those
+/// writes on all but very slow storage, so neither answers sooner than the other. The other work
+/// a new account starts, such as notifying administrators, runs after the answer.
+const REGISTRATION_ANSWER_TIME: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Complete passkey registration
 pub async fn register_finish(
@@ -241,6 +235,7 @@ pub async fn register_finish(
         .storage
         .user_write_guard()
         .await;
+    let answer_at = tokio::time::Instant::now() + REGISTRATION_ANSWER_TIME;
     // The user limit is checked before the username, so a full appliance refuses a taken
     // username and a free one alike.
     let user_count = auth_state
@@ -276,17 +271,12 @@ pub async fn register_finish(
             user_id = %existing_user.user_id,
             "Registration finished for the username of an existing account; nothing stored"
         );
-        tokio::time::sleep(existing_username_answer_delay()).await;
+        tokio::time::sleep_until(answer_at).await;
         return Ok(StatusCode::OK);
     }
     let user = auth_state
         .storage
-        .prepare_user_with_passkey(username.as_str(), passkey)
-        .await
-        .map_err(|e| {
-            error!("Failed to prepare passkey user: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .prepare_user_with_passkey(username.as_str(), passkey, user_count == 0);
 
     auth_state
         .terms_manager
@@ -312,6 +302,19 @@ pub async fn register_finish(
     info!("User registration complete - role: {:?}, status: {:?}, user_id: {}", user.role, user.status, user.user_id);
 
     crate::integrations::trigger_user_created(&user);
+    tokio::spawn(announce_new_user(auth_state, metrics_store, user));
+    tokio::time::sleep_until(answer_at).await;
+
+    Ok(StatusCode::OK)
+}
+
+/// Records the new user in the metrics and notifies: the first user, an administrator, gets the
+/// welcome, and a user awaiting approval is announced to every administrator.
+async fn announce_new_user(
+    auth_state: Arc<AuthState>,
+    metrics_store: Option<Arc<MetricsStore>>,
+    user: crate::auth::storage::UserData,
+) {
     let notif_store_guard = auth_state
         .notification_store
         .read()
@@ -375,9 +378,9 @@ pub async fn register_finish(
                             "New User Awaiting Approval".to_string(),
                             format!(
                                 "User '{}' has registered and is awaiting approval. Please review and approve this user in the User Management section.",
-                                username
+                                user.username
                             ),
-                            serde_json::json!({"username": username, "user_id": user.user_id, "action": crate::integrations::types::NotificationAction::UserApproval}),
+                            serde_json::json!({"username": user.username, "user_id": user.user_id, "action": crate::integrations::types::NotificationAction::UserApproval}),
                         );
                         notification.user_id = admin_user.user_id;
                         if let Err(e) = notif_store
@@ -393,8 +396,6 @@ pub async fn register_finish(
             error!("Notification store not available - cannot notify admins");
         }
     }
-
-    Ok(StatusCode::OK)
 }
 
 /// Start passkey authentication
@@ -648,11 +649,12 @@ pub async fn logout(
 #[cfg(test)]
 mod tests {
     use super::{
-        EXISTING_USERNAME_ANSWER_DELAY, LoginFinishRequest, LoginFinishResponse, LoginStartRequest,
-        RegisterStartRequest, existing_username_answer_delay, login_finish, login_start, register_start,
+        LoginFinishRequest, LoginFinishResponse, LoginStartRequest, RegisterStartRequest, login_finish, login_start,
+        register_start,
     };
     use crate::auth::{
         AuthState,
+        state::MAX_PENDING_CHALLENGES,
         storage::UserData,
         types::{UserRole, UserStatus},
     };
@@ -972,10 +974,10 @@ mod tests {
     async fn a_challenge_is_taken_once_while_fresh_and_refused_once_expired() {
         let (_temp_dir, state) = test_auth_state().await;
         let fresh = state
-            .store_challenge(challenge_created(chrono::TimeDelta::minutes(4)))
+            .store_challenge(challenge_created(chrono::TimeDelta::minutes(5)))
             .await;
         let expired = state
-            .store_challenge(challenge_created(chrono::TimeDelta::minutes(6)))
+            .store_challenge(challenge_created(chrono::TimeDelta::minutes(7)))
             .await;
 
         assert!(
@@ -999,32 +1001,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn storing_a_challenge_drops_the_expired_ones() {
+    async fn a_full_challenge_store_drops_the_expired_challenges_first() {
         let (_temp_dir, state) = test_auth_state().await;
         let expired = state
-            .store_challenge(challenge_created(chrono::TimeDelta::minutes(6)))
+            .store_challenge(challenge_created(chrono::TimeDelta::minutes(7)))
             .await;
+        for _ in 1..MAX_PENDING_CHALLENGES {
+            state
+                .store_challenge(challenge_created(chrono::TimeDelta::minutes(1)))
+                .await;
+        }
 
-        let fresh = state
+        let newest = state
             .store_challenge(challenge_created(chrono::TimeDelta::zero()))
             .await;
 
         let stored = state.challenges.read().await;
         assert!(!stored.contains_key(&expired));
-        assert!(stored.contains_key(&fresh));
-        assert_eq!(stored.len(), 1);
+        assert!(stored.contains_key(&newest));
+        assert_eq!(stored.len(), MAX_PENDING_CHALLENGES);
     }
 
-    #[test]
-    fn an_existing_username_is_answered_after_a_pause_drawn_afresh_within_its_range() {
-        let delays: std::collections::HashSet<std::time::Duration> = (0..50)
-            .map(|_| existing_username_answer_delay())
-            .collect();
-
-        for delay in &delays {
-            assert!(EXISTING_USERNAME_ANSWER_DELAY.contains(delay), "{delay:?}");
+    #[tokio::test]
+    async fn a_full_challenge_store_of_fresh_challenges_drops_the_oldest() {
+        let (_temp_dir, state) = test_auth_state().await;
+        let oldest = state
+            .store_challenge(challenge_created(chrono::TimeDelta::minutes(3)))
+            .await;
+        let older = state
+            .store_challenge(challenge_created(chrono::TimeDelta::minutes(2)))
+            .await;
+        for _ in 2..MAX_PENDING_CHALLENGES {
+            state
+                .store_challenge(challenge_created(chrono::TimeDelta::minutes(1)))
+                .await;
         }
-        assert!(delays.len() > 1, "every pause was {delays:?}");
+
+        let newest = state
+            .store_challenge(challenge_created(chrono::TimeDelta::zero()))
+            .await;
+
+        let stored = state.challenges.read().await;
+        assert!(!stored.contains_key(&oldest));
+        assert!(stored.contains_key(&older));
+        assert!(stored.contains_key(&newest));
+        assert_eq!(stored.len(), MAX_PENDING_CHALLENGES);
     }
 
     #[tokio::test]

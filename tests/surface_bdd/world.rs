@@ -187,6 +187,8 @@ pub struct SurfaceWorld {
     pub sign_in_challenge_credentials: Vec<Vec<serde_json::Value>>,
     /// A passkey the scenario registered for a username that already had an account.
     pub other_passkey: Option<SoftPasskey>,
+    /// How long the last passkey registration finish took to be answered.
+    pub registration_answer_time: Option<std::time::Duration>,
     /// The event payload a sign-in step last found on the Redis stream.
     pub sign_in_event: Option<serde_json::Value>,
     /// The payload with Agent Watch's record content a sign-in step last found on the stream.
@@ -274,6 +276,7 @@ impl SurfaceWorld {
             started_sign_in: None,
             sign_in_challenge_credentials: Vec::new(),
             other_passkey: None,
+            registration_answer_time: None,
             sign_in_event: None,
             sign_in_record: None,
             client_certificates: HashMap::new(),

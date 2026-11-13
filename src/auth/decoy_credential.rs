@@ -110,7 +110,7 @@ impl DecoyCredentialKey {
         let stored: StoredDecoyCredentialKey = serde_json::from_str(stored)
             .map_err(|_| anyhow::anyhow!("the file is not a login decoy credential key record"))?;
         let mut secret = Zeroizing::new([0u8; 32]);
-        if stored.key.len() != 64 || hex::decode_to_slice(&stored.key, secret.as_mut()).is_err() {
+        if hex::decode_to_slice(&stored.key, secret.as_mut()).is_err() {
             anyhow::bail!("the key must be 64 hexadecimal characters");
         }
         Ok(Self { secret })

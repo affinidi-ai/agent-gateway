@@ -4,7 +4,8 @@ Feature: Passkey sign-in and registration do not tell whether an account exists
   challenge for that username: usually one 20-byte ID, sometimes one of another common length,
   sometimes two or three. No authenticator holds a decoy, so that sign-in fails like any other.
   Registering a username that already has an account, approved or awaiting approval, is answered
-  as a new registration and changes nothing, so the answer does not tell whether it exists.
+  as a new registration and changes nothing, and every registration is answered 25 ms after the
+  username is checked, so neither the answer nor its timing tells whether it exists.
 
   Scenario: A sign-in for an unknown username names stable decoy credentials
     When passkey sign-ins are started twice for "bravo"
@@ -31,9 +32,15 @@ Feature: Passkey sign-in and registration do not tell whether an account exists
     Given human user "alpha" is approved and has a passkey
     When another passkey is registered for the username "alpha"
     Then the response status is 200
+    And the registration was answered no sooner than 25 ms
     And human user "alpha" is listed once, with status "approved"
     And human user "alpha" still signs in with the passkey they registered
     And the other passkey cannot sign in as human user "alpha"
+
+  Scenario: Registering a new username is answered 25 ms after the username check
+    When a passkey is registered for the new username "echo"
+    Then the response status is 200
+    And the registration was answered no sooner than 25 ms
 
   Scenario: Registering the username of an account awaiting approval is answered as a new registration
     Given human user "delta" has registered a passkey and awaits approval

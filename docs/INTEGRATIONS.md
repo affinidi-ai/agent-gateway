@@ -141,7 +141,7 @@ failure after verification, such as provisioning a SAML user or opening the sess
 | `FAILURE_REASON` | Meaning |
 | --- | --- |
 | `invalid_credential` | The account exists and is approved, but the passkey presented is not one of its passkeys |
-| `not_approved` | The account exists but is not approved |
+| `not_approved` | The account exists but is not approved. A browser rarely sends this sign-in: the challenge for such an account names decoy credentials, not its passkeys, so the browser finds no passkey to use |
 | `unknown_user` | No account has the username the sign-in named, or the account was deleted before the sign-in finished |
 | `saml_rejected` | The SAML response was rejected |
 

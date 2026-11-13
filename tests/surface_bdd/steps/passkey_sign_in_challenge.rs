@@ -4,6 +4,7 @@ use reqwest::Method;
 use serde_json::{Value, json};
 
 use crate::bdd_support::admin_client::recorded_response;
+use crate::bdd_support::passkey::SoftPasskey;
 use crate::steps::sign_in_events::{finish_sign_in, passkey_for, post_json, start_passkey_sign_in};
 use crate::steps::when::ensure_admin_session;
 use crate::world::SurfaceWorld;
@@ -104,27 +105,57 @@ async fn another_passkey_registers_username(
     world: &mut SurfaceWorld,
     username: String,
 ) {
+    let passkey = register_timed(world, username).await;
+    world.other_passkey = Some(passkey);
+}
+
+#[when(expr = "a passkey is registered for the new username {string}")]
+async fn passkey_registers_new_username(
+    world: &mut SurfaceWorld,
+    username: String,
+) {
+    ensure_admin_session(world).await;
+    register_timed(world, username).await;
+}
+
+#[then(expr = "the registration was answered no sooner than {int} ms")]
+fn registration_answered_no_sooner_than(
+    world: &mut SurfaceWorld,
+    millis: u64,
+) {
+    let answered = world
+        .registration_answer_time
+        .expect("a finished registration");
+    assert!(answered >= std::time::Duration::from_millis(millis), "answered after {answered:?}");
+}
+
+/// Registers a passkey for `username`, records the response and how long the finish took to be
+/// answered, and returns the passkey.
+async fn register_timed(
+    world: &mut SurfaceWorld,
+    username: String,
+) -> SoftPasskey {
     let passkey = passkey_for(world);
     let started: Value = post_json(world, "/auth/register/start", &json!({"username": username}))
         .await
         .json()
         .await
         .expect("a registration challenge");
+    let credential = passkey.register(&started["creation_options"]);
+    let sent = std::time::Instant::now();
     let finished = post_json(
         world,
         "/auth/register/finish",
-        &json!({
-            "challenge_id": started["challenge_id"],
-            "credential": passkey.register(&started["creation_options"]),
-        }),
+        &json!({"challenge_id": started["challenge_id"], "credential": credential}),
     )
     .await;
+    world.registration_answer_time = Some(sent.elapsed());
     world.caller_response = Some(
         recorded_response(finished)
             .await
             .expect("record the registration response"),
     );
-    world.other_passkey = Some(passkey);
+    passkey
 }
 
 #[then(expr = "human user {string} is listed once, with status {string}")]
