@@ -67,7 +67,7 @@ pub enum PathScope {
     Unscoped,
 }
 
-const HANDLER_ENFORCED_FAMILIES: &[&str] = &["secrets", "api-keys", "certificates"];
+const HANDLER_ENFORCED_FAMILIES: &[&str] = &["secrets", "api-keys", "certificates", "agents"];
 
 fn classify_special_family(
     name: &str,
@@ -83,8 +83,11 @@ fn classify_special_family(
         | ("api-keys", [])
         | ("api-keys", [_])
         | ("api-keys", [_, _])
-        | ("api-keys", [_, _, "revoke" | "rotate"]) => Some(PathScope::HandlerEnforced),
-        ("secrets" | "certificates" | "api-keys", _) => Some(PathScope::DenyScoped),
+        | ("api-keys", [_, _, "revoke" | "rotate"])
+        | ("agents", [])
+        | ("agents", [_])
+        | ("agents", [_, "agent-card"]) => Some(PathScope::HandlerEnforced),
+        ("secrets" | "certificates" | "api-keys" | "agents", _) => Some(PathScope::DenyScoped),
         ("delegation-vault", ["connects"]) | ("delegation-vault", ["connects", _, "complete"]) => {
             Some(PathScope::HandlerEnforced)
         }
@@ -143,14 +146,6 @@ fn is_handler_enforced_nested_action(
     )
 }
 
-/// Agent ids are surface ids, so `/v1/agents` is scoped as Surfaces.
-fn path_family_kind(family: &str) -> Option<ResourceKind> {
-    match family {
-        "agents" => Some(ResourceKind::Surfaces),
-        _ => ResourceKind::from_path_family(family),
-    }
-}
-
 pub fn classify_resource_path(path: &str) -> PathScope {
     let segments: Vec<&str> = path
         .split('/')
@@ -161,7 +156,7 @@ pub fn classify_resource_path(path: &str) -> PathScope {
         if segments[index] == "v1" && index + 1 < segments.len() {
             let candidate = segments[index + 1];
             if HANDLER_ENFORCED_FAMILIES.contains(&candidate)
-                || path_family_kind(candidate).is_some()
+                || ResourceKind::from_path_family(candidate).is_some()
                 || candidate == "sts"
             {
                 family = Some((candidate, index + 2));
@@ -193,7 +188,7 @@ pub fn classify_resource_path(path: &str) -> PathScope {
         };
     }
 
-    let Some(kind) = path_family_kind(name) else {
+    let Some(kind) = ResourceKind::from_path_family(name) else {
         return PathScope::Unscoped;
     };
 
@@ -312,23 +307,13 @@ mod tests {
     }
 
     #[test]
-    fn agent_routes_are_scoped_as_surfaces() {
-        assert_eq!(classify_resource_path("/api/v1/agents"), PathScope::HandlerEnforced);
-        assert_eq!(
-            classify_resource_path("/api/v1/agents/surface%2Fa"),
-            PathScope::EnforceId {
-                kind: ResourceKind::Surfaces,
-                id: "surface/a".into(),
-            }
-        );
-        assert_eq!(
-            classify_resource_path("/api/v1/agents/surface-a/agent-card"),
-            PathScope::EnforceId {
-                kind: ResourceKind::Surfaces,
-                id: "surface-a".into(),
-            }
-        );
-        assert_eq!(classify_resource_path("/v1/agents/id/future-action"), PathScope::DenyScoped);
+    fn agent_routes_are_handler_enforced_over_listed_surfaces() {
+        for path in ["/api/v1/agents", "/api/v1/agents/9f2c", "/api/v1/agents/9f2c/agent-card", "/v1/agents/9f2c"] {
+            assert_eq!(classify_resource_path(path), PathScope::HandlerEnforced, "{path}");
+        }
+        for path in ["/v1/agents/id/future-action", "/v1/agents/id/agent-card/refresh"] {
+            assert_eq!(classify_resource_path(path), PathScope::DenyScoped, "{path}");
+        }
         assert_eq!(ResourceKind::from_path_family("agents"), None);
     }
 

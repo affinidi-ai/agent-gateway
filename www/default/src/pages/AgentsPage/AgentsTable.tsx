@@ -1,20 +1,8 @@
 import React from 'react';
 import { Link } from 'react-router-dom';
 import type { AgentRecord } from '../../api';
-import {
-  AgentDid,
-  AgentProtocolBadge,
-  AgentStatusBadge,
-  AgentTrustRegistryBadges,
-} from './AgentBadges';
-import {
-  UNNAMED_AGENT,
-  lastActivityLabel,
-  listRowSurfaceId,
-  otherSurfacesNote,
-  runtimeIcon,
-  runtimeLabel,
-} from './agentLabels';
+import { AgentIdentities, AgentProtocolBadge, AgentTrustRegistryBadge } from './AgentBadges';
+import { UNNAMED_AGENT, lastActivityLabel, runtimeIcon, runtimeLabel } from './agentLabels';
 
 interface AgentsTableProps {
   agents: AgentRecord[];
@@ -22,17 +10,17 @@ interface AgentsTableProps {
   onOpen: (agent: AgentRecord) => void;
 }
 
-/** One row per agent; inactive agents are dimmed. A row opens the details. */
+/** One row per managed agent. A row opens the details. */
 const AgentsTable: React.FC<AgentsTableProps> = ({ agents, retentionMinutes, onOpen }) => (
   <div className="table-responsive">
     <table className="table table-hover table-sm">
       <thead>
         <tr>
-          <th style={{ width: '28%' }}>Agent</th>
-          <th style={{ width: '16%' }}>Runtime &amp; protocol</th>
-          <th style={{ width: '9%' }}>Status</th>
+          <th style={{ width: '20%' }}>Agent</th>
+          <th style={{ width: '15%' }}>Runtime &amp; protocol</th>
+          <th style={{ width: '20%' }}>Identities</th>
           <th style={{ width: '17%' }}>Used by surfaces</th>
-          <th style={{ width: '15%' }}>Trust registry</th>
+          <th style={{ width: '13%' }}>Trust registry</th>
           <th style={{ width: '15%' }}>Last activity</th>
         </tr>
       </thead>
@@ -40,7 +28,7 @@ const AgentsTable: React.FC<AgentsTableProps> = ({ agents, retentionMinutes, onO
         {agents.map(agent => (
           <tr
             key={agent.id}
-            className={agent.status === 'active' ? 'agents-row' : 'agents-row agents-row-dimmed'}
+            className="agents-row"
             tabIndex={0}
             onClick={() => onOpen(agent)}
             onKeyDown={e => {
@@ -52,16 +40,13 @@ const AgentsTable: React.FC<AgentsTableProps> = ({ agents, retentionMinutes, onO
             data-testid={`agents-row-${agent.id}`}
           >
             <td>
-              <div>
-                {agent.name ? (
-                  <strong data-testid="agents-name">{agent.name}</strong>
-                ) : (
-                  <span className="text-muted fst-italic" data-testid="agents-unnamed">
-                    {UNNAMED_AGENT}
-                  </span>
-                )}
-              </div>
-              <AgentDid did={agent.agent_did} note={otherSurfacesNote(agent.did_surface_count)} />
+              {agent.name ? (
+                <strong data-testid="agents-name">{agent.name}</strong>
+              ) : (
+                <span className="text-muted fst-italic" data-testid="agents-unnamed">
+                  {UNNAMED_AGENT}
+                </span>
+              )}
             </td>
             <td>
               <div className="small mb-1" data-testid="agents-runtime">
@@ -71,19 +56,25 @@ const AgentsTable: React.FC<AgentsTableProps> = ({ agents, retentionMinutes, onO
               <AgentProtocolBadge protocol={agent.protocol} runtime={agent.runtime} />
             </td>
             <td>
-              <AgentStatusBadge status={agent.status} />
+              <AgentIdentities identities={agent.identities} />
             </td>
             <td>
-              <Link
-                to={`/surfaces/${encodeURIComponent(listRowSurfaceId(agent))}`}
-                onClick={e => e.stopPropagation()}
-                data-testid="agents-surface-link"
-              >
-                {agent.surface_name}
-              </Link>
+              <ul className="list-unstyled mb-0" data-testid="agents-surfaces">
+                {agent.surfaces.map(surface => (
+                  <li key={surface.surface_id}>
+                    <Link
+                      to={`/surfaces/${encodeURIComponent(surface.surface_id)}`}
+                      onClick={e => e.stopPropagation()}
+                      data-testid="agents-surface-link"
+                    >
+                      {surface.name}
+                    </Link>
+                  </li>
+                ))}
+              </ul>
             </td>
             <td>
-              <AgentTrustRegistryBadges trust={agent.trust_registry} />
+              <AgentTrustRegistryBadge trust={agent.trust_registry} />
             </td>
             <td>
               <span

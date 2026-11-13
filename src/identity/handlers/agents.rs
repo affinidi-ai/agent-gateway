@@ -1,10 +1,11 @@
-//! Read-only Agents API: one agent record per Agent Surface the caller can access.
+//! Read-only Agents API: one agent record per managed agent behind the Agent Surfaces the
+//! caller can access.
 //!
-//! Records are built from the surface, the managed identities used on it and the
-//! retained request metrics. Identities and metrics are joined only to surfaces
-//! already in the caller's tenant and resource scope.
+//! Surfaces whose targets share a normalised endpoint and Agent Card path are one managed
+//! agent. Only surfaces in the caller's tenant and resource scope are grouped, and
+//! identities, Trust Recorder outcomes and metrics are joined only to those surfaces.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -19,20 +20,21 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tracing::{debug, error, warn};
 
 use crate::auth_manager::pat::PatResourceScope;
 use crate::config::agent_surface::{AgentSurface, SurfaceProtocol, SurfaceStatus};
-use crate::config::types::TrustRecorderConfig;
 use crate::identity::display_name::managed_surfaces_by_did;
-use crate::identity::filesystem::{AgentIdentityRecord, IdentityOrigin};
+use crate::identity::filesystem::AgentIdentityRecord;
 use crate::identity::state::IdentityApiState;
-use crate::identity::target_card_names::{CardLocation, TargetCardSource};
+use crate::identity::target_card_names::{CardLocation, TargetCardNameService, TargetCardSource};
 use crate::metrics::SurfaceStats;
 use crate::observability::caller_names::{AGENT_CARD_FETCH_TIMEOUT, AGENT_CARD_MAX_BYTES};
 use crate::proxy::upstream_body::UpstreamBodyLimits;
 use crate::surfaces::AgentSurfaceStore;
 use crate::tenancy::{PatTenantContext, ResourceKind, can_access, scope_allows_resource};
+use crate::trust_registry_verification::recorder_status::{RecorderState, TrustRecorderStatusStore, global_store};
 
 const AGENT_CARD_CACHE_TTL: Duration = Duration::from_secs(300);
 const AGENT_CARD_FAILURE_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -76,60 +78,31 @@ impl AgentRuntime {
     }
 }
 
-/// Trust Registry records the surface is configured to write. Configuration
-/// only: nothing here was checked against a Trust Registry.
+/// Whether any of the agent's current identities was written to a Trust Registry.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 pub struct AgentTrustRegistry {
-    pub recognized: bool,
-    pub authorized: bool,
+    pub recorded: bool,
 }
 
-impl AgentTrustRegistry {
-    fn from_recorder(recorder: Option<&TrustRecorderConfig>) -> Self {
-        let entries = recorder.map_or(&[][..], |recorder| recorder.entries.as_slice());
-        let has_record_type = |record_type: &str| {
-            entries.iter().any(|entry| {
-                entry
-                    .custom_resources
-                    .iter()
-                    .any(|resource| resource.record_type == record_type)
-            })
-        };
-        Self {
-            recognized: entries.iter().any(|entry| {
-                entry
-                    .custom_resources
-                    .is_empty()
-            }) || has_record_type("recognition"),
-            authorized: has_record_type("authorization"),
-        }
-    }
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum IdentitySource {
+    Surface,
+    Managed,
 }
 
-/// The managed identity shown as a surface's agent DID.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MatchedIdentity {
+/// A managed agent DID: a surface's own agent DID, or a managed identity used on a surface.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AgentIdentity {
     pub did: String,
     pub created_at: Option<DateTime<Utc>>,
-    pub surface_count: usize,
+    pub source: IdentitySource,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct AgentRecord {
-    pub id: String,
-    pub registration: AgentRegistration,
-    pub name: Option<String>,
-    pub surface_name: String,
-    pub status: SurfaceStatus,
-    pub protocol: SurfaceProtocol,
-    pub runtime: AgentRuntime,
-    pub endpoint: String,
-    pub tags: Vec<String>,
-    pub trust_registry: AgentTrustRegistry,
-    pub agent_did: Option<String>,
-    pub did_surface_count: usize,
-    pub identity_created_at: Option<DateTime<Utc>>,
-    pub last_activity_at: Option<DateTime<Utc>>,
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AgentSurfaceRef {
+    pub surface_id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -138,7 +111,21 @@ pub struct AgentSurfaceSummary {
     pub name: String,
     pub protocol: SurfaceProtocol,
     pub route: String,
-    pub status: SurfaceStatus,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AgentRecord<S> {
+    pub id: String,
+    pub registration: AgentRegistration,
+    pub name: Option<String>,
+    pub protocol: SurfaceProtocol,
+    pub runtime: AgentRuntime,
+    pub endpoint: String,
+    pub tags: Vec<String>,
+    pub surfaces: Vec<S>,
+    pub identities: Vec<AgentIdentity>,
+    pub trust_registry: AgentTrustRegistry,
+    pub last_activity_at: Option<DateTime<Utc>>,
 }
 
 /// Request totals over the metrics retention window, summed across the
@@ -155,14 +142,13 @@ pub struct AgentTraffic {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct AgentDetails {
     #[serde(flatten)]
-    pub agent: AgentRecord,
-    pub surfaces: Vec<AgentSurfaceSummary>,
+    pub agent: AgentRecord<AgentSurfaceSummary>,
     pub traffic: AgentTraffic,
 }
 
 #[derive(Debug, Serialize)]
 pub struct AgentListResponse {
-    pub agents: Vec<AgentRecord>,
+    pub agents: Vec<AgentRecord<AgentSurfaceRef>>,
 }
 
 /// Why the agent's own Agent Card can't be fetched.
@@ -259,111 +245,268 @@ fn is_listed(
         && scope_allows_resource(scope, context, ResourceKind::Surfaces, &surface.surface_id)
 }
 
-/// When `record`, a managed identity, was last used on `surface_id`.
-fn last_used_on(
-    record: &AgentIdentityRecord,
-    surface_id: &str,
-) -> Option<DateTime<Utc>> {
-    record
-        .channel_usage
+fn without_query(value: &str) -> &str {
+    &value[..value
+        .find(['?', '#'])
+        .unwrap_or(value.len())]
+}
+
+/// Lower-cases scheme and host and drops userinfo, query, fragment and trailing slashes, for
+/// every scheme alike. Userinfo is cut before the query, so a `?` or `#` in a password never
+/// leaves part of it behind.
+fn normalise_endpoint(raw: &str) -> String {
+    let raw = raw.trim();
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return without_query(raw)
+            .trim_end_matches('/')
+            .to_string();
+    };
+    let authority_end = rest
+        .find('/')
+        .unwrap_or(rest.len());
+    let host_start = rest[..authority_end]
+        .rfind('@')
+        .map_or(0, |at| at + 1);
+    let rest = without_query(&rest[host_start..]);
+    let (host, path) = rest.split_at(
+        rest.find('/')
+            .unwrap_or(rest.len()),
+    );
+    format!("{}://{}{}", scheme.to_ascii_lowercase(), host.to_ascii_lowercase(), path)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn card_path(surface: &AgentSurface) -> &str {
+    surface
+        .access_point
+        .agent_card_path
+        .as_deref()
+        .map_or("", str::trim)
+}
+
+/// Hex SHA-256 of the normalised endpoint and Agent Card path.
+fn agent_id(
+    endpoint: &str,
+    card_path: &str,
+) -> String {
+    let digest = Sha256::digest(format!("{endpoint}\n{card_path}").as_bytes());
+    format!("{digest:x}")
+}
+
+/// The surfaces behind one managed agent, ordered by name then id.
+struct AgentGroup<'a> {
+    id: String,
+    endpoint: String,
+    surfaces: Vec<&'a AgentSurface>,
+}
+
+fn group_surfaces<'a>(surfaces: impl IntoIterator<Item = &'a AgentSurface>) -> Vec<AgentGroup<'a>> {
+    let mut groups: BTreeMap<String, AgentGroup<'a>> = BTreeMap::new();
+    for surface in surfaces {
+        let endpoint = normalise_endpoint(&surface.target.endpoint);
+        let id = agent_id(&endpoint, card_path(surface));
+        groups
+            .entry(id.clone())
+            .or_insert_with(|| AgentGroup {
+                id,
+                endpoint,
+                surfaces: Vec::new(),
+            })
+            .surfaces
+            .push(surface);
+    }
+    let mut groups: Vec<AgentGroup<'a>> = groups.into_values().collect();
+    for group in &mut groups {
+        group
+            .surfaces
+            .sort_by(|a, b| {
+                a.name
+                    .cmp(&b.name)
+                    .then_with(|| {
+                        a.surface_id
+                            .cmp(&b.surface_id)
+                    })
+            });
+    }
+    groups
+}
+
+/// Groups only the surfaces the caller can list.
+fn listed_groups<'a>(
+    live_surfaces: &'a [AgentSurface],
+    context: Option<&PatTenantContext>,
+    scope: Option<&PatResourceScope>,
+) -> Vec<AgentGroup<'a>> {
+    group_surfaces(
+        live_surfaces
+            .iter()
+            .filter(|surface| is_listed(surface, context, scope)),
+    )
+}
+
+/// The caller's agent `id`, recomputed over the surfaces the caller can list. 404 otherwise.
+fn listed_group<'a>(
+    live_surfaces: &'a [AgentSurface],
+    id: &str,
+    context: Option<&PatTenantContext>,
+    scope: Option<&PatResourceScope>,
+) -> Result<AgentGroup<'a>, AgentApiError> {
+    listed_groups(live_surfaces, context, scope)
+        .into_iter()
+        .find(|group| group.id == id)
+        .ok_or(AgentApiError::NotFound)
+}
+
+/// What a record joins to its surfaces.
+struct RegistryData<'a> {
+    identity_records: &'a [AgentIdentityRecord],
+    managed_surfaces_by_did: &'a HashMap<String, BTreeSet<String>>,
+    stats: &'a HashMap<String, SurfaceStats>,
+}
+
+impl RegistryData<'_> {
+    fn last_activity(
+        &self,
+        surface: &AgentSurface,
+    ) -> Option<DateTime<Utc>> {
+        self.stats
+            .get(&surface.surface_id)
+            .and_then(|stats| stats.last_activity)
+    }
+
+    fn earliest_created_at(
+        &self,
+        did: &str,
+    ) -> Option<DateTime<Utc>> {
+        self.identity_records
+            .iter()
+            .filter(|record| record.did == did)
+            .map(|record| record.created_at)
+            .min()
+    }
+
+    /// The group's surfaces, most recently active first; ties and inactive surfaces keep
+    /// name order.
+    fn by_activity<'s>(
+        &self,
+        group: &AgentGroup<'s>,
+    ) -> Vec<&'s AgentSurface> {
+        let mut surfaces = group.surfaces.clone();
+        surfaces.sort_by_key(|surface| std::cmp::Reverse(self.last_activity(surface)));
+        surfaces
+    }
+
+    /// Each surface's own agent DID plus the managed identities used on the group's
+    /// surfaces, once per DID. Caller identities are never managed, so never included.
+    fn identities(
+        &self,
+        group: &AgentGroup<'_>,
+    ) -> Vec<AgentIdentity> {
+        let surface_ids: HashSet<&str> = group
+            .surfaces
+            .iter()
+            .map(|surface| surface.surface_id.as_str())
+            .collect();
+        let mut sources: BTreeMap<&str, IdentitySource> = BTreeMap::new();
+        for did in group
+            .surfaces
+            .iter()
+            .filter_map(|surface| surface.agent_did.as_deref())
+            .map(str::trim)
+            .filter(|did| !did.is_empty())
+        {
+            sources.insert(did, IdentitySource::Surface);
+        }
+        for (did, ids) in self.managed_surfaces_by_did {
+            if ids
+                .iter()
+                .any(|id| surface_ids.contains(id.as_str()))
+            {
+                sources
+                    .entry(did.as_str())
+                    .or_insert(IdentitySource::Managed);
+            }
+        }
+        sources
+            .into_iter()
+            .map(|(did, source)| AgentIdentity {
+                did: did.to_string(),
+                created_at: self.earliest_created_at(did),
+                source,
+            })
+            .collect()
+    }
+}
+
+/// Looks up a surface's Agent Card name.
+type CardName = dyn Fn(&AgentSurface) -> Option<String> + Sync;
+
+/// The Agent Card name of the most recently active surface that has one, else that
+/// surface's canvas target name, else none.
+fn display_name(
+    by_activity: &[&AgentSurface],
+    card_name: &CardName,
+) -> Option<String> {
+    by_activity
         .iter()
-        .filter(|usage| usage.channel_config_id == surface_id)
-        .map(|usage| usage.last_used_at)
-        .max()
+        .find_map(|surface| card_name(surface))
         .or_else(|| {
-            (record
-                .channel_config_id
-                .as_deref()
-                == Some(surface_id))
-            .then_some(record.last_used_at)
-            .flatten()
+            by_activity
+                .iter()
+                .find_map(|surface| canvas_target_name(surface.canvas.as_ref()))
         })
 }
 
-fn earliest_created_at(
-    records: &[AgentIdentityRecord],
-    did: &str,
-) -> Option<DateTime<Utc>> {
-    records
-        .iter()
-        .filter(|record| record.did == did)
-        .map(|record| record.created_at)
-        .min()
-}
-
-fn did_surface_count(
-    surfaces_by_did: &HashMap<String, BTreeSet<String>>,
-    did: &str,
-    surface_id: &str,
-) -> usize {
-    let surfaces = surfaces_by_did.get(did);
-    surfaces.map_or(0, BTreeSet::len) + usize::from(!surfaces.is_some_and(|ids| ids.contains(surface_id)))
-}
-
-/// The surface's own `agent_did` when set; otherwise the managed identity most
-/// recently used on the surface.
-pub fn match_identity(
-    surface: &AgentSurface,
-    records: &[AgentIdentityRecord],
-    surfaces_by_did: &HashMap<String, BTreeSet<String>>,
-) -> Option<MatchedIdentity> {
-    let surface_id = surface.surface_id.as_str();
-    let did = match surface.agent_did.as_deref() {
-        Some(did) if !did.is_empty() => did.to_string(),
-        _ => records
-            .iter()
-            .filter(|record| record.effective_origin() == Some(IdentityOrigin::Managed))
-            .filter(|record| {
-                surfaces_by_did
-                    .get(&record.did)
-                    .is_some_and(|ids| ids.contains(surface_id))
-            })
-            .max_by(|a, b| {
-                last_used_on(a, surface_id)
-                    .cmp(&last_used_on(b, surface_id))
-                    .then_with(|| b.did.cmp(&a.did))
-            })?
-            .did
-            .clone(),
+/// A2A wins over every other protocol, then AP2.
+fn primary_protocol(group: &AgentGroup<'_>) -> SurfaceProtocol {
+    let rank = |protocol: &SurfaceProtocol| match protocol {
+        SurfaceProtocol::A2a => 0,
+        SurfaceProtocol::Ap2 => 1,
+        SurfaceProtocol::DIDComm => 2,
+        SurfaceProtocol::Mcp => 3,
     };
-    Some(MatchedIdentity {
-        created_at: earliest_created_at(records, &did),
-        surface_count: did_surface_count(surfaces_by_did, &did, surface_id),
-        did,
-    })
-}
-
-pub fn build_agent_record(
-    surface: &AgentSurface,
-    identity: Option<&MatchedIdentity>,
-    stats: Option<&SurfaceStats>,
-) -> AgentRecord {
-    AgentRecord {
-        id: surface.surface_id.clone(),
-        registration: AgentRegistration::Unregistered,
-        name: canvas_target_name(surface.canvas.as_ref()),
-        surface_name: surface.name.clone(),
-        status: surface.status.clone(),
-        protocol: surface
-            .access_point
-            .protocol
-            .clone(),
-        runtime: AgentRuntime::from_endpoint(&surface.target.endpoint),
-        endpoint: surface
-            .target
-            .endpoint
-            .clone(),
-        tags: surface.tags.clone(),
-        trust_registry: AgentTrustRegistry::from_recorder(
+    group
+        .surfaces
+        .iter()
+        .map(|surface| {
             surface
                 .access_point
-                .trust_recorder
-                .as_ref(),
-        ),
-        agent_did: identity.map(|identity| identity.did.clone()),
-        did_surface_count: identity.map_or(0, |identity| identity.surface_count),
-        identity_created_at: identity.and_then(|identity| identity.created_at),
-        last_activity_at: stats.and_then(|stats| stats.last_activity),
+                .protocol
+                .clone()
+        })
+        .min_by_key(rank)
+        .unwrap_or_default()
+}
+
+/// Recorded when a (surface, DID) pair of the group is Recorded or Partly recorded and the
+/// DID is still one of the agent's identities. Without a store nothing is recorded.
+async fn is_recorded(
+    recorder: Option<&TrustRecorderStatusStore>,
+    group: &AgentGroup<'_>,
+    identities: &[AgentIdentity],
+) -> bool {
+    let Some(recorder) = recorder else {
+        return false;
+    };
+    for surface in &group.surfaces {
+        for identity in identities {
+            let state = recorder
+                .status_for(&surface.surface_id, &identity.did)
+                .await
+                .map(|status| status.state);
+            if matches!(state, Some(RecorderState::Recorded | RecorderState::Partial)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn surface_ref(surface: &AgentSurface) -> AgentSurfaceRef {
+    AgentSurfaceRef {
+        surface_id: surface.surface_id.clone(),
+        name: surface.name.clone(),
     }
 }
 
@@ -379,8 +522,61 @@ fn surface_summary(surface: &AgentSurface) -> AgentSurfaceSummary {
             .access_point
             .route
             .clone(),
-        status: surface.status.clone(),
     }
+}
+
+async fn agent_record<S>(
+    group: &AgentGroup<'_>,
+    data: &RegistryData<'_>,
+    recorder: Option<&TrustRecorderStatusStore>,
+    card_name: &CardName,
+    summarise: fn(&AgentSurface) -> S,
+) -> AgentRecord<S> {
+    let identities = data.identities(group);
+    let recorded = is_recorded(recorder, group, &identities).await;
+    let tags: BTreeSet<&String> = group
+        .surfaces
+        .iter()
+        .flat_map(|surface| &surface.tags)
+        .collect();
+    AgentRecord {
+        id: group.id.clone(),
+        registration: AgentRegistration::Unregistered,
+        name: display_name(&data.by_activity(group), card_name),
+        protocol: primary_protocol(group),
+        runtime: AgentRuntime::from_endpoint(&group.endpoint),
+        endpoint: group.endpoint.clone(),
+        tags: tags
+            .into_iter()
+            .cloned()
+            .collect(),
+        surfaces: group
+            .surfaces
+            .iter()
+            .map(|surface| summarise(surface))
+            .collect(),
+        identities,
+        trust_registry: AgentTrustRegistry { recorded },
+        last_activity_at: group
+            .surfaces
+            .iter()
+            .filter_map(|surface| data.last_activity(surface))
+            .max(),
+    }
+}
+
+/// By display name ignoring case, unnamed agents last, then by id.
+fn sort_agents<S>(agents: &mut [AgentRecord<S>]) {
+    agents.sort_by_cached_key(|agent| {
+        (
+            agent.name.is_none(),
+            agent
+                .name
+                .as_deref()
+                .map(str::to_lowercase),
+            agent.id.clone(),
+        )
+    });
 }
 
 fn traffic(
@@ -457,84 +653,91 @@ async fn stats_by_surface(state: &IdentityApiState) -> HashMap<String, SurfaceSt
         .collect()
 }
 
-/// List one agent record per non-deleted surface the caller can access.
+/// The Trust Recorder status store, or `None` with a warning when it failed to open.
+fn recorder_store() -> Option<Arc<TrustRecorderStatusStore>> {
+    let store = global_store();
+    if store.is_none() {
+        warn!("Trust Recorder status store unavailable; Agent Registry shows every agent as not recorded");
+    }
+    store
+}
+
+/// The cached Agent Card name of a surface's target; never waits for a fetch.
+fn cached_card_name(surface: &AgentSurface) -> Option<String> {
+    CardLocation::for_surface(surface)
+        .and_then(|location| TargetCardNameService::global().lookup_or_spawn(&surface.surface_id, &location))
+}
+
+/// List one agent record per managed agent behind the surfaces the caller can list.
 pub async fn list_agents(
     State(state): State<IdentityApiState>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
 ) -> Result<Json<AgentListResponse>, AgentApiError> {
     let live_surfaces = all_surfaces(&state).await?;
-    let surfaces: Vec<&AgentSurface> = live_surfaces
-        .iter()
-        .filter(|surface| is_listed(surface, tenant_context(&context), resource_scope(&scope)))
-        .collect();
-    if surfaces.is_empty() {
+    let groups = listed_groups(&live_surfaces, tenant_context(&context), resource_scope(&scope));
+    if groups.is_empty() {
         return Ok(Json(AgentListResponse { agents: Vec::new() }));
     }
 
     let records = identity_records(&state).await?;
     let by_did = surfaces_by_did(&records, &live_surfaces);
     let stats = stats_by_surface(&state).await;
+    let data = RegistryData {
+        identity_records: &records,
+        managed_surfaces_by_did: &by_did,
+        stats: &stats,
+    };
+    let recorder = recorder_store();
 
-    let mut agents: Vec<AgentRecord> = surfaces
-        .iter()
-        .map(|surface| {
-            let identity = match_identity(surface, &records, &by_did);
-            build_agent_record(surface, identity.as_ref(), stats.get(&surface.surface_id))
-        })
-        .collect();
-    agents.sort_by(|a, b| {
-        a.surface_name
-            .cmp(&b.surface_name)
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    let mut agents = Vec::with_capacity(groups.len());
+    for group in &groups {
+        agents.push(agent_record(group, &data, recorder.as_deref(), &cached_card_name, surface_ref).await);
+    }
+    sort_agents(&mut agents);
 
     debug!(count = agents.len(), "Listed agents");
     Ok(Json(AgentListResponse { agents }))
 }
 
-/// The surface behind agent `id`. 404 when it's missing, deleted or outside the
-/// caller's tenant or resource scope.
-async fn listed_surface(
-    state: &IdentityApiState,
-    id: &str,
-    context: &Option<Extension<PatTenantContext>>,
-    scope: &Option<Extension<PatResourceScope>>,
-) -> Result<AgentSurface, AgentApiError> {
-    surface_store(state)?
-        .get(id)
-        .await
-        .map_err(|e| AgentApiError::Internal(format!("failed to get surface: {e}")))?
-        .filter(|surface| is_listed(surface, tenant_context(context), resource_scope(scope)))
-        .ok_or(AgentApiError::NotFound)
-}
-
-/// One agent record plus its surfaces and traffic.
+/// One agent record with every surface and the traffic summed across them.
 pub async fn get_agent(
     Path(id): Path<String>,
     State(state): State<IdentityApiState>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
 ) -> Result<Json<AgentDetails>, AgentApiError> {
-    let surface = listed_surface(&state, &id, &context, &scope).await?;
+    let live_surfaces = all_surfaces(&state).await?;
+    let group = listed_group(&live_surfaces, &id, tenant_context(&context), resource_scope(&scope))?;
 
     let records = identity_records(&state).await?;
-    let by_did = surfaces_by_did(&records, &all_surfaces(&state).await?);
-    let identity = match_identity(&surface, &records, &by_did);
+    let by_did = surfaces_by_did(&records, &live_surfaces);
     let stats = stats_by_surface(&state).await;
-    let surface_stats = stats.get(&surface.surface_id);
+    let data = RegistryData {
+        identity_records: &records,
+        managed_surfaces_by_did: &by_did,
+        stats: &stats,
+    };
+    let agent = agent_record(&group, &data, recorder_store().as_deref(), &cached_card_name, surface_summary).await;
 
-    let surface_ids = [surface.surface_id.as_str()];
+    let surface_ids: Vec<&str> = group
+        .surfaces
+        .iter()
+        .map(|surface| surface.surface_id.as_str())
+        .collect();
+    let group_stats: Vec<&SurfaceStats> = surface_ids
+        .iter()
+        .filter_map(|id| stats.get(*id))
+        .collect();
     let p95_latency_ms = state
         .metrics_store
         .inbound_p95_latency_ms(&surface_ids)
         .await;
 
     Ok(Json(AgentDetails {
-        agent: build_agent_record(&surface, identity.as_ref(), surface_stats),
-        surfaces: vec![surface_summary(&surface)],
+        agent,
         traffic: traffic(
-            surface_stats.as_slice(),
+            &group_stats,
             state
                 .metrics_store
                 .retention_minutes(),
@@ -543,13 +746,25 @@ pub async fn get_agent(
     }))
 }
 
-/// Where the agent publishes its own card. The protocol is checked first, so
-/// `no_agent_card` wins when both reasons apply.
-fn agent_card_location(surface: &AgentSurface) -> Result<CardLocation, AgentCardUnavailable> {
-    if !matches!(surface.access_point.protocol, SurfaceProtocol::A2a | SurfaceProtocol::Ap2) {
-        return Err(AgentCardUnavailable::NoAgentCard);
+/// Where the agent publishes its own card, read through the first surface that can reach
+/// it. `no_agent_card` when no surface speaks A2A or AP2.
+fn agent_card_location(group: &AgentGroup<'_>) -> Result<CardLocation, AgentCardUnavailable> {
+    if let Some(location) = group
+        .surfaces
+        .iter()
+        .find_map(|surface| CardLocation::for_surface(surface))
+    {
+        return Ok(location);
     }
-    CardLocation::for_surface(surface).ok_or(AgentCardUnavailable::UnsupportedRuntime)
+    let has_card = group
+        .surfaces
+        .iter()
+        .any(|surface| matches!(surface.access_point.protocol, SurfaceProtocol::A2a | SurfaceProtocol::Ap2));
+    Err(if has_card {
+        AgentCardUnavailable::UnsupportedRuntime
+    } else {
+        AgentCardUnavailable::NoAgentCard
+    })
 }
 
 /// Reads the card from the surface's target endpoint through the egress policy,
@@ -580,8 +795,8 @@ struct CachedCard {
     fetched_at: Instant,
 }
 
-/// Fetch results per surface. A card is reused until `ttl` passes and a failure
-/// until `failure_ttl` passes, or until the surface's card location changes.
+/// Fetch results per agent. A card is reused until `ttl` passes and a failure
+/// until `failure_ttl` passes, or until the agent's card location changes.
 /// Caching failures stops repeated views of an unreachable agent from each
 /// waiting for the fetch timeout.
 pub struct AgentCardCache {
@@ -614,10 +829,10 @@ impl AgentCardCache {
 
     pub async fn get(
         &self,
-        surface_id: &str,
+        agent_id: &str,
         location: &CardLocation,
     ) -> Option<Value> {
-        if let Some(cached) = self.entries.get(surface_id)
+        if let Some(cached) = self.entries.get(agent_id)
             && cached.location == *location
         {
             let ttl = if cached.card.is_some() {
@@ -634,7 +849,7 @@ impl AgentCardCache {
             .fetch_agent_card(location)
             .await;
         self.entries.insert(
-            surface_id.to_string(),
+            agent_id.to_string(),
             CachedCard {
                 location: location.clone(),
                 card: card.clone(),
@@ -646,20 +861,20 @@ impl AgentCardCache {
 }
 
 async fn agent_card_response(
-    surface: &AgentSurface,
+    group: &AgentGroup<'_>,
     cache: &AgentCardCache,
 ) -> Result<AgentCardResponse, AgentApiError> {
-    let location = match agent_card_location(surface) {
+    let location = match agent_card_location(group) {
         Ok(location) => location,
         Err(reason) => return Ok(AgentCardResponse::unavailable(reason)),
     };
     match cache
-        .get(&surface.surface_id, &location)
+        .get(&group.id, &location)
         .await
     {
         Some(card) => Ok(AgentCardResponse::available(card)),
         None => {
-            warn!(surface_id = %surface.surface_id, "Agent Card fetch failed");
+            warn!(agent_id = %group.id, "Agent Card fetch failed");
             Err(AgentApiError::BadGateway)
         }
     }
@@ -673,8 +888,9 @@ pub async fn get_agent_card(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
 ) -> Result<Json<AgentCardResponse>, AgentApiError> {
-    let surface = listed_surface(&state, &id, &context, &scope).await?;
-    agent_card_response(&surface, AgentCardCache::global())
+    let live_surfaces = all_surfaces(&state).await?;
+    let group = listed_group(&live_surfaces, &id, tenant_context(&context), resource_scope(&scope))?;
+    agent_card_response(&group, AgentCardCache::global())
         .await
         .map(Json)
 }
@@ -682,9 +898,9 @@ pub async fn get_agent_card(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::types::{CustomResource, EntityTarget, TrustRecorderEntry};
-    use crate::identity::filesystem::ChannelUsage;
+    use crate::identity::filesystem::IdentityOrigin;
     use crate::identity::test_helpers::test_surface_identity_record;
+    use crate::trust_registry_verification::recorder_status::{EntryStatus, RecorderReason};
     use chrono::Duration;
     use regex::Regex;
     use std::sync::Arc;
@@ -701,6 +917,15 @@ mod tests {
         surface
     }
 
+    fn targeting(
+        id: &str,
+        endpoint: &str,
+    ) -> AgentSurface {
+        let mut surface = surface(id);
+        surface.target.endpoint = endpoint.to_string();
+        surface
+    }
+
     fn with_target_node(
         mut surface: AgentSurface,
         node: serde_json::Value,
@@ -714,14 +939,19 @@ mod tests {
         surface
     }
 
+    fn with_canvas_name(
+        surface: AgentSurface,
+        name: &str,
+    ) -> AgentSurface {
+        with_target_node(surface, serde_json::json!({ "type": "target", "config": { "name": name } }))
+    }
+
     fn managed(
         did: &str,
         surface_id: &str,
-        last_used_at: DateTime<Utc>,
     ) -> AgentIdentityRecord {
         let mut record = test_surface_identity_record(did, surface_id);
         record.origin = Some(IdentityOrigin::Managed);
-        record.channel_usage[0].last_used_at = last_used_at;
         record
     }
 
@@ -729,30 +959,6 @@ mod tests {
         let mut live = surface("live");
         live.target.endpoint = "a2a-proxy://p1".to_string();
         managed_surfaces_by_did(records, |_| Some(&live))
-    }
-
-    fn recorder(resources: &[&[&str]]) -> TrustRecorderConfig {
-        TrustRecorderConfig {
-            entries: resources
-                .iter()
-                .map(|record_types| TrustRecorderEntry {
-                    trust_registry_id: "tr".to_string(),
-                    issuer_did: "did:web:issuer".to_string(),
-                    authority_did: "did:web:authority".to_string(),
-                    include_owned_agent: true,
-                    authority_source: None,
-                    custom_resources: record_types
-                        .iter()
-                        .map(|record_type| CustomResource {
-                            action: "is".to_string(),
-                            resource: "ownedAgent".to_string(),
-                            entity_target: EntityTarget::Agent,
-                            record_type: record_type.to_string(),
-                        })
-                        .collect(),
-                })
-                .collect(),
-        }
     }
 
     fn stats(
@@ -772,6 +978,13 @@ mod tests {
         }
     }
 
+    fn active_at(entries: &[(&str, DateTime<Utc>)]) -> HashMap<String, SurfaceStats> {
+        entries
+            .iter()
+            .map(|(id, at)| (id.to_string(), stats(id, 1, 0, 0, Some(*at))))
+            .collect()
+    }
+
     fn tenant(id: &str) -> PatTenantContext {
         PatTenantContext {
             token_id: "token".to_string(),
@@ -779,203 +992,481 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_build_agent_record_finds_target_node_by_type() {
-        let surface = with_target_node(
-            surface("s1"),
-            serde_json::json!({ "id": "target", "type": "target", "label": "TimeAsker", "config": { "name": "TimeAsker" } }),
-        );
-        let record = build_agent_record(&surface, None, None);
-        assert_eq!(record.name.as_deref(), Some("TimeAsker"));
-        assert_eq!(record.id, "s1");
-        assert_eq!(record.surface_name, "s1-name");
-        assert_eq!(record.registration, AgentRegistration::Unregistered);
-        assert_eq!(record.tags, vec!["team:platform".to_string()]);
+    fn no_card(_: &AgentSurface) -> Option<String> {
+        None
+    }
+
+    /// Builds every record from `surfaces` with no recorder store.
+    struct Fixture {
+        records: Vec<AgentIdentityRecord>,
+        stats: HashMap<String, SurfaceStats>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self {
+                records: Vec::new(),
+                stats: HashMap::new(),
+            }
+        }
+
+        async fn agents(
+            &self,
+            surfaces: &[AgentSurface],
+            recorder: Option<&TrustRecorderStatusStore>,
+            card_name: &CardName,
+        ) -> Vec<AgentRecord<AgentSurfaceRef>> {
+            let by_did = managed_by_did(&self.records);
+            let data = RegistryData {
+                identity_records: &self.records,
+                managed_surfaces_by_did: &by_did,
+                stats: &self.stats,
+            };
+            let mut agents = Vec::new();
+            for group in &group_surfaces(surfaces) {
+                agents.push(agent_record(group, &data, recorder, card_name, surface_ref).await);
+            }
+            sort_agents(&mut agents);
+            agents
+        }
+
+        async fn only(
+            &self,
+            surfaces: &[AgentSurface],
+            recorder: Option<&TrustRecorderStatusStore>,
+        ) -> AgentRecord<AgentSurfaceRef> {
+            let mut agents = self
+                .agents(surfaces, recorder, &no_card)
+                .await;
+            assert_eq!(agents.len(), 1, "one record expected");
+            agents.remove(0)
+        }
+    }
+
+    fn surface_names(agent: &AgentRecord<AgentSurfaceRef>) -> Vec<&str> {
+        agent
+            .surfaces
+            .iter()
+            .map(|surface| surface.name.as_str())
+            .collect()
+    }
+
+    fn dids(agent: &AgentRecord<AgentSurfaceRef>) -> Vec<&str> {
+        agent
+            .identities
+            .iter()
+            .map(|identity| identity.did.as_str())
+            .collect()
     }
 
     #[test]
-    fn test_build_agent_record_without_target_name_is_unnamed() {
-        let missing_name = with_target_node(
-            surface("s1"),
-            serde_json::json!({ "id": "target", "type": "target", "label": "Managed Agent", "config": { "endpoint": "a2a-proxy://p1" } }),
-        );
-        let no_target = with_target_node(
-            surface("s1"),
-            serde_json::json!({ "id": "npc", "type": "npc", "config": { "name": "Caller" } }),
-        );
-        let blank =
-            with_target_node(surface("s1"), serde_json::json!({ "type": "target", "config": { "name": "   " } }));
-        for surface in [missing_name, no_target, blank, surface("s1")] {
-            assert_eq!(build_agent_record(&surface, None, None).name, None);
+    fn test_normalise_endpoint_strips_credentials_query_case_and_trailing_slash() {
+        for (raw, expected) in [
+            ("https://user:secret@Bravo.example/a2a/?k=1", "https://bravo.example/a2a"),
+            ("https://bravo.example/a2a", "https://bravo.example/a2a"),
+            ("HTTPS://BRAVO.example:8443/A2A#frag", "https://bravo.example:8443/A2A"),
+            ("https://u:p?ss#w@bravo.example/a2a", "https://bravo.example/a2a"),
+            ("https://bravo.example/", "https://bravo.example"),
+            ("  http://localhost:9002//  ", "http://localhost:9002"),
+            ("A2A-Proxy://Proxy-1/?x=1", "a2a-proxy://proxy-1"),
+            ("fabric://key@Gateway-1/channel-1/", "fabric://gateway-1/channel-1"),
+        ] {
+            assert_eq!(normalise_endpoint(raw), expected, "{raw}");
         }
     }
 
     #[test]
-    fn test_build_agent_record_runtime_follows_endpoint_scheme() {
+    fn test_agent_id_is_hex_sha256_of_endpoint_and_card_path() {
+        let id = agent_id("https://bravo.example/a2a", "");
+        assert_eq!(id.len(), 64);
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_hexdigit())
+        );
+        assert_eq!(id, agent_id("https://bravo.example/a2a", ""));
+        assert_ne!(id, agent_id("https://bravo.example/a2a", "/card.json"));
+        assert_ne!(id, agent_id("https://bravo.example/b2b", ""));
+    }
+
+    #[tokio::test]
+    async fn test_surfaces_targeting_the_same_agent_are_listed_once() {
+        let surfaces = [
+            targeting("s-oxygen", "https://user:secret@Bravo.example/a2a/?k=1"),
+            targeting("s-helium", "https://bravo.example/a2a"),
+        ];
+        let agent = Fixture::new()
+            .only(&surfaces, None)
+            .await;
+        assert_eq!(agent.endpoint, "https://bravo.example/a2a");
+        assert_eq!(surface_names(&agent), vec!["s-helium-name", "s-oxygen-name"]);
+        assert_eq!(agent.id, agent_id("https://bravo.example/a2a", ""));
+        let text = serde_json::to_string(&agent).expect("serialize");
+        for forbidden in ["secret", "k=1", "user:"] {
+            assert!(!text.contains(forbidden), "response contains {forbidden}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_different_agent_card_paths_are_different_agents() {
+        let mut oxygen = targeting("s-oxygen", "https://bravo.example/a2a");
+        oxygen
+            .access_point
+            .agent_card_path = Some("/cards/one.json".to_string());
+        let mut helium = targeting("s-helium", "https://bravo.example/a2a");
+        helium
+            .access_point
+            .agent_card_path = Some("/cards/two.json".to_string());
+        let mut default_path = targeting("s-neon", "https://bravo.example/a2a");
+        default_path
+            .access_point
+            .agent_card_path = Some("  ".to_string());
+        let agents = Fixture::new()
+            .agents(&[oxygen, helium, default_path, targeting("s-argon", "https://bravo.example/a2a")], None, &no_card)
+            .await;
+        assert_eq!(agents.len(), 3);
+        let mut grouped: Vec<Vec<&str>> = agents
+            .iter()
+            .map(surface_names)
+            .collect();
+        grouped.sort();
+        assert_eq!(grouped, vec![vec!["s-argon-name", "s-neon-name"], vec!["s-helium-name"], vec!["s-oxygen-name"]]);
+    }
+
+    #[test]
+    fn test_listed_groups_never_group_across_other_tenants() {
+        let mut own = targeting("s-oxygen", "https://bravo.example/a2a");
+        own.tenant_id = Some("tenant-a".to_string());
+        let mut other = targeting("s-helium", "https://bravo.example/a2a");
+        other.tenant_id = Some("tenant-b".to_string());
+        let live = [own, other];
+        let context = tenant("tenant-a");
+        let groups = listed_groups(&live, Some(&context), None);
+        assert_eq!(groups.len(), 1);
+        let ids: Vec<&str> = groups[0]
+            .surfaces
+            .iter()
+            .map(|surface| surface.surface_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["s-oxygen"]);
+    }
+
+    #[tokio::test]
+    async fn test_a_tenant_sees_only_identities_of_its_own_surfaces() {
+        let mut own = targeting("s-oxygen", "https://bravo.example/a2a");
+        own.tenant_id = Some("tenant-a".to_string());
+        let mut other = targeting("s-helium", "https://bravo.example/a2a");
+        other.tenant_id = Some("tenant-b".to_string());
+        other.agent_did = Some("did:web:other-surface".to_string());
+        let live = [own, other];
+        let mut fixture = Fixture::new();
+        fixture.records = vec![managed("did:a", "s-oxygen"), managed("did:b", "s-helium")];
+        let by_did = managed_by_did(&fixture.records);
+        let data = RegistryData {
+            identity_records: &fixture.records,
+            managed_surfaces_by_did: &by_did,
+            stats: &fixture.stats,
+        };
+        let context = tenant("tenant-a");
+        let groups = listed_groups(&live, Some(&context), None);
+        let agent = agent_record(&groups[0], &data, None, &no_card, surface_ref).await;
+        assert_eq!(dids(&agent), vec!["did:a"]);
+        assert_eq!(surface_names(&agent), vec!["s-oxygen-name"]);
+    }
+
+    #[test]
+    fn test_another_tenants_agent_id_is_not_found() {
+        let mut own = targeting("s-oxygen", "https://alpha.example/a2a");
+        own.tenant_id = Some("tenant-a".to_string());
+        let mut other = targeting("s-helium", "https://bravo.example/a2a");
+        other.tenant_id = Some("tenant-b".to_string());
+        let live = [own, other];
+        let bravo = agent_id("https://bravo.example/a2a", "");
+        let context = tenant("tenant-a");
+        assert!(matches!(listed_group(&live, &bravo, Some(&context), None), Err(AgentApiError::NotFound)));
+        assert!(matches!(listed_group(&live, "s-helium", Some(&context), None), Err(AgentApiError::NotFound)));
+        assert_eq!(
+            listed_group(&live, &bravo, Some(&tenant("tenant-b")), None)
+                .expect("own agent")
+                .id,
+            bravo
+        );
+    }
+
+    #[test]
+    fn test_out_of_scope_agent_id_is_not_found() {
+        let scope = PatResourceScope(Arc::new(Regex::new("^TENANT:tenant-a:surfaces:allowed$").expect("regex")));
+        let context = tenant("tenant-a");
+        let mut allowed = targeting("allowed", "https://alpha.example/a2a");
+        allowed.tenant_id = Some("tenant-a".to_string());
+        let mut denied = targeting("denied", "https://bravo.example/a2a");
+        denied.tenant_id = Some("tenant-a".to_string());
+        let live = [allowed, denied];
+        let bravo = agent_id("https://bravo.example/a2a", "");
+        assert!(matches!(listed_group(&live, &bravo, Some(&context), Some(&scope)), Err(AgentApiError::NotFound)));
+        assert!(listed_group(&live, &agent_id("https://alpha.example/a2a", ""), Some(&context), Some(&scope)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_display_name_prefers_the_agent_card() {
+        let now = Utc::now();
+        let mut fixture = Fixture::new();
+        fixture.stats = active_at(&[("s-helium", now)]);
+        let surfaces =
+            [with_canvas_name(surface("s-oxygen"), "billing"), with_canvas_name(surface("s-helium"), "bill-v2")];
+        let card = |surface: &AgentSurface| (surface.surface_id == "s-oxygen").then(|| "Billing Bot".to_string());
+        let agents = fixture
+            .agents(&surfaces, None, &card)
+            .await;
+        assert_eq!(agents[0].name.as_deref(), Some("Billing Bot"));
+    }
+
+    #[tokio::test]
+    async fn test_display_name_falls_back_to_most_recently_active_canvas_name() {
+        let now = Utc::now();
+        let mut fixture = Fixture::new();
+        fixture.stats = active_at(&[("s-oxygen", now - Duration::hours(1)), ("s-helium", now - Duration::minutes(5))]);
+        let surfaces =
+            [with_canvas_name(surface("s-oxygen"), "billing"), with_canvas_name(surface("s-helium"), "bill-v2")];
+        let agent = fixture
+            .only(&surfaces, None)
+            .await;
+        assert_eq!(agent.name.as_deref(), Some("bill-v2"));
+    }
+
+    #[tokio::test]
+    async fn test_display_name_ties_and_no_activity_use_surface_name_order() {
+        let mut beta = with_canvas_name(surface("s1"), "from-beta");
+        beta.name = "beta".to_string();
+        let mut alpha = with_canvas_name(surface("s2"), "from-alpha");
+        alpha.name = "alpha".to_string();
+        let mut unnamed = surface("s3");
+        unnamed.name = "aaa".to_string();
+        let agent = Fixture::new()
+            .only(&[beta, alpha, unnamed], None)
+            .await;
+        assert_eq!(agent.name.as_deref(), Some("from-alpha"), "skips a surface without a canvas name");
+    }
+
+    #[tokio::test]
+    async fn test_display_name_is_none_without_card_or_canvas_name() {
+        let missing_name = with_target_node(
+            surface("s1"),
+            serde_json::json!({ "type": "target", "config": { "endpoint": "a2a-proxy://p1" } }),
+        );
+        let no_target =
+            with_target_node(surface("s2"), serde_json::json!({ "type": "npc", "config": { "name": "Caller" } }));
+        let blank = with_canvas_name(surface("s3"), "   ");
+        let agent = Fixture::new()
+            .only(&[missing_name, no_target, blank, surface("s4")], None)
+            .await;
+        assert_eq!(agent.name, None);
+    }
+
+    #[tokio::test]
+    async fn test_last_activity_is_the_latest_across_surfaces() {
+        let now = Utc::now();
+        let mut fixture = Fixture::new();
+        fixture.stats = active_at(&[("s-oxygen", now - Duration::hours(1)), ("s-helium", now - Duration::minutes(5))]);
+        let agent = fixture
+            .only(&[surface("s-oxygen"), surface("s-helium"), surface("s-idle")], None)
+            .await;
+        assert_eq!(agent.last_activity_at, Some(now - Duration::minutes(5)));
+        assert_eq!(
+            Fixture::new()
+                .only(&[surface("s1")], None)
+                .await
+                .last_activity_at,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_identities_are_the_union_across_surfaces_once_per_did() {
+        let mut fixture = Fixture::new();
+        let did_b = managed("did:b", "s-oxygen");
+        let created_b = did_b.created_at;
+        let mut caller = test_surface_identity_record("did:caller", "s-oxygen");
+        caller.origin = Some(IdentityOrigin::ExternalCaller);
+        fixture.records = vec![
+            managed("did:a", "s-oxygen"),
+            did_b,
+            managed("did:b", "s-helium"),
+            managed("did:c", "s-helium"),
+            caller,
+        ];
+        let mut helium = surface("s-helium");
+        helium.agent_did = Some("did:c".to_string());
+        let agent = fixture
+            .only(&[surface("s-oxygen"), helium], None)
+            .await;
+        assert_eq!(dids(&agent), vec!["did:a", "did:b", "did:c"]);
+        let did_c = &agent.identities[2];
+        assert_eq!(did_c.source, IdentitySource::Surface, "a surface's own DID is reported as surface");
+        assert_eq!(agent.identities[1].source, IdentitySource::Managed);
+        assert!(agent.identities[1].created_at <= Some(created_b));
+    }
+
+    #[tokio::test]
+    async fn test_tags_are_a_sorted_union() {
+        let mut a = surface("s1");
+        a.tags = vec!["prod".to_string(), "billing".to_string()];
+        let mut b = surface("s2");
+        b.tags = vec!["billing".to_string(), "eu".to_string()];
+        let agent = Fixture::new()
+            .only(&[a, b], None)
+            .await;
+        assert_eq!(agent.tags, vec!["billing", "eu", "prod"]);
+    }
+
+    #[tokio::test]
+    async fn test_protocol_is_primary_and_runtime_follows_endpoint() {
+        let mut ap2 = surface("s1");
+        ap2.access_point.protocol = SurfaceProtocol::Ap2;
+        let agent = Fixture::new()
+            .only(&[ap2.clone(), surface("s2")], None)
+            .await;
+        assert_eq!(agent.protocol, SurfaceProtocol::A2a);
+        assert_eq!(
+            Fixture::new()
+                .only(&[ap2], None)
+                .await
+                .protocol,
+            SurfaceProtocol::Ap2
+        );
         for (endpoint, runtime) in [
             ("https://agent.example.com", AgentRuntime::Url),
-            ("http://localhost:9002", AgentRuntime::Url),
             ("a2a-proxy://proxy-1", AgentRuntime::A2aProxy),
             ("fabric://gateway-1/channel-1", AgentRuntime::Gateway),
         ] {
-            let mut surface = surface("s1");
-            surface.target.endpoint = endpoint.to_string();
-            surface.access_point.protocol = SurfaceProtocol::Mcp;
-            let record = build_agent_record(&surface, None, None);
-            assert_eq!(record.runtime, runtime, "{endpoint}");
-            assert_eq!(record.endpoint, endpoint);
-            assert_eq!(record.protocol, SurfaceProtocol::Mcp);
+            let agent = Fixture::new()
+                .only(&[targeting("s1", endpoint)], None)
+                .await;
+            assert_eq!(agent.runtime, runtime, "{endpoint}");
         }
     }
 
-    #[test]
-    fn test_trust_registry_rules_cover_all_entries() {
-        let cases: [(Option<TrustRecorderConfig>, AgentTrustRegistry); 6] = [
-            (None, AgentTrustRegistry::default()),
-            (
-                Some(recorder(&[&[]])),
-                AgentTrustRegistry {
-                    recognized: true,
-                    authorized: false,
-                },
-            ),
-            (
-                Some(recorder(&[&["recognition"]])),
-                AgentTrustRegistry {
-                    recognized: true,
-                    authorized: false,
-                },
-            ),
-            (
-                Some(recorder(&[&["authorization"]])),
-                AgentTrustRegistry {
-                    recognized: false,
-                    authorized: true,
-                },
-            ),
-            (
-                Some(recorder(&[&["recognition", "authorization"]])),
-                AgentTrustRegistry {
-                    recognized: true,
-                    authorized: true,
-                },
-            ),
-            (
-                Some(recorder(&[&["authorization"], &["recognition"]])),
-                AgentTrustRegistry {
-                    recognized: true,
-                    authorized: true,
-                },
-            ),
-        ];
-        for (config, expected) in cases {
-            let mut surface = surface("s1");
-            surface
-                .access_point
-                .trust_recorder = config;
-            assert_eq!(build_agent_record(&surface, None, None).trust_registry, expected);
-        }
-    }
-
-    #[test]
-    fn test_match_identity_prefers_surface_agent_did() {
-        let mut surface = surface("s1");
-        surface.agent_did = Some("did:web:own".to_string());
-        let records = vec![managed("did:web:managed", "s1", Utc::now())];
-        let matched = match_identity(&surface, &records, &managed_by_did(&records));
-        assert_eq!(
-            matched,
-            Some(MatchedIdentity {
-                did: "did:web:own".to_string(),
-                created_at: None,
-                surface_count: 1,
-            })
-        );
-    }
-
-    #[test]
-    fn test_match_identity_ignores_records_without_managed_origin() {
-        let mut legacy = test_surface_identity_record("did:web:legacy", "s1");
-        legacy.origin = None;
-        legacy.is_local = true;
-        let mut caller = test_surface_identity_record("did:web:caller", "s1");
-        caller.origin = Some(IdentityOrigin::ExternalCaller);
-        let records = vec![legacy, caller];
-        assert_eq!(match_identity(&surface("s1"), &records, &managed_by_did(&records)), None);
-    }
-
-    #[test]
-    fn test_match_identity_matches_surface_found_only_in_channel_usage() {
-        let mut record = managed("did:web:a", "s2", Utc::now());
-        record
-            .channel_usage
-            .push(ChannelUsage {
-                channel_config_id: "s1".to_string(),
-                usage_count: 1,
-                last_used_at: Utc::now(),
-                role: Some(IdentityOrigin::Managed),
-            });
-        let created_at = record.created_at;
-        let records = vec![record];
-        let matched = match_identity(&surface("s1"), &records, &managed_by_did(&records));
-        assert_eq!(
-            matched,
-            Some(MatchedIdentity {
-                did: "did:web:a".to_string(),
-                created_at: Some(created_at),
-                surface_count: 2,
-            })
-        );
-    }
-
-    #[test]
-    fn test_match_identity_shows_shared_did_on_both_surfaces() {
-        let mut record = managed("did:web:shared", "s1", Utc::now());
-        record
-            .channel_usage
-            .push(ChannelUsage {
-                channel_config_id: "s2".to_string(),
-                usage_count: 1,
-                last_used_at: Utc::now(),
-                role: Some(IdentityOrigin::Managed),
-            });
-        let records = vec![record];
-        let by_did = managed_by_did(&records);
-        for id in ["s1", "s2"] {
-            let matched = match_identity(&surface(id), &records, &by_did).expect("matched");
-            assert_eq!(matched.did, "did:web:shared");
-            assert_eq!(matched.surface_count, 2);
-        }
-    }
-
-    #[test]
-    fn test_match_identity_takes_latest_use_on_this_surface() {
+    async fn record_outcome(
+        store: &TrustRecorderStatusStore,
+        surface_id: &str,
+        did: &str,
+        entry: EntryStatus,
+    ) {
         let now = Utc::now();
-        let older = managed("did:web:older", "s1", now - Duration::minutes(10));
-        let mut newer = managed("did:web:newer", "s1", now);
-        newer.identity_hash = "newer".to_string();
-        let records = vec![older, newer];
-        let matched = match_identity(&surface("s1"), &records, &managed_by_did(&records)).expect("matched");
-        assert_eq!(matched.did, "did:web:newer");
+        store
+            .record(surface_id, did, vec![entry], now, now)
+            .await
+            .expect("record");
     }
 
-    #[test]
-    fn test_match_identity_without_match_is_none() {
-        let records = vec![managed("did:web:a", "other", Utc::now())];
-        let matched = match_identity(&surface("s1"), &records, &managed_by_did(&records));
-        assert_eq!(matched, None);
-        let record = build_agent_record(&surface("s1"), matched.as_ref(), None);
-        assert_eq!(record.agent_did, None);
-        assert_eq!(record.did_surface_count, 0);
-        assert_eq!(record.identity_created_at, None);
+    fn recorder_fixture() -> Fixture {
+        let mut fixture = Fixture::new();
+        fixture.records = vec![managed("did:a", "s-oxygen"), managed("did:b", "s-helium")];
+        fixture
     }
 
-    #[test]
-    fn test_build_agent_record_last_activity_from_stats() {
-        let at = Utc::now();
-        let with = build_agent_record(&surface("s1"), None, Some(&stats("s1", 3, 1, 0, Some(at))));
-        assert_eq!(with.last_activity_at, Some(at));
-        assert_eq!(build_agent_record(&surface("s1"), None, None).last_activity_at, None);
+    #[tokio::test]
+    async fn test_trust_registry_is_recorded_when_any_identity_is_partly_recorded() {
+        let store = TrustRecorderStatusStore::in_memory();
+        record_outcome(&store, "s-oxygen", "did:a", EntryStatus::from_counts("tr", 0, 0, 1, None)).await;
+        record_outcome(
+            &store,
+            "s-helium",
+            "did:b",
+            EntryStatus::from_counts("tr", 1, 0, 1, Some(RecorderReason::Rejected)),
+        )
+        .await;
+        let agent = recorder_fixture()
+            .only(&[surface("s-oxygen"), surface("s-helium")], Some(&store))
+            .await;
+        assert!(agent.trust_registry.recorded);
+    }
+
+    #[tokio::test]
+    async fn test_trust_registry_is_recorded_when_an_identity_is_recorded() {
+        let store = TrustRecorderStatusStore::in_memory();
+        record_outcome(&store, "s-helium", "did:b", EntryStatus::from_counts("tr", 1, 0, 0, None)).await;
+        let agent = recorder_fixture()
+            .only(&[surface("s-oxygen"), surface("s-helium")], Some(&store))
+            .await;
+        assert!(agent.trust_registry.recorded);
+    }
+
+    #[tokio::test]
+    async fn test_trust_registry_is_not_recorded_when_every_outcome_failed() {
+        let store = TrustRecorderStatusStore::in_memory();
+        record_outcome(&store, "s-oxygen", "did:a", EntryStatus::from_counts("tr", 0, 0, 1, None)).await;
+        record_outcome(&store, "s-helium", "did:b", EntryStatus::skipped("tr", RecorderReason::NoSurfaceIssuer)).await;
+        let agent = recorder_fixture()
+            .only(&[surface("s-oxygen"), surface("s-helium")], Some(&store))
+            .await;
+        assert!(!agent.trust_registry.recorded);
+    }
+
+    #[tokio::test]
+    async fn test_stale_recorder_status_is_ignored() {
+        let store = TrustRecorderStatusStore::in_memory();
+        record_outcome(&store, "s-oxygen", "did:old", EntryStatus::from_counts("tr", 1, 0, 0, None)).await;
+        record_outcome(&store, "s-other", "did:a", EntryStatus::from_counts("tr", 1, 0, 0, None)).await;
+        let agent = recorder_fixture()
+            .only(&[surface("s-oxygen"), surface("s-helium")], Some(&store))
+            .await;
+        assert!(!agent.trust_registry.recorded);
+    }
+
+    #[tokio::test]
+    async fn test_unavailable_recorder_store_is_not_recorded() {
+        let agent = recorder_fixture()
+            .only(&[surface("s-oxygen"), surface("s-helium")], None)
+            .await;
+        assert_eq!(agent.trust_registry, AgentTrustRegistry { recorded: false });
+    }
+
+    #[tokio::test]
+    async fn test_agents_sort_by_display_name_ignoring_case_then_id() {
+        let surfaces = [
+            with_canvas_name(targeting("s1", "https://one.example"), "bravo"),
+            with_canvas_name(targeting("s2", "https://two.example"), "Alpha"),
+            targeting("s3", "https://three.example"),
+            with_canvas_name(targeting("s4", "https://four.example"), "alpha"),
+        ];
+        let agents = Fixture::new()
+            .agents(&surfaces, None, &no_card)
+            .await;
+        let names: Vec<Option<&str>> = agents
+            .iter()
+            .map(|agent| agent.name.as_deref())
+            .collect();
+        assert_eq!(&names[2..], &[Some("bravo"), None]);
+        let (first, second) = (&agents[0], &agents[1]);
+        assert!(first.id < second.id, "equal names fall back to id");
+        assert_eq!(
+            [first.name.as_deref(), second.name.as_deref()]
+                .into_iter()
+                .map(|name| name.map(str::to_lowercase))
+                .collect::<Vec<_>>(),
+            vec![Some("alpha".to_string()), Some("alpha".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_agent_with_only_disabled_surfaces_is_listed() {
+        let mut disabled = surface("s1");
+        disabled.status = SurfaceStatus::Disabled;
+        let live = [disabled];
+        let groups = listed_groups(&live, None, None);
+        assert_eq!(groups.len(), 1);
+        let json = serde_json::to_value(
+            Fixture::new()
+                .only(&live, None)
+                .await,
+        )
+        .expect("serialize");
+        assert!(json.get("status").is_none());
+        assert!(
+            json["surfaces"][0]
+                .get("status")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1042,36 +1533,66 @@ mod tests {
         assert_eq!(traffic(&[], 360, None).total_requests, 0);
     }
 
-    #[test]
-    fn test_agent_details_serialize_without_raw_surface_fields() {
-        let mut source =
-            with_target_node(surface("s1"), serde_json::json!({ "type": "target", "config": { "name": "TimeAsker" } }));
-        source
-            .access_point
-            .trust_recorder = Some(recorder(&[&["authorization"]]));
-        let mut identity = managed("did:web:a", "s1", Utc::now());
+    #[tokio::test]
+    async fn test_agent_details_serialize_without_raw_or_removed_fields() {
+        let mut source = with_canvas_name(targeting("s1", "https://user:pw@agent.example/a2a?token=abc"), "TimeAsker");
+        let mut ap2 = targeting("s2", "https://agent.example/a2a");
+        ap2.access_point.protocol = SurfaceProtocol::Ap2;
+        source.agent_did = Some("did:web:a".to_string());
+        let mut identity = managed("did:web:a", "s1");
         identity.private_key = Some(serde_json::json!({ "d": "secret-key-material" }));
         let records = vec![identity];
-        let matched = match_identity(&source, &records, &managed_by_did(&records));
+        let by_did = managed_by_did(&records);
+        let stats = HashMap::new();
+        let data = RegistryData {
+            identity_records: &records,
+            managed_surfaces_by_did: &by_did,
+            stats: &stats,
+        };
+        let live = [source, ap2];
+        let group = &group_surfaces(&live)[0];
         let details = AgentDetails {
-            agent: build_agent_record(&source, matched.as_ref(), None),
-            surfaces: vec![surface_summary(&source)],
+            agent: agent_record(group, &data, None, &no_card, surface_summary).await,
             traffic: traffic(&[], 360, None),
         };
 
         let json = serde_json::to_value(&details).expect("serialize");
         let text = json.to_string();
-        for forbidden in ["private_key", "secret-key-material", "canvas", "trust_recorder", "authority_did"] {
+        for forbidden in [
+            "private_key",
+            "secret-key-material",
+            "canvas",
+            "trust_recorder",
+            "user:pw",
+            "token=abc",
+            "surface_name",
+            "agent_did",
+            "did_surface_count",
+            "identity_created_at",
+            "recognized",
+            "authorized",
+            "\"status\"",
+        ] {
             assert!(!text.contains(forbidden), "response contains {forbidden}: {text}");
         }
-        assert_eq!(json["id"], "s1");
+        assert_eq!(json["id"], group.id);
+        assert_eq!(json["name"], "TimeAsker");
         assert_eq!(json["registration"], "unregistered");
         assert_eq!(json["runtime"], "url");
         assert_eq!(json["protocol"], "a2a");
-        assert_eq!(json["status"], "active");
-        assert_eq!(json["agent_did"], "did:web:a");
-        assert_eq!(json["trust_registry"], serde_json::json!({ "recognized": false, "authorized": true }));
-        assert_eq!(json["surfaces"][0]["route"], "/s1");
+        assert_eq!(json["endpoint"], "https://agent.example/a2a");
+        assert_eq!(json["trust_registry"], serde_json::json!({ "recorded": false }));
+        assert_eq!(
+            json["identities"],
+            serde_json::json!([{ "did": "did:web:a", "created_at": records[0].created_at, "source": "surface" }])
+        );
+        assert_eq!(
+            json["surfaces"],
+            serde_json::json!([
+                { "surface_id": "s1", "name": "s1-name", "protocol": "a2a", "route": "/s1" },
+                { "surface_id": "s2", "name": "s2-name", "protocol": "ap2", "route": "/s2" },
+            ])
+        );
         assert_eq!(json["traffic"]["p95_latency_ms"], serde_json::Value::Null);
         assert_eq!(json["last_activity_at"], serde_json::Value::Null);
     }
@@ -1145,11 +1666,15 @@ mod tests {
         }
     }
 
+    fn location_of(surfaces: &[AgentSurface]) -> Result<CardLocation, AgentCardUnavailable> {
+        agent_card_location(&group_surfaces(surfaces)[0])
+    }
+
     #[test]
     fn test_agent_card_location_checks_protocol_before_runtime() {
         for (protocol, endpoint, expected) in [
-            (SurfaceProtocol::Mcp, "http://localhost:9002", Err(AgentCardUnavailable::NoAgentCard)),
-            (SurfaceProtocol::Mcp, "a2a-proxy://proxy-1", Err(AgentCardUnavailable::NoAgentCard)),
+            (SurfaceProtocol::DIDComm, "http://localhost:9002", Err(AgentCardUnavailable::NoAgentCard)),
+            (SurfaceProtocol::DIDComm, "a2a-proxy://proxy-1", Err(AgentCardUnavailable::NoAgentCard)),
             (SurfaceProtocol::A2a, "a2a-proxy://proxy-1", Err(AgentCardUnavailable::UnsupportedRuntime)),
             (SurfaceProtocol::Ap2, "fabric://gateway-1/channel-1", Err(AgentCardUnavailable::UnsupportedRuntime)),
             (
@@ -1161,44 +1686,46 @@ mod tests {
                 }),
             ),
         ] {
-            let mut surface = surface("s1");
+            let mut surface = targeting("s1", endpoint);
             surface.access_point.protocol = protocol;
-            surface.target.endpoint = endpoint.to_string();
-            assert_eq!(agent_card_location(&surface), expected, "{endpoint}");
+            assert_eq!(location_of(&[surface]), expected, "{endpoint}");
         }
     }
 
     #[test]
-    fn test_agent_card_location_keeps_card_path_override() {
-        let mut surface = surface("s1");
-        surface
-            .access_point
+    fn test_agent_card_location_uses_a_surface_that_can_reach_the_card() {
+        let mut didcomm = targeting("a-first", "https://user:pw@agent.example/a2a");
+        didcomm.access_point.protocol = SurfaceProtocol::DIDComm;
+        let mut a2a = targeting("b-second", "https://user:pw@agent.example/a2a");
+        a2a.access_point
             .agent_card_path = Some("/cards/time.json".to_string());
-        assert_eq!(
-            agent_card_location(&surface)
-                .expect("location")
-                .card_path
-                .as_deref(),
-            Some("/cards/time.json")
-        );
+        didcomm
+            .access_point
+            .agent_card_path = a2a
+            .access_point
+            .agent_card_path
+            .clone();
+        let location = location_of(&[didcomm, a2a]).expect("location");
+        assert_eq!(location.endpoint, "https://user:pw@agent.example/a2a", "fetched with the raw endpoint");
+        assert_eq!(location.card_path.as_deref(), Some("/cards/time.json"));
     }
 
     #[tokio::test]
     async fn test_agent_card_response_unavailable_skips_fetch() {
         let source = CountingSource::new(Some(serde_json::json!({ "name": "TimeAsker" })));
         let cache = AgentCardCache::new(source.clone(), AGENT_CARD_CACHE_TTL, AGENT_CARD_FAILURE_CACHE_TTL);
-        let mut mcp = surface("s1");
-        mcp.access_point.protocol = SurfaceProtocol::Mcp;
-        let response = agent_card_response(&mcp, &cache)
+        let mut didcomm = surface("s1");
+        didcomm.access_point.protocol = SurfaceProtocol::DIDComm;
+        let live = [didcomm];
+        let response = agent_card_response(&group_surfaces(&live)[0], &cache)
             .await
             .expect("response");
         assert_eq!(
             serde_json::to_value(&response).expect("serialize"),
             serde_json::json!({ "available": false, "reason": "no_agent_card" })
         );
-        let mut proxy = surface("s2");
-        proxy.target.endpoint = "a2a-proxy://proxy-1".to_string();
-        let response = agent_card_response(&proxy, &cache)
+        let live = [targeting("s2", "a2a-proxy://proxy-1")];
+        let response = agent_card_response(&group_surfaces(&live)[0], &cache)
             .await
             .expect("response");
         assert_eq!(
@@ -1216,7 +1743,8 @@ mod tests {
             AGENT_CARD_CACHE_TTL,
             AGENT_CARD_FAILURE_CACHE_TTL,
         );
-        let response = agent_card_response(&surface("s1"), &cache)
+        let live = [surface("s1")];
+        let response = agent_card_response(&group_surfaces(&live)[0], &cache)
             .await
             .expect("response");
         assert_eq!(
@@ -1228,7 +1756,8 @@ mod tests {
     #[tokio::test]
     async fn test_agent_card_fetch_failure_is_generic_502() {
         let cache = AgentCardCache::new(CountingSource::new(None), AGENT_CARD_CACHE_TTL, AGENT_CARD_FAILURE_CACHE_TTL);
-        let error = agent_card_response(&surface("s1"), &cache)
+        let live = [surface("s1")];
+        let error = agent_card_response(&group_surfaces(&live)[0], &cache)
             .await
             .expect_err("fetch fails");
         let response = error.into_response();
@@ -1243,32 +1772,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_agent_card_cache_reuses_card_per_surface_and_location() {
+    async fn test_agent_card_cache_reuses_card_per_agent_and_location() {
         let source = CountingSource::new(Some(serde_json::json!({ "name": "TimeAsker" })));
         let cache = AgentCardCache::new(source.clone(), AGENT_CARD_CACHE_TTL, AGENT_CARD_FAILURE_CACHE_TTL);
-        let location = agent_card_location(&surface("s1")).expect("location");
+        let location = location_of(&[surface("s1")]).expect("location");
         cache
-            .get("s1", &location)
+            .get("a1", &location)
             .await
             .expect("card");
         cache
-            .get("s1", &location)
+            .get("a1", &location)
             .await
             .expect("card");
         assert_eq!(source.fetches(), 1);
 
         cache
-            .get("s2", &location)
+            .get("a2", &location)
             .await
             .expect("card");
-        assert_eq!(source.fetches(), 2, "cached per surface");
+        assert_eq!(source.fetches(), 2, "cached per agent");
 
         let moved = CardLocation {
             endpoint: "http://localhost:9003".to_string(),
             card_path: None,
         };
         cache
-            .get("s1", &moved)
+            .get("a1", &moved)
             .await
             .expect("card");
         assert_eq!(source.fetches(), 3, "a new location is fetched again");
@@ -1278,10 +1807,10 @@ mod tests {
     async fn test_agent_card_cache_reuses_failure_until_failure_ttl() {
         let source = CountingSource::new(None);
         let cache = AgentCardCache::new(source.clone(), AGENT_CARD_CACHE_TTL, AGENT_CARD_FAILURE_CACHE_TTL);
-        let location = agent_card_location(&surface("s1")).expect("location");
+        let location = location_of(&[surface("s1")]).expect("location");
         assert_eq!(
             cache
-                .get("s1", &location)
+                .get("a1", &location)
                 .await,
             None
         );
@@ -1289,7 +1818,7 @@ mod tests {
         source.set_card(Some(serde_json::json!({ "name": "TimeAsker" })));
         assert_eq!(
             cache
-                .get("s1", &location)
+                .get("a1", &location)
                 .await,
             None,
             "the failure is reused"
@@ -1302,7 +1831,7 @@ mod tests {
         };
         assert!(
             cache
-                .get("s1", &moved)
+                .get("a1", &moved)
                 .await
                 .is_some(),
             "a new location is fetched again"
@@ -1313,10 +1842,10 @@ mod tests {
     async fn test_agent_card_cache_refetches_after_ttls() {
         let source = CountingSource::new(None);
         let cache = AgentCardCache::new(source.clone(), std::time::Duration::ZERO, std::time::Duration::ZERO);
-        let location = agent_card_location(&surface("s1")).expect("location");
+        let location = location_of(&[surface("s1")]).expect("location");
         assert_eq!(
             cache
-                .get("s1", &location)
+                .get("a1", &location)
                 .await,
             None
         );
@@ -1324,13 +1853,13 @@ mod tests {
         source.set_card(Some(serde_json::json!({ "name": "TimeAsker" })));
         assert!(
             cache
-                .get("s1", &location)
+                .get("a1", &location)
                 .await
                 .is_some(),
             "an expired failure is fetched again"
         );
         cache
-            .get("s1", &location)
+            .get("a1", &location)
             .await
             .expect("card");
         assert_eq!(source.fetches(), 3, "an expired card is fetched again");

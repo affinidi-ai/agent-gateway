@@ -1,4 +1,4 @@
-import type { AgentRecord, AgentRuntime, AgentTrustRegistry } from '../../api';
+import type { AgentIdentity, AgentRecord, AgentRuntime, AgentTrustRegistry } from '../../api';
 import { timeAgo } from '../../utils/stringUtils';
 
 /**
@@ -35,9 +35,10 @@ const PROTOCOL_TONES: Record<string, BadgeTone> = {
 
 export const UNNAMED_AGENT = 'Unnamed agent';
 export const NO_DID = 'No DID';
-export const NO_TRUST_REGISTRY = 'No Trust Registry';
-export const TRUST_NOT_CHECKED =
-  'Configured on the surface, not checked against the Trust Registry';
+
+export function displayName(agent: Pick<AgentRecord, 'name'>): string {
+  return agent.name ?? UNNAMED_AGENT;
+}
 
 export function runtimeLabel(runtime: string): string {
   return RUNTIME_LABELS[runtime as AgentRuntime] ?? 'Unknown runtime';
@@ -70,18 +71,8 @@ export function protocolBadgeTitle(runtime: string): string | undefined {
   return undefined;
 }
 
-export function statusLabel(status: string): string {
-  if (status === 'active') return 'Active';
-  if (status === 'disabled') return 'Disabled';
-  return 'Unknown';
-}
-
-/** `Recognised`, `Authorised`, both, or none (shown as `No Trust Registry`). */
-export function trustRegistryLabels(trust: AgentTrustRegistry): string[] {
-  const labels: string[] = [];
-  if (trust.recognized) labels.push('Recognised');
-  if (trust.authorized) labels.push('Authorised');
-  return labels;
+export function trustRegistryLabel(trust: AgentTrustRegistry): string {
+  return trust.recorded ? 'Recorded' : 'Not recorded';
 }
 
 /** What `target.endpoint` points at, safe to display. */
@@ -141,47 +132,17 @@ export function shortenDid(did: string, head = 20, tail = 8): string {
   return `${did.slice(0, head)}…${did.slice(-tail)}`;
 }
 
-export function otherSurfacesNote(didSurfaceCount: number): string | null {
-  const others = didSurfaceCount - 1;
-  if (others < 1) return null;
-  return `Also used on ${others} other surface${others === 1 ? '' : 's'}`;
+export function identitySourceLabel(source: AgentIdentity['source']): string {
+  return source === 'managed' ? 'Managed identity, issued by this gateway' : 'Set on the surface';
 }
 
-/**
- * Where the DID comes from. A managed identity always has a creation time; a
- * DID set on the surface (`agent_did`) has no identity record.
- */
-export function didSourceLabel(agent: AgentRecord): string | null {
-  if (!agent.agent_did) return null;
-  return agent.identity_created_at
-    ? 'Managed identity, issued by this gateway'
-    : 'Set on the surface';
-}
-
+/** Matches the display name, every surface name and the runtime label. */
 export function agentMatchesFilter(agent: AgentRecord, term: string): boolean {
   const needle = term.trim().toLowerCase();
   if (!needle) return true;
-  return [agent.name ?? '', agent.surface_name, runtimeLabel(agent.runtime)].some(value =>
-    value.toLowerCase().includes(needle)
-  );
-}
-
-export type AgentStatusFilter = 'all' | 'active' | 'disabled';
-
-export const STATUS_FILTER_OPTIONS: { value: AgentStatusFilter; label: string }[] = [
-  { value: 'all', label: 'All statuses' },
-  { value: 'active', label: 'Active' },
-  { value: 'disabled', label: 'Disabled' },
-];
-
-export function agentMatchesStatus(agent: AgentRecord, filter: AgentStatusFilter): boolean {
-  return filter === 'all' || agent.status === filter;
-}
-/**
- * The surface behind a list row. Iteration 1 maps one surface to one agent and
- * the opaque `id` is that surface's id; the details response carries real
- * `surfaces[]`, so only the list uses this.
- */
-export function listRowSurfaceId(agent: AgentRecord): string {
-  return agent.id;
+  return [
+    displayName(agent),
+    ...agent.surfaces.map(surface => surface.name),
+    runtimeLabel(agent.runtime),
+  ].some(value => value.toLowerCase().includes(needle));
 }

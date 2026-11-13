@@ -92,36 +92,41 @@ export interface LimitItem {
 /** How the gateway reaches an agent, from its `target.endpoint` scheme. */
 export type AgentRuntime = 'url' | 'a2a-proxy' | 'gateway';
 
-/** Trust Registry records the surface is configured to write. Not checked against a registry. */
+/** `recorded`: at least one of the agent's identities was recorded to a trust registry. */
 export interface AgentTrustRegistry {
-  recognized: boolean;
-  authorized: boolean;
+  recorded: boolean;
 }
 
-/** One row of GET /v1/agents. `id` is opaque: don't parse it. */
+export interface AgentSurfaceRef {
+  surface_id: string;
+  name: string;
+}
+
+/** `surface`: the surface's own agent DID. `managed`: a managed identity used on a surface. */
+export interface AgentIdentity {
+  did: string;
+  created_at: string | null;
+  source: 'surface' | 'managed';
+}
+
+/** One managed agent of GET /v1/agents, across every surface that targets it. `id` is opaque. */
 export interface AgentRecord {
   id: string;
   registration: 'unregistered';
   name: string | null;
-  surface_name: string;
-  status: SurfaceStatus;
   protocol: SurfaceProtocol;
   runtime: AgentRuntime;
   endpoint: string;
   tags: string[];
+  surfaces: AgentSurfaceRef[];
+  identities: AgentIdentity[];
   trust_registry: AgentTrustRegistry;
-  agent_did: string | null;
-  did_surface_count: number;
-  identity_created_at: string | null;
   last_activity_at: string | null;
 }
 
-export interface AgentSurfaceSummary {
-  surface_id: string;
-  name: string;
+export interface AgentSurfaceSummary extends AgentSurfaceRef {
   protocol: SurfaceProtocol;
   route: string;
-  status: SurfaceStatus;
 }
 
 /** Request totals over the metrics retention window (`window_minutes`). */

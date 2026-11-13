@@ -32,23 +32,19 @@ const mockedGetAgent = apiClient.getAgent as jest.Mock;
 const mockedGetAgentCard = apiClient.getAgentCard as jest.Mock;
 
 const details = (overrides: Partial<AgentDetails> = {}): AgentDetails => ({
-  id: 's1',
+  id: 'a1',
   registration: 'unregistered',
   name: 'TimeAsker',
-  surface_name: 'RICK',
-  status: 'active',
   protocol: 'a2a',
   runtime: 'gateway',
   endpoint: 'fabric://g1/c1',
   tags: [],
-  trust_registry: { recognized: false, authorized: true },
-  agent_did: 'did:web:agent.example.com',
-  did_surface_count: 1,
-  identity_created_at: '2026-10-22T11:24:02Z',
-  last_activity_at: null,
-  surfaces: [
-    { surface_id: 's1', name: 'RICK', protocol: 'a2a', route: '/agents/rick', status: 'active' },
+  identities: [
+    { did: 'did:web:agent.example.com', created_at: '2026-10-22T11:24:02Z', source: 'managed' },
   ],
+  trust_registry: { recorded: true },
+  last_activity_at: null,
+  surfaces: [{ surface_id: 's1', name: 'RICK', protocol: 'a2a', route: '/agents/rick' }],
   traffic: {
     window_minutes: 360,
     total_requests: 12,
@@ -61,7 +57,7 @@ const details = (overrides: Partial<AgentDetails> = {}): AgentDetails => ({
 
 const renderPage = () =>
   render(
-    <MemoryRouter initialEntries={['/agent-registry/s1']}>
+    <MemoryRouter initialEntries={['/agent-registry/a1']}>
       <Routes>
         <Route path="/agent-registry/:agentId" element={<AgentDetailPage />} />
         <Route path="/agent-registry" element={<div data-testid="list-route" />} />
@@ -123,7 +119,8 @@ describe('AgentDetailPage', () => {
 
     expect(await screen.findByTestId('agent-details-name')).toHaveTextContent('TimeAsker');
     const header = screen.getByTestId('agent-details-header');
-    expect(within(header).getByTestId('agent-details-status')).toHaveTextContent('Active');
+    expect(within(header).queryByTestId('agent-details-status')).not.toBeInTheDocument();
+    expect(within(header).queryByText(/Active|Disabled/)).not.toBeInTheDocument();
     expect(within(header).getByTestId('agents-protocol-badge')).toHaveTextContent(
       'A2A via gateway'
     );
@@ -135,16 +132,58 @@ describe('AgentDetailPage', () => {
     expect(within(header).queryByRole('button')).not.toBeInTheDocument();
     expect(screen.getByTestId('agent-overview-runtime')).toHaveTextContent('Remote gateway');
     expect(screen.getByTestId('agent-overview-description')).toHaveTextContent('—');
-    expect(screen.getByText('Identity created')).toBeInTheDocument();
-    expect(screen.getByTestId('agent-overview-identity-created')).toHaveTextContent('2026');
-    expect(screen.getByTestId('agent-overview-did-source')).toHaveTextContent(
-      'Managed identity, issued by this gateway'
+    expect(screen.getByTestId('agent-overview-identity-source')).toHaveTextContent(
+      'Managed identity, issued by this gateway. Created'
     );
+    expect(screen.getByTestId('agent-overview-identity-source')).toHaveTextContent('2026');
     expect(screen.getByTestId('agents-did')).toHaveTextContent('did:web:agent.example.com');
-    expect(screen.getByText('Authorised')).toBeInTheDocument();
-    expect(screen.getByTestId('agent-overview-trust-note')).toHaveTextContent(
-      'not checked against the Trust Registry'
+    expect(screen.getByTestId('agents-trust-recorded')).toHaveTextContent('Recorded');
+    expect(screen.queryByTestId('agents-trust-not-recorded')).not.toBeInTheDocument();
+    expect(screen.queryByText(/not checked against the Trust Registry/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Recognised|Authorised|other surface/)).not.toBeInTheDocument();
+  });
+
+  it('shows Unnamed agent for an agent without a name', async () => {
+    mockedGetAgent.mockResolvedValue(details({ name: null }));
+    renderPage();
+    expect(await screen.findByTestId('agent-details-name')).toHaveTextContent('Unnamed agent');
+  });
+
+  it('shows every identity in the Overview, and Not recorded', async () => {
+    mockedGetAgent.mockResolvedValue(
+      details({
+        identities: [
+          { did: 'did:web:a.example', created_at: null, source: 'surface' },
+          { did: 'did:key:z6Mkb', created_at: '2026-10-22T11:24:02Z', source: 'managed' },
+        ],
+        trust_registry: { recorded: false },
+      })
     );
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+
+    const items = screen.getAllByTestId('agent-overview-identity');
+    expect(items).toHaveLength(2);
+    expect(within(items[0]).getByTestId('agents-did')).toHaveTextContent('did:web:a.example');
+    expect(within(items[0]).getByTestId('agent-overview-identity-source')).toHaveTextContent(
+      /^Set on the surface$/
+    );
+    expect(within(items[1]).getByTestId('agents-did')).toHaveTextContent('did:key:z6Mkb');
+    expect(within(items[1]).getByTestId('agent-overview-identity-source')).toHaveTextContent(
+      'Managed identity, issued by this gateway. Created'
+    );
+    expect(screen.getByText('Identities (2)')).toBeInTheDocument();
+    expect(screen.getByTestId('agents-trust-not-recorded')).toHaveTextContent('Not recorded');
+    expect(screen.queryByTestId('agents-trust-recorded')).not.toBeInTheDocument();
+  });
+
+  it('shows No DID when the agent has no identity', async () => {
+    mockedGetAgent.mockResolvedValue(details({ identities: [] }));
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+
+    expect(screen.getByTestId('agents-no-did')).toHaveTextContent('No DID');
+    expect(screen.queryByTestId('agent-overview-identity')).not.toBeInTheDocument();
   });
 
   it('shows not found for a 404', async () => {
@@ -271,15 +310,29 @@ describe('AgentDetailPage', () => {
     expect(await screen.findByTestId('agent-card-preview-name')).toHaveTextContent('TimeAsker');
   });
 
-  it('lists the one surface', async () => {
-    mockedGetAgent.mockResolvedValue(details());
+  it('lists every surface without a status', async () => {
+    mockedGetAgent.mockResolvedValue(
+      details({
+        surfaces: [
+          { surface_id: 's1', name: 'helium', protocol: 'ap2', route: '/helium' },
+          { surface_id: 's2', name: 'oxygen', protocol: 'a2a', route: '/oxygen' },
+        ],
+      })
+    );
     renderPage();
     await screen.findByTestId('agent-details-name');
-    openTab(/Surfaces \(1\)/);
+    openTab(/Surfaces \(2\)/);
 
+    const tab = screen.getByTestId('agent-surfaces-tab');
     expect(screen.getByTestId('agent-surfaces-row-s1')).toBeInTheDocument();
-    expect(screen.getByTestId('agent-surfaces-link')).toHaveTextContent('RICK');
-    expect(screen.getByText('/agents/rick')).toBeInTheDocument();
+    expect(screen.getByTestId('agent-surfaces-row-s2')).toBeInTheDocument();
+    const links = within(tab).getAllByTestId('agent-surfaces-link');
+    expect(links.map(l => l.textContent)).toEqual(['helium', 'oxygen']);
+    expect(links[1]).toHaveAttribute('href', '/surfaces/s2');
+    expect(within(tab).getByText('/helium')).toBeInTheDocument();
+    expect(within(tab).getByText('/oxygen')).toBeInTheDocument();
+    expect(within(tab).queryByRole('columnheader', { name: 'Status' })).not.toBeInTheDocument();
+    expect(within(tab).queryByText(/Active|Disabled/)).not.toBeInTheDocument();
   });
 
   it('labels traffic with the retained window and shows — for 7 days', async () => {

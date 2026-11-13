@@ -2,10 +2,9 @@ import React from 'react';
 import { Link } from 'react-router-dom';
 import type { AgentSurfaceSummary } from '../../api';
 import { Badge } from '../../components/shared/Badge';
-import { AgentStatusBadge } from '../AgentsPage/AgentBadges';
 import { protocolLabel, protocolTone } from '../AgentsPage/agentLabels';
 
-/** The surfaces that expose this agent. One in iteration 1. */
+/** Every surface that targets this agent. */
 const SurfacesTab: React.FC<{ surfaces: AgentSurfaceSummary[] }> = ({ surfaces }) => (
   <div className="table-responsive" data-testid="agent-surfaces-tab">
     <table className="table table-sm">
@@ -14,7 +13,6 @@ const SurfacesTab: React.FC<{ surfaces: AgentSurfaceSummary[] }> = ({ surfaces }
           <th style={{ width: '12%' }}>Protocol</th>
           <th>Surface</th>
           <th>Access point route</th>
-          <th style={{ width: '12%' }}>Status</th>
         </tr>
       </thead>
       <tbody>
@@ -37,9 +35,6 @@ const SurfacesTab: React.FC<{ surfaces: AgentSurfaceSummary[] }> = ({ surfaces }
             </td>
             <td>
               <code className="small">{surface.route}</code>
-            </td>
-            <td>
-              <AgentStatusBadge status={surface.status} />
             </td>
           </tr>
         ))}

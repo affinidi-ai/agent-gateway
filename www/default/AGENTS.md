@@ -1680,24 +1680,36 @@ are read-only and need `surfaces.view`. They call only `apiClient.listAgents`, `
 disable or rotate action: the API has no write endpoints for agents. Styles are in
 `pages/AgentsPage/AgentRegistry.css`, built on the theme variables with `body.dark-theme` overrides.
 
-- MCP surfaces front tool servers, not agents, so `/v1/agents` leaves them out (`is_listed` in
+- One record per managed agent: the gateway groups the surfaces that target the same agent and
+  returns them in display-name order (case-insensitive, then id); the page does not re-sort.
+  MCP surfaces front tool servers, not agents, so `/v1/agents` leaves them out (`is_listed` in
   `src/identity/handlers/agents.rs`) and their details and card return 404. The page adds no
   protocol filter of its own.
-- The list filters client-side by text (name, surface name, runtime label) and by status (All,
-  Active, Disabled). Rows that aren't active are dimmed.
+- The Agent Registry shows no status anywhere: no list column, filter or dimmed rows, no
+  details header badge, and no per-surface status in the Surfaces tab.
+- The list filters client-side by text only: the display name (**Unnamed agent** included), every
+  surface name in the record, and the runtime label (`agentMatchesFilter`).
+- Columns: Agent, Runtime & protocol, Identities, Used by surfaces, Trust registry, Last activity.
+  **Used by surfaces** lists every surface of the record, one per line, each a link to
+  `/surfaces/<surface_id>` that does not open the details. **Identities** lists every DID in
+  `identities`, one per line, shortened in the middle with the full value in the tooltip and a
+  copy button, or **No DID** without any.
 - Raw API values are never shown. `pages/AgentsPage/agentLabels.ts` maps them: runtime `url`,
   `a2a-proxy`, `gateway` to Direct URL, A2A proxy, Remote gateway, and the protocol badge to `A2A`,
   `A2A via proxy`, `A2A via gateway`. Shared badges are in `pages/AgentsPage/AgentBadges.tsx`.
-- An agent without a name shows **Unnamed agent** in muted text; without a DID, **No DID** and no
-  copy button. The list shortens the DID in the middle, with the full value in the tooltip.
-- Agent `id` is opaque. Only `listRowSurfaceId` reads it as a surface id, for the list's surface
-  link; the details page links from `surfaces[]`.
+- An agent with a `null` name shows **Unnamed agent** in muted text, in the list and the details
+  header.
+- **Trust registry** shows **Recorded** (success badge) when `trust_registry.recorded` is true,
+  else **Not recorded** (`badge-none`), with no tooltip.
+- The details **Overview** lists every identity in full with a copy button and its source: **Set on
+  the surface** (`source: "surface"`) or **Managed identity, issued by this gateway**
+  (`"managed"`), followed by its creation time when `created_at` is set.
+- Agent `id` is opaque and never read as a surface id; surface links come from `surfaces[]`.
 - The **Connection** tab is read-only and built from `endpoint` by `connectionTarget`. A URL is
   shown without credentials, query string or fragment, with a note when any was removed. An
   `a2a-proxy://` or `fabric://` target links to its A2A proxy or remote gateway page only when
   the viewer has `a2a_proxies.edit` or `gateways.edit`, which those pages need; otherwise the
   id is plain text.
-- Trust Registry badges are configuration, labelled "not checked against the Trust Registry".
 - The Agent Card is untrusted: render it as plain text only (no HTML, Markdown or links), labelled
   **Published by the agent, not verified**. The tab opens on a visual **Preview**
   (`AgentDetailPage/AgentCardPreview.tsx`, reading known A2A card fields defensively, with the URL
@@ -1710,10 +1722,14 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
 | ------------------------------- | -------------------------------------------------------------------------------- |
 | Pages                           | `page-agents`, `page-agent-details`                                              |
 | List row, filter, count, retry  | `agents-row-<id>`, `agents-filter-input`, `agents-count`, `agents-retry-button`  |
-| Status filter                   | `agents-status-filter`                                                           |
-| Surface link, DID, copy DID     | `agents-surface-link`, `agents-did`, `agents-copy-did-button`                    |
+| Name, unnamed                   | `agents-name`, `agents-unnamed`                                                  |
+| Surfaces, surface link          | `agents-surfaces`, `agents-surface-link`                                         |
+| Identities, DID, copy, none     | `agents-identities`, `agents-did`, `agents-copy-did-button`, `agents-no-did`     |
+| Trust registry                  | `agents-trust-recorded`, `agents-trust-not-recorded`                             |
 | Back, details retry             | `agent-back-button`, `agent-retry-button`                                        |
-| Details header                  | `agent-details-header`, `-name`, `-status`, `-runtime`                           |
+| Details header                  | `agent-details-header`, `-name`, `-runtime`                                      |
+| Overview identities             | `agent-overview-identities`, `agent-overview-identity`, `-identity-source`       |
+| Details surfaces                | `agent-surfaces-tab`, `agent-surfaces-row-<surface_id>`, `agent-surfaces-link`   |
 | Agent Card states               | `agent-card-json`, `agent-card-unverified`, `agent-card-retry-button`            |
 | Agent Card view toggle, preview | `agent-card-view-preview`, `-view-json`, `agent-card-preview`, `-preview-name`   |
 | Traffic cards                   | `agent-traffic-requests`, `-requests-7d`, `-failed`, `-p95`                      |

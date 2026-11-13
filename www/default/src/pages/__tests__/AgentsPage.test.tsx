@@ -22,19 +22,16 @@ const mockedListAgents = apiClient.listAgents as jest.Mock;
 const LONG_DID = 'did:webvh:QmYAuadF1234567890:agent-gateway1.example.com:surface:abcdef12';
 
 const agent = (overrides: Partial<AgentRecord> = {}): AgentRecord => ({
-  id: 's1',
+  id: 'a1',
   registration: 'unregistered',
   name: 'TimeAsker',
-  surface_name: 'RICK',
-  status: 'active',
   protocol: 'a2a',
   runtime: 'url',
   endpoint: 'http://localhost:9002',
   tags: [],
-  trust_registry: { recognized: true, authorized: false },
-  agent_did: LONG_DID,
-  did_surface_count: 2,
-  identity_created_at: '2026-10-22T11:24:02Z',
+  surfaces: [{ surface_id: 's1', name: 'RICK' }],
+  identities: [{ did: LONG_DID, created_at: '2026-10-22T11:24:02Z', source: 'managed' }],
+  trust_registry: { recorded: true },
   last_activity_at: null,
   ...overrides,
 });
@@ -60,96 +57,153 @@ describe('AgentsPage', () => {
     mockedListAgents.mockResolvedValue([
       agent(),
       agent({
-        id: 's2',
+        id: 'a2',
         name: null,
-        surface_name: 'Frank 003',
+        surfaces: [{ surface_id: 's2', name: 'Frank 003' }],
         runtime: 'a2a-proxy',
-        status: 'disabled',
-        agent_did: null,
-        did_surface_count: 0,
-        trust_registry: { recognized: false, authorized: false },
+        identities: [],
+        trust_registry: { recorded: false },
       }),
     ]);
     renderPage();
 
-    const first = await screen.findByTestId('agents-row-s1');
+    const first = await screen.findByTestId('agents-row-a1');
     expect(screen.getByTestId('agents-count')).toHaveTextContent('2');
     expect(within(first).getByText('TimeAsker')).toBeInTheDocument();
     expect(within(first).getByText('Direct URL')).toBeInTheDocument();
     expect(within(first).getByTestId('agents-protocol-badge')).toHaveTextContent('A2A');
-    expect(within(first).getByText('Active')).toBeInTheDocument();
-    expect(within(first).getByText('Recognised')).toBeInTheDocument();
+    expect(within(first).getByTestId('agents-trust-recorded')).toHaveTextContent('Recorded');
+    expect(within(first).queryByTestId('agents-trust-not-recorded')).not.toBeInTheDocument();
     expect(within(first).getByText('None in last 6h')).toBeInTheDocument();
 
     const did = within(first).getByTestId('agents-did');
     expect(did).not.toHaveTextContent(LONG_DID);
     expect(did).toHaveTextContent('…');
-    expect(did).toHaveAttribute('title', `${LONG_DID}\nAlso used on 1 other surface`);
+    expect(did).toHaveAttribute('title', LONG_DID);
     expect(within(first).getByTestId('agents-copy-did-button')).toBeInTheDocument();
 
-    const second = screen.getByTestId('agents-row-s2');
-    expect(within(second).getByText('Unnamed agent')).toBeInTheDocument();
+    const second = screen.getByTestId('agents-row-a2');
+    expect(within(second).getByTestId('agents-unnamed')).toHaveTextContent('Unnamed agent');
+    expect(within(second).queryByTestId('agents-name')).not.toBeInTheDocument();
     expect(within(second).getByText('No DID')).toBeInTheDocument();
     expect(within(second).queryByTestId('agents-copy-did-button')).not.toBeInTheDocument();
     expect(within(second).getByText('A2A proxy')).toBeInTheDocument();
     expect(within(second).getByTestId('agents-protocol-badge')).toHaveTextContent('A2A via proxy');
-    expect(within(second).getByText('Disabled')).toBeInTheDocument();
-    expect(within(second).getByText('No Trust Registry')).toBeInTheDocument();
+    expect(within(second).getByTestId('agents-trust-not-recorded')).toHaveTextContent(
+      'Not recorded'
+    );
+    expect(within(second).queryByTestId('agents-trust-recorded')).not.toBeInTheDocument();
     expect(screen.queryByText('a2a-proxy')).not.toBeInTheDocument();
+  });
+
+  it('shows no status column, status filter or dimmed rows', async () => {
+    mockedListAgents.mockResolvedValue([agent()]);
+    renderPage();
+    const row = await screen.findByTestId('agents-row-a1');
+
+    expect(screen.queryByRole('columnheader', { name: 'Status' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('combobox', { name: 'Filter by status' })).not.toBeInTheDocument();
+    expect(screen.queryByTestId('agents-status-badge')).not.toBeInTheDocument();
+    expect(row).not.toHaveClass('agents-row-dimmed');
+    expect(
+      within(row).queryByText(/Active|Disabled|Recognised|Authorised/)
+    ).not.toBeInTheDocument();
+  });
+
+  it('lists every identity of the agent', async () => {
+    mockedListAgents.mockResolvedValue([
+      agent({
+        identities: [
+          { did: 'did:web:a.example', created_at: null, source: 'surface' },
+          { did: 'did:web:b.example', created_at: '2026-10-22T11:24:02Z', source: 'managed' },
+        ],
+      }),
+    ]);
+    renderPage();
+    const row = await screen.findByTestId('agents-row-a1');
+
+    expect(screen.getByRole('columnheader', { name: 'Identities' })).toBeInTheDocument();
+    const dids = within(row).getAllByTestId('agents-did');
+    expect(dids.map(d => d.textContent)).toEqual(['did:web:a.example', 'did:web:b.example']);
+    expect(within(row).getAllByTestId('agents-copy-did-button')).toHaveLength(2);
+    expect(within(row).queryByText('No DID')).not.toBeInTheDocument();
+    expect(within(row).queryByText(/other surface/)).not.toBeInTheDocument();
+  });
+
+  it('links every surface that uses the agent', async () => {
+    mockedListAgents.mockResolvedValue([
+      agent({
+        surfaces: [
+          { surface_id: 's1', name: 'helium' },
+          { surface_id: 's 2', name: 'oxygen' },
+        ],
+      }),
+    ]);
+    renderPage();
+    const row = await screen.findByTestId('agents-row-a1');
+
+    const links = within(row).getAllByTestId('agents-surface-link');
+    expect(links.map(l => l.textContent)).toEqual(['helium', 'oxygen']);
+    expect(links[0]).toHaveAttribute('href', '/surfaces/s1');
+    expect(links[1]).toHaveAttribute('href', '/surfaces/s%202');
   });
 
   it('filters by name client-side', async () => {
     mockedListAgents.mockResolvedValue([
       agent(),
-      agent({ id: 's2', name: 'Treasury', surface_name: 'Ops' }),
+      agent({ id: 'a2', name: 'Treasury', surfaces: [{ surface_id: 's2', name: 'Ops' }] }),
     ]);
     renderPage();
-    await screen.findByTestId('agents-row-s1');
+    await screen.findByTestId('agents-row-a1');
 
     fireEvent.change(screen.getByTestId('agents-filter-input'), { target: { value: 'treas' } });
-    expect(screen.queryByTestId('agents-row-s1')).not.toBeInTheDocument();
-    expect(screen.getByTestId('agents-row-s2')).toBeInTheDocument();
+    expect(screen.queryByTestId('agents-row-a1')).not.toBeInTheDocument();
+    expect(screen.getByTestId('agents-row-a2')).toBeInTheDocument();
     expect(screen.getByTestId('agents-count')).toHaveTextContent('1 of 2');
 
     fireEvent.change(screen.getByTestId('agents-filter-input'), { target: { value: 'nothing' } });
     expect(screen.getByTestId('agents-no-match')).toBeInTheDocument();
   });
 
+  it('filters by any surface name and by Unnamed agent', async () => {
+    mockedListAgents.mockResolvedValue([
+      agent({
+        surfaces: [
+          { surface_id: 's1', name: 'helium' },
+          { surface_id: 's2', name: 'oxygen' },
+        ],
+      }),
+      agent({ id: 'a2', name: null, surfaces: [{ surface_id: 's3', name: 'Ops' }] }),
+    ]);
+    renderPage();
+    await screen.findByTestId('agents-row-a1');
+    const input = screen.getByTestId('agents-filter-input');
+
+    fireEvent.change(input, { target: { value: 'oxy' } });
+    expect(screen.getByTestId('agents-row-a1')).toBeInTheDocument();
+    expect(screen.queryByTestId('agents-row-a2')).not.toBeInTheDocument();
+
+    fireEvent.change(input, { target: { value: 'unnamed' } });
+    expect(screen.queryByTestId('agents-row-a1')).not.toBeInTheDocument();
+    expect(screen.getByTestId('agents-row-a2')).toBeInTheDocument();
+  });
+
   it('filters by runtime label', async () => {
     mockedListAgents.mockResolvedValue([
       agent(),
-      agent({ id: 's2', name: 'Treasury', surface_name: 'Ops', runtime: 'gateway' }),
+      agent({
+        id: 'a2',
+        name: 'Treasury',
+        surfaces: [{ surface_id: 's2', name: 'Ops' }],
+        runtime: 'gateway',
+      }),
     ]);
     renderPage();
-    await screen.findByTestId('agents-row-s1');
+    await screen.findByTestId('agents-row-a1');
 
     fireEvent.change(screen.getByTestId('agents-filter-input'), { target: { value: 'remote' } });
-    expect(screen.queryByTestId('agents-row-s1')).not.toBeInTheDocument();
-    expect(screen.getByTestId('agents-row-s2')).toBeInTheDocument();
-  });
-
-  it('filters by status and dims inactive rows', async () => {
-    mockedListAgents.mockResolvedValue([
-      agent(),
-      agent({ id: 's2', name: 'Treasury', status: 'disabled' }),
-    ]);
-    renderPage();
-    await screen.findByTestId('agents-row-s1');
-    expect(screen.getByTestId('agents-row-s1')).not.toHaveClass('agents-row-dimmed');
-    expect(screen.getByTestId('agents-row-s2')).toHaveClass('agents-row-dimmed');
-
-    const status = screen.getByRole('combobox', { name: 'Filter by status' });
-    fireEvent.change(status, { target: { value: 'disabled' } });
-    expect(screen.queryByTestId('agents-row-s1')).not.toBeInTheDocument();
-    expect(screen.getByTestId('agents-row-s2')).toBeInTheDocument();
-    expect(screen.getByTestId('agents-count')).toHaveTextContent('1 of 2');
-
-    fireEvent.change(status, { target: { value: 'active' } });
-    expect(screen.getByTestId('agents-row-s1')).toBeInTheDocument();
-    expect(screen.queryByTestId('agents-row-s2')).not.toBeInTheDocument();
-
-    fireEvent.change(screen.getByTestId('agents-filter-input'), { target: { value: 'treas' } });
-    expect(screen.getByTestId('agents-no-match')).toBeInTheDocument();
+    expect(screen.queryByTestId('agents-row-a1')).not.toBeInTheDocument();
+    expect(screen.getByTestId('agents-row-a2')).toBeInTheDocument();
   });
 
   it('shows the empty state', async () => {
@@ -165,14 +219,14 @@ describe('AgentsPage', () => {
 
     expect(await screen.findByTestId('agents-load-error')).toBeInTheDocument();
     fireEvent.click(screen.getByTestId('agents-retry-button'));
-    expect(await screen.findByTestId('agents-row-s1')).toBeInTheDocument();
+    expect(await screen.findByTestId('agents-row-a1')).toBeInTheDocument();
     expect(mockedListAgents).toHaveBeenCalledTimes(2);
   });
 
   it('opens the details on row click', async () => {
     mockedListAgents.mockResolvedValue([agent()]);
     renderPage();
-    fireEvent.click(await screen.findByTestId('agents-row-s1'));
+    fireEvent.click(await screen.findByTestId('agents-row-a1'));
     expect(screen.getByTestId('details-route')).toBeInTheDocument();
   });
 

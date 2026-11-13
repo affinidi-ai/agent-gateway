@@ -1,15 +1,5 @@
-.agents-status-filter {
-  display: inline-block;
-  width: 160px;
-  margin-left: 0.75rem;
-}
-
 .agents-row {
   cursor: pointer;
-}
-
-.agents-row-dimmed {
-  opacity: 0.6;
 }
 
 .agent-preview {

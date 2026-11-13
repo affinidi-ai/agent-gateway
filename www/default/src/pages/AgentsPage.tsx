@@ -8,18 +8,12 @@ import SearchInput from '../components/shared/SearchInput';
 import { DOCS_URL } from '../config/docs';
 import { useApp } from '../context/AppContext';
 import AgentsTable from './AgentsPage/AgentsTable';
-import {
-  AgentStatusFilter,
-  STATUS_FILTER_OPTIONS,
-  agentMatchesFilter,
-  agentMatchesStatus,
-} from './AgentsPage/agentLabels';
+import { agentMatchesFilter } from './AgentsPage/agentLabels';
 import './AgentsPage/AgentRegistry.css';
 
 /**
- * Agents list page. Read-only: one row per Agent Surface's managed agent,
- * built by the gateway from the surface, its managed identity and the
- * retained metrics.
+ * Agents list page. Read-only: one row per managed agent, built by the gateway
+ * from the surfaces that target it, their identities and the retained metrics.
  */
 const AgentsPage: React.FC = () => {
   const navigate = useNavigate();
@@ -30,7 +24,6 @@ const AgentsPage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
-  const [statusFilter, setStatusFilter] = useState<AgentStatusFilter>('all');
 
   const loadAgents = useCallback(async () => {
     try {
@@ -49,11 +42,8 @@ const AgentsPage: React.FC = () => {
   }, [loadAgents]);
 
   const visible = useMemo(
-    () =>
-      agents.filter(
-        agent => agentMatchesFilter(agent, searchTerm) && agentMatchesStatus(agent, statusFilter)
-      ),
-    [agents, searchTerm, statusFilter]
+    () => agents.filter(agent => agentMatchesFilter(agent, searchTerm)),
+    [agents, searchTerm]
   );
 
   const openAgent = (agent: AgentRecord) =>
@@ -76,7 +66,7 @@ const AgentsPage: React.FC = () => {
     );
   }
 
-  const filtered = searchTerm.trim() !== '' || statusFilter !== 'all';
+  const filtered = searchTerm.trim() !== '';
 
   return (
     <div className="container-fluid" data-testid="page-agents">
@@ -88,19 +78,6 @@ const AgentsPage: React.FC = () => {
             placeholder="Filter agents..."
             data-testid="agents-filter-input"
           />
-          <select
-            className="form-control dropdown-styling agents-status-filter"
-            value={statusFilter}
-            onChange={e => setStatusFilter(e.target.value as AgentStatusFilter)}
-            aria-label="Filter by status"
-            data-testid="agents-status-filter"
-          >
-            {STATUS_FILTER_OPTIONS.map(option => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
         </div>
       </div>
 
