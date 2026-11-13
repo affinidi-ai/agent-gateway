@@ -8,7 +8,7 @@ changes:
         authority_id. The gateway queries every listed authority in parallel, waits for each to answer or time out
         (a built-in 5 seconds per authority; timeout_secs is refused on such a query), and gives
         policy one result per authority under the element's id, so a surface can accept callers
-        that any participating organisation recognises. Gateway 1.0.8 and earlier skips any
+        that any participating organisation recognises. Gateway 1.0.9 and earlier skips any
         surface or managed connection with a Trust Check that sets query.authority_ids, even a
         list of one, so change such queries to a single authority_id before rolling back.
     - timestamp: '2026-11-12T00:00:00Z'
@@ -25,8 +25,10 @@ changes:
       description: >-
         In the Trust Check editor, a query's Authority ID is one multi-select of the
         Issuers and Authorities, plus on the caller leg the agent identity credential issuer and the
-        sending gateway DID, and keeps the picks in the order picked. The editor's card header
-        shows how many authorities each query names. A query with several saves
+        sending gateway DID, and keeps the picks in the order picked. On the caller leg the
+        agent identity credential issuer is checked while nothing is picked, and the first pick
+        replaces it; it stays only when ticked beside other picks. The editor's card header
+        shows how many authorities a query with several names. A query with several saves
         query.authority_ids with authority_sources recording the register each was picked from; a
         query with one keeps authority_id as before. A listed Authority that was deleted blocks
         Save, as a single one does.
@@ -37,8 +39,8 @@ changes:
         A Trust Check list is no longer refused for holding more than 10 queries, and there is no
         limit on the authorities its queries name. The gateway sends one TRQP query per listed
         authority, all at once, so each one adds a DIDComm message to the trust registry on every
-        request. The dashboard's count line shows the number of queries. Gateway
-        1.0.8 and earlier still loads and runs a list of more than 10 queries, but refuses
+        request. The Queries badge in the dashboard shows the number of queries. Gateway
+        1.0.9 and earlier still loads and runs a list of more than 10 queries, but refuses
         to save that surface or managed connection (400) until the list is trimmed to 10.
     - timestamp: '2026-11-12T00:00:00Z'
       title: Fail a Trust Check whose authority resolves to a blank value

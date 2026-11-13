@@ -88,7 +88,7 @@ describe('TrustCheckQueryForm — Authority rendering', () => {
     expect(toggle).toHaveTextContent(/Agent identity credential issuer \(default\)/i);
   });
 
-  it('surfaces a stored legacy template as a locked "from JSON API" option on the caller leg', () => {
+  it('surfaces a stored legacy template as a checked "from JSON API" option on the caller leg', () => {
     renderForm(
       baseProps({
         isApMa: true,
@@ -192,7 +192,7 @@ describe('TrustCheckQueryForm — Authority rendering', () => {
     ]);
   });
 
-  it('surfaces a stored legacy template as a locked "from JSON API" option on the target leg', () => {
+  it('surfaces a stored legacy template as a checked "from JSON API" option on the target leg', () => {
     renderForm(
       baseProps({
         isApMa: false,
@@ -207,7 +207,7 @@ describe('TrustCheckQueryForm — Authority rendering', () => {
       })
     );
     const toggle = screen.getByTestId('trust-check-query-0-authority');
-    // The locked custom option's label renders on the toggle.
+    // The checked custom option's label renders on the toggle.
     expect(toggle).toHaveTextContent(/Legacy template \(from JSON API\)/i);
   });
 
@@ -350,26 +350,51 @@ describe('TrustCheckQueryForm — several Authorities', () => {
     expect(screen.getByRole('listbox')).toBeInTheDocument();
   });
 
-  it('adds a checked Authority beside the caller-leg default', () => {
+  it('replaces the implicit caller-leg default with the first picked Authority', () => {
     const setAuthoritiesAt = jest.fn();
     renderForm(baseProps({ setAuthoritiesAt, authorities: AUTHORITIES as any }));
     fireEvent.click(screen.getByTestId('trust-check-query-0-authority'));
     fireEvent.click(option('did:web:authority-a'));
     expect(setAuthoritiesAt).toHaveBeenCalledWith(0, [
-      { did: '{{ input.agent.identity_issuer_did }}' },
       { did: 'did:web:authority-a', source: 'authority' },
     ]);
   });
 
-  it('checks both caller-leg templates together', () => {
+  it('replaces the implicit caller-leg default with the first picked template', () => {
     const setAuthoritiesAt = jest.fn();
     renderForm(baseProps({ setAuthoritiesAt }));
     fireEvent.click(screen.getByTestId('trust-check-query-0-authority'));
     fireEvent.click(option('{{ input.gateway.source_id }}'));
+    expect(setAuthoritiesAt).toHaveBeenCalledWith(0, [{ did: '{{ input.gateway.source_id }}' }]);
+  });
+
+  it('keeps the caller-leg default when it is ticked beside a stored pick', () => {
+    const setAuthoritiesAt = jest.fn();
+    renderForm(
+      baseProps({
+        setAuthoritiesAt,
+        queryConfig: {
+          id: 'q-1',
+          trust_registry_id: 'tr-1',
+          query_type: 'recognition',
+          query: { authority_id: '{{ input.gateway.source_id }}' },
+        },
+      })
+    );
+    fireEvent.click(screen.getByTestId('trust-check-query-0-authority'));
+    fireEvent.click(option('{{ input.agent.identity_issuer_did }}'));
     expect(setAuthoritiesAt).toHaveBeenCalledWith(0, [
-      { did: '{{ input.agent.identity_issuer_did }}' },
       { did: '{{ input.gateway.source_id }}' },
+      { did: '{{ input.agent.identity_issuer_did }}' },
     ]);
+  });
+
+  it('unchecking the implicit caller-leg default leaves nothing stored', () => {
+    const setAuthoritiesAt = jest.fn();
+    renderForm(baseProps({ setAuthoritiesAt }));
+    fireEvent.click(screen.getByTestId('trust-check-query-0-authority'));
+    fireEvent.click(option('{{ input.agent.identity_issuer_did }}'));
+    expect(setAuthoritiesAt).toHaveBeenCalledWith(0, []);
   });
 
   it('unchecks a picked Authority', () => {
@@ -492,7 +517,7 @@ describe('TrustCheckQueryForm — Authority source', () => {
     expect(picks[picks.length - 1]).toEqual({ did: '{{ input.agent.identity_issuer_did }}' });
   });
 
-  it('shows a deleted Authority as locked and invalid, with the Configuration required warning', () => {
+  it('shows a deleted Authority as checked and invalid, with the Configuration required warning', () => {
     renderForm(
       baseProps({
         isApMa: false,

@@ -400,7 +400,8 @@ interface IssuerAuthorityPickerProps {
  * On the caller leg the templates (the verified-issuer default and the
  * sending-gateway DID) are offered too and combine with the literal DIDs
  * like any other pick. While nothing is stored the default shows as
- * checked, so a pick is added beside it.
+ * checked, and the first pick replaces it; ticking the default again
+ * keeps it beside the other picks.
  *
  * Storing a literal DID (rather than a `{{ input.agent.provider_did }}`
  * template) means the runtime never resolves provider metadata off an
@@ -419,7 +420,7 @@ interface IssuerAuthorityPickerProps {
  * a stored Authority the loaded register no longer has as a checked
  * "Deleted Authority" option, marked invalid, with the Configuration
  * required warning; unchecking either removes it. When neither register
- * has entries and nothing is stored, a locked read-only textbox prompts the
+ * has entries and nothing is stored, a disabled read-only textbox prompts the
  * operator to configure a Department or Authority.
  *
  * Picking an Issuer records `'issuer'` as its source, an Authority
@@ -554,16 +555,15 @@ const IssuerAuthorityPicker: React.FC<IssuerAuthorityPickerProps> = ({
   }
   const handleToggle = (value: string) => {
     if (value === GRP_ISSUERS || value === GRP_AUTHORITIES) return;
-    // The shown selection, including the caller-leg default while nothing is stored.
-    const current: AuthorityRow[] = selected.map(did => rows.find(r => r.did === did) ?? { did });
     if (selected.includes(value)) {
-      onChange(current.filter(r => r.did !== value));
+      onChange(rows.filter(r => r.did !== value));
       return;
     }
     const pick: AuthorityRow = CALLER_TEMPLATES.has(value)
       ? { did: value }
       : { did: value, source: issuerDids.has(value) ? 'issuer' : 'authority' };
-    onChange([...current, pick]);
+    // While nothing is stored the caller-leg default is only shown, so the first pick replaces it.
+    onChange([...rows, pick]);
   };
 
   return (

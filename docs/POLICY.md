@@ -337,10 +337,10 @@ problem report on such a thread that no query still awaits is logged and ignored
 it arrives. Only a problem report on any other thread is taken as the registry rejecting the
 gateway.
 
-Gateway 1.0.8 and earlier cannot read `query.authority_ids`, even a list of one. It skips any
+Gateway 1.0.9 and earlier cannot read `query.authority_ids`, even a list of one. It skips any
 stored surface or managed connection with a Trust Check that sets `query.authority_ids`, and
 logs a parse error. Requests to that surface fail as unknown, and that client cannot
-authenticate. Before rolling back to 1.0.8 or earlier, or before a standby on such a version
+authenticate. Before rolling back to 1.0.9 or earlier, or before a standby on such a version
 takes over, change each such query to a single `authority_id`. Surfaces and managed
 connections whose queries set only `authority_id` load as before. Such a gateway also caps a leg's list at 10 Trust Checks, but only when saving: it loads
 and runs a longer list, and refuses to save that surface or managed connection (`400`) until

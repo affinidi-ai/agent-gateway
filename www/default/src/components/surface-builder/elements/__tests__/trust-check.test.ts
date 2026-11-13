@@ -727,6 +727,29 @@ describe('trustCheckDefinition — multiple queries per node', () => {
       ).toMatch(/Replace the caller-leg Authority template/);
     });
   });
+
+  it.each([
+    ['Transit Point', TP_SLOT, 'tp-1'],
+    ['Managed Agent', MA_SLOT, 'target'],
+  ])(
+    'flags a blank Authority on a newly dropped %s Trust Check (no _edge yet)',
+    (_leg, slotId, parentId) => {
+      const blank = {
+        trust_registry_id: 'tr-1',
+        query_type: 'authorization',
+        query: { action: 'issue', resource: 'payment' },
+      };
+      expect(
+        trustCheckDefinition.incompleteReason({ queries: [blank] }, { id: 'tc', slotId, parentId })
+      ).toBe('Select an Issuer or Authority for the target-leg Authority');
+      expect(
+        trustCheckDefinition.incompleteReason(
+          { queries: [blank] },
+          { id: 'tc', slotId: AP_SLOT, parentId: 'access-point' }
+        )
+      ).toBeNull();
+    }
+  );
 });
 
 describe('trustCheckDefinition — hydrate → buildPayload round-trip', () => {

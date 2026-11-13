@@ -902,8 +902,8 @@ export const trustCheckDefinition: NodeDefinition = {
     title: 'Trust Check',
     docLink: DOCS_URL.trustElements,
     bodyHtml: `
-      <p>Each Trust Check holds up to 10 TRQP queries, and each leg takes
-      one Trust Check. Every query result is surfaced to your policies on
+      <p>A Trust Check holds any number of TRQP queries, each checking one
+      or several Authorities, and each leg takes one Trust Check. Every query result is surfaced to your policies on
       every gateway and surface evaluation, which decide what to do with
       allow / deny / unreachable.</p>
       <p><strong>Placement determines which leg the query runs on:</strong></p>
@@ -936,10 +936,11 @@ export const trustCheckDefinition: NodeDefinition = {
         managedAgentTrustCheckTargetMessage(c, ctx.allNodes),
     },
   ],
-  incompleteReason: c => {
+  incompleteReason: (c, node) => {
     const queries = readQueries(c);
     if (queries.length === 0) return 'Needs at least one query';
-    const isTargetLeg = c?._edge === 'ma-tp';
+    // A newly dropped node has no `_edge` (set only on hydration), so its slot decides too.
+    const isTargetLeg = c?._edge === 'ma-tp' || (!!node && trustCheckLeg(node) !== 'caller');
     for (let i = 0; i < queries.length; i++) {
       const q = queries[i];
       const prefix = queries.length > 1 ? `Query ${i + 1}: ` : '';

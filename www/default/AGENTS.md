@@ -689,7 +689,8 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   list and its `authority_sources` map through every load and save (`listedAuthorities`,
   `queryFromElement`, `buildEntry`), on every leg and in variants; the save never adds
   `authority_id` or `authority_source` beside it. In the fullscreen editor a query's **Authority
-  ID** is one multi-select (`IssuerAuthorityPicker` on the shared `FormMultiSelect`): a picked Issuer
+  ID** is one multi-select (`IssuerAuthorityPicker` on the shared `FormMultiSelect`, which shares
+  its keyboard handling and option markup with `FormSelect` through `shared/listbox.tsx`): a picked Issuer
   or Authority shows a check on the right, as in `FormSelect`; a click toggles it and keeps the menu open, and the toggle lists
   the picked names in order. One pick is the single `authority_id` with `authority_source`,
   exactly as before; two or more are `authority_ids` in the order picked, each DID recorded in
@@ -698,7 +699,8 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   unchecking all leaves an empty `authority_id` (the caller leg's default). The caller-leg
   templates (the verified-issuer default and the sending-gateway DID) combine with each other and
   with literal DIDs like any pick, with no source recorded; while nothing is stored the default
-  shows checked, so a pick is added beside it. There is no limit on how many Authorities a query
+  shows checked and the first pick replaces it, and it stays only when ticked beside other
+  picks. There is no limit on how many Authorities a query
   or a Trust Check names, in the editor or at the gateway. A picked Authority that
   was deleted shows as a checked "Deleted Authority" option with the warning, and like a deleted
   single Authority it is listed in the panel's "Configuration required" warning, draws the node
@@ -726,8 +728,8 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   `InfoBanner` titled "Configuration required", `role="alert"`) saying the check fails with
   `AUTHORITY_NOT_FOUND` until it is fixed, the fixes (pick another Authority, add an Authority
   with the same DID through `deepLinks.authority`, or remove the Trust Check) and the stored DID
-  ("Query <n>: <did>" when the node has several queries); the picker shows the DID as a locked
-  "Deleted Authority" option marked invalid. Save is blocked on both surface pages, in the base
+  ("Query <n>: <did>" when the node has several queries); the picker shows the DID as a checked
+  "Deleted Authority" option marked invalid, which unchecking removes. Save is blocked on both surface pages, in the base
   and every variant, with the full warning and **Show me** (`firstMissingAuthorityNode` in
   `elements/missingAuthority.ts`). It is not part of `configured` or `getIncompleteReason`. The
   panel copy says the DID is stored directly and that, for an Authority, the gateway fails the
