@@ -14,25 +14,19 @@ Feature: Trust Checks that list several authorities
     Then the admin API response status is 201
     And the stored Trust Check "authority-recognised" of the surface under test lists authorities "did:web:authority-a, did:web:authority-b, did:web:authority-c"
 
-  Scenario: A Trust Check that names one authority and also lists authorities is refused
-    When the operator creates the surface for route "/orders" with a caller-leg Trust Check against DID "did:web:authority-a" that also lists authorities "did:web:authority-b"
+  Scenario Outline: A Trust Check whose authorities are not one authority or one valid list is refused
+    When the operator creates the surface for route "/orders" with <trust_check>
     Then the admin API response status is 400
-    And the admin API error response mentions "query.authority_id and query.authority_ids cannot both be set"
+    And the admin API error response mentions "<error>"
 
-  Scenario: A Trust Check that names one authority and sets sources for listed authorities is refused
-    When the operator creates the surface for route "/orders" with a caller-leg Trust Check against DID "did:web:authority-a" that takes listed authority "did:web:authority-a" from the Authorities register
-    Then the admin API response status is 400
-    And the admin API error response mentions "authority_sources cannot be set without query.authority_ids"
-
-  Scenario: A Trust Check that lists authorities and sets its own timeout is refused
-    When the operator creates the surface for route "/orders" with a caller-leg Trust Check listing authorities "did:web:authority-a, did:web:authority-b" and a timeout of 2 seconds
-    Then the admin API response status is 400
-    And the admin API error response mentions "timeout_secs cannot be set when query.authority_ids is set"
-
-  Scenario: A Trust Check that lists the same authority twice is refused
-    When the operator creates the surface for route "/orders" with a caller-leg Trust Check listing authorities "did:web:authority-a, did:web:authority-a"
-    Then the admin API response status is 400
-    And the admin API error response mentions "query.authority_ids[1] repeats an earlier entry"
+    Examples:
+      | trust_check | error |
+      | a caller-leg Trust Check against DID "did:web:authority-a" that also lists authorities "did:web:authority-b" | query.authority_id and query.authority_ids cannot both be set |
+      | a caller-leg Trust Check against DID "did:web:authority-a" that takes listed authority "did:web:authority-a" from the Authorities register | authority_sources cannot be set without query.authority_ids |
+      | a caller-leg Trust Check listing authorities "did:web:authority-a, did:web:authority-b" that takes its single authority from the Authorities register | authority_source cannot be set when query.authority_ids is set |
+      | a caller-leg Trust Check listing authorities "did:web:authority-a, did:web:authority-b" and a timeout of 2 seconds | timeout_secs cannot be set when query.authority_ids is set |
+      | a caller-leg Trust Check listing authorities "did:web:authority-a, did:web:authority-a" | query.authority_ids[1] repeats an earlier entry |
+      | a caller-leg Trust Check listing authorities "did:web:authority-a, " | query.authority_ids[1] must not be blank |
 
   Scenario: A Trust Check that lists many authorities is saved
     When the operator creates the surface for route "/orders" with a caller-leg Trust Check listing 26 distinct authorities
@@ -41,8 +35,3 @@ Feature: Trust Checks that list several authorities
   Scenario: A leg with more than 10 Trust Checks is saved
     When the operator creates the surface for route "/orders" with 11 caller-leg Trust Checks
     Then the admin API response status is 201
-
-  Scenario: A Trust Check that lists a blank authority is refused
-    When the operator creates the surface for route "/orders" with a caller-leg Trust Check listing authorities "did:web:authority-a, "
-    Then the admin API response status is 400
-    And the admin API error response mentions "query.authority_ids[1] must not be blank"

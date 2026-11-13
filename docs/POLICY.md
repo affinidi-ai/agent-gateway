@@ -262,7 +262,7 @@ Element validation is in
 | `id` | Required, unique within the leg, at most `TRUST_CHECK_ID_MAX_CODE_POINTS` (64) code points. Rego-addressable and audit-visible. |
 | `name` | Optional display label, at most `TRUST_CHECK_NAME_MAX_CODE_POINTS` (64) code points. |
 | `id` and `name` | Control, DEL, C1, and bidi-override codepoints are rejected. |
-| `query.authority_id` / `query.authority_ids` | Exactly one is set. `authority_ids` holds one or more distinct, non-blank DIDs or templates. `authority_sources` is refused without `authority_ids`. |
+| `query.authority_id` / `query.authority_ids` | Exactly one is set. `authority_ids` holds one or more distinct, non-blank DIDs or templates. `authority_sources` is refused without `authority_ids`, and `authority_source` is refused with it. |
 | `timeout_secs` | Optional on a single-authority element; without it the element waits for the trust registry transport's own timeout. Refused on a multi-authority element, where each authority always waits `TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS` (5). |
 
 The two caps are separate constants that happen to share a value today, because `id` is
@@ -328,20 +328,20 @@ Accepted risk: nothing bounds how many authorities a leg queries. Every request 
 message per listed authority, all at once, through the trust registry's connection and its
 mediator, and writes one audit record and one `agent_gateway_trust_check_total` sample per
 authority, so the lists an operator configures set the load each request puts on the registry,
-the mediator and the audit sinks. A connection remembers only its latest 256 timed-out query
-threads (`TIMED_OUT_QUERIES_KEPT` in
-[`src/trust_registries/communication.rs`](../src/trust_registries/communication.rs)). If more
-than 256 queries to one registry time out before the registry answers an earlier one with a
-problem report, that late report no longer matches a remembered thread and is taken as the
-registry rejecting the gateway, which marks the registry connection `Failed`. Keep lists to the
-authorities a policy needs.
+the mediator and the audit sinks. Keep lists to the authorities a policy needs. A query that
+times out never marks the registry connection `Failed`: every request the gateway sends to a
+registry has a thread id starting with `ag-req-` (`REQUEST_THREAD_PREFIX` in
+[`src/trust_registries/communication.rs`](../src/trust_registries/communication.rs)), and a
+problem report on such a thread that no query still awaits is logged and ignored, however late
+it arrives. Only a problem report on any other thread is taken as the registry rejecting the
+gateway.
 
-A gateway older than this feature cannot read `query.authority_ids`. It skips any stored surface
-or managed connection with a Trust Check that lists several authorities, and logs a parse error.
-Requests to that surface fail as unknown, and that client cannot authenticate. Before rolling
-back, or before a standby on an older version takes over, change each such query to a single
-`authority_id`. Surfaces and managed connections whose queries name one authority load as
-before. Such a gateway also caps a leg's list at 10 Trust Checks, but only when saving: it loads
+Gateway 1.0.8 and earlier cannot read `query.authority_ids`, even a list of one. It skips any
+stored surface or managed connection with a Trust Check that sets `query.authority_ids`, and
+logs a parse error. Requests to that surface fail as unknown, and that client cannot
+authenticate. Before rolling back to 1.0.8 or earlier, or before a standby on such a version
+takes over, change each such query to a single `authority_id`. Surfaces and managed
+connections whose queries set only `authority_id` load as before. Such a gateway also caps a leg's list at 10 Trust Checks, but only when saving: it loads
 and runs a longer list, and refuses to save that surface or managed connection (`400`) until
 the list is trimmed to 10.
 

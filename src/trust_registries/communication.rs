@@ -221,57 +221,28 @@ pub(crate) struct TrustRegistryConnection {
     /// Shared across clones so the single stream reader can deliver a response
     /// to whichever `send_and_await` call registered that thread.
     pub(crate) response_waiters: ResponseWaiters,
-    /// The threads of this connection's latest queries that timed out.
-    pub(crate) timed_out_queries: TimedOutQueries,
 }
 
 /// Maps an in-flight query's `thid` to the oneshot that its `send_and_await`
 /// caller is awaiting. The stream reader delivers responses here.
 pub(crate) type ResponseWaiters = Arc<Mutex<HashMap<String, oneshot::Sender<PollResult>>>>;
 
-/// How many of a connection's latest timed-out query threads are remembered.
-const TIMED_OUT_QUERIES_KEPT: usize = 256;
+/// Starts the thread id of every request `send_and_await` sends, so the reader
+/// can tell a late reply to one of them from the registry rejecting the gateway,
+/// however long ago and on whichever connection the request was sent.
+pub(crate) const REQUEST_THREAD_PREFIX: &str = "ag-req-";
 
-/// The latest query threads of a connection that timed out, so the reader can
-/// tell a late reply to one of them from the registry rejecting the gateway.
-#[derive(Clone, Default)]
-pub(crate) struct TimedOutQueries(Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
-
-impl TimedOutQueries {
-    pub(crate) fn record(
-        &self,
-        thid: &str,
-    ) {
-        let mut threads = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if threads.len() == TIMED_OUT_QUERIES_KEPT {
-            threads.pop_front();
-        }
-        threads.push_back(thid.to_string());
-    }
-
-    pub(crate) fn contains(
-        &self,
-        thid: &str,
-    ) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .any(|query| query == thid)
-    }
+/// Whether `thid` is the thread of a request `send_and_await` sent.
+pub(crate) fn is_request_thread(thid: &str) -> bool {
+    thid.starts_with(REQUEST_THREAD_PREFIX)
 }
 
 /// A query thread that `send_and_await` is waiting on. Unless a response was
-/// delivered to it, dropping it records the thread as timed out and only then
-/// removes its waiter, so a late reply is never taken for the registry rejecting
-/// the gateway, however the query was abandoned: by its own deadline, by a
-/// caller's outer timeout dropping the future, or by the reader closing.
+/// delivered to it, dropping it removes its waiter, however the query was
+/// abandoned: by its own deadline, by a caller's outer timeout dropping the
+/// future, or by the reader closing.
 struct PendingQuery {
     waiters: ResponseWaiters,
-    timed_out_queries: TimedOutQueries,
     thid: String,
     answered: bool,
 }
@@ -281,8 +252,6 @@ impl Drop for PendingQuery {
         if self.answered {
             return;
         }
-        self.timed_out_queries
-            .record(&self.thid);
         if let Ok(mut waiters) = self.waiters.try_lock() {
             waiters.remove(&self.thid);
         } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -625,9 +594,6 @@ pub struct TrustRegistryListenerManager {
     /// Background retries keyed by trust registry ID.
     retries: Mutex<HashMap<String, Retry>>,
     retry_policy: ReconnectPolicy,
-    /// The timed-out query threads of each registry, shared by every connection
-    /// built for it.
-    timed_out_queries: std::sync::Mutex<HashMap<BuildKey, TimedOutQueries>>,
     self_ref: Weak<Self>,
 }
 
@@ -658,7 +624,6 @@ impl TrustRegistryListenerManager {
             ownership: Mutex::new(Ownership::default()),
             retries: Mutex::new(HashMap::new()),
             retry_policy,
-            timed_out_queries: std::sync::Mutex::new(HashMap::new()),
             self_ref: self_ref.clone(),
         })
     }
@@ -1064,7 +1029,6 @@ impl TrustRegistryListenerManager {
                 is_temporary: false,
                 client,
                 response_waiters: Arc::new(Mutex::new(HashMap::new())),
-                timed_out_queries: TimedOutQueries::default(),
             };
             let extras = OobExtras {
                 mediator_url: "https://mediator.example".to_string(),
@@ -1195,7 +1159,6 @@ impl TrustRegistryListenerManager {
             is_temporary: false,
             client,
             response_waiters: Arc::new(Mutex::new(HashMap::new())),
-            timed_out_queries: TimedOutQueries::default(),
         };
 
         info!("🔗 Trust registry '{}' connection established — awaiting registry-side approval", trust_registry_id);
@@ -1261,7 +1224,6 @@ impl TrustRegistryListenerManager {
             is_temporary: false,
             client,
             response_waiters: Arc::new(Mutex::new(HashMap::new())),
-            timed_out_queries: TimedOutQueries::default(),
         };
 
         #[cfg(test)]
@@ -1452,10 +1414,6 @@ impl TrustRegistryListenerManager {
             .await;
         self.remove_connection(trust_registry_id)
             .await;
-        self.timed_out_queries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&BuildKey::Stored(trust_registry_id.to_string()));
         if let Some(running) = running {
             let _ = Self::await_build(Pending::Building(running), Some(Instant::now() + BUILD_TIMEOUT)).await;
         }
@@ -1483,7 +1441,7 @@ impl TrustRegistryListenerManager {
     /// while the node is Standby or the registry is deleted.
     async fn install_connection(
         &self,
-        mut connection: TrustRegistryConnection,
+        connection: TrustRegistryConnection,
     ) -> Result<TrustRegistryConnection, TrustRegistryError> {
         let ownership = self.ownership.lock().await;
         if connection.is_temporary
@@ -1515,7 +1473,6 @@ impl TrustRegistryListenerManager {
             connection.close().await;
             return Err(refusal);
         }
-        connection.timed_out_queries = self.timed_out_queries_for(&connection);
 
         let displaced = {
             let mut connections = self.connections.write().await;
@@ -1550,33 +1507,6 @@ impl TrustRegistryListenerManager {
             debug!("Closed replaced connection for trust registry '{}'", replaced.trust_registry_id);
         }
         Ok(connection)
-    }
-
-    /// The timed-out query threads of the registry `connection` serves, so a late
-    /// reply to a query that a replaced connection sent is still recognised.
-    fn timed_out_queries_for(
-        &self,
-        connection: &TrustRegistryConnection,
-    ) -> TimedOutQueries {
-        let key = if connection.is_temporary {
-            BuildKey::Temporary(
-                connection
-                    .registry_did
-                    .clone(),
-            )
-        } else {
-            BuildKey::Stored(
-                connection
-                    .trust_registry_id
-                    .clone(),
-            )
-        };
-        self.timed_out_queries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(key)
-            .or_default()
-            .clone()
     }
 
     /// Look up a stored trust registry by DID (checks main_did, registry_did, did).
@@ -2355,7 +2285,6 @@ impl TrustRegistryListenerManager {
                     is_temporary: true,
                     client,
                     response_waiters: Arc::new(Mutex::new(HashMap::new())),
-                    timed_out_queries: TimedOutQueries::default(),
                 })
                 .map_err(TrustRegistryError::ConnectionError);
         }
@@ -2420,7 +2349,6 @@ impl TrustRegistryListenerManager {
             is_temporary: true,
             client,
             response_waiters: Arc::new(Mutex::new(HashMap::new())),
-            timed_out_queries: TimedOutQueries::default(),
         })
     }
 
@@ -2486,7 +2414,7 @@ impl TrustRegistryListenerManager {
             return Err(TrustRegistryError::Timeout("no time left to send to the trust registry".to_string()));
         }
         let message_id = uuid::Uuid::new_v4().to_string();
-        let thread_id = uuid::Uuid::new_v4().to_string();
+        let thread_id = format!("{REQUEST_THREAD_PREFIX}{}", uuid::Uuid::new_v4());
 
         let message = DIDCommMessage::build(message_id.clone(), message_type.to_string(), body)
             .from(connection.our_did.clone())
@@ -2516,9 +2444,6 @@ impl TrustRegistryListenerManager {
         let mut pending = PendingQuery {
             waiters: connection
                 .response_waiters
-                .clone(),
-            timed_out_queries: connection
-                .timed_out_queries
                 .clone(),
             thid: thread_id.clone(),
             answered: false,
@@ -3217,7 +3142,6 @@ mod tests {
             is_temporary: false,
             client: super::super::test_builds::offline_client().await,
             response_waiters: empty_waiters(),
-            timed_out_queries: TimedOutQueries::default(),
         }
     }
 
@@ -4366,26 +4290,18 @@ mod tests {
     }
 
     #[test]
-    fn timed_out_queries_keep_only_the_latest_threads() {
-        let threads = TimedOutQueries::default();
-        for i in 0..=TIMED_OUT_QUERIES_KEPT {
-            threads.record(&format!("thid-{i}"));
-        }
-
-        assert!(!threads.contains("thid-0"), "the oldest thread is forgotten");
-        assert!(threads.contains("thid-1"));
-        assert!(threads.contains(&format!("thid-{TIMED_OUT_QUERIES_KEPT}")));
-        assert!(!threads.contains("thid-unknown"));
+    fn only_request_threads_are_recognised_as_request_threads() {
+        assert!(is_request_thread(&format!("{REQUEST_THREAD_PREFIX}{}", uuid::Uuid::new_v4())));
+        assert!(!is_request_thread(&uuid::Uuid::new_v4().to_string()));
+        assert!(!is_request_thread(""));
     }
 
     fn pending_query(
         waiters: &ResponseWaiters,
-        threads: &TimedOutQueries,
         thid: &str,
     ) -> PendingQuery {
         PendingQuery {
             waiters: waiters.clone(),
-            timed_out_queries: threads.clone(),
             thid: thid.to_string(),
             answered: false,
         }
@@ -4399,10 +4315,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_query_dropped_by_an_outer_timeout_is_recorded_and_its_waiter_removed() {
-        let (waiters, threads) = (empty_waiters(), TimedOutQueries::default());
+    async fn a_query_dropped_by_an_outer_timeout_has_its_waiter_removed() {
+        let waiters = empty_waiters();
         let rx = register_waiter_in(&waiters, "thid-dropped".to_string()).await;
-        let pending = pending_query(&waiters, &threads, "thid-dropped");
+        let pending = pending_query(&waiters, "thid-dropped");
 
         let outer = tokio::time::timeout(std::time::Duration::from_millis(20), async move {
             let _pending = pending;
@@ -4411,7 +4327,6 @@ mod tests {
         .await;
 
         assert!(outer.is_err(), "the outer timeout dropped the query");
-        assert!(threads.contains("thid-dropped"), "the late reply is recognised");
         assert!(
             waiters
                 .lock()
@@ -4423,41 +4338,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_query_whose_reader_closed_is_recorded() {
-        let (waiters, threads) = (empty_waiters(), TimedOutQueries::default());
-        let rx = register_waiter_in(&waiters, "thid-closed".to_string()).await;
-        let pending = pending_query(&waiters, &threads, "thid-closed");
-
-        waiters.lock().await.clear();
-        assert!(rx.await.is_err());
-        drop(pending);
-
-        assert!(threads.contains("thid-closed"), "a reply after the socket reconnects is recognised");
-    }
-
-    #[tokio::test]
-    async fn an_answered_query_is_not_recorded() {
-        let (waiters, threads) = (empty_waiters(), TimedOutQueries::default());
-        let rx = register_waiter_in(&waiters, "thid-answered".to_string()).await;
-        let mut pending = pending_query(&waiters, &threads, "thid-answered");
-
-        assert!(deliver_response_in(&waiters, "thid-answered", problem_report()).await);
-        assert!(rx.await.is_ok());
-        pending.answered = true;
-        drop(pending);
-
-        assert!(!threads.contains("thid-answered"));
-    }
-
-    #[tokio::test]
-    async fn a_dropped_query_is_recorded_before_its_waiter_is_removed_while_the_waiters_are_locked() {
-        let (waiters, threads) = (empty_waiters(), TimedOutQueries::default());
+    async fn a_dropped_query_has_its_waiter_removed_once_the_waiters_are_unlocked() {
+        let waiters = empty_waiters();
         let _rx = register_waiter_in(&waiters, "thid-busy".to_string()).await;
-        let pending = pending_query(&waiters, &threads, "thid-busy");
+        let pending = pending_query(&waiters, "thid-busy");
 
         let held = waiters.lock().await;
         drop(pending);
-        assert!(threads.contains("thid-busy"), "recorded while the waiter is still registered");
         drop(held);
 
         for _ in 0..100 {
@@ -4471,33 +4358,6 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("the waiter was never removed");
-    }
-
-    #[tokio::test]
-    async fn a_query_that_timed_out_on_a_replaced_connection_is_recognised_on_its_replacement() {
-        let mgr = test_manager();
-        let id = format!("tr-{}", uuid::Uuid::new_v4());
-        let first = mgr
-            .install_connection(test_connection(&id).await)
-            .await
-            .expect("installed");
-        first
-            .timed_out_queries
-            .record("thid-old");
-
-        let replacement = mgr
-            .install_connection(test_connection(&id).await)
-            .await
-            .expect("installed");
-
-        assert!(
-            replacement
-                .timed_out_queries
-                .contains("thid-old")
-        );
-        mgr.delete_registry(&id).await;
-        let recreated = mgr.timed_out_queries_for(&test_connection(&id).await);
-        assert!(!recreated.contains("thid-old"), "a deleted registry's threads are forgotten");
     }
 
     #[tokio::test]

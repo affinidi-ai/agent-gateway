@@ -261,6 +261,21 @@ async fn operator_creates_surface_with_authority_list(
 }
 
 #[when(
+    expr = "the operator creates the surface for route {string} with a caller-leg Trust Check listing authorities {string} that takes its single authority from the Authorities register"
+)]
+async fn operator_creates_surface_with_authority_list_and_single_source(
+    world: &mut SurfaceWorld,
+    route: String,
+    authorities: String,
+) {
+    let fields = json!({
+        "query": {"authority_ids": authority_list(&authorities), "entity_id": "{{ input.agent.did }}"},
+        "authority_source": "authority"
+    });
+    create_surface_with_trust_check_element(world, &route, fields).await;
+}
+
+#[when(
     expr = "the operator creates the surface for route {string} with a caller-leg Trust Check listing {int} distinct authorities"
 )]
 async fn operator_creates_surface_with_counted_authority_list(

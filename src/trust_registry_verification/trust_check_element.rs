@@ -177,6 +177,8 @@ pub enum TrustCheckElementValidationError {
     AuthoritiesDuplicate { index: usize },
     #[error("authority_sources cannot be set without query.authority_ids")]
     AuthoritySourcesWithoutList,
+    #[error("authority_source cannot be set when query.authority_ids is set; use authority_sources")]
+    AuthoritySourceWithList,
     #[error("timeout_secs cannot be set when query.authority_ids is set")]
     AuthoritiesTimeoutSet,
     #[error("name exceeds {max} code points (got {got})")]
@@ -246,6 +248,12 @@ impl TrustCheckElement {
         };
         if single_set {
             return Err(TrustCheckElementValidationError::AuthorityBothSet);
+        }
+        if self
+            .authority_source
+            .is_some()
+        {
+            return Err(TrustCheckElementValidationError::AuthoritySourceWithList);
         }
         if self.timeout_secs.is_some() {
             return Err(TrustCheckElementValidationError::AuthoritiesTimeoutSet);
@@ -845,6 +853,15 @@ mod tests {
         elem.authority_sources
             .insert("did:a".to_string(), AuthoritySource::Authority);
         assert_eq!(elem.validate(), Err(TrustCheckElementValidationError::AuthoritySourcesWithoutList));
+    }
+
+    #[test]
+    fn validate_rejects_authority_source_beside_authority_list() {
+        use crate::trust_registry_verification::authority_source::AuthoritySource;
+
+        let mut elem = multi(&["did:web:authority-a"]);
+        elem.authority_source = Some(AuthoritySource::Authority);
+        assert_eq!(elem.validate(), Err(TrustCheckElementValidationError::AuthoritySourceWithList));
     }
 
     #[test]
