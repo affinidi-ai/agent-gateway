@@ -9,6 +9,7 @@ import { Link } from '../components/shared/Link';
 import { DOCS_URL } from '../config/docs';
 import { showToast } from '../utils/toaster';
 import { joinWarnings, parseWarningHeader } from '../utils/warningHeader';
+import { strategyDeleteError } from './SettingsPage/StrategiesTab';
 
 interface JwksSourceForm {
   type: 'remote' | 'static';
@@ -215,7 +216,11 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
 
       if (!response.ok) {
         const text = await response.text();
-        throw new Error(formatApiError(response.status, text, response.statusText));
+        throw new Error(
+          response.status === 409
+            ? strategyDeleteError(response.status, text, response.statusText)
+            : formatApiError(response.status, text, response.statusText)
+        );
       }
 
       const warnings = parseWarningHeader(response.headers?.get('Warning'));

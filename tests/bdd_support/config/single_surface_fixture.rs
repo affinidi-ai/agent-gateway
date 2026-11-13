@@ -60,6 +60,16 @@ pub struct SurfaceConfigBuilder {
     /// The surface's OAuth provider is stored as the admin API now creates one: with a
     /// record id of its own, which its callback path ends in, instead of its provider id.
     pub oauth_callback_path_ends_in_record_id: bool,
+    /// The callers' identity provider runs, and the gateway has an identity hash pepper.
+    pub identity_provider: bool,
+    /// The authorization and token endpoints of the callers' identity provider, once it runs.
+    pub identity_provider_endpoints: Option<IdentityProviderEndpoints>,
+    /// The surface's OAuth provider has its caller sign in at the identity provider first.
+    pub consent_confirmation: bool,
+    /// That provider refuses a consent link to a caller it cannot confirm.
+    pub consent_confirmation_required: bool,
+    /// The gateway runs without an identity hash pepper, even with the callers' identity provider.
+    pub identity_hash_pepper_unset: bool,
     pub mcp_identity_payload_schema: Option<serde_json::Value>,
     pub required_mcp_identity_field: Option<String>,
     pub constrained_mcp_identity_field: Option<String>,
@@ -138,6 +148,14 @@ pub struct CallerKeyFixture {
     pub secret_id: String,
     pub secret_value: Option<String>,
     pub header: Option<String>,
+}
+
+/// Where the gateway sends a person to sign in at the callers' identity provider, and
+/// exchanges the code it gets back.
+#[derive(Debug, Clone)]
+pub struct IdentityProviderEndpoints {
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
 }
 
 /// A prefix the operator adds to `gateway.json`.
@@ -230,6 +248,11 @@ impl Default for SurfaceConfigBuilder {
             oauth_authorization_response_issuer: None,
             additional_oauth_providers: Vec::new(),
             oauth_callback_path_ends_in_record_id: false,
+            identity_provider: false,
+            identity_provider_endpoints: None,
+            consent_confirmation: false,
+            consent_confirmation_required: false,
+            identity_hash_pepper_unset: false,
             mcp_identity_payload_schema: None,
             required_mcp_identity_field: None,
             constrained_mcp_identity_field: None,

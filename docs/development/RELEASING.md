@@ -65,9 +65,8 @@ It then:
 1. Validates every `.changelog/wip/*.yaml` fragment.
 2. Computes the next version. If the version in `Cargo.toml` has no matching tag yet (the first
    release), it releases that version as-is. Otherwise it applies the chosen increment to the
-   `Cargo.toml` version. The run fails if the pending fragments need a bigger increment than the
-   chosen one: `breaking` entries need at least `minor` before 1.0.0 and `major` from 1.0.0, and
-   `added` entries need at least `minor`. Choose a larger increment, or change the fragments.
+   `Cargo.toml` version. The chosen increment always decides the version: the categories of the
+   pending fragments (`breaking`, `added`) do not raise it or block the run.
 3. Bumps `Cargo.toml` and `Cargo.lock` to that version.
 4. Folds every fragment into a new `CHANGELOG.md` section and archives the fragments under
    `.changelog/history/<version>/`.

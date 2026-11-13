@@ -6900,6 +6900,10 @@ async fn proxy_charged_request(
                 mcp_session_id: validated_mcp_session_id.clone(),
             };
 
+            let consent_strategies = state
+                .source_auth_middleware
+                .as_ref()
+                .map(|middleware| middleware.provider_store());
             let delegation_results = deferred_audit
                 .scope(crate::proxy::credential_delegation::resolve_delegation_credentials(
                     &outbound_credentials,
@@ -6918,6 +6922,16 @@ async fn proxy_charged_request(
                     secrets_store,
                     base_url,
                     false, // via_fabric = false (direct HTTP path)
+                    crate::delegation_vault::consent_confirmation::ConsentCaller::AccessPoint {
+                        identity: authenticated_identity.as_ref(),
+                        strategies: consent_strategies.as_deref(),
+                        gateway_issuer: state
+                            .network_config
+                            .sts
+                            .mcp_issuer
+                            .as_ref()
+                            .map(|profile| profile.issuer.as_str()),
+                    },
                     Some(&delegation_audit_ctx),
                     delegation_consent_principal.as_deref(),
                 ))
@@ -22928,6 +22942,7 @@ allow if {
             let (issuer, _dir) = test_vc_issuer().await;
             let state = state_with(inbound_from_api_key("pak-wrong-auth"), Some(issuer));
             let jwt = AuthenticatedIdentity::JwtBearer {
+                strategy_id: None,
                 principal_claim: "sub".to_string(),
                 subject: "user-1".into(),
                 claims: serde_json::json!({"sub": "user-1"}),
@@ -24258,6 +24273,7 @@ mod fabric_send_tests {
                 "metadata": {"https://fabric.affinidi.io/extensions/agent-identity/v1": {"cloudProvider": "local", "model": "gpt-4"}}}}
         });
         let caller = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: json!({"iss": "https://idp.example.com", "email": "ada@example.com"}),

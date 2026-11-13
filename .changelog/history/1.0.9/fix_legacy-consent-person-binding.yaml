@@ -1,0 +1,76 @@
+branch: fix/legacy-consent-person-binding
+changes:
+  added:
+    - timestamp: '2026-11-11T14:00:00Z'
+      title: Set consent confirmation in the dashboard's credential provider editor
+      description: >-
+        The credential provider editor of a legacy authorization code provider now has a Consent
+        confirmation switch with the login client ID and client secret, both picked from the
+        secrets store, the authorization and token endpoints, JWT verification strategy and
+        optional ID-token principal claim, offering only strategies the provider's tenant can use,
+        and shows the Confirmation redirect URI to register at the identity provider. Saving sends
+        the setting while the switch is on and clears a stored one when it is switched off.
+    - timestamp: '2026-11-12T12:00:00Z'
+      title: Refuse consent links to callers consent confirmation cannot confirm
+      description: >-
+        consent_confirmation.require, off by default and set by the editor's Refuse callers that
+        can't be confirmed switch, refuses the request and mints no consent link for a caller the
+        setting cannot confirm, such as an API key, mTLS or DID caller, a Transit Point or Fabric
+        request, or a caller of another issuer, instead of a link that goes straight to the
+        vendor. Use it on a provider whose callers can all be confirmed.
+    - timestamp: '2026-11-12T12:05:00Z'
+      title: Count consent links of providers with consent confirmation
+      description: >-
+        The Prometheus counter agent_gateway_consent_confirmation_links_total counts every
+        consent link a provider with consent confirmation is asked for, by provider, surface,
+        outcome (confirmed, unconfirmed or refused) and reason, so operators can see how many
+        links skip the confirmation rather than only the first log line.
+  changed:
+    - timestamp: '2026-11-11T19:00:00Z'
+      title: Refuse deleting a JWT verification strategy a credential provider uses
+      description: >-
+        DELETE /api/v1/jwt-verification-strategies/{id} now answers 409, listing the providers,
+        while a credential provider's consent_confirmation.jwt_verification_strategy_id or its
+        consent_identity_strategy_id names the strategy, so deleting it no longer breaks modern
+        consent and can't leave consent confirmation without its strategy. This also applies to providers that
+        never set consent_confirmation. The Strategies tab's alert names those providers, counts
+        the ones the user can't view, and says that a provider's consent confirmation is changed
+        in its editor and its consent_identity_strategy_id through the API.
+    - timestamp: '2026-11-11T19:05:00Z'
+      title: Refuse a strategy issuer that a credential provider using it would refuse
+      description: >-
+        PUT /api/v1/jwt-verification-strategies/{id} now answers 409, listing the providers, when
+        it changes expected_issuer to one that a credential provider naming the strategy would
+        refuse at its own save: an issuer of this gateway's own STS or an Entra issuer while
+        callers are named by sub for consent_confirmation, or an issuer that is not a canonical
+        https URL for consent_identity_strategy_id. Before, such an edit stopped modern consent
+        from finding the strategy. The strategy editor shows the refusal with those providers
+        and where to change them.
+  fixed:
+    - timestamp: '2026-11-11T21:00:00Z'
+      title: Report a caller JWT without an iss claim as an invalid issuer
+      description: >-
+        A JWT Bearer caller whose token has no iss claim is now refused with the reason Invalid
+        issuer instead of Invalid audience, in the gateway log and in the cause a consent
+        confirmation logs for an ID token. The response and the audit record are unchanged.
+  removed: []
+  security:
+    - timestamp: '2026-11-11T12:00:00Z'
+      title: ⭐ Confirm the caller at their identity provider before legacy consent
+      description: >-
+        A legacy authorization code credential provider can now carry a consent_confirmation
+        setting that names a login client at the callers' identity provider, whose client ID and
+        secret are both read from the secrets store in the provider's own tenant, and the JWT
+        verification strategy that identifies them. When a JWT caller whose issuer and principal
+        claim are that strategy's opens a consent link, the gateway first signs them in at the
+        identity provider, verifies the ID token and checks that it names the same person the
+        link was issued to, and only then continues to the vendor. Another person is refused with
+        403 before the vendor is reached, on a page that tells them to switch account at the
+        identity provider. Saving the setting checks the provider type, the strategy and its
+        tenant, both endpoints, the client ID and secret, the confirmation redirect URI, the
+        principal claim and the identity hash pepper. A setting that no longer confirms any
+        caller, for example after the pepper is lost on a redeploy, refuses consent links to JWT
+        callers. Consent links of providers without the setting, of API key, mTLS and DID callers,
+        and of Transit Point and Fabric callers are minted as before unless the provider sets
+        require, with a warning in the gateway log when the provider has the setting.
+  breaking: []

@@ -308,6 +308,7 @@ impl SourceAuthMiddleware {
                 &config.audiences,
                 config.audience_claim,
             ),
+            strategy_id: Some(jwt_strategy.id),
         })
     }
 
@@ -2070,7 +2071,7 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
         let kid = "source-auth-test-key";
         let (mw, strategy_id, _server) = jwt_test_setup_naming(Some("oid")).await;
         let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
-            jwt_verification_strategy_id: strategy_id,
+            jwt_verification_strategy_id: strategy_id.clone(),
             audiences: vec!["my-audience".to_string()],
             ..Default::default()
         });
@@ -2099,9 +2100,15 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
             .await
             .expect("a token with the claim authenticates");
         match &identity {
-            AuthenticatedIdentity::JwtBearer { subject, principal_claim, .. } => {
+            AuthenticatedIdentity::JwtBearer {
+                subject,
+                principal_claim,
+                strategy_id: verified_by,
+                ..
+            } => {
                 assert_eq!(subject, "00000000-0000-0000-0000-0000000000aa");
                 assert_eq!(principal_claim, "oid");
+                assert_eq!(verified_by.as_deref(), Some(strategy_id.as_str()), "the identity names its strategy");
             }
             _ => panic!("expected a JwtBearer identity"),
         }

@@ -70,10 +70,13 @@ Point, identifies callers by the same claim.
   names a different claim is refused with `400`, and an update that leaves it out keeps it. To
   use another claim:
   1. Create a new strategy for the issuer that names the claim.
-  2. Point every surface method, and every credential provider whose
-     `consent_identity_strategy_id` names the old strategy, at the new one.
-  3. Delete the old strategy. Nothing checks that it is unused, so a provider still naming it
-     would answer its consents with not found.
+  2. Point every surface method, every credential provider whose
+     `consent_identity_strategy_id` names the old strategy, and every credential provider whose
+     `consent_confirmation.jwt_verification_strategy_id` names it, at the new one.
+  3. Delete the old strategy. The delete answers `409`, naming the providers, while a credential
+     provider's `consent_identity_strategy_id` or `consent_confirmation.jwt_verification_strategy_id`
+     still names it ([Consent confirmation](CREDENTIAL_DELEGATION.md#turning-it-on)). Nothing
+     checks surface methods, so point them at the new strategy first.
   4. Have callers connect again, since their identity hashes have changed.
 
   From step 1 to step 3, token exchange and `jwt-bearer` redemption refuse the issuer's tokens
@@ -383,17 +386,18 @@ To find the affected surfaces and callers:
   whose base or enabled variant now refuses such a caller (one that authenticates callers without protected
   resource metadata, `on_failure: reject` or an inbound `from_jwt_claim` identity, which refused
   already), naming the surface:
-  `This Access Point is neither closed nor public, and it refuses callers whose credential is
-  missing or invalid with 401, as a closed one does …`;
-- the dashboard's Access Point panel shows such a surface as legacy, with a **Close Access
-  Point** button.
+  `This Access Point is configured for authenticated callers only. Any request without valid
+  credentials is denied with a 401 Unauthorized response. To allow requests from those callers,
+  switch the Access Point to Public access.`.
 
 To keep handing failed callers to policy, mark the surface public (`access_point.public: true`,
 the **Public access** switch). To make the refusal explicit in storage, close it
-(`access_point.public: false`, **Close Access Point**). Either writes `public`, which releases
+(`access_point.public: false`, set through the API or the JSON editor). Either writes `public`, which releases
 before v1.0.4 cannot load (see [Upgrading and rolling back](#upgrading-and-rolling-back)). A
 surface built from DynamoDB takes the same setting from an optional `public` attribute on its
-item: a boolean, or the string `"true"` or `"false"`.
+item: a boolean, or the string `"true"` or `"false"`. Any other value is ignored, so the surface
+keeps no Public access setting, and the gateway logs a warning naming the item and the type of value it held (never
+the value), at start and on a later load.
 
 #### Not ready Access Points
 

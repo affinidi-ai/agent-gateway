@@ -601,9 +601,9 @@ pub const LEGACY_OPEN_ACCESS_POINT_WARNING: &str = "This Access Point is neither
 /// What the gateway logs at start for each legacy surface (no `public`) that
 /// refuses a caller whose credential is missing or invalid only because it is
 /// not public; see [`AgentSurface::legacy_access_point_notice`].
-pub const LEGACY_ACCESS_POINT_REFUSES_FAILED_CALLERS_NOTICE: &str = "This Access Point is neither closed nor \
-     public, and it refuses callers whose credential is missing or invalid with 401, as a closed one does. Set \
-     access_point.public to true to hand them to policy, or to false to close it.";
+pub const LEGACY_ACCESS_POINT_REFUSES_FAILED_CALLERS_NOTICE: &str = "This Access Point is configured for \
+     authenticated callers only. Any request without valid credentials is denied with a 401 Unauthorized response. \
+     To allow requests from those callers, switch the Access Point to Public access.";
 
 /// What the Gateway needs to know about the caller.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -4861,17 +4861,29 @@ mod tests {
             None,
             "an inbound from_jwt_claim identity refuses failed callers on any Access Point"
         );
-        let mut from_jwt_claim = surface_with_access_point(serde_json::json!({"caller_authentication": {"methods": [
-            {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []}
-        ]}}));
-        from_jwt_claim["identity_slots"] =
-            serde_json::json!({"inbound": {"type": "from_jwt_claim", "claim": "oid", "namespace_claims": []}});
+        let jwt_variant = |identity_slots: serde_json::Value| {
+            let mut overrides = serde_json::json!({"access_point": {"caller_authentication": {"methods": [
+                {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []}
+            ]}}});
+            if !identity_slots.is_null() {
+                overrides["identity_slots"] = identity_slots;
+            }
+            serde_json::json!([{"id": "beta", "alias": "beta", "name": "Beta", "enabled": true, "overrides": overrides}])
+        };
         assert_eq!(
-            serde_json::from_value::<super::AgentSurface>(from_jwt_claim)
-                .unwrap()
-                .legacy_access_point_notice(),
+            notice(serde_json::json!({}), jwt_variant(serde_json::Value::Null)),
+            Some(super::LEGACY_ACCESS_POINT_REFUSES_FAILED_CALLERS_NOTICE),
+            "a variant that authenticates callers with a JWT is newly refused"
+        );
+        assert_eq!(
+            notice(
+                serde_json::json!({}),
+                jwt_variant(
+                    serde_json::json!({"inbound": {"type": "from_jwt_claim", "claim": "oid", "namespace_claims": []}})
+                )
+            ),
             None,
-            "an inbound from_jwt_claim identity refuses failed callers on any Access Point"
+            "a variant with an inbound from_jwt_claim identity already refused failed callers"
         );
         for status in ["disabled", "deleted"] {
             let mut stopped = surface_with_access_point(

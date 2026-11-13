@@ -31,6 +31,9 @@ pub mod prom {
     pub const MANAGED_IDENTITY_RESOLVE_DURATION_SECONDS: &str =
         "agent_gateway_managed_identity_resolve_duration_seconds";
 
+    // Consent links minted or refused for providers with consent confirmation
+    pub const CONSENT_CONFIRMATION_LINKS_TOTAL: &str = "agent_gateway_consent_confirmation_links_total";
+
     // Trust Check element execution (TRQP authorization/recognition queries)
     pub const TRUST_CHECK_TOTAL: &str = "agent_gateway_trust_check_total";
     pub const TRUST_CHECK_DURATION_SECONDS: &str = "agent_gateway_trust_check_duration_seconds";

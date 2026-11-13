@@ -573,6 +573,7 @@ mod tests {
     #[test]
     fn caller_span_fields_jwt_bearer() {
         let id = AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "alice@example.com".to_string(),
             claims: serde_json::json!({"sub": "alice@example.com"}),
@@ -800,6 +801,7 @@ mod tests {
             rt.block_on(async {
                 async fn handler() -> &'static str {
                     let identity = AuthenticatedIdentity::JwtBearer {
+                        strategy_id: None,
                         principal_claim: "sub".to_string(),
                         subject: "alice@example.com".to_string(),
                         claims: serde_json::json!({"sub": "alice@example.com"}),
@@ -929,6 +931,7 @@ mod tests {
                 async fn handler() -> &'static str {
                     // Caller authenticated with a JWT bearer (no DID known here)…
                     let identity = AuthenticatedIdentity::JwtBearer {
+                        strategy_id: None,
                         principal_claim: "sub".to_string(),
                         subject: "agent-oid-123".to_string(),
                         claims: serde_json::json!({"oid": "agent-oid-123"}),

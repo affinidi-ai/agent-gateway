@@ -403,6 +403,10 @@ pub enum AuthenticatedIdentity {
         /// Where the keys that verified the token come from, and the audiences it was
         /// accepted against.
         verification: JwtVerification,
+        /// The Caller Context JWT verification strategy that verified the
+        /// token; `None` when no strategy did, such as for a token of this
+        /// gateway's own Resource Server.
+        strategy_id: Option<String>,
     },
 
     /// API Key authentication succeeded.
@@ -989,6 +993,7 @@ mod tests {
     #[test]
     fn authenticated_identity_jwt_claims_accessor() {
         let id = AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "agent-1".to_string(),
             claims: serde_json::json!({"oid": "abc", "tid": "tenant-1"}),
@@ -1023,6 +1028,7 @@ mod tests {
             principal_claim: principal_claim.to_string(),
             claims,
             verification: Default::default(),
+            strategy_id: None,
         }
     }
 
@@ -1136,6 +1142,7 @@ mod tests {
     fn an_identity_whose_subject_is_not_its_principal_claims_value_has_no_hash() {
         let claims = serde_json::json!({ "iss": "https://login.example.com", "sub": "alice", "oid": "o-1" });
         let forged = AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             subject: "alice".to_string(),
             principal_claim: "oid".to_string(),
             claims,
@@ -1158,6 +1165,7 @@ mod tests {
     #[test]
     fn the_identity_hash_has_fixed_values_for_known_callers() {
         let jwt_subject = |subject: &str| AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             subject: subject.to_string(),
             principal_claim: "sub".to_string(),
             claims: serde_json::json!({"iss": "https://login.example.com", "sub": subject}),
@@ -1212,6 +1220,7 @@ mod tests {
     fn the_identity_hash_tells_callers_apart_by_method_issuer_and_tenant() {
         use sha2::{Digest, Sha256};
         let jwt = |claims: serde_json::Value| AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: claims["sub"]
                 .as_str()
@@ -1268,6 +1277,7 @@ mod tests {
                     subject: "alice".into(),
                     claims: serde_json::json!({"iss": "https://idp.example", "sub": "bob"}),
                     verification: Default::default(),
+                    strategy_id: None,
                 },
             ),
             ("an empty key name", api_key("", None)),

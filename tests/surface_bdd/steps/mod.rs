@@ -1,6 +1,7 @@
 pub mod agent_card_preview;
 pub mod authority_dependencies;
 pub mod caller_key_save;
+pub mod consent_confirmation;
 pub mod credential_references;
 pub mod credential_save;
 pub mod dashboard_routes;

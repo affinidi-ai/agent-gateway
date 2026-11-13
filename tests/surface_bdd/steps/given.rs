@@ -989,6 +989,22 @@ fn transit_point_requires_a_transit_token(
     transit_point_config_mut(world, &transit_point).require_transit_token = true;
 }
 
+/// The audience a Transit Point's JWT callers' tokens are issued for.
+pub(crate) const TRANSIT_AUDIENCE: &str = "bdd-transit-audience";
+
+#[given(expr = "Transit Point {string} authenticates its callers with JWT Bearer")]
+fn transit_point_authenticates_its_callers_with_jwt_bearer(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+) {
+    transit_point_config_mut(world, &transit_point).source_auth = Some(serde_json::json!({
+        "type": "jwt_bearer",
+        "jwt_verification_strategy_id": crate::steps::consent_confirmation::CALLERS_STRATEGY_ID,
+        "audiences": [TRANSIT_AUDIENCE],
+        "forward_header": false,
+    }));
+}
+
 #[given(expr = "Transit Point {string} admits {int} request(s) per minute from each caller")]
 fn transit_point_admits_requests_per_minute_from_each_caller(
     world: &mut SurfaceWorld,
@@ -3880,7 +3896,7 @@ fn mcp_server_returns_tool_result(
 }
 
 #[given(expr = "the surface requires delegated credentials from OAuth provider {string}")]
-fn surface_requires_oauth_delegated_credentials(
+pub(crate) fn surface_requires_oauth_delegated_credentials(
     world: &mut SurfaceWorld,
     provider: String,
 ) {

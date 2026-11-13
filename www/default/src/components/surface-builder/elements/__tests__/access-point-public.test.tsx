@@ -3,11 +3,7 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { registry } from '../index';
 import type { PayloadContext } from '../types';
-import AccessPointPanel, {
-  CLOSE_ACCESS_POINT_LABEL,
-  CLOSING_ACCESS_POINT_TEXT,
-  LEGACY_ACCESS_POINT_TEXT,
-} from '../access-point/AccessPointPanel';
+import AccessPointPanel, { CLOSING_ACCESS_POINT_TEXT } from '../access-point/AccessPointPanel';
 import { SurfaceMetaProvider } from '../../SurfaceMetaContext';
 import { nodesFromSurface } from '../../nodesFromSurface';
 import { showSurfaceSaveToast } from '../saveWarnings';
@@ -168,26 +164,8 @@ describe('AccessPointPanel Public access switch', () => {
       return updateField;
     };
 
-    it('shows the legacy state and closes the Access Point on request', () => {
-      const updateField = showLegacyPanel({});
-
-      expect(screen.getByTestId('access-point-public-switch')).not.toBeChecked();
-      expect(screen.getByTestId('access-point-legacy-notice')).toHaveTextContent(
-        LEGACY_ACCESS_POINT_TEXT
-      );
-      fireEvent.click(screen.getByRole('button', { name: CLOSE_ACCESS_POINT_LABEL }));
-      expect(updateField).toHaveBeenCalledWith('public', false);
-    });
-
-    it('offers no close action when read-only', () => {
-      showLegacyPanel({}, true);
-      expect(screen.getByTestId('access-point-legacy-notice')).toBeInTheDocument();
-      expect(screen.queryByTestId('access-point-close-button')).not.toBeInTheDocument();
-    });
-
     it('says it will be closed once the operator closes it', () => {
       showLegacyPanel({ public: false });
-      expect(screen.queryByTestId('access-point-legacy-notice')).not.toBeInTheDocument();
       expect(screen.getByTestId('access-point-closing-notice')).toHaveTextContent(
         CLOSING_ACCESS_POINT_TEXT
       );
@@ -198,11 +176,6 @@ describe('AccessPointPanel Public access switch', () => {
       fireEvent.click(screen.getByTestId('access-point-public-switch'));
       expect(updateField).toHaveBeenCalledWith('public', undefined);
     });
-  });
-
-  it('shows no legacy state on a closed or new surface', () => {
-    render(<AccessPointPanel {...props({})} />);
-    expect(screen.queryByTestId('access-point-legacy-notice')).not.toBeInTheDocument();
   });
 
   it('writes the field into the payload once set', () => {

@@ -613,6 +613,58 @@ mod tests {
     }
 
     #[test]
+    fn a_consent_confirmation_secret_outside_the_providers_tenant_is_reported() {
+        let provider = |login_client_id: &str, login_secret: &str| -> CredentialProvider {
+            serde_json::from_value(serde_json::json!({
+                "id": format!("uses-{login_client_id}-{login_secret}"), "tenant_id": "t1", "name": "GitHub", "provider_id": "github",
+                "provider_type": "oauth2_authorization_code",
+                "token_endpoint": "https://github.com/login/oauth/access_token",
+                "client_id_secret_ref": "OWN_ID", "client_secret_secret_ref": "OWN_SECRET",
+                "consent_confirmation": {
+                    "client_id_secret_ref": login_client_id, "client_secret_secret_ref": login_secret,
+                    "authorization_endpoint": "https://idp.example/authorize",
+                    "token_endpoint": "https://idp.example/token", "jwt_verification_strategy_id": "strategy"
+                },
+                "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let secret_tenants: HashMap<&str, Option<&str>> = [
+            ("OWN_ID", Some("t1")),
+            ("OWN_SECRET", Some("t1")),
+            ("OWN_LOGIN_ID", Some("t1")),
+            ("OWN_LOGIN", Some("t1")),
+            ("WIDE_LOGIN_ID", None),
+            ("WIDE_LOGIN", None),
+        ]
+        .into_iter()
+        .collect();
+        let findings = find_breaches(
+            &[
+                provider("OWN_LOGIN_ID", "OWN_LOGIN"),
+                provider("OWN_LOGIN_ID", "WIDE_LOGIN"),
+                provider("WIDE_LOGIN_ID", "OWN_LOGIN"),
+            ],
+            &[],
+            &secret_tenants,
+            None,
+            &egress(CredentialPolicyConfig::default()),
+            &HttpsMcpProxies::default(),
+        );
+        assert_eq!(
+            findings.breaches,
+            ["uses-OWN_LOGIN_ID-WIDE_LOGIN", "uses-WIDE_LOGIN_ID-OWN_LOGIN"]
+                .map(|id| PolicyBreach {
+                    subject: "credential_provider",
+                    id: id.to_string(),
+                    tenant_id: Some("t1".to_string()),
+                    rule: RULE_TENANT_CREDENTIAL_ISOLATION,
+                })
+                .to_vec()
+        );
+    }
+
+    #[test]
     fn a_surface_that_cannot_be_inspected_is_skipped_and_counted() {
         let secret_tenants = HashMap::new();
         let healthy = AgentSurface {
