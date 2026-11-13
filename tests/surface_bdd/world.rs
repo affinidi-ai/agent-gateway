@@ -183,6 +183,10 @@ pub struct SurfaceWorld {
     pub passkeys: HashMap<String, SoftPasskey>,
     /// The passkey sign-in started last and not yet finished.
     pub started_sign_in: Option<StartedSignIn>,
+    /// The `allowCredentials` of each passkey sign-in challenge the scenario started, in order.
+    pub sign_in_challenge_credentials: Vec<Vec<serde_json::Value>>,
+    /// A passkey the scenario registered for a username that already had an account.
+    pub other_passkey: Option<SoftPasskey>,
     /// The event payload a sign-in step last found on the Redis stream.
     pub sign_in_event: Option<serde_json::Value>,
     /// The payload with Agent Watch's record content a sign-in step last found on the stream.
@@ -268,6 +272,8 @@ impl SurfaceWorld {
             sign_in_stream: None,
             passkeys: HashMap::new(),
             started_sign_in: None,
+            sign_in_challenge_credentials: Vec::new(),
+            other_passkey: None,
             sign_in_event: None,
             sign_in_record: None,
             client_certificates: HashMap::new(),

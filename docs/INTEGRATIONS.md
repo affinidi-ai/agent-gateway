@@ -118,7 +118,8 @@ This gateway verifies no x402 or MPP payment itself, so `x402.verification.faile
 `mpp.*` events stay in the catalog, where existing integrations name them, but are never raised.
 The other x402 events come from settling and pruning x402 payments recorded before.
 
-A passkey registration raises `user.created`, and an administrator's approval `user.approved`. A
+A passkey registration that creates an account raises `user.created` (registering a username that
+already has an account creates nothing and raises nothing), and an administrator's approval `user.approved`. A
 SAML sign-in that creates the user raises `user.created`; SAML users are approved on creation,
 so no `user.approved` follows. A later SAML sign-in that changes the user's role, status, or
 primary flag raises `user.updated`. Every SAML sign-in then raises `user.login`, in that order

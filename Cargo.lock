@@ -765,6 +765,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "webauthn-rs",
+ "webauthn-rs-proto",
  "x25519-dalek 2.0.1",
  "x402-chain-eip155",
  "x402-chain-solana",

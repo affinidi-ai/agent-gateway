@@ -1642,7 +1642,7 @@ pub async fn run_axum_proxy(
                         (Some(state_arc), None)
                     }
                     Err(e) => {
-                        return Err(anyhow::anyhow!("Failed to initialize passkey authentication: {}", e));
+                        return Err(anyhow::anyhow!("Failed to initialize passkey authentication: {:#}", e));
                     }
                 }
             }
@@ -4768,6 +4768,13 @@ async fn initialize_auth_state(
         .storage_paths
         .sessions
         .clone();
+    let decoy_credentials = crate::auth::decoy_credential::DecoyCredentialKey::load_or_create(&PathBuf::from(
+        &bootstrap_config
+            .storage_paths
+            .vc_keys,
+    ))
+    .await
+    .context("Failed to load the login decoy credential key")?;
     let auth_state = crate::auth::AuthState::new(
         rp_id,
         rp_origin,
@@ -4776,6 +4783,7 @@ async fn initialize_auth_state(
         session_timeout_minutes,
         sessions_path,
         terms_manager,
+        decoy_credentials,
     )
     .await?;
 

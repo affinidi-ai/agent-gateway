@@ -26,6 +26,9 @@ pub struct AuthState {
 
     /// Terms enforcement for human authentication.
     pub terms_manager: Arc<crate::terms::TermsManager>,
+
+    /// Derives the credential a sign-in challenge names for a username with no usable passkey
+    pub decoy_credentials: Arc<crate::auth::decoy_credential::DecoyCredentialKey>,
 }
 
 /// Temporary state for WebAuthn challenges
@@ -55,6 +58,7 @@ impl AuthState {
         session_timeout_minutes: u64,
         sessions_storage_path: String,
         terms_manager: Arc<crate::terms::TermsManager>,
+        decoy_credentials: crate::auth::decoy_credential::DecoyCredentialKey,
     ) -> anyhow::Result<Self> {
         // Build WebAuthn instance
         let builder = WebauthnBuilder::new(&rp_id, &rp_origin)?;
@@ -76,20 +80,44 @@ impl AuthState {
             challenges: Arc::new(RwLock::new(HashMap::new())),
             notification_store: Arc::new(RwLock::new(None)),
             terms_manager,
+            decoy_credentials: Arc::new(decoy_credentials),
         })
     }
 
-    /// Clean up expired challenges (should be called periodically)
-    #[allow(dead_code)]
-    pub async fn cleanup_expired_challenges(&self) {
-        let mut challenges = self.challenges.write().await;
+    /// Stores a new sign-in or registration challenge and returns its id. Challenges older than
+    /// [`CHALLENGE_LIFETIME`] are dropped first, so unfinished ones do not pile up.
+    pub async fn store_challenge(
+        &self,
+        challenge: ChallengeState,
+    ) -> String {
+        let challenge_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
-
-        challenges.retain(|_, state| {
-            // Keep challenges younger than 5 minutes
-            now.signed_duration_since(state.created_at)
-                .num_minutes()
-                < 5
-        });
+        let mut challenges = self.challenges.write().await;
+        challenges.retain(|_, stored| is_fresh(stored, now));
+        challenges.insert(challenge_id.clone(), challenge);
+        challenge_id
     }
+
+    /// Takes the challenge `challenge_id` out of the store, or `None` when there is none or it is
+    /// older than [`CHALLENGE_LIFETIME`].
+    pub async fn take_challenge(
+        &self,
+        challenge_id: &str,
+    ) -> Option<ChallengeState> {
+        self.challenges
+            .write()
+            .await
+            .remove(challenge_id)
+            .filter(|challenge| is_fresh(challenge, chrono::Utc::now()))
+    }
+}
+
+/// How long a sign-in or registration challenge can be finished.
+pub const CHALLENGE_LIFETIME: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
+
+fn is_fresh(
+    challenge: &ChallengeState,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    now.signed_duration_since(challenge.created_at) < CHALLENGE_LIFETIME
 }

@@ -318,6 +318,31 @@ registration to succeed. A mismatch is the most common local-setup failure, and
 [`development/GETTING_STARTED.md`](development/GETTING_STARTED.md) treats the generated
 value as the source of truth.
 
+A passkey sign-in challenge (`POST /auth/login/start` under the `identity_api` prefix,
+`/api` by default) names the passkeys of an approved account. For any other username
+(unknown, not approved, or without passkeys) it names decoy credentials instead, with no
+transports: usually one 20-byte ID, sometimes one of 16, 32 or 64 bytes, sometimes two or
+three. They are derived from the username with the key in `login_decoy_credential_key.json`
+under `[storage_paths] vc_keys`, which the gateway creates on its first start the way it creates
+the transit token key, so a username gets the same decoys on every challenge and the answer
+does not tell whether it has an account. No authenticator holds a decoy, so the browser finds
+no passkey for it and offers another device or a security key instead, and the sign-in goes no
+further. An approved account whose passkeys differ in count or length from what decoys take can
+still be told apart. A key file that cannot be read stops the gateway from starting in passkey
+mode. To replace the key, stop every instance, delete both `login_decoy_credential_key.json`
+and `login_decoy_credential_key.json.enc`, and start them again; every username then gets new
+decoys. The `.atgx` export leaves the key file out.
+
+Registering a passkey (`POST /auth/register/finish`) for a username that already has an
+account, approved or awaiting approval, checks the passkey and the accepted Terms as for a new
+account and is answered `200` like one, but stores nothing: the existing account and its
+passkeys are unchanged, and the new passkey cannot sign in. Since storing nothing is faster
+than creating an account, that answer waits a random 1 to 10 ms first, so its timing does not
+tell the username is taken.
+
+A sign-in or registration challenge can be finished for 5 minutes; after that the finish is
+refused with `400` and the passkey ceremony starts again.
+
 ### Log redaction
 
 `logging.redaction` masks values before they leave the gateway: in stderr, in the log

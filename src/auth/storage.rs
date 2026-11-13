@@ -251,29 +251,6 @@ impl PasskeyStorage {
             .await
     }
 
-    /// Check if user is approved to sign in
-    pub async fn is_user_approved(
-        &self,
-        username: &str,
-    ) -> Result<bool> {
-        Ok(self
-            .load_user(username)
-            .await?
-            .is_some_and(|user_data| user_data.status == UserStatus::Approved))
-    }
-
-    /// Get all passkeys for a user
-    pub async fn get_passkeys(
-        &self,
-        username: &str,
-    ) -> Result<Vec<Passkey>> {
-        Ok(self
-            .load_user(username)
-            .await?
-            .map(|data| data.passkeys)
-            .unwrap_or_default())
-    }
-
     /// List all user_ids from cache
     #[allow(dead_code)]
     pub async fn list_users(&self) -> Result<Vec<String>> {
@@ -325,32 +302,6 @@ impl PasskeyStorage {
 mod tests {
     use super::{PasskeyStorage, UserData, UserRole, UserStatus};
     use tempfile::tempdir;
-
-    #[tokio::test]
-    async fn missing_user_is_not_approved() {
-        let temp_dir = tempdir().unwrap();
-        let storage = PasskeyStorage::new(
-            temp_dir
-                .path()
-                .join("users")
-                .to_string_lossy()
-                .into_owned(),
-            temp_dir
-                .path()
-                .join("avatars")
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            !storage
-                .is_user_approved("missing-user")
-                .await
-                .unwrap()
-        );
-    }
 
     #[tokio::test]
     async fn deleting_a_user_logs_its_user_id_but_not_its_username() {

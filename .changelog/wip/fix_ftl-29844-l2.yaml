@@ -1,0 +1,29 @@
+branch: fix/ftl-29844-l2
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-13T00:00:00Z'
+      title: Expire unfinished passkey sign-in and registration challenges after 5 minutes
+      description: >-
+        Every POST /auth/login/start and /auth/register/start kept its challenge in memory
+        until the gateway restarted, and a challenge could be finished at any later time, so
+        repeated unauthenticated requests grew memory without limit. A challenge can now be
+        finished for 5 minutes, and expired ones are dropped as new ones are stored.
+  removed: []
+  security:
+    - timestamp: '2026-11-13T00:00:00Z'
+      title: Stop passkey sign-in and registration from revealing which accounts exist
+      description: >-
+        POST /auth/login/start named an approved user's passkeys and no credential for any
+        other username, and POST /auth/register/finish refused a username that already had an
+        account with 400, so anyone could test whether an account existed. A username without
+        a passkey to sign in with now gets decoy credentials derived from it with a key the
+        gateway creates under vc_keys on its first start, the same on every request: usually
+        one 20-byte ID, sometimes another common length, sometimes two or three. Registering a
+        taken username, approved or awaiting approval, is answered 200 like a new registration
+        and stores nothing, after a random 1 to 10 ms pause so it takes about as long as
+        creating an account. Signing in to an approved account with its passkeys is unchanged.
+        A user awaiting approval no longer picks a passkey and is refused with 401; the browser
+        finds none for the decoy and offers another device or a security key instead.
+  breaking: []
