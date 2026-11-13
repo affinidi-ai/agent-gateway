@@ -48,4 +48,10 @@ changes:
         every DID's per-surface traffic with the last request payload seen for it. It is replaced by
         the scoped Agents API, and the gateway no longer keeps the per-identity last payload in
         memory.
-  breaking: []
+  breaking:
+    - timestamp: '2026-11-13T12:00:00Z'
+      title: Reserve the agent-registry path for the dashboard
+      description: >-
+        `agent-registry` is now a dashboard page, so the gateway no longer serves a channel, MCP
+        proxy, proxy or redirect prefix under `/agent-registry`. A gateway whose configuration
+        uses that segment stops serving that prefix after the upgrade; move it to another path.
