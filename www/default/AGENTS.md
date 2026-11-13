@@ -616,10 +616,10 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   migrated copy) still hydrates onto that Transit Point's arrow and saves back, so it can be
   kept or removed; once removed it cannot be added there again. Such a copy is read-only
   (`readOnlyTrustCheckProtocol`): the sidebar panel and fullscreen editor say "Trust Checks can't
-  be changed on an MCP Transit Point; keep or remove this migrated copy.", the sidebar link
-  (`trust-check-panel-configure`) reads "View queries" instead of "Configure queries", the
-  fullscreen editor's query settings sit in a disabled `fieldset`, **Add query** and the remove
-  buttons are disabled (a query row still selects a query to view), and it has no Save. It keeps the stored wire entries (`STORED_TRUST_CHECK_LIST_KEY`) and saves them
+  be changed on an MCP Transit Point; keep or remove this migrated copy.", the sidebar button
+  (`trust-check-panel-configure`) reads "View Queries…" instead of "Configure Queries…", the
+  fullscreen query list sits in a disabled `fieldset` (no field edits, add or remove query) and
+  has no Save. It keeps the stored wire entries (`STORED_TRUST_CHECK_LIST_KEY`) and saves them
   back exactly as loaded, never rebuilt from the panel's queries. A2A and AP2 copies stay
   editable and are rebuilt from their queries.
 - A node parented on a Transit Point is that Transit Point's leg whatever its slot id says
@@ -688,32 +688,24 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
 - **Authority lists.** A query stored with `query.authority_ids` (several authorities) keeps that
   list and its `authority_sources` map through every load and save (`listedAuthorities`,
   `queryFromElement`, `buildEntry`), on every leg and in variants; the save never adds
-  `authority_id` or `authority_source` beside it. In the fullscreen editor a query's
-  **Authorities** (`trust-check/AuthorityListEditor.tsx`) are a compact table in result order with
-  an **Add Issuers or Authorities** multi-select dropdown above it. The dropdown opens on click or
-  keyboard (never hover) with a search box and three groups: on the caller leg only, **From the
-  request** (the agent identity credential issuer and the sending gateway DID templates), then the
-  Authorities and the Issuers (a DID in both shows once, as an Issuer). Values the query lists show
-  ticked and locked, with no row number; ticked ones are appended in the order ticked
-  (`appendAuthorityRows`) when **Add N** is pressed, and a status line names them. Each table row
-  shows its number, name, shortened DID, register (Issuer, Authority, From request, Template, DID),
-  **New** while it was added since the editor opened, and a remove button. Rows cannot be
-  reordered: to change the order, remove a row and add it again. Past 8 rows a filter box
-  appears, and the list scrolls inside its box. One row is the single `authority_id` with
-  `authority_source`, exactly as before; two or more are `authority_ids` in row order, each DID
-  recorded in `authority_sources` as `issuer` or `authority` by the register it was picked from,
-  and a template recorded in none. Removing rows down to one makes the query single again, and
-  removing the last leaves `authority_id` empty (`removeAuthorityRow`): the caller leg then uses
-  the agent identity credential issuer by default, and a target leg is incomplete. There is no
-  limit on the Authorities of a query or of a whole Trust Check, in the editor or the gateway. A
-  row whose Authority was deleted reads "Deleted Authority", and like a deleted single Authority
-  it is listed in the "Configuration required" warning (by row when the query lists several),
-  draws the node unconfigured and blocks Save (`missingTrustCheckAuthorities` walks
-  `authorityRows`). A stored empty row, or a template a target leg cannot use, is incomplete
-  ("Select an Issuer or Authority for every Authority row", `queryAuthorityMissing`), is marked
-  invalid, and blocks the editor's Save. The sidebar shows "N Authorities"
-  under such a query, with the names on hover, reading names from the Issuers and Authorities registers (a DID
-  when neither has it), and the fullscreen editor's list shows the same row. A node with one such
+  `authority_id` or `authority_source` beside it. In the fullscreen editor a query's **Authority
+  ID** is one multi-select (`IssuerAuthorityPicker` on the shared `FormMultiSelect`): each Issuer
+  and Authority has a checkbox, a click toggles it and keeps the menu open, and the toggle lists
+  the picked names in order. One pick is the single `authority_id` with `authority_source`,
+  exactly as before; two or more are `authority_ids` in the order picked, each DID recorded in
+  `authority_sources` as `issuer` or `authority` by the register it was picked from
+  (`authorityRows`, `pickAuthorities`). Unchecking down to one makes the query single again, and
+  unchecking all leaves an empty `authority_id` (the caller leg's default). The caller-leg
+  templates (the verified-issuer default and the sending-gateway DID) combine with each other and
+  with literal DIDs like any pick, with no source recorded; while nothing is stored the default
+  shows checked, so a pick is added beside it. There is no limit on how many Authorities a query
+  or a Trust Check names, in the editor or at the gateway. A picked Authority that
+  was deleted shows as a checked "Deleted Authority" option with the warning, and like a deleted
+  single Authority it is listed in the panel's "Configuration required" warning, draws the node
+  unconfigured and blocks Save (`missingTrustCheckAuthorities` walks `authorityRows`). A stored
+  list with an empty entry is incomplete ("Select an Issuer or Authority for every Authority
+  row"), is marked invalid, and blocks the editor's Save. The side panel lists each query as "Query N" and its record type
+  only, with no Authorities or name; the fullscreen card header adds "N authorities". A node with one such
   query has the canvas summary `<type> · N authorities`; a node with several queries keeps "N
   queries".
 - **Deleted Authority.** A query whose `authority_source` is `authority` and whose DID the loaded
@@ -726,68 +718,32 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   another tab clears the problem. Nothing is flagged while it loads or after it failed; the
   fullscreen editors flag only once their own read loaded (`authoritiesLoaded`). It follows the
   blocking API key pattern: the node gets the red `unconfigured-ring` with "Authority deleted"
-  under its label; the sidebar panel, and the Authority table in the fullscreen editor, show the shared
+  under its label; the sidebar panel, and the picker in the fullscreen editor, show the shared
   `MissingAuthorityWarning` (`_shared/MissingAuthorityWarning.tsx`, a non-collapsible `danger`
   `InfoBanner` titled "Configuration required", `role="alert"`) saying the check fails with
   `AUTHORITY_NOT_FOUND` until it is fixed, the fixes (pick another Authority, add an Authority
   with the same DID through `deepLinks.authority`, or remove the Trust Check) and the stored DID
-  ("Query <n>: <did>" when the node has several queries, "Row <n>: <did>" in the editor when the
-  query lists several); the table shows that row as "Deleted Authority", marked invalid. Save is blocked on both surface pages, in the base
+  ("Query <n>: <did>" when the node has several queries); the picker shows the DID as a locked
+  "Deleted Authority" option marked invalid. Save is blocked on both surface pages, in the base
   and every variant, with the full warning and **Show me** (`firstMissingAuthorityNode` in
   `elements/missingAuthority.ts`). It is not part of `configured` or `getIncompleteReason`. The
-  "Configuration required" warning is the only copy that names `AUTHORITY_NOT_FOUND`; the editor
-  has no standing explanation of it. The Audit Log words `AUTHORITY_NOT_FOUND` as "the
+  panel copy says the DID is stored directly and that, for an Authority, the gateway fails the
+  check once that Authority is deleted. The Audit Log words `AUTHORITY_NOT_FOUND` as "the
   Authority this Trust Check uses no longer exists" (`TRUST_ERROR_LABEL`).
-- **Sidebar.** The panel follows the Caller Context sidebar: the warnings, a one-paragraph intro
-  saying what the leg checks and the OPA path (plus "Applies to this Transit Point only." on a
-  Transit Point), the read-only line, one collapsed "How does OPA use the result?" banner with the
-  leg summary, then **Trust Check Queries**: `TrustCheckQueryList` (`trust-check/TrustCheckQueryList.tsx`,
-  `list-group` rows like `CallerAuthMethodList`, no per-row button) or the empty state, a
-  **Configure queries** link (`btn-link`) that opens the fullscreen editor, and a line saying every
-  query runs. A row shows a ready or problem icon (`queryProblem` in `definition.ts`, the same check
-  `incompleteReason` reports as "Query N: …"; both take the leg from the node's slot or parent, and
-  `incompleteReason` also from a hydrated node's `_edge`), "Query N", a type badge (`fa-id-badge` Recognition,
-  `fa-user-shield` Authorization), then one muted line: the problem, or `<registry> · <Authority>`
-  ("N Authorities" for a list, the names in the line's `title`), names best effort with shortened
-  ids otherwise. The action and resource are only in the fullscreen editor. It shows the first 5
-  queries, then "+N more". The leg copy is in `trust-check/legContext.ts`. No inline `style`.
-- **Fullscreen editor.** `TrustCheckFullscreenPanel` is one card that fills the editor tab
-  (`.trust-check-editor` in `pages/SurfaceBuilder.css`), so adding queries or Authorities never
-  grows the page. Its header has "Trust Check", a "Caller leg" or "Target leg" pill and "Unsaved
-  changes" while the draft differs; under it one line with what the leg checks and the OPA path
-  (plus "Applies to this Transit Point only.", `describeTrustCheckLeg`), with no Where / When /
-  Example block, then the read-only line and the migrated warning. Below, two panes scroll on their own: on the
-  left (280px) **Trust Check Queries** with "N queries" on the line below it (not limited), the
-  `TrustCheckQueryList` rows, each one button that selects its query (`list-group-item-primary`,
-  `aria-current`), and **Add query** (`btn-link`), which appends a default query and selects it;
-  on the right "Query N" with **Remove query**, then `TrustCheckQueryForm` for the selected
-  query: Record type (a two-button toggle with the badge icons) beside Trust registry, Authorities,
-  Entity ID, and Action and Resource side by side. There is no query filter. Below 720px wide (a
-  container query) the query pane sits on top at 172px. The first query is selected on open, and
-  removing the selected query selects the one before it. Changes stay in a draft until Save, which
-  checks every query before it writes and opens the first that blocks it; the footer holds
-  Discard (Close when unchanged) and Save.
 
 | Element                          | Test id                                                                                            |
 | -------------------------------- | -------------------------------------------------------------------------------------------------- |
-| Sidebar intro, query list        | `trust-check-panel-results-ref`, `trust-check-panel-list`, `trust-check-panel-empty-state`         |
-| Sidebar query row, status, more  | `trust-check-panel-query-<n>`, `-status`, `-type` (shared `Badge`), `trust-check-panel-more` |
-| Sidebar Configure / View link    | `trust-check-panel-configure`                                                                      |
 | Per-Transit-Point scope line     | `trust-check-panel-transit-point-scope`                                                            |
 | Fullscreen leg label             | `trust-check-fullscreen-leg`                                                                       |
 | Managed Agent URL-target warning | `trust-check-panel-managed-agent-target-warning`                                                   |
 | Read-only migrated copy line     | `trust-check-panel-read-only`, `trust-check-fullscreen-read-only`                                  |
-| Fullscreen header and count      | `trust-check-fullscreen-leg-pill`, `trust-check-fullscreen-unsaved`, `trust-check-fullscreen-count` |
-| Fullscreen query list and row    | `trust-check-editor-list`, `trust-check-editor-query-<n>` (the select button) with `-status`, `-type`; `trust-check-editor-empty-state`; `trust-check-editor-remove-query-button` |
-| Add query, Save, Discard         | `trust-check-add-query`, `trust-check-save`, `trust-check-discard`                                 |
-| Selected query's settings        | `trust-check-editor-query-settings`; record type `trust-check-query-<n>-type-<recognition\|authorization>` |
+| Fullscreen query list            | `trust-check-fullscreen-queries`                                                                   |
 | Migrated warning and Keep        | `trust-check-panel-migrated-warning`, `trust-check-fullscreen-migrated-warning`, each with `-keep` |
 | Review summary                   | `surface-migrated-trust-checks-summary`                                                            |
 | Migrated canvas badge            | `surface-node-trust-check-migrated-badge`                                                          |
 | Deleted Authority warning        | `trust-check-panel-authority-missing`, `trust-check-query-<n>-authority-missing`, each with `-dids` and `-add-authority-link` |
-| Add Issuers or Authorities       | `trust-check-query-<n>-add-authority` (trigger), `-add-authority-menu`, `-add-authority-search`, `-add-authority-option-<did, agent-identity-issuer or sending-gateway>`, `-add-authority-cancel`, `-add-authority-confirm` |
-| Authority table                  | `trust-check-query-<n>-authorities`; per row `-authority-<r>`, `-authority-<r>-remove`; `-authority-count`, `-authority-filter`, `-authority-added`, `-authority-empty`, `-authority-locked` |
-| Sidebar authority count, names   | `trust-check-panel-query-<n>-authorities`                                                          |
+| Authority multi-select           | `trust-check-query-<n>-authority`; options `-authority-option-<did>`; `-authority-count` (two or more) |
+| Sidebar query row                | `trust-check-panel-query-<n>` (query number and record type only)                                 |
 
 ## Trust Recorder
 

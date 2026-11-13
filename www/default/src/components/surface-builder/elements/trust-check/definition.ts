@@ -556,13 +556,11 @@ export function authorityRows(q: TrustCheckQueryConfig): AuthorityRow[] {
 }
 
 /**
- * Write rows back: no row is an empty `authority_id` (the caller-leg default, or nothing picked on
- * a target leg); one row is `authority_id` with `authority_source`, the shape a single-authority
+ * Write rows back: one row is `authority_id` with `authority_source`, the shape a single-authority
  * query always had; two or more are `authority_ids` with `authority_sources` keyed by DID.
  */
 function withAuthorityRows(q: TrustCheckQueryConfig, rows: AuthorityRow[]): TrustCheckQueryConfig {
   const { rest, query } = withoutAuthorityFields(q);
-  if (rows.length === 0) return { ...rest, query: { ...query, authority_id: '' } };
   if (rows.length === 1) {
     const [{ did, source }] = rows;
     return {
@@ -581,52 +579,26 @@ function withAuthorityRows(q: TrustCheckQueryConfig, rows: AuthorityRow[]): Trus
 }
 
 /**
- * Append `picks` after the query's own rows, in the order given, skipping a value the query
- * already lists. An empty row (the caller-leg default, or nothing picked yet) is replaced. A
- * literal DID keeps the register it was picked from; a template (the caller-leg request values)
- * records none.
+ * Set the query's Authorities to `picks`, in order, as the multi-select picker leaves them. None
+ * is an empty `authority_id` (the caller leg's default), one is `authority_id`, two or more are
+ * `authority_ids`; each literal DID keeps the register it was picked from.
  */
-export function appendAuthorityRows(
+export function pickAuthorities(
   q: TrustCheckQueryConfig,
   picks: readonly AuthorityRow[]
 ): TrustCheckQueryConfig {
-  const rows = authorityRows(q).filter(r => r.did.trim() !== '');
-  const listed = new Set(rows.map(r => r.did));
-  const added: AuthorityRow[] = [];
-  for (const pick of picks) {
-    if (pick.did.trim() === '' || listed.has(pick.did)) continue;
-    listed.add(pick.did);
-    added.push({ did: pick.did, source: authoritySourceFor(pick.did, pick.source) });
-  }
-  return added.length === 0 ? q : withAuthorityRows(q, [...rows, ...added]);
+  const rows = picks.map(p => ({ did: p.did, source: authoritySourceFor(p.did, p.source) }));
+  return withAuthorityRows(q, rows.length > 0 ? rows : [{ did: '' }]);
 }
 
 /**
- * Remove row `row`. Down to one row the query is single again; removing the last row leaves an
- * empty `authority_id` (the caller-leg default, or nothing picked on a target leg).
- */
-export function removeAuthorityRow(q: TrustCheckQueryConfig, row: number): TrustCheckQueryConfig {
-  const rows = authorityRows(q);
-  if (row < 0 || row >= rows.length) return q;
-  return withAuthorityRows(
-    q,
-    rows.filter((_, i) => i !== row)
-  );
-}
-
-/**
- * True when the query's Authority is not usable: a row of several left empty or holding a
- * template this leg rejects, or a single Authority `authorityNeedsSelection` rejects.
+ * True when the query's Authority is not usable: a row of several left empty, or a single
+ * Authority `authorityNeedsSelection` rejects on this leg.
  */
 export function queryAuthorityMissing(q: TrustCheckQueryConfig, isApMa: boolean): boolean {
-  if (!isMultiAuthorityQuery(q)) {
-    return authorityNeedsSelection(q.query?.authority_id as string | undefined, isApMa);
-  }
-  const rows = authorityRows(q);
-  return (
-    rows.length === 0 ||
-    rows.some(r => r.did.trim() === '' || authorityNeedsSelection(r.did, isApMa))
-  );
+  return isMultiAuthorityQuery(q)
+    ? authorityRows(q).length === 0 || authorityRows(q).some(r => r.did.trim() === '')
+    : authorityNeedsSelection(q.query?.authority_id as string | undefined, isApMa);
 }
 
 /** "1 authority", "3 authorities". */
@@ -782,30 +754,6 @@ export function managedAgentTrustCheckTargetMessage(
     : MANAGED_AGENT_TRUST_CHECK_TARGET_MESSAGE;
 }
 
-/**
- * What stops one query from running, or null when it is ready. The sidebar
- * rows show it as is; `incompleteReason` prefixes "Query N: " when the node
- * has several queries.
- */
-export function queryProblem(q: TrustCheckQueryConfig, isTargetLeg: boolean): string | null {
-  if (!q.trust_registry_id) return 'Trust registry must be selected';
-  if (isMultiAuthorityQuery(q)) {
-    if (queryAuthorityMissing(q, !isTargetLeg))
-      return 'Select an Issuer or Authority for every Authority row';
-  } else if (authorityNeedsSelection(q.query?.authority_id as string, !isTargetLeg)) {
-    return isTargetLeg
-      ? 'Select an Issuer or Authority for the target-leg Authority'
-      : 'Replace the caller-leg Authority template with the agent identity credential issuer default or an explicit Issuer / Authority';
-  }
-  if (q.query_type !== 'recognition') {
-    const action = typeof q.query?.action === 'string' ? q.query.action.trim() : '';
-    const resource = typeof q.query?.resource === 'string' ? q.query.resource.trim() : '';
-    if (!action) return 'Action is required for authorization queries';
-    if (!resource) return 'Resource is required for authorization queries';
-  }
-  return null;
-}
-
 /** Mint a fresh empty query for the panel's "+ Add Another Query" action. */
 export function makeDefaultQuery(): TrustCheckQueryConfig {
   return {
@@ -950,8 +898,8 @@ export const trustCheckDefinition: NodeDefinition = {
     title: 'Trust Check',
     docLink: DOCS_URL.trustElements,
     bodyHtml: `
-      <p>A Trust Check holds any number of TRQP queries, each checking one
-      or several Authorities, and each leg takes one Trust Check. Every query result is surfaced to your policies on
+      <p>Each Trust Check holds up to 10 TRQP queries, and each leg takes
+      one Trust Check. Every query result is surfaced to your policies on
       every gateway and surface evaluation, which decide what to do with
       allow / deny / unreachable.</p>
       <p><strong>Placement determines which leg the query runs on:</strong></p>
@@ -984,14 +932,30 @@ export const trustCheckDefinition: NodeDefinition = {
         managedAgentTrustCheckTargetMessage(c, ctx.allNodes),
     },
   ],
-  incompleteReason: (c, node) => {
+  incompleteReason: c => {
     const queries = readQueries(c);
     if (queries.length === 0) return 'Needs at least one query';
-    // A newly dropped node has no `_edge` (set only on hydration), so its slot decides too.
-    const isTargetLeg = c?._edge === 'ma-tp' || (!!node && trustCheckLeg(node) !== 'caller');
+    const isTargetLeg = c?._edge === 'ma-tp';
     for (let i = 0; i < queries.length; i++) {
-      const problem = queryProblem(queries[i], isTargetLeg);
-      if (problem) return queries.length > 1 ? `Query ${i + 1}: ${problem}` : problem;
+      const q = queries[i];
+      const prefix = queries.length > 1 ? `Query ${i + 1}: ` : '';
+      if (!q.trust_registry_id) return `${prefix}Trust registry must be selected`;
+      if (isMultiAuthorityQuery(q)) {
+        if (queryAuthorityMissing(q, !isTargetLeg))
+          return `${prefix}Select an Issuer or Authority for every Authority row`;
+      } else if (authorityNeedsSelection(q.query?.authority_id as string, !isTargetLeg)) {
+        return isTargetLeg
+          ? `${prefix}Select an Issuer or Authority for the target-leg Authority`
+          : `${prefix}Replace the caller-leg Authority template with the agent identity credential issuer default or an explicit Issuer / Authority`;
+      }
+      const qt: TrustCheckRecordType =
+        q.query_type === 'recognition' ? 'recognition' : 'authorization';
+      if (qt === 'authorization') {
+        const action = typeof q.query?.action === 'string' ? q.query.action.trim() : '';
+        const resource = typeof q.query?.resource === 'string' ? q.query.resource.trim() : '';
+        if (!action) return `${prefix}Action is required for authorization queries`;
+        if (!resource) return `${prefix}Resource is required for authorization queries`;
+      }
     }
     return null;
   },

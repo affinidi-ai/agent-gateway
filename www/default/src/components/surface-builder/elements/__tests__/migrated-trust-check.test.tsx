@@ -216,7 +216,7 @@ describe('migrated Trust Check — fullscreen panel', () => {
     await screen.findByTestId('trust-check-save');
     expect(screen.getByTestId('trust-check-fullscreen-migrated-warning')).toBeInTheDocument();
     expect(screen.getByTestId('trust-check-fullscreen-leg')).toHaveTextContent(
-      'Applies to this Transit Point only.'
+      'of this Transit Point only'
     );
     fireEvent.click(screen.getByTestId('trust-check-fullscreen-migrated-warning-keep'));
     expect(props.updateField).toHaveBeenCalledWith('trust_check_migrated', false);
@@ -226,7 +226,7 @@ describe('migrated Trust Check — fullscreen panel', () => {
     const props = panelProps({ queries, trust_check_migrated: true });
     render(<TrustCheckFullscreenPanel {...(props as any)} />);
     await screen.findByTestId('trust-check-save');
-    fireEvent.click(screen.getByTestId('trust-check-editor-remove-query-button'));
+    fireEvent.click(screen.getByTestId('trust-check-query-0-remove'));
     fireEvent.click(screen.getByTestId('trust-check-save'));
     expect(props.updateFields).toHaveBeenCalledWith({
       queries: [],

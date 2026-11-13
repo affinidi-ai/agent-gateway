@@ -2,7 +2,6 @@ import { trustCheckDefinition } from '../trust-check/definition';
 import {
   AGENT_IDENTITY_ISSUER_DID_TEMPLATE,
   INPUT_GATEWAY_SOURCE_ID_TEMPLATE,
-  queryProblem,
   subjectForTemplate,
   subjectLabel,
   templateForSubject,
@@ -684,96 +683,10 @@ describe('trustCheckDefinition — multiple queries per node', () => {
     it('accepts any number of Authorities in total', () => {
       expect(
         trustCheckDefinition.incompleteReason({
-          queries: [listing(30, 'a'), listing(6, 'b'), singleQuery],
+          queries: [listing(30, 'a'), listing(20, 'b'), singleQuery],
         })
       ).toBeNull();
     });
-  });
-});
-
-describe('queryProblem', () => {
-  const ready = {
-    trust_registry_id: 'tr-1',
-    query_type: 'authorization' as const,
-    query: { authority_id: 'did:web:auth.example', action: 'issue', resource: 'payment' },
-  };
-
-  it('returns null for a ready query on either leg', () => {
-    expect(queryProblem(ready, false)).toBeNull();
-    expect(queryProblem(ready, true)).toBeNull();
-  });
-
-  it('asks for a registry first, without a "Query N" prefix', () => {
-    expect(queryProblem({ ...ready, trust_registry_id: '' }, false)).toBe(
-      'Trust registry must be selected'
-    );
-  });
-
-  it('accepts a blank Authority on the caller leg only', () => {
-    const blank = { ...ready, query: { action: 'issue', resource: 'payment' } };
-    expect(queryProblem(blank, false)).toBeNull();
-    expect(queryProblem(blank, true)).toBe(
-      'Select an Issuer or Authority for the target-leg Authority'
-    );
-  });
-
-  it('flags a legacy template Authority on the caller leg', () => {
-    const legacy = {
-      ...ready,
-      query: { ...ready.query, authority_id: '{{ input.agent.provider_did }}' },
-    };
-    expect(queryProblem(legacy, false)).toMatch(/^Replace the caller-leg Authority template/);
-  });
-
-  it('flags an empty row in a list of Authorities', () => {
-    const listed = { ...ready, query: { ...ready.query, authority_ids: ['did:web:a', ''] } };
-    expect(queryProblem(listed, true)).toBe(
-      'Select an Issuer or Authority for every Authority row'
-    );
-  });
-
-  it('needs action and resource on an authorization query, not on recognition', () => {
-    expect(queryProblem({ ...ready, query: { authority_id: 'did:web:a' } }, false)).toBe(
-      'Action is required for authorization queries'
-    );
-    expect(
-      queryProblem({ ...ready, query: { authority_id: 'did:web:a', action: 'issue' } }, false)
-    ).toBe('Resource is required for authorization queries');
-    expect(
-      queryProblem(
-        { ...ready, query_type: 'recognition', query: { authority_id: 'did:web:a' } },
-        false
-      )
-    ).toBeNull();
-  });
-
-  it.each([
-    ['Transit Point', TP_SLOT, 'tp-1'],
-    ['Managed Agent', MA_SLOT, 'target'],
-  ])(
-    'flags a blank Authority on a newly dropped %s Trust Check (no _edge yet)',
-    (_leg, slotId, parentId) => {
-      const blank = { ...ready, query: { action: 'issue', resource: 'payment' } };
-      expect(
-        trustCheckDefinition.incompleteReason({ queries: [blank] }, { id: 'tc', slotId, parentId })
-      ).toBe('Select an Issuer or Authority for the target-leg Authority');
-      expect(
-        trustCheckDefinition.incompleteReason(
-          { queries: [blank] },
-          { id: 'tc', slotId: AP_SLOT, parentId: 'access-point' }
-        )
-      ).toBeNull();
-    }
-  );
-
-  it('is what incompleteReason reports, prefixed with "Query N: " when there are several', () => {
-    const broken = { ...ready, trust_registry_id: '' };
-    expect(trustCheckDefinition.incompleteReason({ queries: [broken] })).toBe(
-      'Trust registry must be selected'
-    );
-    expect(trustCheckDefinition.incompleteReason({ queries: [ready, broken] })).toBe(
-      'Query 2: Trust registry must be selected'
-    );
   });
 });
 

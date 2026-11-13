@@ -9,10 +9,7 @@ import {
   classifyTargetAuthoritySelection,
   missingTrustCheckAuthorities,
   queriesFromWire,
-  appendAuthorityRows,
-  authorityRows,
-  queryAuthorityMissing,
-  removeAuthorityRow,
+  pickAuthorities,
   type TrustCheckQueryConfig,
 } from '../trust-check/definition';
 import {
@@ -224,59 +221,44 @@ describe('several Authorities per query', () => {
       query: { authority_id, entity_id: '{{ input.agent.did }}' },
     }) as TrustCheckQueryConfig;
 
-  /** Add every DID after the first, as the editor's Add Issuers or Authorities does. */
+  /** Check each DID in the multi-select, in order. */
   const listOf = (dids: string[], source: 'authority' | 'issuer' = 'authority') =>
-    appendAuthorityRows(
+    pickAuthorities(
       single(dids[0], source),
-      dids.slice(1).map(did => ({ did, source }))
+      dids.map(did => ({ did, source }))
     );
 
-  it('turns a picked Authority into the first of several when another is added', () => {
-    const multi = appendAuthorityRows(single(AUTHORITY, 'authority'), [
+  it('writes two or more picks as authority_ids, each with the register it came from', () => {
+    const q = pickAuthorities(single(AUTHORITY, 'authority'), [
+      { did: AUTHORITY, source: 'authority' },
       { did: ISSUER, source: 'issuer' },
     ]);
-    expect(multi.query).toEqual({
+    expect(q.query).toEqual({
       authority_ids: [AUTHORITY, ISSUER],
       entity_id: '{{ input.agent.did }}',
     });
-    expect(multi.authority_sources).toEqual({ [AUTHORITY]: 'authority', [ISSUER]: 'issuer' });
-    expect(multi).not.toHaveProperty('authority_source');
+    expect(q.authority_sources).toEqual({ [AUTHORITY]: 'authority', [ISSUER]: 'issuer' });
+    expect(q).not.toHaveProperty('authority_source');
   });
 
-  it('replaces an empty default, skips a listed value, and has no limit', () => {
-    const fromDefault = appendAuthorityRows(single(''), [{ did: AUTHORITY, source: 'authority' }]);
-    expect(fromDefault.query).toEqual({
-      authority_id: AUTHORITY,
-      entity_id: '{{ input.agent.did }}',
-    });
-    expect(fromDefault.authority_source).toBe('authority');
-    const same = single(AUTHORITY, 'authority');
-    expect(appendAuthorityRows(same, [{ did: AUTHORITY, source: 'authority' }])).toBe(same);
-    const long = listOf(Array.from({ length: 30 }, (_, i) => `did:web:authority-${i}`));
-    expect(authorityRows(long)).toHaveLength(30);
-  });
+  it('writes one pick as authority_id, and none as an empty authority_id', () => {
+    const one = pickAuthorities(listOf(LISTED), [{ did: LISTED[1], source: 'authority' }]);
+    expect(one.query).toEqual({ authority_id: LISTED[1], entity_id: '{{ input.agent.did }}' });
+    expect(one.authority_source).toBe('authority');
+    expect(one).not.toHaveProperty('authority_sources');
 
-  it('lists a caller-leg request value beside picked Authorities, with no source for it', () => {
-    const q = appendAuthorityRows(single(AUTHORITY, 'authority'), [
-      { did: AGENT_IDENTITY_ISSUER_DID_TEMPLATE },
-    ]);
-    expect(q.query?.authority_ids).toEqual([AUTHORITY, AGENT_IDENTITY_ISSUER_DID_TEMPLATE]);
-    expect(q.authority_sources).toEqual({ [AUTHORITY]: 'authority' });
-    expect(queryAuthorityMissing(q, true)).toBe(false);
-    expect(queryAuthorityMissing(q, false)).toBe(true);
-  });
-
-  it('removes a row, and goes back to a single authority_id at one row', () => {
-    const q = removeAuthorityRow(listOf(LISTED), 0);
-    expect(q.query?.authority_ids).toEqual([LISTED[1], LISTED[2]]);
-    expect(q.authority_sources).toEqual({ [LISTED[1]]: 'authority', [LISTED[2]]: 'authority' });
-    const back = removeAuthorityRow(q, 1);
-    expect(back.query).toEqual({ authority_id: LISTED[1], entity_id: '{{ input.agent.did }}' });
-    expect(back.authority_source).toBe('authority');
-    expect(back).not.toHaveProperty('authority_sources');
-    const none = removeAuthorityRow(back, 0);
+    const none = pickAuthorities(listOf(LISTED), []);
     expect(none.query).toEqual({ authority_id: '', entity_id: '{{ input.agent.did }}' });
     expect(none).not.toHaveProperty('authority_source');
+    expect(none).not.toHaveProperty('authority_sources');
+  });
+
+  it('records no source beside a template', () => {
+    const q = pickAuthorities(single(AUTHORITY, 'authority'), [
+      { did: AGENT_IDENTITY_ISSUER_DID_TEMPLATE },
+    ]);
+    expect(q.query?.authority_id).toBe(AGENT_IDENTITY_ISSUER_DID_TEMPLATE);
+    expect(q).not.toHaveProperty('authority_source');
   });
 
   it('saves the picked list and its sources, with no authority_id', () => {
@@ -298,11 +280,9 @@ describe('several Authorities per query', () => {
     expect(element).not.toHaveProperty('authority_source');
   });
 
-  it('is incomplete while a stored row is empty', () => {
+  it('is incomplete while a stored list has an empty entry', () => {
     const open = {
-      ...single(AUTHORITY, 'authority'),
-      authority_source: undefined,
-      authority_sources: { [AUTHORITY]: 'authority' },
+      ...single(AUTHORITY),
       query: { authority_ids: [AUTHORITY, ''], entity_id: '{{ input.agent.did }}' },
     } as TrustCheckQueryConfig;
     expect(registry.getIncompleteReason('trust-check', { queries: [open] })).toBe(

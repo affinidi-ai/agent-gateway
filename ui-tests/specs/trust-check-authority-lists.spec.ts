@@ -98,10 +98,10 @@ test.describe('Trust Check — several Authorities in one query', () => {
             trustCheck({authority_id: AUTHORITY_A.did}, {authority_source: 'authority'}),
         );
 
-        await page.getByTestId('trust-check-query-0-add-authority').click();
-        await page.getByTestId(`trust-check-query-0-add-authority-option-${AUTHORITY_B.did}`).check();
-        await page.getByTestId('trust-check-query-0-add-authority-confirm').click();
-        await expect(page.getByTestId('trust-check-query-0-authority-1')).toContainText(AUTHORITY_B.name);
+        await page.getByTestId('trust-check-query-0-authority').click();
+        await page.getByTestId(`trust-check-query-0-authority-option-${AUTHORITY_B.did}`).click();
+        await page.keyboard.press('Escape');
+        await expect(page.getByTestId('trust-check-query-0-authority')).toContainText(AUTHORITY_B.name);
         await captureFullPage(page, 'trust-check-two-authorities');
         await page.getByTestId('trust-check-save').click();
 

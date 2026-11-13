@@ -1,13 +1,11 @@
 import React from 'react';
-import { act, render, screen, fireEvent } from '@testing-library/react';
+import { act, render, screen, within, fireEvent } from '@testing-library/react';
 import TrustCheckPanel from '../trust-check/TrustCheckPanel';
 import TrustCheckFullscreenPanel from '../trust-check/TrustCheckFullscreenPanel';
 import { SurfaceMetaProvider, type SurfaceMetaValue } from '../../SurfaceMetaContext';
 
 jest.mock('../../../../api', () => ({
-  apiClient: {
-    listTrustRegistries: () => Promise.resolve([{ id: 'tr-1', name: 'Partner Registry' }]),
-  },
+  apiClient: { listTrustRegistries: () => Promise.resolve([]) },
 }));
 jest.mock('../../../../utils/issuersCache', () => ({
   getIssuers: () =>
@@ -95,187 +93,127 @@ describe('TrustCheckPanel — leg scope', () => {
   );
 });
 
-describe('TrustCheckPanel — intro and banner', () => {
-  it('opens with what the caller leg checks and where the results land', () => {
+describe('TrustCheckPanel — sidebar context block', () => {
+  it('renders the per-leg context block on the caller (AP→MA) leg', () => {
     render(<TrustCheckPanel {...(baseProps(AP_SLOT) as any)} />);
 
-    expect(screen.getByTestId('trust-check-panel-results-ref')).toHaveTextContent(
-      'Checks the caller against a trust registry before the request reaches the agent. Results land on OPA at input.trust_check_results.caller[]; OPA decides allow or deny.'
-    );
+    const ctx = screen.getByTestId('trust-check-panel-context');
+    expect(ctx).toBeInTheDocument();
+    expect(within(ctx).getByText(/sender of an incoming request/i)).toBeInTheDocument();
   });
 
-  it('opens with what the target leg checks on a Transit Point', () => {
+  it('renders the per-leg context block on the target (MA→TP) leg', () => {
     render(<TrustCheckPanel {...(baseProps(TP_SLOT) as any)} />);
 
-    expect(screen.getByTestId('trust-check-panel-results-ref')).toHaveTextContent(
-      /^Checks the target agent .* leaves the gateway\. .* Applies to this Transit Point only\.$/
-    );
+    const ctx = screen.getByTestId('trust-check-panel-context');
+    expect(ctx).toBeInTheDocument();
+    expect(within(ctx).getByText(/destination entity before sending/i)).toBeInTheDocument();
   });
 
-  it.each([
-    [AP_SLOT, /CALLER identity/],
-    [TP_SLOT, /TARGET identity/],
-  ])('shows one collapsed "How does OPA use the result?" banner (%s)', (slot, summary) => {
-    render(<TrustCheckPanel {...(baseProps(slot) as any)} />);
-
-    const toggle = screen.getByTestId('trust-check-panel-context-toggle');
-    expect(toggle).toHaveTextContent('How does OPA use the result?');
-    expect(toggle).toHaveAttribute('aria-expanded', 'false');
-    expect(screen.queryByTestId('trust-check-panel-context-body')).toBeNull();
-
-    fireEvent.click(toggle);
-    const body = screen.getByTestId('trust-check-panel-context-body');
-    expect(body).toHaveTextContent(summary);
-    expect(body).not.toHaveTextContent(/Where|When|Example/);
-  });
-});
-
-describe('TrustCheckPanel — query list', () => {
-  const flush = () => act(() => new Promise<void>(resolve => setTimeout(resolve, 0)));
-  const recognition = (id: string, authority_id: string) => ({
-    id,
-    trust_registry_id: 'tr-1',
-    query_type: 'recognition',
-    authority_source: 'authority',
-    query: { authority_id },
-  });
-
-  it('lists the queries under a Trust Check Queries heading', () => {
-    render(
-      <TrustCheckPanel
-        {...(baseProps(AP_SLOT, { queries: [recognition('q-1', 'did:web:auth.example')] }) as any)}
-      />
-    );
-
-    expect(screen.getByText('Trust Check Queries')).toBeInstanceOf(HTMLLabelElement);
-    expect(screen.getByTestId('trust-check-panel-list')).toHaveClass('list-group');
-    expect(screen.queryByTestId('trust-check-panel-empty-state')).toBeNull();
-  });
-
-  it('shows a ready row with its type, registry name and Authority name', async () => {
-    render(
-      <TrustCheckPanel
-        {...(baseProps(AP_SLOT, { queries: [recognition('q-1', 'did:web:auth.example')] }) as any)}
-      />
-    );
-    await flush();
-
-    const row = screen.getByTestId('trust-check-panel-query-0');
-    expect(row).toHaveTextContent('Query 1');
-    expect(row).toHaveTextContent('Recognition');
-    const type = screen.getByTestId('trust-check-panel-query-0-type');
-    expect(type).toHaveClass('app-badge', 'text-bg-secondary');
-    expect(type).toContainHTML('<i class="fas fa-id-badge" aria-hidden="true"></i>');
-    expect(row).toHaveTextContent('Partner Registry · Payments Authority');
-    expect(screen.getByTestId('trust-check-panel-query-0-authorities')).toHaveTextContent(
-      /^Payments Authority$/
-    );
-    // One detail line only: the action and resource stay in the fullscreen editor.
-    expect(row).not.toHaveTextContent('ownedAgent');
-    const status = screen.getByTestId('trust-check-panel-query-0-status');
-    expect(status).toHaveClass('fa-circle-check', 'text-success');
-    expect(status).toHaveAttribute('aria-label', 'Ready');
-  });
-
-  it('shows an authorization row without its action and resource', async () => {
-    const config = {
-      queries: [
-        {
-          ...recognition('q-1', 'did:web:auth.example'),
-          query_type: 'authorization',
-          query: { authority_id: 'did:web:auth.example', action: 'issue', resource: 'payment' },
-        },
-      ],
-    };
-    render(<TrustCheckPanel {...(baseProps(AP_SLOT, config) as any)} />);
-    await flush();
-
-    const row = screen.getByTestId('trust-check-panel-query-0');
-    expect(row).toHaveTextContent('Authorization');
-    expect(screen.getByTestId('trust-check-panel-query-0-type')).toContainHTML(
-      '<i class="fas fa-user-shield" aria-hidden="true"></i>'
-    );
-    expect(row).not.toHaveTextContent('payment');
-  });
-
-  it('shows the problem of an incomplete query on its row, with a warning icon', () => {
-    const config = { queries: [{ id: 'q-1', trust_registry_id: '', query_type: 'recognition' }] };
-    render(<TrustCheckPanel {...(baseProps(TP_SLOT, config) as any)} />);
-
-    const status = screen.getByTestId('trust-check-panel-query-0-status');
-    expect(status).toHaveClass('fa-circle-exclamation', 'text-warning');
-    expect(status).toHaveAttribute('aria-label', 'Trust registry must be selected');
-    expect(screen.getByTestId('trust-check-panel-query-0')).toHaveTextContent(
-      'Trust registry must be selected'
-    );
-  });
-
-  it('counts the listed Authorities, with their names on hover', async () => {
-    const config = {
+  it('lists a JSON-API-authored query without its name', () => {
+    const props = baseProps(AP_SLOT, {
       queries: [
         {
           id: 'q-1',
           trust_registry_id: 'tr-1',
+          query_type: 'authorization',
+          name: 'issuer-accreditation',
+          query: { authority_id: 'a', entity_id: 'e', action: 'issue', resource: 'r' },
+        },
+      ],
+    });
+    render(<TrustCheckPanel {...(props as any)} />);
+
+    // The side panel shows the query number and record type only; the name still round-trips.
+    expect(screen.getByTestId('trust-check-panel-query-0')).toHaveTextContent(
+      /^Query 1Authorization$/
+    );
+    expect(screen.queryByText(/issuer-accreditation/)).toBeNull();
+    // With at least one query the empty-state block must not render.
+    expect(screen.queryByTestId('trust-check-panel-empty-state')).toBeNull();
+  });
+
+  it('renders an enriched empty state with leg-aware copy on the caller leg', () => {
+    render(<TrustCheckPanel {...(baseProps(AP_SLOT) as any)} />);
+
+    const empty = screen.getByTestId('trust-check-panel-empty-state');
+    expect(empty).toBeInTheDocument();
+    expect(within(empty).getByText(/No trust checks yet/i)).toBeInTheDocument();
+    // Caller-leg copy: "verify the caller" + "reaches the agent".
+    expect(within(empty).getByText(/verify the caller/i)).toBeInTheDocument();
+    expect(within(empty).getByText(/reaches the agent/i)).toBeInTheDocument();
+  });
+
+  it('renders an enriched empty state with leg-aware copy on the target leg', () => {
+    render(<TrustCheckPanel {...(baseProps(TP_SLOT) as any)} />);
+
+    const empty = screen.getByTestId('trust-check-panel-empty-state');
+    expect(empty).toBeInTheDocument();
+    expect(within(empty).getByText(/No trust checks yet/i)).toBeInTheDocument();
+    // Target-leg copy swaps "caller" → "upstream agent" and "reaches the agent" → "leaves the gateway".
+    expect(within(empty).getByText(/verify the upstream agent/i)).toBeInTheDocument();
+    expect(within(empty).getByText(/leaves the gateway/i)).toBeInTheDocument();
+  });
+
+  it('renders the Configure Queries button as a solid primary with 8px top margin', () => {
+    render(<TrustCheckPanel {...(baseProps(AP_SLOT) as any)} />);
+
+    const button = screen.getByTestId('trust-check-panel-configure');
+    expect(button).toBeInTheDocument();
+    // Solid primary (not outline) — the outline variant would fail this assertion.
+    expect(button).toHaveClass('btn-primary');
+    expect(button).not.toHaveClass('btn-outline-primary');
+    // 8px top margin (Bootstrap's `mt-2`) separates the button from the queries preview above.
+    expect(button).toHaveClass('mt-2');
+    // Rendered by the shared `AppButton` component — marker class distinguishes
+    // it from a raw Bootstrap `<button className="btn">`.
+    expect(button).toHaveClass('app-button');
+  });
+
+  it('renders the context block collapsed by default with an aria-expanded toggle', () => {
+    render(<TrustCheckPanel {...(baseProps(AP_SLOT) as any)} />);
+
+    // Body is absent because the block is collapsed by default.
+    expect(screen.queryByTestId('trust-check-panel-context-body')).toBeNull();
+
+    const toggle = screen.getByTestId('trust-check-panel-context-toggle');
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  });
+
+  it('expands the body when the toggle is clicked, keeping the title visible', () => {
+    render(<TrustCheckPanel {...(baseProps(AP_SLOT) as any)} />);
+
+    const toggle = screen.getByTestId('trust-check-panel-context-toggle');
+    fireEvent.click(toggle);
+
+    // Body visible after expand.
+    expect(screen.getByTestId('trust-check-panel-context-body')).toBeInTheDocument();
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+
+    // Title row stays visible.
+    expect(screen.getByText(/sender of an incoming request/i)).toBeInTheDocument();
+  });
+});
+
+describe('TrustCheckPanel — query list', () => {
+  it('shows only the query number and record type, not its Authorities or name', () => {
+    const config = {
+      queries: [
+        {
+          id: 'q-1',
+          name: 'partner check',
+          trust_registry_id: 'tr-1',
           query_type: 'recognition',
           query: {
-            authority_ids: ['did:web:authority-a', 'did:web:issuer.example', 'did:web:unknown'],
+            authority_ids: ['did:web:authority-a', '{{ input.agent.identity_issuer_did }}'],
           },
         },
       ],
     };
     render(<TrustCheckPanel {...(baseProps(AP_SLOT, config) as any)} />);
-    await flush();
-    expect(screen.getByTestId('trust-check-panel-query-0-authorities')).toHaveTextContent(
-      /^3 Authorities$/
+    expect(screen.getByTestId('trust-check-panel-query-0')).toHaveTextContent(
+      /^Query 1Recognition$/
     );
-    expect(
-      screen.getByTitle('Partner Registry · authority-A, Acme Issuer, did:web:unknown')
-    ).toHaveTextContent('Partner Registry · 3 Authorities');
-  });
-
-  it('shows the first 5 of 7 queries, then "+2 more"', () => {
-    const queries = Array.from({ length: 7 }, (_, i) =>
-      recognition(`q-${i}`, 'did:web:auth.example')
-    );
-    render(<TrustCheckPanel {...(baseProps(AP_SLOT, { queries }) as any)} />);
-
-    expect(screen.getByTestId('trust-check-panel-query-4')).toBeInTheDocument();
-    expect(screen.queryByTestId('trust-check-panel-query-5')).toBeNull();
-    expect(screen.getByTestId('trust-check-panel-more')).toHaveTextContent('+2 more');
-  });
-
-  it.each([
-    [AP_SLOT, 'Add a query to have OPA verify the caller against a trust registry.'],
-    [TP_SLOT, 'Add a query to have OPA verify the upstream agent against a trust registry.'],
-  ])('shows the empty state in place of the list (%s)', (slot, copy) => {
-    render(<TrustCheckPanel {...(baseProps(slot) as any)} />);
-
-    const empty = screen.getByTestId('trust-check-panel-empty-state');
-    expect(empty).toHaveTextContent('No trust checks yet');
-    expect(empty).toHaveTextContent(copy);
-    expect(screen.queryByTestId('trust-check-panel-list')).toBeNull();
-    expect(screen.getByTestId('trust-check-panel-configure')).toBeInTheDocument();
-  });
-
-  it('opens the editor from a Configure queries link below the list', () => {
-    const props = baseProps(AP_SLOT);
-    render(<TrustCheckPanel {...(props as any)} />);
-
-    const link = screen.getByTestId('trust-check-panel-configure');
-    expect(link).toHaveTextContent('Configure queries');
-    expect(link).toHaveClass('btn', 'btn-sm', 'btn-link', 'px-0');
-    expect(link).toContainHTML('<i class="fas fa-pen-to-square me-1"></i>');
-    fireEvent.click(link);
-    expect(props.openFullscreenEditor).toHaveBeenCalled();
-  });
-
-  it('uses no inline styles', () => {
-    const { container } = render(
-      <TrustCheckPanel
-        {...(baseProps(TP_SLOT, { queries: [recognition('q-1', 'did:web:auth.example')] }) as any)}
-      />
-    );
-    expect(container.innerHTML).not.toMatch(/\sstyle=/);
   });
 });
 
@@ -352,19 +290,17 @@ describe('TrustCheckFullscreenPanel — Authority source', () => {
     return props;
   }
 
-  /** Open Add Issuers or Authorities, tick each DID in order, then Add. */
-  function addAuthorities(...dids: string[]) {
-    fireEvent.click(screen.getByTestId('trust-check-query-0-add-authority'));
-    for (const did of dids) {
-      fireEvent.click(screen.getByTestId(`trust-check-query-0-add-authority-option-${did}`));
-    }
-    fireEvent.click(screen.getByTestId('trust-check-query-0-add-authority-confirm'));
+  const toggleAuthority = (did: string) =>
+    fireEvent.click(screen.getByTestId(`trust-check-query-0-authority-option-${did}`));
+
+  /** Open the Authority multi-select and check or uncheck each DID in turn. */
+  function toggleAuthorities(...dids: string[]) {
+    fireEvent.click(screen.getByTestId('trust-check-query-0-authority'));
+    dids.forEach(toggleAuthority);
   }
 
-  /** Replace the stored single Authority with `did`, then Save. */
-  function replaceAuthority(did: string) {
-    fireEvent.click(screen.getByTestId('trust-check-query-0-authority-0-remove'));
-    addAuthorities(did);
+  async function swapAuthority(from: string, to: string) {
+    toggleAuthorities(from, to);
     fireEvent.click(screen.getByTestId('trust-check-save'));
   }
 
@@ -378,7 +314,7 @@ describe('TrustCheckFullscreenPanel — Authority source', () => {
 
   it('saves authority_source "authority" beside a picked Authority', async () => {
     const { updateFields } = await openEditor([stored('did:web:issuer.example', 'issuer')]);
-    replaceAuthority('did:web:auth.example');
+    await swapAuthority('did:web:issuer.example', 'did:web:auth.example');
     const [query] = updateFields.mock.calls[0][0].queries;
     expect(query.authority_source).toBe('authority');
     expect(query.query.authority_id).toBe('did:web:auth.example');
@@ -386,16 +322,15 @@ describe('TrustCheckFullscreenPanel — Authority source', () => {
 
   it('saves authority_source "issuer" beside a picked Issuer', async () => {
     const { updateFields } = await openEditor([stored('did:web:auth.example', 'authority')]);
-    replaceAuthority('did:web:issuer.example');
+    await swapAuthority('did:web:auth.example', 'did:web:issuer.example');
     const [query] = updateFields.mock.calls[0][0].queries;
     expect(query.authority_source).toBe('issuer');
     expect(query.query.authority_id).toBe('did:web:issuer.example');
   });
 
-  it('saves several Authorities and an Issuer, added together, each with its register', async () => {
+  it('saves several Authorities and an Issuer checked in turn, each with its register', async () => {
     const { updateFields } = await openEditor([stored('did:web:authority-a', 'authority')]);
-    addAuthorities('did:web:authority-b', 'did:web:authority-c', 'did:web:issuer.example');
-    expect(screen.getByTestId('trust-check-query-0-authority-3')).toHaveTextContent('New');
+    toggleAuthorities('did:web:authority-b', 'did:web:authority-c', 'did:web:issuer.example');
     fireEvent.click(screen.getByTestId('trust-check-save'));
     const [query] = updateFields.mock.calls[0][0].queries;
     expect(query.query.authority_ids).toEqual([
@@ -414,18 +349,17 @@ describe('TrustCheckFullscreenPanel — Authority source', () => {
     expect(query).not.toHaveProperty('authority_source');
   });
 
-  it('does not save a target leg left with no Authority', async () => {
+  it('does not save once every Authority is unchecked', async () => {
     const { updateFields } = await openEditor([stored('did:web:authority-a', 'authority')]);
-    fireEvent.click(screen.getByTestId('trust-check-query-0-authority-0-remove'));
+    toggleAuthorities('did:web:authority-a');
     fireEvent.click(screen.getByTestId('trust-check-save'));
     expect(updateFields).not.toHaveBeenCalled();
-    expect(screen.getByTestId('trust-check-query-0-authority-empty')).toHaveClass('is-invalid');
+    expect(screen.getByTestId('trust-check-query-0-authority')).toHaveClass('is-invalid');
   });
 
-  it('saves a single authority_id again once the extra rows are removed', async () => {
+  it('saves a single authority_id again once the others are unchecked', async () => {
     const { updateFields } = await openEditor([stored('did:web:authority-a', 'authority')]);
-    addAuthorities('did:web:authority-b');
-    fireEvent.click(screen.getByTestId('trust-check-query-0-authority-0-remove'));
+    toggleAuthorities('did:web:authority-b', 'did:web:authority-a');
     fireEvent.click(screen.getByTestId('trust-check-save'));
     const [query] = updateFields.mock.calls[0][0].queries;
     expect(query.query).toEqual({ authority_id: 'did:web:authority-b' });
@@ -433,7 +367,7 @@ describe('TrustCheckFullscreenPanel — Authority source', () => {
     expect(query).not.toHaveProperty('authority_sources');
   });
 
-  it('opens a stored list of Authorities row by row, with nothing to save', async () => {
+  it('opens a stored list of Authorities checked in order, with nothing to save', async () => {
     const listed = {
       id: 'q-1',
       trust_registry_id: 'tr-1',
@@ -442,27 +376,30 @@ describe('TrustCheckFullscreenPanel — Authority source', () => {
       query: { authority_ids: ['did:web:authority-b', 'did:web:issuer.example'] },
     };
     const { updateFields } = await openEditor([listed]);
-    expect(screen.getByTestId('trust-check-query-0-authority-0')).toHaveTextContent('authority-B');
-    expect(screen.getByTestId('trust-check-query-0-authority-1')).toHaveTextContent('Acme Issuer');
+    expect(screen.getByTestId('trust-check-query-0-authority')).toHaveTextContent(
+      'authority-B, Acme Issuer'
+    );
     expect(screen.getByTestId('trust-check-save')).toBeDisabled();
     expect(updateFields).not.toHaveBeenCalled();
   });
 
-  it('saves more than 10 queries', async () => {
+  it('saves queries naming any number of Authorities in total', async () => {
     const listOf = (id: string, count: number) => ({
       id,
       trust_registry_id: 'tr-1',
       query_type: 'recognition',
       query: { authority_ids: Array.from({ length: count }, (_, i) => `did:web:${id}-${i}`) },
     });
-    const { updateFields } = await openEditor(
-      Array.from({ length: 12 }, (_, i) => listOf(`q-${i}`, 2))
-    );
-    fireEvent.click(screen.getByTestId('trust-check-editor-query-11'));
-    fireEvent.click(screen.getByTestId('trust-check-editor-remove-query-button'));
+    const { updateFields } = await openEditor([
+      listOf('first', 20),
+      listOf('second', 6),
+      stored('did:web:authority-a', 'authority'),
+    ]);
+    fireEvent.click(screen.getByTestId('trust-check-query-2-remove'));
+    expect(screen.queryByTestId('trust-check-authority-total-limit')).toBeNull();
     expect(screen.getByTestId('trust-check-add-query')).toBeEnabled();
     fireEvent.click(screen.getByTestId('trust-check-save'));
-    expect(updateFields.mock.calls[0][0].queries).toHaveLength(11);
+    expect(updateFields).toHaveBeenCalled();
   });
 
   it('flags a deleted Authority once the register has loaded', async () => {
@@ -470,123 +407,5 @@ describe('TrustCheckFullscreenPanel — Authority source', () => {
     expect(screen.getByTestId('trust-check-query-0-authority-missing')).toHaveTextContent(
       'did:web:deleted-authority.example'
     );
-  });
-});
-
-describe('TrustCheckFullscreenPanel — layout', () => {
-  const flush = () => act(() => new Promise<void>(resolve => setTimeout(resolve, 0)));
-
-  const recognition = (id: string, trust_registry_id = 'tr-1') => ({
-    id,
-    trust_registry_id,
-    query_type: 'recognition',
-    authority_source: 'authority',
-    query: { authority_id: 'did:web:auth.example' },
-  });
-
-  async function openEditor(slotId: string, queries: unknown[]) {
-    const props = { ...baseProps(slotId, { queries }), closeFullscreenEditor: jest.fn() } as any;
-    render(<TrustCheckFullscreenPanel {...props} />);
-    await flush();
-    return props;
-  }
-
-  it('lists every query with its status and opens the first one', async () => {
-    await openEditor(AP_SLOT, [recognition('q-1'), recognition('q-2', '')]);
-    expect(screen.getByTestId('trust-check-editor-query-0')).toHaveAttribute(
-      'aria-current',
-      'true'
-    );
-    expect(screen.getByTestId('trust-check-editor-query-0')).toHaveTextContent('Partner Registry');
-    expect(screen.getByTestId('trust-check-editor-query-0-status')).toHaveAttribute(
-      'aria-label',
-      'Ready'
-    );
-    expect(screen.getByTestId('trust-check-editor-query-1-status')).toHaveClass('text-warning');
-    expect(screen.getByTestId('trust-check-editor-query-settings')).toHaveTextContent('Query 1');
-    expect(screen.getByTestId('trust-check-fullscreen-count')).toHaveTextContent('2 queries');
-    expect(screen.getByTestId('trust-check-fullscreen-leg-pill')).toHaveTextContent('Caller leg');
-  });
-
-  it('shows the settings of the query a row selects', async () => {
-    await openEditor(AP_SLOT, [recognition('q-1'), recognition('q-2')]);
-    fireEvent.click(screen.getByTestId('trust-check-editor-query-1'));
-    expect(screen.getByTestId('trust-check-editor-query-1')).toHaveAttribute(
-      'aria-current',
-      'true'
-    );
-    expect(screen.getByTestId('trust-check-editor-query-0')).not.toHaveAttribute('aria-current');
-    expect(screen.getByTestId('trust-check-editor-query-settings')).toHaveTextContent('Query 2');
-    expect(screen.getByTestId('trust-check-query-1-form')).toBeInTheDocument();
-  });
-
-  it('adds a query and selects it, marking the draft unsaved', async () => {
-    await openEditor(AP_SLOT, [recognition('q-1')]);
-    expect(screen.queryByTestId('trust-check-fullscreen-unsaved')).toBeNull();
-    fireEvent.click(screen.getByTestId('trust-check-add-query'));
-    expect(screen.getByTestId('trust-check-editor-query-1')).toHaveAttribute(
-      'aria-current',
-      'true'
-    );
-    expect(screen.getByTestId('trust-check-fullscreen-unsaved')).toHaveTextContent(
-      'Unsaved changes'
-    );
-  });
-
-  it('switches the record type with the toggle', async () => {
-    const { updateFields } = await openEditor(AP_SLOT, [recognition('q-1')]);
-    expect(screen.getByTestId('trust-check-query-0-type-recognition')).toHaveAttribute(
-      'aria-pressed',
-      'true'
-    );
-    fireEvent.click(screen.getByTestId('trust-check-query-0-type-authorization'));
-    expect(screen.getByTestId('trust-check-query-0-type-authorization')).toHaveAttribute(
-      'aria-pressed',
-      'true'
-    );
-    expect(screen.getByTestId('trust-check-editor-query-0-type')).toHaveTextContent(
-      'Authorization'
-    );
-    fireEvent.change(screen.getByTestId('trust-check-query-0-action'), {
-      target: { value: 'issue' },
-    });
-    fireEvent.change(screen.getByTestId('trust-check-query-0-resource'), {
-      target: { value: 'credential:X' },
-    });
-    fireEvent.click(screen.getByTestId('trust-check-save'));
-    expect(updateFields.mock.calls[0][0].queries[0].query_type).toBe('authorization');
-  });
-
-  it('removes the selected query and selects the one before it', async () => {
-    await openEditor(AP_SLOT, [recognition('q-1'), recognition('q-2'), recognition('q-3')]);
-    fireEvent.click(screen.getByTestId('trust-check-editor-query-2'));
-    fireEvent.click(screen.getByTestId('trust-check-editor-remove-query-button'));
-    expect(screen.queryByTestId('trust-check-editor-query-2')).toBeNull();
-    expect(screen.getByTestId('trust-check-editor-query-1')).toHaveAttribute(
-      'aria-current',
-      'true'
-    );
-    expect(screen.getByTestId('trust-check-editor-query-settings')).toHaveTextContent('Query 2');
-  });
-
-  it('opens the first query that blocks Save', async () => {
-    const { updateFields } = await openEditor(AP_SLOT, [
-      recognition('q-1'),
-      { ...recognition('q-2'), query_type: 'authorization' },
-    ]);
-    fireEvent.click(screen.getByTestId('trust-check-add-query'));
-    fireEvent.click(screen.getByTestId('trust-check-editor-query-0'));
-    fireEvent.click(screen.getByTestId('trust-check-save'));
-    expect(updateFields).not.toHaveBeenCalled();
-    expect(screen.getByTestId('trust-check-editor-query-settings')).toHaveTextContent('Query 2');
-    expect(screen.getByTestId('trust-check-query-1-action')).toHaveClass('is-invalid');
-  });
-
-  it('states the leg and its OPA path in one line, with no Where / When block', async () => {
-    await openEditor(TP_SLOT, [recognition('q-1')]);
-    const intro = screen.getByTestId('trust-check-fullscreen-leg');
-    expect(intro).toHaveTextContent('input.trust_check_results.target[]');
-    expect(intro).toHaveTextContent('Applies to this Transit Point only.');
-    expect(screen.queryByText('Where, when and an example')).toBeNull();
   });
 });

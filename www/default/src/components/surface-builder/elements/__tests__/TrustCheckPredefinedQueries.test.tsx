@@ -56,7 +56,7 @@ function baseProps(overrides: Partial<Parameters<typeof TrustCheckQueryForm>[0]>
     loadError: null,
     updateQueryAt: jest.fn(),
     updateQuerySubField: jest.fn(),
-    replaceQueryAt: jest.fn(),
+    updateAuthorityAt: jest.fn(),
     updateEntityAt: jest.fn(),
     handleQueryTypeChangeAt: jest.fn(),
     ...overrides,
