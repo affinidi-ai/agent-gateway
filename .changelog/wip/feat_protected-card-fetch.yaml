@@ -64,4 +64,10 @@ changes:
         input, the success log now shows the card's url without userinfo or query values and the
         card's name escaped, as the card location is already logged, so a credential in the
         card's url no longer reaches the logs.
+    - timestamp: '2026-11-13T15:45:00Z'
+      title: Update quinn-udp to 0.5.16 for a receive loop advisory
+      description: >-
+        The QUIC transport crate quinn-udp, used by the Solana client libraries, moves from
+        0.5.14 to 0.5.16, which fixes RUSTSEC-2026-0538: its receive loop could spin after a
+        truncated datagram.
   breaking: []
