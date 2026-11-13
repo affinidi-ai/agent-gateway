@@ -1,0 +1,29 @@
+# CodeQL Configuration
+# https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/configuring-code-scanning
+
+# Exclude build artifacts and dependencies from analysis to speed up scanning
+# while maintaining full source code coverage (src, tests, www, .github/scripts, etc.)
+paths-ignore:
+  # Rust build artifacts
+  - target
+  - .cargo
+  
+  # Node.js build and dependencies
+  - node_modules
+  - dist
+  - build
+  - www/default/node_modules
+  - www/default/dist
+  - www/default/build
+  
+  # Python virtual environments
+  - .venv
+  - venv
+  
+  # Test output directories
+  - ui-tests
+  - coverage
+  - .nyc_output
+  
+  # Documentation (not code)
+  - '**/*.md'
