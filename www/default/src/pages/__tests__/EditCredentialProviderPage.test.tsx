@@ -253,10 +253,20 @@ describe('EditCredentialProviderPage consent time limit', () => {
 
     expect(
       await screen.findByText(
-        'Consent time limit must be a whole number from 1 minute to 365 days, or empty for no limit.'
+        'Consent time limit must be a whole number from 1 minute to 365 days, or empty to set none.'
       )
     ).toBeInTheDocument();
     expect(puts()).toHaveLength(0);
+  });
+
+  it('says an empty limit leaves the gateway its own default and ceiling', async () => {
+    await renderProvider(authorizationCode());
+    expect(screen.getByTestId(LIMIT)).toHaveAttribute('placeholder', 'Not set');
+    expect(
+      screen.getByText(
+        "Leave empty to set no limit on this provider. A default or a ceiling in the gateway's configuration still applies. From 1 minute to 365 days."
+      )
+    ).toBeInTheDocument();
   });
 
   it('says a deactivated provider takes no new consent, and never sends that state on save', async () => {

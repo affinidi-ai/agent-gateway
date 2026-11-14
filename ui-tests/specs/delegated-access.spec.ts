@@ -430,7 +430,7 @@ test.describe("Credential provider editor consent time limit", () => {
 
     await expect(
       page.getByText(
-        "Consent time limit must be a whole number from 1 minute to 365 days, or empty for no limit.",
+        "Consent time limit must be a whole number from 1 minute to 365 days, or empty to set none.",
       ),
     ).toBeVisible();
     expect(saved).toEqual([]);

@@ -35,8 +35,9 @@ changes:
       title: Set a provider's consent time limit in the dashboard
       description: >-
         The credential provider editor has a Consent time limit field on Authorization Code
-        providers, external consent ones included: a number and a unit, empty for no limit, from
-        one minute to 365 days. The Surface Builder now shows a binding's own limit, which is set
+        providers, external consent ones included: a number and a unit, from one minute to 365
+        days. An empty field sets no limit on the provider, and the gateway's own default and
+        ceiling still apply. The Surface Builder now shows a binding's own limit, which is set
         through the API, and keeps it when the surface is saved, so a dashboard save never
         removes it.
     - timestamp: '2026-11-13T16:00:00Z'

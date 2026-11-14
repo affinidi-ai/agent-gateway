@@ -1045,7 +1045,7 @@ const EditCredentialProviderPage: React.FC = () => {
                     min={1}
                     step={1}
                     className="form-control"
-                    placeholder="No limit"
+                    placeholder="Not set"
                     value={form.consent_limit_amount}
                     onChange={handleChange}
                     data-testid="credential-provider-consent-limit-input"
@@ -1066,7 +1066,8 @@ const EditCredentialProviderPage: React.FC = () => {
                   </select>
                 </div>
                 <small className="form-text text-muted">
-                  Empty for no limit. From 1 minute to 365 days.
+                  Leave empty to set no limit on this provider. A default or a ceiling in the
+                  gateway's configuration still applies. From 1 minute to 365 days.
                 </small>
               </div>
             )}

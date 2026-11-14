@@ -227,9 +227,10 @@ _Credential provider editor_ in
 [`docs/CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md#deactivating-a-provider).
 
 The credential provider editor's **Consent time limit** (Authorization Code providers only)
-writes `max_consent_age_secs`, `0` when empty, and the Surface Builder keeps and shows a
-binding's own limit, which is set through the API; see _Credential provider editor_ and _Surface
-Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
+writes `max_consent_age_secs`, `0` when empty, and says an empty field sets no limit on the
+provider while the gateway's own default and ceiling still apply. The Surface Builder keeps and
+shows a binding's own limit, which is set through the API; see _Credential provider editor_ and
+_Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
 
 The credential provider editor shows the inputs of the chosen type, picks the JWT signing key
 and certificate from the secrets store, keeps an authorization code provider's stored Callback URL
