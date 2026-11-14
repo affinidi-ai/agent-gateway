@@ -21,7 +21,14 @@ export const CATEGORY_OPTIONS = [
   { value: 'trace_terminated', label: 'Trace Terminated', lowFrequency: true },
   { value: 'vp_injected', label: 'VP Injected', lowFrequency: true },
   { value: 'token_injected', label: 'Token Injected', lowFrequency: true },
+  { value: 'token_refreshed', label: 'Token Refreshed', lowFrequency: true },
+  { value: 'refresh_failed', label: 'Refresh Failed', lowFrequency: true },
+  { value: 'token_not_found', label: 'Token Not Found', lowFrequency: true },
   { value: 'consent_granted', label: 'Consent Granted', lowFrequency: true },
+  { value: 'consent_required', label: 'Consent Required', lowFrequency: true },
+  { value: 'consent_expired', label: 'Consent Expired', lowFrequency: true },
+  { value: 'token_revoked', label: 'Token Revoked', lowFrequency: true },
+  { value: 'user_tokens_revoked', label: 'User Tokens Revoked', lowFrequency: true },
   { value: 'policy_created', label: 'Policy Created', lowFrequency: true },
   { value: 'policy_updated', label: 'Policy Updated', lowFrequency: true },
   { value: 'policy_deleted', label: 'Policy Deleted', lowFrequency: true },
@@ -30,6 +37,38 @@ export const CATEGORY_OPTIONS = [
   { value: 'policy_attachment_changed', label: 'Policy Attachment Changed', lowFrequency: true },
   { value: 'policy_change_refused', label: 'Policy Change Refused', lowFrequency: true },
 ] as const;
+
+/** The categories of the credential delegation records, which the Credentials page links to. */
+export const DELEGATION_CATEGORIES = [
+  'token_injected',
+  'token_refreshed',
+  'refresh_failed',
+  'token_not_found',
+  'consent_granted',
+  'consent_required',
+  'consent_expired',
+  'token_revoked',
+  'user_tokens_revoked',
+] as const;
+
+/** The categories that record delegated access coming to an end. */
+export const DELEGATION_ENDED_CATEGORIES = [
+  'consent_expired',
+  'token_revoked',
+  'user_tokens_revoked',
+] as const;
+
+/**
+ * The Audit Log narrowed to `categories`, and to the records that mention `filter` when it is
+ * given, as a path the page reads its filters from.
+ */
+export function auditLogPath(categories: readonly string[], filter?: string): string {
+  const params = new URLSearchParams();
+  if (filter) params.set('filter', filter);
+  if (categories.length > 0) params.set('category', categories.join(','));
+  const query = params.toString();
+  return query ? `/audit?${query}` : '/audit';
+}
 
 const CATEGORY_BADGE: Record<string, string> = {
   policy_created: 'badge-success',
@@ -47,8 +86,10 @@ const CATEGORY_BADGE: Record<string, string> = {
   token_refreshed: 'badge-info',
   consent_granted: 'badge-success',
   consent_required: 'badge-warning',
+  consent_expired: 'badge-warning',
   refresh_failed: 'badge-danger',
   token_revoked: 'badge-danger',
+  user_tokens_revoked: 'badge-danger',
 };
 
 export function categoryBadgeClass(name: string): string {
@@ -159,6 +200,8 @@ export function categoryLabel(name: string): string {
       return 'Consent Granted';
     case 'consent_required':
       return 'Consent Required';
+    case 'consent_expired':
+      return 'Consent Expired';
     case 'refresh_failed':
       return 'Refresh Failed';
     case 'token_revoked':

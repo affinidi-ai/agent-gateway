@@ -530,7 +530,11 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   option. An `external` binding is read-only: its provider, scopes, consent mode and injection
   inputs are disabled, and only the switch that removes it stays enabled, with a line saying
   whose grant it uses and that changing or removing it revokes its grants
-  (`transit-point-binding-subject`): such a binding is changed through the API. The Credential
+  (`transit-point-binding-subject`): such a binding is changed through the API. A binding's
+  own consent time limit (`max_consent_age_secs`) has no control either: it round-trips through
+  the form and is shown as a line under the consent select, in words from `describeConsentLimit`
+  (`transit-point-binding-consent-limit`, and `credential-delegation-binding-consent-limit` in the
+  Credential Delegation element), so a dashboard save never drops a limit set through the API. The Credential
   Delegation element (`_shared/OutboundCredentialsListSection.tsx`) does the same for the Access
   Point Target's binding with external consent in `outbound_credentials`
   (`credential-delegation-consent-mode-select`, `credential-delegation-binding-subject`), and asks
@@ -1058,12 +1062,65 @@ credential providers that use the strategy block the delete. The strategy editor
 on save (an issuer change a provider using the strategy would refuse) with the same
 `strategyDeleteError` text, so it names those providers and where to change them.
 
-## Credentials audit tab
+## Credential Tokens and Delegated Access tabs
 
-`pages/CredentialsPage/CredentialAuditTab.tsx` shows an expanded event's caller. **Subject** is
-the token's own `sub`; a **Principal** row (`credential-audit-caller-principal`) shows the value
-the caller's grants are keyed by, `caller.principal`, only when the JWT strategy names a claim
-other than `sub`.
+The Credentials page keeps its **Credential Tokens** tab (`pages/CredentialsPage/CredentialTokensTab.tsx`,
+tab key `credential-tokens`) and has a **Delegated Access** tab beside it
+(`pages/CredentialsPage/DelegatedAccessTab.tsx`, tab key `delegated-access`, trigger
+`credentials-delegated-access-tab-trigger`). Both read `GET /api/v1/delegation-vault`; the shared
+rules live in `pages/CredentialsPage/delegatedAccess.ts` (`consentState`, `timeLeft`,
+`isActiveDelegation`) and the page links in `PaginationControls.tsx`. A new view of the vault is a
+new tab: an existing tab is never renamed or removed.
+
+Credential Tokens lists every agent-keyed token, service tokens included.
+
+- The **Consented** cell shows the consent time and, under it, the consent's end
+  (`credential-token-consent-end-<id>`): "Ends <date> (in 3 hours)", "Ended <date>", or "No time
+  limit" when the vault reports no `consent_expires_at`. The expanded row shows it as **Consent
+  Ends**, the date first. **Token Expires** is the access token's own expiry.
+- The status badge reads "Consent ended" once the end has passed and "Ending soon" within 24 hours
+  of it; otherwise it is the access token's status (Active, Expired (refreshable), Expired). The
+  header counts leave ended consents out of "active" and count them as "consent ended"
+  (`credential-tokens-consent-ended-count`).
+- No modal and no browser dialog confirms a revoke. The row's **Revoke delegation** is the two-step
+  `DeleteButton`. **Revoke all for this user** (`credential-token-revoke-user-button-<id>`) is the
+  shared `components/shared/TwoStepButton`, for a two-step action that is not a delete: the first
+  click shows "Click again to revoke all", the second sends the `DELETE`, and a click elsewhere
+  cancels.
+- The expanded row links to the user's delegation records in the Audit Log
+  (`credential-token-view-activity-button-<id>`): the Audit Log opens with the user identity hash
+  as its text filter and the delegation categories selected. The link is shown only to a user
+  with `audit.view`.
+
+Delegated Access lists only active access: a token of an Authorization Code provider whose consent
+has not ended and whose access token is valid or refreshable. It has no history of its own.
+
+- Columns: User, System (the provider's name, else its `provider_id`), Agent, Access (scopes),
+  Status (Active, or Ending soon within 24 hours of the end), Ends (`delegated-access-ends-<id>`: the
+  time left over the date, or "No time limit"), Last Used and, with `settings.edit`, the two-step
+  **Revoke access** `DeleteButton` (`delegated-access-revoke-button-<id>`). Rows are
+  `delegated-access-row-<id>`; the header counts those ending soon
+  (`delegated-access-ending-soon-count`).
+- **History** (`delegated-access-history-button`) opens the Audit Log on the records of access
+  that ended: `consent_expired`, `token_revoked` and `user_tokens_revoked`. It is shown only to a
+  user with `audit.view`.
+- The list still loads when the providers cannot be read: every token then counts as a person's.
+
+## Credential delegation audit
+
+The credential delegation records are read in the Audit Log (`pages/AuditPage`), not on the
+Credentials page. The **Credential Delegation Audit** tab stays in the Credentials tab row
+(`credentials-credential-audit-tab-trigger`, shown with `audit.view`) as a link: selecting it, or
+opening `/credentials?tab=credential-audit`, goes to the Audit Log with the delegation categories
+selected. Every link from the Credentials page into the audit is built by `auditLogPath` from
+`DELEGATION_CATEGORIES` or `DELEGATION_ENDED_CATEGORIES` (`pages/AuditPage/auditHelpers.ts`).
+
+- The Audit Log offers each delegation category in its Category filter, labels and narrates
+  `consent_expired` ("Consent expired", a warning, apart from a revocation), and shows it with
+  the other delegation events.
+- Its Identity group shows **Subject**, the token's own `sub`, and a **Principal** row with the
+  value the caller's grants are keyed by, `caller.principal`, only when the JWT strategy names a
+  claim other than `sub`.
 
 ## Credential provider editor
 
@@ -1191,6 +1248,30 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   (`credential-provider-external-notice`) in place of the type, endpoint, client, callback and
   additional parameter inputs, which the gateway keeps fixed; Save sends only its name,
   description, default scopes and token refresh (`externalProviderUpdate`).
+- An Authorization Code provider, external consent or not, has a **Consent time limit**: a whole
+  number (`credential-provider-consent-limit-input`, placeholder "Not set") and a unit select
+  (`credential-provider-consent-limit-unit-select`: seconds, minutes, hours or days, hours by
+  default), with its explanation behind `FieldHelp` (`field-help-consent-limit`). The line under
+  it says an empty field sets no limit on the provider and that the gateway's own default and
+  ceiling still apply, never that an empty field means no limit. A stored
+  `max_consent_age_secs` loads in its largest whole unit (`consentLimitOf`). Save always sends
+  `max_consent_age_secs` (`consentLimitSeconds`): the limit in seconds, or `0`, which removes it,
+  for an empty field and for every other provider type, where the field is not shown. A limit
+  outside one minute to 365 days, or not a whole number, is refused before anything is sent
+  (`CONSENT_LIMIT_RANGE_MESSAGE`). The unit arithmetic and wording live in
+  `utils/consentLimit.ts`.
+- A provider a person consents to (`takesConsent`: Authorization Code, external consent or not)
+  is deactivated, never deleted, from the dashboard. Its row on the Credential Providers tab has
+  **Deactivate** (`credential-provider-deactivate-button-<id>`, the shared two-step
+  `TwoStepButton`: the first click shows "Click again to deactivate", the second sends
+  `POST /credential-providers/{id}/deactivate`) in place of the delete button, which only the
+  other provider types keep. A deactivated row shows a "Deactivated" badge
+  (`credential-provider-deactivated-badge-<id>`) and **Activate**
+  (`credential-provider-activate-button-<id>`, one click). The row stays in the list either way.
+  The editor shows a warning (`credential-provider-deactivated-notice`) that nobody can consent
+  again while access already given keeps working, and never sends `deactivated_at` on save. The
+  Delegated Access tab marks the access of a deactivated provider "No new consent"
+  (`delegated-access-provider-deactivated-<id>`). Success and failure are toasts.
 - The Credential Providers tab labels the types from `PROVIDER_TYPE_LABELS` in the same module, and
   shows a secondary badge after the type of a JWT Bearer provider that has a
   `client_authentication` (`credential-provider-client-authentication-badge`: Client ID only,
@@ -1348,9 +1429,7 @@ only that.
   empty state, saying no records could be read and that this is not the log holding none. The
   toast stays, for the moment the read fails; the panel is what is still there after it fades.
   Refresh stays enabled while `error` is set, since a failed read leaves `total` at `0` and
-  Refresh is the way back. `CredentialAuditTab` shows the same failure as its own error line.
-- `pages/CredentialsPage/CredentialAuditTab.tsx` reads the same two fields from
-  `/v1/delegation-audit` and appends the same `+` to its badge and its `n–m of t` line.
+  Refresh is the way back.
 - `AuditLogSize.tsx` shows one line above the list, `Audit log: 312 MiB of 1 GiB`, with a thin
   bar: neutral under the configured size, amber over it, and over it a line naming the two
   things an operator can do. It is **usage against a mark, never a quota**: nothing is enforced

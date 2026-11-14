@@ -206,9 +206,31 @@ The JWT verification strategy editor's Caller identity claim is editable only on
 see _JWT verification strategy editor_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#jwt-verification-strategy-editor).
 
-The Credentials audit tab shows a caller's Principal beside Subject when its strategy names a
-claim other than `sub`; see _Credentials audit tab_ in
-[`www/default/AGENTS.md`](www/default/AGENTS.md#credentials-audit-tab).
+The Credentials page keeps its **Credential Tokens** tab, which shows when each consent ends and
+confirms every revoke in place (two clicks, never a modal or a browser dialog), and has a
+**Delegated Access** tab beside it that lists only active access and opens the Audit Log as its
+history. A new view is a new tab; an existing tab is never renamed or removed. See _Credential
+Tokens and Delegated Access tabs_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#credential-tokens-and-delegated-access-tabs).
+
+The credential delegation records are read in the Audit Log; the Credentials page's **Credential
+Delegation Audit** tab is a link to it, filtered to the delegation categories. The Audit Log
+shows a caller's Principal beside Subject when its strategy names a claim other than `sub`; see
+_Credential delegation audit_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#credential-delegation-audit).
+
+A credential provider a person consents to is deactivated, never deleted, from the dashboard:
+**Deactivate** (two clicks, in place) and **Activate** on the Credential Providers tab stop and
+restore new consent only, and the provider's row, its tokens and its audit records stay; see
+_Credential provider editor_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor) and
+[`docs/CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md#deactivating-a-provider).
+
+The credential provider editor's **Consent time limit** (Authorization Code providers only)
+writes `max_consent_age_secs`, `0` when empty, and says an empty field sets no limit on the
+provider while the gateway's own default and ceiling still apply. The Surface Builder keeps and
+shows a binding's own limit, which is set through the API; see _Credential provider editor_ and
+_Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
 
 The credential provider editor shows the inputs of the chosen type, picks the JWT signing key
 and certificate from the secrets store, keeps an authorization code provider's stored Callback URL
@@ -250,10 +272,10 @@ variants and refusals_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#audit-
 
 An audit response says what a read did not return in two fields: `truncated` (it stopped before
 the end of the history) and `dropped_records` (the history holds records it could not read).
-Either makes the counts lower bounds, so the Audit Log and the Credentials audit tab render every
+Either makes the counts lower bounds, so the Audit Log renders every
 number from that read with a trailing `+`, an empty page of such a read says the records searched
 held none rather than that the log is empty, and nothing else changes. A read the gateway could
-not make at all is answered with `500`, and both views show that failure — the Audit Log as an
+not make at all is answered with `500`, and the Audit Log shows that failure as an
 error panel with a Retry in place of its empty state, never as an empty log. The Audit Log also shows the size of the history against the advisory
 `[audit] vp_audit_log_soft_cap_bytes`, which enforces nothing, formatted by the one shared
 `utils/formatBytes.ts`; see _Audit page: partial reads and

@@ -71,11 +71,19 @@ fn now_secs() -> Result<u64, ContinuationError> {
         .map_err(|_| ContinuationError::Unavailable)
 }
 
+/// What a consent ticket is checked against: its provider, the strategy that
+/// names the consenting person, and the time limits of the consent it asks for.
+struct AuthorizedTicket {
+    provider: CredentialProvider,
+    strategy: crate::jwt_bearer::models::JwtVerificationStrategy,
+    consent_limits: super::consent_age::ConsentLimits,
+}
+
 async fn authorize_ticket(
     state: &ModernConsentState,
     ticket: &ConsentTicket,
     provider_id: &str,
-) -> Result<(CredentialProvider, crate::jwt_bearer::models::JwtVerificationStrategy), ContinuationError> {
+) -> Result<AuthorizedTicket, ContinuationError> {
     use crate::mcp::continuations::delegation::{identity_strategy_digest, provider_digest, surface_digest};
     use crate::mcp::continuations::protected::ContinuationRoute;
 
@@ -165,7 +173,8 @@ async fn authorize_ticket(
         .await
         .map_err(|_| ContinuationError::Unavailable)?
         .ok_or(ContinuationError::NotFound)?;
-    if provider_digest(&provider)? != ticket.provider_digest
+    if provider.is_deactivated()
+        || provider_digest(&provider)? != ticket.provider_digest
         || !crate::tenancy::can_reference(surface.tenant_id.as_deref(), provider.tenant_id.as_deref())
     {
         return Err(ContinuationError::BindingMismatch);
@@ -185,13 +194,24 @@ async fn authorize_ticket(
     {
         return Err(ContinuationError::BindingMismatch);
     }
-    if !surface
+    let mut bindings = surface
         .agent_keyed_outbound_credentials()
-        .any(|binding| binding.credential_provider_id == provider_id)
-    {
+        .filter(|binding| binding.credential_provider_id == provider_id)
+        .peekable();
+    if bindings.peek().is_none() {
         return Err(ContinuationError::BindingMismatch);
     }
-    Ok((provider, strategy))
+    // The ticket does not say which binding asked, so the shortest limit of
+    // the provider's bindings on the surface ends the consent.
+    let binding_secs = bindings
+        .filter_map(|binding| binding.max_consent_age_secs)
+        .min();
+    let consent_limits = super::consent_age::ConsentLimits::of(binding_secs, provider.max_consent_age_secs);
+    Ok(AuthorizedTicket {
+        provider,
+        strategy,
+        consent_limits,
+    })
 }
 
 async fn connect(
@@ -215,7 +235,7 @@ async fn connect(
             .read_consent_ticket(&query.state, false, now)
             .await
             .map_err(failure)?;
-        let (provider, _) = authorize_ticket(&state, &ticket, &provider_id)
+        let AuthorizedTicket { provider, .. } = authorize_ticket(&state, &ticket, &provider_id)
             .await
             .map_err(failure)?;
         let client_id = super::oauth::resolve_secret(
@@ -271,7 +291,7 @@ async fn callback(
             .read_consent_ticket(&query.state, true, now_secs().map_err(failure)?)
             .await
             .map_err(failure)?;
-        let (provider, strategy) = authorize_ticket(&state, &ticket, &provider_id)
+        let AuthorizedTicket { provider, strategy, .. } = authorize_ticket(&state, &ticket, &provider_id)
             .await
             .map_err(failure)?;
         if query
@@ -319,9 +339,10 @@ async fn callback(
         )
         .await
         .map_err(failure)?;
-        authorize_ticket(&state, &claimed.ticket, &provider_id)
+        let consent_limits = authorize_ticket(&state, &claimed.ticket, &provider_id)
             .await
-            .map_err(failure)?;
+            .map_err(failure)?
+            .consent_limits;
         let profile = state
             .network
             .sts
@@ -390,6 +411,7 @@ async fn callback(
             delegation_vc: None,
             consent_identity: Some(consent_identity),
             consent_granted_at: now,
+            consent_expires_at: consent_limits.expires_at(now),
             last_used_at: None,
             created_at: now,
             updated_at: now,

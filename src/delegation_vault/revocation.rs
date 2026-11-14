@@ -1055,6 +1055,16 @@ pub async fn revoke_unkept(
     revoke_each(grants, &revoker, Some(UNKEPT_TOKENS)).await;
 }
 
+/// Revoke grants removed because their consent ended at its time limit, as
+/// [`revoke_removed`] revokes removed grants, their audit records ending
+/// `,consent_expired`: the outcome of an expiry, which nobody revoked.
+pub async fn revoke_expired(
+    grants: Vec<DelegatedGrant>,
+    revoker: Revoker,
+) {
+    revoke_each(grants, &revoker, Some(super::consent_age::CONSENT_EXPIRED)).await;
+}
+
 /// Revoke grants already removed from the vault, at most
 /// [`REVOCATION_CONCURRENCY`] at a time, logging and auditing each outcome.
 /// At a provider whose revocation ends the whole authorization of the vendor

@@ -1978,6 +1978,63 @@ async fn read_audit_log_as_operator(
     record_admin_response(world, response);
 }
 
+/// The delegated credentials an administrator sees in the delegation vault.
+pub(crate) async fn list_delegation_vault(world: &mut SurfaceWorld) -> Vec<serde_json::Value> {
+    ensure_admin_session(world).await;
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_recorded_json::<serde_json::Value>(reqwest::Method::GET, "/v1/delegation-vault", None)
+        .await
+        .expect("list the delegation vault through the admin API");
+    assert_eq!(response.status, 200, "listing the delegation vault: {}", response.body);
+    response
+        .body
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("the delegation vault is listed as an array, got {}", response.body))
+}
+
+/// Deactivates credential provider `provider`, or activates it again, as an
+/// operator does through the admin API.
+pub(crate) async fn set_oauth_provider_active(
+    world: &mut SurfaceWorld,
+    provider: &str,
+    active: bool,
+) {
+    ensure_admin_session(world).await;
+    let id = world
+        .surface_config
+        .provider_record_id(provider);
+    let action = if active {
+        "activate"
+    } else {
+        "deactivate"
+    };
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_recorded_json::<serde_json::Value>(
+            reqwest::Method::POST,
+            &format!("/v1/credential-providers/{id}/{action}"),
+            None,
+        )
+        .await
+        .expect("change the provider's activation through the admin API");
+    assert_eq!(response.status, 200, "{action} OAuth provider '{provider}': {}", response.body);
+    assert_eq!(
+        response
+            .body
+            .get("deactivated_at")
+            .is_some(),
+        !active,
+        "{}",
+        response.body
+    );
+}
+
 pub(crate) async fn read_delegation_audit_trail(world: &mut SurfaceWorld) {
     record_delegation_audit_trail(world).await;
     let response = world

@@ -34,6 +34,7 @@ use tracing::{info, warn};
 
 use super::audit::AuditCallerContext;
 use super::connects::{ConnectClaim, PendingConnect, TooManyPendingConnects};
+use super::consent_age::ConsentLimits;
 use super::grants::{DelegatedGrant, GrantBinding, GrantKey, OWNER_PRINCIPAL, ObtainedTokens, UnreadableGrant};
 use super::handlers::DelegationVaultState;
 use super::token_endpoint::{TokenFailure, TokenRequest};
@@ -194,8 +195,8 @@ async fn managed_surface(
     }
 }
 
-/// The external consent provider `id` of `tenant_id`, if it is one and the
-/// operator's rules still permit it.
+/// The external consent provider `id` of `tenant_id`, if it is one, takes
+/// new consent and the operator's rules still permit it.
 async fn permitted_provider(
     state: &DelegationVaultState,
     id: &str,
@@ -208,6 +209,9 @@ async fn permitted_provider(
         .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "provider_unavailable"))?
         .filter(|provider| provider.is_external_consent() && provider.tenant_id.as_deref() == tenant_id)
         .ok_or((StatusCode::CONFLICT, "provider_unavailable"))?;
+    if provider.is_deactivated() {
+        return Err((StatusCode::CONFLICT, "provider_deactivated"));
+    }
     let issuers = state.issuers.rules();
     if crate::credential_providers::external::issuer_permitted(&provider, issuers).is_err() {
         warn!(
@@ -467,12 +471,15 @@ pub async fn start_connect(
         return error(StatusCode::BAD_REQUEST, "scope_not_permitted", "scopes must lie within the binding's scopes");
     }
     let (connect, code_challenge) = PendingConnect::start(&key, scopes, request.redirect_uri, Utc::now());
-    let answer = serde_json::json!({
+    let mut answer = serde_json::json!({
         "connect_id": connect.id,
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
         "expires_at": connect.expires_at,
     });
+    if let Some(secs) = ConsentLimits::of(binding.max_consent_age_secs, provider.max_consent_age_secs).lifetime_secs() {
+        answer["max_consent_age_secs"] = serde_json::json!(secs);
+    }
     match state
         .vault_store
         .start_connect(connect)
@@ -589,16 +596,18 @@ pub async fn complete_connect(
         "External consent connect completed"
     );
     match outcome {
-        Ok(grant) => (
-            status,
-            Json(serde_json::json!({
+        Ok(grant) => {
+            let mut answer = serde_json::json!({
                 "status": "connected",
                 "grant_id": grant.id,
                 "scopes": grant.scopes,
                 "expires_at": grant.expires_at,
-            })),
-        )
-            .into_response(),
+            });
+            if let Some(end) = grant.consent_expires_at {
+                answer["consent_expires_at"] = serde_json::json!(end);
+            }
+            (status, Json(answer)).into_response()
+        }
         Err(unkept) => unkept.response(),
     }
 }
@@ -711,6 +720,21 @@ async fn redeem(
         revoke_unkept(state, &provider, grant, &manager.actor);
         return Err((StatusCode::SERVICE_UNAVAILABLE, "grants_unavailable").into());
     };
+    // The binding as saved now sets the end the person is told. One changed
+    // before the grant is stored is still checked at every release.
+    let binding_secs = match surfaces
+        .get(&grant.surface_id)
+        .await
+    {
+        Ok(Some(surface)) => crate::identity::handlers::surface_grants::binding_max_consent_age(&surface, &grant),
+        Ok(None) => None,
+        Err(error) => {
+            warn!(target: "credential_delegation", error = %error, "Failed to read a surface to end a grant's consent");
+            revoke_unkept(state, &provider, grant, &manager.actor);
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "grants_unavailable").into());
+        }
+    };
+    grant.consent_expires_at = ConsentLimits::of(binding_secs, provider.max_consent_age_secs).expires_at(now);
     let stored = match crate::identity::handlers::surface_grants::store_grant_while_bound(
         &state.vault_store,
         surfaces.as_ref(),
@@ -747,7 +771,12 @@ async fn redeem(
         event.token_id = Some(stored.grant.id.clone());
         event.provider_name = Some(provider.name.clone());
         event.scopes = Some(stored.grant.scopes.clone());
-        event.detail = Some("grant_by_binding:external_consent".to_string());
+        event.detail = super::consent_age::grant_detail(
+            Some("grant_by_binding:external_consent"),
+            stored
+                .grant
+                .consent_expires_at,
+        );
         event.caller = Some(manager.actor.clone());
         event
     });
@@ -766,9 +795,13 @@ pub struct GrantsQuery {
     pub principal: Option<String>,
 }
 
-/// A grant's metadata; never a token.
-fn grant_summary(grant: &DelegatedGrant) -> serde_json::Value {
-    serde_json::json!({
+/// A grant's metadata; never a token. `consent_expires_at` is when its
+/// consent ends, for one under a time limit.
+fn grant_summary(
+    grant: &DelegatedGrant,
+    consent_expires_at: Option<chrono::DateTime<Utc>>,
+) -> serde_json::Value {
+    let mut summary = serde_json::json!({
         "grant_id": grant.id,
         "principal": grant.principal,
         "scopes": grant.scopes,
@@ -777,7 +810,11 @@ fn grant_summary(grant: &DelegatedGrant) -> serde_json::Value {
         "last_used_at": grant.last_used_at,
         "expires_at": grant.expires_at,
         "state": grant.state(),
-    })
+    });
+    if let Some(end) = consent_expires_at {
+        summary["consent_expires_at"] = serde_json::json!(end);
+    }
+    summary
 }
 
 /// Report each `consent_mode: external` binding of a surface: its hop,
@@ -892,7 +929,24 @@ pub async fn list_grants(
                     if subject == GrantSubject::Owner {
                         entry["connected"] = serde_json::json!(true);
                     }
-                    entry["grant"] = grant_summary(&grant);
+                    let provider_limit = match state
+                        .provider_store
+                        .get(binding.credential_provider_id)
+                        .await
+                    {
+                        Ok(provider) => provider.and_then(|provider| provider.max_consent_age_secs),
+                        Err(error) => {
+                            warn!(target: "credential_delegation", error = %error, "Failed to read a binding's provider");
+                            return self::error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "grants_unavailable",
+                                "The vault cannot read grants now",
+                            );
+                        }
+                    };
+                    let consent_end = ConsentLimits::of(binding.max_consent_age_secs, provider_limit)
+                        .ends_for_binding_at(grant.created_at, grant.consent_expires_at);
+                    entry["grant"] = grant_summary(&grant, consent_end);
                 }
                 Ok(None) => {}
                 Err(error)
@@ -1638,10 +1692,240 @@ mod tests {
         assert_eq!(owner["connected"], true);
         assert_eq!(owner["grant"]["state"], "live");
         assert!(
+            owner["grant"]
+                .get("consent_expires_at")
+                .is_none(),
+            "a grant under no time limit has no end: {owner}"
+        );
+        assert!(
             !listed
                 .to_string()
                 .contains("access-1"),
             "no token is listed"
+        );
+    }
+
+    /// A deactivated provider takes no new connect: one is refused at its
+    /// start, and one started before the deactivation is refused when it is
+    /// completed, before any code is redeemed. Activated again, it connects.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deactivated_provider_starts_and_completes_no_connect() {
+        let fixture = Fixture::new(vec![token_answer("access-1")]).await;
+        let (status, under_way) = fixture
+            .start(Some("tenant-a"), owner_start())
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{under_way}");
+        let set_active = |active: bool| {
+            let providers = fixture
+                .state
+                .provider_store
+                .clone();
+            async move {
+                let mut provider = providers
+                    .get("vendor")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                provider.deactivated_at = (!active).then(Utc::now);
+                providers
+                    .update(provider)
+                    .await
+                    .unwrap();
+            }
+        };
+
+        set_active(false).await;
+        let (status, refused) = fixture
+            .start(Some("tenant-a"), owner_start())
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "provider_deactivated", "{refused}");
+        let (status, completed) = fixture
+            .complete(
+                under_way["connect_id"]
+                    .as_str()
+                    .unwrap(),
+                json!({"code": "the-code", "iss": fixture.issuer()}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{completed}");
+        assert_eq!(completed["reason"], "provider_deactivated", "{completed}");
+        assert!(
+            fixture
+                .token_requests()
+                .is_empty(),
+            "no code is redeemed for a deactivated provider"
+        );
+
+        set_active(true).await;
+        let (status, started) = fixture
+            .start(Some("tenant-a"), owner_start())
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{started}");
+    }
+
+    /// Under a consent time limit a connect says how long the grant will last
+    /// before the person consents, and the grant it keeps ends then: at the
+    /// shorter of its binding's limit and its provider's. Without a limit
+    /// neither answer mentions one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connect_under_a_time_limit_says_how_long_the_grant_lasts_and_stores_its_end() {
+        let fixture = Fixture::new(vec![token_answer("access-1"), token_answer("access-2")]).await;
+        let (status, started) = fixture
+            .start(Some("tenant-a"), owner_start())
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{started}");
+        assert!(
+            started
+                .get("max_consent_age_secs")
+                .is_none(),
+            "{started}"
+        );
+
+        let mut provider = fixture
+            .state
+            .provider_store
+            .get("vendor")
+            .await
+            .unwrap()
+            .unwrap();
+        provider.max_consent_age_secs = Some(21_600);
+        fixture
+            .state
+            .provider_store
+            .update(provider)
+            .await
+            .unwrap();
+        async fn connect(fixture: &Fixture) -> (serde_json::Value, serde_json::Value) {
+            let (status, started) = fixture
+                .start(Some("tenant-a"), owner_start())
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "{started}");
+            let (status, completed) = fixture
+                .complete(
+                    started["connect_id"]
+                        .as_str()
+                        .unwrap(),
+                    json!({"code": "the-code", "iss": fixture.issuer()}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{completed}");
+            (started, completed)
+        }
+        async fn stored(fixture: &Fixture) -> DelegatedGrant {
+            fixture
+                .state
+                .vault_store
+                .grant(&GrantKey::owner(Some("tenant-a"), "surface", "owner-hop", "vendor"))
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        async fn reported_end(fixture: &Fixture) -> serde_json::Value {
+            fixture.grants(None).await["bindings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|binding| binding["hop"] == "owner-hop")
+                .unwrap()["grant"]["consent_expires_at"]
+                .clone()
+        }
+
+        let (started, completed) = connect(&fixture).await;
+        assert_eq!(started["max_consent_age_secs"], 21_600, "the provider's limit");
+        let grant = stored(&fixture).await;
+        assert_eq!(grant.consent_expires_at, Some(grant.created_at + chrono::Duration::seconds(21_600)));
+        assert_eq!(completed["consent_expires_at"], json!(grant.consent_expires_at));
+        assert_eq!(reported_end(&fixture).await, json!(grant.consent_expires_at), "the report names the end");
+
+        let surfaces = fixture
+            .state
+            .agent_surface_store
+            .clone()
+            .unwrap();
+        let mut surface = surfaces
+            .get("surface")
+            .await
+            .unwrap()
+            .unwrap();
+        surface
+            .transit
+            .as_mut()
+            .unwrap()
+            .points
+            .iter_mut()
+            .find(|point| point.id == "owner-hop")
+            .unwrap()
+            .transit_credentials
+            .as_mut()
+            .unwrap()
+            .max_consent_age_secs = Some(3_600);
+        surfaces
+            .save(&surface)
+            .await
+            .unwrap();
+        assert_eq!(
+            reported_end(&fixture).await,
+            json!(grant.created_at + chrono::Duration::seconds(3_600)),
+            "a limit the binding set since ends the grant sooner"
+        );
+        let (started, _) = connect(&fixture).await;
+        assert_eq!(started["max_consent_age_secs"], 3_600, "the binding's shorter limit");
+        let grant = stored(&fixture).await;
+        assert_eq!(grant.consent_expires_at, Some(grant.created_at + chrono::Duration::seconds(3_600)));
+    }
+
+    /// The `consent_granted` record of a grant by binding says what it always
+    /// said of the grant and, under a consent time limit, when its consent
+    /// ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_by_binding_is_audited_with_the_end_of_its_consent() {
+        use crate::audit::producer::capture;
+        use crate::delegation_vault::audit::{DelegationAuditAction, DelegationAuditEvent};
+        fn grant_details(events: &[DelegationAuditEvent]) -> Vec<Option<String>> {
+            events
+                .iter()
+                .filter(|event| matches!(event.event, DelegationAuditAction::ConsentGranted))
+                .map(|event| event.detail.clone())
+                .collect()
+        }
+        let fixture = Fixture::new(vec![token_answer("access-1"), token_answer("access-2")]).await;
+
+        let ((status, completed), events) = capture(connect_owner(&fixture)).await;
+        assert_eq!(status, StatusCode::OK, "{completed}");
+        assert_eq!(grant_details(&events), [Some("grant_by_binding:external_consent".to_string())]);
+
+        let mut provider = fixture
+            .state
+            .provider_store
+            .get("vendor")
+            .await
+            .unwrap()
+            .unwrap();
+        provider.max_consent_age_secs = Some(21_600);
+        fixture
+            .state
+            .provider_store
+            .update(provider)
+            .await
+            .unwrap();
+        let ((status, completed), events) = capture(connect_owner(&fixture)).await;
+        assert_eq!(status, StatusCode::OK, "{completed}");
+        let end = fixture
+            .state
+            .vault_store
+            .grant(&GrantKey::owner(Some("tenant-a"), "surface", "owner-hop", "vendor"))
+            .await
+            .unwrap()
+            .unwrap()
+            .consent_expires_at
+            .expect("a grant under a limit has an end");
+        assert_eq!(
+            grant_details(&events),
+            [Some(format!(
+                "grant_by_binding:external_consent,consent_expires_at:{}",
+                end.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ))]
         );
     }
 

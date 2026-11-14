@@ -6971,17 +6971,11 @@ async fn proxy_charged_request(
             // Check for consent_required — if any binding needs consent, return immediately
             let mut consent_entries = Vec::new();
             for resolution in &delegation_results {
-                if let crate::proxy::credential_delegation::DelegationLookupResult::ConsentRequired {
-                    authorization_url,
-                    provider_name,
-                    scopes,
-                } = &resolution.result
+                if let Some(entry) = resolution
+                    .result
+                    .consent_entry()
                 {
-                    consent_entries.push(serde_json::json!({
-                        "provider_name": provider_name,
-                        "authorization_url": authorization_url,
-                        "scopes": scopes,
-                    }));
+                    consent_entries.push(entry);
                 }
             }
 

@@ -126,6 +126,7 @@ interface DelegationTokenFixture {
     scopes: string[];
     expires_at: string | null;
     consent_granted_at: string;
+    consent_expires_at?: string | null;
     last_used_at: string | null;
     created_at: string;
     updated_at: string;
@@ -147,31 +148,6 @@ interface StsClientFixture {
     issue_id_jag: boolean;
     created_at: string;
     updated_at: string;
-}
-
-/** Mirrors `AuditEvent` / `AuditLogPage` in `www/default/src/pages/CredentialsPage/CredentialAuditTab.tsx`. */
-interface DelegationAuditEventFixture {
-    timestamp: string;
-    event: string;
-    agent_did?: string;
-    user_identity_hash?: string;
-    provider_id?: string;
-    provider_name?: string;
-    channel_id?: string;
-    channel_name?: string;
-    target_endpoint?: string;
-    protocol?: string;
-    scopes?: string[];
-    via_fabric: boolean;
-    caller?: {auth_method: string; iss?: string; sub?: string; email?: string};
-}
-
-interface DelegationAuditPageFixture {
-    events: DelegationAuditEventFixture[];
-    total: number;
-    page: number;
-    page_size: number;
-    total_pages: number;
 }
 
 /** Mirrors `PolicyDefinition` in `www/default/src/pages/PoliciesPage/PolicyListTab.tsx`. */
@@ -399,6 +375,7 @@ const delegationTokens: DelegationTokenFixture[] = [
         scopes: ['purchase-orders.read', 'supplier-invoices.read', 'goods-receipts.read'],
         expires_at: iso(-60),
         consent_granted_at: iso(300),
+        consent_expires_at: new Date(Date.now() + 23 * 3_600_000).toISOString(),
         last_used_at: iso(5),
         created_at: iso(300),
         updated_at: iso(5),
@@ -423,33 +400,6 @@ const stsClients: StsClientFixture[] = [
         updated_at: iso(80),
     },
 ];
-
-const delegationAudit: DelegationAuditPageFixture = {
-    events: ['token_injected', 'consent_granted'].map((event, i) => ({
-        timestamp: iso(10 + i),
-        event,
-        agent_did: LONG_DID,
-        user_identity_hash: 'sha256:9f2c7a4e1b8d3f6a0c5e9b2d7f4a1c8e3b6d9f2a5c8e1b4d7f0a3c6e9b2d5f8a',
-        provider_id: FIXTURE_ID.credentialProvider,
-        provider_name: `${LONG_NAME} Supplier Portal OAuth`,
-        channel_id: FIXTURE_ID.surface,
-        channel_name: LONG_NAME,
-        target_endpoint: LONG_URL,
-        protocol: 'a2a',
-        scopes: ['purchase-orders.read', 'supplier-invoices.read'],
-        via_fabric: false,
-        caller: {
-            auth_method: 'jwt_bearer',
-            iss: `https://login.${DOMAIN}/tenants/procurement-emea-production/v2.0`,
-            sub: 'procurement.reconciliation.service-account@enterprise-operations.example.com',
-            email: 'procurement.reconciliation.service-account@enterprise-operations.example.com',
-        },
-    })),
-    total: 2,
-    page: 1,
-    page_size: 25,
-    total_pages: 1,
-};
 
 const policyDefinitions: PolicyDefinitionFixture[] = [
     {
@@ -801,7 +751,6 @@ const API_FIXTURES: Record<string, Body> = {
     '/api/v1/credential-providers': credentialProviders,
     '/api/v1/delegation-vault': delegationTokens,
     '/api/v1/sts/clients': stsClients,
-    '/api/v1/delegation-audit': delegationAudit,
     '/api/v1/policy-definitions': policyDefinitions,
     '/api/v1/secrets/': secrets,
     '/api/v1/api-keys': apiKeys,

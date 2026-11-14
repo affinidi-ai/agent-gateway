@@ -8,6 +8,7 @@ import {
   splitByTenant,
 } from '../../../../utils/tenantScope';
 import { useSurfaceTenant } from '../../SurfaceMetaContext';
+import { describeConsentLimit, storedConsentLimit } from '../../../../utils/consentLimit';
 
 interface CredentialProviderOption {
   id: string;
@@ -35,6 +36,8 @@ export interface TransitCredentialsForm {
   elicit_fallback?: string;
   /** Whose account an `external` binding's grant is: kept from the stored value. */
   subject?: 'owner' | 'caller';
+  /** The binding's consent time limit, in seconds: kept from the stored value and shown. */
+  max_consent_age_secs?: number;
 }
 
 /** Labels of the consent modes the select shows only when they are stored. */
@@ -76,6 +79,9 @@ export function transitCredentialsFormToApi(f: TransitCredentialsForm | null | u
     ...(f.elicit_timeout_secs !== undefined ? { elicit_timeout_secs: f.elicit_timeout_secs } : {}),
     ...(f.elicit_fallback !== undefined ? { elicit_fallback: f.elicit_fallback } : {}),
     ...(f.subject !== undefined ? { subject: f.subject } : {}),
+    ...(f.max_consent_age_secs !== undefined
+      ? { max_consent_age_secs: f.max_consent_age_secs }
+      : {}),
   };
 }
 
@@ -107,6 +113,9 @@ export function transitCredentialsApiToForm(api: any): TransitCredentialsForm | 
       : {}),
     ...(api.elicit_fallback !== undefined ? { elicit_fallback: api.elicit_fallback } : {}),
     ...(api.subject === 'owner' || api.subject === 'caller' ? { subject: api.subject } : {}),
+    ...(storedConsentLimit(api.max_consent_age_secs) !== undefined
+      ? { max_consent_age_secs: api.max_consent_age_secs }
+      : {}),
   };
 }
 
@@ -312,6 +321,16 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
                   : 'Every caller uses the one grant of the account that connected.'}{' '}
                 Another system obtains the grant; change this binding through the API. Changing or
                 removing this binding revokes its grants.
+              </Form.Text>
+            )}
+            {value.max_consent_age_secs !== undefined && (
+              <Form.Text
+                className="text-muted d-block"
+                data-testid="transit-point-binding-consent-limit"
+                style={{ fontSize: '10px' }}
+              >
+                Consent time limit: {describeConsentLimit(value.max_consent_age_secs)}, set through
+                the API. A consent older than this is asked for again.
               </Form.Text>
             )}
           </Form.Group>

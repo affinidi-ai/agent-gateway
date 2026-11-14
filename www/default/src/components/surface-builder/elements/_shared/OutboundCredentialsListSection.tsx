@@ -10,6 +10,7 @@ import {
   splitByTenant,
 } from '../../../../utils/tenantScope';
 import { useSurfaceTenant } from '../../SurfaceMetaContext';
+import { describeConsentLimit, storedConsentLimit } from '../../../../utils/consentLimit';
 
 interface CredentialProviderOption {
   id: string;
@@ -35,6 +36,8 @@ export interface OutboundCredentialFormRow {
   consent_mode: 'on_demand' | 'pre_authorize' | 'elicit' | 'external';
   /** Whose account an `external` binding's grant is: kept from the stored value. */
   subject?: 'owner' | 'caller';
+  /** The binding's consent time limit, in seconds: kept from the stored value and shown. */
+  max_consent_age_secs?: number;
   elicit_timeout_secs?: number;
   elicit_fallback?: 'on_demand' | 'fail';
   required_for_mode: 'all' | 'tools';
@@ -93,6 +96,7 @@ export function outboundCredentialFormToApi(f: OutboundCredentialFormRow): any |
       elicit_fallback: f.elicit_fallback ?? 'on_demand',
     }),
     ...(f.subject !== undefined && { subject: f.subject }),
+    ...(f.max_consent_age_secs !== undefined && { max_consent_age_secs: f.max_consent_age_secs }),
     inject_as,
   };
 }
@@ -127,6 +131,9 @@ export function outboundCredentialApiToForm(api: any): OutboundCredentialFormRow
     scopes: Array.isArray(api.scopes) ? api.scopes.join(', ') : '',
     consent_mode: api.consent_mode ?? 'on_demand',
     ...(api.subject === 'owner' || api.subject === 'caller' ? { subject: api.subject } : {}),
+    ...(storedConsentLimit(api.max_consent_age_secs) !== undefined
+      ? { max_consent_age_secs: api.max_consent_age_secs }
+      : {}),
     elicit_timeout_secs: api.elicit_timeout_secs ?? 300,
     elicit_fallback: api.elicit_fallback ?? 'on_demand',
     required_for_mode,
@@ -367,6 +374,16 @@ const OutboundCredentialsListSection: React.FC<Props> = ({ rows, onChange }) => 
                     : "Every caller's requests to the Target carry the one grant of the account that connected."}{' '}
                   Another system obtains the grant; change this binding through the API. Changing or
                   removing this binding revokes its grants.
+                </Form.Text>
+              )}
+              {row.max_consent_age_secs !== undefined && (
+                <Form.Text
+                  className="text-muted d-block"
+                  data-testid="credential-delegation-binding-consent-limit"
+                  style={{ fontSize: '10px' }}
+                >
+                  Consent time limit: {describeConsentLimit(row.max_consent_age_secs)}, set through
+                  the API. A consent older than this is asked for again.
                 </Form.Text>
               )}
               {row.consent_mode === 'elicit' && (

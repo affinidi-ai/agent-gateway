@@ -296,6 +296,7 @@ mod tests {
     fn seed_token(id: &str) -> DelegationToken {
         let now = Utc::now();
         DelegationToken {
+            consent_expires_at: None,
             id: id.to_string(),
             agent_did: "did:web:agent.example".to_string(),
             user_identity_hash: "sha256:user-1".to_string(),
@@ -1577,6 +1578,7 @@ mod tests {
             &["repo".to_string()],
             "https://198.51.100.7",
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1650,6 +1652,133 @@ mod tests {
             .await;
         assert_eq!(accepted.status, StatusCode::OK, "{}", accepted.body);
         assert_eq!(fixture.vault_records(), 1);
+    }
+
+    /// Under a consent time limit the start page says how long the agent may
+    /// use the consent, the callback stores its end with the credential, and
+    /// the page after it says until when. Without one, none of them mentions it.
+    #[tokio::test]
+    async fn a_time_limit_is_shown_on_the_consent_pages_and_ends_the_stored_consent() {
+        let fixture = consent::Fixture::new().await;
+        let unlimited = fixture
+            .get(&consent::local(&fixture.start_url()), &[])
+            .await;
+        assert_eq!(unlimited.status, StatusCode::OK, "{}", unlimited.body);
+        assert!(
+            !unlimited
+                .body
+                .contains("Time limit"),
+            "{}",
+            unlimited.body
+        );
+
+        let start_url = fixture.start_url_under(Some(21_600));
+        let page = fixture
+            .get(&consent::local(&start_url), &[])
+            .await;
+        assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+        assert!(
+            page.body.contains(
+                "<dt>Time limit</dt><dd>The agent may use it for 6 hours after you approve. Then it asks you \
+                 again.</dd>"
+            ),
+            "{}",
+            page.body
+        );
+
+        let (callback_state, cookie) = fixture
+            .begin_at(&start_url)
+            .await;
+        let done = fixture
+            .callback("github", &format!("code=vendor-code&state={callback_state}"), Some(&cookie))
+            .await;
+        assert_eq!(done.status, StatusCode::OK, "{}", done.body);
+        let stored = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        let end = stored[0].consent_granted_at + chrono::Duration::seconds(21_600);
+        assert_eq!(stored[0].consent_expires_at, Some(end));
+        assert!(
+            done.body
+                .contains(&format!("on your behalf until {}.", end.format("%-d %B %Y, %H:%M UTC"))),
+            "{}",
+            done.body
+        );
+
+        let (callback_state, cookie) = fixture.begin().await;
+        let done = fixture
+            .callback("github", &format!("code=vendor-code&state={callback_state}"), Some(&cookie))
+            .await;
+        assert_eq!(done.status, StatusCode::OK, "{}", done.body);
+        assert!(
+            done.body
+                .contains("on your behalf.</p>"),
+            "{}",
+            done.body
+        );
+        let stored = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap();
+        assert!(
+            stored
+                .iter()
+                .any(|token| token
+                    .consent_expires_at
+                    .is_none()),
+            "a consent given under no limit has no end"
+        );
+    }
+
+    /// The `consent_granted` record of a consent given under a time limit
+    /// names its end in `detail`, so the audit shows it while the consent is
+    /// in use; one given under no limit has no detail.
+    #[tokio::test]
+    async fn a_consent_under_a_time_limit_is_audited_with_its_end() {
+        fn grant_details(events: &[crate::delegation_vault::audit::DelegationAuditEvent]) -> Vec<Option<String>> {
+            events
+                .iter()
+                .filter(|event| matches!(event.event, DelegationAuditAction::ConsentGranted))
+                .map(|event| event.detail.clone())
+                .collect()
+        }
+        let fixture = consent::Fixture::new().await;
+
+        let (callback_state, cookie) = fixture
+            .begin_at(&fixture.start_url_under(Some(21_600)))
+            .await;
+        let (done, events) = capture(async {
+            fixture
+                .callback("github", &format!("code=vendor-code&state={callback_state}"), Some(&cookie))
+                .await
+        })
+        .await;
+        assert_eq!(done.status, StatusCode::OK, "{}", done.body);
+        let end = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap()[0]
+            .consent_expires_at
+            .expect("a consent under a limit has an end");
+        assert_eq!(
+            grant_details(&events),
+            [Some(format!("consent_expires_at:{}", end.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)))]
+        );
+
+        let (callback_state, cookie) = fixture.begin().await;
+        let (done, events) = capture(async {
+            fixture
+                .callback("github", &format!("code=vendor-code&state={callback_state}"), Some(&cookie))
+                .await
+        })
+        .await;
+        assert_eq!(done.status, StatusCode::OK, "{}", done.body);
+        assert_eq!(grant_details(&events), [None], "a consent under no limit names no end");
     }
 
     /// The start page claims nothing and sets no cookie, so it may be fetched
@@ -1933,6 +2062,7 @@ mod tests {
             &[],
             "https://198.51.100.7",
             None,
+            None,
         )
         .unwrap();
         let started = fixture
@@ -2121,6 +2251,113 @@ mod tests {
             .await;
         assert_eq!(stored.status, StatusCode::OK, "{}", stored.body);
         assert_eq!(fixture.vault_records(), 1);
+    }
+
+    /// A deactivated provider takes no new consent: a link minted before it
+    /// was deactivated opens no start page and starts nothing, and a consent
+    /// already on its way to the vendor is not completed. Activated again, it
+    /// consents as before.
+    #[tokio::test]
+    async fn a_deactivated_provider_starts_and_completes_no_consent() {
+        let fixture = consent::Fixture::new().await;
+        let origin = [("origin", "https://198.51.100.7")];
+        let start_url = fixture.start_url();
+        let (under_way, cookie) = fixture.begin().await;
+        let set_active = |active: bool| {
+            let fixture = &fixture;
+            async move {
+                let mut provider = fixture.provider();
+                provider.deactivated_at = (!active).then(Utc::now);
+                fixture
+                    .providers
+                    .update(provider)
+                    .await
+                    .unwrap();
+            }
+        };
+
+        set_active(false).await;
+        let (refused, events) = capture(async {
+            fixture
+                .start_post(&consent::start_state(&start_url), &origin)
+                .await
+        })
+        .await;
+        consent::assert_refused(&refused, StatusCode::BAD_REQUEST, None);
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ProviderDeactivated]);
+        let (completed, events) = capture(async {
+            fixture
+                .callback("github", &format!("code=vendor-code&state={under_way}"), Some(&cookie))
+                .await
+        })
+        .await;
+        assert_eq!(completed.status, StatusCode::BAD_REQUEST, "{}", completed.body);
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ProviderDeactivated]);
+        assert_eq!(fixture.vault_records(), 0, "nothing is stored");
+        assert_eq!(fixture.token_calls(), 0, "and the vendor's token endpoint is not called");
+
+        set_active(true).await;
+        let (callback_state, cookie) = fixture.begin().await;
+        let done = fixture
+            .callback("github", &format!("code=vendor-code&state={callback_state}"), Some(&cookie))
+            .await;
+        assert_eq!(done.status, StatusCode::OK, "{}", done.body);
+        assert_eq!(fixture.vault_records(), 1);
+    }
+
+    /// A consent confirmed at the identity provider first keeps its time
+    /// limit through both redirects, so the stored consent ends when the
+    /// start page said it would.
+    #[tokio::test]
+    async fn a_consent_confirmed_first_keeps_its_time_limit() {
+        use crate::delegation_vault::oauth::{decode_callback_state, decode_confirmation_state};
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture
+            .confirming_at_idp(None, None)
+            .await;
+        let alice = consent::caller_hash("sub", "alice");
+        let sign_in = fixture
+            .sign_in_under(&strategy, &alice, Some(21_600))
+            .await;
+        assert_eq!(
+            decode_confirmation_state(&sign_in.state)
+                .unwrap()
+                .max_consent_age_secs,
+            Some(21_600)
+        );
+        fixture.idp_answers(serde_json::json!({"id_token": fixture.id_token(&sign_in.nonce, serde_json::json!({}))}));
+        let confirmed = fixture
+            .confirm_code(&sign_in)
+            .await;
+        assert_eq!(confirmed.status, StatusCode::FOUND, "{}", confirmed.body);
+        let vendor = url::Url::parse(
+            confirmed
+                .header("location")
+                .unwrap(),
+        )
+        .unwrap();
+        let vendor_state = consent::query_value(&vendor, "state");
+        assert_eq!(
+            decode_callback_state(&vendor_state)
+                .unwrap()
+                .max_consent_age_secs,
+            Some(21_600)
+        );
+
+        let stored = fixture
+            .callback("github", &format!("code=vendor-code&state={vendor_state}"), Some(&sign_in.cookie))
+            .await;
+        assert_eq!(stored.status, StatusCode::OK, "{}", stored.body);
+        let tokens = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(
+            tokens[0].consent_expires_at,
+            Some(tokens[0].consent_granted_at + chrono::Duration::seconds(21_600))
+        );
     }
 
     /// A person other than the one the link was minted for, signing in at
@@ -3291,6 +3528,15 @@ mod tests {
             }
 
             pub fn start_url(&self) -> String {
+                self.start_url_under(None)
+            }
+
+            /// The start page of a consent that may be used for
+            /// `max_consent_age_secs` once given.
+            pub fn start_url_under(
+                &self,
+                max_consent_age_secs: Option<u64>,
+            ) -> String {
                 crate::delegation_vault::oauth::build_authorization_url(
                     &self.provider(),
                     "did:web:agent.example",
@@ -3298,6 +3544,7 @@ mod tests {
                     "surface",
                     &["repo".to_string(), "read:user".to_string()],
                     "https://198.51.100.7",
+                    max_consent_age_secs,
                     None,
                 )
                 .unwrap()
@@ -3354,6 +3601,7 @@ mod tests {
                     "surface",
                     &["repo".to_string(), "read:user".to_string()],
                     "https://198.51.100.7",
+                    None,
                     Some(crate::delegation_vault::ConsentStage::ConfirmStart(confirm_binding(strategy))),
                 )
                 .unwrap()
@@ -3415,6 +3663,18 @@ mod tests {
                 strategy: &JwtVerificationStrategy,
                 user_identity_hash: &str,
             ) -> SignIn {
+                self.sign_in_under(strategy, user_identity_hash, None)
+                    .await
+            }
+
+            /// [`Self::sign_in`], for a link whose consent may be used for
+            /// `max_consent_age_secs`.
+            pub async fn sign_in_under(
+                &self,
+                strategy: &JwtVerificationStrategy,
+                user_identity_hash: &str,
+                max_consent_age_secs: Option<u64>,
+            ) -> SignIn {
                 let start = crate::delegation_vault::oauth::build_authorization_url(
                     &self.provider(),
                     "did:web:agent.example",
@@ -3422,6 +3682,7 @@ mod tests {
                     "surface",
                     &["repo".to_string(), "read:user".to_string()],
                     "https://198.51.100.7",
+                    max_consent_age_secs,
                     Some(crate::delegation_vault::ConsentStage::ConfirmStart(confirm_binding(strategy))),
                 )
                 .unwrap();
@@ -3544,8 +3805,17 @@ mod tests {
             /// A callback state and the binding cookie of the browser that
             /// posted its start page.
             pub async fn begin(&self) -> (String, String) {
+                self.begin_at(&self.start_url())
+                    .await
+            }
+
+            /// [`Self::begin`] from the start page at `start_url`.
+            pub async fn begin_at(
+                &self,
+                start_url: &str,
+            ) -> (String, String) {
                 let started = self
-                    .start_post(&start_state(&self.start_url()), &[("origin", "https://198.51.100.7")])
+                    .start_post(&start_state(start_url), &[("origin", "https://198.51.100.7")])
                     .await;
                 assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
                 let vendor = url::Url::parse(
@@ -3958,6 +4228,26 @@ mod tests {
         let evt = &events[0];
         assert!(matches!(evt.event, DelegationAuditAction::TokenRevoked));
         assert_eq!(evt.token_id.as_deref(), Some("t1"));
+        let revoked = seed_token("t1");
+        assert_eq!(evt.agent_did.as_deref(), Some(revoked.agent_did.as_str()), "whose agent lost the access");
+        assert_eq!(
+            evt.user_identity_hash
+                .as_deref(),
+            Some(
+                revoked
+                    .user_identity_hash
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            evt.provider_id.as_deref(),
+            Some(
+                revoked
+                    .credential_provider_id
+                    .as_str()
+            )
+        );
+        assert_eq!(evt.scopes.as_ref(), Some(&revoked.scopes));
         let caller = evt
             .caller
             .as_ref()

@@ -43,7 +43,8 @@ pub fn binding_cookie_name(state: &OAuthState) -> Option<String> {
 /// The gateway's consent start page for `provider`: `{redirect URI}/start`
 /// with a sealed start state, of `stage` when it has one. The person opens it
 /// and confirms; only then does the gateway build the vendor's authorization
-/// URL.
+/// URL. `max_consent_age_secs` is how long the consent may be used once given,
+/// which the page says and the callback stores as the consent's end.
 pub fn build_authorization_url(
     provider: &CredentialProvider,
     agent_did: &str,
@@ -51,6 +52,7 @@ pub fn build_authorization_url(
     surface_id: &str,
     scopes: &[String],
     gateway_base_url: &str,
+    max_consent_age_secs: Option<u64>,
     stage: Option<ConsentStage>,
 ) -> Result<String> {
     let mut url = provider
@@ -67,6 +69,7 @@ pub fn build_authorization_url(
         surface_id: surface_id.to_string(),
         credential_provider_id: provider.id.clone(),
         provider_id: provider.provider_id.clone(),
+        max_consent_age_secs,
         nonce: Uuid::new_v4().to_string(),
         expires_at: Utc::now() + Duration::minutes(CONSENT_STATE_LIFETIME_MINUTES),
         code_verifier: None,
@@ -111,7 +114,11 @@ pub async fn mint_consent_link(
     gateway_base_url: &str,
     secrets_store: &Arc<dyn SecretsStore>,
     provider_store: &dyn crate::credential_providers::storage::CredentialProviderStorage,
+    max_consent_age_secs: Option<u64>,
 ) -> Result<String> {
+    if provider.is_deactivated() {
+        return Err(anyhow!("Provider '{}' is deactivated and takes no new consent", provider.provider_id));
+    }
     provider
         .consent_redirect_uri(gateway_base_url)
         .map_err(|reason| anyhow!("Provider '{}': {reason}", provider.provider_id))?;
@@ -147,7 +154,16 @@ pub async fn mint_consent_link(
         }
         _ => None,
     };
-    build_authorization_url(provider, agent_did, user_identity_hash, surface_id, scopes, gateway_base_url, stage)
+    build_authorization_url(
+        provider,
+        agent_did,
+        user_identity_hash,
+        surface_id,
+        scopes,
+        gateway_base_url,
+        max_consent_age_secs,
+        stage,
+    )
 }
 
 /// What the consent start POST answers with: the vendor's or, for a caller
@@ -1593,19 +1609,21 @@ pub fn build_consent_required(
 ///
 /// Produces a W3C VC v2 credential with an EdDsaRdfc2022 Data Integrity Proof
 /// when a `vc_signer` is provided. Falls back to an unsigned VC if no signer
-/// is available (e.g. during tests or degraded mode).
+/// is available (e.g. during tests or degraded mode). A consent under a time
+/// limit ends at `valid_until`, which the credential names as `validUntil`.
 pub async fn build_delegation_vc(
     gateway_did: &str,
     agent_did: &str,
     user_identity_hash: &str,
     provider: &CredentialProvider,
     scopes: &[String],
+    valid_until: Option<chrono::DateTime<Utc>>,
     vc_signer: Option<&Arc<dyn VcSigner>>,
 ) -> Result<serde_json::Value> {
     let now = Utc::now();
     let vc_id = format!("urn:uuid:{}", Uuid::new_v4());
 
-    let credential = json!({
+    let mut credential = json!({
         "@context": [
             "https://www.w3.org/ns/credentials/v2",
             "https://fabric.affinidi.io/credentials/delegation/v1"
@@ -1629,6 +1647,9 @@ pub async fn build_delegation_vc(
             "consentedAt": now.to_rfc3339()
         }
     });
+    if let Some(valid_until) = valid_until {
+        credential["validUntil"] = json!(valid_until.to_rfc3339());
+    }
 
     match vc_signer {
         Some(signer) => signer
@@ -1921,6 +1942,7 @@ mod tests {
     fn test_encode_decode_oauth_state_roundtrip_encrypted() {
         init_test_encryption();
         let state = OAuthState {
+            max_consent_age_secs: None,
             agent_did: "did:web:agent.example.com".to_string(),
             user_identity_hash: "sha256:abc123".to_string(),
             surface_id: "ch-test-1".to_string(),
@@ -1950,6 +1972,7 @@ mod tests {
     fn test_decode_oauth_state_rejects_expired() {
         init_test_encryption();
         let state = OAuthState {
+            max_consent_age_secs: None,
             agent_did: "did:web:agent".to_string(),
             user_identity_hash: "sha256:user".to_string(),
             surface_id: "ch-1".to_string(),
@@ -2077,6 +2100,7 @@ mod tests {
                 &[],
                 "https://ignored.example",
                 None,
+                None,
             )
             .unwrap(),
         )
@@ -2105,7 +2129,8 @@ mod tests {
                 "surface",
                 &[],
                 "https://gw.example",
-                None
+                None,
+                None,
             )
             .is_err()
         );
@@ -2454,6 +2479,7 @@ mod tests {
 
     fn sample_state() -> OAuthState {
         OAuthState {
+            max_consent_age_secs: None,
             agent_did: "did:web:agent.example.com".to_string(),
             user_identity_hash: "sha256:abc123".to_string(),
             surface_id: "ch-test-1".to_string(),
@@ -3769,6 +3795,8 @@ mod tests {
     #[test]
     fn test_build_consent_required_format() {
         let provider = CredentialProvider {
+            deactivated_at: None,
+            max_consent_age_secs: None,
             id: "cp-1".to_string(),
             tenant_id: None,
             name: "GitHub".to_string(),
@@ -3823,6 +3851,8 @@ mod tests {
     #[tokio::test]
     async fn test_build_delegation_vc_structure() {
         let provider = CredentialProvider {
+            deactivated_at: None,
+            max_consent_age_secs: None,
             id: "cp-1".to_string(),
             tenant_id: None,
             name: "GitHub".to_string(),
@@ -3865,9 +3895,25 @@ mod tests {
             &provider,
             &["repo".to_string(), "read:user".to_string()],
             None,
+            None,
         )
         .await
         .expect("build_delegation_vc should succeed without signer");
+
+        assert!(vc.get("validUntil").is_none(), "a consent under no time limit names no end");
+        let valid_until = Utc::now() + Duration::hours(6);
+        let limited = build_delegation_vc(
+            "did:web:gateway.example.com",
+            "did:web:agent.example.com",
+            "sha256:user123",
+            &provider,
+            &["repo".to_string()],
+            Some(valid_until),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(limited["validUntil"], valid_until.to_rfc3339());
 
         assert_eq!(vc["issuer"], "did:web:gateway.example.com");
         assert_eq!(vc["credentialSubject"]["id"], "did:web:agent.example.com");
@@ -3950,6 +3996,7 @@ mod tests {
     fn test_oauth_state_with_code_verifier_roundtrip() {
         init_test_encryption();
         let state = OAuthState {
+            max_consent_age_secs: None,
             agent_did: "did:web:agent".to_string(),
             user_identity_hash: "sha256:user".to_string(),
             surface_id: "ch-1".to_string(),
@@ -3971,6 +4018,7 @@ mod tests {
     fn test_oauth_state_without_code_verifier_roundtrip() {
         init_test_encryption();
         let state = OAuthState {
+            max_consent_age_secs: None,
             agent_did: "did:web:agent".to_string(),
             user_identity_hash: "sha256:user".to_string(),
             surface_id: "ch-1".to_string(),
@@ -4007,6 +4055,8 @@ mod tests {
         let signer: Arc<dyn VcSigner> = Arc::new(LocalVcSigner::new(config));
 
         let provider = CredentialProvider {
+            deactivated_at: None,
+            max_consent_age_secs: None,
             id: "cp-1".to_string(),
             tenant_id: None,
             name: "GitHub".to_string(),
@@ -4047,6 +4097,7 @@ mod tests {
             "sha256:user123",
             &provider,
             &["repo".to_string()],
+            None,
             Some(&signer),
         )
         .await

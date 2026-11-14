@@ -629,7 +629,7 @@ answers an unreadable log with an empty page, which would assert that the admini
 at all of the evidence.
 
 A page read with `truncated: true` or a non-zero `dropped_records` shows every number that came
-from the walk as a lower bound: the Audit page and the Credentials → Audit tab render the record
+from the walk as a lower bound: the Audit page renders the record
 total, the pager's page count and each category chip's count with a trailing `+` (`1243+`,
 `Page 5 of 687+`), and nothing else about them changes. A partial count is therefore never
 presented as a complete one, and an empty page of such a read says that the records searched held
@@ -867,6 +867,24 @@ Trust); see [`POLICY.md`](POLICY.md#the-authority-of-a-trust-check).
   is `true`, and `referrers` lists each record that used it as `{kind, id}` (`surface` or
   `sts_client`). `actor` names the management caller as on policy change events. The record
   carries no record name and sets no `surface_id`.
+
+**Consent expiry events.** Raised when a consent reaches its time limit (group Delegation); see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#consent-time-limit).
+
+- `consent_expired`: the stored credential of an ended consent was removed, and the person is
+  asked to consent again. It is never a `token_revoked` or `user_tokens_revoked`, which record
+  a revocation. The record names the agent (`agent_did`, absent for a grant by binding), the
+  caller's identity hash or `owner` (`user_identity_hash`), the provider, the surface, the
+  scopes and the token or grant id (`token_id`). Its `detail` is
+  `consent_granted_at:<time>,consent_expired_at:<time>,source:<source>`, the times in RFC 3339
+  UTC and `source` what found the consent ended: `release` is a request that needed the
+  credential, and `sweep` the hourly removal of ended consents, whose record names no surface
+  for an agent-keyed token. One removal writes one record, whichever finds the consent ended
+  first.
+
+A consent given under a time limit also names its end when it is given: the `detail` of its
+`consent_granted` record holds `consent_expires_at:<time>` in RFC 3339 UTC, after
+`grant_by_binding:external_consent,` for a grant by binding.
 
 **MCP Proxy pin change events.** Raised by management API writes to a surface (group
 Delegation); see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#through-an-mcp-proxy)

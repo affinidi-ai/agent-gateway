@@ -189,6 +189,8 @@ pub enum DelegationFailureReason {
     TokenExchangeFailed,
     /// A consent confirmation sign-in gave no ID token that names a caller.
     ConsentIdentityMissing,
+    /// The state's provider was deactivated: it takes no new consent.
+    ProviderDeactivated,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

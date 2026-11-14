@@ -4,6 +4,7 @@ use super::{ResolvedCredentialInjection, build_injection_headers};
 use crate::config::agent_surface::AgentSurface;
 use crate::config::types::{CredentialInjection, CredentialRequirement, OutboundCredentialBinding};
 use crate::credential_providers::{CredentialProvider, CredentialProviderType, storage::CredentialProviderStorage};
+use crate::delegation_vault::consent_age::{self, ConsentAge, ConsentLimits};
 use crate::delegation_vault::{DelegationToken, VaultLookupResult, storage::DelegationVaultStorage};
 use crate::jwt_bearer::{JwtVerificationStrategyStorage, models::JwtVerificationStrategy};
 use crate::mcp::continuations::{
@@ -154,6 +155,18 @@ struct SelectedProvider<'binding> {
     provider: CredentialProvider,
     strategy: Option<JwtVerificationStrategy>,
     binding: ContinuationBinding,
+}
+
+/// The time limits on the consents the binding of `selected` uses.
+fn consent_limits(selected: &SelectedProvider<'_>) -> ConsentLimits {
+    ConsentLimits::of(
+        selected
+            .config
+            .max_consent_age_secs,
+        selected
+            .provider
+            .max_consent_age_secs,
+    )
 }
 
 pub async fn prepare_direct(
@@ -641,13 +654,14 @@ impl ModernDelegationContext<'_> {
                 prepared.add_credential(&provider.config.inject_as, &token)?;
                 continue;
             }
+            let mut asked_again = None;
             let credential = if resumed_credential
                 .as_ref()
                 .is_some_and(|credential| credential.credential_provider_id == provider.provider.id)
             {
                 resumed_credential.take()
             } else {
-                match self
+                let found = self
                     .vault
                     .lookup(
                         self.agent_did,
@@ -657,8 +671,11 @@ impl ModernDelegationContext<'_> {
                         &provider.provider.id,
                     )
                     .await
-                    .map_err(|_| ContinuationError::Unavailable)?
-                {
+                    .map_err(|_| ContinuationError::Unavailable)?;
+                let found = self
+                    .within_consent_limits(found, &provider, &mut asked_again)
+                    .await;
+                match found {
                     VaultLookupResult::Found(credential) => Some(credential),
                     VaultLookupResult::ExpiredRefreshable(credential)
                         if provider
@@ -674,6 +691,12 @@ impl ModernDelegationContext<'_> {
             };
             let credential = credential.filter(|credential| verified_credential(credential, &provider, now));
             let Some(credential) = credential else {
+                if provider
+                    .provider
+                    .is_deactivated()
+                {
+                    return Err(ContinuationError::Unavailable.into());
+                }
                 if !starts_consent {
                     return Err(ModernDelegationError::ConsentNotAvailableForPartners);
                 }
@@ -681,6 +704,7 @@ impl ModernDelegationContext<'_> {
                     return Err(ContinuationError::Denied.into());
                 }
                 require_client_capability(request, RequiredClientCapability::ElicitationUrl)?;
+                let lifetime_secs = consent_limits(&provider).lifetime_secs();
                 let origin = url::Url::parse(&self.profile.issuer)
                     .map_err(|_| ContinuationError::InvalidRecord)?
                     .origin()
@@ -718,8 +742,11 @@ impl ModernDelegationContext<'_> {
                 consent_url
                     .query_pairs_mut()
                     .append_pair("state", &connect);
-                let response =
-                    input_required_response(request, &issued, &consent_url, "Authorize access to the provider")?;
+                let message = match consent_age::notice(asked_again, lifetime_secs) {
+                    Some(notice) => format!("Authorize access to the provider. {notice}"),
+                    None => "Authorize access to the provider".to_string(),
+                };
+                let response = input_required_response(request, &issued, &consent_url, &message)?;
                 if let Some(claimed) = prepared.claimed {
                     self.service
                         .complete(claimed, now)
@@ -730,6 +757,45 @@ impl ModernDelegationContext<'_> {
             prepared.add_credential(&provider.config.inject_as, &credential.access_token)?;
         }
         Ok(ModernDelegationResult::Prepared(Box::new(prepared)))
+    }
+
+    /// `found` while its consent is within the time limits of `selected`.
+    /// Otherwise no credential, with why the caller is asked again in
+    /// `asked_again`: a consent past its end is removed from the vault and
+    /// audited, and one only too old for this binding is kept for the others.
+    async fn within_consent_limits(
+        &self,
+        found: VaultLookupResult,
+        selected: &SelectedProvider<'_>,
+        asked_again: &mut Option<&'static str>,
+    ) -> VaultLookupResult {
+        let credential = match &found {
+            VaultLookupResult::Found(credential)
+            | VaultLookupResult::ExpiredRefreshable(credential)
+            | VaultLookupResult::ExpiredNoRefresh(credential) => credential,
+            VaultLookupResult::NotFound => return found,
+        };
+        let limits = consent_limits(selected);
+        match limits.judge(credential.consent_granted_at, credential.consent_expires_at, chrono::Utc::now()) {
+            ConsentAge::Current => return found,
+            ConsentAge::TooOldForBinding => *asked_again = Some(consent_age::CONSENT_TOO_OLD),
+            ConsentAge::Ended => {
+                *asked_again = Some(consent_age::CONSENT_EXPIRED);
+                consent_age::end_consent(
+                    self.vault,
+                    credential,
+                    limits.ends_at(credential.consent_granted_at, credential.consent_expires_at),
+                    "release",
+                    Some(&self.surface.surface_id),
+                    |event| {
+                        event.provider_name = Some(selected.provider.name.clone());
+                        event.channel_name = Some(self.surface.name.clone());
+                    },
+                )
+                .await;
+            }
+        }
+        VaultLookupResult::NotFound
     }
 
     async fn service_credential(
@@ -2639,5 +2705,317 @@ mod tests {
                 assert_eq!(sent["params"]["_meta"]["io.affinidi.fabric/delegated-credential"], "live-access");
             }
         }
+    }
+
+    /// The stores and settings a 2026-07-28 preparation reads, for one
+    /// surface whose binding of `provider` limits a consent to `binding_secs`.
+    struct ConsentFixture {
+        _directory: tempfile::TempDir,
+        providers: FileSystemCredentialProviderStore,
+        strategies: FileSystemJwtVerificationStrategyStore,
+        vault: FileSystemDelegationVaultStore,
+        surface: AgentSurface,
+        authorization: McpResourceServerConfig,
+        profile: McpIssuerProfile,
+        caller: AuthenticatedIdentity,
+        service: ContinuationService,
+    }
+
+    impl ConsentFixture {
+        async fn new(binding_secs: Option<u64>) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let providers = FileSystemCredentialProviderStore::new(
+                directory
+                    .path()
+                    .join("providers"),
+            )
+            .await
+            .unwrap();
+            let strategies = FileSystemJwtVerificationStrategyStore::new(
+                directory
+                    .path()
+                    .join("strategies"),
+            )
+            .await
+            .unwrap();
+            let vault = FileSystemDelegationVaultStore::new(directory.path().join("vault"))
+                .await
+                .unwrap();
+            let strategy = strategies
+                .create(
+                    crate::sts::handlers::gateway_self_trust_strategy(
+                        "https://identity.example/",
+                        &json!({"keys": []}),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            providers
+                .create(
+                    serde_json::from_value(json!({
+                        "id": "provider", "name": "Provider", "provider_id": "provider",
+                        "resource": "https://provider.example/api", "consent_identity_strategy_id": strategy.id,
+                        "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let mut binding = json!({"credential_provider_id": "provider", "scopes": ["read"]});
+            if let Some(secs) = binding_secs {
+                binding["max_consent_age_secs"] = json!(secs);
+            }
+            let profile = McpIssuerProfile {
+                issuer: "https://gateway.example/oauth2/mcp".into(),
+            };
+            Self {
+                providers,
+                strategies,
+                vault,
+                surface: serde_json::from_value(json!({
+                    "surface_id": "surface", "name": "Surface",
+                    "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+                    "target": {"endpoint": "https://provider.example/api"}, "outbound_credentials": [binding]
+                }))
+                .unwrap(),
+                authorization: McpResourceServerConfig {
+                    resource: "https://gateway.example/mcp".into(),
+                    scopes: vec!["read".into()],
+                },
+                caller: AuthenticatedIdentity::JwtBearer {
+                    strategy_id: None,
+                    principal_claim: "sub".to_string(),
+                    subject: "user".into(),
+                    claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+                    verification: Default::default(),
+                },
+                profile,
+                service: ContinuationService::new(
+                    ContinuationCipher::new(
+                        "deployment".into(),
+                        "key".into(),
+                        vec![ContinuationKey::new("key".into(), [7; 32], 1, 1000, 1900).unwrap()],
+                    )
+                    .unwrap(),
+                    Arc::new(EmbeddedContinuations::new(32).unwrap()),
+                ),
+                _directory: directory,
+            }
+        }
+
+        fn context(&self) -> ModernDelegationContext<'_> {
+            ModernDelegationContext {
+                service: &self.service,
+                deployment: "deployment",
+                ttl_secs: 100,
+                surface: &self.surface,
+                variant_id: None,
+                route: ContinuationRoute::AccessPoint,
+                authorization: &self.authorization,
+                identity: &self.caller,
+                agent_did: "did:web:agent.example",
+                profile: &self.profile,
+                vault: &self.vault,
+                providers: &self.providers,
+                strategies: &self.strategies,
+                secrets: None,
+                provider_egress: None,
+                isolation: crate::config::credential_policy::RuleMode::Warn,
+            }
+        }
+
+        fn tool_call() -> ValidatedModernMessage {
+            ValidatedModernMessage {
+                protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+                client_capabilities: Some(json!({"elicitation": {"url": {}}})),
+                client_info: None,
+                method: "tools/call".into(),
+                id: Some(json!(1)),
+                kind: McpMessageKind::Request,
+                params: Some(json!({"name": "read", "arguments": {"value": 1}})),
+            }
+        }
+
+        /// Store a credential the caller consented to `age` ago, whose
+        /// consent ends `ends_in` from now when it has a stored end.
+        async fn store_consent(
+            &self,
+            age: chrono::Duration,
+            ends_in: Option<chrono::Duration>,
+        ) {
+            let context = self.context();
+            let selected = context
+                .select(&Self::tool_call())
+                .await
+                .unwrap();
+            let now = chrono::Utc::now();
+            let mut token: DelegationToken = serde_json::from_value(json!({
+                "id": "consented", "agent_did": context.agent_did,
+                "user_identity_hash": selected[0].binding.user_identity_hash,
+                "credential_provider_id": "provider", "provider_id": "provider",
+                "access_token": "consented-credential", "scopes": ["read"],
+                "consent_identity": {
+                    "principal": selected[0].binding.principal,
+                    "provider_digest": provider_digest(&selected[0].provider).unwrap(),
+                    "strategy_digest": identity_strategy_digest(selected[0].strategy.as_ref().unwrap()).unwrap()
+                },
+                "consent_granted_at": now - age, "created_at": now - age, "updated_at": now - age
+            }))
+            .unwrap();
+            token.consent_expires_at = ends_in.map(|ends_in| now + ends_in);
+            self.vault
+                .store(token)
+                .await
+                .unwrap();
+        }
+
+        /// Deactivates the fixture's provider, or makes it active again, as
+        /// the management API does: its `updated_at` is left alone.
+        async fn set_provider_active(
+            &self,
+            active: bool,
+        ) {
+            let mut provider = self
+                .providers
+                .get("provider")
+                .await
+                .unwrap()
+                .unwrap();
+            provider.deactivated_at = (!active).then(chrono::Utc::now);
+            self.providers
+                .update(provider)
+                .await
+                .unwrap();
+        }
+
+        /// The message of the consent the preparation of a tool call asks
+        /// for, the audit records it wrote and whether the vault still holds
+        /// the stored credential; `None` for a call prepared with it.
+        async fn prepare(&self) -> (Option<String>, Vec<&'static str>, bool) {
+            let context = self.context();
+            let (prepared, events) = crate::audit::producer::capture(context.prepare(&Self::tool_call(), 10)).await;
+            let message = match prepared
+                .ok()
+                .expect("the preparation succeeds")
+            {
+                ModernDelegationResult::Prepared(prepared) => {
+                    assert_eq!(
+                        prepared
+                            .credential_headers()
+                            .unwrap()["authorization"],
+                        "Bearer consented-credential"
+                    );
+                    None
+                }
+                ModernDelegationResult::InputRequired(response) => Some(
+                    response["result"]["inputRequests"]
+                        .as_object()
+                        .unwrap()
+                        .values()
+                        .next()
+                        .unwrap()["params"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                ),
+            };
+            let categories = events
+                .iter()
+                .map(|event| crate::delegation_vault::audit::action_category(&event.event))
+                .collect();
+            let kept = self
+                .vault
+                .get("consented")
+                .await
+                .unwrap()
+                .is_some();
+            (message, categories, kept)
+        }
+    }
+
+    /// Deactivating a provider leaves the consent a caller already gave in
+    /// use on the 2026-07-28 path, and activating it again changes nothing
+    /// for that consent. A caller without one is refused and not asked.
+    #[tokio::test]
+    async fn a_deactivated_provider_serves_its_modern_consents_and_asks_for_no_new_one() {
+        let minutes = chrono::Duration::minutes;
+        let fixture = ConsentFixture::new(None).await;
+        fixture
+            .store_consent(minutes(10), None)
+            .await;
+        fixture
+            .set_provider_active(false)
+            .await;
+        assert_eq!(fixture.prepare().await, (None, vec![], true), "the consent it has is still used");
+        fixture
+            .set_provider_active(true)
+            .await;
+        assert_eq!(fixture.prepare().await, (None, vec![], true), "and again once the provider is active");
+
+        let without = ConsentFixture::new(None).await;
+        without
+            .set_provider_active(false)
+            .await;
+        let refused = without
+            .context()
+            .prepare(&ConsentFixture::tool_call(), 10)
+            .await;
+        assert!(
+            matches!(refused, Err(ModernDelegationError::Continuation(ContinuationError::Unavailable))),
+            "a caller without a consent is refused, not asked"
+        );
+    }
+
+    /// A consent past its time limit is removed on the 2026-07-28 path, and
+    /// the caller is asked to consent again and told why. One that has not
+    /// ended but is too old for the binding is kept, and one within every
+    /// limit, or under none, is used.
+    #[tokio::test]
+    async fn a_modern_consent_is_used_only_within_its_time_limits() {
+        let hours = chrono::Duration::hours;
+        let minutes = chrono::Duration::minutes;
+
+        let ended = ConsentFixture::new(None).await;
+        ended
+            .store_consent(hours(2), Some(-hours(1)))
+            .await;
+        assert_eq!(
+            ended.prepare().await,
+            (
+                Some("Authorize access to the provider. Your earlier access ended at its time limit.".to_string()),
+                vec!["consent_expired"],
+                false
+            )
+        );
+
+        let too_old = ConsentFixture::new(Some(3_600)).await;
+        too_old
+            .store_consent(hours(2), None)
+            .await;
+        assert_eq!(
+            too_old.prepare().await,
+            (
+                Some(
+                    "Authorize access to the provider. Your earlier access is too old for this request. The agent \
+                     may use this access for 1 hour."
+                        .to_string()
+                ),
+                vec![],
+                true
+            )
+        );
+
+        let within = ConsentFixture::new(Some(3_600)).await;
+        within
+            .store_consent(minutes(10), Some(minutes(50)))
+            .await;
+        assert_eq!(within.prepare().await, (None, vec![], true));
+
+        let unlimited = ConsentFixture::new(None).await;
+        unlimited
+            .store_consent(chrono::Duration::days(400), None)
+            .await;
+        assert_eq!(unlimited.prepare().await, (None, vec![], true));
     }
 }

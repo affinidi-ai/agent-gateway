@@ -6,6 +6,8 @@ import { AppButton } from '../../components/shared/AppButton';
 import { Badge } from '../../components/shared/Badge';
 import SearchInput from '../../components/shared/SearchInput';
 import { DeleteButton } from '../../components/shared/DeleteButton';
+import { TwoStepButton } from '../../components/shared/TwoStepButton';
+import { showToast } from '../../utils/toaster';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { DOCS_URL } from '../../config/docs';
 import { formatDateTime } from '../../utils/stringUtils';
@@ -17,6 +19,7 @@ import {
   PROVIDER_TYPE_LABELS,
   entraRejectsResource,
   entraResourceMessage,
+  takesConsent,
 } from '../EditCredentialProviderPage/credentialProviderForm';
 
 /**
@@ -50,6 +53,8 @@ interface CredentialProviderListItem {
   default_scopes: string[];
   token_refresh_enabled: boolean;
   description?: string;
+  /** Set once the provider takes no new consent. */
+  deactivated_at?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -117,6 +122,35 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
       setProviders(prev => prev.filter(p => p.id !== provider.id));
     } catch (e: any) {
       alert(`Failed to delete provider: ${e.message}`);
+    }
+  };
+
+  /** Deactivates a provider, which stops new consent and nothing else, or activates it again. */
+  const setActive = async (provider: CredentialProviderListItem, active: boolean) => {
+    try {
+      const response = await apiClient.fetch(
+        `/api/v1/credential-providers/${encodeURIComponent(provider.id)}/${active ? 'activate' : 'deactivate'}`,
+        { method: 'POST' }
+      );
+      if (!response.ok) {
+        throw new Error(
+          formatApiError(response.status, await response.text(), response.statusText)
+        );
+      }
+      const saved = await response.json();
+      setProviders(prev =>
+        prev.map(p =>
+          p.id === provider.id ? { ...p, deactivated_at: saved.deactivated_at ?? null } : p
+        )
+      );
+      showToast(
+        'success',
+        active
+          ? `"${provider.name}" takes consent again`
+          : `"${provider.name}" takes no new consent. Access already given keeps working.`
+      );
+    } catch (e: any) {
+      showToast('error', `Failed to ${active ? 'activate' : 'deactivate'} provider: ${e.message}`);
     }
   };
 
@@ -269,6 +303,15 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
                             {CLIENT_AUTHENTICATION_LABELS[provider.client_authentication]}
                           </span>
                         )}
+                      {provider.deactivated_at && (
+                        <span
+                          className="badge text-bg-secondary ms-1"
+                          title="Takes no new consent. Access already given keeps working."
+                          data-testid={`credential-provider-deactivated-badge-${provider.id}`}
+                        >
+                          Deactivated
+                        </span>
+                      )}
                     </td>
                     <td>
                       {provider.default_scopes.length > 0 ? (
@@ -292,7 +335,7 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
                       <small>{formatDateTime(provider.updated_at)}</small>
                     </td>
                     <td onClick={e => e.stopPropagation()}>
-                      {canEdit && (
+                      {canEdit && !takesConsent(provider.provider_type) && (
                         <DeleteButton
                           data-testid={`credential-provider-delete-button-${provider.id}`}
                           onDelete={() => handleDelete(provider)}
@@ -300,6 +343,34 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
                           title={`Delete "${provider.name}"`}
                         />
                       )}
+                      {canEdit &&
+                        takesConsent(provider.provider_type) &&
+                        !provider.deactivated_at && (
+                          <TwoStepButton
+                            icon="fa-ban"
+                            label="Deactivate"
+                            confirmLabel="Click again to deactivate"
+                            title={`Deactivate "${provider.name}": no new consent, access already given keeps working`}
+                            confirmTitle={`Click again to deactivate "${provider.name}"`}
+                            className="btn btn-outline-warning btn-sm text-nowrap"
+                            data-testid={`credential-provider-deactivate-button-${provider.id}`}
+                            onConfirm={() => setActive(provider, false)}
+                          />
+                        )}
+                      {canEdit &&
+                        takesConsent(provider.provider_type) &&
+                        provider.deactivated_at && (
+                          <AppButton
+                            variant="outline-primary"
+                            size="sm"
+                            className="text-nowrap"
+                            data-testid={`credential-provider-activate-button-${provider.id}`}
+                            title={`Let "${provider.name}" take consent again`}
+                            onClick={() => setActive(provider, true)}
+                          >
+                            Activate
+                          </AppButton>
+                        )}
                     </td>
                   </tr>
                 ))}

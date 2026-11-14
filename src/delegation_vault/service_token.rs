@@ -410,6 +410,7 @@ pub async fn acquire(
         .vault
         .store_replacing_expired(
             DelegationToken {
+                consent_expires_at: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 agent_did: key.agent_did.into(),
                 user_identity_hash: identity,
@@ -2782,6 +2783,7 @@ mod tests {
             .await;
         let expired_at = Utc::now() - chrono::Duration::seconds(10);
         let row = |id: &str, agent_did: &str, user_identity_hash: &str, expires_at: DateTime<Utc>| DelegationToken {
+            consent_expires_at: None,
             id: id.into(),
             agent_did: agent_did.into(),
             user_identity_hash: user_identity_hash.into(),
@@ -2933,6 +2935,7 @@ mod tests {
             fixture
                 .vault
                 .store(DelegationToken {
+                    consent_expires_at: None,
                     id: "other-replica".into(),
                     agent_did: KEY.agent_did.into(),
                     user_identity_hash: identity.clone(),

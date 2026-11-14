@@ -1,0 +1,100 @@
+branch: feat/time-bound-consent
+changes:
+  added:
+    - timestamp: '2026-11-12T12:00:00Z'
+      title: ⭐ End a delegated consent at a configurable time limit
+      description: >-
+        A person's consent to a credential provider can now have an end. `max_consent_age_secs`
+        on an `oauth2_authorization_code` credential provider limits every consent given to it,
+        the same field on a binding (`outbound_credentials[]`, a Transit Point's
+        `transit_credentials`) limits the consents used through that binding, and
+        `[credential_policy]` in config.toml takes `default_max_consent_age_secs`, for providers
+        that set none, and `max_consent_age_ceiling_secs`, which no limit reaches past. Each is
+        from 60 seconds to 365 days. The end is fixed when the person consents and stored with
+        the credential, so a shortened limit also ends older consents and a lengthened one never
+        extends a consent already given. From its end a credential is never injected and never
+        refreshed, even when the vendor would still refresh it: the gateway removes it, records
+        `consent_expired`, which is not a revocation, and answers the existing `consent_required`
+        or `connect_required` with the reason, so the person is asked again. A binding with a
+        shorter limit than the consent it finds asks again with `consent_too_old` and leaves the
+        credential for other bindings. The consent start page, the elicitation message and the
+        `consent_required` entries say how long the new consent lasts. Without a limit nothing
+        changes, and revocation works as before.
+    - timestamp: '2026-11-13T09:00:00Z'
+      title: Remove ended consents hourly and show when a consent ends
+      description: >-
+        A consent past its time limit is now removed even when no request needs it again. Once
+        an hour, while the node is active, the gateway deletes every ended agent-keyed token and
+        every ended grant by binding, revokes those grants at the vendor, and records each as
+        `consent_expired` with `source:sweep`, so a refresh token does not stay in the vault
+        long after its consent ended. `GET /api/v1/delegation-vault`, `GET
+        /api/v1/delegation-vault/{id}` and the grants report now show `consent_expires_at`, the
+        end as the limits set now make it, and a `DelegationCredential` issued for a consent
+        under a time limit carries it as `validUntil`.
+    - timestamp: '2026-11-13T12:00:00Z'
+      title: Set a provider's consent time limit in the dashboard
+      description: >-
+        The credential provider editor has a Consent time limit field on Authorization Code
+        providers, external consent ones included: a number and a unit, from one minute to 365
+        days. An empty field sets no limit on the provider, and the gateway's own default and
+        ceiling still apply. The Surface Builder now shows a binding's own limit, which is set
+        through the API, and keeps it when the surface is saved, so a dashboard save never
+        removes it.
+    - timestamp: '2026-11-13T16:00:00Z'
+      title: Add a Delegated Access tab that lists active delegated access
+      description: >-
+        The Credentials page has a Delegated Access tab beside Credential Tokens. It lists only
+        the access a person gave that an agent can still use: the user, the system, the agent,
+        the scopes, whether it ends within a day, when it ends and when it was last used, with a
+        revoke confirmed by a second click. Service tokens, ended consents and tokens that can
+        no longer be refreshed are left out, and a History button opens the Audit Log on the
+        records of access that ended or was revoked.
+    - timestamp: '2026-11-13T20:00:00Z'
+      title: Deactivate a credential provider instead of deleting it
+      description: >-
+        A credential provider a person consents to can be deactivated with `POST
+        /api/v1/credential-providers/{id}/deactivate` and activated again with `.../activate`. A
+        deactivated provider takes no new consent: a caller without a stored credential is refused
+        instead of being asked, earlier consent links and consents under way are refused with
+        `provider_deactivated`, and the connect API answers `409 provider_deactivated`. Nothing
+        else changes: the provider's record stays, and the credentials people already consented
+        to are used and refreshed until they end or are revoked. The dashboard offers Deactivate
+        and Activate in place of Delete for these providers, marks a deactivated one, and keeps
+        it in the list. Other provider types, and `DELETE` through the API, are unchanged.
+  changed:
+    - timestamp: '2026-11-13T15:00:00Z'
+      title: Show when each consent ends on the Credential Tokens tab
+      description: >-
+        Each entry of the Credentials page's Credential Tokens tab shows when its consent ends
+        and how long is left, or that it has no time limit, and is marked Ending soon within a
+        day of its end and Consent ended after it. Revoking every delegation of a user is
+        confirmed in place with a second click instead of a browser dialog, and the expanded
+        row links to that user's delegation records in the Audit Log.
+    - timestamp: '2026-11-13T18:00:00Z'
+      title: Read the credential delegation audit in the Audit Log
+      description: >-
+        The credential delegation records are now read on the Audit page, with the rest of the
+        audit, instead of in a separate list on the Credentials page. The Audit Log offers every
+        delegation category as a filter, describes an expired consent apart from a revocation,
+        and shows a caller's Principal beside Subject. The Credential Delegation Audit tab stays
+        in the Credentials tab row as a link that opens the Audit Log on the delegation
+        categories, and `/credentials?tab=credential-audit` leads there too.
+    - timestamp: '2026-11-13T17:00:00Z'
+      title: Name whose access a vault revoke ended in its audit record
+      description: >-
+        The `token_revoked` audit record of `DELETE /api/v1/delegation-vault/{id}` now names the
+        agent, the user identity hash, the credential provider and the scopes of the entry that
+        was revoked, beside who revoked it. Before, it carried only the entry's id, so a search of
+        the delegation audit for a user did not find the revokes of that user's access.
+    - timestamp: '2026-11-14T10:00:00Z'
+      title: Name a consent's end in its consent_granted audit record
+      description: >-
+        The `consent_granted` audit record of a consent given under a time limit now says when
+        the consent ends: its `detail` holds `consent_expires_at:<time>`, after
+        `grant_by_binding:external_consent,` for a grant by binding. Before, the audit named the
+        end only in `consent_expired`, once the consent had ended. A consent under no limit is
+        recorded as before.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

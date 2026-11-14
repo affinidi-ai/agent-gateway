@@ -221,8 +221,26 @@ describe('eventNarrative', () => {
   it('tones unit events semantically', () => {
     expect(eventTone(at('token_injected'))).toBe('allow');
     expect(eventTone(at('consent_required'))).toBe('warn');
+    expect(eventTone(at('consent_expired'))).toBe('warn');
     expect(eventTone(at('refresh_failed'))).toBe('deny');
     expect(eventTone(at('something_unknown'))).toBe('neutral');
+  });
+
+  it('says a consent reached its time limit, apart from a revocation', () => {
+    const expired = describeEntry(at('consent_expired', { provider_name: 'GitHub' }));
+    expect(expired.title).toBe('Consent expired');
+    expect(expired.summary).toBe(
+      'The consent for GitHub reached its time limit, so the stored credential was removed.'
+    );
+    expect(expired.detail).toBe(
+      'The person is asked to consent again the next time the agent needs it.'
+    );
+    expect(describeEntry(at('consent_expired')).summary).toBe(
+      'A consent reached its time limit, so the stored credential was removed.'
+    );
+    expect(describeEntry(at('token_revoked', { provider_name: 'GitHub' })).title).toBe(
+      'Token revoked'
+    );
   });
 
   describe('policy changes', () => {

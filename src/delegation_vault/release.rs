@@ -39,6 +39,7 @@ use base64::Engine as _;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
+use super::consent_age::{self, ConsentAge, ConsentLimits};
 use super::grants::{DelegatedGrant, FailedRefresh, GrantKey, ObtainedTokens};
 use super::storage::{DelegationVaultStorage, RefreshError};
 use super::token_endpoint::{TokenFailure, TokenRequest};
@@ -105,6 +106,10 @@ pub enum GrantRefusal {
         subject: GrantSubject,
         /// For a caller's grant, [`connect_hint`] of the caller.
         hint: Option<String>,
+        /// Why a binding that had a grant has none:
+        /// [`consent_age::CONSENT_EXPIRED`] for a grant whose consent ended at
+        /// its time limit.
+        cause: Option<&'static str>,
     },
     /// The vendor answered that the token lacks a scope, named when its
     /// challenge named a plain one.
@@ -123,6 +128,20 @@ impl GrantRefusal {
         Self::ConnectRequired {
             subject,
             hint: (subject == GrantSubject::Caller).then(|| connect_hint(&key.principal)),
+            cause: None,
+        }
+    }
+
+    /// `connect_required` for the binding of `key`, whose grant was removed
+    /// because its consent ended at its time limit.
+    pub fn consent_expired(
+        key: &GrantKey,
+        subject: GrantSubject,
+    ) -> Self {
+        Self::ConnectRequired {
+            subject,
+            hint: (subject == GrantSubject::Caller).then(|| connect_hint(&key.principal)),
+            cause: Some(consent_age::CONSENT_EXPIRED),
         }
     }
 
@@ -148,6 +167,14 @@ impl GrantRefusal {
     pub fn message(&self) -> &'static str {
         match self {
             Self::ConnectRequired {
+                subject: GrantSubject::Owner,
+                cause: Some(_),
+                ..
+            } => "The owner's connection of this account ended at its time limit",
+            Self::ConnectRequired { cause: Some(_), .. } => {
+                "Your connection ended at its time limit; connect your account again"
+            }
+            Self::ConnectRequired {
                 subject: GrantSubject::Owner, ..
             } => "The owner of this agent has not connected this account",
             Self::ConnectRequired { .. } => "Connect your account to use this",
@@ -157,17 +184,21 @@ impl GrantRefusal {
     }
 
     /// The JSON-RPC error's `data`, and the problem's extension members:
-    /// `reason`, then `subject` and `hint` or `scope` when there are any.
+    /// `reason`, then `subject`, `hint` and `cause`, or `scope`, when there
+    /// are any.
     pub fn data(&self) -> serde_json::Value {
         let mut data = serde_json::json!({ "reason": self.reason() });
         match self {
-            Self::ConnectRequired { subject, hint } => {
+            Self::ConnectRequired { subject, hint, cause } => {
                 data["subject"] = serde_json::json!(match subject {
                     GrantSubject::Owner => "owner",
                     GrantSubject::Caller => "caller",
                 });
                 if let Some(hint) = hint {
                     data["hint"] = serde_json::json!(hint);
+                }
+                if let Some(cause) = cause {
+                    data["cause"] = serde_json::json!(cause);
                 }
             }
             Self::ScopeInsufficient { scope: Some(scope) } => data["scope"] = serde_json::json!(scope),
@@ -262,6 +293,9 @@ pub struct ReleaseContext<'a> {
     /// How many refusals of a grant's refresh, other than `invalid_grant`,
     /// make a call that cannot use the grant answer `connect_required`.
     pub refusal_limit: u32,
+    /// The time limit the binding sets on the consent of its grants, in
+    /// seconds, beside its provider's and the gateway's.
+    pub max_consent_age_secs: Option<u64>,
 }
 
 static USES_IN_FLIGHT: std::sync::LazyLock<dashmap::DashSet<String>> = std::sync::LazyLock::new(dashmap::DashSet::new);
@@ -352,6 +386,71 @@ impl ReleaseContext<'_> {
         }
     }
 
+    /// The grant of `key`, while its consent is within the time limits of the
+    /// binding, of `provider` and of the gateway. One whose consent ended is
+    /// removed, whatever refresh token it holds, and revoked at the vendor in
+    /// the background: someone must connect again. Every release and every
+    /// refresh starts here, so no refresh carries a consent past its end.
+    async fn read_within_limits(
+        &self,
+        provider: &CredentialProvider,
+        key: &GrantKey,
+        subject: GrantSubject,
+    ) -> Result<DelegatedGrant, Refused> {
+        let grant = self
+            .read(key, subject)
+            .await?;
+        let limits = ConsentLimits::of(self.max_consent_age_secs, provider.max_consent_age_secs);
+        if limits.judge(grant.created_at, grant.consent_expires_at, Utc::now()) == ConsentAge::Current {
+            return Ok(grant);
+        }
+        self.end_consent(provider, key, &grant, limits.ends_for_binding_at(grant.created_at, grant.consent_expires_at))
+            .await;
+        Err(refused(GrantRefusal::consent_expired(key, subject), consent_age::CONSENT_EXPIRED))
+    }
+
+    /// Remove the grant of `key`, whose consent ended at `ended_at`, while it
+    /// still holds the access token of `grant` as read, audit the expiry and
+    /// revoke it at the vendor in the background. A grant refreshed or
+    /// connected again since is left to the next call.
+    async fn end_consent(
+        &self,
+        provider: &CredentialProvider,
+        key: &GrantKey,
+        grant: &DelegatedGrant,
+        ended_at: Option<chrono::DateTime<Utc>>,
+    ) {
+        let grant_id = key.record_id();
+        let surface_variant = crate::observability::policy_audit::current_request_variant();
+        match self
+            .vault
+            .delete_grant_holding(&grant_id, &grant.access_token)
+            .await
+        {
+            Ok(Some(removed)) => {
+                tracing::info!(
+                    target: "credential_delegation",
+                    surface_variant = surface_variant.as_deref(),
+                    grant_id = %grant_id,
+                    "Consent ended at its time limit - removed the delegated grant; someone must connect again"
+                );
+                consent_age::record_grant_expiry(&removed, Some(&provider.name), ended_at, "release");
+                crate::observability::policy_audit::spawn_in_request(super::revocation::revoke_expired(
+                    vec![removed],
+                    self.revoker(provider),
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                target: "credential_delegation",
+                surface_variant = surface_variant.as_deref(),
+                grant_id = %grant_id,
+                error = %error,
+                "Failed to remove a delegated grant whose consent ended at its time limit"
+            ),
+        }
+    }
+
     /// The revoker of grants made with `provider`, on no management caller's
     /// behalf: a call's own removals and unkept tokens.
     fn revoker(
@@ -389,7 +488,7 @@ impl ReleaseContext<'_> {
         subject: GrantSubject,
     ) -> Result<DelegatedGrant, Refused> {
         let grant = self
-            .read(key, subject)
+            .read_within_limits(provider, key, subject)
             .await?;
         if !grant.refresh_due_at(Utc::now()) {
             return Ok(grant);
@@ -417,7 +516,7 @@ impl ReleaseContext<'_> {
         rejected: &DelegatedGrant,
     ) -> Result<DelegatedGrant, Refused> {
         let current = self
-            .read(key, subject)
+            .read_within_limits(provider, key, subject)
             .await?;
         if current.access_token != rejected.access_token {
             return Ok(current);
@@ -673,6 +772,7 @@ impl ReleaseContext<'_> {
             .exact_allowlist
             .map(str::to_string);
         let refusal_limit = self.refusal_limit;
+        let max_consent_age_secs = self.max_consent_age_secs;
         let provider = provider.clone();
         let key = key.clone();
         let done = RefreshDone(refresh_notice(&before.id));
@@ -683,6 +783,7 @@ impl ReleaseContext<'_> {
                 secrets: secrets.as_ref(),
                 exact_allowlist: exact_allowlist.as_deref(),
                 refusal_limit,
+                max_consent_age_secs,
             }
             .run_refresh(&provider, &key, subject, claim, forced, &before)
             .await

@@ -12,6 +12,7 @@
 pub mod audit;
 pub mod connect_api;
 pub mod connects;
+pub mod consent_age;
 pub(crate) mod consent_confirmation;
 pub mod consent_cookie;
 pub(crate) mod consent_id_token;
@@ -90,6 +91,12 @@ pub struct DelegationToken {
     /// When the user granted consent
     pub consent_granted_at: DateTime<Utc>,
 
+    /// When the consent ends, as the person was told when giving it: the
+    /// consent time plus the time limit then in force. `None` for a consent
+    /// given under no limit, and for a service token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent_expires_at: Option<DateTime<Utc>>,
+
     /// When the token was last used to make an outbound request
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<DateTime<Utc>>,
@@ -123,6 +130,7 @@ impl std::fmt::Debug for DelegationToken {
             .field("delegation_vc", &self.delegation_vc)
             .field("consent_identity", &self.consent_identity)
             .field("consent_granted_at", &self.consent_granted_at)
+            .field("consent_expires_at", &self.consent_expires_at)
             .field("last_used_at", &self.last_used_at)
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
@@ -176,6 +184,10 @@ pub struct OAuthState {
     pub credential_provider_id: String,
     /// Provider ID (machine-readable)
     pub provider_id: String,
+    /// Seconds the consent may be used once given, as the start page says;
+    /// `None` under no time limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_consent_age_secs: Option<u64>,
     /// Random nonce for CSRF prevention
     pub nonce: String,
     /// When this state expires
@@ -262,6 +274,7 @@ impl std::fmt::Debug for OAuthState {
             .field("surface_id", &self.surface_id)
             .field("credential_provider_id", &self.credential_provider_id)
             .field("provider_id", &self.provider_id)
+            .field("max_consent_age_secs", &self.max_consent_age_secs)
             .field("nonce", &loggable::REDACTED)
             .field("expires_at", &self.expires_at)
             .field(
@@ -355,6 +368,9 @@ pub struct DelegationTokenListItem {
     pub scopes: Vec<String>,
     pub expires_at: Option<DateTime<Utc>>,
     pub consent_granted_at: DateTime<Utc>,
+    /// When the consent ends; absent for a consent given under no time limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent_expires_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -376,6 +392,7 @@ impl From<&DelegationToken> for DelegationTokenListItem {
             scopes: t.scopes.clone(),
             expires_at: t.expires_at,
             consent_granted_at: t.consent_granted_at,
+            consent_expires_at: t.consent_expires_at,
             last_used_at: t.last_used_at,
             created_at: t.created_at,
             updated_at: t.updated_at,
@@ -396,6 +413,7 @@ mod tests {
     ) -> DelegationToken {
         let now = Utc::now();
         DelegationToken {
+            consent_expires_at: None,
             id: "test-token-1".to_string(),
             agent_did: "did:web:agent.example.com".to_string(),
             user_identity_hash: "sha256:abc123".to_string(),
@@ -444,6 +462,7 @@ mod tests {
         let state = format!(
             "{:?}",
             OAuthState {
+                max_consent_age_secs: None,
                 agent_did: "did:web:agent.example.com".to_string(),
                 user_identity_hash: "sha256:abc123".to_string(),
                 surface_id: "surface-1".to_string(),
@@ -558,6 +577,23 @@ mod tests {
     }
 
     #[test]
+    fn a_list_item_shows_the_end_of_a_consent_only_when_it_has_one() {
+        let mut token = make_token(Some(3600), true);
+        let unlimited = serde_json::to_value(DelegationTokenListItem::from(&token)).unwrap();
+        assert!(
+            unlimited
+                .get("consent_expires_at")
+                .is_none(),
+            "{unlimited}"
+        );
+
+        let end = token.consent_granted_at + Duration::hours(6);
+        token.consent_expires_at = Some(end);
+        let limited = serde_json::to_value(DelegationTokenListItem::from(&token)).unwrap();
+        assert_eq!(limited["consent_expires_at"], serde_json::json!(end), "{limited}");
+    }
+
+    #[test]
     fn test_list_item_expired_refreshable() {
         let token = make_token(Some(-60), true);
         let item = DelegationTokenListItem::from(&token);
@@ -568,6 +604,7 @@ mod tests {
     #[test]
     fn test_oauth_state_serialization() {
         let state = OAuthState {
+            max_consent_age_secs: None,
             agent_did: "did:web:agent.example.com".to_string(),
             user_identity_hash: "sha256:abc123".to_string(),
             surface_id: "ch-1".to_string(),
@@ -658,6 +695,7 @@ mod tests {
         };
 
         let binding = OutboundCredentialBinding {
+            max_consent_age_secs: None,
             credential_provider_id: "cp-1".to_string(),
             scopes: vec!["repo".to_string()],
             required_for: CredentialRequirement::All,

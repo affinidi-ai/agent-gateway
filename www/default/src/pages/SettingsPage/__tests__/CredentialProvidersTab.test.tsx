@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { MemoryRouter } from 'react-router-dom';
 import CredentialProvidersTab, { providerDeleteError } from '../CredentialProvidersTab';
@@ -8,9 +8,11 @@ import { apiClient } from '../../../api';
 jest.mock('../../../api', () => ({
   apiClient: { get: jest.fn(), put: jest.fn(), post: jest.fn(), fetch: jest.fn() },
 }));
+const mockHasPermission = jest.fn();
 jest.mock('../../../context/PermissionsContext', () => ({
-  usePermissions: () => ({ hasPermission: () => false, loading: false }),
+  usePermissions: () => ({ hasPermission: mockHasPermission, loading: false }),
 }));
+jest.mock('../../../utils/toaster', () => ({ showToast: jest.fn() }));
 
 const mockFetch = apiClient.fetch as jest.Mock;
 
@@ -142,5 +144,80 @@ describe('CredentialProvidersTab', () => {
         screen.queryByTestId('credential-provider-client-authentication-badge')
       ).not.toBeInTheDocument();
     });
+  });
+});
+
+describe('CredentialProvidersTab deactivation', () => {
+  const consented = (id: string, deactivated_at?: string) => ({
+    ...item(id, 'https://github.com/login/oauth/access_token', null),
+    provider_type: 'oauth2_authorization_code',
+    ...(deactivated_at ? { deactivated_at } : {}),
+  });
+  const posts = () => mockFetch.mock.calls.filter(([, options]) => options?.method === 'POST');
+
+  const renderTab = async (
+    providers: Record<string, unknown>[],
+    answer?: Record<string, unknown>
+  ) => {
+    mockHasPermission.mockReturnValue(true);
+    mockFetch.mockImplementation((_url: string, options?: { method?: string }) =>
+      Promise.resolve({
+        ok: true,
+        statusText: 'OK',
+        text: () => Promise.resolve(''),
+        json: () => Promise.resolve(options?.method === 'POST' ? answer : providers),
+      })
+    );
+    render(
+      <MemoryRouter>
+        <CredentialProvidersTab />
+      </MemoryRouter>
+    );
+    await screen.findByRole('row', { name: new RegExp(`^${providers[0].name}`) });
+  };
+
+  it('deactivates a provider a person consents to only on a second click, and never deletes it', async () => {
+    await renderTab([consented('github')], {
+      ...consented('github'),
+      deactivated_at: '2026-11-13T10:00:00Z',
+    });
+    expect(screen.queryByTestId('credential-provider-delete-button-github')).toBeNull();
+    const button = screen.getByTestId('credential-provider-deactivate-button-github');
+
+    fireEvent.click(button);
+    expect(button).toHaveTextContent('Click again to deactivate');
+    expect(posts()).toHaveLength(0);
+
+    fireEvent.click(button);
+    await waitFor(() => expect(posts()).toHaveLength(1));
+    expect(posts()[0][0]).toBe('/api/v1/credential-providers/github/deactivate');
+    expect(
+      await screen.findByTestId('credential-provider-deactivated-badge-github')
+    ).toHaveTextContent('Deactivated');
+    expect(screen.getByRole('row', { name: /^github/ })).toBeInTheDocument();
+    expect(screen.queryByTestId('credential-provider-deactivate-button-github')).toBeNull();
+    expect(screen.getByTestId('credential-provider-activate-button-github')).toBeInTheDocument();
+  });
+
+  it('activates a deactivated provider again', async () => {
+    await renderTab([consented('github', '2026-11-13T10:00:00Z')], consented('github'));
+    expect(screen.getByTestId('credential-provider-deactivated-badge-github')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('credential-provider-activate-button-github'));
+
+    await waitFor(() => expect(posts()).toHaveLength(1));
+    expect(posts()[0][0]).toBe('/api/v1/credential-providers/github/activate');
+    await waitFor(() =>
+      expect(screen.queryByTestId('credential-provider-deactivated-badge-github')).toBeNull()
+    );
+    expect(screen.getByTestId('credential-provider-deactivate-button-github')).toBeInTheDocument();
+  });
+
+  it('keeps Delete, and offers no Deactivate, on a provider nobody consents to', async () => {
+    await renderTab([item('billing', 'https://oauth2.googleapis.com/token', null)]);
+
+    expect(screen.getByTestId('credential-provider-delete-button-billing')).toBeInTheDocument();
+    expect(screen.queryByTestId('credential-provider-deactivate-button-billing')).toBeNull();
+    expect(screen.queryByTestId('credential-provider-activate-button-billing')).toBeNull();
   });
 });

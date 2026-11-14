@@ -409,4 +409,24 @@ describe('an Access Point Target binding with external consent', () => {
       expect(outboundCredentialFormToApi(row)).toEqual(api);
     }
   });
+
+  it('keeps a consent time limit set through the API through the form', () => {
+    const api = {
+      credential_provider_id: 'vendor',
+      scopes: ['read'],
+      required_for: 'all',
+      consent_mode: 'on_demand',
+      inject_as: { type: 'bearer_header' },
+    };
+    const limited = { ...api, max_consent_age_secs: 21_600 };
+    const row = outboundCredentialApiToForm(limited)!;
+    expect(row.max_consent_age_secs).toBe(21_600);
+    expect(outboundCredentialFormToApi(row)).toEqual(limited);
+    expect(outboundCredentialFormToApi(outboundCredentialApiToForm(api)!)).not.toHaveProperty(
+      'max_consent_age_secs'
+    );
+    expect(
+      outboundCredentialApiToForm({ ...api, max_consent_age_secs: 'soon' })
+    ).not.toHaveProperty('max_consent_age_secs');
+  });
 });
