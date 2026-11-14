@@ -265,9 +265,28 @@ pub fn expiry_detail(
     ended_at: Option<DateTime<Utc>>,
     source: &str,
 ) -> String {
-    let stamp = |time: DateTime<Utc>| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let ended_at = ended_at.map_or_else(String::new, |time| format!(",consent_expired_at:{}", stamp(time)));
     format!("consent_granted_at:{}{ended_at},source:{source}", stamp(granted_at))
+}
+
+/// The `detail` of a `consent_granted` audit record: `kind`, what the record
+/// says of the grant itself, then when the consent ends under a time limit.
+/// `None` when there is neither.
+pub fn grant_detail(
+    kind: Option<&str>,
+    expires_at: Option<DateTime<Utc>>,
+) -> Option<String> {
+    let end = expires_at.map(|end| format!("consent_expires_at:{}", stamp(end)));
+    match (kind, end) {
+        (Some(kind), Some(end)) => Some(format!("{kind},{end}")),
+        (Some(kind), None) => Some(kind.to_string()),
+        (None, end) => end,
+    }
+}
+
+/// `time` as an audit `detail` writes it: RFC 3339 UTC, to the second.
+fn stamp(time: DateTime<Utc>) -> String {
+    time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 /// The earlier of two ends, or of two limits the shorter; the one there is
@@ -504,6 +523,20 @@ mod tests {
             "consent_granted_at:2027-01-15T08:00:00Z,consent_expired_at:2027-01-15T09:00:00Z,source:release"
         );
         assert_eq!(expiry_detail(at(0), None, "sweep"), "consent_granted_at:2027-01-15T08:00:00Z,source:sweep");
+    }
+
+    #[test]
+    fn the_grant_detail_names_the_end_of_a_consent_under_a_limit() {
+        assert_eq!(grant_detail(None, Some(at(3_600))).as_deref(), Some("consent_expires_at:2027-01-15T09:00:00Z"));
+        assert_eq!(
+            grant_detail(Some("grant_by_binding:external_consent"), Some(at(3_600))).as_deref(),
+            Some("grant_by_binding:external_consent,consent_expires_at:2027-01-15T09:00:00Z")
+        );
+        assert_eq!(
+            grant_detail(Some("grant_by_binding:external_consent"), None).as_deref(),
+            Some("grant_by_binding:external_consent")
+        );
+        assert_eq!(grant_detail(None, None), None);
     }
 
     #[test]

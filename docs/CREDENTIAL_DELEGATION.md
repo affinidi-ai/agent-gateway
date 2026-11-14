@@ -2380,6 +2380,11 @@ binding's limit. A grant by binding has one binding, so a consent too old for it
 
 ### Audit
 
+A consent given under a time limit names its end in its `consent_granted` record: `detail`
+holds `consent_expires_at:<time>`, and for a grant by binding
+`grant_by_binding:external_consent,consent_expires_at:<time>`. Under no limit the record names
+no end. A consent given on the `2026-07-28` MCP path writes no `consent_granted` record.
+
 An ended consent is recorded as `consent_expired`, never as `token_revoked` or
 `user_tokens_revoked`: the agent, the caller's identity hash (or `owner`), the provider, the
 surface, the scopes, the token or grant id, and in `detail`

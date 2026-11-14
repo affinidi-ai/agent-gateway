@@ -882,6 +882,10 @@ Trust); see [`POLICY.md`](POLICY.md#the-authority-of-a-trust-check).
   for an agent-keyed token. One removal writes one record, whichever finds the consent ended
   first.
 
+A consent given under a time limit also names its end when it is given: the `detail` of its
+`consent_granted` record holds `consent_expires_at:<time>` in RFC 3339 UTC, after
+`grant_by_binding:external_consent,` for a grant by binding.
+
 **MCP Proxy pin change events.** Raised by management API writes to a surface (group
 Delegation); see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#through-an-mcp-proxy)
 for when a save changes a pin.

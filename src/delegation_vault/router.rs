@@ -1734,6 +1734,53 @@ mod tests {
         );
     }
 
+    /// The `consent_granted` record of a consent given under a time limit
+    /// names its end in `detail`, so the audit shows it while the consent is
+    /// in use; one given under no limit has no detail.
+    #[tokio::test]
+    async fn a_consent_under_a_time_limit_is_audited_with_its_end() {
+        fn grant_details(events: &[crate::delegation_vault::audit::DelegationAuditEvent]) -> Vec<Option<String>> {
+            events
+                .iter()
+                .filter(|event| matches!(event.event, DelegationAuditAction::ConsentGranted))
+                .map(|event| event.detail.clone())
+                .collect()
+        }
+        let fixture = consent::Fixture::new().await;
+
+        let (callback_state, cookie) = fixture
+            .begin_at(&fixture.start_url_under(Some(21_600)))
+            .await;
+        let (done, events) = capture(async {
+            fixture
+                .callback("github", &format!("code=vendor-code&state={callback_state}"), Some(&cookie))
+                .await
+        })
+        .await;
+        assert_eq!(done.status, StatusCode::OK, "{}", done.body);
+        let end = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap()[0]
+            .consent_expires_at
+            .expect("a consent under a limit has an end");
+        assert_eq!(
+            grant_details(&events),
+            [Some(format!("consent_expires_at:{}", end.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)))]
+        );
+
+        let (callback_state, cookie) = fixture.begin().await;
+        let (done, events) = capture(async {
+            fixture
+                .callback("github", &format!("code=vendor-code&state={callback_state}"), Some(&cookie))
+                .await
+        })
+        .await;
+        assert_eq!(done.status, StatusCode::OK, "{}", done.body);
+        assert_eq!(grant_details(&events), [None], "a consent under no limit names no end");
+    }
+
     /// The start page claims nothing and sets no cookie, so it may be fetched
     /// any number of times; the start POST then succeeds once, and a second
     /// POST of the same start state is refused.

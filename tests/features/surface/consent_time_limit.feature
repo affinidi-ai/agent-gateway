@@ -26,6 +26,14 @@ Feature: Consent time limit
     Then the OAuth callback response status is 200
     And the delegated credential in the delegation vault ends its consent 3600 seconds after it was given
 
+  Scenario: A consent given under a time limit is audited with its end
+    Given OAuth provider "calendar" limits a consent to 3600 seconds
+    And caller "alice" has started OAuth consent for provider "calendar"
+    And OAuth provider "calendar" is ready to exchange an authorization code for delegated credentials
+    When OAuth provider "calendar" redirects the caller back with a valid authorization code
+    Then the OAuth callback response status is 200
+    And the delegation audit trail records when the consent to OAuth provider "calendar" ends
+
   Scenario: A caller asked for consent is told how long it will last
     Given OAuth provider "calendar" limits a consent to 3600 seconds
     And caller "alice" has no delegated credentials for OAuth provider "calendar"

@@ -3838,6 +3838,50 @@ async fn delegation_audit_trail_contains_event(
     assert!(found, "expected delegation audit event '{event}' for provider '{provider}' ({record_id}), got {events:?}");
 }
 
+/// The `consent_granted` record of a consent given under a time limit names
+/// in `detail` the end the delegation vault lists for it, to the second.
+#[then(expr = "the delegation audit trail records when the consent to OAuth provider {string} ends")]
+async fn delegation_audit_trail_records_the_consent_end(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    let held = crate::steps::when::list_delegation_vault(world).await;
+    assert_eq!(held.len(), 1, "expected one delegated credential, got {held:?}");
+    let end = chrono::DateTime::parse_from_rfc3339(
+        held[0]["consent_expires_at"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the delegated credential has no consent_expires_at: {}", held[0])),
+    )
+    .expect("a listed time is RFC 3339")
+    .with_timezone(&chrono::Utc)
+    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let detail = format!("consent_expires_at:{end}");
+    let record_id = world
+        .surface_config
+        .provider_record_id(&provider);
+    let (found, events) = eventually_delegation_audit_events(world, |events| {
+        events.iter().any(|entry| {
+            entry
+                .get("event")
+                .and_then(|value| value.as_str())
+                == Some("consent_granted")
+                && entry
+                    .get("provider_id")
+                    .and_then(|value| value.as_str())
+                    == Some(record_id.as_str())
+                && entry
+                    .get("detail")
+                    .and_then(|value| value.as_str())
+                    == Some(detail.as_str())
+        })
+    })
+    .await;
+    assert!(
+        found,
+        "expected a consent_granted record with detail '{detail}' for provider '{provider}' ({record_id}), got {events:?}"
+    );
+}
+
 #[then(expr = "the delegation audit trail has no event {string} for OAuth provider {string}")]
 async fn delegation_audit_trail_has_no_event(
     world: &mut SurfaceWorld,

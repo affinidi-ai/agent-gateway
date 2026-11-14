@@ -771,7 +771,12 @@ async fn redeem(
         event.token_id = Some(stored.grant.id.clone());
         event.provider_name = Some(provider.name.clone());
         event.scopes = Some(stored.grant.scopes.clone());
-        event.detail = Some("grant_by_binding:external_consent".to_string());
+        event.detail = super::consent_age::grant_detail(
+            Some("grant_by_binding:external_consent"),
+            stored
+                .grant
+                .consent_expires_at,
+        );
         event.caller = Some(manager.actor.clone());
         event
     });
@@ -1868,6 +1873,60 @@ mod tests {
         assert_eq!(started["max_consent_age_secs"], 3_600, "the binding's shorter limit");
         let grant = stored(&fixture).await;
         assert_eq!(grant.consent_expires_at, Some(grant.created_at + chrono::Duration::seconds(3_600)));
+    }
+
+    /// The `consent_granted` record of a grant by binding says what it always
+    /// said of the grant and, under a consent time limit, when its consent
+    /// ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_by_binding_is_audited_with_the_end_of_its_consent() {
+        use crate::audit::producer::capture;
+        use crate::delegation_vault::audit::{DelegationAuditAction, DelegationAuditEvent};
+        fn grant_details(events: &[DelegationAuditEvent]) -> Vec<Option<String>> {
+            events
+                .iter()
+                .filter(|event| matches!(event.event, DelegationAuditAction::ConsentGranted))
+                .map(|event| event.detail.clone())
+                .collect()
+        }
+        let fixture = Fixture::new(vec![token_answer("access-1"), token_answer("access-2")]).await;
+
+        let ((status, completed), events) = capture(connect_owner(&fixture)).await;
+        assert_eq!(status, StatusCode::OK, "{completed}");
+        assert_eq!(grant_details(&events), [Some("grant_by_binding:external_consent".to_string())]);
+
+        let mut provider = fixture
+            .state
+            .provider_store
+            .get("vendor")
+            .await
+            .unwrap()
+            .unwrap();
+        provider.max_consent_age_secs = Some(21_600);
+        fixture
+            .state
+            .provider_store
+            .update(provider)
+            .await
+            .unwrap();
+        let ((status, completed), events) = capture(connect_owner(&fixture)).await;
+        assert_eq!(status, StatusCode::OK, "{completed}");
+        let end = fixture
+            .state
+            .vault_store
+            .grant(&GrantKey::owner(Some("tenant-a"), "surface", "owner-hop", "vendor"))
+            .await
+            .unwrap()
+            .unwrap()
+            .consent_expires_at
+            .expect("a grant under a limit has an end");
+        assert_eq!(
+            grant_details(&events),
+            [Some(format!(
+                "grant_by_binding:external_consent,consent_expires_at:{}",
+                end.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ))]
+        );
     }
 
     /// A Transit Point whose target is an MCP Proxy starts a connect only while

@@ -85,6 +85,14 @@ changes:
         agent, the user identity hash, the credential provider and the scopes of the entry that
         was revoked, beside who revoked it. Before, it carried only the entry's id, so a search of
         the delegation audit for a user did not find the revokes of that user's access.
+    - timestamp: '2026-11-14T10:00:00Z'
+      title: Name a consent's end in its consent_granted audit record
+      description: >-
+        The `consent_granted` audit record of a consent given under a time limit now says when
+        the consent ends: its `detail` holds `consent_expires_at:<time>`, after
+        `grant_by_binding:external_consent,` for a grant by binding. Before, the audit named the
+        end only in `consent_expired`, once the consent had ended. A consent under no limit is
+        recorded as before.
   fixed: []
   removed: []
   security: []

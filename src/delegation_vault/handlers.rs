@@ -1435,6 +1435,7 @@ pub async fn oauth_callback(
                 evt.provider_name = Some(provider.name.clone());
                 evt.token_id = Some(delegation_token_id_for_audit.clone());
                 evt.agent_identity_did = Some(oauth_state.agent_did.clone());
+                evt.detail = super::consent_age::grant_detail(None, consent_expires_at);
                 let surface = if let Some(ref cs) = state.agent_surface_store {
                     match cs
                         .get(&oauth_state.surface_id)
