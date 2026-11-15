@@ -625,6 +625,60 @@ async fn the_policy_card_read_uses_the_target_credential_and_yields_no_card_with
     assert_eq!(card(variant_without_auth).await, None, "a variant without the credential reads its own card");
 }
 
+/// The card read for the policy input presents the Target credential only to
+/// the Target: a path under the Target endpoint, or the configured card location
+/// on the Target's origin. A URL anywhere else is not read at all.
+#[tokio::test]
+async fn the_policy_card_read_presents_the_target_credential_only_to_the_target() {
+    if ran_in_child("ATG_FABRIC_POLICY_CARD_DESTINATION_CHILD").await {
+        return;
+    }
+    let target = ProtectedTarget::start().await;
+    let elsewhere = ProtectedTarget::open().await;
+    let root = tempfile::tempdir().unwrap();
+    let secrets = root.path().join("secrets");
+    store_target_key(&secrets).await;
+    let store: Arc<dyn crate::secrets::SecretsStore> = Arc::new(
+        crate::secrets::FilesystemSecretsStore::new_async(secrets.to_str().unwrap())
+            .await
+            .unwrap(),
+    );
+    let surface = protected_surface(&format!("{}/agents/a", target.url), "target-key", Some("/cards/me"));
+    let read = |card_url: String| {
+        let surface = surface.clone();
+        super::TEST_SECRETS_STORE
+            .scope(store.clone(), async move { super::read_policy_agent_card(&surface, &card_url, SURFACE_ID).await })
+    };
+
+    for (what, outside) in [
+        ("another origin", format!("{}/.well-known/agent.json", elsewhere.url)),
+        ("a path outside the Target", format!("{}/other/.well-known/agent.json", target.url)),
+    ] {
+        assert_eq!(read(outside).await, None, "{what}");
+    }
+    assert!(
+        elsewhere
+            .received()
+            .is_empty(),
+        "another origin was asked for the card"
+    );
+    assert!(target.received().is_empty(), "a path outside the Target was asked for the card");
+
+    for inside in ["/cards/me", "/agents/a/.well-known/agent.json"] {
+        assert_eq!(
+            read(format!("{}{inside}", target.url)).await,
+            Some(json!({ "name": "protected-agent" })),
+            "{inside}"
+        );
+        let request = target
+            .received()
+            .pop()
+            .unwrap();
+        assert_eq!(request.path, inside);
+        assert_eq!(header_values(&request.headers, TARGET_KEY_HEADER), [TARGET_KEY], "{inside}");
+    }
+}
+
 /// The gateway's own card fetch carries no trace id from the peer's request,
 /// even where the surface would forward a fresh one; a caller's request still
 /// carries one.

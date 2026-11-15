@@ -527,7 +527,11 @@ resolving it from the gateway's secrets store rather than opening one per reques
 provider token the Target refuses as `invalid_token`, as the forward does. Under
 `target.auth.fallback: passthrough` a credential that cannot be resolved reads the card without it.
 A Target that is not an `http(s)` URL, such as a `proxy://` MCP proxy, has no card to read, so no
-credential is resolved for it.
+credential is resolved for it. On a surface with `target.auth` the card is read only from a URL
+the forward would send that credential to
+([`is_target_credential_destination`](../src/proxy/paths.rs)): a path under the Target endpoint,
+or the configured card location on the Target's origin; any other URL yields no card and is not
+asked.
 The outcome, card or none, is cached per surface and `target.auth` (so a variant with its own
 `target.auth` reads its own card) for 60 seconds (10 seconds for none) and cleared on
 configuration reload or a surface save; see

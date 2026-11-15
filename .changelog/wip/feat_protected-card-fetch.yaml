@@ -42,8 +42,10 @@ changes:
         it reads the agent card for the surface policy's input. Under fallback passthrough a
         credential that cannot be resolved reads the card without it, a provider token the Target
         refuses as invalid_token is dropped as on the forward, and a Target that is not an http or
-        https URL has no card read and no credential resolved. The outcome is cached per surface
-        and Target authentication for up to 60 seconds, so a variant with its own Target
+        https URL has no card read and no credential resolved. The card is read only from a path
+        under the Target endpoint or the configured card location on the Target's origin, the
+        destinations a forwarded request may carry that credential to. The outcome is cached per
+        surface and Target authentication for up to 60 seconds, so a variant with its own Target
         authentication reads its own card.
   removed: []
   security:

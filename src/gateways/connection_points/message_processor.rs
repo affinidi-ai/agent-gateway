@@ -3601,6 +3601,19 @@ async fn read_policy_agent_card(
 ) -> Option<serde_json::Value> {
     let credential = match surface.target_auth() {
         Some(target_auth) => {
+            if !crate::proxy::paths::is_target_credential_destination(
+                surface.target_endpoint(),
+                "GET",
+                card_url,
+                surface.agent_card_location_path(),
+            ) {
+                channel_warn!(
+                    config_id,
+                    "GW2: No agent card for policy: {} is outside the Target, so it is not read with the Target credential",
+                    loggable::url(card_url)
+                );
+                return None;
+            }
             let secrets = get_secrets_store();
             let providers = get_credential_provider_store();
             let vault = get_delegation_vault_store();
