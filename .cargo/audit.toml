@@ -73,5 +73,11 @@ ignore = [
     "RUSTSEC-2026-0398",
     # https://rustsec.org/advisories/RUSTSEC-2026-0403
     "RUSTSEC-2026-0403",
+
+    # quinn-udp 0.5.14 — Receive loop can spin after a truncated datagram (low-severity DoS).
+    # Transitive via: anza-quinn 0.11.9 ← solana-client/solana-quic-client/solana-streamer 3.1.14
+    # ← x402-chain-solana 1.5.6. No patched version available in current Solana release line.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0538
+    "RUSTSEC-2026-0538",
 ]
 informational_warnings = ["unmaintained", "unsound", "notice"]

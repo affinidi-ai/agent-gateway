@@ -169,8 +169,6 @@ pub struct SurfaceWorld {
     pub consent_confirmation_callback: Option<String>,
     /// The transit token the managed agent sends on its Transit Point calls.
     pub transit_token: Option<String>,
-    /// The last HTTP response from a transit point discovery request.
-    pub last_response: Option<RecordedResponse>,
     /// The last error reason from a failed request.
     pub last_error_reason: Option<String>,
     /// The ids of the credential providers the operator created, by `provider_id` slug.
@@ -265,7 +263,6 @@ impl SurfaceWorld {
             oauth_confirmed_state: None,
             consent_confirmation_callback: None,
             transit_token: None,
-            last_response: None,
             last_error_reason: None,
             credential_provider_ids: HashMap::new(),
             surface_draft: None,

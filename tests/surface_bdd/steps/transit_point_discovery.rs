@@ -85,10 +85,8 @@ async fn send_discovery_request_through_transit_point(
     };
 
     // Add transit token header if requested (reuse existing with_transit_token helper style)
-    if include_token {
-        if let Some(transit_token) = world.transit_token.as_ref() {
-            request = request.header("X-Transit-Token", transit_token);
-        }
+    if include_token && let Some(transit_token) = world.transit_token.as_ref() {
+        request = request.header("X-Transit-Token", transit_token);
     }
 
     // Send the request and record the response in caller_response (used by generic Then steps)
