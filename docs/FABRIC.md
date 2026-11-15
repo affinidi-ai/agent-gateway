@@ -671,11 +671,14 @@ request back and forth without end. A hop count bounds them.
 Hops are counted only across Fabric. A chain through an `http` Transit Point into another
 gateway's Access Point, or an agent calling an Access Point directly, its own gateway's
 included, starts again at 1, and so does a call without a transit token through a Transit Point
-that does not require one (it reads the count from a token the agent sends), a call
-through a Transit Point of a gateway with no transit token issuer, which reads no token, and a
-discovery read (a `GET` or `HEAD` of an agent card or other discovery document directly below
-the Transit Point) through any Transit Point, which reads no token either. So does a chain through a gateway that predates the hop count,
+that does not require one (it reads the count from a token the agent sends), and a call
+through a Transit Point of a gateway with no transit token issuer, which reads no token. So does a chain through a gateway that predates the hop count,
 which neither reads nor sends it. A peer that does not follow these rules can reset the count.
+
+Discovery reads (a `GET` or `HEAD` of an agent card or other discovery document directly below
+the Transit Point) require a transit token when the Transit Point is configured to require it and read hop count and trace id from the token, just like
+other Transit Point requests.
+
 The gateway's own read of a `fabric://` Transit Point target's agent card, for its Trust Checks
 or a policy with `require_agent_context`, is a discovery read too: it goes straight over Fabric,
 not through the Transit Point, with a count of 1 and a trace id of its own. It reads

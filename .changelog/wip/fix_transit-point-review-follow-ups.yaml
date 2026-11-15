@@ -1,29 +1,7 @@
 branch: fix/transit-point-review-follow-ups
 changes:
-  added:
-    - timestamp: '2026-11-12T11:40:00+02:00'
-      title: Add test coverage for Transit Point discovery token requirement
-      description: >-
-        Unit tests and BDD scenarios verify that discovery reads require valid transit tokens
-        and carry no credentials to targets. Unit tests cover 15 discovery path patterns
-        (GET/HEAD at Transit Point root like /.well-known/agent-card.json, /agent.json,
-        /discovery, plus edge cases with traversals and non-canonical spellings). BDD
-        scenarios verify GET/HEAD methods with valid tokens (200), and GET without tokens
-        (401 rejection). All tests confirm discovery reads pass through the full security
-        pipeline including trust checks and OPA policies.
-  changed:
-    - timestamp: '2026-11-10T16:31:39+02:00'
-      title: Require transit token and policy evaluation for Transit Point discovery reads
-      description: >-
-        Discovery requests on Transit Points (GET/HEAD of agent cards, UCP, discovery paths)
-        now require a valid transit token and pass through trust context collection, trust
-        checks, and OPA policy evaluation (gateway, surface, and Transit Point scopes).
-        The caller is still reported as unauthenticated to the target because discovery is
-        metadata-only, but the gateway validates the request through its full security pipeline.
-        This closes the security gap where unauthenticated requests could reach target services
-        via discovery paths. Clients that previously called discovery without a transit token
-        will receive 401 Unauthorized and must provide a valid token. Access Point discovery
-        (which is public) is unaffected.
+  added: []
+  changed: []
   fixed: []
   removed: []
   security:
@@ -38,5 +16,22 @@ changes:
         its capabilities and identify attack vectors. Now all discovery reads require transit
         token validation and pass through the full security pipeline including trust checks
         and OPA policy evaluation. Targets can no longer be discovered without explicit
-        authorization from the gateway.
-  breaking: []
+        authorization from the gateway (except on Transit Points with `require_transit_token: false`).
+        Unit tests and BDD scenarios verify that discovery reads require valid transit tokens
+        and carry no credentials to targets.
+  breaking:
+    - timestamp: '2026-11-10T16:31:39+02:00'
+      title: Transit Point discovery reads now require a transit token
+      description: >-
+        Clients that call GET or HEAD on discovery documents (/.well-known/agent-card.json,
+        /agent.json, /discovery, etc.) on a Transit Point configured with
+        `require_transit_token: true` (the default) will now receive 401 Unauthorized if no
+        valid transit token is provided. This affects managed agents resolving peer cards
+        before holding a token, browser-based discovery calls, and integration tests that
+        fetch discovery without authentication. Additionally, existing OPA policies now
+        evaluate discovery reads and must allow them (previously they were skipped). Remedy:
+        (1) provide a valid transit token in the X-Transit-Token header on discovery reads,
+        (2) set `require_transit_token: false` on Transit Points that serve discovery to
+        unauthenticated clients, or (3) update OPA policies to explicitly allow discovery
+        reads. Access Point discovery (/.well-known/agent-card.json on an Access Point)
+        remains public and unaffected.

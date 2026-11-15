@@ -15,15 +15,23 @@ Feature: Transit Point Discovery Requires Token Authentication
     Given Transit Point "metadata" requires a transit token
     And managed agent "example-agent" holds the transit token the Access Point gave it
     When managed agent "example-agent" sends GET "/.well-known/agent-card.json" with transit token through Transit Point "metadata"
-    Then the response status is 200 from discovery request
+    Then the response status is 200
 
   Scenario: HEAD discovery document with valid transit token is forwarded
     Given Transit Point "metadata" requires a transit token
     And managed agent "example-agent" holds the transit token the Access Point gave it
     When managed agent "example-agent" sends HEAD "/.well-known/agent-card.json" with transit token through Transit Point "metadata"
-    Then the response status is 200 from discovery request
+    Then the response status is 200
 
-  Scenario: GET discovery document without transit token is rejected with 401
+  # ===================================================================
+  # Security: Discovery without Token is Rejected (GET and HEAD Methods)
+  # ===================================================================
+
+  Scenario Outline: <method> discovery document without transit token is rejected with 401
     Given Transit Point "metadata" requires a transit token
-    When managed agent "example-agent" sends GET "/.well-known/agent-card.json" without transit token through Transit Point "metadata"
-    Then the response status is 401 from discovery request
+    When managed agent "example-agent" sends <method> "/.well-known/agent-card.json" without transit token through Transit Point "metadata"
+    Then the response status is 401
+    Examples:
+      | method |
+      | GET    |
+      | HEAD   |

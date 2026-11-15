@@ -7018,9 +7018,10 @@ fn compute_outbound_remainder_path(
         .to_string()
 }
 
-/// Whether the request is a public discovery read of the Transit Point's target:
+/// Whether the request is a discovery read of the Transit Point's target:
 /// a `GET` or `HEAD` of a discovery document at the target's root. It is
-/// forwarded without a transit token check, the request gates, or any credential.
+/// authenticated by the gateway (requires a valid transit token and passes through
+/// all security gates), but carries no caller credential to the target.
 fn is_transit_discovery_read(ctx: &OutboundPipelineContext) -> bool {
     crate::proxy::paths::is_transit_discovery_request(
         ctx.original_method.as_str(),
@@ -7035,8 +7036,11 @@ fn is_transit_discovery_read(ctx: &OutboundPipelineContext) -> bool {
     )
 }
 
-/// A public discovery read was not authenticated, so the gateway vouches for no
-/// caller on it; any other Transit Point request was.
+/// A discovery read is authenticated by the gateway (requires a valid transit token and
+/// passes through all security gates), but is reported to the target as unauthenticated:
+/// no caller identity is sent to the target. This preserves the metadata-only nature of
+/// discovery while ensuring the gateway validates the request. Any other Transit Point
+/// request is reported as authenticated.
 fn transit_caller_assertion(ctx: &OutboundPipelineContext) -> crate::proxy::handler::CallerAssertion {
     if is_transit_discovery_read(ctx) {
         crate::proxy::handler::CallerAssertion::Unauthenticated
@@ -15810,8 +15814,10 @@ mod tests {
     }
 
     /// Discovery reads (GET/HEAD of discovery documents at the Transit Point's
-    /// root) now require a transit token like all other requests, but they carry
-    /// no caller credential to the target.
+    /// root) now require a transit token like all other requests, and carry no
+    /// caller credential to the target. This test verifies the security fix:
+    /// discovery reads are rejected without a token, rejected with an invalid token,
+    /// and pass through policy like any other request.
     #[tokio::test]
     async fn discovery_reads_require_transit_token_and_carry_no_credential() {
         let mut state = test_outbound_state();
@@ -15840,34 +15846,88 @@ mod tests {
             (Method::GET, "admin;/discovery", false),
             (Method::GET, "discovery;x=1", false),
         ] {
-            let mut ctx = test_pipeline_context();
-            ctx.original_method = method.clone();
-            ctx.request_path = format!("{base}/{path}");
+            // Test 1: Valid token — request succeeds
+            {
+                let mut ctx = test_pipeline_context();
+                ctx.original_method = method.clone();
+                ctx.request_path = format!("{base}/{path}");
 
-            // Set the surface ID to match the token
-            Arc::make_mut(&mut ctx.surface).surface_id = surface_id.into();
+                // Set the surface ID to match the token
+                Arc::make_mut(&mut ctx.surface).surface_id = surface_id.into();
 
-            // Issue a valid token for this surface with partner-a as allowed
-            let token = issuer
-                .issue(
-                    surface_id,
-                    Some("did:web:gateway.example"),
-                    None,
-                    None,
-                    None,
-                    None,
-                    vec!["partner-a".to_string()],
-                )
-                .unwrap();
-            ctx.original_headers
-                .insert("X-Transit-Token", token.parse().unwrap());
+                // Issue a valid token for this surface with partner-a as allowed
+                let token = issuer
+                    .issue(
+                        surface_id,
+                        Some("did:web:gateway.example"),
+                        None,
+                        None,
+                        None,
+                        None,
+                        vec!["partner-a".to_string()],
+                    )
+                    .unwrap();
+                ctx.original_headers
+                    .insert("X-Transit-Token", token.parse().unwrap());
 
-            let result = step_validate_transit_token(&state, &mut ctx).await;
+                let result = step_validate_transit_token(&state, &mut ctx).await;
 
-            // All requests now require a valid transit token
-            assert!(result.is_ok(), "{method} {path}: {result:?}");
-            // But only discovery reads carry no credential to the target
-            assert_eq!(transit_caller_assertion(&ctx).permits_target_credential(), !discovery, "{method} {path}");
+                // All requests now require a valid transit token
+                assert!(result.is_ok(), "{method} {path}: {result:?}");
+                // But only discovery reads carry no credential to the target
+                assert_eq!(transit_caller_assertion(&ctx).permits_target_credential(), !discovery, "{method} {path}");
+            }
+
+            // Test 2: No token — request is rejected (critical security fix)
+            if discovery {
+                let mut ctx = test_pipeline_context();
+                ctx.original_method = method.clone();
+                ctx.request_path = format!("{base}/{path}");
+                Arc::make_mut(&mut ctx.surface).surface_id = surface_id.into();
+                // No X-Transit-Token header
+                let result = step_validate_transit_token(&state, &mut ctx).await;
+                assert!(result.is_err(), "Discovery read without token should fail: {method} {path}");
+                match result.unwrap_err() {
+                    OutboundPipelineError::TransitTokenInvalid(msg) => {
+                        assert!(
+                            msg.contains("missing") || msg.contains("invalid"),
+                            "Expected missing/invalid token error for {method} {path}"
+                        );
+                    }
+                    other => panic!("Expected TransitTokenInvalid for discovery without token, got: {:?}", other),
+                }
+            }
+
+            // Test 3: Invalid token (wrong surface) — request is rejected
+            if discovery {
+                let mut ctx = test_pipeline_context();
+                ctx.original_method = method.clone();
+                ctx.request_path = format!("{base}/{path}");
+                Arc::make_mut(&mut ctx.surface).surface_id = "different-surface".into();
+
+                let token = issuer
+                    .issue(
+                        surface_id, // Token is for surface_id, but context is for different-surface
+                        Some("did:web:gateway.example"),
+                        None,
+                        None,
+                        None,
+                        None,
+                        vec!["partner-a".to_string()],
+                    )
+                    .unwrap();
+                ctx.original_headers
+                    .insert("X-Transit-Token", token.parse().unwrap());
+
+                let result = step_validate_transit_token(&state, &mut ctx).await;
+                assert!(result.is_err(), "Discovery read with token for wrong surface should fail: {method} {path}");
+                match result.unwrap_err() {
+                    OutboundPipelineError::TransitTokenInvalid(msg) => {
+                        assert!(!msg.is_empty(), "Error message should explain token mismatch");
+                    }
+                    other => panic!("Expected TransitTokenInvalid for wrong surface, got: {:?}", other),
+                }
+            }
         }
     }
 
