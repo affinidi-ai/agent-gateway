@@ -273,13 +273,12 @@ fn named_non_a2a_managed_agent_did_not_receive_header(
 ) {
     let target = get_observed_target_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
     let requests = get_observed_target_requests(target, &agent_name);
-    let header_name = header_name.to_ascii_lowercase();
+    assert!(!requests.is_empty(), "non-A2A managed agent '{agent_name}' received no request to inspect");
     for request in requests {
-        assert!(
-            !request
-                .headers
-                .contains_key(&header_name),
-            "non-A2A managed agent '{agent_name}' should not receive header '{header_name}'; observed request was {request:?}"
+        assert_collaborator_header_absent(
+            &request.headers,
+            &header_name,
+            &format!("non-A2A managed agent '{agent_name}'"),
         );
     }
 }
@@ -1290,6 +1289,39 @@ async fn target_trust_check_reported_error_code(
     assert_trust_check_error_code(world, "target", &expected_code).await;
 }
 
+#[then(expr = "the target Trust Check reported error code {string} {int} times")]
+async fn target_trust_check_reported_error_code_times(
+    world: &mut SurfaceWorld,
+    expected_code: String,
+    expected_count: usize,
+) {
+    let reports_code = |event: &serde_json::Value| {
+        extract_trust_check_error_codes(std::slice::from_ref(event), "target")
+            .iter()
+            .any(|(_, code)| code.as_deref() == Some(expected_code.as_str()))
+    };
+    let mut events = Vec::new();
+    let mut reported = 0;
+    for _ in 0..20 {
+        let (found, read) = vp_audit_events_matching(world, reports_code).await;
+        events = read;
+        reported = events
+            .iter()
+            .filter(|event| reports_code(event))
+            .count();
+        if found && reported >= expected_count {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        reported,
+        expected_count,
+        "target-leg Trust Check audit events with error code {expected_code:?}; observed {:?}",
+        extract_trust_check_error_codes(&events, "target")
+    );
+}
+
 #[then(expr = "the caller Trust Check reported error code {string}")]
 async fn caller_trust_check_reported_error_code(
     world: &mut SurfaceWorld,
@@ -1313,6 +1345,38 @@ async fn no_trust_check_audit_event_is_recorded(world: &mut SurfaceWorld) {
         events
             .iter()
             .filter(|event| is_trust_check(event))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[then(expr = "the caller Trust Check reported error code {string} for authority {string}")]
+async fn caller_trust_check_reported_error_code_for_authority(
+    world: &mut SurfaceWorld,
+    expected_code: String,
+    authority: String,
+) {
+    let reports_code = |event: &serde_json::Value| {
+        event
+            .get("event")
+            .and_then(|action| action.get("trust_check"))
+            .is_some_and(|trust_check| {
+                trust_check["leg"] == "caller"
+                    && trust_check["authority_id"] == authority.as_str()
+                    && trust_check["error_code"] == expected_code.as_str()
+            })
+    };
+    let (found, events) = vp_audit_events_matching(world, reports_code).await;
+    assert!(
+        found,
+        "expected a caller-leg Trust Check audit event for authority {authority:?} with error code \
+         {expected_code:?}; observed {:?}",
+        events
+            .iter()
+            .filter_map(|event| {
+                event
+                    .get("event")
+                    .and_then(|action| action.get("trust_check"))
+            })
             .collect::<Vec<_>>()
     );
 }
@@ -1622,11 +1686,19 @@ fn response_body_is_error(
             "status": 403,
             "detail": "Request blocked by surface policy"
         }),
-        "agent_card_target_auth_failed" => serde_json::json!({
+        "agent_card_target_auth_misconfigured" => serde_json::json!({
             "type": "https://a2a-protocol.org/errors/proxy-error",
-            "title": "Bad Gateway",
-            "status": 502,
-            "detail": "Target authentication failed"
+            "title": "Internal Server Error",
+            "status": 500,
+            "detail": "Target authentication failed",
+            "reason": "target_auth_misconfigured"
+        }),
+        "agent_card_target_auth_unavailable" => serde_json::json!({
+            "type": "https://a2a-protocol.org/errors/proxy-error",
+            "title": "Service Unavailable",
+            "status": 503,
+            "detail": "Target authentication failed",
+            "reason": "target_auth_unavailable"
         }),
         "agent_card_upstream_redirected" => serde_json::json!({
             "type": "https://a2a-protocol.org/errors/proxy-error",
@@ -2976,8 +3048,8 @@ fn assert_actor_received_header(
     expected_value: &str,
 ) {
     let request = get_observed_request_for_actor(world, actor_name, expected_kind);
-    assert_collaborator_header_value(
-        &request.headers,
+    crate::bdd_support::collaborators::assert_single_header_value(
+        request,
         header_name,
         expected_value,
         &format!("{expected_kind:?} '{}'", actor_name),
@@ -4284,6 +4356,49 @@ fn managed_agent_received_agent_card_at_path(
         request.path_and_query, expected_path,
         "agent card request to managed agent '{}' must hit configured path '{}', got '{}'",
         agent_name, expected_path, request.path_and_query
+    );
+}
+
+#[then(expr = "managed agent {string} received a {word} request at path {string}")]
+fn managed_agent_received_method_request_at_path(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    method: String,
+    expected_path: String,
+) {
+    let request = get_observed_request_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
+    assert_eq!(
+        request.method, method,
+        "request to managed agent '{}' must be a {}, got '{}'",
+        agent_name, method, request.method
+    );
+    assert_eq!(
+        request.path_and_query, expected_path,
+        "request to managed agent '{}' must hit path '{}', got '{}'",
+        agent_name, expected_path, request.path_and_query
+    );
+}
+
+#[then(expr = "managed agent {string} did not receive a {word} request at path {string}")]
+fn managed_agent_did_not_receive_method_request_at_path(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    method: String,
+    path: String,
+) {
+    let requests = get_observed_target_requests(
+        get_observed_target_for_actor(world, &agent_name, TargetActorKind::ManagedAgent),
+        &format!("managed agent '{agent_name}'"),
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.method == method && request.path_and_query == path),
+        "managed agent '{agent_name}' must not receive {method} {path}, got {:?}",
+        requests
+            .iter()
+            .map(|request| format!("{} {}", request.method, request.path_and_query))
+            .collect::<Vec<_>>()
     );
 }
 

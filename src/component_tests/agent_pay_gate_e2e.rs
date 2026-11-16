@@ -436,7 +436,7 @@ async fn a_call_whose_target_authentication_fails_is_never_charged() {
     let (status, _, _) =
         post(&harness, &tool_call("paid_report", json!({})), &[("PAYMENT-SIGNATURE", "unserved-proof")]).await;
 
-    assert_eq!(status, 502);
+    assert_eq!(status, 500, "a missing Target secret is target_auth_misconfigured");
     assert_eq!(gate.calls(), 0, "the Target could not be authenticated to, so nothing was charged");
     assert_eq!(forwarded(&harness), 0);
 }

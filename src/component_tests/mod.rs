@@ -90,7 +90,7 @@ mod freeze {
         ("request_body_bounds_e2e.rs", 12),
         ("stored_reference_transit_token_e2e.rs", 1),
         ("surface_reload_listener_e2e.rs", 3),
-        ("target_auth_provider_e2e.rs", 2),
+        ("target_auth_provider_e2e.rs", 1),
         ("tenant_credential_save_e2e.rs", 36),
         ("tr_naming_e2e.rs", 4),
         ("transit_caller_auth_e2e.rs", 12),

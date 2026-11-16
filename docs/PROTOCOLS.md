@@ -65,14 +65,15 @@ sequenceDiagram
 
 | Aspect | Behaviour |
 | --- | --- |
-| `target.auth.fallback: reject` | 502 with the generic detail "Target authentication failed" when the secret cannot be read, the provider's token request fails, or `target_https` in `enforce` withholds the credential from a Target that is not https. The cause is written to the VP Audit Log as a `target_auth_failed` record (see [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)) and never reaches the caller. `target_source_auth` never withholds it here: the fetch is the gateway's own, with no caller to check (see [Target credential rules on the request path](CREDENTIAL_DELEGATION.md#target-credential-rules-on-the-request-path)). |
+| `target.auth.fallback: reject` | `500 target_auth_misconfigured` or `503 target_auth_unavailable`, with the generic detail "Target authentication failed", when the secret cannot be read, the provider's token request fails, or `target_https` in `enforce` withholds the credential from a Target that is not https (see [When a Target credential cannot be obtained](CREDENTIAL_DELEGATION.md#when-a-target-credential-cannot-be-obtained)). The cause is written to the VP Audit Log as a `target_auth_failed` record (see [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)) and never reaches the caller. `target_source_auth` never withholds it here: the fetch is the gateway's own, with no caller to check (see [Target credential rules on the request path](CREDENTIAL_DELEGATION.md#target-credential-rules-on-the-request-path)). |
 | `target.auth.fallback: passthrough` | Fetches without the credential. |
 | Provider token | Requested once, then reused from the vault and renewed up to 5 minutes before it expires. While a renewal fails, the cached token is still used until 60 seconds before it expires. |
 | Caller headers | Only `Accept`, `Accept-Language`, and `User-Agent` are forwarded while the credential is attached, so an anonymous caller can neither override the credential nor add identity or forwarding headers. |
 | Redirects | The client is pinned to the vetted target address with redirects disabled, so the credential cannot follow a 3xx to another host. A 3xx answers 502 "Upstream redirected". |
 | Blocked by egress policy | 403 |
 | Without `target.auth` | The fetch forwards caller headers except `Cookie`, and follows redirects as before. |
-| `fabric://` targets | Unchanged. The remote gateway applies its own target auth. |
+| `fabric://` targets | The remote gateway applies its own target auth. Its Target authentication refusal reaches the caller with the same status, the detail "Target authentication failed" and the same `reason`; its `502` "Upstream redirected" with the same text; any other refusal answers its status with "Upstream error: <status>". See [`FABRIC.md`](FABRIC.md#agent-card-fetch-over-fabric). |
+| Fabric receive | On a surface with `target.auth`, the receiving gateway applies these header, body and failure rules to a card fetch a peer sends: only a `GET` of exactly `/.well-known/agent-card.json` or the configured card location is credentialed, as a bodiless `GET` with the same three caller headers, and with the same failure text. Only the headers that describe the card reach the peer. Redirects are not followed: a 3xx answers 502 "Upstream redirected" without `Location`, and any other error reaches the peer as its status with the body "Upstream error: <status>". Without `target.auth` none of this applies: the request is forwarded as the peer sent it, body included, and a Target redirect is relayed, so the sending gateway's caller gets that 3xx status with the body "Upstream error: <status>" and no `Location`. Unlike the direct path, a `HEAD`, a legacy `agent.json` request or a card path with a query or dot segments is forwarded without the credential (to the configured card location when the surface has one). A card path in another case is not a public read: source authentication runs on it, and an authenticated caller's request carries the credential. A `GET` at a configured card location that is not a discovery path is the card fetch after source authentication, including for a caller who failed it on a public Access Point; every Access Point that refuses failed callers (closed, legacy, `from_jwt_claim` inbound identity or `caller_authentication.on_failure: reject`) answers it `401`, so the sending gateway's card fetch, which carries no caller credential, gets `401` there. See [`FABRIC.md`](FABRIC.md#agent-card-fetch-over-fabric). |
 
 The card fetched with `target.auth` is served to unauthenticated callers as is, so a
 target must not return credential-only content on its card path. A2A's authenticated
@@ -859,19 +860,23 @@ every path on its origin. A `GET` or `HEAD` of the configured agent card locatio
 (`access_point.agent_card_path`, or the Transit Point's `agent_card_path`) on the destination's
 origin is also allowed; any other method there is refused.
 
+A path the caller sent is the caller's error, so it is refused with `400` and reason
+`target_path_refused`. On an MCP proxy the tool URL is built from the caller's tool arguments,
+so it is refused the same way. Every refusal carries the detail "Target authentication failed".
+
 | Path | Checked URL | Refusal |
 | --- | --- | --- |
-| Direct forward | The Target endpoint joined with the request path | 502 "Target authentication failed" |
-| Fabric send (an Access Point with a `fabric://` Target) | The path after the route, which must not climb above the peer gateway's base | 502 "Target authentication failed" |
-| Fabric receive | The receiving surface's Target joined with the forwarded path | ForwardResponse 502, detail "Target authentication failed" |
-| MCP proxy `tools/call` (direct or over Fabric) | The REST URL the OpenAPI tool resolves, against the proxy's `base_url` with a trailing `/` added when missing | 502 "Target authentication failed" |
-| Transit Point to an `http(s)` destination | The destination endpoint joined with the path after the Transit Point's listen prefix | 502 "Target authentication credentials unavailable" |
-| Transit Point to a `fabric://` destination | The path after the listen prefix, which must not climb above the peer gateway's base | 502 "Target authentication credentials unavailable" |
+| Direct forward | The Target endpoint joined with the request path | `400 target_path_refused` |
+| Fabric send (an Access Point with a `fabric://` Target) | The path after the route, which must not climb above the peer gateway's base | `400 target_path_refused` |
+| Fabric receive | The receiving surface's Target joined with the forwarded path | ForwardResponse `400 target_path_refused` |
+| MCP proxy `tools/call` (direct or over Fabric) | The REST URL the OpenAPI tool resolves, against the proxy's `base_url` with a trailing `/` added when missing | `400 target_path_refused` |
+| Transit Point to an `http(s)` destination | The destination endpoint joined with the path after the Transit Point's listen prefix | `400 target_path_refused` |
+| Transit Point to a `fabric://` destination | The path after the listen prefix, which must not climb above the peer gateway's base | `400 target_path_refused` |
 
 On the MCP proxy, a path parameter value containing another path parameter's `{name}`
 placeholder is also refused while the credential is attached, because the OpenAPI client
 substitutes parameters one at a time and the value would be rewritten into another parameter's
-place. It is refused as leaving the base: a 502 "Target authentication failed" and a
+place. It is refused as leaving the base: a `400 target_path_refused` and a
 `target_auth_failed` record in the VP Audit Log with outcome `rejected`, whatever the `fallback`.
 Any other value containing `{` or `}` is refused as invalid arguments by the gateway's REST client,
 which sends the tool call, encodes each path parameter as one segment, refuses a braced or `.`

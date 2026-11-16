@@ -631,6 +631,27 @@ async fn surface_has_caller_trust_check_using_a2a_metadata_field(
     surface_name: String,
     field: String,
 ) {
+    attach_caller_trust_check_on_a2a_metadata_field(world, &surface_name, &field, "entity_id").await;
+}
+
+#[given(expr = "surface {string} has caller Trust Check whose authority is A2A metadata field {string}")]
+async fn surface_has_caller_trust_check_with_authority_from_a2a_metadata_field(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+    field: String,
+) {
+    attach_caller_trust_check_on_a2a_metadata_field(world, &surface_name, &field, "authority_id").await;
+}
+
+/// Gives surface `surface_name` one caller Trust Check whose `query_field` is a template on
+/// mapped A2A metadata field `field`, and a policy that denies only when a caller Trust Check
+/// fails with TEMPLATE_RESOLUTION_FAILED.
+async fn attach_caller_trust_check_on_a2a_metadata_field(
+    world: &mut SurfaceWorld,
+    surface_name: &str,
+    field: &str,
+    query_field: &str,
+) {
     let trust_registry_id = create_unconnected_trust_registry(world).await;
     let policy_id = format!("bdd-header-metadata-trust-check-policy-{}", uuid::Uuid::new_v4());
     let rego = r#"package surface.policy
@@ -659,26 +680,28 @@ allow := false if {
         response.status, response.body
     );
 
-    let field_literal = serde_json::to_string(&field).expect("field should serialize");
-    let entity_template = format!(
+    let field_literal = serde_json::to_string(field).expect("field should serialize");
+    let template = format!(
         "{{{{ input.a2a.message.metadata[\"https://fabric.affinidi.io/extensions/header-metadata/v1\"][{field_literal}] }}}}"
     );
+    let mut query = serde_json::json!({
+        "authority_id": "did:example:authority",
+        "entity_id": "did:example:entity"
+    });
+    query[query_field] = serde_json::json!(template);
     let mut surface = current_surface_body(world, "attaching header metadata Trust Check");
     surface["access_point"]["trust_check_list"] = serde_json::json!([
         {
             "id": "caller-header-metadata-template",
             "trust_registry_id": trust_registry_id,
             "query_type": "recognition",
-            "query": {
-                "authority_id": "did:example:authority",
-                "entity_id": entity_template
-            }
+            "query": query
         }
     ]);
     surface["target"]["policy"] = serde_json::json!({
         "policy_definition_id": policy_id,
     });
-    update_named_surface(world, &surface_name, surface, "attaching header metadata Trust Check").await;
+    update_named_surface(world, surface_name, surface, "attaching header metadata Trust Check").await;
 }
 
 #[given(expr = "the caller has DID {string}")]
@@ -714,6 +737,30 @@ fn surface_has_caller_trust_check_with_entity_template(
         .push(element);
 }
 
+#[given(expr = "the caller-leg Trust Check lists authorities {string}")]
+fn caller_trust_check_lists_authorities(
+    world: &mut SurfaceWorld,
+    authorities: String,
+) {
+    let element = world
+        .surface_config
+        .caller_trust_check_list
+        .last_mut()
+        .expect("the surface has a caller-leg Trust Check");
+    let query = element["query"]
+        .as_object_mut()
+        .expect("the Trust Check has a query");
+    query.remove("authority_id");
+    query.insert("authority_ids".to_string(), serde_json::json!(authority_list(&authorities)));
+}
+
+pub(crate) fn authority_list(authorities: &str) -> Vec<String> {
+    authorities
+        .split(',')
+        .map(|did| did.trim().to_string())
+        .collect()
+}
+
 const DELETED_AUTHORITY_DID: &str = "did:web:deleted-authority.example";
 
 #[given("the caller-leg Trust Check takes its authority from an Authority that no longer exists")]
@@ -725,6 +772,25 @@ fn caller_trust_check_uses_deleted_authority(world: &mut SurfaceWorld) {
         .expect("the surface has a caller-leg Trust Check");
     element["query"]["authority_id"] = serde_json::json!(DELETED_AUTHORITY_DID);
     element["authority_source"] = serde_json::json!("authority");
+}
+
+#[given(expr = "the caller-leg Trust Check takes listed authority {string} from an Authority that no longer exists")]
+fn caller_trust_check_lists_deleted_authority(
+    world: &mut SurfaceWorld,
+    did: String,
+) {
+    let element = world
+        .surface_config
+        .caller_trust_check_list
+        .last_mut()
+        .expect("the surface has a caller-leg Trust Check");
+    assert!(
+        element["query"]["authority_ids"]
+            .as_array()
+            .is_some_and(|listed| listed.contains(&serde_json::json!(did))),
+        "the caller-leg Trust Check does not list {did}: {element}"
+    );
+    element["authority_sources"][did.as_str()] = serde_json::json!("authority");
 }
 
 #[given(
@@ -1474,6 +1540,23 @@ fn transit_point_has_target_trust_check(
     transit_point_config_mut(world, &transit_point)
         .trust_check_list
         .push(element);
+}
+
+#[given(expr = "the target-leg Trust Check of transit point {string} lists authorities {string}")]
+fn transit_point_trust_check_lists_authorities(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    authorities: String,
+) {
+    let element = transit_point_config_mut(world, &transit_point)
+        .trust_check_list
+        .last_mut()
+        .expect("the transit point has a target-leg Trust Check");
+    let query = element["query"]
+        .as_object_mut()
+        .expect("the Trust Check has a query");
+    query.remove("authority_id");
+    query.insert("authority_ids".to_string(), serde_json::json!(authority_list(&authorities)));
 }
 
 #[given(expr = "transit point {string} has a policy that denies unless every target Trust Check succeeded")]
@@ -2822,6 +2905,14 @@ fn mcp_surface_has_deny_all_request_policy(world: &mut SurfaceWorld) {
         Some(RequestPolicyFixture::new("bdd-mcp-deny-all", "BDD deny-all surface policy for MCP proxy", rego));
 }
 
+#[given("the surface has a request policy that denies all requests")]
+fn surface_has_deny_all_request_policy(world: &mut SurfaceWorld) {
+    let rego = "package surface.policy\n\ndefault allow := false\n".to_string();
+    world
+        .surface_config
+        .request_policy = Some(RequestPolicyFixture::new("bdd-deny-all", "BDD deny-all surface policy", rego));
+}
+
 #[given(expr = "the MCP surface has a request policy that allows all requests")]
 fn mcp_surface_has_allow_all_request_policy(world: &mut SurfaceWorld) {
     let rego = "package surface.policy\n\ndefault allow := true\n".to_string();
@@ -2917,6 +3008,15 @@ fn surface_authenticates_target_with_client_credentials(world: &mut SurfaceWorld
         .target_auth_provider = Some(SurfaceTargetAuthProviderConfig::new(TargetAuthProviderGrant::ClientCredentials));
 }
 
+#[given("the appliance stores an authorization code provider that no surface uses")]
+fn appliance_stores_unused_authorization_code_provider(world: &mut SurfaceWorld) {
+    let mut provider = SurfaceTargetAuthProviderConfig::new(TargetAuthProviderGrant::AuthorizationCode);
+    provider.authenticates_surface_target = false;
+    world
+        .surface_config
+        .target_auth_provider = Some(provider);
+}
+
 /// Serves a client credentials provider that the surface's own Target does not use, for a
 /// Transit Point or a delegated credential binding to use instead.
 fn serve_client_credentials_provider_off_the_surface_target(world: &mut SurfaceWorld) {
@@ -2994,6 +3094,17 @@ fn target_credential_provider_stores_unused_client_references(world: &mut Surfac
     jwt_bearer_target_auth_provider(world).stores_unused_client_references = true;
 }
 
+#[given("the credential provider stores no client secret")]
+fn target_credential_provider_stores_no_client_secret(world: &mut SurfaceWorld) {
+    let provider = target_auth_provider(world);
+    assert_ne!(
+        provider.grant,
+        TargetAuthProviderGrant::JwtBearer,
+        "this step applies only to a provider type that needs a client secret"
+    );
+    provider.omits_client_secret_reference = true;
+}
+
 #[given(expr = "the credential provider authenticates its client with {string}")]
 fn target_credential_provider_authenticates_its_client(
     world: &mut SurfaceWorld,
@@ -3035,6 +3146,11 @@ fn target_credential_provider_token_lifetime(
 #[given("the credential provider has a plain http token endpoint")]
 fn target_credential_provider_has_http_token_endpoint(world: &mut SurfaceWorld) {
     target_auth_provider(world).insecure_token_endpoint = true;
+}
+
+#[given("the gateway's insecure token endpoints list names the credential provider's token endpoint")]
+fn gateway_lists_target_credential_provider_token_endpoint(world: &mut SurfaceWorld) {
+    target_auth_provider(world).token_endpoint_listed_as_insecure = true;
 }
 
 #[given("the gateway keeps its log of warnings")]

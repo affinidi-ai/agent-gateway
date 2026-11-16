@@ -34,7 +34,20 @@ Applies to:
    explicitly requested.
 8. Header topbar controls must use the shared topbar action button pattern, a single
    reusable component plus shared CSS state rules, rather than ad-hoc per-button markup.
-9. Mediator lists may contain directory entries (`directory:*` ids), and stored records
+9. Theme-dependent styles hang off `body.dark-theme`, never `@media (prefers-color-scheme)`:
+   the dashboard theme is the operator's choice and need not match the operating system, so a
+   media query paints light text on a light surface (or the reverse). `themeSelectors.test.ts`
+   fails on any stylesheet that uses it.
+10. Text and icons on a light surface use the text-safe tokens in `dashboard.css`
+   (`--warning-text`, `--success-text`, `--danger-text`, `--accent-blue-text`,
+   `--accent-teal-text`, `--accent-purple-text`, `--muted-text`), which `body.dark-theme` swaps for
+   lighter values; solid buttons and badges under white text use `--primary-solid`,
+   `--success-solid`, `--warning-solid` and `--danger-solid`. The brand colours `--warning`,
+   `--success`, `--danger` and `--accent-blue` stay for borders, tints and text on dark
+   surfaces. Normal text needs 4.5:1 and informational icons 3:1 in both themes; do not use
+   `#9ca3af`, `--gray-400`, `--gray-500` on a dark surface, or an `opacity` below 1 for text.
+   Purely decorative icons, such as the large stat card and empty state icons, are exempt.
+11. Mediator lists may contain directory entries (`directory:*` ids), and stored records
    created from them carry `provided: true`. The Create Connection Point wizard pre-selects the
    first `directory:` entry (else the only mediator, else nothing; never a stored provided
    record) and marks it in no other way. The dropdown lists a directory mediator once, as its
@@ -681,6 +694,34 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   template. The Authority picker writes `issuer` for an Issuer and `authority` for an Authority,
   and removes it for a caller-leg template; a preset (`applyPresetToQuery`) removes it; a stored
   custom DID or legacy template left untouched keeps what is stored.
+- **Authority lists.** A query stored with `query.authority_ids` (several authorities) keeps that
+  list and its `authority_sources` map through every load and save (`listedAuthorities`,
+  `queryFromElement`, `buildEntry`), on every leg and in variants; the save never adds
+  `authority_id` or `authority_source` beside it. In the fullscreen editor a query's **Authority
+  ID** is one multi-select (`IssuerAuthorityPicker` on the shared `FormMultiSelect`, which shares
+  its keyboard handling and option markup with `FormSelect` through `shared/listbox.tsx`): a picked Issuer
+  or Authority shows a check on the right, as in `FormSelect`; a click toggles it and keeps the menu open, and the toggle lists
+  the picked names in order. One pick is the single `authority_id` with `authority_source`,
+  exactly as before; two or more are `authority_ids` in the order picked, each DID recorded in
+  `authority_sources` as `issuer` or `authority` by the register it was picked from
+  (`authorityRows`, `pickAuthorities`). Unchecking down to one makes the query single again, and
+  unchecking all leaves an empty `authority_id` (the caller leg's default). The caller-leg
+  templates (the verified-issuer default and the sending-gateway DID) combine with each other and
+  with literal DIDs like any pick, with no source recorded; while nothing is stored the default
+  shows checked and the first pick replaces it, and it stays only when ticked beside other
+  picks. There is no limit on how many Authorities a query
+  or a Trust Check names, in the editor or at the gateway. A picked Authority that
+  was deleted shows as a checked "Deleted Authority" option with the warning, and like a deleted
+  single Authority it is listed in the panel's "Configuration required" warning, draws the node
+  unconfigured and blocks Save (`missingTrustCheckAuthorities` walks `authorityRows`). A stored
+  list is incomplete, is marked invalid, and blocks the editor's Save when it has an empty entry
+  or a template its leg refuses: any template on the target leg ("Select an Issuer or Authority
+  for every Authority row"), or on the caller leg a template other than the verified-issuer
+  default and the sending-gateway DID ("Replace the caller-leg Authority template …"); an empty
+  entry gives the first message on either leg. The side panel lists each query as "Query N" and its record type
+  only, with no Authorities or name; the fullscreen card header adds "N authorities". A node with one such
+  query has the canvas summary `<type> · N authorities`; a node with several queries keeps "N
+  queries".
 - **Deleted Authority.** A query whose `authority_source` is `authority` and whose DID the loaded
   Authorities register no longer has is `missing-authority` (`classifyTargetAuthoritySelection`,
   checked against the Authorities only, even when an Issuer has the DID); the gateway fails it
@@ -696,8 +737,8 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   `InfoBanner` titled "Configuration required", `role="alert"`) saying the check fails with
   `AUTHORITY_NOT_FOUND` until it is fixed, the fixes (pick another Authority, add an Authority
   with the same DID through `deepLinks.authority`, or remove the Trust Check) and the stored DID
-  ("Query <n>: <did>" when the node has several queries); the picker shows the DID as a locked
-  "Deleted Authority" option marked invalid. Save is blocked on both surface pages, in the base
+  ("Query <n>: <did>" when the node has several queries); the picker shows the DID as a checked
+  "Deleted Authority" option marked invalid, which unchecking removes. Save is blocked on both surface pages, in the base
   and every variant, with the full warning and **Show me** (`firstMissingAuthorityNode` in
   `elements/missingAuthority.ts`). It is not part of `configured` or `getIncompleteReason`. The
   panel copy says the DID is stored directly and that, for an Authority, the gateway fails the
@@ -715,6 +756,8 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
 | Review summary                   | `surface-migrated-trust-checks-summary`                                                            |
 | Migrated canvas badge            | `surface-node-trust-check-migrated-badge`                                                          |
 | Deleted Authority warning        | `trust-check-panel-authority-missing`, `trust-check-query-<n>-authority-missing`, each with `-dids` and `-add-authority-link` |
+| Authority multi-select           | `trust-check-query-<n>-authority`; options `-authority-option-<did>`; `-authority-count` (two or more) |
+| Sidebar query row                | `trust-check-panel-query-<n>` (query number and record type only)                                 |
 
 ## Trust Recorder
 
@@ -1065,6 +1108,12 @@ the token's own `sub`; a **Principal** row (`credential-audit-caller-principal`)
 the caller's grants are keyed by, `caller.principal`, only when the JWT strategy names a claim
 other than `sub`.
 
+## Target authentication fallback
+
+The Target authentication fallback select on the Managed Agent and on a Transit Point offers
+**Reject request** and a pass-through option. The reject label names no status: the gateway
+answers `500 target_auth_misconfigured` or `503 target_auth_unavailable` depending on the cause.
+
 ## Credential provider editor
 
 `/credential-providers/new` and `/credential-providers/:id` (`EditCredentialProviderPage.tsx`)
@@ -1120,8 +1169,9 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   (`credential-provider-token-endpoint-https-warning`, warning styling, field not marked invalid)
   saying new or changed http endpoints are refused unless listed by exact URL in the bootstrap
   `credential_policy.insecure_token_endpoints`, and that an unchanged stored one, on a provider
-  whose type is unchanged, is still accepted while `token_endpoint_https` is `warn`. It does not
-  block Save; the gateway decides on save.
+  whose type is unchanged, is still accepted while `token_endpoint_https` is `warn`, unless the
+  save starts sending a client secret (a client authentication that sends one, or a client
+  secret the provider did not have). It does not block Save; the gateway decides on save.
 - The Callback URL of an authorization code provider is, when editing, the stored `callback_url`
   unchanged (a reverse proxy prefix included) while the chosen listen address is still its origin
   and the stored URL is `https` and its path ends in the stored `callback_path`

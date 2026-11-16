@@ -1,0 +1,52 @@
+branch: feat/target-auth-failure-statuses
+changes:
+  added:
+    - timestamp: '2026-11-13T00:00:00Z'
+      title: Report a Target credential the peer gateway refuses as target_auth_rejected
+      description: >-
+        Over Fabric, a gateway that refuses the one caller credential it read from a header now names
+        that header in the ForwardResponse envelope field caller_refusal, never in the body. When it
+        is the header the sending gateway put its own Target credential in, the sending gateway
+        answers its caller 500 target_auth_rejected instead of the peer's 401, which the caller read
+        as its own credential failing, and records target_auth_failed with outcome refused_by_target
+        and upstream_status 401 in the VP Audit Log. Any other 401 passes through unchanged. A peer
+        MCP surface that checks bearer tokens as a Resource Server names the authorization header
+        when it refuses a token that came.
+  changed:
+    - timestamp: '2026-11-13T00:00:00Z'
+      title: Answer a Target credential that cannot be obtained with 500 or 503 and a reason
+      description: >-
+        With Target authentication fallback reject, a request whose Target credential cannot be
+        obtained is refused with 500 target_auth_misconfigured (a missing secret or provider, a
+        credential policy rule in enforce, a token endpoint that refuses the request as a client
+        error) or 503 target_auth_unavailable (a store that cannot be read, a token endpoint that
+        is unreachable, times out or answers 5xx or 429) instead of 502, which callers read as an
+        outage of the next hop although it was never called. A request the token retry backoff
+        holds back fails as the request that started it. The reason is a top-level field of the problem JSON, or error.data.reason for an MCP
+        Transit Point or MCP surface, and a gateway sending over Fabric passes on the peer's status
+        and reason; the cause stays in the VP Audit Log, whose http_status now reports the status
+        answered. The dashboard's reject option reads Reject request. Callers or alerts that expect
+        502 for these failures now get 500 or 503; a refusal by the Target's egress policy still
+        answers 502.
+    - timestamp: '2026-11-13T00:00:00Z'
+      title: Refuse a request path that leaves the Target base path with 400
+      description: >-
+        A request whose path would carry the Target credential outside the Target's base path, on
+        the direct path, a Fabric send or receive, a Transit Point, or an MCP proxy tool call whose
+        arguments make its URL leave the proxy's base_url, is refused with 400 target_path_refused
+        instead of 502, since the caller's path or arguments are at fault and nothing upstream
+        failed. It is refused whatever the fallback and recorded in the VP Audit Log with the status
+        answered. Callers or alerts that expect 502 for it now get 400.
+  fixed:
+    - timestamp: '2026-11-13T00:00:00Z'
+      title: Keep refusing a held-back provider token request for the cause that started it
+      description: >-
+        While a credential provider's token retry backoff holds requests back, each one now fails
+        as the token request that started the backoff did, instead of as a generic failed request.
+        A modern MCP request whose delegated credential was refused for a scope mismatch keeps
+        answering 403 MCP credential authorization denied rather than switching to 503 MCP
+        credential service unavailable for up to a minute, and its VP Audit Log record keeps the
+        token endpoint's OAuth error.
+  removed: []
+  security: []
+  breaking: []

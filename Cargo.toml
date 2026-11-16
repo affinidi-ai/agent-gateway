@@ -155,6 +155,7 @@ serde_jcs = { version = "0.1", optional = true }
 
 # WebAuthn for passkey authentication
 webauthn-rs = "0.5"
+webauthn-rs-proto = "0.5"
 url = "2.5.8"
 
 # SAML authentication

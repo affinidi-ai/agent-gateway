@@ -485,6 +485,15 @@ and limit requests per client upstream of the gateway if credential guessing is 
 `Caller credential missing or invalid`; the reason is logged. Public discovery reads, the DID Auth ceremony and
 onboarding surfaces are unaffected.
 
+On Fabric receive, when the gateway verified exactly one credential, read from a header the
+request carries, and refuses it with `401` (plainly or with the protected resource discovery
+challenge), its `ForwardResponse` also names that header in the envelope field `caller_refusal`
+(`{"credential_header": "x-api-key"}`, lowercase), never in the body. A missing credential,
+credentials for more than one method, a credential read from the body or a client certificate,
+and a public Access Point get no `caller_refusal`. The sending gateway uses it to tell its own
+Target credential being refused from any other `401` (see [Target credential refused by the
+peer gateway](CREDENTIAL_DELEGATION.md#target-credential-refused-by-the-peer-gateway)).
+
 Create and update responses are the saved surface plus `access_point_status` and, when it
 names a key id, `api_key_references`. A save warns
 in `Warning` headers (code 299), before the Transit Point warnings described below, when the
@@ -1013,7 +1022,7 @@ Which requests carry one:
 | Pipeline | Issues a transit token |
 | --- | --- |
 | Access Point (direct HTTP: MCP, A2A, HTTP) | For every request it forwards to the managed agent of a surface with Transit Points, an anonymous caller's included, but not for an agent card fetch |
-| Fabric receive, buffered and framed stream | For every request a paired gateway sends that it forwards to an HTTP or HTTPS Target of a surface with Transit Points, but not for a public discovery `GET` such as an agent card fetch. The token lists every Transit Point of the surface, as the Access Point's does; which partners reach a surface is set by peer exposure (see [`FABRIC.md`](FABRIC.md#which-transit-points-a-partner-can-drive)). When one should be issued and cannot be, the request is refused with `503` |
+| Fabric receive, buffered and framed stream | For every request a paired gateway sends that it forwards to an HTTP or HTTPS Target of a surface with Transit Points, but not for a public discovery `GET` such as an agent card fetch, or the gateway's own agent card fetch at a configured card location. The token lists every Transit Point of the surface, as the Access Point's does; which partners reach a surface is set by peer exposure (see [`FABRIC.md`](FABRIC.md#which-transit-points-a-partner-can-drive)). When one should be issued and cannot be, the request is refused with `503` |
 | `proxy://` and `a2a-proxy://` Targets, on either path | Never: the gateway runs the MCP Proxy and there is no agent, and an A2A Proxy's backend, such as Direct Line, must never see one |
 | Fabric send, the STS, the management API | Never |
 

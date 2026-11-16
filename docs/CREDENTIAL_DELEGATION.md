@@ -44,7 +44,9 @@ same message in both (for example
 `client_id_secret_ref and client_secret_secret_ref are required for OAuth providers`). An update
 therefore cannot clear one of these references with an empty string, and a retype to one of
 these types must send the references the provider does not store yet. A stored provider that
-already lacks one is refused every update until the update names it.
+already lacks one is refused every update until the update names it. On a token endpoint that
+is still http and not listed in `insecure_token_endpoints`, naming a missing client secret
+reference is refused as well (see [https token endpoints](#https-token-endpoints)).
 
 ### Records that are still in use
 
@@ -169,7 +171,7 @@ sets how the rule is applied (see [Credential policy](CONFIGURATION_RELOAD.md#cr
 | --- | --- | --- |
 | Create, or an update that sets a new token endpoint or changes the provider type (an `api_key` provider turning into an OAuth type, or one OAuth type into another) | 400 `token_endpoint must be an https URL` | The same |
 | Update that keeps a stored http endpoint and the provider type | Saved | 400 |
-| Update that keeps a stored http endpoint not listed in `insecure_token_endpoints` and sets `client_authentication` to `client_secret_basic` or `client_secret_post` on an `oauth2_jwt_bearer` provider that sent no client secret before | 400 `token_endpoint must be an https URL` | The same |
+| Update that keeps a stored http endpoint not listed in `insecure_token_endpoints` and starts sending a client secret: it sets `client_authentication` to `client_secret_basic` or `client_secret_post` on an `oauth2_jwt_bearer` provider that sent none before, or sets a `client_secret_secret_ref` on an `oauth2_client_credentials` or `oauth2_authorization_code` provider that held none | 400 `token_endpoint must be an https URL` | The same |
 | `POST /api/v1/credential-providers/validate` | 400, before the endpoint is contacted | The same |
 | Token request, refresh or code exchange of a stored http provider | Sent, with a warning log | Refused before any secret is read |
 
@@ -182,19 +184,30 @@ already cached, the legacy code exchange and refresh fail with `token_endpoint m
 URL`, and the `2026-07-28` consent exchange answers an invalid record. Move such providers to
 https, or list a deliberate http endpoint, before switching to `enforce`.
 
-In `warn` mode a stored http provider therefore cannot start sending a client secret by turning on
-a `client_authentication` that sends one, and cannot change its type to an OAuth type: a retype
-must meet the rule like a new provider. Setting `client_authentication` to `none`, clearing it,
-or switching between `client_secret_basic` and `client_secret_post` is still saved. Listing the
-endpoint in `insecure_token_endpoints` allows the change on purpose.
+In `warn` mode a stored http provider therefore cannot start sending a client secret, either by
+turning on a `client_authentication` that sends one or, on an `oauth2_client_credentials` or
+`oauth2_authorization_code` provider, by being given a `client_secret_secret_ref` it did not
+hold, and cannot change its type to an OAuth type: a retype must meet the rule like a new
+provider. Setting `client_authentication` to `none`, clearing it, or switching between
+`client_secret_basic` and `client_secret_post` is still saved. Listing the endpoint in
+`insecure_token_endpoints` allows the change on purpose.
 
-The rule does not compare `client_secret_secret_ref`. A stored http provider may point it at
-another secret of its tenant, which is a rotation and is saved, and a secret's value can already
-change through the secrets API without any check by a provider, so pinning the reference would
-not pin what the endpoint receives. What a stored provider cannot do is lose the reference:
-`oauth2_client_credentials` and `oauth2_authorization_code` providers need it, so an update that
-clears it is refused (see [Credential providers](#credential-providers)), and a provider cannot
-be emptied of its client secret and given one again later on an endpoint that is still http.
+A provider sends a client secret when it holds a `client_secret_secret_ref` and its type sends
+it: an `oauth2_client_credentials` or `oauth2_authorization_code` provider always does, an
+`oauth2_jwt_bearer` provider only while its `client_authentication` is `client_secret_basic` or
+`client_secret_post`, and the other types never do. The rule compares that for the stored and
+the saved provider, not which secret the reference names. A stored http provider may point the
+reference at another secret of its tenant, which is a rotation and is saved, and a secret's
+value can already change through the secrets API without any check by a provider, so pinning the
+reference would not pin what the endpoint receives.
+
+`oauth2_client_credentials` and `oauth2_authorization_code` providers without an `issuer` need
+the reference, so an update that clears it is refused on any endpoint (see
+[Credential providers](#credential-providers)). A provider of these types stored without it,
+which a gateway before 1.0.8 let an update leave behind, cannot be given one while its endpoint
+is still http: move the endpoint to https in the same update, or first list it in
+`insecure_token_endpoints` and restart the gateway (see
+[Credential policy](CONFIGURATION_RELOAD.md#credential-policy)).
 
 ### Provider secrets belong to the provider's tenant
 
@@ -430,14 +443,15 @@ asks the provider for a new token, with these limits:
 The refused request is answered as the Target answered it and is not retried. A `401` without
 `invalid_token`, a `403`, a static secret or `api_key` credential, and a provider token sent in
 another header or scheme change nothing: a Bearer challenge speaks only about the `Authorization`
-Bearer token, which in that case may be the caller's. The direct path, Fabric receive and the
-agent card fetch check the answer, and so does a `proxy://` MCP Target, direct or on Fabric
-receive, legacy or `2026-07-28`: its tool call's REST backend answers the token, while the
-caller gets that answer as a tool result with `isError` set. A Transit Point and the Fabric send
-leg do not: their refusals leave the token in place until it is renewed. The Target and a Transit
-Point that use the same provider and scopes on one surface share one cached token, so only the
-Target's own answers can drop it. To keep a Transit Point's token unusable at the Target, give the
-Transit Point a provider whose `resource` names its own server.
+Bearer token, which in that case may be the caller's. The direct path, Fabric receive, the
+receiving gateway's card read for its policy input and the agent card fetch check the answer, and
+so does a `proxy://` MCP Target, direct or on Fabric receive, legacy or `2026-07-28`: its tool
+call's REST backend answers the token, while the caller gets that answer as a tool result with
+`isError` set. A Transit Point and the Fabric send leg do not: their refusals leave the token in
+place until it is renewed. The Target and a Transit Point that use the same provider and scopes on
+one surface share one cached token, so only the Target's own answers can drop it. To keep a Transit
+Point's token unusable at the Target, give the Transit Point a provider whose `resource` names its
+own server.
 
 ### Logging token endpoint errors
 
@@ -739,7 +753,7 @@ give them different names to send both.
 
 A credential header value that is not ASCII is sent to an HTTP target byte for byte. A Fabric
 target can carry only text header values, so a Transit Point refuses a Fabric request whose
-`target_auth` header cannot be carried with `502`, and one whose delegated credential header
+`target_auth` header cannot be carried with `500 target_auth_misconfigured`, and one whose delegated credential header
 cannot be carried with `503`, rather than forwarding it without the credential.
 
 An Access Point and Fabric receive apply the same rule to the caller's headers: a caller
@@ -1004,16 +1018,62 @@ provider with different scopes each keep their own token. The token shows in the
 request the gateway vetted (`CallerAssertion`), so a provider token is never spent on an
 unauthenticated discovery request, except on the gateway's own agent card fetch. On Fabric
 receive that fetch is only a `GET` of exactly `/.well-known/agent-card.json` or the surface's
-configured card location; a `HEAD`, a query, `/discovery` and every other discovery read get no
-credential, the legacy
-`/.well-known/agent.json` fallback of a Fabric card read included. A token that
-cannot be obtained follows `fallback`: `reject` answers 502 "Target authentication failed",
-`passthrough` forwards without the credential, and either way a `target_auth_failed` record in the VP Audit Log names the cause. A `401` from the
+configured card location; a `HEAD`, a query, `/discovery` and every other discovery read a peer
+sends get no credential, a peer's read of the legacy `/.well-known/agent.json` included. The
+receiving gateway's own card read for its policy input is a card fetch too: it presents the
+credential at the configured card location, or else at `<target>/.well-known/agent.json`, of an
+`http(s)` Target (see [`FABRIC.md`](FABRIC.md#agent-card-fetch-over-fabric)). A token that
+cannot be obtained follows `fallback`: `reject` refuses the request (see [When a Target
+credential cannot be obtained](#when-a-target-credential-cannot-be-obtained)),
+`passthrough` forwards without the credential, and either way a `target_auth_failed` record in the
+VP Audit Log names the cause. The policy card read is the exception: it writes no record, logs a
+warning and leaves the policy input without a card, or under `passthrough` reads the card without
+the credential ([`POLICY.md`](POLICY.md#other-pinned-egress-sinks)). A `401` from the
 target evicts the cached token only when it refuses that token as `invalid_token` ([see
 above](#service-tokens)).
 The [agent card preview](PROTOCOLS.md#agent-card-preview) fetches the card with the same Target
 Authentication and reports whether the credential was sent or why it could not be obtained, never
 the token.
+
+### When a Target credential cannot be obtained
+
+With `fallback: reject`, a request whose Target credential cannot be obtained is refused with a
+status that says what kind of failure it is, the generic detail "Target authentication failed"
+and a fixed `reason`: a top-level field of the problem JSON, or `error.data.reason` in the
+JSON-RPC error of an MCP Transit Point. The cause itself reaches only the VP Audit Log.
+
+| Status | `reason` | When |
+| --- | --- | --- |
+| `500` | `target_auth_misconfigured` | The secret or provider does not exist or belongs to another tenant; the provider needs a user's consent or issues no service token; the header breaks a header rule; `target_https` or `target_source_auth` in `enforce` withholds the credential; the token endpoint is not https or the egress policy refuses it; the token endpoint refuses the request as a client error (`4xx` other than `429`) with an OAuth error, or grants other scopes than requested; the provider's settings are unusable. |
+| `503` | `target_auth_unavailable` | The secrets or credential store cannot be read; the token request fails otherwise: no connection, a timeout, a `5xx` or `429` answer whatever its body, or an answer without a usable token; the provider changed during the token request. |
+
+A request the token request retry backoff holds back fails as the request that started the
+backoff did, with the same status, and its `target_auth_failed` record names the same OAuth
+error.
+
+This holds on the direct path, a `proxy://` MCP Target, the Fabric send leg, Fabric receive
+(whose ForwardResponse carries the status and reason, which the sending gateway passes on; an
+MCP surface puts the reason in `error.data.reason`), a Transit Point
+and the agent card fetch. A Transit Point credential that cannot be sent as a header is refused
+with `500 target_auth_misconfigured` whatever the `fallback`. A request that would carry the
+credential outside the Target's base path is refused whatever the `fallback`, with `400
+target_path_refused`, whether the caller's path or an MCP proxy tool URL built from the caller's
+arguments leaves it (see [Target credential scope](PROTOCOLS.md)).
+
+### Target credential refused by the peer gateway
+
+On a `fabric://` route (an Access Point's Target or a Transit Point), when the peer gateway
+answers `401` and its `ForwardResponse` names, in `caller_refusal`, the header this gateway sent
+its Target credential in, the caller gets `500` with reason `target_auth_rejected` instead of the
+peer's `401`: the caller's own credential was not at fault. A peer MCP surface that checks bearer
+tokens as a Resource Server names `authorization` when it refuses a token that came, not when none
+came or the token lacks a scope. The VP Audit Log records a
+`target_auth_failed` refusal with outcome `refused_by_target` and `upstream_status` `401`. Any
+other `401` reaches the caller unchanged and is not recorded: one from the peer's Target, a peer
+that sent no `caller_refusal` (an older gateway, a missing credential, credentials for more than
+one method, a public Access Point), and any answer from a URL destination, which this gateway
+treats as a third-party API. A framed stream carries no `caller_refusal`, so its `401` reaches
+the caller unchanged too.
 
 `POST /v1/mcp-proxies/discover-tools`, the Surface Builder's design-time tool listing, still
 accepts only `static_secret` target authentication, so listing the tools of an MCP server behind
@@ -1083,7 +1143,7 @@ the request checks the header and format rules of the save: a `header_name` that
 field name or is reserved, or a `header_format` without exactly one `{value}` or with CR, LF or
 NUL, is never sent, on the direct path, a `proxy://` MCP Target, the Fabric send leg, Fabric
 receive, the agent card fetch and a Transit Point. It is treated as a credential that cannot be
-obtained: `fallback` `reject` answers 502 "Target authentication failed", `passthrough` forwards
+obtained: `fallback` `reject` answers `500 target_auth_misconfigured`, `passthrough` forwards
 the request without it, as for a secret that cannot be read, and either way a
 `target_auth_failed` record names the outcome. The agent card preview reports it as
 `invalid_header`. The rule against a header another credential on the leg sends is checked at
@@ -1103,11 +1163,13 @@ withholds the credential logs none for a rule still in `warn`.
 
 The gateway's own agent card fetch has no caller to check, so `target_source_auth` never
 withholds its credential; `target_https` does. On Fabric receive only a `GET` of exactly
-`/.well-known/agent-card.json` or the surface's configured card location counts as that fetch;
-any other discovery read, the `/.well-known/agent.json` fallback included, is a caller's request
-and never gets the credential, so a remote Target that serves its card only at that path and requires its credential there is reported as `AGENT_CARD_UNAVAILABLE`. A credential withheld under `enforce` is treated
-as one that cannot be resolved: no token is requested, and `target.auth.fallback` decides the
-request (`reject` answers 502, `passthrough` forwards it without the credential), on the direct
+`/.well-known/agent-card.json` or the surface's configured card location counts as that fetch,
+beside the receiving gateway's own card read for its policy input (above). Any other discovery
+read a peer sends, its read of the legacy `/.well-known/agent.json` included, is a caller's
+request and never gets the credential, so a remote Target that serves its card only at that path
+and requires its credential there is reported as `AGENT_CARD_UNAVAILABLE`. A credential withheld
+under `enforce` is treated as one that cannot be resolved: no token is requested, and `target.auth.fallback` decides the
+request (`reject` answers `500 target_auth_misconfigured`, `passthrough` forwards it without the credential), on the direct
 path, a `proxy://` MCP Target, the Fabric send leg, Fabric receive, the agent card fetch and a
 Transit Point. The [agent card preview](PROTOCOLS.md#agent-card-preview) reports it as
 `forbidden`. A `target.auth` or Transit Point `target_auth` credential that is withheld or
@@ -1534,7 +1596,7 @@ grant.
 
 The Target credential is sent only to URLs under the Target endpoint, and a Target's redirect is
 returned, never followed. A request whose path climbs out, such as `{route}/%2e%2e/admin` against
-`https://api.example.com/base`, is refused with 502 and nothing is forwarded, whatever the
+`https://api.example.com/base`, is refused with `400 target_path_refused` and nothing is forwarded, whatever the
 `fallback`, and recorded in the VP Audit Log as a `target_auth_failed` refusal with outcome
 `rejected`. This covers the direct path, Fabric send and receive, Transit Points and MCP proxy
 tool calls; the rules and each path's answer are in
@@ -1556,7 +1618,9 @@ its own, so no field can be read as part of another. The claim is the first of
 without a string `iss`, or without any of the claims as such a string, gets no key. The same
 caller on the same surface gets the same key on every request, every variant of the surface
 included; another caller, another issuer, another surface, another secret, another key source
-or another audience set gives another key. The setting and its rules
+or another audience set gives another key. The gateway's own agent card fetch is not a
+caller's request and carries no caller key, over Fabric at a configured card location
+included (see [`FABRIC.md`](FABRIC.md#agent-card-fetch-over-fabric)). The setting and its rules
 are in [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#surface-caller-keys), and the
 derivation in [`proxy/caller_key.rs`](../src/proxy/caller_key.rs).
 
@@ -1707,7 +1771,7 @@ sends the secret nor read it. A tenant reassignment that would give a tenant pro
 appliance-wide Direct Line secret answers `409`, whether the proxy moves into a tenant or its
 secret becomes appliance-wide.
 
-A refused Target authentication follows the usual 502 "Target authentication failed" (or
+A refused Target authentication follows the usual `500 target_auth_misconfigured` (or
 `fallback`), and a `target_auth_failed` record in the VP Audit Log names the cause. A refused legacy binding records
 `provider_unavailable` with detail `provider_forbidden`, raised before any cached token is read
 or grant is requested, and answers as in

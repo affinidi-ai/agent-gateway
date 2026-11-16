@@ -15,7 +15,7 @@ use affinidi_messaging_didcomm::Message as DIDCommMessage;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use super::communication::{TrustRegistryConnection, connection};
+use super::communication::{TrustRegistryConnection, connection, is_request_thread};
 use super::store::TrustRegistryStore;
 use super::types::{TrustRegistry, TrustRegistryConnectionStatus};
 use crate::comm::didcomm::trust_registry::PollResult;
@@ -126,16 +126,15 @@ async fn handle_message(
                 .await
             {
                 debug!("TR reader: delivered problem-report to waiter (thid {})", thid);
-            } else if connection
-                .timed_out_queries
-                .contains(&thid)
-            {
+            } else if is_request_thread(&thid) {
                 warn!(
-                    "TR reader: problem-report for '{}' answers a query that timed out (thid {}), ignoring",
-                    connection.trust_registry_id, thid
+                    // Peer-chosen: capped at 64 chars and Debug-escaped.
+                    thid = ?thid.chars().take(64).collect::<String>(),
+                    "TR reader: problem-report for '{}' answers a request no longer awaited, ignoring",
+                    connection.trust_registry_id
                 );
             } else {
-                // No query waiter → the registry rejected the gateway.
+                // Not a reply to a request → the registry rejected the gateway.
                 let code = message
                     .body
                     .get("code")
@@ -212,7 +211,6 @@ async fn update_status(
 mod tests {
     use super::*;
     use crate::trust_registries::FileSystemTrustRegistryStore;
-    use crate::trust_registries::communication::TimedOutQueries;
     use crate::trust_registries::did_manager::DidMethod;
     use crate::trust_registries::types::TrustRegistry;
     use tokio::sync::Mutex;
@@ -244,7 +242,6 @@ mod tests {
             is_temporary: false,
             client: crate::trust_registries::test_builds::offline_client().await,
             response_waiters: Arc::new(Mutex::new(HashMap::new())),
-            timed_out_queries: TimedOutQueries::default(),
         };
         (connection, Some(Arc::new(store) as Arc<dyn TrustRegistryStore>), dir)
     }
@@ -274,28 +271,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_problem_report_answering_a_timed_out_query_keeps_the_status() {
+    async fn a_problem_report_answering_a_request_no_longer_awaited_keeps_the_status() {
         let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connected).await;
-        connection
-            .timed_out_queries
-            .record("thid-timed-out");
 
-        handle_message(problem_report("thid-timed-out"), &connection, &store, &None).await;
+        let thid = format!("{}timed-out", super::super::communication::REQUEST_THREAD_PREFIX);
+        handle_message(problem_report(&thid), &connection, &store, &None).await;
 
         assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Connected);
     }
 
     #[tokio::test]
-    async fn any_other_unmatched_problem_report_marks_the_registry_failed() {
+    async fn an_unmatched_problem_report_on_any_other_thread_marks_the_registry_failed() {
         for status in [
             TrustRegistryConnectionStatus::Connecting,
             TrustRegistryConnectionStatus::AwaitingApproval,
             TrustRegistryConnectionStatus::Connected,
         ] {
             let (connection, store, _dir) = registry_with(status).await;
-            connection
-                .timed_out_queries
-                .record("thid-timed-out");
 
             handle_message(problem_report("thid-rejection"), &connection, &store, &None).await;
 

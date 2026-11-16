@@ -26,7 +26,8 @@ Feature: HTTP MCP surface forwarding
   Scenario: Missing MCP target authentication secret rejects the request when fallback is reject
     Given the gateway authenticates to the managed agent with missing secret "bdd-missing-target-secret" in header "x-target-api-key", falling back to "reject"
     When the caller asks the MCP surface for available tools
-    Then the response status is 502
+    Then the response status is 500
+    And the response reason is "target_auth_misconfigured"
     And MCP server "bravo" was not called
 
   Scenario: Missing MCP target authentication secret passes through when fallback is passthrough

@@ -83,10 +83,12 @@ pub enum RejectionReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetAuthOutcome {
-    /// Refused with 502.
+    /// Refused before it was forwarded.
     Rejected,
     /// Forwarded without the credential.
     Passthrough,
+    /// Sent, and refused by the peer gateway that checked it as its caller credential.
+    RefusedByTarget,
 }
 
 /// The detail of a `target_auth_failed` refusal. Never a token, an assertion, a token
@@ -100,6 +102,9 @@ pub struct TargetAuthRejection {
     /// The token endpoint's OAuth `error` code, when it answered with one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_error: Option<String>,
+    /// The status the peer gateway refused the credential with, for `refused_by_target`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_status: Option<u16>,
 }
 
 /// The leg of a surface whose Target Authentication a management change set.

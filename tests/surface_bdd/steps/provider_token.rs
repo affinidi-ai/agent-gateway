@@ -303,6 +303,19 @@ async fn operator_clears_provider_client_secret(world: &mut SurfaceWorld) {
     change_stored_provider(world, json!({ "client_secret_secret_ref": "" }), None).await;
 }
 
+#[when("the operator gives the credential provider a client secret")]
+async fn operator_gives_provider_client_secret(world: &mut SurfaceWorld) {
+    change_stored_provider(world, json!({ "client_secret_secret_ref": TARGET_AUTH_CLIENT_SECRET_SECRET }), None).await;
+}
+
+#[when(expr = "the operator changes the credential provider's client secret to the secret {string}")]
+async fn operator_changes_provider_client_secret(
+    world: &mut SurfaceWorld,
+    secret_id: String,
+) {
+    change_stored_provider(world, json!({ "client_secret_secret_ref": secret_id }), None).await;
+}
+
 #[given("the operator has cleared the credential provider's client authentication")]
 async fn operator_has_cleared_provider_client_authentication(world: &mut SurfaceWorld) {
     change_stored_provider(world, json!({ "client_authentication": "" }), None).await;
@@ -361,6 +374,17 @@ async fn stored_provider_has_client_authentication(
     assert_eq!(stored["client_authentication"], json!(expected), "the stored provider: {stored}");
 }
 
+#[then("the stored credential provider has no client secret")]
+async fn stored_provider_has_no_client_secret(world: &mut SurfaceWorld) {
+    let stored = stored_target_auth_provider(world).await;
+    assert!(
+        stored
+            .get("client_secret_secret_ref")
+            .is_none_or(Value::is_null),
+        "the stored provider: {stored}"
+    );
+}
+
 #[then("the stored credential provider has no client authentication")]
 async fn stored_provider_has_no_client_authentication(world: &mut SurfaceWorld) {
     let stored = stored_target_auth_provider(world).await;
@@ -372,8 +396,8 @@ async fn stored_provider_has_no_client_authentication(world: &mut SurfaceWorld) 
     );
 }
 
-#[then(expr = "the stored credential provider still has the client secret {string}")]
-async fn stored_provider_still_has_client_secret(
+#[then(expr = "the stored credential provider (still )has the client secret {string}")]
+async fn stored_provider_has_client_secret(
     world: &mut SurfaceWorld,
     secret_id: String,
 ) {
@@ -384,7 +408,7 @@ async fn stored_provider_still_has_client_secret(
 /// The Target's credential provider as the admin API returns it.
 async fn stored_target_auth_provider(world: &mut SurfaceWorld) -> Value {
     ensure_admin_session(world).await;
-    world
+    let response = world
         .admin_client
         .as_ref()
         .expect("admin client must exist")
@@ -394,8 +418,9 @@ async fn stored_target_auth_provider(world: &mut SurfaceWorld) -> Value {
             None,
         )
         .await
-        .expect("read the credential provider through the admin API")
-        .body
+        .expect("read the credential provider through the admin API");
+    assert_eq!(response.status, 200, "reading the stored credential provider answered {}", response.body);
+    response.body
 }
 
 #[then(expr = "the credential provider stores the subject {string}")]

@@ -2746,16 +2746,17 @@ async fn enrich_and_evaluate_surface_policies(
                 let mut merged = trust_check_results
                     .take()
                     .unwrap_or_default();
-                merged.target = target_elements
-                    .iter()
-                    .map(|elem| {
-                        crate::trust_registry_verification::synthesize_failure(
-                            elem,
-                            crate::trust_registry_verification::AGENT_CARD_UNAVAILABLE,
-                            "A2A proxy target agent card could not be synthesized".to_string(),
-                        )
-                    })
-                    .collect();
+                merged.target =
+                    crate::trust_registry_verification::trust_check_element::expand_authorities(target_elements)
+                        .iter()
+                        .map(|elem| {
+                            crate::trust_registry_verification::synthesize_failure(
+                                elem,
+                                crate::trust_registry_verification::AGENT_CARD_UNAVAILABLE,
+                                "A2A proxy target agent card could not be synthesized".to_string(),
+                            )
+                        })
+                        .collect();
                 trust_check_results = Some(merged);
             }
         }
@@ -2802,43 +2803,7 @@ async fn enrich_and_evaluate_surface_policies(
             .flatten()
             .map(|prepared| prepared.card)
         } else {
-            let card_url = if surface.override_agent_card_location()
-                && surface
-                    .agent_card_location_path()
-                    .is_some()
-            {
-                let custom_path = surface
-                    .agent_card_location_path()
-                    .unwrap();
-                let target_endpoint = surface.target_endpoint();
-                let origin = if let Some(scheme_end) = target_endpoint.find("://") {
-                    let after_scheme = &target_endpoint[scheme_end + 3..];
-                    let authority_end = after_scheme
-                        .find('/')
-                        .unwrap_or(after_scheme.len());
-                    &target_endpoint[..scheme_end + 3 + authority_end]
-                } else {
-                    target_endpoint
-                };
-                if custom_path.starts_with('/') {
-                    format!("{}{}", origin, custom_path)
-                } else {
-                    format!("{}/{}", origin, custom_path)
-                }
-            } else {
-                format!(
-                    "{}/.well-known/agent.json",
-                    surface
-                        .target_endpoint()
-                        .trim_end_matches('/')
-                )
-            };
-            channel_info!(config_id, "GW2: Fetching agent card from: {}", loggable::url(&card_url));
-            let timeout = GLOBAL_FORWARD_TIMEOUT
-                .get()
-                .copied()
-                .unwrap_or(std::time::Duration::from_secs(30));
-            fetch_agent_card(&card_url, timeout, fabric_body_limits(surface), config_id).await
+            policy_agent_card(surface, config_id).await
         };
         channel_info!(config_id, "GW2: Agent card obtained: {}", card_json.is_some());
         let agent_ctx =
@@ -3221,6 +3186,49 @@ async fn axum_response_to_forward_result(response: axum::http::Response<axum::bo
     }
 }
 
+/// The header of the one caller credential this gateway verified and refused: the method
+/// read it from a header the request carries, and no other method's credential came with
+/// it. `None` for a missing credential, ambiguous credentials, or one not read from a header.
+fn refused_credential_header<'a>(
+    method: &'a crate::source_auth::SourceAuthConfig,
+    ambiguous: bool,
+    headers: &axum::http::HeaderMap,
+) -> Option<&'a str> {
+    if ambiguous || !method.is_presented(headers, false) {
+        return None;
+    }
+    method.credential_header_name()
+}
+
+/// The header of the bearer token a protected MCP surface verified and refused with `401`;
+/// `None` when no token came or the refusal is not of the token itself.
+fn refused_bearer_header(error: crate::protocols::protected_resource::ResourceTokenError) -> Option<&'static str> {
+    (error == crate::protocols::protected_resource::ResourceTokenError::Invalid).then_some("authorization")
+}
+
+/// Marks this gateway's own refusal of a caller credential in the ForwardResponse envelope,
+/// beside `status`, so the sending gateway learns which header held the refused credential.
+/// The HTTP body is left as it is.
+fn with_caller_refusal(
+    result: ProcessingResult,
+    credential_header: Option<&str>,
+) -> ProcessingResult {
+    match (result, credential_header) {
+        (
+            ProcessingResult::RequiresResponse {
+                response_type,
+                mut response_body,
+            },
+            Some(header),
+        ) => {
+            response_body[crate::proxy::fabric_forward::CALLER_REFUSAL_FIELD] =
+                serde_json::json!({ "credential_header": header.to_ascii_lowercase() });
+            ProcessingResult::RequiresResponse { response_type, response_body }
+        }
+        (result, _) => result,
+    }
+}
+
 async fn process_modern_fabric_response<Process, ProcessFuture>(
     response: reqwest::Response,
     headers: axum::http::HeaderMap,
@@ -3563,12 +3571,144 @@ fn fabric_body_limits(
     )
 }
 
+/// Whether a Target response header reaches the peer on the gateway's own agent
+/// card fetch. The fetch carried the Target credential, so only headers that
+/// describe the card pass; a session cookie or authentication answer stays here.
+fn is_relayed_from_credentialed_card_fetch(name: &str) -> bool {
+    ["content-type", "content-language", "cache-control", "etag", "last-modified", "vary"]
+        .iter()
+        .any(|relayed| name.eq_ignore_ascii_case(relayed))
+}
+
+/// The status and body that answer the peer when the Target does not answer the gateway's own
+/// agent card fetch with a `2xx`, so nothing the Target said about the gateway's credential
+/// reaches the peer. A redirect, which the gateway never follows and whose `Location` is not
+/// relayed, answers `502` "Upstream redirected", as on the direct path; any other status is
+/// relayed with the body "Upstream error: <status>".
+fn credentialed_card_fetch_refusal(target_status: u16) -> (u16, String) {
+    let (status, title, detail) = if (300..400).contains(&target_status) {
+        (502, "Bad Gateway", crate::proxy::handler::UPSTREAM_REDIRECTED.to_string())
+    } else {
+        (target_status, "Upstream error", format!("Upstream error: {target_status}"))
+    };
+    let body = serde_json::json!({
+        "type": "about:blank",
+        "title": title,
+        "status": status,
+        "detail": detail,
+    })
+    .to_string();
+    (status, body)
+}
+
+/// The local Target's agent card for the GW2 policy context: the configured card
+/// location on the Target's origin, or `/.well-known/agent.json` under the Target
+/// endpoint, fetched as the gateway itself with the surface's Target
+/// authentication, resolved from the gateway's secrets store. A credential that
+/// cannot be resolved yields no card, or under `fallback: passthrough` a card
+/// read without it. The outcome is cached per surface and Target authentication
+/// for the card cache's TTLs, so a request neither fetches the card nor resolves
+/// the credential again, and a variant with its own Target authentication reads
+/// its own card. A Target that is not an `http(s)` URL, such as a `proxy://` MCP
+/// proxy, has no card to read, so no credential is resolved for it.
+async fn policy_agent_card(
+    surface: &crate::config::agent_surface::AgentSurface,
+    config_id: &str,
+) -> Option<serde_json::Value> {
+    if !crate::config::agent_surface::endpoint_is_http_url(surface.target_endpoint()) {
+        return None;
+    }
+    let card_url = match surface.agent_card_location_path() {
+        Some(_) => crate::proxy::handler::agent_card::card_target_url(surface),
+        None => format!(
+            "{}/.well-known/agent.json",
+            surface
+                .target_endpoint()
+                .trim_end_matches('/')
+        ),
+    };
+    let target_auth = serde_json::to_string(&surface.target.auth).unwrap_or_default();
+    if let Some(card) =
+        crate::proxy::agent_card_cache::lookup_surface_card(&surface.surface_id, &card_url, &target_auth)
+    {
+        return card;
+    }
+    let card = read_policy_agent_card(surface, &card_url, config_id).await;
+    crate::proxy::agent_card_cache::insert_surface_card(&surface.surface_id, &card_url, &target_auth, card.clone());
+    card
+}
+
+async fn read_policy_agent_card(
+    surface: &crate::config::agent_surface::AgentSurface,
+    card_url: &str,
+    config_id: &str,
+) -> Option<serde_json::Value> {
+    let credential = match surface.target_auth() {
+        Some(target_auth) => {
+            if !crate::proxy::paths::is_target_credential_destination(
+                surface.target_endpoint(),
+                "GET",
+                card_url,
+                surface.agent_card_location_path(),
+            ) {
+                channel_warn!(
+                    config_id,
+                    "GW2: No agent card for policy: {} is outside the Target, so it is not read with the Target credential",
+                    loggable::url(card_url)
+                );
+                return None;
+            }
+            let secrets = get_secrets_store();
+            let providers = get_credential_provider_store();
+            let vault = get_delegation_vault_store();
+            let context = crate::proxy::handler::TargetAuthContext::of_surface(
+                surface,
+                secrets.as_ref(),
+                providers.as_ref(),
+                vault.as_ref(),
+            );
+            match crate::proxy::handler::resolve_target_credential(
+                target_auth,
+                &context,
+                &surface.name,
+                crate::proxy::handler::CallerAssertion::GatewayOriginated,
+            )
+            .await
+            {
+                Ok(credential) => credential,
+                Err(error) if target_auth.fallback == crate::config::TargetAuthFallback::Passthrough => {
+                    channel_warn!(
+                        config_id,
+                        "GW2: Reading the agent card for policy without target authentication: {}",
+                        error
+                    );
+                    None
+                }
+                Err(error) => {
+                    channel_warn!(config_id, "GW2: No agent card for policy: target authentication failed: {}", error);
+                    return None;
+                }
+            }
+        }
+        None => None,
+    };
+    channel_info!(config_id, "GW2: Fetching agent card from: {}", loggable::url(card_url));
+    let timeout = GLOBAL_FORWARD_TIMEOUT
+        .get()
+        .copied()
+        .unwrap_or(std::time::Duration::from_secs(30));
+    fetch_agent_card(card_url, credential.as_ref(), timeout, fabric_body_limits(surface), config_id).await
+}
+
 /// Fetch the local Target's agent card for the GW2 policy context, through the
 /// same pinned, redirect-free client as the forward and within the buffered
-/// response bounds. Any failure, including a blocked target or a redirect,
-/// yields no card.
+/// response bounds, with `credential` as its only header. A provider token the
+/// Target refuses as `invalid_token` is dropped, as on the forward, so the next
+/// read asks the provider for a new one. Any failure, including a blocked target
+/// or a redirect, yields no card.
 async fn fetch_agent_card(
     card_url: &str,
+    credential: Option<&crate::proxy::handler::TargetCredential>,
     timeout: std::time::Duration,
     limits: crate::proxy::upstream_body::UpstreamBodyLimits,
     config_id: &str,
@@ -3585,11 +3725,15 @@ async fn fetch_agent_card(
             return None;
         }
     };
-    let response = match client
-        .get(card_url)
-        .send()
-        .await
+    let mut request = client.get(card_url);
+    if let Some(crate::proxy::handler::TargetCredential {
+        header: (header_name, header_value),
+        ..
+    }) = credential
     {
+        request = request.header(header_name.as_str(), header_value.as_str());
+    }
+    let response = match request.send().await {
         Ok(response) => response,
         Err(e) => {
             channel_warn!(
@@ -3601,6 +3745,14 @@ async fn fetch_agent_card(
             return None;
         }
     };
+    crate::proxy::handler::forget_refused_target_token(
+        get_delegation_vault_store().as_deref(),
+        credential.and_then(|credential| credential.issued.as_ref()),
+        config_id,
+        response.status().as_u16(),
+        response.headers(),
+    )
+    .await;
     channel_info!(config_id, "GW2: Agent card fetch HTTP status: {}", response.status());
     if !response.status().is_success() {
         channel_warn!(config_id, "GW2: Agent card fetch returned non-success status: {}", response.status());
@@ -3618,8 +3770,12 @@ async fn fetch_agent_card(
             channel_info!(
                 config_id,
                 "GW2: Agent card fetched successfully: name={:?} url={:?}",
-                card.get("name"),
+                card.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(loggable::untrusted),
                 card.get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .map(loggable::url)
             );
             Some(card)
         }
@@ -4903,7 +5059,8 @@ async fn process_charged_forward_request(
                 Ok(identity) => identity,
                 Err(error) => {
                     token_refused(error);
-                    return axum_response_to_forward_result(authorization.challenge(error)).await;
+                    let refusal = axum_response_to_forward_result(authorization.challenge(error)).await;
+                    return with_caller_refusal(refusal, refused_bearer_header(error));
                 }
             };
             if let Some(headers) = headers.as_mut() {
@@ -4998,8 +5155,12 @@ async fn process_charged_forward_request(
                             refused,
                             None,
                         );
+                        let refused_header =
+                            refused_credential_header(auth_config, selection.ambiguous, &axum_headers);
                         if challenged && let Some(protected_resource) = &protected_resource {
-                            return axum_response_to_forward_result(protected_resource.fabric_refusal(&e)).await;
+                            let refusal =
+                                axum_response_to_forward_result(protected_resource.fabric_refusal(&e)).await;
+                            return with_caller_refusal(refusal, refused_header);
                         }
                         if refused {
                             let refusal = crate::source_auth::errors::caller_refusal(
@@ -5007,7 +5168,7 @@ async fn process_charged_forward_request(
                                 &resolved_auth_config,
                                 refused_mcp_request_id(&surface, &body_bytes),
                             );
-                            return axum_response_to_forward_result(refusal).await;
+                            return with_caller_refusal(axum_response_to_forward_result(refusal).await, refused_header);
                         }
                         source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
                             attempted_method: resolved_auth_config.method_tag().to_string(),
@@ -5757,35 +5918,23 @@ async fn process_charged_forward_request(
         .await;
     }
 
-    // Build the target URL (path includes query params if present)
-    // When override_agent_card_location is enabled and this is an agent card request,
-    // use the custom path relative to the target's origin (scheme + host + port),
-    // stripping any sub-path from target_endpoint.
-    let target_url = if is_agent_card_request
-        && surface.override_agent_card_location()
-        && surface.agent_card_location_path().is_some()
-    {
-        let custom_path = surface.agent_card_location_path().unwrap();
-        let target_endpoint = surface.target_endpoint();
-        let origin = if let Some(scheme_end) = target_endpoint.find("://") {
-            let after_scheme = &target_endpoint[scheme_end + 3..];
-            let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
-            &target_endpoint[..scheme_end + 3 + authority_end]
-        } else {
-            target_endpoint
-        };
-        let url = if custom_path.starts_with('/') {
-            format!("{}{}", origin, custom_path)
-        } else {
-            format!("{}/{}", origin, custom_path)
-        };
-        channel_info!(
-            config_id,
-            "Agent card location override applied: {} (origin={}, custom_path={})",
-            loggable::url(&url),
-            loggable::origin(origin),
-            custom_path
-        );
+    // A card fetch on a surface with Target authentication is the gateway's own
+    // request, as on the direct path: a bodiless GET of the card path that keeps
+    // only content-negotiation headers from the peer, and carries no caller's
+    // delegated credential, caller key or transit token.
+    let credentialed_card_fetch =
+        surface.target_auth().is_some() && crate::proxy::handler::is_fabric_card_fetch(&surface, method, path);
+    if credentialed_card_fetch {
+        body_bytes = Default::default();
+        outbound_creds.clear();
+        modern_delegation = None;
+    }
+
+    // An agent card request at a configured card location goes to that path on the
+    // Target's origin, dropping any sub-path of the Target endpoint.
+    let target_url = if (is_agent_card_request || credentialed_card_fetch) && surface.agent_card_location_path().is_some() {
+        let url = crate::proxy::handler::agent_card::card_target_url(&surface);
+        channel_info!(config_id, "Agent card location override applied: {}", loggable::url(&url));
         url
     } else {
         join_endpoint_path(surface.target_endpoint(), path)
@@ -5793,9 +5942,10 @@ async fn process_charged_forward_request(
 
     channel_info!(
         config_id,
-        "🌐 Making HTTP request: {} {}",
+        "🌐 Making HTTP request: {} {}{}",
         method.to_uppercase(),
-        loggable::url(&target_url)
+        loggable::url(&target_url),
+        if credentialed_card_fetch { " as the gateway's own agent card GET" } else { "" }
     );
 
     // Start timer for latency measurement
@@ -5852,6 +6002,9 @@ async fn process_charged_forward_request(
     if let Some(ref headers_map) = headers {
         channel_info!(config_id, "  ↳ Adding {} headers", headers_map.len());
         for (key, value) in headers_map {
+            if credentialed_card_fetch && !crate::proxy::handler::is_forwarded_on_credentialed_card_fetch(key) {
+                continue;
+            }
             let key_lower = key.to_lowercase();
             if key_lower == "content-type" {
                 has_content_type = true;
@@ -5918,8 +6071,9 @@ async fn process_charged_forward_request(
             surface.agent_card_location_path(),
         ) {
             channel_warn!(config_id, "Refusing a request outside the Target base path: it would carry the Target credential");
-            crate::proxy::handler::record_target_auth_refusal(&audit_facts, None, target_auth);
-            return target_auth_failed_result(TARGET_AUTH_FAILED);
+            let refusal = crate::proxy::handler::TargetAuthFailure::PathRefused;
+            crate::proxy::handler::record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
+            return target_auth_failure_result(refusal);
         }
         // Build a secrets store from the storage path passed via message context
         let secrets_store: Option<Arc<dyn crate::secrets::SecretsStore>> = match message
@@ -5975,7 +6129,7 @@ async fn process_charged_forward_request(
                 crate::proxy::handler::record_target_auth_failure(&audit_facts, None, target_auth, &e);
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
-                        return target_auth_failed_result(TARGET_AUTH_CONFIGURATION_ERROR);
+                        return target_auth_failure_result(e.failure());
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         channel_warn!(
@@ -5988,13 +6142,14 @@ async fn process_charged_forward_request(
         }
     }
 
-    if let Some((header_name, header_value)) = crate::proxy::caller_key::caller_key_header(
-        &surface,
-        surface.target_endpoint(),
-        authenticated_identity.as_ref(),
-        get_secrets_store().as_ref(),
-    )
-    .await
+    if !credentialed_card_fetch
+        && let Some((header_name, header_value)) = crate::proxy::caller_key::caller_key_header(
+            &surface,
+            surface.target_endpoint(),
+            authenticated_identity.as_ref(),
+            get_secrets_store().as_ref(),
+        )
+        .await
     {
         req = crate::proxy::handler::replace_request_header(req, &header_name, &header_value);
     }
@@ -6284,8 +6439,10 @@ async fn process_charged_forward_request(
     // trace. Normally this is the request's own trace (`REQUEST_TRACE_ID`); when the
     // surface terminates traces we forward a FRESH id instead, so this gateway's own
     // VP/audit keep the incoming trace (past stays traceable) while the downstream
-    // chain is isolated from it.
-    let onward_trace_id = if surface.access_point.terminate_trace_id {
+    // chain is isolated from it. The gateway's own agent card fetch carries none.
+    let onward_trace_id = if credentialed_card_fetch {
+        None
+    } else if surface.access_point.terminate_trace_id {
         Some(uuid::Uuid::new_v4().to_string())
     } else {
         crate::observability::policy_audit::current_span_trace_id()
@@ -6304,7 +6461,7 @@ async fn process_charged_forward_request(
             .map(|network| network.transit_token_max_lifetime_secs),
         &surface,
         &target_url,
-        is_agent_card_request,
+        is_agent_card_request || credentialed_card_fetch,
         &FabricReceiveCaller {
             peer_gateway_id: &sender.id,
             peer_issuer_did: sender.issuer_did.as_deref(),
@@ -6540,6 +6697,21 @@ async fn process_charged_forward_request(
             // Start response timer (measures response processing time)
             let response_start = std::time::Instant::now();
             let status = response.status().as_u16();
+            let card_fetch_refusal =
+                (credentialed_card_fetch && !(200..300).contains(&status)).then(|| credentialed_card_fetch_refusal(status));
+            if let Some((answered, _)) = &card_fetch_refusal
+                && *answered != status
+            {
+                channel_warn!(
+                    config_id,
+                    "GW2: The Target redirected the gateway's own agent card fetch (status {}); answering {}",
+                    status,
+                    answered
+                );
+            }
+            let status = card_fetch_refusal
+                .as_ref()
+                .map_or(status, |(answered, _)| *answered);
 
             // MCP Legacy SSE fallback: if the upstream rejects a plain POST
             // (400/404/405), it likely only supports Legacy SSE transport.
@@ -6647,7 +6819,8 @@ async fn process_charged_forward_request(
                         | "trailers"
                         | "upgrade"
                         | "content-length" // Skip content-length - will be set by HTTP layer
-                ) {
+                ) || (credentialed_card_fetch && !is_relayed_from_credentialed_card_fetch(&key_lower))
+                {
                     continue;
                 }
                 if let Ok(v_str) = v.to_str() {
@@ -6675,7 +6848,14 @@ async fn process_charged_forward_request(
                 (Some(response), String::new())
             } else {
                 match read_forward_target_body(response, is_sse_response, &body_bytes, fabric_body_limits(&surface), config_id).await {
-                    Ok(body) => (None, body),
+                    Ok(body) => match card_fetch_refusal {
+                        Some((_, refusal)) => {
+                            response_headers.retain(|name, _| !name.eq_ignore_ascii_case("content-type"));
+                            response_headers.insert("content-type".to_string(), vec!["application/problem+json".to_string()]);
+                            (None, refusal)
+                        }
+                        None => (None, body),
+                    },
                     Err(error) => return ForwardRefusal::from(error).into_forward_response(&body_bytes).await,
                 }
             };
@@ -6760,7 +6940,7 @@ async fn process_charged_forward_request(
             }
 
             // GW2: Inject trust registry extension into agent card responses for fabric requests
-            if is_agent_card_request && status == 200 && !response_body.is_empty() {
+            if (is_agent_card_request || credentialed_card_fetch) && status == 200 && !response_body.is_empty() {
                 info!(
                     config_id,
                     "GW2: Agent card response detected, checking for trust registry injection"
@@ -7459,6 +7639,7 @@ async fn process_charged_forward_request(
                     crate::config::ChannelProtocol::A2a | crate::config::ChannelProtocol::Ap2
                 );
                 let is_card_response = is_agent_card_request
+                    || credentialed_card_fetch
                     || (is_a2a_surface
                         && (crate::a2a::url_rewriter::extended_agent_card_request_id(&body_bytes).is_some()
                             || crate::proxy::paths::is_rest_extended_agent_card_request(
@@ -8295,24 +8476,25 @@ fn fabric_mcp_tool_policy_error(
     mcp_forward_error_response(id, crate::mcp::error_codes::INTERNAL_ERROR, "Internal error: policy evaluation failed")
 }
 
-const TARGET_AUTH_CONFIGURATION_ERROR: &str = "Target authentication configuration error";
-
-/// The 502 a Fabric receive answers when the Target credential cannot be sent.
-fn target_auth_failed_result(detail: &str) -> ProcessingResult {
+/// What a Fabric receive answers when the Target credential cannot be sent: the failure's
+/// status and `reason`, with the generic detail.
+fn target_auth_failure_result(failure: crate::proxy::handler::TargetAuthFailure) -> ProcessingResult {
+    let status = failure.status();
     ProcessingResult::RequiresResponse {
         response_type: MessageType::ForwardResponse.to_string(),
         response_body: serde_json::json!({
-            "status": 502,
+            "status": status.as_u16(),
             "headers": {
                 "content-type": "application/problem+json",
             },
             "body": serde_json::json!({
                 "type": "about:blank",
-                "title": "Bad Gateway",
-                "status": 502,
-                "detail": detail,
+                "title": status.canonical_reason().unwrap_or("Error"),
+                "status": status.as_u16(),
+                "detail": TARGET_AUTH_FAILED,
+                "reason": failure.reason(),
             }).to_string(),
-            "error": detail,
+            "error": TARGET_AUTH_FAILED,
         }),
     }
 }
@@ -8904,7 +9086,7 @@ async fn handle_mcp_proxy_forward(
                 crate::proxy::handler::record_target_auth_failure(&audit_facts, None, target_auth, &e);
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
-                        return target_auth_failed_result(TARGET_AUTH_CONFIGURATION_ERROR);
+                        return target_auth_failure_result(e.failure());
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         channel_warn!(
@@ -9111,10 +9293,11 @@ async fn handle_mcp_proxy_forward(
             }
         }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::OutsideTargetBase) => {
+            let refusal = crate::proxy::handler::TargetAuthFailure::PathRefused;
             if let Some(target_auth) = surface.target_auth() {
-                crate::proxy::handler::record_target_auth_refusal(&audit_facts, None, target_auth);
+                crate::proxy::handler::record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
             }
-            target_auth_failed_result(TARGET_AUTH_FAILED)
+            target_auth_failure_result(refusal)
         }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::Failed(error_msg)) => {
             let config_id = surface
@@ -9444,6 +9627,9 @@ mod mcp_receive_tests;
 mod fabric_transit_tests;
 
 #[cfg(test)]
+mod fabric_card_fetch_tests;
+
+#[cfg(test)]
 mod fabric_caller_key_tests;
 
 #[cfg(test)]
@@ -9461,6 +9647,67 @@ mod tests {
     use crate::gateways::connection_points::messages::{MessageMetadata, ReceivedMessage};
     use axum::body::Body;
     use axum::http::{Response, StatusCode};
+
+    fn api_key_method() -> crate::source_auth::SourceAuthConfig {
+        serde_json::from_value(serde_json::json!({
+            "type": "api_key", "secret_id": "caller-key",
+            "extraction": {"source": "http_header", "field": "X-API-Key"}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn only_a_presented_unambiguous_header_credential_is_named_as_refused() {
+        let method = api_key_method();
+        let mut presented = axum::http::HeaderMap::new();
+        presented.insert("x-api-key", axum::http::HeaderValue::from_static("wrong"));
+
+        assert_eq!(refused_credential_header(&method, false, &presented), Some("X-API-Key"));
+        assert_eq!(refused_credential_header(&method, true, &presented), None, "ambiguous credentials");
+        assert_eq!(
+            refused_credential_header(&method, false, &axum::http::HeaderMap::new()),
+            None,
+            "a missing credential"
+        );
+    }
+
+    #[test]
+    fn a_caller_refusal_is_marked_in_the_envelope_and_never_in_the_body() {
+        let refusal = || ProcessingResult::RequiresResponse {
+            response_type: MessageType::ForwardResponse.to_string(),
+            response_body: serde_json::json!({"status": 401, "headers": {}, "body": "{\"detail\":\"refused\"}"}),
+        };
+        let ProcessingResult::RequiresResponse { response_body, .. } =
+            with_caller_refusal(refusal(), Some("X-API-Key"))
+        else {
+            panic!("expected RequiresResponse");
+        };
+        assert_eq!(response_body["caller_refusal"], serde_json::json!({"credential_header": "x-api-key"}));
+        assert_eq!(response_body["body"], "{\"detail\":\"refused\"}");
+
+        let ProcessingResult::RequiresResponse { response_body, .. } = with_caller_refusal(refusal(), None) else {
+            panic!("expected RequiresResponse");
+        };
+        assert!(
+            response_body
+                .get("caller_refusal")
+                .is_none(),
+            "{response_body}"
+        );
+    }
+
+    #[test]
+    fn only_a_refused_bearer_token_names_its_header_as_the_refused_credential() {
+        use crate::protocols::protected_resource::ResourceTokenError;
+        for (error, expected) in [
+            (ResourceTokenError::Invalid, Some("authorization")),
+            (ResourceTokenError::Missing, None),
+            (ResourceTokenError::InsufficientScope, None),
+            (ResourceTokenError::Unavailable, None),
+        ] {
+            assert_eq!(refused_bearer_header(error), expected, "{error:?}");
+        }
+    }
 
     #[test]
     fn a_gateway_info_query_is_answered_with_null_info() {
@@ -10920,7 +11167,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await });
         let fetch = |path: &str| {
             let url = format!("http://{address}{path}");
-            async move { fetch_agent_card(&url, PATIENT, limits(1024, Some(PATIENT), PATIENT), "surface-1").await }
+            async move { fetch_agent_card(&url, None, PATIENT, limits(1024, Some(PATIENT), PATIENT), "surface-1").await }
         };
 
         assert_eq!(fetch("/card").await, Some(serde_json::json!({"name": "card"})));

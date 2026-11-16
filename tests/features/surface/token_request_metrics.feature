@@ -26,7 +26,8 @@ Feature: Credential provider token request metrics
     And the gateway authenticates to the managed agent with a client credentials provider
     And the credential provider's token endpoint is not listening
     When the caller sends a request to the surface
-    Then the response status is 502
+    Then the response status is 503
+    And the response reason is "target_auth_unavailable"
     And the token request metric counts 1 "refused" request for provider type "oauth2_client_credentials"
     And the token request metric counts 0 "success" request for provider type "oauth2_client_credentials"
 
@@ -35,6 +36,7 @@ Feature: Credential provider token request metrics
     And the gateway authenticates to the managed agent with a client credentials provider
     And the credential provider answers token requests with no access token
     When the caller sends a request to the surface
-    Then the response status is 502
+    Then the response status is 503
+    And the response reason is "target_auth_unavailable"
     And the token request metric counts 1 "invalid_response" request for provider type "oauth2_client_credentials"
     And the token request metric counts 0 "success" request for provider type "oauth2_client_credentials"

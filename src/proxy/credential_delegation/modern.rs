@@ -1766,6 +1766,16 @@ mod tests {
             Err(ContinuationError::Denied)
         ));
         assert_eq!(calls(), 3);
+        assert!(
+            matches!(
+                context
+                    .service_credential(&selected[0], now)
+                    .await,
+                Err(ContinuationError::Denied)
+            ),
+            "a request the retry backoff holds back is denied like the scope mismatch that started it"
+        );
+        assert_eq!(calls(), 3, "the held back request sends no token request");
 
         let unlisted = crate::delegation_vault::oauth::TokenEgress {
             exact_allowlist: None,
@@ -1777,12 +1787,11 @@ mod tests {
             variant_id: context.variant_id.clone(),
             ..context
         };
-        assert!(matches!(
-            blocked
-                .service_credential(&selected[0], now)
-                .await,
-            Err(ContinuationError::Unavailable)
-        ));
+        let after_the_backoff = now + 2;
+        let refused = blocked
+            .service_credential(&selected[0], after_the_backoff)
+            .await;
+        assert!(matches!(refused, Err(ContinuationError::Unavailable)), "{refused:?}");
         assert_eq!(calls(), 3);
         tasks.shutdown().await;
     }

@@ -3,7 +3,7 @@ Feature: Credential policy on a Transit Point
   credential, with a stored credential provider is held to the bootstrap credential policy
   like the Access Point. In warn mode the call is forwarded with the provider's token; in
   enforce mode the credential is withheld before any token request, and the fallback
-  decides whether the call fails or goes on without it. A Transit Point checks its callers
+  decides whether the call fails with 500 or goes on without it. A Transit Point checks its callers
   when it requires a transit token or has its own source authentication; one that checks
   callers' MCP authorization is covered by the save rules and unit tests. A target endpoint
   that refuses the Transit Point's token as invalid does not make the gateway drop it. A
@@ -30,7 +30,8 @@ Feature: Credential policy on a Transit Point
     And the credential provider has a plain http token endpoint
     And the gateway enforces the credential rule "token_endpoint_https"
     When managed agent "example-agent" asks for available tools through Transit Point "alpha"
-    Then the response status is 502
+    Then the response status is 500
+    And the response reason is "target_auth_misconfigured"
     And the credential provider received 0 token requests
     And MCP server "bravo" was not called
 
@@ -47,7 +48,8 @@ Feature: Credential policy on a Transit Point
     And the gateway authenticates to the destination of Transit Point "alpha" with a client credentials provider
     And the gateway enforces the credential rule "tenant_credential_isolation"
     When managed agent "example-agent" asks for available tools through Transit Point "alpha"
-    Then the response status is 502
+    Then the response status is 500
+    And the response reason is "target_auth_misconfigured"
     And the credential provider received 0 token requests
     And MCP server "bravo" was not called
 
@@ -86,7 +88,8 @@ Feature: Credential policy on a Transit Point
     And the gateway keeps its log of warnings
     And the VP Audit Log keeps every audit event
     When managed agent "example-agent" asks for available tools through Transit Point "alpha"
-    Then the response status is 502
+    Then the response status is 500
+    And the response reason is "target_auth_misconfigured"
     And the credential provider received 0 token requests
     And MCP server "bravo" was not called
     And the gateway log has no warning containing "it will be withheld once credential_policy.target_https is enforce"
@@ -118,7 +121,8 @@ Feature: Credential policy on a Transit Point
     And the gateway keeps its log of warnings
     And the VP Audit Log keeps every audit event
     When managed agent "example-agent" asks for available tools through Transit Point "alpha"
-    Then the response status is 502
+    Then the response status is 500
+    And the response reason is "target_auth_misconfigured"
     And the credential provider received 0 token requests
     And MCP server "bravo" was not called
     And the gateway log has no warning containing "it will be withheld once credential_policy.target_source_auth is enforce"
@@ -131,7 +135,8 @@ Feature: Credential policy on a Transit Point
     And the gateway enforces the credential rule "target_source_auth"
     And the VP Audit Log keeps every audit event
     When managed agent "example-agent" asks for available tools through Transit Point "alpha"
-    Then the response status is 502
+    Then the response status is 500
+    And the response reason is "target_auth_misconfigured"
     And the credential provider received 0 token requests
     And MCP server "bravo" was not called
     And the VP Audit Log records a Target credential of Transit Point "alpha" that was not sent, with outcome "rejected"
@@ -189,8 +194,8 @@ Feature: Credential policy on a Transit Point
     Given the gateway authenticates to the destination of Transit Point "alpha" with a client credentials provider
     And the target endpoint of Transit Point "alpha" has the base path "/base"
     When managed agent "example-agent" asks for available tools through the Transit Point path "<path>" exactly as written
-    Then the response status is 502
-    And the response mentions "Target authentication credentials unavailable"
+    Then the response status is 400
+    And the response reason is "target_path_refused"
     And MCP server "bravo" was not called
 
     Examples:
@@ -225,3 +230,10 @@ Feature: Credential policy on a Transit Point
     Then the response status is 200
     And MCP server "bravo" received header "x-agent-note" with value "agent-chosen-value"
     And MCP server "bravo" did not receive header "x-target-api-key"
+
+  Scenario: A Transit Point whose Target credential secret is missing refuses the call as misconfigured
+    Given the gateway authenticates to the destination of Transit Point "alpha" with missing secret "bdd-missing-target-secret" in header "X-Target-Api-Key", falling back to "reject"
+    When managed agent "example-agent" asks for available tools through Transit Point "alpha"
+    Then the response status is 500
+    And the response reason is "target_auth_misconfigured"
+    And MCP server "bravo" was not called

@@ -19,6 +19,7 @@ pub use version::{ADVERTISED_VERSION, negotiate_from_headers};
 
 pub use auth::clear_secret_cache;
 pub use errors::create_error_response;
+pub use errors::create_error_response_with_reason;
 pub use errors::create_identity_error_response;
 pub use errors::create_jsonrpc_error_response;
 pub use errors::create_version_not_supported_response;

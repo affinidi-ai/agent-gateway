@@ -254,6 +254,9 @@ describe('EditCredentialProviderPage tenant-aware secrets and https error', () =
     );
     expect(warning).toHaveTextContent('on a provider whose type is unchanged');
     expect(warning).toHaveTextContent('still accepted while token_endpoint_https is warn');
+    expect(warning).toHaveTextContent(
+      'unless the save starts sending a client secret (a client authentication that sends one, or a client secret the provider did not have)'
+    );
     expect(warning).not.toHaveTextContent('refuses to save any other http endpoint');
     const input = screen.getByDisplayValue('http://idp.internal/token');
     expect(input).not.toHaveClass('is-invalid');

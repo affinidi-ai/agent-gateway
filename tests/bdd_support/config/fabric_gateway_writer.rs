@@ -20,8 +20,11 @@ use crate::bdd_support::config::modern_consent;
 use crate::bdd_support::config::policy_definitions::{
     PolicyDefinitionFixtureKind, inbound_policy_definition_id, policy_definition_id as kinded_policy_definition_id,
 };
+use crate::bdd_support::config::single_surface_writer::{target_auth_provider_fixture, target_auth_provider_secrets};
 use crate::bdd_support::config::source_auth::api_key_source_auth_method_json;
-use crate::bdd_support::config::target_auth::static_secret_target_auth_json;
+use crate::bdd_support::config::target_auth::{
+    TARGET_AUTH_PROVIDER_ID, credential_provider_target_auth_json, static_secret_target_auth_json,
+};
 
 /// Write the full config tree for one gateway listening on `gateway_port` and
 /// exposing `surfaces`.
@@ -64,6 +67,12 @@ pub fn write_fabric_gateway_config(
                 .mcp_proxies
                 .insert(proxy.proxy_id.clone(), proxy.clone());
         }
+        if let Some(provider) = &surface.target_auth_provider {
+            let replaced = config_tree
+                .credential_providers
+                .insert(TARGET_AUTH_PROVIDER_ID.to_string(), target_auth_provider_fixture(provider));
+            assert!(replaced.is_none(), "only one surface per gateway may authenticate with the credential provider");
+        }
     }
 
     write_gateway_config_tree(base_dir, &config_tree, true);
@@ -72,6 +81,11 @@ pub fn write_fabric_gateway_config(
 /// Deterministic policy-definition id derived from the surface id.
 pub fn policy_definition_id(surface_id: &str) -> String {
     inbound_policy_definition_id(surface_id)
+}
+
+/// Deterministic surface request policy (`target.policy`) id for a surface.
+fn target_policy_definition_id(surface_id: &str) -> String {
+    format!("{surface_id}-target-request-policy")
 }
 
 /// Deterministic transit-level (outbound) policy-definition id for a surface.
@@ -98,6 +112,9 @@ fn secret_fixtures(surface: &SurfaceSpec) -> Vec<SecretFixture> {
     {
         secrets.push(SecretFixture::new(&target_auth.secret_id, secret_value));
     }
+    if let Some(provider) = &surface.target_auth_provider {
+        secrets.extend(target_auth_provider_secrets(provider));
+    }
     secrets
 }
 
@@ -107,6 +124,13 @@ fn policy_fixtures(surface: &SurfaceSpec) -> Vec<PolicyDefinitionFixture> {
         policies.push(PolicyDefinitionFixture::new(
             policy_definition_id(&surface.surface_id),
             "g2g BDD inbound policy",
+            rego,
+        ));
+    }
+    if let Some(rego) = &surface.target_policy_rego {
+        policies.push(PolicyDefinitionFixture::new(
+            target_policy_definition_id(&surface.surface_id),
+            "g2g BDD surface request policy",
             rego,
         ));
     }
@@ -156,6 +180,16 @@ fn build_surface_fixture(
     }
 
     if surface
+        .target_policy_rego
+        .is_some()
+    {
+        fixture = fixture.with_target_policy_definition_id(target_policy_definition_id(&surface.surface_id));
+    }
+    if let Some(path) = &surface.agent_card_path {
+        fixture = fixture.with_agent_card_path(path);
+    }
+
+    if surface
         .inbound_policy_rego
         .is_some()
     {
@@ -200,6 +234,10 @@ fn build_surface_fixture(
             &target_auth.header_format,
             &target_auth.fallback,
         ));
+    }
+    if let Some(provider) = &surface.target_auth_provider {
+        fixture =
+            fixture.with_target_auth(credential_provider_target_auth_json(TARGET_AUTH_PROVIDER_ID, &provider.fallback));
     }
     if let Some(policy) = &surface.mcp_tool_policy {
         fixture = fixture.with_mcp_tool_policy(&policy.allowed_tool, &policy.policy_definition_id);

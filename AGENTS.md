@@ -80,6 +80,8 @@ Frontend work spans two concerns:
 
 For frontend work under `www/default/` (the current dashboard shipped to users), use the scoped frontend instructions at [`www/default/AGENTS.md`](www/default/AGENTS.md).
 
+Theme styles hang off `body.dark-theme`, never `prefers-color-scheme`, and text and icons use the text-safe colour tokens (`--warning-text`, `--success-text`, `--danger-text`, `--accent-blue-text`, `--muted-text`) with `--*-solid` backgrounds under white text, so normal text keeps 4.5:1 in both themes; see working rules 9 and 10 in [`www/default/AGENTS.md`](www/default/AGENTS.md#working-rules).
+
 Laptop viewport rules (the Audit Log stacking breakpoint and scroll on select, wrapping badges in list tables, and the page header and chart rules for Tasks, Metrics, Identities and Connection Points) live under _Laptop layouts_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#laptop-layouts).
 
 The Surface Builder's **Send delegated credentials over Fabric** switch is per route
@@ -167,6 +169,10 @@ The endpoint editor picks a Kafka endpoint's security protocol (`plaintext`, `ss
 `SCRAM-SHA-256` or `SCRAM-SHA-512`); see
 _Endpoint editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#endpoint-editor).
 
+The Target authentication fallback select on the Managed Agent and on a Transit Point labels
+its reject option **Reject request**, with no status; see _Target authentication fallback_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#target-authentication-fallback).
+
 The credential provider editor's **Client authentication** select (JWT Bearer) keeps its
 explanation behind `FieldHelp`; see _Credential provider editor_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
@@ -239,10 +245,15 @@ Authority and the surface has no Issuer or its Issuer no longer exists; see _Tru
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder).
 
 Trust Checks and Trust Recorder entries keep `authority_source` through every save and the
-Authority pickers set it. One whose Authority was deleted from the Authorities register is drawn
+Authority pickers set it. One whose Authority, or any Authority a query lists, was deleted from
+the Authorities register is drawn
 unconfigured with a "Configuration required" warning and blocks Save, and a refused Authority
 delete lists what uses the Authority in a dialog with no way to delete it anyway; see _Trust
 Check_ and _Authority delete_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#authority-delete).
+A Trust Check query that lists several authorities (`query.authority_ids`) keeps its list and
+`authority_sources` through every dashboard save, and the fullscreen editor picks that list in one
+multi-select of the Issuers and Authorities registers; see _Authority lists_ under _Trust Check_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#trust-check).
 
 The Audit Log names the surface variant of each request record and describes `request_rejected`
 records, and the Metrics page badges configured variant aliases only; see _Audit page: surface

@@ -2,24 +2,26 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { apiClient } from '../../../../api';
 import { getAuthorities } from '../../../../utils/authoritiesCache';
 import { getIssuers } from '../../../../utils/issuersCache';
-import type { Authority, AuthoritySource, Issuer, TrustRegistry } from '../../../../types';
+import type { Authority, Issuer, TrustRegistry } from '../../../../types';
 import type { ConfigPanelProps } from '../types';
 import {
-  authorityNeedsSelection,
+  authorityCountLabel,
   isMigratedTrustCheck,
+  isMultiAuthorityQuery,
+  listedAuthorities,
   makeDefaultQuery,
+  queryAuthorityMissing,
   readOnlyTrustCheckMessage,
   readOnlyTrustCheckProtocol,
   readQueries,
+  pickAuthorities,
   trustCheckLeg,
+  type AuthorityRow,
   type TrustCheckQueryConfig,
   type TrustCheckRecordType,
 } from './definition';
 import TrustCheckQueryForm from './TrustCheckQueryForm';
 import MigratedTrustCheckWarning from './MigratedTrustCheckWarning';
-
-// Mirrors backend `TRUST_CHECK_LIST_MAX` in `src/config/agent_surface.rs`.
-const TRUST_CHECK_LIST_MAX = 10;
 
 function seedInitial(config: any): TrustCheckQueryConfig[] {
   const existing = readQueries(config);
@@ -116,20 +118,15 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
     );
   };
 
-  const updateAuthorityAt = (idx: number, value: string, source?: AuthoritySource) => {
-    setDraft(prev =>
-      prev.map((q, i) => {
-        if (i !== idx) return q;
-        const { authority_source: _previous, ...rest } = q;
-        void _previous;
-        return {
-          ...rest,
-          ...(source ? { authority_source: source } : {}),
-          query: { ...(q.query || {}), authority_id: value },
-        };
-      })
-    );
+  const updateQueryWith = (
+    idx: number,
+    fn: (q: TrustCheckQueryConfig) => TrustCheckQueryConfig
+  ) => {
+    setDraft(prev => prev.map((q, i) => (i === idx ? fn(q) : q)));
   };
+
+  const setAuthoritiesAt = (idx: number, picks: AuthorityRow[]) =>
+    updateQueryWith(idx, q => pickAuthorities(q, picks));
 
   const updateEntityAt = (idx: number, value: string) => {
     updateQuerySubField(idx, 'entity_id', value);
@@ -140,7 +137,6 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
   };
 
   const addQuery = () => {
-    if (draft.length >= TRUST_CHECK_LIST_MAX) return;
     const next = [...draft, makeDefaultQuery()];
     setDraft(next);
     setExpandedIdx(next.length - 1);
@@ -173,9 +169,7 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
     // the caller leg a blank value is fine — it defaults to the verified
     // agent-identity-credential issuer — so only a *different* leftover
     // template blocks the save.
-    const hasAuthorityGap = draft.some(q =>
-      authorityNeedsSelection(q.query?.authority_id as string | undefined, isApMa)
-    );
+    const hasAuthorityGap = draft.some(q => queryAuthorityMissing(q, isApMa));
     if (hasAuthorityGap) return;
     updateFields({ queries: draft, trust_check_migrated: false });
     closeFullscreenEditor?.();
@@ -196,7 +190,12 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
     const expanded = expandedIdx === idx;
     const nameValue = typeof q.name === 'string' ? q.name : '';
     const headerLabel = nameValue ? `Query ${idx + 1} · ${nameValue}` : `Query ${idx + 1}`;
-    const headerSummary = `${queryType} · ${registryNameById(q.trust_registry_id)}`;
+    const listed = listedAuthorities(q.query).length;
+    const headerSummary = [
+      queryType,
+      registryNameById(q.trust_registry_id),
+      ...(isMultiAuthorityQuery(q) ? [authorityCountLabel(listed)] : []),
+    ].join(' · ');
 
     return (
       <div
@@ -243,7 +242,7 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
             loadError={loadError}
             updateQueryAt={updateQueryAt}
             updateQuerySubField={updateQuerySubField}
-            updateAuthorityAt={updateAuthorityAt}
+            setAuthoritiesAt={setAuthoritiesAt}
             updateEntityAt={updateEntityAt}
             handleQueryTypeChangeAt={handleQueryTypeChangeAt}
             saveAttempted={saveAttempted}
@@ -252,8 +251,6 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
       </div>
     );
   };
-
-  const atCap = draft.length >= TRUST_CHECK_LIST_MAX;
 
   return (
     <div className="container-fluid py-4">
@@ -266,9 +263,6 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
           Runs on the <strong>{legLabel} leg</strong>
           {leg === 'transit-point' && <> of this Transit Point only</>}. Each query lands on OPA at{' '}
           <code>input.trust_check_results.{legLabel}[]</code> in the order shown below.
-        </div>
-        <div className="text-muted small mt-1">
-          <strong>Only a maximum of {TRUST_CHECK_LIST_MAX} queries allowed per Trust Check.</strong>
         </div>
         {readOnlyProtocol && (
           <div className="small mt-1" data-testid="trust-check-fullscreen-read-only">
@@ -292,9 +286,7 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
             <i className="fas fa-list-check me-2" />
             Queries
           </h6>
-          <span className="badge text-bg-light border">
-            {draft.length}/{TRUST_CHECK_LIST_MAX}
-          </span>
+          <span className="badge text-bg-light border">{draft.length}</span>
         </div>
         <fieldset
           className="card-body"
@@ -313,8 +305,6 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
             type="button"
             className="btn btn-outline-primary btn-sm"
             onClick={addQuery}
-            disabled={atCap}
-            title={atCap ? `Maximum ${TRUST_CHECK_LIST_MAX} queries per leg` : undefined}
             data-testid="trust-check-add-query"
           >
             <i className="fas fa-plus me-1" /> Add Another Query

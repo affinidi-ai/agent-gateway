@@ -24,6 +24,10 @@ use crate::gateways::ConnectionPointListenerManager;
 /// between the two gateways.
 const CAPABILITY_QUERY_ENVELOPE_LIFETIME_SECS: u64 = 300;
 
+/// The `ForwardResponse` envelope field in which a receiving gateway names the header of the
+/// caller credential it refused: `{"credential_header": "<lowercase name>"}`.
+pub(crate) const CALLER_REFUSAL_FIELD: &str = "caller_refusal";
+
 /// Outcome of a fabric forward: the remote `ForwardResponse` decoded into the
 /// HTTP primitives the caller needs to build its own response.
 pub(crate) struct FabricForwardResponse {
@@ -36,6 +40,25 @@ pub(crate) struct FabricForwardResponse {
     /// The remote gateway refused the request itself, answering with an error
     /// envelope rather than relaying its surface's answer.
     pub refused_by_gateway: bool,
+    /// The header of the caller credential the remote gateway verified and refused, when it
+    /// refused one ([`CALLER_REFUSAL_FIELD`]).
+    pub refused_credential_header: Option<String>,
+}
+
+impl FabricForwardResponse {
+    /// Whether the remote gateway answered `401` because it refused the credential this
+    /// gateway sent in `injected_header`.
+    pub(crate) fn refused_credential_in(
+        &self,
+        injected_header: &str,
+    ) -> bool {
+        refused_injected_credential(
+            self.status,
+            self.refused_credential_header
+                .as_deref(),
+            injected_header,
+        )
+    }
 }
 
 /// Typed failures for the fabric forward transport.
@@ -110,9 +133,10 @@ pub(crate) struct FabricCardRequest<'a> {
 /// stands, so the read is not cached.
 pub(crate) enum FabricCardOutcome {
     Card(serde_json::Value),
-    /// The remote answered with this non-success status.
+    /// The remote answered with this non-success status and body.
     Refused {
         status: u16,
+        body: Vec<u8>,
     },
     /// The remote answered with a card body over the size bound.
     TooLarge,
@@ -136,7 +160,7 @@ impl FabricCardOutcome {
     pub(crate) fn describes_the_remote(&self) -> bool {
         match self {
             Self::Failed(error) => !error.never_reached_the_remote(),
-            Self::Refused { status } => *status != 503,
+            Self::Refused { status, .. } => *status != 503,
             _ => true,
         }
     }
@@ -211,7 +235,13 @@ where
                     by_gateway,
                     "Fabric agent card read refused"
                 );
-                (FabricCardOutcome::Refused { status: response.status }, by_gateway)
+                (
+                    FabricCardOutcome::Refused {
+                        status: response.status,
+                        body: response.body,
+                    },
+                    by_gateway,
+                )
             }
             Err(error) => {
                 debug!(trace_id = request.trace_id, label = request.log_label, path, error = %error, "Fabric agent card read failed");
@@ -220,7 +250,7 @@ where
         };
         // A path the remote could not answer for the moment keeps the read
         // uncached, whatever a later path says.
-        if !matches!(outcome, FabricCardOutcome::Refused { status: 503 }) {
+        if !matches!(outcome, FabricCardOutcome::Refused { status: 503, .. }) {
             outcome = answer;
         }
         if last {
@@ -905,7 +935,26 @@ fn decode_forward_response(response_body: &serde_json::Value) -> FabricForwardRe
         headers,
         body,
         refused_by_gateway: error.is_some(),
+        refused_credential_header: refused_credential_header(response_body).map(str::to_string),
     }
+}
+
+/// The header of the caller credential a `ForwardResponse` says the remote gateway refused.
+pub(crate) fn refused_credential_header(response_body: &serde_json::Value) -> Option<&str> {
+    response_body
+        .get(CALLER_REFUSAL_FIELD)
+        .and_then(|refusal| refusal.get("credential_header"))
+        .and_then(serde_json::Value::as_str)
+}
+
+/// Whether a remote gateway answered `status` 401 because it refused the credential this
+/// gateway sent in `injected_header`, as its `refused_header` says.
+pub(crate) fn refused_injected_credential(
+    status: u16,
+    refused_header: Option<&str>,
+    injected_header: &str,
+) -> bool {
+    status == 401 && refused_header.is_some_and(|refused| refused.eq_ignore_ascii_case(injected_header))
 }
 
 #[cfg(test)]
@@ -953,6 +1002,7 @@ mod tests {
                     headers: HashMap::new(),
                     body: body.as_bytes().to_vec(),
                     refused_by_gateway,
+                    refused_credential_header: None,
                 })
             }
         })
@@ -1061,7 +1111,7 @@ mod tests {
                     assert_eq!(card, &serde_json::json!({"name": "partner"}), "{case}");
                     "card".to_string()
                 }
-                FabricCardOutcome::Refused { status } => format!("refused {status}"),
+                FabricCardOutcome::Refused { status, .. } => format!("refused {status}"),
                 FabricCardOutcome::TooLarge => "too large".to_string(),
                 FabricCardOutcome::NotJson => "not JSON".to_string(),
                 FabricCardOutcome::Failed(_) => "failed".to_string(),
@@ -1090,6 +1140,41 @@ mod tests {
         }));
         assert!(refused_with_body.refused_by_gateway, "an envelope with a body and an error");
         assert_eq!(refused_with_body.body, br#"{"error":"Forbidden"}"#.to_vec());
+    }
+
+    #[test]
+    fn a_remote_gateways_refusal_of_a_credential_names_its_header_outside_the_body() {
+        let refused = decode_forward_response(&serde_json::json!({
+            "status": 401, "headers": {}, "body": "{\"detail\":\"Caller credential missing or invalid\"}",
+            CALLER_REFUSAL_FIELD: {"credential_header": "x-api-key"}
+        }));
+        assert_eq!(
+            refused
+                .refused_credential_header
+                .as_deref(),
+            Some("x-api-key")
+        );
+        assert_eq!(refused.body, br#"{"detail":"Caller credential missing or invalid"}"#.to_vec());
+
+        let relayed = decode_forward_response(&serde_json::json!({"status": 401, "headers": {}, "body": "{}"}));
+        assert_eq!(relayed.refused_credential_header, None, "an older gateway or a relayed answer");
+    }
+
+    #[test]
+    fn only_a_401_naming_the_injected_header_refused_the_injected_credential() {
+        for (status, refused, injected, expected) in [
+            (401, Some("x-api-key"), "X-API-Key", true),
+            (401, Some("x-api-key"), "authorization", false),
+            (401, None, "x-api-key", false),
+            (403, Some("x-api-key"), "x-api-key", false),
+            (500, Some("x-api-key"), "x-api-key", false),
+        ] {
+            assert_eq!(
+                refused_injected_credential(status, refused, injected),
+                expected,
+                "{status} {refused:?} {injected}"
+            );
+        }
     }
 
     #[test]
@@ -1127,8 +1212,8 @@ mod tests {
         let failed = |error| FabricCardOutcome::Failed(error);
         for (case, outcome, expected) in [
             ("card", FabricCardOutcome::Card(serde_json::json!({})), true),
-            ("refused", FabricCardOutcome::Refused { status: 404 }, true),
-            ("briefly unavailable", FabricCardOutcome::Refused { status: 503 }, false),
+            ("refused", FabricCardOutcome::Refused { status: 404, body: Vec::new() }, true),
+            ("briefly unavailable", FabricCardOutcome::Refused { status: 503, body: Vec::new() }, false),
             ("too large", FabricCardOutcome::TooLarge, true),
             ("not JSON", FabricCardOutcome::NotJson, true),
             ("no answer in time", failed(FabricForwardError::NoResponse("peer".into())), true),

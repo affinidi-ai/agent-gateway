@@ -128,12 +128,17 @@ pub(crate) async fn transit_token_received_by(
 }
 
 /// The transit token on the last request `agent_name` served, other than an
-/// agent card fetch, if it carried one.
+/// agent card fetch, its surface's configured card location included, if it
+/// carried one.
 pub(crate) async fn last_transit_token_received_by(
     world: &G2gWorld,
     agent_name: &str,
 ) -> Option<String> {
     let (gw_index, surface_id) = world.target(agent_name);
+    let card_location = world
+        .surface_spec(gw_index, &surface_id)
+        .agent_card_path
+        .clone();
     world
         .harness()
         .gw(gw_index)
@@ -147,6 +152,12 @@ pub(crate) async fn last_transit_token_received_by(
             !request
                 .path_and_query
                 .contains(".well-known/agent")
+                && card_location.as_deref()
+                    != Some(
+                        request
+                            .path_and_query
+                            .as_str(),
+                    )
         })
         .and_then(|request| {
             request
@@ -293,6 +304,101 @@ async fn fetch_agent_card(
         .await
         .unwrap_or_default();
     world.response_body = Some(parse_json_or_sse_body(&raw, content_type.as_deref()));
+    world.response_status = Some(status);
+    world.response_content_type = content_type;
+}
+
+#[when(expr = "the caller sends a {word} request to gateway {int} surface {string} path {string}")]
+async fn method_request_sent_to_surface_path(
+    world: &mut G2gWorld,
+    method: String,
+    gw_index: usize,
+    surface_name: String,
+    path: String,
+) {
+    send_method_request_to_surface_path(world, &method, gw_index, &surface_name, &path, Vec::new(), None).await;
+}
+
+#[when(
+    expr = "the caller sends a {word} request with an A2A message body to gateway {int} surface {string} path {string}"
+)]
+async fn method_request_with_a2a_body_sent_to_surface_path(
+    world: &mut G2gWorld,
+    method: String,
+    gw_index: usize,
+    surface_name: String,
+    path: String,
+) {
+    let body = build_a2a_request_body();
+    send_method_request_to_surface_path(world, &method, gw_index, &surface_name, &path, Vec::new(), Some(body)).await;
+}
+
+#[when(expr = "the caller sends a {word} request to gateway {int} surface {string} path {string} with headers")]
+async fn method_request_sent_to_surface_path_with_headers(
+    world: &mut G2gWorld,
+    method: String,
+    gw_index: usize,
+    surface_name: String,
+    path: String,
+    step: &cucumber::gherkin::Step,
+) {
+    let headers: Vec<(String, String)> = step
+        .table
+        .as_ref()
+        .expect("step must have a table of headers")
+        .rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [name, value] => (name.clone(), value.clone()),
+            other => panic!("header row must have a name and a value, got {other:?}"),
+        })
+        .collect();
+    send_method_request_to_surface_path(world, &method, gw_index, &surface_name, &path, headers, None).await;
+}
+
+async fn send_method_request_to_surface_path(
+    world: &mut G2gWorld,
+    method: &str,
+    gw_index: usize,
+    surface_name: &str,
+    path: &str,
+    headers: Vec<(String, String)>,
+    body: Option<Value>,
+) {
+    world.start().await;
+    let (_gw, surface_id) = world.surface(surface_name);
+    let port = world
+        .harness()
+        .gw(gw_index)
+        .port;
+    let method = reqwest::Method::from_bytes(method.as_bytes()).expect("step method must be a valid HTTP method");
+    let mut request = Client::new().request(method.clone(), format!("http://127.0.0.1:{port}/{surface_id}{path}"));
+    for (name, value) in &headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    if let Some(body) = body.or_else(|| (method == reqwest::Method::POST).then(build_a2a_request_body)) {
+        request = request.json(&body);
+        world.sent_body = Some(body);
+    }
+    let response = request
+        .send()
+        .await
+        .expect("caller request must succeed at the transport layer");
+
+    let status = response.status().as_u16();
+    let response_headers = collect_headers(response.headers());
+    let content_type = response_headers
+        .get("content-type")
+        .cloned();
+    world.response_headers = response_headers;
+    let raw = response
+        .text()
+        .await
+        .unwrap_or_default();
+    world.response_body = Some(match parse_json_or_sse_body(&raw, content_type.as_deref()) {
+        Value::Null if !raw.is_empty() => Value::String(raw),
+        parsed => parsed,
+    });
     world.response_status = Some(status);
     world.response_content_type = content_type;
 }
