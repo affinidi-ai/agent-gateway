@@ -1,8 +1,13 @@
 import React from 'react';
-import { Link } from 'react-router-dom';
 import type { AgentRecord } from '../../api';
 import { AgentIdentities, AgentProtocolBadge, AgentTrustRegistryBadge } from './AgentBadges';
-import { UNNAMED_AGENT, lastActivityLabel, runtimeIcon, runtimeLabel } from './agentLabels';
+import {
+  UNNAMED_AGENT,
+  lastActivityLabel,
+  runtimeIcon,
+  runtimeLabel,
+  surfacesUsedLabel,
+} from './agentLabels';
 
 interface AgentsTableProps {
   agents: AgentRecord[];
@@ -59,19 +64,29 @@ const AgentsTable: React.FC<AgentsTableProps> = ({ agents, retentionMinutes, onO
               <AgentIdentities identities={agent.identities} />
             </td>
             <td>
-              <ul className="list-unstyled mb-0" data-testid="agents-surfaces">
-                {agent.surfaces.map(surface => (
-                  <li key={surface.surface_id}>
-                    <Link
-                      to={`/surfaces/${encodeURIComponent(surface.surface_id)}`}
-                      onClick={e => e.stopPropagation()}
-                      data-testid="agents-surface-link"
-                    >
-                      {surface.name}
-                    </Link>
-                  </li>
-                ))}
-              </ul>
+              {agent.surfaces.length === 0 ? (
+                <span className="small text-muted" data-testid="agents-surfaces-count">
+                  {surfacesUsedLabel(0)}
+                </span>
+              ) : (
+                <div
+                  className="d-flex align-items-center gap-2 small"
+                  style={{ maxWidth: '16rem' }}
+                  title={agent.surfaces.map(surface => surface.name).join(', ')}
+                  data-testid="agents-surfaces"
+                >
+                  <span
+                    className="badge rounded-pill text-bg-primary"
+                    aria-label={surfacesUsedLabel(agent.surfaces.length)}
+                    data-testid="agents-surfaces-count"
+                  >
+                    {agent.surfaces.length}
+                  </span>
+                  <span className="text-truncate" data-testid="agents-surface-names">
+                    {agent.surfaces.map(surface => surface.name).join(', ')}
+                  </span>
+                </div>
+              )}
             </td>
             <td>
               <AgentTrustRegistryBadge trust={agent.trust_registry} />

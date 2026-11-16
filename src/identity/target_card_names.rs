@@ -344,7 +344,12 @@ mod tests {
             ("http://user:pw@", None),
         ] {
             let loc = CardLocation::for_surface(&surface(SurfaceProtocol::A2a, raw));
-            assert_eq!(loc.map(|loc| loc.endpoint).as_deref(), expected, "{raw}");
+            assert_eq!(
+                loc.map(|loc| loc.endpoint)
+                    .as_deref(),
+                expected,
+                "{raw}"
+            );
         }
     }
 

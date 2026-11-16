@@ -142,6 +142,11 @@ export function identitySourceLabel(source: AgentIdentity['source']): string {
   return source === 'managed' ? 'Managed identity, issued by this gateway' : 'Set on the surface';
 }
 
+/** "Not used", "1 surface" or "N surfaces". */
+export function surfacesUsedLabel(count: number): string {
+  return count === 0 ? 'Not used' : `${count} surface${count === 1 ? '' : 's'}`;
+}
+
 /** Matches the display name, every surface name and the runtime label. */
 export function agentMatchesFilter(agent: AgentRecord, term: string): boolean {
   const needle = term.trim().toLowerCase();

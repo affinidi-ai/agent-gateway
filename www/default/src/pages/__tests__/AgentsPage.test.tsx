@@ -138,7 +138,7 @@ describe('AgentsPage', () => {
     expect(within(row).queryByText(/other surface/)).not.toBeInTheDocument();
   });
 
-  it('links every surface that uses the agent', async () => {
+  it('shows the count and names of the surfaces that use the agent', async () => {
     mockedListAgents.mockResolvedValue(
       list(
         agent({
@@ -152,10 +152,12 @@ describe('AgentsPage', () => {
     renderPage();
     const row = await screen.findByTestId('agents-row-a1');
 
-    const links = within(row).getAllByTestId('agents-surface-link');
-    expect(links.map(l => l.textContent)).toEqual(['helium', 'oxygen']);
-    expect(links[0]).toHaveAttribute('href', '/surfaces/s1');
-    expect(links[1]).toHaveAttribute('href', '/surfaces/s%202');
+    const count = within(row).getByTestId('agents-surfaces-count');
+    expect(count).toHaveTextContent('2');
+    expect(count).toHaveAttribute('aria-label', '2 surfaces');
+    expect(within(row).getByTestId('agents-surfaces')).toHaveAttribute('title', 'helium, oxygen');
+    expect(within(row).getByTestId('agents-surface-names')).toHaveTextContent('helium, oxygen');
+    expect(within(row).queryByRole('link')).not.toBeInTheDocument();
   });
 
   it('filters by name client-side', async () => {
@@ -244,15 +246,5 @@ describe('AgentsPage', () => {
     renderPage();
     fireEvent.click(await screen.findByTestId('agents-row-a1'));
     expect(screen.getByTestId('details-route')).toBeInTheDocument();
-  });
-
-  it('links Used by surfaces to the surface without opening the details', async () => {
-    mockedListAgents.mockResolvedValue(list(agent()));
-    renderPage();
-    const link = await screen.findByTestId('agents-surface-link');
-    expect(link).toHaveTextContent('RICK');
-    fireEvent.click(link);
-    expect(screen.getByTestId('surface-route')).toBeInTheDocument();
-    expect(screen.queryByTestId('details-route')).not.toBeInTheDocument();
   });
 });

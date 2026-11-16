@@ -1950,7 +1950,13 @@ mod tests {
             .expect("response");
         assert!(response.available, "the operator still reads the card");
         assert_eq!(source.fetches(), 1);
-        assert_eq!(source.last_endpoint().as_deref(), Some("https://agent.example/a2a"), "no userinfo is sent");
+        assert_eq!(
+            source
+                .last_endpoint()
+                .as_deref(),
+            Some("https://agent.example/a2a"),
+            "no userinfo is sent"
+        );
     }
 
     #[tokio::test]
@@ -1968,7 +1974,13 @@ mod tests {
             .await
             .expect("response");
         assert!(response.available);
-        assert_eq!(source.last_endpoint().as_deref(), Some("https://agent.example/a2a/"), "the own surface's location");
+        assert_eq!(
+            source
+                .last_endpoint()
+                .as_deref(),
+            Some("https://agent.example/a2a/"),
+            "the own surface's location"
+        );
     }
 
     #[tokio::test]
@@ -2211,7 +2223,11 @@ mod tests {
                 .expect("card");
         }
         assert_eq!(cache.entries.len(), 1);
-        assert!(cache.entries.contains_key("a3"));
+        assert!(
+            cache
+                .entries
+                .contains_key("a3")
+        );
 
         let kept = AgentCardCache::new(source, AGENT_CARD_CACHE_TTL, AGENT_CARD_FAILURE_CACHE_TTL);
         for id in ["a1", "a2"] {
