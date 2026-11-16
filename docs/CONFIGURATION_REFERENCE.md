@@ -248,6 +248,7 @@ Network topology and the surfaces served. The largest configuration file; the ex
 | `integration` | Notification and webhook integration settings |
 | `sts` | Security Token Service runtime settings. See [`STS.md`](STS.md). |
 | `cli_login_throttle` | Optional per-client-IP limit on each `fabric` CLI login endpoint: `enabled` (default `false`) and `per_ip` `{requests, window_secs}` (default 20 per 60 seconds). Behind a load balancer, set `client_ip.trusted_proxies` first. |
+| `passkey_login_throttle` | Optional per-client-IP limit on starting a passkey sign-in or registration (`POST /api/auth/login/start` and `/api/auth/register/start`, one budget for both): `enabled` (default `false`) and `per_ip` `{requests, window_secs}` (default 20 per 60 seconds). A client over it gets `429` with `Retry-After`. Behind a load balancer, set `client_ip.trusted_proxies` first: until then every caller shares the balancer's budget, and one client can use it up for all. |
 | `transit_token_max_lifetime_secs` | The longest lifetime, in seconds, a surface may set for its transit tokens in `transit.transit_token_lifetime_secs`, and the longest the Access Point issues, from 30 to 900; 300 when unset. Read once, when the gateway starts: anything but a whole number from 30 to 900 stops it from starting, and a change takes a restart, as a reload keeps the startup value and logs a warning while the file differs from it. A stored surface lifetime above it gets tokens living this long, with a warning; it never stops the gateway. A Transit Point does not read it, so instances with different values accept each other's tokens. The shortest lifetime, 30, is fixed. Upgrade every instance that shares surface storage before raising it above 300 or setting any surface lifetime: an earlier release refuses tokens living longer than 300 seconds and drops a stored surface lifetime when it saves the surface. See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token-lifetime). |
 | `payment_gate` | `breaker_failures` (default `5`, 1 to 1000) consecutive failed calls to one agent-pay gateway open its circuit breaker for `breaker_open_secs` (default `30`, 1 to 3600); the gate then answers `503` at once. Read at startup. Opening and closing are logged and counted (see [`OBSERVABILITY.md`](OBSERVABILITY.md#settlement-breaker-and-ledger-metrics)). |
 | `payment_ledger` | `retention_days` (default `7`, 1 to 400): how long the payments ledger keeps its hourly segments. `max_size_mb` (default `2048`, 16 to 1,048,576): the oldest segments are deleted early while the ledger is larger. Neither deletes a segment holding a payment still awaiting capture or void. Read at startup; a value out of range is clamped and logged as a warning. See [Taking the payment](#taking-the-payment). |
@@ -317,6 +318,34 @@ records rather than file content; see [`src/config/agent_surface.rs`](../src/con
 registration to succeed. A mismatch is the most common local-setup failure, and
 [`development/GETTING_STARTED.md`](development/GETTING_STARTED.md) treats the generated
 value as the source of truth.
+
+A passkey sign-in challenge (`POST /auth/login/start` under the `identity_api` prefix,
+`/api` by default) names the passkeys of an approved account. For any other username
+(unknown, not approved, or without passkeys) it names decoy credentials instead, with no
+transports: usually one 20-byte ID, sometimes one of 16, 32 or 64 bytes, sometimes two or
+three. They are derived from the username with the key in `login_decoy_credential_key.json`
+under `[storage_paths] vc_keys`, which the gateway creates on its first start in passkey sign-in
+mode the way it creates the transit token key, so a username gets the same decoys on every challenge and the answer
+does not tell whether it has an account. No authenticator holds a decoy, so the browser finds
+no passkey for it and offers another device or a security key instead, and the sign-in goes no
+further. An approved account whose passkeys differ in count or length from what decoys take can
+still be told apart. A key file that cannot be read stops the gateway from starting in passkey
+mode. To replace the key, stop every instance, delete both `login_decoy_credential_key.json`
+and `login_decoy_credential_key.json.enc`, and start them again; every username then gets new
+decoys. The `.atgx` export leaves the key file out.
+
+Registering a passkey (`POST /auth/register/finish`) for a username that already has an
+account, approved or awaiting approval, checks the passkey and the accepted Terms as for a new
+account and is answered `200` like one, but stores nothing: the existing account and its
+passkeys are unchanged, and the new passkey cannot sign in. Both answers are sent 25 ms after the
+username is checked, so the time saved by storing nothing does not tell the username is taken;
+administrators are notified of a new account after it is answered.
+
+A sign-in or registration challenge can be finished for 6 minutes, the 5 minutes the browser
+gives the user and a minute for the answer to arrive; after that the finish is refused with `400`
+and the passkey ceremony starts again. At most 10,000 unfinished challenges are kept; when full,
+the expired ones are dropped, and then the oldest. Sign-in and registration refuse a username
+longer than 256 bytes with `400`, so no challenge holds a larger one.
 
 ### Log redaction
 

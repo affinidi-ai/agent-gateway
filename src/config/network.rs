@@ -110,6 +110,10 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub cli_login_throttle: crate::config::types::LoginThrottleConfig,
 
+    /// Per-client-IP limit on starting a passkey sign-in or registration.
+    #[serde(default)]
+    pub passkey_login_throttle: crate::config::types::LoginThrottleConfig,
+
     /// Proxies trusted to report the caller's address for per-client-IP limits.
     #[serde(default)]
     pub client_ip: crate::config::types::ClientIpConfig,
@@ -822,6 +826,54 @@ mod url_mapping_tests {
             cfg.client_ip
                 .trusted_proxies
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_passkey_login_throttle_is_off_by_default_and_reads_its_settings() {
+        let defaults = cfg_with_listeners(serde_json::json!([]));
+        let mut configured = serde_json::to_value(&defaults).unwrap();
+        configured["passkey_login_throttle"] =
+            serde_json::json!({"enabled": true, "per_ip": {"requests": 5, "window_secs": 30}});
+        let configured: NetworkConfig = serde_json::from_value(configured).unwrap();
+
+        assert!(
+            !defaults
+                .passkey_login_throttle
+                .enabled
+        );
+        assert_eq!(
+            defaults
+                .passkey_login_throttle
+                .per_ip
+                .requests,
+            20
+        );
+        assert_eq!(
+            defaults
+                .passkey_login_throttle
+                .per_ip
+                .window_secs,
+            60
+        );
+        assert!(
+            configured
+                .passkey_login_throttle
+                .enabled
+        );
+        assert_eq!(
+            configured
+                .passkey_login_throttle
+                .per_ip
+                .requests,
+            5
+        );
+        assert_eq!(
+            configured
+                .passkey_login_throttle
+                .per_ip
+                .window_secs,
+            30
         );
     }
 

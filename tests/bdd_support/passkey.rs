@@ -53,6 +53,11 @@ impl SoftPasskey {
         }
     }
 
+    /// The base64url ID of this passkey's credential.
+    pub fn credential_id(&self) -> String {
+        URL_SAFE_NO_PAD.encode(self.credential_id)
+    }
+
     /// The credential that registers this passkey for `creation_options`, the relying party's
     /// `CredentialCreationOptions`.
     pub fn register(
