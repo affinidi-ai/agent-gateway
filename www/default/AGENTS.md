@@ -1098,10 +1098,14 @@ has not ended and whose access token is valid or refreshable. It has no history 
 
 - Columns: User, System (the provider's name, else its `provider_id`), Agent, Access (scopes),
   Status (Active, or Ending soon within 24 hours of the end), Ends (`delegated-access-ends-<id>`: the
-  time left over the date, or "No time limit"), Last Used and, with `settings.edit`, the two-step
-  **Revoke access** `DeleteButton` (`delegated-access-revoke-button-<id>`). Rows are
-  `delegated-access-row-<id>`; the header counts those ending soon
-  (`delegated-access-ending-soon-count`).
+  time left over the date, or "No time limit"), Last Used and, with `settings.edit`, a text
+  **Revoke** button (`delegated-access-revoke-button-<id>`, the shared `TwoStepButton` with
+  `confirmAs="danger"` and a `cancelTestId`). Its first click turns it into a danger button that
+  names what it ends, "Revoke GitHub access?" with the provider's name as System shows it, and
+  offers **Cancel** beside or under it (`delegated-access-revoke-cancel-button-<id>`, focus back
+  on Revoke); the second click sends the `DELETE`, and Cancel or a click elsewhere cancels. No
+  modal and no browser dialog. Rows are `delegated-access-row-<id>`; the header counts those
+  ending soon (`delegated-access-ending-soon-count`).
 - **History** (`delegated-access-history-button`) opens the Audit Log on the records of access
   that ended: `consent_expired`, `token_revoked` and `user_tokens_revoked`. It is shown only to a
   user with `audit.view`.

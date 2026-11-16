@@ -55,6 +55,24 @@ async function serveVault(
   return revoked;
 }
 
+/** Answers the provider list with the GitHub provider the tokens belong to. */
+async function serveProviders(page: Page): Promise<void> {
+  await page.route("**/api/v1/credential-providers", async (route) => {
+    await route.fulfill({
+      json: [
+        {
+          id: "cp-github",
+          name: "GitHub",
+          provider_id: "github",
+          provider_type: "oauth2_authorization_code",
+          default_scopes: [],
+          token_refresh_enabled: true,
+        },
+      ],
+    });
+  });
+}
+
 /** Opens the Credential Tokens tab over `tokens`. */
 async function openCredentialTokens(
   page: Page,
@@ -85,20 +103,7 @@ test.describe("Credentials page Delegated Access tab", () => {
   test("lists only active access and opens the Audit Log as its history", async ({
     page,
   }) => {
-    await page.route("**/api/v1/credential-providers", async (route) => {
-      await route.fulfill({
-        json: [
-          {
-            id: "cp-github",
-            name: "GitHub",
-            provider_id: "github",
-            provider_type: "oauth2_authorization_code",
-            default_scopes: [],
-            token_refresh_enabled: true,
-          },
-        ],
-      });
-    });
+    await serveProviders(page);
     await serveVault(page, [
       token("soon", ALICE, fromNow(3 * HOUR + 5 * 60_000)),
       token("unlimited", BOB),
@@ -127,7 +132,7 @@ test.describe("Credentials page Delegated Access tab", () => {
     );
   });
 
-  test("revokes one access on a second click, with no dialog", async ({
+  test("revokes one access on a second click that names it, with no dialog", async ({
     page,
   }) => {
     let dialogs = 0;
@@ -135,14 +140,20 @@ test.describe("Credentials page Delegated Access tab", () => {
       dialogs += 1;
       await dialog.dismiss();
     });
+    await serveProviders(page);
     const revoked = await serveVault(page, [
       token("t1", ALICE),
       token("t2", BOB),
     ]);
     await page.goto(`${BASE_URL}/credentials?tab=delegated-access`);
     const button = page.getByTestId("delegated-access-revoke-button-t1");
+    await expect(button).toHaveText("Revoke");
 
     await button.click();
+    await expect(button).toHaveText("Revoke GitHub access?");
+    await expect(
+      page.getByTestId("delegated-access-revoke-cancel-button-t1"),
+    ).toBeVisible();
     expect(revoked).toEqual([]);
     await expect(accessRow(page, "t1")).toBeVisible();
 
@@ -152,6 +163,23 @@ test.describe("Credentials page Delegated Access tab", () => {
     expect(revoked).toEqual(["/api/v1/delegation-vault/t1"]);
     expect(dialogs).toBe(0);
     await expect(page.locator('[role="dialog"]')).toHaveCount(0);
+  });
+
+  test("keeps the access when the revoke is cancelled", async ({ page }) => {
+    await serveProviders(page);
+    const revoked = await serveVault(page, [token("t1", ALICE)]);
+    await page.goto(`${BASE_URL}/credentials?tab=delegated-access`);
+    const button = page.getByTestId("delegated-access-revoke-button-t1");
+
+    await button.click();
+    await page.getByTestId("delegated-access-revoke-cancel-button-t1").click();
+
+    await expect(button).toHaveText("Revoke");
+    await expect(
+      page.getByTestId("delegated-access-revoke-cancel-button-t1"),
+    ).toHaveCount(0);
+    await expect(accessRow(page, "t1")).toBeVisible();
+    expect(revoked).toEqual([]);
   });
 });
 

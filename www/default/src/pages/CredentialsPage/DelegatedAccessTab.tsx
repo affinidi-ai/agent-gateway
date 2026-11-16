@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { usePermissions } from '../../context/PermissionsContext';
 import { AppButton } from '../../components/shared/AppButton';
 import { Badge } from '../../components/shared/Badge';
-import { DeleteButton } from '../../components/shared/DeleteButton';
+import { TwoStepButton } from '../../components/shared/TwoStepButton';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { apiClient } from '../../api';
 import { showToast } from '../../utils/toaster';
@@ -247,12 +247,16 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
                       </td>
                       {canRevoke && (
                         <td>
-                          <DeleteButton
-                            data-testid={`delegated-access-revoke-button-${token.id}`}
-                            onDelete={() => revoke(token)}
-                            className="btn-sm"
+                          <TwoStepButton
+                            label="Revoke"
+                            confirmAs="danger"
+                            confirmLabel={`Revoke ${systemOf(token)} access?`}
                             title="Revoke access"
                             confirmTitle="Click again to revoke this access"
+                            className="btn btn-outline-danger btn-sm text-nowrap"
+                            cancelTestId={`delegated-access-revoke-cancel-button-${token.id}`}
+                            data-testid={`delegated-access-revoke-button-${token.id}`}
+                            onConfirm={() => revoke(token)}
                           />
                         </td>
                       )}

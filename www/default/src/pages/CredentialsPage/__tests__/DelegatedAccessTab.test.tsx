@@ -119,19 +119,41 @@ describe('Delegated Access tab', () => {
     );
   });
 
-  it('revokes one access on a second click', async () => {
+  it('revokes one access on a second click, which names what it ends', async () => {
+    const confirm = jest.spyOn(window, 'confirm');
     await renderTab([token('t1'), token('t2', { user_identity_hash: BOB })]);
     const button = screen.getByTestId('delegated-access-revoke-button-t1');
+    expect(button).toHaveTextContent(/^Revoke$/);
 
     fireEvent.click(button);
     expect(deletes()).toHaveLength(0);
+    expect(button).toHaveTextContent(/^Revoke GitHub access\?$/);
+    expect(button).toHaveClass('btn-danger');
     expect(button).toHaveAttribute('title', 'Click again to revoke this access');
+    expect(screen.getByTestId('delegated-access-revoke-cancel-button-t1')).toHaveTextContent(
+      'Cancel'
+    );
 
     fireEvent.click(button);
     await waitFor(() => expect(deletes()).toHaveLength(1), WAIT);
     expect(deletes()[0][0]).toBe('/api/v1/delegation-vault/t1');
     await waitFor(() => expect(rowIds()).toEqual(['t2']), WAIT);
     expect(showToast).toHaveBeenCalledWith('success', 'Access revoked');
+    expect(confirm).not.toHaveBeenCalled();
+    confirm.mockRestore();
+  });
+
+  it('keeps the access when the revoke is cancelled', async () => {
+    await renderTab([token('t1')]);
+    const button = screen.getByTestId('delegated-access-revoke-button-t1');
+
+    fireEvent.click(button);
+    fireEvent.click(screen.getByTestId('delegated-access-revoke-cancel-button-t1'));
+
+    expect(button).toHaveTextContent(/^Revoke$/);
+    expect(screen.queryByTestId('delegated-access-revoke-cancel-button-t1')).toBeNull();
+    expect(deletes()).toHaveLength(0);
+    expect(rowIds()).toEqual(['t1']);
   });
 
   it('offers no revoke to a user who may not edit', async () => {

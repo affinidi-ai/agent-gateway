@@ -51,4 +51,41 @@ describe('TwoStepButton', () => {
     await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(button()).toHaveClass('text-warning'));
   });
+
+  it('names a danger confirm by what it reads', () => {
+    const { button } = renderButton({ confirmAs: 'danger', confirmLabel: 'Revoke GitHub access?' });
+
+    fireEvent.click(button());
+    expect(button()).toHaveAccessibleName('Revoke GitHub access?');
+  });
+
+  it('shows a text button without an icon', () => {
+    const { button } = renderButton({ icon: undefined, label: 'Revoke' });
+
+    expect(button()).toHaveTextContent(/^Revoke$/);
+    expect(button().innerHTML).not.toContain('fa-');
+    expect(button().innerHTML).not.toContain('small');
+  });
+
+  it('offers Cancel beside the confirm, which asks no more and acts on nothing', () => {
+    const { onConfirm, button } = renderButton({
+      icon: undefined,
+      label: 'Revoke',
+      confirmAs: 'danger',
+      confirmLabel: 'Revoke GitHub access?',
+      cancelTestId: 'two-step-cancel',
+    });
+    expect(screen.queryByTestId('two-step-cancel')).toBeNull();
+
+    fireEvent.click(button());
+    const cancel = screen.getByTestId('two-step-cancel');
+    expect(cancel).toHaveTextContent(/^Cancel$/);
+    fireEvent.mouseDown(cancel);
+    fireEvent.click(cancel);
+
+    expect(screen.queryByTestId('two-step-cancel')).toBeNull();
+    expect(button()).toHaveTextContent(/^Revoke$/);
+    expect(button()).toHaveFocus();
+    expect(onConfirm).not.toHaveBeenCalled();
+  });
 });
