@@ -8,8 +8,14 @@ const UNIT_SECONDS: [ConsentLimitUnit, number][] = [
   ['seconds', 1],
 ];
 
-/** The units offered for a consent time limit, the smallest first. */
-export const CONSENT_LIMIT_UNITS: ConsentLimitUnit[] = ['seconds', 'minutes', 'hours', 'days'];
+/**
+ * The units offered for a consent time limit, the smallest first: minutes, hours and days, and
+ * seconds too while the stored limit is not a whole number of minutes, so it loads and saves as is.
+ */
+export function consentLimitUnitsFor(storedSecs: number | undefined): ConsentLimitUnit[] {
+  const units: ConsentLimitUnit[] = ['minutes', 'hours', 'days'];
+  return storedSecs !== undefined && storedSecs % 60 !== 0 ? ['seconds', ...units] : units;
+}
 
 /** The gateway's bounds on `max_consent_age_secs`: one minute to 365 days. */
 export const MIN_CONSENT_LIMIT_SECS = 60;

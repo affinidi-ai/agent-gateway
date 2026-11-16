@@ -235,7 +235,8 @@ _Credential provider editor_ in
 [`docs/CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md#deactivating-a-provider).
 
 The credential provider editor's **Consent time limit** (Authorization Code providers only)
-writes `max_consent_age_secs`, `0` when empty, and says an empty field sets no limit on the
+writes `max_consent_age_secs`, `0` when empty, in minutes, hours or days (seconds only for a
+stored limit that is not a whole number of minutes), and says an empty field sets no limit on the
 provider while the gateway's own default and ceiling still apply. A refused limit is shown
 under the field, which is marked invalid and takes the focus. A limit shorter than the stored
 one warns under the field how many active consents saving ends, from

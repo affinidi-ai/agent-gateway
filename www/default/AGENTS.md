@@ -1274,8 +1274,10 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   description, default scopes and token refresh (`externalProviderUpdate`).
 - An Authorization Code provider, external consent or not, has a **Consent time limit**: a whole
   number (`credential-provider-consent-limit-input`, placeholder "Not set") and a unit select
-  (`credential-provider-consent-limit-unit-select`: seconds, minutes, hours or days, hours by
-  default), with its explanation behind `FieldHelp` (`field-help-consent-limit`). The line under
+  (`credential-provider-consent-limit-unit-select`: minutes, hours or days, hours by default;
+  seconds only while the stored limit is not a whole number of minutes, `consentLimitUnitsFor`,
+  so such a limit loads and saves unchanged), with its explanation behind `FieldHelp`
+  (`field-help-consent-limit`). The line under
   it says an empty field sets no limit on the provider and that the gateway's own default and
   ceiling still apply, never that an empty field means no limit. A stored
   `max_consent_age_secs` loads in its largest whole unit (`consentLimitOf`). Save always sends

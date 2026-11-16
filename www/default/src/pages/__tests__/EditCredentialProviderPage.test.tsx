@@ -237,6 +237,28 @@ describe('EditCredentialProviderPage consent time limit', () => {
     expect((await savedBody()).max_consent_age_secs).toBe(2_592_000);
   });
 
+  it('offers minutes, hours and days, and no seconds', async () => {
+    await renderProvider(authorizationCode({ max_consent_age_secs: 21_600 }));
+    const units = within(screen.getByTestId(UNIT))
+      .getAllByRole('option')
+      .map(option => option.getAttribute('value'));
+
+    expect(units).toEqual(['minutes', 'hours', 'days']);
+  });
+
+  it('keeps a stored limit that is not a whole number of minutes, in seconds, unchanged', async () => {
+    await renderProvider(authorizationCode({ max_consent_age_secs: 90 }));
+    expect(screen.getByTestId(LIMIT)).toHaveValue(90);
+    expect(screen.getByTestId(UNIT)).toHaveValue('seconds');
+    expect(
+      within(screen.getByTestId(UNIT))
+        .getAllByRole('option')
+        .map(option => option.getAttribute('value'))
+    ).toEqual(['seconds', 'minutes', 'hours', 'days']);
+
+    expect((await savedBody()).max_consent_age_secs).toBe(90);
+  });
+
   it('shows no limit as an empty field and saves 0, which removes a stored one', async () => {
     await renderProvider(authorizationCode({ max_consent_age_secs: 3_600 }));
     fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '' } });

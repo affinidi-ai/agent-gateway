@@ -427,6 +427,11 @@ test.describe("Credential provider editor consent time limit", () => {
     await expect(page.getByTestId(LIMIT)).toBeVisible();
     await expect(page.getByTestId(LIMIT)).toHaveValue("");
     await expect(page.getByTestId(UNIT)).toHaveValue("hours");
+    await expect(page.getByTestId(UNIT).locator("option")).toHaveText([
+      "minutes",
+      "hours",
+      "days",
+    ]);
 
     await page
       .getByTestId("credential-provider-type-select")

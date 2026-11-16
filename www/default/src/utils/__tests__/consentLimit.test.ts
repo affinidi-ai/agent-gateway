@@ -1,5 +1,6 @@
 import {
   consentLimitLabel,
+  consentLimitUnitsFor,
   describeConsentLimit,
   largestWholeUnit,
   secondsIn,
@@ -23,6 +24,13 @@ describe('consent time limit', () => {
     expect(consentLimitLabel(86_400)).toBe('1-day limit');
     expect(consentLimitLabel(5_400)).toBe('90-minute limit');
     expect(consentLimitLabel(90)).toBe('90-second limit');
+  });
+
+  it('offers seconds only for a stored limit that is not a whole number of minutes', () => {
+    expect(consentLimitUnitsFor(undefined)).toEqual(['minutes', 'hours', 'days']);
+    expect(consentLimitUnitsFor(60)).toEqual(['minutes', 'hours', 'days']);
+    expect(consentLimitUnitsFor(21_600)).toEqual(['minutes', 'hours', 'days']);
+    expect(consentLimitUnitsFor(90)).toEqual(['seconds', 'minutes', 'hours', 'days']);
   });
 
   it('knows the seconds in each unit', () => {

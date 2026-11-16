@@ -47,6 +47,12 @@ changes:
         "Deactivated" badge with "No new consent" under it, instead of a "Deactivated" badge in
         the Type column. Deactivate and Activate now share one outline button style, so the
         Status column, not the button, carries the colour.
+    - timestamp: '2026-11-16T16:20:00Z'
+      title: Offer minutes, hours and days for a consent time limit, not seconds
+      description: >-
+        The provider form's consent time limit unit menu no longer offers seconds, since the
+        shortest limit is one minute. A stored limit that is not a whole number of minutes, which
+        only the API can set, still loads in seconds and saves unchanged.
   fixed:
     - timestamp: '2026-11-16T15:10:00Z'
       title: Say that token refresh stops when a provider's consent time limit ends

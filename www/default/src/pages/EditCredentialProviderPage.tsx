@@ -15,7 +15,7 @@ import ConsentConfirmationSection from './EditCredentialProviderPage/ConsentConf
 import JwtAssertionSection from './EditCredentialProviderPage/JwtAssertionSection';
 import { SecretOption as Secret, SecretOptions } from './EditCredentialProviderPage/SecretSelect';
 import { splitByTenant, type OwnerTenant } from '../utils/tenantScope';
-import { CONSENT_LIMIT_UNITS, storedConsentLimit } from '../utils/consentLimit';
+import { consentLimitUnitsFor, storedConsentLimit } from '../utils/consentLimit';
 import { useConsentImpact } from './EditCredentialProviderPage/useConsentImpact';
 import {
   CONSENT_LIMIT_FIELD_MESSAGE,
@@ -1081,7 +1081,7 @@ const EditCredentialProviderPage: React.FC = () => {
                     onChange={handleChange}
                     data-testid="credential-provider-consent-limit-unit-select"
                   >
-                    {CONSENT_LIMIT_UNITS.map(unit => (
+                    {consentLimitUnitsFor(storedConsentLimitSecs).map(unit => (
                       <option key={unit} value={unit}>
                         {unit}
                       </option>
