@@ -115,6 +115,17 @@ export interface VtaDeploymentStatus {
   control_did_method?: 'did_key' | 'did_webvh';
   /** The `did:key` control key the gateway holds and can rotate. Absent or null when it holds none. */
   control_key?: VtaControlKeyStatus | null;
+  /** Which backend the configuration resolves to for signing, and why (computed by the gateway). */
+  default_resolution?: VtaDefaultResolution;
+}
+
+/** What the configuration resolves the appliance's signing backend to. */
+export interface VtaDefaultResolution {
+  backend: string;
+  /** Operator-facing explanation, computed server-side. */
+  reason: string;
+  explicit: boolean;
+  fallback_from?: string;
 }
 
 /** The control key the gateway signs in to its trust agent with, from `GET /v1/vta/status`. */

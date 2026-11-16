@@ -1,6 +1,5 @@
 import React from 'react';
 import { Settings } from '../../types';
-import { KeyManagementSettingsSection } from './KeyManagementSettingsSection';
 
 interface SystemSettingsTabProps {
   formData: Settings;
@@ -19,7 +18,6 @@ const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({
 }) => {
   return (
     <>
-      <KeyManagementSettingsSection />
       <div className="card shadow mb-3">
         <div className="card-body">
           <p className="text-muted mb-3">

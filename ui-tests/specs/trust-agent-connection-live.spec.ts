@@ -46,112 +46,116 @@ async function api(
   );
 }
 
+const connectionNamed = async (page: Page) =>
+  (await api(page, "/api/v1/vta/connections")).json.find(
+    (c: any) => c.name === NAME,
+  );
+
 /**
- * Drives the Trust Agent page against a real trust agent, in two runs because
- * the trust agent's access list is written offline, between them:
+ * Drives the dashboard against a real trust agent, in two runs because the trust agent's access
+ * list is written offline between them:
  *
- * - `VTA_LIVE_PHASE=add` creates a connection through the same API the wizard
- *   uses and saves what pairing printed.
- * - `VTA_LIVE_PHASE=rotate` verifies the grant, then clicks Rotate control key.
+ * - `VTA_LIVE_PHASE=add` fills in the connect wizard, creates and pairs the connection, and saves
+ *   the grant command the wizard shows.
+ * - `VTA_LIVE_PHASE=rotate` resumes the wizard to verify the grant, completes it, clicks Rotate
+ *   control key on the connection's row, and sets an issuer to sign through the agent.
  *
  * Needs `VTA_LIVE_URL`, `VTA_LIVE_DID`, `VTA_LIVE_STATE_FILE` and optionally
  * `VTA_LIVE_CONTEXT`; skipped without them. The trust agent must be able to
  * reach the gateway's `/vta-auth/<id>/did.jsonl`, which locally means the
  * gateway's DID names its plain-HTTP port.
  */
-test.describe("Trust Agent page against a real trust agent", () => {
+test.describe("Connections against a real trust agent", () => {
   test.skip(
     !configured,
     "set VTA_LIVE_URL, VTA_LIVE_DID and VTA_LIVE_STATE_FILE to run",
   );
 
-  test("a new connection is paired for one context under the initiator role, never admin", async ({
+  test("the connect wizard pairs a new connection for one context under the initiator role, never admin", async ({
     page,
   }) => {
     test.skip(PHASE !== "add", "VTA_LIVE_PHASE is not add");
-    await page.goto(`${BASE_URL}/trust-agent`);
-    await expect(page.getByText("Connections").first()).toBeVisible();
+    await page.goto(`${BASE_URL}/connections?tab=trust-agents`);
+    await page.getByTestId("trust-agents-connect-button").click();
+    await expect(page.getByTestId("wizard-add-trust-agent")).toBeVisible();
 
-    const created = await api(page, "/api/v1/vta/connections", {
-      method: "POST",
-      body: {
-        name: NAME,
-        endpoint: VTA_URL,
-        vta_did: VTA_DID,
-        default_context_id: CONTEXT,
-        transport: "https",
-        enabled: true,
-      },
-    });
-    expect(created.status, JSON.stringify(created.json)).toBe(201);
-    const id = created.json.id as string;
+    await page.getByTestId("wizard-trust-agent-name-input").fill(NAME);
+    await page.getByTestId("wizard-trust-agent-endpoint-input").fill(VTA_URL!);
+    await page.getByTestId("wizard-trust-agent-did-input").fill(VTA_DID!);
+    await page.getByTestId("wizard-trust-agent-context-input").fill(CONTEXT);
+    await page.getByTestId("wizard-next").click();
 
-    const pairing = await api(page, `/api/v1/vta/connections/${id}/pair`, {
-      method: "POST",
-    });
-    expect(pairing.status, JSON.stringify(pairing.json)).toBe(200);
-    const payload = pairing.json;
+    await expect(page.getByTestId("wizard-step-grant")).toBeVisible();
+    const command = (
+      await page
+        .getByTestId("wizard-step-grant")
+        .locator("pre code")
+        .innerText()
+    ).trim();
+    expect(command).toContain("vta acl create");
+    expect(command).toContain("--role initiator");
+    expect(command).toContain(`--contexts ${CONTEXT}`);
+    expect(command).not.toContain("admin");
 
-    expect(payload.control_did).toMatch(/^did:webvh:/);
-    expect(payload.requested_role).toBe("initiator");
-    expect(payload.grant_command).toContain(`--contexts ${CONTEXT}`);
-    expect(payload.grant_command).toContain("--role initiator");
-    expect(payload.grant_command).not.toContain("admin");
-
-    await page.reload();
-    await expect(page.locator("tr", { hasText: NAME })).toBeVisible();
-
+    const created = await connectionNamed(page);
+    expect(created.control_did).toMatch(/^did:webvh:/);
     fs.writeFileSync(
       STATE_FILE!,
       JSON.stringify({
-        id,
-        control_did: payload.control_did,
-        grant_command: payload.grant_command,
+        id: created.id,
+        control_did: created.control_did,
+        grant_command: command,
       }),
     );
   });
 
-  test("Rotate control key moves the connection to a new key under the same DID and the same grant", async ({
+  test("the wizard verifies the grant and completes, Rotate control key moves the key under the same DID and grant, and an issuer signs through the agent", async ({
     page,
   }) => {
     test.skip(PHASE !== "rotate", "VTA_LIVE_PHASE is not rotate");
-    test.setTimeout(240_000);
+    test.setTimeout(300_000);
     const state = JSON.parse(fs.readFileSync(STATE_FILE!, "utf8"));
+    const find = async () =>
+      (await api(page, "/api/v1/vta/connections")).json.find(
+        (c: any) => c.id === state.id,
+      );
 
-    await page.goto(`${BASE_URL}/trust-agent`);
-    const row = page.locator("tr", { hasText: NAME });
-    await expect(row).toBeVisible();
-
-    await row.getByRole("button", { name: "Verify" }).click();
-    await expect(row.getByRole("button", { name: "Verify" })).toBeVisible();
-    await expect
-      .poll(
-        async () =>
-          (await api(page, `/api/v1/vta/connections`)).json.find(
-            (c: any) => c.id === state.id,
-          )?.status,
-      )
-      .toBe("connected");
-
-    const before = (await api(page, "/api/v1/vta/connections")).json.find(
-      (c: any) => c.id === state.id,
+    // The wizard, resumed: the grant step, then Verify, then Complete (which mints the signing key).
+    await page.goto(
+      `${BASE_URL}/connections/trust-agents/connect?id=${encodeURIComponent(state.id)}`,
     );
+    await expect(page.getByTestId("wizard-step-grant")).toBeVisible();
+    await page.getByTestId("wizard-next").click();
+    await expect(page.getByTestId("wizard-step-complete")).toBeVisible({
+      timeout: 120_000,
+    });
+    await expect
+      .poll(async () => (await find())?.keys?.active?.key_id, {
+        timeout: 120_000,
+      })
+      .toBeTruthy();
+    await page.getByTestId("wizard-submit").click();
+    await expect(page).toHaveURL(/\/connections\?tab=trust-agents/);
+
+    const before = await find();
+    expect(before.status).toBe("connected");
     expect(before.pairing.granted_role).toBe("initiator");
     expect(before.pairing.granted_contexts).toEqual([CONTEXT]);
     expect(before.control_did).toBe(state.control_did);
     const firstKey = before.control_key_state?.verification_method;
-    await expect(row.getByTestId("vta-row-control-key")).toBeVisible();
 
+    // The Trust Agents tab: rotate the control key from the row.
+    const row = page.locator("tr", { hasText: NAME });
+    await expect(row.getByTestId("vta-row-control-key")).toBeVisible();
     await row.getByTestId("vta-row-rotate-control-key").click();
     await page.getByTestId("vta-row-rotate-confirm").click();
-
     await expect
       .poll(
-        async () =>
-          (await api(page, "/api/v1/vta/connections")).json.find(
-            (c: any) => c.id === state.id,
-          )?.control_key_state?.verification_method,
-        { timeout: 200_000, intervals: [2_000] },
+        async () => (await find())?.control_key_state?.verification_method,
+        {
+          timeout: 200_000,
+          intervals: [2_000],
+        },
       )
       .not.toBe(firstKey);
     await expect(
@@ -159,9 +163,7 @@ test.describe("Trust Agent page against a real trust agent", () => {
     ).toBeVisible();
     await expect(row.getByTestId("vta-row-rotation-error")).toHaveCount(0);
 
-    const after = (await api(page, "/api/v1/vta/connections")).json.find(
-      (c: any) => c.id === state.id,
-    );
+    const after = await find();
     expect(
       after.control_did,
       "the DID, and so the grant, does not change",
@@ -170,17 +172,39 @@ test.describe("Trust Agent page against a real trust agent", () => {
     expect(after.control_key_state?.rotation).toBeUndefined();
     expect(after.pairing.granted_role).toBe("initiator");
     expect(after.pairing.granted_contexts).toEqual([CONTEXT]);
+    expect(after.keys?.active?.key_id).toBeTruthy();
 
-    const minted = await api(page, `/api/v1/vta/connections/${state.id}/keys`, {
-      method: "POST",
+    // Key Management names the agent once the wizard's "use for all signing" was applied.
+    await page.goto(`${BASE_URL}/connections?tab=key-management`);
+    await expect(page.getByTestId("key-management-signing-with")).toContainText(
+      NAME,
+    );
+
+    // An issuer takes the agent to sign for its surfaces, from the issuer editor.
+    await page.goto(`${BASE_URL}/identities?tab=issuers`);
+    await page.getByTestId("issuers-add-button").click();
+    await page.locator("#issuer-name").fill("Live issuer");
+    await page
+      .locator("#issuer-description")
+      .fill("Signs through the live agent");
+    await page
+      .getByTestId("surface-signing-type-select")
+      .selectOption("remote");
+    await page
+      .getByTestId("surface-signing-agent-select")
+      .selectOption(state.id);
+    await page.getByTestId("issuer-editor-save-button").click();
+
+    await expect(page.getByText("Live issuer")).toBeVisible();
+    const issuers = (await api(page, "/api/v1/issuers")).json;
+    const issuer = issuers.find((i: any) => i.name === "Live issuer");
+    expect(issuer.signing).toMatchObject({
+      backend: "vta",
+      connection_id: state.id,
+      context_id: CONTEXT,
     });
-    expect(
-      minted.status,
-      `the new key signs in and the grant still mints a key: ${JSON.stringify(minted.json)}`,
-    ).toBeLessThan(300);
-    expect(
-      minted.json.keys?.active,
-      "a signing key now exists in the context",
-    ).toBeTruthy();
+    await expect(page.getByTestId(`issuers-signing-${issuer.id}`)).toHaveText(
+      `Remote · ${NAME}`,
+    );
   });
 });

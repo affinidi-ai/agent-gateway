@@ -1,3 +1,4 @@
+import type { SurfaceSigning } from './components/surface-builder/elements/types';
 import React from 'react';
 import type { ChannelProtocol } from './generated/ChannelProtocol';
 
@@ -953,6 +954,8 @@ export interface Issuer {
   trust_registry_did?: string;
   authority_did?: string;
   tr_registered?: boolean;
+  /** Which backend signs for the surfaces this issuer owns; absent follows the appliance default. */
+  signing?: SurfaceSigning;
   created_at: string;
   updated_at: string;
 }

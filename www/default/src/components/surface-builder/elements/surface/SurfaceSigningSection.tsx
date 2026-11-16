@@ -1,60 +1,93 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { Form } from 'react-bootstrap';
 import FieldHelp from '../../../shared/FieldHelp';
 import { apiClient } from '../../../../api';
 import type { SurfaceSigning } from '../types';
 import type { VtaConnection } from '../../../../pages/VtaConnectionsPage/types';
 import { BOOTSTRAP_CONNECTION_ID } from '../../../../pages/VtaConnectionsPage/vtaConnectionHelpers';
+import { ROUTES } from '../../../../routes';
 
-/** Not a connection id, so the select needs a sentinel for "use the default". */
-const INHERIT = '__inherit__';
-const LOCAL = '__local__';
+type SigningType = 'local' | 'remote';
 
 interface Props {
   signing?: SurfaceSigning;
   setSigning: (value: SurfaceSigning | undefined) => void;
   disabled?: boolean;
+  /** What the choice is for: one surface, or every surface an issuer owns. */
+  subject?: 'surface' | 'issuer';
+  /** The issuer that owns this surface, whose own choice a surface that sets nothing follows. */
+  owner?: { name: string; signing?: SurfaceSigning };
 }
 
 /**
- * Which backend signs for this surface.
+ * Which backend signs for this surface: this gateway's own key (**Local**) or a connected trust
+ * agent (**Remote**), chosen from the connections.
  *
- * Defaults to **inherit**, and says so rather than showing the value it would
- * resolve to: hiding that nothing is configured defeats the point of looking,
- * and it is the same rule the Key Management tab follows.
+ * A surface that sets nothing inherits the appliance default, and says so rather than hiding that
+ * nothing is configured: the type shown is the one the default resolves to, and it only becomes
+ * the surface's own once the operator picks one. **Use the appliance default** takes it back.
  *
- * Only `connected` + `enabled` connections carrying an active key can be
- * chosen, mirroring the backend's `assert_usable`. A connection that is paired
- * but has no key is listed and disabled with the reason, so a half-finished
- * setup reads as what it is instead of looking like a failure.
+ * Only `connected` + `enabled` connections carrying an active key can be chosen, mirroring the
+ * backend's `assert_usable`. A connection that is paired but has no key is listed and disabled
+ * with the reason, so a half-finished setup reads as what it is instead of looking like a failure.
  */
-export const SurfaceSigningSection: React.FC<Props> = ({ signing, setSigning, disabled }) => {
+export const SurfaceSigningSection: React.FC<Props> = ({
+  signing,
+  setSigning,
+  disabled,
+  subject = 'surface',
+  owner,
+}) => {
   const [connections, setConnections] = useState<VtaConnection[]>([]);
   const [loadError, setLoadError] = useState(false);
+  const [defaultBackend, setDefaultBackend] = useState<string>('local');
+  /** Remote was picked and no agent has been chosen yet, so nothing is stored for it. */
+  const [remotePending, setRemotePending] = useState(false);
+
+  const loadConnections = useCallback(() => {
+    setLoadError(false);
+    return apiClient
+      .fetch('/api/v1/vta/connections')
+      .then(response => (response.ok ? response.json() : Promise.reject(new Error('failed'))))
+      .then((list: VtaConnection[]) => setConnections(list))
+      .catch(() => {
+        // A surface can still be saved without this list; only the Remote option becomes
+        // unusable, which the empty select communicates.
+        setLoadError(true);
+      });
+  }, []);
 
   useEffect(() => {
     let alive = true;
+    void loadConnections();
     apiClient
-      .fetch('/api/v1/vta/connections')
-      .then(response => (response.ok ? response.json() : Promise.reject(new Error('failed'))))
-      .then((list: VtaConnection[]) => {
-        if (alive) setConnections(list);
+      .fetch('/api/v1/vta/status')
+      .then(response => (response.ok ? response.json() : null))
+      .then(status => {
+        if (alive && status?.default_resolution?.backend) {
+          setDefaultBackend(status.default_resolution.backend);
+        }
       })
-      .catch(() => {
-        // A surface can still be saved without this list; only the VTA option
-        // becomes unavailable, which the empty select communicates.
-        if (alive) setLoadError(true);
-      });
+      .catch(() => undefined);
     return () => {
       alive = false;
     };
-  }, []);
+  }, [loadConnections]);
 
-  const selected = (() => {
-    if (!signing?.backend) return INHERIT;
-    if (signing.backend === 'local') return LOCAL;
-    return signing.connection_id ?? INHERIT;
-  })();
+  const inherited = !signing?.backend;
+  // What this surface follows while it sets nothing: its issuer's choice, then the appliance default.
+  const ownerSigning = inherited && owner?.signing?.backend ? owner.signing : undefined;
+  const shown = signing?.backend ? signing : ownerSigning;
+  const type: SigningType = remotePending
+    ? 'remote'
+    : shown?.backend === 'local'
+      ? 'local'
+      : shown?.backend
+        ? 'remote'
+        : defaultBackend === 'local'
+          ? 'local'
+          : 'remote';
+  const selectedAgent = shown?.backend === 'vta' ? (shown.connection_id ?? '') : '';
 
   const ready = (connection: VtaConnection) =>
     connection.enabled &&
@@ -69,20 +102,27 @@ export const SurfaceSigningSection: React.FC<Props> = ({ signing, setSigning, di
     ready(connection) ||
     signing?.connection_id === connection.id;
 
-  const choose = (value: string) => {
-    if (value === INHERIT) {
-      // Undefined, not an empty block: the backend treats "no signing" and
-      // "empty signing" alike, and sending one would make an inheriting
-      // surface look configured.
-      setSigning(undefined);
-      return;
-    }
-    if (value === LOCAL) {
+  const chooseType = (value: string) => {
+    if (value === 'local') {
+      setRemotePending(false);
       setSigning({ backend: 'local' });
       return;
     }
-    const connection = connections.find(c => c.id === value);
+    // Remote needs an agent. Until one is chosen nothing is stored for it, so a surface never
+    // saves a backend it cannot sign with.
+    setRemotePending(true);
+    if (signing?.backend !== 'vta') setSigning(undefined);
+  };
+
+  const chooseAgent = (id: string) => {
+    if (!id) {
+      setRemotePending(true);
+      setSigning(undefined);
+      return;
+    }
+    const connection = connections.find(c => c.id === id);
     if (!connection) return;
+    setRemotePending(false);
     setSigning({
       backend: 'vta',
       connection_id: connection.id,
@@ -92,34 +132,118 @@ export const SurfaceSigningSection: React.FC<Props> = ({ signing, setSigning, di
     });
   };
 
+  const useDefault = () => {
+    // Undefined, not an empty block: the backend treats "no signing" and "empty signing" alike,
+    // and sending one would make an inheriting surface look configured.
+    setRemotePending(false);
+    setSigning(undefined);
+  };
+
   return (
     <Form.Group className="mb-3">
-      <Form.Label htmlFor="surface-signing-select">
-        Signing key
-        <FieldHelp text="Which backend signs credentials issued for this surface. Inherit uses whatever the appliance is set to in Settings → Key management." />
-      </Form.Label>
+      <div className="d-flex align-items-center gap-1 mb-1">
+        <Form.Label htmlFor="surface-signing-type-select" className="mb-0">
+          Signing
+        </Form.Label>
+        <FieldHelp
+          text={
+            (subject === 'issuer'
+              ? 'Which backend signs credentials issued for the surfaces this issuer owns. A surface that sets its own signing keeps it. '
+              : 'Which backend signs credentials issued for this surface. ') +
+            "Local uses this gateway's own key. Remote signs through a trust agent you have connected (Connections → Trust Agents), in the context and with the key of that connection. " +
+            (subject === 'issuer'
+              ? 'An issuer that sets neither follows the appliance default (Connections → Key Management).'
+              : "A surface that sets neither follows its issuer's choice, then the appliance default (Connections → Key Management).")
+          }
+        />
+      </div>
       <Form.Select
-        id="surface-signing-select"
-        value={selected}
+        id="surface-signing-type-select"
+        data-testid="surface-signing-type-select"
+        value={type}
         disabled={disabled}
-        onChange={event => choose(event.target.value)}
+        onChange={event => chooseType(event.target.value)}
       >
-        <option value={INHERIT}>Inherit the appliance default</option>
-        <option value={LOCAL}>This gateway&apos;s own key (local)</option>
-        {connections.filter(listed).map(connection => (
-          <option key={connection.id} value={connection.id} disabled={!ready(connection)}>
-            {connection.name}
-            {ready(connection) ? '' : ' — not ready: connect it and provision a key first'}
-          </option>
-        ))}
+        <option value="local">Local — this gateway&apos;s own key</option>
+        <option value="remote">Remote — a connected trust agent</option>
       </Form.Select>
+
+      {inherited && !remotePending && (
+        <Form.Text className="d-block text-muted" data-testid="surface-signing-inherited">
+          {ownerSigning
+            ? `Following its issuer, ${owner?.name} (${ownerSigning.backend === 'local' ? 'local' : 'remote'}).`
+            : `Following the appliance default (${defaultBackend === 'local' ? 'local' : 'remote'}).`}{' '}
+          Choose a type to set {subject === 'issuer' ? "this issuer's" : "this surface's"} own.
+        </Form.Text>
+      )}
+      {!inherited && (
+        <button
+          type="button"
+          className="btn btn-link btn-sm p-0"
+          data-testid="surface-signing-reset"
+          disabled={disabled}
+          onClick={useDefault}
+        >
+          Use the appliance default
+        </button>
+      )}
+
+      {type === 'remote' && (
+        <div className="mt-2">
+          <Form.Label htmlFor="surface-signing-agent-select" className="small text-muted mb-1">
+            Trust agent
+          </Form.Label>
+          <Form.Select
+            id="surface-signing-agent-select"
+            data-testid="surface-signing-agent-select"
+            size="sm"
+            value={selectedAgent}
+            disabled={disabled}
+            onChange={event => chooseAgent(event.target.value)}
+          >
+            <option value="">Select a trust agent…</option>
+            {connections.filter(listed).map(connection => (
+              <option key={connection.id} value={connection.id} disabled={!ready(connection)}>
+                {connection.name}
+                {ready(connection) ? '' : ' — not ready: connect it and provision a key first'}
+              </option>
+            ))}
+          </Form.Select>
+          <Form.Text className="d-block text-muted">
+            <a
+              href={ROUTES.TRUST_AGENT_CONNECT}
+              target="_blank"
+              rel="noopener noreferrer"
+              data-testid="surface-signing-connect-link"
+            >
+              Connect a trust agent
+            </a>{' '}
+            ·{' '}
+            <button
+              type="button"
+              className="btn btn-link btn-sm p-0 align-baseline"
+              data-testid="surface-signing-refresh"
+              onClick={() => void loadConnections()}
+            >
+              Refresh
+            </button>
+          </Form.Text>
+          {selectedAgent === '' && (
+            <Form.Text className="d-block text-warning" data-testid="surface-signing-pick-agent">
+              Choose a trust agent. Until then this {subject} follows{' '}
+              {ownerSigning ? 'its issuer' : 'the appliance default'}.
+            </Form.Text>
+          )}
+        </div>
+      )}
+
       {loadError && (
         <Form.Text className="text-muted">
           Trust agents could not be listed, so only the local key can be chosen here.
         </Form.Text>
       )}
       {signing?.backend === 'vta' && signing.context_id && (
-        <Form.Text className="text-muted">
+        <Form.Text className="d-block text-muted">
           Signs in context <code>{signing.context_id}</code>
           {signing.key_id ? (
             <>

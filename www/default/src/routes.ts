@@ -9,7 +9,14 @@ export const ROUTES = {
   EVENT_SET_NEW: '/integrations/event-sets/new',
   PAYMENT_GATEWAY_CONNECT: '/payment-gateways/connect',
   PAYMENT_GATEWAYS_TAB: '/connections?tab=payment-gateways',
+  TRUST_AGENT_CONNECT: '/connections/trust-agents/connect',
+  TRUST_AGENTS_TAB: '/connections?tab=trust-agents',
+  KEY_MANAGEMENT_TAB: '/connections?tab=key-management',
 } as const;
+
+/** The connect wizard, resumed at the grant step of a trust agent connection that was created. */
+export const trustAgentResumePath = (id: string): string =>
+  `${ROUTES.TRUST_AGENT_CONNECT}?id=${encodeURIComponent(id)}`;
 
 /** The detail page of one payment gateway. */
 export const paymentGatewayPath = (id: string): string =>

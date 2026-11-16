@@ -149,7 +149,12 @@ const SurfacePanel: React.FC<ConfigPanelProps> = ({ hasAttemptedSave }) => {
           </Form.Text>
         </Form.Group>
 
-        <SurfaceSigningSection signing={signing} setSigning={setSigning} disabled={disabled} />
+        <SurfaceSigningSection
+          signing={signing}
+          setSigning={setSigning}
+          disabled={disabled}
+          owner={issuers.find(d => d.id === issuerId)}
+        />
       </div>
 
       <div className="config-section">

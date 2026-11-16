@@ -2,7 +2,7 @@ branch: vta-local-signing
 changes:
   added:
     - timestamp: '2026-11-10T16:00:00Z'
-      title: Rotate a custom connection's control key from its row on Trust Agent
+      title: Rotate a custom connection's control key from its row in Connections
       description: >-
         A connection added by hand with a did:webvh identity shows which key it
         signs in with and when it was last rotated, and has a Rotate control key
@@ -79,6 +79,15 @@ changes:
         ready". The record now validates without a secrets-store control key and
         shows its signing key once connected, so a surface can be pinned to it
         while the appliance default is another trust agent.
+    - timestamp: '2026-11-16T12:00:00Z'
+      title: Choose a trust agent to sign for an issuer's surfaces
+      description: >-
+        An issuer can set which backend signs for the surfaces it owns, local or
+        one of the connected trust agents, in the issuer editor, and the Issuers
+        list shows the choice. A surface or variant that sets its own signing
+        keeps it; a surface that sets none follows its issuer, then the appliance
+        default. An issuer can only name a trust agent connection its tenant may
+        use.
   changed:
     - timestamp: '2026-11-11T18:00:00Z'
       title: ⭐ Sign with the gateway's own keys through the VTA library
@@ -167,6 +176,21 @@ changes:
         refuse it. A challenge and a domain are now bound into the signed proof
         rather than refused. The gateway will not sign if the agent's own
         context is not the holder the presentation names.
+    - timestamp: '2026-11-16T12:05:00Z'
+      title: Manage trust agents and key management from the Connections page
+      description: >-
+        Trust Agents and Key Management are now tabs of Connections, beside
+        Gateways, Mediators and Registries, and the separate Trust Agent page and
+        the Key management card in Settings are gone. Connect an agent opens a
+        full-page wizard with a step bar instead of a pop-up. The Mediators and Registries
+        tabs now show only to users who may view them.
+    - timestamp: '2026-11-16T12:10:00Z'
+      title: Pick Local or Remote signing for a surface, then a connected trust agent
+      description: >-
+        The Surface Builder's signing choice is now two options, Local and
+        Remote, and Remote lists the connected trust agents with a link to
+        connect another. A surface that sets nothing shows what it follows, its
+        issuer's choice or the appliance default, and can be handed back to it.
   fixed:
     - timestamp: '2026-11-10T14:00:00Z'
       title: Retry a trust agent call whose session a key change ended

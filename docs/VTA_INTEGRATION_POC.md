@@ -202,7 +202,7 @@ Run live tests with `--test-threads=1`, or give each its own control key.
 A connection added from the dashboard authenticates as a `did:webvh` the gateway publishes at
 `/vta-auth/<id>/did.jsonl`. Its control key can be replaced **without a new grant**: the DID, and
 so the access entry on the trust agent, do not change. Use **Rotate control key** on the
-connection's row on the Trust Agent page, or
+connection's row on **Connections → Trust Agents**, or
 `POST /v1/vta/connections/{id}/control-key/rotate` (key management edit rights).
 
 Three steps, each saved on the connection record before the action that follows it, so a
@@ -242,7 +242,7 @@ When the `[vta]` block authenticates as a `did:key` held in a file
 (`control_did_method = "did_key"`, `auth_key_source = "file://<path>"`, no `auth_did`), the
 gateway can move that key while it runs, with `acl/swap-key`:
 
-- **On demand**: the **Rotate control key** button on the Trust Agent page or
+- **On demand**: the **Rotate control key** button on **Connections → Key Management** or
   `POST /v1/vta/control-key/rotate` (key management edit rights). It answers `404` when the
   gateway holds no such key, `409` while a rotation is running, `429` with a `Retry-After` within
   ten minutes of the last rotation, `503` on a standby gateway and `502` when the trust agent
@@ -294,6 +294,16 @@ credential is issued and signed by that trust agent, under the DID of the contex
 every other surface keeps the default signing. Each agent's own key, and the presentation it
 makes, stay in the default, so a request through such a surface can touch two signers.
 
+In the Surface Builder this is the **Signing** field: **Local** or **Remote**, and Remote picks
+one of the connected trust agents.
+
+An **Issuer** can set the same `signing` block, which then applies to every surface it owns
+that sets none of its own (`PUT /v1/issuers/{id}`, `signing`; an empty block clears it). A
+signing key resolves in this order, first match wins: a variant's block, the surface's block,
+the owning issuer's block, a tenant mapping, the appliance default (Connections → Key
+Management), then the gateway's own key. An issuer's `connection_id` must name a connection its
+tenant may use, the same rule as a surface's.
+
 ## Bring up a local VTA (for the live e2e)
 
 ```bash
@@ -309,10 +319,15 @@ cargo build -p vta-service --features webvh --bin vta
 VTA_ALLOW_PRIVATE_ENDPOINTS=1 ./target/debug/vta setup \
   --from local-dev/vta-root-webvh-setup.toml
 
-# Seed the gateway's control did:key (the fixed test seed [42u8;32]).
-./target/debug/vta import-did --config /tmp/vta-dev-root/config.toml \
+# The context the gateway signs in, and its control did:key (the fixed test seed
+# [42u8;32]) scoped to that one context: the initiator role with four capabilities,
+# never admin. This is what the connect wizard prints for a real connection.
+./target/debug/vta contexts create --config /tmp/vta-dev-root/config.toml \
+  --id gwtest --name "gateway test"
+./target/debug/vta acl create --config /tmp/vta-dev-root/config.toml \
   --did did:key:z6MkgAnvkP45uNxwCKeNdt6wrYkEjpYX4f7Nrd8MQqFL8Fbn \
-  --role admin --label gateway
+  --role initiator --contexts gwtest \
+  --capabilities context-create,key-mint,sign-jws,sign-document --label gateway
 
 # Run it (detached; survives terminal cleanup).
 VTA_ALLOW_PRIVATE_ENDPOINTS=1 nohup ./target/debug/vta \
@@ -557,12 +572,12 @@ pinned to the former, so a passkey returns `401` on any other origin.
 
 #### 3. Connect the agent
 
-**Trust Agent → Connect an agent**, with endpoint `http://127.0.0.1:3000`, the
-DID from step 1, and context `gwtest`. Backend *my own agent*, transport
-*HTTPS*, then **Pair**.
+**Connections → Trust Agents → Connect an agent** opens the connect wizard (a full
+page, `/connections/trust-agents/connect`). Enter a name, the address `http://127.0.0.1:3000`, the
+DID from step 1, and context `gwtest`, then **Create and pair**.
 
 Copy the printed `vta acl create` command, **stop the agent**, run it (adding
-`--config ~/vta-dev-root/config.toml`), start the agent again, then **Verify**.
+`--config ~/vta-dev-root/config.toml`), start the agent again, then continue to **Verify**.
 
 Env-var prefixes are `VAR=1 cmd`, not `export VAR=1 cmd` — `export` takes only
 assignments and will reject a command argument.
@@ -572,7 +587,7 @@ signing*, pre-checked when no agent is the default yet. **Done** applies it.
 
 #### 4. Confirm the gateway signs through the agent
 
-**Settings → System → Key management** should name the connection. Then, in the
+**Connections → Key Management** should name the connection. Then, in the
 browser console on `:8080`:
 
 ```js
@@ -608,17 +623,17 @@ attributing a credential to an issuer that did not sign it.
 separate question. `did:key:…` means it was minted inside the trust agent and
 the gateway never held a private half — the result you want. A
 `did:webvh:…:8443` means the gateway minted it locally, so check that an agent
-is the appliance default in Settings → System → Key management.
+is the appliance default in Connections → Key Management.
 
 This endpoint is **appliance-scoped**: it passes no surface, so a surface's own
-`Signing key` does not apply here and changing it will not move these values.
+`Signing` does not apply here and changing it will not move these values.
 Use step 5 to exercise that setting.
 
 #### 5. Optional — a surface, end to end
 
 The step above exercises credential issuance. The **injected presentation** on a
 live request is the other half, and the only place a surface's own
-`Signing key` applies.
+`Signing` applies.
 
 Point an `a2a` surface (not `mcp` — MCP validates every POST and a plain body
 is rejected `-32600`) at any A2A listener. It needs **both** of:
@@ -632,7 +647,7 @@ With the toggle alone the gateway logs *"inject_vp is enabled but no identity
 binding VP was produced"* and signs nothing, so the agent stays idle and looks
 broken when it is behaving correctly.
 
-Set **Signing key** to the connection, send a valid `message/send` through the
+Set **Signing** to **Remote** and pick the connection, send a valid `message/send` through the
 surface's route, and inspect
 `message.metadata["https://fabric.affinidi.io/extensions/agent-identity-credential/v1"]`
 on what arrives: the embedded credential's issuer should be the agent.

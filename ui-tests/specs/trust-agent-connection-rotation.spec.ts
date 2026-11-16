@@ -34,7 +34,7 @@ const configConnection = {
   updated_at: "2026-01-01T00:00:00Z",
 };
 
-test.describe("Trust Agent page: control key rotation", () => {
+test.describe("Connections: control key rotation", () => {
   test("the control key card shows the key and rotates it, and is absent without one", async ({
     page,
   }) => {
@@ -66,7 +66,7 @@ test.describe("Trust Agent page: control key rotation", () => {
         },
       });
     });
-    await page.goto(`${BASE_URL}/trust-agent`);
+    await page.goto(`${BASE_URL}/connections?tab=key-management`);
 
     await expect(page.getByTestId("vta-control-key-did")).toHaveAttribute(
       "title",
@@ -96,9 +96,9 @@ test.describe("Trust Agent page: control key rotation", () => {
     await page.route(/\/api\/v1\/vta\/status(\?.*)?$/, (route) =>
       route.fulfill({ json: deployment(null) }),
     );
-    await page.goto(`${BASE_URL}/trust-agent`);
+    await page.goto(`${BASE_URL}/connections?tab=key-management`);
 
-    await expect(page.getByText("Connections").first()).toBeVisible();
+    await expect(page.getByTestId("key-management-panel")).toBeVisible();
     await expect(page.getByTestId("vta-control-key")).toHaveCount(0);
   });
 
@@ -157,7 +157,7 @@ test.describe("Trust Agent page: control key rotation", () => {
         });
       },
     );
-    await page.goto(`${BASE_URL}/trust-agent`);
+    await page.goto(`${BASE_URL}/connections?tab=trust-agents`);
 
     const row = page.locator("tr", { hasText: "Custom VTA" });
     await expect(row.getByTestId("vta-row-control-key-rotated-at")).toHaveText(

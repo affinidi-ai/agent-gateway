@@ -33,6 +33,8 @@ export interface SurfaceMapping {
   context_id?: string;
   key_id?: string;
   inherits: boolean;
+  /** The issuer whose signing this surface follows, when it sets none of its own. */
+  via_issuer?: string;
   derived_context: string;
 }
 

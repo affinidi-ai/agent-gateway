@@ -160,12 +160,20 @@ key of a deleted surface is no longer in use. See _Surface Builder_ and
 [_API key delete_](www/default/AGENTS.md#api-key-delete) in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
-The Trust Agent page's tier banner never implies key custody for a local deployment or a trust agent
+Trust agents are connections: **Trust Agents** and **Key Management** are tabs of the Connections page,
+and there is no Trust Agent page or Settings card for key management. The Trust Agents tab lists
+the connections and opens a full-page connect wizard (`/connections/trust-agents/connect`), never a pop-up.
+The Key Management tab's tier banner never implies key custody for a local deployment or a trust agent
 the operator runs. Its Control key card, shown while `GET /v1/vta/status` reports a `control_key`,
 shows the key the gateway signs in to its trust agent with, when it was last rotated and when it is
 next due, and a Rotate control key button for key management editors. A connection added by hand
-with a `did:webvh` identity has a Rotate control key action on its row, with a rotation-under-way state and Cancel; see _Trust Agent page_ in
-[`www/default/AGENTS.md`](www/default/AGENTS.md#trust-agent-page).
+with a `did:webvh` identity has a Rotate control key action on its row, with a rotation-under-way state and Cancel; see _Trust Agents and Key Management tabs_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#trust-agents-and-key-management-tabs).
+
+The Surface Builder's **Signing** has two types, Local and Remote, and Remote picks a connected trust
+agent; an Issuer sets the same choice for every surface it owns, which a surface or variant that sets
+its own overrides, before the appliance default. See _Where a trust agent can be chosen_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#where-a-trust-agent-can-be-chosen).
 
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
 

@@ -87,7 +87,18 @@ export const SurfaceMappingTable: React.FC<{
               )}
             </td>
             <td>
-              {mapping.inherits ? (
+              {mapping.via_issuer ? (
+                // The surface sets nothing, so the issuer that owns it decides.
+                <>
+                  {mapping.backend}
+                  <span
+                    className="badge text-bg-secondary ms-2"
+                    data-testid={`key-mapping-via-issuer-${mapping.surface_id}`}
+                  >
+                    via issuer {mapping.via_issuer}
+                  </span>
+                </>
+              ) : mapping.inherits ? (
                 // Showing the resolved value would hide that nothing is
                 // configured — which is what the operator is checking.
                 <span className="text-muted fst-italic">inherit</span>
