@@ -142,6 +142,12 @@ without the permission learns nothing about which ids exist. The built-in defaul
 `agent-gateway.log`; `POST /v1/metrics/truncate` drops stored metrics older than the retention
 period. Both need `settings.edit`. Without an auth backend neither route is registered.
 
+`GET /v1/logs/download` returns the server log files as one ZIP archive and needs `audit.view`.
+The logs hold every tenant's detail, so it also refuses, with `403`, any PAT scoped by a tenant, a
+resource pattern or required headers alone (see
+[`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#what-tenancy-does-not-partition)). A failed download
+answers a fixed error body and logs the detail.
+
 `GET` and `PUT /v1/notifications/user-welcome-template` read and change the notification a user
 receives when their account is approved, and `POST /v1/notifications/send-welcome` sends a
 notification with the given title and text to the user named in the request. All three need

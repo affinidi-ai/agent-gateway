@@ -1,0 +1,19 @@
+branch: fix/upgrade-rmcp
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-09T12:00:00Z'
+      title: Upgrade rmcp to 3.9 and rmcp-openapi to 0.32.1
+      description: >-
+        Before 3.9.0, the Streamable HTTP clients in rmcp read a response body into memory
+        with no size limit (RUSTSEC-2026-0462). The gateway already leaves those client
+        features off and listed the advisory as ignored; it now moves to a release with the
+        fix, rmcp 3.9 with rmcp-openapi 0.32.1, the rmcp-openapi line that uses rmcp 3, and
+        the advisory is no longer ignored. The rmcp-openapi releases in between also change how it builds
+        tools from an OpenAPI document (OpenAPI examples, allOf and anyOf in tool schemas,
+        deepObject query parameters sent as key[prop]=value). tokio-util is no longer
+        pinned to an exact version, since rmcp-openapi 0.32 needs 0.7.19 or later.
+  breaking: []

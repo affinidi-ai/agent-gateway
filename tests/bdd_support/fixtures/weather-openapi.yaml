@@ -59,3 +59,21 @@ paths:
                           type: number
                         low:
                           type: number
+  /weather/{city}/map:
+    get:
+      operationId: get_weather_map
+      summary: Get the weather map for a city as a PDF document
+      parameters:
+        - name: city
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Weather map
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary

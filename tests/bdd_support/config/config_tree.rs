@@ -94,11 +94,14 @@ pub struct ApiKeyProviderFixture {
     pub key_id: String,
     pub client_id: String,
     pub secret: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CredentialProviderFixture {
     pub id: String,
+    /// The tenant that owns the provider; appliance-wide when `None`.
+    pub tenant_id: Option<String>,
     pub name: String,
     pub provider_id: String,
     pub provider_type: String,
@@ -111,8 +114,10 @@ pub struct CredentialProviderFixture {
     pub callback_url: Option<String>,
     pub token_refresh_enabled: bool,
     pub api_key_secret_ref: Option<String>,
+    pub authorization_response_issuer: Option<String>,
     /// The `jwt_*` settings of a provider that signs a JWT, merged into the record.
     pub jwt_settings: Option<serde_json::Value>,
+    pub consent_confirmation: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -131,6 +136,7 @@ impl ApiKeyProviderFixture {
             key_id: key_id.into(),
             client_id: client_id.into(),
             secret: secret.into(),
+            created_at: Utc::now(),
         }
     }
 }
@@ -334,6 +340,7 @@ pub fn write_gateway_config_tree(
             &api_key_provider.key_id,
             &api_key_provider.client_id,
             &api_key_provider.secret,
+            api_key_provider.created_at,
         );
     }
 
@@ -484,6 +491,9 @@ fn write_credential_provider_fixture(
         "created_at": provider.created_at.to_rfc3339(),
         "updated_at": provider.updated_at.to_rfc3339(),
     });
+    if let Some(tenant_id) = &provider.tenant_id {
+        value["tenant_id"] = serde_json::json!(tenant_id);
+    }
     if let Some(endpoint) = &provider.authorization_endpoint {
         value["authorization_endpoint"] = serde_json::json!(endpoint);
     }
@@ -501,6 +511,12 @@ fn write_credential_provider_fixture(
     }
     if let Some(secret_ref) = &provider.api_key_secret_ref {
         value["api_key_secret_ref"] = serde_json::json!(secret_ref);
+    }
+    if let Some(issuer) = &provider.authorization_response_issuer {
+        value["authorization_response_issuer"] = serde_json::json!(issuer);
+    }
+    if let Some(confirmation) = &provider.consent_confirmation {
+        value["consent_confirmation"] = confirmation.clone();
     }
     if let Some(serde_json::Value::Object(settings)) = &provider.jwt_settings {
         for (name, setting) in settings {

@@ -20,4 +20,4 @@ pub mod models;
 pub mod peer_cert;
 
 pub use middleware::SourceAuthMiddleware;
-pub use models::{AuthenticatedIdentity, ManagedIdentityConfig, SourceAuthConfig};
+pub use models::{AuthenticatedIdentity, JwtVerification, ManagedIdentityConfig, SourceAuthConfig};

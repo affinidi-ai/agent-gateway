@@ -32,13 +32,26 @@ pub struct MockAgentFixture {
 #[derive(Debug, Clone)]
 pub struct ReceivedRequest {
     pub method: String,
+    /// Each header's values joined with ", ", keyed by its lowercase name.
     pub headers: HashMap<String, String>,
+    /// Every value of each header in the order received, keyed by its lowercase name.
+    pub header_values: HashMap<String, Vec<String>>,
     pub raw_body: String,
     pub content_type: Option<String>,
     pub path_and_query: String,
 }
 
 impl ReceivedRequest {
+    /// Every value the request carried for `name`, matched without regard to case.
+    pub fn values_of_header(
+        &self,
+        name: &str,
+    ) -> &[String] {
+        self.header_values
+            .get(&name.to_ascii_lowercase())
+            .map_or(&[], Vec::as_slice)
+    }
+
     pub fn json_body(&self) -> serde_json::Value {
         serde_json::from_str(&self.raw_body).unwrap_or(serde_json::Value::Null)
     }
@@ -89,6 +102,13 @@ pub enum MockStream {
     /// Each element of the configured JSON array as one SSE `message` event,
     /// then the end of the body.
     Events,
+    /// The configured JSON string, base64-decoded, as the raw body: a file,
+    /// not JSON.
+    Bytes,
+    /// One JSON body, gzip-compressed when the request accepts gzip.
+    GzipWhenAsked,
+    /// One JSON body, gzip-compressed whatever the request accepts.
+    Gzip,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -373,6 +393,19 @@ impl MockServer {
             .status = status;
     }
 
+    pub async fn set_response_header(
+        &self,
+        name: &str,
+        value: &str,
+    ) {
+        self.state
+            .lock()
+            .await
+            .response
+            .headers
+            .insert(name.to_string(), value.to_string());
+    }
+
     /// Lets a `ProgressThenRelease` response send its final message.
     pub async fn release_stream(&self) {
         self.state
@@ -428,20 +461,25 @@ pub fn discover_non_loopback_local_ip() -> std::net::IpAddr {
     ip
 }
 
-/// Joins a repeated header's values with ", ", so a step comparing one value fails on a duplicate.
-fn received_headers(headers: &axum::http::HeaderMap) -> HashMap<String, String> {
-    let mut received: HashMap<String, String> = HashMap::new();
+/// The request headers per lowercase name: their values joined with ", ", so a step comparing
+/// one value fails on a duplicate, and every value in the order received.
+fn received_headers(headers: &axum::http::HeaderMap) -> (HashMap<String, String>, HashMap<String, Vec<String>>) {
+    let mut joined: HashMap<String, String> = HashMap::new();
+    let mut all: HashMap<String, Vec<String>> = HashMap::new();
     for (name, value) in headers {
         let value = value.to_str().unwrap_or("");
-        received
+        joined
             .entry(name.to_string())
             .and_modify(|existing| {
                 existing.push_str(", ");
                 existing.push_str(value);
             })
             .or_insert_with(|| value.to_string());
+        all.entry(name.to_string())
+            .or_default()
+            .push(value.to_string());
     }
-    received
+    (joined, all)
 }
 
 async fn handler(
@@ -452,7 +490,10 @@ async fn handler(
         .method()
         .as_str()
         .to_string();
-    let headers = received_headers(request.headers());
+    let (headers, header_values) = received_headers(request.headers());
+    let accepts_gzip = headers
+        .get("accept-encoding")
+        .is_some_and(|accepted| accepted.contains("gzip"));
     let content_type = headers
         .get("content-type")
         .cloned();
@@ -484,6 +525,7 @@ async fn handler(
             .push(ReceivedRequest {
                 method: method.clone(),
                 headers,
+                header_values,
                 raw_body: raw_body.clone(),
                 content_type,
                 path_and_query: path_and_query.clone(),
@@ -521,7 +563,26 @@ async fn handler(
 
     let body = match response.stream {
         MockStream::None => Body::from(serde_json::to_vec(&response_body_value).unwrap()),
+        MockStream::GzipWhenAsked if !accepts_gzip => Body::from(serde_json::to_vec(&response_body_value).unwrap()),
+        MockStream::GzipWhenAsked | MockStream::Gzip => {
+            use std::io::Write;
+            let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder
+                .write_all(&serde_json::to_vec(&response_body_value).unwrap())
+                .unwrap();
+            builder = builder.header("content-encoding", "gzip");
+            Body::from(encoder.finish().unwrap())
+        }
         MockStream::Sse => Body::from(sse_event(&response_body_value)),
+        MockStream::Bytes => Body::from(
+            base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                response_body_value
+                    .as_str()
+                    .expect("a Bytes response is configured with a base64 JSON string"),
+            )
+            .expect("a Bytes response is configured with valid base64"),
+        ),
         MockStream::Events => {
             let events: Vec<u8> = response_body_value
                 .as_array()
@@ -649,18 +710,7 @@ async fn forward_handler(
     };
 
     // let request_uri = request.uri().clone();
-    let request_headers: HashMap<String, String> = request
-        .headers()
-        .iter()
-        .map(|(k, v)| {
-            (
-                k.to_string(),
-                v.to_str()
-                    .unwrap_or("")
-                    .to_string(),
-            )
-        })
-        .collect();
+    let (request_headers, request_header_values) = received_headers(request.headers());
     let content_type = request_headers
         .get("content-type")
         .cloned();
@@ -692,6 +742,7 @@ async fn forward_handler(
         .requests
         .push(ReceivedRequest {
             headers: request_headers.clone(),
+            header_values: request_header_values,
             method: method.as_str().to_string(),
             raw_body: request_raw_body.clone(),
             path_and_query: request_path_and_query.clone(),
@@ -805,7 +856,7 @@ async fn default_handler(
 
     let method = request.method().clone();
 
-    let headers = received_headers(request.headers());
+    let (headers, header_values) = received_headers(request.headers());
     let content_type = headers
         .get("content-type")
         .cloned();
@@ -843,6 +894,7 @@ async fn default_handler(
         .requests
         .push(ReceivedRequest {
             headers,
+            header_values,
             raw_body,
             method: method.as_str().to_string(),
             path_and_query,

@@ -248,13 +248,16 @@ export function identityConfigToWire(ic: Record<string, any> | undefined): any |
  * reason. The empty string sentinel from the sidebar dropdown does NOT
  * count as a selected type.
  */
+export const SELECT_OWN_API_KEY =
+  'Select an API key of this surface. A new surface has no API keys yet: remove this Identity or choose another type, save the surface, add an API key, then come back and select it.';
+
 function identityIncompleteReason(
   config: Record<string, any>,
   node?: DependencyNode
 ): string | null {
   if (!config.type) return 'Select an identity extraction type';
   if (config.type === 'from_api_key' && !config.api_key_id && !isInboundIdentity(node))
-    return 'Select an API key';
+    return SELECT_OWN_API_KEY;
   if (config.type === 'from_mtls' && !config.certificate_id) return 'Select a certificate';
   if (config.type === 'static' && !config.static_did) return 'Enter a static DID';
   return null;

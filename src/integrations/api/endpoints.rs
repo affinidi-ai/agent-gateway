@@ -247,6 +247,72 @@ mod tests {
         assert!(!has_cached_kafka_producer(&id(&created)).await, "a delete drops the producer");
     }
 
+    fn kafka_body(connection: JsonValue) -> JsonValue {
+        let mut configuration = json!({"platform": "kafka", "topic": "gw1.audit", "brokers": "b-1.msk.example:9196"});
+        if let (Some(configuration), Some(connection)) = (configuration.as_object_mut(), connection.as_object()) {
+            configuration.extend(connection.clone());
+        }
+        json!({"name": "MSK", "type": "stream", "configuration": configuration})
+    }
+
+    #[tokio::test]
+    async fn refuses_a_kafka_endpoint_with_an_unknown_protocol_or_incomplete_sasl() {
+        let f = Fixture::new().await;
+
+        for (connection, reason) in [
+            (
+                json!({"security_protocol": "SASL_SSL"}),
+                "security_protocol must be one of plaintext, ssl, sasl_plaintext or sasl_ssl",
+            ),
+            (
+                json!({"security_protocol": "sasl_ssl", "sasl_mechanism": "OAUTHBEARER", "sasl_username": "gw1", "sasl_password": "pw"}),
+                "sasl_mechanism must be one of PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512",
+            ),
+            (
+                json!({"security_protocol": "sasl_ssl", "sasl_mechanism": "SCRAM-SHA-512", "sasl_username": "gw1"}),
+                "A SASL security_protocol needs a sasl_password",
+            ),
+        ] {
+            let (status, body) = f
+                .call(ADMIN, "POST", "/v1/integrations/endpoints", Some(kafka_body(connection.clone())))
+                .await;
+
+            assert_eq!((status, body), (StatusCode::BAD_REQUEST, json!(reason)), "{connection}");
+        }
+        assert!(
+            f.stores
+                .endpoints
+                .list()
+                .await
+                .expect("list")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn stores_a_kafka_endpoint_with_sasl_ssl_and_scram() {
+        let f = Fixture::new().await;
+
+        let (status, created) = f
+            .call(
+                ADMIN,
+                "POST",
+                "/v1/integrations/endpoints",
+                Some(kafka_body(json!({
+                    "security_protocol": "sasl_ssl",
+                    "sasl_mechanism": "SCRAM-SHA-512",
+                    "sasl_username": "gw1",
+                    "sasl_password": "pw"
+                }))),
+            )
+            .await;
+
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_eq!(created["configuration"]["security_protocol"], "sasl_ssl");
+        assert_eq!(created["configuration"]["sasl_mechanism"], "SCRAM-SHA-512");
+        assert_eq!(created["secrets"], json!(["sasl_password"]));
+    }
+
     #[tokio::test]
     async fn creating_an_endpoint_stores_its_secret_but_never_returns_it() {
         let f = Fixture::new().await;

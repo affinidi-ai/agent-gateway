@@ -5,8 +5,9 @@
 //! with redirects refused and proxies ignored, and is sent and read by the
 //! token request every credential provider shares
 //! ([`super::oauth::post_token_request`]): a 30 second timeout and a 64 KiB
-//! cap on the answer. It names the provider's `resource` (RFC 8707), and the
-//! client authenticates as its `token_endpoint_auth_method` says
+//! cap on the answer. It names the provider's `resource` (RFC 8707) unless the
+//! provider's `send_resource` is off, and the client authenticates as its
+//! `token_endpoint_auth_method` says
 //! ([`super::revocation::ClientCredential`]), with a secret or signing key
 //! of the provider's own tenant only (an untenanted provider uses untenanted
 //! ones). The answer must be a
@@ -172,7 +173,9 @@ pub async fn request_token(
             form
         }
     };
-    if let Some(resource) = provider.resource.as_deref() {
+    if provider.send_resource
+        && let Some(resource) = provider.resource.as_deref()
+    {
         form.push(("resource", resource));
     }
     form.extend(
@@ -447,6 +450,56 @@ mod tests {
         assert!(head.contains("authorization: Basic Y2xpZW50K2lkOnMzY3JldCUzQSUyNiUzRA=="), "{head}");
     }
 
+    /// A provider whose `send_resource` is off redeems a code and refreshes a
+    /// grant without `resource`, for a token endpoint that refuses it; one
+    /// that sets it, or leaves it out, sends the resource on both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_resource_is_sent_unless_the_provider_turns_it_off() {
+        let scopes = ["read".to_string()];
+        for (send_resource, expected) in [
+            (None, Some("https://vendor.example/mcp")),
+            (Some(true), Some("https://vendor.example/mcp")),
+            (Some(false), None),
+        ] {
+            for grant_type in ["authorization_code", "refresh_token"] {
+                let server = RecordingServer::start_answering(vec![Answer::json(
+                    200,
+                    json!({"access_token": "access", "token_type": "Bearer"}),
+                )])
+                .await;
+                let mut record = serde_json::to_value(provider(&server, "none", None)).unwrap();
+                assert!(
+                    record
+                        .get("send_resource")
+                        .is_none(),
+                    "left out while on"
+                );
+                if let Some(send_resource) = send_resource {
+                    record["send_resource"] = json!(send_resource);
+                }
+                let provider: CredentialProvider = serde_json::from_value(record).unwrap();
+                let request = match grant_type {
+                    "authorization_code" => code(),
+                    _ => TokenRequest::Refresh {
+                        refresh_token: "the-refresh",
+                        scopes: &scopes,
+                    },
+                };
+                request_token(&provider, None, Some(&server.origin()), request)
+                    .await
+                    .unwrap();
+                let sent = form(&server.requests()[0].1);
+                assert_eq!(sent["grant_type"], grant_type);
+                assert_eq!(
+                    sent.get("resource")
+                        .map(String::as_str),
+                    expected,
+                    "{send_resource:?} {grant_type}"
+                );
+            }
+        }
+    }
+
     /// A `private_key_jwt` client redeems a code with a client assertion its
     /// key signs, built by the shared RFC 7523 assertion code and addressed to
     /// the provider's issuer, and no secret.
@@ -558,6 +611,25 @@ mod tests {
                 TokenFailure::InvalidResponse,
             ),
             (
+                Answer::json(200, json!({"access_token": "a", "token_type": "Bearer", "expires_in": -1})),
+                TokenFailure::InvalidResponse,
+            ),
+            (
+                Answer::json(
+                    200,
+                    json!({"access_token": "a", "token_type": "Bearer", "expires_in": MAX_EXPIRES_IN_SECS + 1}),
+                ),
+                TokenFailure::InvalidResponse,
+            ),
+            (
+                Answer::json(200, json!({"access_token": "a", "token_type": "Bearer", "expires_in": 3600.5})),
+                TokenFailure::InvalidResponse,
+            ),
+            (
+                Answer::json(200, json!({"access_token": "a", "token_type": "Bearer", "expires_in": "3600.5"})),
+                TokenFailure::InvalidResponse,
+            ),
+            (
                 Answer::json(200, json!({"access_token": "a", "token_type": "Bearer", "refresh_token": ""})),
                 TokenFailure::InvalidResponse,
             ),
@@ -590,6 +662,19 @@ mod tests {
                 .expires_in,
             Some(3600),
             "a lifetime given as a string is read"
+        );
+        let server = RecordingServer::start_answering(vec![Answer::json(
+            200,
+            json!({"access_token": "a", "token_type": "Bearer", "expires_in": MAX_EXPIRES_IN_SECS}),
+        )])
+        .await;
+        assert_eq!(
+            request_token(&provider(&server, "none", None), None, Some(&server.origin()), code())
+                .await
+                .unwrap()
+                .expires_in,
+            Some(MAX_EXPIRES_IN_SECS),
+            "the longest lifetime is accepted"
         );
     }
 

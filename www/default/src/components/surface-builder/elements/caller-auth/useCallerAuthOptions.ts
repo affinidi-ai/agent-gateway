@@ -5,6 +5,7 @@ export interface JwtVerificationStrategyOption {
   id: string;
   name: string;
   expected_issuer?: string;
+  tenant_id?: string | null;
 }
 
 export interface ApiKeySecretOption {
@@ -14,23 +15,55 @@ export interface ApiKeySecretOption {
   secret_type?: string;
 }
 
-/** The JWT verification strategies a caller authentication method can name, loaded while `enabled`. */
-export function useJwtStrategies(enabled = true): JwtVerificationStrategyOption[] {
+export type JwtStrategiesStatus = 'idle' | 'loading' | 'loaded' | 'failed';
+
+/**
+ * The JWT verification strategies, loaded while `enabled`, and whether the list loaded or could
+ * not be read; a refused request is `failed`, never an empty list.
+ */
+export function useJwtStrategyList(enabled = true): {
+  strategies: JwtVerificationStrategyOption[];
+  status: JwtStrategiesStatus;
+} {
   const [strategies, setStrategies] = useState<JwtVerificationStrategyOption[]>([]);
+  const [status, setStatus] = useState<JwtStrategiesStatus>('idle');
   useEffect(() => {
     if (!enabled) return;
+    let current = true;
+    setStatus('loading');
     apiClient
       .fetch('/api/v1/jwt-verification-strategies')
-      .then(r => (r.ok ? r.json() : []))
-      .then((data: JwtVerificationStrategyOption[]) =>
-        setStrategies(Array.isArray(data) ? data : [])
-      )
-      .catch(() => setStrategies([]));
+      .then(async r => {
+        if (!r.ok) throw new Error(`${r.status}`);
+        const data: unknown = await r.json();
+        if (!current) return;
+        setStrategies(Array.isArray(data) ? data : []);
+        setStatus('loaded');
+      })
+      .catch(() => {
+        if (!current) return;
+        setStrategies([]);
+        setStatus('failed');
+      });
+    return () => {
+      current = false;
+    };
   }, [enabled]);
-  return strategies;
+  return { strategies, status };
 }
 
-/** The secrets that can hold accepted API keys, loaded while `enabled`. */
+/** The JWT verification strategies a caller authentication method can name, loaded while `enabled`. */
+export function useJwtStrategies(enabled = true): JwtVerificationStrategyOption[] {
+  return useJwtStrategyList(enabled).strategies;
+}
+
+const apiKeyTypeFirst = (a: ApiKeySecretOption, b: ApiKeySecretOption): number =>
+  Number(b.secret_type === 'ApiKey') - Number(a.secret_type === 'ApiKey');
+
+/**
+ * The secrets that can hold accepted API keys, loaded while `enabled`. The gateway reads the
+ * secret whatever its type, so every secret is offered, those of type `ApiKey` first.
+ */
 export function useApiKeySecrets(enabled: boolean): {
   secrets: ApiKeySecretOption[];
   loading: boolean;
@@ -44,7 +77,7 @@ export function useApiKeySecrets(enabled: boolean): {
       .get<ApiKeySecretOption[]>('/secrets/')
       .then(res => {
         const list: ApiKeySecretOption[] = Array.isArray(res.data) ? res.data : [];
-        setSecrets(list.filter(secret => !secret.secret_type || secret.secret_type === 'ApiKey'));
+        setSecrets([...list].sort(apiKeyTypeFirst));
       })
       .catch(() => setSecrets([]))
       .finally(() => setLoading(false));

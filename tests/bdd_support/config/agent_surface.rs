@@ -15,6 +15,8 @@ pub struct AgentSurfaceFixture {
     pub identity_slots: HashMap<String, Value>,
     pub transit_points: HashMap<String, TransitPointFixture>,
     pub mcp_http: Option<Value>,
+    pub caller_key: Option<Value>,
+    pub browser_origins: Vec<String>,
     pub a2a_settings: Option<Value>,
     pub tenant_id: Option<String>,
 }
@@ -32,6 +34,12 @@ pub struct AccessPointFixture {
     pub caller_trust_check_list: Vec<Value>,
     pub trust_recorder_entries: Vec<Value>,
     pub rate_limit: Option<Value>,
+    /// `access_point.public` as stored; `None` derives what the admin API
+    /// writes: closed when the Access Point authenticates callers, public
+    /// otherwise.
+    pub public: Option<bool>,
+    /// Store no `access_point.public`, as a legacy surface does.
+    pub legacy: bool,
 }
 impl Default for AccessPointFixture {
     fn default() -> Self {
@@ -47,6 +55,8 @@ impl Default for AccessPointFixture {
             caller_trust_check_list: Vec::new(),
             trust_recorder_entries: Vec::new(),
             rate_limit: None,
+            public: None,
+            legacy: false,
         }
     }
 }
@@ -136,6 +146,8 @@ impl AgentSurfaceFixture {
                 caller_trust_check_list: Vec::new(),
                 trust_recorder_entries: Vec::new(),
                 rate_limit: None,
+                public: None,
+                legacy: false,
             },
             target: TargetFixture {
                 endpoint: target_endpoint.into(),
@@ -156,6 +168,8 @@ impl AgentSurfaceFixture {
             identity_slots: HashMap::new(),
             transit_points: HashMap::new(),
             mcp_http: None,
+            caller_key: None,
+            browser_origins: Vec::new(),
             a2a_settings: None,
             tenant_id: None,
         }
@@ -195,6 +209,19 @@ impl AgentSurfaceFixture {
     ) -> Self {
         self.access_point
             .agent_card_path = Some(agent_card_path.into());
+        self
+    }
+
+    pub fn with_public(
+        mut self,
+        public: bool,
+    ) -> Self {
+        self.access_point.public = Some(public);
+        self
+    }
+
+    pub fn with_legacy_access_point(mut self) -> Self {
+        self.access_point.legacy = true;
         self
     }
 
@@ -301,6 +328,22 @@ impl AgentSurfaceFixture {
         self
     }
 
+    pub fn with_caller_key(
+        mut self,
+        caller_key: Value,
+    ) -> Self {
+        self.caller_key = Some(caller_key);
+        self
+    }
+
+    pub fn with_browser_origins(
+        mut self,
+        origins: &[String],
+    ) -> Self {
+        self.browser_origins = origins.to_vec();
+        self
+    }
+
     pub fn with_a2a_settings(
         mut self,
         a2a: Value,
@@ -359,6 +402,21 @@ impl AgentSurfaceFixture {
             "protocol": self.access_point.protocol,
             "publish_to_did_document": false
         });
+        if !self.access_point.legacy {
+            let authenticates = !self
+                .access_point
+                .caller_authentication_methods
+                .is_empty()
+                || self
+                    .mcp_http
+                    .as_ref()
+                    .is_some_and(|mcp_http| !mcp_http["authorization"].is_null());
+            access_point["public"] = json!(
+                self.access_point
+                    .public
+                    .unwrap_or(!authenticates)
+            );
+        }
         if !self
             .access_point
             .caller_authentication_methods
@@ -487,6 +545,15 @@ impl AgentSurfaceFixture {
         if let Some(mcp_http) = &self.mcp_http {
             surface["mcp_http"] = mcp_http.clone();
         }
+        if let Some(caller_key) = &self.caller_key {
+            surface["caller_key"] = caller_key.clone();
+        }
+        if !self
+            .browser_origins
+            .is_empty()
+        {
+            surface["browser_origins"] = json!(self.browser_origins);
+        }
         if let Some(a2a) = &self.a2a_settings {
             surface["access_point"]["a2a"] = a2a.clone();
         }
@@ -572,6 +639,8 @@ impl Default for AgentSurfaceFixture {
                 caller_trust_check_list: Vec::new(),
                 trust_recorder_entries: Vec::new(),
                 rate_limit: None,
+                public: None,
+                legacy: false,
             },
             target: TargetFixture {
                 endpoint: "".to_string(),
@@ -592,6 +661,8 @@ impl Default for AgentSurfaceFixture {
             identity_slots: HashMap::new(),
             transit_points: HashMap::new(),
             mcp_http: None,
+            caller_key: None,
+            browser_origins: Vec::new(),
             a2a_settings: None,
             tenant_id: None,
         }

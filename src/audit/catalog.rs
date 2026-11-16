@@ -92,6 +92,12 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         Delegation,
     ),
     event(
+        "connector_call",
+        "Connector Call",
+        "A call through a connector's Transit Point was forwarded with a grant, or refused before it was",
+        Delegation,
+    ),
+    event(
         "token_refreshed",
         "Token Refreshed",
         "An expired delegated credential was refreshed and injected",
@@ -204,6 +210,30 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         "A secret was deleted with force, whether or not surfaces, providers or proxies still used it",
         Auth,
     ),
+    event(
+        "authority_force_deleted",
+        "Authority Force-Deleted",
+        "An Authority was deleted with force, whether or not Trust Checks or Trust Recorder entries still used it",
+        Trust,
+    ),
+    event(
+        "delegation_failed",
+        "Delegation Failed",
+        "An OAuth consent start or callback was refused, with the reason",
+        Delegation,
+    ),
+    event(
+        "mcp_proxy_pin_changed",
+        "MCP Proxy Pin Changed",
+        "A surface save pinned a Transit Point's grant binding to its MCP Proxy as the proxy is now",
+        Delegation,
+    ),
+    event(
+        "browser_origins_changed",
+        "Browser Origins Changed",
+        "A surface save changed the browser origins whose pages may call the surface",
+        Auth,
+    ),
 ];
 
 /// The event's bit in a selection bitmap: its position in [`AUDIT_EVENTS`].
@@ -284,6 +314,7 @@ mod tests {
         assert_eq!(group_of("auth_failed"), Some(AuditEventGroup::Auth));
         assert_eq!(group_of("target_auth_changed"), Some(AuditEventGroup::Auth));
         assert_eq!(group_of("secret_force_deleted"), Some(AuditEventGroup::Auth));
+        assert_eq!(group_of("browser_origins_changed"), Some(AuditEventGroup::Auth));
         assert_eq!(group_of("identity_binding_failed"), Some(AuditEventGroup::Identity));
         assert_eq!(group_of("identity_binding_verified"), Some(AuditEventGroup::Identity));
         for request in ["request_rejected", "rate_limited"] {
@@ -291,6 +322,7 @@ mod tests {
         }
         for delegation in [
             "token_injected",
+            "connector_call",
             "token_refreshed",
             "token_not_found",
             "token_revoked",
@@ -303,6 +335,7 @@ mod tests {
             "elicitation_declined",
             "elicitation_cancelled",
             "elicitation_timed_out",
+            "mcp_proxy_pin_changed",
         ] {
             assert_eq!(group_of(delegation), Some(AuditEventGroup::Delegation), "{delegation}");
         }
@@ -310,7 +343,7 @@ mod tests {
 
     #[test]
     fn record_types_the_gateway_does_not_produce_are_not_offered() {
-        for unproduced in ["delegation_failed", "request_failed", "request_completed"] {
+        for unproduced in ["request_failed", "request_completed"] {
             assert_eq!(event_bit(unproduced), None, "{unproduced}");
         }
     }

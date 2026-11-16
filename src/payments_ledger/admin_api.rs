@@ -76,12 +76,23 @@ fn caller_can_see(
     context: &Option<Extension<PatTenantContext>>,
     scope: &Option<Extension<PatResourceScope>>,
 ) -> impl Fn(Option<&str>, &str) -> bool {
-    let context = context
-        .as_ref()
-        .map(|Extension(context)| context.clone());
-    let scope = scope
-        .as_ref()
-        .map(|Extension(scope)| scope.clone());
+    owned_caller_can_see(
+        context
+            .as_ref()
+            .map(|Extension(context)| context.clone()),
+        scope
+            .as_ref()
+            .map(|Extension(scope)| scope.clone()),
+    )
+}
+
+/// [`caller_can_see`] for a caller that outlives the request's extensions. The
+/// payments audit read decides visibility inside its walk, on a blocking
+/// thread, so the test it decides with has to own what it reads.
+fn owned_caller_can_see(
+    context: Option<PatTenantContext>,
+    scope: Option<PatResourceScope>,
+) -> impl Fn(Option<&str>, &str) -> bool + Send + 'static {
     move |tenant_id, surface_id| {
         context
             .as_ref()
@@ -182,6 +193,13 @@ struct PaymentAuditPage {
     page: usize,
     page_size: usize,
     total_pages: usize,
+    /// Whether the walk of the VP Audit Log stopped before the end of the
+    /// history, so `total` and the page describe its newest part rather than
+    /// every payment record the appliance kept.
+    truncated: bool,
+    /// Records the history holds that the walk could not read. `total` is a
+    /// lower bound by this many, whatever `truncated` says.
+    dropped_records: usize,
 }
 
 /// What a caller asked of the payment audit trail, checked.
@@ -256,45 +274,37 @@ impl AuditFilter {
     }
 }
 
-/// One page of `events` (newest first) that `filter` and `visible` admit. A
-/// payment record leaves here with its credential fingerprint, never the
-/// credential itself.
-fn audit_page(
-    events: Vec<DelegationAuditEvent>,
-    filter: &AuditFilter,
-    visible: impl Fn(&DelegationAuditEvent) -> bool,
-    page: usize,
-    page_size: usize,
-) -> PaymentAuditPage {
-    let mut kept: Vec<DelegationAuditEvent> = events
-        .into_iter()
-        .filter(|event| filter.matches(event) && visible(event))
-        .collect();
-    let total = kept.len();
-    let total_pages = total
-        .div_ceil(page_size)
-        .max(1);
-    let page = page.clamp(1, total_pages);
-    let events = kept
-        .drain(((page - 1) * page_size).min(total)..)
-        .take(page_size)
-        .map(|mut event| {
-            event.vp_jwt = None;
-            event
-        })
-        .collect();
+/// The page the walk returned, as the endpoint answers it. A payment record
+/// leaves here with its credential fingerprint, never the credential itself.
+///
+/// The filtering and the paging happen inside the walk (see
+/// [`crate::delegation_vault::audit::read_payment_events`]), so this holds one
+/// page and never the matching records of the whole history: the appliance
+/// this change exists to protect cannot afford the second.
+fn audit_page(read: crate::delegation_vault::audit::PaymentEventsPage) -> PaymentAuditPage {
     PaymentAuditPage {
-        events,
-        total,
-        page,
-        page_size,
-        total_pages,
+        events: read
+            .events
+            .into_iter()
+            .map(|mut event| {
+                event.vp_jwt = None;
+                event
+            })
+            .collect(),
+        total: read.total,
+        page: read.page,
+        page_size: read.page_size,
+        total_pages: read.total_pages,
+        truncated: read.truncated,
+        dropped_records: read.dropped_records,
     }
 }
 
-/// Recent `payment` records from the VP Audit Log. A tenant caller sees only the
-/// records of surfaces whose ledger rows it may see; a record whose surface has
-/// no row in the ledger window is shown to operator callers only.
+/// Recent `payment` records from the VP Audit Log, taken from the live log and
+/// the rotated files behind it. A tenant caller sees only the records of
+/// surfaces whose ledger rows it may see; a record whose surface has no row in
+/// the ledger window is shown to operator callers only. `truncated` says the
+/// read stopped before the end of the history.
 async fn list_payment_audit(
     State(state): State<PaymentsLedgerApiState>,
     Query(query): Query<PaymentAuditQuery>,
@@ -315,16 +325,24 @@ async fn list_payment_audit(
         .map(|store| store.surface_tenants())
         .unwrap_or_default();
     let restricted = context.is_some() || scope.is_some();
-    let can_see = caller_can_see(&context, &scope);
-    let visible = |event: &DelegationAuditEvent| match event.surface_id.as_deref() {
-        Some(surface_id) => match tenants.get(surface_id) {
-            Some(tenant_id) => can_see(tenant_id.as_deref(), surface_id),
-            None => context.is_none() && can_see(None, surface_id),
-        },
-        None => !restricted,
+    let tenant_scoped = context.is_some();
+    let can_see = owned_caller_can_see(context.map(|Extension(context)| context), scope.map(|Extension(scope)| scope));
+    // Decided inside the walk, so the page and `total` describe the same set
+    // and neither is built from records the caller may not see.
+    let keep = move |event: &DelegationAuditEvent| {
+        if !filter.matches(event) {
+            return false;
+        }
+        match event.surface_id.as_deref() {
+            Some(surface_id) => match tenants.get(surface_id) {
+                Some(tenant_id) => can_see(tenant_id.as_deref(), surface_id),
+                None => !tenant_scoped && can_see(None, surface_id),
+            },
+            None => !restricted,
+        }
     };
-    let events = crate::delegation_vault::audit::read_payment_events().await;
-    Json(audit_page(events, &filter, visible, query.page.unwrap_or(1), page_size)).into_response()
+    let read = crate::delegation_vault::audit::read_payment_events(query.page.unwrap_or(1), page_size, keep).await;
+    Json(audit_page(read)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -706,47 +724,73 @@ mod tests {
         ]
     }
 
+    fn read(
+        events: Vec<DelegationAuditEvent>,
+        truncated: bool,
+    ) -> crate::delegation_vault::audit::PaymentEventsPage {
+        let total = events.len();
+        crate::delegation_vault::audit::PaymentEventsPage {
+            events,
+            total,
+            page: 1,
+            page_size: 50,
+            total_pages: 1,
+            truncated,
+            dropped_records: 0,
+        }
+    }
+
     #[test]
-    fn the_audit_trail_filters_by_surface_stage_trace_and_time_and_pages_newest_first() {
-        let all = |_: &DelegationAuditEvent| true;
-        let page = |pairs: &[(&str, &str)], page: usize, size: usize| {
-            audit_page(sample_events(), &AuditFilter::parse(&audit_query(pairs)).unwrap(), all, page, size)
+    fn the_audit_trail_filter_admits_by_surface_stage_trace_and_time() {
+        let kept = |pairs: &[(&str, &str)]| {
+            let filter = AuditFilter::parse(&audit_query(pairs)).unwrap();
+            sample_events()
+                .into_iter()
+                .filter(|event| filter.matches(event))
+                .filter_map(|event| event.trace_id)
+                .collect::<Vec<_>>()
         };
 
-        let everything = page(&[], 1, 50);
-        assert_eq!(traces(&everything), vec!["t-3", "t-2", "t-1", "t-0"]);
-        assert_eq!((everything.total, everything.total_pages), (4, 1));
+        assert_eq!(kept(&[]), vec!["t-3", "t-2", "t-1", "t-0"], "newest first, as the walk hands them over");
+        assert_eq!(kept(&[("surface_id", "s-1")]), vec!["t-3", "t-1"]);
+        assert_eq!(kept(&[("stage", "verified")]), vec!["t-2", "t-1"]);
+        assert_eq!(kept(&[("trace_id", "t-2")]), vec!["t-2"]);
+        assert_eq!(
+            kept(&[("since", "2026-10-26T10:00:00Z"), ("until", "2026-10-26T11:30:00+00:00")]),
+            vec!["t-2", "t-1"]
+        );
+        assert!(kept(&[("trace_id", "nope")]).is_empty(), "a filter nothing matches keeps nothing");
+    }
+
+    #[test]
+    fn a_payment_page_leaves_with_the_fingerprint_and_its_counts_and_never_the_credential() {
+        let page = audit_page(read(sample_events(), false));
+
+        assert_eq!(traces(&page), vec!["t-3", "t-2", "t-1", "t-0"]);
+        assert_eq!((page.total, page.page, page.page_size, page.total_pages), (4, 1, 50, 1));
         assert!(
-            everything
-                .events
+            page.events
                 .iter()
                 .all(|event| event.vp_jwt.is_none()),
             "the credential never leaves"
         );
         assert_eq!(
-            everything.events[0]
+            page.events[0]
                 .vp_fingerprint
                 .as_deref(),
             Some("sha256:t-3")
         );
+        assert!(!page.truncated, "the whole history was read");
+    }
 
-        assert_eq!(traces(&page(&[("surface_id", "s-1")], 1, 50)), vec!["t-3", "t-1"]);
-        assert_eq!(traces(&page(&[("stage", "verified")], 1, 50)), vec!["t-2", "t-1"]);
-        assert_eq!(traces(&page(&[("trace_id", "t-2")], 1, 50)), vec!["t-2"]);
-        assert_eq!(
-            traces(&page(&[("since", "2026-10-26T10:00:00Z"), ("until", "2026-10-26T11:30:00+00:00")], 1, 50)),
-            vec!["t-2", "t-1"]
-        );
-        assert!(
-            page(&[("trace_id", "nope")], 1, 50)
-                .events
-                .is_empty()
-        );
+    #[test]
+    fn a_payment_page_read_from_part_of_the_history_says_so() {
+        let events = vec![payment_event(Some("s-1"), PaymentStage::Failed, "t-3", "2026-10-26T12:00:00Z")];
 
-        let second = page(&[], 2, 3);
-        assert_eq!(traces(&second), vec!["t-0"]);
-        assert_eq!((second.page, second.page_size, second.total_pages, second.total), (2, 3, 2, 4));
-        assert_eq!(page(&[], 9, 3).page, 2, "a page past the end is the last page");
+        let page = audit_page(read(events, true));
+
+        assert!(page.truncated, "the counts describe the records the read reached");
+        assert_eq!(page.total, 1);
     }
 
     #[test]
@@ -782,7 +826,10 @@ mod tests {
         );
         let (status, body) = call(router, "/payments/audit", None, None).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(keys(&body), vec!["events", "page", "page_size", "total", "total_pages"]);
+        assert_eq!(
+            keys(&body),
+            vec!["dropped_records", "events", "page", "page_size", "total", "total_pages", "truncated"]
+        );
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
 

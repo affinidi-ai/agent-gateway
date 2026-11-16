@@ -24,6 +24,16 @@ Feature: Trust Recorder status on the Identities dashboard
     When the operator reads the Identities dashboard
     Then within ten seconds the Managed Agent identity shows Trust Recorder status "skipped" because "no_surface_issuer"
 
+  Scenario: A Trust Recorder whose Authority no longer exists is shown as skipped
+    Given A2A surface "oxygen" is defined for route "/oxygen" with managed agent "bravo" as its target
+    And the surface has managed identity enabled
+    And managed agent "bravo" response contains the agent-identity extension
+    And the surface has a Trust Recorder for trust registry "missing-registry" with issuer "did:web:example.com:issuer"
+    And the Trust Recorder for trust registry "missing-registry" takes its authority from an Authority that no longer exists
+    And the caller has sent a request to the surface
+    When the operator reads the Identities dashboard
+    Then within ten seconds the Managed Agent identity shows Trust Recorder status "skipped" because "authority_not_found"
+
   Scenario: A Trust Recorder whose trust registry is not connected is shown as skipped
     Given A2A surface "oxygen" is defined for route "/oxygen" with managed agent "bravo" as its target
     And the surface has managed identity enabled

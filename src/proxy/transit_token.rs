@@ -56,27 +56,17 @@ impl TransitTokenKey {
         Ok(Self { kid: hex::encode(kid), secret })
     }
 
-    /// The key kept in `directory`, created there on first use. Instances starting on one
-    /// storage directory at the same moment create one key between them and all use it. A key
-    /// file that cannot be read or parsed is an error, never replaced. An existing key file,
-    /// such as one a restore wrote, is restricted to its owner.
+    /// The key kept in `directory`, created there on first use; see
+    /// [`load_or_create_key`](crate::encryption::secret_file::load_or_create_key).
     pub async fn load_or_create(directory: &Path) -> Result<Self> {
-        let path = directory.join(KEY_FILE_NAME);
-        let invalid = || format!("Invalid transit token signing key in {}", path.display());
-        if let Some(stored) = crate::encryption::secret_file::read_secret_file(&path).await? {
-            crate::encryption::secret_file::restrict_secret_file_to_owner(&path).await;
-            return Self::parse(&Zeroizing::new(stored)).with_context(invalid);
-        }
-        let generated = Self::generate()?;
-        if crate::encryption::secret_file::create_secret_file(&path, &generated.to_stored()?).await? {
-            return Ok(generated);
-        }
-        let stored = crate::encryption::secret_file::read_secret_file(&path)
-            .await?
-            .with_context(|| {
-                format!("Transit token signing key {} disappeared while it was created", path.display())
-            })?;
-        Self::parse(&Zeroizing::new(stored)).with_context(invalid)
+        crate::encryption::secret_file::load_or_create_key(
+            &directory.join(KEY_FILE_NAME),
+            "transit token signing key",
+            Self::generate,
+            Self::to_stored,
+            Self::parse,
+        )
+        .await
     }
 
     fn parse(stored: &str) -> Result<Self> {
@@ -469,6 +459,7 @@ fn check_lifetime(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     const LIFETIME: u64 = crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_LIFETIME_SECS;
 
@@ -781,7 +772,148 @@ mod tests {
         );
     }
 
+    /// An SMB share (Azure Files), the usual persistent storage for Azure
+    /// Container Apps, has no hard links. The key is still created once there and
+    /// shared by the instances starting together on it.
     #[tokio::test]
+    async fn instances_starting_together_share_one_key_where_there_are_no_hard_links() {
+        crate::encryption::secret_file::simulate_link_failure(true);
+        let dir = tempfile::tempdir().unwrap();
+
+        let (active, standby) =
+            tokio::join!(TransitTokenKey::load_or_create(dir.path()), TransitTokenKey::load_or_create(dir.path()));
+        let active = TransitTokenIssuer::new(active.unwrap(), "gw-test-001".to_string());
+        let standby = TransitTokenIssuer::new(standby.unwrap(), "gw-test-001".to_string());
+        let restarted = TransitTokenKey::load_or_create(dir.path())
+            .await
+            .unwrap();
+
+        let token = active
+            .issue("surf-001", None, None, None, None, None, vec![])
+            .unwrap();
+        for issuer in [&standby, &TransitTokenIssuer::new(restarted, "gw-test-001".to_string())] {
+            assert_eq!(
+                issuer
+                    .validate(&token, LIFETIME)
+                    .unwrap()
+                    .surface_id,
+                "surf-001"
+            );
+        }
+    }
+
+    /// Created in place, a key file is briefly empty: the instance reading it
+    /// waits for the creator to finish instead of refusing it as damaged.
+    #[tokio::test]
+    async fn a_key_file_another_instance_is_still_filling_is_read_once_it_is_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(KEY_FILE_NAME);
+        std::fs::write(&path, "").unwrap();
+        let being_filled = path.clone();
+        let creator = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            std::fs::write(&being_filled, format!(r#"{{"kid":"filled-in-place","key":"{}"}}"#, hex::encode([3u8; 32])))
+                .unwrap();
+        });
+
+        let loaded = TransitTokenKey::load_or_create(dir.path())
+            .await
+            .unwrap();
+
+        creator.await.unwrap();
+        assert_eq!(loaded.kid, "filled-in-place");
+        assert_eq!(loaded.secret.as_ref(), &[3u8; 32][..]);
+    }
+
+    /// Under encryption at rest the file created in place is the `.enc` sibling,
+    /// and a ciphertext caught half written fails to decrypt rather than to
+    /// parse. That read failure is waited out the same way.
+    #[tokio::test]
+    async fn a_half_written_encrypted_key_file_is_read_once_it_is_complete() {
+        crate::encryption::global::set_test_encryption(
+            crate::config::EncryptionConfig {
+                enabled: true,
+                key_source: crate::config::KeySourceConfig::Environment,
+                ..crate::config::EncryptionConfig::default()
+            },
+            crate::encryption::EncryptionService::new(crate::encryption::KeySource::Raw { key: [9u8; 32] }).unwrap(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(KEY_FILE_NAME);
+        let enc_path = crate::encryption::secret_file::secret_enc_path(&path);
+        crate::encryption::secret_file::write_secret_file(
+            &path,
+            &format!(r#"{{"kid":"filled-in-place","key":"{}"}}"#, hex::encode([3u8; 32])),
+        )
+        .await
+        .unwrap();
+        let complete = std::fs::read_to_string(&enc_path).unwrap();
+        std::fs::write(&enc_path, &complete[..complete.len() - 4]).unwrap();
+        let creator = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            std::fs::write(&enc_path, complete).unwrap();
+        });
+
+        let loaded = TransitTokenKey::load_or_create(dir.path())
+            .await
+            .unwrap();
+
+        creator.await.unwrap();
+        assert_eq!(loaded.kid, "filled-in-place");
+        assert_eq!(loaded.secret.as_ref(), &[3u8; 32][..]);
+    }
+
+    /// A first start killed between creating the key file and filling it leaves
+    /// it empty. The next start waits out the window for a creator that may still
+    /// be filling it, then creates the key again instead of refusing the empty
+    /// file for good. The clock is paused so the wait passes instantly.
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_key_file_left_by_an_interrupted_first_start_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(KEY_FILE_NAME);
+        std::fs::write(&path, "").unwrap();
+
+        let created = TransitTokenKey::load_or_create(dir.path())
+            .await
+            .unwrap();
+
+        let stored: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(stored["kid"].as_str(), Some(created.kid.as_str()));
+        assert_eq!(
+            stored["key"].as_str(),
+            Some(hex::encode(created.secret.as_ref()).as_str()),
+            "the new key is the one written to the empty file"
+        );
+        let reloaded = TransitTokenKey::load_or_create(dir.path())
+            .await
+            .unwrap();
+        assert_eq!(reloaded.kid, created.kid);
+        assert_eq!(reloaded.secret.as_ref(), created.secret.as_ref());
+    }
+
+    /// Two instances recovering the same empty leftover must end on one key. The
+    /// one that loses the re-creation reads the winner's key instead of stopping,
+    /// which it can only do because the read-then-create retry has a window of
+    /// its own: waiting the leftover out spends a whole window first.
+    #[tokio::test(start_paused = true)]
+    async fn instances_recovering_the_same_empty_key_file_share_one_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(KEY_FILE_NAME);
+        std::fs::write(&path, "").unwrap();
+
+        let (first, second) =
+            tokio::join!(TransitTokenKey::load_or_create(dir.path()), TransitTokenKey::load_or_create(dir.path()));
+        let (first, second) = (first.unwrap(), second.unwrap());
+
+        assert_eq!(first.kid, second.kid, "both instances must end on one key");
+        assert_eq!(first.secret.as_ref(), second.secret.as_ref());
+        let stored: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(stored["kid"].as_str(), Some(first.kid.as_str()), "the shared key is the one on disk");
+    }
+
+    /// The clock is paused so the retries of each damaged file pass instantly
+    /// instead of waiting out the unreadable key file wait six times over.
+    #[tokio::test(start_paused = true)]
     async fn a_damaged_key_file_stops_the_load_rather_than_being_replaced() {
         for damaged in [
             "not json",

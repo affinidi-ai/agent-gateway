@@ -364,3 +364,170 @@ describe('SurfaceDetailPage Access Point readiness notice', () => {
     expect(notice()).toHaveTextContent(/^$/);
   });
 });
+
+describe('SurfaceDetailPage API key references', () => {
+  let updateSurface: jest.SpyInstance;
+
+  const REVOKED_WARNING =
+    'The API key this Identity uses was revoked. Select an active API key of this surface.';
+
+  const withKey = (
+    keyId: string,
+    references: AgentSurface['api_key_references'],
+    extra: Partial<AgentSurface> = {}
+  ): AgentSurface =>
+    ({
+      ...stored({ public: true }),
+      access_point: {
+        listen_address: 'https://gw.example',
+        route: '/agents/orders',
+        protocol: 'a2a',
+        public: true,
+      },
+      identity_slots: { protected: { type: 'from_api_key', api_key_id: keyId } },
+      api_key_references: references,
+      ...extra,
+    }) as unknown as AgentSurface;
+
+  const renderPage = async (surface: AgentSurface) => {
+    jest.spyOn(apiClient, 'getSurface').mockResolvedValue(surface);
+    updateSurface.mockImplementation(async (_id: string, payload: Partial<AgentSurface>) => ({
+      ...surface,
+      ...payload,
+    }));
+    render(
+      <MemoryRouter initialEntries={['/surfaces/srf-1']}>
+        <Routes>
+          <Route path="/surfaces/:surfaceId" element={<SurfaceDetailPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+    await screen.findByTestId('surface-save-button');
+  };
+
+  const errorToasts = () => toast.mock.calls.filter(c => c[0] === 'error').map(c => c[1]);
+
+  beforeEach(() => {
+    jest.restoreAllMocks();
+    toast.mockReset();
+    updateSurface = jest.spyOn(apiClient, 'updateSurface');
+  });
+
+  it('blocks Save on a blocking base key and sends no PUT', async () => {
+    await renderPage(
+      withKey('atgk_bad', [{ key_id: 'atgk_bad', status: 'revoked', blocking: true }])
+    );
+
+    fireEvent.click(screen.getByTestId('surface-save-button'));
+
+    await waitFor(() => expect(errorToasts()).toEqual([`Identity: ${REVOKED_WARNING}`]));
+    expect(updateSurface).not.toHaveBeenCalled();
+  });
+
+  it('blocks Save on a blocking key of an inactive variant, naming the variant', async () => {
+    await renderPage(
+      withKey(
+        'atgk_good',
+        [
+          { key_id: 'atgk_good', status: 'active', blocking: false },
+          { key_id: 'atgk_bad', status: 'revoked', blocking: true },
+        ],
+        {
+          variants: [
+            {
+              id: 'v-beta',
+              alias: 'beta',
+              name: 'Beta',
+              overrides: {
+                identity_slots: { protected: { type: 'from_api_key', api_key_id: 'atgk_bad' } },
+              },
+            },
+          ],
+        }
+      )
+    );
+
+    fireEvent.click(screen.getByTestId('surface-save-button'));
+
+    await waitFor(() =>
+      expect(errorToasts()).toEqual([`Variant "Beta" — Identity: ${REVOKED_WARNING}`])
+    );
+    expect(updateSurface).not.toHaveBeenCalled();
+  });
+
+  it('saves with an active key', async () => {
+    await renderPage(
+      withKey('atgk_good', [{ key_id: 'atgk_good', status: 'active', blocking: false }])
+    );
+
+    fireEvent.click(screen.getByTestId('surface-save-button'));
+
+    await waitFor(() => expect(updateSurface).toHaveBeenCalledTimes(1));
+    expect(errorToasts()).toEqual([]);
+  });
+
+  it('saves with a key of another surface that does not block', async () => {
+    await renderPage(
+      withKey('atgk_other', [{ key_id: 'atgk_other', status: 'unavailable', blocking: false }])
+    );
+
+    fireEvent.click(screen.getByTestId('surface-save-button'));
+
+    await waitFor(() => expect(updateSurface).toHaveBeenCalledTimes(1));
+    expect(errorToasts()).toEqual([]);
+    const sent = updateSurface.mock.calls[0][1] as AgentSurface;
+    expect(sent).not.toHaveProperty('api_key_references');
+    expect(sent).not.toHaveProperty('serving_status');
+  });
+
+  it('blocks Save on a key of another surface that blocks', async () => {
+    await renderPage(
+      withKey('atgk_other', [{ key_id: 'atgk_other', status: 'unavailable', blocking: true }])
+    );
+
+    fireEvent.click(screen.getByTestId('surface-save-button'));
+
+    await waitFor(() =>
+      expect(errorToasts()).toEqual([
+        'Identity: The API key this Identity uses belongs to another surface. Select an active API key of this surface.',
+      ])
+    );
+    expect(updateSurface).not.toHaveBeenCalled();
+  });
+});
+
+describe('SurfaceDetailPage serving status', () => {
+  const renderPage = async (surface: AgentSurface) => {
+    jest.spyOn(apiClient, 'getSurface').mockResolvedValue(surface);
+    render(
+      <MemoryRouter initialEntries={['/surfaces/srf-1']}>
+        <Routes>
+          <Route path="/surfaces/:surfaceId" element={<SurfaceDetailPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+    await screen.findByTestId('surface-save-button');
+  };
+
+  beforeEach(() => {
+    jest.restoreAllMocks();
+    toast.mockReset();
+  });
+
+  it('says the surface is refusing requests when it is not serving', async () => {
+    await renderPage({ ...stored({ public: true }), serving_status: 'not_serving' });
+
+    expect(screen.getByTestId('surface-refusing-requests')).toHaveTextContent(
+      'This surface is refusing requests'
+    );
+  });
+
+  it.each(['serving', 'not_judged', undefined] as const)(
+    'shows no refusing notice when serving_status is %s',
+    async servingStatus => {
+      await renderPage({ ...stored({ public: true }), serving_status: servingStatus });
+
+      expect(screen.queryByTestId('surface-refusing-requests')).toBeNull();
+    }
+  );
+});

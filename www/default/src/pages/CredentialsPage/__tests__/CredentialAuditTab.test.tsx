@@ -39,6 +39,38 @@ const renderWith = (caller: Record<string, string>) => {
   );
 };
 
+const renderPage = (page: Record<string, unknown>) => {
+  (apiClient.fetch as jest.Mock).mockResolvedValue({
+    ok: true,
+    json: () => Promise.resolve(page),
+  });
+  render(
+    <MemoryRouter>
+      <CredentialAuditTab />
+    </MemoryRouter>
+  );
+};
+
+describe('CredentialAuditTab counts', () => {
+  it('shows the total of a partial read as a lower bound', async () => {
+    renderPage({ ...auditPage({ sub: 'alice' }), total: 12, truncated: true });
+
+    expect(await screen.findByLabelText('12+ audit events')).toBeInTheDocument();
+  });
+
+  it('shows the total as a lower bound when the read met records it could not read', async () => {
+    renderPage({ ...auditPage({ sub: 'alice' }), total: 12, dropped_records: 1 });
+
+    expect(await screen.findByLabelText('12+ audit events')).toBeInTheDocument();
+  });
+
+  it('shows the total of a complete read as it is', async () => {
+    renderPage({ ...auditPage({ sub: 'alice' }), total: 12, dropped_records: 0 });
+
+    expect(await screen.findByLabelText('12 audit events')).toBeInTheDocument();
+  });
+});
+
 describe('CredentialAuditTab caller', () => {
   it("shows the principal a caller's grants are keyed by beside the token's sub", async () => {
     renderWith({ sub: 'pairwise-sub', principal: 'person-1' });

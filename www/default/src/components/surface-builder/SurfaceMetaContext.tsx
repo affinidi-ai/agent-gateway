@@ -2,6 +2,7 @@ import { createContext, useContext } from 'react';
 import type { AgentSurface } from '../../api';
 import type { Protocol, SurfaceSigning } from './elements/types';
 import type { AccessPointNotice } from './elements/access-point/readiness';
+import type { ApiKeyStatuses } from './elements/identity/apiKeyStatus';
 
 export type DidwebvhInjectionMode = 'header' | 'signed_header' | 'protocol_native';
 
@@ -68,9 +69,13 @@ export interface SurfaceMetaValue {
   accessPointNotice?: AccessPointNotice | null;
   /**
    * The stored surface has no `access_point.public`: a legacy Access Point,
-   * which hands callers whose credential fails to policy unless it is closed.
+   * which refuses callers whose credential fails, as a closed one does.
    */
   legacyAccessPoint?: boolean;
+  /** Status of each API key the stored surface names, by key id; absent while creating. */
+  apiKeyStatuses?: ApiKeyStatuses;
+  /** DIDs of the Authorities register; `null` while it loads or when it could not be loaded. */
+  authorityDids?: ReadonlySet<string> | null;
   /** Selects the Access Point and points at the Caller Context element in the palette. */
   onConfigureAuthentication?: () => void;
   setName: (v: string) => void;

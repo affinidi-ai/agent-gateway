@@ -83,10 +83,12 @@ pub enum RejectionReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetAuthOutcome {
-    /// Refused with 502.
+    /// Refused before it was forwarded.
     Rejected,
     /// Forwarded without the credential.
     Passthrough,
+    /// Sent, and refused by the peer gateway that checked it as its caller credential.
+    RefusedByTarget,
 }
 
 /// The detail of a `target_auth_failed` refusal. Never a token, an assertion, a token
@@ -100,6 +102,9 @@ pub struct TargetAuthRejection {
     /// The token endpoint's OAuth `error` code, when it answered with one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_error: Option<String>,
+    /// The status the peer gateway refused the credential with, for `refused_by_target`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_status: Option<u16>,
 }
 
 /// The leg of a surface whose Target Authentication a management change set.
@@ -156,6 +161,39 @@ pub enum DelegationFailureReason {
     CredentialsUnavailable,
     AnonymousCaller,
     ContinuationError,
+    /// A consent start or callback state that is missing, not sealed by this
+    /// gateway, expired, or of the wrong stage.
+    ConsentStateInvalid,
+    /// A consent start or callback state that was already used on this process.
+    ConsentStateReused,
+    /// The path names another provider than the state, or the state's provider
+    /// is gone, renamed or no longer an authorization code provider without an
+    /// issuer.
+    ConsentProviderMismatch,
+    /// A consent callback without the binding cookie the start POST set.
+    BrowserBindingMismatch,
+    /// A consent callback without `iss` from a provider whose issuer is recorded.
+    IssMissing,
+    /// A consent callback whose `iss` is not the provider's recorded issuer,
+    /// or a consent confirmation whose `iss` is not its strategy's issuer.
+    IssMismatch,
+    /// A consent callback that is malformed or carries no code.
+    ConsentResponseInvalid,
+    /// The vendor, or the identity provider of a consent confirmation,
+    /// answered with an error.
+    ConsentDenied,
+    /// The provider's redirect URI breaks the consent rules or is another
+    /// provider's.
+    RedirectUriInvalid,
+    /// The provider's authorization endpoint or parameters break the consent rules.
+    AuthorizationUrlInvalid,
+    /// A consent start POST that did not come from the gateway's start page.
+    CrossSiteConsentStart,
+    /// The vendor's token endpoint, or the consent confirmation login
+    /// client's, refused or failed the code exchange.
+    TokenExchangeFailed,
+    /// A consent confirmation sign-in gave no ID token that names a caller.
+    ConsentIdentityMissing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

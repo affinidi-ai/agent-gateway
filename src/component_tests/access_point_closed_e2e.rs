@@ -4,7 +4,8 @@
 //! authentication it refuses a caller whose credential is missing or invalid
 //! with `401`, in the caller's protocol shape, before policy and the Target,
 //! and public discovery reads stay open. A legacy surface (no
-//! `access_point.public`) keeps continuing a failed caller to policy.
+//! `access_point.public`) refuses a failed caller too, and admits every caller
+//! when it has no caller authentication.
 
 use super::helpers::{
     GatewayHarness, MockServer, build_minimal_channel, configure_admin_api, configure_gateway_route_prefixes,
@@ -703,7 +704,7 @@ async fn a_variant_without_caller_authentication_is_not_ready_while_the_base_sta
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_legacy_surface_keeps_its_behaviour() {
+async fn a_legacy_surface_refuses_a_failed_caller_and_admits_any_caller_without_caller_authentication() {
     let mut open = build_minimal_channel();
     open.surface_id = "legacy-open".to_string();
     open.access_point.route = "/legacy-open".to_string();
@@ -722,8 +723,8 @@ async fn a_legacy_surface_keeps_its_behaviour() {
     let (status, _, _) = gateway
         .call("/legacy-keyed/rpc", &a2a_request(), Some("wrong-key"))
         .await;
-    assert_eq!(status, 200, "a failed caller still goes on to policy");
-    assert_eq!(gateway.reached(), 2);
+    assert_eq!(status, 401, "a failed caller is refused, as on a closed Access Point");
+    assert_eq!(gateway.reached(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

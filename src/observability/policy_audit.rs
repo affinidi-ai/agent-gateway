@@ -936,9 +936,11 @@ mod tests {
     #[test]
     fn caller_fields_map_each_identity_variant() {
         let jwt = AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "sub-123".to_string(),
             claims: serde_json::json!({}),
+            verification: Default::default(),
         };
         let (method, principal, did) = caller_fields(&jwt);
         assert_eq!(method, "jwt_bearer");
@@ -966,9 +968,11 @@ mod tests {
     #[test]
     fn decision_caller_prefers_the_authenticated_identity_over_a_carried_caller() {
         let identity = AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: serde_json::json!({"email": "ada@example.com"}),
+            verification: Default::default(),
         };
         let carried = crate::delegation_vault::audit::AuditCallerContext {
             principal: None,

@@ -8,16 +8,28 @@ pub use crate::bdd_support::admin_client::RecordedResponse;
 use crate::bdd_support::actors::{
     ActorRegistry, PRIMARY_COLLABORATOR_KEY, RuntimeRegistry, SECONDARY_COLLABORATOR_KEY, TargetActorKind,
 };
+use crate::bdd_support::config::api_keys::UnreadableKeyFolders;
 use crate::bdd_support::gateway_process::GatewayProcess;
 use crate::bdd_support::jwt::JwksServer;
 use crate::bdd_support::mock_server::{MockResponse, MockServer, ReceivedRequest};
+use crate::bdd_support::oidc::OidcProvider;
+use crate::bdd_support::passkey::SoftPasskey;
+use crate::bdd_support::redis_stream::RedisStreamStandIn;
 use crate::bdd_support::temp::TempDirGuard;
 
+/// A passkey sign-in the gateway issued a challenge for.
+#[derive(Debug, Clone)]
+pub struct StartedSignIn {
+    pub username: String,
+    pub challenge_id: String,
+    pub request_options: serde_json::Value,
+}
+
 pub use crate::bdd_support::config::single_surface_fixture::{
-    ApiKeyProviderSourceAuthConfig, ApiKeySourceAuthConfig, CredentialProviderKind, DelegatedCredentialInjection,
-    JwtSourceAuthConfig, RequestPolicyFixture, SurfaceConfigBuilder, SurfaceCredentialDelegationConfig,
-    SurfaceCustomMetadataConfig, SurfaceSourceAuthConfig, SurfaceTargetAuthConfig, SurfaceTransitPointConfig,
-    TransitPointHeaderMetadataMappingRow, TransitPointManagedIdentityConfig,
+    ApiKeyProviderSourceAuthConfig, ApiKeySourceAuthConfig, CallerKeyFixture, CredentialProviderKind,
+    DelegatedCredentialInjection, JwtSourceAuthConfig, RequestPolicyFixture, SurfaceConfigBuilder,
+    SurfaceCredentialDelegationConfig, SurfaceCustomMetadataConfig, SurfaceSourceAuthConfig, SurfaceTargetAuthConfig,
+    SurfaceTransitPointConfig, TransitPointHeaderMetadataMappingRow, TransitPointManagedIdentityConfig,
 };
 
 use tempfile::TempDir;
@@ -95,6 +107,8 @@ pub fn get_default_temp_dir() -> TempDir {
 pub struct SurfaceWorld {
     pub actors: ActorRegistry,
     pub collaborators: HashMap<String, MockCollaborator>,
+    /// A second gateway process on the same storage, and the operator's session on it.
+    pub other_node: Option<(GatewayProcess, AdminApiClient)>,
     pub infra: Option<ScenarioInfra>,
     pub surface_config: SurfaceConfigBuilder,
     pub sent_body: Option<serde_json::Value>,
@@ -152,12 +166,41 @@ pub struct SurfaceWorld {
     pub a2a_stream_ended: bool,
     /// The query of the last OAuth callback sent with a gateway-issued state.
     pub oauth_callback_query: Option<String>,
+    /// The binding cookie the consent start POST set for that callback.
+    pub oauth_binding_cookie: Option<String>,
+    /// The state the vendor got after the caller confirmed the consent start page.
+    pub oauth_confirmed_state: Option<String>,
+    /// Where the identity provider sends the caller back to the gateway after they signed in.
+    pub consent_confirmation_callback: Option<String>,
     /// The transit token the managed agent sends on its Transit Point calls.
     pub transit_token: Option<String>,
+    /// The ids of the credential providers the operator created, by `provider_id` slug.
+    pub credential_provider_ids: HashMap<String, String>,
     /// A surface the operator is about to save through the admin API.
     pub surface_draft: Option<serde_json::Value>,
     /// A client presenting the personal access token an operator minted in the scenario.
     pub personal_access_token_client: Option<reqwest::Client>,
+    /// API keys the scenario created, by scenario name: the owning surface id and the key id.
+    pub api_keys: HashMap<String, (String, String)>,
+    /// The Redis stream an integration delivers sign-in events to.
+    pub sign_in_stream: Option<RedisStreamStandIn>,
+    /// The passkeys console users registered in the scenario, by username.
+    pub passkeys: HashMap<String, SoftPasskey>,
+    /// The passkey sign-in started last and not yet finished.
+    pub started_sign_in: Option<StartedSignIn>,
+    /// The `allowCredentials` of each passkey sign-in challenge the scenario started, in order.
+    pub sign_in_challenge_credentials: Vec<Vec<serde_json::Value>>,
+    /// A passkey the scenario registered for a username that already had an account.
+    pub other_passkey: Option<SoftPasskey>,
+    /// How long the last passkey registration finish took to be answered.
+    pub registration_answer_time: Option<std::time::Duration>,
+    /// The event payload a sign-in step last found on the Redis stream.
+    pub sign_in_event: Option<serde_json::Value>,
+    /// The payload with Agent Watch's record content a sign-in step last found on the stream.
+    pub sign_in_record: Option<serde_json::Value>,
+    /// Client certificates the scenario stored through the admin API, by scenario name: the
+    /// stored certificate id.
+    pub client_certificates: HashMap<String, String>,
     pub temp_dir: TempDir,
     pub debug: bool,
     pub runtimes: RuntimeRegistry,
@@ -173,6 +216,7 @@ impl SurfaceWorld {
         Self {
             actors: ActorRegistry::default(),
             collaborators: default_collaborators(default_response.clone()),
+            other_node: None,
             infra: None,
             surface_config: SurfaceConfigBuilder::default(),
             sent_body: None,
@@ -227,9 +271,23 @@ impl SurfaceWorld {
             a2a_stream_events: Vec::new(),
             a2a_stream_ended: false,
             oauth_callback_query: None,
+            oauth_binding_cookie: None,
+            oauth_confirmed_state: None,
+            consent_confirmation_callback: None,
             transit_token: None,
+            credential_provider_ids: HashMap::new(),
             surface_draft: None,
             personal_access_token_client: None,
+            api_keys: HashMap::new(),
+            sign_in_stream: None,
+            passkeys: HashMap::new(),
+            started_sign_in: None,
+            sign_in_challenge_credentials: Vec::new(),
+            other_passkey: None,
+            registration_answer_time: None,
+            sign_in_event: None,
+            sign_in_record: None,
+            client_certificates: HashMap::new(),
             temp_dir: get_default_temp_dir(),
             debug: is_debug,
             runtimes: RuntimeRegistry::default(),
@@ -507,6 +565,8 @@ fn default_collaborators(default_response: serde_json::Value) -> HashMap<String,
 }
 
 pub struct ScenarioInfra {
+    /// Dropped first, so the scenario's directory can be removed.
+    pub _unreadable_key_folders: UnreadableKeyFolders,
     pub _temp_dir: TempDirGuard,
     pub gateway: GatewayProcess,
     pub mock: MockServer,
@@ -517,6 +577,8 @@ pub struct ScenarioInfra {
     pub transit_point_mocks: HashMap<String, MockServer>,
     pub affinidi_well: Option<MockServer>,
     pub _jwks_server: Option<JwksServer>,
+    /// The callers' identity provider, where a consent confirmation signs the person in.
+    pub identity_provider: Option<OidcProvider>,
     pub gateway_port: u16,
     pub outbound_port: u16,
 }

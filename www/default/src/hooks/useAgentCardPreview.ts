@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { apiClient } from '../api';
 import {
   fetchAgentCardPreview,
+  isCardServed,
   refreshAgentCardPreview,
   type AgentCardPreview,
   type CardJson,
@@ -32,7 +33,9 @@ export interface UseAgentCardPreview {
 const fetcher = (url: string, init?: RequestInit) => apiClient.fetch(url, init);
 
 function servedSnapshot(preview: AgentCardPreview): ServedCardSnapshot | null {
-  if (!preview.supported || preview.fetch.status !== 'ok' || preview.after === null) return null;
+  if (!preview.supported || !isCardServed(preview.fetch.status) || preview.after === null) {
+    return null;
+  }
   return { card: preview.after, fetchedAt: preview.fetched_at };
 }
 

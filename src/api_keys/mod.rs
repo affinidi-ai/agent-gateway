@@ -27,7 +27,7 @@ pub mod store;
 mod types;
 
 // Re-exports for public API
-pub use errors::ApiKeyResult;
+pub use errors::{ApiKeyError, ApiKeyResult};
 pub use filesystem::FileSystemApiKeyStore;
 pub use generator::KEY_ID_PREFIX;
 pub use store::ApiKeyValidator;

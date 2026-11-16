@@ -78,6 +78,16 @@ pub struct NetworkConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_consent_issuers: Option<HashMap<String, Vec<String>>>,
 
+    /// Issuers the credential providers of external consent may name besides
+    /// those of `external_consent_issuers`, one pattern per vendor whose
+    /// issuer carries the customer's tenant, such as
+    /// `https://login.microsoftonline.com/{tenant}/v2.0`. Set, even empty, it
+    /// limits issuers as `external_consent_issuers` does. Only this file sets
+    /// it; no tenant or API caller can add to it. A pattern that is not valid
+    /// matches nothing and is named at startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_consent_issuer_patterns: Option<Vec<IssuerPattern>>,
+
     /// How many refreshes of a grant by binding the authorization server may
     /// refuse, by an answer other than `invalid_grant`, since the last that
     /// succeeded, before a call whose grant cannot be used answers
@@ -99,6 +109,10 @@ pub struct NetworkConfig {
     /// Per-client-IP limit on each `fabric` CLI login endpoint.
     #[serde(default)]
     pub cli_login_throttle: crate::config::types::LoginThrottleConfig,
+
+    /// Per-client-IP limit on starting a passkey sign-in or registration.
+    #[serde(default)]
+    pub passkey_login_throttle: crate::config::types::LoginThrottleConfig,
 
     /// Proxies trusted to report the caller's address for per-client-IP limits.
     #[serde(default)]
@@ -124,6 +138,36 @@ pub struct NetworkConfig {
     /// How long and how large the delegated payments ledger is kept.
     #[serde(default)]
     pub payment_ledger: crate::config::types::PaymentLedgerConfig,
+}
+
+/// One entry of `external_consent_issuer_patterns`: the issuers of one vendor
+/// that differ only by the customer's tenant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuerPattern {
+    /// An `https` issuer with one `{tenant}` standing for a whole path segment
+    /// or for the leftmost label of its host.
+    pub issuer: String,
+    /// What may stand for `{tenant}`.
+    pub tenant: IssuerTenant,
+    /// The origins the endpoints and `jwks_uri` of a matching issuer may use
+    /// beyond its own host, as in `external_consent_issuers`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoint_origins: Vec<String>,
+    /// The resource origins permitted beyond a matching issuer's own host, as
+    /// in `external_consent_resource_origins`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resource_origins: Vec<String>,
+}
+
+/// What may stand for `{tenant}` in an [`IssuerPattern`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IssuerTenant {
+    /// A UUID in its canonical 8-4-4-4-12 hex form, in either case.
+    Uuid,
+    /// A DNS label: 1 to 63 lower-case letters, digits and `-`, neither
+    /// starting nor ending with `-`.
+    Label,
 }
 
 fn default_external_consent_refresh_refusals() -> u32 {
@@ -242,6 +286,20 @@ pub enum RouteType {
     Onboarding,
 }
 
+impl RouteType {
+    /// The name `gateway.json` gives this type.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RouteType::Proxy => "proxy",
+            RouteType::IdentityApi => "identity_api",
+            RouteType::Static => "static",
+            RouteType::ConnectionPoint => "connection_point",
+            RouteType::Redirect => "redirect",
+            RouteType::Onboarding => "onboarding",
+        }
+    }
+}
+
 /// A category of routes (e.g., "channels", "agents", "routes")
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteCategory {
@@ -266,17 +324,27 @@ pub struct RouteCategory {
 }
 
 impl NetworkConfig {
-    /// The route prefixes this configuration serves through the proxy: every
-    /// channel prefix and every route of type `proxy`. These are what must not
-    /// shadow a dashboard page.
-    pub fn proxy_prefixes(&self) -> Vec<&str> {
+    /// The route prefixes this configuration registers ahead of the dashboard:
+    /// every channel prefix, every MCP proxy prefix, every `proxy` route and
+    /// every `redirect` route that has a target. These are what must not shadow
+    /// a dashboard page.
+    pub fn dashboard_shadowing_prefixes(&self) -> Vec<&str> {
         self.channels
             .iter()
+            .chain(
+                self.mcp_proxies
+                    .iter()
+                    .flatten(),
+            )
             .map(|channel| channel.prefix.as_str())
             .chain(
                 self.routes
                     .values()
-                    .filter(|route| matches!(route.route_type, RouteType::Proxy))
+                    .filter(|route| match route.route_type {
+                        RouteType::Proxy => true,
+                        RouteType::Redirect => route.target.is_some(),
+                        _ => false,
+                    })
                     .map(|route| route.prefix.as_str()),
             )
             .collect()
@@ -294,8 +362,10 @@ impl NetworkConfig {
 
     pub fn load_from_file(path: &str) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
-        let config: NetworkConfig = serde_json::from_str(&contents)?;
+        let mut config: NetworkConfig = serde_json::from_str(&contents)?;
+        config.normalize_route_prefixes();
         config.validate_listeners()?;
+        config.validate_route_prefixes()?;
         config.validate_terms()?;
         if let Some(profile) = &config.sts.mcp_issuer {
             profile.validate_network(&config)?;
@@ -760,6 +830,54 @@ mod url_mapping_tests {
     }
 
     #[test]
+    fn the_passkey_login_throttle_is_off_by_default_and_reads_its_settings() {
+        let defaults = cfg_with_listeners(serde_json::json!([]));
+        let mut configured = serde_json::to_value(&defaults).unwrap();
+        configured["passkey_login_throttle"] =
+            serde_json::json!({"enabled": true, "per_ip": {"requests": 5, "window_secs": 30}});
+        let configured: NetworkConfig = serde_json::from_value(configured).unwrap();
+
+        assert!(
+            !defaults
+                .passkey_login_throttle
+                .enabled
+        );
+        assert_eq!(
+            defaults
+                .passkey_login_throttle
+                .per_ip
+                .requests,
+            20
+        );
+        assert_eq!(
+            defaults
+                .passkey_login_throttle
+                .per_ip
+                .window_secs,
+            60
+        );
+        assert!(
+            configured
+                .passkey_login_throttle
+                .enabled
+        );
+        assert_eq!(
+            configured
+                .passkey_login_throttle
+                .per_ip
+                .requests,
+            5
+        );
+        assert_eq!(
+            configured
+                .passkey_login_throttle
+                .per_ip
+                .window_secs,
+            30
+        );
+    }
+
+    #[test]
     fn the_payment_gate_breaker_defaults_to_five_failures_and_thirty_seconds_and_reads_its_overrides() {
         let defaults = cfg_with_listeners(serde_json::json!([]));
         assert_eq!(
@@ -1073,7 +1191,21 @@ mod url_mapping_tests {
     }
 
     #[test]
-    fn proxy_prefixes_are_the_channel_prefixes_and_the_proxy_routes_only() {
+    fn a_route_type_name_is_the_one_gateway_json_uses() {
+        for route_type in [
+            RouteType::Proxy,
+            RouteType::IdentityApi,
+            RouteType::Static,
+            RouteType::ConnectionPoint,
+            RouteType::Redirect,
+            RouteType::Onboarding,
+        ] {
+            assert_eq!(serde_json::to_value(&route_type).unwrap(), route_type.as_str());
+        }
+    }
+
+    #[test]
+    fn dashboard_shadowing_prefixes_are_the_channels_mcp_proxies_and_proxy_and_redirect_routes() {
         let cfg: NetworkConfig = serde_json::from_value(serde_json::json!({
             "did": { "domain": "test.local" },
             "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
@@ -1083,14 +1215,48 @@ mod url_mapping_tests {
             "mcp_proxies": [{ "id": "mcp", "name": "mcp", "prefix": "/mcp" }],
             "routes": {
                 "channels": { "type": "proxy", "prefix": "/svc" },
+                "legacy": { "type": "redirect", "prefix": "/old", "target": "/new" },
                 "api": { "type": "identity_api", "prefix": "/api" },
                 "dashboard": { "type": "static", "prefix": "/", "path": "www", "fallback": true }
             },
         }))
         .expect("network config should deserialize");
 
-        let mut prefixes = cfg.proxy_prefixes();
+        let mut prefixes = cfg.dashboard_shadowing_prefixes();
         prefixes.sort_unstable();
-        assert_eq!(prefixes, vec!["/agents", "/svc"]);
+        assert_eq!(prefixes, vec!["/agents", "/mcp", "/old", "/svc"]);
+    }
+
+    #[test]
+    fn a_redirect_route_without_a_target_shadows_nothing() {
+        let cfg: NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "channels": [],
+            "routes": {
+                "dead": { "type": "redirect", "prefix": "/settings" },
+                "live": { "type": "redirect", "prefix": "/policies", "target": "/new" }
+            },
+        }))
+        .expect("network config should deserialize");
+
+        assert_eq!(cfg.dashboard_shadowing_prefixes(), vec!["/policies"]);
+    }
+
+    #[test]
+    fn dashboard_shadowing_prefixes_without_mcp_proxies_are_the_channels_and_routes() {
+        let cfg: NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "channels": [{ "id": "agents", "name": "agents", "prefix": "/agents" }],
+            "routes": {},
+        }))
+        .expect("network config should deserialize");
+
+        assert_eq!(cfg.dashboard_shadowing_prefixes(), vec!["/agents"]);
     }
 }

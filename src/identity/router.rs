@@ -323,7 +323,8 @@ pub async fn create_identity_api_router(
             get(crate::observability::get_ucp_operation_stats),
         )
         .route("/v1/dashboard/metrics/hierarchical", get(crate::observability::get_hierarchical_metrics))
-        .route("/v1/dashboard/system-metrics", get(crate::observability::get_system_metrics));
+        .route("/v1/dashboard/system-metrics", get(crate::observability::get_system_metrics))
+        .route("/v1/identities/by-hash/{identity_hash}/rotations", get(crate::observability::get_identity_rotations));
 
     // Add WebSocket routes conditionally based on auth requirement
     info!(
@@ -456,6 +457,13 @@ pub async fn create_identity_api_router(
                 #[cfg(not(debug_assertions))]
                 let test_support_router = Router::new();
 
+                crate::source_auth::client_ip::warn_if_login_throttle_shares_one_limit(
+                    "passkey_login_throttle",
+                    &state
+                        .network_config
+                        .passkey_login_throttle,
+                    &state.network_config.client_ip,
+                );
                 let router = Router::new()
                     // Auth mode endpoint (unauthenticated)
                     .route("/v1/auth/mode", get(crate::auth::mode_handler::get_auth_mode))
@@ -463,8 +471,16 @@ pub async fn create_identity_api_router(
                     .merge(
                         Router::new()
                             .route("/auth/register/start", post(crate::auth::handlers::register_start))
-                            .route("/auth/register/finish", post(crate::auth::handlers::register_finish))
                             .route("/auth/login/start", post(crate::auth::handlers::login_start))
+                            .route_layer(axum::middleware::from_fn_with_state(
+                                std::sync::Arc::new(crate::sts::throttle::TokenEndpointThrottle::per_client_ip(
+                                    &state
+                                        .network_config
+                                        .passkey_login_throttle,
+                                )),
+                                crate::auth::handlers::throttle_passkey_start,
+                            ))
+                            .route("/auth/register/finish", post(crate::auth::handlers::register_finish))
                             .route("/auth/login/finish", post(crate::auth::handlers::login_finish))
                             .route("/auth/check", get(crate::auth::handlers::check_auth))
                             .route("/auth/logout", post(crate::auth::handlers::logout))
@@ -1061,9 +1077,25 @@ pub async fn create_identity_api_router(
     let oidc_provider_router = if let (Some(store), Some(storage), Some(sess_mgr)) =
         (jwt_verification_strategy_store, passkey_storage_for_manager.as_ref(), session_manager_for_manager.as_ref())
     {
+        let references = crate::credential_providers::references::ReferenceStores {
+            credential_providers: state
+                .credential_provider_store
+                .clone(),
+            ..Default::default()
+        };
+        let gateway_issuer = crate::jwt_bearer::handlers::GatewayMcpIssuer(
+            state
+                .network_config
+                .sts
+                .mcp_issuer
+                .as_ref()
+                .map(|profile| profile.issuer.clone()),
+        );
         let state: crate::jwt_bearer::handlers::JwtVerificationStrategyState = store;
         info!("JWT verification strategy management routes registered");
         let router = crate::jwt_bearer::router::create_jwt_verification_strategies_router(state)
+            .layer(Extension(references))
+            .layer(Extension(gateway_issuer))
             .layer(middleware::from_fn(crate::auth_manager::middleware::extract_user_id))
             .layer(Extension(sess_mgr.clone()))
             .layer(Extension(storage.clone()))
@@ -1955,6 +1987,17 @@ pub async fn create_identity_api_router(
 
     // Create authority routes if store is provided
     let authority_router = if let Some(store) = authority_store {
+        let authority_references = crate::credential_providers::references::ReferenceStores {
+            surfaces: state
+                .agent_surface_store
+                .clone()
+                .map(|store| store as Arc<dyn crate::surfaces::AgentSurfaceStore>),
+            sts_clients: sts_client_store.clone(),
+            ..Default::default()
+        };
+        let authority_rbac = passkey_storage_for_manager
+            .as_ref()
+            .map(|storage| crate::auth_manager::middleware::RbacGuard::new(storage.clone(), rbac_config.clone()));
         Router::new()
             .route(
                 "/v1/authorities",
@@ -1997,6 +2040,8 @@ pub async fn create_identity_api_router(
             )
             .layer(Extension(store))
             .layer(Extension(issuer_tr_listener_manager))
+            .layer(Extension(authority_references))
+            .layer(Extension(authority_rbac))
     } else {
         Router::new()
     };

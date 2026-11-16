@@ -65,6 +65,30 @@ describe('AgentCardFetchLine', () => {
     );
   });
 
+  it('warns that the card is served without a managed identity', async () => {
+    mockFetch.mockResolvedValue(
+      reply(
+        200,
+        previewBody({
+          fetch: {
+            status: 'served_without_identity',
+            cause: 'identity_missing',
+            http_status: null,
+            duration_ms: 9,
+          },
+        })
+      )
+    );
+    renderLine();
+    await waitFor(() =>
+      expect(status()).toHaveTextContent('Card fetch: Served – No managed identity')
+    );
+    expect(status()).toHaveClass('agent-card-fetch-warning');
+    expect(screen.getByTestId('managed-agent-card-fetch-icon')).toHaveClass(
+      'fa-circle-exclamation'
+    );
+  });
+
   it('leaves out the HTTP status when the gateway did not reach the agent', async () => {
     mockFetch.mockResolvedValue(reply(200, failedBody('timeout', null)));
     renderLine();

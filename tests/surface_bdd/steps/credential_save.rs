@@ -3,6 +3,7 @@ use reqwest::Method;
 use serde_json::{Value, json};
 
 use crate::bdd_support::admin_client::RecordedResponse;
+use crate::bdd_support::config::single_surface_fixture::TargetAuthClientAuthentication;
 use crate::steps::when::{build_primary_target_surface_payload, ensure_admin_session};
 use crate::world::SurfaceWorld;
 
@@ -24,7 +25,7 @@ pub(crate) async fn send(
 
 pub(crate) const SECRET_VALUE: &str = "bdd-secret-value";
 
-async fn create_secret(
+pub(crate) async fn create_secret(
     world: &mut SurfaceWorld,
     secret_id: &str,
     tenant: Option<&str>,
@@ -32,7 +33,7 @@ async fn create_secret(
     create_secret_with_value(world, secret_id, tenant, SECRET_VALUE).await;
 }
 
-async fn create_secret_with_value(
+pub(crate) async fn create_secret_with_value(
     world: &mut SurfaceWorld,
     secret_id: &str,
     tenant: Option<&str>,
@@ -43,6 +44,20 @@ async fn create_secret_with_value(
     assert_eq!(response.status, 201, "creating a secret for tenant {tenant:?}: {}", response.body);
 }
 
+fn client_credentials_provider_body(
+    provider_id: &str,
+    token_endpoint: &str,
+    tenant: Option<&str>,
+    client_secrets: (&str, &str),
+) -> Value {
+    json!({
+        "name": provider_id, "provider_id": provider_id, "provider_type": "oauth2_client_credentials",
+        "token_endpoint": token_endpoint,
+        "client_id_secret_ref": client_secrets.0, "client_secret_secret_ref": client_secrets.1,
+        "tenant_id": tenant
+    })
+}
+
 pub(crate) async fn create_provider(
     world: &mut SurfaceWorld,
     provider_id: &str,
@@ -50,22 +65,152 @@ pub(crate) async fn create_provider(
     tenant: Option<&str>,
     client_secrets: (&str, &str),
 ) {
-    let body = json!({
-        "name": provider_id, "provider_id": provider_id, "provider_type": "oauth2_client_credentials",
-        "token_endpoint": token_endpoint,
-        "client_id_secret_ref": client_secrets.0, "client_secret_secret_ref": client_secrets.1,
-        "tenant_id": tenant
-    });
+    let body = client_credentials_provider_body(provider_id, token_endpoint, tenant, client_secrets);
     let response = send(world, Method::POST, "/v1/credential-providers", Some(&body)).await;
     world.admin_response = Some(response);
 }
 
-async fn create_jwt_bearer_provider(
+async fn create_authorization_code_provider(
     world: &mut SurfaceWorld,
+    provider_id: &str,
+    tenant: Option<&str>,
+    client_secrets: (&str, &str),
+    callback_url: Option<&str>,
+) -> RecordedResponse {
+    let body = json!({
+        "name": provider_id, "provider_id": provider_id, "provider_type": "oauth2_authorization_code",
+        "authorization_endpoint": "https://192.0.2.1/authorize", "token_endpoint": "https://192.0.2.1/token",
+        "client_id_secret_ref": client_secrets.0, "client_secret_secret_ref": client_secrets.1,
+        "tenant_id": tenant, "callback_url": callback_url
+    });
+    send(world, Method::POST, "/v1/credential-providers", Some(&body)).await
+}
+
+#[given(
+    expr = "the operator has created the authorization code provider {string} for tenant {string} using secrets {string} and {string}"
+)]
+async fn operator_has_created_tenant_authorization_code_provider(
+    world: &mut SurfaceWorld,
+    provider_id: String,
+    tenant: String,
+    client_id_secret: String,
+    client_secret_secret: String,
+) {
+    let response = create_authorization_code_provider(
+        world,
+        &provider_id,
+        Some(&tenant),
+        (&client_id_secret, &client_secret_secret),
+        None,
+    )
+    .await;
+    assert_eq!(response.status, 201, "creating provider {provider_id} for {tenant}: {}", response.body);
+}
+
+#[when(
+    expr = "the operator creates the authorization code provider {string} for tenant {string} using secrets {string} and {string}"
+)]
+async fn operator_creates_tenant_authorization_code_provider(
+    world: &mut SurfaceWorld,
+    provider_id: String,
+    tenant: String,
+    client_id_secret: String,
+    client_secret_secret: String,
+) {
+    let response = create_authorization_code_provider(
+        world,
+        &provider_id,
+        Some(&tenant),
+        (&client_id_secret, &client_secret_secret),
+        None,
+    )
+    .await;
+    world.admin_response = Some(response);
+}
+
+#[when(
+    expr = "the operator creates the authorization code provider {string} with callback URL {string} using secrets {string} and {string}"
+)]
+async fn operator_creates_authorization_code_provider_with_callback_url(
+    world: &mut SurfaceWorld,
+    provider_id: String,
+    callback_url: String,
+    client_id_secret: String,
+    client_secret_secret: String,
+) {
+    let response = create_authorization_code_provider(
+        world,
+        &provider_id,
+        None,
+        (&client_id_secret, &client_secret_secret),
+        Some(&callback_url),
+    )
+    .await;
+    world.admin_response = Some(response);
+}
+
+#[when("the operator reads the surface routing settings")]
+async fn operator_reads_surface_routing_settings(world: &mut SurfaceWorld) {
+    let response = send(world, Method::GET, "/v1/config/surface-routing", None).await;
+    world.admin_response = Some(response);
+}
+
+#[then("the surface routing settings name the gateway's own https address as its base URL")]
+fn surface_routing_settings_name_gateway_base_url(world: &mut SurfaceWorld) {
+    let base_url = format!(
+        "https://localhost:{}",
+        world
+            .infra
+            .as_ref()
+            .expect("the gateway is running")
+            .gateway_port
+    );
+    let response = world
+        .admin_response
+        .as_ref()
+        .expect("an admin API response");
+    assert_eq!(response.body["gateway_base_url"], base_url, "surface routing settings: {}", response.body);
+}
+
+#[then(expr = "both credential providers {string} have a callback path ending in the id the gateway gave each")]
+async fn each_provider_has_a_callback_path_of_its_own(
+    world: &mut SurfaceWorld,
+    provider_id: String,
+) {
+    let response = send(world, Method::GET, "/v1/credential-providers", None).await;
+    assert_eq!(response.status, 200, "listing credential providers: {}", response.body);
+    let ids: Vec<String> = response
+        .body
+        .as_array()
+        .expect("the provider list is an array")
+        .iter()
+        .filter(|provider| provider["provider_id"] == provider_id.as_str())
+        .filter_map(|provider| {
+            provider["id"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(ids.len(), 2, "expected two providers {provider_id}, got {ids:?}");
+    for id in &ids {
+        let stored = send(world, Method::GET, &format!("/v1/credential-providers/{id}"), None).await;
+        assert_eq!(stored.status, 200, "reading provider {id}: {}", stored.body);
+        let path = stored.body["callback_path"]
+            .as_str()
+            .unwrap_or_default();
+        assert_eq!(
+            path,
+            format!("/v1/identity/oauth/callback/{id}"),
+            "provider {id} should have the consent route the gateway serves, ending in its id"
+        );
+    }
+}
+
+fn jwt_bearer_provider_body(
     provider_id: &str,
     signing_key_secret: &str,
     subject: Option<&str>,
-) {
+) -> Value {
     let mut body = json!({
         "name": provider_id, "provider_id": provider_id, "provider_type": "oauth2_jwt_bearer",
         "token_endpoint": "https://192.0.2.1/token",
@@ -75,6 +220,40 @@ async fn create_jwt_bearer_provider(
     });
     if let Some(subject) = subject {
         body["jwt_subject"] = json!(subject);
+    }
+    body
+}
+
+async fn create_jwt_bearer_provider(
+    world: &mut SurfaceWorld,
+    provider_id: &str,
+    signing_key_secret: &str,
+    subject: Option<&str>,
+) {
+    let body = jwt_bearer_provider_body(provider_id, signing_key_secret, subject);
+    let response = send(world, Method::POST, "/v1/credential-providers", Some(&body)).await;
+    world.admin_response = Some(response);
+}
+
+struct ClientAuthenticationFields<'a> {
+    authentication: &'a str,
+    client_id_secret: &'a str,
+    client_secret: Option<&'a str>,
+}
+
+async fn create_jwt_bearer_provider_authenticating_its_client(
+    world: &mut SurfaceWorld,
+    provider_id: &str,
+    signing_key_secret: &str,
+    subject: &str,
+    client: ClientAuthenticationFields<'_>,
+) {
+    let mut body = jwt_bearer_provider_body(provider_id, signing_key_secret, Some(subject));
+    body["client_authentication"] =
+        json!(TargetAuthClientAuthentication::from_wording(client.authentication).api_value());
+    body["client_id_secret_ref"] = json!(client.client_id_secret);
+    if let Some(client_secret) = client.client_secret {
+        body["client_secret_secret_ref"] = json!(client_secret);
     }
     let response = send(world, Method::POST, "/v1/credential-providers", Some(&body)).await;
     world.admin_response = Some(response);
@@ -152,8 +331,6 @@ async fn create_surface_with_secret(
     );
 }
 
-const SEEDED_SURFACE_ID: &str = "bdd-surface";
-
 pub(crate) fn surface_id(world: &SurfaceWorld) -> String {
     world
         .surface_under_test_id
@@ -162,7 +339,7 @@ pub(crate) fn surface_id(world: &SurfaceWorld) -> String {
             world
                 .surface_config
                 .seed_surface
-                .then(|| SEEDED_SURFACE_ID.to_string())
+                .then(|| crate::bdd_support::config::single_surface_fixture::SEEDED_SURFACE_ID.to_string())
         })
         .expect("the surface under test must exist")
 }
@@ -249,6 +426,28 @@ async fn operator_created_appliance_surface(
 }
 
 #[when(
+    expr = "the operator creates the credential provider {string} with token endpoint {string} using secrets {string} and {string}, authenticating its client with {string}"
+)]
+async fn operator_creates_provider_authenticating_its_client(
+    world: &mut SurfaceWorld,
+    provider_id: String,
+    token_endpoint: String,
+    client_id_secret: String,
+    client_secret_secret: String,
+    authentication: String,
+) {
+    let mut body = client_credentials_provider_body(
+        &provider_id,
+        &token_endpoint,
+        None,
+        (&client_id_secret, &client_secret_secret),
+    );
+    body["client_authentication"] = json!(TargetAuthClientAuthentication::from_wording(&authentication).api_value());
+    let response = send(world, Method::POST, "/v1/credential-providers", Some(&body)).await;
+    world.admin_response = Some(response);
+}
+
+#[when(
     expr = "the operator creates the credential provider {string} with token endpoint {string} using secrets {string} and {string}"
 )]
 async fn operator_creates_appliance_provider(
@@ -291,6 +490,47 @@ async fn operator_creates_jwt_bearer_provider_with_subject(
     create_jwt_bearer_provider(world, &provider_id, &signing_key_secret, Some(&subject)).await;
 }
 
+#[when(
+    expr = "the operator creates the JWT Bearer provider {string} using the secret {string} with subject {string}, authenticating its client with {string} with the client ID secret {string}"
+)]
+async fn operator_creates_jwt_bearer_provider_with_client_id_secret(
+    world: &mut SurfaceWorld,
+    provider_id: String,
+    signing_key_secret: String,
+    subject: String,
+    authentication: String,
+    client_id_secret: String,
+) {
+    let client = ClientAuthenticationFields {
+        authentication: &authentication,
+        client_id_secret: &client_id_secret,
+        client_secret: None,
+    };
+    create_jwt_bearer_provider_authenticating_its_client(world, &provider_id, &signing_key_secret, &subject, client)
+        .await;
+}
+
+#[when(
+    expr = "the operator creates the JWT Bearer provider {string} using the secret {string} with subject {string}, authenticating its client with {string} with the client ID secret {string} and the client secret {string}"
+)]
+async fn operator_creates_jwt_bearer_provider_with_client_id_and_client_secret(
+    world: &mut SurfaceWorld,
+    provider_id: String,
+    signing_key_secret: String,
+    subject: String,
+    authentication: String,
+    client_id_secret: String,
+    client_secret: String,
+) {
+    let client = ClientAuthenticationFields {
+        authentication: &authentication,
+        client_id_secret: &client_id_secret,
+        client_secret: Some(&client_secret),
+    };
+    create_jwt_bearer_provider_authenticating_its_client(world, &provider_id, &signing_key_secret, &subject, client)
+        .await;
+}
+
 #[when(expr = "the operator creates the JWT Bearer provider {string} using the secret {string} without a subject")]
 async fn operator_creates_jwt_bearer_provider_without_subject(
     world: &mut SurfaceWorld,
@@ -328,6 +568,34 @@ async fn operator_reassigns_surface(
     let path = format!("/v1/tenant-ownership/surfaces/{}", surface_id(world));
     let response = send(world, Method::PUT, &path, Some(&json!({"tenant_id": tenant}))).await;
     world.admin_response = Some(response);
+}
+
+#[when("the operator lists the credential providers")]
+async fn operator_lists_credential_providers(world: &mut SurfaceWorld) {
+    let response = send(world, Method::GET, "/v1/credential-providers", None).await;
+    world.admin_response = Some(response);
+}
+
+#[then(expr = "the credential provider list shows the client authentication {string} for provider {string}")]
+async fn provider_list_shows_client_authentication(
+    world: &mut SurfaceWorld,
+    authentication: String,
+    provider_id: String,
+) {
+    let expected = TargetAuthClientAuthentication::from_wording(&authentication).api_value();
+    let response = world
+        .admin_response
+        .as_ref()
+        .expect("the operator listed the credential providers");
+    assert_eq!(response.status, 200, "listing credential providers: {}", response.body);
+    let provider = response
+        .body
+        .as_array()
+        .expect("the provider list is an array")
+        .iter()
+        .find(|provider| provider["provider_id"] == provider_id)
+        .unwrap_or_else(|| panic!("provider {provider_id} is not in the list: {}", response.body));
+    assert_eq!(provider["client_authentication"], json!(expected), "the list entry: {provider}");
 }
 
 #[then(expr = "the credential provider {string} is stored")]

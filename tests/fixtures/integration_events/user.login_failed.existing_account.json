@@ -1,0 +1,25 @@
+{
+  "event_type": "user.login_failed",
+  "event_name": "User Login Failed",
+  "timestamp": "<timestamp>",
+  "appliance_id": "<appliance_id>",
+  "summary": "A passkey sign-in failed: invalid_credential",
+  "data": {
+    "old_state": null,
+    "new_state": {
+      "user_id": "<user_id>",
+      "role": "administrator",
+      "status": "approved",
+      "is_primary": false,
+      "created_at": "<timestamp>",
+      "updated_at": "<timestamp>"
+    },
+    "user_id": "<user_id>",
+    "username": "alpha",
+    "user_email": "alpha@example.test",
+    "user_role": "administrator",
+    "user_status": "approved",
+    "login_method": "passkey",
+    "failure_reason": "invalid_credential"
+  }
+}

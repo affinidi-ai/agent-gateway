@@ -38,11 +38,22 @@ Feature: MCP credential delegation
     And OAuth provider "calendar" received the authorization code exchange
     And the delegation audit trail contains event "consent_granted" for OAuth provider "calendar"
 
+  Scenario: OAuth consent completes at a callback path ending in the id the gateway gave the provider
+    Given the surface requires delegated credentials from OAuth provider "calendar"
+    And OAuth provider "calendar" has a callback path ending in the id the gateway gave it
+    And the surface has an explicit inbound identity slot for MCP
+    And caller "alice" has started OAuth consent for provider "calendar"
+    And OAuth provider "calendar" is ready to exchange an authorization code for delegated credentials
+    When OAuth provider "calendar" redirects the caller back with a valid authorization code
+    Then the OAuth callback response status is 200
+    And OAuth provider "calendar" received the authorization code exchange
+    And the delegation audit trail contains event "consent_granted" for OAuth provider "calendar"
+
   Scenario Outline: OAuth callback shows an authorization failure page without exchanging credentials
     Given the surface requires delegated credentials from OAuth provider "calendar"
     And caller "alice" has started OAuth consent for provider "calendar"
     When OAuth provider "calendar" redirects the caller back <callback condition>
-    Then the OAuth callback response status is 200
+    Then the OAuth callback response status is 400
     And the OAuth callback response shows an authorization failure page
     And OAuth provider "calendar" was not asked to exchange an authorization code
 
@@ -58,8 +69,47 @@ Feature: MCP credential delegation
     And caller "alice" has started OAuth consent for provider "calendar"
     And caller "alice" has completed OAuth consent for provider "calendar"
     When OAuth provider "calendar" redirects the caller back again with the same state
-    Then the OAuth callback response status is 200
+    Then the OAuth callback response status is 400
     And the OAuth callback response shows an authorization failure page
+
+  Scenario: OAuth callback opened in another browser is refused without exchanging credentials
+    Given the surface requires delegated credentials from OAuth provider "calendar"
+    And caller "alice" has started OAuth consent for provider "calendar"
+    And caller "alice" has confirmed the consent start page for provider "calendar"
+    When OAuth provider "calendar" redirects another browser back with a valid authorization code
+    Then the OAuth callback response status is 403
+    And the OAuth callback response shows an authorization failure page
+    And OAuth provider "calendar" was not asked to exchange an authorization code
+    And the delegation audit trail records a refused consent for OAuth provider "calendar" with reason "browser_binding_mismatch"
+
+  Scenario: OAuth callback with another issuer is refused when the provider records its issuer
+    Given the surface requires delegated credentials from OAuth provider "calendar"
+    And OAuth provider "calendar" records authorization response issuer "https://calendar.example"
+    And caller "alice" has started OAuth consent for provider "calendar"
+    When OAuth provider "calendar" redirects the caller back with a valid authorization code and issuer "https://other.example"
+    Then the OAuth callback response status is 400
+    And the OAuth callback response shows an authorization failure page
+    And OAuth provider "calendar" was not asked to exchange an authorization code
+    And the delegation audit trail records a refused consent for OAuth provider "calendar" with reason "iss_mismatch"
+
+  Scenario: OAuth callback at another provider's callback URL is refused
+    Given the surface requires delegated credentials from OAuth provider "calendar"
+    And the gateway has OAuth provider "mail"
+    And caller "alice" has started OAuth consent for provider "calendar"
+    When OAuth provider "calendar" redirects the caller back to the callback URL of OAuth provider "mail"
+    Then the OAuth callback response status is 400
+    And the OAuth callback response shows an authorization failure page
+    And OAuth provider "calendar" was not asked to exchange an authorization code
+    And the delegation audit trail records a refused consent for OAuth provider "mail" with reason "consent_provider_mismatch"
+
+  Scenario: A consent start posted from another site is refused and does not reach the OAuth provider
+    Given the surface requires delegated credentials from OAuth provider "calendar"
+    And caller "alice" has started OAuth consent for provider "calendar"
+    When a page on another site confirms the consent start page for OAuth provider "calendar"
+    Then the consent start response status is 403
+    And the consent start response shows an authorization failure page
+    And the consent start response does not send the browser to OAuth provider "calendar"
+    And the delegation audit trail records a refused consent for OAuth provider "calendar" with reason "cross_site_consent_start"
 
   Scenario: Delegated credentials are injected into the MCP server request after consent
     Given the surface requires delegated credentials from OAuth provider "calendar"

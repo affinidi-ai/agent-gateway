@@ -3,7 +3,7 @@
 use super::{
     CreateCredentialProviderRequest, CredentialProvider, CredentialProviderListItem, CredentialProviderType,
     JwtAssertionSettings, JwtSigningAlgorithm, UpdateCredentialProviderRequest, ValidateCredentialProviderRequest,
-    storage::CredentialProviderStorage,
+    is_blank, storage::CredentialProviderStorage,
 };
 use axum::{
     Extension, Json,
@@ -42,6 +42,9 @@ pub struct CredentialProviderState {
     pub secrets_store: Arc<dyn SecretsStore>,
     pub identity_strategies: Option<Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>>,
     pub oauth_callback_route: String,
+    /// The gateway's base URL, which a provider without `callback_url` uses for
+    /// its redirect URI.
+    pub gateway_base_url: String,
     /// Reads the issuer's metadata an external consent provider is checked against.
     pub issuer_metadata: super::external::IssuerMetadata,
     /// The surfaces whose bindings keep a provider from being deleted.
@@ -54,13 +57,17 @@ pub struct CredentialProviderState {
     /// gateway.json's `external_consent_resource_origins`: the resource origins
     /// permitted, beyond the issuer's own host, for each issuer's providers.
     pub resource_origins: Arc<std::collections::HashMap<String, Vec<String>>>,
-    /// gateway.json's `external_consent_issuers`: when set, the only issuers an
-    /// external consent provider may name, with the origins their endpoints may
-    /// use beyond the issuer's own host.
-    pub issuers: Arc<Option<std::collections::HashMap<String, Vec<String>>>>,
+    /// gateway.json's `external_consent_issuers` and
+    /// `external_consent_issuer_patterns`: when either is set, the only issuers
+    /// an external consent provider may name, with the origins their endpoints
+    /// may use beyond the issuer's own host.
+    pub issuers: Arc<super::external::PermittedIssuers>,
     pub references: super::references::ReferenceStores,
     /// Decides which referrers a 409 may name; `None` names none.
     pub rbac: Option<crate::auth_manager::middleware::RbacGuard>,
+    /// gateway.json's `sts.mcp_issuer`: the issuer of this gateway's own STS
+    /// tokens, which no `consent_confirmation` strategy may expect.
+    pub gateway_mcp_issuer: Option<String>,
 }
 
 /// A provider as the API returns it, with `resource_origin`, the only origin
@@ -103,10 +110,20 @@ fn reference_scan_failed(error: anyhow::Error) -> Response {
 enum ProviderValidationError {
     #[error("token_endpoint must be an https URL")]
     TokenEndpointNotHttps,
+    #[error(
+        "token_endpoint rejected: it must be an http(s) URL without a user name or password whose host resolves to neither loopback nor cloud metadata"
+    )]
+    TokenEndpointBlocked,
     #[error("{0} is required for this provider type")]
     Missing(&'static str),
+    #[error("{0} is required for this client_authentication")]
+    MissingForClientAuthentication(&'static str),
     #[error("client_secret_secret_ref is not allowed: this provider authenticates with a signed JWT")]
     ClientSecretNotAllowed,
+    #[error("client_authentication is only for oauth2_jwt_bearer providers")]
+    ClientAuthenticationNotAllowed,
+    #[error("client_secret_secret_ref is not allowed with client_authentication none")]
+    PublicClientTakesNoSecret,
     #[error("jwt_signing_algorithm is not supported for this provider type")]
     UnsupportedAlgorithm,
     #[error("jwt_audience: {0}")]
@@ -125,20 +142,30 @@ enum ProviderValidationError {
     InvalidSigningKey,
     #[error("jwt_certificate_secret_ref must reference a PEM certificate")]
     InvalidCertificate,
+    #[error("{0}")]
+    InvalidConsentConfirmation(String),
+    #[error("Consent confirmation strategy is invalid or not accessible")]
+    InvalidConfirmationStrategy,
 }
 
 impl IntoResponse for ProviderValidationError {
     fn into_response(self) -> Response {
         match self {
             Self::TokenEndpointNotHttps
+            | Self::TokenEndpointBlocked
             | Self::Missing(_)
+            | Self::MissingForClientAuthentication(_)
             | Self::ClientSecretNotAllowed
+            | Self::ClientAuthenticationNotAllowed
+            | Self::PublicClientTakesNoSecret
             | Self::UnsupportedAlgorithm
             | Self::InvalidAudience(_)
             | Self::InvalidConsentStrategy
             | Self::SecretNotAccessible
             | Self::InvalidSigningKey
-            | Self::InvalidCertificate => {
+            | Self::InvalidCertificate
+            | Self::InvalidConsentConfirmation(_)
+            | Self::InvalidConfirmationStrategy => {
                 (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": self.to_string() }))).into_response()
             }
             Self::IdentityConfigurationUnavailable => {
@@ -174,24 +201,151 @@ async fn validate_consent_strategy(
     {
         return Err(ProviderValidationError::InvalidConsentStrategy);
     }
-    let strategy = state
+    let strategy = referenceable_strategy(state, provider, id, context, scope)
+        .await?
+        .ok_or(ProviderValidationError::InvalidConsentStrategy)?;
+    if crate::sts::mcp_profile::canonical_https_url(&strategy.expected_issuer).is_err() {
+        return Err(ProviderValidationError::InvalidConsentStrategy);
+    }
+    Ok(())
+}
+
+/// The JWT verification strategy `id` when it exists, the provider's tenant
+/// can reference it and the caller's scope covers it; `None` otherwise, so a
+/// strategy of another tenant and a missing one are refused alike.
+async fn referenceable_strategy(
+    state: &CredentialProviderState,
+    provider: &CredentialProvider,
+    id: &str,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Result<Option<crate::jwt_bearer::models::JwtVerificationStrategy>, ProviderValidationError> {
+    let Some(strategies) = state
         .identity_strategies
         .as_ref()
-        .ok_or(ProviderValidationError::InvalidConsentStrategy)?
+    else {
+        return Ok(None);
+    };
+    let strategy = strategies
         .get(id)
         .await
-        .map_err(|_| ProviderValidationError::IdentityConfigurationUnavailable)?
-        .ok_or(ProviderValidationError::InvalidConsentStrategy)?;
-    if !can_reference(provider.tenant_id.as_deref(), strategy.tenant_id.as_deref())
-        || !scope_allows_resource(
-            resource_scope(scope),
-            tenant_context(context),
-            ResourceKind::JwtVerificationStrategies,
-            id,
-        )
-        || crate::sts::mcp_profile::canonical_https_url(&strategy.expected_issuer).is_err()
+        .map_err(|_| ProviderValidationError::IdentityConfigurationUnavailable)?;
+    Ok(strategy.filter(|strategy| {
+        can_reference(provider.tenant_id.as_deref(), strategy.tenant_id.as_deref())
+            && scope_allows_resource(
+                resource_scope(scope),
+                tenant_context(context),
+                ResourceKind::JwtVerificationStrategies,
+                id,
+            )
+    }))
+}
+
+/// The `consent_confirmation` rules, checked when the setting is present: a
+/// legacy consent provider, a configured identity hash pepper, a login client,
+/// an `id_token_principal_claim` that names a caller, endpoints the start POST
+/// and the confirmation exchange accept, and a strategy the provider's tenant
+/// can reference that names no Entra caller by `sub`, neither in the strategy
+/// nor in the ID token. The client ID and secret references are checked with
+/// the provider's other secret references, and the client ID's value after
+/// them ([`validate_consent_confirmation_client_id`]).
+async fn validate_consent_confirmation(
+    state: &CredentialProviderState,
+    provider: &CredentialProvider,
+    egress: &TokenEgress,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Result<(), ProviderValidationError> {
+    let invalid = |message: &str| Err(ProviderValidationError::InvalidConsentConfirmation(message.to_string()));
+    let Some(confirmation) = provider
+        .consent_confirmation
+        .as_ref()
+    else {
+        return Ok(());
+    };
+    if !provider.uses_legacy_consent() {
+        return invalid("consent_confirmation is allowed only on an oauth2_authorization_code provider without issuer");
+    }
+    if !crate::identity::credential_identity::pepper_is_configured() {
+        return invalid("consent_confirmation needs AG_IDENTITY_HASH_PEPPER to be set");
+    }
+    if [
+        &confirmation.client_id_secret_ref,
+        &confirmation.client_secret_secret_ref,
+        &confirmation.jwt_verification_strategy_id,
+    ]
+    .iter()
+    .any(|value| value.trim().is_empty())
     {
-        return Err(ProviderValidationError::InvalidConsentStrategy);
+        return invalid(
+            "consent_confirmation needs client_id_secret_ref, client_secret_secret_ref and jwt_verification_strategy_id",
+        );
+    }
+    confirmation
+        .authorization_endpoint_url()
+        .map_err(ProviderValidationError::InvalidConsentConfirmation)?;
+    if let Err(error) = crate::url_validation::validate_oauth_endpoint_url(&confirmation.token_endpoint) {
+        return invalid(&format!("consent_confirmation.token_endpoint: {error}"));
+    }
+    if !egress.permits_token_endpoint(&confirmation.token_endpoint) {
+        return invalid("consent_confirmation.token_endpoint must be an https URL");
+    }
+    let strategy = referenceable_strategy(state, provider, &confirmation.jwt_verification_strategy_id, context, scope)
+        .await?
+        .ok_or(ProviderValidationError::InvalidConfirmationStrategy)?;
+    use super::ConfirmationStrategyRefusal as Refusal;
+    match confirmation.claims_through(
+        &strategy,
+        state
+            .gateway_mcp_issuer
+            .as_deref(),
+    ) {
+        Ok(_) => Ok(()),
+        Err(Refusal::StrategyClaim) => Err(ProviderValidationError::InvalidConfirmationStrategy),
+        Err(Refusal::IdTokenClaim(error)) => {
+            invalid(&format!("consent_confirmation.id_token_principal_claim: {error}"))
+        }
+        Err(Refusal::GatewayIssuer) => invalid(
+            "consent_confirmation cannot confirm callers of this gateway's own MCP issuer, who sign in nowhere else",
+        ),
+        Err(Refusal::EntraCallerNamedBySub) => invalid(
+            "consent_confirmation cannot name an Entra caller by sub, which Entra issues per application: use oid",
+        ),
+        Err(Refusal::CallerNamedByEmail) => {
+            invalid("consent_confirmation cannot name a caller by email, which the sign-in does not ask for")
+        }
+        Err(Refusal::EditableClaim) => invalid(
+            "consent_confirmation cannot name a caller by a claim the person can change at their identity provider: \
+             use an immutable claim the identity provider assigns, such as sub or oid",
+        ),
+    }
+}
+
+/// The login client ID a `consent_confirmation` reads from the secrets store is at most
+/// [`MAX_CLIENT_ID_CHARS`](super::external::MAX_CLIENT_ID_CHARS) characters, without
+/// whitespace or control characters. Run once the secret references are checked, so only a
+/// secret the provider may use is read.
+async fn validate_consent_confirmation_client_id(
+    state: &CredentialProviderState,
+    provider: &CredentialProvider,
+) -> Result<(), ProviderValidationError> {
+    let Some(confirmation) = provider
+        .consent_confirmation
+        .as_ref()
+    else {
+        return Ok(());
+    };
+    let client_id = stored_secret(state, &confirmation.client_id_secret_ref)
+        .await?
+        .value;
+    if client_id.chars().count() > super::external::MAX_CLIENT_ID_CHARS
+        || super::external::has_whitespace_or_control(&client_id)
+    {
+        return Err(ProviderValidationError::InvalidConsentConfirmation(
+            "consent_confirmation.client_id_secret_ref must hold a client ID of at most 2048 characters, without \
+             whitespace"
+                .to_string(),
+        ));
     }
     Ok(())
 }
@@ -249,10 +403,18 @@ async fn validate_secret_references(
     Ok(())
 }
 
-/// The required fields (`jwt_subject` included for a JWT Bearer grant), algorithm and
-/// audience of an `oauth2_jwt_bearer` or `oauth2_client_credentials_jwt_auth` provider;
-/// other types pass unchecked.
+/// The required fields (`jwt_subject` included for a JWT Bearer grant), client authentication,
+/// algorithm and audience of an `oauth2_jwt_bearer` or `oauth2_client_credentials_jwt_auth`
+/// provider; other types pass unchecked, except that none may set a client authentication.
 fn validate_jwt_provider(provider: &CredentialProvider) -> Result<(), ProviderValidationError> {
+    if provider.provider_type != CredentialProviderType::OAuth2JwtBearer
+        && provider
+            .jwt
+            .client_authentication_method()
+            .is_some()
+    {
+        return Err(ProviderValidationError::ClientAuthenticationNotAllowed);
+    }
     let required = match provider.provider_type {
         CredentialProviderType::OAuth2JwtBearer => vec![
             (
@@ -303,13 +465,14 @@ fn validate_jwt_provider(provider: &CredentialProvider) -> Result<(), ProviderVa
     };
     if let Some((field, _)) = required
         .into_iter()
-        .find(|(_, value)| value.is_none_or(|value| value.trim().is_empty()))
+        .find(|(_, value)| is_blank(*value))
     {
         return Err(ProviderValidationError::Missing(field));
     }
     if provider.lacks_jwt_subject() {
         return Err(ProviderValidationError::Missing("jwt_subject"));
     }
+    validate_client_authentication(provider)?;
     if provider.provider_type == CredentialProviderType::OAuth2ClientCredentialsJwtAuth
         && provider
             .client_secret_secret_ref
@@ -335,6 +498,35 @@ fn validate_jwt_provider(provider: &CredentialProvider) -> Result<(), ProviderVa
             .map_err(|error| ProviderValidationError::InvalidAudience(error.to_string()))?;
     }
     Ok(())
+}
+
+/// A JWT Bearer provider's client authentication needs the client references it sends: the
+/// client ID for every method, the client secret for the methods that send one, and no secret
+/// for a public client.
+fn validate_client_authentication(provider: &CredentialProvider) -> Result<(), ProviderValidationError> {
+    let Some(method) = provider
+        .jwt
+        .client_authentication_method()
+    else {
+        return Ok(());
+    };
+    if is_blank(
+        provider
+            .client_id_secret_ref
+            .as_deref(),
+    ) {
+        return Err(ProviderValidationError::MissingForClientAuthentication("client_id_secret_ref"));
+    }
+    let secret_missing = is_blank(
+        provider
+            .client_secret_secret_ref
+            .as_deref(),
+    );
+    match (method.uses_secret(), secret_missing) {
+        (true, true) => Err(ProviderValidationError::MissingForClientAuthentication("client_secret_secret_ref")),
+        (false, false) => Err(ProviderValidationError::PublicClientTakesNoSecret),
+        _ => Ok(()),
+    }
 }
 
 /// Resolve the signing key and certificate a JWT-signing provider references and check
@@ -386,8 +578,9 @@ async fn validate_jwt_key_material(
 }
 
 /// A new provider, or one whose token endpoint or type changes, must have a token endpoint
-/// that meets the https rule. A stored provider saved with the same http endpoint keeps it
-/// while `credential_policy.token_endpoint_https` is `warn`.
+/// that meets the https rule. A stored provider saved with the same type and the same http
+/// endpoint keeps it while `credential_policy.token_endpoint_https` is `warn`, unless the save
+/// makes it start sending a client secret there.
 fn validate_token_endpoint_scheme(
     egress: &TokenEgress,
     previous: Option<&CredentialProvider>,
@@ -406,16 +599,36 @@ fn validate_token_endpoint_scheme(
         return Ok(());
     }
     let unchanged = previous.is_some_and(|previous| {
-        previous.provider_type != CredentialProviderType::ApiKey
+        previous.provider_type == provider.provider_type
             && previous
                 .token_endpoint
                 .as_deref()
                 == Some(endpoint)
+            && (previous.sends_client_secret() || !provider.sends_client_secret())
     });
     if unchanged && egress.admits_token_endpoint(endpoint) {
         return Ok(());
     }
     Err(ProviderValidationError::TokenEndpointNotHttps)
+}
+
+/// The JWT settings an update stores: the requested ones over the stored ones, without a
+/// stored client authentication when the update retypes the provider away from
+/// `oauth2_jwt_bearer` and does not send one.
+fn updated_jwt_settings(
+    requested: JwtAssertionSettings,
+    stored: JwtAssertionSettings,
+    provider_type: &CredentialProviderType,
+) -> JwtAssertionSettings {
+    let keeps_stored_method = *provider_type == CredentialProviderType::OAuth2JwtBearer
+        || requested
+            .client_authentication
+            .is_some();
+    let mut settings = requested.or(stored);
+    if !keeps_stored_method {
+        settings.client_authentication = None;
+    }
+    settings.normalized()
 }
 
 /// The checks a provider passes before it is stored, `previous` being the stored record an
@@ -431,6 +644,7 @@ async fn validate_provider_settings(
 ) -> Result<(), ProviderValidationError> {
     validate_token_endpoint_scheme(egress, previous, provider)?;
     validate_jwt_provider(provider)?;
+    validate_consent_confirmation(state, provider, egress, context, scope).await?;
     let isolation = egress
         .policy
         .tenant_credential_isolation;
@@ -445,6 +659,7 @@ async fn validate_provider_settings(
         scope,
     )
     .await?;
+    validate_consent_confirmation_client_id(state, provider).await?;
     validate_jwt_key_material(state, provider.jwt_signing_algorithm(), &provider.jwt).await?;
     validate_consent_strategy(state, provider, context, scope).await
 }
@@ -452,6 +667,19 @@ async fn validate_provider_settings(
 /// A blank secret reference is no reference: the dashboard sends unused fields empty.
 fn blank_to_none(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.trim().is_empty())
+}
+
+/// A blank client ID reference of a JWT Bearer provider, whose client ID is optional, is no
+/// reference. Any other type keeps it, and the secret check refuses it.
+fn client_id_reference(
+    provider_type: &CredentialProviderType,
+    reference: Option<String>,
+) -> Option<String> {
+    if *provider_type == CredentialProviderType::OAuth2JwtBearer {
+        blank_to_none(reference)
+    } else {
+        reference
+    }
 }
 
 /// Validate a set of named URL fields against the SSRF blocklist.
@@ -471,21 +699,20 @@ fn validate_url_fields(fields: &[(&str, Option<&str>)]) -> Option<Response> {
 
 /// The type-specific fields a provider without an issuer needs, if one is missing.
 fn legacy_type_error(provider: &CredentialProvider) -> Option<&'static str> {
-    let blank = |value: Option<&str>| value.is_none_or(|value| value.trim().is_empty());
     match provider.provider_type {
         CredentialProviderType::OAuth2AuthorizationCode | CredentialProviderType::OAuth2ClientCredentials => {
-            if blank(
+            if is_blank(
                 provider
                     .token_endpoint
                     .as_deref(),
             ) {
                 return Some("token_endpoint is required for OAuth providers");
             }
-            if blank(
+            if is_blank(
                 provider
                     .client_id_secret_ref
                     .as_deref(),
-            ) || blank(
+            ) || is_blank(
                 provider
                     .client_secret_secret_ref
                     .as_deref(),
@@ -494,13 +721,97 @@ fn legacy_type_error(provider: &CredentialProvider) -> Option<&'static str> {
             }
             None
         }
-        CredentialProviderType::ApiKey => blank(
+        CredentialProviderType::ApiKey => is_blank(
             provider
                 .api_key_secret_ref
                 .as_deref(),
         )
         .then_some("api_key_secret_ref is required for ApiKey providers"),
         CredentialProviderType::OAuth2JwtBearer | CredentialProviderType::OAuth2ClientCredentialsJwtAuth => None,
+    }
+}
+
+/// The `400` answer for a provider that lacks what its type needs, if it does. A provider with
+/// an issuer takes its client from the issuer, so it needs none of it.
+fn missing_type_fields(provider: &CredentialProvider) -> Option<Response> {
+    if provider.is_external_consent() {
+        return None;
+    }
+    legacy_type_error(provider)
+        .map(|message| (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": message }))).into_response())
+}
+
+/// The consent-flow rules a provider passes before it is stored: an
+/// `authorization_response_issuer` only where allowed, and for an authorization
+/// code provider without an `issuer`, an authorization endpoint, when it has
+/// one, that the consent start can build the vendor's URL from, and a redirect URI the consent flow
+/// can use and that no other provider, in any tenant, uses. An update that
+/// keeps the `previous` consent provider's endpoint and `additional_params`, or
+/// its redirect URI, is not checked against those rules, so a stored provider
+/// that breaks them can still be edited. Such a provider is created without a
+/// `callback_url`: its `callback_path` ends in its id, so an update sets it,
+/// and no other provider can already hold its redirect URI. A provider with
+/// `consent_confirmation` is always checked against the other providers'
+/// redirect URIs, since its confirmation redirect URI may be one of them.
+async fn consent_flow_error(
+    state: &CredentialProviderState,
+    provider: &CredentialProvider,
+    previous: Option<&CredentialProvider>,
+) -> Option<Response> {
+    let refused =
+        |message: &str| Some((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": message }))).into_response());
+    if let Some(message) = provider.authorization_response_issuer_error() {
+        return refused(message);
+    }
+    if !provider.uses_legacy_consent() {
+        return None;
+    }
+    if previous.is_none()
+        && provider
+            .callback_url
+            .is_some()
+    {
+        return refused(
+            "callback_url is set by an update after create, and must end in the callback_path the create returns",
+        );
+    }
+    let creating = previous.is_none();
+    let previous = previous.filter(|previous| previous.uses_legacy_consent());
+    let keeps_endpoint = previous.is_some_and(|previous| {
+        previous.authorization_endpoint == provider.authorization_endpoint
+            && previous.additional_params == provider.additional_params
+    });
+    if !keeps_endpoint
+        && provider
+            .authorization_endpoint
+            .is_some()
+        && let Err(message) = provider.consent_authorization_endpoint()
+    {
+        return refused(message);
+    }
+    let keeps_redirect_uri = previous.is_some_and(|previous| {
+        previous.redirect_uri(&state.gateway_base_url) == provider.redirect_uri(&state.gateway_base_url)
+    });
+    if !keeps_redirect_uri && let Err(message) = provider.consent_redirect_uri(&state.gateway_base_url) {
+        return refused(message);
+    }
+    if (creating || keeps_redirect_uri)
+        && provider
+            .consent_confirmation
+            .is_none()
+    {
+        return None;
+    }
+    match super::redirect_uri_taken_by(state.store.as_ref(), provider, &state.gateway_base_url).await {
+        Ok(None) => None,
+        Ok(Some(_)) => refused("callback_url is already the redirect URI of another credential provider"),
+        Err(error) => {
+            warn!(target: "credential_delegation", %error, "Failed to check credential provider redirect URIs");
+            Some(
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Internal server error"})))
+                    .into_response(),
+            )
+        }
     }
 }
 
@@ -550,6 +861,11 @@ pub async fn create_provider(
         req.client_secret_secret_ref
             .take(),
     );
+    req.client_id_secret_ref = client_id_reference(
+        &req.provider_type,
+        req.client_id_secret_ref
+            .take(),
+    );
     req.jwt = req.jwt.normalized();
     let now = Utc::now();
 
@@ -570,7 +886,7 @@ pub async fn create_provider(
             .client_secret_secret_ref
             .map(|s| s.trim().to_string()),
         default_scopes: req.default_scopes,
-        callback_path: format!("{}/{}", state.oauth_callback_route, provider_id_clean),
+        callback_path: format!("{}/{}", state.oauth_callback_route, id),
         callback_url: req
             .callback_url
             .map(|s| s.trim().to_string()),
@@ -589,8 +905,11 @@ pub async fn create_provider(
         client_id: req.client_id,
         allow_unadvertised_pkce: req.allow_unadvertised_pkce,
         authorization_response_iss_parameter_supported: None,
+        authorization_response_issuer: blank_to_none(req.authorization_response_issuer),
         scope_comparison: req.scope_comparison,
         revocation_ends_authorization: req.revocation_ends_authorization,
+        send_resource: req.send_resource,
+        consent_confirmation: req.consent_confirmation,
         created_at: now,
         updated_at: now,
     };
@@ -598,10 +917,8 @@ pub async fn create_provider(
     if let Err(error) = super::external::validate(&provider) {
         return error.into_response();
     }
-    if !provider.is_external_consent()
-        && let Some(message) = legacy_type_error(&provider)
-    {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": message }))).into_response();
+    if let Some(response) = missing_type_fields(&provider) {
+        return response;
     }
 
     if let Some(resource) = &provider.resource
@@ -641,48 +958,28 @@ pub async fn create_provider(
         return resp;
     }
 
-    // A provider's slug is unique within its tenant, and among untenanted providers.
-    match state
-        .store
-        .find_by_provider_id(provider.tenant_id.as_deref(), &provider.provider_id)
-        .await
-    {
-        Ok(Some(_)) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": format!("provider_id '{}' already exists", provider.provider_id)
-                })),
-            )
-                .into_response();
-        }
-        Ok(None) => {}
-        Err(e) => {
-            warn!(
-                target: "credential_delegation",
-                error = %e,
-                "Failed to check for duplicate provider_id"
-            );
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Internal server error"})))
-                .into_response();
-        }
-    }
-
     if let Err(error) =
         validate_provider_settings(&state, &provider, None, &TokenEgress::from_environment(), &context, &scope).await
     {
         return error.into_response();
     }
+    if let Some(response) = consent_flow_error(&state, &provider, None).await {
+        return response;
+    }
 
-    if provider.is_external_consent() && tenant_context(&context).is_some() && state.issuers.is_none() {
+    let issuers = state.issuers.rules();
+    if provider.is_external_consent() && tenant_context(&context).is_some() && !issuers.is_set() {
         warn!(
             target: "credential_delegation",
             provider_id = ?provider.provider_id,
-            "Refused a tenant's credential provider with an issuer: the gateway lists no external_consent_issuers"
+            "Refused a tenant's credential provider with an issuer: the gateway lists no external_consent_issuers or \
+             external_consent_issuer_patterns"
         );
         return super::external::ExternalProviderError::IssuersRequired.into_response();
     }
-    if provider.is_external_consent() && !super::external::resource_permitted(&provider, &state.resource_origins) {
+    if provider.is_external_consent()
+        && !super::external::resource_permitted(&provider, &state.resource_origins, issuers)
+    {
         warn!(
             target: "credential_delegation",
             provider_id = ?provider.provider_id,
@@ -691,19 +988,14 @@ pub async fn create_provider(
         return super::external::ExternalProviderError::ResourceNotPermitted.into_response();
     }
     if provider.is_external_consent()
-        && let Err(field) = super::external::issuer_permitted(
-            &provider,
-            state
-                .issuers
-                .as_ref()
-                .as_ref(),
-        )
+        && let Err(field) = super::external::issuer_permitted(&provider, issuers)
     {
         warn!(
             target: "credential_delegation",
             provider_id = ?provider.provider_id,
             field,
-            "Refused a credential provider that the gateway's external_consent_issuers does not permit"
+            "Refused a credential provider that the gateway's external_consent_issuers and \
+             external_consent_issuer_patterns do not permit"
         );
         return super::external::ExternalProviderError::IssuerNotPermitted(field).into_response();
     }
@@ -731,19 +1023,13 @@ pub async fn create_provider(
             );
             return error.into_response();
         }
-        if let Err(field) = super::external::metadata_permitted(
-            &metadata,
-            state
-                .issuers
-                .as_ref()
-                .as_ref(),
-        ) {
+        if let Err(field) = super::external::metadata_permitted(&metadata, issuers) {
             warn!(
                 target: "credential_delegation",
                 provider_id = ?provider.provider_id,
                 field,
-                "Refused a credential provider whose issuer's metadata the gateway's external_consent_issuers does \
-                 not permit"
+                "Refused a credential provider whose issuer's metadata the gateway's external_consent_issuers and \
+                 external_consent_issuer_patterns do not permit"
             );
             return super::external::ExternalProviderError::IssuerNotPermitted(field).into_response();
         }
@@ -755,6 +1041,35 @@ pub async fn create_provider(
     if let Err(error) = refuse_gone_secrets(&state, &provider).await {
         return error.into_response();
     }
+    static SLUG_CHECK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _one_create_at_a_time = SLUG_CHECK.lock().await;
+    // A provider's slug is unique within its tenant, and among untenanted providers.
+    match state
+        .store
+        .find_by_provider_id(provider.tenant_id.as_deref(), &provider.provider_id)
+        .await
+    {
+        Ok(Some(_)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!("provider_id '{}' already exists", provider.provider_id)
+                })),
+            )
+                .into_response();
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(
+                target: "credential_delegation",
+                error = %e,
+                "Failed to check for duplicate provider_id"
+            );
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Internal server error"})))
+                .into_response();
+        }
+    }
+
     match state
         .store
         .create(provider.clone())
@@ -900,6 +1215,9 @@ pub async fn update_provider(
     }
 
     let previous = existing.clone();
+    let provider_type = req
+        .provider_type
+        .unwrap_or_else(|| existing.provider_type.clone());
     let updated = CredentialProvider {
         id: existing.id,
         tenant_id: existing.tenant_id,
@@ -907,18 +1225,18 @@ pub async fn update_provider(
             .name
             .unwrap_or(existing.name),
         provider_id: existing.provider_id, // immutable
-        provider_type: req
-            .provider_type
-            .unwrap_or(existing.provider_type),
+        provider_type: provider_type.clone(),
         authorization_endpoint: req
             .authorization_endpoint
             .or(existing.authorization_endpoint),
         token_endpoint: req
             .token_endpoint
             .or(existing.token_endpoint),
-        client_id_secret_ref: req
-            .client_id_secret_ref
-            .or(existing.client_id_secret_ref),
+        client_id_secret_ref: client_id_reference(
+            &provider_type,
+            req.client_id_secret_ref
+                .or(existing.client_id_secret_ref),
+        ),
         // A blank reference in the request clears the stored one.
         client_secret_secret_ref: blank_to_none(
             req.client_secret_secret_ref
@@ -946,10 +1264,7 @@ pub async fn update_provider(
         api_key_secret_ref: req
             .api_key_secret_ref
             .or(existing.api_key_secret_ref),
-        jwt: req
-            .jwt
-            .or(existing.jwt)
-            .normalized(),
+        jwt: updated_jwt_settings(req.jwt, existing.jwt, &provider_type),
         description: req
             .description
             .or(existing.description),
@@ -959,11 +1274,23 @@ pub async fn update_provider(
         client_id: existing.client_id,
         allow_unadvertised_pkce: existing.allow_unadvertised_pkce,
         authorization_response_iss_parameter_supported: existing.authorization_response_iss_parameter_supported,
+        authorization_response_issuer: blank_to_none(
+            req.authorization_response_issuer
+                .or(existing.authorization_response_issuer),
+        ),
         scope_comparison: existing.scope_comparison,
         revocation_ends_authorization: existing.revocation_ends_authorization,
+        send_resource: existing.send_resource,
+        consent_confirmation: req
+            .consent_confirmation
+            .unwrap_or(existing.consent_confirmation),
         created_at: existing.created_at,
         updated_at: Utc::now(),
     };
+
+    if let Some(response) = missing_type_fields(&updated) {
+        return response;
+    }
 
     let retypes_to_need_consent = previous
         .provider_type
@@ -986,6 +1313,9 @@ pub async fn update_provider(
     .await
     {
         return error.into_response();
+    }
+    if let Some(response) = consent_flow_error(&state, &updated, Some(&previous)).await {
+        return response;
     }
 
     let _bindings = if retypes_to_need_consent {
@@ -1093,6 +1423,54 @@ pub async fn delete_provider(
         .0
 }
 
+/// Provider `id` as stored now, when the caller of `context` and `scope` may
+/// delete it, or the answer that refuses. Read again once the provider lock is
+/// held, as a tenant move or another delete may have changed it while the
+/// caller waited for the lock.
+async fn deletable_provider(
+    state: &CredentialProviderState,
+    id: &str,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Result<CredentialProvider, Box<Response>> {
+    let not_found = || {
+        Box::new(
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Credential provider not found"})))
+                .into_response(),
+        )
+    };
+    let existing = match state.store.get(id).await {
+        Ok(Some(provider)) => provider,
+        Ok(None) => return Err(not_found()),
+        Err(error) => {
+            return Err(Box::new(
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": error.to_string()})))
+                    .into_response(),
+            ));
+        }
+    };
+    if !can_access(existing.tenant_id.as_deref(), tenant_context(context))
+        || !scope_allows_resource(
+            resource_scope(scope),
+            tenant_context(context),
+            ResourceKind::CredentialProviders,
+            &existing.id,
+        )
+    {
+        return Err(not_found());
+    }
+    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(context)) {
+        return Err(Box::new(
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "credential provider is outside this token's permitted scope" })),
+            )
+                .into_response(),
+        ));
+    }
+    Ok(existing)
+}
+
 /// Delete provider `id` for the caller of `context` and `scope`, naming
 /// `actor` in the audit of its grants' revocations. Returns the answer and,
 /// when the provider had grants, the task that revokes them. The provider
@@ -1107,51 +1485,17 @@ async fn remove_provider(
     scope: &Option<Extension<PatResourceScope>>,
     actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
 ) -> (Response, Option<tokio::task::JoinHandle<()>>) {
-    let existing = match state.store.get(id).await {
-        Ok(Some(provider)) => provider,
-        Ok(None) => {
-            return (
-                (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Credential provider not found"})))
-                    .into_response(),
-                None,
-            );
-        }
-        Err(error) => {
-            return (
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": error.to_string()})))
-                    .into_response(),
-                None,
-            );
-        }
-    };
-    if !can_access(existing.tenant_id.as_deref(), tenant_context(context))
-        || !scope_allows_resource(
-            resource_scope(scope),
-            tenant_context(context),
-            ResourceKind::CredentialProviders,
-            &existing.id,
-        )
-    {
-        return (
-            (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Credential provider not found"})))
-                .into_response(),
-            None,
-        );
-    }
-    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(context)) {
-        return (
-            (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({ "error": "credential provider is outside this token's permitted scope" })),
-            )
-                .into_response(),
-            None,
-        );
+    if let Err(refused) = deletable_provider(state, id, context, scope).await {
+        return (*refused, None);
     }
     // Held, with the task that deletes the provider's grants, until the
     // provider is deleted, so no surface write binds it after the check below
     // found it unbound.
     let bindings = Arc::new(crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await);
+    let existing = match deletable_provider(state, id, context, scope).await {
+        Ok(provider) => provider,
+        Err(refused) => return (*refused, None),
+    };
     if let Err(refused) = refuse_bound_provider(state, &existing, tenant_context(context), resource_scope(scope)).await
     {
         return (refused.into_response(), None);
@@ -1160,6 +1504,8 @@ async fn remove_provider(
     let outcome = crate::delegation_vault::revocation::ChangeOutcome {
         saved: outcome,
         stored: Box::pin(provider_deleted(Arc::clone(&state.store), id.to_string())),
+        kept: Vec::new(),
+        provider_gone: true,
     };
     let revocations = match remove_provider_grants(state, &existing, actor, Arc::clone(&bindings), outcome).await {
         Ok(revocations) => revocations,
@@ -1217,6 +1563,12 @@ enum ProviderDeleteError {
          cannot be found; restore the AG_IDENTITY_HASH_PEPPER they were written under, or have an operator purge them"
     )]
     PepperMismatch,
+    #[error(
+        "The delegation vault keeps revocations it cannot read now, so the provider is kept: once it is gone they \
+         could never be revoked. Make them readable again (for at-rest encryption, enable [encryption] with the key \
+         they were written under), then delete the provider"
+    )]
+    UnreadableKeptRevocation,
     /// A surface binds the provider; `surface_id` names it when the caller
     /// may see it.
     #[error("The credential provider is bound by an agent surface; remove the binding first")]
@@ -1236,7 +1588,8 @@ impl IntoResponse for ProviderDeleteError {
             Self::SurfacesUnavailable
             | Self::VaultUnavailable
             | Self::UnreadableGrant { .. }
-            | Self::PepperMismatch => {
+            | Self::PepperMismatch
+            | Self::UnreadableKeptRevocation => {
                 (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": self.to_string() })))
                     .into_response()
             }
@@ -1294,13 +1647,16 @@ async fn refuse_bound_provider(
 /// keeps the provider, as does a grant of this provider that cannot be read,
 /// for example because at-rest encryption is now off: it would otherwise be
 /// left unrevoked on disk. The refusal names that grant, which an operator
-/// can purge.
+/// can purge. Also returns the revocations the vault kept for the provider's
+/// earlier removals, read before these grants are deleted, for the delete to
+/// decide once the provider is gone; a vault that cannot read them keeps the
+/// provider too.
 async fn remove_provider_grants(
     state: &CredentialProviderState,
     provider: &CredentialProvider,
     actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
     bindings: Arc<tokio::sync::RwLockWriteGuard<'static, ()>>,
-    outcome: crate::delegation_vault::revocation::ChangeOutcome,
+    mut outcome: crate::delegation_vault::revocation::ChangeOutcome,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, ProviderDeleteError> {
     if !provider.is_external_consent() {
         return Ok(None);
@@ -1327,16 +1683,24 @@ async fn remove_provider_grants(
             return Err(ProviderDeleteError::VaultUnavailable);
         }
     };
-    if grants.is_empty() {
+    // Read before the grants below are deleted, which keep revocations of
+    // their own that the delete decides itself.
+    let kept = match crate::delegation_vault::revocation::kept_revocations_of(vault, &provider.id).await {
+        Ok(kept) => kept,
+        Err(error) if error.is::<crate::delegation_vault::grants::UnreadableKeptRevocation>() => {
+            warn!(target: "credential_delegation", error = %error, "Failed to read a provider's kept revocations");
+            return Err(ProviderDeleteError::UnreadableKeptRevocation);
+        }
+        Err(error) => {
+            warn!(target: "credential_delegation", error = %error, "Failed to read a provider's kept revocations");
+            return Err(ProviderDeleteError::VaultUnavailable);
+        }
+    };
+    if grants.is_empty() && kept.is_empty() {
         return Ok(None);
     }
-    let revoker = crate::delegation_vault::revocation::Revoker {
-        providers: std::collections::HashMap::from([(provider.id.clone(), provider.clone())]),
-        secrets: Some(Arc::clone(&state.secrets_store)),
-        exact_allowlist: state.egress_allowlist.clone(),
-        actor: actor.cloned(),
-        vault: Some(Arc::clone(vault)),
-    };
+    outcome.kept = kept;
+    let revoker = provider_revoker(state, provider, actor, vault);
     crate::delegation_vault::revocation::delete_then_revoke(vault, grants, revoker, bindings, Some(outcome))
         .await
         .map(Some)
@@ -1346,9 +1710,25 @@ async fn remove_provider_grants(
         })
 }
 
+/// A revoker holding only `provider`, which revokes in `actor`'s name.
+fn provider_revoker(
+    state: &CredentialProviderState,
+    provider: &CredentialProvider,
+    actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
+    vault: &Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>,
+) -> crate::delegation_vault::revocation::Revoker {
+    crate::delegation_vault::revocation::Revoker {
+        providers: std::collections::HashMap::from([(provider.id.clone(), provider.clone())]),
+        secrets: Some(Arc::clone(&state.secrets_store)),
+        exact_allowlist: state.egress_allowlist.clone(),
+        actor: actor.cloned(),
+        vault: Some(Arc::clone(vault)),
+    }
+}
+
 /// POST /api/v1/credential-providers/validate
 /// Checks the key material a JWT-signing provider references, with the same tenancy rules
-/// as a save, then that the token endpoint is reachable
+/// as a save, then that the token endpoint passes the Configured egress policy and is reachable
 pub async fn validate_provider(
     State(state): State<CredentialProviderState>,
     pat: Option<Extension<PatContext>>,
@@ -1356,9 +1736,7 @@ pub async fn validate_provider(
     scope: Option<Extension<PatResourceScope>>,
     Json(req): Json<ValidateCredentialProviderRequest>,
 ) -> impl IntoResponse {
-    let client = crate::http_client::with_short_timeout().unwrap_or_else(|_| reqwest::Client::new());
-    validate_provider_with(&state, &client, &TokenEgress::from_environment(), pat.is_some(), &context, &scope, req)
-        .await
+    validate_provider_with(&state, &TokenEgress::from_environment(), pat.is_some(), &context, &scope, req).await
 }
 
 /// The algorithm the requested provider would sign with, once its key material checks
@@ -1410,7 +1788,6 @@ async fn validate_key_material_request(
 
 async fn validate_provider_with(
     state: &CredentialProviderState,
-    client: &reqwest::Client,
     egress: &TokenEgress,
     pat_authenticated: bool,
     context: &Option<Extension<PatTenantContext>>,
@@ -1426,10 +1803,6 @@ async fn validate_provider_with(
             .into_response();
     };
 
-    if let Err(e) = crate::url_validation::validate_oauth_endpoint_url(&token_endpoint) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("token_endpoint: {}", e)})))
-            .into_response();
-    }
     if !egress.permits_token_endpoint(&token_endpoint) {
         return ProviderValidationError::TokenEndpointNotHttps.into_response();
     }
@@ -1440,11 +1813,34 @@ async fn validate_provider_with(
         Err(error) => return error.into_response(),
     };
 
-    match client
-        .get(&token_endpoint)
-        .send()
+    let unreachable = |error: &dyn std::fmt::Display| {
+        warn!(
+            target: "credential_delegation",
+            token_endpoint = %token_endpoint,
+            error = %error,
+            "Token endpoint validation failed"
+        );
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "reachable": false,
+                "error": "token_endpoint could not be reached",
+                "token_endpoint": token_endpoint,
+            })),
+        )
+            .into_response()
+    };
+    let (client, url) = match egress
+        .pinned_client(&token_endpoint)
         .await
     {
+        Ok(pinned) => pinned,
+        Err(error) if error.is::<crate::delegation_vault::oauth::TokenEndpointRefused>() => {
+            return ProviderValidationError::TokenEndpointBlocked.into_response();
+        }
+        Err(error) => return unreachable(&error),
+    };
+    match client.get(url).send().await {
         Ok(resp) => {
             // We just check reachability — OAuth token endpoints typically return 400/405
             // for GET requests, which is fine
@@ -1465,23 +1861,7 @@ async fn validate_provider_with(
             }
             (StatusCode::OK, Json(body)).into_response()
         }
-        Err(e) => {
-            warn!(
-                target: "credential_delegation",
-                token_endpoint = %token_endpoint,
-                error = %e,
-                "Token endpoint validation failed"
-            );
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "reachable": false,
-                    "error": format!("{}", e),
-                    "token_endpoint": token_endpoint,
-                })),
-            )
-                .into_response()
-        }
+        Err(error) => unreachable(&error),
     }
 }
 
@@ -1514,14 +1894,16 @@ mod jwt_provider_tests {
             ),
             identity_strategies: None,
             oauth_callback_route: "/oauth/callback".into(),
+            gateway_base_url: "https://gateway.example".into(),
             issuer_metadata: super::super::external::strict_issuer_metadata(),
             surfaces: None,
             vault: None,
             egress_allowlist: None,
             resource_origins: Arc::default(),
-            issuers: Arc::default(),
+            issuers: Default::default(),
             references: Default::default(),
             rbac: None,
+            gateway_mcp_issuer: None,
         }
     }
 
@@ -1619,6 +2001,373 @@ mod jwt_provider_tests {
         add_secret(&state, "SA_JSON", &key_file(&test_keys::rsa_pkcs8().private_pem)).await;
         add_secret(&state, "BAD_JSON", &key_file("key-secret-marker")).await;
         state
+    }
+
+    async fn add_tenant_secret(
+        state: &CredentialProviderState,
+        tenant_id: &str,
+        secret_id: &str,
+    ) {
+        state
+            .secrets_store
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: Some(tenant_id.into()),
+                name: secret_id.into(),
+                secret_id: secret_id.into(),
+                description: None,
+                value: "value".into(),
+                secret_type: "general".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+    }
+
+    fn authorization_code(provider_id: &str) -> Value {
+        json!({
+            "name": "GitHub", "provider_id": provider_id, "provider_type": "oauth2_authorization_code",
+            "authorization_endpoint": "https://github.com/login/oauth/authorize",
+            "token_endpoint": "https://github.com/login/oauth/access_token",
+            "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"
+        })
+    }
+
+    fn with(
+        mut body: Value,
+        fields: Value,
+    ) -> Value {
+        for (name, value) in fields.as_object().unwrap() {
+            body[name] = value.clone();
+        }
+        body
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_authorization_response_issuer_is_kept_on_a_consent_provider_without_making_it_external() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, body) = create(
+            &state,
+            with(
+                authorization_code("github"),
+                json!({"authorization_response_issuer": "https://github.com/login/oauth"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["authorization_response_issuer"], "https://github.com/login/oauth");
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let stored = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!stored.is_external_consent());
+        assert!(stored.uses_legacy_consent());
+
+        let (status, body) =
+            update(&state, &id, json!({"authorization_response_issuer": "https://github.com/login/oauth?x=1"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["error"],
+            "authorization_response_issuer must be an https URL with a host and no query or fragment"
+        );
+        let (status, body) = update(&state, &id, json!({"authorization_response_issuer": ""})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body.get("authorization_response_issuer"), None, "a blank value clears it: {body}");
+        let (status, body) = update(&state, &id, json!({"name": "GitHub renamed"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body.get("authorization_response_issuer"), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_authorization_response_issuer_is_refused_unless_https_and_on_a_consent_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        for issuer in [
+            "http://github.com/login/oauth",
+            "https://github.com/login/oauth#fragment",
+            "https://github.com/login/oauth?query=1",
+            "https://user@github.com/",
+            "github.com",
+        ] {
+            let (status, body) =
+                create(&state, with(authorization_code("github"), json!({"authorization_response_issuer": issuer})))
+                    .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{issuer}: {body}");
+            assert_eq!(
+                body["error"],
+                "authorization_response_issuer must be an https URL with a host and no query or fragment"
+            );
+        }
+        let client_credentials = json!({
+            "name": "Svc", "provider_id": "svc", "provider_type": "oauth2_client_credentials",
+            "token_endpoint": "https://github.com/token",
+            "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+            "authorization_response_issuer": "https://github.com"
+        });
+        let (status, body) = create(&state, client_credentials).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["error"],
+            "authorization_response_issuer is allowed only on an oauth2_authorization_code provider without issuer"
+        );
+
+        let (status, body) = create(&state, authorization_code("github")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = update(
+            &state,
+            body["id"]
+                .as_str()
+                .unwrap(),
+            json!({"provider_type": "oauth2_client_credentials", "authorization_response_issuer": "https://github.com"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "the rule holds on the merged provider: {body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_consent_providers_callback_url_must_be_https_and_end_in_its_callback_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, body) =
+            create(&state, with(authorization_code("github"), json!({"callback_url": "https://198.51.100.7/x"}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["error"],
+            "callback_url is set by an update after create, and must end in the callback_path the create returns"
+        );
+
+        let (status, body) = create(&state, authorization_code("github")).await;
+        assert_eq!(status, StatusCode::CREATED, "without callback_url the gateway's own URL is used: {body}");
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(body["callback_path"], format!("/oauth/callback/{id}"), "the path ends in the provider's id");
+        let upper = id.to_uppercase();
+        for (callback_url, error) in [
+            (format!("http://198.51.100.7/oauth/callback/{id}"), "callback_url must be an https URL with a host"),
+            (
+                format!("https://198.51.100.7/oauth/callback/{id}?x=1"),
+                "callback_url must not carry credentials, a query or a fragment",
+            ),
+            (
+                format!("https://198.51.100.7/oauth/callback/{id}#f"),
+                "callback_url must not carry credentials, a query or a fragment",
+            ),
+            (
+                "https://198.51.100.7/oauth/callback/github".to_string(),
+                "callback_url path must end in the provider's callback_path",
+            ),
+            (
+                format!("https://198.51.100.7/oauth/callback/{upper}"),
+                "callback_url path must end in the provider's callback_path",
+            ),
+        ] {
+            let (status, body) = update(&state, &id, json!({"callback_url": callback_url})).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{callback_url}: {body}");
+            assert_eq!(body["error"], error, "{callback_url}");
+        }
+        let (status, body) =
+            update(&state, &id, json!({"callback_url": format!("https://198.51.100.7/prefix/oauth/callback/{id}")}))
+                .await;
+        assert_eq!(status, StatusCode::OK, "a reverse proxy prefix is kept: {body}");
+
+        let mut client_credentials = authorization_code("svc");
+        client_credentials["provider_type"] = json!("oauth2_client_credentials");
+        client_credentials["callback_url"] = json!("http://198.51.100.7/elsewhere");
+        let (status, body) = create(&state, client_credentials).await;
+        assert_eq!(status, StatusCode::CREATED, "the rule is for consent providers only: {body}");
+    }
+
+    /// A consent provider's authorization endpoint and `additional_params` must
+    /// let the consent start build the vendor's URL, on create and on an update
+    /// that changes them; a stored provider that breaks the rule can still take
+    /// other edits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_consent_providers_authorization_endpoint_must_follow_the_consent_start_rules() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let endpoint_error = "authorization_endpoint must be an https URL with a host and no credentials or fragment";
+        let params_error = "authorization_endpoint query and additional_params must not repeat a reserved or duplicate \
+                            parameter or exceed the limits";
+        for (fields, error) in [
+            (json!({"authorization_endpoint": "http://github.com/login/oauth/authorize"}), endpoint_error),
+            (json!({"authorization_endpoint": "https://github.com/authorize#f"}), endpoint_error),
+            (json!({"authorization_endpoint": "https://github.com/authorize?state=x"}), params_error),
+            (json!({"additional_params": {"redirect_uri": "https://attacker.example"}}), params_error),
+        ] {
+            let (status, body) = create(&state, with(authorization_code("github"), fields.clone())).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{fields}: {body}");
+            assert_eq!(body["error"], error, "{fields}");
+        }
+
+        let (status, body) =
+            create(&state, with(authorization_code("github"), json!({"additional_params": {"prompt": "consent"}})))
+                .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, body) =
+            update(&state, &id, json!({"authorization_endpoint": "http://github.com/login/oauth/authorize"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], endpoint_error);
+
+        let mut stored = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        stored.authorization_endpoint = Some("http://github.com/login/oauth/authorize".into());
+        state
+            .store
+            .update(stored)
+            .await
+            .unwrap();
+        let (status, body) = update(&state, &id, json!({"name": "Renamed"})).await;
+        assert_eq!(status, StatusCode::OK, "an edit that keeps the stored endpoint is accepted: {body}");
+    }
+
+    /// A stored provider whose redirect URI breaks the consent rules, or is
+    /// shared, can still be edited while its redirect URI stays the same; an
+    /// update that changes it must make it conform.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stored_non_conforming_provider_takes_edits_that_keep_its_redirect_uri() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, body) = create(&state, authorization_code("github")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut stored = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        stored.callback_url = Some("http://198.51.100.7/oauth/callback/github".into());
+        state
+            .store
+            .update(stored.clone())
+            .await
+            .unwrap();
+        let mut shared = stored.clone();
+        shared.id = "shared-twin".into();
+        state
+            .store
+            .create(shared)
+            .await
+            .unwrap();
+
+        for target in [id.as_str(), "shared-twin"] {
+            let (status, body) = update(&state, target, json!({"name": "Renamed"})).await;
+            assert_eq!(status, StatusCode::OK, "{target}: {body}");
+            assert_eq!(body["name"], "Renamed", "{target}");
+        }
+        let (status, body) =
+            update(&state, &id, json!({"callback_url": "http://198.51.100.7/elsewhere/oauth/callback/github"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "callback_url must be an https URL with a host");
+        let (status, body) =
+            update(&state, &id, json!({"callback_url": format!("https://198.51.100.7/oauth/callback/{id}")})).await;
+        assert_eq!(status, StatusCode::OK, "an update may make it conform: {body}");
+    }
+
+    /// An update that turns a provider into a consent provider is checked
+    /// against the other providers' redirect URIs, like any update that gives a
+    /// consent provider a new one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_retyped_to_consent_may_not_take_another_providers_redirect_uri() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, first) = create(&state, authorization_code("github")).await;
+        assert_eq!(status, StatusCode::CREATED, "{first}");
+        let mut client_credentials = authorization_code("svc");
+        client_credentials["provider_type"] = json!("oauth2_client_credentials");
+        let (status, second) = create(&state, client_credentials).await;
+        assert_eq!(status, StatusCode::CREATED, "{second}");
+        let second_id = second["id"].as_str().unwrap();
+        let mut stored = state
+            .store
+            .get(second_id)
+            .await
+            .unwrap()
+            .unwrap();
+        stored.callback_path = first["callback_path"]
+            .as_str()
+            .unwrap()
+            .into();
+        state
+            .store
+            .update(stored)
+            .await
+            .unwrap();
+
+        let (status, body) = update(&state, second_id, json!({"provider_type": "oauth2_authorization_code"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "callback_url is already the redirect URI of another credential provider");
+    }
+
+    /// Each new consent provider's redirect URI ends in its own id, so tenants
+    /// may use the same slug; an update may still not take a stored provider's
+    /// redirect URI, as two providers stored with one slug path could.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_redirect_uri_names_one_consent_provider_across_tenants() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = with_key_material(&directory).await;
+        state.gateway_base_url = "https://198.51.100.9".into();
+        for tenant in ["tenant-a", "tenant-b"] {
+            add_tenant_secret(&state, tenant, &format!("{tenant}-id")).await;
+            add_tenant_secret(&state, tenant, &format!("{tenant}-secret")).await;
+        }
+        let tenant_provider = |tenant: &str, fields: Value| {
+            with(
+                authorization_code("github"),
+                with(
+                    json!({"tenant_id": tenant, "client_id_secret_ref": format!("{tenant}-id"),
+                        "client_secret_secret_ref": format!("{tenant}-secret")}),
+                    fields,
+                ),
+            )
+        };
+        let (status, first) = create(&state, tenant_provider("tenant-a", json!({}))).await;
+        assert_eq!(status, StatusCode::CREATED, "{first}");
+        let (status, second) = create(&state, tenant_provider("tenant-b", json!({}))).await;
+        assert_eq!(status, StatusCode::CREATED, "the same slug in another tenant: {second}");
+        assert_ne!(first["callback_path"], second["callback_path"]);
+
+        let second_id = second["id"].as_str().unwrap();
+        let mut stored = state
+            .store
+            .get(second_id)
+            .await
+            .unwrap()
+            .unwrap();
+        stored.callback_path = first["callback_path"]
+            .as_str()
+            .unwrap()
+            .into();
+        stored.callback_url = Some(format!("https://203.0.113.8{}", stored.callback_path));
+        state
+            .store
+            .update(stored.clone())
+            .await
+            .unwrap();
+        let (status, body) =
+            update(&state, second_id, json!({"callback_url": format!("https://198.51.100.9{}", stored.callback_path)}))
+                .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "an update may not take another's redirect URI: {body}");
+        assert_eq!(body["error"], "callback_url is already the redirect URI of another credential provider");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2101,6 +2850,541 @@ mod jwt_provider_tests {
         );
     }
 
+    fn jwt_bearer_with_client(
+        provider_id: &str,
+        client_authentication: &str,
+        secret: bool,
+    ) -> Value {
+        let mut body = jwt_bearer(provider_id);
+        body["client_authentication"] = json!(client_authentication);
+        body["client_id_secret_ref"] = json!("CLIENT_ID");
+        if secret {
+            body["client_secret_secret_ref"] = json!("CLIENT_SECRET");
+        }
+        body
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_jwt_bearer_provider_stores_the_client_authentication_and_references_it_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        for (method, secret) in [("none", false), ("client_secret_basic", true), ("client_secret_post", true)] {
+            let (status, body) = create(&state, jwt_bearer_with_client(method, method, secret)).await;
+            assert_eq!(status, StatusCode::CREATED, "{method}: {body}");
+            assert_eq!(body["client_authentication"], method);
+            let stored = state
+                .store
+                .find_by_provider_id(None, method)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored
+                    .client_id_secret_ref
+                    .as_deref(),
+                Some("CLIENT_ID"),
+                "{method}"
+            );
+            assert_eq!(
+                stored
+                    .client_secret_secret_ref
+                    .as_deref(),
+                secret.then_some("CLIENT_SECRET"),
+                "{method}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_authentication_missing_what_it_needs_is_refused_and_not_stored() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let without = |mut body: Value, field: &str| {
+            body.as_object_mut()
+                .unwrap()
+                .remove(field);
+            body
+        };
+        let mut blank_id = jwt_bearer_with_client("blank-id", "client_secret_post", true);
+        blank_id["client_id_secret_ref"] = json!("  ");
+        let mut blank_secret = jwt_bearer_with_client("blank-secret", "client_secret_post", true);
+        blank_secret["client_secret_secret_ref"] = json!("");
+        for (body, field) in [
+            (
+                without(jwt_bearer_with_client("public-no-id", "none", false), "client_id_secret_ref"),
+                "client_id_secret_ref",
+            ),
+            (
+                without(jwt_bearer_with_client("basic-no-id", "client_secret_basic", true), "client_id_secret_ref"),
+                "client_id_secret_ref",
+            ),
+            (jwt_bearer_with_client("basic-no-secret", "client_secret_basic", false), "client_secret_secret_ref"),
+            (jwt_bearer_with_client("post-no-secret", "client_secret_post", false), "client_secret_secret_ref"),
+            (blank_id, "client_id_secret_ref"),
+            (blank_secret, "client_secret_secret_ref"),
+        ] {
+            let provider_id = body["provider_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let (status, response) = create(&state, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{provider_id}: {response}");
+            assert_eq!(
+                response["error"],
+                format!("{field} is required for this client_authentication"),
+                "{provider_id}"
+            );
+            assert!(
+                state
+                    .store
+                    .find_by_provider_id(None, &provider_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{provider_id}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_public_client_takes_no_client_secret() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, response) = create(&state, jwt_bearer_with_client("public", "none", true)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"], "client_secret_secret_ref is not allowed with client_authentication none");
+        assert!(
+            state
+                .store
+                .find_by_provider_id(None, "public")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retyping_a_jwt_bearer_provider_drops_its_client_authentication() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, created) = create(&state, jwt_bearer_with_client("retyped", "client_secret_basic", true)).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (status, response) = update(
+            &state,
+            &id,
+            json!({"provider_type": "oauth2_client_credentials", "client_authentication": "client_secret_basic"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"], "client_authentication is only for oauth2_jwt_bearer providers");
+
+        let (status, response) = update(&state, &id, json!({"provider_type": "oauth2_client_credentials"})).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["provider_type"], "oauth2_client_credentials");
+        assert!(
+            response
+                .get("client_authentication")
+                .is_none(),
+            "{response}"
+        );
+        let stored = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored
+                .jwt
+                .client_authentication
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_authentication_is_refused_on_other_provider_types() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let client_credentials = |provider_id: &str, client_authentication: &str| {
+            json!({
+                "name": "M2M", "provider_id": provider_id, "provider_type": "oauth2_client_credentials",
+                "token_endpoint": "https://oauth2.googleapis.com/token",
+                "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+                "client_authentication": client_authentication
+            })
+        };
+        let mut client_assertion = jwt_auth("foundry");
+        client_assertion["client_authentication"] = json!("none");
+        for body in [client_credentials("m2m", "client_secret_basic"), client_assertion] {
+            let (status, response) = create(&state, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+            assert_eq!(response["error"], "client_authentication is only for oauth2_jwt_bearer providers");
+        }
+        let (status, response) = create(&state, client_credentials("m2m-empty", "")).await;
+        assert_eq!(status, StatusCode::CREATED, "{response}");
+        assert!(
+            response
+                .get("client_authentication")
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_keeps_changes_or_clears_the_client_authentication() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, created) = create(&state, jwt_bearer_with_client("vertex", "client_secret_basic", true)).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let method = |body: &Value| {
+            body.get("client_authentication")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+
+        let (status, body) = update(&state, &id, json!({"description": "renamed"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(method(&body).as_deref(), Some("client_secret_basic"));
+
+        let (status, body) = update(&state, &id, json!({"client_authentication": "client_secret_post"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(method(&body).as_deref(), Some("client_secret_post"));
+
+        let (status, body) = update(&state, &id, json!({"client_authentication": "none"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "client_secret_secret_ref is not allowed with client_authentication none");
+        let (status, body) =
+            update(&state, &id, json!({"client_authentication": "none", "client_secret_secret_ref": ""})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(method(&body).as_deref(), Some("none"));
+
+        let (status, body) = update(&state, &id, json!({"client_authentication": ""})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(method(&body), None);
+        let stored = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .jwt
+                .client_authentication,
+            None
+        );
+        assert_eq!(
+            stored
+                .client_id_secret_ref
+                .as_deref(),
+            Some("CLIENT_ID"),
+            "the client ID reference stays stored, and unread"
+        );
+        assert_eq!(stored.client_secret_secret_ref, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blank_client_id_reference_of_a_jwt_bearer_provider_is_none() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let mut blank = jwt_bearer("blank");
+        blank["client_id_secret_ref"] = json!("  ");
+        let (status, response) = create(&state, blank).await;
+        assert_eq!(status, StatusCode::CREATED, "{response}");
+        let stored = state
+            .store
+            .find_by_provider_id(None, "blank")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.client_id_secret_ref, None);
+
+        let (status, created) = create(&state, jwt_bearer_with_client("public", "none", false)).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, response) = update(&state, &id, json!({"client_id_secret_ref": ""})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "a method still needs its client ID: {response}");
+        assert_eq!(response["error"], "client_id_secret_ref is required for this client_authentication");
+
+        let (status, response) =
+            update(&state, &id, json!({"client_authentication": "", "client_id_secret_ref": ""})).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert!(
+            response
+                .get("client_id_secret_ref")
+                .is_none()
+        );
+        let stored = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.client_id_secret_ref, None);
+        assert_eq!(
+            stored
+                .jwt
+                .client_authentication,
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blank_client_id_reference_is_still_refused_on_a_client_credentials_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, created) = create(
+            &state,
+            json!({
+                "name": "M2M", "provider_id": "m2m", "provider_type": "oauth2_client_credentials",
+                "token_endpoint": "https://oauth2.googleapis.com/token",
+                "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, response) = update(&state, &id, json!({"client_id_secret_ref": ""})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"], OAUTH_CLIENT_REFERENCES_REQUIRED);
+        let stored = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .client_id_secret_ref
+                .as_deref(),
+            Some("CLIENT_ID")
+        );
+    }
+
+    const OAUTH_CLIENT_REFERENCES_REQUIRED: &str =
+        "client_id_secret_ref and client_secret_secret_ref are required for OAuth providers";
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_cannot_leave_an_oauth_provider_without_its_client_references() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        for provider_type in ["oauth2_client_credentials", "oauth2_authorization_code"] {
+            let (status, created) = create(
+                &state,
+                with_token_endpoint(client_credentials(provider_type), provider_type, "https://192.0.2.1/token"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{provider_type}: {created}");
+            let id = created["id"]
+                .as_str()
+                .unwrap();
+
+            for cleared in [
+                json!({"client_secret_secret_ref": ""}),
+                json!({"client_secret_secret_ref": "   "}),
+                json!({"client_id_secret_ref": ""}),
+                json!({"client_id_secret_ref": "   "}),
+                json!({"client_id_secret_ref": "", "client_secret_secret_ref": ""}),
+            ] {
+                let (status, response) = update(&state, id, cleared.clone()).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{provider_type} {cleared}: {response}");
+                assert_eq!(response["error"], OAUTH_CLIENT_REFERENCES_REQUIRED, "{provider_type} {cleared}");
+            }
+            let stored = state
+                .store
+                .get(id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored
+                    .client_id_secret_ref
+                    .as_deref(),
+                Some("CLIENT_ID"),
+                "{provider_type}"
+            );
+            assert_eq!(
+                stored
+                    .client_secret_secret_ref
+                    .as_deref(),
+                Some("CLIENT_SECRET"),
+                "{provider_type}"
+            );
+
+            let (status, response) = update(&state, id, json!({"name": "Renamed"})).await;
+            assert_eq!(status, StatusCode::OK, "{provider_type}: {response}");
+            assert_eq!(response["client_id_secret_ref"], "CLIENT_ID", "{provider_type}");
+            assert_eq!(response["client_secret_secret_ref"], "CLIENT_SECRET", "{provider_type}");
+            let (status, response) = update(&state, id, json!({"client_secret_secret_ref": "NOT_A_KEY"})).await;
+            assert_eq!(status, StatusCode::OK, "{provider_type} may name another secret: {response}");
+            assert_eq!(response["client_secret_secret_ref"], "NOT_A_KEY", "{provider_type}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retyping_a_provider_needs_the_references_the_new_type_requires() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, created) = create(&state, jwt_bearer("bearer")).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"]
+            .as_str()
+            .unwrap();
+
+        for (retype, error) in [
+            (json!({"provider_type": "oauth2_client_credentials"}), OAUTH_CLIENT_REFERENCES_REQUIRED),
+            (json!({"provider_type": "oauth2_authorization_code"}), OAUTH_CLIENT_REFERENCES_REQUIRED),
+            (
+                json!({"provider_type": "oauth2_client_credentials", "client_id_secret_ref": "CLIENT_ID"}),
+                OAUTH_CLIENT_REFERENCES_REQUIRED,
+            ),
+            (json!({"provider_type": "api_key"}), "api_key_secret_ref is required for ApiKey providers"),
+        ] {
+            let (status, response) = update(&state, id, retype.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{retype}: {response}");
+            assert_eq!(response["error"], error, "{retype}");
+        }
+        let stored = state
+            .store
+            .get(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.provider_type, CredentialProviderType::OAuth2JwtBearer);
+
+        let (status, response) = update(
+            &state,
+            id,
+            json!({"provider_type": "oauth2_client_credentials",
+                   "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["provider_type"], "oauth2_client_credentials");
+        let (status, response) =
+            update(&state, id, json!({"provider_type": "api_key", "api_key_secret_ref": "CLIENT_SECRET"})).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["api_key_secret_ref"], "CLIENT_SECRET");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_cannot_clear_the_api_key_reference_of_an_api_key_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, created) = create(
+            &state,
+            json!({"name": "Key", "provider_id": "key", "provider_type": "api_key", "api_key_secret_ref": "CLIENT_SECRET"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"]
+            .as_str()
+            .unwrap();
+
+        for cleared in [json!({"api_key_secret_ref": ""}), json!({"api_key_secret_ref": "   "})] {
+            let (status, response) = update(&state, id, cleared.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{cleared}: {response}");
+            assert_eq!(response["error"], "api_key_secret_ref is required for ApiKey providers", "{cleared}");
+        }
+        let stored = state
+            .store
+            .get(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .api_key_secret_ref
+                .as_deref(),
+            Some("CLIENT_SECRET")
+        );
+
+        let (status, response) = update(&state, id, json!({"name": "Renamed"})).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["api_key_secret_ref"], "CLIENT_SECRET");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stored_provider_that_lacks_a_required_reference_is_refused_every_update_until_it_names_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let stored: CredentialProvider = serde_json::from_value(json!({
+            "id": "legacy", "name": "Legacy", "provider_id": "legacy", "provider_type": "oauth2_client_credentials",
+            "token_endpoint": "https://192.0.2.1/token", "client_id_secret_ref": "CLIENT_ID",
+            "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+        }))
+        .unwrap();
+        state
+            .store
+            .create(stored)
+            .await
+            .unwrap();
+
+        let (status, response) = update(&state, "legacy", json!({"name": "Renamed"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"], OAUTH_CLIENT_REFERENCES_REQUIRED);
+
+        let (status, response) =
+            update(&state, "legacy", json!({"name": "Renamed", "client_secret_secret_ref": "CLIENT_SECRET"})).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["name"], "Renamed");
+        assert_eq!(response["client_secret_secret_ref"], "CLIENT_SECRET");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_jwt_bearer_provider_without_a_client_authentication_keeps_ignoring_client_references() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let mut body = jwt_bearer("leftover");
+        body["client_id_secret_ref"] = json!("CLIENT_ID");
+        body["client_secret_secret_ref"] = json!("CLIENT_SECRET");
+        let (status, response) = create(&state, body).await;
+        assert_eq!(status, StatusCode::CREATED, "{response}");
+        assert!(
+            response
+                .get("client_authentication")
+                .is_none()
+        );
+        let stored = state
+            .store
+            .find_by_provider_id(None, "leftover")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .client_id_secret_ref
+                .as_deref(),
+            Some("CLIENT_ID")
+        );
+        assert_eq!(
+            stored
+                .client_secret_secret_ref
+                .as_deref(),
+            Some("CLIENT_SECRET")
+        );
+        assert_eq!(
+            stored
+                .jwt
+                .client_authentication,
+            None
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_algorithm_outside_the_type_or_a_blocked_audience_is_rejected() {
         let directory = tempfile::tempdir().unwrap();
@@ -2134,8 +3418,9 @@ mod jwt_provider_tests {
         body["jwt_signing_key_secret_ref"] = json!("SA_JSON");
         let (status, response) = create(&state, body).await;
         assert_eq!(status, StatusCode::CREATED, "{response}");
-        let (http, _requests, _server) = token_endpoint_answering_get().await;
-        let (status, response) = validate(&state, &http, None, validate_jwt_bearer("SA_JSON")).await;
+        let (endpoint, _requests, _server) = token_endpoint_answering_get().await;
+        let (status, response) =
+            validate_against_fixture(&state, &endpoint, None, validate_jwt_bearer("SA_JSON")).await;
         assert_eq!(status, StatusCode::OK, "{response}");
         assert_eq!(response["key_material"], "ok");
     }
@@ -2157,8 +3442,8 @@ mod jwt_provider_tests {
                 .to_string()
                 .contains("key-secret-marker")
         );
-        let (http, _requests, _server) = token_endpoint_answering_get().await;
-        let (status, _) = validate(&state, &http, None, validate_jwt_bearer("BAD_JSON")).await;
+        let (endpoint, _requests, _server) = token_endpoint_answering_get().await;
+        let (status, _) = validate_against_fixture(&state, &endpoint, None, validate_jwt_bearer("BAD_JSON")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
@@ -2330,6 +3615,82 @@ mod jwt_provider_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_private_token_endpoint_is_saved_and_a_loopback_or_metadata_one_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        for (index, endpoint) in [
+            "https://127.0.0.1/token",
+            "https://[::1]/token",
+            "https://169.254.169.254/token",
+            "https://[fd00:ec2::254]/token",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for body in [client_credentials("oauth2_client_credentials"), jwt_bearer("p")] {
+                let (status, response) =
+                    create(&state, with_token_endpoint(body.clone(), &format!("blocked-{index}"), endpoint)).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{endpoint}: {response}");
+                assert!(
+                    response["error"]
+                        .as_str()
+                        .is_some_and(|error| error.starts_with("token_endpoint:")),
+                    "{endpoint}: {response}"
+                );
+            }
+        }
+        assert!(
+            state
+                .store
+                .list()
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing is stored"
+        );
+
+        for (index, endpoint) in
+            ["https://10.0.0.1/token", "https://192.168.100.100:11443/token", "https://[fd00::1]/token"]
+                .into_iter()
+                .enumerate()
+        {
+            let (status, response) = create(
+                &state,
+                with_token_endpoint(
+                    client_credentials("oauth2_client_credentials"),
+                    &format!("private-{index}"),
+                    endpoint,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "a private network endpoint is saved: {endpoint}: {response}");
+        }
+
+        let (status, created) = create(&state, client_credentials("oauth2_client_credentials")).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"]
+            .as_str()
+            .unwrap();
+        let (status, response) = update(&state, id, json!({"token_endpoint": "https://172.16.0.1/token"})).await;
+        assert_eq!(status, StatusCode::OK, "an update to a private network endpoint is saved: {response}");
+        let (status, response) = update(&state, id, json!({"token_endpoint": "https://127.0.0.1/token"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "an update to loopback is refused: {response}");
+        let stored = state
+            .store
+            .get(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .token_endpoint
+                .as_deref(),
+            Some("https://172.16.0.1/token"),
+            "the stored endpoint is kept"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_update_to_an_http_token_endpoint_is_refused_and_a_stored_one_is_kept_in_warn_mode() {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
@@ -2403,9 +3764,6 @@ mod jwt_provider_tests {
         let http = provider(CredentialProviderType::OAuth2ClientCredentials, "http://idp.internal/token");
         let https = provider(CredentialProviderType::OAuth2ClientCredentials, "https://idp.internal/token");
         let was_api_key = provider(CredentialProviderType::ApiKey, "http://idp.internal/token");
-        let refused = |result: Result<(), ProviderValidationError>| {
-            matches!(result, Err(ProviderValidationError::TokenEndpointNotHttps))
-        };
 
         let warn = egress(RuleMode::Warn, vec![]);
         assert!(refused(validate_token_endpoint_scheme(&warn, None, &http)));
@@ -2423,43 +3781,552 @@ mod jwt_provider_tests {
         assert!(validate_token_endpoint_scheme(&listed, None, &http).is_ok());
     }
 
+    fn warn_egress(insecure_token_endpoints: Vec<String>) -> TokenEgress {
+        use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode};
+
+        TokenEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: None,
+            policy: std::borrow::Cow::Owned(CredentialPolicyConfig {
+                token_endpoint_https: RuleMode::Warn,
+                insecure_token_endpoints,
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn refused(result: Result<(), ProviderValidationError>) -> bool {
+        matches!(result, Err(ProviderValidationError::TokenEndpointNotHttps))
+    }
+
+    #[test]
+    fn the_save_check_refuses_a_client_secret_newly_sent_to_a_stored_http_endpoint() {
+        let provider = |client_authentication: Value| -> CredentialProvider {
+            serde_json::from_value(json!({
+                "id": "cp", "name": "Provider", "provider_id": "provider", "provider_type": "oauth2_jwt_bearer",
+                "token_endpoint": "http://idp.internal/token", "jwt_subject": "admin@example.com",
+                "jwt_signing_key_secret_ref": "SA_KEY", "client_id_secret_ref": "CLIENT_ID",
+                "client_secret_secret_ref": "CLIENT_SECRET", "client_authentication": client_authentication,
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let stored = provider(Value::Null);
+
+        let warn = warn_egress(vec![]);
+        assert!(
+            validate_token_endpoint_scheme(&warn, Some(&stored), &stored).is_ok(),
+            "the stored provider still saves"
+        );
+        for method in ["client_secret_basic", "client_secret_post"] {
+            assert!(
+                refused(validate_token_endpoint_scheme(&warn, Some(&stored), &provider(json!(method)))),
+                "{method} would send the client secret over http"
+            );
+        }
+        assert!(
+            validate_token_endpoint_scheme(&warn, Some(&stored), &provider(json!("none"))).is_ok(),
+            "a public client sends no client secret"
+        );
+        let basic = provider(json!("client_secret_basic"));
+        assert!(
+            validate_token_endpoint_scheme(&warn, Some(&basic), &provider(json!("client_secret_post"))).is_ok(),
+            "the client secret was already sent there"
+        );
+        assert!(
+            validate_token_endpoint_scheme(&warn, Some(&basic), &stored).is_ok(),
+            "clearing the client authentication stops sending the client secret"
+        );
+
+        let listed = warn_egress(vec!["http://idp.internal/token".into()]);
+        assert!(
+            validate_token_endpoint_scheme(&listed, Some(&stored), &provider(json!("client_secret_basic"))).is_ok(),
+            "an endpoint insecure_token_endpoints lists is allowed on purpose"
+        );
+    }
+
+    const STORED_HTTP_TOKEN_ENDPOINT: &str = "http://192.0.2.1/token";
+
+    fn http_oauth_provider(
+        provider_type: &str,
+        client_secret_secret_ref: Value,
+    ) -> CredentialProvider {
+        serde_json::from_value(json!({
+            "id": provider_type, "name": "Provider", "provider_id": provider_type, "provider_type": provider_type,
+            "token_endpoint": STORED_HTTP_TOKEN_ENDPOINT, "client_id_secret_ref": "CLIENT_ID",
+            "client_secret_secret_ref": client_secret_secret_ref,
+            "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_save_check_refuses_a_client_secret_newly_given_to_a_stored_http_oauth_provider() {
+        let warn = warn_egress(vec![]);
+        let listed = warn_egress(vec![STORED_HTTP_TOKEN_ENDPOINT.into()]);
+
+        for provider_type in ["oauth2_client_credentials", "oauth2_authorization_code"] {
+            let without_secret = http_oauth_provider(provider_type, Value::Null);
+            let with_secret = http_oauth_provider(provider_type, json!("CLIENT_SECRET"));
+            assert!(
+                validate_token_endpoint_scheme(&warn, Some(&without_secret), &without_secret).is_ok(),
+                "{provider_type}: the stored provider still saves"
+            );
+            assert!(
+                refused(validate_token_endpoint_scheme(&warn, Some(&without_secret), &with_secret)),
+                "{provider_type}: the client secret would be sent over http"
+            );
+            assert!(
+                validate_token_endpoint_scheme(&listed, Some(&without_secret), &with_secret).is_ok(),
+                "{provider_type}: an endpoint insecure_token_endpoints lists is allowed on purpose"
+            );
+            assert!(
+                validate_token_endpoint_scheme(
+                    &warn,
+                    Some(&with_secret),
+                    &http_oauth_provider(provider_type, json!("NEW_SECRET"))
+                )
+                .is_ok(),
+                "{provider_type}: the client secret was already sent there"
+            );
+            assert!(
+                validate_token_endpoint_scheme(&warn, Some(&with_secret), &without_secret).is_ok(),
+                "{provider_type}: dropping the client secret stops sending it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_save_check_reads_a_blank_client_secret_reference_as_none() {
+        let warn = warn_egress(vec![]);
+        for provider_type in ["oauth2_client_credentials", "oauth2_authorization_code"] {
+            let without_secret = http_oauth_provider(provider_type, Value::Null);
+            let with_secret = http_oauth_provider(provider_type, json!("CLIENT_SECRET"));
+            for blank in ["", "  "] {
+                let blank_secret = http_oauth_provider(provider_type, json!(blank));
+                assert!(
+                    refused(validate_token_endpoint_scheme(&warn, Some(&blank_secret), &with_secret)),
+                    "{provider_type}: a stored reference {blank:?} sent no client secret"
+                );
+                assert!(
+                    validate_token_endpoint_scheme(&warn, Some(&without_secret), &blank_secret).is_ok(),
+                    "{provider_type}: a requested reference {blank:?} sends no client secret"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_save_check_ignores_a_client_secret_reference_that_other_provider_types_never_send() {
+        let warn = warn_egress(vec![]);
+        for provider_type in ["oauth2_jwt_bearer", "oauth2_client_credentials_jwt_auth"] {
+            assert!(
+                validate_token_endpoint_scheme(
+                    &warn,
+                    Some(&http_oauth_provider(provider_type, Value::Null)),
+                    &http_oauth_provider(provider_type, json!("CLIENT_SECRET"))
+                )
+                .is_ok(),
+                "{provider_type}: the reference alone sends nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn the_save_check_ignores_a_client_authentication_on_a_provider_type_that_never_reads_it() {
+        let warn = warn_egress(vec![]);
+        for provider_type in ["oauth2_client_credentials", "oauth2_authorization_code"] {
+            let mut stored = http_oauth_provider(provider_type, Value::Null);
+            stored
+                .jwt
+                .client_authentication = Some(crate::credential_providers::GrantClientAuthentication::ClientSecretPost);
+            assert!(
+                refused(validate_token_endpoint_scheme(
+                    &warn,
+                    Some(&stored),
+                    &http_oauth_provider(provider_type, json!("CLIENT_SECRET"))
+                )),
+                "{provider_type}: the stored record sent no client secret"
+            );
+
+            let mut public = http_oauth_provider(provider_type, json!("CLIENT_SECRET"));
+            public
+                .jwt
+                .client_authentication = Some(crate::credential_providers::GrantClientAuthentication::PublicClient);
+            assert!(
+                validate_token_endpoint_scheme(
+                    &warn,
+                    Some(&public),
+                    &http_oauth_provider(provider_type, json!("NEW_SECRET"))
+                )
+                .is_ok(),
+                "{provider_type}: the client secret was already sent there"
+            );
+        }
+    }
+
+    #[test]
+    fn the_save_check_counts_a_jwt_bearer_client_secret_only_once_the_provider_holds_one() {
+        let warn = warn_egress(vec![]);
+        let jwt_bearer = |client_secret_secret_ref: Value| {
+            let mut provider = http_oauth_provider("oauth2_jwt_bearer", client_secret_secret_ref);
+            provider
+                .jwt
+                .client_authentication =
+                Some(crate::credential_providers::GrantClientAuthentication::ClientSecretBasic);
+            provider
+        };
+        assert!(
+            refused(validate_token_endpoint_scheme(
+                &warn,
+                Some(&jwt_bearer(Value::Null)),
+                &jwt_bearer(json!("CLIENT_SECRET"))
+            )),
+            "a stored client authentication without a client secret sent none"
+        );
+        assert!(
+            validate_token_endpoint_scheme(
+                &warn,
+                Some(&jwt_bearer(json!("OLD_SECRET"))),
+                &jwt_bearer(json!("NEW_SECRET"))
+            )
+            .is_ok(),
+            "the client secret was already sent there"
+        );
+    }
+
+    #[test]
+    fn the_save_check_refuses_a_retype_of_a_stored_http_provider() {
+        let provider = |provider_type: &str| -> CredentialProvider {
+            serde_json::from_value(json!({
+                "id": "cp", "name": "Provider", "provider_id": "provider", "provider_type": provider_type,
+                "token_endpoint": "http://idp.internal/token",
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let types = [
+            "oauth2_client_credentials",
+            "oauth2_client_credentials_jwt_auth",
+            "oauth2_authorization_code",
+            "oauth2_jwt_bearer",
+        ];
+
+        let warn = warn_egress(vec![]);
+        for stored in types {
+            for requested in types {
+                let result = validate_token_endpoint_scheme(&warn, Some(&provider(stored)), &provider(requested));
+                if stored == requested {
+                    assert!(result.is_ok(), "{stored} saved again keeps its stored http endpoint");
+                } else {
+                    assert!(
+                        refused(result),
+                        "{stored} retyped to {requested} would use its stored http endpoint in a new way"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            validate_token_endpoint_scheme(&warn, Some(&provider("oauth2_jwt_bearer")), &provider("api_key")).is_ok(),
+            "an API key provider sends nothing to a token endpoint"
+        );
+
+        let listed = warn_egress(vec!["http://idp.internal/token".into()]);
+        assert!(
+            validate_token_endpoint_scheme(
+                &listed,
+                Some(&provider("oauth2_jwt_bearer")),
+                &provider("oauth2_client_credentials")
+            )
+            .is_ok(),
+            "an endpoint insecure_token_endpoints lists is allowed on purpose"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn turning_on_a_client_secret_for_a_stored_http_jwt_bearer_endpoint_is_refused_in_warn_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let stored: CredentialProvider = serde_json::from_value(json!({
+            "id": "stored-http", "name": "Hydra", "provider_id": "stored-http", "provider_type": "oauth2_jwt_bearer",
+            "token_endpoint": "http://192.0.2.1/token", "jwt_issuer": "gateway", "jwt_subject": "admin@example.com",
+            "jwt_signing_key_secret_ref": "SA_KEY",
+            "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+        }))
+        .unwrap();
+        state
+            .store
+            .create(stored)
+            .await
+            .unwrap();
+
+        let (status, response) = update(&state, "stored-http", json!({"name": "Renamed"})).await;
+        assert_eq!(status, StatusCode::OK, "the stored provider still saves: {response}");
+
+        for method in ["client_secret_basic", "client_secret_post"] {
+            let (status, response) = update(
+                &state,
+                "stored-http",
+                json!({"client_authentication": method, "client_id_secret_ref": "CLIENT_ID",
+                       "client_secret_secret_ref": "CLIENT_SECRET"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} would send the client secret over http: {response}");
+            assert_eq!(response["error"], "token_endpoint must be an https URL");
+        }
+        let kept = state
+            .store
+            .get("stored-http")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            kept.jwt
+                .client_authentication
+                .is_none()
+        );
+
+        let (status, response) = update(
+            &state,
+            "stored-http",
+            json!({"client_authentication": "none", "client_id_secret_ref": "CLIENT_ID"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "a public client sends no client secret: {response}");
+        assert_eq!(response["client_authentication"], "none");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retyping_a_stored_http_jwt_bearer_provider_to_client_credentials_is_refused_in_warn_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let stored: CredentialProvider = serde_json::from_value(json!({
+            "id": "stored-http", "name": "Hydra", "provider_id": "stored-http", "provider_type": "oauth2_jwt_bearer",
+            "token_endpoint": "http://192.0.2.1/token", "jwt_issuer": "gateway", "jwt_subject": "admin@example.com",
+            "jwt_signing_key_secret_ref": "SA_KEY", "client_id_secret_ref": "CLIENT_ID",
+            "client_secret_secret_ref": "CLIENT_SECRET",
+            "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+        }))
+        .unwrap();
+        state
+            .store
+            .create(stored)
+            .await
+            .unwrap();
+
+        let (status, response) =
+            update(&state, "stored-http", json!({"provider_type": "oauth2_client_credentials"})).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a client credentials grant would send the client secret over http: {response}"
+        );
+        assert_eq!(response["error"], "token_endpoint must be an https URL");
+        let kept = state
+            .store
+            .get("stored-http")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.provider_type, CredentialProviderType::OAuth2JwtBearer);
+
+        let (status, response) = update(&state, "stored-http", json!({"name": "Renamed"})).await;
+        assert_eq!(status, StatusCode::OK, "the stored provider still saves as the type it is: {response}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn giving_a_client_secret_to_a_stored_http_provider_that_holds_none_is_refused_in_warn_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        for provider_type in ["oauth2_client_credentials", "oauth2_authorization_code"] {
+            state
+                .store
+                .create(http_oauth_provider(provider_type, Value::Null))
+                .await
+                .unwrap();
+
+            let (status, response) =
+                update(&state, provider_type, json!({"client_secret_secret_ref": "CLIENT_SECRET"})).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{provider_type}: the client secret would be sent over http: {response}"
+            );
+            assert_eq!(response["error"], "token_endpoint must be an https URL", "{provider_type}");
+            let kept = state
+                .store
+                .get(provider_type)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(kept.client_secret_secret_ref, None, "{provider_type}");
+
+            let (status, response) = update(
+                &state,
+                provider_type,
+                json!({"token_endpoint": "https://192.0.2.1/token", "client_secret_secret_ref": "CLIENT_SECRET"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{provider_type}: https carries the client secret: {response}");
+            assert_eq!(response["client_secret_secret_ref"], "CLIENT_SECRET", "{provider_type}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stored_http_provider_that_holds_no_client_secret_is_given_one_on_a_listed_endpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let listed = warn_egress(vec![STORED_HTTP_TOKEN_ENDPOINT.into()]);
+        for provider_type in ["oauth2_client_credentials", "oauth2_authorization_code"] {
+            state
+                .store
+                .create(http_oauth_provider(provider_type, Value::Null))
+                .await
+                .unwrap();
+
+            let (status, response) = listed
+                .clone()
+                .scope(update(&state, provider_type, json!({"client_secret_secret_ref": "CLIENT_SECRET"})))
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{provider_type}: an endpoint insecure_token_endpoints lists is allowed on purpose: {response}"
+            );
+            assert_eq!(response["client_secret_secret_ref"], "CLIENT_SECRET", "{provider_type}");
+            assert_eq!(response["token_endpoint"], STORED_HTTP_TOKEN_ENDPOINT, "{provider_type}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stored_http_provider_keeps_a_client_secret_it_may_replace_but_not_clear() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        for provider_type in ["oauth2_client_credentials", "oauth2_authorization_code"] {
+            state
+                .store
+                .create(http_oauth_provider(provider_type, json!("CLIENT_SECRET")))
+                .await
+                .unwrap();
+
+            let (status, response) = update(&state, provider_type, json!({"client_secret_secret_ref": ""})).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{provider_type}: {response}");
+            assert_eq!(response["error"], OAUTH_CLIENT_REFERENCES_REQUIRED, "{provider_type}");
+            let kept = state
+                .store
+                .get(provider_type)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                kept.client_secret_secret_ref
+                    .as_deref(),
+                Some("CLIENT_SECRET"),
+                "{provider_type}"
+            );
+
+            let (status, response) =
+                update(&state, provider_type, json!({"client_secret_secret_ref": "NOT_A_KEY"})).await;
+            assert_eq!(status, StatusCode::OK, "{provider_type} rotates its client secret: {response}");
+            assert_eq!(response["client_secret_secret_ref"], "NOT_A_KEY", "{provider_type}");
+            assert_eq!(response["token_endpoint"], "http://192.0.2.1/token", "{provider_type}");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn validate_refuses_an_http_token_endpoint_without_contacting_it() {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
-        let (http, requests, _server) = token_endpoint_answering_get().await;
+        let (endpoint, requests, _server) = token_endpoint_answering_get().await;
         let production = TokenEgress {
-            policy: Default::default(),
-            ..listed_http_egress()
+            exact_allowlist: None,
+            ..listed_http_egress(&endpoint)
         };
         let (status, response) = validate_with(
             &state,
-            &http,
             &production,
             None,
-            json!({"provider_type": "oauth2_client_credentials", "token_endpoint": "http://192.0.2.1/token"}),
+            json!({"provider_type": "oauth2_client_credentials", "token_endpoint": endpoint}),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(response["error"], "token_endpoint must be an https URL");
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
 
-        let (status, response) = validate(
+        let (status, response) = validate_against_fixture(
             &state,
-            &http,
+            &endpoint,
             None,
-            json!({"provider_type": "oauth2_client_credentials", "token_endpoint": "http://192.0.2.1/token"}),
+            json!({"provider_type": "oauth2_client_credentials", "token_endpoint": endpoint}),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "an endpoint insecure_token_endpoints lists is checked: {response}");
+        assert_eq!(status, StatusCode::OK, "an endpoint the test allow-list names is checked: {response}");
         assert_eq!(response["reachable"], true);
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    /// A client whose every request reaches a local server that answers GET with 405, as a
-    /// token endpoint does, and the number of requests it received.
-    async fn token_endpoint_answering_get()
-    -> (reqwest::Client, Arc<std::sync::atomic::AtomicUsize>, tokio::task::JoinSet<()>) {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn validate_refuses_a_loopback_or_metadata_token_endpoint_without_contacting_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (endpoint, requests, _server) = token_endpoint_answering_get().await;
+        let production = TokenEgress {
+            exact_allowlist: None,
+            ..listed_http_egress(&endpoint)
+        };
+        for token_endpoint in [
+            endpoint.replace("http://", "https://"),
+            "https://[::1]/token".to_string(),
+            "https://169.254.169.254/token".to_string(),
+            "https://[fd00:ec2::254]/token".to_string(),
+        ] {
+            let (status, response) = validate_with(
+                &state,
+                &production,
+                None,
+                json!({"provider_type": "oauth2_client_credentials", "token_endpoint": token_endpoint}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{token_endpoint}: {response}");
+            assert_eq!(
+                response["error"],
+                "token_endpoint rejected: it must be an http(s) URL without a user name or password whose host resolves to neither loopback nor cloud metadata"
+            );
+        }
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn validate_reports_an_unreachable_token_endpoint_without_its_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let endpoint = format!("http://{closed}/token");
+        let (status, response) = validate_against_fixture(
+            &state,
+            &endpoint,
+            None,
+            json!({"provider_type": "oauth2_client_credentials", "token_endpoint": endpoint}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["reachable"], false);
+        assert_eq!(response["error"], "token_endpoint could not be reached");
+        assert!(
+            response
+                .get("http_status")
+                .is_none(),
+            "{response}"
+        );
+    }
+
+    /// A local token endpoint that answers GET with 405, as a token endpoint does, and counts
+    /// the requests it receives: its URL, the count, and the server.
+    async fn token_endpoint_answering_get() -> (String, Arc<std::sync::atomic::AtomicUsize>, tokio::task::JoinSet<()>) {
         let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = requests.clone();
         let app = axum::Router::new().fallback(axum::routing::get(move || {
@@ -2469,52 +4336,48 @@ mod jwt_provider_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .unwrap();
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .proxy(reqwest::Proxy::http(format!("http://{}", listener.local_addr().unwrap())).unwrap())
-            .build()
-            .unwrap();
+        let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
         let mut server = tokio::task::JoinSet::new();
         server.spawn(async move {
             axum::serve(listener, app)
                 .await
                 .unwrap();
         });
-        (client, requests, server)
+        (endpoint, requests, server)
     }
 
-    /// The egress of an appliance whose credential policy allows the documentation address
-    /// the validate tests use as an http token endpoint.
-    fn listed_http_egress() -> TokenEgress {
+    /// The egress of an appliance whose test allow-list admits the loopback `endpoint`, which
+    /// the Configured policy otherwise refuses, as an http token endpoint.
+    fn listed_http_egress(endpoint: &str) -> TokenEgress {
         TokenEgress {
             timeout: std::time::Duration::from_secs(5),
-            exact_allowlist: None,
-            policy: std::borrow::Cow::Owned(crate::config::credential_policy::CredentialPolicyConfig {
-                insecure_token_endpoints: vec!["http://192.0.2.1/token".into()],
-                ..Default::default()
-            }),
+            exact_allowlist: Some(endpoint.to_string()),
+            policy: Default::default(),
         }
     }
 
-    async fn validate(
+    /// Validates `body` against the local token endpoint `endpoint`: it rewrites any
+    /// `token_endpoint` the body names to `endpoint`, so the probe reaches the fixture.
+    async fn validate_against_fixture(
         state: &CredentialProviderState,
-        http: &reqwest::Client,
+        endpoint: &str,
         context: Option<Extension<PatTenantContext>>,
-        body: Value,
+        mut body: Value,
     ) -> (StatusCode, Value) {
-        validate_with(state, http, &listed_http_egress(), context, body).await
+        if let Some(token_endpoint) = body.get_mut("token_endpoint") {
+            *token_endpoint = json!(endpoint);
+        }
+        validate_with(state, &listed_http_egress(endpoint), context, body).await
     }
 
     async fn validate_with(
         state: &CredentialProviderState,
-        http: &reqwest::Client,
         egress: &TokenEgress,
         context: Option<Extension<PatTenantContext>>,
         body: Value,
     ) -> (StatusCode, Value) {
         let response = validate_provider_with(
             state,
-            http,
             egress,
             context.is_some(),
             &context,
@@ -2536,17 +4399,17 @@ mod jwt_provider_tests {
     async fn validate_checks_reachability_and_the_key_material_of_a_jwt_provider() {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
-        let (http, _requests, _server) = token_endpoint_answering_get().await;
-        let (status, response) = validate(&state, &http, None, validate_jwt_bearer("SA_KEY")).await;
+        let (endpoint, _requests, _server) = token_endpoint_answering_get().await;
+        let (status, response) = validate_against_fixture(&state, &endpoint, None, validate_jwt_bearer("SA_KEY")).await;
         assert_eq!(status, StatusCode::OK, "{response}");
         assert_eq!(response["reachable"], true);
         assert_eq!(response["http_status"], 405);
-        assert_eq!(response["token_endpoint"], "http://192.0.2.1/token");
+        assert_eq!(response["token_endpoint"], endpoint);
         assert_eq!(response["key_material"], "ok");
 
-        let (status, response) = validate(
+        let (status, response) = validate_against_fixture(
             &state,
-            &http,
+            &endpoint,
             None,
             json!({"provider_type": "oauth2_client_credentials", "token_endpoint": "http://192.0.2.1/token"}),
         )
@@ -2565,16 +4428,16 @@ mod jwt_provider_tests {
     async fn validate_refuses_a_jwt_bearer_provider_without_a_subject_before_any_request() {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
-        let (http, requests, _server) = token_endpoint_answering_get().await;
+        let (endpoint, requests, _server) = token_endpoint_answering_get().await;
         let mut body = validate_jwt_bearer("SA_KEY");
         body.as_object_mut()
             .unwrap()
             .remove("jwt_subject");
-        let (status, response) = validate(&state, &http, None, body).await;
+        let (status, response) = validate_against_fixture(&state, &endpoint, None, body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(response["error"], "jwt_subject is required for this provider type");
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
-        let (status, response) = validate(&state, &http, None, validate_jwt_bearer("SA_KEY")).await;
+        let (status, response) = validate_against_fixture(&state, &endpoint, None, validate_jwt_bearer("SA_KEY")).await;
         assert_eq!(status, StatusCode::OK, "{response}");
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -2583,8 +4446,9 @@ mod jwt_provider_tests {
     async fn validate_refuses_key_material_in_the_wrong_format_without_echoing_it() {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
-        let (http, _requests, _server) = token_endpoint_answering_get().await;
-        let (status, response) = validate(&state, &http, None, validate_jwt_bearer("NOT_A_KEY")).await;
+        let (endpoint, _requests, _server) = token_endpoint_answering_get().await;
+        let (status, response) =
+            validate_against_fixture(&state, &endpoint, None, validate_jwt_bearer("NOT_A_KEY")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(
             response["error"],
@@ -2597,7 +4461,7 @@ mod jwt_provider_tests {
         );
         let mut pss_bearer = validate_jwt_bearer("SA_KEY");
         pss_bearer["jwt_signing_algorithm"] = json!("PS256");
-        let (status, response) = validate(&state, &http, None, pss_bearer).await;
+        let (status, response) = validate_against_fixture(&state, &endpoint, None, pss_bearer).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(response["error"], "jwt_signing_algorithm is not supported for this provider type");
     }
@@ -2767,6 +4631,131 @@ mod jwt_provider_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_authentication_sends_the_stored_client_references_so_they_are_checked_again_in_warn_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let stored: CredentialProvider = serde_json::from_value(json!({
+            "id": "stored", "name": "Vertex", "provider_id": "stored", "provider_type": "oauth2_jwt_bearer",
+            "tenant_id": "tenant-a", "token_endpoint": "https://oauth2.googleapis.com/token",
+            "jwt_issuer": "agent@project.iam.gserviceaccount.com", "jwt_subject": "admin@example.com",
+            "jwt_signing_key_secret_ref": "SA_KEY",
+            "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+            "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+        }))
+        .unwrap();
+        state
+            .store
+            .create(stored)
+            .await
+            .unwrap();
+        let update_as_tenant_a = |body: Value| {
+            update_provider(
+                State(state.clone()),
+                Path("stored".into()),
+                tenant_a_context(),
+                None,
+                None,
+                None,
+                Json(serde_json::from_value(body).unwrap()),
+            )
+        };
+
+        let (status, response) = body_of(
+            update_as_tenant_a(json!({"name": "Renamed"}))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "references the provider sends nothing with are kept: {response}");
+        let (status, response) = body_of(
+            update_as_tenant_a(json!({"client_authentication": "client_secret_post"}))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "appliance-wide client references would now be sent: {response}");
+        assert_eq!(response["error"], "Secret reference is not accessible");
+        let stored = state
+            .store
+            .get("stored")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .jwt
+                .client_authentication,
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enforce_mode_refuses_a_client_authentication_that_sends_another_tenants_client_references() {
+        use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode};
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        add_tenant_a_secret(&state, "TENANT_CLIENT_ID").await;
+        state
+            .secrets_store
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: Some("tenant-a".into()),
+                name: "TENANT_SA_KEY".into(),
+                secret_id: "TENANT_SA_KEY".into(),
+                description: None,
+                value: test_keys::rsa_pkcs8()
+                    .private_pem
+                    .clone(),
+                secret_type: "general".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+        let provider = |client_id_secret_ref: &str, client_authentication: Value| -> CredentialProvider {
+            serde_json::from_value(json!({
+                "id": "stored", "name": "Vertex", "provider_id": "stored", "provider_type": "oauth2_jwt_bearer",
+                "tenant_id": "tenant-a", "token_endpoint": "https://oauth2.googleapis.com/token",
+                "jwt_issuer": "agent@project.iam.gserviceaccount.com", "jwt_subject": "admin@example.com",
+                "jwt_signing_key_secret_ref": "TENANT_SA_KEY", "client_id_secret_ref": client_id_secret_ref,
+                "client_authentication": client_authentication,
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let enforce = TokenEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: None,
+            policy: std::borrow::Cow::Owned(CredentialPolicyConfig {
+                tenant_credential_isolation: RuleMode::Enforce,
+                ..Default::default()
+            }),
+        };
+        let stored = provider("CLIENT_ID", Value::Null);
+        let check = |provider: CredentialProvider| {
+            let state = state.clone();
+            let stored = stored.clone();
+            let enforce = enforce.clone();
+            async move {
+                validate_provider_settings(&state, &provider, Some(&stored), &enforce, &tenant_a_context(), &None).await
+            }
+        };
+
+        assert!(
+            matches!(check(stored.clone()).await, Err(ProviderValidationError::SecretNotAccessible)),
+            "enforce mode checks every client reference, sent or not"
+        );
+        assert!(matches!(
+            check(provider("CLIENT_ID", json!("none"))).await,
+            Err(ProviderValidationError::SecretNotAccessible)
+        ));
+        assert!(
+            check(provider("TENANT_CLIENT_ID", json!("none")))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_provider_with_an_issuer_never_keeps_a_secret_outside_its_tenant_even_in_warn_mode() {
         use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode};
 
@@ -2826,12 +4815,13 @@ mod jwt_provider_tests {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
         add_tenant_a_secret(&state, "TENANT_KEY").await;
-        let (http, requests, _server) = token_endpoint_answering_get().await;
-        let (status, response) = validate(&state, &http, tenant_a_context(), validate_jwt_bearer("SA_KEY")).await;
+        let (endpoint, requests, _server) = token_endpoint_answering_get().await;
+        let (status, response) =
+            validate_against_fixture(&state, &endpoint, tenant_a_context(), validate_jwt_bearer("SA_KEY")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
         assert_eq!(response["error"], "Secret reference is not accessible");
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
-        let (status, response) = validate(&state, &http, None, validate_jwt_bearer("SA_KEY")).await;
+        let (status, response) = validate_against_fixture(&state, &endpoint, None, validate_jwt_bearer("SA_KEY")).await;
         assert_eq!(status, StatusCode::OK, "{response}");
     }
 
@@ -2853,12 +4843,13 @@ mod jwt_provider_tests {
             })
             .await
             .unwrap();
-        let (http, _requests, _server) = token_endpoint_answering_get().await;
+        let (endpoint, _requests, _server) = token_endpoint_answering_get().await;
         let tenant_a = Some(Extension(PatTenantContext {
             token_id: "token-a".into(),
             tenant_id: "tenant-a".into(),
         }));
-        let (status, response) = validate(&state, &http, tenant_a, validate_jwt_bearer("B_KEY")).await;
+        let (status, response) =
+            validate_against_fixture(&state, &endpoint, tenant_a, validate_jwt_bearer("B_KEY")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(response["error"], "Secret reference is not accessible");
     }
@@ -2912,6 +4903,7 @@ mod consent_strategy_tests {
             ),
             identity_strategies: Some(strategies.clone()),
             oauth_callback_route: "/oauth/callback".into(),
+            gateway_base_url: "https://gateway.example".into(),
             issuer_metadata: super::super::external::strict_issuer_metadata(),
             surfaces: None,
             vault: None,
@@ -2920,6 +4912,7 @@ mod consent_strategy_tests {
             issuers: Default::default(),
             references: Default::default(),
             rbac: None,
+            gateway_mcp_issuer: None,
         };
         let mut provider: CredentialProvider = serde_json::from_value(json!({
             "id": "provider", "name": "Provider", "provider_id": "provider", "tenant_id": "tenant-a",
@@ -3052,6 +5045,7 @@ mod consent_strategy_tests {
             ),
             identity_strategies: None,
             oauth_callback_route: "/oauth/callback".into(),
+            gateway_base_url: "https://gateway.example".into(),
             issuer_metadata: super::super::external::strict_issuer_metadata(),
             surfaces: Some(Arc::new(
                 crate::surfaces::FileSystemAgentSurfaceStore::new(
@@ -3068,9 +5062,25 @@ mod consent_strategy_tests {
             issuers: Default::default(),
             references: Default::default(),
             rbac: None,
+            gateway_mcp_issuer: None,
         };
+        state
+            .secrets_store
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: tenant_id.map(str::to_string),
+                name: "Provider key".into(),
+                secret_id: "provider-key".into(),
+                description: None,
+                value: "value".into(),
+                secret_type: "general".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
         let provider: CredentialProvider = serde_json::from_value(json!({
             "id": "provider", "name": "Operator provider", "provider_id": "provider", "tenant_id": tenant_id,
+            "provider_type": "api_key", "api_key_secret_ref": "provider-key",
+            "callback_path": "/oauth/callback/provider",
             "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
         }))
         .unwrap();
@@ -3228,17 +5238,22 @@ mod external_provider_tests {
             ),
             identity_strategies: None,
             oauth_callback_route: "/oauth/callback".into(),
+            gateway_base_url: "https://gateway.example".into(),
             issuer_metadata: answering(answer),
             surfaces: None,
             vault: None,
             egress_allowlist: None,
             resource_origins: Default::default(),
-            issuers: Arc::new(Some(std::collections::HashMap::from([(
-                crate::credential_providers::external::tests::ISSUER.to_string(),
-                Vec::new(),
-            )]))),
+            issuers: Arc::new(crate::credential_providers::external::PermittedIssuers::new(
+                Some(std::collections::HashMap::from([(
+                    crate::credential_providers::external::tests::ISSUER.to_string(),
+                    Vec::new(),
+                )])),
+                None,
+            )),
             references: Default::default(),
             rbac: None,
+            gateway_mcp_issuer: None,
         }
     }
 
@@ -3250,7 +5265,7 @@ mod external_provider_tests {
     async fn a_tenant_creates_an_external_provider_only_once_the_operator_lists_its_issuers() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = state(&directory, Ok(metadata())).await;
-        state.issuers = Arc::new(None);
+        state.issuers = Arc::default();
         let (status, body) = create(&state, "tenant-a", create_request(|_| {})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["code"], "external_consent_issuers_required");
@@ -3271,12 +5286,49 @@ mod external_provider_tests {
             .into_response();
         assert_eq!(operator.status(), StatusCode::CREATED, "an operator's own provider needs no list");
 
-        state.issuers = Arc::new(Some(std::collections::HashMap::from([(
-            crate::credential_providers::external::tests::ISSUER.to_string(),
-            Vec::new(),
-        )])));
+        state.issuers = Arc::new(crate::credential_providers::external::PermittedIssuers::new(
+            Some(std::collections::HashMap::from([(
+                crate::credential_providers::external::tests::ISSUER.to_string(),
+                Vec::new(),
+            )])),
+            None,
+        ));
         let (status, body) = create(&state, "tenant-a", create_request(|_| {})).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    /// `external_consent_issuer_patterns`, even empty, counts as the
+    /// operator's list for a tenant: an issuer it does not match is refused as
+    /// not permitted, and one it matches is created, without
+    /// `external_consent_issuers`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tenant_creates_an_external_provider_whose_issuer_matches_an_operator_pattern() {
+        use crate::config::network::{IssuerPattern, IssuerTenant};
+        let issuer =
+            format!("{}/0c7a1e52-3b9d-4f68-a2e4-5d81f6b39c07", crate::credential_providers::external::tests::ISSUER);
+        let mut tenant_metadata = metadata();
+        tenant_metadata.issuer = issuer.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = state(&directory, Ok(tenant_metadata)).await;
+        state.issuers = Arc::new(crate::credential_providers::external::PermittedIssuers::new(None, Some(Vec::new())));
+        let request = || create_request(|body| body["issuer"] = json!(issuer));
+        let (status, body) = create(&state, "tenant-a", request()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "provider_issuer_not_permitted");
+        assert_eq!(body["field"], "issuer");
+
+        state.issuers = Arc::new(crate::credential_providers::external::PermittedIssuers::new(
+            None,
+            Some(vec![IssuerPattern {
+                issuer: format!("{}/{{tenant}}", crate::credential_providers::external::tests::ISSUER),
+                tenant: IssuerTenant::Uuid,
+                endpoint_origins: Vec::new(),
+                resource_origins: Vec::new(),
+            }]),
+        ));
+        let (status, body) = create(&state, "tenant-a", request()).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["issuer"], json!(issuer));
     }
 
     /// With `external_consent_issuers` set, a provider is created only for a
@@ -3293,8 +5345,10 @@ mod external_provider_tests {
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async { Ok(metadata()) })
         });
-        state.issuers =
-            Arc::new(Some(std::collections::HashMap::from([("https://issuer.example".to_string(), Vec::new())])));
+        state.issuers = Arc::new(crate::credential_providers::external::PermittedIssuers::new(
+            Some(std::collections::HashMap::from([("https://issuer.example".to_string(), Vec::new())])),
+            None,
+        ));
         let (status, body) = create(&state, "tenant-a", create_request(|_| {})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["code"], "provider_issuer_not_permitted");
@@ -3306,8 +5360,10 @@ mod external_provider_tests {
                 .is_empty()
         );
 
-        state.issuers =
-            Arc::new(Some(std::collections::HashMap::from([("https://203.0.113.10".to_string(), Vec::new())])));
+        state.issuers = Arc::new(crate::credential_providers::external::PermittedIssuers::new(
+            Some(std::collections::HashMap::from([("https://203.0.113.10".to_string(), Vec::new())])),
+            None,
+        ));
         let mut jwks_elsewhere = metadata();
         jwks_elsewhere.jwks_uri = Some("https://203.0.113.66/jwks".into());
         state.issuer_metadata = answering(Ok(jwks_elsewhere));
@@ -3610,6 +5666,30 @@ mod external_provider_tests {
         assert_eq!(stored(&state).await.len(), 2);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn simultaneous_creates_of_one_slug_store_one_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(&directory, Ok(metadata())).await;
+        let statuses = futures::future::join_all((0..8).map(|_| {
+            let state = state.clone();
+            async move {
+                create(&state, "tenant-a", create_request(|_| {}))
+                    .await
+                    .0
+            }
+        }))
+        .await;
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::CREATED)
+                .count(),
+            1,
+            "{statuses:?}"
+        );
+        assert_eq!(stored(&state).await.len(), 1);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_update_keeps_an_external_providers_client_but_may_rename_it() {
         let directory = tempfile::tempdir().unwrap();
@@ -3653,6 +5733,98 @@ mod external_provider_tests {
                 .as_deref(),
             Some("https://203.0.113.10/token")
         );
+    }
+
+    /// `send_resource` is chosen when an external consent provider is created,
+    /// shown by the record and the list, and fixed: an update that sends the
+    /// stored value is accepted, one that changes it refused. Left out, it is
+    /// on, and neither the record nor the list names it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_resource_is_chosen_at_create_listed_and_fixed() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(&directory, Ok(metadata())).await;
+        let (status, created) = create(
+            &state,
+            "tenant-a",
+            create_request(|body| {
+                body["provider_id"] = json!("entra");
+                body["send_resource"] = json!(false);
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_eq!(created["send_resource"], json!(false));
+        let (status, default) =
+            create(&state, "tenant-a", create_request(|body| body["provider_id"] = json!("linear"))).await;
+        assert_eq!(status, StatusCode::CREATED, "{default}");
+        assert!(
+            default
+                .get("send_resource")
+                .is_none(),
+            "{default}"
+        );
+
+        let response = list_providers(State(state.clone()), tenant("tenant-a"), None)
+            .await
+            .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        let listed_item = |slug: &str| {
+            listed
+                .iter()
+                .find(|item| item["provider_id"] == slug)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(listed_item("entra")["send_resource"], json!(false));
+        assert!(
+            listed_item("linear")
+                .get("send_resource")
+                .is_none()
+        );
+
+        let id = created["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let put = |body: serde_json::Value| {
+            let state = state.clone();
+            let id = id.clone();
+            async move {
+                let response = update_provider(
+                    State(state),
+                    Path(id),
+                    tenant("tenant-a"),
+                    None,
+                    None,
+                    None,
+                    Json(serde_json::from_value(body).unwrap()),
+                )
+                .await
+                .into_response();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (status, serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default())
+            }
+        };
+        let (status, body) = put(json!({"send_resource": true})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "provider_field_immutable");
+        assert_eq!(body["field"], "send_resource");
+        let (status, body) = put(json!({"name": "Entra (work)", "send_resource": false})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let entra = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entra.name, "Entra (work)");
+        assert!(!entra.send_resource);
     }
 
     fn bound_surface(binding: serde_json::Value) -> crate::config::agent_surface::AgentSurface {
@@ -3763,6 +5935,44 @@ mod external_provider_tests {
         id: &str,
     ) -> (StatusCode, serde_json::Value) {
         answer_once_revoked(remove_provider(state, id, &tenant("tenant-a"), &None, None).await).await
+    }
+
+    /// A delete decides on the provider as it is once it holds the lock: one
+    /// moved to another tenant while it waited is not deleted by the caller
+    /// who could reach it before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delete_that_waited_for_the_lock_decides_on_the_provider_as_it_is_then() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(&directory, Ok(metadata())).await;
+        let (status, body) = create(&state, "tenant-a", create_request(|_| {})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = stored(&state).await[0]
+            .id
+            .clone();
+        let holding = crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await;
+        let deleting = tokio::spawn({
+            let state = state.clone();
+            let id = id.clone();
+            async move {
+                remove_provider(&state, &id, &tenant("tenant-a"), &None, None)
+                    .await
+                    .0
+                    .status()
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!deleting.is_finished(), "the delete waits for the lock");
+        let mut moved = stored(&state).await.remove(0);
+        moved.tenant_id = Some("tenant-b".into());
+        state
+            .store
+            .update(moved)
+            .await
+            .unwrap();
+        drop(holding);
+
+        assert_eq!(deleting.await.unwrap(), StatusCode::NOT_FOUND);
+        assert_eq!(stored(&state).await.len(), 1, "the provider is kept");
     }
 
     /// The `DELETE` route itself, answering without waiting for the
@@ -3888,6 +6098,215 @@ mod external_provider_tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// A provider delete also decides the revocations the vault kept for the
+    /// provider's earlier removals while it still holds the provider, which a
+    /// later sweep could only forget unrevoked; another provider's are kept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleting_a_provider_revokes_what_its_earlier_removals_deferred() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let server = crate::delegation_vault::revocation::tests::RecordingServer::start(200).await;
+        let state = delete_state(&directory, &server).await;
+        let vault = state.vault.clone().unwrap();
+        for (provider, token) in [("provider", "deferred"), ("other-provider", "other-deferred")] {
+            let key = GrantKey::owner(Some("tenant-a"), "surface", "tp-1", provider);
+            let mut removed = crate::delegation_vault::grants::tests::grant(&key, token);
+            removed.id = key.record_id();
+            vault
+                .defer_revocation(removed, None)
+                .await
+                .unwrap();
+        }
+
+        let (status, body) = delete(&state, "provider").await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+        assert_eq!(server.revoked_tokens(), ["deferred", "deferred-refresh"]);
+        let kept: Vec<_> = vault
+            .deferred_revocations()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|kept| {
+                kept.grant
+                    .credential_provider_id
+            })
+            .collect();
+        assert_eq!(kept, ["other-provider"]);
+    }
+
+    /// A provider delete keeps the provider while a revocation the vault kept
+    /// cannot be read, here because at-rest encryption is now off, and says
+    /// why: once the provider is gone that revocation could never be decided.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_is_kept_while_a_kept_revocation_cannot_be_read() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let server = crate::delegation_vault::revocation::tests::RecordingServer::start(200).await;
+        let mut state = delete_state(&directory, &server).await;
+        let key = GrantKey::owner(Some("tenant-b"), "elsewhere", "tp-1", "other-provider");
+        let mut removed = crate::delegation_vault::grants::tests::grant(&key, "kept");
+        removed.id = key.record_id();
+        state
+            .vault
+            .as_ref()
+            .unwrap()
+            .defer_revocation(removed, None)
+            .await
+            .unwrap();
+        crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig::default()).unwrap();
+        state.vault = Some(Arc::new(
+            crate::delegation_vault::storage::FileSystemDelegationVaultStore::new(directory.path().join("vault"))
+                .await
+                .unwrap(),
+        ));
+
+        let (status, body) = delete(&state, "provider").await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("keeps revocations it cannot read")),
+            "{body}"
+        );
+        assert!(
+            state
+                .store
+                .get("provider")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A provider store whose delete removes the provider, says so, then never
+    /// answers, as a request dropped once the provider is gone.
+    struct DeleteThenHang(Arc<dyn CredentialProviderStorage>, Arc<tokio::sync::Notify>);
+
+    #[async_trait::async_trait]
+    impl CredentialProviderStorage for DeleteThenHang {
+        async fn get_checked(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<crate::credential_providers::CredentialProvider>> {
+            self.get(id).await
+        }
+
+        async fn create(
+            &self,
+            provider: CredentialProvider,
+        ) -> anyhow::Result<CredentialProvider> {
+            self.0.create(provider).await
+        }
+
+        async fn get(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<CredentialProvider>> {
+            self.0.get(id).await
+        }
+
+        async fn list(&self) -> anyhow::Result<Vec<CredentialProvider>> {
+            self.0.list().await
+        }
+
+        async fn update(
+            &self,
+            provider: CredentialProvider,
+        ) -> anyhow::Result<CredentialProvider> {
+            self.0.update(provider).await
+        }
+
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<bool> {
+            self.0.delete(id).await?;
+            self.1.notify_one();
+            std::future::pending().await
+        }
+
+        async fn find_by_provider_id(
+            &self,
+            tenant_id: Option<&str>,
+            provider_id: &str,
+        ) -> anyhow::Result<Option<CredentialProvider>> {
+            self.0
+                .find_by_provider_id(tenant_id, provider_id)
+                .await
+        }
+    }
+
+    /// A provider delete dropped once the provider is gone still revokes what
+    /// the provider's earlier removals deferred.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_delete_dropped_part_way_still_revokes_what_was_deferred() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let server = crate::delegation_vault::revocation::tests::RecordingServer::start(200).await;
+        let mut state = delete_state(&directory, &server).await;
+        let deleted = Arc::new(tokio::sync::Notify::new());
+        state.store = Arc::new(DeleteThenHang(Arc::clone(&state.store), Arc::clone(&deleted)));
+        let key = GrantKey::owner(Some("tenant-a"), "surface", "tp-1", "provider");
+        let mut removed = crate::delegation_vault::grants::tests::grant(&key, "deferred");
+        removed.id = key.record_id();
+        state
+            .vault
+            .as_ref()
+            .unwrap()
+            .defer_revocation(removed, None)
+            .await
+            .unwrap();
+
+        let context = tenant("tenant-a");
+        tokio::select! {
+            _ = remove_provider(&state, "provider", &context, &None, None) => {
+                panic!("the delete never answers")
+            }
+            _ = deleted.notified() => {}
+        }
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let tokens = server.revoked_tokens();
+                if tokens.len() == 2 && tokens.contains(&"deferred".to_string()) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert_eq!(server.revoked_tokens(), ["deferred", "deferred-refresh"]);
+    }
+
+    /// A provider delete whose kept revocations cannot be read keeps the
+    /// provider, since once it is gone they could only be forgotten unrevoked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_whose_kept_revocations_cannot_be_read_is_kept() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = crate::delegation_vault::revocation::tests::RecordingServer::start(200).await;
+        let state = delete_state(&directory, &server).await;
+        let kept = directory
+            .path()
+            .join("vault")
+            .join(crate::delegation_vault::storage::DEFERRED_REVOCATIONS_DIRECTORY);
+        let _ = std::fs::remove_dir_all(&kept);
+        std::fs::write(&kept, b"not a directory").unwrap();
+
+        let (status, body) = delete(&state, "provider").await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(
+            state
+                .store
+                .get("provider")
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 
@@ -4341,5 +6760,1097 @@ mod external_provider_tests {
             .expect("the revocation names its actor");
         assert_eq!(caller.sub.as_deref(), Some("operator"));
         assert_eq!(caller.token_id.as_deref(), Some("pat-1"));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_kept_revocation_keeps_the_provider_with_a_503() {
+        let response = ProviderDeleteError::UnreadableKeptRevocation.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("the provider is kept")
+        );
+    }
+}
+
+#[cfg(test)]
+mod consent_confirmation_tests {
+    use super::*;
+    use crate::jwt_bearer::storage::{FileSystemJwtVerificationStrategyStore, JwtVerificationStrategyStorage};
+    use serde_json::{Value, json};
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        state: CredentialProviderState,
+        strategies: Arc<FileSystemJwtVerificationStrategyStore>,
+    }
+
+    async fn fixture() -> Fixture {
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        let directory = tempfile::tempdir().unwrap();
+        let strategies = Arc::new(
+            FileSystemJwtVerificationStrategyStore::new(
+                directory
+                    .path()
+                    .join("strategies"),
+            )
+            .await
+            .unwrap(),
+        );
+        let state = CredentialProviderState {
+            store: Arc::new(
+                super::super::storage::FileSystemCredentialProviderStore::new(
+                    directory
+                        .path()
+                        .join("providers"),
+                )
+                .await
+                .unwrap(),
+            ),
+            secrets_store: Arc::new(
+                crate::secrets::FilesystemSecretsStore::new(
+                    directory
+                        .path()
+                        .join("secrets")
+                        .to_str()
+                        .unwrap(),
+                )
+                .unwrap(),
+            ),
+            identity_strategies: Some(strategies.clone()),
+            oauth_callback_route: "/oauth/callback".into(),
+            gateway_base_url: "https://gateway.example".into(),
+            issuer_metadata: super::super::external::strict_issuer_metadata(),
+            surfaces: None,
+            vault: None,
+            egress_allowlist: None,
+            resource_origins: Default::default(),
+            issuers: Default::default(),
+            references: Default::default(),
+            rbac: None,
+            gateway_mcp_issuer: None,
+        };
+        for (tenant, secret_id, value) in [
+            (None, "CLIENT_ID", "value"),
+            (None, "CLIENT_SECRET", "value"),
+            (None, "LOGIN_CLIENT_ID", "login-client"),
+            (None, "LOGIN_SECRET", "value"),
+            (Some("tenant-a"), "A_CLIENT_ID", "value"),
+            (Some("tenant-a"), "A_CLIENT_SECRET", "value"),
+            (Some("tenant-a"), "A_LOGIN_CLIENT_ID", "login-client"),
+            (Some("tenant-a"), "A_LOGIN_SECRET", "value"),
+        ] {
+            state
+                .secrets_store
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: tenant.map(Into::into),
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    value: value.into(),
+                    secret_type: "general".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        Fixture {
+            _directory: directory,
+            state,
+            strategies,
+        }
+    }
+
+    impl Fixture {
+        async fn strategy(
+            &self,
+            tenant: Option<&str>,
+            expected_issuer: &str,
+            principal_claim: Option<&str>,
+        ) -> String {
+            let strategy = serde_json::from_value(json!({
+                "id": "", "tenant_id": tenant, "name": "Callers", "expected_issuer": expected_issuer,
+                "jwks_source": {"type": "static", "jwks": []}, "principal_claim": principal_claim,
+                "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+            }))
+            .unwrap();
+            self.strategies
+                .create(strategy)
+                .await
+                .unwrap()
+                .id
+        }
+
+        async fn create(
+            &self,
+            context: Option<Extension<PatTenantContext>>,
+            body: Value,
+        ) -> (StatusCode, Value) {
+            body_of(
+                create_provider(
+                    State(self.state.clone()),
+                    None,
+                    context,
+                    None,
+                    Json(serde_json::from_value(body).unwrap()),
+                )
+                .await
+                .into_response(),
+            )
+            .await
+        }
+
+        async fn update(
+            &self,
+            id: &str,
+            body: Value,
+        ) -> (StatusCode, Value) {
+            body_of(
+                update_provider(
+                    State(self.state.clone()),
+                    Path(id.into()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Json(serde_json::from_value(body).unwrap()),
+                )
+                .await
+                .into_response(),
+            )
+            .await
+        }
+
+        async fn stored(
+            &self,
+            id: &str,
+        ) -> CredentialProvider {
+            self.state
+                .store
+                .get(id)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    }
+
+    async fn body_of(response: Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    fn tenant_a() -> Option<Extension<PatTenantContext>> {
+        Some(Extension(PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        }))
+    }
+
+    fn confirmation(strategy_id: &str) -> Value {
+        json!({
+            "client_id_secret_ref": "LOGIN_CLIENT_ID",
+            "client_secret_secret_ref": "LOGIN_SECRET",
+            "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+            "token_endpoint": "https://oauth2.googleapis.com/token",
+            "jwt_verification_strategy_id": strategy_id
+        })
+    }
+
+    /// [`confirmation`] with tenant-a's login client ID and secret.
+    fn tenant_a_confirmation(strategy_id: &str) -> Value {
+        let confirmation = with(confirmation(strategy_id), &["client_id_secret_ref"], json!("A_LOGIN_CLIENT_ID"));
+        with(confirmation, &["client_secret_secret_ref"], json!("A_LOGIN_SECRET"))
+    }
+
+    fn github(confirmation: Value) -> Value {
+        json!({
+            "name": "GitHub", "provider_id": "github", "provider_type": "oauth2_authorization_code",
+            "authorization_endpoint": "https://github.com/login/oauth/authorize",
+            "token_endpoint": "https://github.com/login/oauth/access_token",
+            "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+            "consent_confirmation": confirmation
+        })
+    }
+
+    fn with(
+        mut body: Value,
+        path: &[&str],
+        value: Value,
+    ) -> Value {
+        let (last, parents) = path.split_last().unwrap();
+        let mut target = &mut body;
+        for parent in parents {
+            target = &mut target[*parent];
+        }
+        target[*last] = value;
+        body
+    }
+
+    const GOOGLE: &str = "https://accounts.google.com";
+    const ENTRA: &str = "https://login.microsoftonline.com/0000-tenant/v2.0";
+
+    /// Callers holding this gateway's own STS tokens have no identity
+    /// provider to sign in at, so a strategy for the gateway's own MCP issuer
+    /// cannot confirm them, however its issuer is spelled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_strategy_for_the_gateways_own_issuer_cannot_confirm_callers() {
+        let mut fixture = fixture().await;
+        fixture
+            .state
+            .gateway_mcp_issuer = Some("https://gateway.example/oauth2/mcp".to_string());
+        for (index, issuer) in [
+            "https://gateway.example/oauth2/mcp",
+            "https://gateway.example/oauth2/mcp/",
+            "https://GATEWAY.example/oauth2/mcp",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let own = fixture
+                .strategy(None, issuer, None)
+                .await;
+            let (status, body) = fixture
+                .create(None, with(github(confirmation(&own)), &["provider_id"], json!(format!("own-{index}"))))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{issuer}: {body}");
+            assert_eq!(
+                body["error"],
+                "consent_confirmation cannot confirm callers of this gateway's own MCP issuer, who sign in nowhere else"
+            );
+        }
+        let google = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let (status, body) = fixture
+            .create(None, github(confirmation(&google)))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        let mut without_sts = fixture;
+        without_sts
+            .state
+            .gateway_mcp_issuer = None;
+        let own = without_sts
+            .strategy(None, "https://gateway.example/oauth2/mcp", None)
+            .await;
+        let (status, body) = without_sts
+            .create(None, with(github(confirmation(&own)), &["provider_id"], json!("no-sts")))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "no STS issuer is configured: {body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_legacy_consent_provider_stores_its_consent_confirmation() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let (status, body) = fixture
+            .create(None, github(confirmation(&strategy)))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["consent_confirmation"], confirmation(&strategy));
+        let stored = fixture
+            .stored(body["id"].as_str().unwrap())
+            .await;
+        let stored = stored
+            .consent_confirmation
+            .unwrap();
+        assert_eq!(stored.client_id_secret_ref, "LOGIN_CLIENT_ID");
+        assert_eq!(stored.jwt_verification_strategy_id, strategy);
+        assert_eq!(stored.id_token_principal_claim, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consent_confirmation_is_refused_on_any_provider_but_legacy_authorization_code() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let client_credentials = json!({
+            "name": "M2M", "provider_id": "m2m", "provider_type": "oauth2_client_credentials",
+            "token_endpoint": "https://github.com/login/oauth/access_token",
+            "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+            "consent_confirmation": confirmation(&strategy)
+        });
+        let (status, body) = fixture
+            .create(None, client_credentials)
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["error"],
+            "consent_confirmation is allowed only on an oauth2_authorization_code provider without issuer"
+        );
+        let mut external = super::super::external::tests::external_provider();
+        external.consent_confirmation = Some(serde_json::from_value(confirmation(&strategy)).unwrap());
+        let refusal =
+            validate_consent_confirmation(&fixture.state, &external, &TokenEgress::from_environment(), &None, &None)
+                .await;
+        assert!(
+            matches!(&refusal, Err(ProviderValidationError::InvalidConsentConfirmation(message)) if message.contains("without issuer")),
+            "{refusal:?}"
+        );
+
+        let (status, body) = fixture
+            .create(None, github(confirmation(&strategy)))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, body) = fixture
+            .update(&id, json!({"provider_type": "oauth2_client_credentials"}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "a retype keeping the setting is refused: {body}");
+        assert_eq!(
+            fixture
+                .stored(&id)
+                .await
+                .provider_type,
+            CredentialProviderType::OAuth2AuthorizationCode
+        );
+        let (status, body) = fixture
+            .update(&id, json!({"provider_type": "oauth2_client_credentials", "consent_confirmation": null}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            fixture
+                .stored(&id)
+                .await
+                .consent_confirmation
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_keeps_the_setting_when_absent_clears_it_on_null_and_checks_a_replacement() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let (_, body) = fixture
+            .create(None, github(confirmation(&strategy)))
+            .await;
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, body) = fixture
+            .update(&id, json!({"name": "GitHub renamed"}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["consent_confirmation"], confirmation(&strategy));
+
+        let (status, body) = fixture
+            .update(&id, json!({"consent_confirmation": with(confirmation(&strategy), &["jwt_verification_strategy_id"], json!("gone"))}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            fixture
+                .stored(&id)
+                .await
+                .consent_confirmation
+                .unwrap()
+                .jwt_verification_strategy_id,
+            strategy
+        );
+
+        let (status, body) = fixture
+            .update(&id, json!({"consent_confirmation": null}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body.get("consent_confirmation"), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_strategy_must_exist_and_be_one_the_providers_tenant_can_reference() {
+        let fixture = fixture().await;
+        let own = fixture
+            .strategy(Some("tenant-a"), GOOGLE, None)
+            .await;
+        let wide = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let other = fixture
+            .strategy(Some("tenant-b"), GOOGLE, None)
+            .await;
+        let tenant_github = |strategy: &str, provider_id: &str| {
+            let mut body = github(tenant_a_confirmation(strategy));
+            body["provider_id"] = json!(provider_id);
+            body["client_id_secret_ref"] = json!("A_CLIENT_ID");
+            body["client_secret_secret_ref"] = json!("A_CLIENT_SECRET");
+            body
+        };
+        for (strategy, provider_id) in [(&other, "other"), (&"missing".to_string(), "missing")] {
+            let (status, body) = fixture
+                .create(tenant_a(), tenant_github(strategy, provider_id))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{provider_id}: {body}");
+            assert_eq!(body["error"], "Consent confirmation strategy is invalid or not accessible");
+        }
+        for (strategy, provider_id) in [(&own, "own"), (&wide, "wide")] {
+            let (status, body) = fixture
+                .create(tenant_a(), tenant_github(strategy, provider_id))
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "{provider_id}: {body}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn both_endpoints_must_pass_the_oauth_endpoint_rules() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        for (field, endpoint) in [
+            ("token_endpoint", "https://127.0.0.1/token"),
+            ("token_endpoint", "https://169.254.169.254/token"),
+            ("token_endpoint", "http://oauth2.googleapis.com/token"),
+            ("authorization_endpoint", "https://127.0.0.1/authorize"),
+            ("authorization_endpoint", "http://accounts.google.com/o/oauth2/v2/auth"),
+            ("authorization_endpoint", "https://accounts.google.com/o/oauth2/v2/auth#fragment"),
+            ("authorization_endpoint", "https://accounts.google.com/o/oauth2/v2/auth?prompt=login"),
+        ] {
+            let (status, body) = fixture
+                .create(None, github(with(confirmation(&strategy), &[field], json!(endpoint))))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{endpoint}: {body}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&format!("consent_confirmation.{field}")),
+                "{endpoint}: {body}"
+            );
+        }
+        let (status, body) = fixture
+            .create(None, github(confirmation(&strategy)))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_login_client_and_strategy_must_be_named() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        for (field, blank) in
+            [("client_id_secret_ref", " "), ("client_secret_secret_ref", ""), ("jwt_verification_strategy_id", " ")]
+        {
+            let (status, body) = fixture
+                .create(None, github(with(confirmation(&strategy), &[field], json!(blank))))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {body}");
+            assert_eq!(
+                body["error"],
+                "consent_confirmation needs client_id_secret_ref, client_secret_secret_ref and jwt_verification_strategy_id"
+            );
+        }
+        let (status, body) = fixture
+            .create(None, github(confirmation(&strategy)))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_login_client_id_in_its_secret_takes_no_whitespace() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let client_id_secret = |secret_id: &str, tenant: Option<&str>, value: String| {
+            let fixture = &fixture;
+            let request = crate::secrets::CreateSecretRequest {
+                tenant_id: tenant.map(Into::into),
+                name: secret_id.into(),
+                secret_id: secret_id.into(),
+                description: None,
+                value,
+                secret_type: "general".into(),
+                tags: vec![],
+            };
+            async move {
+                fixture
+                    .state
+                    .secrets_store
+                    .create(request)
+                    .await
+                    .unwrap();
+            }
+        };
+        let invalid = [" login-client".to_string(), "login-client\n".into(), "login client".into(), "a".repeat(2049)];
+        for (index, client_id) in invalid.iter().enumerate() {
+            let secret_id = format!("BAD_LOGIN_CLIENT_ID_{index}");
+            client_id_secret(&secret_id, None, client_id.clone()).await;
+            let (status, body) = fixture
+                .create(None, github(with(confirmation(&strategy), &["client_id_secret_ref"], json!(secret_id))))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{client_id:?}: {body}");
+            assert_eq!(
+                body["error"],
+                "consent_confirmation.client_id_secret_ref must hold a client ID of at most 2048 characters, without \
+                 whitespace"
+            );
+            assert!(
+                !body
+                    .to_string()
+                    .contains("login client"),
+                "{body}"
+            );
+        }
+        client_id_secret("LONGEST_LOGIN_CLIENT_ID", None, "a".repeat(2048)).await;
+        let (status, body) = fixture
+            .create(
+                None,
+                github(with(confirmation(&strategy), &["client_id_secret_ref"], json!("LONGEST_LOGIN_CLIENT_ID"))),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        client_id_secret("B_LOGIN_CLIENT_ID", Some("tenant-b"), "login client".into()).await;
+        let mut body =
+            github(with(tenant_a_confirmation(&strategy), &["client_id_secret_ref"], json!("B_LOGIN_CLIENT_ID")));
+        body["client_id_secret_ref"] = json!("A_CLIENT_ID");
+        body["client_secret_secret_ref"] = json!("A_CLIENT_SECRET");
+        let (status, body) = fixture
+            .create(tenant_a(), body)
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["error"], "Secret reference is not accessible",
+            "another tenant's value is never read, so its shape is not told"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_scope_that_does_not_cover_the_strategy_is_refused() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(Some("tenant-a"), GOOGLE, None)
+            .await;
+        let provider: CredentialProvider = serde_json::from_value(json!({
+            "id": "provider", "tenant_id": "tenant-a", "name": "GitHub", "provider_id": "github",
+            "provider_type": "oauth2_authorization_code",
+            "client_id_secret_ref": "A_CLIENT_ID", "client_secret_secret_ref": "A_CLIENT_SECRET",
+            "consent_confirmation": tenant_a_confirmation(&strategy),
+            "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+        }))
+        .unwrap();
+        let scope = |pattern: String| Some(Extension(PatResourceScope(Arc::new(regex::Regex::new(&pattern).unwrap()))));
+        let covering = scope(format!(r"\ATENANT:tenant-a:jwt-verification-strategies:{}\z", regex::escape(&strategy)));
+        let elsewhere = scope(r"\ATENANT:tenant-a:jwt-verification-strategies:other\z".to_string());
+        let check = |scope| {
+            let fixture = &fixture;
+            let provider = &provider;
+            async move {
+                validate_consent_confirmation(
+                    &fixture.state,
+                    provider,
+                    &TokenEgress::from_environment(),
+                    &tenant_a(),
+                    &scope,
+                )
+                .await
+            }
+        };
+        assert!(check(covering).await.is_ok());
+        let refusal = check(elsewhere).await;
+        assert!(matches!(refusal, Err(ProviderValidationError::InvalidConfirmationStrategy)), "{refusal:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_login_client_id_and_secret_must_exist_in_the_providers_own_tenant() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        for field in ["client_id_secret_ref", "client_secret_secret_ref"] {
+            let (status, body) = fixture
+                .create(None, github(with(confirmation(&strategy), &[field], json!("MISSING"))))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {body}");
+            assert_eq!(body["error"], "Secret reference is not accessible", "{field}");
+        }
+
+        let tenant_github = |login_client_id: &str, login_secret: &str| {
+            let confirmation = with(confirmation(&strategy), &["client_id_secret_ref"], json!(login_client_id));
+            let mut body = github(with(confirmation, &["client_secret_secret_ref"], json!(login_secret)));
+            body["client_id_secret_ref"] = json!("A_CLIENT_ID");
+            body["client_secret_secret_ref"] = json!("A_CLIENT_SECRET");
+            body
+        };
+        for (case, (login_client_id, login_secret)) in
+            [("A_LOGIN_CLIENT_ID", "LOGIN_SECRET"), ("LOGIN_CLIENT_ID", "A_LOGIN_SECRET")]
+                .into_iter()
+                .enumerate()
+        {
+            let (status, body) = fixture
+                .create(tenant_a(), tenant_github(login_client_id, login_secret))
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "an appliance-wide secret for a tenant provider, case {case}: {body}"
+            );
+            assert_eq!(body["error"], "Secret reference is not accessible");
+        }
+        let (status, body) = fixture
+            .create(tenant_a(), tenant_github("A_LOGIN_CLIENT_ID", "A_LOGIN_SECRET"))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let stored = fixture
+            .stored(body["id"].as_str().unwrap())
+            .await;
+        let references = stored.secret_refs();
+        assert!(
+            references.contains(&"A_LOGIN_CLIENT_ID") && references.contains(&"A_LOGIN_SECRET"),
+            "the stored provider refers to both login client secrets"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_entra_issuer_is_refused_when_the_strategy_or_the_id_token_names_callers_by_sub() {
+        let fixture = fixture().await;
+        let mut refused = Vec::new();
+        for issuer in [
+            ENTRA,
+            "https://sts.windows.net/0000-tenant/",
+            "https://login.microsoftonline.us/0000-tenant/v2.0",
+            "https://login.chinacloudapi.cn/0000-tenant/v2.0",
+            "https://login.partner.microsoftonline.cn/0000-tenant/v2.0",
+            "https://contoso.ciamlogin.com/0000-tenant/v2.0",
+        ] {
+            let sub = fixture
+                .strategy(None, issuer, None)
+                .await;
+            let oid = fixture
+                .strategy(None, issuer, Some("oid"))
+                .await;
+            refused.push((issuer, confirmation(&sub)));
+            refused.push((issuer, with(confirmation(&sub), &["id_token_principal_claim"], json!("oid"))));
+            refused.push((issuer, with(confirmation(&oid), &["id_token_principal_claim"], json!("sub"))));
+        }
+        for (index, (issuer, setting)) in refused
+            .into_iter()
+            .enumerate()
+        {
+            let (status, body) = fixture
+                .create(None, with(github(setting), &["provider_id"], json!(format!("refused-{index}"))))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{issuer} {index}: {body}");
+            assert_eq!(
+                body["error"],
+                "consent_confirmation cannot name an Entra caller by sub, which Entra issues per application: use oid"
+            );
+        }
+        let mut accepted = Vec::new();
+        for issuer in [ENTRA, "https://contoso.ciamlogin.com/0000-tenant/v2.0"] {
+            let oid = fixture
+                .strategy(None, issuer, Some("oid"))
+                .await;
+            accepted.push(confirmation(&oid));
+        }
+        for not_entra in [
+            "https://ciamlogin.com/0000-tenant/v2.0",
+            "https://evilciamlogin.com/0000-tenant/v2.0",
+            "https://login.microsoftonline.com.evil.example/0000-tenant/v2.0",
+        ] {
+            let sub = fixture
+                .strategy(None, not_entra, None)
+                .await;
+            accepted.push(confirmation(&sub));
+        }
+        for (index, setting) in accepted
+            .into_iter()
+            .enumerate()
+        {
+            let (status, body) = fixture
+                .create(None, with(github(setting), &["provider_id"], json!(format!("accepted-{index}"))))
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "{index}: {body}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_caller_named_by_email_in_the_strategy_or_the_id_token_is_refused() {
+        let fixture = fixture().await;
+        let email = fixture
+            .strategy(None, GOOGLE, Some("email"))
+            .await;
+        let sub = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        for (index, setting) in [
+            confirmation(&email),
+            with(confirmation(&email), &["id_token_principal_claim"], json!("sub")),
+            with(confirmation(&sub), &["id_token_principal_claim"], json!("email")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (status, body) = fixture
+                .create(None, with(github(setting), &["provider_id"], json!(format!("email-{index}"))))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{index}: {body}");
+            assert_eq!(
+                body["error"],
+                "consent_confirmation cannot name a caller by email, which the sign-in does not ask for"
+            );
+        }
+        let (status, body) = fixture
+            .create(None, github(confirmation(&sub)))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_id_token_principal_claim_follows_the_strategy_principal_claim_rule() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        for claim in ["iss", "aud", "azp", "", "has space"] {
+            let (status, body) = fixture
+                .create(None, github(with(confirmation(&strategy), &["id_token_principal_claim"], json!(claim))))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{claim}: {body}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("consent_confirmation.id_token_principal_claim: principal_claim"),
+                "{claim}: {body}"
+            );
+        }
+        let (status, body) = fixture
+            .create(None, github(with(confirmation(&strategy), &["id_token_principal_claim"], json!("sub"))))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["consent_confirmation"]["id_token_principal_claim"], "sub", "sub is stored, not dropped");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consent_confirmation_needs_a_configured_identity_hash_pepper() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        crate::identity::credential_identity::configure_pepper_for_tests(false);
+        let (status, body) = fixture
+            .create(None, github(confirmation(&strategy)))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "consent_confirmation needs AG_IDENTITY_HASH_PEPPER to be set");
+        let (status, body) = fixture
+            .create(None, github(Value::Null))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "a provider without the setting needs no pepper: {body}");
+
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        let (status, body) = fixture
+            .create(None, with(github(confirmation(&strategy)), &["provider_id"], json!("github-2")))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adding_the_setting_is_refused_while_another_providers_redirect_uri_is_its_confirmation_uri() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let stored = |id: &str, callback_path: &str, callback_url: &str| -> CredentialProvider {
+            serde_json::from_value(json!({
+                "id": id, "name": id, "provider_id": id, "provider_type": "oauth2_authorization_code",
+                "authorization_endpoint": "https://github.com/login/oauth/authorize",
+                "token_endpoint": "https://github.com/login/oauth/access_token",
+                "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+                "callback_path": callback_path, "callback_url": callback_url,
+                "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        for provider in [
+            stored("cb", "/cb/cb", "https://gateway.example/cb/cb"),
+            stored("confirm", "/cb/confirm", "https://gateway.example/cb/cb/confirm"),
+            stored("free", "/cb/free", "https://gateway.example/cb/free"),
+        ] {
+            fixture
+                .state
+                .store
+                .create(provider)
+                .await
+                .unwrap();
+        }
+        let (status, body) = fixture
+            .update("cb", json!({"consent_confirmation": confirmation(&strategy)}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "callback_url is already the redirect URI of another credential provider");
+        assert!(
+            fixture
+                .stored("cb")
+                .await
+                .consent_confirmation
+                .is_none()
+        );
+        let (status, body) = fixture
+            .update("free", json!({"consent_confirmation": confirmation(&strategy)}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stored_provider_without_the_setting_loads_and_saves_unchanged() {
+        let fixture = fixture().await;
+        let stored = json!({
+            "id": "legacy", "name": "GitHub", "provider_id": "github", "provider_type": "oauth2_authorization_code",
+            "authorization_endpoint": "https://github.com/login/oauth/authorize",
+            "token_endpoint": "https://github.com/login/oauth/access_token",
+            "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+            "default_scopes": ["repo"], "callback_path": "/oauth/callback/legacy", "token_refresh_enabled": true,
+            "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+        });
+        let provider: CredentialProvider = serde_json::from_value(stored.clone()).unwrap();
+        assert!(
+            provider
+                .consent_confirmation
+                .is_none()
+        );
+        assert_eq!(serde_json::to_value(&provider).unwrap(), stored);
+        fixture
+            .state
+            .store
+            .create(provider)
+            .await
+            .unwrap();
+        crate::identity::credential_identity::configure_pepper_for_tests(false);
+        let (status, body) = fixture
+            .update("legacy", json!({"description": "kept"}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let mut saved = serde_json::to_value(fixture.stored("legacy").await).unwrap();
+        saved
+            .as_object_mut()
+            .unwrap()
+            .remove("updated_at");
+        let mut expected = with(stored, &["description"], json!("kept"));
+        expected
+            .as_object_mut()
+            .unwrap()
+            .remove("updated_at");
+        assert_eq!(saved, expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn creating_a_provider_with_an_issuer_and_the_setting_is_refused() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let mut body = serde_json::to_value(super::super::external::tests::external_provider()).unwrap();
+        for field in ["id", "tenant_id", "created_at", "updated_at"] {
+            body.as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
+        body["consent_confirmation"] = tenant_a_confirmation(&strategy);
+        let (status, body) = fixture
+            .create(tenant_a(), body)
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["error"],
+            "consent_confirmation is allowed only on an oauth2_authorization_code provider without issuer"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_replacing_the_setting_is_checked_against_every_rule() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let entra_sub = fixture
+            .strategy(None, ENTRA, None)
+            .await;
+        let entra_oid = fixture
+            .strategy(None, ENTRA, Some("oid"))
+            .await;
+        let (status, body) = fixture
+            .create(None, github(confirmation(&strategy)))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let original = fixture
+            .stored(&id)
+            .await
+            .consent_confirmation;
+        let refused = [
+            (
+                with(confirmation(&strategy), &["token_endpoint"], json!("https://127.0.0.1/token")),
+                "consent_confirmation.token_endpoint",
+            ),
+            (
+                with(
+                    confirmation(&strategy),
+                    &["authorization_endpoint"],
+                    json!("https://accounts.google.com/auth?x=1"),
+                ),
+                "consent_confirmation.authorization_endpoint",
+            ),
+            (
+                with(confirmation(&strategy), &["client_secret_secret_ref"], json!("MISSING")),
+                "Secret reference is not accessible",
+            ),
+            (confirmation(&entra_sub), "consent_confirmation cannot name an Entra caller by sub"),
+            (
+                with(confirmation(&strategy), &["id_token_principal_claim"], json!("iss")),
+                "consent_confirmation.id_token_principal_claim",
+            ),
+            (
+                with(confirmation(&strategy), &["client_id_secret_ref"], json!("")),
+                "consent_confirmation needs client_id_secret_ref",
+            ),
+            (
+                with(confirmation(&strategy), &["client_id_secret_ref"], json!("MISSING")),
+                "Secret reference is not accessible",
+            ),
+        ];
+        for (setting, error) in refused {
+            let (status, body) = fixture
+                .update(&id, json!({"consent_confirmation": setting}))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}: {body}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(error),
+                "{error}: {body}"
+            );
+            assert_eq!(
+                fixture
+                    .stored(&id)
+                    .await
+                    .consent_confirmation,
+                original
+            );
+        }
+
+        crate::identity::credential_identity::configure_pepper_for_tests(false);
+        let (status, body) = fixture
+            .update(&id, json!({"consent_confirmation": confirmation(&entra_oid)}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "consent_confirmation needs AG_IDENTITY_HASH_PEPPER to be set");
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+
+        let (status, body) = fixture
+            .update(&id, json!({"consent_confirmation": confirmation(&entra_oid)}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            fixture
+                .stored(&id)
+                .await
+                .consent_confirmation
+                .unwrap()
+                .jwt_verification_strategy_id,
+            entra_oid
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_of_a_tenant_provider_refuses_a_login_secret_outside_its_tenant() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let mut body = github(tenant_a_confirmation(&strategy));
+        body["client_id_secret_ref"] = json!("A_CLIENT_ID");
+        body["client_secret_secret_ref"] = json!("A_CLIENT_SECRET");
+        let (status, body) = fixture
+            .create(tenant_a(), body)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, body) = fixture
+            .update(&id, json!({"consent_confirmation": confirmation(&strategy)}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "Secret reference is not accessible");
+        assert_eq!(
+            fixture
+                .stored(&id)
+                .await
+                .consent_confirmation
+                .unwrap()
+                .client_secret_secret_ref,
+            "A_LOGIN_SECRET"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moving_a_redirect_uri_onto_a_confirming_providers_confirmation_uri_is_refused() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let stored = |id: &str, callback_path: &str, callback_url: &str| -> CredentialProvider {
+            serde_json::from_value(json!({
+                "id": id, "name": id, "provider_id": id, "provider_type": "oauth2_authorization_code",
+                "authorization_endpoint": "https://github.com/login/oauth/authorize",
+                "token_endpoint": "https://github.com/login/oauth/access_token",
+                "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+                "callback_path": callback_path, "callback_url": callback_url,
+                "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let mut confirming = stored("cb", "/cb/cb", "https://203.0.113.20/cb/cb");
+        confirming.consent_confirmation = Some(serde_json::from_value(confirmation(&strategy)).unwrap());
+        for provider in [confirming, stored("mover", "/cb/confirm", "https://203.0.113.21/cb/confirm")] {
+            fixture
+                .state
+                .store
+                .create(provider)
+                .await
+                .unwrap();
+        }
+        let (status, body) = fixture
+            .update("mover", json!({"callback_url": "https://203.0.113.20/cb/cb/confirm"}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "callback_url is already the redirect URI of another credential provider");
+        assert_eq!(
+            fixture
+                .stored("mover")
+                .await
+                .callback_url
+                .as_deref(),
+            Some("https://203.0.113.21/cb/confirm")
+        );
+        let (status, body) = fixture
+            .update("mover", json!({"callback_url": "https://203.0.113.22/cb/confirm"}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 }

@@ -12,8 +12,8 @@ use crate::bdd_support::config::mcp_proxy::WEATHER_OPENAPI_SPEC;
 use crate::bdd_support::config::reserve_free_port;
 use crate::bdd_support::config::single_surface_fixture::{
     A2aProxyTargetFixture, DidWebVhIdentityFixture, McpProxyTargetFixture, McpToolPolicyFixture,
-    McpWildcardToolPolicyFixture, ProtectedResourceFixture, SurfaceTargetAuthProviderConfig, TargetAuthProviderGrant,
-    VariantInboundPolicyFixture, VariantTargetPolicyFixture,
+    McpWildcardToolPolicyFixture, ProtectedResourceFixture, SurfaceTargetAuthProviderConfig,
+    TargetAuthClientAuthentication, TargetAuthProviderGrant, VariantInboundPolicyFixture, VariantTargetPolicyFixture,
 };
 use crate::bdd_support::config::source_auth::caller_authentication_method_json;
 use crate::bdd_support::gateway_process::SURFACE_TEST_AUTH_TOKEN as TEST_AUTH_TOKEN;
@@ -25,10 +25,11 @@ use crate::bdd_support::policies::{
     build_transit_point_request_path_policy,
 };
 use crate::world::{
-    ApiKeyProviderSourceAuthConfig, ApiKeySourceAuthConfig, CredentialProviderKind, DelegatedCredentialInjection,
-    JwtSourceAuthConfig, RequestPolicyFixture, SurfaceCredentialDelegationConfig, SurfaceSourceAuthConfig,
-    SurfaceTargetAuthConfig, SurfaceTransitPointConfig, SurfaceWorld, TransitPointHeaderMetadataMappingRow,
-    TransitPointManagedIdentityConfig, mcp_identity_schema_with_field, select_identity_schema_field,
+    ApiKeyProviderSourceAuthConfig, ApiKeySourceAuthConfig, CallerKeyFixture, CredentialProviderKind,
+    DelegatedCredentialInjection, JwtSourceAuthConfig, RequestPolicyFixture, SurfaceCredentialDelegationConfig,
+    SurfaceSourceAuthConfig, SurfaceTargetAuthConfig, SurfaceTransitPointConfig, SurfaceWorld,
+    TransitPointHeaderMetadataMappingRow, TransitPointManagedIdentityConfig, mcp_identity_schema_with_field,
+    select_identity_schema_field,
 };
 use tracing::log::Level;
 
@@ -36,7 +37,8 @@ use crate::bdd_support::config::agent_surface::{
     AccessPointFixture, AgentSurfaceFixture, TargetFixture, TransitPointFixture,
 };
 
-const AGENT_IDENTITY_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity/v1";
+pub(crate) const AGENT_IDENTITY_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity/v1";
+const AGENT_IDENTITY_CREDENTIAL_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity-credential/v1";
 
 fn set_primary_target_response(
     world: &mut SurfaceWorld,
@@ -591,7 +593,7 @@ async fn surface_has_request_policy_allowing_a2a_metadata_field(
 }
 
 /// Adds a trust registry whose connection fails, so it stays stored but unconnected.
-async fn create_unconnected_trust_registry(world: &mut SurfaceWorld) -> String {
+pub(crate) async fn create_unconnected_trust_registry(world: &mut SurfaceWorld) -> String {
     crate::steps::when::ensure_admin_session(world).await;
     let registry_name = format!("bdd-unreachable-registry-{}", uuid::Uuid::new_v4());
     let admin_client = world
@@ -629,6 +631,27 @@ async fn surface_has_caller_trust_check_using_a2a_metadata_field(
     surface_name: String,
     field: String,
 ) {
+    attach_caller_trust_check_on_a2a_metadata_field(world, &surface_name, &field, "entity_id").await;
+}
+
+#[given(expr = "surface {string} has caller Trust Check whose authority is A2A metadata field {string}")]
+async fn surface_has_caller_trust_check_with_authority_from_a2a_metadata_field(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+    field: String,
+) {
+    attach_caller_trust_check_on_a2a_metadata_field(world, &surface_name, &field, "authority_id").await;
+}
+
+/// Gives surface `surface_name` one caller Trust Check whose `query_field` is a template on
+/// mapped A2A metadata field `field`, and a policy that denies only when a caller Trust Check
+/// fails with TEMPLATE_RESOLUTION_FAILED.
+async fn attach_caller_trust_check_on_a2a_metadata_field(
+    world: &mut SurfaceWorld,
+    surface_name: &str,
+    field: &str,
+    query_field: &str,
+) {
     let trust_registry_id = create_unconnected_trust_registry(world).await;
     let policy_id = format!("bdd-header-metadata-trust-check-policy-{}", uuid::Uuid::new_v4());
     let rego = r#"package surface.policy
@@ -657,26 +680,28 @@ allow := false if {
         response.status, response.body
     );
 
-    let field_literal = serde_json::to_string(&field).expect("field should serialize");
-    let entity_template = format!(
+    let field_literal = serde_json::to_string(field).expect("field should serialize");
+    let template = format!(
         "{{{{ input.a2a.message.metadata[\"https://fabric.affinidi.io/extensions/header-metadata/v1\"][{field_literal}] }}}}"
     );
+    let mut query = serde_json::json!({
+        "authority_id": "did:example:authority",
+        "entity_id": "did:example:entity"
+    });
+    query[query_field] = serde_json::json!(template);
     let mut surface = current_surface_body(world, "attaching header metadata Trust Check");
     surface["access_point"]["trust_check_list"] = serde_json::json!([
         {
             "id": "caller-header-metadata-template",
             "trust_registry_id": trust_registry_id,
             "query_type": "recognition",
-            "query": {
-                "authority_id": "did:example:authority",
-                "entity_id": entity_template
-            }
+            "query": query
         }
     ]);
     surface["target"]["policy"] = serde_json::json!({
         "policy_definition_id": policy_id,
     });
-    update_named_surface(world, &surface_name, surface, "attaching header metadata Trust Check").await;
+    update_named_surface(world, surface_name, surface, "attaching header metadata Trust Check").await;
 }
 
 #[given(expr = "the caller has DID {string}")]
@@ -710,6 +735,79 @@ fn surface_has_caller_trust_check_with_entity_template(
         .surface_config
         .caller_trust_check_list
         .push(element);
+}
+
+#[given(expr = "the caller-leg Trust Check lists authorities {string}")]
+fn caller_trust_check_lists_authorities(
+    world: &mut SurfaceWorld,
+    authorities: String,
+) {
+    let element = world
+        .surface_config
+        .caller_trust_check_list
+        .last_mut()
+        .expect("the surface has a caller-leg Trust Check");
+    let query = element["query"]
+        .as_object_mut()
+        .expect("the Trust Check has a query");
+    query.remove("authority_id");
+    query.insert("authority_ids".to_string(), serde_json::json!(authority_list(&authorities)));
+}
+
+pub(crate) fn authority_list(authorities: &str) -> Vec<String> {
+    authorities
+        .split(',')
+        .map(|did| did.trim().to_string())
+        .collect()
+}
+
+const DELETED_AUTHORITY_DID: &str = "did:web:deleted-authority.example";
+
+#[given("the caller-leg Trust Check takes its authority from an Authority that no longer exists")]
+fn caller_trust_check_uses_deleted_authority(world: &mut SurfaceWorld) {
+    let element = world
+        .surface_config
+        .caller_trust_check_list
+        .last_mut()
+        .expect("the surface has a caller-leg Trust Check");
+    element["query"]["authority_id"] = serde_json::json!(DELETED_AUTHORITY_DID);
+    element["authority_source"] = serde_json::json!("authority");
+}
+
+#[given(expr = "the caller-leg Trust Check takes listed authority {string} from an Authority that no longer exists")]
+fn caller_trust_check_lists_deleted_authority(
+    world: &mut SurfaceWorld,
+    did: String,
+) {
+    let element = world
+        .surface_config
+        .caller_trust_check_list
+        .last_mut()
+        .expect("the surface has a caller-leg Trust Check");
+    assert!(
+        element["query"]["authority_ids"]
+            .as_array()
+            .is_some_and(|listed| listed.contains(&serde_json::json!(did))),
+        "the caller-leg Trust Check does not list {did}: {element}"
+    );
+    element["authority_sources"][did.as_str()] = serde_json::json!("authority");
+}
+
+#[given(
+    expr = "the Trust Recorder for trust registry {string} takes its authority from an Authority that no longer exists"
+)]
+fn trust_recorder_uses_deleted_authority(
+    world: &mut SurfaceWorld,
+    trust_registry_id: String,
+) {
+    let entry = world
+        .surface_config
+        .trust_recorder_entries
+        .iter_mut()
+        .find(|entry| entry["trust_registry_id"] == trust_registry_id)
+        .unwrap_or_else(|| panic!("the surface has no Trust Recorder for trust registry {trust_registry_id:?}"));
+    entry["authority_did"] = serde_json::json!(DELETED_AUTHORITY_DID);
+    entry["authority_source"] = serde_json::json!("authority");
 }
 
 const RECORDER_AUTHORITY_DID: &str = "did:web:example.com:authority";
@@ -957,6 +1055,22 @@ fn transit_point_requires_a_transit_token(
     transit_point_config_mut(world, &transit_point).require_transit_token = true;
 }
 
+/// The audience a Transit Point's JWT callers' tokens are issued for.
+pub(crate) const TRANSIT_AUDIENCE: &str = "bdd-transit-audience";
+
+#[given(expr = "Transit Point {string} authenticates its callers with JWT Bearer")]
+fn transit_point_authenticates_its_callers_with_jwt_bearer(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+) {
+    transit_point_config_mut(world, &transit_point).source_auth = Some(serde_json::json!({
+        "type": "jwt_bearer",
+        "jwt_verification_strategy_id": crate::steps::consent_confirmation::CALLERS_STRATEGY_ID,
+        "audiences": [TRANSIT_AUDIENCE],
+        "forward_header": false,
+    }));
+}
+
 #[given(expr = "Transit Point {string} admits {int} request(s) per minute from each caller")]
 fn transit_point_admits_requests_per_minute_from_each_caller(
     world: &mut SurfaceWorld,
@@ -1123,6 +1237,16 @@ fn transit_point_injects_api_key_delegated_credentials(
     surface_requires_api_key_delegated_credentials(world, provider);
 }
 
+#[given(expr = "Transit Point {string} injects delegated credentials from OAuth provider {string}")]
+fn transit_point_injects_oauth_delegated_credentials(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    provider: String,
+) {
+    transit_point_config_mut(world, &transit_point).delegated_credentials = true;
+    surface_requires_oauth_delegated_credentials(world, provider);
+}
+
 #[given(
     expr = "Transit Point {string} injects delegated credentials from credential provider {string}, which the gateway does not have"
 )]
@@ -1136,6 +1260,8 @@ fn transit_point_injects_delegated_credentials_from_an_unknown_provider(
         .surface_config
         .credential_delegation = Some(SurfaceCredentialDelegationConfig {
         provider_id: provider,
+        record_id: None,
+        tenant_id: None,
         provider_kind: CredentialProviderKind::Unknown,
         required_tool: None,
         inject_as: DelegatedCredentialInjection::BearerHeader,
@@ -1275,10 +1401,11 @@ async fn managed_agent_holds_a_transit_token_naming_a_caller(
     ));
 }
 
-#[given(expr = "surface {string} has A2A Transit Point {string} to external agent {string}")]
-fn surface_has_a2a_transit_point_to_external_agent(
+#[given(regex = r#"^surface \"([^\"]+)\" has (A2A|HTTP) Transit Point \"([^\"]+)\" to external agent \"([^\"]+)\"$"#)]
+fn surface_has_transit_point_of_protocol_to_external_agent(
     world: &mut SurfaceWorld,
     surface_name: String,
+    protocol: String,
     transit_point: String,
     external_agent: String,
 ) {
@@ -1292,7 +1419,7 @@ fn surface_has_a2a_transit_point_to_external_agent(
     add_transit_point(
         world,
         &transit_point,
-        "a2a",
+        &protocol.to_ascii_lowercase(),
         &external_agent,
         TargetActorKind::ExternalAgent,
         Some(surface_name),
@@ -1336,6 +1463,35 @@ fn build_external_agent_card(
         "name": "external-agent",
         "capabilities": { "extensions": extensions }
     })
+}
+
+pub(crate) const AGENT_OWN_CARD_URL: &str = "http://agent.internal.example/a2a";
+
+#[given(
+    regex = r#"^(?:managed|external) agent \"([^\"]+)\" serves a gzip-compressed agent card (when asked|even when not asked)$"#
+)]
+fn agent_serves_a_gzip_compressed_agent_card(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    when: String,
+) {
+    let mut response = MockResponse::json(serde_json::json!({
+        "protocolVersion": "0.3.0",
+        "name": "gzip-agent",
+        "description": "An agent that compresses its replies",
+        "url": AGENT_OWN_CARD_URL,
+        "version": "1.0.0",
+        "capabilities": {},
+        "defaultInputModes": ["text/plain"],
+        "defaultOutputModes": ["text/plain"],
+        "skills": []
+    }));
+    response.stream = if when == "when asked" {
+        MockStream::GzipWhenAsked
+    } else {
+        MockStream::Gzip
+    };
+    set_target_response_for_actor(world, &agent_name, response);
 }
 
 #[given(expr = "external agent {string} publishes an agent card without an agent-identity-credential")]
@@ -1384,6 +1540,23 @@ fn transit_point_has_target_trust_check(
     transit_point_config_mut(world, &transit_point)
         .trust_check_list
         .push(element);
+}
+
+#[given(expr = "the target-leg Trust Check of transit point {string} lists authorities {string}")]
+fn transit_point_trust_check_lists_authorities(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    authorities: String,
+) {
+    let element = transit_point_config_mut(world, &transit_point)
+        .trust_check_list
+        .last_mut()
+        .expect("the transit point has a target-leg Trust Check");
+    let query = element["query"]
+        .as_object_mut()
+        .expect("the Trust Check has a query");
+    query.remove("authority_id");
+    query.insert("authority_ids".to_string(), serde_json::json!(authority_list(&authorities)));
 }
 
 #[given(expr = "transit point {string} has a policy that denies unless every target Trust Check succeeded")]
@@ -2281,6 +2454,83 @@ fn rest_api_answers_weather_report_with_temperature(
     );
 }
 
+#[given(expr = "REST API {string} answers a PDF document")]
+fn rest_api_answers_pdf_document(
+    world: &mut SurfaceWorld,
+    rest_api_name: String,
+) {
+    const PDF: &[u8] = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n";
+    world
+        .actors
+        .expect_target_kind(&rest_api_name, TargetActorKind::RestApi);
+    set_target_response_for_actor(
+        world,
+        &rest_api_name,
+        MockResponse {
+            status: 200,
+            headers: HashMap::from([("content-type".to_string(), "application/pdf".to_string())]),
+            body: serde_json::Value::String(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, PDF)),
+            stream: MockStream::Bytes,
+        },
+    );
+}
+
+#[given(expr = "REST API {string} answers a file of {int} bytes")]
+fn rest_api_answers_file_of_size(
+    world: &mut SurfaceWorld,
+    rest_api_name: String,
+    size: usize,
+) {
+    world
+        .actors
+        .expect_target_kind(&rest_api_name, TargetActorKind::RestApi);
+    set_target_response_for_actor(
+        world,
+        &rest_api_name,
+        MockResponse {
+            status: 200,
+            headers: HashMap::from([("content-type".to_string(), "application/octet-stream".to_string())]),
+            body: serde_json::Value::String(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                vec![0xffu8; size],
+            )),
+            stream: MockStream::Bytes,
+        },
+    );
+}
+
+#[given(expr = "the surface limits MCP responses to {int} bytes")]
+fn surface_limits_mcp_responses(
+    world: &mut SurfaceWorld,
+    max_response_bytes: usize,
+) {
+    world
+        .surface_config
+        .mcp_http
+        .get_or_insert_with(|| serde_json::json!({}))["max_response_bytes"] = serde_json::json!(max_response_bytes);
+}
+
+#[given(expr = "REST API {string} answers its weather as {string}")]
+fn rest_api_answers_weather_as_content_type(
+    world: &mut SurfaceWorld,
+    rest_api_name: String,
+    content_type: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&rest_api_name, TargetActorKind::RestApi);
+    set_target_response_for_actor(
+        world,
+        &rest_api_name,
+        MockResponse {
+            status: 200,
+            headers: HashMap::from([("content-type".to_string(), content_type)]),
+            body: serde_json::json!({"city": "Paris", "temperature": 21, "conditions": "Sunny"}),
+            stream: MockStream::None,
+        },
+    );
+}
+
 #[given(expr = "REST API {string} is failing with status {int}")]
 fn rest_api_is_failing_with_status(
     world: &mut SurfaceWorld,
@@ -2333,6 +2583,7 @@ fn source_auth_fixture(auth_type: &str) -> SurfaceSourceAuthConfig {
             jwks_url: String::new(),
             issuer: String::new(),
             audiences: Vec::new(),
+            audience_claim: None,
             forward_header: false,
         }),
         "API Key" => SurfaceSourceAuthConfig::ApiKey(ApiKeySourceAuthConfig {
@@ -2359,6 +2610,64 @@ fn surface_requires_source_auth(
     world
         .surface_config
         .source_auth = Some(source_auth_fixture(&auth_type));
+}
+
+#[given("the surface is stored as a legacy surface")]
+fn surface_is_stored_as_a_legacy_surface(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .legacy_access_point = true;
+}
+
+#[given("the surface is stored with a public Access Point")]
+fn surface_is_stored_with_a_public_access_point(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .access_point_public = Some(true);
+}
+
+/// The value of the secret a caller key fixture stores: 32 bytes, the fewest a caller key
+/// secret may hold.
+pub(crate) const CALLER_KEY_SECRET_VALUE: &str = "bdd-caller-key-secret-0123456789";
+
+fn derive_caller_keys(
+    world: &mut SurfaceWorld,
+    secret_id: String,
+    secret_value: Option<&str>,
+    header: Option<String>,
+) {
+    world
+        .surface_config
+        .caller_key = Some(CallerKeyFixture {
+        secret_id,
+        secret_value: secret_value.map(str::to_string),
+        header,
+    });
+}
+
+#[given(expr = "the surface derives caller keys from secret {string}")]
+fn surface_derives_caller_keys(
+    world: &mut SurfaceWorld,
+    secret_id: String,
+) {
+    derive_caller_keys(world, secret_id, Some(CALLER_KEY_SECRET_VALUE), None);
+}
+
+#[given(expr = "the surface derives caller keys in header {string} from secret {string}")]
+fn surface_derives_caller_keys_in_header(
+    world: &mut SurfaceWorld,
+    header: String,
+    secret_id: String,
+) {
+    derive_caller_keys(world, secret_id, Some(CALLER_KEY_SECRET_VALUE), Some(header));
+}
+
+#[given(expr = "the surface derives caller keys from secret {string}, which is not stored")]
+fn surface_derives_caller_keys_from_a_missing_secret(
+    world: &mut SurfaceWorld,
+    secret_id: String,
+) {
+    derive_caller_keys(world, secret_id, None, None);
 }
 
 #[given(expr = "the surface accepts {string} and {string} source authentication")]
@@ -2596,6 +2905,14 @@ fn mcp_surface_has_deny_all_request_policy(world: &mut SurfaceWorld) {
         Some(RequestPolicyFixture::new("bdd-mcp-deny-all", "BDD deny-all surface policy for MCP proxy", rego));
 }
 
+#[given("the surface has a request policy that denies all requests")]
+fn surface_has_deny_all_request_policy(world: &mut SurfaceWorld) {
+    let rego = "package surface.policy\n\ndefault allow := false\n".to_string();
+    world
+        .surface_config
+        .request_policy = Some(RequestPolicyFixture::new("bdd-deny-all", "BDD deny-all surface policy", rego));
+}
+
 #[given(expr = "the MCP surface has a request policy that allows all requests")]
 fn mcp_surface_has_allow_all_request_policy(world: &mut SurfaceWorld) {
     let rego = "package surface.policy\n\ndefault allow := true\n".to_string();
@@ -2691,6 +3008,15 @@ fn surface_authenticates_target_with_client_credentials(world: &mut SurfaceWorld
         .target_auth_provider = Some(SurfaceTargetAuthProviderConfig::new(TargetAuthProviderGrant::ClientCredentials));
 }
 
+#[given("the appliance stores an authorization code provider that no surface uses")]
+fn appliance_stores_unused_authorization_code_provider(world: &mut SurfaceWorld) {
+    let mut provider = SurfaceTargetAuthProviderConfig::new(TargetAuthProviderGrant::AuthorizationCode);
+    provider.authenticates_surface_target = false;
+    world
+        .surface_config
+        .target_auth_provider = Some(provider);
+}
+
 /// Serves a client credentials provider that the surface's own Target does not use, for a
 /// Transit Point or a delegated credential binding to use instead.
 fn serve_client_credentials_provider_off_the_surface_target(world: &mut SurfaceWorld) {
@@ -2719,6 +3045,8 @@ fn surface_requires_client_credentials_delegated_credentials(world: &mut Surface
         .surface_config
         .credential_delegation = Some(SurfaceCredentialDelegationConfig {
         provider_id: crate::bdd_support::config::target_auth::TARGET_AUTH_PROVIDER_ID.to_string(),
+        record_id: None,
+        tenant_id: None,
         provider_kind: CredentialProviderKind::ClientCredentials,
         required_tool: None,
         inject_as: DelegatedCredentialInjection::BearerHeader,
@@ -2749,6 +3077,41 @@ fn surface_authenticates_target_with_jwt_bearer_without_subject(world: &mut Surf
     world
         .surface_config
         .target_auth_provider = Some(provider);
+}
+
+fn jwt_bearer_target_auth_provider(world: &mut SurfaceWorld) -> &mut SurfaceTargetAuthProviderConfig {
+    let provider = target_auth_provider(world);
+    assert_eq!(
+        provider.grant,
+        TargetAuthProviderGrant::JwtBearer,
+        "only a JWT Bearer provider has a client authentication"
+    );
+    provider
+}
+
+#[given("the credential provider stores a client ID and a client secret but sets no client authentication")]
+fn target_credential_provider_stores_unused_client_references(world: &mut SurfaceWorld) {
+    jwt_bearer_target_auth_provider(world).stores_unused_client_references = true;
+}
+
+#[given("the credential provider stores no client secret")]
+fn target_credential_provider_stores_no_client_secret(world: &mut SurfaceWorld) {
+    let provider = target_auth_provider(world);
+    assert_ne!(
+        provider.grant,
+        TargetAuthProviderGrant::JwtBearer,
+        "this step applies only to a provider type that needs a client secret"
+    );
+    provider.omits_client_secret_reference = true;
+}
+
+#[given(expr = "the credential provider authenticates its client with {string}")]
+fn target_credential_provider_authenticates_its_client(
+    world: &mut SurfaceWorld,
+    wording: String,
+) {
+    jwt_bearer_target_auth_provider(world).client_authentication =
+        Some(TargetAuthClientAuthentication::from_wording(&wording));
 }
 
 #[given("the credential provider is refusing token requests")]
@@ -2783,6 +3146,11 @@ fn target_credential_provider_token_lifetime(
 #[given("the credential provider has a plain http token endpoint")]
 fn target_credential_provider_has_http_token_endpoint(world: &mut SurfaceWorld) {
     target_auth_provider(world).insecure_token_endpoint = true;
+}
+
+#[given("the gateway's insecure token endpoints list names the credential provider's token endpoint")]
+fn gateway_lists_target_credential_provider_token_endpoint(world: &mut SurfaceWorld) {
+    target_auth_provider(world).token_endpoint_listed_as_insecure = true;
 }
 
 #[given("the gateway keeps its log of warnings")]
@@ -2906,6 +3274,13 @@ fn surface_has_mcp_inbound_identity_strip_raw(world: &mut SurfaceWorld) {
         .mcp_inbound_identity_strip_raw = true;
 }
 
+#[given("the surface derives the inbound identity from a JWT claim")]
+fn surface_derives_inbound_identity_from_jwt_claim(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .jwt_claim_inbound_identity = true;
+}
+
 #[given(expr = "the surface injects custom metadata key {string} value {string} into {string}")]
 fn surface_injects_custom_metadata(
     world: &mut SurfaceWorld,
@@ -2990,6 +3365,94 @@ async fn vp_audit_log_keeps_every_audit_event(world: &mut SurfaceWorld) {
             .surface_config
             .audit_log_keeps_every_event = true;
     }
+}
+
+/// The live VP Audit Log of the running gateway: beside its logs when the
+/// scenario configured a log directory, and under `_storage/audit` otherwise,
+/// which the gateway resolves against the base folder it runs in. The rotated
+/// files sit beside it as `delegation-audit.jsonl.<position>`, counting up
+/// from `.1`.
+fn vp_audit_log_path(world: &SurfaceWorld) -> std::path::PathBuf {
+    let base = world
+        .infra
+        .as_ref()
+        .expect("the gateway must be running before its VP Audit Log is reached")
+        ._temp_dir
+        .path();
+    if world
+        .surface_config
+        .writes_log_directory
+    {
+        base.join("_storage/logs/delegation-audit.jsonl")
+    } else {
+        base.join("_storage/audit/delegation-audit.jsonl")
+    }
+}
+
+fn rotated_vp_audit_log_path(
+    world: &SurfaceWorld,
+    position: usize,
+) -> std::path::PathBuf {
+    let live = vp_audit_log_path(world);
+    live.with_file_name(format!("delegation-audit.jsonl.{position}"))
+}
+
+/// One credential injection as the VP Audit Log stores it: a single JSON line,
+/// closed by its newline.
+fn stored_credential_injection(trace_id: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({
+            "timestamp": "2026-11-07T10:00:00Z",
+            "event": "token_injected",
+            "trace_id": trace_id,
+            "provider_id": "calendar",
+            "provider_name": "Calendar",
+            "via_fabric": false,
+        })
+    )
+}
+
+fn write_rotated_vp_audit_log_file(
+    world: &SurfaceWorld,
+    position: usize,
+    trace_id: &str,
+) {
+    let path = rotated_vp_audit_log_path(world, position);
+    std::fs::write(&path, stored_credential_injection(trace_id))
+        .unwrap_or_else(|error| panic!("rotated VP Audit Log file {} must be written: {error}", path.display()));
+}
+
+#[given(expr = "a rotated VP Audit Log file holds a credential injection with trace {string}")]
+fn rotated_vp_audit_log_file_holds_a_credential_injection(
+    world: &mut SurfaceWorld,
+    trace_id: String,
+) {
+    write_rotated_vp_audit_log_file(world, 1, &trace_id);
+}
+
+/// Positions run consecutively while the history is whole, so leaving `.2` out
+/// is what a crash during a rotation, or a file deleted beside the gateway,
+/// leaves behind: the records it held are in no file a read can reach.
+#[given("a rotated VP Audit Log file is missing from the middle of the history")]
+fn rotated_vp_audit_log_file_is_missing_from_the_middle(world: &mut SurfaceWorld) {
+    write_rotated_vp_audit_log_file(world, 1, "gap-oldest-trace");
+    write_rotated_vp_audit_log_file(world, 3, "gap-newest-trace");
+}
+
+/// The half-written line an append interrupted by a crash or a power loss
+/// leaves at the end of the live log.
+#[given("the VP Audit Log holds a line that is not a record")]
+fn vp_audit_log_holds_a_line_that_is_not_a_record(world: &mut SurfaceWorld) {
+    use std::io::Write;
+
+    let path = vp_audit_log_path(world);
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap_or_else(|error| panic!("the VP Audit Log at {} must be open for appending: {error}", path.display()));
+    file.write_all(b"{\"timestamp\":\"2026-11-07T10:00:00Z\",\"ev\n")
+        .unwrap_or_else(|error| panic!("the half-written record must be appended: {error}"));
 }
 
 #[given(
@@ -3285,6 +3748,34 @@ async fn managed_agent_response_has_identity(
             }
         }
     });
+    set_managed_agent_message_response(world, response).await;
+}
+
+#[given(expr = "managed agent {string} responds without the agent-identity extension")]
+async fn managed_agent_response_has_no_identity(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "kind": "message",
+            "messageId": "msg-001",
+            "role": "agent",
+            "parts": [{"kind": "text", "text": "response"}]
+        }
+    });
+    set_managed_agent_message_response(world, response).await;
+}
+
+async fn set_managed_agent_message_response(
+    world: &mut SurfaceWorld,
+    response: serde_json::Value,
+) {
     // Surfaces created through the admin API start the mock before this step.
     if let Some(infra) = world.infra.as_ref() {
         infra
@@ -3357,6 +3848,26 @@ fn managed_agent_streams_a_task_claiming_identity(
     set_primary_target_response(world, streamed_task(Some(message)));
 }
 
+#[given(
+    expr = "managed agent {string} streams a task whose final status message declares its identity without the payload"
+)]
+fn managed_agent_streams_a_task_with_an_invalid_identity_claim(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let message = serde_json::json!({
+        "messageId": "bdd-agent-message",
+        "role": "ROLE_AGENT",
+        "parts": [{ "text": "done" }],
+        "extensions": [AGENT_IDENTITY_URI],
+        "metadata": {}
+    });
+    set_primary_target_response(world, streamed_task(Some(message)));
+}
+
 #[given(expr = "managed agent {string} streams the error {string}")]
 fn managed_agent_streams_an_error(
     world: &mut SurfaceWorld,
@@ -3392,6 +3903,54 @@ fn managed_agent_publishes_agent_card_with_identity(
                     }
                 }
             ]
+        }
+    });
+    set_primary_target_response(world, agent_card);
+}
+
+#[given(expr = "managed agent {string} publishes an agent card without the agent-identity extension")]
+fn managed_agent_publishes_agent_card_without_identity(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let agent_card = serde_json::json!({
+        "name": "test-agent",
+        "url": "http://mock.local",
+        "version": "1.0.0",
+        "capabilities": {"streaming": false}
+    });
+    set_primary_target_response(world, agent_card);
+}
+
+#[given(
+    expr = "managed agent {string} publishes an agent card whose identity credential names a different DID than its presentation"
+)]
+fn managed_agent_publishes_agent_card_with_mismatched_credential(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let presentation = serde_json::json!({
+        "holder": "did:key:z6MkPresentationHolder",
+        "verifiableCredential": {"credentialSubject": {"id": "did:key:z6MkPresentationHolder"}}
+    });
+    let agent_card = serde_json::json!({
+        "name": "test-agent",
+        "url": "http://mock.local",
+        "version": "1.0.0",
+        "capabilities": {
+            "extensions": [{
+                "uri": AGENT_IDENTITY_CREDENTIAL_URI,
+                "params": {
+                    "did": "did:key:z6MkClaimedAgent",
+                    "verifiablePresentation": presentation.to_string()
+                }
+            }]
         }
     });
     set_primary_target_response(world, agent_card);
@@ -3453,7 +4012,7 @@ fn mcp_server_returns_tool_result(
 }
 
 #[given(expr = "the surface requires delegated credentials from OAuth provider {string}")]
-fn surface_requires_oauth_delegated_credentials(
+pub(crate) fn surface_requires_oauth_delegated_credentials(
     world: &mut SurfaceWorld,
     provider: String,
 ) {
@@ -3461,11 +4020,27 @@ fn surface_requires_oauth_delegated_credentials(
         .surface_config
         .credential_delegation = Some(SurfaceCredentialDelegationConfig {
         provider_id: provider,
+        record_id: None,
+        tenant_id: None,
         provider_kind: CredentialProviderKind::OAuth2AuthorizationCode,
         required_tool: None,
         inject_as: DelegatedCredentialInjection::BearerHeader,
         scopes: vec!["calendar.read".to_string(), "calendar.write".to_string()],
     });
+}
+
+/// The provider keeps `provider` as its `provider_id` slug and name, and
+/// takes a record id of its own, so its id and slug differ.
+#[given(expr = "OAuth provider {string} belongs to tenant {string}")]
+fn oauth_provider_belongs_to_tenant(
+    world: &mut SurfaceWorld,
+    provider: String,
+    tenant: String,
+) {
+    let delegation = delegation_config_mut(world);
+    assert_eq!(delegation.provider_id, provider, "the surface's delegated provider");
+    delegation.record_id = Some(format!("{provider}-of-{tenant}"));
+    delegation.tenant_id = Some(tenant);
 }
 
 #[given(expr = "the surface requires delegated credentials from OAuth provider {string} only for MCP tool {string}")]
@@ -3487,6 +4062,8 @@ fn surface_requires_api_key_delegated_credentials(
         .surface_config
         .credential_delegation = Some(SurfaceCredentialDelegationConfig {
         provider_id: provider.clone(),
+        record_id: None,
+        tenant_id: None,
         provider_kind: CredentialProviderKind::ApiKey {
             secret_id: format!("bdd-{provider}-api-key"),
             secret_value: "bdd-delegated-api-key".to_string(),
@@ -3508,6 +4085,8 @@ fn surface_requires_delegated_credentials_from_an_unknown_provider(
         .surface_config
         .credential_delegation = Some(SurfaceCredentialDelegationConfig {
         provider_id: provider,
+        record_id: None,
+        tenant_id: None,
         provider_kind: CredentialProviderKind::Unknown,
         required_tool: None,
         inject_as: DelegatedCredentialInjection::BearerHeader,
@@ -3599,6 +4178,27 @@ fn surface_accepts_jwt_audience(
     }
 }
 
+/// The JWT Bearer method checks the `client_id` a token was issued to, as for
+/// an identity provider whose tokens carry no audience.
+#[given(expr = "the surface accepts JWT Bearer tokens issued to client {string}")]
+fn surface_accepts_jwt_bearer_tokens_issued_to_client(
+    world: &mut SurfaceWorld,
+    client: String,
+) {
+    match world
+        .surface_config
+        .source_auth
+        .as_mut()
+        .expect("JWT source authentication must be configured before naming its clients")
+    {
+        SurfaceSourceAuthConfig::JwtBearer(config) => {
+            config.audiences = vec![client];
+            config.audience_claim = Some("client_id".to_string());
+        }
+        _ => panic!("JWT source authentication must be configured before naming its clients"),
+    }
+}
+
 #[given(expr = "the surface has an explicit inbound identity slot for MCP requiring selected identity field {string}")]
 fn surface_has_inbound_identity_requiring_selected_field(
     world: &mut SurfaceWorld,
@@ -3647,6 +4247,76 @@ async fn oauth_provider_ready_to_exchange_code(
             "scope": "calendar.read calendar.write"
         })))
         .await;
+}
+
+#[given(expr = "OAuth provider {string} records authorization response issuer {string}")]
+fn oauth_provider_records_authorization_response_issuer(
+    world: &mut SurfaceWorld,
+    provider: String,
+    issuer: String,
+) {
+    let delegated = world
+        .surface_config
+        .credential_delegation
+        .as_ref()
+        .map(|delegation| {
+            delegation
+                .provider_id
+                .as_str()
+        });
+    assert_eq!(
+        delegated,
+        Some(provider.as_str()),
+        "an authorization response issuer is recorded only on the surface's own OAuth provider"
+    );
+    world
+        .surface_config
+        .oauth_authorization_response_issuer = Some(issuer);
+}
+
+#[given(expr = "OAuth provider {string} has a callback path ending in the id the gateway gave it")]
+fn oauth_provider_callback_path_ends_in_its_id(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    let delegated = world
+        .surface_config
+        .credential_delegation
+        .as_ref()
+        .map(|delegation| {
+            delegation
+                .provider_id
+                .as_str()
+        });
+    assert_eq!(
+        delegated,
+        Some(provider.as_str()),
+        "only the surface's own OAuth provider is stored with a callback path ending in its id"
+    );
+    world
+        .surface_config
+        .oauth_callback_path_ends_in_record_id = true;
+}
+
+#[given(expr = "the gateway has OAuth provider {string}")]
+fn gateway_has_oauth_provider(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    world
+        .surface_config
+        .additional_oauth_providers
+        .push(provider);
+}
+
+#[given(expr = "caller {string} has confirmed the consent start page for provider {string}")]
+async fn caller_has_confirmed_consent_start_page(
+    world: &mut SurfaceWorld,
+    _caller: String,
+    provider: String,
+) {
+    let (state, _cookie) = crate::steps::when::confirm_consent_start_page(world, &provider).await;
+    world.oauth_confirmed_state = Some(state);
 }
 
 #[given(expr = "caller {string} has been asked to complete OAuth consent for provider {string}")]
@@ -4548,6 +5218,28 @@ fn surface_accepts_mcp_origin(
     let mut origins = origins;
     origins.push(serde_json::json!(origin));
     mcp_http["allowed_origins"] = serde_json::Value::Array(origins);
+}
+
+#[given(expr = "the gateway's network CORS list allows origin {string}")]
+fn network_cors_allows_origin(
+    world: &mut SurfaceWorld,
+    origin: String,
+) {
+    world
+        .surface_config
+        .network_cors
+        .push(origin);
+}
+
+#[given(expr = "the surface allows browser origin {string}")]
+fn surface_allows_browser_origin(
+    world: &mut SurfaceWorld,
+    origin: String,
+) {
+    world
+        .surface_config
+        .browser_origins
+        .push(origin);
 }
 
 fn set_modern_tool_response(

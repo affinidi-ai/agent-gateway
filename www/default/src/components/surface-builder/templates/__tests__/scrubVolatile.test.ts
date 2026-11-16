@@ -1,6 +1,101 @@
 import { scrubVolatileTemplateFields, findDuplicateListenerRoutes } from '../scrubVolatile';
+import { tokenizeSnapshot } from '../tokenizeSnapshot';
 
 describe('scrubVolatileTemplateFields', () => {
+  it('drops every API key id an Identity names, keeping the Identity', () => {
+    const key = { type: 'from_api_key', api_key_id: 'atgk_own' };
+    const input = {
+      identity_slots: { inbound: { type: 'from_api_key' }, protected: key, external: key },
+      target: { endpoint: 'https://upstream', identity_injection: key },
+      transit: { points: [{ target_endpoint: 'https://tp', managed_identity: key }] },
+      variants: [{ alias: 'v', overrides: { identity_slots: { protected: key } } }],
+      canvas: {
+        nodes: [
+          { id: 'identity-protected', type: 'identity', config: key },
+          { id: 'ma', type: 'managed-agent', config: { api_key_id: 'kept' } },
+        ],
+      },
+    };
+    const out = scrubVolatileTemplateFields(input) as any;
+    const fromApiKey = { type: 'from_api_key' };
+    expect(out.identity_slots).toEqual({
+      inbound: fromApiKey,
+      protected: fromApiKey,
+      external: fromApiKey,
+    });
+    expect(out.target).toEqual({ endpoint: 'https://upstream', identity_injection: fromApiKey });
+    expect(out.transit.points[0].managed_identity).toEqual(fromApiKey);
+    expect(out.variants[0].overrides.identity_slots.protected).toEqual(fromApiKey);
+    expect(out.canvas.nodes[0].config).toEqual(fromApiKey);
+    expect(out.canvas.nodes[1].config.api_key_id).toBe('kept');
+    expect(input.identity_slots.protected.api_key_id).toBe('atgk_own');
+  });
+
+  it('drops an API key shaped Caller Context secret and variant canvas key ids', () => {
+    const apiKeyMethod = {
+      type: 'api_key',
+      secret_id: 'atgk_own',
+      extraction: { field: 'x-api-key' },
+    };
+    const plainMethod = { type: 'api_key', secret_id: 'plain-secret' };
+    const input = {
+      access_point: { caller_authentication: { methods: [apiKeyMethod, plainMethod] } },
+      variants: [
+        {
+          alias: 'v',
+          overrides: {
+            access_point: { caller_authentication: { methods: [apiKeyMethod] } },
+            canvas: {
+              nodes: [
+                {
+                  id: 'identity-protected',
+                  type: 'identity',
+                  config: { type: 'from_api_key', api_key_id: 'atgk_own' },
+                },
+                { id: 'ma', type: 'managed-agent', config: { api_key_id: 'kept' } },
+              ],
+            },
+          },
+        },
+      ],
+    };
+    const out = scrubVolatileTemplateFields(input) as any;
+    expect(out.access_point.caller_authentication.methods).toEqual([
+      { type: 'api_key', extraction: { field: 'x-api-key' } },
+      plainMethod,
+    ]);
+    const overrides = out.variants[0].overrides;
+    expect(overrides.access_point.caller_authentication.methods).toEqual([
+      { type: 'api_key', extraction: { field: 'x-api-key' } },
+    ]);
+    expect(overrides.canvas.nodes[0].config).toEqual({ type: 'from_api_key' });
+    expect(overrides.canvas.nodes[1].config.api_key_id).toBe('kept');
+    expect(input.access_point.caller_authentication.methods[0].secret_id).toBe('atgk_own');
+  });
+
+  it('drops the read-only fields the gateway sets on a surface response', () => {
+    const out = scrubVolatileTemplateFields({
+      name: 's',
+      access_point_status: 'not_ready',
+      api_key_references: [{ key_id: 'atgk_own', status: 'revoked', blocking: true }],
+      serving_status: 'not_serving',
+    });
+    expect(out).toEqual({ name: 's' });
+  });
+
+  it('keeps a template snapshot free of the read-only surface fields', () => {
+    const { surface } = tokenizeSnapshot(
+      {
+        name: 's',
+        access_point_status: 'ready',
+        api_key_references: [{ key_id: 'atgk_own', status: 'active', blocking: false }],
+        serving_status: 'serving',
+      },
+      { tokenizeNamedFields: false }
+    );
+    expect(surface).toEqual({ name: 's' });
+  });
+
   it('blanks transit-point listener + identity fields', () => {
     const out = scrubVolatileTemplateFields({
       access_point: { listen_address: '$HOST', route: '$ROUTE' },

@@ -9,8 +9,8 @@ Feature: Trust Check on the Access Point request edge
   include NOT_RECOGNIZED, NOT_AUTHORIZED, TRUST_REGISTRY_UNREACHABLE,
   QUERY_FAILED, QUERY_TIMEOUT, TRUST_REGISTRY_PROBLEM_REPORT,
   TRUST_REGISTRY_PARSE_ERROR, TEMPLATE_RESOLUTION_FAILED,
-  AGENT_CARD_UNAVAILABLE, TARGET_AGENT_IDENTITY_UNAVAILABLE, and
-  IDENTITY_VP_VERIFICATION_FAILED.
+  AGENT_CARD_UNAVAILABLE, TARGET_AGENT_IDENTITY_UNAVAILABLE,
+  IDENTITY_VP_VERIFICATION_FAILED, and AUTHORITY_NOT_FOUND.
 
   Background:
     Given an A2A surface targeting managed agent "bravo"
@@ -85,3 +85,51 @@ Feature: Trust Check on the Access Point request edge
     And managed agent "bravo" was not called
     And the caller Trust Check for trust registry "alpha-registry" of type "recognition" reported result "error"
     And the caller Trust Check reported error code "TEMPLATE_RESOLUTION_FAILED"
+
+  # ── Several authorities ────────────────────────────────────────────
+
+  Scenario: A caller Trust Check that lists several authorities asks about each one
+    Given the surface has a caller-leg Trust Check for trust registry "alpha-registry" of type "recognition" with entity template "did:web:example.com:agent"
+    And the caller-leg Trust Check lists authorities "did:web:authority-a, did:web:authority-b"
+    And the surface has a policy that denies unless every caller Trust Check succeeded
+    And the VP Audit Log keeps every audit event
+    When the caller sends a request to the surface
+    Then the response status is 403
+    And managed agent "bravo" was not called
+    And the caller Trust Check reported error code "TRUST_REGISTRY_UNREACHABLE" for authority "did:web:authority-a"
+    And the caller Trust Check reported error code "TRUST_REGISTRY_UNREACHABLE" for authority "did:web:authority-b"
+
+  Scenario: A Transit Point Trust Check that lists several authorities fails each one when the target agent card cannot be fetched
+    Given the surface has a transit point "tp1" to external agent "charlie"
+    And transit point "tp1" has a target-leg Trust Check for trust registry "alpha-registry" of type "recognition"
+    And the target-leg Trust Check of transit point "tp1" lists authorities "did:web:authority-a, did:web:authority-b"
+    And transit point "tp1" has a policy that denies unless every target Trust Check succeeded
+    And external agent "charlie" is unreachable
+    And the VP Audit Log keeps every audit event
+    When managed agent "bravo" sends an A2A message/send request through Transit Point "tp1"
+    Then the response status is 403
+    And the target Trust Check reported error code "AGENT_CARD_UNAVAILABLE" 2 times
+    And external agent "charlie" was not called
+
+  # ── Deleted Authority ──────────────────────────────────────────────
+
+  Scenario: A Trust Check whose Authority no longer exists fails without asking its trust registry
+    Given the surface has a caller-leg Trust Check for trust registry "alpha-registry" of type "recognition" with entity template "{{ input.agent.did }}"
+    And the caller-leg Trust Check takes its authority from an Authority that no longer exists
+    And the surface has a policy that denies unless every caller Trust Check succeeded
+    And the VP Audit Log keeps every audit event
+    When the caller sends a request to the surface
+    Then the response status is 403
+    And managed agent "bravo" was not called
+    And the caller Trust Check reported error code "AUTHORITY_NOT_FOUND"
+
+  Scenario: A Trust Check that lists several authorities fails the one whose Authority no longer exists and still asks about the others
+    Given the surface has a caller-leg Trust Check for trust registry "alpha-registry" of type "recognition" with entity template "did:web:example.com:agent"
+    And the caller-leg Trust Check lists authorities "did:web:authority-a, did:web:authority-b"
+    And the caller-leg Trust Check takes listed authority "did:web:authority-a" from an Authority that no longer exists
+    And the surface has a policy that denies unless every caller Trust Check succeeded
+    And the VP Audit Log keeps every audit event
+    When the caller sends a request to the surface
+    Then the response status is 403
+    And the caller Trust Check reported error code "AUTHORITY_NOT_FOUND" for authority "did:web:authority-a"
+    And the caller Trust Check reported error code "TRUST_REGISTRY_UNREACHABLE" for authority "did:web:authority-b"

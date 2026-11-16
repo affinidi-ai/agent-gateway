@@ -1,0 +1,24 @@
+branch: fix/sts-tenant-jwt-bearer-tokens
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-09T18:00:00Z'
+      title: Refuse STS tokens of another tenant's connection at JWT Bearer surfaces
+      description: >-
+        A JWT Bearer surface that trusts this gateway's STS now accepts a token the STS issued
+        only when the managed connection it was minted for belongs to the surface's tenant or to
+        no tenant. Every STS access token and ID-JAG now names that connection by its record id in
+        a `connection_id` claim, so renaming a connection or reusing its `client_id` cannot move a
+        token to another connection; a token minted before this change has no such claim and is
+        refused at these surfaces, so callers must exchange for a new one. A token minted for another tenant's connection, or for a connection that no
+        longer exists, is refused as an invalid credential, so one tenant can no longer reach
+        another tenant's JWT Bearer surface with a token minted for its audience. A token signed
+        under the gateway DID that names no managed connection in `client_id`, such as an AP2
+        presentation, is refused there too, and every token of this gateway's issuers fails as an
+        internal error while the managed connection store is unavailable. MCP resource tokens
+        (`mcp_http.authorization`) get the same check on surfaces, over Fabric and on MCP Proxies,
+        so a token of a deleted connection or of another tenant's connection is refused there.
+  breaking: []

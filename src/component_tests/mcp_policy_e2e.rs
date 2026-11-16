@@ -1405,9 +1405,10 @@ async fn access_point_refuses_tool_call_batches_before_tool_level_controls() {
         assert_eq!(
             body,
             json!({
-                "type": "https://a2a-protocol.org/errors/proxy-error",
+                "type": "about:blank",
                 "title": "Unprocessable Entity",
                 "status": 422,
+                "code": "batch_not_supported",
                 "detail": "JSON-RPC batches are not supported"
             }),
             "{tool}"
@@ -1520,6 +1521,7 @@ async fn access_point_tool_scoped_credentials_flow() {
                             "id": "provider", "name": "Provider", "provider_id": "provider",
                             "authorization_endpoint": "https://provider.example/authorize",
                             "client_id_secret_ref": "provider-client-id",
+                            "callback_path": "/v1/identity/oauth/callback/provider",
                             "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
                         }))
                         .expect("provider"),

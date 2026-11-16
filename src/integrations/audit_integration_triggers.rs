@@ -207,8 +207,8 @@ mod tests {
         RejectionReason, RejectionStage, RequestFailureOutcome, TargetAuthLeg, TargetAuthMethodKind, TargetKind,
     };
     use crate::delegation_vault::audit::{
-        PaymentEventDetails, PaymentRail, PaymentStage, PolicyChangeDetails, SecretForceDeleteDetails,
-        TargetAuthChangeDetails, audit_event,
+        AuthorityForceDeleteDetails, BrowserOriginsChangeDetails, McpProxyPinChangeDetails, PaymentEventDetails,
+        PaymentRail, PaymentStage, PolicyChangeDetails, SecretForceDeleteDetails, TargetAuthChangeDetails, audit_event,
     };
     use std::collections::HashSet;
 
@@ -251,9 +251,11 @@ mod tests {
         name: Option<&str>,
     ) -> AuditCallerContext {
         crate::delegation_vault::audit::build_caller_context(&crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: serde_json::json!({"iss": "https://idp.example.com", "email": email, "name": name}),
+            verification: Default::default(),
         })
     }
 
@@ -448,9 +450,11 @@ mod tests {
         assert_eq!(with(jwt_caller(Some(""), None)), "user-123", "an empty claim is skipped");
         let by_oid = crate::delegation_vault::audit::build_caller_context(
             &crate::source_auth::AuthenticatedIdentity::JwtBearer {
+                strategy_id: None,
                 principal_claim: "oid".to_string(),
                 subject: "person-1".to_string(),
                 claims: serde_json::json!({"iss": "https://idp.example.com", "sub": "pairwise", "oid": "person-1"}),
+                verification: Default::default(),
             },
         );
         assert_eq!(with(by_oid), "person-1", "the principal claim's value names the caller, not the token's sub");
@@ -549,6 +553,7 @@ mod tests {
             | DelegationAuditAction::TraceTerminated { .. }
             | DelegationAuditAction::PaymentEvent(_)
             | DelegationAuditAction::AuthFailed { .. }
+            | DelegationAuditAction::ConnectorCall { .. }
             | DelegationAuditAction::RateLimited { .. }
             | DelegationAuditAction::RequestRejected { .. }
             | DelegationAuditAction::IdentityBindingFailed { .. }
@@ -564,7 +569,10 @@ mod tests {
             | DelegationAuditAction::PolicyAttachmentChanged(_)
             | DelegationAuditAction::PolicyChangeRefused(_)
             | DelegationAuditAction::TargetAuthChanged(_)
-            | DelegationAuditAction::SecretForceDeleted(_) => {}
+            | DelegationAuditAction::SecretForceDeleted(_)
+            | DelegationAuditAction::AuthorityForceDeleted(_)
+            | DelegationAuditAction::McpProxyPinChanged(_)
+            | DelegationAuditAction::BrowserOriginsChanged(_) => {}
         }
     }
 
@@ -618,6 +626,14 @@ mod tests {
                 reason: "expired".to_string(),
                 blocking: true,
                 client_ip: None,
+            },
+            DelegationAuditAction::ConnectorCall {
+                transit_point: "linear".to_string(),
+                subject: Some(crate::config::agent_surface::GrantSubject::Caller),
+                outcome: crate::delegation_vault::audit::ConnectorCallOutcome::Forwarded,
+                status_class: Some("2xx".to_string()),
+                reason: None,
+                cause: None,
             },
             DelegationAuditAction::RateLimited {
                 scope: RateLimitScope::Surface,
@@ -687,6 +703,28 @@ mod tests {
                 force: true,
                 referrers: Vec::new(),
             })),
+            DelegationAuditAction::AuthorityForceDeleted(Box::new(AuthorityForceDeleteDetails {
+                actor: Actor::user("u-1"),
+                authority_id: "authority-1".to_string(),
+                did: "did:web:authority.example".to_string(),
+                force: true,
+                referrers: Vec::new(),
+            })),
+            DelegationAuditAction::McpProxyPinChanged(Box::new(McpProxyPinChangeDetails {
+                actor: Actor::user("u-1"),
+                surface_variant: "_base_".to_string(),
+                variant_id: None,
+                transit_point_id: "tp-1".to_string(),
+                transit_point: "drive".to_string(),
+                mcp_proxy_id: "drive".to_string(),
+                previous_pin: None,
+                pin: "sha256:00".to_string(),
+            })),
+            DelegationAuditAction::BrowserOriginsChanged(Box::new(BrowserOriginsChangeDetails {
+                actor: Actor::user("u-1"),
+                previous_origins: Vec::new(),
+                origins: vec!["https://chat.example.com".to_string()],
+            })),
         ]
     }
 
@@ -696,7 +734,7 @@ mod tests {
 
     #[test]
     fn the_event_catalog_lists_every_audit_record_category_the_gateway_produces() {
-        let unproduced = ["delegation_failed", "request_failed", "request_completed"];
+        let unproduced = ["request_failed", "request_completed"];
         let actions = every_action();
         actions
             .iter()

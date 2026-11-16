@@ -241,6 +241,14 @@ async fn personal_access_token_removes_old_log_files(world: &mut SurfaceWorld) {
     remove_old_log_files(world, Caller::PersonalAccessToken).await;
 }
 
+#[when(expr = "operator {string} downloads the server logs")]
+async fn operator_downloads_server_logs(
+    world: &mut SurfaceWorld,
+    operator: String,
+) {
+    record(world, Caller::Operator(&operator), Method::GET, "/v1/logs/download", None).await;
+}
+
 #[when(expr = "operator {string} truncates stored metrics")]
 async fn operator_truncates_stored_metrics(
     world: &mut SurfaceWorld,
@@ -340,6 +348,23 @@ fn response_reports_validated_token_endpoint(world: &mut SurfaceWorld) {
     let body = &management_response(world).body;
     assert_eq!(body["token_endpoint"].as_str(), Some(PROBE_TOKEN_ENDPOINT), "validated token endpoint: {body}");
     assert!(body["reachable"].is_boolean(), "the validation reports whether the token endpoint answered: {body}");
+}
+
+#[then("the answer is a ZIP archive of the server logs")]
+fn answer_is_server_log_archive(world: &mut SurfaceWorld) {
+    let headers = &management_response(world).headers;
+    assert_eq!(
+        (
+            headers
+                .get("content-type")
+                .map(String::as_str),
+            headers
+                .get("content-disposition")
+                .map(String::as_str)
+        ),
+        (Some("application/zip"), Some(r#"attachment; filename="logs.zip""#)),
+        "{headers:?}"
+    );
 }
 
 #[then(expr = "the log file {string} still exists")]

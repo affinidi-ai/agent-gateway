@@ -82,6 +82,8 @@ Use this when the backend is already running and you only need the dashboard dev
 | `make config-debug-dev` | Prepare local debug configuration without a static dashboard build |
 | `make config-release` | Prepare the release environment |
 
+Preparation refuses an environment whose `config/gateway.json` has a channel, MCP proxy, `proxy` route or `redirect` route (with a target) prefix whose first path segment is a dashboard page. The gateway itself would start, skip that prefix and log `spa_collision_warning`, because the prefix would answer a reload of that page with a proxy `404`; preparation is stricter on purpose, so a route that would silently go missing is caught before the first run, and it cannot be bypassed to reproduce the skip locally. The message names each offending prefix and the page it shadows; rename the prefix (for `/settings`, to something such as `/svc/settings`) and the clients that call it, then rerun. Nothing is rewritten for you. The reserved pages are read from `SPA_RESERVED_TOP_LEVEL` in [`src/proxy/paths.rs`](../../src/proxy/paths.rs), the same list the gateway checks; when that list cannot be read, preparation says so and leaves the check to startup.
+
 ## Named Instances
 
 Run isolated local instances by supplying `x`:
@@ -128,12 +130,19 @@ itself, so run that first:
 ```bash
 make config-docker                                   # 1. generate envs/docker/{config,certs}
 export AG_BACKUP_ENCRYPTION_KEY=$(openssl rand -hex 32)   # 2. required 64-hex key
-docker compose up                                    # 3. run
+export AG_MASTER_KEY=$(cat envs/master_encryption_key)    # 3. key for encryption at rest
+docker compose up                                    # 4. run
 ```
 
 If you skip step 1, compose stops immediately with `bind source path does not
-exist` instead of a cryptic in-container error. Keep the key exported for every
+exist` instead of a cryptic in-container error. Keep the backup key exported for every
 `docker compose` command (including `down`).
+
+A config that `make config-docker` creates encrypts storage at rest with the master key
+from `AG_MASTER_KEY`, and the gateway refuses to start without it. Export the same
+value every time: storage encrypted under one key cannot be read with another.
+`make docker-run` passes it from `envs/master_encryption_key` itself, whatever
+`AG_MASTER_KEY` your shell holds.
 
 ### Accessing the gateway
 
@@ -342,7 +351,7 @@ This section covers only commands and archive distinctions implemented by this s
 | `.atgx` | Diagnostic sharing | Excludes sensitive directories, redacts remaining data, then encrypts to a recipient public key |
 | `.agbak` | Full restore | Contains appliance storage needed for restoration, including sensitive records, and is encrypted with the configured backup encryption key |
 
-The `.atgx` export leaves out the storage paths configured for `identities`, `secrets`, `vc_keys`, `passkeys`, `apikeys`, `certificates`, `sessions`, `avatars`, `delegation_vault` and `identity_hash_pepper` under `[storage_paths]`, matched by their resolved path whatever they are named, any directory named `identities`, `secrets`, `vc_keys`, `passkeys`, `apikeys`, `certificates`, `sessions` or `avatars`, every `transit_token_key.json` or `transit_token_key.json.enc` file, and every `key_<n>.json` or `key_<n>.json.enc` file, which hold the private keys of Connection Point, issuer and trust registry DIDs. In the records it keeps, the export replaces the whole value of a secret field, such as `private_key`, `privateKeyJwk`, `secrets`, `our_secrets` or `refresh_token`, whether it is a string, an object or a list.
+The `.atgx` export leaves out the storage paths configured for `identities`, `secrets`, `vc_keys`, `passkeys`, `apikeys`, `certificates`, `sessions`, `avatars`, `delegation_vault` and `identity_hash_pepper` under `[storage_paths]`, matched by their resolved path whatever they are named, any directory named `identities`, `secrets`, `vc_keys`, `passkeys`, `apikeys`, `certificates`, `sessions` or `avatars`, every `transit_token_key.json`, `transit_token_key.json.enc`, `login_decoy_credential_key.json` or `login_decoy_credential_key.json.enc` file, and every `key_<n>.json` or `key_<n>.json.enc` file, which hold the private keys of Connection Point, issuer and trust registry DIDs. In the records it keeps, the export replaces the whole value of a secret field, such as `private_key`, `privateKeyJwk`, `secrets`, `our_secrets` or `refresh_token`, whether it is a string, an object or a list.
 
 Use `.atgx` when sharing diagnostic state with a trusted recipient. Use `.agbak` for controlled backup and restore. A redacted `.atgx` export cannot restore an appliance, and a `.agbak` file must not be treated as sanitized support data.
 
@@ -376,7 +385,7 @@ Paste the contents of `private.pem` when prompted, followed by an empty line. Th
 
 Full backup and restore are management operations exposed by the running Gateway and dashboard. They require a configured backup encryption key. Retain that key under your organization's key-management and recovery policy; losing it makes the encrypted backup unusable. The legacy `.tgwbak` extension written by earlier builds is still accepted on restore.
 
-See the dashboard's backup and restore controls for the running instance. Review the storage and encryption settings before relying on backups in an operational environment. Encryption at rest is a separate option and is disabled by default.
+See the dashboard's backup and restore controls for the running instance. Review the storage and encryption settings before relying on backups in an operational environment. Encryption at rest is a separate option: environments created by the setup targets turn it on, and a configuration from `--generate-bootstrap` has it off.
 
 ## Related Documentation
 

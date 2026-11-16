@@ -70,6 +70,23 @@ fn fabric_route_probe_uses_source_protocol_route_and_api_key_headers() {
 }
 
 #[test]
+fn fabric_route_probe_presents_the_receiving_surfaces_api_key_when_the_sender_checks_none() {
+    let mut target = target_surface();
+    target.source_auth = Some(SourceAuthSpec::ApiKey {
+        header_name: "x-api-key".to_string(),
+        secret_id: "target-key".to_string(),
+        valid_key: "target-valid-key".to_string(),
+    });
+    let (topology, link) = topology_with_link("mcp", target);
+
+    let probe =
+        fabric_route_probe(&topology, &link, FabricRouteProbeStage::AfterPolicies).expect("probe should be built");
+
+    assert_eq!(probe.extra_headers, vec![("x-api-key".to_string(), "target-valid-key".to_string())]);
+    assert!(probe.expect_target_call);
+}
+
+#[test]
 fn fabric_route_probe_reaches_an_external_upstream_without_waiting_for_a_mock() {
     let mut target = target_surface();
     target.external_target = true;

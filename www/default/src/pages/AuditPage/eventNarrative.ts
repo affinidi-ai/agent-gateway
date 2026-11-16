@@ -53,6 +53,7 @@ const TRUST_ERROR_LABEL: Record<string, string> = {
   TRUST_REGISTRY_PROBLEM_REPORT: 'the registry returned a problem report',
   TRUST_REGISTRY_PARSE_ERROR: 'the registry response could not be parsed',
   TEMPLATE_RESOLUTION_FAILED: 'a query template could not be resolved',
+  AUTHORITY_NOT_FOUND: 'the Authority this Trust Check uses no longer exists',
   AGENT_CARD_UNAVAILABLE: "the target's agent card was unavailable",
   IDENTITY_VP_VERIFICATION_FAILED: "the target's agent identity credential could not be verified",
   TARGET_AGENT_IDENTITY_UNAVAILABLE: "the target's agent card carries no agent identity credential",

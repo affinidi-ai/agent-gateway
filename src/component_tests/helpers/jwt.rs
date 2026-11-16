@@ -95,7 +95,8 @@ pub fn write_jwt_strategy(
 /// Setup function for `jwt_bearer_auth_rejects_missing_then_accepts_valid`.
 ///
 /// Writes a JWT verification strategy fixture to disk and configures the gateway
-/// with a channel that requires JWT Bearer authentication.
+/// with a channel that requires JWT Bearer authentication on a closed Access
+/// Point.
 pub fn setup_jwt_bearer_auth_rejects_missing_then_accepts_valid(
     fixture: &JwksFixture,
     temp_dir: &Path,
@@ -111,6 +112,7 @@ pub fn setup_jwt_bearer_auth_rejects_missing_then_accepts_valid(
             "listen_address": "inbound_port_placeholder",
             "route": "/smoke",
             "protocol": "a2a",
+            "public": false,
             "caller_authentication": {
                 "methods": [{
                     "type": "jwt_bearer",

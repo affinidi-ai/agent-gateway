@@ -26,6 +26,11 @@ use std::collections::HashMap;
 
 use crate::storage::filesystem::StorableEntity;
 
+/// Whether a reference or setting is left out or holds only whitespace.
+pub(crate) fn is_blank(value: Option<&str>) -> bool {
+    value.is_none_or(|value| value.trim().is_empty())
+}
+
 /// The type of credential flow this provider supports
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum CredentialProviderType {
@@ -104,6 +109,45 @@ pub enum JwtSigningAlgorithm {
     ES256,
 }
 
+/// How the client of an `oauth2_jwt_bearer` grant identifies itself to the token endpoint
+/// (RFC 6749 section 2.3). A provider that sets no client authentication sends no client
+/// identity with its grant, as a Google service account does. `Unset` is what an empty string
+/// in a request means: it clears the stored setting and is never stored. It is separate from
+/// [`TokenEndpointAuthMethod`], which an external consent provider's metadata names and which
+/// includes `private_key_jwt`: a JWT Bearer grant's client never signs a second JWT, and this
+/// setting needs the empty string that clears it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GrantClientAuthentication {
+    #[serde(rename = "")]
+    Unset,
+    /// A public client: its `client_id` in the form body, no secret.
+    #[serde(rename = "none")]
+    PublicClient,
+    /// HTTP Basic with the client id and secret.
+    #[serde(rename = "client_secret_basic")]
+    ClientSecretBasic,
+    /// The client id and secret in the form body.
+    #[serde(rename = "client_secret_post")]
+    ClientSecretPost,
+}
+
+impl GrantClientAuthentication {
+    /// The method's name in a request, empty for `Unset`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unset => "",
+            Self::PublicClient => "none",
+            Self::ClientSecretBasic => "client_secret_basic",
+            Self::ClientSecretPost => "client_secret_post",
+        }
+    }
+
+    /// Whether the client authenticates with a secret.
+    pub fn uses_secret(self) -> bool {
+        matches!(self, Self::ClientSecretBasic | Self::ClientSecretPost)
+    }
+}
+
 /// The signed-JWT settings of the `oauth2_jwt_bearer` and
 /// `oauth2_client_credentials_jwt_auth` types. Key and certificate are secret
 /// references; the PEM values never leave the secrets store except to sign.
@@ -131,6 +175,11 @@ pub struct JwtAssertionSettings {
     /// `sub` claim of a JWT Bearer grant: required for a JWT Bearer provider (domain-wide delegation)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt_subject: Option<String>,
+    /// How the client of a JWT Bearer grant identifies itself; unset sends no client identity
+    /// and leaves the client references unread. `oauth2_jwt_bearer` only, cleared by an empty
+    /// string in an update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_authentication: Option<GrantClientAuthentication>,
 }
 
 impl JwtAssertionSettings {
@@ -161,7 +210,16 @@ impl JwtAssertionSettings {
             jwt_subject: self
                 .jwt_subject
                 .or(existing.jwt_subject),
+            client_authentication: self
+                .client_authentication
+                .or(existing.client_authentication),
         }
+    }
+
+    /// The client authentication these settings set, `None` when they set none.
+    pub fn client_authentication_method(&self) -> Option<GrantClientAuthentication> {
+        self.client_authentication
+            .filter(|method| *method != GrantClientAuthentication::Unset)
     }
 
     /// Does a provider of `provider_type` need a `jwt_subject` these settings leave blank?
@@ -170,11 +228,7 @@ impl JwtAssertionSettings {
         &self,
         provider_type: &CredentialProviderType,
     ) -> bool {
-        *provider_type == CredentialProviderType::OAuth2JwtBearer
-            && self
-                .jwt_subject
-                .as_deref()
-                .is_none_or(|subject| subject.trim().is_empty())
+        *provider_type == CredentialProviderType::OAuth2JwtBearer && is_blank(self.jwt_subject.as_deref())
     }
 
     /// The same settings with blank values removed and the rest trimmed, so a field
@@ -185,6 +239,7 @@ impl JwtAssertionSettings {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         }
+        let client_authentication = self.client_authentication_method();
         Self {
             jwt_signing_key_secret_ref: clean(self.jwt_signing_key_secret_ref),
             jwt_certificate_secret_ref: clean(self.jwt_certificate_secret_ref),
@@ -193,6 +248,7 @@ impl JwtAssertionSettings {
             jwt_key_id: clean(self.jwt_key_id),
             jwt_issuer: clean(self.jwt_issuer),
             jwt_subject: clean(self.jwt_subject),
+            client_authentication,
         }
     }
 }
@@ -229,6 +285,205 @@ impl TokenEndpointAuthMethod {
         matches!(self, Self::ClientSecretBasic | Self::ClientSecretPost)
     }
 }
+
+/// The gateway's login client at the callers' identity provider, with which a
+/// legacy consent provider confirms the person at the consent start before
+/// sending them to the vendor. The ID token it gets is verified by
+/// `jwt_verification_strategy_id`, and names the caller by
+/// `id_token_principal_claim`, or by that strategy's principal claim when unset.
+///
+/// The caller's vault key hashes a principal value under the strategy's own
+/// principal claim name, and its confirmation is recomputed under that same
+/// name: `id_token_principal_claim` only chooses which ID-token claim supplies
+/// the value, never the name the value is hashed under.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConsentConfirmation {
+    /// Secret ID for the login client's id.
+    pub client_id_secret_ref: String,
+    /// Secret ID for the login client's secret.
+    pub client_secret_secret_ref: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub jwt_verification_strategy_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_token_principal_claim: Option<String>,
+    /// Refuse a consent link to a caller the setting cannot confirm, rather
+    /// than minting one that goes straight to the vendor.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require: bool,
+}
+
+impl ConsentConfirmation {
+    /// Whether confirming through a strategy that expects `expected_issuer` and
+    /// names callers by `strategy_claim` would name an Entra caller by `sub`,
+    /// in the strategy or in the ID token. Entra issues `sub` per application,
+    /// so the `sub` of an ID token issued to the login client never equals the
+    /// one in a caller's access token.
+    pub fn names_entra_caller_by_sub(
+        &self,
+        expected_issuer: &str,
+        strategy_claim: &str,
+    ) -> bool {
+        let id_token_claim = self
+            .id_token_principal_claim
+            .as_deref()
+            .unwrap_or(strategy_claim);
+        is_entra_issuer(expected_issuer)
+            && [strategy_claim, id_token_claim].contains(&crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM)
+    }
+
+    /// The claims a confirmation through `strategy` names its caller by, when
+    /// the save rules accept them: `id_token_principal_claim` and the
+    /// strategy's principal claim name a caller, the strategy expects no issuer
+    /// of this gateway's own STS (`gateway_issuer`), names no Entra caller by
+    /// `sub`, no caller by `email`, and the ID token names the caller by no
+    /// [`EDITABLE_CLAIMS`] claim. Saving, minting and the confirmation route all
+    /// check through it.
+    pub fn claims_through<'a>(
+        &'a self,
+        strategy: &'a crate::jwt_bearer::models::JwtVerificationStrategy,
+        gateway_issuer: Option<&str>,
+    ) -> Result<ConfirmationClaims<'a>, ConfirmationStrategyRefusal> {
+        crate::jwt_bearer::models::normalize_principal_claim(
+            self.id_token_principal_claim
+                .as_deref(),
+        )
+        .map_err(ConfirmationStrategyRefusal::IdTokenClaim)?;
+        let strategy_claim = strategy
+            .principal_claim_name()
+            .map_err(|_| ConfirmationStrategyRefusal::StrategyClaim)?;
+        if is_gateway_issuer(&strategy.expected_issuer, gateway_issuer) {
+            return Err(ConfirmationStrategyRefusal::GatewayIssuer);
+        }
+        if self.names_entra_caller_by_sub(&strategy.expected_issuer, strategy_claim) {
+            return Err(ConfirmationStrategyRefusal::EntraCallerNamedBySub);
+        }
+        let id_token_claim = self
+            .id_token_principal_claim
+            .as_deref()
+            .unwrap_or(strategy_claim);
+        if [strategy_claim, id_token_claim].contains(&"email") {
+            return Err(ConfirmationStrategyRefusal::CallerNamedByEmail);
+        }
+        if EDITABLE_CLAIMS.contains(&id_token_claim) {
+            return Err(ConfirmationStrategyRefusal::EditableClaim);
+        }
+        Ok(ConfirmationClaims { strategy_claim, id_token_claim })
+    }
+
+    /// The authorization endpoint parsed, when the save rules accept it: an
+    /// OAuth endpoint URL that is https, with a host and no query or fragment.
+    pub fn authorization_endpoint_url(&self) -> Result<url::Url, String> {
+        self.checked_authorization_endpoint(crate::url_validation::validate_oauth_endpoint_url)
+    }
+
+    /// [`Self::authorization_endpoint_url`] without resolving its host, for
+    /// the consent start POST.
+    pub fn authorization_endpoint_url_unresolved(&self) -> Result<url::Url, String> {
+        self.checked_authorization_endpoint(crate::url_validation::validate_oauth_endpoint_url_unresolved)
+    }
+
+    fn checked_authorization_endpoint(
+        &self,
+        validate: fn(&str) -> Result<url::Url, String>,
+    ) -> Result<url::Url, String> {
+        let url = validate(&self.authorization_endpoint)
+            .map_err(|error| format!("consent_confirmation.authorization_endpoint: {error}"))?;
+        if !crate::url_validation::is_https_or_bdd_allowed(&url)
+            || url.host().is_none()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err("consent_confirmation.authorization_endpoint must be an https URL with a host and no query \
+                        or fragment"
+                .to_string());
+        }
+        Ok(url)
+    }
+}
+
+/// The claims a consent confirmation names its caller by: the strategy's,
+/// the name the vault key hashes the value under, and the ID token's, the
+/// claim that supplies the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfirmationClaims<'a> {
+    pub strategy_claim: &'a str,
+    pub id_token_claim: &'a str,
+}
+
+/// The claims a person can change at common identity providers. The ID-token
+/// claim that confirms a caller must be one the identity provider assigns and
+/// nobody can edit.
+pub const EDITABLE_CLAIMS: [&str; 9] = [
+    "preferred_username",
+    "nickname",
+    "name",
+    "given_name",
+    "family_name",
+    "upn",
+    "unique_name",
+    "email",
+    "phone_number",
+];
+
+/// Why a `consent_confirmation` cannot confirm callers through a strategy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmationStrategyRefusal {
+    /// `id_token_principal_claim` names no caller, for this reason.
+    IdTokenClaim(String),
+    /// The strategy's principal claim names no caller.
+    StrategyClaim,
+    /// The strategy expects this gateway's own STS issuer.
+    GatewayIssuer,
+    EntraCallerNamedBySub,
+    CallerNamedByEmail,
+    /// The ID token names the caller by one of [`EDITABLE_CLAIMS`].
+    EditableClaim,
+}
+
+/// Whether `expected_issuer` names `gateway_issuer`, this gateway's own STS
+/// MCP issuer, compared as URLs and without a trailing `/`.
+pub fn is_gateway_issuer(
+    expected_issuer: &str,
+    gateway_issuer: Option<&str>,
+) -> bool {
+    let normalized = |issuer: &str| {
+        url::Url::parse(issuer).map_or_else(
+            |_| {
+                issuer
+                    .trim_end_matches('/')
+                    .to_string()
+            },
+            |url| {
+                url.as_str()
+                    .trim_end_matches('/')
+                    .to_string()
+            },
+        )
+    };
+    gateway_issuer.is_some_and(|gateway| normalized(gateway) == normalized(expected_issuer))
+}
+
+/// Entra's issuers: the global, US government, China and partner cloud login
+/// hosts, `sts.windows.net` for v1 tokens, and the subdomains of
+/// `ciamlogin.com` for External ID tenants.
+fn is_entra_issuer(issuer: &str) -> bool {
+    const HOSTS: [&str; 5] = [
+        "login.microsoftonline.com",
+        "sts.windows.net",
+        "login.microsoftonline.us",
+        "login.chinacloudapi.cn",
+        "login.partner.microsoftonline.cn",
+    ];
+    url::Url::parse(issuer).is_ok_and(|url| {
+        url.host_str()
+            .is_some_and(|host| HOSTS.contains(&host) || host.ends_with(".ciamlogin.com"))
+    })
+}
+
+/// The path the identity provider redirects back to after a consent
+/// confirmation sign-in, appended to the provider's redirect URI.
+pub const CONSENT_CONFIRMATION_PATH: &str = "/confirm";
 
 /// A configured OAuth 2.0 credential provider
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -274,12 +529,14 @@ pub struct CredentialProvider {
     #[serde(default)]
     pub default_scopes: Vec<String>,
 
-    /// Auto-generated callback path for authorization code flow
-    /// Format: /v1/identity/oauth/callback/{provider_id}
+    /// Auto-generated callback path for authorization code flow:
+    /// `{oauth_callback_route}/{id}`, or `{oauth_callback_route}/{provider_id}`
+    /// for a provider created before paths ended in its id.
     #[serde(default)]
     pub callback_path: String,
 
-    /// Full callback URL including host (e.g. "https://gw.example.com/v1/identity/oauth/callback/github")
+    /// Full callback URL including host, ending in `callback_path` (e.g.
+    /// "https://gw.example.com/v1/identity/oauth/callback/{id}").
     /// User-configurable; used as redirect_uri in OAuth authorization requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callback_url: Option<String>,
@@ -346,6 +603,14 @@ pub struct CredentialProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorization_response_iss_parameter_supported: Option<bool>,
 
+    /// The `iss` (RFC 9207) the authorization server of an authorization code
+    /// provider without an `issuer` puts on its authorization responses, set by
+    /// the operator. When set, a consent callback without this exact `iss` is
+    /// refused; when unset, `iss` is ignored. It does not make the provider an
+    /// external consent provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_response_issuer: Option<String>,
+
     /// How the scopes an external consent provider's token endpoint grants are
     /// compared with those asked for: exactly by default. An external consent
     /// provider only, fixed for its life.
@@ -361,12 +626,29 @@ pub struct CredentialProvider {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub revocation_ends_authorization: bool,
 
+    /// Whether an external consent provider's code exchange and refresh send
+    /// its `resource` (RFC 8707) to the token endpoint. Off for a token
+    /// endpoint that refuses the parameter, such as the Microsoft identity
+    /// platform v2.0 one; the resource still decides where the grants may
+    /// go. An external consent provider only, fixed for its life.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub send_resource: bool,
+
+    /// Confirms the person at their identity provider before the vendor. An
+    /// authorization code provider without an `issuer` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent_confirmation: Option<ConsentConfirmation>,
+
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 impl StorableEntity for CredentialProvider {
@@ -376,31 +658,80 @@ impl StorableEntity for CredentialProvider {
 }
 
 impl CredentialProvider {
-    /// The secret ids this provider reads: client, API key, signing key and certificate.
+    /// The secret ids this provider reads: client, API key, signing key, certificate and
+    /// consent confirmation client ID and secret.
     pub fn secret_refs(&self) -> Vec<&str> {
         self.secret_ref_fields()
             .into_iter()
+            .chain(self.consent_confirmation_secret_refs())
             .flatten()
             .collect()
     }
 
+    fn consent_confirmation_secret_refs(&self) -> [Option<&str>; 2] {
+        let confirmation = self
+            .consent_confirmation
+            .as_ref();
+        [
+            confirmation.map(|confirmation| {
+                confirmation
+                    .client_id_secret_ref
+                    .as_str()
+            }),
+            confirmation.map(|confirmation| {
+                confirmation
+                    .client_secret_secret_ref
+                    .as_str()
+            }),
+        ]
+    }
+
     /// The secret ids a service token of this provider's type reads: the API key; the client
-    /// ID and secret; a JWT Bearer grant's signing key and certificate; or the client ID,
+    /// ID and secret; a JWT Bearer grant's signing key and certificate, preceded by the client
+    /// ID, and the client secret too when its client authentication uses one; or the client ID,
     /// signing key and certificate of a client authenticating with a JWT. A reference left
-    /// from another type is not among them, and an authorization code provider issues no
-    /// service token.
+    /// from another type, or a client reference of a JWT Bearer provider that sets no client
+    /// authentication, is not among them, and an authorization code provider issues no service
+    /// token.
     pub fn service_token_secret_refs(&self) -> Vec<&str> {
         let [client_id, client_secret, api_key, signing_key, certificate] = self.secret_ref_fields();
         match self.provider_type {
             CredentialProviderType::ApiKey => vec![api_key],
             CredentialProviderType::OAuth2ClientCredentials => vec![client_id, client_secret],
-            CredentialProviderType::OAuth2JwtBearer => vec![signing_key, certificate],
+            CredentialProviderType::OAuth2JwtBearer => match self
+                .jwt
+                .client_authentication_method()
+            {
+                None => vec![signing_key, certificate],
+                Some(method) if method.uses_secret() => vec![client_id, client_secret, signing_key, certificate],
+                Some(_) => vec![client_id, signing_key, certificate],
+            },
             CredentialProviderType::OAuth2ClientCredentialsJwtAuth => vec![client_id, signing_key, certificate],
             CredentialProviderType::OAuth2AuthorizationCode => Vec::new(),
         }
         .into_iter()
         .flatten()
         .collect()
+    }
+
+    /// Whether a grant of this provider carries its client secret: it holds a client secret
+    /// reference and its type sends it. A client credentials or authorization code provider
+    /// always sends the one it holds, a JWT Bearer provider only when its client authentication
+    /// uses a secret, and an API key provider or a client authenticating with a JWT never does.
+    pub fn sends_client_secret(&self) -> bool {
+        let type_sends_it = match self.provider_type {
+            CredentialProviderType::OAuth2ClientCredentials | CredentialProviderType::OAuth2AuthorizationCode => true,
+            CredentialProviderType::OAuth2JwtBearer => self
+                .jwt
+                .client_authentication_method()
+                .is_some_and(|method| method.uses_secret()),
+            CredentialProviderType::ApiKey | CredentialProviderType::OAuth2ClientCredentialsJwtAuth => false,
+        };
+        type_sends_it
+            && !is_blank(
+                self.client_secret_secret_ref
+                    .as_deref(),
+            )
     }
 
     /// The secret reference of each field, in the order of [`Self::secret_refs`].
@@ -423,8 +754,9 @@ impl CredentialProvider {
 
     /// Each secret reference, paired with whether `previous` held it in the same field while
     /// this provider keeps the type and sends it to the same place: the token and
-    /// authorization endpoints, resource, additional parameters, default scopes and JWT issuer,
-    /// subject and audience.
+    /// authorization endpoints, resource, additional parameters, default scopes, JWT issuer,
+    /// subject and audience, and client authentication. The consent confirmation client ID
+    /// and secret are never kept.
     fn secret_refs_kept_from(
         &self,
         previous: Option<&Self>,
@@ -440,6 +772,12 @@ impl CredentialProvider {
                     && self.jwt.jwt_issuer == previous.jwt.jwt_issuer
                     && self.jwt.jwt_subject == previous.jwt.jwt_subject
                     && self.jwt.jwt_audience == previous.jwt.jwt_audience
+                    && self
+                        .jwt
+                        .client_authentication_method()
+                        == previous
+                            .jwt
+                            .client_authentication_method()
             })
             .map(Self::secret_ref_fields)
             .unwrap_or_default();
@@ -447,6 +785,12 @@ impl CredentialProvider {
             .into_iter()
             .zip(stored)
             .filter_map(|(reference, stored)| reference.map(|reference| (reference, stored == Some(reference))))
+            .chain(
+                self.consent_confirmation_secret_refs()
+                    .into_iter()
+                    .flatten()
+                    .map(|reference| (reference, false)),
+            )
             .collect()
     }
 
@@ -534,6 +878,156 @@ impl CredentialProvider {
         self.issuer.is_some()
     }
 
+    /// Whether a person grants this provider's credential through the gateway's
+    /// consent start page and OAuth callback: an authorization code provider
+    /// without an `issuer`.
+    pub fn uses_legacy_consent(&self) -> bool {
+        self.provider_type == CredentialProviderType::OAuth2AuthorizationCode && self.issuer.is_none()
+    }
+
+    /// The redirect URI of the gateway's consent flow: `callback_url`, or
+    /// `gateway_base_url` followed by `callback_path`.
+    pub fn redirect_uri(
+        &self,
+        gateway_base_url: &str,
+    ) -> String {
+        self.callback_url
+            .clone()
+            .unwrap_or_else(|| format!("{gateway_base_url}{}", self.callback_path))
+    }
+
+    /// The redirect URI of the consent confirmation sign-in: the redirect URI
+    /// followed by [`CONSENT_CONFIRMATION_PATH`].
+    pub fn consent_confirmation_redirect_uri(
+        &self,
+        gateway_base_url: &str,
+    ) -> String {
+        format!("{}{CONSENT_CONFIRMATION_PATH}", self.redirect_uri(gateway_base_url))
+    }
+
+    /// The redirect URIs this provider's consent flow answers on: its redirect
+    /// URI, and its confirmation redirect URI while it has
+    /// `consent_confirmation`.
+    fn consent_redirect_uris(
+        &self,
+        gateway_base_url: &str,
+    ) -> Vec<url::Url> {
+        let confirmation = self
+            .consent_confirmation
+            .is_some()
+            .then(|| self.consent_confirmation_redirect_uri(gateway_base_url));
+        [Some(self.redirect_uri(gateway_base_url)), confirmation]
+            .into_iter()
+            .flatten()
+            .filter_map(|uri| url::Url::parse(&uri).ok())
+            .collect()
+    }
+
+    /// Whether this provider and `other` answer on a redirect URI in common.
+    fn shares_redirect_uri_with(
+        &self,
+        other: &Self,
+        gateway_base_url: &str,
+    ) -> bool {
+        let others = other.consent_redirect_uris(gateway_base_url);
+        self.consent_redirect_uris(gateway_base_url)
+            .iter()
+            .any(|uri| others.contains(uri))
+    }
+
+    /// The redirect URI parsed, when it is one the consent flow may use: an
+    /// https URL with a host and no credentials, query or fragment, whose path
+    /// ends in `callback_path`, the path the callback route answers on.
+    pub fn consent_redirect_uri(
+        &self,
+        gateway_base_url: &str,
+    ) -> Result<url::Url, &'static str> {
+        let url = url::Url::parse(&self.redirect_uri(gateway_base_url))
+            .map_err(|_| "callback_url must be an https URL with a host")?;
+        if !crate::url_validation::is_https_or_bdd_allowed(&url) || url.host().is_none() {
+            return Err("callback_url must be an https URL with a host");
+        }
+        if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
+            return Err("callback_url must not carry credentials, a query or a fragment");
+        }
+        if self.callback_path.is_empty()
+            || !url
+                .path()
+                .ends_with(&self.callback_path)
+        {
+            return Err("callback_url path must end in the provider's callback_path");
+        }
+        Ok(url)
+    }
+
+    /// The authorization endpoint parsed, when the consent flow may build the
+    /// vendor's authorization URL from it: an https URL with a host and no
+    /// credentials or fragment, whose query and `additional_params` together
+    /// hold at most 32 parameters, none reserved or repeated, with names of at
+    /// most 128 bytes and values of at most 2048.
+    pub fn consent_authorization_endpoint(&self) -> Result<url::Url, &'static str> {
+        let url = self
+            .authorization_endpoint
+            .as_deref()
+            .and_then(|endpoint| url::Url::parse(endpoint).ok())
+            .ok_or("authorization_endpoint must be an https URL with a host")?;
+        if !crate::url_validation::is_https_or_bdd_allowed(&url)
+            || url.host().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
+            return Err("authorization_endpoint must be an https URL with a host and no credentials or fragment");
+        }
+        let endpoint_params: Vec<_> = url
+            .query_pairs()
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect();
+        let mut names = std::collections::HashSet::new();
+        for (count, (name, value)) in endpoint_params
+            .iter()
+            .map(|(name, value)| (name, value))
+            .chain(&self.additional_params)
+            .enumerate()
+        {
+            if count >= MAX_AUTHORIZATION_PARAMS
+                || RESERVED_AUTHORIZATION_PARAMS.contains(&name.as_str())
+                || name.len() > 128
+                || value.len() > 2048
+                || !names.insert(name.as_str())
+            {
+                return Err(
+                    "authorization_endpoint query and additional_params must not repeat a reserved or duplicate \
+                     parameter or exceed the limits",
+                );
+            }
+        }
+        Ok(url)
+    }
+
+    /// Why `authorization_response_issuer` may not be stored on this provider:
+    /// only an authorization code provider without an `issuer` takes it, and
+    /// only as an https URL with a host and no credentials, query or fragment.
+    pub fn authorization_response_issuer_error(&self) -> Option<&'static str> {
+        let issuer = self
+            .authorization_response_issuer
+            .as_deref()?;
+        if !self.uses_legacy_consent() {
+            return Some(
+                "authorization_response_issuer is allowed only on an oauth2_authorization_code provider without issuer",
+            );
+        }
+        let valid = url::Url::parse(issuer).is_ok_and(|url| {
+            url.scheme() == "https"
+                && url.host().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+        });
+        (!valid).then_some("authorization_response_issuer must be an https URL with a host and no query or fragment")
+    }
+
     /// Whether this provider may use a secret of `secret_tenant_id`. An
     /// external consent provider uses its own tenant's secrets only, an
     /// untenanted one untenanted secrets only, since its client authenticates
@@ -550,6 +1044,98 @@ impl CredentialProvider {
         }
         crate::tenancy::can_reference(self.tenant_id.as_deref(), secret_tenant_id)
     }
+}
+
+/// The authorization request parameters the gateway sets itself, which neither
+/// the endpoint's own query nor `additional_params` may repeat.
+const RESERVED_AUTHORIZATION_PARAMS: [&str; 7] =
+    ["response_type", "client_id", "redirect_uri", "scope", "state", "code_challenge", "code_challenge_method"];
+
+/// How many parameters the endpoint's query and `additional_params` may hold together.
+const MAX_AUTHORIZATION_PARAMS: usize = 32;
+
+/// Another consent-flow provider, of any tenant, that answers on one of
+/// `provider`'s redirect URIs: its redirect URI, or the confirmation redirect
+/// URI of a provider with `consent_confirmation`. Each redirect URI names one
+/// provider, so the redirect identifies it.
+pub async fn redirect_uri_taken_by(
+    store: &dyn storage::CredentialProviderStorage,
+    provider: &CredentialProvider,
+    gateway_base_url: &str,
+) -> anyhow::Result<Option<CredentialProvider>> {
+    Ok(store
+        .list()
+        .await?
+        .into_iter()
+        .find(|other| {
+            other.id != provider.id
+                && other.uses_legacy_consent()
+                && provider.shares_redirect_uri_with(other, gateway_base_url)
+        }))
+}
+
+/// Logs an ERROR for each pair of consent-flow providers that share a redirect
+/// URI, naming both by id only, and returns the pairs. Both providers' consent
+/// fails closed at the start page until one of them gets another redirect URI.
+pub fn log_redirect_uri_conflicts<'provider>(
+    providers: &'provider [CredentialProvider],
+    gateway_base_url: &str,
+) -> Vec<(&'provider str, &'provider str)> {
+    let consent_providers: Vec<_> = providers
+        .iter()
+        .filter(|provider| provider.uses_legacy_consent())
+        .collect();
+    let mut conflicts = Vec::new();
+    for (index, &provider) in consent_providers
+        .iter()
+        .enumerate()
+    {
+        let id = provider.id.as_str();
+        for &other in &consent_providers[index + 1..] {
+            let other_id = other.id.as_str();
+            if provider.shares_redirect_uri_with(other, gateway_base_url) {
+                tracing::error!(
+                    target: "credential_delegation",
+                    provider_id = %id,
+                    other_provider_id = %other_id,
+                    "Two credential providers share a redirect URI, so consent for both is refused; give one a \
+                     callback_url on a distinct host, or recreate it, which gives it a callback path of its own"
+                );
+                conflicts.push((id, other_id));
+            }
+        }
+    }
+    conflicts
+}
+
+/// Logs an ERROR for each consent-flow provider whose redirect URI or
+/// authorization endpoint breaks the consent rules, naming it by id and the
+/// rule only, and returns them. Such a provider gets no consent link until it
+/// is fixed.
+pub fn log_consent_rule_breaches<'provider>(
+    providers: &'provider [CredentialProvider],
+    gateway_base_url: &str,
+) -> Vec<(&'provider str, &'static str)> {
+    let breaches: Vec<_> = providers
+        .iter()
+        .filter(|provider| provider.uses_legacy_consent())
+        .filter_map(|provider| {
+            provider
+                .consent_redirect_uri(gateway_base_url)
+                .and_then(|_| provider.consent_authorization_endpoint())
+                .err()
+                .map(|rule| (provider.id.as_str(), rule))
+        })
+        .collect();
+    for (id, rule) in &breaches {
+        tracing::error!(
+            target: "credential_delegation",
+            provider_id = %id,
+            rule = %rule,
+            "A credential provider breaks the consent rules, so it gets no consent link until it is fixed"
+        );
+    }
+    breaches
 }
 
 /// Request to create a new credential provider
@@ -581,7 +1167,9 @@ pub struct CreateCredentialProviderRequest {
     pub jwt: JwtAssertionSettings,
     #[serde(default)]
     pub description: Option<String>,
-    /// Full callback URL (host + path) — overrides auto-generated callback URL
+    /// Full callback URL (host + path). Refused for an authorization code
+    /// provider without an `issuer`, whose `callback_path` is known only once it
+    /// is created; an update sets it.
     #[serde(default)]
     pub callback_url: Option<String>,
     #[serde(default)]
@@ -602,6 +1190,12 @@ pub struct CreateCredentialProviderRequest {
     pub scope_comparison: scope_comparison::ScopeComparison,
     #[serde(default)]
     pub revocation_ends_authorization: bool,
+    #[serde(default = "default_true")]
+    pub send_resource: bool,
+    #[serde(default)]
+    pub authorization_response_issuer: Option<String>,
+    #[serde(default)]
+    pub consent_confirmation: Option<ConsentConfirmation>,
 }
 
 /// Request to update an existing credential provider
@@ -631,7 +1225,8 @@ pub struct UpdateCredentialProviderRequest {
     pub jwt: JwtAssertionSettings,
     #[serde(default)]
     pub description: Option<String>,
-    /// Full callback URL (host + path) — overrides auto-generated callback URL
+    /// Full callback URL (host + path), ending in the stored `callback_path`;
+    /// used as the redirect URI in place of the gateway's own URL.
     #[serde(default)]
     pub callback_url: Option<String>,
     #[serde(default)]
@@ -659,6 +1254,24 @@ pub struct UpdateCredentialProviderRequest {
     /// Never changes a provider: a value other than the stored one is refused.
     #[serde(default)]
     pub revocation_ends_authorization: Option<bool>,
+    /// Never changes a provider: a value other than the stored one is refused.
+    #[serde(default)]
+    pub send_resource: Option<bool>,
+    /// A blank value clears the stored one.
+    #[serde(default)]
+    pub authorization_response_issuer: Option<String>,
+    /// Absent keeps the stored setting, `null` clears it, and a value replaces it.
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub consent_confirmation: Option<Option<ConsentConfirmation>>,
+}
+
+/// A field that is present in a request, `null` included.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 /// Request to check a provider before it is saved: the token endpoint's reachability and,
@@ -711,6 +1324,8 @@ pub struct CredentialProviderListItem {
     pub jwt_issuer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt_subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_authentication: Option<GrantClientAuthentication>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issuer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -725,6 +1340,8 @@ pub struct CredentialProviderListItem {
     pub scope_comparison: scope_comparison::ScopeComparison,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub revocation_ends_authorization: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub send_resource: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -758,6 +1375,9 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
             jwt_key_id: p.jwt.jwt_key_id.clone(),
             jwt_issuer: p.jwt.jwt_issuer.clone(),
             jwt_subject: p.jwt.jwt_subject.clone(),
+            client_authentication: p
+                .jwt
+                .client_authentication_method(),
             issuer: p.issuer.clone(),
             revocation_endpoint: p.revocation_endpoint.clone(),
             token_endpoint_auth_method: p.token_endpoint_auth_method,
@@ -765,6 +1385,7 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
             allow_unadvertised_pkce: p.allow_unadvertised_pkce,
             scope_comparison: p.scope_comparison,
             revocation_ends_authorization: p.revocation_ends_authorization,
+            send_resource: p.send_resource,
             created_at: p.created_at,
             updated_at: p.updated_at,
         }
@@ -774,6 +1395,304 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn consent_provider(
+        id: &str,
+        slug: &str,
+        callback_url: Option<&str>,
+    ) -> CredentialProvider {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "tenant_id": format!("tenant-of-{id}"), "name": "N", "provider_id": slug,
+            "callback_path": format!("/v1/identity/oauth/callback/{slug}"), "callback_url": callback_url,
+            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    /// A caller is confirmed only by an ID-token claim the identity provider
+    /// assigns: one the person can edit is refused, whether
+    /// `id_token_principal_claim` names it or the strategy's claim stands in.
+    #[test]
+    fn a_claim_the_person_can_edit_never_confirms_a_caller() {
+        let strategy = |claim: Option<&str>| -> crate::jwt_bearer::models::JwtVerificationStrategy {
+            serde_json::from_value(serde_json::json!({
+                "id": "strategy", "name": "Callers", "expected_issuer": "https://idp.example",
+                "jwks_source": {"type": "remote", "jwks_uri": "https://idp.example/jwks"},
+                "principal_claim": claim,
+                "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let confirmation = |claim: Option<&str>| ConsentConfirmation {
+            id_token_principal_claim: claim.map(String::from),
+            ..confirming(consent_provider("a", "a", None))
+                .consent_confirmation
+                .unwrap()
+        };
+        for claim in EDITABLE_CLAIMS {
+            let expected = if claim == "email" {
+                ConfirmationStrategyRefusal::CallerNamedByEmail
+            } else {
+                ConfirmationStrategyRefusal::EditableClaim
+            };
+            assert_eq!(
+                confirmation(Some(claim)).claims_through(&strategy(None), None),
+                Err(expected.clone()),
+                "{claim}"
+            );
+            assert_eq!(confirmation(None).claims_through(&strategy(Some(claim)), None), Err(expected), "{claim}");
+        }
+        for (strategy_claim, id_token_claim) in [(None, None), (Some("oid"), None), (None, Some("oid"))] {
+            assert!(
+                confirmation(id_token_claim)
+                    .claims_through(&strategy(strategy_claim), None)
+                    .is_ok(),
+                "{strategy_claim:?}, {id_token_claim:?}"
+            );
+        }
+        assert!(matches!(
+            confirmation(Some("iss")).claims_through(&strategy(None), None),
+            Err(ConfirmationStrategyRefusal::IdTokenClaim(reason)) if reason.starts_with("principal_claim")
+        ));
+    }
+
+    #[test]
+    fn require_is_stored_only_when_set() {
+        let mut setting = confirming(consent_provider("a", "a", None))
+            .consent_confirmation
+            .unwrap();
+        let stored = serde_json::to_value(&setting).unwrap();
+        assert_eq!(stored.get("require"), None);
+        assert!(
+            !serde_json::from_value::<ConsentConfirmation>(stored)
+                .unwrap()
+                .require
+        );
+        setting.require = true;
+        let stored = serde_json::to_value(&setting).unwrap();
+        assert_eq!(stored["require"], serde_json::json!(true));
+        assert!(
+            serde_json::from_value::<ConsentConfirmation>(stored)
+                .unwrap()
+                .require
+        );
+    }
+
+    fn confirming(mut provider: CredentialProvider) -> CredentialProvider {
+        provider.consent_confirmation = Some(ConsentConfirmation {
+            client_id_secret_ref: "LOGIN_CLIENT_ID".into(),
+            client_secret_secret_ref: "LOGIN_SECRET".into(),
+            authorization_endpoint: "https://idp.example/authorize".into(),
+            token_endpoint: "https://idp.example/token".into(),
+            jwt_verification_strategy_id: "strategy".into(),
+            id_token_principal_claim: None,
+            require: false,
+        });
+        provider
+    }
+
+    /// A provider with `consent_confirmation` also answers on its redirect URI
+    /// followed by `/confirm`, so another provider whose redirect URI is that
+    /// one shares a redirect URI with it, whichever of the two is checked. A
+    /// provider without the setting reserves no such URI.
+    #[tokio::test]
+    async fn a_confirmation_redirect_uri_is_taken_like_a_redirect_uri() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = storage::FileSystemCredentialProviderStore::new(directory.path().to_path_buf())
+            .await
+            .unwrap();
+        let confirming_one =
+            confirming(consent_provider("a", "a", Some("https://gw.example/v1/identity/oauth/callback/a")));
+        let at_its_confirmation_uri =
+            consent_provider("b", "confirm", Some("https://gw.example/v1/identity/oauth/callback/a/confirm"));
+        use storage::CredentialProviderStorage as _;
+        store
+            .create(confirming_one.clone())
+            .await
+            .unwrap();
+        store
+            .create(at_its_confirmation_uri.clone())
+            .await
+            .unwrap();
+
+        let taken = |provider: CredentialProvider| {
+            let store = &store;
+            async move {
+                redirect_uri_taken_by(store, &provider, "https://gw.example")
+                    .await
+                    .unwrap()
+                    .map(|other| other.id)
+            }
+        };
+        assert_eq!(
+            taken(confirming_one.clone())
+                .await
+                .as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            taken(at_its_confirmation_uri.clone())
+                .await
+                .as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            log_redirect_uri_conflicts(
+                &[confirming_one.clone(), at_its_confirmation_uri.clone()],
+                "https://gw.example"
+            ),
+            [("a", "b")]
+        );
+
+        let mut not_confirming = confirming_one;
+        not_confirming.consent_confirmation = None;
+        store
+            .update(not_confirming.clone())
+            .await
+            .unwrap();
+        assert_eq!(taken(not_confirming.clone()).await, None);
+        assert_eq!(taken(at_its_confirmation_uri.clone()).await, None);
+        assert!(
+            log_redirect_uri_conflicts(&[not_confirming, at_its_confirmation_uri], "https://gw.example").is_empty()
+        );
+    }
+
+    #[test]
+    fn an_update_request_tells_an_absent_consent_confirmation_from_null() {
+        let parse = |body: &str| {
+            serde_json::from_str::<UpdateCredentialProviderRequest>(body)
+                .unwrap()
+                .consent_confirmation
+        };
+        assert_eq!(parse("{}"), None);
+        assert_eq!(parse(r#"{"consent_confirmation": null}"#), Some(None));
+        let absent: UpdateCredentialProviderRequest = serde_json::from_str("{}").unwrap();
+        let round_trip = serde_json::to_string(&absent).unwrap();
+        assert_eq!(parse(&round_trip), None, "an absent setting stays absent: {round_trip}");
+        let cleared: UpdateCredentialProviderRequest =
+            serde_json::from_str(r#"{"consent_confirmation": null}"#).unwrap();
+        assert_eq!(parse(&serde_json::to_string(&cleared).unwrap()), Some(None));
+    }
+
+    /// Each pair of consent providers sharing a redirect URI is logged once as
+    /// an ERROR naming both by id, and nothing else about them; providers with
+    /// distinct redirect URIs, or outside the consent flow, are not.
+    #[test]
+    fn shared_redirect_uris_are_logged_as_errors_by_provider_id() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let mut client_credentials = consent_provider("cc", "github", None);
+        client_credentials.provider_type = CredentialProviderType::OAuth2ClientCredentials;
+        let distinct = [
+            consent_provider("a", "github", None),
+            consent_provider("b", "github", Some("https://other.example/v1/identity/oauth/callback/github")),
+            consent_provider("c", "gitlab", None),
+            client_credentials,
+        ];
+        assert!(log_redirect_uri_conflicts(&distinct, "https://gw.example").is_empty());
+        assert!(
+            !logs
+                .text()
+                .contains("redirect URI"),
+            "{}",
+            logs.text()
+        );
+
+        let shared = [
+            consent_provider("a", "github", None),
+            consent_provider("b", "github", None),
+            consent_provider("c", "github", Some("https://gw.example:443/v1/identity/oauth/callback/github")),
+            consent_provider("d", "gitlab", None),
+        ];
+        assert_eq!(log_redirect_uri_conflicts(&shared, "https://gw.example"), [("a", "b"), ("a", "c"), ("b", "c")]);
+        let lines: Vec<_> = logs
+            .text()
+            .lines()
+            .filter(|line| line.contains("share a redirect URI"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.contains("ERROR")),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("provider_id=a") && lines[0].contains("other_provider_id=b"), "{}", lines[0]);
+        assert!(
+            !logs
+                .text()
+                .contains("tenant-of-"),
+            "no tenant is named: {}",
+            logs.text()
+        );
+    }
+
+    /// A stored consent provider whose redirect URI or authorization endpoint
+    /// breaks the consent rules is logged as an ERROR naming it and the rule,
+    /// never its URLs or parameters; conforming providers and providers
+    /// outside the consent flow are not.
+    #[test]
+    fn stored_consent_providers_that_break_the_consent_rules_are_logged_as_errors() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let with = |id: &str, callback_url: Option<&str>, endpoint: &str, params: &[(&str, &str)]| {
+            let mut provider = consent_provider(id, id, callback_url);
+            provider.authorization_endpoint = Some(endpoint.to_string());
+            provider.additional_params = params
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+            provider
+        };
+        let endpoint = "https://idp.example/authorize";
+        let mut external = with("external", Some("http://gw.example/cb"), "http://idp.example/authorize", &[]);
+        external.issuer = Some("https://idp.example".to_string());
+        let mut client_credentials = with("cc", Some("http://gw.example/cb"), endpoint, &[]);
+        client_credentials.provider_type = CredentialProviderType::OAuth2ClientCredentials;
+        let providers = [
+            with("fine", None, endpoint, &[("prompt", "consent")]),
+            with("plain-http", Some("http://gw.example/v1/identity/oauth/callback/plain-http"), endpoint, &[]),
+            with("query", Some("https://gw.example/v1/identity/oauth/callback/query?x=1"), endpoint, &[]),
+            with("http-endpoint", None, "http://idp.example/authorize", &[]),
+            with("reserved", None, endpoint, &[("state", "secret-param-value")]),
+            external,
+            client_credentials,
+        ];
+
+        let breaches = log_consent_rule_breaches(&providers, "https://gw.example");
+
+        assert_eq!(
+            breaches,
+            [
+                ("plain-http", "callback_url must be an https URL with a host"),
+                ("query", "callback_url must not carry credentials, a query or a fragment"),
+                (
+                    "http-endpoint",
+                    "authorization_endpoint must be an https URL with a host and no credentials or fragment"
+                ),
+                (
+                    "reserved",
+                    "authorization_endpoint query and additional_params must not repeat a reserved or duplicate \
+                     parameter or exceed the limits"
+                ),
+            ]
+        );
+        let text = logs.text();
+        let lines: Vec<_> = text
+            .lines()
+            .filter(|line| line.contains("breaks the consent rules"))
+            .collect();
+        assert_eq!(lines.len(), 4, "{text}");
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.contains("ERROR")),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("provider_id=plain-http"), "{}", lines[0]);
+        for leaked in ["gw.example", "idp.example", "secret-param-value", "tenant-of-"] {
+            assert!(!text.contains(leaked), "the log names no URL, parameter or tenant: {text}");
+        }
+    }
 
     #[test]
     fn a_service_token_reads_only_the_secrets_its_provider_type_uses() {
@@ -879,6 +1798,82 @@ mod tests {
     }
 
     #[test]
+    fn a_client_reference_left_on_a_provider_is_not_kept_once_a_client_authentication_sends_it() {
+        let stored: CredentialProvider = serde_json::from_value(serde_json::json!({
+            "id": "p", "name": "p", "provider_id": "p", "provider_type": "oauth2_jwt_bearer",
+            "token_endpoint": "https://idp.example/token", "jwt_signing_key_secret_ref": "KEY",
+            "client_id_secret_ref": "ID", "client_secret_secret_ref": "SECRET",
+            "jwt_issuer": "iss", "jwt_subject": "sub",
+            "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+        }))
+        .unwrap();
+        let all_kept = vec![("ID", true), ("SECRET", true), ("KEY", true)];
+        let none_kept = vec![("ID", false), ("SECRET", false), ("KEY", false)];
+        assert_eq!(stored.secret_refs_kept_from(Some(&stored)), all_kept);
+
+        let mut sending = stored.clone();
+        sending
+            .jwt
+            .client_authentication = Some(GrantClientAuthentication::ClientSecretPost);
+        assert_eq!(sending.secret_refs_kept_from(Some(&sending)), all_kept);
+        assert_eq!(sending.secret_refs_kept_from(Some(&stored)), none_kept);
+        assert_eq!(
+            stored.secret_refs_kept_from(Some(&sending)),
+            none_kept,
+            "dropping the client authentication is a change of what the provider sends too"
+        );
+    }
+
+    #[test]
+    fn sends_client_secret_follows_the_provider_type_and_the_held_reference() {
+        let provider = |provider_type: &str, client_authentication: Option<&str>, reference: Option<&str>| {
+            serde_json::from_value::<CredentialProvider>(serde_json::json!({
+                "id": "p", "name": "p", "provider_id": "p", "provider_type": provider_type,
+                "client_authentication": client_authentication, "client_secret_secret_ref": reference,
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let cases = [
+            ("oauth2_client_credentials", None, Some("SECRET"), true),
+            ("oauth2_authorization_code", None, Some("SECRET"), true),
+            ("oauth2_client_credentials", None, None, false),
+            ("oauth2_authorization_code", None, None, false),
+            ("oauth2_client_credentials", Some("none"), Some("SECRET"), true),
+            ("oauth2_client_credentials", Some("client_secret_post"), None, false),
+            ("oauth2_jwt_bearer", Some("client_secret_basic"), Some("SECRET"), true),
+            ("oauth2_jwt_bearer", Some("client_secret_post"), Some("SECRET"), true),
+            ("oauth2_jwt_bearer", Some("client_secret_basic"), None, false),
+            ("oauth2_jwt_bearer", Some("none"), Some("SECRET"), false),
+            ("oauth2_jwt_bearer", None, Some("SECRET"), false),
+            ("oauth2_client_credentials_jwt_auth", None, Some("SECRET"), false),
+            ("api_key", None, Some("SECRET"), false),
+            ("oauth2_client_credentials", None, Some("  "), false),
+            ("oauth2_authorization_code", None, Some(""), false),
+            ("oauth2_jwt_bearer", Some("client_secret_basic"), Some("  "), false),
+        ];
+        for (provider_type, client_authentication, reference, sends) in cases {
+            assert_eq!(
+                provider(provider_type, client_authentication, reference).sends_client_secret(),
+                sends,
+                "{provider_type}, client authentication {client_authentication:?}, reference {reference:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_consent_confirmation_client_id_and_secret_are_read_and_never_kept() {
+        let mut stored = confirming(consent_provider("a", "a", None));
+        stored.client_id_secret_ref = Some("CLIENT_ID".into());
+        stored.client_secret_secret_ref = Some("CLIENT_SECRET".into());
+        assert_eq!(stored.secret_refs(), vec!["CLIENT_ID", "CLIENT_SECRET", "LOGIN_CLIENT_ID", "LOGIN_SECRET"]);
+        assert_eq!(
+            stored.secret_refs_kept_from(Some(&stored)),
+            vec![("CLIENT_ID", true), ("CLIENT_SECRET", true), ("LOGIN_CLIENT_ID", false), ("LOGIN_SECRET", false)]
+        );
+    }
+
+    #[test]
     fn a_provider_is_usable_by_a_surface_according_to_type_tenant_and_mode() {
         use crate::config::credential_policy::RuleMode::{Enforce, Warn};
         use crate::tenancy::SurfaceTenancy;
@@ -976,6 +1971,7 @@ mod tests {
             api_key_secret_ref: None,
             jwt: Default::default(),
             description: Some("Test provider".to_string()),
+            consent_confirmation: None,
             created_at: now,
             updated_at: now,
             callback_url: None,
@@ -987,8 +1983,10 @@ mod tests {
             client_id: None,
             allow_unadvertised_pkce: false,
             authorization_response_iss_parameter_supported: None,
+            authorization_response_issuer: None,
             scope_comparison: Default::default(),
             revocation_ends_authorization: false,
+            send_resource: true,
         }
     }
 
@@ -1061,12 +2059,6 @@ mod tests {
     }
 
     #[test]
-    fn test_callback_path_format() {
-        let provider = make_provider("GitHub", "github");
-        assert_eq!(provider.callback_path, "/oauth/callback/github");
-    }
-
-    #[test]
     fn test_api_key_type_deserialization() {
         let json = r#"{
             "name": "External Service",
@@ -1112,6 +2104,7 @@ mod tests {
             api_key_secret_ref: Some("MY_API_KEY".to_string()),
             jwt: Default::default(),
             description: None,
+            consent_confirmation: None,
             created_at: now,
             updated_at: now,
             callback_url: None,
@@ -1123,8 +2116,10 @@ mod tests {
             client_id: None,
             allow_unadvertised_pkce: false,
             authorization_response_iss_parameter_supported: None,
+            authorization_response_issuer: None,
             scope_comparison: Default::default(),
             revocation_ends_authorization: false,
+            send_resource: true,
         };
         let json = serde_json::to_string(&provider).unwrap();
         assert!(json.contains("api_key"));
@@ -1163,6 +2158,7 @@ mod tests {
                 jwt_key_id: Some("key-1".into()),
                 jwt_issuer: Some("agent@project.iam.gserviceaccount.com".into()),
                 jwt_subject: Some("user@example.com".into()),
+                client_authentication: None,
             }
         );
         let value = serde_json::to_value(&provider).unwrap();
@@ -1237,6 +2233,7 @@ mod tests {
             jwt_key_id: Some("kid-1".into()),
             jwt_issuer: Some("sa@example.iam".into()),
             jwt_subject: Some("user@example.com".into()),
+            client_authentication: None,
         };
         let item = serde_json::to_value(CredentialProviderListItem::from(&provider)).unwrap();
         assert_eq!(item["provider_type"], "oauth2_jwt_bearer");
@@ -1248,6 +2245,29 @@ mod tests {
         let text = item.to_string();
         assert!(!text.contains("KEY_REF_MARKER"));
         assert!(!text.contains("CERT_REF_MARKER"));
+    }
+
+    #[test]
+    fn list_item_shows_the_client_authentication_but_never_the_client_references() {
+        let mut provider = make_provider("Vertex", "vertex");
+        provider.provider_type = CredentialProviderType::OAuth2JwtBearer;
+        provider.client_id_secret_ref = Some("ID_REF_MARKER".into());
+        provider.client_secret_secret_ref = Some("SECRET_REF_MARKER".into());
+        let unset = serde_json::to_value(CredentialProviderListItem::from(&provider)).unwrap();
+        assert!(
+            unset
+                .get("client_authentication")
+                .is_none()
+        );
+
+        provider
+            .jwt
+            .client_authentication = Some(GrantClientAuthentication::ClientSecretBasic);
+        let item = serde_json::to_value(CredentialProviderListItem::from(&provider)).unwrap();
+        assert_eq!(item["client_authentication"], "client_secret_basic");
+        let text = item.to_string();
+        assert!(!text.contains("ID_REF_MARKER"));
+        assert!(!text.contains("SECRET_REF_MARKER"));
     }
 
     #[test]
@@ -1274,6 +2294,88 @@ mod tests {
         );
         assert_eq!(merged.jwt_issuer.as_deref(), Some("new@example"));
         assert_eq!(merged.jwt_key_id, None);
+    }
+
+    #[test]
+    fn a_client_authentication_is_kept_unless_an_update_names_or_clears_it() {
+        let stored = JwtAssertionSettings {
+            client_authentication: Some(GrantClientAuthentication::ClientSecretBasic),
+            ..Default::default()
+        };
+        let sent = |value: &str| -> JwtAssertionSettings {
+            serde_json::from_value(serde_json::json!({ "client_authentication": value })).unwrap()
+        };
+        let kept = JwtAssertionSettings::default()
+            .or(stored.clone())
+            .normalized();
+        assert_eq!(kept.client_authentication, Some(GrantClientAuthentication::ClientSecretBasic));
+        let changed = sent("client_secret_post")
+            .or(stored.clone())
+            .normalized();
+        assert_eq!(changed.client_authentication, Some(GrantClientAuthentication::ClientSecretPost));
+        let cleared = sent("")
+            .or(stored)
+            .normalized();
+        assert_eq!(cleared.client_authentication, None);
+        assert_eq!(
+            sent("")
+                .normalized()
+                .client_authentication,
+            None
+        );
+    }
+
+    #[test]
+    fn client_authentication_uses_the_oauth_method_names_and_is_left_out_when_unset() {
+        use GrantClientAuthentication::*;
+        for (name, method) in [
+            ("none", PublicClient),
+            ("client_secret_basic", ClientSecretBasic),
+            ("client_secret_post", ClientSecretPost),
+        ] {
+            let settings: JwtAssertionSettings =
+                serde_json::from_value(serde_json::json!({ "client_authentication": name })).unwrap();
+            assert_eq!(settings.client_authentication, Some(method), "{name}");
+            assert_eq!(serde_json::to_value(&settings).unwrap()["client_authentication"], name);
+            assert_eq!(method.as_str(), name);
+            assert_eq!(method.uses_secret(), name.starts_with("client_secret"), "{name}");
+        }
+        assert_eq!(serde_json::to_value(Unset).unwrap(), Unset.as_str());
+        let unset = serde_json::to_value(JwtAssertionSettings::default()).unwrap();
+        assert!(
+            unset
+                .get("client_authentication")
+                .is_none()
+        );
+        for refused in ["private_key_jwt", "basic", "NONE"] {
+            assert!(
+                serde_json::from_value::<JwtAssertionSettings>(serde_json::json!({ "client_authentication": refused }))
+                    .is_err(),
+                "{refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_jwt_bearer_service_token_reads_the_client_references_only_for_the_method_that_uses_them() {
+        let provider = |method: Option<&str>| -> CredentialProvider {
+            serde_json::from_value(serde_json::json!({
+                "id": "p", "name": "p", "provider_id": "p", "provider_type": "oauth2_jwt_bearer",
+                "client_id_secret_ref": "ID", "client_secret_secret_ref": "SECRET",
+                "jwt_signing_key_secret_ref": "SIGNING", "jwt_certificate_secret_ref": "CERT",
+                "client_authentication": method,
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        for (method, expected) in [
+            (None, vec!["SIGNING", "CERT"]),
+            (Some("none"), vec!["ID", "SIGNING", "CERT"]),
+            (Some("client_secret_basic"), vec!["ID", "SECRET", "SIGNING", "CERT"]),
+            (Some("client_secret_post"), vec!["ID", "SECRET", "SIGNING", "CERT"]),
+        ] {
+            assert_eq!(provider(method).service_token_secret_refs(), expected, "{method:?}");
+        }
     }
 
     #[test]

@@ -67,6 +67,7 @@ changes:
   - One behaviour per scenario, in the vocabulary of [`CONTEXT.md`](CONTEXT.md).
   - Exercise the real gateway through its public interfaces.
   - Assert what the caller or operator observes, not internal state.
+  - Fixtures store an Access Point as the admin API creates it: closed when it authenticates callers, public when it does not. Test a caller whose credential fails on that protected flow (refused with `401`, the Target never called). Only a scenario about what a public Access Point still guarantees (the failed caller reaches policy, gets no Target credential and no caller identity, and a policy can deny it) says `the surface is stored with a public Access Point`, and only one about a legacy surface says `the surface is stored as a legacy surface`.
 - **Legacy component**: `src/component_tests/` is frozen. No new files, test functions or helpers; existing tests may be fixed or deleted. The `freeze` tests in `src/component_tests/mod.rs` pin each file's test count in `FROZEN_FILES` and fail on a new file or a count that moves without its pin. Pins only go down. New helpers are a review rule; the tests do not catch them.
 - **MCP conformance**: `make mcp-conformance` (`scripts/mcp-conformance/`) runs the published MCP suite and the legacy compatibility checks against the ordinary gateway binary; `ARGS=--unit-tests` adds the full binary test suite.
 
@@ -144,7 +145,19 @@ _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-bui
 
 The Surface Builder's inbound Identity **From API Key** shows no key picker, since each caller is
 identified by the API key it presents, and blocks Save unless every Caller Context method is API
-Key or API Key Provider; see _Surface Builder_ in
+Key or API Key Provider; the protected and external Identities' key picker lists only the
+surface's own active keys; see _Surface Builder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+A protected, external or Transit Point Identity whose API key reference is `blocking`
+(`api_key_references`: a revoked or deleted key, or another surface's key that is revoked or
+under `enforce`) is
+drawn unconfigured, with a red dashed ring and a
+short reason under the node on the canvas and the full warning in its panel, and Save shows that warning as an error until it names an active key. Another surface's key that does
+not block gets only a yellow notice in the panel and saves. The surface page says "This surface
+is refusing requests" while `serving_status` is `not_serving`. The API key detail page says a
+key of a deleted surface is no longer in use. See _Surface Builder_ and
+[_API key delete_](www/default/AGENTS.md#api-key-delete) in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Trust Agent page's tier banner never implies key custody for a local deployment or a trust agent
@@ -156,8 +169,49 @@ with a `did:webvh` identity has a Rotate control key action on its row, with a r
 
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
 
+The endpoint editor picks a Kafka endpoint's security protocol (`plaintext`, `ssl`,
+`sasl_plaintext` or `sasl_ssl`) and, for a SASL one, the SASL mechanism (`PLAIN`,
+`SCRAM-SHA-256` or `SCRAM-SHA-512`); see
+_Endpoint editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#endpoint-editor).
+
+The Target authentication fallback select on the Managed Agent and on a Transit Point labels
+its reject option **Reject request**, with no status; see _Target authentication fallback_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#target-authentication-fallback).
+
+The credential provider editor's **Client authentication** select (JWT Bearer) keeps its
+explanation behind `FieldHelp`; see _Credential provider editor_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
+
+The credential provider editor and list warn when a provider's token requests send `resource`
+to a Microsoft identity platform v2.0 token endpoint, never for an external consent provider
+with `send_resource: false`, and tell an external consent provider that sends it to be
+re-created with `send_resource: false`; see _Credential provider editor_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
+
 The secret editor has one save button and never shows a stored secret value; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
+
+Deleting an API key on the Secrets page or the API key page opens a confirmation dialog that
+says surfaces using the key stop working until another key is picked, and deletes only after
+**Delete API key** in that dialog. Revoking one opens the same dialog component worded for
+revoke: surfaces using the key stop serving, the key can't be restored and a new key gives the
+surface a new DID; it revokes only after **Revoke API key**, and a failed revoke shows an error
+toast. See _API key
+delete_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#api-key-delete).
+
+The credential provider editor shows a **Consent confirmation** switch and its login client
+(ID and secret, both picked from the secrets store), endpoints, strategy (only the provider's
+tenant's and appliance-wide ones; appliance-wide only on a new provider), principal claim and a
+**Refuse callers that can't be confirmed** switch (`require`) on a legacy consent provider (authorization
+code, no `issuer`), with the read-only Confirmation redirect URI to register; Save sends the
+setting while on, `null` when a stored one is switched off or the provider is no longer legacy
+consent, and nothing otherwise; see _Credential provider editor_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
+
+The strategies tab shows a refused JWT verification strategy delete, and the strategy editor a
+refused issuer change, with the credential providers that still use the strategy, by name, and a
+count of those the user can't view; see _JWT verification strategy editor_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#jwt-verification-strategy-editor).
 
 The JWT verification strategy editor's Caller identity claim is editable only on a new strategy;
 see _JWT verification strategy editor_ in
@@ -168,7 +222,13 @@ claim other than `sub`; see _Credentials audit tab_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credentials-audit-tab).
 
 The credential provider editor shows the inputs of the chosen type, picks the JWT signing key
-and certificate from the secrets store, and target authentication on a Managed Agent or Transit
+and certificate from the secrets store, keeps an authorization code provider's stored Callback URL
+while its host is unchanged and it conforms (`https`, path ending in the stored `callback_path`)
+and otherwise builds it from the stored `callback_path` (when creating, it saves the
+Callback URL in a second request once the gateway returns the path it built from the id it
+generated for the provider, then opens that provider, also when the second request fails; a
+stored provider without a Callback URL shows the gateway's own one), and target
+authentication on a Managed Agent or Transit
 Point can take its credential from a credential provider; see _Credential provider editor_ and
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
 
@@ -189,9 +249,31 @@ The Trust Recorder panel and its entries warn while an entry uses the surface Is
 Authority and the surface has no Issuer or its Issuer no longer exists; see _Trust Recorder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder).
 
+Trust Checks and Trust Recorder entries keep `authority_source` through every save and the
+Authority pickers set it. One whose Authority, or any Authority a query lists, was deleted from
+the Authorities register is drawn
+unconfigured with a "Configuration required" warning and blocks Save, and a refused Authority
+delete lists what uses the Authority in a dialog with no way to delete it anyway; see _Trust
+Check_ and _Authority delete_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#authority-delete).
+A Trust Check query that lists several authorities (`query.authority_ids`) keeps its list and
+`authority_sources` through every dashboard save, and the fullscreen editor picks that list in one
+multi-select of the Issuers and Authorities registers; see _Authority lists_ under _Trust Check_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#trust-check).
+
 The Audit Log names the surface variant of each request record and describes `request_rejected`
 records, and the Metrics page badges configured variant aliases only; see _Audit page: surface
 variants and refusals_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#audit-page-surface-variants-and-refusals).
+
+An audit response says what a read did not return in two fields: `truncated` (it stopped before
+the end of the history) and `dropped_records` (the history holds records it could not read).
+Either makes the counts lower bounds, so the Audit Log and the Credentials audit tab render every
+number from that read with a trailing `+`, an empty page of such a read says the records searched
+held none rather than that the log is empty, and nothing else changes. A read the gateway could
+not make at all is answered with `500`, and both views show that failure — the Audit Log as an
+error panel with a Retry in place of its empty state, never as an empty log. The Audit Log also shows the size of the history against the advisory
+`[audit] vp_audit_log_soft_cap_bytes`, which enforces nothing, formatted by the one shared
+`utils/formatBytes.ts`; see _Audit page: partial reads and
+log size_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#audit-page-partial-reads-and-log-size).
 
 The Identities page shows a Trust Recorder status chip and a Recorder filter, and the Trust
 Recorder panel shows a Last outcome row; see _Identities page_ and _Trust Recorder panel_ in
@@ -202,13 +284,37 @@ Count column, and lists a managed agent DID shared by several surfaces once, as 
 with its surface count and every one of its surfaces; see _Identities page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page).
 
+The Identities page marks an identity whose API key was revoked or deleted, or whose every
+surface was deleted, with a red "Revoked" badge, shows a deleted surface as plain text with a
+"Deleted" badge and no link, and selecting a revoked identity says it is no longer in use; see
+_Identities page_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page).
+
 The Agent Cards view of an A2A or AP2 surface shows the managed agent's card beside the served card,
-and the Managed Agent panel shows its fetch status; see _Agent Cards tab_ in
+and the Managed Agent panel shows its fetch status, including a card served without a managed
+identity, in the warning tone; a card refused for its identity names the identity error; see
+_Agent Cards tab_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#agent-cards-tab).
+
+The Identities page shows one row per surface Managed Agent, with its earlier DIDs (from its
+responses and from its Transit Points) and certificate or API key rotations listed as
+versions in the expanded row, each earlier DID with its own actions; rows carry only
+`rotation_count`, and Version History loads the rotations when opened; see _Identities page_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page) and
+[`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#identity-versions).
+
+The Agent Identity panel doesn't offer From API Key on the Managed Agent's response identity,
+and a stored one keeps working; see _Surface Builder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Caller Context element lists its caller authentication methods in order, in the sidebar and
 in the fullscreen editor, each row with a Configure button that opens that method's settings;
 see _Caller Context methods_ in [`www/default/AGENTS.md`](www/default/AGENTS.md).
+
+A JWT Bearer Caller Context method requires Accepted Audiences, keeps one stored without them
+until it is changed, and has an **Audience Claim** select (`aud`, `client_id`, `azp`) for identity
+providers that issue no `aud`; see _Caller Context methods_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md).
 
 The Caller Context editor of an MCP surface whose first method is JWT Bearer edits
 authorization server discovery (`caller_authentication.protected_resource`), and Save removes
@@ -219,8 +325,7 @@ The Access Point panel's **Public access** switch writes `access_point.public`. 
 surface with no Caller Context saves but is not ready (unless it sends a Target credential,
 or has an `a2a-proxy://` Target, while `credential_policy.target_source_auth` is `enforce`,
 which refuses the save), shown as "Not ready for external access" under the Access Point URL
-with a **Configure Authentication** action. Saving a public surface, a not-ready one, or a
-surface without `public` and without a Caller Context, warns after the save; see
+with a **Configure Authentication** action; see
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Dashboard shows the metrics **Delete** button only to users with `settings.edit`; see
@@ -256,16 +361,20 @@ Legacy `package channel.policy` is migrated to `surface.policy` at boot. Deny re
 are `data.gateway.policy.deny_reason` and `data.surface.policy.deny_reason`.
 
 **Policy planes and identity attribution fail closed.** Two stages publish results and
-let OPA decide instead: Trust Check, and caller source authentication. Three exceptions refuse
-a failed caller before policy with a `401`, direct or over Fabric: a closed Access Point
-(`access_point.public: false`), an Access Point whose `caller_authentication.on_failure` is
-`reject`, and an MCP Access Point that publishes protected resource metadata (a missing or
+let OPA decide instead: Trust Check, and caller source authentication. Source authentication
+hands a failed caller to policy only on a public Access Point (`access_point.public: true`);
+every other Access Point refuses it before policy with a `401`, direct or over Fabric: a closed
+one (`public: false`), a legacy one stored without `public`, and any whose
+`caller_authentication.on_failure` is `reject`. Two more refuse it, public or not: an Access
+Point whose inbound identity is `from_jwt_claim` (no caller identity can be derived without a
+valid JWT), and an MCP Access Point that publishes protected resource metadata (a missing or
 refused JWT Bearer credential gets the discovery challenge on direct requests, a failed
-credential of another method a plain `401`). The
-admin API creates every surface closed unless `access_point.public` is `true`; a closed
-surface without source authentication is not ready and refuses every request with `503`.
-Surfaces without `public` keep forwarding failed callers to policy unless `on_failure` is
-`reject`, and policy must deny `input.source_auth.method == "failed"` to reject them.
+credential of another method a plain `401`). Each such refusal's body says only `Caller
+credential missing or invalid`; the reason is logged, not sent. The admin API creates every
+surface closed unless `access_point.public` is `true`; a closed surface without source
+authentication is not ready and refuses every request with `503`. A legacy surface without
+source authentication admits every caller. On a public Access Point, policy must deny
+`input.source_auth.method == "failed"` to reject failed callers.
 See [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#closed-and-public-access-points) and
 [`docs/POLICY.md`](docs/POLICY.md#failed-caller-authentication).
 

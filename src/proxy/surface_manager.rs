@@ -521,6 +521,17 @@ impl SurfaceTaskManager {
         let _reload_guard = self.reload_lock.lock().await;
         info!("Reloading channel configuration...");
 
+        let network_config = self
+            .bootstrap_config
+            .load_network_config()
+            .map_err(|e| anyhow::anyhow!("Failed to load network configuration: {}", e))?;
+        let collisions = crate::proxy::paths::check_spa_route_collisions(network_config.dashboard_shadowing_prefixes());
+        let skipped_prefixes = (!collisions.is_empty()).then(|| {
+            let warning = crate::proxy::paths::spa_collision_warning(&collisions);
+            error!("{warning}");
+            warning
+        });
+
         // Step 1: Clear the task IDs map
         self.task_ids
             .write()
@@ -560,11 +571,7 @@ impl SurfaceTaskManager {
             warn!("Failed to save configuration to cache: {}", e);
         }
 
-        // Step 4: Load network configuration and extract ports
-        let network_config = self
-            .bootstrap_config
-            .load_network_config()
-            .map_err(|e| anyhow::anyhow!("Failed to load network configuration: {}", e))?;
+        // Step 4: Extract ports from the network configuration
         for surface in &new_config.surfaces {
             if let Some(adjustment) =
                 surface.transit_token_lifetime_adjustment(network_config.transit_token_max_lifetime_secs)
@@ -967,16 +974,23 @@ impl SurfaceTaskManager {
             .await
             .clear();
 
-        if !failed_ports.is_empty() {
+        let failed_ports = (!failed_ports.is_empty()).then(|| {
             let warning = format!(
                 "These ports could not be given their rebuilt routes and keep serving their previous ones: {}",
                 failed_ports.join("; ")
             );
             warn!("{warning}");
-            return Ok((channels_count, false, Some(warning)));
+            warning
+        });
+        let warnings: Vec<String> = [skipped_prefixes, failed_ports]
+            .into_iter()
+            .flatten()
+            .collect();
+        if warnings.is_empty() {
+            info!("Successfully reloaded {} channels", channels_count);
+            return Ok((channels_count, false, None));
         }
-        info!("Successfully reloaded {} channels", channels_count);
-        Ok((channels_count, false, None))
+        Ok((channels_count, false, Some(warnings.join(". "))))
     }
 
     /// Reload channels with fallback to cached configuration on failure

@@ -42,6 +42,27 @@ Feature: A2A HTTP surface forwarding and identity
     And the agent card does not contain the raw identity extension
     And the agent card contains a valid Verifiable Presentation
 
+  Scenario: A2A agent card without the identity extension is served without an identity credential
+    Given the surface has managed identity enabled
+    And managed agent "bravo" publishes an agent card without the agent-identity extension
+    When the caller fetches the agent card
+    Then the response status is 200
+    And the agent card url points to the gateway listen address
+    And the agent card does not contain the credential extension
+
+  Scenario: A2A agent card whose identity credential names a different DID than its presentation is refused
+    Given the surface has managed identity enabled
+    And managed agent "bravo" publishes an agent card whose identity credential names a different DID than its presentation
+    When the caller fetches the agent card
+    Then the response is a "protected_identity" identity validation error
+
+  Scenario: A2A response from the managed agent without the agent-identity extension is refused
+    Given the surface has managed identity enabled
+    And managed agent "bravo" responds without the agent-identity extension
+    When the caller sends a request to the surface
+    Then the response is a "protected_identity" identity extension missing error
+    And managed agent "bravo" received the forwarded request
+
   Scenario: Caller identity is not enforced when only a Server Identity (MA to AP) is configured
     # The surface configures a protected (MA to AP) Server Identity but no
     # inbound (CA to AP) identity element. A caller that happens to include a
@@ -94,8 +115,8 @@ Feature: A2A HTTP surface forwarding and identity
   Scenario: A missing target credential fails the agent card when fallback is reject
     Given the gateway authenticates to the managed agent with missing secret "bdd-missing-target-secret" in header "x-target-api-key", falling back to "reject"
     When the caller fetches the agent card
-    Then the response status is 502
-    And the response body is error "agent_card_target_auth_failed"
+    Then the response status is 500
+    And the response body is error "agent_card_target_auth_misconfigured"
     And managed agent "bravo" was not called
 
   Scenario: A missing target credential fetches the agent card without it when fallback is passthrough
@@ -135,8 +156,8 @@ Feature: A2A HTTP surface forwarding and identity
     And the credential provider is refusing token requests
     And the gateway's authentication to the managed agent falls back to "reject"
     When the caller fetches the agent card
-    Then the response status is 502
-    And the response body is error "agent_card_target_auth_failed"
+    Then the response status is 503
+    And the response body is error "agent_card_target_auth_unavailable"
     And managed agent "bravo" was not called
 
   Scenario: A refused provider token request fetches the agent card without it when fallback is passthrough
@@ -153,6 +174,7 @@ Feature: A2A HTTP surface forwarding and identity
     Then the response status is 200
     And managed agent "bravo" received header "authorization" with value "Bearer bdd-target-provider-token"
     And the credential provider received a JWT Bearer grant signed with the provider key
+    And the credential provider's latest token request has no client ID or secret in its form body
 
   Scenario: A forwarded request presents a provider-issued target credential
     Given the gateway authenticates to the managed agent with a client credentials provider
@@ -175,6 +197,91 @@ Feature: A2A HTTP surface forwarding and identity
     Then the response status is 200
     And managed agent "bravo" received header "x-request-id" with value "req-caller"
     And managed agent "bravo" did not receive header "cookie"
+    And managed agent "bravo" did not receive header "x-target-api-key"
+
+  Scenario: The target credential is sent on a GET of the well-known agent card
+    Given the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    When the caller sends a GET request to the surface route path "/.well-known/agent-card.json"
+    Then the response status is 200
+    And managed agent "bravo" received a GET request at path "/.well-known/agent-card.json"
+    And managed agent "bravo" received header "x-target-api-key" with value "bdd-target-secret"
+
+  Scenario: The target credential is sent on a GET of the legacy well-known agent card
+    Given the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    When the caller sends a GET request to the surface route path "/.well-known/agent.json"
+    Then the response status is 200
+    And managed agent "bravo" received a GET request at path "/.well-known/agent-card.json"
+    And managed agent "bravo" received header "x-target-api-key" with value "bdd-target-secret"
+
+  Scenario: The target credential is sent on a GET of the well-known agent card with a query string
+    Given the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    When the caller sends a GET request to the surface route path "/.well-known/agent-card.json?probe=1"
+    Then the response status is 200
+    And managed agent "bravo" received a GET request at path "/.well-known/agent-card.json"
+    And managed agent "bravo" received header "x-target-api-key" with value "bdd-target-secret"
+
+  Scenario: The target credential is sent on a HEAD of the well-known agent card
+    Given the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    When the caller sends a HEAD request to the surface route path "/.well-known/agent-card.json"
+    Then the response status is 200
+    And managed agent "bravo" received a GET request at path "/.well-known/agent-card.json"
+    And managed agent "bravo" received header "x-target-api-key" with value "bdd-target-secret"
+
+  Scenario: The target credential is sent on a HEAD of the legacy well-known agent card
+    Given the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    When the caller sends a HEAD request to the surface route path "/.well-known/agent.json"
+    Then the response status is 200
+    And managed agent "bravo" received a GET request at path "/.well-known/agent-card.json"
+    And managed agent "bravo" received header "x-target-api-key" with value "bdd-target-secret"
+
+  Scenario: The target credential is sent on a HEAD of the well-known agent card with a query string
+    Given the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    When the caller sends a HEAD request to the surface route path "/.well-known/agent-card.json?probe=1"
+    Then the response status is 200
+    And managed agent "bravo" received a GET request at path "/.well-known/agent-card.json"
+    And managed agent "bravo" received header "x-target-api-key" with value "bdd-target-secret"
+
+  Scenario: The target credential is sent to the configured agent card location
+    Given the surface fetches its agent card from path "/agents/bravo/card.json"
+    And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    When the caller sends a GET request to the surface route path "/.well-known/agent-card.json"
+    Then the response status is 200
+    And managed agent "bravo" received a GET request at path "/agents/bravo/card.json"
+    And managed agent "bravo" received header "x-target-api-key" with value "bdd-target-secret"
+
+  Scenario Outline: The target credential is not sent on a public discovery read that is not the agent card
+    Given the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    When the caller sends a GET request to the surface route path "<path>"
+    Then the response status is 200
+    And managed agent "bravo" received a GET request at path "<forwarded path>"
+    And managed agent "bravo" did not receive header "x-target-api-key"
+
+    Examples:
+      | path                | forwarded path      |
+      | /discovery          | /discovery          |
+      | /.well-known/ucp    | /.well-known/ucp    |
+
+  Scenario: A POST to a path that only ends like an agent card runs the surface policy
+    Given the surface has a request policy that denies all requests
+    And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    When the caller sends a POST request to the surface route path "/rpc/agent-card.json"
+    Then the response status is 403
+    And managed agent "bravo" was not called
+
+  Scenario: A POST to the well-known agent card path is answered by the gateway's own card GET before policy
+    Given the surface has a request policy that denies all requests
+    When the caller sends a POST request to the surface route path "/.well-known/agent-card.json"
+    Then the response status is 200
+    And managed agent "bravo" received a GET request at path "/.well-known/agent-card.json"
+    And managed agent "bravo" did not receive a POST request at path "/.well-known/agent-card.json"
+
+  Scenario: A path whose case differs is not served as the agent card fetch
+    Given the surface requires "API Key" source authentication
+    And the surface is stored with a public Access Point
+    And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    When the caller sends a GET request to the surface route path "/.well-known/Agent-Card.json"
+    Then the response status is 200
+    And managed agent "bravo" received a GET request at path "/.well-known/Agent-Card.json"
     And managed agent "bravo" did not receive header "x-target-api-key"
 
   Scenario: A2A agent card URL points to the gateway, not the Target

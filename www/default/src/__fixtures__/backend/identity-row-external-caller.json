@@ -1,0 +1,25 @@
+{
+  "did": "did:web:acme.com:billing",
+  "created_at": "2026-01-01T00:00:00+00:00",
+  "identity_hash": "did:web:acme.com:billing",
+  "agent_identity": {
+    "certificate_id": "NITROGEN"
+  },
+  "usage_count": 1,
+  "last_used_at": "2026-01-01T00:00:00+00:00",
+  "channel_config_id": "oxygen",
+  "channel_name": "OXYGEN",
+  "is_local": false,
+  "verified": true,
+  "channel_usage": [
+    {
+      "channel_config_id": "oxygen",
+      "usage_count": 1,
+      "last_used_at": "2026-01-01T00:00:00+00:00"
+    }
+  ],
+  "origin": "external_caller",
+  "display_name": "acme.com/@billing",
+  "display_name_source": "agent_name",
+  "display_name_verified": true
+}

@@ -148,13 +148,30 @@ Feature: Routing through a proxy:// MCP target
     And REST API "bravo" received "GET /weather/Paris"
     And the MCP tool result matches REST API "bravo" response
 
-  Scenario: A caller whose source authentication failed does not get the target credential on a proxy:// MCP target
+  Scenario: A public surface does not give a caller whose source authentication failed the target credential on a proxy:// MCP target
     Given the surface requires "API Key" source authentication
+    And the surface is stored with a public Access Point
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     When the caller invokes the MCP tool "get_weather" for city "Paris"
     Then the response status is 200
     And REST API "bravo" received "GET /weather/Paris"
     And REST API "bravo" did not receive header "x-target-api-key"
+
+  Scenario: A legacy surface refuses a caller whose source authentication failed on a proxy:// MCP target
+    Given the surface requires "API Key" source authentication
+    And the surface is stored as a legacy surface
+    And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    When the caller invokes the MCP tool "get_weather" for city "Paris"
+    Then the response status is 401
+    And REST API "bravo" was not called
+
+  Scenario: A missing Target credential refuses a tool call on a proxy:// MCP target when fallback is reject
+    Given the gateway authenticates to the managed agent with missing secret "bdd-missing-target-secret" in header "x-target-api-key", falling back to "reject"
+    When the caller invokes the MCP tool "get_weather" for city "Paris"
+    Then the response status is 500
+    And the response mentions "Target authentication failed"
+    And the response reason is "target_auth_misconfigured"
+    And REST API "bravo" was not called
 
   Scenario: An authenticated caller gets the target credential on a proxy:// MCP target
     Given the surface requires "API Key" source authentication
@@ -163,16 +180,55 @@ Feature: Routing through a proxy:// MCP target
     Then the response status is 200
     And REST API "bravo" received header "x-target-api-key" with value "bdd-target-secret"
 
-  Scenario: A legacy MCP proxy tool call answers the same tool result with and without the Target credential
+  Scenario: A tool call on the legacy MCP revision answers the same tool result with and without the Target credential
     Given the surface requires "API Key" source authentication
+    And the surface is stored with a public Access Point
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     When the caller invokes the MCP tool "get_weather" for city "Paris" once without and once with a valid API key
     Then the response status is 200
     And the MCP tool result matches REST API "bravo" response
     And REST API "bravo" answered the same MCP tool result with and without the Target credential
 
-  Scenario: A legacy MCP proxy tool call answers the same failed tool result with and without the Target credential
+  Scenario: A credentialed tool call returns a file the REST API answers as an embedded resource
     Given the surface requires "API Key" source authentication
+    And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    And REST API "bravo" answers a PDF document
+    When the caller invokes the MCP tool "get_weather_map" for city "Paris" with a valid API key
+    Then the response status is 200
+    And REST API "bravo" received "GET /weather/Paris/map"
+    And the MCP tool result is REST API "bravo"'s file as an embedded "application/pdf" resource
+
+  Scenario: A 2026-07-28 tool call returns a file the REST API answers as an embedded resource
+    Given REST API "bravo" answers a PDF document
+    When the caller invokes the MCP tool "get_weather_map" for city "Paris" using protocol version "2026-07-28"
+    Then the response status is 200
+    And REST API "bravo" received "GET /weather/Paris/map"
+    And the MCP tool result is REST API "bravo"'s file as an embedded "application/pdf" resource
+
+  Scenario: A 2026-07-28 tool call returns JSON the REST API serves under a non-JSON content type as text
+    Given REST API "bravo" answers its weather as "application/octet-stream"
+    When the caller invokes the MCP tool "get_weather" for city "Paris" using protocol version "2026-07-28"
+    Then the response status is 200
+    And the MCP tool result matches REST API "bravo" response
+
+  Scenario: A 2026-07-28 tool call refuses a file that does not fit the response limit once base64-encoded
+    Given the surface limits MCP responses to 4096 bytes
+    And REST API "bravo" answers a file of 3200 bytes
+    When the caller invokes the MCP tool "get_weather_map" for city "Paris" using protocol version "2026-07-28"
+    Then the response status is 502
+    And the MCP response is a JSON-RPC error with code -32603
+
+  Scenario: A credentialed tool call returns JSON the REST API serves under a non-JSON content type as text
+    Given the surface requires "API Key" source authentication
+    And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    And REST API "bravo" answers its weather as "application/octet-stream"
+    When the caller invokes the MCP tool "get_weather" for city "Paris" with a valid API key
+    Then the response status is 200
+    And the MCP tool result matches REST API "bravo" response
+
+  Scenario: A tool call on the legacy MCP revision answers the same failed tool result with and without the Target credential
+    Given the surface requires "API Key" source authentication
+    And the surface is stored with a public Access Point
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     And REST API "bravo" is failing with status 503
     When the caller invokes the MCP tool "get_weather" for city "Paris" once without and once with a valid API key
@@ -181,8 +237,9 @@ Feature: Routing through a proxy:// MCP target
     And the MCP tool result matches REST API "bravo" response
     And REST API "bravo" answered the same MCP tool result with and without the Target credential
 
-  Scenario: Only a legacy MCP proxy tool call with the Target credential checks the REST response against the tool's output schema
+  Scenario: Only a tool call on the legacy MCP revision with the Target credential checks the REST response against the tool's output schema
     Given the surface requires "API Key" source authentication
+    And the surface is stored with a public Access Point
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     And REST API "bravo" answers a weather report whose temperature is "warm"
     When the caller invokes the MCP tool "get_weather" for city "Paris" once without and once with a valid API key
@@ -215,8 +272,8 @@ Feature: Routing through a proxy:// MCP target
     And the surface requires "API Key" source authentication
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     When the caller invokes the MCP tool "get_weather" for city "../../../api/weather/Paris" with a valid API key
-    Then the response status is 502
-    And the response mentions "Target authentication failed"
+    Then the response status is 400
+    And the response reason is "target_path_refused"
     And REST API "bravo" was not called
 
   Scenario: A credentialed tool call whose path leaves the MCP proxy base path is refused before the REST API
@@ -224,8 +281,8 @@ Feature: Routing through a proxy:// MCP target
     And the surface requires "API Key" source authentication
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     When the caller invokes the MCP tool "get_weather" for city "../../admin" with a valid API key
-    Then the response status is 502
-    And the response mentions "Target authentication failed"
+    Then the response status is 400
+    And the response reason is "target_path_refused"
     And REST API "bravo" was not called
 
   Scenario: A credentialed tool call with a braced path value is refused as invalid arguments, not as leaving the base path
@@ -263,8 +320,8 @@ Feature: Routing through a proxy:// MCP target
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     And the gateway enforces the credential rule "target_https"
     When the caller invokes the MCP tool "get_weather" for city "Paris" with a valid API key
-    Then the response status is 502
-    And the response mentions "Target authentication"
+    Then the response status is 500
+    And the response reason is "target_auth_misconfigured"
     And REST API "bravo" was not called
 
   Scenario: An MCP proxy tool call goes out without the Target credential when https Targets are enforced and fallback is passthrough

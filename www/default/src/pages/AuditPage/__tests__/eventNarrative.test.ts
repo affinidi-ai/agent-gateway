@@ -93,6 +93,21 @@ describe('eventNarrative', () => {
     );
   });
 
+  it('describes a Trust Check whose Authority was deleted', () => {
+    const n = describeEntry(
+      at({
+        trust_check: {
+          leg: 'caller',
+          authority_id: 'did:web:deleted-authority.example',
+          ok: false,
+          error_code: 'AUTHORITY_NOT_FOUND',
+        },
+      })
+    );
+    expect(n.tone).toBe('deny');
+    expect(n.detail).toBe('Failed because the Authority this Trust Check uses no longer exists.');
+  });
+
   it('describes a caller-leg TRUST_REGISTRY_METADATA_UNAVAILABLE with caller-payload wording', () => {
     const n = describeEntry(
       at({

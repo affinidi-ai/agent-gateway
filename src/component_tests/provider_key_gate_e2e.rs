@@ -2,7 +2,10 @@
 //! check, at boot or on a configuration reload. Under `tenant_credential_isolation: warn` it keeps
 //! serving and the gateway logs the key id and rule; under `enforce`, or while the API key store
 //! is unavailable, its Access Point is not ready: every request is refused with `503`. A surface
-//! naming its own tenant's key serves in both modes.
+//! names only its own keys: one naming its own key serves in both modes, one naming another
+//! surface's key of its own tenant is held back like one naming another tenant's. Revoking a
+//! surface's own key takes it out of service on the next request in both modes. A surface naming
+//! an active key whose owning surface is gone is not ready under `enforce` and serves under `warn`.
 
 use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
@@ -14,7 +17,8 @@ use crate::source_auth::errors::ACCESS_POINT_UNAVAILABLE;
 const KEY_A: &str = "atgk_0000000000000000000000000000ga01";
 const KEY_B: &str = "atgk_0000000000000000000000000000gb01";
 const NAMES_CROSS: &str = "names-cross";
-const NAMES_OWN: &str = "names-own";
+const NAMES_OWN: &str = "owner-a";
+const NAMES_SAME_TENANT: &str = "names-same-tenant";
 const LEGACY_CALLER: &str = "legacy-caller";
 
 struct Gate {
@@ -72,9 +76,9 @@ fn names(key_id: &str) -> Value {
 }
 
 impl Gate {
-    /// Boots a gateway whose store holds two key-owning surfaces, of tenants `a` and `b`, a
-    /// tenant `a` surface naming tenant `b`'s key, one naming its own, and one whose Caller
-    /// Context API Key secret id is tenant `b`'s key. Without `key_store`, the API key store
+    /// Boots a gateway whose store holds two key-owning surfaces, of tenants `a` and `b`, the
+    /// first naming its own key, a tenant `a` surface naming tenant `b`'s key, one naming the
+    /// tenant `a` owner's key, and one whose Caller Context API Key secret id is tenant `b`'s key. Without `key_store`, the API key store
     /// cannot start.
     async fn start(
         isolation: RuleMode,
@@ -124,10 +128,10 @@ impl Gate {
                 }]}}
             });
             for (id, tenant, extra) in [
-                ("owner-a", "tenant-a", json!({})),
+                (NAMES_OWN, "tenant-a", names(KEY_A)),
                 ("owner-b", "tenant-b", json!({})),
                 (NAMES_CROSS, "tenant-a", names(KEY_B)),
-                (NAMES_OWN, "tenant-a", names(KEY_A)),
+                (NAMES_SAME_TENANT, "tenant-a", names(KEY_A)),
                 (LEGACY_CALLER, "tenant-a", legacy),
             ] {
                 std::fs::write(
@@ -149,7 +153,7 @@ impl Gate {
                     let store = crate::api_keys::FileSystemApiKeyStore::new(&api_keys.to_string_lossy())
                         .await
                         .unwrap();
-                    for (owner, key_id) in [("owner-a", KEY_A), ("owner-b", KEY_B)] {
+                    for (owner, key_id) in [(NAMES_OWN, KEY_A), ("owner-b", KEY_B)] {
                         store
                             .create_with_material(
                                 owner,
@@ -290,7 +294,11 @@ async fn under_warn_a_surface_naming_another_tenants_key_serves_and_is_logged() 
     assert_eq!(status, 200, "{body}");
     let (status, body) = gate.call(NAMES_OWN).await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(gate.reached(), 2);
+    let (status, body) = gate
+        .call(NAMES_SAME_TENANT)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(gate.reached(), 3);
 
     let warnings = gate.h.startup_warnings();
     let line = warnings
@@ -298,6 +306,11 @@ async fn under_warn_a_surface_naming_another_tenants_key_serves_and_is_logged() 
         .find(|line| line.contains("provider_key_tenant") && line.contains(NAMES_CROSS))
         .unwrap_or_else(|| panic!("a provider key warning for {NAMES_CROSS}: {warnings}"));
     assert!(line.contains(&format!("{KEY_B}:other_tenant")) && line.contains("tenant-a"), "{line}");
+    let line = warnings
+        .lines()
+        .find(|line| line.contains("provider_key_tenant") && line.contains(NAMES_SAME_TENANT))
+        .unwrap_or_else(|| panic!("a provider key warning for {NAMES_SAME_TENANT}: {warnings}"));
+    assert!(line.contains(&format!("{KEY_A}:other_surface")) && line.contains("not_ready=false"), "{line}");
     assert!(!warnings.contains("atgs_"), "no key secret is logged: {warnings}");
     assert!(
         !warnings
@@ -312,6 +325,11 @@ async fn under_enforce_a_surface_naming_another_tenants_key_is_not_ready() {
     let gate = Gate::start(RuleMode::Enforce, true).await;
 
     assert_not_ready(gate.call(NAMES_CROSS).await, "another tenant's key");
+    assert_not_ready(
+        gate.call(NAMES_SAME_TENANT)
+            .await,
+        "another surface's key of the same tenant",
+    );
     assert_not_ready(gate.call(LEGACY_CALLER).await, "a legacy caller secret shaped like another tenant's key");
     assert_eq!(gate.reached(), 0, "a not-ready Access Point never reaches the Target");
     let (status, body) = gate.call(NAMES_OWN).await;
@@ -354,7 +372,7 @@ async fn without_an_api_key_store_a_surface_naming_a_key_is_not_ready() {
 
     assert_not_ready(gate.call(NAMES_OWN).await, "its own key, no store");
     assert_not_ready(gate.call(NAMES_CROSS).await, "another tenant's key, no store");
-    let (status, body) = gate.call("owner-a").await;
+    let (status, body) = gate.call("owner-b").await;
     assert_eq!(status, 200, "a surface naming no key is served: {body}");
 }
 
@@ -417,7 +435,7 @@ async fn refresh_scan_flow() {
 }
 
 #[test]
-fn a_key_owner_moved_to_another_tenant_by_another_node_takes_the_surfaces_naming_its_key_out_of_service() {
+fn a_key_owner_moved_to_another_tenant_by_another_node_keeps_serving_its_own_key() {
     run_in_own_process(owner_tenant_change_flow);
 }
 
@@ -427,23 +445,27 @@ async fn owner_tenant_change_flow() {
     let (status, body) = gate.call(NAMES_OWN).await;
     assert_eq!(status, 200, "{body}");
 
-    gate.rewrite("owner-a", |stored| {
+    let verdicts = gate.h.provider_key_gate();
+    assert_not_ready(
+        gate.call(NAMES_SAME_TENANT)
+            .await,
+        "another surface's key",
+    );
+    assert!(verdicts.has_verdict(NAMES_SAME_TENANT));
+
+    gate.rewrite(NAMES_OWN, |stored| {
         stored["tenant_id"] = json!("tenant-b");
     });
-    assert_not_ready(
-        gate.call_until(NAMES_OWN, 503)
-            .await,
-        "its key's owner moved to another tenant by another node",
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while verdicts.has_verdict(NAMES_SAME_TENANT) && std::time::Instant::now() < deadline {
+        let (status, body) = gate.call(NAMES_OWN).await;
+        assert_eq!(status, 200, "a surface moved with its own key keeps serving it: {body}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        !verdicts.has_verdict(NAMES_SAME_TENANT),
+        "the refresh scan applies the owner's move and drops the verdicts that read it"
     );
-    let reached = gate.reached();
-    assert_not_ready(gate.call(NAMES_OWN).await, "its key's owner moved to another tenant");
-    assert_eq!(gate.reached(), reached, "a not-ready Access Point never reaches the Target");
-
-    gate.rewrite("owner-a", |stored| {
-        stored["tenant_id"] = json!("tenant-a");
-    });
-    let (status, body) = gate
-        .call_until(NAMES_OWN, 200)
-        .await;
-    assert_eq!(status, 200, "its key's owner moved back: {body}");
+    let (status, body) = gate.call(NAMES_OWN).await;
+    assert_eq!(status, 200, "a surface moved with its own key keeps serving it: {body}");
 }

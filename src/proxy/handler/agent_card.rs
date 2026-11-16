@@ -12,7 +12,7 @@ use axum::response::Response;
 use serde_json::Value as JsonValue;
 use tracing::{debug, error, info, warn};
 
-use super::{CallerAssertion, TARGET_AUTH_FAILED, TargetAuthContext, TargetAuthError};
+use super::{CallerAssertion, TARGET_AUTH_FAILED, TargetAuthContext, TargetAuthError, UPSTREAM_REDIRECTED};
 use crate::a2a::create_error_response;
 use crate::observability::loggable;
 use crate::proxy::backend_identity::ProtectedAgentIdentity;
@@ -46,6 +46,9 @@ pub(crate) struct BuiltCard {
     pub generated: bool,
     /// Whether the fetch carried the Target credential.
     pub credential_sent: bool,
+    /// Whether the agent's card carried no identity, so the card is served without
+    /// an identity credential although the surface reads the managed identity from it.
+    pub served_without_identity: bool,
 }
 
 /// Why the card was not built, and exactly what the card route answers.
@@ -81,10 +84,17 @@ pub(crate) enum FetchFault {
     BlockedByEgress,
     Unreachable,
     TimedOut,
-    Status { status: u16, credential_sent: bool },
+    Status {
+        status: u16,
+        credential_sent: bool,
+    },
     TooLarge,
     InvalidCard,
-    IdentityFailed,
+    Compressed,
+    IdentityFailed {
+        slot: crate::proxy::card_preview::CardIdentitySlot,
+        error: crate::proxy::card_preview::CardIdentityError,
+    },
     RewriteFailed,
 }
 
@@ -103,6 +113,7 @@ impl FetchFault {
             UpstreamBodyError::TooLarge(_) => Self::TooLarge,
             UpstreamBodyError::TimedOut => Self::TimedOut,
             UpstreamBodyError::Read(error) => Self::of_send(error),
+            UpstreamBodyError::Compressed => Self::Compressed,
         }
     }
 }
@@ -184,11 +195,18 @@ pub(crate) async fn build_public_card(
     if mode.serves() {
         record_served_effects(state, source_addr, &resolved_identity);
     }
+    let served_without_identity = !generated
+        && matches!(resolved_identity, ProtectedAgentIdentity::Anonymous)
+        && crate::proxy::backend_identity::slot_reads_response_body(
+            &state.surface,
+            crate::proxy::backend_identity::IdentitySlot::Protected,
+        );
     Ok(BuiltCard {
         upstream,
         served: agent_card,
         generated,
         credential_sent,
+        served_without_identity,
     })
 }
 
@@ -251,7 +269,10 @@ async fn resolve_card_identity(
             "Protected agent identity resolution failed for agent card intercept"
         );
         CardFailure::new(
-            FetchFault::IdentityFailed,
+            FetchFault::IdentityFailed {
+                slot: crate::proxy::card_preview::CardIdentitySlot::ProtectedIdentity,
+                error: crate::proxy::card_preview::CardIdentityError::of(&e),
+            },
             crate::a2a::create_identity_error_response(
                 e.http_status(),
                 e.code(),
@@ -299,7 +320,10 @@ async fn resolve_external_card_identity(
             "External agent identity resolution failed for agent card intercept"
         );
         CardFailure::new(
-            FetchFault::IdentityFailed,
+            FetchFault::IdentityFailed {
+                slot: crate::proxy::card_preview::CardIdentitySlot::ExternalIdentity,
+                error: crate::proxy::card_preview::CardIdentityError::of(&e),
+            },
             crate::a2a::create_identity_error_response(
                 e.http_status(),
                 e.code(),
@@ -363,7 +387,10 @@ async fn inject_identity_credential(
         .map_err(|e| {
             error!(channel = channel_name, error = %e, "Failed to inject identity credential into agent card");
             CardFailure::new(
-                FetchFault::IdentityFailed,
+                FetchFault::IdentityFailed {
+                    slot: crate::proxy::card_preview::CardIdentitySlot::ProtectedIdentity,
+                    error: crate::proxy::card_preview::CardIdentityError::CredentialInjectionFailed,
+                },
                 create_error_response(
                     StatusCode::BAD_GATEWAY,
                     &format!("Agent card identity credential injection failed: {}", e),
@@ -561,9 +588,12 @@ impl TargetCardFetch<'_> {
         )
         .await;
 
-        fabric_card_result(outcome).map_err(|(fault, status, message)| {
+        fabric_card_result(outcome).map_err(|(fault, status, message, reason)| {
             error!(channel = channel_name, ?fault, status = %status, "Fabric agent card read failed - gateway fault");
-            let response = create_error_response(status, &message);
+            let response = match reason {
+                Some(reason) => crate::a2a::create_error_response_with_reason(status, &message, reason),
+                None => create_error_response(status, &message),
+            };
             if fault == FetchFault::InvalidCard {
                 CardFailure::new(fault, response)
             } else {
@@ -574,8 +604,8 @@ impl TargetCardFetch<'_> {
 
     /// The surface's target credential for the gateway's own card fetch, or `None`
     /// when the surface has none. Honours `target.auth.fallback` exactly as the
-    /// forwarded path does: `reject` fails the card with 502 rather than asking the
-    /// target without the credential it requires.
+    /// forwarded path does: `reject` fails the card with the error's status and reason
+    /// rather than asking the target without the credential it requires.
     async fn target_credential(&self) -> Result<Option<super::TargetCredential>, CardFailure> {
         let state = self.state;
         let channel_name = self.channel_name();
@@ -605,10 +635,10 @@ impl TargetCardFetch<'_> {
                     &e,
                 );
                 match target_auth.fallback {
-                    crate::config::TargetAuthFallback::Reject => Err(self.fail(
-                        FetchFault::CredentialRejected(e),
-                        create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED),
-                    )),
+                    crate::config::TargetAuthFallback::Reject => {
+                        let refusal = e.failure().response();
+                        Err(self.fail(FetchFault::CredentialRejected(e), refusal))
+                    }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(
                             channel = channel_name,
@@ -705,10 +735,15 @@ impl TargetCardFetch<'_> {
                     &credential_headers,
                 ),
             };
-            if forward {
+            if forward
+                && !key
+                    .as_str()
+                    .eq_ignore_ascii_case("accept-encoding")
+            {
                 req = req.header(key.as_str(), value.as_bytes());
             }
         }
+        req = req.header(reqwest::header::ACCEPT_ENCODING, "identity");
         if let Some(super::TargetCredential {
             header: (header_name, header_value),
             ..
@@ -754,7 +789,7 @@ impl TargetCardFetch<'_> {
             .is_redirection()
         {
             error!(channel = channel_name, status = %response.status(), "Upstream redirected the agent card fetch - gateway fault");
-            return Err(self.fail(fault, create_error_response(StatusCode::BAD_GATEWAY, "Upstream redirected")));
+            return Err(self.fail(fault, create_error_response(StatusCode::BAD_GATEWAY, UPSTREAM_REDIRECTED)));
         }
         if !response.status().is_success() {
             error!(channel = channel_name, status = %response.status(), "Upstream returned error for agent card - gateway fault");
@@ -772,12 +807,17 @@ impl TargetCardFetch<'_> {
                 .a2a
                 .timeout_seconds,
         );
-        let body = crate::proxy::upstream_body::read_bounded(response, limits)
+        let body = crate::proxy::upstream_body::read_bounded_uncompressed(response, limits)
             .await
             .map_err(|e| {
-                error!(channel = channel_name, error = %e, "Failed to read agent card from upstream - gateway fault");
                 let (status, message) = e.status_and_message();
-                self.fail(FetchFault::of_body(&e), create_error_response(status, message))
+                let response = create_error_response(status, message);
+                if matches!(e, crate::proxy::upstream_body::UpstreamBodyError::Compressed) {
+                    warn!(channel = channel_name, "The agent compressed its agent card although none was accepted");
+                    return CardFailure::new(FetchFault::Compressed, response);
+                }
+                error!(channel = channel_name, error = %e, "Failed to read agent card from upstream - gateway fault");
+                self.fail(FetchFault::of_body(&e), response)
             })?;
         serde_json::from_slice(&body).map_err(|e| {
             error!(channel = channel_name, error = %e, "Failed to parse agent card JSON");
@@ -863,33 +903,41 @@ fn record_agent_card_gateway_fault(
     }
 }
 
-/// The card a Fabric card read found, or the fault, status and message its
+/// The card a Fabric card read found, or the fault, status, message and `reason` its
 /// failure is answered with.
 fn fabric_card_result(
     outcome: crate::proxy::fabric_forward::FabricCardOutcome
-) -> Result<JsonValue, (FetchFault, StatusCode, String)> {
+) -> Result<JsonValue, (FetchFault, StatusCode, String, Option<&'static str>)> {
     use crate::proxy::fabric_forward::FabricCardOutcome;
     match outcome {
         FabricCardOutcome::Card(card) => Ok(card),
-        FabricCardOutcome::Failed(error) => {
-            Err((FetchFault::Unreachable, StatusCode::BAD_GATEWAY, format!("Failed to fetch from upstream: {error}")))
-        }
-        FabricCardOutcome::Refused { status } => {
+        FabricCardOutcome::Failed(error) => Err((
+            FetchFault::Unreachable,
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to fetch from upstream: {error}"),
+            None,
+        )),
+        FabricCardOutcome::Refused { status, body } => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-            Err((
-                FetchFault::Status {
-                    status: status.as_u16(),
-                    credential_sent: false,
-                },
-                status,
-                format!("Upstream error: {status}"),
-            ))
+            let fault = FetchFault::Status {
+                status: status.as_u16(),
+                credential_sent: false,
+            };
+            if let Some(failure) = std::str::from_utf8(&body)
+                .ok()
+                .and_then(|body| super::TargetAuthFailure::relayed(status.as_u16(), body))
+            {
+                return Err((fault, status, TARGET_AUTH_FAILED.to_string(), Some(failure.reason())));
+            }
+            let detail = peer_gateway_card_refusal(status, &body)
+                .map_or_else(|| format!("Upstream error: {status}"), str::to_string);
+            Err((fault, status, detail, None))
         }
         FabricCardOutcome::TooLarge => {
-            Err((FetchFault::TooLarge, StatusCode::BAD_GATEWAY, "Upstream response too large".to_string()))
+            Err((FetchFault::TooLarge, StatusCode::BAD_GATEWAY, "Upstream response too large".to_string(), None))
         }
         FabricCardOutcome::NotJson => {
-            Err((FetchFault::InvalidCard, StatusCode::BAD_GATEWAY, "Invalid JSON from upstream".to_string()))
+            Err((FetchFault::InvalidCard, StatusCode::BAD_GATEWAY, "Invalid JSON from upstream".to_string(), None))
         }
     }
 }
@@ -905,6 +953,27 @@ fn fabric_card_timeout_secs(state: &ProxyState) -> u64 {
         .surface
         .timeout()
         .map_or(a2a, |timeout| timeout.request_secs.min(a2a))
+}
+
+/// The fixed text a peer gateway answered its `502` with when it could not make its own card
+/// fetch: [`UPSTREAM_REDIRECTED`], or [`TARGET_AUTH_FAILED`] from a peer that answers a Target
+/// authentication failure without a `reason`. A caller over Fabric then gets the
+/// same text as on the direct path. Only these constants are ever returned, so nothing the peer or
+/// its Target wrote reaches the caller; any other answer gets `None`.
+fn peer_gateway_card_refusal(
+    status: StatusCode,
+    body: &[u8],
+) -> Option<&'static str> {
+    if status != StatusCode::BAD_GATEWAY {
+        return None;
+    }
+    let problem: JsonValue = serde_json::from_slice(body).ok()?;
+    let detail = problem
+        .get("detail")?
+        .as_str()?;
+    [TARGET_AUTH_FAILED, UPSTREAM_REDIRECTED]
+        .into_iter()
+        .find(|fixed| *fixed == detail)
 }
 
 /// The caller's headers a card fetch over Fabric carries: those the Access Point forwards,
@@ -941,33 +1010,67 @@ mod tests {
             fabric_card_result(FabricCardOutcome::Card(serde_json::json!({"name": "partner"}))).unwrap(),
             serde_json::json!({"name": "partner"})
         );
-        for (case, outcome, fault, status, message) in [
+        for (case, outcome, fault, status, message, reason) in [
             (
                 "no answer",
                 FabricCardOutcome::Failed(FabricForwardError::GatewayNotConnected("peer".into())),
                 FetchFault::Unreachable,
                 StatusCode::BAD_GATEWAY,
                 "Failed to fetch from upstream: Remote gateway 'peer' not connected",
+                None,
             ),
             (
                 "refused",
-                FabricCardOutcome::Refused { status: 404 },
+                FabricCardOutcome::Refused { status: 404, body: Vec::new() },
                 FetchFault::Status {
                     status: 404,
                     credential_sent: false,
                 },
                 StatusCode::NOT_FOUND,
                 "Upstream error: 404 Not Found",
+                None,
+            ),
+            (
+                "refused by the peer gateway's own card fetch with a reason",
+                FabricCardOutcome::Refused {
+                    status: 500,
+                    body: serde_json::json!({"status": 500, "detail": super::TARGET_AUTH_FAILED,
+                        "reason": "target_auth_misconfigured"})
+                    .to_string()
+                    .into_bytes(),
+                },
+                FetchFault::Status {
+                    status: 500,
+                    credential_sent: false,
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                super::TARGET_AUTH_FAILED,
+                Some("target_auth_misconfigured"),
+            ),
+            (
+                "refused by an older peer gateway's own card fetch",
+                FabricCardOutcome::Refused {
+                    status: 502,
+                    body: problem(serde_json::json!(super::TARGET_AUTH_FAILED)),
+                },
+                FetchFault::Status {
+                    status: 502,
+                    credential_sent: false,
+                },
+                StatusCode::BAD_GATEWAY,
+                super::TARGET_AUTH_FAILED,
+                None,
             ),
             (
                 "not a status",
-                FabricCardOutcome::Refused { status: 1 },
+                FabricCardOutcome::Refused { status: 1, body: Vec::new() },
                 FetchFault::Status {
                     status: 502,
                     credential_sent: false,
                 },
                 StatusCode::BAD_GATEWAY,
                 "Upstream error: 502 Bad Gateway",
+                None,
             ),
             (
                 "too large",
@@ -975,6 +1078,7 @@ mod tests {
                 FetchFault::TooLarge,
                 StatusCode::BAD_GATEWAY,
                 "Upstream response too large",
+                None,
             ),
             (
                 "not JSON",
@@ -982,9 +1086,14 @@ mod tests {
                 FetchFault::InvalidCard,
                 StatusCode::BAD_GATEWAY,
                 "Invalid JSON from upstream",
+                None,
             ),
         ] {
-            assert_eq!(fabric_card_result(outcome).unwrap_err(), (fault, status, message.to_string()), "{case}");
+            assert_eq!(
+                fabric_card_result(outcome).unwrap_err(),
+                (fault, status, message.to_string(), reason),
+                "{case}"
+            );
         }
     }
 
@@ -1082,7 +1191,14 @@ mod tests {
         target: JsonValue,
         metrics: &Arc<crate::metrics::MetricsStore>,
     ) -> ProxyState {
-        let state = super::super::variant_routing_tests::router(surface(target))
+        state_of(surface(target), metrics).await
+    }
+
+    async fn state_of(
+        surface: crate::config::agent_surface::AgentSurface,
+        metrics: &Arc<crate::metrics::MetricsStore>,
+    ) -> ProxyState {
+        let state = super::super::variant_routing_tests::router(surface)
             .base_proxy_state("orders")
             .await
             .unwrap();
@@ -1156,8 +1272,48 @@ mod tests {
         assert_eq!(served.upstream, Some(card));
         assert!(!preview.generated && !served.generated);
         assert_eq!(preview.served, served.served);
+        assert!(
+            !preview.served_without_identity && !served.served_without_identity,
+            "a surface without managed identity has nothing missing"
+        );
         assert_ne!(served.served["url"], "http://agent.internal/a2a", "the card points at the Access Point");
         assert_eq!(recorded(&metrics, 1).await, vec![crate::metrics::ConnectionStatus::Success]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_card_without_an_identity_extension_is_served_without_an_identity_credential() {
+        let card = json!({"name": "Orders agent", "url": "http://agent.internal/a2a", "skills": []});
+        let target = MockServer::start_with_response(card.to_string()).await;
+        let metrics = Arc::new(crate::metrics::MetricsStore::new(10));
+        let mut managed = surface(json!({"endpoint": target.url()}));
+        managed
+            .identity_slots
+            .protected = Some(crate::source_auth::ManagedIdentityConfig::PayloadExtraction(
+            crate::source_auth::models::PayloadExtractionConfig {
+                meta_field: "agentIdentity".to_string(),
+                ..Default::default()
+            },
+        ));
+        let state = state_of(managed, &metrics).await;
+
+        for mode in [CardMode::Preview, CardMode::Serve] {
+            let built = build(&state, mode)
+                .await
+                .unwrap_or_else(|failure| panic!("{mode:?}: {:?}", failure.fault));
+            assert_eq!(built.upstream, Some(card.clone()), "{mode:?}");
+            assert_ne!(
+                built.served["url"], "http://agent.internal/a2a",
+                "{mode:?}: the card points at the Access Point"
+            );
+            assert_eq!(
+                built
+                    .served
+                    .pointer("/capabilities/extensions"),
+                None,
+                "{mode:?}: no identity credential"
+            );
+            assert!(built.served_without_identity, "{mode:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1255,7 +1411,12 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(failure.fault, FetchFault::CredentialRejected(TargetAuthError::StoreUnavailable), "{mode:?}");
-            assert_eq!(failure.response.status(), StatusCode::BAD_GATEWAY, "{mode:?}");
+            assert_eq!(failure.response.status(), StatusCode::SERVICE_UNAVAILABLE, "{mode:?}");
+            let body = axum::body::to_bytes(failure.response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["reason"], "target_auth_unavailable", "{mode:?}");
         }
     }
 
@@ -1339,6 +1500,45 @@ mod tests {
                 .agent_card_path = agent_card_path.map(str::to_string);
 
             assert_eq!(card_target_url(&surface), expected, "{case}");
+        }
+    }
+
+    fn problem(detail: JsonValue) -> Vec<u8> {
+        json!({"type": "about:blank", "title": "Bad Gateway", "status": 502, "detail": detail})
+            .to_string()
+            .into_bytes()
+    }
+
+    #[test]
+    fn a_peer_gateways_own_card_refusal_is_answered_with_the_same_fixed_text() {
+        for fixed in [TARGET_AUTH_FAILED, UPSTREAM_REDIRECTED] {
+            assert_eq!(peer_gateway_card_refusal(StatusCode::BAD_GATEWAY, &problem(json!(fixed))), Some(fixed));
+        }
+    }
+
+    #[test]
+    fn no_other_peer_answer_is_taken_as_a_fixed_refusal() {
+        let cases: [(&str, StatusCode, Vec<u8>); 7] = [
+            ("another status", StatusCode::UNAUTHORIZED, problem(json!(TARGET_AUTH_FAILED))),
+            ("a gateway timeout", StatusCode::GATEWAY_TIMEOUT, problem(json!(UPSTREAM_REDIRECTED))),
+            ("another detail", StatusCode::BAD_GATEWAY, problem(json!("Upstream error: 502"))),
+            (
+                "the fixed text with more after it",
+                StatusCode::BAD_GATEWAY,
+                problem(json!("Target authentication failed: token=leaked")),
+            ),
+            ("a detail in another case", StatusCode::BAD_GATEWAY, problem(json!("upstream redirected"))),
+            ("a detail that is not a string", StatusCode::BAD_GATEWAY, problem(json!({"text": TARGET_AUTH_FAILED}))),
+            (
+                "a body that is not JSON",
+                StatusCode::BAD_GATEWAY,
+                TARGET_AUTH_FAILED
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        ];
+        for (case, status, body) in cases {
+            assert_eq!(peer_gateway_card_refusal(status, &body), None, "{case}");
         }
     }
 }

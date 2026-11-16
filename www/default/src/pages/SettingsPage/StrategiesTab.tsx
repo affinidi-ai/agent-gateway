@@ -7,6 +7,7 @@ import { formatDateTime, topAndTail } from '../../utils/stringUtils';
 import { AppButton } from '../../components/shared/AppButton';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { DOCS_URL } from '../../config/docs';
+import { formatApiError } from '../../utils/apiError';
 
 export interface JwksSource {
   type: 'remote' | 'static';
@@ -21,6 +22,43 @@ export interface JwtVerificationStrategy {
   jwks_source: JwksSource;
   created_at: string;
   updated_at: string;
+}
+
+const nonEmpty = (value: unknown): value is string => typeof value === 'string' && value !== '';
+
+/**
+ * Why a strategy delete or an editor save failed: the API's message, the credential providers a
+ * `409` names as still using the strategy (by name, else id) and how many more the caller can't
+ * view, where to change them, and the status.
+ */
+export function strategyDeleteError(status: number, body: string, statusText: string): string {
+  let names: string[] = [];
+  let hidden = 0;
+  try {
+    const parsed = JSON.parse(body);
+    if (Array.isArray(parsed?.references)) {
+      names = parsed.references
+        .map((reference: { name?: unknown; id?: unknown }) =>
+          nonEmpty(reference?.name) ? reference.name : reference?.id
+        )
+        .filter(nonEmpty);
+    }
+    const count = Number(parsed?.hidden_references);
+    hidden = Number.isInteger(count) && count > 0 ? count : 0;
+  } catch {
+    names = [];
+  }
+  const message = formatApiError(undefined, body, statusText);
+  const listed = [
+    ...(names.length > 0 ? [names.join(', ')] : []),
+    ...(hidden > 0 ? [`${hidden} you can't view`] : []),
+  ];
+  const named = listed.length > 0 ? `${message} (providers ${listed.join(' and ')})` : message;
+  const where =
+    status === 409
+      ? ". Change a provider's consent confirmation in its editor; its consent_identity_strategy_id is changed through the API"
+      : '';
+  return `${named}${where} (${status})`;
 }
 
 interface StrategiesTabProps {
@@ -70,7 +108,7 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
   const handleDelete = async (strategy: JwtVerificationStrategy) => {
     if (
       !window.confirm(
-        `Delete JWT verification strategy "${strategy.name}"?\n\nWarning: any channel still referencing this strategy will return 403.`
+        `Delete JWT verification strategy "${strategy.name}"?\n\nCredential providers that use this strategy block the delete. Warning: any surface still referencing it will return 403.`
       )
     ) {
       return;
@@ -82,7 +120,9 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
         { method: 'DELETE' }
       );
       if (!response.ok) {
-        throw new Error(`Delete failed: ${response.statusText}`);
+        throw new Error(
+          strategyDeleteError(response.status, await response.text(), response.statusText)
+        );
       }
       setStrategies(prev => prev.filter(s => s.id !== strategy.id));
     } catch (e: any) {

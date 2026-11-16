@@ -53,6 +53,7 @@ fn vendor_surface(
     serde_json::from_value(json!({
         "surface_id": "vendor-agent", "name": "vendor-agent", "tenant_id": TENANT,
         "access_point": {"listen_address": "https://gateway.example", "route": "/vendor", "protocol": protocol,
+            "public": false,
             "caller_authentication": {"methods": [{"type": "api_key",
                 "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "caller-key"}]}},
         "target": {"endpoint": target},
@@ -211,6 +212,28 @@ impl Fixture {
             .is_some()
     }
 
+    /// The tokens the authorization server has been asked to revoke, once
+    /// `count` of them have arrived. Revocation is spawned and outlives the
+    /// response, so waiting a fixed time for it races a loaded runner.
+    async fn revoked_eventually(
+        &self,
+        count: usize,
+    ) -> Vec<String> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let revoked = self
+                    .authorization_server
+                    .revoked_tokens();
+                if revoked.len() >= count {
+                    return revoked;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{count} tokens are revoked"))
+    }
+
     async fn send(
         &self,
         request: axum::http::Request<axum::body::Body>,
@@ -351,6 +374,35 @@ async fn the_owners_grant_goes_to_the_target_in_place_of_the_callers_credentials
         let (status, headers, body) = fixture
             .send(mcp_call(key))
             .await;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED, "{case}: {body}");
+        assert_eq!(body["id"], 7, "{case}");
+        assert_eq!(body["error"]["code"], -32603, "{case}");
+        assert_eq!(body["error"]["message"], crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED, "{case}");
+        assert!(
+            headers
+                .get("set-cookie")
+                .is_none(),
+            "{case}: {headers:?}"
+        );
+    }
+    assert_eq!(
+        fixture
+            .vendor
+            .requests()
+            .len(),
+        1,
+        "an unidentified caller reaches no vendor"
+    );
+
+    let mut public = vendor_surface("mcp", &format!("{}/mcp", fixture.vendor.origin()), "owner");
+    public.access_point.public = Some(true);
+    fixture.serve(public).await;
+    for (case, key) in
+        [("no API key on a public surface", None), ("another API key on a public surface", Some("key-b"))]
+    {
+        let (status, headers, body) = fixture
+            .send(mcp_call(key))
+            .await;
         assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{case}: {body}");
         assert_eq!(body["id"], 7, "{case}");
         assert_eq!(body["error"]["code"], -32001, "{case}");
@@ -362,7 +414,7 @@ async fn the_owners_grant_goes_to_the_target_in_place_of_the_callers_credentials
             .requests()
             .len(),
         1,
-        "an unidentified caller reaches no vendor"
+        "a public surface releases the owner's grant to no unidentified caller"
     );
 }
 
@@ -448,6 +500,66 @@ fn refresh_answer(access_token: &str) -> Answer {
 
 fn rejected_token() -> Answer {
     Answer::status(401).with_header("WWW-Authenticate", r#"Bearer error="invalid_token""#)
+}
+
+/// A vendor's `401` to a grant that cannot be refreshed asks for a new
+/// connect. A caller's grant is removed and revoked. An owner's is kept and
+/// nothing is revoked: any caller of the binding can send a request the
+/// vendor refuses, so none ends the owner's grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_targets_401_to_a_grant_that_cannot_be_refreshed_removes_only_a_callers_grant() {
+    for (subject, key) in [("owner", owner_key()), ("caller", caller_key(&caller_principal()))] {
+        let fixture = Fixture::new(vec![Answer::status(200)], vec![rejected_token()]).await;
+        let target = format!("{}/mcp", fixture.vendor.origin());
+        fixture
+            .serve(vendor_surface("mcp", &target, subject))
+            .await;
+        let mut grant = crate::delegation_vault::grants::tests::grant(&key, "dead");
+        grant.refresh_token = None;
+        grant.expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(3600));
+        fixture
+            .vault
+            .store_grant(grant)
+            .await
+            .unwrap();
+
+        let (status, _, body) = fixture
+            .send(mcp_call(Some(KEY)))
+            .await;
+
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{subject}: {body}");
+        assert_eq!(body["error"]["data"]["reason"], "connect_required", "{subject}: {body}");
+        if subject == "owner" {
+            assert!(fixture.kept(&key).await, "{subject}: the grant is kept");
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(
+                fixture
+                    .authorization_server
+                    .revoked_tokens()
+                    .is_empty(),
+                "{subject}: nothing is revoked"
+            );
+        } else {
+            assert!(!fixture.kept(&key).await, "{subject}: the grant is removed");
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while fixture
+                    .authorization_server
+                    .revoked_tokens()
+                    .is_empty()
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            assert!(
+                fixture
+                    .authorization_server
+                    .revoked_tokens()
+                    .contains(&"dead".to_string()),
+                "{subject}: the grant is revoked"
+            );
+        }
+    }
 }
 
 /// A vendor's `401` that rejects the token gets one refresh and one retry
@@ -605,6 +717,79 @@ async fn the_grant_goes_only_to_its_providers_resource() {
             .requests()
             .is_empty()
     );
+}
+
+/// `external_consent_issuer_patterns` alone limits issuers as the exact list
+/// does: while no pattern matches the provider's issuer the grant is refused
+/// for it, before anything is sent; once one does, the request passes the
+/// operator's rules and is refused only later, here because the vendor's
+/// host does not resolve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_grant_goes_only_while_its_providers_issuer_matches_an_operator_pattern() {
+    use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+    use crate::config::network::{IssuerPattern, IssuerTenant};
+    let mut fixture = Fixture::new(vec![Answer::status(200)], vec![vendor_result()]).await;
+    fixture
+        .store(&owner_key(), "owner-access")
+        .await;
+    let patterns = |issuer: &str| {
+        Some(vec![IssuerPattern {
+            issuer: issuer.to_string(),
+            tenant: IssuerTenant::Uuid,
+            endpoint_origins: Vec::new(),
+            resource_origins: Vec::new(),
+        }])
+    };
+    let refusal_reasons =
+        |text: &str| (text.contains("issuer_not_permitted"), text.contains("forward_refused_by_strict_egress"));
+
+    Arc::make_mut(&mut fixture.router.network_config).external_consent_issuer_patterns =
+        patterns("https://vendor.invalid/{tenant}");
+    let logs = FormattedLogs::capture();
+    let (status, _, body) = fixture
+        .send(mcp_call(Some(KEY)))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["data"], json!({"reason": "connector_unavailable"}));
+    let text = logs.text();
+    assert_eq!(refusal_reasons(&text), (true, false), "{text}");
+    assert!(
+        fixture
+            .vendor
+            .requests()
+            .is_empty()
+    );
+
+    let issuer = "https://vendor.invalid/1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b";
+    let providers = fixture
+        .router
+        .credential_provider_store
+        .clone()
+        .unwrap();
+    let mut provider = providers
+        .get("vendor")
+        .await
+        .unwrap()
+        .unwrap();
+    provider.issuer = Some(issuer.into());
+    provider.authorization_endpoint = Some(format!("{issuer}/authorize"));
+    provider.token_endpoint = Some(format!("{issuer}/token"));
+    provider.revocation_endpoint = None;
+    provider.resource = Some("https://vendor.invalid/mcp".into());
+    providers
+        .update(provider)
+        .await
+        .unwrap();
+    fixture
+        .serve(vendor_surface("mcp", "https://vendor.invalid/mcp", "owner"))
+        .await;
+    let logs = FormattedLogs::capture();
+    let (status, _, body) = fixture
+        .send(mcp_call(Some(KEY)))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let text = logs.text();
+    assert_eq!(refusal_reasons(&text), (false, true), "{text}");
 }
 
 /// Two calls that release the Target's grant at once, while its refresh is
@@ -774,11 +959,10 @@ async fn a_refused_refresh_after_the_targets_refusal_removes_the_grant() {
             .await,
         "a refused refresh removes the grant"
     );
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(
         fixture
-            .authorization_server
-            .revoked_tokens(),
+            .revoked_eventually(2)
+            .await,
         ["first", "first-refresh"]
     );
 }
@@ -1586,9 +1770,9 @@ async fn no_payment_is_taken_for_the_targets_grant() {
 /// The injection of a refreshed grant into the one retry is audited as the
 /// first one is: under the caller's identity hash, whose grant it is or who
 /// acts as the owner, with the binding's subject in the detail; and the
-/// refreshed grant is recorded as used.
+/// grant's use is recorded, on a task of its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_retry_is_audited_under_its_caller_and_its_grant_marked_used() {
+async fn the_retry_is_audited_under_its_caller_and_the_grants_use_recorded() {
     for (subject, key) in [("owner", owner_key()), ("caller", caller_key(&caller_principal()))] {
         let fixture = Fixture::new(vec![refresh_answer("second")], vec![rejected_token(), vendor_result()]).await;
         let target = format!("{}/mcp", fixture.vendor.origin());
@@ -1619,20 +1803,21 @@ async fn the_retry_is_audited_under_its_caller_and_its_grant_marked_used() {
             .collect();
         let expected = (Some(caller_principal()), Some(format!("grant_by_binding:{subject}:target")));
         assert_eq!(injected, [expected.clone(), expected], "{subject}");
-        let kept = fixture
-            .vault
-            .grant(&key)
-            .await
-            .unwrap()
-            .unwrap();
+        let mut kept = None;
+        for _ in 0..250 {
+            let grant = fixture
+                .vault
+                .grant(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            if grant.last_used_at.is_some() {
+                kept = Some(grant);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let kept = kept.unwrap_or_else(|| panic!("{subject}: the grant's use is recorded"));
         assert_eq!(kept.access_token, "second", "{subject}");
-        assert!(
-            kept.last_used_at
-                .zip(kept.refreshed_at)
-                .is_some_and(|(used, refreshed)| used >= refreshed),
-            "{subject}: the refreshed grant is recorded as used: {:?} {:?}",
-            kept.last_used_at,
-            kept.refreshed_at
-        );
     }
 }

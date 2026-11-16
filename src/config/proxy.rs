@@ -48,10 +48,22 @@ impl BootstrapConfig {
         Ok(issuers)
     }
 
+    /// Reads `external_consent_issuer_patterns` from `gateway.json` when the
+    /// gateway starts and pins it, as [`Self::pin_external_consent_issuers`]
+    /// pins the issuers. A change takes a restart.
+    pub fn pin_external_consent_issuer_patterns(
+        &mut self
+    ) -> anyhow::Result<Option<Vec<crate::config::network::IssuerPattern>>> {
+        let patterns = NetworkConfig::load_from_file(&self.config_files.gateway)?.external_consent_issuer_patterns;
+        self.pinned_external_consent_issuer_patterns = Some(patterns.clone());
+        Ok(patterns)
+    }
+
     /// Load network configuration from the configured path, with the
-    /// `transit_token_max_lifetime_secs`, `external_consent_resource_origins`
-    /// and `external_consent_issuers` pinned at startup, once pinned. A `WARN` says when the file holds a
-    /// different value, which takes a restart.
+    /// `transit_token_max_lifetime_secs`, `external_consent_resource_origins`,
+    /// `external_consent_issuers` and `external_consent_issuer_patterns` pinned
+    /// at startup, once pinned. A `WARN` says when the file holds a different
+    /// value, which takes a restart.
     pub fn load_network_config(&self) -> anyhow::Result<NetworkConfig> {
         let network_path = &self.config_files.gateway;
         info!("Loading network configuration from: {}", network_path);
@@ -80,6 +92,15 @@ impl BootstrapConfig {
                  keeps until it restarts"
             );
             network_config.external_consent_issuers = issuers.clone();
+        }
+        if let Some(patterns) = &self.pinned_external_consent_issuer_patterns
+            && network_config.external_consent_issuer_patterns != *patterns
+        {
+            warn!(
+                "{network_path}: external_consent_issuer_patterns differs from the value the gateway started with, \
+                 which it keeps until it restarts"
+            );
+            network_config.external_consent_issuer_patterns = patterns.clone();
         }
 
         if let Some((old_domain, new_domain)) = network_config.normalize_localhost_did_domain() {
@@ -182,8 +203,10 @@ impl GatewayConfig {
                 _retired_protocol_mode: Default::default(),
                 mcp_http: None,
                 signing: None,
+                caller_key: None,
                 trust_check_split: false,
                 transit_point_source_auth: false,
+                browser_origins: Vec::new(),
             }],
             tls: TlsConfig {
                 cert_path: PathBuf::from("cert.pem"),
@@ -373,7 +396,7 @@ impl GatewayConfig {
 /// Validate a loaded surface's `source_auth` at boot: every rule of a save but
 /// the DID Auth session TTL bound, which a stored value is held to at runtime
 /// (see [`GatewayConfig::did_auth_session_ttl_adjustments`]). A
-/// `from_jwt_claim` identity beside a method other than `jwt_bearer`, and an
+/// `from_jwt_claim` identity without `jwt_bearer` as its only method, and an
 /// inbound `from_api_key` identity beside a method other than an API key, are
 /// only warned about here: stored surfaces predating the rule booted with
 /// them, and saving them enforces it.
@@ -533,6 +556,26 @@ pub fn log_additional_source_auth_method_notices(surfaces: &[crate::config::agen
     }
 }
 
+/// Log each surface's [`AgentSurface::unchecked_audience_warnings`](crate::config::agent_surface::AgentSurface::unchecked_audience_warnings)
+/// at `WARN`, as the gateway does once when it starts.
+pub fn log_unchecked_audience_warnings(surfaces: &[crate::config::agent_surface::AgentSurface]) {
+    for surface in surfaces {
+        for warning in surface.unchecked_audience_warnings() {
+            warn!("Surface '{}' ({}): {warning}", surface.name, surface.surface_id);
+        }
+    }
+}
+
+/// Log each surface's [`AgentSurface::legacy_access_point_notice`](crate::config::agent_surface::AgentSurface::legacy_access_point_notice)
+/// at `WARN`, as the gateway does once when it starts.
+pub fn log_legacy_access_point_notices(surfaces: &[crate::config::agent_surface::AgentSurface]) {
+    for surface in surfaces {
+        if let Some(notice) = surface.legacy_access_point_notice() {
+            warn!("Surface '{}' ({}): {notice}", surface.name, surface.surface_id);
+        }
+    }
+}
+
 /// Apply [`fall_back_to_first_source_auth_method`] to surfaces held in memory,
 /// as a DynamoDB load does, logging each trim.
 pub fn fall_back_to_first_source_auth_methods_in_memory(surfaces: &mut [crate::config::agent_surface::AgentSurface]) {
@@ -672,7 +715,120 @@ pub fn validate_source_auth_config(
         }
     }
     validate_method_selection(methods, &surface.name)?;
+    validate_jwt_bearer_audiences(surface, stored)?;
     validate_jwt_claim_identity(surface)
+}
+
+/// Each Access Point `jwt_bearer` method must name an audience, so a token
+/// its identity provider issued for another service is refused, unless the
+/// Access Point publishes a protected resource, whose `resource` is then the
+/// audience, matched against `aud`. A method stored unchanged, such as an
+/// empty list saved before this rule, is kept, so an unrelated edit still
+/// saves; the save warns about it instead. It is kept when `stored`, or an
+/// enabled variant `stored` holds, has it beside no protected resource, so a
+/// variant added, copied or renamed keeps the method it inherits. A disabled
+/// variant is not validated on save, so its method is never a source: one
+/// saved disabled cannot be enabled with a method that never passed the rule.
+fn validate_jwt_bearer_audiences(
+    surface: &crate::config::agent_surface::AgentSurface,
+    stored: Option<&crate::config::agent_surface::AgentSurface>,
+) -> anyhow::Result<()> {
+    use crate::source_auth::SourceAuthConfig;
+
+    let protected_resource = surface
+        .protected_resource()
+        .is_some();
+    let mut stored_views: Option<Vec<crate::config::agent_surface::AgentSurface>> = None;
+    for method in surface.source_auth_methods() {
+        let SourceAuthConfig::JwtBearer(config) = method else {
+            continue;
+        };
+        if protected_resource {
+            if !config.audience_claim.is_aud() {
+                anyhow::bail!(
+                    "Surface '{}': jwt_bearer audience_claim must be aud beside caller_authentication.protected_resource, \
+                     whose resource is the audience",
+                    surface.name
+                );
+            }
+            continue;
+        }
+        if !config.audience_claim.is_aud() && releases_per_caller_credentials(surface) {
+            anyhow::bail!(
+                "Surface '{}': jwt_bearer method (strategy '{}') checks audience_claim {}, so it accepts a token that \
+                 client was issued for another service; it cannot authenticate the callers of a binding that releases \
+                 their own delegated credentials (consent_mode on_demand, pre_authorize or elicit): use audience_claim \
+                 aud",
+                surface.name,
+                config.jwt_verification_strategy_id,
+                config.audience_claim.as_str()
+            );
+        }
+        if config
+            .audiences
+            .iter()
+            .any(|audience| !audience.trim().is_empty())
+        {
+            continue;
+        }
+        let kept = config.audience_claim.is_aud()
+            && stored_views
+                .get_or_insert_with(|| stored.map_or_else(Vec::new, enabled_views))
+                .iter()
+                .any(|view| {
+                    view.protected_resource()
+                        .is_none()
+                        && view
+                            .source_auth_methods()
+                            .contains(method)
+                });
+        if !kept {
+            anyhow::bail!(
+                "Surface '{}': jwt_bearer method (strategy '{}') must name the audiences it accepts, so a token its \
+                 identity provider issued for another service is refused; for an identity provider that issues no \
+                 aud, set audience_claim to client_id or azp and list the clients it accepts",
+                surface.name,
+                config.jwt_verification_strategy_id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Whether a binding of `surface`, on its Target or a Transit Point, releases
+/// a caller's own delegated credentials: any but `consent_mode = external`.
+fn releases_per_caller_credentials(surface: &crate::config::agent_surface::AgentSurface) -> bool {
+    !surface
+        .target_outbound_credentials()
+        .is_empty()
+        || surface
+            .transit
+            .iter()
+            .flat_map(|transit| transit.points.iter())
+            .any(|point| {
+                !surface
+                    .transit_point_outbound_credentials(point)
+                    .is_empty()
+            })
+}
+
+/// `surface` and each of its enabled variants, as resolved.
+fn enabled_views(
+    surface: &crate::config::agent_surface::AgentSurface
+) -> Vec<crate::config::agent_surface::AgentSurface> {
+    std::iter::once(surface.clone())
+        .chain(
+            surface
+                .variants
+                .iter()
+                .filter(|variant| variant.enabled)
+                .map(|variant| {
+                    surface
+                        .serve_selected(Some(variant))
+                        .surface
+                }),
+        )
+        .collect()
 }
 
 /// Validate one source authentication method being saved, set on the Access
@@ -838,14 +994,14 @@ fn validate_jwt_claim_identity(surface: &crate::config::agent_surface::AgentSurf
     .flatten()
     .chain(transit_identities)
     .any(|identity| matches!(identity, ManagedIdentityConfig::FromJwtClaim { .. }));
-    if uses_jwt_claim
-        && surface
-            .source_auth_methods()
+    let methods = surface.source_auth_methods();
+    let jwt_bearer_only = !methods.is_empty()
+        && methods
             .iter()
-            .any(|method| !matches!(method, SourceAuthConfig::JwtBearer(_)))
-    {
+            .all(|method| matches!(method, SourceAuthConfig::JwtBearer(_)));
+    if uses_jwt_claim && !jwt_bearer_only {
         anyhow::bail!(
-            "Channel '{}': from_jwt_claim identity requires every source authentication method to be jwt_bearer",
+            "Channel '{}': from_jwt_claim identity requires jwt_bearer as the only source authentication method",
             surface.name
         );
     }
@@ -981,7 +1137,7 @@ mod tests {
     }
 
     fn jwt_method() -> serde_json::Value {
-        serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "strat-1", "audiences": []})
+        serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "strat-1", "audiences": ["api://agent"]})
     }
 
     fn api_key_method(header: &str) -> serde_json::Value {
@@ -1023,6 +1179,202 @@ mod tests {
                 && notices[1].contains("authenticate callers: 2 (did_auth);"),
             "{}",
             notices[1]
+        );
+    }
+
+    fn jwt_with(
+        audiences: serde_json::Value,
+        extra: serde_json::Value,
+    ) -> crate::config::agent_surface::AgentSurface {
+        let mut method = serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "strat-1", "audiences": audiences});
+        if let (Some(method), Some(extra)) = (method.as_object_mut(), extra.as_object()) {
+            method.extend(extra.clone());
+        }
+        surface_with_caller_auth(serde_json::json!([method]), serde_json::json!({}))
+    }
+
+    fn with_protected_resource(
+        mut surface: crate::config::agent_surface::AgentSurface
+    ) -> crate::config::agent_surface::AgentSurface {
+        surface
+            .access_point
+            .caller_authentication
+            .as_mut()
+            .unwrap()
+            .protected_resource = Some(crate::protocols::protected_resource::ProtectedResourceConfig {
+            resource: "https://gateway.example/multi".to_string(),
+            authorization_servers: vec!["https://issuer.example".to_string()],
+            scopes: Vec::new(),
+        });
+        surface
+    }
+
+    #[test]
+    fn a_new_jwt_bearer_method_without_an_audience_is_refused() {
+        for audiences in [serde_json::json!([]), serde_json::json!(["", "  "])] {
+            let error = validate_source_auth_config(&jwt_with(audiences.clone(), serde_json::json!({})), None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("jwt_bearer method (strategy 'strat-1') must name the audiences it accepts")
+                    && error.contains("audience_claim to client_id or azp"),
+                "{audiences}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_jwt_bearer_method_with_an_audience_or_client_list_is_accepted() {
+        validate_source_auth_config(&jwt_with(serde_json::json!(["api://agent"]), serde_json::json!({})), None)
+            .unwrap();
+        validate_source_auth_config(
+            &jwt_with(serde_json::json!(["app-1"]), serde_json::json!({"audience_claim": "client_id"})),
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_save_that_keeps_a_stored_method_without_an_audience_is_accepted() {
+        let stored = jwt_with(serde_json::json!([]), serde_json::json!({}));
+        validate_source_auth_config(&stored, Some(&stored)).expect("an unrelated edit keeps the stored method");
+    }
+
+    #[test]
+    fn a_stored_method_without_an_audience_is_kept_only_unchanged() {
+        let stored = jwt_with(serde_json::json!([]), serde_json::json!({}));
+        let other_strategy = surface_with_caller_auth(
+            serde_json::json!([{"type": "jwt_bearer", "jwt_verification_strategy_id": "strat-2", "audiences": []}]),
+            serde_json::json!({}),
+        );
+        let client_bound = jwt_with(serde_json::json!([]), serde_json::json!({"audience_claim": "client_id"}));
+        let header_changed = jwt_with(serde_json::json!([]), serde_json::json!({"token_header": "X-Token"}));
+        for (case, saved) in [
+            ("another strategy", other_strategy),
+            ("client_id with no clients", client_bound),
+            ("another token header", header_changed),
+        ] {
+            assert!(validate_source_auth_config(&saved, Some(&stored)).is_err(), "{case} should be refused");
+        }
+        let was_discovery = with_protected_resource(stored.clone());
+        assert!(
+            validate_source_auth_config(&stored, Some(&was_discovery)).is_err(),
+            "dropping protected_resource leaves no audience, so it is not kept"
+        );
+    }
+
+    /// A variant with no stored counterpart is checked against the stored
+    /// surface, so it keeps a method stored without audiences on the base or
+    /// on an enabled stored variant, but not one only a disabled variant has:
+    /// a disabled variant is not validated on save, so its method may never
+    /// have passed the rule.
+    #[test]
+    fn a_method_stored_without_an_audience_is_kept_from_the_base_or_an_enabled_variant() {
+        let method = |strategy: &str| serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": strategy, "audiences": []});
+        let variant = |alias: &str, enabled: bool, strategy: &str| {
+            serde_json::json!({
+                "id": format!("v-{alias}"), "name": alias, "alias": alias, "enabled": enabled,
+                "overrides": {"access_point": {"caller_authentication": {"methods": [method(strategy)]}}}
+            })
+        };
+        let mut stored = jwt_with(serde_json::json!([]), serde_json::json!({}));
+        stored.variants = serde_json::from_value(serde_json::json!([
+            variant("live", true, "strat-live"),
+            variant("off", false, "strat-off")
+        ]))
+        .unwrap();
+
+        let inherits_base = jwt_with(serde_json::json!([]), serde_json::json!({}));
+        validate_source_auth_config(&inherits_base, Some(&stored)).expect("a new variant keeps the base's method");
+
+        let copies_enabled = surface_with_caller_auth(serde_json::json!([method("strat-live")]), serde_json::json!({}));
+        validate_source_auth_config(&copies_enabled, Some(&stored))
+            .expect("a copy of an enabled variant keeps the method that variant has");
+
+        let enabled_again = surface_with_caller_auth(serde_json::json!([method("strat-off")]), serde_json::json!({}));
+        assert!(
+            validate_source_auth_config(&enabled_again, Some(&stored)).is_err(),
+            "a variant saved disabled cannot be enabled with a method that never passed the rule"
+        );
+
+        let never_stored = surface_with_caller_auth(
+            serde_json::json!([{"type": "jwt_bearer", "jwt_verification_strategy_id": "strat-3", "audiences": []}]),
+            serde_json::json!({}),
+        );
+        assert!(
+            validate_source_auth_config(&never_stored, Some(&stored)).is_err(),
+            "a method no stored view has is new"
+        );
+    }
+
+    /// A method that checks only the client a token was issued to accepts a
+    /// token that client was issued for another service, so it cannot sit
+    /// beside a binding that releases a caller's own delegated credentials
+    /// (`on_demand`, `pre_authorize`, `elicit`), on the Target or a Transit
+    /// Point. An `external` binding is gated where it releases its grant.
+    #[test]
+    fn a_client_bound_method_is_refused_beside_a_binding_that_releases_per_caller_credentials() {
+        let client_bound = |extra: serde_json::Value| {
+            surface_with_caller_auth(
+                serde_json::json!([{"type": "jwt_bearer", "jwt_verification_strategy_id": "strat-1",
+                    "audiences": ["app-1"], "audience_claim": "client_id"}]),
+                extra,
+            )
+        };
+        let binding = |mode: &str| serde_json::json!({"credential_provider_id": "vendor", "consent_mode": mode});
+        let transit_point = serde_json::json!({"points": [{"alias": "crm", "target_endpoint": "https://crm.example",
+            "require_transit_token": true, "transit_credentials": binding("on_demand")}]});
+
+        for (case, extra) in [
+            ("an on_demand Target binding", serde_json::json!({"outbound_credentials": [binding("on_demand")]})),
+            ("a pre_authorize Target binding", serde_json::json!({"outbound_credentials": [binding("pre_authorize")]})),
+            ("an elicit Target binding", serde_json::json!({"outbound_credentials": [binding("elicit")]})),
+            ("a Transit Point's own binding", serde_json::json!({"transit": transit_point})),
+        ] {
+            let error = validate_source_auth_config(&client_bound(extra), None)
+                .expect_err(case)
+                .to_string();
+            assert!(
+                error.contains("audience_claim client_id")
+                    && error.contains("consent_mode on_demand, pre_authorize or elicit"),
+                "{case}: {error}"
+            );
+        }
+
+        let external = serde_json::json!({"outbound_credentials": [
+            {"credential_provider_id": "vendor", "consent_mode": "external", "subject": "owner"}
+        ]});
+        validate_source_auth_config(&client_bound(external), None)
+            .expect("an external binding is gated where it releases");
+        validate_source_auth_config(&client_bound(serde_json::json!({})), None).expect("no binding releases anything");
+
+        let aud_bound = surface_with_caller_auth(
+            serde_json::json!([jwt_method()]),
+            serde_json::json!({"outbound_credentials": [binding("on_demand")]}),
+        );
+        validate_source_auth_config(&aud_bound, None)
+            .expect("a method that checks aud may release per-caller credentials");
+    }
+
+    #[test]
+    fn a_protected_resource_is_the_audience_and_is_matched_against_aud() {
+        validate_source_auth_config(
+            &with_protected_resource(jwt_with(serde_json::json!([]), serde_json::json!({}))),
+            None,
+        )
+        .expect("the resource is the audience");
+        let error = validate_source_auth_config(
+            &with_protected_resource(jwt_with(
+                serde_json::json!(["app-1"]),
+                serde_json::json!({"audience_claim": "azp"}),
+            )),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("audience_claim must be aud beside caller_authentication.protected_resource"),
+            "{error}"
         );
     }
 
@@ -1101,7 +1453,7 @@ mod tests {
     }
 
     #[test]
-    fn from_jwt_claim_identity_requires_every_method_to_be_jwt_bearer() {
+    fn from_jwt_claim_identity_requires_jwt_bearer_as_the_only_method() {
         let inbound = serde_json::json!({"identity_slots": {"inbound": {"type": "from_jwt_claim"}}});
         let mixed =
             surface_with_caller_auth(serde_json::json!([jwt_method(), api_key_method("X-API-Key")]), inbound.clone());
@@ -1110,8 +1462,14 @@ mod tests {
             .to_string();
         assert_eq!(
             error,
-            "Channel 'multi': from_jwt_claim identity requires every source authentication method to be jwt_bearer"
+            "Channel 'multi': from_jwt_claim identity requires jwt_bearer as the only source authentication method"
         );
+
+        let none = surface_with_caller_auth(serde_json::json!([]), inbound.clone());
+        let error = validate_source_auth_config(&none, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("from_jwt_claim identity requires"), "{error}");
 
         let jwt_only = surface_with_caller_auth(serde_json::json!([jwt_method()]), inbound);
         validate_source_auth_config(&jwt_only, None).unwrap();
@@ -1623,6 +1981,84 @@ mod tests {
                 .load_network_config()
                 .unwrap()
                 .external_consent_issuers,
+            None,
+            "a list added after startup takes a restart"
+        );
+    }
+
+    /// `external_consent_issuer_patterns` is pinned at startup as the issuers
+    /// are: a later load keeps it, whether the file adds, changes or removes
+    /// it.
+    #[test]
+    fn the_external_consent_issuer_patterns_are_pinned_when_the_gateway_starts() {
+        use crate::config::network::{IssuerPattern, IssuerTenant};
+        let dir = tempfile::tempdir().unwrap();
+        let gateway_json = dir
+            .path()
+            .join("gateway.json");
+        let write = |patterns: Option<serde_json::Value>| {
+            let mut config = serde_json::json!({
+                "did": { "domain": "test.local" },
+                "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+                "integration": { "types": [], "categories": [] },
+                "listeners": [],
+                "routes": {}
+            });
+            if let Some(patterns) = patterns {
+                config["external_consent_issuer_patterns"] = patterns;
+            }
+            std::fs::write(&gateway_json, config.to_string()).unwrap();
+        };
+        let mut bootstrap: BootstrapConfig =
+            toml::from_str(&crate::render_default_bootstrap_toml("", "").unwrap()).unwrap();
+        bootstrap.config_files.gateway = gateway_json
+            .to_string_lossy()
+            .into_owned();
+        write(Some(serde_json::json!([{
+            "issuer": "https://login.microsoftonline.com/{tenant}/v2.0", "tenant": "uuid",
+            "resource_origins": ["https://graph.microsoft.com"]
+        }])));
+        let expected = Some(vec![IssuerPattern {
+            issuer: "https://login.microsoftonline.com/{tenant}/v2.0".to_string(),
+            tenant: IssuerTenant::Uuid,
+            endpoint_origins: Vec::new(),
+            resource_origins: vec!["https://graph.microsoft.com".to_string()],
+        }]);
+        assert_eq!(
+            bootstrap
+                .pin_external_consent_issuer_patterns()
+                .unwrap(),
+            expected
+        );
+        for on_disk in [
+            None,
+            Some(serde_json::json!([])),
+            Some(serde_json::json!([{ "issuer": "https://{tenant}.my.salesforce.com", "tenant": "label" }])),
+        ] {
+            write(on_disk.clone());
+            assert_eq!(
+                bootstrap
+                    .load_network_config()
+                    .unwrap()
+                    .external_consent_issuer_patterns,
+                expected,
+                "{on_disk:?}"
+            );
+        }
+
+        write(None);
+        assert_eq!(
+            bootstrap
+                .pin_external_consent_issuer_patterns()
+                .unwrap(),
+            None
+        );
+        write(Some(serde_json::json!([])));
+        assert_eq!(
+            bootstrap
+                .load_network_config()
+                .unwrap()
+                .external_consent_issuer_patterns,
             None,
             "a list added after startup takes a restart"
         );

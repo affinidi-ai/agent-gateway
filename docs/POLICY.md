@@ -23,6 +23,18 @@ There are exactly two policy planes — **Gateway** (appliance-to-appliance) and
 `surface.policy` at boot. Deny reason: `data.surface.policy.deny_reason` /
 `data.gateway.policy.deny_reason`.
 
+A surface's own policy is skipped only for a public discovery read: a `GET` or `HEAD` of a path
+ending in `/agent-card.json`, `/agent.json`, `/.well-known/agent-card`, `/.well-known/ucp` or
+`/discovery` (`paths::is_public_request`). This holds on the direct path, Fabric receive, and the
+sending gateway of a `fabric://` Target, so a `POST` to a path that merely ends in
+`/agent-card.json` or `/agent.json` is evaluated like any other call, and the sending gateway
+skips its policy for a `GET` of `/discovery` or `/.well-known/ucp` as the direct path does.
+
+On the direct path and the sending gateway, a request of any method whose path ends in
+`/.well-known/agent-card.json` or `/.well-known/agent.json` is answered by the gateway's own agent
+card fetch, a `GET` to the Target, before policy runs (`handle_agent_card`), so that request never
+reaches the Target as sent.
+
 ### MCP request context (`input.mcp`)
 
 On an MCP surface, gateway and surface policies get `input.mcp` on the direct
@@ -156,8 +168,10 @@ for trust, no identity verification, no TRQP query. A request through a Transit 
 only that Transit Point's results, at `input.trust_check_results.target`, in all three
 outbound OPA scopes (gateway, surface, Transit Point).
 
-A list holds at most `TRUST_CHECK_LIST_MAX` (10) elements
-([`src/config/agent_surface.rs`](../src/config/agent_surface.rs)). A surface variant
+A list has no limit on its elements or on the authorities they query
+([`src/config/agent_surface.rs`](../src/config/agent_surface.rs)). The gateway queries every
+listed authority of a leg at once, so each authority adds one TRQP message per request (see
+the accepted risk under [_Several authorities in one query_](#several-authorities-in-one-query)). A surface variant
 override replaces the whole list verbatim, never element by element; a variant gives its
 Transit Points their own lists through its `transit.points` override.
 
@@ -260,6 +274,8 @@ Element validation is in
 | `id` | Required, unique within the leg, at most `TRUST_CHECK_ID_MAX_CODE_POINTS` (64) code points. Rego-addressable and audit-visible. |
 | `name` | Optional display label, at most `TRUST_CHECK_NAME_MAX_CODE_POINTS` (64) code points. |
 | `id` and `name` | Control, DEL, C1, and bidi-override codepoints are rejected. |
+| `query.authority_id` / `query.authority_ids` | Exactly one is set. `authority_ids` holds one or more distinct, non-blank DIDs or templates. `authority_sources` is refused without `authority_ids` or with a key `authority_ids` does not list, and `authority_source` is refused with `authority_ids`. |
+| `timeout_secs` | Optional on a single-authority element; without it the element waits for the trust registry transport's own timeout. Refused on a multi-authority element, where each authority always waits `TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS` (5). |
 
 The two caps are separate constants that happen to share a value today, because `id` is
 addressable from policy while `name` is only a label. Counts are code points, not bytes.
@@ -269,20 +285,156 @@ surface id, the request's trace id and the authenticated caller (on the Access P
 and MCP-proxy paths), so a trust check can be tied to the request and principal that
 triggered it. On the outbound path the record also names the Transit Point.
 
+### Several authorities in one query
+
+A query that must accept an entity any of several organisations recognises lists them in
+`query.authority_ids` instead of `query.authority_id`:
+
+```json
+{
+  "id": "authority-recognised",
+  "trust_registry_id": "tr-main",
+  "query_type": "recognition",
+  "query": {
+    "authority_ids": ["did:web:authority-a", "did:web:authority-b", "did:web:authority-c"],
+    "entity_id": "{{ input.agent.did }}"
+  }
+}
+```
+
+The gateway sends one TRQP query per listed authority, all at once, and waits until each one
+answers or reaches its built-in 5-second timeout (`TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS`),
+which fails that authority's result with `QUERY_TIMEOUT`; it never stops early and never
+combines the answers. Such an element cannot set `timeout_secs`. Each
+authority gets its own result, in list order, all carrying the element's `id` and each its own
+`authority_id`, and its own audit record and `agent_gateway_trust_check_total` sample. A result
+failed with `AGENT_CARD_UNAVAILABLE`, `TRUST_REGISTRY_METADATA_UNAVAILABLE`,
+`IDENTITY_VP_VERIFICATION_FAILED` or `TARGET_AGENT_IDENTITY_UNAVAILABLE` omits `authority_id`
+and `entity_id`, so the authorities of one element tell such results apart only by order. A
+template that fails to resolve, a missing metadata field or an unreachable registry fails only
+that authority's result. An authority that resolves to a blank value, in a list or in
+`query.authority_id`, fails with `TEMPLATE_RESOLUTION_FAILED` without querying its registry.
+When the target cannot be checked at all (for example its agent card
+is unavailable), every listed authority gets a result with that error code.
+
+Because several results share an `id`, an any-of rule iterates them:
+
+```rego
+allow if {
+    some r in input.trust_check_results.caller
+    r.id == "authority-recognised"
+    r.ok
+}
+```
+
+A rule that addresses one result by `id` alone matches every authority of the element.
+`authority_sources` maps each listed literal DID to the register it was picked from, as
+`authority_source` does for `authority_id` (see
+[_The authority of a Trust Check_](#the-authority-of-a-trust-check)); a template or a DID in
+neither register has no entry. A listed Authority that no longer exists fails only its own
+result with `AUTHORITY_NOT_FOUND`, and the other authorities are queried as usual. The Surface
+Builder's fullscreen editor picks that list in one multi-select of the Issuers and Authorities
+registers; see _Authority lists_ in
+[`www/default/AGENTS.md`](../www/default/AGENTS.md).
+
+Accepted risk: nothing bounds how many authorities a leg queries. Every request sends one TRQP
+message per listed authority, all at once, through the trust registry's connection and its
+mediator, and writes one audit record and one `agent_gateway_trust_check_total` sample per
+authority, so the lists an operator configures set the load each request puts on the registry,
+the mediator and the audit sinks. Keep lists to the authorities a policy needs. A query that
+times out never marks the registry connection `Failed`: every request the gateway sends to a
+registry has a thread id starting with `ag-req-` (`REQUEST_THREAD_PREFIX` in
+[`src/trust_registries/communication.rs`](../src/trust_registries/communication.rs)), and a
+problem report on such a thread that no query still awaits is logged and ignored, however late
+it arrives. Only a problem report on any other thread is taken as the registry rejecting the
+gateway.
+
+Gateway 1.0.9 and earlier cannot read `query.authority_ids`, even a list of one. It skips any
+stored surface or managed connection with a Trust Check that sets `query.authority_ids`, and
+logs a parse error. Requests to that surface fail as unknown, and that client cannot
+authenticate. Before rolling back to 1.0.9 or earlier, or before a standby on such a version
+takes over, change each such query to a single `authority_id`. Surfaces and managed
+connections whose queries set only `authority_id` load as before. Such a gateway also caps a leg's list at 10 Trust Checks, but only when saving: it loads
+and runs a longer list, and refuses to save that surface or managed connection (`400`) until
+the list is trimmed to 10.
+
+### The authority of a Trust Check
+
+`query.authority_id` is stored as text: a literal DID, or a template resolved per request.
+`authority_source` beside it records the register a literal DID was found in
+([`authority_source.rs`](../src/trust_registry_verification/authority_source.rs)):
+
+| `authority_source` | Meaning |
+| --- | --- |
+| `authority` | Linked to the Authority with that DID. The Authority must still exist. |
+| `issuer` | An Issuer has that DID. |
+| absent | A template, or a DID in neither register. |
+
+For a query that lists authorities, `authority_sources` holds the same value per listed DID, and
+everything below applies to each listed DID on its own.
+
+Every save of a surface or STS client sets it for each literal DID: `authority` when the write
+sends `authority`, when the stored record already had the DID as `authority`, or when an
+Authority the record's tenant may use has the DID; else `issuer` when such an Issuer has it;
+else none. A link to an Authority is never dropped, so a client that leaves the field out or
+sends another value cannot turn a deleted Authority into a plain DID. A save is refused with
+`400` when a source is set on a template, or when a link names an Authority that does not exist
+or belongs to another tenant; both answer alike. Without an Authority store nothing is set or
+refused. Stored surfaces are classified the same way on each load (an active node saves the
+ones that changed; a standby node keeps them in memory), and stored STS clients at startup on
+an active node.
+
+A link from a surface or STS client to an Authority is an ownership reference: moving the
+Authority, the surface or the STS client to a tenant that would make it cross-tenant is refused
+with `409`, like any other cross-tenant reference.
+
+`DELETE /v1/authorities/{id}` is refused with `409` while a Trust Check or a Trust Recorder
+entry on any surface (base or variant) or STS client names the Authority's DID, counting only
+records whose tenant may use the Authority: a record of another tenant that names the same DID
+neither holds the Authority nor learns of it. The answer lists
+the surfaces and STS clients the caller may view, each with `uses`: the Trust Checks
+(`element: trust_check`, `id`, `name`, `placement` (`access_point`, `target` or
+`transit_point`), `transit_point`, `variant`) and Trust Recorder entries
+(`element: trust_recorder`, `trust_registry_id`, `variant`) that name it, and
+`hidden_references` counts the rest. `?force=true` deletes it anyway, but only when the caller
+may view every record that names it, and records an `authority_force_deleted` event (see
+[`OBSERVABILITY.md`](OBSERVABILITY.md)). The records keep their configuration. A delete and a
+surface save never interleave: the save re-checks its new links under the lock the delete
+holds.
+
+A Trust Check linked to an Authority that no longer exists fails with `AUTHORITY_NOT_FOUND`
+without querying its trust registry, whether the Authority was deleted with force, removed from
+`_storage/`, or never existed; so does one whose Authority store is missing or unreadable. The
+result keeps the configured `authority_id`, so policy and the audit trail can see which DID was
+refused. The check looks the DID up among all Authorities, whose DIDs are unique; whether the
+record's tenant may use it is checked on save and on tenant moves. A DID with no source is not
+checked, so a forced delete leaves a record that a node has not classified yet, such as an STS
+client stored while the node was in standby, querying the DID until its next save or startup.
+Likewise a record naming an Authority that was deleted before this check existed has no source
+on its first load, because no register has the DID any more, and its Trust Check keeps running.
+Each load logs, per surface and STS client, the literal DIDs it names that are in neither
+register, so such a record can be found and pointed at an Authority or removed.
+
 ## Failed caller authentication
 
-A closed Access Point (`access_point.public: false`, which the admin API sets on every surface
-it creates unless it is public), and one whose `caller_authentication.on_failure` is `reject`,
-refuse a missing or invalid credential with `401` before policy, see
-[`SOURCE_AUTH.md`](SOURCE_AUTH.md#closed-and-public-access-points). Otherwise source auth
-does not refuse a request whose credential is missing or invalid. The request continues with no caller identity, `input.source_auth` is
+Every Access Point that is not public refuses a missing or invalid credential with `401`
+before policy: a closed one (`access_point.public: false`, which the admin API sets on every
+surface it creates unless it is public), a legacy one stored without `public`, and any whose
+`caller_authentication.on_failure` is `reject`, see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#closed-and-public-access-points). An Access Point whose
+inbound identity is `from_jwt_claim`, public or not, direct or over fabric, refuses one the
+same way, because no caller identity can be derived without a valid JWT. These refusals run
+before gateway policy, so a gateway deny does not apply to them, and surface policy never sees
+the request. Their body is the generic `Caller credential missing or invalid`; the reason is
+logged. Only on any other public Access Point (`public: true`) does source auth hand a request
+whose credential is missing or invalid to policy. The request continues with no caller identity, `input.source_auth` is
 `{"method": "failed", "attempted_method": ..., "reason": ...}`, where `attempted_method` is
 the method selected for the request (see
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#several-methods-on-one-access-point)). On every forwarding
 path (direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets, Fabric send and
 Fabric receive, the last for surfaces without protected resource metadata) the stored
 target credential, or the A2A proxy's Direct Line secret, is not attached, because it
-vouches that the gateway vetted the caller. A legacy surface that
+vouches that the gateway vetted the caller. A public surface that
 must reject such callers needs a policy that denies `input.source_auth.method == "failed"`.
 Server-side source-auth errors (missing configuration, internal failures) still block
 with `500`. A request to an MCP Access Point that publishes protected resource
@@ -298,8 +450,9 @@ itself, with `401`, before any policy runs, so an outbound policy never sees
 
 Over Fabric, the sending Gateway strips the credential headers of every method its own
 surface configures before forwarding. A receiving surface without protected resource metadata that requires
-source authentication on that same header therefore sees every Fabric caller as failed and
-forwards without its target credential; one with the metadata, or a closed one, refuses them with `401`. Require caller authentication on one side of the Fabric hop, or use a
+source authentication on that same header therefore sees every Fabric caller as failed: a
+public one forwards them without its target credential, and every other one refuses them
+with `401`. Require caller authentication on one side of the Fabric hop, or use a
 different credential header on each side.
 
 ## Caller identity verification in policy input
@@ -504,8 +657,9 @@ and forwards through a per-request `reqwest::Client` **pinned** to that exact
 resolved address via `resolve_to_addrs` (TLS SNI preserved) with **redirects
 disabled** — so a host cannot rebind to an internal/metadata IP between vetting
 and connect, and an upstream 3xx is returned to the caller rather than followed.
-A2A-proxy and legacy MCP `proxy://` targets are **not** DNS-resolved/pinned here
-(vetted at dial time / MCP-proxy create time). A modern (`2026-07-28`) owned MCP
+A2A-proxy and legacy MCP `proxy://` Access Point Targets are **not** DNS-resolved/pinned here
+(vetted at dial time / MCP-proxy create time); a `proxy://` Transit Point's tool calls are (see
+_Other pinned egress sinks_). A modern (`2026-07-28`) owned MCP
 Proxy `tools/call`, and a legacy one that carries the Target credential, dials its
 REST backend through a pinned, redirect-free client too, under the stricter
 save-time policy (see _Other pinned egress sinks_). A
@@ -533,7 +687,8 @@ The vendor clients of external consent, which carry a client's credentials or a 
 ignore proxy settings (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and the system proxy) and always
 connect directly: the fetch of an external consent provider's authorization server metadata,
 the code exchange and refresh, RFC 7009 revocation, and the forward of a request that carries a
-grant by binding. A proxy would resolve the host again and connect to an address nobody vetted,
+grant by binding. The JWKS fetches of JWT verification strategies and the token requests of
+credential providers ignore proxy settings the same way. A proxy would resolve the host again and connect to an address nobody vetted,
 voiding the pin. The gateway warns at startup when a proxy variable is set. Every other pinned client, the authorization
 server discovery of inbound JWT and MCP authorization included, uses a configured proxy as
 before; the proxy then resolves the host itself, so the pin does not hold through it.
@@ -580,18 +735,43 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   `AG_TEST_MODE=true`, `AG_BDD_EGRESS_ALLOWLIST` can admit an exact loopback
   fixture (never cloud metadata); the MCP conformance runner uses this for its
   REST fixture.
-- `egress::pinned_configured_client` also pins the **credential provider
-  token requests** of `src/delegation_vault/oauth.rs`: service-token grants,
-  refreshes, and the legacy and `2026-07-28` authorization-code exchanges (a
-  grant's connect code exchange and refresh go through `pinned_vendor_client`,
-  below). The
-  token endpoint is resolved once, off the async runtime, and the request goes
-  to that address with redirects off; a blocked address is refused before any
-  request. The pin holds when no HTTP proxy is configured: with `HTTPS_PROXY`,
-  `HTTP_PROXY` or `ALL_PROXY` set, the proxy resolves the host itself. RFC 1918 token endpoints stay reachable. Under `AG_TEST_MODE=true`,
-  `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` admits listed loopback test endpoints.
-- `egress::pinned_forward_client` (cloud-metadata-only) pins the **JWKS** fetch
-  (`src/jwt_bearer/jwks.rs`, fresh client per fetch) and the **x402
+- `egress::pinned_vendor_client` (the Strict policy, `https` only) pins every
+  **`tools/call` of a `proxy://` Transit Point** to its MCP Proxy's REST
+  backend, with a grant or without: internal addresses refused after DNS
+  resolution, the connection pinned, redirects refused, and no HTTP proxy.
+  `rmcp-openapi`'s client is never used on this path. See
+  [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#through-an-mcp-proxy).
+- `egress::pinned_configured_direct_client` (Configured policy — blocks cloud
+  metadata, loopback and unspecified addresses, and their IPv4-mapped forms;
+  allows private networks, so an identity provider inside the operator's
+  network keeps working) pins the **credential provider token requests** of
+  `src/delegation_vault/oauth.rs`: service-token grants, refreshes, and the
+  legacy and `2026-07-28` authorization-code exchanges (a grant's connect code
+  exchange and refresh go through `pinned_vendor_client`, below). The token
+  endpoint is resolved once, off the async runtime, and the request goes to
+  that address with redirects off, so a host cannot rebind to a blocked
+  address after the check; a blocked address is refused before any request.
+  Saving a provider whose token endpoint resolves to a blocked address is
+  refused with `400`. The client ignores any HTTP proxy, since a proxy would
+  resolve the host again and void the pin; see
+  [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md). Under
+  `AG_TEST_MODE=true`, `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` admits listed loopback
+  test endpoints.
+- `egress::pinned_configured_direct_client` also pins the **JWKS** fetch of a
+  JWT verification strategy (`src/jwt_bearer/jwks.rs`, fresh client per fetch,
+  answer read up to 256 KiB). Creating or updating a strategy whose `jwks_uri`
+  resolves to a blocked address is refused with `400`, and a stored strategy
+  whose `jwks_uri` resolves to one is refused on every fetch; a host that does
+  not resolve at save time is saved and vetted on every fetch. `POST
+  /api/v1/jwt-verification-strategies/validate-jwks-uri` needs
+  `jwt_verification_strategies.edit` and answers one of two fixed errors (the
+  URI is refused, or it could not be fetched or is not a JWKS); the detail is
+  only logged. Since private networks are allowed, this probe and the
+  credential provider probe still tell a user with the edit permission whether
+  a private host answers. The fetch ignores any HTTP proxy. Under
+  `AG_TEST_MODE=true`, `AG_BDD_EGRESS_ALLOWLIST` admits listed loopback
+  fixtures, never cloud metadata.
+- `egress::pinned_forward_client` (cloud-metadata-only) pins the **x402
   remote-facilitator** client (`src/x402/remote_facilitator.rs`, re-pinned per
   construction, resolve/pin on `spawn_blocking` off the async runtime).
 - `egress::pinned_forward_client` pins the **event hook** call (`src/event_hook/transport.rs`),
@@ -626,7 +806,20 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
 - Fabric receive's **agent-card hop** to the local Target, made for the GW2
   policy context, uses the forward's `forward_client_for`
   (`egress::pinned_forward_client` for an `http(s)` Target), so it is pinned
-  and does not follow redirects. A blocked target or a redirect yields no card.
+  and does not follow redirects, and reads the card within `a2a.max_body_size`.
+  It presents the surface's `target.auth` as the gateway's own request, so the
+  policy input sees the card of a protected Target, and drops a provider token
+  the Target refuses as `invalid_token`, as the forward does. A blocked target, a
+  redirect, a non-success answer or a `target.auth` credential that cannot be
+  resolved yields no card in the policy input; the failure is logged as a
+  warning without the credential. Under `target.auth.fallback: passthrough` a
+  credential that cannot be resolved reads the card without it. A Target that is
+  not an `http(s)` URL, such as a `proxy://` MCP proxy, has no card to read, so
+  no credential is resolved for it. The outcome is
+  cached per surface and `target.auth` for 60 seconds (10 seconds for no card),
+  is not cleared when a secret or credential provider changes, and is cleared on
+  configuration reload or a surface save, so the policy input may see a card up
+  to a minute old.
 - The Transit Point's **agent-card fetch** for target-leg Trust Check and
   agent context (`src/proxy/outbound_handler.rs::fetch_agent_card`) pins each
   well-known URL with `egress::pinned_forward_client`, the forward step's

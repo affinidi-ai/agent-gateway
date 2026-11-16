@@ -37,8 +37,8 @@ const CallerAuthPanel: React.FC<ConfigPanelProps> = ({
         Extracts and verifies the caller&apos;s identity before any policy or payment gate runs. A
         closed Access Point (Public access off) is not ready for external access without it, and
         answers every caller with <code>503</code>. Once it is ready, a missing or invalid
-        credential is refused with <code>401</code>. On a public Access Point, or one without the
-        Public access setting, the request continues to policy as{' '}
+        credential is refused with <code>401</code>, also on a surface without the Public access
+        setting. Only on a public Access Point does the request continue to policy as{' '}
         <code>source_auth.method == &quot;failed&quot;</code>.
       </Form.Text>
       <InfoBanner

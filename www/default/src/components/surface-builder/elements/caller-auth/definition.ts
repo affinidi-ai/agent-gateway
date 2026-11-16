@@ -82,11 +82,11 @@ export const callerAuthDefinition: NodeDefinition = {
       until then it answers every caller with <code>503</code>, and the
       Access Point shows "Not ready for external access". It turns on as
       soon as a save adds one. A ready closed Access Point refuses a caller
-      whose credential is missing or invalid with <code>401</code>. A public
-      Access Point, or a surface without the Public access setting, forwards
-      such callers to policy as <code>source_auth.method == "failed"</code>;
-      add a policy that denies unverified callers to require credentials
-      there.</p>
+      whose credential is missing or invalid with <code>401</code>, and so
+      does a surface without the Public access setting. Only a public Access
+      Point forwards such callers to policy as
+      <code>source_auth.method == "failed"</code>; add a policy that denies
+      unverified callers to require credentials there.</p>
       <p><strong>Methods:</strong></p>
       <ul>
         <li><strong>JWT bearer</strong>: verify a signed JWT against a

@@ -57,6 +57,9 @@ pub struct OutboundProxyState {
     pub delegation_vault_store: Option<Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>>,
     /// Credential provider store — resolves provider metadata for OAuth flows.
     pub credential_provider_store: Option<Arc<dyn crate::credential_providers::storage::CredentialProviderStorage>>,
+    /// MCP Proxy store: serves a Transit Point whose `target_endpoint` is
+    /// `proxy://<id>`.
+    pub mcp_proxy_store: Option<Arc<crate::mcp_proxies::FileSystemMcpProxyStore>>,
     pub consent_identity_strategies: Option<Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>>,
     /// Authenticates a Transit Point's callers with its `source_auth`.
     pub source_auth_middleware: Option<Arc<crate::source_auth::SourceAuthMiddleware>>,

@@ -34,10 +34,15 @@ fn delegating_transit_point(
     .unwrap()
 }
 
+/// A surface whose public Access Point admits anonymous callers, so the
+/// Access Point leg can hand the managed agent a transit token. Its JWT Bearer
+/// method names no stored strategy and verifies no caller; it is there because
+/// a per-user binding requires caller authentication.
 fn surface() -> crate::config::agent_surface::AgentSurface {
     let mut surface = helpers::build_minimal_outbound_channel();
     surface.surface_id = "fabric-transit-surface".to_string();
     surface.name = "fabric-transit-surface".to_string();
+    surface.access_point.public = Some(true);
     surface
         .access_point
         .caller_authentication = Some(

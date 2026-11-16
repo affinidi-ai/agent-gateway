@@ -151,7 +151,13 @@ pub(crate) fn fabric_route_probe(
     let source = surface_spec(topology, link.from_gw, &link.from_surface);
     let target = surface_spec(topology, link.to_gw, &link.to_surface);
 
+    // The sending gateway strips only the credential headers its own surface
+    // checks, so a receiving surface that authenticates callers gets its key
+    // from the probe when the sender checks none.
     let mut extra_headers = source_auth_headers(source);
+    if extra_headers.is_empty() {
+        extra_headers = source_auth_headers(target);
+    }
     let body = match source.protocol.as_str() {
         "a2a" => build_a2a_request_body(),
         // An MCP surface in front of a modern upstream is probed the way its
@@ -213,7 +219,7 @@ fn fabric_route_probe_stage(
 ) -> Option<FabricRouteProbeStage> {
     let target = surface_spec(topology, link.to_gw, &link.to_surface);
 
-    if target
+    let target_credential_unavailable = target
         .target_auth
         .as_ref()
         .is_some_and(|target_auth| {
@@ -222,7 +228,15 @@ fn fabric_route_probe_stage(
                 .is_none()
                 && target_auth.fallback == "reject"
         })
-    {
+        || target
+            .target_auth_provider
+            .as_ref()
+            .is_some_and(|provider| provider.token_status != 200 && provider.fallback == "reject");
+    if target_credential_unavailable {
+        return None;
+    }
+
+    if route_refuses_by_design(topology, link, target) {
         return None;
     }
 
@@ -241,6 +255,38 @@ fn fabric_route_probe_stage(
         Some(_) => None,
         None => Some(FabricRouteProbeStage::AfterPolicies),
     }
+}
+
+/// A route that never answers `200`, so no probe can show it ready: the target's mock
+/// answers another status, or the sending surface's Target credential goes in the header the
+/// receiving surface checks with a value it does not accept.
+fn route_refuses_by_design(
+    topology: &TopologyBuilder,
+    link: &FabricLink,
+    target: &SurfaceSpec,
+) -> bool {
+    let mock_refuses = topology
+        .plans
+        .get(&link.to_gw)
+        .and_then(|plan| {
+            plan.mock_statuses
+                .get(&link.to_surface)
+        })
+        .is_some_and(|status| *status != 200);
+    let source = surface_spec(topology, link.from_gw, &link.from_surface);
+    let credential_refused = match (&source.target_auth, &target.source_auth) {
+        (Some(target_auth), Some(SourceAuthSpec::ApiKey { header_name, valid_key, .. })) => {
+            target_auth
+                .header_name
+                .eq_ignore_ascii_case(header_name)
+                && target_auth
+                    .secret_value
+                    .as_deref()
+                    != Some(valid_key.as_str())
+        }
+        _ => false,
+    };
+    mock_refuses || credential_refused
 }
 
 fn surface_spec<'a>(
@@ -288,6 +334,8 @@ pub struct G2gWorld {
     pub response_status: Option<u16>,
     pub response_body: Option<Value>,
     pub response_content_type: Option<String>,
+    /// Headers of the last surface response, for steps that record them.
+    pub response_headers: HashMap<String, String>,
     /// How long the caller waited for the last surface response.
     pub response_elapsed: Option<std::time::Duration>,
     pub concurrent_requests: Vec<Value>,
@@ -354,6 +402,7 @@ impl G2gWorld {
             response_status: None,
             response_body: None,
             response_content_type: None,
+            response_headers: HashMap::new(),
             response_elapsed: None,
             concurrent_requests: Vec::new(),
             concurrent_responses: Vec::new(),

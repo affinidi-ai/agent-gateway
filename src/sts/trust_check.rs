@@ -95,6 +95,8 @@ mod tests {
         TrustCheckElement {
             id: "e1".to_string(),
             trust_registry_id: "reg".to_string(),
+            authority_source: None,
+            authority_sources: Default::default(),
             query_type: TrqpQueryType::Recognition,
             query: TrqpQueryParams::default(),
             timeout_secs: None,

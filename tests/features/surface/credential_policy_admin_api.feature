@@ -1,12 +1,17 @@
 Feature: Credential rules when saving through the admin API
   The admin API refuses to store a credential provider that sends its token request over
   plain http, and refuses to give a tenant's credential provider or surface a secret that is
-  appliance-wide or belongs to another tenant. A surface that already stores an appliance-wide
-  secret keeps it while tenant credential isolation only warns, and is refused once the gateway
-  enforces it. A surface whose stored Target credential, on the Target or a Transit Point,
-  breaks the https or caller rule saves again unchanged and the save answers with a Warning
-  header for each breach; once that credential is edited it is checked as new, and refused
-  while the rule is enforced.
+  appliance-wide or belongs to another tenant. An update cannot remove the client references
+  an OAuth credential provider needs, even from a provider that keeps a plain http token
+  endpoint. While the gateway only warns on plain http token endpoints, an update cannot give
+  a client secret to a provider that keeps such an endpoint and holds none, unless the
+  gateway lists that endpoint as insecure on purpose, but can point one that holds a client
+  secret at another. A surface that already stores an appliance-wide
+  secret keeps it while tenant credential isolation only warns, and is refused once the
+  gateway enforces it. A surface whose stored Target credential, on the Target or a Transit
+  Point, breaks the https or caller rule saves again unchanged and the save answers with a
+  Warning header for each breach; once that credential is edited it is checked as new, and
+  refused while the rule is enforced.
 
   Scenario: A credential provider with an http token endpoint is refused and not stored
     Given the operator can use the admin API and no surface is configured for route "/example"
@@ -24,6 +29,58 @@ Feature: Credential rules when saving through the admin API
     When the operator creates the credential provider "secure-https" with token endpoint "https://192.0.2.1/token" using secrets "provider-id-secret" and "provider-password-secret"
     Then the admin API response status is 201
     And the credential provider "secure-https" is stored
+
+  Scenario: A stored credential provider with an http token endpoint is refused an update that clears its client secret
+    Given an A2A surface targeting managed agent "bravo"
+    And the gateway authenticates to the managed agent with a client credentials provider
+    And the credential provider has a plain http token endpoint
+    When the operator clears the credential provider's client secret
+    Then the admin API response status is 400
+    And the admin API error response mentions "client_id_secret_ref and client_secret_secret_ref are required for OAuth providers"
+    And the stored credential provider still has the client secret "bdd-target-client-secret"
+
+  Scenario: A stored credential provider with an http token endpoint and no client secret is refused an update that gives it one
+    Given an A2A surface targeting managed agent "bravo"
+    And the gateway authenticates to the managed agent with a client credentials provider
+    And the credential provider has a plain http token endpoint
+    And the credential provider stores no client secret
+    And the gateway only warns on the credential rule "token_endpoint_https"
+    When the operator gives the credential provider a client secret
+    Then the admin API response status is 400
+    And the admin API error response mentions "token_endpoint must be an https URL"
+    And the stored credential provider has no client secret
+
+  Scenario: A stored authorization code provider with an http token endpoint and no client secret is refused an update that gives it one
+    Given an A2A surface targeting managed agent "bravo"
+    And the appliance stores an authorization code provider that no surface uses
+    And the credential provider has a plain http token endpoint
+    And the credential provider stores no client secret
+    And the gateway only warns on the credential rule "token_endpoint_https"
+    When the operator gives the credential provider a client secret
+    Then the admin API response status is 400
+    And the admin API error response mentions "token_endpoint must be an https URL"
+    And the stored credential provider has no client secret
+
+  Scenario: A stored credential provider with a listed http token endpoint and no client secret is given one
+    Given an A2A surface targeting managed agent "bravo"
+    And the gateway authenticates to the managed agent with a client credentials provider
+    And the credential provider has a plain http token endpoint
+    And the gateway's insecure token endpoints list names the credential provider's token endpoint
+    And the credential provider stores no client secret
+    And the gateway only warns on the credential rule "token_endpoint_https"
+    When the operator gives the credential provider a client secret
+    Then the admin API response status is 200
+    And the stored credential provider has the client secret "bdd-target-client-secret"
+
+  Scenario: A stored credential provider with an http token endpoint is given another client secret
+    Given an A2A surface targeting managed agent "bravo"
+    And the gateway authenticates to the managed agent with a client credentials provider
+    And the credential provider has a plain http token endpoint
+    And the gateway only warns on the credential rule "token_endpoint_https"
+    And the appliance holds the secret "replacement-client-secret"
+    When the operator changes the credential provider's client secret to the secret "replacement-client-secret"
+    Then the admin API response status is 200
+    And the stored credential provider has the client secret "replacement-client-secret"
 
   Scenario: A tenant credential provider cannot reference appliance-wide secrets
     Given the operator can use the admin API and no surface is configured for route "/example"
@@ -50,6 +107,32 @@ Feature: Credential rules when saving through the admin API
     When the operator creates the credential provider "tenant-cc" for tenant "tenant-a" using secrets "own-id-secret" and "own-password-secret"
     Then the admin API response status is 201
     And the credential provider "tenant-cc" is stored
+
+  Scenario: Two tenants each create an authorization code provider with the same provider id
+    Given the operator can use the admin API and no surface is configured for route "/example"
+    And tenant "tenant-a" holds the secret "alpha-id-secret"
+    And tenant "tenant-a" holds the secret "alpha-password-secret"
+    And tenant "tenant-b" holds the secret "bravo-id-secret"
+    And tenant "tenant-b" holds the secret "bravo-password-secret"
+    And the operator has created the authorization code provider "example" for tenant "tenant-a" using secrets "alpha-id-secret" and "alpha-password-secret"
+    When the operator creates the authorization code provider "example" for tenant "tenant-b" using secrets "bravo-id-secret" and "bravo-password-secret"
+    Then the admin API response status is 201
+    And both credential providers "example" have a callback path ending in the id the gateway gave each
+
+  Scenario: The surface routing settings name the gateway's own base URL for callback URLs
+    Given the operator can use the admin API and no surface is configured for route "/example"
+    When the operator reads the surface routing settings
+    Then the admin API response status is 200
+    And the surface routing settings name the gateway's own https address as its base URL
+
+  Scenario: An authorization code provider cannot be created with a callback URL
+    Given the operator can use the admin API and no surface is configured for route "/example"
+    And the appliance holds the secret "provider-id-secret"
+    And the appliance holds the secret "provider-password-secret"
+    When the operator creates the authorization code provider "example" with callback URL "https://192.0.2.1/v1/identity/oauth/callback/example" using secrets "provider-id-secret" and "provider-password-secret"
+    Then the admin API response status is 400
+    And the admin API error response mentions "callback_url is set by an update after create"
+    And no credential provider "example" is stored
 
   Scenario: A tenant surface cannot newly authenticate its target with an appliance-wide secret
     Given the operator can use the admin API and no surface is configured for route "/example"

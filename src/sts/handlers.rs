@@ -80,6 +80,10 @@ impl Default for StsConfig {
 /// A managed connection: what an authenticated client is permitted to request.
 #[derive(Debug, Clone, Default)]
 pub struct StsClientRecord {
+    /// The connection's record id, which never changes: minted into every
+    /// token as `connection_id`, so a renamed or reused `client_id` cannot
+    /// carry a token to another connection.
+    pub id: String,
     #[allow(dead_code)]
     pub client_id: String,
     /// The owning tenant; `None` for an appliance-global client.
@@ -296,7 +300,7 @@ impl JwtBearerSubjectVerifier {
             .map_err(|error| StsError::ServerError(format!("gateway jwks projection failed: {error}")))?;
         let strategy = gateway_self_trust_strategy(issuer, &jwks)?;
         self.verifier
-            .validate(token, &strategy, &[])
+            .validate(token, &strategy, &[], crate::jwt_bearer::models::AudienceClaim::Aud)
             .await
             .map_err(|error| StsError::InvalidGrant(format!("assertion verification failed: {error}")))
     }
@@ -453,7 +457,7 @@ async fn verify_with_client_strategies(
     }
     for (strategy, principal_claim) in candidates {
         match verifier
-            .validate(token, &strategy, &[])
+            .validate(token, &strategy, &[], crate::jwt_bearer::models::AudienceClaim::Aud)
             .await
         {
             Ok(claims) => return Ok(VerifiedAssertion { claims, principal_claim }),
@@ -1261,6 +1265,7 @@ async fn handle_token_exchange(
         if let Some(resource) = &mcp_resource {
             claims["resource"] = json!(resource);
         }
+        claims[crate::sts::token_origin::CONNECTION_ID_CLAIM] = json!(record.id);
         let token = state
             .signer
             .sign_id_jag(&claims)
@@ -1284,7 +1289,7 @@ async fn handle_token_exchange(
         });
     }
 
-    let claims = build_access_token_claims(AccessTokenParams {
+    let mut claims = build_access_token_claims(AccessTokenParams {
         issuer: &issuer,
         subject: &subject_sub,
         subject_act,
@@ -1296,6 +1301,7 @@ async fn handle_token_exchange(
         ttl_secs: ttl,
         jti: &jti,
     });
+    claims[crate::sts::token_origin::CONNECTION_ID_CLAIM] = json!(record.id);
     let token = if profile.is_some() {
         state
             .signer
@@ -1512,7 +1518,7 @@ async fn handle_jwt_bearer(
         Some(act) => (Some(act.clone()), None),
         None => (None, Some(client_id.as_str())),
     };
-    let token_claims = build_access_token_claims(AccessTokenParams {
+    let mut token_claims = build_access_token_claims(AccessTokenParams {
         issuer: &issuer,
         subject: &subject,
         subject_act: grant_act,
@@ -1524,6 +1530,7 @@ async fn handle_jwt_bearer(
         ttl_secs: ttl,
         jti: &jti,
     });
+    token_claims[crate::sts::token_origin::CONNECTION_ID_CLAIM] = json!(record.id);
     let token = if profile.is_some() {
         state
             .signer
@@ -2089,6 +2096,7 @@ mod tests {
 
     fn base_record() -> StsClientRecord {
         StsClientRecord {
+            id: "agent-connection".to_string(),
             client_id: "agent-client".to_string(),
             ..Default::default()
         }
@@ -2725,6 +2733,7 @@ mod tests {
         // Delegation by default: the calling client is the implicit actor.
         assert_eq!(minted["act"], json!({ "sub": "agent-client" }));
         assert_eq!(minted["client_id"], "agent-client");
+        assert_eq!(minted["connection_id"], "agent-connection");
     }
 
     #[tokio::test]
@@ -2866,6 +2875,7 @@ mod tests {
         let minted: Value = serde_json::from_str(&resp.access_token).unwrap();
         assert_eq!(minted["aud"], "https://resource.example");
         assert_eq!(minted["client_id"], "agent-client");
+        assert_eq!(minted["connection_id"], "agent-connection");
     }
 
     #[tokio::test]
@@ -2994,6 +3004,7 @@ mod tests {
         assert_eq!(minted["sub"], "did:example:user");
         assert_eq!(minted["act"], json!({ "sub": "did:example:agent" }));
         assert_eq!(minted["client_id"], "agent-client");
+        assert_eq!(minted["connection_id"], "agent-connection");
     }
 
     #[tokio::test]
@@ -3297,6 +3308,8 @@ mod tests {
         crate::trust_registry_verification::TrustCheckElement {
             id: "e1".to_string(),
             trust_registry_id: "reg".to_string(),
+            authority_source: None,
+            authority_sources: Default::default(),
             query_type: crate::trust_registry_verification::trust_check_element::TrqpQueryType::Recognition,
             query: crate::trust_registry_verification::trust_check_element::TrqpQueryParams::default(),
             timeout_secs: None,

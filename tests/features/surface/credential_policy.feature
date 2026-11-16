@@ -28,7 +28,8 @@ Feature: Credential policy on the request path
     Given the credential provider has a plain http token endpoint
     And the gateway enforces the credential rule "token_endpoint_https"
     When the caller sends a request to the surface
-    Then the response status is 502
+    Then the response status is 500
+    And the response reason is "target_auth_misconfigured"
     And the credential provider received 0 token requests
     And the token request metric counts no requests
     And managed agent "bravo" was not called
@@ -49,7 +50,8 @@ Feature: Credential policy on the request path
     Given the surface belongs to tenant "tenant-a"
     And the gateway enforces the credential rule "tenant_credential_isolation"
     When the caller sends a request to the surface
-    Then the response status is 502
+    Then the response status is 500
+    And the response reason is "target_auth_misconfigured"
     And the credential provider received 0 token requests
     And managed agent "bravo" was not called
     And the gateway log has no warning containing "refused once tenant_credential_isolation is enforce"
@@ -117,7 +119,8 @@ Feature: Credential policy on the request path
     Given the gateway enforces the credential rule "target_https"
     And the VP Audit Log keeps every audit event
     When the caller sends a request to the surface
-    Then the response status is 502
+    Then the response status is 500
+    And the response reason is "target_auth_misconfigured"
     And the credential provider received 0 token requests
     And the token request metric counts no requests
     And managed agent "bravo" was not called
@@ -146,7 +149,8 @@ Feature: Credential policy on the request path
     Given the gateway enforces the credential rule "target_source_auth"
     And the VP Audit Log keeps every audit event
     When the caller sends a request to the surface
-    Then the response status is 502
+    Then the response status is 500
+    And the response reason is "target_auth_misconfigured"
     And the credential provider received 0 token requests
     And the token request metric counts no requests
     And managed agent "bravo" was not called
@@ -200,13 +204,12 @@ Feature: Credential policy on the request path
       | with a valid token   |
       | with a valid API key |
 
-  Scenario Outline: A caller carrying credentials for two source authentication methods gets no Target credential
+  Scenario Outline: A caller carrying credentials for two source authentication methods is refused and gets no Target credential
     Given the surface accepts "JWT Bearer" and "API Key" source authentication
     And the gateway <rule mode> the credential rule "target_source_auth"
     When the caller sends a request to the surface with a valid token and a valid API key
-    Then the response status is 200
-    And managed agent "bravo" did not receive header "authorization"
-    And managed agent "bravo" did not receive header "x-api-key"
+    Then the response status is 401
+    And managed agent "bravo" was not called
     And the credential provider received 0 token requests
     And the gateway log has no warning containing "credential_policy.target_source_auth is enforce"
 
@@ -224,8 +227,8 @@ Feature: Credential policy on the request path
   Scenario: The agent card fails when https Targets are enforced and the Target is plain http
     Given the gateway enforces the credential rule "target_https"
     When the caller fetches the agent card
-    Then the response status is 502
-    And the response body is error "agent_card_target_auth_failed"
+    Then the response status is 500
+    And the response body is error "agent_card_target_auth_misconfigured"
     And the credential provider received 0 token requests
     And managed agent "bravo" was not called
 
@@ -240,8 +243,8 @@ Feature: Credential policy on the request path
     Given the credential provider has a plain http token endpoint
     And the gateway enforces the credential rule "token_endpoint_https"
     When the caller fetches the agent card
-    Then the response status is 502
-    And the response body is error "agent_card_target_auth_failed"
+    Then the response status is 500
+    And the response body is error "agent_card_target_auth_misconfigured"
     And the credential provider received 0 token requests
     And managed agent "bravo" was not called
 
@@ -256,8 +259,8 @@ Feature: Credential policy on the request path
     Given the surface belongs to tenant "tenant-a"
     And the gateway enforces the credential rule "tenant_credential_isolation"
     When the caller fetches the agent card
-    Then the response status is 502
-    And the response body is error "agent_card_target_auth_failed"
+    Then the response status is 500
+    And the response body is error "agent_card_target_auth_misconfigured"
     And the credential provider received 0 token requests
     And managed agent "bravo" was not called
 
@@ -313,7 +316,8 @@ Feature: Credential policy on the request path
     Given the VP Audit Log keeps every audit event
     And the credential provider refuses token requests with error "invalid_client" and description "bdd-description"
     When the caller sends a request to the surface
-    Then the response status is 502
+    Then the response status is 500
+    And the response reason is "target_auth_misconfigured"
     And managed agent "bravo" was not called
     And the VP Audit Log records a Target credential that was not sent, with outcome "rejected" and OAuth error "invalid_client"
 
@@ -321,6 +325,7 @@ Feature: Credential policy on the request path
     Given the VP Audit Log keeps every audit event
     And the credential provider refuses token requests with error "bdd_unlisted_error" and description "bdd-description"
     When the caller sends a request to the surface
-    Then the response status is 502
+    Then the response status is 500
+    And the response reason is "target_auth_misconfigured"
     And managed agent "bravo" was not called
     And the VP Audit Log records a Target credential that was not sent, with outcome "rejected" and OAuth error "other"

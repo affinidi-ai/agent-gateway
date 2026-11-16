@@ -14,82 +14,70 @@ use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use super::{ConsentRequired, OAuthState, OAuthTokenResponse};
+use super::{ConsentRequired, ConsentStage, OAuthState, OAuthTokenResponse};
 use crate::config::credential_policy::{RuleMode, credential_policy};
-use crate::credential_providers::CredentialProvider;
+use crate::credential_providers::{CredentialProvider, GrantClientAuthentication};
 use crate::identity::ssi::vc_issuer::VcSigner;
 use crate::secrets::SecretsStore;
 use std::sync::Arc;
 
-/// Build the authorization URL with resolved client_id from secrets store
-pub async fn build_authorization_url(
+/// How long a consent start link, and the callback state it leads to, stay usable.
+const CONSENT_STATE_LIFETIME_MINUTES: i64 = 10;
+
+/// The prefix of the cookie that binds a consent callback to the browser that
+/// confirmed the consent start page. `__Host-` keeps it on the gateway's own
+/// host, on `Path=/`, so a sibling subdomain cannot set it.
+pub const CONSENT_COOKIE_PREFIX: &str = "__Host-ag_consent_";
+
+/// The binding cookie of `state`: [`CONSENT_COOKIE_PREFIX`] followed by the
+/// first 16 characters of its sealed browser binding, so each consent has a
+/// cookie of its own and the callback reads only that one.
+pub fn binding_cookie_name(state: &OAuthState) -> Option<String> {
+    state
+        .browser_binding
+        .as_deref()
+        .and_then(|binding| binding.get(..16))
+        .map(|id| format!("{CONSENT_COOKIE_PREFIX}{id}"))
+}
+
+/// The gateway's consent start page for `provider`: `{redirect URI}/start`
+/// with a sealed start state, of `stage` when it has one. The person opens it
+/// and confirms; only then does the gateway build the vendor's authorization
+/// URL.
+pub fn build_authorization_url(
     provider: &CredentialProvider,
     agent_did: &str,
     user_identity_hash: &str,
-    channel_id: &str,
+    surface_id: &str,
     scopes: &[String],
     gateway_base_url: &str,
-    secrets_store: &Arc<dyn SecretsStore>,
+    stage: Option<ConsentStage>,
 ) -> Result<String> {
-    let auth_endpoint = provider
-        .authorization_endpoint
-        .as_deref()
-        .ok_or_else(|| anyhow!("Provider '{}' has no authorization_endpoint", provider.provider_id))?;
-
-    // Resolve client_id from secrets store
-    let client_id_ref = provider
-        .client_id_secret_ref
-        .as_deref()
-        .ok_or_else(|| anyhow!("Provider '{}' has no client_id_secret_ref", provider.provider_id))?;
-    let client_id = resolve_secret(provider, secrets_store, client_id_ref, isolation_mode())
-        .await
-        .context("Failed to resolve client_id secret")?;
-
-    let nonce = Uuid::new_v4().to_string();
-
-    // Generate PKCE code_verifier (RFC 7636 §4.1: 43-128 chars, unreserved charset)
-    let code_verifier = generate_pkce_verifier();
-    let code_challenge = generate_pkce_challenge(&code_verifier);
-
-    let state = OAuthState {
-        agent_did: agent_did.to_string(),
-        user_identity_hash: user_identity_hash.to_string(),
-        surface_id: channel_id.to_string(),
-        credential_provider_id: provider.id.clone(),
-        provider_id: provider.provider_id.clone(),
-        nonce,
-        expires_at: Utc::now() + Duration::minutes(10),
-        code_verifier: Some(code_verifier),
-    };
-
-    let state_encoded = encode_oauth_state(&state)?;
-
-    let callback_url = provider
-        .callback_url
-        .as_deref()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("{}{}", gateway_base_url, provider.callback_path));
-
+    let mut url = provider
+        .consent_redirect_uri(gateway_base_url)
+        .map_err(|reason| anyhow!("Provider '{}': {reason}", provider.provider_id))?;
     let effective_scopes = if scopes.is_empty() {
         &provider.default_scopes
     } else {
         scopes
     };
-    let scope_string = effective_scopes.join(" ");
-
-    let mut url = format!(
-        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
-        auth_endpoint,
-        urlencoding::encode(&client_id),
-        urlencoding::encode(&callback_url),
-        urlencoding::encode(&scope_string),
-        urlencoding::encode(&state_encoded),
-        urlencoding::encode(&code_challenge),
-    );
-
-    for (key, value) in &provider.additional_params {
-        url.push_str(&format!("&{}={}", urlencoding::encode(key), urlencoding::encode(value)));
-    }
+    let state = OAuthState {
+        agent_did: agent_did.to_string(),
+        user_identity_hash: user_identity_hash.to_string(),
+        surface_id: surface_id.to_string(),
+        credential_provider_id: provider.id.clone(),
+        provider_id: provider.provider_id.clone(),
+        nonce: Uuid::new_v4().to_string(),
+        expires_at: Utc::now() + Duration::minutes(CONSENT_STATE_LIFETIME_MINUTES),
+        code_verifier: None,
+        scopes: effective_scopes.to_vec(),
+        browser_binding: None,
+        stage,
+    };
+    let start_path = format!("{}/start", url.path());
+    url.set_path(&start_path);
+    url.query_pairs_mut()
+        .append_pair("state", &encode_oauth_state(&state)?);
 
     info!(
         target: "credential_delegation",
@@ -97,10 +85,376 @@ pub async fn build_authorization_url(
         agent_did = %agent_did,
         user_hash = %user_identity_hash,
         scopes = ?effective_scopes,
-        "Built OAuth authorization URL with resolved client_id"
+        "Built OAuth consent start URL"
     );
 
+    Ok(url.into())
+}
+
+/// The consent start page for `provider` ([`build_authorization_url`]), minted
+/// only when the start POST could complete: the redirect URI follows the
+/// consent rules and no other provider has it, the client ID resolves, and the
+/// vendor's authorization URL can be built. Its start state confirms `caller`
+/// at their identity provider when the provider's `consent_confirmation` can
+/// ([`consent_confirmation::decide`](super::consent_confirmation::decide)),
+/// and no link is minted for a caller it cannot confirm while the setting
+/// confirms no caller of the provider or sets `require`.
+#[allow(clippy::too_many_arguments)]
+pub async fn mint_consent_link(
+    provider: &CredentialProvider,
+    agent_did: &str,
+    user_identity_hash: &str,
+    surface_id: &str,
+    surface_tenant_id: Option<&str>,
+    caller: super::consent_confirmation::ConsentCaller<'_>,
+    scopes: &[String],
+    gateway_base_url: &str,
+    secrets_store: &Arc<dyn SecretsStore>,
+    provider_store: &dyn crate::credential_providers::storage::CredentialProviderStorage,
+) -> Result<String> {
+    provider
+        .consent_redirect_uri(gateway_base_url)
+        .map_err(|reason| anyhow!("Provider '{}': {reason}", provider.provider_id))?;
+    if crate::credential_providers::redirect_uri_taken_by(provider_store, provider, gateway_base_url)
+        .await?
+        .is_some()
+    {
+        return Err(anyhow!("Provider '{}' shares its redirect URI with another provider", provider.provider_id));
+    }
+    let client_id_ref = provider
+        .client_id_secret_ref
+        .as_deref()
+        .ok_or_else(|| anyhow!("Provider '{}' has no client_id_secret_ref", provider.provider_id))?;
+    resolve_secret(provider, secrets_store, client_id_ref, isolation_mode())
+        .await
+        .context("Failed to resolve client_id secret")?;
+    provider
+        .consent_authorization_endpoint()
+        .map_err(|rule| anyhow!("Provider '{}': {rule}", provider.provider_id))?;
+    let decision = super::consent_confirmation::decide(provider, caller, surface_tenant_id, user_identity_hash)
+        .await
+        .context("Failed to read the consent confirmation strategy")?;
+    super::consent_confirmation::note(provider, surface_id, &decision, caller);
+    let stage = match decision {
+        super::consent_confirmation::ConfirmDecision::Confirm(binding) => Some(ConsentStage::ConfirmStart(binding)),
+        super::consent_confirmation::ConfirmDecision::Unconfirmed(reason)
+            if super::consent_confirmation::refuses(provider, reason) =>
+        {
+            return Err(anyhow!(
+                "Provider '{}': consent confirmation refuses this caller ({reason:?})",
+                provider.provider_id
+            ));
+        }
+        _ => None,
+    };
+    build_authorization_url(provider, agent_did, user_identity_hash, surface_id, scopes, gateway_base_url, stage)
+}
+
+/// What the consent start POST answers with: the vendor's or, for a caller
+/// confirmed first, the identity provider's authorization URL, the binding
+/// cookie's value and when the state it carries expires.
+pub struct ConsentStart {
+    pub authorization_url: url::Url,
+    pub cookie_name: String,
+    pub cookie_value: zeroize::Zeroizing<String>,
+    pub expires_at: chrono::DateTime<Utc>,
+}
+
+/// Begin consent from a decoded start state: resolve the client id, make a
+/// PKCE verifier and 32 random binding bytes, seal a callback state that holds
+/// the verifier and the bytes' SHA-256 under a fresh nonce, and build the
+/// vendor's authorization URL. Nothing is claimed: the caller claims the start
+/// nonce once this succeeds.
+pub async fn begin_consent(
+    provider: &CredentialProvider,
+    start: &OAuthState,
+    redirect_uri: &url::Url,
+    secrets_store: &Arc<dyn SecretsStore>,
+) -> Result<ConsentStart> {
+    let (cookie_value, browser_binding) = new_browser_binding();
+    let (vendor_url, callback) =
+        vendor_leg(provider, start, browser_binding, start.stage.clone(), redirect_uri, secrets_store).await?;
+    consent_started(vendor_url, &callback, cookie_value)
+}
+
+/// The vendor's authorization URL for a caller the
+/// [`ConsentStage::Confirmation`] state `confirmation` has confirmed: a
+/// [`ConsentStage::Vendor`] state sealed with `binding` on the confirmation's
+/// own browser binding, so the browser keeps its cookie, with a fresh nonce
+/// and PKCE verifier. The URL is the one [`begin_consent`] builds, but for its
+/// state and PKCE challenge.
+pub(super) async fn continue_to_vendor(
+    provider: &CredentialProvider,
+    confirmation: &OAuthState,
+    binding: &super::ConsentConfirmBinding,
+    redirect_uri: &url::Url,
+    secrets_store: &Arc<dyn SecretsStore>,
+) -> Result<url::Url> {
+    let browser_binding = confirmation
+        .browser_binding
+        .clone()
+        .ok_or_else(|| anyhow!("OAuth state has no browser binding"))?;
+    let stage = Some(ConsentStage::Vendor(binding.clone()));
+    vendor_leg(provider, confirmation, browser_binding, stage, redirect_uri, secrets_store)
+        .await
+        .map(|(vendor_url, _)| vendor_url)
+}
+
+/// The vendor callback state that follows `from`, sealed with `stage` and
+/// `browser_binding`, a fresh nonce and PKCE verifier, and the vendor's
+/// authorization URL that carries it.
+async fn vendor_leg(
+    provider: &CredentialProvider,
+    from: &OAuthState,
+    browser_binding: String,
+    stage: Option<ConsentStage>,
+    redirect_uri: &url::Url,
+    secrets_store: &Arc<dyn SecretsStore>,
+) -> Result<(url::Url, OAuthState)> {
+    let client_id_ref = provider
+        .client_id_secret_ref
+        .as_deref()
+        .ok_or_else(|| anyhow!("Provider '{}' has no client_id_secret_ref", provider.provider_id))?;
+    let client_id = resolve_secret(provider, secrets_store, client_id_ref, isolation_mode())
+        .await
+        .context("Failed to resolve client_id secret")?;
+    let code_verifier = generate_pkce_verifier();
+    let code_challenge = generate_pkce_challenge(&code_verifier);
+    let callback = OAuthState {
+        nonce: Uuid::new_v4().to_string(),
+        expires_at: next_state_expiry(from),
+        code_verifier: Some(code_verifier),
+        browser_binding: Some(browser_binding),
+        stage,
+        ..from.clone()
+    };
+    let vendor_url = vendor_authorization_url(
+        provider,
+        &client_id,
+        redirect_uri.as_str(),
+        &from.scopes,
+        &encode_oauth_state(&callback)?,
+        &code_challenge,
+    )?;
+    Ok((vendor_url, callback))
+}
+
+/// Begin confirming the caller of a confirm start state sealed with `binding`
+/// at their identity provider, as [`begin_consent`] begins the vendor's
+/// consent: a PKCE verifier and 32 random binding bytes, sealed with the start
+/// state's consent in a [`ConsentStage::Confirmation`] state with a random ID
+/// token nonce and the time the sign-in began, and the authorization URL of
+/// `sign_in` with `response_mode=query`, since the binding cookie is
+/// `SameSite=Lax`.
+pub(super) fn begin_confirmation(
+    start: &OAuthState,
+    binding: &super::ConsentConfirmBinding,
+    sign_in: &super::consent_confirmation::SignIn,
+) -> Result<ConsentStart> {
+    let code_verifier = generate_pkce_verifier();
+    let code_challenge = generate_pkce_challenge(&code_verifier);
+    let (cookie_value, browser_binding) = new_browser_binding();
+    let id_token_nonce = Uuid::new_v4().to_string();
+    let confirmation = OAuthState {
+        nonce: Uuid::new_v4().to_string(),
+        expires_at: next_state_expiry(start),
+        code_verifier: Some(code_verifier),
+        browser_binding: Some(browser_binding),
+        stage: Some(ConsentStage::Confirmation(super::ConfirmationSignIn {
+            binding: binding.clone(),
+            nonce: id_token_nonce.clone(),
+            issued_at: Utc::now(),
+        })),
+        ..start.clone()
+    };
+    let mut url = sign_in
+        .authorization_endpoint
+        .clone();
+    url.query_pairs_mut()
+        .extend_pairs([
+            ("response_type", "code"),
+            ("client_id", sign_in.client_id.as_str()),
+            ("redirect_uri", sign_in.redirect_uri.as_str()),
+            ("scope", sign_in.scope),
+            ("state", encode_oauth_state(&confirmation)?.as_str()),
+            ("nonce", id_token_nonce.as_str()),
+            ("code_challenge", code_challenge.as_str()),
+            ("code_challenge_method", "S256"),
+            ("response_mode", "query"),
+        ]);
+    consent_started(url, &confirmation, cookie_value)
+}
+
+/// When the state that follows `from` expires: with `from`, and at most
+/// [`CONSENT_STATE_LIFETIME_MINUTES`] from now.
+fn next_state_expiry(from: &OAuthState) -> chrono::DateTime<Utc> {
+    from.expires_at
+        .min(Utc::now() + Duration::minutes(CONSENT_STATE_LIFETIME_MINUTES))
+}
+
+/// 32 random browser binding bytes, as the cookie value that carries them and
+/// the SHA-256 a state seals.
+fn new_browser_binding() -> (zeroize::Zeroizing<String>, String) {
+    let mut binding = zeroize::Zeroizing::new([0u8; 32]);
+    rand::rng().fill(&mut binding[..]);
+    (
+        zeroize::Zeroizing::new(base64_url_encode_bytes(binding.as_slice())),
+        base64_url_encode_bytes(&Sha256::digest(binding.as_slice())),
+    )
+}
+
+fn consent_started(
+    authorization_url: url::Url,
+    state: &OAuthState,
+    cookie_value: zeroize::Zeroizing<String>,
+) -> Result<ConsentStart> {
+    Ok(ConsentStart {
+        authorization_url,
+        cookie_name: binding_cookie_name(state).ok_or_else(|| anyhow!("OAuth state has no browser binding"))?,
+        cookie_value,
+        expires_at: state.expires_at,
+    })
+}
+
+/// The vendor's authorization URL: the provider's
+/// [`consent_authorization_endpoint`](CredentialProvider::consent_authorization_endpoint)
+/// with the gateway's parameters and `additional_params` added.
+fn vendor_authorization_url(
+    provider: &CredentialProvider,
+    client_id: &str,
+    redirect_uri: &str,
+    scopes: &[String],
+    state: &str,
+    code_challenge: &str,
+) -> Result<url::Url> {
+    let mut url = provider
+        .consent_authorization_endpoint()
+        .map_err(|rule| anyhow!("Provider '{}': {rule}", provider.provider_id))?;
+    url.query_pairs_mut()
+        .extend_pairs([
+            ("response_type", "code"),
+            ("client_id", client_id),
+            ("redirect_uri", redirect_uri),
+            ("scope", scopes.join(" ").as_str()),
+            ("state", state),
+            ("code_challenge", code_challenge),
+            ("code_challenge_method", "S256"),
+        ])
+        .extend_pairs(&provider.additional_params);
     Ok(url)
+}
+
+/// Decode a consent start state: a start state without a stage, as
+/// [`build_authorization_url`] seals it, or a [`ConsentStage::ConfirmStart`] one.
+pub fn decode_start_state(encoded: &str) -> Result<OAuthState> {
+    decode_consent_state(encoded, "start", &[StageKind::Start, StageKind::ConfirmStart])
+}
+
+/// Decode the state the identity provider redirects back with: a
+/// [`ConsentStage::Confirmation`] state.
+pub fn decode_confirmation_state(encoded: &str) -> Result<OAuthState> {
+    decode_consent_state(encoded, "confirmation", &[StageKind::Confirmation])
+}
+
+/// Decode a consent callback state: a legacy vendor callback state, which only
+/// [`begin_consent`] seals, or a [`ConsentStage::Vendor`] one, which only
+/// [`continue_to_vendor`] seals.
+pub fn decode_callback_state(encoded: &str) -> Result<OAuthState> {
+    decode_consent_state(encoded, "callback", &[StageKind::Vendor])
+}
+
+fn decode_consent_state(
+    encoded: &str,
+    route: &str,
+    accepted: &[StageKind],
+) -> Result<OAuthState> {
+    let (state, seal) = open_oauth_state(encoded)?;
+    match sealed_stage(&state, seal) {
+        Some(stage) if accepted.contains(&stage) => Ok(state),
+        _ => Err(anyhow!("OAuth state is not a consent {route} state")),
+    }
+}
+
+/// A [`ConsentStage`] without the binding it carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StageKind {
+    Start,
+    ConfirmStart,
+    Confirmation,
+    Vendor,
+}
+
+impl From<&ConsentStage> for StageKind {
+    fn from(stage: &ConsentStage) -> Self {
+        match stage {
+            ConsentStage::ConfirmStart(_) => Self::ConfirmStart,
+            ConsentStage::Confirmation(_) => Self::Confirmation,
+            ConsentStage::Vendor(_) => Self::Vendor,
+        }
+    }
+}
+
+/// The stage `state` is good for when it was sealed under `seal`, or `None`
+/// for a pairing the gateway never seals. A legacy state has no stage of its
+/// own: neither a browser binding nor a PKCE verifier makes it a start state,
+/// both make it a vendor callback state. A staged state's fields follow the
+/// same rule.
+fn sealed_stage(
+    state: &OAuthState,
+    seal: StateSeal,
+) -> Option<StageKind> {
+    let callback_fields = match (
+        state
+            .browser_binding
+            .is_some(),
+        state.code_verifier.is_some(),
+    ) {
+        (false, false) => false,
+        (true, true) => true,
+        _ => return None,
+    };
+    let stage = match (
+        seal,
+        state
+            .stage
+            .as_ref()
+            .map(StageKind::from),
+    ) {
+        (StateSeal::Legacy, None) if callback_fields => StageKind::Vendor,
+        (StateSeal::Legacy, None) => StageKind::Start,
+        (StateSeal::Confirm, Some(stage @ StageKind::ConfirmStart)) if !callback_fields => stage,
+        (StateSeal::Confirm, Some(stage @ (StageKind::Confirmation | StageKind::Vendor))) if callback_fields => stage,
+        _ => return None,
+    };
+    Some(stage)
+}
+
+/// Whether `cookie_value`, the value of `state`'s own binding cookie, is the
+/// browser binding `state` was sealed with: 32 base64url bytes whose SHA-256 is
+/// the state's, compared in constant time.
+pub fn browser_binding_matches(
+    state: &OAuthState,
+    cookie_value: Option<&str>,
+) -> bool {
+    use subtle::ConstantTimeEq;
+    let Some(expected) = state
+        .browser_binding
+        .as_deref()
+        .and_then(|binding| base64_url_decode(binding).ok())
+        .filter(|binding| binding.len() == 32)
+    else {
+        return false;
+    };
+    cookie_value
+        .and_then(|value| base64_url_decode(value).ok())
+        .filter(|bytes| bytes.len() == 32)
+        .is_some_and(|bytes| {
+            bool::from(
+                Sha256::digest(&bytes)
+                    .as_slice()
+                    .ct_eq(&expected),
+            )
+        })
 }
 
 /// Exchange an OAuth authorization code for tokens
@@ -165,10 +519,9 @@ async fn exchange_code_for_tokens_with(
     .context("Failed to resolve client_secret")?;
 
     let callback_url = provider
-        .callback_url
-        .as_deref()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("{}{}", gateway_base_url, provider.callback_path));
+        .consent_redirect_uri(gateway_base_url)
+        .map_err(|reason| anyhow!("Provider '{}': {reason}", provider.provider_id))?
+        .to_string();
     crate::url_validation::validate_oauth_endpoint_url(&callback_url)
         .map_err(|e| anyhow!("Blocked callback_url for provider '{}': {}", provider.provider_id, e))?;
     let (http_client, token_url) = egress
@@ -473,32 +826,11 @@ async fn scoped_token_grant(
         None if refresh_token.is_some() => return Err(misconfigured("Missing refresh resource")),
         None => None,
     };
-    let client_id = resolve_secret(
-        provider,
-        secrets,
-        provider
-            .client_id_secret_ref
-            .as_deref()
-            .ok_or_else(|| misconfigured("Missing provider client"))?,
-        egress
-            .policy
-            .tenant_credential_isolation,
-    )
-    .await?;
-    let client_secret = zeroize::Zeroizing::new(
-        resolve_secret(
-            provider,
-            secrets,
-            provider
-                .client_secret_secret_ref
-                .as_deref()
-                .ok_or_else(|| misconfigured("Missing provider client secret"))?,
-            egress
-                .policy
-                .tenant_credential_isolation,
-        )
-        .await?,
-    );
+    let mode = egress
+        .policy
+        .tenant_credential_isolation;
+    let client_id = provider_client_id(provider, secrets, mode).await?;
+    let client_secret = provider_client_secret(provider, secrets, mode).await?;
     let scope = scopes.join(" ");
     let mut params = vec![
         (
@@ -521,14 +853,81 @@ async fn scoped_token_grant(
     if let Some(refresh_token) = refresh_token {
         params.push(("refresh_token", refresh_token));
     }
-    request_token(provider, endpoint, &params, refresh_token.is_some(), egress).await
+    request_token(provider, endpoint, &params, None, refresh_token.is_some(), egress).await
 }
 
 const JWT_BEARER_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
 const JWT_CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 
+/// The client identity a JWT Bearer grant carries, resolved from the provider's secret
+/// references and held in zeroizing buffers until the request is sent.
+enum GrantClient {
+    /// A public client: `client_id` in the form body.
+    Public { id: String },
+    /// `client_id` and `client_secret` in the form body.
+    Post { id: String, secret: zeroize::Zeroizing<String> },
+    /// The `Authorization` header value of HTTP Basic client authentication.
+    Basic { authorization: zeroize::Zeroizing<String> },
+}
+
+/// The client ID the provider's `client_id_secret_ref` names.
+async fn provider_client_id(
+    provider: &CredentialProvider,
+    secrets: &Arc<dyn SecretsStore>,
+    mode: RuleMode,
+) -> Result<String> {
+    let reference = provider
+        .client_id_secret_ref
+        .as_deref()
+        .ok_or_else(|| misconfigured("Missing provider client"))?;
+    Ok(resolve_secret(provider, secrets, reference, mode).await?)
+}
+
+/// The client secret the provider's `client_secret_secret_ref` names.
+async fn provider_client_secret(
+    provider: &CredentialProvider,
+    secrets: &Arc<dyn SecretsStore>,
+    mode: RuleMode,
+) -> Result<zeroize::Zeroizing<String>> {
+    let reference = provider
+        .client_secret_secret_ref
+        .as_deref()
+        .ok_or_else(|| misconfigured("Missing provider client secret"))?;
+    Ok(zeroize::Zeroizing::new(resolve_secret(provider, secrets, reference, mode).await?))
+}
+
+/// The client identity the provider's client authentication sends with its grant, or `None`
+/// when it sets no client authentication, in which case its client references are not read.
+async fn grant_client(
+    provider: &CredentialProvider,
+    secrets: &Arc<dyn SecretsStore>,
+    mode: RuleMode,
+) -> Result<Option<GrantClient>> {
+    let Some(method) = provider
+        .jwt
+        .client_authentication_method()
+    else {
+        return Ok(None);
+    };
+    let id = provider_client_id(provider, secrets, mode).await?;
+    if !method.uses_secret() {
+        return Ok(Some(GrantClient::Public { id }));
+    }
+    let secret = provider_client_secret(provider, secrets, mode).await?;
+    Ok(Some(if method == GrantClientAuthentication::ClientSecretBasic {
+        GrantClient::Basic {
+            authorization: super::revocation::basic_authorization(&id, &secret),
+        }
+    } else {
+        GrantClient::Post { id, secret }
+    }))
+}
+
 /// Fetch a token with a JWT Bearer grant (RFC 7523 section 2.1): the signed JWT is the
-/// grant, and no client credentials are sent.
+/// grant, and the client identifies itself only as the provider's client authentication
+/// says, not at all when it sets no client authentication. A provider that sets one also
+/// asks for its scopes in the `scope` form field, which servers such as Ory Hydra grant
+/// scopes from; one that sets none of them names its scopes only in the assertion's `scope` claim.
 pub async fn fetch_jwt_bearer_token(
     provider: &CredentialProvider,
     scopes: &[String],
@@ -536,6 +935,14 @@ pub async fn fetch_jwt_bearer_token(
     egress: &TokenEgress,
 ) -> Result<OAuthTokenResponse> {
     let endpoint = validated_token_endpoint(provider, egress)?;
+    let client = grant_client(
+        provider,
+        secrets,
+        egress
+            .policy
+            .tenant_credential_isolation,
+    )
+    .await?;
     let claims = super::jwt_assertion::grant_assertion_claims(provider, scopes, Utc::now().timestamp())
         .map_err(|e| misconfigured(e.to_string()))?;
     let assertion = signed_assertion(
@@ -547,11 +954,28 @@ pub async fn fetch_jwt_bearer_token(
             .tenant_credential_isolation,
     )
     .await?;
+    let scope = scopes.join(" ");
     let mut params = vec![("grant_type", JWT_BEARER_GRANT_TYPE), ("assertion", assertion.as_str())];
     if let Some(resource) = provider.resource.as_deref() {
         params.push(("resource", resource));
     }
-    request_token(provider, endpoint, &params, false, egress)
+    let authorization = match &client {
+        None => None,
+        Some(GrantClient::Public { id }) => {
+            params.push(("client_id", id.as_str()));
+            None
+        }
+        Some(GrantClient::Post { id, secret }) => {
+            params.push(("client_id", id.as_str()));
+            params.push(("client_secret", secret.as_str()));
+            None
+        }
+        Some(GrantClient::Basic { authorization }) => Some(authorization.as_str()),
+    };
+    if client.is_some() && !scope.is_empty() {
+        params.push(("scope", scope.as_str()));
+    }
+    request_token(provider, endpoint, &params, authorization, false, egress)
         .await?
         .ok_or_else(|| anyhow!("Provider credential grant rejected"))
 }
@@ -565,13 +989,9 @@ pub async fn fetch_client_credentials_jwt_auth_token(
     egress: &TokenEgress,
 ) -> Result<OAuthTokenResponse> {
     let endpoint = validated_token_endpoint(provider, egress)?;
-    let client_id = resolve_secret(
+    let client_id = provider_client_id(
         provider,
         secrets,
-        provider
-            .client_id_secret_ref
-            .as_deref()
-            .ok_or_else(|| misconfigured("Missing provider client"))?,
         egress
             .policy
             .tenant_credential_isolation,
@@ -601,7 +1021,7 @@ pub async fn fetch_client_credentials_jwt_auth_token(
     if let Some(resource) = provider.resource.as_deref() {
         params.push(("resource", resource));
     }
-    request_token(provider, endpoint, &params, false, egress)
+    request_token(provider, endpoint, &params, None, false, egress)
         .await?
         .ok_or_else(|| anyhow!("Provider credential grant rejected"))
 }
@@ -736,8 +1156,9 @@ impl std::fmt::Display for OAuthErrorCode {
     }
 }
 
-/// A service token request the token endpoint answered with an OAuth error. Only its `error`
-/// code is kept.
+/// A service token request the token endpoint refused as a client error (a `4xx` other than
+/// `429`) with an OAuth error. Only its `error` code is kept. A `5xx` or `429` answer is a
+/// failed request whatever its body says.
 #[derive(Debug, thiserror::Error)]
 #[error("Provider token request rejected")]
 pub struct TokenRequestRejected {
@@ -849,8 +1270,10 @@ impl TokenEgress {
         Ok(())
     }
 
-    /// A redirect-off client pinned to the addresses `endpoint` resolved to when it was
-    /// vetted, and the URL to post to. A blocked address is [`TokenEndpointRefused`].
+    /// A redirect-off client that ignores proxies, pinned to the addresses `endpoint`
+    /// resolved to when the Configured policy vetted it (cloud metadata, loopback and
+    /// unspecified addresses refused, private networks allowed), and the URL to post to.
+    /// A refused address is [`TokenEndpointRefused`].
     pub(crate) async fn pinned_client(
         &self,
         endpoint: &str,
@@ -859,12 +1282,14 @@ impl TokenEgress {
         let timeout = self.timeout;
         let allowlist = self.exact_allowlist.clone();
         let (client, target) = tokio::task::spawn_blocking(move || {
-            crate::egress::pinned_configured_client(&raw, timeout, allowlist.as_deref())
+            crate::egress::pinned_configured_direct_client(&raw, timeout, allowlist.as_deref())
         })
         .await
         .context("Provider token request failed")?
         .map_err(|error| match error {
-            crate::egress::EgressError::Blocked(_) => anyhow::Error::new(TokenEndpointRefused),
+            crate::egress::EgressError::Blocked(_) | crate::egress::EgressError::Parse(_) => {
+                anyhow::Error::new(TokenEndpointRefused)
+            }
             _ => anyhow!("Provider token request failed"),
         })?;
         Ok((client, target.url))
@@ -894,6 +1319,21 @@ pub(crate) enum TokenPostFailure {
     TooLarge,
     #[error("Provider token request timed out")]
     TimedOut,
+}
+
+/// `request` with `authorization` as its `Authorization` header, marked sensitive so that no
+/// debug output of the request shows it. `authorization` is a `Basic` credential from
+/// `revocation::basic_authorization`, always printable ASCII, so a value that is not a header
+/// value is a bug and stops here rather than going out unmarked. Token requests and revocation
+/// requests both set the header through this function.
+pub(super) fn with_sensitive_authorization(
+    request: reqwest::RequestBuilder,
+    authorization: &str,
+) -> reqwest::RequestBuilder {
+    let mut value =
+        reqwest::header::HeaderValue::from_str(authorization).expect("an Authorization value is printable ASCII");
+    value.set_sensitive(true);
+    request.header(reqwest::header::AUTHORIZATION, value)
 }
 
 /// POST `params` to the token endpoint `endpoint` through `client`, asking for
@@ -926,7 +1366,7 @@ pub(crate) async fn post_token_request_within(
             .header(reqwest::header::ACCEPT, "application/json")
             .form(params);
         if let Some(authorization) = authorization {
-            request = request.header(reqwest::header::AUTHORIZATION, authorization);
+            request = with_sensitive_authorization(request, authorization);
         }
         let mut response = request
             .send()
@@ -1026,9 +1466,10 @@ impl TokenPostFailure {
     }
 }
 
-/// POST a token request through the egress's pinned client ([`post_token_request_within`])
-/// and read its JSON response, the whole request within the egress timeout. The access
-/// token must be a non-empty Bearer with an `expires_in` of up to 366 days.
+/// POST a token request through the egress's pinned client ([`post_token_request_within`]),
+/// with `authorization` as its `Authorization` header when one is given, and read its JSON
+/// response, the whole request within the egress timeout. The access token must be a
+/// non-empty Bearer with an `expires_in` of up to 366 days.
 /// When `refresh` is set an `invalid_grant` answer is `Ok(None)`; any other refusal is
 /// an error, and only its OAuth `error` code is logged. A failed service token request that
 /// reached the endpoint is counted here; [`TokenRequestOutcome::Success`] is counted by the
@@ -1037,6 +1478,7 @@ async fn request_token(
     provider: &CredentialProvider,
     endpoint: &str,
     params: &[(&str, &str)],
+    authorization: Option<&str>,
     refresh: bool,
     egress: &TokenEgress,
 ) -> Result<Option<OAuthTokenResponse>> {
@@ -1047,7 +1489,7 @@ async fn request_token(
     let remaining = egress
         .timeout
         .saturating_sub(started.elapsed());
-    let answer = match post_token_request_within(&client, url.as_str(), params, None, remaining).await {
+    let answer = match post_token_request_within(&client, url.as_str(), params, authorization, remaining).await {
         Ok(answer) => answer,
         Err(failure) => {
             if !refresh {
@@ -1082,6 +1524,10 @@ fn read_token_answer(
             provider_id = %provider.provider_id,
             status = %status,
             reason = %token_error_code(&String::from_utf8_lossy(&bytes)),
+            client_authentication = provider
+                .jwt
+                .client_authentication_method()
+                .map_or("unset", GrantClientAuthentication::as_str),
             "Provider token request rejected"
         );
     }
@@ -1096,10 +1542,12 @@ fn read_token_answer(
         return Ok(None);
     }
     if !status.is_success() {
+        let refused_as_client_error = status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS;
         return Err(
             match value
                 .get("error")
                 .and_then(serde_json::Value::as_str)
+                .filter(|_| refused_as_client_error)
             {
                 Some(error) => anyhow::Error::new(TokenRequestRejected {
                     code: OAuthErrorCode::new(error),
@@ -1238,6 +1686,51 @@ const SEALED_STATE_PREFIX: &str = "SEALED.";
 /// Derivation label, and AES-GCM associated data, for the OAuth state key.
 const OAUTH_STATE_KEY_LABEL: &[u8] = b"agent-gateway/oauth-state/v1";
 
+/// Derivation label, and AES-GCM associated data, for the key that seals every
+/// state with a [`ConsentStage`] of its own, so a gateway that predates
+/// consent stages opens none of them.
+const OAUTH_CONFIRM_STATE_KEY_LABEL: &[u8] = b"agent-gateway/oauth-state/confirm/v1";
+
+/// The key and label a state was sealed under: the legacy one, or the at-rest
+/// service, for a state without a stage; the confirm one for a staged state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StateSeal {
+    Legacy,
+    Confirm,
+}
+
+impl StateSeal {
+    fn label(self) -> &'static [u8] {
+        match self {
+            Self::Legacy => OAUTH_STATE_KEY_LABEL,
+            Self::Confirm => OAUTH_CONFIRM_STATE_KEY_LABEL,
+        }
+    }
+
+    fn seal(
+        self,
+        state_json: &str,
+    ) -> Result<String> {
+        let sealed = crate::encryption::aes_gcm::AesGcmEncryptor::new()
+            .encrypt_with_aad(&self.key(), state_json.as_bytes(), self.label())
+            .map_err(|e| anyhow!("Failed to seal OAuth state: {e}"))?;
+        Ok(format!("{SEALED_STATE_PREFIX}{}", base64_url_encode_bytes(&sealed)))
+    }
+
+    fn open(
+        self,
+        sealed: &[u8],
+    ) -> Option<Vec<u8>> {
+        crate::encryption::aes_gcm::AesGcmEncryptor::new()
+            .decrypt_with_aad(&self.key(), sealed, self.label())
+            .ok()
+    }
+
+    fn key(self) -> [u8; 32] {
+        crate::identity::credential_identity::derived_key(self.label())
+    }
+}
+
 /// How long a used state nonce is remembered: longer than a state lives.
 const USED_STATE_NONCE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
@@ -1253,9 +1746,11 @@ static USED_STATE_NONCES: std::sync::LazyLock<moka::future::Cache<String, ()>> =
 /// The state is serialized to JSON, sealed with AES-256-GCM and base64url-encoded
 /// for embedding in the authorization URL, so neither the OAuth provider nor any
 /// intermediary can read it (agent_did, user_identity_hash, surface_id, the PKCE
-/// code_verifier, etc.) or forge one. The at-rest encryption service seals it when
-/// enabled; otherwise a key derived from the identity hash pepper does, which
-/// gateways sharing `AG_IDENTITY_HASH_PEPPER` share.
+/// code_verifier, etc.) or forge one. A state without a stage is sealed by the
+/// at-rest encryption service when enabled, otherwise under the legacy label by a
+/// key derived from the identity hash pepper, which gateways sharing
+/// `AG_IDENTITY_HASH_PEPPER` share. A staged state is always sealed under the
+/// confirm label, and only when its fields fit its stage.
 pub(super) fn encode_oauth_state(state: &OAuthState) -> Result<String> {
     encode_oauth_state_with(state, crate::encryption::global::get_encryption_service())
 }
@@ -1266,53 +1761,54 @@ fn encode_oauth_state_with(
 ) -> Result<String> {
     let state_json = serde_json::to_string(state).context("Failed to serialize OAuth state")?;
 
-    let payload = match encryption {
-        Some(enc) if enc.is_enabled() => enc
+    let payload = match (&state.stage, encryption) {
+        (Some(_), _) if sealed_stage(state, StateSeal::Confirm).is_none() => {
+            return Err(anyhow!("OAuth state's fields do not fit its consent stage"));
+        }
+        (Some(_), _) => StateSeal::Confirm.seal(&state_json)?,
+        (None, Some(enc)) if enc.is_enabled() => enc
             .encrypt_string(state_json)
             .context("Failed to encrypt OAuth state")?,
-        _ => {
-            let sealed = crate::encryption::aes_gcm::AesGcmEncryptor::new()
-                .encrypt_with_aad(&oauth_state_key(), state_json.as_bytes(), OAUTH_STATE_KEY_LABEL)
-                .map_err(|e| anyhow!("Failed to seal OAuth state: {e}"))?;
-            format!("{SEALED_STATE_PREFIX}{}", base64_url_encode_bytes(&sealed))
-        }
+        (None, _) => StateSeal::Legacy.seal(&state_json)?,
     };
 
     Ok(base64_url_encode(&payload))
 }
 
-fn oauth_state_key() -> [u8; 32] {
-    crate::identity::credential_identity::derived_key(OAUTH_STATE_KEY_LABEL)
-}
-
-/// Decode and validate the OAuth state parameter.
+/// Open the OAuth state parameter and say which seal it was under.
 ///
 /// Reverses `encode_oauth_state`: base64url-decode, open the seal, then parse JSON and
 /// check expiry. A state this gateway did not seal is rejected, so it cannot be forged.
-pub fn decode_oauth_state(encoded: &str) -> Result<OAuthState> {
-    decode_oauth_state_with(encoded, crate::encryption::global::get_encryption_service())
+fn open_oauth_state(encoded: &str) -> Result<(OAuthState, StateSeal)> {
+    open_oauth_state_with(encoded, crate::encryption::global::get_encryption_service())
 }
 
-fn decode_oauth_state_with(
+fn open_oauth_state_with(
     encoded: &str,
     encryption: Option<crate::encryption::EncryptionService>,
-) -> Result<OAuthState> {
+) -> Result<(OAuthState, StateSeal)> {
     let decoded_bytes = base64_url_decode(encoded).context("Failed to base64url decode state")?;
     let decoded_str = String::from_utf8(decoded_bytes).context("OAuth state is not valid UTF-8")?;
 
-    let state_json = if decoded_str.starts_with("ENC[") {
+    let (state_json, seal) = if decoded_str.starts_with("ENC[") {
         match encryption {
-            Some(enc) => enc
-                .decrypt_string(decoded_str)
-                .context("Failed to decrypt OAuth state — key may have rotated")?,
+            Some(enc) => (
+                enc.decrypt_string(decoded_str)
+                    .context("Failed to decrypt OAuth state — key may have rotated")?,
+                StateSeal::Legacy,
+            ),
             None => return Err(anyhow!("OAuth state is encrypted but encryption service is not available")),
         }
     } else if let Some(sealed) = decoded_str.strip_prefix(SEALED_STATE_PREFIX) {
         let sealed = base64_url_decode(sealed).context("Failed to base64url decode sealed OAuth state")?;
-        let opened = crate::encryption::aes_gcm::AesGcmEncryptor::new()
-            .decrypt_with_aad(&oauth_state_key(), &sealed, OAUTH_STATE_KEY_LABEL)
-            .map_err(|_| anyhow!("OAuth state was not issued by this gateway"))?;
-        String::from_utf8(opened).context("OAuth state is not valid UTF-8")?
+        let (opened, seal) = [StateSeal::Legacy, StateSeal::Confirm]
+            .into_iter()
+            .find_map(|seal| {
+                seal.open(&sealed)
+                    .map(|opened| (opened, seal))
+            })
+            .ok_or_else(|| anyhow!("OAuth state was not issued by this gateway"))?;
+        (String::from_utf8(opened).context("OAuth state is not valid UTF-8")?, seal)
     } else {
         return Err(anyhow!("OAuth state is not sealed — unsealed state is not accepted"));
     };
@@ -1324,7 +1820,7 @@ fn decode_oauth_state_with(
         return Err(anyhow!("OAuth state has expired"));
     }
 
-    Ok(state)
+    Ok((state, seal))
 }
 
 /// Mark a decoded state's nonce as used, so each state completes one callback.
@@ -1336,6 +1832,19 @@ pub async fn claim_oauth_state(state: &OAuthState) -> bool {
         .or_insert(())
         .await
         .is_fresh()
+}
+
+/// `state` sealed under the legacy label whatever its stage, as a gateway
+/// that predates consent stages would seal it.
+#[cfg(test)]
+pub(crate) fn seal_under_legacy_label(state: &OAuthState) -> String {
+    tests::seal_under(state, OAUTH_STATE_KEY_LABEL)
+}
+
+/// Whether `state`'s nonce was already claimed on this process.
+#[cfg(test)]
+pub(crate) async fn is_claimed(state: &OAuthState) -> bool {
+    USED_STATE_NONCES.contains_key(&state.nonce)
 }
 
 /// Why a provider's secret could not be read.
@@ -1423,6 +1932,9 @@ mod tests {
             nonce: "nonce-42".to_string(),
             expires_at: Utc::now() + Duration::minutes(10),
             code_verifier: None,
+            scopes: Vec::new(),
+            browser_binding: None,
+            stage: None,
         };
 
         let encoded = encode_oauth_state(&state).expect("encode should succeed");
@@ -1449,6 +1961,9 @@ mod tests {
             nonce: "nonce".to_string(),
             expires_at: Utc::now() - Duration::minutes(1), // already expired
             code_verifier: None,
+            scopes: Vec::new(),
+            browser_binding: None,
+            stage: None,
         };
 
         let encoded = encode_oauth_state(&state).expect("encode should succeed");
@@ -1458,6 +1973,480 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err_msg.contains("expired"), "Error should mention expiry, got: {}", err_msg);
+    }
+
+    fn consent_provider() -> CredentialProvider {
+        serde_json::from_value(json!({
+            "id": "cp-1", "name": "GitHub", "provider_id": "github",
+            "authorization_endpoint": "https://github.com/login/oauth/authorize?allow_signup=false",
+            "default_scopes": ["repo"], "callback_path": "/v1/identity/oauth/callback/github",
+            "additional_params": {"prompt": "consent"},
+            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_vendor_url_carries_the_gateways_parameters_once_after_the_endpoints_own() {
+        let url = vendor_authorization_url(
+            &consent_provider(),
+            "client",
+            "https://gw.example/v1/identity/oauth/callback/github",
+            &["repo".to_string(), "read:user".to_string()],
+            "sealed",
+            "challenge",
+        )
+        .unwrap();
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .into_owned()
+            .collect();
+        let expected: Vec<(String, String)> = [
+            ("allow_signup", "false"),
+            ("response_type", "code"),
+            ("client_id", "client"),
+            ("redirect_uri", "https://gw.example/v1/identity/oauth/callback/github"),
+            ("scope", "repo read:user"),
+            ("state", "sealed"),
+            ("code_challenge", "challenge"),
+            ("code_challenge_method", "S256"),
+            ("prompt", "consent"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+        assert_eq!(pairs, expected);
+        assert_eq!(
+            url.origin()
+                .ascii_serialization(),
+            "https://github.com"
+        );
+    }
+
+    #[test]
+    fn the_vendor_url_refuses_an_unsafe_endpoint_and_reserved_or_oversized_parameters() {
+        let build = |provider: &CredentialProvider| {
+            vendor_authorization_url(provider, "client", "https://gw.example/cb", &[], "sealed", "challenge")
+        };
+        for endpoint in [
+            "http://github.com/login/oauth/authorize",
+            "https://user:pass@github.com/authorize",
+            "https://github.com/authorize#fragment",
+            "https://github.com/authorize?state=forged",
+            "https://github.com/authorize?a=1&a=2",
+            "not a url",
+        ] {
+            let mut provider = consent_provider();
+            provider.authorization_endpoint = Some(endpoint.to_string());
+            assert!(build(&provider).is_err(), "{endpoint}");
+        }
+        for (name, value) in [
+            ("redirect_uri", "https://attacker.example".to_string()),
+            ("code_challenge", "x".to_string()),
+            ("allow_signup", "true".to_string()),
+            ("long", "v".repeat(2049)),
+            (&"n".repeat(129), "v".to_string()),
+        ] {
+            let mut provider = consent_provider();
+            provider
+                .additional_params
+                .insert(name.to_string(), value);
+            assert!(build(&provider).is_err(), "{name}");
+        }
+        let mut provider = consent_provider();
+        provider.additional_params = (0..32)
+            .map(|index| (format!("p{index}"), "v".to_string()))
+            .collect();
+        assert!(build(&provider).is_err(), "33 parameters with the endpoint's own");
+        provider
+            .additional_params
+            .remove("p0");
+        assert!(build(&provider).is_ok(), "32 parameters");
+        let mut provider = consent_provider();
+        provider.authorization_endpoint = None;
+        assert!(build(&provider).is_err());
+    }
+
+    #[test]
+    fn the_consent_url_is_the_gateways_start_page_with_a_start_state() {
+        let mut provider = consent_provider();
+        provider.callback_url = Some("https://gw.example/prefix/v1/identity/oauth/callback/github".to_string());
+        let url = url::Url::parse(
+            &build_authorization_url(
+                &provider,
+                "did:web:agent",
+                "sha256:user",
+                "surface",
+                &[],
+                "https://ignored.example",
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            url.origin()
+                .ascii_serialization(),
+            "https://gw.example"
+        );
+        assert_eq!(url.path(), "/prefix/v1/identity/oauth/callback/github/start");
+        let state = url
+            .query_pairs()
+            .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+            .unwrap();
+        let start = decode_start_state(&state).unwrap();
+        assert_eq!(start.scopes, ["repo"]);
+        assert_eq!((start.code_verifier, start.browser_binding), (None, None));
+        assert!(decode_callback_state(&state).is_err(), "a start state is not a callback state");
+
+        provider.callback_url = Some("http://gw.example/prefix/v1/identity/oauth/callback/github".to_string());
+        assert!(
+            build_authorization_url(
+                &provider,
+                "did:web:agent",
+                "sha256:user",
+                "surface",
+                &[],
+                "https://gw.example",
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn each_consent_stage_decodes_only_its_own_state() {
+        let start = OAuthState {
+            nonce: uuid::Uuid::new_v4().to_string(),
+            code_verifier: None,
+            ..sample_state()
+        };
+        let older = sample_state();
+        let callback = OAuthState {
+            browser_binding: Some(base64_url_encode_bytes(&Sha256::digest([1u8; 32]))),
+            ..sample_state()
+        };
+        let binding_only = OAuthState {
+            code_verifier: None,
+            ..callback.clone()
+        };
+        let staged = |stage, shape: &OAuthState| OAuthState {
+            stage: Some(stage),
+            ..shape.clone()
+        };
+        let confirm_start = staged(ConsentStage::ConfirmStart(confirm_binding()), &start);
+        let confirmation = staged(ConsentStage::Confirmation(sign_in()), &callback);
+        let confirmed_vendor = staged(ConsentStage::Vendor(confirm_binding()), &callback);
+
+        type Decoder = fn(&str) -> Result<OAuthState>;
+        let decoders: [(&str, Decoder); 3] = [
+            ("start", decode_start_state),
+            ("confirmation", decode_confirmation_state),
+            ("callback", decode_callback_state),
+        ];
+        let accepted = [
+            ("legacy start", &start, encode_oauth_state(&start).unwrap(), "start"),
+            ("legacy start sealed by hand", &start, seal_under(&start, OAUTH_STATE_KEY_LABEL), "start"),
+            ("confirm start", &confirm_start, encode_oauth_state(&confirm_start).unwrap(), "start"),
+            ("confirm start sealed by hand", &confirm_start, seal_under(&confirm_start, CONFIRM_LABEL), "start"),
+            ("confirmation", &confirmation, encode_oauth_state(&confirmation).unwrap(), "confirmation"),
+            ("confirmation sealed by hand", &confirmation, seal_under(&confirmation, CONFIRM_LABEL), "confirmation"),
+            ("legacy vendor", &callback, encode_oauth_state(&callback).unwrap(), "callback"),
+            ("legacy vendor sealed by hand", &callback, seal_under(&callback, OAUTH_STATE_KEY_LABEL), "callback"),
+            ("confirmed vendor", &confirmed_vendor, encode_oauth_state(&confirmed_vendor).unwrap(), "callback"),
+            (
+                "confirmed vendor sealed by hand",
+                &confirmed_vendor,
+                seal_under(&confirmed_vendor, CONFIRM_LABEL),
+                "callback",
+            ),
+        ];
+        let mut refused_everywhere = vec![
+            ("older", encode_oauth_state(&older).unwrap()),
+            ("binding only", encode_oauth_state(&binding_only).unwrap()),
+        ];
+        for stage in [
+            ConsentStage::ConfirmStart(confirm_binding()),
+            ConsentStage::Confirmation(sign_in()),
+            ConsentStage::Vendor(confirm_binding()),
+        ] {
+            for shape in [&start, &callback] {
+                let state = staged(stage.clone(), shape);
+                refused_everywhere.push(("legacy label with a stage", seal_under(&state, OAUTH_STATE_KEY_LABEL)));
+                if sealed_stage(&state, StateSeal::Confirm).is_none() {
+                    refused_everywhere
+                        .push(("confirm label with a stage its fields contradict", seal_under(&state, CONFIRM_LABEL)));
+                }
+            }
+        }
+        for shape in [&start, &callback, &older, &binding_only] {
+            refused_everywhere.push(("confirm label without a stage", seal_under(shape, CONFIRM_LABEL)));
+        }
+
+        for (name, state, encoded, route) in &accepted {
+            for (decoder_route, decode) in decoders {
+                match decode(encoded) {
+                    Ok(decoded) => {
+                        assert_eq!(decoder_route, *route, "{name} state accepted by the {decoder_route} decoder");
+                        assert!(decoded == **state, "{name} state decodes to what was sealed: {decoded:?}");
+                    }
+                    Err(error) => {
+                        assert_ne!(decoder_route, *route, "{name} state refused by its own decoder: {error}");
+                        assert_eq!(error.to_string(), format!("OAuth state is not a consent {decoder_route} state"));
+                    }
+                }
+            }
+        }
+        for (name, encoded) in &refused_everywhere {
+            for (decoder_route, decode) in decoders {
+                let error =
+                    decode(encoded).expect_err(&format!("{name} state accepted by the {decoder_route} decoder"));
+                assert_eq!(
+                    error.to_string(),
+                    format!("OAuth state is not a consent {decoder_route} state"),
+                    "{name} state at the {decoder_route} decoder"
+                );
+            }
+        }
+    }
+
+    const CONFIRM_LABEL: &[u8] = OAUTH_CONFIRM_STATE_KEY_LABEL;
+
+    fn confirm_binding() -> crate::delegation_vault::ConsentConfirmBinding {
+        crate::delegation_vault::ConsentConfirmBinding {
+            strategy_id: "strategy-1".to_string(),
+            strategy_digest: "ab".repeat(32),
+            tenant_id: Some("tenant-a".to_string()),
+        }
+    }
+
+    fn sign_in() -> crate::delegation_vault::ConfirmationSignIn {
+        crate::delegation_vault::ConfirmationSignIn {
+            binding: confirm_binding(),
+            nonce: "id-token-nonce".to_string(),
+            issued_at: Utc::now(),
+        }
+    }
+
+    pub(super) fn seal_under(
+        state: &OAuthState,
+        label: &[u8],
+    ) -> String {
+        let sealed = crate::encryption::aes_gcm::AesGcmEncryptor::new()
+            .encrypt_with_aad(
+                &crate::identity::credential_identity::derived_key(label),
+                serde_json::to_string(state)
+                    .unwrap()
+                    .as_bytes(),
+                label,
+            )
+            .unwrap();
+        base64_url_encode(&format!("{SEALED_STATE_PREFIX}{}", base64_url_encode_bytes(&sealed)))
+    }
+
+    /// What a gateway that predates consent stages does with a state: open the
+    /// seal with the one key and label it knows, or the at-rest service.
+    fn opened_by_a_gateway_without_stages(encoded: &str) -> bool {
+        let decoded = String::from_utf8(base64_url_decode(encoded).unwrap()).unwrap();
+        if let Some(sealed) = decoded.strip_prefix(SEALED_STATE_PREFIX) {
+            return crate::encryption::aes_gcm::AesGcmEncryptor::new()
+                .decrypt_with_aad(
+                    &crate::identity::credential_identity::derived_key(OAUTH_STATE_KEY_LABEL),
+                    &base64_url_decode(sealed).unwrap(),
+                    OAUTH_STATE_KEY_LABEL,
+                )
+                .is_ok();
+        }
+        crate::encryption::global::get_encryption_service().is_some_and(|enc| {
+            enc.decrypt_string(decoded)
+                .is_ok_and(|json| json.starts_with('{'))
+        })
+    }
+
+    #[test]
+    fn a_gateway_without_consent_stages_cannot_open_a_staged_state() {
+        let start = OAuthState {
+            code_verifier: None,
+            ..sample_state()
+        };
+        let callback = OAuthState {
+            browser_binding: Some(base64_url_encode_bytes(&Sha256::digest([1u8; 32]))),
+            ..sample_state()
+        };
+        let staged = [
+            OAuthState {
+                stage: Some(ConsentStage::ConfirmStart(confirm_binding())),
+                ..start.clone()
+            },
+            OAuthState {
+                stage: Some(ConsentStage::Confirmation(sign_in())),
+                ..callback.clone()
+            },
+            OAuthState {
+                stage: Some(ConsentStage::Vendor(confirm_binding())),
+                ..callback.clone()
+            },
+        ];
+        for encryption in [false, true] {
+            if encryption {
+                init_test_encryption();
+            }
+            for legacy in [&start, &callback] {
+                assert!(
+                    opened_by_a_gateway_without_stages(&encode_oauth_state(legacy).unwrap()),
+                    "a legacy state, encryption {encryption}"
+                );
+            }
+            for state in &staged {
+                let encoded = encode_oauth_state(state).unwrap();
+                let payload = String::from_utf8(base64_url_decode(&encoded).unwrap()).unwrap();
+                assert!(payload.starts_with(SEALED_STATE_PREFIX), "{:?}, encryption {encryption}", state.stage);
+                assert!(
+                    !opened_by_a_gateway_without_stages(&encoded),
+                    "{:?} opened under the legacy label, encryption {encryption}",
+                    state.stage
+                );
+                let (opened, seal) = open_oauth_state(&encoded).unwrap();
+                assert_eq!((&opened.stage, seal), (&state.stage, StateSeal::Confirm));
+            }
+        }
+        let enc = crate::encryption::global::get_encryption_service().unwrap();
+        for state in &staged {
+            let at_rest = base64_url_encode(
+                &enc.encrypt_string(serde_json::to_string(state).unwrap())
+                    .unwrap(),
+            );
+            for decode in [decode_start_state, decode_confirmation_state, decode_callback_state] {
+                assert!(decode(&at_rest).is_err(), "{:?} under the at-rest service", state.stage);
+            }
+        }
+    }
+
+    #[test]
+    fn a_staged_state_whose_fields_contradict_its_stage_is_never_sealed() {
+        let start = OAuthState {
+            code_verifier: None,
+            ..sample_state()
+        };
+        let callback = OAuthState {
+            browser_binding: Some(base64_url_encode_bytes(&Sha256::digest([1u8; 32]))),
+            ..sample_state()
+        };
+        for (stage, shape) in [
+            (ConsentStage::ConfirmStart(confirm_binding()), &callback),
+            (ConsentStage::Confirmation(sign_in()), &start),
+            (ConsentStage::Vendor(confirm_binding()), &start),
+            (ConsentStage::Vendor(confirm_binding()), &sample_state()),
+        ] {
+            let state = OAuthState {
+                stage: Some(stage.clone()),
+                ..shape.clone()
+            };
+            assert_eq!(
+                encode_oauth_state(&state)
+                    .unwrap_err()
+                    .to_string(),
+                "OAuth state's fields do not fit its consent stage",
+                "{stage:?} sealed with contradicting fields"
+            );
+        }
+    }
+
+    /// A confirm binding lives only inside a stage, and every staged state the
+    /// encoder seals is under the confirm label, so no state under the legacy
+    /// label can carry one.
+    #[test]
+    fn the_encoder_seals_no_confirm_binding_under_the_legacy_label() {
+        let start = OAuthState {
+            code_verifier: None,
+            ..sample_state()
+        };
+        let callback = OAuthState {
+            browser_binding: Some(base64_url_encode_bytes(&Sha256::digest([1u8; 32]))),
+            ..sample_state()
+        };
+        for encryption in [false, true] {
+            if encryption {
+                init_test_encryption();
+            }
+            for state in [
+                OAuthState {
+                    stage: Some(ConsentStage::ConfirmStart(confirm_binding())),
+                    ..start.clone()
+                },
+                OAuthState {
+                    stage: Some(ConsentStage::Confirmation(sign_in())),
+                    ..callback.clone()
+                },
+                OAuthState {
+                    stage: Some(ConsentStage::Vendor(confirm_binding())),
+                    ..callback.clone()
+                },
+            ] {
+                let (_, seal) = open_oauth_state(&encode_oauth_state(&state).unwrap()).unwrap();
+                assert_eq!(seal, StateSeal::Confirm, "{:?}, encryption {encryption}", state.stage);
+            }
+            for legacy in [&start, &callback] {
+                let (opened, seal) = open_oauth_state(&encode_oauth_state(legacy).unwrap()).unwrap();
+                assert_eq!((opened.stage, seal), (None, StateSeal::Legacy), "encryption {encryption}");
+            }
+        }
+    }
+
+    /// The start POST copies its start state into the vendor callback state, so
+    /// a confirm start state, whose stage needs a start state's fields, never
+    /// becomes a vendor callback state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn begin_consent_refuses_a_confirm_start_state() {
+        let (_directory, secrets) = secrets_with_tenants().await;
+        let mut provider = tenant_provider(None);
+        provider.provider_type = crate::credential_providers::CredentialProviderType::OAuth2AuthorizationCode;
+        provider.client_id_secret_ref = Some("WIDE".to_string());
+        provider.authorization_endpoint = Some("https://vendor.example/authorize".to_string());
+        let redirect_uri = url::Url::parse("https://gw.example/v1/identity/oauth/callback/provider").unwrap();
+        let start = OAuthState {
+            code_verifier: None,
+            ..sample_state()
+        };
+        assert!(
+            begin_consent(&provider, &start, &redirect_uri, &secrets)
+                .await
+                .is_ok(),
+            "a legacy start state begins consent"
+        );
+        let confirm_start = OAuthState {
+            stage: Some(ConsentStage::ConfirmStart(confirm_binding())),
+            ..start
+        };
+        let refused = begin_consent(&provider, &confirm_start, &redirect_uri, &secrets)
+            .await
+            .err()
+            .expect("a confirm start state does not begin vendor consent");
+        assert_eq!(refused.to_string(), "OAuth state's fields do not fit its consent stage");
+    }
+
+    #[test]
+    fn only_the_browsers_own_binding_bytes_match_their_state() {
+        let bytes = [7u8; 32];
+        let state = OAuthState {
+            browser_binding: Some(base64_url_encode_bytes(&Sha256::digest(bytes))),
+            ..sample_state()
+        };
+        let cookie = base64_url_encode_bytes(&bytes);
+        assert!(browser_binding_matches(&state, Some(cookie.as_str())));
+        let other = base64_url_encode_bytes(&[8u8; 32]);
+        let hash_itself = state
+            .browser_binding
+            .clone()
+            .unwrap();
+        let short = base64_url_encode_bytes(&bytes[..16]);
+        for refused in [other.as_str(), hash_itself.as_str(), short.as_str(), "", "!!"] {
+            assert!(!browser_binding_matches(&state, Some(refused)), "{refused}");
+        }
+        assert!(!browser_binding_matches(&state, None));
+        assert!(!browser_binding_matches(&sample_state(), Some(cookie.as_str())), "a state without a binding");
+        assert_eq!(binding_cookie_name(&state).unwrap(), format!("__Host-ag_consent_{}", &hash_itself[..16]));
+        assert_eq!(binding_cookie_name(&sample_state()), None);
     }
 
     #[test]
@@ -1476,7 +2465,21 @@ mod tests {
             nonce: "nonce-42".to_string(),
             expires_at: Utc::now() + Duration::minutes(10),
             code_verifier: Some("pkce-verifier".to_string()),
+            scopes: Vec::new(),
+            browser_binding: None,
+            stage: None,
         }
+    }
+
+    fn decode_oauth_state(encoded: &str) -> Result<OAuthState> {
+        open_oauth_state(encoded).map(|(state, _)| state)
+    }
+
+    fn decode_oauth_state_with(
+        encoded: &str,
+        encryption: Option<crate::encryption::EncryptionService>,
+    ) -> Result<OAuthState> {
+        open_oauth_state_with(encoded, encryption).map(|(state, _)| state)
     }
 
     #[test]
@@ -1719,6 +2722,7 @@ mod tests {
             url: String,
             egress: TokenEgress,
             requests: tokio::sync::mpsc::Receiver<HashMap<String, String>>,
+            authorizations: tokio::sync::mpsc::UnboundedReceiver<Option<String>>,
             _server: tokio::task::JoinSet<()>,
         }
 
@@ -1727,11 +2731,21 @@ mod tests {
             body: Value,
         ) -> TokenEndpoint {
             let (sender, requests) = tokio::sync::mpsc::channel(4);
+            let (authorization_sender, authorizations) = tokio::sync::mpsc::unbounded_channel();
             let app = axum::Router::new().fallback(axum::routing::post(
-                move |axum::Form(form): axum::Form<HashMap<String, String>>| {
+                move |headers: axum::http::HeaderMap, axum::Form(form): axum::Form<HashMap<String, String>>| {
                     let sender = sender.clone();
+                    let authorization_sender = authorization_sender.clone();
                     let body = body.clone();
                     async move {
+                        authorization_sender
+                            .send(
+                                headers
+                                    .get(axum::http::header::AUTHORIZATION)
+                                    .and_then(|value| value.to_str().ok())
+                                    .map(str::to_string),
+                            )
+                            .ok();
                         sender
                             .send(form)
                             .await
@@ -1758,6 +2772,7 @@ mod tests {
                 },
                 url,
                 requests,
+                authorizations,
                 _server: server,
             }
         }
@@ -1821,7 +2836,7 @@ mod tests {
         ) -> CredentialProvider {
             let mut value = json!({
                 "id": "cp", "name": "Provider", "provider_id": "provider",
-                "token_endpoint": token_endpoint,
+                "token_endpoint": token_endpoint, "callback_path": "/v1/identity/oauth/callback/provider",
                 "jwt_signing_key_secret_ref": "SIGNING_KEY",
                 "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
             });
@@ -1965,6 +2980,258 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(form["resource"], "https://api.example/");
+        }
+
+        #[test]
+        fn an_authorization_header_is_marked_sensitive() {
+            let request =
+                with_sensitive_authorization(reqwest::Client::new().post("http://127.0.0.1/token"), "Basic abc")
+                    .build()
+                    .unwrap();
+            let value = &request.headers()[reqwest::header::AUTHORIZATION];
+            assert_eq!(value, "Basic abc");
+            assert!(value.is_sensitive(), "the Authorization header is not marked sensitive");
+        }
+
+        #[test]
+        #[should_panic(expected = "printable ASCII")]
+        fn an_authorization_value_that_is_not_a_header_value_fails_instead_of_going_unmarked() {
+            let _ = with_sensitive_authorization(reqwest::Client::new().post("http://127.0.0.1/token"), "Basic a\nb");
+        }
+
+        #[test]
+        fn a_basic_credential_is_a_header_value_whatever_the_client_id_and_secret_hold() {
+            let long_id = "x".repeat(4096);
+            let long_secret = "é".repeat(4096);
+            let cases = [
+                ("", ""),
+                ("client id", "p@ss:w+rd/%"),
+                ("line\nbreak", "tab\tand\r\nreturn"),
+                ("nul\0byte", "\u{7f}del"),
+                ("ünïcödé", "日本語🔑"),
+                (long_id.as_str(), long_secret.as_str()),
+            ];
+            for (index, (client_id, secret)) in cases.into_iter().enumerate() {
+                let authorization = crate::delegation_vault::revocation::basic_authorization(client_id, secret);
+                assert!(
+                    reqwest::header::HeaderValue::from_str(&authorization).is_ok(),
+                    "the Basic credential of case {index} is not a header value"
+                );
+            }
+        }
+
+        fn bearer_with_client_references(client_authentication: Option<&str>) -> Value {
+            json!({
+                "provider_type": "oauth2_jwt_bearer",
+                "jwt_issuer": "agent@project.iam.gserviceaccount.com",
+                "jwt_subject": "admin@example.com",
+                "client_id_secret_ref": "CLIENT_ID",
+                "client_secret_secret_ref": "CLIENT_SECRET",
+                "client_authentication": client_authentication,
+            })
+        }
+
+        async fn grant_sent(client_authentication: Option<&str>) -> (HashMap<String, String>, Option<String>) {
+            let fixture = fixture().await;
+            let mut endpoint = token_endpoint(200, issued()).await;
+            let provider = provider(&endpoint.url, bearer_with_client_references(client_authentication));
+            fetch_jwt_bearer_token(&provider, &[], &fixture.secrets, &endpoint.egress)
+                .await
+                .unwrap();
+            let form = endpoint
+                .requests
+                .recv()
+                .await
+                .unwrap();
+            let authorization = endpoint
+                .authorizations
+                .recv()
+                .await
+                .unwrap();
+            (form, authorization)
+        }
+
+        fn form_keys(form: &HashMap<String, String>) -> Vec<&str> {
+            let mut keys: Vec<_> = form
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            keys
+        }
+
+        fn basic(
+            client_id: &str,
+            secret: &str,
+        ) -> String {
+            use base64::Engine;
+            format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{client_id}:{secret}")))
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_jwt_bearer_grant_without_a_client_authentication_sends_no_client_identity() {
+            let (form, authorization) = grant_sent(None).await;
+            assert_eq!(form_keys(&form), ["assertion", "grant_type"]);
+            assert_eq!(authorization, None);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_grant_with_a_client_authentication_also_asks_for_its_scopes_in_the_form_body() {
+            let fixture = fixture().await;
+            let scopes = vec!["read".to_string(), "write".to_string()];
+            for method in ["none", "client_secret_basic", "client_secret_post"] {
+                let mut endpoint = token_endpoint(200, issued()).await;
+                let provider = provider(&endpoint.url, bearer_with_client_references(Some(method)));
+                fetch_jwt_bearer_token(&provider, &scopes, &fixture.secrets, &endpoint.egress)
+                    .await
+                    .unwrap();
+                let form = endpoint
+                    .requests
+                    .recv()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    form.get("scope")
+                        .map(String::as_str),
+                    Some("read write"),
+                    "{method}"
+                );
+                assert_eq!(
+                    claims(&form["assertion"], &fixture.key.public_pem, Algorithm::RS256, &endpoint.url)["scope"],
+                    "read write"
+                );
+            }
+            let mut endpoint = token_endpoint(200, issued()).await;
+            let provider = provider(&endpoint.url, bearer_with_client_references(Some("none")));
+            fetch_jwt_bearer_token(&provider, &[], &fixture.secrets, &endpoint.egress)
+                .await
+                .unwrap();
+            assert!(
+                !endpoint
+                    .requests
+                    .recv()
+                    .await
+                    .unwrap()
+                    .contains_key("scope"),
+                "a grant with no scopes asks for none in the form body"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_public_client_sends_its_client_id_and_no_secret() {
+            let (form, authorization) = grant_sent(Some("none")).await;
+            assert_eq!(form_keys(&form), ["assertion", "client_id", "grant_type"]);
+            assert_eq!(form["client_id"], "client-123");
+            assert_eq!(authorization, None);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn client_secret_basic_sends_http_basic_and_no_client_field_in_the_form() {
+            let (form, authorization) = grant_sent(Some("client_secret_basic")).await;
+            assert_eq!(form_keys(&form), ["assertion", "grant_type"]);
+            assert_eq!(authorization, Some(basic("client-123", "client-secret")));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn client_secret_post_sends_the_client_id_and_secret_in_the_form() {
+            let (form, authorization) = grant_sent(Some("client_secret_post")).await;
+            assert_eq!(form_keys(&form), ["assertion", "client_id", "client_secret", "grant_type"]);
+            assert_eq!(form["client_id"], "client-123");
+            assert_eq!(form["client_secret"], "client-secret");
+            assert_eq!(authorization, None);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_basic_credential_form_urlencodes_the_client_id_and_secret_before_joining_them() {
+            let fixture = fixture().await;
+            for (secret_id, value) in [("ODD_ID", "client id"), ("ODD_SECRET", "p@ss:w+rd/%")] {
+                fixture
+                    .secrets
+                    .create(crate::secrets::CreateSecretRequest {
+                        tenant_id: None,
+                        name: secret_id.into(),
+                        secret_id: secret_id.into(),
+                        description: None,
+                        value: value.into(),
+                        secret_type: "General".into(),
+                        tags: vec![],
+                    })
+                    .await
+                    .unwrap();
+            }
+            let mut endpoint = token_endpoint(200, issued()).await;
+            let mut body = bearer_with_client_references(Some("client_secret_basic"));
+            body["client_id_secret_ref"] = json!("ODD_ID");
+            body["client_secret_secret_ref"] = json!("ODD_SECRET");
+            let provider = provider(&endpoint.url, body);
+            fetch_jwt_bearer_token(&provider, &[], &fixture.secrets, &endpoint.egress)
+                .await
+                .unwrap();
+            assert_eq!(
+                endpoint
+                    .authorizations
+                    .recv()
+                    .await
+                    .unwrap(),
+                Some(basic("client+id", "p%40ss%3Aw%2Brd%2F%25"))
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_client_authentication_without_the_references_it_needs_fails_before_any_request() {
+            let fixture = fixture().await;
+            for (method, reference, replacement) in [
+                ("none", "client_id_secret_ref", None),
+                ("client_secret_basic", "client_id_secret_ref", None),
+                ("client_secret_basic", "client_secret_secret_ref", None),
+                ("client_secret_post", "client_secret_secret_ref", None),
+                ("none", "client_id_secret_ref", Some("NO_SUCH_SECRET")),
+                ("client_secret_post", "client_secret_secret_ref", Some("NO_SUCH_SECRET")),
+            ] {
+                let mut endpoint = token_endpoint(200, issued()).await;
+                let mut body = bearer_with_client_references(Some(method));
+                match replacement {
+                    Some(secret_id) => body[reference] = json!(secret_id),
+                    None => {
+                        body.as_object_mut()
+                            .unwrap()
+                            .remove(reference);
+                    }
+                }
+                let provider = provider(&endpoint.url, body);
+                let error = fetch_jwt_bearer_token(&provider, &[], &fixture.secrets, &endpoint.egress)
+                    .await
+                    .expect_err(&format!("{method} with {reference} {replacement:?} was sent"));
+                let text = format!("{error:#}");
+                assert!(!text.contains("client-secret"), "{text}");
+                assert!(
+                    endpoint
+                        .requests
+                        .try_recv()
+                        .is_err(),
+                    "{method} with {reference} {replacement:?} reached the token endpoint"
+                );
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refused_grant_never_shows_the_client_secret_or_the_basic_credential() {
+            let fixture = fixture().await;
+            for method in ["client_secret_basic", "client_secret_post"] {
+                let endpoint = token_endpoint(
+                    401,
+                    json!({"error": "invalid_client", "error_description": "client-secret was not accepted"}),
+                )
+                .await;
+                let provider = provider(&endpoint.url, bearer_with_client_references(Some(method)));
+                let error = fetch_jwt_bearer_token(&provider, &[], &fixture.secrets, &endpoint.egress)
+                    .await
+                    .unwrap_err();
+                let text = format!("{error:#}");
+                assert!(!text.contains("client-secret"), "{method}: {text}");
+                assert!(!text.contains(&basic("client-123", "client-secret")), "{method}: {text}");
+                assert!(!text.contains("was not accepted"), "{method}: {text}");
+            }
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2305,6 +3572,29 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn only_a_client_error_with_an_oauth_error_is_a_rejected_token_request() {
+            let fixture = fixture().await;
+            for (status, rejected) in [(400, true), (401, true), (429, false), (500, false), (503, false)] {
+                let endpoint = token_endpoint(status, json!({"error": "invalid_client"})).await;
+                let provider = provider(
+                    &endpoint.url,
+                    json!({"provider_type": "oauth2_client_credentials",
+                           "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"}),
+                );
+                let error = fetch_scoped_client_credentials_token(&provider, &[], &fixture.secrets, &endpoint.egress)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error
+                        .downcast_ref::<TokenRequestRejected>()
+                        .map(|rejected| rejected.code.as_str()),
+                    rejected.then_some("invalid_client"),
+                    "HTTP {status}"
+                );
+            }
+        }
+
+        #[tokio::test]
         async fn a_refused_token_request_logs_and_returns_only_the_oauth_error_code() {
             let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
             let fixture = fixture().await;
@@ -2521,6 +3811,7 @@ mod tests {
             api_key_secret_ref: None,
             jwt: Default::default(),
             description: None,
+            consent_confirmation: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             callback_url: None,
@@ -2532,8 +3823,10 @@ mod tests {
             client_id: None,
             allow_unadvertised_pkce: false,
             authorization_response_iss_parameter_supported: None,
+            authorization_response_issuer: None,
             scope_comparison: Default::default(),
             revocation_ends_authorization: false,
+            send_resource: true,
         };
 
         let consent =
@@ -2572,6 +3865,7 @@ mod tests {
             api_key_secret_ref: None,
             jwt: Default::default(),
             description: None,
+            consent_confirmation: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             callback_url: None,
@@ -2583,8 +3877,10 @@ mod tests {
             client_id: None,
             allow_unadvertised_pkce: false,
             authorization_response_iss_parameter_supported: None,
+            authorization_response_issuer: None,
             scope_comparison: Default::default(),
             revocation_ends_authorization: false,
+            send_resource: true,
         };
 
         // Test without signer (unsigned fallback)
@@ -2688,6 +3984,9 @@ mod tests {
             nonce: "nonce-pkce".to_string(),
             expires_at: Utc::now() + Duration::minutes(10),
             code_verifier: Some("test_verifier_value_12345678901234567890".to_string()),
+            scopes: Vec::new(),
+            browser_binding: None,
+            stage: None,
         };
         let encoded = encode_oauth_state(&state).expect("encode should succeed");
         let decoded = decode_oauth_state(&encoded).expect("decode should succeed");
@@ -2706,6 +4005,9 @@ mod tests {
             nonce: "nonce-no-pkce".to_string(),
             expires_at: Utc::now() + Duration::minutes(10),
             code_verifier: None,
+            scopes: Vec::new(),
+            browser_binding: None,
+            stage: None,
         };
         let encoded = encode_oauth_state(&state).expect("encode should succeed");
         let decoded = decode_oauth_state(&encoded).expect("decode should succeed");
@@ -2747,6 +4049,7 @@ mod tests {
             api_key_secret_ref: None,
             jwt: Default::default(),
             description: None,
+            consent_confirmation: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             callback_url: None,
@@ -2758,8 +4061,10 @@ mod tests {
             client_id: None,
             allow_unadvertised_pkce: false,
             authorization_response_iss_parameter_supported: None,
+            authorization_response_issuer: None,
             scope_comparison: Default::default(),
             revocation_ends_authorization: false,
+            send_resource: true,
         };
 
         let vc = build_delegation_vc(

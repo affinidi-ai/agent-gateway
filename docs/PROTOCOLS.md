@@ -65,14 +65,15 @@ sequenceDiagram
 
 | Aspect | Behaviour |
 | --- | --- |
-| `target.auth.fallback: reject` | 502 with the generic detail "Target authentication failed" when the secret cannot be read, the provider's token request fails, or `target_https` in `enforce` withholds the credential from a Target that is not https. The cause is written to the VP Audit Log as a `target_auth_failed` record (see [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)) and never reaches the caller. `target_source_auth` never withholds it here: the fetch is the gateway's own, with no caller to check (see [Target credential rules on the request path](CREDENTIAL_DELEGATION.md#target-credential-rules-on-the-request-path)). |
+| `target.auth.fallback: reject` | `500 target_auth_misconfigured` or `503 target_auth_unavailable`, with the generic detail "Target authentication failed", when the secret cannot be read, the provider's token request fails, or `target_https` in `enforce` withholds the credential from a Target that is not https (see [When a Target credential cannot be obtained](CREDENTIAL_DELEGATION.md#when-a-target-credential-cannot-be-obtained)). The cause is written to the VP Audit Log as a `target_auth_failed` record (see [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)) and never reaches the caller. `target_source_auth` never withholds it here: the fetch is the gateway's own, with no caller to check (see [Target credential rules on the request path](CREDENTIAL_DELEGATION.md#target-credential-rules-on-the-request-path)). |
 | `target.auth.fallback: passthrough` | Fetches without the credential. |
 | Provider token | Requested once, then reused from the vault and renewed up to 5 minutes before it expires. While a renewal fails, the cached token is still used until 60 seconds before it expires. |
 | Caller headers | Only `Accept`, `Accept-Language`, and `User-Agent` are forwarded while the credential is attached, so an anonymous caller can neither override the credential nor add identity or forwarding headers. |
 | Redirects | The client is pinned to the vetted target address with redirects disabled, so the credential cannot follow a 3xx to another host. A 3xx answers 502 "Upstream redirected". |
 | Blocked by egress policy | 403 |
 | Without `target.auth` | The fetch forwards caller headers except `Cookie`, and follows redirects as before. |
-| `fabric://` targets | Unchanged. The remote gateway applies its own target auth. |
+| `fabric://` targets | The remote gateway applies its own target auth. Its Target authentication refusal reaches the caller with the same status, the detail "Target authentication failed" and the same `reason`; its `502` "Upstream redirected" with the same text; any other refusal answers its status with "Upstream error: <status>". See [`FABRIC.md`](FABRIC.md#agent-card-fetch-over-fabric). |
+| Fabric receive | On a surface with `target.auth`, the receiving gateway applies these header, body and failure rules to a card fetch a peer sends: only a `GET` of exactly `/.well-known/agent-card.json` or the configured card location is credentialed, as a bodiless `GET` with the same three caller headers, and with the same failure text. Only the headers that describe the card reach the peer. Redirects are not followed: a 3xx answers 502 "Upstream redirected" without `Location`, and any other error reaches the peer as its status with the body "Upstream error: <status>". Without `target.auth` none of this applies: the request is forwarded as the peer sent it, body included, and a Target redirect is relayed, so the sending gateway's caller gets that 3xx status with the body "Upstream error: <status>" and no `Location`. Unlike the direct path, a `HEAD`, a legacy `agent.json` request or a card path with a query or dot segments is forwarded without the credential (to the configured card location when the surface has one). A card path in another case is not a public read: source authentication runs on it, and an authenticated caller's request carries the credential. A `GET` at a configured card location that is not a discovery path is the card fetch after source authentication, including for a caller who failed it on a public Access Point; every Access Point that refuses failed callers (closed, legacy, `from_jwt_claim` inbound identity or `caller_authentication.on_failure: reject`) answers it `401`, so the sending gateway's card fetch, which carries no caller credential, gets `401` there. See [`FABRIC.md`](FABRIC.md#agent-card-fetch-over-fabric). |
 
 The card fetched with `target.auth` is served to unauthenticated callers as is, so a
 target must not return credential-only content on its card path. A2A's authenticated
@@ -106,7 +107,7 @@ Every fetch result is a `200` with these fields, each always present:
 | `served_url` | The card URL callers use: the first external URL of the Access Point's listener, the route and `/.well-known/agent-card.json`. |
 | `source_url`, `source_url_query_hidden` | The card URL fetched from the Target, without user info, query or fragment; the flag says a query or user info was removed. |
 | `fetched_at`, `cached` | When the fetch started; `cached` is `true` when the answer is the last preview instead of a new fetch. |
-| `fetch` | `status` (`ok`, `failed`, `not_served`), `cause`, `http_status`, `duration_ms`. |
+| `fetch` | `status` (`ok`, `failed`, `not_served`, `served_without_identity`), `cause`, `http_status`, `duration_ms`, `identity_error`, `identity_slot`. |
 | `auth` | `kind` (`none`, `static_secret`, `credential_provider`, `credential_lookup`, `remote_gateway`), `result` (`not_configured`, `sent`, `not_sent`, `failed`) and `failure`; `provider_name` and `token_expires_at` are `null`. |
 | `before`, `before_bytes` | The agent's own card as fetched, and its size. |
 | `after`, `after_bytes` | The card the gateway serves, and its size. |
@@ -116,9 +117,21 @@ Every fetch result is a `200` with these fields, each always present:
 The causes are fixed strings, never upstream text: `needs_token` (401 without a credential),
 `auth_failed` (401 with a credential, a remote gateway's 401 or 403, or a credential the gateway
 could not obtain), `forbidden` (403), `not_found` (404 or 410), `redirected` (3xx),
-`upstream_error`, `unreachable`, `timeout`, `too_large`, `invalid_card`, `blocked_by_egress`,
+`upstream_error`, `unreachable`, `timeout`, `too_large`, `invalid_card`, `compressed` (the agent
+compressed its card although `identity` was asked for), `blocked_by_egress`,
 `proxy_unavailable`, and, with status `not_served` and the agent's card in `before`,
-`identity_failed` and `rewrite_failed`. An `auth.failure` is `secret_unavailable`,
+`identity_failed` and `rewrite_failed`, and, with status `served_without_identity`,
+`identity_missing`: the surface reads the managed identity from the card, the agent's card
+carries none, and the gateway serves it without an identity credential (see
+[Generated agent cards](#generated-agent-cards)); `after` is then the served card and counts as
+the last good card. `identity_error` is `null` unless the cause is `identity_failed`, and then names
+why: the code of the identity error the card route answers with (`identity_extension_missing`,
+`identity_validation_failed`, `identity_invalid_response` or `identity_did_failed`), or
+`credential_injection_failed` when the gateway could not sign or attach its own identity
+credential. `identity_slot` is likewise `null` unless the cause is `identity_failed`, and then
+names the slot that failed with the card route's `slot` spelling: `protected_identity` (the
+managed agent's identity, and the gateway's own credential) or `external_identity`. An
+`auth.failure` is `secret_unavailable`,
 `provider_not_found` (a secret or provider of another tenant reports as missing too),
 `token_unavailable`, `unsupported`, `forbidden` (a `[credential_policy]` rule in `enforce`
 withholds the credential), or `invalid_header` (a stored Target authentication whose header
@@ -522,6 +535,38 @@ response, public or extended. On inbound and fabric paths it skips response exte
 the public card, so response validation rules do not apply to it; outbound transit points still
 validate response extensions on both kinds of card.
 
+When managed identity reads the identity from the response and cannot resolve it, a card or a
+message response (on MCP, a response whose `_meta` should carry `serverIdentity`) is refused with
+`422`. The code is `identity_extension_missing` when no identity is present: no `agent-identity/v1`
+extension on the card, and no identity payload in a message's metadata or an MCP response's
+`_meta`. It is `identity_validation_failed` when one is present but invalid: an `agent-identity/v1`
+declared without its payload, a payload with no identity fields, a payload the identity schema or
+rules reject, or, on a public card, an `agent-identity-credential/v1` whose `did` is not both the
+holder and the subject of its presentation, or whose presentation is missing or not JSON. On an
+extended card such a credential is ignored, so a card that carries only it is
+`identity_extension_missing`.
+
+A public card of an A2A or AP2 surface is the exception for a missing identity on the protected
+slot: when it is a JSON object with a string `name` that carries neither `agent-identity/v1` nor
+`agent-identity-credential/v1`, it is served without an identity credential, with its other
+changes (URL rewrite, `agentDid` and `agentDNA`) applied and no Trust Recorder write. Any other
+body keeps the `422`: one that is not a JSON object or has no `name`, one whose `capabilities` or
+`capabilities.extensions` has another shape, and one listing either identity extension URI in any
+letter case, so an identity the gateway did not check is never passed on. `agentDid` and
+`agentDNA` name the surface's own did:webvh identity, which the operator configures, not the
+agent's; the managed identity signal is the `agent-identity-credential/v1` extension, which such
+a card does not carry. The gateway logs a `WARN` naming the surface, the `protected_identity` slot
+and `identity_extension_missing` the first time a surface's card is built without an identity,
+and again only after that card carried one, after the surface is created, changed or deleted, or
+after a configuration reload or restart. This
+holds on the card route, the agent card preview, a well-known card answered through ordinary
+forwarding, a public card this gateway reads over Fabric, and a public card it serves to a peer
+over Fabric. An invalid identity on a public card is still refused on the first four of those
+paths. A missing identity on an extended card, a message, a stream or the external slot is still
+refused. A public card this gateway serves to a peer over Fabric is never refused for its
+identity: any identity error on it, an invalid identity included, serves the card without an
+identity credential, and the gateway logs the error.
+
 For the JSON-RPC binding, error responses and empty bodies are forwarded unchanged; a JSON-RPC error
 is an object `error` with no `result`, and a `null` member counts as absent, so `"error": null` next
 to a card still has the card rewritten. A card `result` is rewritten whatever the HTTP status. The
@@ -534,12 +579,22 @@ On the JSON-RPC binding the refusal is a JSON-RPC `-32603` error that echoes the
 the HTTP+JSON binding it is a problem response. A non-success response that carries no card
 `result` is forwarded unchanged.
 A public card that cannot be rewritten is answered with `502` on the direct inbound path and
-forwarded as received on fabric and outbound paths.
+forwarded as received on fabric and outbound paths, except a compressed one, which an outbound
+Transit Point of any protocol also answers with `502`: forwarded unrewritten, it would point
+callers past the Transit Point.
 
 A JSON-RPC batch that contains an extended-card call is rejected with `-32600` before it is
 forwarded, whatever the surface's A2A validation level, `"off"` included, because a card inside a
-batch response cannot be rewritten. A compressed card cannot be rewritten either, so an extended-card fetch is forwarded with
-`Accept-Encoding: identity` in place of the caller's value.
+batch response cannot be rewritten. A compressed card cannot be rewritten either, so every card
+fetch, public or extended, on an Access Point or a Transit Point, is forwarded with
+`Accept-Encoding: identity` in place of the caller's value, and a card compressed all the same is
+answered with `502`. A direct fetch names the reason (`Upstream response is compressed`); over
+Fabric an Access Point's caller gets `Upstream error: 502 Bad Gateway`, the receiving gateway's
+status. Other A2A requests on a direct path keep the caller's `Accept-Encoding`, and their
+compressed answers pass through unchanged, except streaming methods and requests to a Target that
+binds a grant, which ask for `identity` too; over Fabric the sending gateway asks for an
+uncompressed answer on every buffered request and the receiving gateway on every request it
+forwards, framed streams included (see [`FABRIC.md`](FABRIC.md#fabric-receive-pipeline)).
 
 Extended cards are detected the same way as the public card: from the request's JSON-RPC method or
 path. Some requests are not recognised, and are forwarded like any other request with their
@@ -805,19 +860,23 @@ every path on its origin. A `GET` or `HEAD` of the configured agent card locatio
 (`access_point.agent_card_path`, or the Transit Point's `agent_card_path`) on the destination's
 origin is also allowed; any other method there is refused.
 
+A path the caller sent is the caller's error, so it is refused with `400` and reason
+`target_path_refused`. On an MCP proxy the tool URL is built from the caller's tool arguments,
+so it is refused the same way. Every refusal carries the detail "Target authentication failed".
+
 | Path | Checked URL | Refusal |
 | --- | --- | --- |
-| Direct forward | The Target endpoint joined with the request path | 502 "Target authentication failed" |
-| Fabric send (an Access Point with a `fabric://` Target) | The path after the route, which must not climb above the peer gateway's base | 502 "Target authentication failed" |
-| Fabric receive | The receiving surface's Target joined with the forwarded path | ForwardResponse 502, detail "Target authentication failed" |
-| MCP proxy `tools/call` (direct or over Fabric) | The REST URL the OpenAPI tool resolves, against the proxy's `base_url` with a trailing `/` added when missing | 502 "Target authentication failed" |
-| Transit Point to an `http(s)` destination | The destination endpoint joined with the path after the Transit Point's listen prefix | 502 "Target authentication credentials unavailable" |
-| Transit Point to a `fabric://` destination | The path after the listen prefix, which must not climb above the peer gateway's base | 502 "Target authentication credentials unavailable" |
+| Direct forward | The Target endpoint joined with the request path | `400 target_path_refused` |
+| Fabric send (an Access Point with a `fabric://` Target) | The path after the route, which must not climb above the peer gateway's base | `400 target_path_refused` |
+| Fabric receive | The receiving surface's Target joined with the forwarded path | ForwardResponse `400 target_path_refused` |
+| MCP proxy `tools/call` (direct or over Fabric) | The REST URL the OpenAPI tool resolves, against the proxy's `base_url` with a trailing `/` added when missing | `400 target_path_refused` |
+| Transit Point to an `http(s)` destination | The destination endpoint joined with the path after the Transit Point's listen prefix | `400 target_path_refused` |
+| Transit Point to a `fabric://` destination | The path after the listen prefix, which must not climb above the peer gateway's base | `400 target_path_refused` |
 
 On the MCP proxy, a path parameter value containing another path parameter's `{name}`
 placeholder is also refused while the credential is attached, because the OpenAPI client
 substitutes parameters one at a time and the value would be rewritten into another parameter's
-place. It is refused as leaving the base: a 502 "Target authentication failed" and a
+place. It is refused as leaving the base: a `400 target_path_refused` and a
 `target_auth_failed` record in the VP Audit Log with outcome `rejected`, whatever the `fallback`.
 Any other value containing `{` or `}` is refused as invalid arguments by the gateway's REST client,
 which sends the tool call, encodes each path parameter as one segment, refuses a braced or `.`
@@ -843,8 +902,11 @@ each path parameter as one segment, and refuses a `base_url` with user info. It 
 response against the tool's output schema, so a response the schema does not admit is a tool
 error, "REST response does not match the tool output schema", where `rmcp-openapi`'s client
 returns it as a success. The result text of a response that is not JSON leaves out the response
-headers and the request body, a response body other than an image that is not UTF-8 text fails
-the call, and a call the gateway refuses names its cause in the client's own words ("Invalid REST
+headers and the request body, a nonempty body that is neither an image nor UTF-8 text, whatever its
+`Content-Type`, is an embedded resource holding its bytes (see [`MCP_METADATA.md`](MCP_METADATA.md)),
+where `rmcp-openapi`'s client answers audio and video as "[Binary content: N bytes, ...]" and
+any other body that is not an image as text decoded by its declared charset (UTF-8 when it
+names none) with invalid bytes replaced, and a call the gateway refuses names its cause in the client's own words ("Invalid REST
 tool arguments", "REST tool execution failed", "REST tool response exceeds its configured limit")
 rather than `rmcp-openapi`'s (for example "1 invalid parameter(s)"). Like the 2026-07-28 path, it
 vets each call's backend with the policy the proxy's `base_url` was saved under (loopback and cloud

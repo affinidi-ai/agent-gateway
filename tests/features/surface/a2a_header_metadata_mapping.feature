@@ -59,6 +59,13 @@ Feature: Header Metadata Mapping on A2A Access Points
     Then the response status is 403
     And managed agent "bravo" was not called
 
+  Scenario: A Trust Check whose authority resolves to a blank mapped header fails its template
+    Given surface "alpha" maps inbound header "x-tenant-id" to A2A metadata field "tenant_id"
+    And surface "alpha" has caller Trust Check whose authority is A2A metadata field "tenant_id"
+    When the caller sends an A2A message/send request to surface "alpha" with header "x-tenant-id" set to ""
+    Then the response status is 403
+    And managed agent "bravo" was not called
+
   Scenario: Missing optional mapped headers do not block forwarding
     Given surface "alpha" maps inbound header "x-agent-session-id" to A2A metadata field "session_id"
     When the caller sends an A2A message/send request to surface "alpha" without header "x-agent-session-id"
@@ -67,8 +74,8 @@ Feature: Header Metadata Mapping on A2A Access Points
     And managed agent "bravo" did not receive A2A metadata field "session_id"
 
   Scenario Outline: Sensitive headers cannot be mapped into A2A metadata
-    Given the operator can use the admin API and no surface is configured for route "/example-sensitive"
-    When the operator attempts to create an A2A surface for route "/example-sensitive" mapping inbound header <header> to A2A metadata field "blocked"
+    Given the operator can use the admin API and no surface is configured for route "/example/sensitive"
+    When the operator attempts to create an A2A surface for route "/example/sensitive" mapping inbound header <header> to A2A metadata field "blocked"
     Then the admin API response status is 400
     And the admin API error response mentions "sensitive header"
 

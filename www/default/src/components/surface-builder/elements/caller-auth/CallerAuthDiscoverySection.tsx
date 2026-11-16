@@ -198,6 +198,7 @@ const CallerAuthDiscoverySection: React.FC<CallerAuthDiscoverySectionProps> = ({
               scopes: [],
             },
             audiences: [],
+            jwt_audience_claim: 'aud',
             jwt_forward_header: false,
             jwt_token_header: 'Authorization',
             jwt_token_scheme: 'Bearer',

@@ -21,6 +21,7 @@ import type { UseSurfaceBuilderReturn } from './hooks/useSurfaceBuilder';
 import type { CanvasNode } from './SurfaceCanvas';
 import type { SurfaceTemplateItem } from '../../api';
 import { SurfaceMetaProvider, type DidwebvhConfig } from './SurfaceMetaContext';
+import type { ApiKeyStatuses } from './elements/identity/apiKeyStatus';
 import type { SurfacePolicyDefinitionLoadState } from './elements/policy/status';
 import type { AccessPointNotice } from './elements/access-point/readiness';
 import { hasPolicyDefinitionReference, policyDefinitionsWarning } from './elements/policy/status';
@@ -170,6 +171,10 @@ export interface SurfaceFormShellProps {
   accessPointNotice?: AccessPointNotice | null;
   /** The stored surface has no `access_point.public`: a legacy Access Point. */
   legacyAccessPoint?: boolean;
+  /** Status of each API key the stored surface names, by key id. */
+  apiKeyStatuses?: ApiKeyStatuses;
+  /** DIDs of the Authorities register; `null` while it loads or when it could not be loaded. */
+  authorityDids?: ReadonlySet<string> | null;
 }
 
 /** True when `variantId` is the default variant in the canvas's variant catalog. */
@@ -330,6 +335,8 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
   hasVariants = false,
   accessPointNotice,
   legacyAccessPoint,
+  apiKeyStatuses,
+  authorityDids,
 }) => {
   const surfacePolicyIds =
     surfacePolicyLoadState.status === 'loaded' ? surfacePolicyLoadState.ids : null;
@@ -856,6 +863,8 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
         saveWarnings,
         accessPointNotice,
         legacyAccessPoint,
+        apiKeyStatuses,
+        authorityDids,
         onConfigureAuthentication: handleConfigureAuthentication,
         setName: setMeta.setName,
         setDescription: setMeta.setDescription,

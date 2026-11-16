@@ -102,7 +102,10 @@ standard DID tooling such as the Universal Resolver. Its own DID is served at
 `/.well-known/did.jsonl`, each managed agent's under `/dids/{path}/did.jsonl`, and surfaces,
 issuers, trust registries, and Connection Points each at their own path. Each document
 carries the verification methods and service endpoints another system needs to check a
-signature.
+signature. The gateway's DID and newly created managed agent DIDs list the Multikey that signs
+their credentials and presentations (`#key-2`) under `assertionMethod`, so strict Data
+Integrity verifiers accept them. The gateway writes its DID log when it first starts, so a gateway that
+already has one keeps publishing the document it was created with.
 
 ## Federation across organisations
 
@@ -186,8 +189,9 @@ Several independent layers, evaluated before a request is forwarded.
 
 A closed Access Point, which the admin API creates by default, refuses a missing or invalid
 caller credential with a `401` before policy and the Target; until it has caller
-authentication it is not ready and refuses every request with a `503`. On a public or legacy Access
-Point the request continues with no caller identity and the failure is passed to policy, so
+authentication it is not ready and refuses every request with a `503`. A legacy Access Point
+(stored without `public`) refuses a failed caller with `401` too. Only on a public Access
+Point does the request continue with no caller identity and the failure is passed to policy, so
 such a surface that must reject unauthenticated callers needs a policy that denies them. An
 MCP Access Point that publishes protected resource metadata always refuses the request with
 a `401`, direct or over Fabric; a direct request's challenge points at that metadata. See
@@ -330,9 +334,12 @@ sequenceDiagram
 agent-pay can also hold a payment for human review; the request is then answered `202`, or
 JSON-RPC error `1003` for MCP and A2A, and the client retries later. Payment receipts, metrics and
 a payments ledger are kept for every call, with the reason a payment was refused or failed. The
-Payments page is one list of payments. The payment audit events stay available from
-`GET /api/admin/payments/audit`. Local x402 and MPP
-verification is no longer supported.
+Payments page is one list of payments. The payment audit events are read from
+`GET /api/admin/payments/audit`, which returns them out of the audit log: it reaches as far back
+as the audit log's own retention keeps, and one read examines at most its newest 256 MiB, so a
+response says `truncated` when it stopped before the end of the history and `dropped_records` when
+the history held records it could not read — either makes its counts lower bounds. See
+[Audit log](#audit-log). Local x402 and MPP verification is no longer supported.
 See [Surface payment policy](CONFIGURATION_REFERENCE.md#surface-payment-policy).
 
 ## Observability
@@ -368,7 +375,13 @@ the gateway authorised, for whom, and under which policy.
 | Consent granted | A user completes consent and a token is stored |
 | Payments | A delegated agent-pay payment is taken, challenged, held for review, or refused |
 
-Entries are written as JSON Lines to a file that rotates daily. Each policy decision
+Entries are written as JSON Lines to a file that is rotated once it reaches its size cap, keeping
+every rotated file beside it by default, so no audit record is deleted; it can also be set to
+keep a fixed number of them and delete anything older. The sizes are set by `[audit]` in
+`config.toml`, and they are read at startup only. One read of the audit API examines at most the
+newest 256 MiB of that history and marks the response `truncated` when it stopped before the end,
+so the dashboard shows its counts as lower bounds rather than as the whole log; see
+[Governance audit forwarding](OBSERVABILITY.md#governance-audit-forwarding). Each policy decision
 records the exact policy version and content hash that decided. On calls through a Transit
 Point, policy decisions are also carried inside the signed workload-binding presentation,
 so the receiving side can check them against the gateway's own key. Auditing is off until
@@ -519,8 +532,9 @@ infrastructure must provide, see [`DEPLOYMENT_REQUIREMENTS.md`](DEPLOYMENT_REQUI
 Secrets live in the gateway's secrets store, on disk or in AWS, and configuration refers
 to them rather than containing them: by environment variable, file, AWS Secrets Manager, or
 AWS Systems Manager Parameter Store. Stored records can be encrypted at rest with a master
-key from the environment, a file, or AWS KMS. Encryption at rest is off by default; enable
-it on any appliance that holds real credentials. See
+key from the environment, a file, or AWS KMS. A configuration from `--generate-bootstrap`
+has encryption at rest off, while the environments the development setup creates have it on;
+enable it on any appliance that holds real credentials. See
 [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#secret-references).
 
 ### Backup and export

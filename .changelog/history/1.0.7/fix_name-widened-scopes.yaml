@@ -1,0 +1,19 @@
+branch: fix/name-widened-scopes
+changes:
+  added:
+    - timestamp: '2026-11-08T15:00:00Z'
+      title: Name the scopes that made a connect or refresh too wide
+      description: >-
+        A connect refused scope_widened said only that the vendor granted more than was asked,
+        so neither the caller of the connect API nor the operator could tell which scopes the
+        vendor added, or which scope_comparison would fit it. The failed answer now carries
+        widened_scopes, the scopes granted beyond those asked for as the provider compares them,
+        and the connect's log line names them; a refresh refused for a wider grant logs them too.
+        They are the vendor's words, so only names spelled entirely as RFC 6749 scope tokens are
+        given (no space, quote, backslash or control character), 1 to 128 bytes each and at most
+        16; any other is left out. Nothing else of the vendor's answer is echoed or logged.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

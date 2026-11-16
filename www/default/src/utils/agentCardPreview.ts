@@ -1,5 +1,13 @@
-export const CARD_FETCH_STATUSES = ['ok', 'failed', 'not_served'] as const;
+export const CARD_FETCH_STATUSES = [
+  'ok',
+  'failed',
+  'not_served',
+  'served_without_identity',
+] as const;
 export type CardFetchStatus = (typeof CARD_FETCH_STATUSES)[number];
+
+export const isCardServed = (status: CardFetchStatus): boolean =>
+  status === 'ok' || status === 'served_without_identity';
 
 export const CARD_FETCH_CAUSES = [
   'needs_token',
@@ -12,12 +20,26 @@ export const CARD_FETCH_CAUSES = [
   'timeout',
   'too_large',
   'invalid_card',
+  'compressed',
   'blocked_by_egress',
   'proxy_unavailable',
   'identity_failed',
   'rewrite_failed',
+  'identity_missing',
 ] as const;
 export type CardFetchCause = (typeof CARD_FETCH_CAUSES)[number];
+
+export const CARD_IDENTITY_ERRORS = [
+  'identity_extension_missing',
+  'identity_validation_failed',
+  'identity_invalid_response',
+  'identity_did_failed',
+  'credential_injection_failed',
+] as const;
+export type CardIdentityError = (typeof CARD_IDENTITY_ERRORS)[number];
+
+export const CARD_IDENTITY_SLOTS = ['protected_identity', 'external_identity'] as const;
+export type CardIdentitySlot = (typeof CARD_IDENTITY_SLOTS)[number];
 
 export const CARD_AUTH_KINDS = [
   'none',
@@ -51,6 +73,8 @@ export interface CardFetch {
   cause: CardFetchCause | null;
   http_status: number | null;
   duration_ms: number;
+  identity_error: CardIdentityError | null;
+  identity_slot: CardIdentitySlot | null;
 }
 
 export interface CardAuthReport {
@@ -118,11 +142,29 @@ function parseFetch(raw: unknown): CardFetch | null {
     raw.cause === null || raw.cause === undefined ? null : oneOf(CARD_FETCH_CAUSES, raw.cause);
   if (raw.cause !== null && raw.cause !== undefined && !cause) return null;
   if ((status === 'ok') !== (cause === null)) return null;
+  const identity_error =
+    raw.identity_error === null || raw.identity_error === undefined
+      ? null
+      : oneOf(CARD_IDENTITY_ERRORS, raw.identity_error);
+  if (raw.identity_error !== null && raw.identity_error !== undefined && !identity_error) {
+    return null;
+  }
+  if (identity_error !== null && cause !== 'identity_failed') return null;
+  const identity_slot =
+    raw.identity_slot === null || raw.identity_slot === undefined
+      ? null
+      : oneOf(CARD_IDENTITY_SLOTS, raw.identity_slot);
+  if (raw.identity_slot !== null && raw.identity_slot !== undefined && !identity_slot) {
+    return null;
+  }
+  if (identity_slot !== null && cause !== 'identity_failed') return null;
   return {
     status,
     cause,
     http_status: asNumber(raw.http_status),
     duration_ms: asNumber(raw.duration_ms) ?? 0,
+    identity_error,
+    identity_slot,
   };
 }
 
@@ -231,10 +273,12 @@ export const CARD_FETCH_CAUSE_LABEL: Record<CardFetchCause, string> = {
   timeout: 'Timed out',
   too_large: 'Card too large',
   invalid_card: 'Not an agent card',
+  compressed: 'Card compressed',
   blocked_by_egress: 'Address not resolvable or not allowed',
   proxy_unavailable: 'A2A proxy unavailable',
   identity_failed: 'Identity failed',
   rewrite_failed: 'Rewrite failed',
+  identity_missing: 'No managed identity',
 };
 
 export const CARD_FETCH_CAUSE_TEXT: Record<CardFetchCause, string> = {
@@ -251,6 +295,8 @@ export const CARD_FETCH_CAUSE_TEXT: Record<CardFetchCause, string> = {
   timeout: 'The agent did not answer in time. Check that the agent is running, then Refresh.',
   too_large: "The agent's card is larger than the gateway accepts. Shrink the agent card.",
   invalid_card: "The agent's answer is not a JSON agent card. Check the agent card location.",
+  compressed:
+    'The agent compressed its card although the gateway asked for an uncompressed one. Have the agent, or the proxy in front of it, honour Accept-Encoding: identity.',
   blocked_by_egress:
     "The gateway could not resolve the agent's host name, or it resolves to a cloud metadata address, which the gateway never calls. Check the endpoint host name and DNS from the gateway host, then Refresh.",
   proxy_unavailable: 'The A2A proxy behind this surface is missing or disabled.',
@@ -258,6 +304,33 @@ export const CARD_FETCH_CAUSE_TEXT: Record<CardFetchCause, string> = {
     "The gateway could not attach the agent's identity to the card. Check the gateway logs, then Refresh.",
   rewrite_failed:
     "The gateway could not rewrite the card's URLs and security. Check the gateway logs, then Refresh.",
+  identity_missing:
+    "The managed agent's card has no identity extension, so the gateway serves it without an identity credential.",
+};
+
+export const CARD_IDENTITY_ERROR_TEXT: Record<CardIdentityError, string> = {
+  identity_extension_missing:
+    "The managed agent's card has no identity extension the gateway can use. Publish the agent-identity extension on the managed agent's card, then Refresh.",
+  identity_validation_failed:
+    "The managed agent's identity extension is invalid or does not match the surface's identity schema or rules. Fix the managed agent's identity extension, then Refresh.",
+  identity_invalid_response:
+    "The gateway could not read the managed agent's card for its managed identity. Check the agent card, then Refresh.",
+  identity_did_failed:
+    'The gateway could not issue a DID for the managed agent. Check the gateway logs and the identity issuer, then Refresh.',
+  credential_injection_failed:
+    'The gateway could not sign or attach its identity credential to the card. Check the gateway logs, then Refresh.',
+};
+
+export const CARD_EXTERNAL_IDENTITY_ERROR_TEXT: Record<CardIdentityError, string> = {
+  identity_extension_missing:
+    "The card has no identity extension the surface's external Identity can read. Check the external Identity element, then Refresh.",
+  identity_validation_failed:
+    "The card's identity extension does not match the external Identity element's schema or rules. Check the external Identity element, then Refresh.",
+  identity_invalid_response:
+    'The gateway could not read the card for the external identity. Check the agent card, then Refresh.',
+  identity_did_failed:
+    'The gateway could not issue a DID for the external agent. Check the gateway logs and the identity issuer, then Refresh.',
+  credential_injection_failed: CARD_IDENTITY_ERROR_TEXT.credential_injection_failed,
 };
 
 export const AUTH_FAILED_ACTION_TEXT = 'Check Target Authentication on the Managed Agent.';
@@ -302,6 +375,13 @@ export function describeFetchCause(fetch: CardFetch, auth: CardAuthReport): stri
     return [CARD_FETCH_CAUSE_TEXT.auth_failed, reason, AUTH_FAILED_ACTION_TEXT]
       .filter(Boolean)
       .join(' ');
+  }
+  if (cause === 'identity_failed' && fetch.identity_error) {
+    const texts =
+      fetch.identity_slot === 'external_identity'
+        ? CARD_EXTERNAL_IDENTITY_ERROR_TEXT
+        : CARD_IDENTITY_ERROR_TEXT;
+    return texts[fetch.identity_error];
   }
   const text = CARD_FETCH_CAUSE_TEXT[cause];
   if (!text.includes('{s}')) return text;
@@ -348,4 +428,5 @@ export const CARD_FETCH_STATUS_LABEL: Record<CardFetchStatus, string> = {
   ok: 'OK',
   failed: 'Failing',
   not_served: 'Not served',
+  served_without_identity: 'Served – No managed identity',
 };

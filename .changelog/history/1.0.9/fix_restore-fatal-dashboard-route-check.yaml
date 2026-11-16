@@ -1,0 +1,14 @@
+branch: fix/restore-fatal-dashboard-route-check
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-11T12:00:00Z'
+      title: Stop env preparation when a prefix shadows a dashboard page
+      description: >-
+        scripts/_prepare.sh, and so make config-debug, run-debug and run-watch, stops with an error
+        naming each channel, MCP proxy, proxy route or redirect route prefix in gateway.json whose
+        first path segment is a dashboard page. The gateway's own startup behaviour is unchanged.
+  removed: []
+  security: []
+  breaking: []

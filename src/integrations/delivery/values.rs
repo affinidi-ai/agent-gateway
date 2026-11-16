@@ -112,6 +112,7 @@ fn summary(
         "user.updated" => "User ${USERNAME} was updated",
         "user.deleted" => "User ${USERNAME} was deleted",
         "user.login" => "User ${USERNAME} logged in",
+        "user.login_failed" => "A ${LOGIN_METHOD} sign-in failed: ${FAILURE_REASON}",
         "user.accessed" => "User ${USERNAME}'s profile was viewed",
         "connection_point.created" => "Connection point ${CP_NAME} was created",
         "connection_point.updated" => "Connection point ${CP_NAME} was updated",
@@ -251,6 +252,33 @@ mod tests {
         assert!(!values.contains_key("APPLIANCE_ID"));
         assert!(!values.contains_key("GATEWAY_NAME"));
         assert!(values.contains_key("TIMESTAMP"));
+    }
+
+    #[test]
+    fn a_failed_sign_in_for_an_unknown_account_names_its_method_and_reason_and_no_user() {
+        let values = event_values(
+            event("user.login_failed"),
+            trigger(&[
+                ("LOGIN_METHOD", "passkey"),
+                ("FAILURE_REASON", "unknown_user"),
+                ("OLD_STATE", ""),
+                ("NEW_STATE", ""),
+            ]),
+            None,
+        );
+
+        assert_eq!(values["EVENT_NAME"], "User Login Failed");
+        assert_eq!(values["EVENT_SUMMARY"], "A passkey sign-in failed: unknown_user");
+        let data: serde_json::Value = serde_json::from_str(&values["EVENT_DATA"]).expect("json");
+        assert_eq!(
+            data,
+            serde_json::json!({
+                "login_method": "passkey",
+                "failure_reason": "unknown_user",
+                "old_state": null,
+                "new_state": null
+            })
+        );
     }
 
     #[test]

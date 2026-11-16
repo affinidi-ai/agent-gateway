@@ -34,6 +34,7 @@ async fn init_source_auth_middleware(
     api_key_validator: Option<Arc<dyn crate::api_keys::ApiKeyValidator>>,
     didauth_session_store: Arc<crate::didauth::DidAuthSessionStore>,
     cert_store: Option<Arc<dyn crate::certificates::CertificateStore>>,
+    sts_token_origins: Option<Arc<dyn crate::sts::token_origin::StsTokenOrigins>>,
 ) -> anyhow::Result<Arc<crate::source_auth::SourceAuthMiddleware>> {
     let storage_path = PathBuf::from(secrets_storage_path)
         .parent()
@@ -63,7 +64,7 @@ async fn init_source_auth_middleware(
         });
     }
     let jwks_client = Arc::new(crate::jwt_bearer::JwksClient::new());
-    Ok(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+    let middleware = crate::source_auth::SourceAuthMiddleware::new(
         didauth_session_store,
         store_arc,
         jwks_client,
@@ -71,7 +72,11 @@ async fn init_source_auth_middleware(
         secrets_cache,
         api_key_validator,
         cert_store,
-    )))
+    );
+    Ok(Arc::new(match sts_token_origins {
+        Some(origins) => middleware.with_sts_token_origins(origins),
+        None => middleware,
+    }))
 }
 
 /// Register live entity counters for appliance resource-limit enforcement.
@@ -560,6 +565,9 @@ pub async fn run_axum_proxy(
         .context("Configuration validation failed")?;
     bootstrap_config
         .pin_external_consent_issuers()
+        .context("Configuration validation failed")?;
+    bootstrap_config
+        .pin_external_consent_issuer_patterns()
         .context("Configuration validation failed")?;
     let config = Arc::new(config);
     let bootstrap_config = Arc::new(bootstrap_config);
@@ -1501,17 +1509,20 @@ pub async fn run_axum_proxy(
                 .clone()
                 .map(|store| store as Arc<dyn crate::surfaces::AgentSurfaceStore>),
         );
+        crate::identity::handlers::deleted_surface_api_keys::revoke_api_keys_of_deleted_surfaces(&identity_state).await;
+        let mut provider_key_listing = None;
         if let Some(ref surface_store) = agent_surface_store {
             match surface_store.list_all().await {
                 Ok(surfaces) => {
-                    for surface in surfaces
-                        .iter()
-                        .filter(|surface| surface.status == crate::config::agent_surface::SurfaceStatus::Active)
-                    {
-                        provider_key_gate
-                            .admit(surface)
-                            .await;
-                    }
+                    provider_key_listing = provider_key_gate
+                        .admit_all(
+                            surfaces
+                                .iter()
+                                .filter(|surface| {
+                                    surface.status == crate::config::agent_surface::SurfaceStatus::Active
+                                }),
+                        )
+                        .await;
                 }
                 Err(e) => warn!("Failed to list surfaces for the provider key check: {}", e),
             }
@@ -1632,7 +1643,7 @@ pub async fn run_axum_proxy(
                         (Some(state_arc), None)
                     }
                     Err(e) => {
-                        return Err(anyhow::anyhow!("Failed to initialize passkey authentication: {}", e));
+                        return Err(anyhow::anyhow!("Failed to initialize passkey authentication: {:#}", e));
                     }
                 }
             }
@@ -1851,6 +1862,21 @@ pub async fn run_axum_proxy(
                 }
             }
         };
+        if let (Some(sts_clients), Some(authorities)) = (sts_client_store.as_deref(), authority_store.as_deref())
+            && !crate::server::mode::is_standby()
+        {
+            match crate::trust_registry_verification::authority_source::AuthorityRegisters::load(
+                authorities,
+                issuer_store
+                    .as_deref()
+                    .map(|store| store as &dyn crate::issuers::IssuerStore),
+            )
+            .await
+            {
+                Ok(registers) => crate::sts::store::record_authority_sources(sts_clients, &registers).await,
+                Err(e) => warn!("Failed to read the Authorities; STS client authority DIDs stay unclassified: {}", e),
+            }
+        }
 
         // VTA connection store (which Verifiable Trust Agent signs for this
         // appliance). A bootstrap `[vta]` block is migrated into it once, under
@@ -1950,8 +1976,20 @@ pub async fn run_axum_proxy(
                  (each must be an exact origin, with no wildcard, path or userinfo); they permit nothing"
             );
         }
-        match &network_config.external_consent_issuers {
-            Some(issuers) => {
+        if let Some(patterns) = &network_config.external_consent_issuer_patterns {
+            let invalid = crate::credential_providers::external::invalid_issuer_pattern_entries(patterns);
+            if !invalid.is_empty() {
+                error!(
+                    target: "credential_delegation",
+                    entries = ?invalid,
+                    "external_consent_issuer_patterns in gateway.json names entries that are not valid (each issuer \
+                     an https issuer whose one tenant placeholder is a whole path segment or the leftmost label of a \
+                     fixed host, each origin with no wildcard, path or userinfo); they permit nothing"
+                );
+            }
+        }
+        match (&network_config.external_consent_issuers, &network_config.external_consent_issuer_patterns) {
+            (Some(issuers), _) => {
                 let invalid = crate::credential_providers::external::invalid_issuer_entries(issuers);
                 if !invalid.is_empty() {
                     error!(
@@ -1965,10 +2003,21 @@ pub async fn run_axum_proxy(
                 info!(
                     target: "credential_delegation",
                     issuers = issuers.len(),
-                    "external_consent_issuers is set: external consent providers may name only the issuers it lists"
+                    issuer_patterns = network_config
+                        .external_consent_issuer_patterns
+                        .as_ref()
+                        .map_or(0, Vec::len),
+                    "external_consent_issuers is set: external consent providers may name only the issuers it lists \
+                     or external_consent_issuer_patterns matches"
                 );
             }
-            None => info!(
+            (None, Some(patterns)) => info!(
+                target: "credential_delegation",
+                issuer_patterns = patterns.len(),
+                "external_consent_issuer_patterns is set: external consent providers may name only the issuers it \
+                 matches"
+            ),
+            (None, None) => info!(
                 target: "credential_delegation",
                 "external_consent_issuers is not set: external consent providers may name any issuer whose metadata \
                  they match"
@@ -2083,6 +2132,7 @@ pub async fn run_axum_proxy(
                 .logging
                 .log_directory
                 .as_deref(),
+            &bootstrap_config.audit,
         )
         .await;
 
@@ -3444,11 +3494,22 @@ pub async fn run_axum_proxy(
             api_key_validator.clone(),
             didauth_session_store.clone(),
             Some(certificates_store.clone()),
+            Some(Arc::new(crate::sts::token_origin::GatewayStsTokenOrigins::new(
+                vc_issuer_for_api.clone(),
+                network_config
+                    .sts
+                    .mcp_issuer
+                    .as_ref()
+                    .map(|profile| profile.issuer.clone()),
+                sts_client_store
+                    .clone()
+                    .map(|clients| clients as Arc<dyn crate::sts::store::StsClientStorage>),
+            )) as Arc<dyn crate::sts::token_origin::StsTokenOrigins>),
         )
         .await?;
         identity_state.certificate_store = Some(certificates_store.clone());
         identity_state.jwt_verification_strategy_store = Some(source_auth_middleware.provider_store());
-        crate::identity::handlers::report_credential_policy(&identity_state).await;
+        crate::identity::handlers::report_credential_policy(&identity_state, provider_key_listing).await;
 
         // Register with the GW2 message processor (global singleton).
         crate::gateways::connection_points::message_processor::init_mcp_auth_network(Arc::new(network_config.clone()));
@@ -3676,6 +3737,7 @@ pub async fn run_axum_proxy(
                 network_config
                     .oauth_callback_route
                     .clone(),
+                base_url.clone(),
                 vault_rbac_guard.clone(),
                 Some(source_auth_middleware.provider_store()),
                 identity_state
@@ -3686,10 +3748,13 @@ pub async fn run_axum_proxy(
                 network_config
                     .external_consent_resource_origins
                     .clone(),
-                network_config
-                    .external_consent_issuers
-                    .clone(),
+                crate::credential_providers::external::PermittedIssuers::of(&network_config),
                 reference_stores.clone(),
+                network_config
+                    .sts
+                    .mcp_issuer
+                    .as_ref()
+                    .map(|profile| profile.issuer.clone()),
             );
 
             let dv_state = crate::delegation_vault::handlers::DelegationVaultState {
@@ -3717,10 +3782,20 @@ pub async fn run_axum_proxy(
                         .external_consent_resource_origins
                         .clone(),
                 ),
-                issuers: Arc::new(
-                    network_config
-                        .external_consent_issuers
-                        .clone(),
+                issuers: Arc::new(crate::credential_providers::external::PermittedIssuers::of(&network_config)),
+                mcp_proxy_store: identity_state
+                    .mcp_proxy_store
+                    .clone(),
+                identity_strategies: source_auth_middleware.provider_store(),
+                verifier: Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(source_auth_middleware.jwks_client())),
+                provider_egress: crate::delegation_vault::oauth::TokenEgress::from_environment(),
+                gateway_mcp_issuer: network_config
+                    .sts
+                    .mcp_issuer
+                    .as_ref()
+                    .map(|profile| profile.issuer.clone()),
+                config_surfaces: Some(
+                    channel_manager.clone() as Arc<dyn crate::delegation_vault::handlers::ConfigSurfaces>
                 ),
             };
             if vault_rbac_guard.is_none() {
@@ -3753,14 +3828,16 @@ pub async fn run_axum_proxy(
             {
                 dv_oauth_router = dv_oauth_router.merge(crate::delegation_vault::modern_consent::router(
                     crate::delegation_vault::modern_consent::ModernConsentState {
-                        vault: dv_state,
                         network: Arc::new(network_config.clone()),
-                        identity_strategies: source_auth_middleware.provider_store(),
-                        verifier: Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(
-                            source_auth_middleware.jwks_client(),
-                        )),
+                        identity_strategies: dv_state
+                            .identity_strategies
+                            .clone(),
+                        verifier: dv_state.verifier.clone(),
                         continuations: runtime.service.clone(),
-                        provider_egress: crate::delegation_vault::oauth::TokenEgress::from_environment(),
+                        provider_egress: dv_state
+                            .provider_egress
+                            .clone(),
+                        vault: dv_state,
                     },
                 ));
             }
@@ -4025,20 +4102,25 @@ pub async fn run_axum_proxy(
                 eprintln!("{}", banner);
             }
 
+            for (surface, reason) in network_config.unservable_surfaces(&all_surfaces) {
+                warn!(
+                    surface = %loggable::untrusted(&surface.name),
+                    surface_id = %loggable::untrusted(&surface.surface_id),
+                    reason = %loggable::untrusted(&reason),
+                    "This stored surface's Access Point route breaks the rules a save now checks: move it to a plain \
+                     path under a surface prefix, or disable it. Fabric callers, who find the surface by id, are not \
+                     affected"
+                );
+            }
+
             crate::config::group_outbound_vcs_by_port(&all_surfaces, &outbound_ports, map_outbound_address_to_port)
         };
 
-        // Fail fast on configuration errors that would shadow dashboard SPA
-        // routes — admin must rename the offending prefix and restart.
-        // Running with these silently would replace dashboard pages with
-        // proxy 404s, which is much worse than refusing to start.
         {
-            let collisions = crate::proxy::paths::check_spa_route_collisions(network_config.proxy_prefixes());
+            let collisions =
+                crate::proxy::paths::check_spa_route_collisions(network_config.dashboard_shadowing_prefixes());
             if !collisions.is_empty() {
-                let banner = crate::proxy::paths::spa_collision_banner(&collisions);
-                error!("{}", banner);
-                eprintln!("{}", banner);
-                std::process::exit(2);
+                error!("{}", crate::proxy::paths::spa_collision_warning(&collisions));
             }
         }
 
@@ -4611,6 +4693,7 @@ async fn rederive_planes_on_activation(
         warn!("API key store refresh on activation failed: {e}");
     }
     crate::payments_ledger::reload_global().await;
+    crate::identity::handlers::deleted_surface_api_keys::revoke_api_keys_of_deleted_surfaces(identity_state).await;
 
     // 2. Rebuild channels + surfaces from the refreshed surfaces on disk.
     let reloading = identity_state
@@ -4738,6 +4821,13 @@ async fn initialize_auth_state(
         .storage_paths
         .sessions
         .clone();
+    let decoy_credentials = crate::auth::decoy_credential::DecoyCredentialKey::load_or_create(&PathBuf::from(
+        &bootstrap_config
+            .storage_paths
+            .vc_keys,
+    ))
+    .await
+    .context("Failed to load the login decoy credential key")?;
     let auth_state = crate::auth::AuthState::new(
         rp_id,
         rp_origin,
@@ -4746,6 +4836,7 @@ async fn initialize_auth_state(
         session_timeout_minutes,
         sessions_path,
         terms_manager,
+        decoy_credentials,
     )
     .await?;
 
@@ -4893,6 +4984,7 @@ mod tests {
             std::sync::Arc::new(dashmap::DashMap::new()),
             None,
             std::sync::Arc::new(crate::didauth::DidAuthSessionStore::new()),
+            None,
             None,
         )
         .await

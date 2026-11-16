@@ -120,6 +120,165 @@ describe('AuditPage', () => {
     expect(await screen.findByTestId('audit-list')).toBeInTheDocument();
   });
 
+  it('shows how many records each category holds on its chip', async () => {
+    mockGet.mockResolvedValue({
+      data: { ...AUDIT_RESPONSE, category_counts: { policy_decision: 24643, trust_check: 0 } },
+    });
+
+    renderPage();
+
+    const categoryFacet = facet('Category:');
+    // The count is the whole point of the facet: it says what selecting a
+    // category would give you before you select it.
+    expect(
+      await within(categoryFacet).findByTestId('filter-chip-policy_decision')
+    ).toHaveTextContent('24643');
+    // A category the read found none of keeps its zero marker instead.
+    fireEvent.click(within(categoryFacet).getByTestId('filter-overflow-trigger-category'));
+    expect(screen.getByTestId('filter-overflow-checkbox-trust_check')).toHaveAccessibleName(
+      /\(0\)/
+    );
+  });
+
+  it('shows the counts of a partial read as lower bounds', async () => {
+    mockGet.mockResolvedValue({
+      data: { ...AUDIT_RESPONSE, total: 120, truncated: true },
+    });
+
+    renderPage();
+
+    expect(await screen.findByTestId('audit-total-badge')).toHaveTextContent('120+');
+    // 120 records at 50 a page is three pages, of which the read reached three.
+    expect(await screen.findByTestId('audit-pagination')).toHaveTextContent('Page 1 of 3+');
+    // A category the read counted none of may still have records behind the
+    // point it stopped at.
+    fireEvent.click(within(facet('Category:')).getByTestId('filter-overflow-trigger-category'));
+    expect(screen.getByTestId('filter-overflow-checkbox-trust_check')).toHaveAccessibleName(
+      /\(0\+\)/
+    );
+  });
+
+  it('shows the counts as lower bounds when records could not be read', async () => {
+    mockGet.mockResolvedValue({
+      data: { ...AUDIT_RESPONSE, total: 120, truncated: false, dropped_records: 1 },
+    });
+
+    renderPage();
+
+    expect(await screen.findByTestId('audit-total-badge')).toHaveTextContent('120+');
+    expect(await screen.findByTestId('audit-pagination')).toHaveTextContent('Page 1 of 3+');
+  });
+
+  it('does not call a partial read an empty log', async () => {
+    mockGet.mockResolvedValue({
+      data: { ...AUDIT_RESPONSE, events: [], total: 0, truncated: true, category_counts: {} },
+    });
+
+    renderPage();
+
+    expect(await screen.findByTestId('audit-empty-truncated')).toHaveTextContent(
+      'No governance events found in the records searched.'
+    );
+    expect(screen.queryByText('No governance events yet')).not.toBeInTheDocument();
+    expect(screen.getByTestId('audit-total-badge')).toHaveTextContent('0+');
+  });
+
+  it('tells an administrator with an empty log how to generate evidence', async () => {
+    mockGet.mockResolvedValue({
+      data: { ...AUDIT_RESPONSE, events: [], total: 0, category_counts: {} },
+    });
+
+    renderPage();
+
+    expect(await screen.findByText('No governance events yet')).toBeInTheDocument();
+    expect(screen.queryByTestId('audit-empty-truncated')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('audit-total-badge')).not.toBeInTheDocument();
+  });
+
+  it('says the records could not be read, not that the log is empty', async () => {
+    mockGet.mockRejectedValue(new Error('Failed to read the audit log (500)'));
+
+    renderPage();
+
+    const failure = await screen.findByTestId('audit-error');
+    expect(failure).toHaveTextContent('Failed to read the audit log (500)');
+    expect(failure).toHaveTextContent('That is not the same as the log holding none.');
+    expect(screen.queryByTestId('audit-empty')).not.toBeInTheDocument();
+    expect(screen.queryByText('No governance events yet')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('audit-empty-truncated')).not.toBeInTheDocument();
+    // Refresh is the way back from a failed read, so it stays usable even
+    // though the read returned no records.
+    expect(screen.getByTestId('audit-refresh')).toBeEnabled();
+  });
+
+  it('reads the log again when a failed read is retried', async () => {
+    mockGet
+      .mockRejectedValueOnce(new Error('Failed to read the audit log (500)'))
+      .mockResolvedValue({ data: AUDIT_RESPONSE });
+
+    renderPage();
+
+    fireEvent.click(await screen.findByTestId('audit-error-retry'));
+
+    expect(await screen.findByTestId('audit-list')).toBeInTheDocument();
+    expect(screen.queryByTestId('audit-error')).not.toBeInTheDocument();
+  });
+
+  it('shows the counts of a complete read as they are', async () => {
+    mockGet.mockResolvedValue({ data: { ...AUDIT_RESPONSE, total: 120 } });
+
+    renderPage();
+
+    expect(await screen.findByTestId('audit-total-badge')).toHaveTextContent('120');
+    expect(await screen.findByTestId('audit-total-badge')).not.toHaveTextContent('+');
+    expect(await screen.findByTestId('audit-pagination')).toHaveTextContent('Page 1 of 3');
+    expect(await screen.findByTestId('audit-pagination')).not.toHaveTextContent('+');
+  });
+
+  it('shows how large the audit log is against the advisory size', async () => {
+    mockGet.mockResolvedValue({
+      data: { ...AUDIT_RESPONSE, history_bytes: 327_155_712, soft_cap_bytes: 1_073_741_824 },
+    });
+
+    renderPage();
+
+    const size = await screen.findByTestId('audit-log-size');
+    expect(size).toHaveTextContent('Audit log: 312 MiB of 1 GiB');
+    expect(screen.getByTestId('audit-log-size-bar')).toBeInTheDocument();
+    expect(screen.queryByTestId('audit-log-size-over')).not.toBeInTheDocument();
+  });
+
+  it('says what to do past the advisory size, and keeps showing the log', async () => {
+    mockGet.mockResolvedValue({
+      data: { ...AUDIT_RESPONSE, history_bytes: 2_147_483_648, soft_cap_bytes: 1_073_741_824 },
+    });
+
+    renderPage();
+
+    const size = await screen.findByTestId('audit-log-size');
+    expect(size).toHaveTextContent('Audit log: 2 GiB of 1 GiB');
+    expect(screen.getByTestId('audit-log-size-over')).toHaveTextContent('vp_audit_log_keep');
+    expect(await screen.findByTestId('audit-list')).toBeInTheDocument();
+  });
+
+  it('shows the size without a bar when no advisory size is set', async () => {
+    mockGet.mockResolvedValue({
+      data: { ...AUDIT_RESPONSE, history_bytes: 1024, soft_cap_bytes: 0 },
+    });
+
+    renderPage();
+
+    expect(await screen.findByTestId('audit-log-size')).toHaveTextContent('Audit log: 1 KiB');
+    expect(screen.queryByTestId('audit-log-size-bar')).not.toBeInTheDocument();
+  });
+
+  it('says nothing about the size when the gateway does not report one', async () => {
+    renderPage();
+
+    expect(await screen.findByTestId('audit-list')).toBeInTheDocument();
+    expect(screen.queryByTestId('audit-log-size')).not.toBeInTheDocument();
+  });
+
   it('keeps the evidence panel open by default and swaps it on selection', async () => {
     renderPage();
 

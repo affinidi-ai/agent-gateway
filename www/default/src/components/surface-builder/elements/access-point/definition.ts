@@ -201,7 +201,7 @@ export const accessPointDefinition: NodeDefinition = {
     if (typeof c.name === 'string' && c.name.trim()) {
       ap.name = c.name.trim();
     }
-    // Left out until set, so saving a surface stored without it keeps its rules.
+    // Left out until set, so saving a surface stored without it keeps it legacy.
     if (typeof c.public === 'boolean') {
       ap.public = c.public;
     }

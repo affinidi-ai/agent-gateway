@@ -11,6 +11,8 @@ import { DOCS_URL } from '../../config/docs';
 import { formatDateTime } from '../../utils/stringUtils';
 import { formatApiError } from '../../utils/apiError';
 import {
+  CLIENT_AUTHENTICATION_LABELS,
+  ClientAuthentication,
   CredentialProviderType,
   PROVIDER_TYPE_LABELS,
   entraRejectsResource,
@@ -40,8 +42,11 @@ interface CredentialProviderListItem {
   name: string;
   provider_id: string;
   provider_type: CredentialProviderType;
+  client_authentication?: ClientAuthentication;
   token_endpoint?: string;
   resource?: string | null;
+  issuer?: string | null;
+  send_resource?: boolean;
   default_scopes: string[];
   token_refresh_enabled: boolean;
   description?: string;
@@ -226,12 +231,16 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
                     <td>
                       <strong>{provider.name}</strong>
                       {provider.resource &&
-                        entraRejectsResource(provider.token_endpoint ?? '', provider.resource) && (
+                        entraRejectsResource(
+                          provider.token_endpoint ?? '',
+                          provider.resource,
+                          provider
+                        ) && (
                           <i
                             className="fas fa-exclamation-triangle text-warning ms-2"
                             role="img"
-                            aria-label={entraResourceMessage(provider.resource)}
-                            title={entraResourceMessage(provider.resource)}
+                            aria-label={entraResourceMessage(provider.resource, provider)}
+                            title={entraResourceMessage(provider.resource, provider)}
                             data-testid="credential-provider-entra-resource-badge"
                           />
                         )}
@@ -250,6 +259,16 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
                       >
                         {PROVIDER_TYPE_LABELS[provider.provider_type] ?? provider.provider_type}
                       </span>
+                      {provider.provider_type === 'oauth2_jwt_bearer' &&
+                        provider.client_authentication &&
+                        CLIENT_AUTHENTICATION_LABELS[provider.client_authentication] && (
+                          <span
+                            className="badge text-bg-secondary ms-1"
+                            data-testid="credential-provider-client-authentication-badge"
+                          >
+                            {CLIENT_AUTHENTICATION_LABELS[provider.client_authentication]}
+                          </span>
+                        )}
                     </td>
                     <td>
                       {provider.default_scopes.length > 0 ? (

@@ -1,5 +1,4 @@
 import React, { useMemo } from 'react';
-import { Nav } from 'react-bootstrap';
 import SearchInput from '../../components/shared/SearchInput';
 import { FilterChipGroup, FilterOverflowMenu } from '../../components/shared/filters';
 import type { FilterOption } from '../../components/shared/filters';
@@ -23,21 +22,29 @@ interface AuditFiltersProps {
   onFlowChange: (v: FlowFilter) => void;
   scopeFilter: ScopeFilter;
   onScopeChange: (v: ScopeFilter) => void;
+  /**
+   * Whether the read stopped before the end of the history, so every category
+   * count is a lower bound and is shown with a trailing `+`.
+   */
+  countsAreLowerBounds?: boolean;
 }
 
+// Every option sits in the overflow menu, so the policy-decision filter row stays
+// one line. They are marked rather than given a zero count: a count of 0 would
+// say the gateway found none of them, which it never reported.
 const FLOW_OPTIONS: FilterOption[] = [
   { value: '', label: 'All' },
-  { value: 'access_point', label: 'Access Point' },
-  { value: 'transit_point', label: 'Transit Point' },
+  { value: 'access_point', label: 'Access Point', lowFrequency: true },
+  { value: 'transit_point', label: 'Transit Point', lowFrequency: true },
   { value: 'fabric', label: 'Fabric', lowFrequency: true },
 ];
 
 const SCOPE_OPTIONS: FilterOption[] = [
   { value: '', label: 'All' },
-  { value: 'gateway', label: 'Gateway' },
-  { value: 'surface', label: 'Surface' },
-  { value: 'mcp_tool', label: 'MCP Tool' },
-  { value: 'response', label: 'Response' },
+  { value: 'gateway', label: 'Gateway', lowFrequency: true },
+  { value: 'surface', label: 'Surface', lowFrequency: true },
+  { value: 'mcp_tool', label: 'MCP Tool', lowFrequency: true },
+  { value: 'response', label: 'Response', lowFrequency: true },
 ];
 
 /** Search box + category (OR-set) pills, then a consolidated policy-decision filter row. */
@@ -58,6 +65,7 @@ const AuditFilters: React.FC<AuditFiltersProps> = ({
   onFlowChange,
   scopeFilter,
   onScopeChange,
+  countsAreLowerBounds = false,
 }) => {
   // Helper: Split options into inline (show always) and overflow (low-frequency/zero-count)
   const splitByFrequency = (
@@ -91,12 +99,16 @@ const AuditFilters: React.FC<AuditFiltersProps> = ({
     () => splitByFrequency(CATEGORY_OPTIONS, categoryCounts),
     [categoryCounts]
   );
+  // No counts: these facets describe one policy decision, not a tally across the
+  // history. Passing `{}` here would read as "zero of everything", which both
+  // shows a `(0)` marker on every option and forces them all into the overflow
+  // menu, so `lowFrequency` would decide nothing.
   const { inline: flowInline, overflow: flowOverflow } = useMemo(
-    () => splitByFrequency(FLOW_OPTIONS, {}, true),
+    () => splitByFrequency(FLOW_OPTIONS, undefined, true),
     []
   );
   const { inline: scopeInline, overflow: scopeOverflow } = useMemo(
-    () => splitByFrequency(SCOPE_OPTIONS, {}, true),
+    () => splitByFrequency(SCOPE_OPTIONS, undefined, true),
     []
   );
 
@@ -173,30 +185,28 @@ const AuditFilters: React.FC<AuditFiltersProps> = ({
     },
   ];
 
-  // Flow options with icons and counts
+  // Flow and Type options carry an icon and no count: the response tallies
+  // categories, not policy-decision markers, so there is no number to show. A
+  // count of 0 here would read as "none of these", which is not what the gateway
+  // said.
   const flowInlineWithIcons = flowInline.map(opt => ({
     ...opt,
     icon: opt.value ? flowIcon(opt.value) : undefined,
-    count: 0, // Placeholder: counts available from API when filtering is applied
   }));
 
   const flowOverflowWithIcons = flowOverflow.map(opt => ({
     ...opt,
     icon: opt.value ? flowIcon(opt.value) : undefined,
-    count: 0, // Placeholder: counts available from API when filtering is applied
   }));
 
-  // Type (scope) options with icons and counts
   const scopeInlineWithIcons = scopeInline.map(opt => ({
     ...opt,
     icon: opt.value ? scopeIcon(opt.value) : undefined,
-    count: 0, // Placeholder: counts available from API when filtering is applied
   }));
 
   const scopeOverflowWithIcons = scopeOverflow.map(opt => ({
     ...opt,
     icon: opt.value ? scopeIcon(opt.value) : undefined,
-    count: 0, // Placeholder: counts available from API when filtering is applied
   }));
 
   return (
@@ -234,7 +244,7 @@ const AuditFilters: React.FC<AuditFiltersProps> = ({
               selected={new Set(selectedCats)}
               onSelect={handleCategoryToggle}
               multiple={true}
-              showBadge={false}
+              countsAreLowerBounds={countsAreLowerBounds}
             />
             {categoryOverflowChips.length > 0 && (
               <FilterOverflowMenu
@@ -247,7 +257,7 @@ const AuditFilters: React.FC<AuditFiltersProps> = ({
                 onToggle={handleCategoryToggle}
                 onClear={handleCategoryClear}
                 facetLabel="Category"
-                showBadge={false}
+                countsAreLowerBounds={countsAreLowerBounds}
               />
             )}
           </div>

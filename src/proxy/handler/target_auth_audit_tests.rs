@@ -64,6 +64,7 @@ fn detail(
         outcome,
         transit_point: None,
         oauth_error: oauth_error.map(str::to_string),
+        upstream_status: None,
     })
 }
 
@@ -75,7 +76,7 @@ async fn agent() -> MockServer {
 async fn a_target_secret_that_cannot_be_read_is_recorded_once_with_what_the_fallback_did() {
     let target = agent().await;
     for (fallback, status, outcome, http_status) in [
-        ("reject", 502, TargetAuthOutcome::Rejected, Some(502)),
+        ("reject", 503, TargetAuthOutcome::Rejected, Some(503)),
         ("passthrough", 200, TargetAuthOutcome::Passthrough, None),
     ] {
         let surface = surface(
@@ -107,12 +108,12 @@ async fn a_credential_withheld_by_an_enforced_rule_is_recorded() {
     let (answered, events) = TEST_CREDENTIAL_POLICY
         .scope(policy, send(router(surface), "/a2a"))
         .await;
-    assert_eq!(answered.as_u16(), 502);
+    assert_eq!(answered.as_u16(), 500);
     assert_eq!(
         target_auth_records(&events),
         vec![(
             RejectionStage::Forward,
-            Some(502),
+            Some(500),
             Some("machine".to_string()),
             Some("trace".to_string()),
             detail(TargetAuthOutcome::Rejected, None)
@@ -127,12 +128,12 @@ async fn a_request_outside_the_target_base_path_is_recorded_as_rejected_whatever
         let surface =
             surface(&format!("{}/base", target.url()), json!({"method": "credential_lookup", "fallback": fallback}));
         let (answered, events) = send(router(surface), "/a2a/%2e%2e/admin").await;
-        assert_eq!(answered.as_u16(), 502, "{fallback}");
+        assert_eq!(answered.as_u16(), 400, "{fallback}");
         assert_eq!(
             target_auth_records(&events),
             vec![(
                 RejectionStage::Forward,
-                Some(502),
+                Some(400),
                 None,
                 Some("trace".to_string()),
                 detail(TargetAuthOutcome::Rejected, None)
@@ -256,12 +257,12 @@ async fn a_refused_token_request_is_recorded_with_its_oauth_error_code_and_no_se
         .scope(send(router, "/a2a"))
         .await;
 
-    assert_eq!(answered.as_u16(), 502);
+    assert_eq!(answered.as_u16(), 500);
     assert_eq!(
         target_auth_records(&events),
         vec![(
             RejectionStage::Forward,
-            Some(502),
+            Some(500),
             Some("machine".to_string()),
             Some("trace".to_string()),
             detail(TargetAuthOutcome::Rejected, Some("invalid_client"))

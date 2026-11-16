@@ -1,3 +1,4 @@
+import type { JwtAudienceClaim } from '../../../../types';
 import type { CallerAuthMethodType } from './methodOptions';
 import { readProtectedResource } from './protectedResource';
 
@@ -13,6 +14,7 @@ export interface CallerAuthMethodConfig {
   method_type?: CallerAuthMethodType;
   jwt_strategy_id?: string;
   audiences?: string[];
+  jwt_audience_claim?: JwtAudienceClaim;
   jwt_token_header?: string;
   jwt_token_scheme?: string;
   jwt_forward_header?: boolean;
@@ -82,6 +84,7 @@ export function defaultMethodConfig(
         method_type: 'jwt_bearer',
         jwt_strategy_id: current.jwt_strategy_id || '',
         audiences: Array.isArray(current.audiences) ? current.audiences : [],
+        jwt_audience_claim: current.jwt_audience_claim ?? 'aud',
         jwt_token_header: current.jwt_token_header || 'Authorization',
         jwt_token_scheme: current.jwt_token_scheme ?? 'Bearer',
         jwt_forward_header: current.jwt_forward_header === true,
@@ -108,6 +111,12 @@ export function methodIncompleteReason(method: CallerAuthMethodConfig): string |
   if (!method.method_type) return 'Authentication method must be selected';
   if (method.method_type === 'jwt_bearer' && !method.jwt_strategy_id)
     return 'JWT strategy must be selected';
+  if (
+    method.method_type === 'jwt_bearer' &&
+    (method.jwt_audience_claim ?? 'aud') !== 'aud' &&
+    !(method.audiences ?? []).some(audience => audience.trim())
+  )
+    return `List the ${method.jwt_audience_claim} values this method accepts`;
   if (method.method_type === 'api_key' && !method.api_key_secret_id)
     return 'API key secret must be selected';
   if (method.method_type === 'mtls' && !method.mtls_certificate_id)
@@ -202,6 +211,9 @@ export function buildMethod(c: CallerAuthMethodConfig, surfaceId: string | undef
         type: 'jwt_bearer',
         jwt_verification_strategy_id: c.jwt_strategy_id,
         audiences: Array.isArray(c.audiences) ? c.audiences : [],
+        ...(c.jwt_audience_claim && c.jwt_audience_claim !== 'aud'
+          ? { audience_claim: c.jwt_audience_claim }
+          : {}),
         token_header: (c.jwt_token_header ?? 'Authorization').trim() || 'Authorization',
         token_scheme: (c.jwt_token_scheme ?? 'Bearer').trim(),
         forward_header: c.jwt_forward_header === true,
@@ -239,6 +251,7 @@ export function methodConfigFromPayload(m: any): CallerAuthMethodConfig {
     if (m.jwt_verification_strategy_id) out.jwt_strategy_id = m.jwt_verification_strategy_id;
     else if (m.strategy_id) out.jwt_strategy_id = m.strategy_id; // legacy
     if (Array.isArray(m.audiences)) out.audiences = m.audiences;
+    out.jwt_audience_claim = m.audience_claim ?? 'aud';
     out.jwt_token_header = m.token_header ?? 'Authorization';
     out.jwt_token_scheme = m.token_scheme ?? 'Bearer';
     out.jwt_forward_header = m.forward_header === true;

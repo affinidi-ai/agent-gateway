@@ -74,21 +74,28 @@ impl StorableEntity for DidAuthSession {
     }
 }
 
-/// The view of a surface a DID Auth session is minted on, and the only one it
-/// authenticates at: the surface, and the variant serving the request, `None`
-/// for the base surface. Both come from server-side state, never from the
-/// request.
+/// The view of a surface a caller authenticates at: the surface, the variant
+/// serving the request (`None` for the base surface) and the surface's tenant.
+/// A DID Auth session is minted on one surface and variant and authenticates
+/// only there; a JWT Bearer token this gateway's STS minted is accepted only
+/// where its managed connection's tenant may reach. All come from server-side
+/// state, never from the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionView<'a> {
     pub surface_id: &'a str,
     pub variant_id: Option<&'a str>,
+    pub tenant_id: Option<&'a str>,
 }
 
 impl<'a> SessionView<'a> {
-    /// The base view of the surface `surface_id`.
+    /// The base view of the global surface `surface_id`.
     #[cfg(test)]
     pub fn base(surface_id: &'a str) -> Self {
-        Self { surface_id, variant_id: None }
+        Self {
+            surface_id,
+            variant_id: None,
+            tenant_id: None,
+        }
     }
 
     /// Whether `session` was minted on this view.

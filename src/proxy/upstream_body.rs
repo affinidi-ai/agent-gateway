@@ -65,6 +65,8 @@ pub(crate) enum UpstreamBodyError {
     TimedOut,
     #[error("failed to read upstream response: {0}")]
     Read(reqwest::Error),
+    #[error("upstream response is compressed although none was accepted")]
+    Compressed,
 }
 
 impl From<reqwest::Error> for UpstreamBodyError {
@@ -81,8 +83,21 @@ impl UpstreamBodyError {
             Self::TooLarge(_) => (StatusCode::BAD_GATEWAY, "Upstream response too large"),
             Self::TimedOut => (StatusCode::GATEWAY_TIMEOUT, "Upstream response timed out"),
             Self::Read(_) => (StatusCode::BAD_GATEWAY, "Failed to read upstream response"),
+            Self::Compressed => (StatusCode::BAD_GATEWAY, "Upstream response is compressed"),
         }
     }
+}
+
+/// [`read_bounded`] for a body the gateway reads, of a Target asked for an
+/// uncompressed answer: one compressed all the same is refused unread.
+pub(crate) async fn read_bounded_uncompressed(
+    response: reqwest::Response,
+    limits: UpstreamBodyLimits,
+) -> Result<Bytes, UpstreamBodyError> {
+    if is_compressed(response.headers()) {
+        return Err(UpstreamBodyError::Compressed);
+    }
+    read_bounded(response, limits).await
 }
 
 pub(crate) async fn read_bounded(
@@ -275,6 +290,33 @@ pub(crate) mod tests {
             .unwrap();
 
         assert_eq!(&read[..], body);
+    }
+
+    #[tokio::test]
+    async fn a_compressed_body_is_refused_unread_where_none_was_accepted() {
+        for (encoding, refused) in [("gzip", true), ("br, gzip", true), ("identity", false), ("", false)] {
+            let head = if encoding.is_empty() {
+                CHUNKED_HEAD.to_string()
+            } else {
+                CHUNKED_HEAD.replace("\r\n\r\n", &format!("\r\ncontent-encoding: {encoding}\r\n\r\n"))
+            };
+            let response = upstream(head, vec![(Duration::ZERO, chunk(b"{}")), (Duration::ZERO, chunk(b""))]).await;
+
+            let read = read_bounded_uncompressed(response, limits(1024, Some(PATIENT), PATIENT)).await;
+
+            match read {
+                Err(UpstreamBodyError::Compressed) => assert!(refused, "{encoding:?}"),
+                Ok(body) => {
+                    assert!(!refused, "{encoding:?}");
+                    assert_eq!(&body[..], b"{}");
+                }
+                Err(other) => panic!("{encoding:?}: {other}"),
+            }
+        }
+        assert_eq!(
+            UpstreamBodyError::Compressed.status_and_message(),
+            (StatusCode::BAD_GATEWAY, "Upstream response is compressed")
+        );
     }
 
     /// A HEAD response declares the length of the body a GET would return but

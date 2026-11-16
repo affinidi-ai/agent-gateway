@@ -28,6 +28,7 @@ const REASON_TEXT: Record<TrustRecorderReason, string> = {
   registry_not_found: 'Trust registry not found',
   registry_not_connected: 'Trust registry not connected',
   no_surface_issuer: 'Surface has no Issuer',
+  authority_not_found: 'Authority not found',
   no_response: 'No response from the registry',
   rejected: 'Registry rejected the record',
   error: 'Registry error',

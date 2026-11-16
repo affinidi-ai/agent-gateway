@@ -100,6 +100,12 @@ nested as a second actor). A **legacy ID-JAG with no `act`** falls back to the
 redeeming `client_id` as the implicit actor, so old grants redeem unchanged.
 `IdJagClaims.act: Option<Value>` is extracted by `validate_id_jag`.
 
+Every access token and ID-JAG also carries `connection_id`, the record id of the
+managed connection it was minted for. Unlike `client_id`, which an administrator can
+rename and which can be reused once its connection is deleted, the record id never
+changes, so surfaces resolve a token's connection by it (see
+[Tenant check of STS tokens](SOURCE_AUTH.md#tenant-check-of-sts-tokens)).
+
 ## Token-exchange order
 
 In `handlers.rs`, `handle_token_exchange` runs: validate params → authenticate
@@ -208,8 +214,8 @@ wired in `build_sts_router` from `IdentityApiState.gateway_policy_manager`.
 In `src/sts/trust_check.rs`: an STS managed connection may carry a
 `trust_check_list` — the same `TrustCheckElement` vocabulary an Agent Surface
 uses on its caller leg (`StsClient.trust_check_list`, validated on the admin API
-via the shared `validate_trust_check_list` — cap `TRUST_CHECK_LIST_MAX`, unique
-ids, per-element `validate()`). Immediately **before** the policy gate, the list
+via the shared `validate_trust_check_list` — unique ids and per-element
+`validate()`). Immediately **before** the policy gate, the list
 is evaluated over TRQP via `run_trust_check_stage` (caller leg, over a
 `TrqpListenerClient`) and the verdict is merged into the OPA input at
 `input.trust_check_results.caller[]`, so the gateway policy can allow/deny on a
@@ -219,7 +225,11 @@ denies — OPA decides. The checker is a port (`StsTrustChecker`); production wr
 the trust-registry listener manager (`ListenerTrustChecker`, wired in
 `build_sts_router` from `create_identity_api_router`'s
 `trust_registry_listener_manager`), and when no manager is wired the list is
-skipped (`DisabledTrustChecker`).
+skipped (`DisabledTrustChecker`). A client's Trust Checks record and check their
+`authority_source` on save as a surface's do, an Authority they name cannot be
+deleted without force, and a check linked to an Authority that is gone fails with
+`AUTHORITY_NOT_FOUND`; see
+[_The authority of a Trust Check_](POLICY.md#the-authority-of-a-trust-check).
 
 ## Managed connections
 
@@ -258,6 +268,11 @@ Per-connection controls:
   `external_urls`. Every grant runs this ownership check: token exchange,
   ID-JAG issuance and jwt-bearer redemption, whether `allowed_audiences` is
   empty or lists the resource.
+  JWT Bearer audiences, static ones and surface agent DIDs alike, are not
+  owned: nothing shows that a surface serves a string it names, and surfaces
+  of several tenants may share one managed DID, so owning them would let one
+  tenant block another's minting. A token minted for one is refused where it
+  is used instead (see [Tenant check of STS tokens](SOURCE_AUTH.md#tenant-check-of-sts-tokens)).
 - `allowed_scopes`
 - `allowed_subject_token_types` — matched against the declared
   `subject_token_type`, except that an ID-JAG-typed token counts as `id-jag`.

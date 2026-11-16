@@ -19,6 +19,7 @@ use crate::audit::cursors::CursorStore;
 use crate::audit::dispatch::{DispatcherConfig, JournalSource, run_dispatcher};
 use crate::audit::integration_sink::ProductionSinks;
 use crate::audit::journal::{JournalWriter, WriterConfig, WriterStopped, spawn_writer};
+use crate::audit::log_files::Rotation;
 use crate::audit::producer::{Producer, producer};
 use crate::audit::registry::{Sinks, sinks};
 use crate::audit::sources::rebuild_sinks_within;
@@ -111,21 +112,22 @@ impl Pipeline {
 }
 
 /// Starts the pipeline for `producer` and `sinks`, keeping the journal under
-/// `audit_dir/journal` and the VP Audit Log at `audit_log`. Everything that
-/// can fail is opened before anything starts. Every job runs under `cancel`.
-/// Fails with [`io::ErrorKind::WouldBlock`] while another writer has the
-/// journal open.
+/// `audit_dir/journal` and the VP Audit Log at `audit_log`, rotated as
+/// `rotation` says. Everything that can fail is opened before anything starts.
+/// Every job runs under `cancel`. Fails with [`io::ErrorKind::WouldBlock`]
+/// while another writer has the journal open.
 pub fn start_with(
     producer: &'static Producer,
     sinks: &'static Sinks,
     audit_dir: &Path,
     audit_log: &Path,
+    rotation: Rotation,
     cancel: CancellationToken,
 ) -> io::Result<Pipeline> {
     let journal_dir = audit_dir.join("journal");
     let writer = JournalWriter::open(&journal_dir, SEGMENT_MAX_BYTES)?;
     let cursors = Arc::new(CursorStore::open(&journal_dir)?);
-    let audit_log = AuditLogSink::open(audit_log, REMEMBERED_IDS)?;
+    let audit_log = AuditLogSink::open(audit_log, REMEMBERED_IDS, rotation)?;
     let factory = ProductionSinks {
         audit_log: audit_log.clone(),
         publish: Arc::new(publish_audit_delivery),
@@ -175,6 +177,8 @@ pub struct PipelineControl {
     sinks: &'static Sinks,
     audit_dir: PathBuf,
     audit_log: PathBuf,
+    /// How the VP Audit Log is rotated, as `[audit]` configured it at startup.
+    rotation: Rotation,
     build_sinks: BuildSinks,
     epoch: parking_lot::Mutex<CancellationToken>,
     running: tokio::sync::Mutex<Option<Pipeline>>,
@@ -186,6 +190,7 @@ impl PipelineControl {
         sinks: &'static Sinks,
         audit_dir: PathBuf,
         audit_log: PathBuf,
+        rotation: Rotation,
         build_sinks: BuildSinks,
     ) -> Self {
         Self {
@@ -193,6 +198,7 @@ impl PipelineControl {
             sinks,
             audit_dir,
             audit_log,
+            rotation,
             build_sinks,
             epoch: parking_lot::Mutex::new(CancellationToken::new()),
             running: tokio::sync::Mutex::new(None),
@@ -205,12 +211,14 @@ impl PipelineControl {
     pub fn process_wide(
         audit_dir: PathBuf,
         audit_log: PathBuf,
+        rotation: Rotation,
     ) -> Self {
         Self::new(
             producer(),
             sinks(),
             audit_dir,
             audit_log,
+            rotation,
             Arc::new(|epoch| Box::pin(rebuild_sinks_within(epoch.clone()))),
         )
     }
@@ -279,7 +287,14 @@ impl PipelineControl {
         if !(self.build_sinks)(epoch).await {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "the audit sinks could not be built"));
         }
-        *running = Some(start_with(self.producer, self.sinks, &self.audit_dir, &self.audit_log, epoch.child_token())?);
+        *running = Some(start_with(
+            self.producer,
+            self.sinks,
+            &self.audit_dir,
+            &self.audit_log,
+            self.rotation,
+            epoch.child_token(),
+        )?);
         Ok(())
     }
 
@@ -302,6 +317,16 @@ mod tests {
     use crate::delegation_vault::audit::{DelegationAuditAction, DelegationAuditEvent, audit_event};
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
+
+    /// A pipeline on the default rotation, under its own cancellation token.
+    fn start(
+        producer: &'static Producer,
+        sinks: &'static Sinks,
+        audit_dir: &Path,
+        audit_log: &Path,
+    ) -> io::Result<Pipeline> {
+        start_with(producer, sinks, audit_dir, audit_log, Rotation::default(), CancellationToken::new())
+    }
 
     fn stored(path: &Path) -> Vec<DelegationAuditEvent> {
         std::fs::read_to_string(path)
@@ -329,7 +354,7 @@ mod tests {
         sinks.replace(vec![Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"]))], Vec::new());
         let producer: &'static Producer = Box::leak(Box::new(Producer::new(sinks)));
 
-        let pipeline = start_with(producer, sinks, dir.path(), &log, CancellationToken::new()).unwrap();
+        let pipeline = start(producer, sinks, dir.path(), &log).unwrap();
         let record = audit_event(DelegationAuditAction::ConsentGranted, None, None, Some("github"), None);
         let event_id = record.event_id.clone();
         producer.submit(record);
@@ -360,7 +385,7 @@ mod tests {
             ],
             Vec::new(),
         );
-        let pipeline = start_with(producer, sinks, dir.path(), &log, CancellationToken::new()).unwrap();
+        let pipeline = start(producer, sinks, dir.path(), &log).unwrap();
 
         producer.submit(audit_event(DelegationAuditAction::ConsentGranted, None, None, None, None));
         let journal = dir.path().join("journal");
@@ -383,7 +408,7 @@ mod tests {
             .path()
             .join("delegation-audit.jsonl");
         let (producer, sinks) = parts();
-        let pipeline = start_with(producer, sinks, dir.path(), &log, CancellationToken::new()).unwrap();
+        let pipeline = start(producer, sinks, dir.path(), &log).unwrap();
         producer.submit(consent());
         wait_until(|| stored(&log).len() == 1).await;
 
@@ -401,7 +426,7 @@ mod tests {
             .path()
             .join("delegation-audit.jsonl");
         let (producer, sinks) = parts();
-        let pipeline = start_with(producer, sinks, dir.path(), &log, CancellationToken::new()).unwrap();
+        let pipeline = start(producer, sinks, dir.path(), &log).unwrap();
         producer.submit(consent());
         wait_until(|| stored(&log).len() == 1).await;
         let cursors = pipeline.cursors.clone();
@@ -430,7 +455,7 @@ mod tests {
             .path()
             .join("delegation-audit.jsonl");
         let (producer, sinks) = parts();
-        let pipeline = start_with(producer, sinks, dir.path(), &log, CancellationToken::new()).unwrap();
+        let pipeline = start(producer, sinks, dir.path(), &log).unwrap();
         assert!(journal_locked(dir.path()));
 
         drop(pipeline);
@@ -476,13 +501,13 @@ mod tests {
             .join("delegation-audit.jsonl");
         let (producer, sinks) = parts();
 
-        let pipeline = start_with(producer, sinks, dir.path(), &log, CancellationToken::new()).unwrap();
+        let pipeline = start(producer, sinks, dir.path(), &log).unwrap();
         producer.submit(consent());
         pipeline.stop().await;
         assert_eq!(journal_seqs(dir.path()), vec![1]);
 
         producer.submit(consent());
-        let pipeline = start_with(producer, sinks, dir.path(), &log, CancellationToken::new()).unwrap();
+        let pipeline = start(producer, sinks, dir.path(), &log).unwrap();
         producer.submit(consent());
 
         wait_until(|| stored(&log).len() == 2).await;
@@ -499,14 +524,14 @@ mod tests {
         let (first_producer, first_sinks) = parts();
         let (second_producer, second_sinks) = parts();
 
-        let first = start_with(first_producer, first_sinks, dir.path(), &log, CancellationToken::new()).unwrap();
-        let busy = start_with(second_producer, second_sinks, dir.path(), &log, CancellationToken::new())
+        let first = start(first_producer, first_sinks, dir.path(), &log).unwrap();
+        let busy = start(second_producer, second_sinks, dir.path(), &log)
             .err()
             .unwrap();
         assert_eq!(busy.kind(), io::ErrorKind::WouldBlock);
 
         first.stop().await;
-        let second = start_with(second_producer, second_sinks, dir.path(), &log, CancellationToken::new()).unwrap();
+        let second = start(second_producer, second_sinks, dir.path(), &log).unwrap();
         second.stop().await;
     }
 
@@ -518,13 +543,20 @@ mod tests {
             .join("delegation-audit.jsonl");
         let (active_producer, active_sinks) = parts();
         let (standby_producer, standby_sinks) = parts();
-        let active =
-            PipelineControl::new(active_producer, active_sinks, dir.path().to_path_buf(), log.clone(), built());
+        let active = PipelineControl::new(
+            active_producer,
+            active_sinks,
+            dir.path().to_path_buf(),
+            log.clone(),
+            Rotation::default(),
+            built(),
+        );
         let standby: &'static PipelineControl = Box::leak(Box::new(PipelineControl::new(
             standby_producer,
             standby_sinks,
             dir.path().to_path_buf(),
             log.clone(),
+            Rotation::default(),
             built(),
         )));
 
@@ -563,9 +595,22 @@ mod tests {
             .join("delegation-audit.jsonl");
         let (active_producer, active_sinks) = parts();
         let (waiting_producer, waiting_sinks) = parts();
-        let active =
-            PipelineControl::new(active_producer, active_sinks, dir.path().to_path_buf(), log.clone(), built());
-        let waiting = PipelineControl::new(waiting_producer, waiting_sinks, dir.path().to_path_buf(), log, built());
+        let active = PipelineControl::new(
+            active_producer,
+            active_sinks,
+            dir.path().to_path_buf(),
+            log.clone(),
+            Rotation::default(),
+            built(),
+        );
+        let waiting = PipelineControl::new(
+            waiting_producer,
+            waiting_sinks,
+            dir.path().to_path_buf(),
+            log,
+            Rotation::default(),
+            built(),
+        );
         active
             .try_start()
             .await
@@ -591,7 +636,7 @@ mod tests {
             .join("delegation-audit.jsonl");
         let (producer, sinks) = parts();
         let (build, attempts) = building(&[true]);
-        let control = PipelineControl::new(producer, sinks, dir.path().to_path_buf(), log, build);
+        let control = PipelineControl::new(producer, sinks, dir.path().to_path_buf(), log, Rotation::default(), build);
         let epoch = control.epoch();
 
         control.stop().await;
@@ -624,7 +669,7 @@ mod tests {
                 .push(epoch.clone());
             Box::pin(async { true })
         });
-        let control = PipelineControl::new(producer, sinks, dir.path().to_path_buf(), log, build);
+        let control = PipelineControl::new(producer, sinks, dir.path().to_path_buf(), log, Rotation::default(), build);
 
         control
             .try_start()
@@ -651,7 +696,8 @@ mod tests {
             .path()
             .join("delegation-audit.jsonl");
         let (producer, sinks) = parts();
-        let control = PipelineControl::new(producer, sinks, dir.path().to_path_buf(), log, built());
+        let control =
+            PipelineControl::new(producer, sinks, dir.path().to_path_buf(), log, Rotation::default(), built());
 
         control
             .try_start()
@@ -708,7 +754,8 @@ mod tests {
             );
             Box::pin(async { true })
         });
-        let control = PipelineControl::new(producer, sinks, dir.path().to_path_buf(), log.clone(), build);
+        let control =
+            PipelineControl::new(producer, sinks, dir.path().to_path_buf(), log.clone(), Rotation::default(), build);
 
         control
             .try_start()
@@ -729,7 +776,7 @@ mod tests {
             .join("delegation-audit.jsonl");
         let (producer, sinks) = parts();
         let (build, attempts) = building(&[false]);
-        let control = PipelineControl::new(producer, sinks, dir.path().to_path_buf(), log, build);
+        let control = PipelineControl::new(producer, sinks, dir.path().to_path_buf(), log, Rotation::default(), build);
 
         let refused = control
             .try_start()
@@ -754,7 +801,8 @@ mod tests {
             .join("delegation-audit.jsonl");
         let (producer, sinks) = parts();
         let (build, attempts) = building(&[false, false, true]);
-        let control = PipelineControl::new(producer, sinks, dir.path().to_path_buf(), log.clone(), build);
+        let control =
+            PipelineControl::new(producer, sinks, dir.path().to_path_buf(), log.clone(), Rotation::default(), build);
 
         let started = control
             .start_when_free(Duration::from_millis(5), &control.epoch())

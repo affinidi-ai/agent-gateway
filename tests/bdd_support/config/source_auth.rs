@@ -18,12 +18,18 @@ pub fn api_key_source_auth_method_json(
 
 pub fn caller_authentication_method_json(config: &SurfaceSourceAuthConfig) -> Value {
     match config {
-        SurfaceSourceAuthConfig::JwtBearer(cfg) => json!({
-            "type": "jwt_bearer",
-            "jwt_verification_strategy_id": "bdd-jwt-strategy",
-            "audiences": &cfg.audiences,
-            "forward_header": cfg.forward_header,
-        }),
+        SurfaceSourceAuthConfig::JwtBearer(cfg) => {
+            let mut method = json!({
+                "type": "jwt_bearer",
+                "jwt_verification_strategy_id": "bdd-jwt-strategy",
+                "audiences": &cfg.audiences,
+                "forward_header": cfg.forward_header,
+            });
+            if let Some(claim) = &cfg.audience_claim {
+                method["audience_claim"] = json!(claim);
+            }
+            method
+        }
         SurfaceSourceAuthConfig::ApiKey(cfg) => api_key_source_auth_method_json(&cfg.header_name, &cfg.secret_id),
         SurfaceSourceAuthConfig::ApiKeyProvider(cfg) => json!({
             "type": "api_key_provider",
@@ -58,6 +64,7 @@ mod tests {
             jwks_url: "https://example.test/.well-known/jwks.json".to_string(),
             issuer: "https://example.test/".to_string(),
             audiences: vec![],
+            audience_claim: None,
             forward_header: false,
         });
         let api_key = SurfaceSourceAuthConfig::ApiKey(ApiKeySourceAuthConfig {
@@ -76,5 +83,29 @@ mod tests {
         assert_eq!(super::caller_authentication_method_json(&jwt)["type"], "jwt_bearer");
         assert_eq!(super::caller_authentication_method_json(&api_key)["type"], "api_key");
         assert_eq!(super::caller_authentication_method_json(&api_key_provider)["type"], "api_key_provider");
+    }
+
+    #[test]
+    fn jwt_method_json_stores_audience_claim_only_when_set() {
+        use crate::bdd_support::config::single_surface_fixture::{JwtSourceAuthConfig, SurfaceSourceAuthConfig};
+
+        let jwt = |audience_claim: Option<&str>| {
+            SurfaceSourceAuthConfig::JwtBearer(JwtSourceAuthConfig {
+                jwks_url: String::new(),
+                issuer: String::new(),
+                audiences: vec!["app-alpha".to_string()],
+                audience_claim: audience_claim.map(str::to_string),
+                forward_header: false,
+            })
+        };
+
+        let client_bound = super::caller_authentication_method_json(&jwt(Some("client_id")));
+        assert_eq!(client_bound["audience_claim"], "client_id");
+        assert_eq!(client_bound["audiences"], serde_json::json!(["app-alpha"]));
+        assert!(
+            super::caller_authentication_method_json(&jwt(None))
+                .get("audience_claim")
+                .is_none()
+        );
     }
 }

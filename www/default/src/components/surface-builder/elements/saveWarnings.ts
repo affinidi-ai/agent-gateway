@@ -4,9 +4,7 @@ import { validateSurfacePayload } from './validateSurface';
 
 /**
  * The gateway's Access Point `Warning` headers (`access_point_warnings`): public,
- * legacy open and not ready. The canvas notice and the Access Point panel
- * already show the Access Point's state, and Public access is the operator's
- * own choice, so a save shows none of them.
+ * open and not ready. A save shows none of them.
  */
 const ACCESS_POINT_WARNINGS: ReadonlySet<string> = new Set([
   'This Access Point is public. Anyone who can reach it can call your agent without credentials.',

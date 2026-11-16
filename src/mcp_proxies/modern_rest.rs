@@ -4,7 +4,7 @@ use std::time::Duration;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use base64::Engine;
 use futures::TryStreamExt;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp_openapi::{ExtractedParameters, ToolGenerator, ToolMetadata};
 use serde_json::{Value, json};
 use url::Url;
@@ -26,6 +26,30 @@ pub(super) enum RestError {
     Unavailable,
     #[error("REST tool execution failed")]
     Execution,
+    /// A tool call that carries a grant by binding would send a body whose
+    /// top-level key asks the backend to run another HTTP method.
+    #[error("REST tool call asks for another HTTP method")]
+    MethodOverride,
+    /// The backend refused the grant by binding the call carried, as
+    /// [`crate::delegation_vault::release::vendor_answer`] reads its answer: its
+    /// status and `WWW-Authenticate` challenges, never its body.
+    #[error("REST backend refused the grant")]
+    GrantRefused { status: u16, challenges: Vec<HeaderValue> },
+}
+
+/// How the client of a tool call is vetted.
+#[derive(Clone, Copy)]
+enum RestEgress<'a> {
+    /// A stored backend, under the Configured egress policy;
+    /// `exact_allowlist` is the BDD allow-list of fixtures.
+    Configured { exact_allowlist: Option<&'a str> },
+    /// A tool call of a Transit Point's MCP Proxy: through Strict,
+    /// `https`-only egress pinned to the vetted addresses, as a Transit Point
+    /// sends a grant ([`crate::egress::pinned_vendor_client`]). With
+    /// `grant_destination`, the call carries a grant by binding: it goes only
+    /// to that origin, the origin of its provider's `resource`, and an answer
+    /// that refuses the grant is [`RestError::GrantRefused`].
+    Transit { grant_destination: Option<&'a url::Origin>, exact_allowlist: Option<&'a str> },
 }
 
 struct OfflineSchemas;
@@ -434,13 +458,18 @@ fn request_headers(
     let mut headers = HeaderMap::new();
     for (name, value) in target {
         if !protected_header(name) {
-            headers.append(name.clone(), value.clone());
+            // The target's headers carry its credential, a grant among them,
+            // in whichever header it goes: never indexed by HPACK.
+            let mut value = value.clone();
+            value.set_sensitive(true);
+            headers.append(name.clone(), value);
         }
     }
     for (name, value) in &parameters.headers {
         let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| RestError::Arguments)?;
         let value = HeaderValue::from_str(&text(value)).map_err(|_| RestError::Arguments)?;
         if protected_header(&name)
+            || crate::config::caller_key::is_caller_key_header(name.as_str())
             || headers
                 .get(&name)
                 .is_some_and(|current| current != value)
@@ -478,29 +507,39 @@ fn request_headers(
     Ok(headers)
 }
 
+/// The body a tool call sends: its `request_body` argument, or its body
+/// arguments as one object; `None` when it sends none.
+fn request_body(parameters: &ExtractedParameters) -> Option<Value> {
+    if parameters.body.is_empty() {
+        return None;
+    }
+    Some(
+        if parameters.body.len() == 1
+            && parameters
+                .body
+                .contains_key("request_body")
+        {
+            parameters.body["request_body"].clone()
+        } else {
+            Value::Object(
+                parameters
+                    .body
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+            )
+        },
+    )
+}
+
 async fn add_body(
     mut request: reqwest::RequestBuilder,
     parameters: &ExtractedParameters,
     content_type: &str,
     max_bytes: usize,
 ) -> Result<reqwest::RequestBuilder, RestError> {
-    if parameters.body.is_empty() {
+    let Some(body) = request_body(parameters) else {
         return Ok(request);
-    }
-    let body = if parameters.body.len() == 1
-        && parameters
-            .body
-            .contains_key("request_body")
-    {
-        parameters.body["request_body"].clone()
-    } else {
-        Value::Object(
-            parameters
-                .body
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect(),
-        )
     };
     let mime: mime::Mime = content_type
         .parse()
@@ -610,6 +649,110 @@ pub(super) async fn call(
     egress_allowlist: Option<&str>,
     sent_token: Option<&SentServiceToken<'_>>,
 ) -> Result<CallToolResult, RestError> {
+    send(
+        base_url,
+        metadata,
+        arguments,
+        target_headers,
+        limits,
+        content_type,
+        RestEgress::Configured {
+            exact_allowlist: egress_allowlist,
+        },
+        sent_token,
+        None,
+    )
+    .await
+}
+
+/// A tool call of a Transit Point's MCP Proxy, with a grant by binding in
+/// `target_headers` or with no credential: sent through Strict, `https`-only
+/// egress pinned to the vetted addresses, with redirects refused
+/// (`exact_allowlist`, the BDD allow-list, alone admits a fixture). With
+/// `grant_destination`, the origin of the grant's `resource`, the call goes
+/// only to that origin, and an answer that refuses the grant, as
+/// [`crate::delegation_vault::release::vendor_answer`] reads it, is
+/// [`RestError::GrantRefused`], without its body, so the caller can refresh
+/// the grant or refuse the call with a fixed reason, and a call whose body
+/// has a top-level key that asks for another HTTP method is
+/// [`RestError::MethodOverride`], never sent. `progress` records the call as
+/// sent just before the request goes out, once its URL, egress, headers and
+/// body passed every check, so a call refused by any of them is never taken
+/// as sent, and then the status the backend answered, even when the answer
+/// is refused afterwards.
+pub(super) async fn call_through_transit_point(
+    base_url: &str,
+    metadata: &ToolMetadata,
+    arguments: &Value,
+    target_headers: &HeaderMap,
+    limits: &McpHttpConfig,
+    content_type: &str,
+    grant_destination: Option<&url::Origin>,
+    exact_allowlist: Option<&str>,
+    progress: &super::handlers::TransitCallProgress,
+) -> Result<CallToolResult, RestError> {
+    send(
+        base_url,
+        metadata,
+        arguments,
+        target_headers,
+        limits,
+        content_type,
+        RestEgress::Transit {
+            grant_destination,
+            exact_allowlist,
+        },
+        None,
+        Some(progress),
+    )
+    .await
+}
+
+/// The client a tool call to `url` is sent with, vetted as `egress` says and
+/// pinned to the vetted address, so DNS cannot rebind it between the check
+/// and the call. Redirects stay off.
+async fn pinned_client(
+    url: &Url,
+    timeout: Duration,
+    egress: RestEgress<'_>,
+) -> Result<reqwest::Client, RestError> {
+    match egress {
+        RestEgress::Configured { exact_allowlist } => {
+            let raw_url = url.to_string();
+            let exact_allowlist = exact_allowlist.map(str::to_string);
+            Ok(tokio::task::spawn_blocking(move || {
+                crate::egress::pinned_configured_client(&raw_url, timeout, exact_allowlist.as_deref())
+            })
+            .await
+            .map_err(|_| RestError::Unavailable)?
+            .map_err(|_| RestError::Target)?
+            .0)
+        }
+        RestEgress::Transit {
+            grant_destination,
+            exact_allowlist,
+        } => {
+            if grant_destination.is_some_and(|destination| url.origin() != *destination) {
+                return Err(RestError::Target);
+            }
+            crate::egress::pinned_vendor_client(url.as_str(), timeout, exact_allowlist)
+                .await
+                .map_err(|_| RestError::Target)
+        }
+    }
+}
+
+async fn send(
+    base_url: &str,
+    metadata: &ToolMetadata,
+    arguments: &Value,
+    target_headers: &HeaderMap,
+    limits: &McpHttpConfig,
+    content_type: &str,
+    egress: RestEgress<'_>,
+    sent_token: Option<&SentServiceToken<'_>>,
+    progress: Option<&super::handlers::TransitCallProgress>,
+) -> Result<CallToolResult, RestError> {
     if serde_json::to_vec(arguments)
         .map_err(|_| RestError::Arguments)?
         .len()
@@ -654,20 +797,7 @@ pub(super) async fn call(
             )
             .max(1),
         );
-    // Resolve the target once, vet it with the save-time policy and pin the client
-    // to that address, so DNS cannot rebind it to loopback between the save-time
-    // check and this call. Redirects stay off.
-    let client = {
-        let raw_url = url.to_string();
-        let egress_allowlist = egress_allowlist.map(str::to_string);
-        tokio::task::spawn_blocking(move || {
-            crate::egress::pinned_configured_client(&raw_url, Duration::from_secs(timeout), egress_allowlist.as_deref())
-        })
-        .await
-        .map_err(|_| RestError::Unavailable)?
-        .map_err(|_| RestError::Target)?
-        .0
-    };
+    let client = pinned_client(&url, Duration::from_secs(timeout), egress).await?;
     let headers = request_headers(&parameters, target_headers)?;
     if headers
         .iter()
@@ -696,14 +826,48 @@ pub(super) async fn call(
     {
         return Err(RestError::Arguments);
     }
+    if let RestEgress::Transit { grant_destination: Some(_), .. } = egress
+        && request_body(&parameters).is_some_and(|body| {
+            body.as_object()
+                .is_some_and(|fields| {
+                    fields
+                        .keys()
+                        .any(|field| super::handlers::overrides_the_method(field))
+                })
+        })
+    {
+        return Err(RestError::MethodOverride);
+    }
+    if let Some(progress) = progress {
+        progress.mark_sent();
+    }
     let mut response = client
         .execute(request)
         .await
         .map_err(|_| RestError::Execution)?;
+    if let Some(progress) = progress {
+        progress.mark_answered(response.status());
+    }
     if let Some(sent_token) = sent_token {
         sent_token
             .forget_if_refused(response.status().as_u16(), response.headers())
             .await;
+    }
+    if let RestEgress::Transit { grant_destination: Some(_), .. } = egress
+        && !matches!(
+            crate::delegation_vault::release::vendor_answer(response.status(), response.headers()),
+            crate::delegation_vault::release::VendorAnswer::Pass
+        )
+    {
+        return Err(RestError::GrantRefused {
+            status: response.status().as_u16(),
+            challenges: response
+                .headers()
+                .get_all(axum::http::header::WWW_AUTHENTICATE)
+                .iter()
+                .cloned()
+                .collect(),
+        });
     }
     if response
         .status()
@@ -751,51 +915,28 @@ pub(super) async fn call(
         }
         body.extend_from_slice(&chunk);
     }
-    let mime = content_type
-        .as_ref()
-        .and_then(|value| {
-            value
-                .parse::<mime::Mime>()
-                .ok()
-        });
-    let (content, structured) = if mime
-        .as_ref()
-        .is_some_and(|mime| mime.type_() == mime::IMAGE)
-    {
+    let is_image = !body.is_empty()
+        && content_type
+            .as_deref()
+            .and_then(|value| {
+                value
+                    .parse::<mime::Mime>()
+                    .ok()
+            })
+            .is_some_and(|mime| mime.type_() == mime::IMAGE);
+    let (content, structured) = if is_image {
         (
-            vec![Content::image(
+            vec![ContentBlock::image(
                 base64::engine::general_purpose::STANDARD.encode(&body),
                 content_type.unwrap_or_default(),
             )],
             None,
         )
     } else {
-        let body = String::from_utf8(body).map_err(|_| RestError::Execution)?;
-        let structured = metadata
-            .output_schema
-            .as_ref()
-            .and_then(|_| serde_json::from_str::<Value>(&body).ok())
-            .map(|body| json!({"status": status.as_u16(), "body": body}));
-        let content = match structured.as_ref() {
-            Some(structured) => serde_json::to_string(structured).map_err(|_| RestError::Execution)?,
-            None => rmcp_openapi::HttpResponse {
-                status_code: status.as_u16(),
-                status_text: status
-                    .canonical_reason()
-                    .unwrap_or("Unknown")
-                    .into(),
-                headers: HashMap::new(),
-                content_type,
-                body,
-                body_bytes: None,
-                is_success: status.is_success(),
-                request_method: metadata.method.clone(),
-                request_url: url.to_string(),
-                request_body: String::new(),
-            }
-            .to_mcp_content(),
-        };
-        (vec![Content::text(content)], structured)
+        match String::from_utf8(body) {
+            Ok(body) => text_content(metadata, &url, status, content_type, body)?,
+            Err(error) => (vec![binary_content(&url, content_type, error.as_bytes())], None),
+        }
     };
     let mut result = if status.is_success() {
         CallToolResult::success(content)
@@ -811,10 +952,66 @@ pub(super) async fn call(
                     .is_none_or(|value| !validator.is_valid(value))
             })
     {
-        return Ok(CallToolResult::error(vec![Content::text("REST response does not match the tool output schema")]));
+        return Ok(CallToolResult::error(vec![ContentBlock::text(
+            "REST response does not match the tool output schema",
+        )]));
     }
     result.structured_content = structured;
     Ok(result)
+}
+
+fn text_content(
+    metadata: &ToolMetadata,
+    url: &Url,
+    status: reqwest::StatusCode,
+    content_type: Option<String>,
+    body: String,
+) -> Result<(Vec<ContentBlock>, Option<Value>), RestError> {
+    let structured = metadata
+        .output_schema
+        .as_ref()
+        .and_then(|_| serde_json::from_str::<Value>(&body).ok())
+        .map(|body| json!({"status": status.as_u16(), "body": body}));
+    let content = match structured.as_ref() {
+        Some(structured) => serde_json::to_string(structured).map_err(|_| RestError::Execution)?,
+        None => rmcp_openapi::HttpResponse {
+            status_code: status.as_u16(),
+            status_text: status
+                .canonical_reason()
+                .unwrap_or("Unknown")
+                .into(),
+            headers: HashMap::new(),
+            content_type,
+            body,
+            body_bytes: None,
+            is_success: status.is_success(),
+            request_method: metadata.method.clone(),
+            request_url: url.to_string(),
+            request_body: String::new(),
+        }
+        .to_mcp_content(),
+    };
+    Ok((vec![ContentBlock::text(content)], structured))
+}
+
+fn resource_uri(url: &Url) -> String {
+    let mut url = url.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
+fn binary_content(
+    url: &Url,
+    content_type: Option<String>,
+    body: &[u8],
+) -> ContentBlock {
+    ContentBlock::resource(rmcp::model::ResourceContents::BlobResourceContents {
+        uri: resource_uri(url),
+        mime_type: Some(content_type.unwrap_or_else(|| "application/octet-stream".into())),
+        blob: base64::engine::general_purpose::STANDARD.encode(body),
+        meta: None,
+    })
 }
 
 #[cfg(test)]
@@ -1064,7 +1261,8 @@ mod tests {
         assert_eq!(request_headers(&parameters, &target).unwrap()["x-api-key-hint"], "kept");
         parameters.headers.clear();
         target.remove("x-api-key");
-        for name in ["host", "content-length", "mcp-param-header", "connection"] {
+        for name in ["host", "content-length", "mcp-param-header", "connection", "x-caller-key", "X_Caller_Key_Memory"]
+        {
             parameters
                 .headers
                 .insert(name.into(), json!("override"));
@@ -1227,5 +1425,479 @@ mod tests {
         .await
         .expect("oversized upstream must be dropped without waiting for EOF");
         tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn binary_rest_responses_arrive_as_embedded_resources_with_their_bytes() {
+        use axum::response::IntoResponse;
+
+        const PDF: &[u8] = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<< /Type /Catalog >>\nendobj\n";
+        let app = axum::Router::new()
+            .route(
+                "/pdf",
+                axum::routing::get(|| async { ([("content-type", "application/pdf")], PDF).into_response() }),
+            )
+            .route(
+                "/untyped",
+                axum::routing::get(|| async {
+                    axum::http::Response::builder()
+                        .body(axum::body::Body::from(vec![0u8, 159, 146, 150]))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/latin1",
+                axum::routing::get(|| async {
+                    ([("content-type", "text/plain; charset=iso-8859-1")], vec![b'c', b'a', b'f', 0xe9]).into_response()
+                }),
+            )
+            .route(
+                "/denied",
+                axum::routing::get(|| async {
+                    (axum::http::StatusCode::FORBIDDEN, [("content-type", "application/pdf")], PDF).into_response()
+                }),
+            )
+            .route("/plain", axum::routing::get(|| async { "hello" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let limits = McpHttpConfig::default();
+        let fetch = |path: &'static str| {
+            let base = base.clone();
+            let limits = limits.clone();
+            async move {
+                let result = call(
+                    &base,
+                    &metadata(path),
+                    &json!({}),
+                    &HeaderMap::new(),
+                    &limits,
+                    "application/json",
+                    Some(base.as_str()),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    result
+                        .structured_content
+                        .is_none()
+                );
+                serde_json::to_value(result).unwrap()
+            }
+        };
+        let blob = |value: &Value| {
+            base64::engine::general_purpose::STANDARD
+                .decode(
+                    value["content"][0]["resource"]["blob"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap()
+        };
+        for (path, mime, bytes, is_error) in [
+            ("/pdf", "application/pdf", PDF.to_vec(), false),
+            ("/untyped", "application/octet-stream", vec![0u8, 159, 146, 150], false),
+            ("/latin1", "text/plain; charset=iso-8859-1", vec![b'c', b'a', b'f', 0xe9], false),
+            ("/denied", "application/pdf", PDF.to_vec(), true),
+        ] {
+            let result = fetch(path).await;
+            assert_eq!(result["isError"], is_error, "{path}");
+            assert_eq!(
+                result["content"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(1),
+                "{path}"
+            );
+            assert_eq!(result["content"][0]["type"], "resource", "{path}");
+            assert_eq!(result["content"][0]["resource"]["mimeType"], mime, "{path}");
+            assert_eq!(result["content"][0]["resource"]["uri"], format!("{base}{path}"), "{path}");
+            assert_eq!(blob(&result), bytes, "{path}");
+        }
+        let mut schema_tool = metadata("/pdf");
+        schema_tool.output_schema = Some(json!({"type": "object"}));
+        let mismatched = call(
+            &base,
+            &schema_tool,
+            &json!({}),
+            &HeaderMap::new(),
+            &limits,
+            "application/json",
+            Some(base.as_str()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(mismatched.is_error, Some(true), "a file is not the JSON the tool's output schema names");
+        let plain = fetch("/plain").await;
+        assert_eq!(plain["content"][0]["type"], "text");
+        assert!(
+            plain["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("hello")
+        );
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn utf8_bodies_stay_text_whatever_their_content_type() {
+        use axum::response::IntoResponse;
+
+        let typed = |content_type: &'static str, body: &'static str| {
+            axum::routing::get(move || async move { ([("content-type", content_type)], body).into_response() })
+        };
+        let app = axum::Router::new()
+            .route("/octet-json", typed("application/octet-stream", r#"{"ok":true}"#))
+            .route("/amz-json", typed("application/x-amz-json-1.1", r#"{"ok":true}"#))
+            .route("/ascii-pdf", typed("application/pdf", "%PDF-1.4 plain"))
+            .route("/empty-pdf", typed("application/pdf", ""))
+            .route("/empty-png", typed("image/png", ""));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let limits = McpHttpConfig::default();
+        let fetch = |tool: ToolMetadata| {
+            let base = base.clone();
+            let limits = limits.clone();
+            async move {
+                call(
+                    &base,
+                    &tool,
+                    &json!({}),
+                    &HeaderMap::new(),
+                    &limits,
+                    "application/json",
+                    Some(base.as_str()),
+                    None,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        for path in ["/octet-json", "/amz-json"] {
+            let mut tool = metadata(path);
+            tool.output_schema = Some(json!({"type": "object", "properties": {"body": {"type": "object"}}}));
+            let result = fetch(tool).await;
+            assert_eq!(result.is_error, Some(false), "{path}");
+            assert_eq!(result.structured_content, Some(json!({"status": 200, "body": {"ok": true}})), "{path}");
+        }
+        for (path, text) in
+            [("/ascii-pdf", "%PDF-1.4 plain"), ("/empty-pdf", "Status: 200 OK"), ("/empty-png", "Status: 200 OK")]
+        {
+            let result = serde_json::to_value(fetch(metadata(path)).await).unwrap();
+            assert_eq!(result["isError"], false, "{path}");
+            assert_eq!(result["content"][0]["type"], "text", "{path}");
+            assert!(
+                result["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(text),
+                "{path}: {result}"
+            );
+        }
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_rest_client_bounds_file_and_image_bytes_before_encoding() {
+        use axum::response::IntoResponse;
+
+        let sized = |content_type: &'static str, byte: u8, len: usize| {
+            axum::routing::get(
+                move || async move { ([("content-type", content_type)], vec![byte; len]).into_response() },
+            )
+        };
+        let app = axum::Router::new()
+            .route("/file-fits", sized("application/octet-stream", 0xff, 400))
+            .route("/file-over", sized("application/octet-stream", 0xff, 401))
+            .route("/image-fits", sized("image/png", 0xff, 400))
+            .route("/image-over", sized("image/png", 0xff, 401))
+            .route("/text-over", sized("text/plain", b'a', 401));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let limits: McpHttpConfig = serde_json::from_value(json!({"max_response_bytes": 400})).unwrap();
+        for (path, fits) in [
+            ("/file-fits", true),
+            ("/file-over", false),
+            ("/image-fits", true),
+            ("/image-over", false),
+            ("/text-over", false),
+        ] {
+            let result = call(
+                &base,
+                &metadata(path),
+                &json!({}),
+                &HeaderMap::new(),
+                &limits,
+                "application/json",
+                Some(base.as_str()),
+                None,
+            )
+            .await;
+            assert_eq!(result.is_ok(), fits, "{path}");
+            if !fits {
+                assert!(matches!(result, Err(RestError::Limit)), "{path}");
+            }
+        }
+        tasks.shutdown().await;
+    }
+
+    #[test]
+    fn a_resource_names_its_backend_url_without_query_or_fragment() {
+        let url = Url::parse("https://www.example.com/download/files/abc?alt=media&key=k#part").unwrap();
+        assert_eq!(resource_uri(&url), "https://www.example.com/download/files/abc");
+        let root = Url::parse("https://www.example.com/?q=1").unwrap();
+        assert_eq!(resource_uri(&root), "https://www.example.com/");
+    }
+
+    /// A tool call that carries a grant goes only to the grant's origin,
+    /// through Strict egress, which admits the loopback fixture only from the
+    /// test allow-list. An answer that refuses the grant comes back as its
+    /// status and challenges, never its body; any other answer, a `403` that
+    /// is not about the grant's scope among them, is the tool's result. Only
+    /// a call that went out is reported sent.
+    #[tokio::test]
+    async fn a_call_with_a_grant_goes_only_to_its_origin_and_reports_a_refused_grant() {
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let challenge = r#"Bearer error="invalid_token""#;
+        let vendor = RecordingServer::start_answering(vec![
+            Answer::json(200, json!({"files": []})),
+            Answer::json(401, json!({"error": "vendor-words"})).with_header("WWW-Authenticate", challenge),
+            Answer::json(403, json!({"error": "not shared with you"})),
+        ])
+        .await;
+        let origin = vendor.origin();
+        let destination = Url::parse(&origin)
+            .unwrap()
+            .origin();
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::AUTHORIZATION, HeaderValue::from_static("Bearer granted"));
+        let limits = McpHttpConfig::default();
+        let sent = |destination: &url::Origin, exact_allowlist: Option<&str>| {
+            let (base, headers, limits, destination, exact_allowlist) = (
+                origin.clone(),
+                headers.clone(),
+                limits.clone(),
+                destination.clone(),
+                exact_allowlist.map(str::to_string),
+            );
+            async move {
+                let progress = crate::mcp_proxies::handlers::TransitCallProgress::default();
+                let answer = call_through_transit_point(
+                    &base,
+                    &metadata("/files"),
+                    &json!({}),
+                    &headers,
+                    &limits,
+                    "application/json",
+                    Some(&destination),
+                    exact_allowlist.as_deref(),
+                    &progress,
+                )
+                .await;
+                (answer, progress.sent(), progress.answered())
+            }
+        };
+
+        let (answered, went_out, status) = sent(&destination, Some(&origin)).await;
+        assert_eq!(answered.unwrap().is_error, Some(false));
+        assert!(went_out);
+        assert_eq!(status.map(|status| status.as_u16()), Some(200));
+        match sent(&destination, Some(&origin)).await {
+            (Err(RestError::GrantRefused { status, challenges }), true, _) => {
+                assert_eq!(status, 401);
+                assert_eq!(challenges, [HeaderValue::from_static(challenge)]);
+            }
+            other => panic!("expected the refused grant, got {other:?}"),
+        }
+        let (forbidden, went_out, status) = sent(&destination, Some(&origin)).await;
+        assert_eq!(forbidden.unwrap().is_error, Some(true), "a 403 that is not about scope is the tool's own error");
+        assert!(went_out);
+        assert_eq!(status.map(|status| status.as_u16()), Some(403), "with the backend's status");
+
+        let elsewhere = Url::parse("http://127.0.0.1:9")
+            .unwrap()
+            .origin();
+        assert!(
+            matches!(sent(&elsewhere, Some(&origin)).await, (Err(RestError::Target), false, None)),
+            "another origin, never sent"
+        );
+        assert!(
+            matches!(sent(&destination, None).await, (Err(RestError::Target), false, None)),
+            "Strict egress refuses the loopback fixture without the test allow-list, and it is never sent"
+        );
+        let requests = vendor.requests();
+        assert_eq!(requests.len(), 3, "only the permitted calls reach the backend");
+        assert!(
+            requests
+                .iter()
+                .all(|(head, _)| head.starts_with("GET /files ") && head.contains("authorization: Bearer granted")),
+            "{requests:?}"
+        );
+    }
+
+    /// A Transit Point's tool call without a grant goes through the same
+    /// Strict egress as one with a grant: a backend whose host resolves to an
+    /// internal address, as a rebinding host would, is never reached, nor is
+    /// one only the test allow-list admits without it; a redirect is never
+    /// followed; and a backend's own refusal is the tool's result, not a
+    /// refused grant.
+    #[tokio::test]
+    async fn a_transit_point_call_without_a_grant_reaches_no_internal_address_and_follows_no_redirect() {
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let backend = RecordingServer::start_answering(vec![
+            Answer::json(200, json!({"files": []})),
+            Answer::json(401, json!({"error": "no key"})).with_header("WWW-Authenticate", "Bearer"),
+        ])
+        .await;
+        let elsewhere = RecordingServer::start_answering(vec![Answer::json(200, json!({"stolen": true}))]).await;
+        let redirecting = RecordingServer::start_answering(vec![
+            Answer::status(302).with_header("Location", &format!("{}/files", elsewhere.origin())),
+        ])
+        .await;
+        let limits = McpHttpConfig::default();
+        let call = |base: String, exact_allowlist: Option<String>| {
+            let limits = limits.clone();
+            async move {
+                let progress = crate::mcp_proxies::handlers::TransitCallProgress::default();
+                let answer = call_through_transit_point(
+                    &base,
+                    &metadata("/files"),
+                    &json!({}),
+                    &HeaderMap::new(),
+                    &limits,
+                    "application/json",
+                    None,
+                    exact_allowlist.as_deref(),
+                    &progress,
+                )
+                .await;
+                (answer, progress.answered())
+            }
+        };
+        let allowlist = Some(format!("{},{},{}", backend.origin(), elsewhere.origin(), redirecting.origin()));
+
+        let (answered, _) = call(backend.origin(), allowlist.clone()).await;
+        assert_eq!(answered.unwrap().is_error, Some(false));
+        let (refused, _) = call(backend.origin(), allowlist.clone()).await;
+        assert_eq!(refused.unwrap().is_error, Some(true), "with no grant, a 401 is the tool's own error");
+
+        let rebound = backend
+            .origin()
+            .replacen("http://127.0.0.1", "https://localhost", 1);
+        assert!(
+            matches!(call(rebound, allowlist.clone()).await, (Err(RestError::Target), None)),
+            "a host that resolves to loopback is refused"
+        );
+        assert!(
+            matches!(call(backend.origin(), None).await, (Err(RestError::Target), None)),
+            "Strict egress refuses a loopback backend the test allow-list does not admit"
+        );
+        let (redirected, status) = call(redirecting.origin(), allowlist).await;
+        assert!(matches!(redirected, Err(RestError::Redirect)), "a redirect is refused, not followed");
+        assert_eq!(
+            status.map(|status| status.as_u16()),
+            Some(302),
+            "the backend's status is kept though its answer is refused"
+        );
+        assert_eq!(backend.requests().len(), 2);
+        assert_eq!(redirecting.requests().len(), 1);
+        assert!(
+            elsewhere
+                .requests()
+                .is_empty(),
+            "{:?}",
+            elsewhere.requests()
+        );
+    }
+
+    /// A tool call that carries a grant is refused, never sent, when its body
+    /// has a top-level key that asks for another HTTP method, whether the
+    /// spec declares it or not, form-encoded or JSON; any other key is sent,
+    /// and a call without a grant is not checked.
+    #[tokio::test]
+    async fn a_call_with_a_grant_whose_body_asks_for_another_method_is_never_sent() {
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let vendor = RecordingServer::start_answering(vec![
+            Answer::json(200, json!({"id": "1"})),
+            Answer::json(200, json!({"id": "2"})),
+        ])
+        .await;
+        let origin = vendor.origin();
+        let destination = Url::parse(&origin)
+            .unwrap()
+            .origin();
+        let mut post = metadata("/files");
+        post.method = "post".into();
+        post.parameters = json!({"type": "object", "properties": {"request_body": {"type": "object",
+            "properties": {"name": {"type": "string"}}, "additionalProperties": true}}});
+        post.parameter_mappings
+            .insert(
+                "request_body".into(),
+                rmcp_openapi::tool::ParameterMapping {
+                    sanitized_name: "request_body".into(),
+                    original_name: "request_body".into(),
+                    location: "body".into(),
+                    explode: false,
+                },
+            );
+        let limits = McpHttpConfig::default();
+        let call = |body: Value, content_type: &'static str, grant: bool| {
+            let (origin, post, limits, destination) =
+                (origin.clone(), post.clone(), limits.clone(), destination.clone());
+            async move {
+                let progress = crate::mcp_proxies::handlers::TransitCallProgress::default();
+                let answer = call_through_transit_point(
+                    &origin,
+                    &post,
+                    &json!({"request_body": body}),
+                    &HeaderMap::new(),
+                    &limits,
+                    content_type,
+                    grant.then_some(&destination),
+                    Some(origin.as_str()),
+                    &progress,
+                )
+                .await;
+                (answer, progress.sent())
+            }
+        };
+        for (body, content_type) in [
+            (json!({"name": "a", "_method": "DELETE"}), "application/x-www-form-urlencoded"),
+            (json!({"name": "a", "_METHOD": "DELETE"}), "application/json"),
+            (json!({"X-HTTP-Method-Override": "DELETE"}), "application/json"),
+        ] {
+            let answer = call(body.clone(), content_type, true).await;
+            assert!(matches!(answer, (Err(RestError::MethodOverride), false)), "{body} as {content_type}: {answer:?}");
+        }
+        assert!(vendor.requests().is_empty(), "{:?}", vendor.requests());
+        let (sent, went_out) = call(json!({"name": "a", "method": "x"}), "application/json", true).await;
+        assert!(sent.is_ok() && went_out, "another key is sent");
+        let (sent, went_out) = call(json!({"_method": "DELETE"}), "application/json", false).await;
+        assert!(sent.is_ok() && went_out, "without a grant, nothing is checked");
     }
 }

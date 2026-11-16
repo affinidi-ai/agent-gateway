@@ -20,6 +20,32 @@ Feature: Audit log access and evidence
     Then the audit read response status is 200
     And the VP Audit Log includes a policy decision
 
+  Scenario: Administrators read the evidence rotation moved out of the live log
+    Given the VP Audit Log contains a policy decision
+    And a rotated VP Audit Log file holds a credential injection with trace "rotated-trace-1"
+    And operator "ada" has the "administrator" role
+    When administrator "ada" reads the VP Audit Log
+    Then the audit read response status is 200
+    And the VP Audit Log includes a policy decision
+    And the VP Audit Log includes the record with trace "rotated-trace-1"
+
+  Scenario: A read that could not reach the end of the history says so
+    Given the VP Audit Log contains a policy decision
+    And a rotated VP Audit Log file is missing from the middle of the history
+    And operator "ada" has the "administrator" role
+    When administrator "ada" reads the VP Audit Log
+    Then the audit read response status is 200
+    And the audit read response says it did not reach the end of the history
+
+  Scenario: A read counts the evidence it could not read apart from where it stopped
+    Given the VP Audit Log contains a policy decision
+    And the VP Audit Log holds a line that is not a record
+    And operator "ada" has the "administrator" role
+    When administrator "ada" reads the VP Audit Log
+    Then the audit read response status is 200
+    And the audit read response counts a record it could not read
+    And the audit read response says it reached the end of the history
+
   Scenario: Administrators can read full Credential Delegation Audit Log evidence
     Given the Credential Delegation Audit Log contains a token injection for caller "alice" with email "alice@example.com" and name "Alice Example"
     And operator "ada" has the "administrator" role

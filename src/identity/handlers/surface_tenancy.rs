@@ -71,6 +71,7 @@ pub async fn validate_surface_references(
         .await?;
     validate_signing_connections(state, surface).await?;
     validate_target_auth_methods(state, surface).await?;
+    super::surface_caller_key::validate_caller_key_secret(state, surface).await?;
     let https_proxies = super::surface_target_auth::https_mcp_proxies(state).await;
     super::surface_target_auth::validate_target_auth_rules(surface, stored, &https_proxies)
 }
@@ -149,6 +150,42 @@ async fn validate_signing_connections(
     Ok(())
 }
 
+/// Classifies each literal authority DID of `surface` by the register it is in, then refuses a
+/// source set on a template and a link to an Authority that does not exist or belongs to
+/// another tenant. A DID that `stored` (the surface as stored, if any) linked to an Authority
+/// stays linked, so a save cannot turn a deleted Authority into a plain DID. Without an
+/// Authority store nothing is classified or refused.
+pub async fn validate_authority_sources(
+    state: &IdentityApiState,
+    surface: &mut AgentSurface,
+    stored: Option<&AgentSurface>,
+) -> Result<(), SurfaceApiError> {
+    use crate::trust_registry_verification::authority_source::{AuthorityRegisters, surface_references};
+
+    let Some(authorities) = state
+        .authority_store
+        .as_deref()
+    else {
+        return Ok(());
+    };
+    if surface_references(surface).is_empty() {
+        return Ok(());
+    }
+    let registers = AuthorityRegisters::load(
+        authorities,
+        state
+            .issuer_store
+            .as_deref()
+            .map(|store| store as &dyn crate::issuers::IssuerStore),
+    )
+    .await
+    .map_err(|error| internal("Authority", error))?;
+    registers.classify_surface(surface, stored);
+    registers
+        .check(&surface_references(surface), surface.tenant_id.as_deref())
+        .map_err(SurfaceApiError::BadRequest)
+}
+
 pub(crate) const TARGET_AUTH_NEEDS_CONSENT: &str =
     "Target authentication cannot use an oauth2_authorization_code credential provider: it needs a user's consent";
 
@@ -211,7 +248,15 @@ async fn validate_target_auth_methods(
 ///   provider with an issuer is bound by no other consent mode.
 /// - Its Transit Point, or the Target, sends the grants only to the provider's
 ///   `resource`: a public `https` target with that origin, never a `fabric://`
-///   route, and that resource is permitted for the provider's issuer.
+///   route, and that resource is permitted for the provider's issuer. A
+///   Transit Point's target may instead be `proxy://<id>`, an MCP Proxy of the
+///   surface's tenant, served only through surfaces, whose `base_url` has that
+///   origin and whose spec sends no method override header, and the binding is
+///   pinned to that proxy as the write and the stored surface say
+///   ([`pin_mcp_proxy_grants`]).
+/// - Every `proxy://` Transit Point, with such a binding or without, speaks
+///   MCP and sends its backend no credential but that binding's grant, in a
+///   header ([`crate::credential_providers::external::check_proxy_transit_point`]).
 /// - The Target's grant goes in a header, in place of the caller's credential
 ///   and of any `target.auth` credential of the Target's own.
 /// - Its Transit Point id names one Transit Point in one place: it appears
@@ -220,10 +265,22 @@ async fn validate_target_auth_methods(
 ///   `outbound_credentials` or one variant's.
 /// - At-rest encryption is active and the identity hash pepper is configured,
 ///   since its grants are kept only then.
+///
+/// `surface` holds the `mcp_proxy_pin`s the write sent, and no other: a write
+/// that starts from the stored surface (a merge `PATCH`, a variant change, a
+/// tenant transfer) clears the stored pins first
+/// ([`forget_mcp_proxy_pins`]). `stored` is the surface as stored, `None` for
+/// a new one.
 pub async fn validate_external_consent_bindings(
     state: &IdentityApiState,
-    surface: &AgentSurface,
+    surface: &mut AgentSurface,
+    stored: Option<&AgentSurface>,
 ) -> Result<(), SurfaceApiError> {
+    let proxies = state
+        .mcp_proxy_store
+        .as_deref()
+        .map(|store| store as &dyn McpProxyStore);
+    pin_mcp_proxy_grants(surface, stored, proxies).await?;
     check_external_consent_bindings(
         state
             .credential_provider_store
@@ -236,12 +293,276 @@ pub async fn validate_external_consent_bindings(
         &state
             .network_config
             .external_consent_resource_origins,
-        state
-            .network_config
-            .external_consent_issuers
-            .as_ref(),
+        crate::credential_providers::external::IssuerRules::of(&state.network_config),
+        proxies,
     )
     .await
+}
+
+/// The code of a surface save refused because a `proxy://` Transit Point
+/// binding's `mcp_proxy_pin` is not its MCP Proxy's current `grant_pin`.
+pub const MCP_PROXY_PIN_NOT_CURRENT: &str = "mcp_proxy_pin_not_current";
+
+/// The id of the MCP Proxy `point` sends a `consent_mode: external` grant
+/// through, when its target is `proxy://<id>` and it has such a binding: the
+/// bindings that are pinned.
+fn pinned_proxy_id(point: &crate::config::agent_surface::TransitPoint) -> Option<String> {
+    point
+        .transit_credentials
+        .as_ref()
+        .filter(|binding| binding.is_external())
+        .and_then(|_| crate::mcp_proxies::types::transit_proxy_id(&point.target_endpoint))
+        .map(str::to_string)
+}
+
+/// Settle the pin of each `consent_mode: external` binding of a `proxy://`
+/// Transit Point, on the surface and in each variant's overrides: the
+/// [`crate::mcp_proxies::types::McpProxy::grant_pin`] its MCP Proxy must still
+/// have for the Transit Point to answer through it and send the grant
+/// ([`crate::credential_providers::external::check_proxy_pin`]). A pin is a
+/// value the gateway computed, never one a write chose. `surface` holds the
+/// pins the write sent, `stored` the surface as stored:
+///
+/// - A pin the write sent must be the proxy's current `grant_pin`, which every
+///   MCP Proxy answer carries, and is kept. So a client that writes the proxy,
+///   then the surface with the pin the proxy write answered, pins exactly the
+///   proxy it wrote, or is refused if the proxy changed in between. Any other
+///   pin is refused, naming the Transit Point: `400` with the code
+///   [`MCP_PROXY_PIN_NOT_CURRENT`].
+/// - With none sent, or the pin stored for the binding sent back, as a client
+///   that `GET`s the surface and `PUT`s it whole does, the binding keeps the
+///   pin stored for it: that of the stored binding of the Transit Point of the
+///   same id through the same proxy. So a save made for another reason never approves an edit to the
+///   proxy: a kept pin the proxy no longer has leaves the Transit Point
+///   refused until a save sends the proxy's current pin.
+/// - A binding with no pin stored, a new one, is pinned to the proxy as it is
+///   now.
+///
+/// Only a proxy of the surface's own tenant is compared or pinned: a missing
+/// proxy and another tenant's get no pin, alike, and the checks that follow
+/// refuse the save. Every other binding's pin is cleared.
+pub(crate) async fn pin_mcp_proxy_grants(
+    surface: &mut AgentSurface,
+    stored: Option<&AgentSurface>,
+    proxies: Option<&dyn McpProxyStore>,
+) -> Result<(), SurfaceApiError> {
+    let mut ids: Vec<String> = all_transit_points(surface)
+        .into_iter()
+        .filter_map(pinned_proxy_id)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut current = std::collections::HashMap::with_capacity(ids.len());
+    if let Some(store) = proxies {
+        for id in ids {
+            match store.get(&id).await {
+                Ok(Some(proxy)) if proxy.tenant_id == surface.tenant_id => {
+                    current.insert(id, proxy.grant_pin());
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(proxy_id = %id, error = %error, "Failed to read an MCP Proxy to pin a surface's grant");
+                    return Err(SurfaceApiError::InternalError(format!("Failed to read MCP Proxy '{id}'")));
+                }
+            }
+        }
+    }
+    let kept: std::collections::HashMap<(String, String), String> = stored
+        .map(all_transit_points)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|point| {
+            let proxy = pinned_proxy_id(point)?;
+            let pin = point
+                .transit_credentials
+                .as_ref()?
+                .mcp_proxy_pin
+                .clone()?;
+            Some(((point.id.clone(), proxy), pin))
+        })
+        .collect();
+    for (prefix, points) in transit_point_lists_mut(surface) {
+        for (index, point) in points.iter_mut().enumerate() {
+            let proxy = pinned_proxy_id(point);
+            let (id, alias) = (point.id.clone(), point.alias.clone());
+            let Some(binding) = point
+                .transit_credentials
+                .as_mut()
+            else {
+                continue;
+            };
+            let sent = binding.mcp_proxy_pin.take();
+            let Some(proxy) = proxy else {
+                continue;
+            };
+            let now = current.get(&proxy);
+            let stored_pin = kept.get(&(id, proxy.clone()));
+            let sent = sent.filter(|sent| Some(sent) != stored_pin);
+            binding.mcp_proxy_pin = match (sent, now) {
+                (Some(sent), Some(now)) if sent == *now => Some(sent),
+                (Some(_), Some(_)) => {
+                    return Err(SurfaceApiError::BadRequestCode(
+                        MCP_PROXY_PIN_NOT_CURRENT,
+                        format!(
+                            "{prefix}transit.points[{index}] ('{alias}'): transit_credentials.mcp_proxy_pin is not the \
+                             current grant_pin of the MCP Proxy '{proxy}'. Send the grant_pin the MCP Proxy answers \
+                             with now to pin the binding to the proxy as it is, or leave mcp_proxy_pin out to keep \
+                             the pin stored"
+                        ),
+                    ));
+                }
+                (Some(_), None) => None,
+                (None, now) => stored_pin.or(now).cloned(),
+            };
+        }
+    }
+    Ok(())
+}
+
+/// The Transit Point lists of `surface`, to change: its own, then each
+/// variant's overrides', each with the prefix that names it in a refusal.
+fn transit_point_lists_mut(
+    surface: &mut AgentSurface
+) -> Vec<(String, &mut Vec<crate::config::agent_surface::TransitPoint>)> {
+    let variants = surface
+        .variants
+        .iter_mut()
+        .filter_map(|variant| {
+            let prefix = format!("variant '{}' ", variant.alias);
+            variant
+                .overrides
+                .transit
+                .as_mut()
+                .and_then(|transit| transit.points.as_mut())
+                .map(|points| (prefix, points))
+        });
+    surface
+        .transit
+        .as_mut()
+        .map(|transit| (String::new(), &mut transit.points))
+        .into_iter()
+        .chain(variants)
+        .collect()
+}
+
+/// Clear the `mcp_proxy_pin` of every Transit Point binding of `surface`, its
+/// own and each variant's. A write that starts from the stored surface clears
+/// them before it applies what the request sent, so that only a pin the
+/// request itself sent is compared with the proxy's, and every other binding
+/// keeps its stored pin ([`pin_mcp_proxy_grants`]).
+pub(crate) fn forget_mcp_proxy_pins(surface: &mut AgentSurface) {
+    for point in all_transit_points_mut(surface) {
+        if let Some(binding) = point
+            .transit_credentials
+            .as_mut()
+        {
+            binding.mcp_proxy_pin = None;
+        }
+    }
+}
+
+/// [`forget_mcp_proxy_pins`] for one variant's own Transit Points.
+pub(crate) fn forget_variant_mcp_proxy_pins(variant: &mut crate::config::agent_surface_variants::SurfaceVariant) {
+    for point in variant
+        .overrides
+        .transit
+        .iter_mut()
+        .filter_map(|transit| transit.points.as_mut())
+        .flatten()
+    {
+        if let Some(binding) = point
+            .transit_credentials
+            .as_mut()
+        {
+            binding.mcp_proxy_pin = None;
+        }
+    }
+}
+
+/// A warning for each `proxy://` Transit Point of `surface`, on the surface or
+/// in a variant, whose binding kept a pin its MCP Proxy no longer has: the
+/// proxy changed after the pin was taken, and the Transit Point is refused
+/// until a save sends the proxy's current `grant_pin`.
+pub(crate) async fn stale_mcp_proxy_pin_warnings(
+    proxies: Option<&dyn McpProxyStore>,
+    surface: &AgentSurface,
+) -> Vec<String> {
+    let Some(store) = proxies else {
+        return Vec::new();
+    };
+    let mut warnings = Vec::new();
+    for point in all_transit_points(surface) {
+        let Some(proxy_id) = pinned_proxy_id(point) else {
+            continue;
+        };
+        let Ok(Some(proxy)) = store.get(&proxy_id).await else {
+            continue;
+        };
+        let pin = point
+            .transit_credentials
+            .as_ref()
+            .and_then(|binding| {
+                binding
+                    .mcp_proxy_pin
+                    .as_deref()
+            });
+        if proxy.tenant_id == surface.tenant_id
+            && crate::credential_providers::external::check_proxy_pin(&proxy, pin).is_err()
+        {
+            warnings.push(format!(
+                "Transit Point '{}': its MCP Proxy '{proxy_id}' has changed since its grant binding was pinned, so \
+                 the Transit Point answers nothing and sends no grant through it until a save sends the proxy's \
+                 current grant_pin as transit_credentials.mcp_proxy_pin",
+                point.alias
+            ));
+        }
+    }
+    warnings
+}
+
+/// Every Transit Point of `surface`: its own and those of each variant's
+/// overrides.
+fn all_transit_points(surface: &AgentSurface) -> Vec<&crate::config::agent_surface::TransitPoint> {
+    let variants = surface
+        .variants
+        .iter()
+        .filter_map(|variant| {
+            variant
+                .overrides
+                .transit
+                .as_ref()
+                .and_then(|transit| transit.points.as_ref())
+        });
+    surface
+        .transit
+        .as_ref()
+        .map(|transit| &transit.points)
+        .into_iter()
+        .chain(variants)
+        .flatten()
+        .collect()
+}
+
+/// [`all_transit_points`], to change.
+fn all_transit_points_mut(surface: &mut AgentSurface) -> Vec<&mut crate::config::agent_surface::TransitPoint> {
+    let variants = surface
+        .variants
+        .iter_mut()
+        .filter_map(|variant| {
+            variant
+                .overrides
+                .transit
+                .as_mut()
+                .and_then(|transit| transit.points.as_mut())
+        });
+    surface
+        .transit
+        .as_mut()
+        .map(|transit| &mut transit.points)
+        .into_iter()
+        .chain(variants)
+        .flatten()
+        .collect()
 }
 
 /// Whether the vault can keep grants by binding: it encrypts at rest, and the
@@ -258,7 +579,8 @@ async fn check_external_consent_bindings(
     surface: &AgentSurface,
     storage: GrantStorage,
     resource_origins: &std::collections::HashMap<String, Vec<String>>,
-    issuers: Option<&std::collections::HashMap<String, Vec<String>>>,
+    issuers: crate::credential_providers::external::IssuerRules<'_>,
+    proxies: Option<&dyn McpProxyStore>,
 ) -> Result<(), SurfaceApiError> {
     check_external_transit_point_ids(surface)?;
     check_access_point_target_places(surface)?;
@@ -276,6 +598,7 @@ async fn check_external_consent_bindings(
         storage,
         resource_origins,
         issuers,
+        proxies,
     };
     for (prefix, view) in &views {
         for (index, binding) in view
@@ -300,7 +623,7 @@ async fn check_external_consent_bindings(
             check_callers(&views, subject).map_err(refuse)?;
             check_access_point_target_binding(view, binding).map_err(refuse)?;
             rules
-                .check(&binding.credential_provider_id, &view.target.endpoint, &refuse)
+                .check(&binding.credential_provider_id, GrantTarget::AccessPointTarget(&view.target.endpoint), &refuse)
                 .await?;
         }
         for (index, point) in view
@@ -308,6 +631,8 @@ async fn check_external_consent_bindings(
             .iter()
             .enumerate()
         {
+            crate::credential_providers::external::check_proxy_transit_point(view, point)
+                .map_err(|reason| SurfaceApiError::BadRequest(format!("{prefix}transit.points[{index}]: {reason}")))?;
             let Some(binding) = point
                 .transit_credentials
                 .as_ref()
@@ -346,7 +671,16 @@ async fn check_external_consent_bindings(
                 ));
             }
             rules
-                .check(&binding.credential_provider_id, &point.target_endpoint, &refuse)
+                .check(
+                    &binding.credential_provider_id,
+                    GrantTarget::TransitPoint {
+                        endpoint: &point.target_endpoint,
+                        proxy_pin: binding
+                            .mcp_proxy_pin
+                            .as_deref(),
+                    },
+                    &refuse,
+                )
                 .await?;
         }
     }
@@ -459,18 +793,33 @@ struct GrantRules<'a> {
     tenant_id: Option<&'a str>,
     storage: GrantStorage,
     resource_origins: &'a std::collections::HashMap<String, Vec<String>>,
-    issuers: Option<&'a std::collections::HashMap<String, Vec<String>>>,
+    issuers: crate::credential_providers::external::IssuerRules<'a>,
+    proxies: Option<&'a dyn McpProxyStore>,
+}
+
+/// Where a `consent_mode: external` binding sends its grants: the endpoint of
+/// the Access Point's Target, or of a Transit Point, which alone may be an MCP
+/// Proxy (`proxy://<id>`), with the pin the save set on its binding.
+#[derive(Clone, Copy)]
+enum GrantTarget<'a> {
+    AccessPointTarget(&'a str),
+    TransitPoint { endpoint: &'a str, proxy_pin: Option<&'a str> },
 }
 
 impl GrantRules<'_> {
     /// The vault can keep the binding's grants, and its provider, of the
     /// surface's own tenant and with an issuer, sends them only to
     /// `destination`, the origin of its permitted `resource`, under an issuer
-    /// the operator permits.
+    /// the operator permits; a Transit Point's `proxy://` destination is an MCP
+    /// Proxy of the surface's tenant, served only through surfaces, whose
+    /// `base_url` has that origin and whose spec sends no method override
+    /// header. Its pin is not compared here: [`pin_mcp_proxy_grants`] settled
+    /// it, and a pin kept that the proxy no longer has refuses the Transit
+    /// Point when it is called, not the save.
     async fn check(
         &self,
         provider_id: &str,
-        destination: &str,
+        destination: GrantTarget<'_>,
         refuse: &(dyn Fn(&str) -> SurfaceApiError + Sync),
     ) -> Result<(), SurfaceApiError> {
         if !self.storage.encrypted {
@@ -498,18 +847,49 @@ impl GrantRules<'_> {
         if provider.tenant_id.as_deref() != self.tenant_id {
             return Err(refuse("consent_mode external needs a credential provider of the surface's own tenant"));
         }
-        crate::credential_providers::external::check_grant_destination(&provider, destination, None)
-            .await
-            .map_err(refuse)?;
-        if !crate::credential_providers::external::resource_permitted(&provider, self.resource_origins) {
+        match destination {
+            GrantTarget::AccessPointTarget(endpoint) => {
+                crate::credential_providers::external::check_grant_destination(&provider, endpoint, None)
+                    .await
+                    .map(|_| ())
+            }
+            GrantTarget::TransitPoint { endpoint, proxy_pin } => {
+                match crate::credential_providers::external::check_transit_grant_destination(
+                    &provider,
+                    endpoint,
+                    proxy_pin,
+                    self.proxies,
+                    self.tenant_id,
+                    None,
+                )
+                .await
+                {
+                    // Every other check passed. The save settled the pin: one
+                    // the write sent is the proxy's, and a new binding's is
+                    // the proxy's, so only a pin kept from the stored binding
+                    // can differ. The proxy changed after it was taken, and
+                    // the Transit Point stays refused until a save sends the
+                    // proxy's current pin; a save for another reason goes
+                    // through.
+                    Ok(_) | Err(crate::credential_providers::external::PROXY_CHANGED) => {
+                        crate::credential_providers::external::check_transit_grant_spec(endpoint, self.proxies).await
+                    }
+                    Err(refused) => Err(refused),
+                }
+            }
+        }
+        .map_err(refuse)?;
+        if !crate::credential_providers::external::resource_permitted(&provider, self.resource_origins, self.issuers) {
             return Err(refuse(
                 "the credential provider's resource is not permitted for its issuer: on the issuer's host or one of \
-                 its subdomains, or listed for the issuer in the gateway's external_consent_resource_origins",
+                 its subdomains, or listed for the issuer in the gateway's external_consent_resource_origins or an \
+                 external_consent_issuer_patterns entry it matches",
             ));
         }
         if let Err(field) = crate::credential_providers::external::issuer_permitted(&provider, self.issuers) {
             return Err(refuse(&format!(
-                "the credential provider's {field} is not permitted by the gateway's external_consent_issuers"
+                "the credential provider's {field} is not permitted by the gateway's external_consent_issuers or \
+                 external_consent_issuer_patterns"
             )));
         }
         Ok(())
@@ -1366,7 +1746,9 @@ impl ReferenceAuthorizer<'_> {
     /// A provider key a surface derives a DID from must exist and have an owning surface, unless
     /// the stored surface already named it, and that owning surface must be one this surface may
     /// reference. A tenant surface names a key of a surface with no tenant only as it sends an
-    /// appliance-wide secret upstream. The token's API key pattern must match every key id.
+    /// appliance-wide secret upstream. A surface names only its own keys: another surface's key
+    /// the stored surface already named is kept under `warn`. A revoked key is refused unless the
+    /// stored surface already named it. The token's API key pattern must match every key id.
     async fn provider_keys(
         &self,
         ids: &ProviderKeyIds,
@@ -1374,9 +1756,18 @@ impl ReferenceAuthorizer<'_> {
         if ids.is_empty() {
             return Ok(());
         }
-        let owners = provider_key_owners(self.state).await?;
+        let store = self
+            .state
+            .api_key_store
+            .as_deref()
+            .ok_or_else(|| unavailable("API key"))?;
+        let listing = if names_a_new_key_id(&self.grandfathered, ids) {
+            provider_key_listing_with_folder(store, self.current_surface_id, ids).await?
+        } else {
+            provider_key_listing_in(store).await?
+        };
         for secret_id in &ids.legacy_secrets {
-            self.legacy_secret(secret_id, &owners)
+            self.legacy_secret(secret_id, &listing)
                 .await?;
         }
         for key_id in &ids.keys {
@@ -1384,12 +1775,10 @@ impl ReferenceAuthorizer<'_> {
             if !scope_allows_resource(self.scope, self.context, ResourceKind::ApiKeys, key_id) {
                 return Err(inaccessible("API-key parent Surface"));
             }
-            let Some(surface_ids) = owners.get(key_id) else {
-                if kept {
-                    continue;
-                }
-                return Err(inaccessible("API key"));
+            let Some(surface_ids) = listed_owners(&listing, key_id, kept, false)? else {
+                continue;
             };
+            let rule = self.rule_for(ResourceKind::ApiKeys, key_id);
             for surface_id in surface_ids {
                 let Some(tenant_id) = self
                     .api_key_parent_tenant(surface_id)
@@ -1400,34 +1789,55 @@ impl ReferenceAuthorizer<'_> {
                     }
                     return Err(inaccessible("API-key parent Surface"));
                 };
-                if !can_reference_with_rule(
-                    self.owner_tenant_id,
-                    tenant_id.as_deref(),
-                    self.rule_for(ResourceKind::ApiKeys, key_id),
-                ) {
+                if !can_reference_with_rule(self.owner_tenant_id, tenant_id.as_deref(), rule) {
                     return Err(inaccessible("API-key parent Surface"));
                 }
+                if surface_id != self.current_surface_id && rule.is_enforced() {
+                    return Err(another_surfaces_key(key_id));
+                }
             }
+            self.revoked_key(key_id, surface_ids, &listing, kept)?;
         }
         Ok(())
     }
 
+    /// Refuses a new reference to the revoked key `key_id` owned by `surface_ids`; one the
+    /// stored surface already named (`kept`) is left to the provider key gate. Only a key of
+    /// this surface is named as revoked.
+    fn revoked_key(
+        &self,
+        key_id: &str,
+        surface_ids: &[String],
+        listing: &KeyListing,
+        kept: bool,
+    ) -> Result<(), SurfaceApiError> {
+        if kept || !listing.is_revoked(key_id) {
+            return Ok(());
+        }
+        if surface_ids
+            .iter()
+            .any(|surface_id| surface_id == self.current_surface_id)
+        {
+            return Err(revoked_key(key_id));
+        }
+        Err(inaccessible("API-key parent Surface"))
+    }
+
     /// A Caller Context API Key `secret_id` shaped like a key id, on a view whose inbound
     /// Identity is From API Key, shares the DID of a key of that id. A new one is refused when
-    /// that key belongs to a surface this one may not reference, or to a surface with no tenant;
-    /// one the stored surface already named is kept under `warn`. An id no key has stays a
-    /// plain secret.
+    /// that key belongs to another surface or is revoked; one the stored surface already named
+    /// is kept under `warn`. An id no key has stays a plain secret.
     async fn legacy_secret(
         &self,
         secret_id: &str,
-        owners: &std::collections::HashMap<String, Vec<String>>,
+        listing: &KeyListing,
     ) -> Result<(), SurfaceApiError> {
         let rule = self.rule_for(ResourceKind::ApiKeys, secret_id);
-        for surface_id in owners
-            .get(secret_id)
-            .into_iter()
-            .flatten()
-        {
+        let kept = is_grandfathered(&self.grandfathered, ResourceKind::ApiKeys, secret_id);
+        let Some(surface_ids) = listed_owners(listing, secret_id, kept, true)? else {
+            return Ok(());
+        };
+        for surface_id in surface_ids {
             let Some(tenant_id) = self
                 .api_key_parent_tenant(surface_id)
                 .await?
@@ -1439,8 +1849,39 @@ impl ReferenceAuthorizer<'_> {
             if breaks && rule.is_enforced() {
                 return Err(inaccessible("API-key parent Surface"));
             }
+            if surface_id != self.current_surface_id && rule.is_enforced() {
+                return Err(another_surfaces_key(secret_id));
+            }
         }
-        Ok(())
+        self.revoked_key(secret_id, surface_ids, listing, kept)
+    }
+}
+
+/// Whether a save names a key id of `ids` the stored surface did not already name.
+fn names_a_new_key_id(
+    grandfathered: &[(ResourceKind, String)],
+    ids: &ProviderKeyIds,
+) -> bool {
+    ids.all()
+        .any(|id| !is_grandfathered(grandfathered, ResourceKind::ApiKeys, id))
+}
+
+/// The surfaces whose key folders hold the key `id` a save names, or `None` when the save leaves
+/// the id alone: one the stored surface already named (`kept`) that no loaded folder holds, or a
+/// `legacy` secret no key has. A new key id no folder holds is refused, as unavailable while a key
+/// folder could not be loaded, since that folder may hold it.
+fn listed_owners<'a>(
+    listing: &'a KeyListing,
+    id: &str,
+    kept: bool,
+    legacy: bool,
+) -> Result<Option<&'a [String]>, SurfaceApiError> {
+    match listing.status_of(id) {
+        KeyStatus::Found(owners) => Ok(Some(owners)),
+        _ if kept => Ok(None),
+        KeyStatus::Unknown => Err(SurfaceApiError::Unavailable("API key store is unavailable".to_string())),
+        KeyStatus::Absent if legacy => Ok(None),
+        KeyStatus::Absent => Err(inaccessible("API key")),
     }
 }
 
@@ -1525,6 +1966,9 @@ fn collect_effective_surface_references(
     }
 
     collect_target_auth_reference(surface.target.auth.as_ref(), references);
+    if let Some(caller_key) = surface.caller_key.as_ref() {
+        push_reference_with_rule(references, ResourceKind::Secrets, &caller_key.secret_id, true);
+    }
     for metadata in std::iter::once(
         surface
             .target
@@ -1591,6 +2035,9 @@ fn collect_effective_surface_references(
             if let Some(id) = endpoint_id(&point.target_endpoint, "fabric://") {
                 push_reference(references, ResourceKind::Gateways, id);
             }
+            if let Some(id) = crate::mcp_proxies::types::endpoint_proxy_id(&point.target_endpoint) {
+                push_reference(references, ResourceKind::McpProxies, id);
+            }
         }
     }
 
@@ -1601,7 +2048,9 @@ fn collect_effective_surface_references(
     {
         push_reference(references, ResourceKind::McpProxies, id);
     }
-    if let Some(id) = endpoint_id(&surface.target.endpoint, "proxy://") {
+    // The whole id the Target is dispatched to, so the proxy checked is the
+    // one that serves it.
+    if let Some(id) = crate::mcp_proxies::types::endpoint_proxy_id(&surface.target.endpoint) {
         push_reference(references, ResourceKind::McpProxies, id);
     }
     if let Some(id) = surface
@@ -1875,12 +2324,20 @@ pub(crate) enum ProviderKeyIssueKind {
     OtherTenant { enforced: bool },
     /// A tenant surface names the key of a surface with no tenant; a breach only when enforced.
     ApplianceKey { enforced: bool },
-    /// No key has this id; key ids are never reused, so its DID is no other key's.
+    /// The key belongs to another surface the surface may reference: a surface names only its
+    /// own keys. A breach only when enforced.
+    OtherSurface { enforced: bool },
+    /// No key has this id, as when the key was deleted; its DID must not be derived, a breach in
+    /// every isolation mode.
     MissingKey,
-    /// The surface owning the key no longer exists.
-    MissingOwner,
-    /// The API key store is unavailable, so the key's owner cannot be told.
+    /// The surface owning the key no longer exists, so its tenant cannot be told; a breach only
+    /// when enforced.
+    MissingOwner { enforced: bool },
+    /// The API key store is unavailable, or no loaded key folder holds the key while a folder
+    /// that may hold it could not be loaded, so the key's owner cannot be told.
     StoreUnavailable,
+    /// The key is revoked, so its DID must not be derived; a breach in every isolation mode.
+    RevokedKey,
 }
 
 impl ProviderKeyIssueKind {
@@ -1888,9 +2345,11 @@ impl ProviderKeyIssueKind {
         match self {
             Self::OtherTenant { .. } => "other_tenant",
             Self::ApplianceKey { .. } => "appliance_key",
+            Self::OtherSurface { .. } => "other_surface",
             Self::MissingKey => "missing_key",
-            Self::MissingOwner => "missing_owner",
+            Self::MissingOwner { .. } => "missing_owner",
             Self::StoreUnavailable => "store_unavailable",
+            Self::RevokedKey => "revoked_key",
         }
     }
 
@@ -1898,7 +2357,13 @@ impl ProviderKeyIssueKind {
     pub(crate) fn is_breach(self) -> bool {
         matches!(
             self,
-            Self::StoreUnavailable | Self::OtherTenant { enforced: true } | Self::ApplianceKey { enforced: true }
+            Self::StoreUnavailable
+                | Self::RevokedKey
+                | Self::MissingKey
+                | Self::OtherTenant { enforced: true }
+                | Self::ApplianceKey { enforced: true }
+                | Self::OtherSurface { enforced: true }
+                | Self::MissingOwner { enforced: true }
         )
     }
 }
@@ -1913,11 +2378,12 @@ pub(crate) struct ProviderKeyIssue {
 /// whose key or owner is gone ([`judge_provider_keys`] on [`provider_key_ids`]).
 pub(crate) fn provider_key_verdict(
     surface: &AgentSurface,
-    owners: Option<&std::collections::HashMap<String, Vec<String>>>,
+    owners: Option<&KeyListing>,
     surface_tenants: &std::collections::HashMap<&str, Option<&str>>,
     isolation: RuleMode,
 ) -> Result<Vec<ProviderKeyIssue>, SurfaceApiError> {
     Ok(judge_provider_keys(
+        &surface.surface_id,
         surface.tenant_id.as_deref(),
         &provider_key_ids(surface)?,
         owners,
@@ -1926,14 +2392,18 @@ pub(crate) fn provider_key_verdict(
     ))
 }
 
-/// The issues of the key ids `ids` a surface of `tenant_id` names. A legacy secret is reported
-/// only when a key of that id belongs to a surface the surface may not reference, or to a
-/// surface with no tenant. `owners` is `None` when the API key store is unavailable;
-/// `surface_tenants` maps every stored surface id to its tenant.
+/// The issues of the key ids `ids` the surface `surface_id` of `tenant_id` names. A revoked key,
+/// the surface's own or not, is reported only as revoked. Otherwise a key the surface owns
+/// itself has none, whatever tenant the stores read for it. A key of another tenant is reported
+/// as that, not also as another surface's. A legacy secret is reported only when a key of that
+/// id is revoked or belongs to another surface. An id only a key folder that could not be loaded
+/// may hold is reported store unavailable. `owners` is `None` when the API key store is
+/// unavailable; `surface_tenants` maps every stored surface id to its tenant.
 pub(crate) fn judge_provider_keys(
+    surface_id: &str,
     tenant_id: Option<&str>,
     ids: &ProviderKeyIds,
-    owners: Option<&std::collections::HashMap<String, Vec<String>>>,
+    owners: Option<&KeyListing>,
     surface_tenants: &std::collections::HashMap<&str, Option<&str>>,
     isolation: RuleMode,
 ) -> Vec<ProviderKeyIssue> {
@@ -1960,16 +2430,35 @@ pub(crate) fn judge_provider_keys(
                 .map(|key_id| (key_id, true)),
         )
     {
-        let Some(owner_ids) = owners.get(key_id) else {
-            if !legacy {
-                issue(key_id, ProviderKeyIssueKind::MissingKey);
+        let owner_ids = match owners.status_of(key_id) {
+            KeyStatus::Found(owner_ids) => owner_ids,
+            KeyStatus::Unknown => {
+                issue(key_id, ProviderKeyIssueKind::StoreUnavailable);
+                continue;
             }
-            continue;
+            KeyStatus::Absent => {
+                if !legacy {
+                    issue(key_id, ProviderKeyIssueKind::MissingKey);
+                }
+                continue;
+            }
         };
+        if owners.is_revoked(key_id) {
+            issue(key_id, ProviderKeyIssueKind::RevokedKey);
+            continue;
+        }
         for owner_id in owner_ids {
+            if owner_id == surface_id {
+                continue;
+            }
             let Some(owner_tenant) = surface_tenants.get(owner_id.as_str()) else {
                 if !legacy {
-                    issue(key_id, ProviderKeyIssueKind::MissingOwner);
+                    issue(
+                        key_id,
+                        ProviderKeyIssueKind::MissingOwner {
+                            enforced: isolation.is_enforced(),
+                        },
+                    );
                 }
                 continue;
             };
@@ -1987,6 +2476,13 @@ pub(crate) fn judge_provider_keys(
                         enforced: isolation.is_enforced(),
                     },
                 );
+            } else {
+                issue(
+                    key_id,
+                    ProviderKeyIssueKind::OtherSurface {
+                        enforced: isolation.is_enforced(),
+                    },
+                );
             }
         }
     }
@@ -1994,34 +2490,411 @@ pub(crate) fn judge_provider_keys(
 }
 
 /// The surfaces owning each API Key Provider key, by key id.
+/// Unavailable while a key folder could not be loaded, as an owner it leaves out may be another
+/// tenant's.
 pub(crate) async fn provider_key_owners(
-    state: &IdentityApiState
-) -> Result<std::collections::HashMap<String, Vec<String>>, SurfaceApiError> {
-    provider_key_owners_in(
-        state
-            .api_key_store
-            .as_deref()
-            .ok_or_else(|| unavailable("API key"))?,
-    )
-    .await
+    store: &dyn crate::api_keys::store::ApiKeyStore
+) -> Result<KeyListing, SurfaceApiError> {
+    let listing = provider_key_listing_in(store).await?;
+    if !listing.is_complete() {
+        return Err(SurfaceApiError::Unavailable("API key store is unavailable".to_string()));
+    }
+    Ok(listing)
 }
 
-/// [`provider_key_owners`] read from `store`.
-pub(crate) async fn provider_key_owners_in(
-    store: &dyn crate::api_keys::store::ApiKeyStore
-) -> Result<std::collections::HashMap<String, Vec<String>>, SurfaceApiError> {
-    let mut owners: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    for key in store
-        .list_all()
+/// Refuses a new surface whose id's key folder holds any API key record, readable or not, such
+/// as the keys kept from a deleted surface of that id, so a new surface never takes over another
+/// surface's keys and the DIDs derived from them. Only the key folder of `surface_id` is read,
+/// from disk; when it cannot be read the create is refused as unavailable.
+pub(crate) async fn refuse_id_owning_api_keys(
+    state: &IdentityApiState,
+    surface_id: &str,
+) -> Result<(), SurfaceApiError> {
+    let Some(store) = state.api_key_store.as_deref() else {
+        return Ok(());
+    };
+    let holds_keys = store
+        .holds_key_records(surface_id)
         .await
-        .map_err(|error| internal("API key", error))?
-    {
-        owners
-            .entry(key.key_id)
-            .or_default()
-            .push(key.agent_id);
+        .map_err(|error| {
+            tracing::error!(surface = %surface_id, %error, "Could not read the API keys of a new surface's id");
+            SurfaceApiError::Unavailable("API key store is unavailable".to_string())
+        })?;
+    if holds_keys {
+        return Err(SurfaceApiError::BadRequest(format!("Surface ID '{surface_id}' is not available")));
     }
-    Ok(owners)
+    Ok(())
+}
+
+/// The surfaces owning each API Key Provider key, by key id, the ids of the revoked keys, and the
+/// key folders that could not be loaded.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct KeyListing {
+    owners: std::collections::HashMap<String, Vec<String>>,
+    /// Key ids with a revoked record; a key id held by more than one surface is revoked when any
+    /// of its records is.
+    revoked: HashSet<String>,
+    skipped: Vec<String>,
+}
+
+/// How a key id stands in a [`KeyListing`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyStatus<'a> {
+    /// The key folders of these surfaces hold a key of this id.
+    Found(&'a [String]),
+    /// No key folder holds a key of this id, and every folder was loaded.
+    Absent,
+    /// No loaded key folder holds a key of this id, and a folder that could not be loaded may.
+    Unknown,
+}
+
+impl KeyListing {
+    /// Takes in `key`; once revoked in any record read, its id stays revoked.
+    pub(crate) fn add(
+        &mut self,
+        key: crate::api_keys::ApiKeyMeta,
+    ) {
+        if key.status == crate::api_keys::ApiKeyStatus::Revoked {
+            self.revoked
+                .insert(key.key_id.clone());
+        }
+        let owners = self
+            .owners
+            .entry(key.key_id)
+            .or_default();
+        if !owners.contains(&key.agent_id) {
+            owners.push(key.agent_id);
+        }
+    }
+
+    pub(crate) fn status_of(
+        &self,
+        id: &str,
+    ) -> KeyStatus<'_> {
+        match self.owners.get(id) {
+            Some(owners) => KeyStatus::Found(owners),
+            None if self.skipped.is_empty() => KeyStatus::Absent,
+            None => KeyStatus::Unknown,
+        }
+    }
+
+    /// The surfaces whose key folders hold a key of this id; none unless it is found.
+    pub(crate) fn owners_of(
+        &self,
+        id: &str,
+    ) -> &[String] {
+        match self.status_of(id) {
+            KeyStatus::Found(owners) => owners,
+            KeyStatus::Absent | KeyStatus::Unknown => &[],
+        }
+    }
+
+    pub(crate) fn is_revoked(
+        &self,
+        id: &str,
+    ) -> bool {
+        self.revoked.contains(id)
+    }
+
+    /// The key folders that could not be loaded.
+    pub(crate) fn skipped(&self) -> &[String] {
+        &self.skipped
+    }
+
+    /// Whether every key folder was loaded.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.skipped.is_empty()
+    }
+
+    /// Takes in the keys of `named` that `keys`, the key folder `folder` read from disk, holds:
+    /// the folder no longer owns a named key it does not hold, and is no longer skipped.
+    pub(crate) fn take_in_folder(
+        &mut self,
+        folder: &str,
+        keys: Vec<crate::api_keys::ApiKeyMeta>,
+        named: &HashSet<&str>,
+    ) {
+        for id in named {
+            if !keys
+                .iter()
+                .any(|key| key.key_id == *id)
+            {
+                self.drop_owner(id, folder);
+            }
+        }
+        self.skipped
+            .retain(|skipped| skipped != folder);
+        for key in keys {
+            if named.contains(key.key_id.as_str()) {
+                self.add(key);
+            }
+        }
+    }
+
+    /// The key folder `folder` could not be read from disk: it is skipped, and no longer read as
+    /// the owner of a key of `named`.
+    pub(crate) fn skip_folder(
+        &mut self,
+        folder: &str,
+        named: &HashSet<&str>,
+    ) {
+        for id in named {
+            self.drop_owner(id, folder);
+        }
+        if !self
+            .skipped
+            .iter()
+            .any(|skipped| skipped == folder)
+        {
+            self.skipped
+                .push(folder.to_string());
+        }
+    }
+
+    fn drop_owner(
+        &mut self,
+        id: &str,
+        folder: &str,
+    ) {
+        let Some(owners) = self.owners.get_mut(id) else {
+            return;
+        };
+        owners.retain(|owner| owner != folder);
+        if owners.is_empty() {
+            self.owners.remove(id);
+            self.revoked.remove(id);
+        }
+    }
+}
+
+/// How a surface's API Key Provider key id stands, as the surface API reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiKeyReferenceStatus {
+    /// A key of this surface that is not revoked.
+    Active,
+    /// A key of this surface that is revoked.
+    Revoked,
+    /// No key has this id.
+    Missing,
+    /// A key of another surface; its status is not reported.
+    Unavailable,
+    /// The API key store could not be read.
+    Unknown,
+}
+
+/// An API Key Provider key id a surface names, how it stands, and whether the surface must name
+/// another key before it serves (`blocking`): exactly when [`judge_provider_keys`], which the
+/// provider key gate refuses by, finds a breach for the id, and never while the store cannot tell.
+/// Another surface's revoked key stays `unavailable`, as the surface's `serving_status` already
+/// shows it does not serve.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ApiKeyReference {
+    pub key_id: String,
+    pub status: ApiKeyReferenceStatus,
+    pub blocking: bool,
+}
+
+/// The [`ApiKeyReference`]s of the key ids `ids` the surface `surface_id` of `tenant_id` names,
+/// judged by [`judge_provider_keys`] with `surface_tenants` mapping each key owner to its tenant:
+/// a legacy secret is reported only when a key of that id exists, and an id is `unknown` when
+/// `listing` is `None` or a key folder it could not load may hold it. Only a key of this surface
+/// reports its status, so nothing of another surface's key is revealed. Sorted by key id.
+pub(crate) fn api_key_references(
+    surface_id: &str,
+    tenant_id: Option<&str>,
+    ids: &ProviderKeyIds,
+    listing: Option<&KeyListing>,
+    surface_tenants: &std::collections::HashMap<&str, Option<&str>>,
+    isolation: RuleMode,
+) -> Vec<ApiKeyReference> {
+    let issues = judge_provider_keys(surface_id, tenant_id, ids, listing, surface_tenants, isolation);
+    let breaches = |key_id: &str| {
+        issues
+            .iter()
+            .any(|issue| issue.key_id == key_id && issue.kind.is_breach())
+    };
+    let mut references: Vec<_> = ids
+        .keys
+        .iter()
+        .map(|key_id| (key_id, false))
+        .chain(
+            ids.legacy_secrets
+                .iter()
+                .map(|key_id| (key_id, true)),
+        )
+        .filter_map(|(key_id, legacy)| {
+            let status = match listing {
+                None => ApiKeyReferenceStatus::Unknown,
+                Some(listing) => match listing.status_of(key_id) {
+                    KeyStatus::Unknown => ApiKeyReferenceStatus::Unknown,
+                    KeyStatus::Absent if legacy => return None,
+                    KeyStatus::Absent => ApiKeyReferenceStatus::Missing,
+                    KeyStatus::Found(owners)
+                        if !owners
+                            .iter()
+                            .any(|owner| owner == surface_id) =>
+                    {
+                        ApiKeyReferenceStatus::Unavailable
+                    }
+                    KeyStatus::Found(_) if listing.is_revoked(key_id) => ApiKeyReferenceStatus::Revoked,
+                    KeyStatus::Found(_) => ApiKeyReferenceStatus::Active,
+                },
+            };
+            Some(ApiKeyReference {
+                key_id: key_id.clone(),
+                status,
+                blocking: status != ApiKeyReferenceStatus::Unknown && breaches(key_id),
+            })
+        })
+        .collect();
+    references.sort_by(|a, b| a.key_id.cmp(&b.key_id));
+    references
+}
+
+/// The [`ApiKeyReference`]s of `surface` in its base and every variant, read from a listing of
+/// the API key store and the tenants of the surfaces owning the keys it names, so an id that a
+/// key folder which cannot be loaded may hold is `unknown`, never `missing`, and every id is
+/// `unknown` while either store cannot be read. `None` when the surface names no key id or its
+/// variants cannot be resolved.
+pub(crate) async fn surface_api_key_references(
+    state: &IdentityApiState,
+    surface: &AgentSurface,
+) -> Option<Vec<ApiKeyReference>> {
+    let ids = provider_key_ids(surface).ok()?;
+    if ids.is_empty() {
+        return None;
+    }
+    let listing = match state.api_key_store.as_deref() {
+        Some(store) => provider_key_listing_with_folder(store, &surface.surface_id, &ids)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(surface = %surface.surface_id, ?error, "Could not list the API keys a surface names");
+            })
+            .ok(),
+        None => None,
+    };
+    let (listing, owner_tenants) = match listing {
+        Some(listing) => match key_owner_tenants(state, &listing, &ids).await {
+            Ok(owner_tenants) => (Some(listing), owner_tenants),
+            Err(error) => {
+                tracing::warn!(surface = %surface.surface_id, %error, "Could not read the surfaces owning the API keys a surface names");
+                (None, Vec::new())
+            }
+        },
+        None => (None, Vec::new()),
+    };
+    let surface_tenants = owner_tenants
+        .iter()
+        .map(|(id, tenant)| (id.as_str(), tenant.as_deref()))
+        .collect();
+    Some(api_key_references(
+        &surface.surface_id,
+        surface.tenant_id.as_deref(),
+        &ids,
+        listing.as_ref(),
+        &surface_tenants,
+        crate::config::credential_policy::credential_policy().tenant_credential_isolation,
+    ))
+}
+
+/// The tenant of each stored surface `listing` names as the owner of a key id of `ids`; an owner
+/// that is not stored is left out, as the provider key gate leaves it out.
+async fn key_owner_tenants(
+    state: &IdentityApiState,
+    listing: &KeyListing,
+    ids: &ProviderKeyIds,
+) -> anyhow::Result<Vec<(String, Option<String>)>> {
+    let store = state
+        .agent_surface_store
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("the agent surface store is not configured"))?;
+    let owners: std::collections::BTreeSet<&String> = ids
+        .all()
+        .flat_map(|id| listing.owners_of(id))
+        .collect();
+    let mut tenants = Vec::new();
+    for owner in owners {
+        if let Some(stored) = crate::surfaces::AgentSurfaceStore::get(store, owner).await? {
+            tenants.push((owner.clone(), stored.tenant_id));
+        }
+    }
+    Ok(tenants)
+}
+
+#[cfg(test)]
+impl From<std::collections::HashMap<String, Vec<String>>> for KeyListing {
+    fn from(owners: std::collections::HashMap<String, Vec<String>>) -> Self {
+        Self { owners, ..Self::default() }
+    }
+}
+
+#[cfg(test)]
+impl KeyListing {
+    /// This listing with the key ids of `revoked` revoked and the key folders of `skipped` not
+    /// loaded.
+    pub(crate) fn with(
+        mut self,
+        revoked: &[&str],
+        skipped: &[&str],
+    ) -> Self {
+        self.revoked.extend(
+            revoked
+                .iter()
+                .map(|id| id.to_string()),
+        );
+        self.skipped.extend(
+            skipped
+                .iter()
+                .map(|folder| folder.to_string()),
+        );
+        self
+    }
+}
+
+/// [`provider_key_listing_in`] with the key folder of `surface_id` read from disk, so a key of
+/// `ids` that another node created, revoked or deleted there is listed as stored. When that
+/// folder cannot be read, it is skipped and owns none of `ids`.
+pub(crate) async fn provider_key_listing_with_folder(
+    store: &dyn crate::api_keys::store::ApiKeyStore,
+    surface_id: &str,
+    ids: &ProviderKeyIds,
+) -> Result<KeyListing, SurfaceApiError> {
+    let mut listing = provider_key_listing_in(store).await?;
+    let named = ids
+        .all()
+        .map(String::as_str)
+        .collect();
+    match store
+        .list_from_disk(surface_id)
+        .await
+    {
+        Ok(keys) => listing.take_in_folder(surface_id, keys, &named),
+        Err(error) => {
+            tracing::warn!(surface = %surface_id, %error, "Could not read a surface's API key folder from disk");
+            listing.skip_folder(surface_id, &named);
+        }
+    }
+    Ok(listing)
+}
+
+/// The [`KeyListing`] of `store`: a key folder that could not be loaded is left out and named as
+/// skipped; an error when the store cannot be listed at all.
+pub(crate) async fn provider_key_listing_in(
+    store: &dyn crate::api_keys::store::ApiKeyStore
+) -> Result<KeyListing, SurfaceApiError> {
+    let (keys, skipped) = store
+        .list_all_with_skipped()
+        .await
+        .map_err(|error| internal("API key", error))?;
+    let mut listing = KeyListing {
+        skipped,
+        ..KeyListing::default()
+    };
+    for key in keys {
+        listing.add(key);
+    }
+    Ok(listing)
 }
 
 fn push_reference(
@@ -2154,6 +3027,16 @@ fn endpoint_id<'a>(
 
 pub(super) fn inaccessible(label: &str) -> SurfaceApiError {
     SurfaceApiError::BadRequest(format!("{label} reference is not accessible"))
+}
+
+fn another_surfaces_key(key_id: &str) -> SurfaceApiError {
+    SurfaceApiError::BadRequest(format!(
+        "API key '{key_id}' belongs to another surface; a surface names only its own API keys"
+    ))
+}
+
+fn revoked_key(key_id: &str) -> SurfaceApiError {
+    SurfaceApiError::BadRequest(format!("API key '{key_id}' is revoked; name an active API key of this surface"))
 }
 
 fn unavailable(label: &str) -> SurfaceApiError {
@@ -2314,6 +3197,438 @@ mod tests {
             RuleMode::Enforce
         );
         assert_eq!(reference_rule(&[], RuleMode::Warn, ResourceKind::Secrets, "old"), RuleMode::Enforce);
+
+        let stored_key = vec![(ResourceKind::ApiKeys, "atgk_stored".to_string())];
+        assert_eq!(reference_rule(&stored_key, RuleMode::Warn, ResourceKind::ApiKeys, "atgk_stored"), RuleMode::Warn);
+        assert_eq!(
+            reference_rule(&stored_key, RuleMode::Enforce, ResourceKind::ApiKeys, "atgk_stored"),
+            RuleMode::Enforce
+        );
+        assert_eq!(reference_rule(&stored_key, RuleMode::Warn, ResourceKind::ApiKeys, "atgk_new"), RuleMode::Enforce);
+    }
+
+    /// The references of surface `own`, of no tenant, whose key owners are none of them stored.
+    fn own_references(
+        ids: &ProviderKeyIds,
+        listing: Option<&KeyListing>,
+        isolation: RuleMode,
+    ) -> Vec<ApiKeyReference> {
+        api_key_references("own", None, ids, listing, &std::collections::HashMap::new(), isolation)
+    }
+
+    #[test]
+    fn a_legacy_secret_of_a_surface_that_is_gone_blocks_only_as_the_gate_refuses_it() {
+        let ids = ProviderKeyIds {
+            keys: Vec::new(),
+            legacy_secrets: vec!["atgk_legacy_foreign".into()],
+        };
+        let listing = KeyListing::from(std::collections::HashMap::from([(
+            "atgk_legacy_foreign".to_string(),
+            vec!["other".to_string()],
+        )]));
+        let stored_owner = std::collections::HashMap::from([("other", None)]);
+        let blocking = |tenants: &std::collections::HashMap<&str, Option<&str>>| {
+            api_key_references("own", None, &ids, Some(&listing), tenants, RuleMode::Enforce)
+                .into_iter()
+                .map(|reference| (reference.status, reference.blocking))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            blocking(&std::collections::HashMap::new()),
+            [(ApiKeyReferenceStatus::Unavailable, false)],
+            "the gate serves a legacy secret whose owning surface is gone"
+        );
+        assert_eq!(
+            blocking(&stored_owner),
+            [(ApiKeyReferenceStatus::Unavailable, true)],
+            "a legacy secret of another stored surface is refused under enforce"
+        );
+    }
+
+    #[test]
+    fn api_key_references_report_status_only_for_the_surfaces_own_keys() {
+        let ids = ProviderKeyIds {
+            keys: vec![
+                "atgk_active".into(),
+                "atgk_foreign".into(),
+                "atgk_foreign_revoked".into(),
+                "atgk_missing".into(),
+                "atgk_revoked".into(),
+            ],
+            legacy_secrets: vec!["atgk_legacy_own".into(), "atgk_legacy_plain".into()],
+        };
+        let listing = KeyListing::from(std::collections::HashMap::from([
+            ("atgk_active".to_string(), vec!["own".to_string()]),
+            ("atgk_revoked".to_string(), vec!["own".to_string()]),
+            ("atgk_foreign".to_string(), vec!["other".to_string()]),
+            ("atgk_foreign_revoked".to_string(), vec!["other".to_string()]),
+            ("atgk_legacy_own".to_string(), vec!["own".to_string()]),
+        ]))
+        .with(&["atgk_revoked", "atgk_foreign_revoked"], &[]);
+        let reference = |key_id: &str, status| (key_id.to_string(), status);
+
+        assert_eq!(
+            own_references(&ids, Some(&listing), RuleMode::Warn)
+                .into_iter()
+                .map(|reference| (reference.key_id, reference.status))
+                .collect::<Vec<_>>(),
+            vec![
+                reference("atgk_active", ApiKeyReferenceStatus::Active),
+                reference("atgk_foreign", ApiKeyReferenceStatus::Unavailable),
+                reference("atgk_foreign_revoked", ApiKeyReferenceStatus::Unavailable),
+                reference("atgk_legacy_own", ApiKeyReferenceStatus::Active),
+                reference("atgk_missing", ApiKeyReferenceStatus::Missing),
+                reference("atgk_revoked", ApiKeyReferenceStatus::Revoked),
+            ]
+        );
+        assert_eq!(
+            own_references(&ids, None, RuleMode::Warn)
+                .into_iter()
+                .map(|reference| reference.status)
+                .collect::<Vec<_>>(),
+            vec![ApiKeyReferenceStatus::Unknown; 7],
+            "the store being unavailable makes every id unknown, as the gate's store_unavailable"
+        );
+    }
+
+    #[test]
+    fn an_api_key_reference_blocks_what_the_gate_refuses_whatever_the_mode_or_by_the_mode_for_another_surfaces_key() {
+        let ids = ProviderKeyIds {
+            keys: vec![
+                "atgk_active".into(),
+                "atgk_foreign".into(),
+                "atgk_foreign_revoked".into(),
+                "atgk_missing".into(),
+                "atgk_revoked".into(),
+            ],
+            legacy_secrets: vec!["atgk_legacy_revoked".into()],
+        };
+        let listing = KeyListing::from(std::collections::HashMap::from([
+            ("atgk_active".to_string(), vec!["own".to_string()]),
+            ("atgk_revoked".to_string(), vec!["own".to_string()]),
+            ("atgk_foreign".to_string(), vec!["other".to_string()]),
+            ("atgk_foreign_revoked".to_string(), vec!["other".to_string()]),
+            ("atgk_legacy_revoked".to_string(), vec!["own".to_string()]),
+        ]))
+        .with(&["atgk_revoked", "atgk_foreign_revoked", "atgk_legacy_revoked"], &[]);
+        let blocking = |listing: &KeyListing, mode| {
+            own_references(&ids, Some(listing), mode)
+                .into_iter()
+                .filter(|reference| reference.blocking)
+                .map(|reference| reference.key_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            blocking(&listing, RuleMode::Warn),
+            ["atgk_foreign_revoked", "atgk_legacy_revoked", "atgk_missing", "atgk_revoked"],
+            "another surface's revoked key blocks under warn, as the gate refuses it"
+        );
+        assert_eq!(
+            own_references(&ids, Some(&listing), RuleMode::Warn)
+                .into_iter()
+                .find(|reference| reference.key_id == "atgk_foreign_revoked")
+                .map(|reference| reference.status),
+            Some(ApiKeyReferenceStatus::Unavailable),
+            "another surface's revoked key still reports no status"
+        );
+        assert_eq!(
+            blocking(&listing, RuleMode::Enforce),
+            ["atgk_foreign", "atgk_foreign_revoked", "atgk_legacy_revoked", "atgk_missing", "atgk_revoked"]
+        );
+        assert_eq!(
+            blocking(
+                &listing
+                    .clone()
+                    .with(&[], &["locked"]),
+                RuleMode::Enforce
+            ),
+            ["atgk_foreign", "atgk_foreign_revoked", "atgk_legacy_revoked", "atgk_revoked"],
+            "an unknown id does not block"
+        );
+        assert!(
+            own_references(&ids, None, RuleMode::Enforce)
+                .iter()
+                .all(|reference| !reference.blocking),
+            "nothing blocks while the store cannot be read"
+        );
+        assert_eq!(
+            serde_json::to_value(&own_references(&ids, Some(&listing), RuleMode::Warn)[0]).unwrap(),
+            serde_json::json!({"key_id": "atgk_active", "status": "active", "blocking": false})
+        );
+    }
+
+    fn partial_listing() -> KeyListing {
+        KeyListing::from(std::collections::HashMap::from([
+            ("atgk_own".to_string(), vec!["own".to_string()]),
+            ("atgk_foreign".to_string(), vec!["other".to_string()]),
+        ]))
+        .with(&[], &["locked"])
+    }
+
+    #[test]
+    fn an_id_no_loaded_key_folder_holds_is_unknown_while_a_folder_is_skipped_and_absent_otherwise() {
+        let partial = partial_listing();
+        let complete =
+            KeyListing::from(std::collections::HashMap::from([("atgk_own".to_string(), vec!["own".to_string()])]));
+
+        assert_eq!(partial.status_of("atgk_own"), KeyStatus::Found(&["own".to_string()]));
+        assert_eq!(partial.status_of("atgk_elsewhere"), KeyStatus::Unknown);
+        assert_eq!(complete.status_of("atgk_elsewhere"), KeyStatus::Absent);
+        assert_eq!(partial.owners_of("atgk_elsewhere"), [] as [String; 0]);
+        assert_eq!(partial.skipped(), ["locked".to_string()]);
+        assert!(!partial.is_complete() && complete.is_complete());
+
+        let named = HashSet::from(["atgk_own"]);
+        let mut unreadable = complete.clone();
+        unreadable.skip_folder("own", &named);
+        assert_eq!(
+            unreadable.status_of("atgk_own"),
+            KeyStatus::Unknown,
+            "a folder that cannot be read from disk owns nothing and is skipped"
+        );
+        unreadable.take_in_folder("own", Vec::new(), &named);
+        assert_eq!(unreadable.status_of("atgk_own"), KeyStatus::Absent, "read again, it no longer holds the key");
+    }
+
+    #[test]
+    fn an_id_no_loaded_key_folder_holds_is_judged_store_unavailable_and_a_found_one_as_usual() {
+        let ids = ProviderKeyIds {
+            keys: vec!["atgk_foreign".into(), "atgk_own".into(), "atgk_unknown".into()],
+            legacy_secrets: vec!["atgk_legacy".into()],
+        };
+        let tenants: std::collections::HashMap<&str, Option<&str>> =
+            [("own", Some("tenant-a")), ("other", Some("tenant-a"))].into();
+
+        let issues: Vec<_> =
+            judge_provider_keys("own", Some("tenant-a"), &ids, Some(&partial_listing()), &tenants, RuleMode::Enforce)
+                .into_iter()
+                .map(|issue| (issue.key_id, issue.kind))
+                .collect();
+
+        assert_eq!(
+            issues,
+            vec![
+                ("atgk_foreign".to_string(), ProviderKeyIssueKind::OtherSurface { enforced: true }),
+                ("atgk_unknown".to_string(), ProviderKeyIssueKind::StoreUnavailable),
+                ("atgk_legacy".to_string(), ProviderKeyIssueKind::StoreUnavailable),
+            ]
+        );
+    }
+
+    #[test]
+    fn api_key_references_report_an_id_no_loaded_key_folder_holds_as_unknown() {
+        let ids = ProviderKeyIds {
+            keys: vec!["atgk_own".into(), "atgk_unknown".into()],
+            legacy_secrets: vec!["atgk_legacy".into()],
+        };
+        let statuses: Vec<_> = own_references(&ids, Some(&partial_listing()), RuleMode::Warn)
+            .into_iter()
+            .map(|reference| (reference.key_id, reference.status))
+            .collect();
+
+        assert_eq!(
+            statuses,
+            vec![
+                ("atgk_legacy".to_string(), ApiKeyReferenceStatus::Unknown),
+                ("atgk_own".to_string(), ApiKeyReferenceStatus::Active),
+                ("atgk_unknown".to_string(), ApiKeyReferenceStatus::Unknown),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_save_refuses_a_new_id_no_loaded_key_folder_holds_as_unavailable_and_keeps_a_stored_one() {
+        let partial = partial_listing();
+        let complete = KeyListing::default();
+        let outcome =
+            |listing: &KeyListing, id: &str, kept: bool, legacy: bool| match listed_owners(listing, id, kept, legacy) {
+                Ok(owners) => Ok(owners.map(<[String]>::to_vec)),
+                Err(SurfaceApiError::Unavailable(message)) => Err(format!("503 {message}")),
+                Err(SurfaceApiError::BadRequest(message)) => Err(format!("400 {message}")),
+                Err(other) => panic!("{other:?}"),
+            };
+        let unavailable = Err("503 API key store is unavailable".to_string());
+
+        assert_eq!(outcome(&partial, "atgk_own", false, false), Ok(Some(vec!["own".to_string()])));
+        assert_eq!(outcome(&partial, "atgk_unknown", false, false), unavailable);
+        assert_eq!(outcome(&partial, "atgk_unknown", false, true), unavailable, "a new legacy secret too");
+        assert_eq!(outcome(&partial, "atgk_unknown", true, false), Ok(None), "a stored one is kept");
+        assert_eq!(outcome(&partial, "atgk_unknown", true, true), Ok(None));
+        assert_eq!(
+            outcome(&complete, "atgk_unknown", false, false),
+            Err("400 API key reference is not accessible".to_string())
+        );
+        assert_eq!(outcome(&complete, "atgk_unknown", false, true), Ok(None), "a legacy secret no key has");
+    }
+
+    #[tokio::test]
+    async fn a_listing_with_a_surfaces_folder_reads_its_keys_as_another_node_stored_them() {
+        use crate::api_keys::store::ApiKeyStore as _;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let node_a = crate::api_keys::FileSystemApiKeyStore::new(&path)
+            .await
+            .unwrap();
+        let revoked = node_a
+            .create("own", "client", None, "test")
+            .await
+            .unwrap()
+            .key_id;
+        let node_b = crate::api_keys::FileSystemApiKeyStore::new(&path)
+            .await
+            .unwrap();
+        node_a
+            .revoke("own", &revoked, "test")
+            .await
+            .unwrap();
+        let added = node_a
+            .create("own", "client", None, "test")
+            .await
+            .unwrap()
+            .key_id;
+        let ids = ProviderKeyIds {
+            keys: vec![added.clone(), revoked.clone()],
+            legacy_secrets: Vec::new(),
+        };
+        let mut sorted = ids.keys.clone();
+        sorted.sort();
+
+        let cached = provider_key_listing_in(&node_b)
+            .await
+            .unwrap();
+        let listing = provider_key_listing_with_folder(&node_b, "own", &ids)
+            .await
+            .unwrap();
+
+        assert!(!cached.is_revoked(&revoked), "node B's cache is stale");
+        assert!(listing.is_revoked(&revoked), "the save is judged from the folder as stored");
+        assert_eq!(listing.owners_of(&added), ["own".to_string()], "a key another node added is found");
+        let statuses: Vec<_> = own_references(&ids, Some(&listing), RuleMode::Warn)
+            .into_iter()
+            .map(|reference| (reference.key_id, reference.status))
+            .collect();
+        let expected: Vec<_> = sorted
+            .into_iter()
+            .map(|id| {
+                let status = if id == revoked {
+                    ApiKeyReferenceStatus::Revoked
+                } else {
+                    ApiKeyReferenceStatus::Active
+                };
+                (id, status)
+            })
+            .collect();
+        assert_eq!(statuses, expected);
+    }
+
+    #[tokio::test]
+    async fn a_listing_whose_surfaces_folder_cannot_be_read_reads_its_keys_as_unknown() {
+        use crate::api_keys::store::ApiKeyStore as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::api_keys::FileSystemApiKeyStore::new(
+            directory
+                .path()
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let own = store
+            .create("own", "client", None, "test")
+            .await
+            .unwrap()
+            .key_id;
+        let foreign = store
+            .create("other", "client", None, "test")
+            .await
+            .unwrap()
+            .key_id;
+        let locked = directory.path().join("own");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read_dir(&locked).is_err();
+        let ids = ProviderKeyIds {
+            keys: vec![own.clone(), foreign.clone()],
+            legacy_secrets: Vec::new(),
+        };
+
+        let listing = provider_key_listing_with_folder(&store, "own", &ids).await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !unreadable {
+            return;
+        }
+
+        let listing = listing.unwrap();
+        assert_eq!(listing.status_of(&own), KeyStatus::Unknown);
+        assert_eq!(listing.owners_of(&foreign), ["other".to_string()], "another folder's key is judged as usual");
+        assert!(
+            matches!(listed_owners(&listing, &own, false, false), Err(SurfaceApiError::Unavailable(_))),
+            "a new reference to it is refused as unavailable"
+        );
+    }
+
+    #[test]
+    fn a_save_reads_the_surfaces_key_folder_only_when_it_names_a_key_id_it_did_not_already_name() {
+        let ids = ProviderKeyIds {
+            keys: vec!["atgk_kept".into()],
+            legacy_secrets: vec!["atgk_legacy".into()],
+        };
+        let kept = |ids: &[&str]| -> Vec<(ResourceKind, String)> {
+            ids.iter()
+                .map(|id| (ResourceKind::ApiKeys, id.to_string()))
+                .collect()
+        };
+
+        assert!(!names_a_new_key_id(&kept(&["atgk_kept", "atgk_legacy"]), &ids));
+        assert!(names_a_new_key_id(&kept(&["atgk_kept"]), &ids));
+        assert!(names_a_new_key_id(&[(ResourceKind::Secrets, "atgk_kept".into())], &ids));
+    }
+
+    #[tokio::test]
+    async fn the_tenant_ownership_listing_is_unavailable_while_a_key_folder_cannot_be_loaded() {
+        use crate::api_keys::store::ApiKeyStore as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let first = crate::api_keys::FileSystemApiKeyStore::new(&path)
+            .await
+            .unwrap();
+        for owner in ["readable", "locked"] {
+            first
+                .create(owner, "client", None, "test")
+                .await
+                .unwrap();
+        }
+        let locked = directory
+            .path()
+            .join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read_dir(&locked).is_err();
+        let store = crate::api_keys::FileSystemApiKeyStore::new(&path)
+            .await
+            .unwrap();
+
+        let refused = provider_key_owners(&store).await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let listed = provider_key_owners(&store).await;
+        if !unreadable {
+            return;
+        }
+
+        assert!(
+            matches!(&refused, Err(SurfaceApiError::Unavailable(message)) if message == "API key store is unavailable"),
+            "{refused:?}"
+        );
+        assert!(listed.is_ok_and(|listing| listing.is_complete()));
     }
 
     #[test]
@@ -2881,6 +4196,29 @@ mod tests {
         assert_eq!(endpoint_id("fabric://", "fabric://"), None);
     }
 
+    /// A Transit Point whose target is an MCP Proxy references that proxy, as
+    /// a `proxy://` Target does, so a save checks the surface may use it.
+    #[test]
+    fn a_transit_point_references_the_mcp_proxy_it_targets() {
+        let surface: AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "surface", "name": "surface", "tenant_id": "tenant-a",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": "proxy://target-tools"},
+            "transit": {"points": [
+                {"id": "tp-1", "alias": "drive", "target_endpoint": "proxy://drive", "protocol": "mcp"},
+                {"id": "tp-2", "alias": "vendor", "target_endpoint": "https://vendor.example/mcp", "protocol": "mcp"}
+            ]}
+        }))
+        .unwrap();
+        let proxies: HashSet<_> = collect_surface_reference_keys(&surface)
+            .unwrap()
+            .into_iter()
+            .filter(|reference| reference.kind == ResourceKind::McpProxies)
+            .map(|reference| reference.id)
+            .collect();
+        assert_eq!(proxies, HashSet::from(["target-tools".to_string(), "drive".to_string()]));
+    }
+
     #[test]
     fn collects_trust_registries_from_both_legs_and_variants() {
         let mut surface = AgentSurface::default();
@@ -2897,6 +4235,7 @@ mod tests {
                 trust_registry_id: "tr-base-recorder".into(),
                 issuer_did: "did:example:issuer".into(),
                 authority_did: "did:example:authority".into(),
+                authority_source: None,
                 include_owned_agent: true,
                 custom_resources: Vec::new(),
             }],
@@ -2915,6 +4254,7 @@ mod tests {
                             trust_registry_id: "tr-variant-recorder".into(),
                             issuer_did: "did:example:variant-issuer".into(),
                             authority_did: "did:example:variant-authority".into(),
+                            authority_source: None,
                             include_owned_agent: true,
                             custom_resources: Vec::new(),
                         }],
@@ -3133,12 +4473,753 @@ mod tests {
         surface: AgentSurface,
         storage: GrantStorage,
     ) -> Result<(), String> {
-        check_external_consent_bindings(Some(providers), &surface, storage, &std::collections::HashMap::new(), None)
+        checked_through(providers, surface, storage, None).await
+    }
+
+    /// The bindings of `surface` pinned and checked with the MCP Proxies of
+    /// `proxies`, as a save does ([`validate_external_consent_bindings`]).
+    async fn checked_through(
+        providers: &std::sync::Arc<dyn CredentialProviderStorage>,
+        mut surface: AgentSurface,
+        storage: GrantStorage,
+        proxies: Option<&dyn McpProxyStore>,
+    ) -> Result<(), String> {
+        pin_mcp_proxy_grants(&mut surface, None, proxies)
             .await
-            .map_err(|error| match error {
-                SurfaceApiError::BadRequest(message) => message,
-                other => panic!("expected a 400, got {other:?}"),
+            .expect("a new binding is pinned");
+        check_external_consent_bindings(
+            Some(providers),
+            &surface,
+            storage,
+            &std::collections::HashMap::new(),
+            crate::credential_providers::external::IssuerRules::default(),
+            proxies,
+        )
+        .await
+        .map_err(|error| match error {
+            SurfaceApiError::BadRequest(message) => message,
+            other => panic!("expected a 400, got {other:?}"),
+        })
+    }
+
+    /// `tenant-a`'s MCP Proxies and one of `tenant-b`'s: `drive` sends its
+    /// tool calls to the origin of the vendor's resource, `elsewhere` to
+    /// another origin, and `direct` can be called on its own route.
+    async fn grant_proxies(directory: &tempfile::TempDir) -> crate::mcp_proxies::FileSystemMcpProxyStore {
+        use crate::credential_providers::external::tests::grant_proxy;
+        let store = crate::mcp_proxies::FileSystemMcpProxyStore::new(
+            directory
+                .path()
+                .join("mcp_proxies"),
+        )
+        .await
+        .unwrap();
+        let mut direct = grant_proxy("direct", Some("tenant-a"), "https://203.0.113.30/drive/v3");
+        direct.direct_access = true;
+        for proxy in [
+            grant_proxy("drive", Some("tenant-a"), "https://203.0.113.30/drive/v3"),
+            grant_proxy("elsewhere", Some("tenant-a"), "https://203.0.113.66/drive/v3"),
+            direct,
+            grant_proxy("of-tenant-b", Some("tenant-b"), "https://203.0.113.30/drive/v3"),
+        ] {
+            store
+                .create(&proxy)
+                .await
+                .unwrap();
+        }
+        store
+    }
+
+    /// An MCP Transit Point whose target is the MCP Proxy `proxy`.
+    fn proxy_point(
+        proxy: &str,
+        binding: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({"id": "tp-1", "alias": "drive", "target_endpoint": format!("proxy://{proxy}"),
+            "protocol": "mcp", "require_transit_token": true, "transit_credentials": binding})
+    }
+
+    /// A `proxy://` Transit Point binds a grant only to an MCP Proxy of the
+    /// surface's tenant, served only through surfaces, whose `base_url` has the
+    /// origin of the provider's resource; it speaks MCP, sends the grant in a
+    /// header and no `target_auth` of its own. The Access Point's Target is
+    /// never such a proxy.
+    #[tokio::test]
+    async fn a_proxy_transit_point_binds_a_grant_only_to_its_tenants_proxy_of_the_resources_origin() {
+        use crate::credential_providers::external::PROXY_UNAVAILABLE;
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        let proxies = grant_proxies(&directory).await;
+        let storage = GrantStorage {
+            encrypted: true,
+            stable_ids: true,
+        };
+        let owner = external("external-a", Some("owner"));
+        let check = |point: serde_json::Value| {
+            let surface = surface_with_points(serde_json::json!([point]), serde_json::json!([]), None);
+            checked_through(&providers, surface, storage, Some(&proxies))
+        };
+        for subject in ["owner", "caller"] {
+            assert_eq!(check(proxy_point("drive", external("external-a", Some(subject)))).await, Ok(()), "{subject}");
+        }
+
+        let mut with_target_auth = proxy_point("drive", owner.clone());
+        with_target_auth["target_auth"] =
+            serde_json::json!({"method": {"static_secret": {"secret_id": "vendor-key", "header_name": "x-key"}}});
+        let mut a2a = proxy_point("drive", owner.clone());
+        a2a["protocol"] = serde_json::json!("a2a");
+        let mut in_meta = owner.clone();
+        in_meta["inject_as"] = serde_json::json!({"type": "meta", "field": "token"});
+        for (case, point, expected) in [
+            (
+                "an MCP Proxy of another origin",
+                proxy_point("elsewhere", owner.clone()),
+                "consent_mode external needs an MCP Proxy whose base_url has the origin of the credential provider's \
+                 resource",
+            ),
+            (
+                "an MCP Proxy anyone can call on its own route",
+                proxy_point("direct", owner.clone()),
+                "consent_mode external needs an MCP Proxy served only through surfaces",
+            ),
+            ("another tenant's MCP Proxy", proxy_point("of-tenant-b", owner.clone()), PROXY_UNAVAILABLE),
+            ("a missing MCP Proxy", proxy_point("missing", owner.clone()), PROXY_UNAVAILABLE),
+        ] {
+            let message = check(point)
+                .await
+                .expect_err(case);
+            assert!(
+                message.starts_with(&format!("transit.points[0].transit_credentials: {expected}")),
+                "{case}: {message}"
+            );
+        }
+
+        // The Transit Point's own rules hold with a grant and without one.
+        let mut without_grant_with_target_auth = with_target_auth.clone();
+        without_grant_with_target_auth
+            .as_object_mut()
+            .unwrap()
+            .remove("transit_credentials");
+        let mut a2a_without_grant = a2a.clone();
+        a2a_without_grant
+            .as_object_mut()
+            .unwrap()
+            .remove("transit_credentials");
+        let other_consent_mode = proxy_point(
+            "drive",
+            serde_json::json!({"credential_provider_id": "legacy-a", "consent_mode": "on_demand"}),
+        );
+        let only_credential = "a Transit Point whose target is an MCP Proxy sends its backend no credential but a \
+                               consent_mode external grant";
+        for (case, point, expected) in [
+            ("a target_auth of its own", with_target_auth, only_credential),
+            ("a target_auth of its own, without a grant", without_grant_with_target_auth, only_credential),
+            ("another protocol", a2a, crate::credential_providers::external::PROXY_TRANSIT_POINT_NEEDS_MCP),
+            (
+                "another protocol, without a grant",
+                a2a_without_grant,
+                crate::credential_providers::external::PROXY_TRANSIT_POINT_NEEDS_MCP,
+            ),
+            ("a binding of another consent mode", other_consent_mode, only_credential),
+            (
+                "a grant in _meta",
+                proxy_point("drive", in_meta),
+                "a Transit Point whose target is an MCP Proxy sends the grant in a header",
+            ),
+        ] {
+            let message = check(point)
+                .await
+                .expect_err(case);
+            assert!(message.starts_with(&format!("transit.points[0]: {expected}")), "{case}: {message}");
+        }
+        let outbound = surface_with_points(
+            serde_json::json!([{"id": "tp-1", "alias": "drive", "target_endpoint": "proxy://drive", "protocol": "mcp"}]),
+            serde_json::json!([{"credential_provider_id": "legacy-a"}]),
+            None,
+        );
+        let message = checked_through(&providers, outbound, storage, Some(&proxies))
+            .await
+            .expect_err("the surface's outbound_credentials apply on every Transit Point");
+        assert!(message.starts_with(&format!("transit.points[0]: {only_credential}")), "{message}");
+        let variant = surface_with_points(
+            serde_json::json!([]),
+            serde_json::json!([]),
+            Some(serde_json::json!([{"id": "tp-v", "alias": "drive", "target_endpoint": "proxy://drive",
+                "protocol": "a2a"}])),
+        );
+        let message = checked_through(&providers, variant, storage, Some(&proxies))
+            .await
+            .expect_err("a variant's Transit Point");
+        assert!(
+            message.starts_with("variant 'candidate' transit.points[0]: a Transit Point whose target is an MCP Proxy"),
+            "{message}"
+        );
+        let without_proxies = checked(
+            &providers,
+            surface_with_points(serde_json::json!([proxy_point("drive", owner.clone())]), serde_json::json!([]), None),
+            true,
+        )
+        .await
+        .expect_err("no MCP Proxy store");
+        assert!(without_proxies.ends_with(PROXY_UNAVAILABLE), "{without_proxies}");
+
+        let target = checked_through(
+            &providers,
+            target_surface(serde_json::json!([owner]), serde_json::json!({"target": {"endpoint": "proxy://drive"}})),
+            storage,
+            Some(&proxies),
+        )
+        .await
+        .expect_err("the Access Point's Target");
+        assert!(
+            target.starts_with(
+                "outbound_credentials[0]: consent_mode external needs a target_endpoint that is a public https URL"
+            ),
+            "{target}"
+        );
+    }
+
+    /// The `mcp_proxy_pin` of every Transit Point binding of `surface`, its
+    /// own, then each variant's.
+    fn pins(surface: &AgentSurface) -> Vec<Option<String>> {
+        all_transit_points(surface)
+            .into_iter()
+            .map(|point| {
+                point
+                    .transit_credentials
+                    .as_ref()
+                    .and_then(|binding| binding.mcp_proxy_pin.clone())
             })
+            .collect()
+    }
+
+    /// `binding` with the pin `pin`, as a write sends it.
+    fn sending_pin(
+        mut binding: serde_json::Value,
+        pin: &str,
+    ) -> serde_json::Value {
+        binding["mcp_proxy_pin"] = serde_json::json!(pin);
+        binding
+    }
+
+    /// The code and message of a refused save.
+    fn refusal(refused: Result<(), SurfaceApiError>) -> (&'static str, String) {
+        match refused {
+            Err(SurfaceApiError::BadRequestCode(code, message)) => (code, message),
+            other => panic!("expected a 400 with a code, got {other:?}"),
+        }
+    }
+
+    /// A new binding, on the surface or in a variant, is pinned to its MCP
+    /// Proxy as it is now; a pin the write sends is kept when it is the
+    /// proxy's current `grant_pin`, and any other is refused with a message
+    /// that names the Transit Point and the proxy, never the proxy's spec. A
+    /// pin sent for an `https` Transit Point is dropped. A pin sent for another
+    /// tenant's proxy is not compared with it: it is refused as a missing
+    /// proxy is, so the save tells nothing of that proxy.
+    #[tokio::test]
+    async fn a_save_pins_a_new_binding_and_keeps_a_sent_pin_only_when_it_is_the_proxys_current_one() {
+        use crate::credential_providers::external::PROXY_UNAVAILABLE;
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        let proxies = grant_proxies(&directory).await;
+        let mut drive = proxies
+            .get("drive")
+            .await
+            .unwrap()
+            .unwrap();
+        drive.openapi_spec = "openapi: 3.0.0 # the spec-text-7d1e".into();
+        proxies
+            .update(&drive)
+            .await
+            .unwrap();
+        let current = drive.grant_pin();
+        assert!(
+            current.starts_with("sha256:")
+                && current.len() == 71
+                && current[7..]
+                    .chars()
+                    .all(|digit| digit.is_ascii_hexdigit() && !digit.is_ascii_uppercase()),
+            "{current}"
+        );
+
+        let https_point = {
+            let mut point = vendor_point(sending_pin(external("external-a", Some("owner")), "sha256:chosen"));
+            point["id"] = serde_json::json!("tp-2");
+            point
+        };
+        let mut variant_point = proxy_point("drive", external("external-a", Some("owner")));
+        variant_point["id"] = serde_json::json!("tp-v");
+        let mut surface = surface_with_points(
+            serde_json::json!([
+                proxy_point("drive", sending_pin(external("external-a", Some("owner")), &current)),
+                https_point
+            ]),
+            serde_json::json!([]),
+            Some(serde_json::json!([variant_point.clone()])),
+        );
+        pin_mcp_proxy_grants(&mut surface, None, Some(&proxies))
+            .await
+            .unwrap();
+        assert_eq!(pins(&surface), [Some(current.clone()), None, Some(current.clone())]);
+        assert!(
+            checked_through(&providers, surface.clone(), GRANTS_KEPT, Some(&proxies))
+                .await
+                .is_ok()
+        );
+
+        for (case, mut surface, prefix) in [
+            (
+                "the surface's",
+                surface_with_points(
+                    serde_json::json!([proxy_point(
+                        "drive",
+                        sending_pin(external("external-a", Some("owner")), "sha256:chosen")
+                    )]),
+                    serde_json::json!([]),
+                    None,
+                ),
+                "",
+            ),
+            (
+                "a variant's",
+                surface_with_points(
+                    serde_json::json!([]),
+                    serde_json::json!([]),
+                    Some(serde_json::json!([proxy_point(
+                        "drive",
+                        sending_pin(external("external-a", Some("owner")), "sha256:chosen")
+                    )])),
+                ),
+                "variant 'candidate' ",
+            ),
+        ] {
+            let (code, message) = refusal(pin_mcp_proxy_grants(&mut surface, None, Some(&proxies)).await);
+            assert_eq!(code, MCP_PROXY_PIN_NOT_CURRENT, "{case}");
+            assert!(
+                message.starts_with(&format!("{prefix}transit.points[0] ('drive'): ")) && message.contains("'drive'"),
+                "{case}: {message}"
+            );
+            assert!(!message.contains("spec-text-7d1e") && !message.contains("sha256:chosen"), "{message}");
+        }
+
+        for proxy in ["of-tenant-b", "missing"] {
+            let other = proxies
+                .get("of-tenant-b")
+                .await
+                .unwrap()
+                .unwrap();
+            let mut surface = surface_with_points(
+                serde_json::json!([proxy_point(
+                    proxy,
+                    sending_pin(external("external-a", Some("owner")), &other.grant_pin())
+                )]),
+                serde_json::json!([]),
+                None,
+            );
+            pin_mcp_proxy_grants(&mut surface, None, Some(&proxies))
+                .await
+                .unwrap_or_else(|error| panic!("{proxy}: not compared, {error:?}"));
+            assert_eq!(pins(&surface), [None], "{proxy}");
+            let refused = check_external_consent_bindings(
+                Some(&providers),
+                &surface,
+                GRANTS_KEPT,
+                &std::collections::HashMap::new(),
+                crate::credential_providers::external::IssuerRules::default(),
+                Some(&proxies),
+            )
+            .await;
+            match refused {
+                Err(SurfaceApiError::BadRequest(message)) => {
+                    assert!(message.ends_with(PROXY_UNAVAILABLE), "{proxy}: {message}");
+                }
+                other => panic!("{proxy}: {other:?}"),
+            }
+        }
+    }
+
+    /// Grants can be kept: at-rest encryption on and the pepper configured.
+    const GRANTS_KEPT: GrantStorage = GrantStorage {
+        encrypted: true,
+        stable_ids: true,
+    };
+
+    /// A save that sends no pin, as a merge `PATCH`, a variant change, a
+    /// tenant transfer, or a `PUT` that leaves it out, keeps the binding's
+    /// stored pin, even when the MCP Proxy has changed since: the save goes
+    /// through, with a warning, and the Transit Point stays refused. A save that
+    /// sends the stored pin back, as a dashboard `PUT` of the stored surface
+    /// does, keeps it alike; any other stale pin is refused. A save that sends the
+    /// proxy's current pin pins the binding to it, and only then do the
+    /// Transit Point's grants go through the edited proxy again. A binding
+    /// that names another proxy than the stored one is a new binding.
+    #[tokio::test]
+    async fn a_save_without_a_pin_keeps_the_stored_one_so_an_edited_proxy_stays_refused() {
+        use crate::credential_providers::external::{PROXY_CHANGED, check_proxy_pin};
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        let proxies = grant_proxies(&directory).await;
+        let drive = proxies
+            .get("drive")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut variant_point = proxy_point("drive", external("external-a", Some("owner")));
+        variant_point["id"] = serde_json::json!("tp-v");
+        let mut stored = surface_with_points(
+            serde_json::json!([proxy_point("drive", external("external-a", Some("owner")))]),
+            serde_json::json!([]),
+            Some(serde_json::json!([variant_point])),
+        );
+        pin_mcp_proxy_grants(&mut stored, None, Some(&proxies))
+            .await
+            .unwrap();
+        let first = drive.grant_pin();
+        assert_eq!(pins(&stored), [Some(first.clone()), Some(first.clone())]);
+
+        let mut edited = drive.clone();
+        edited.openapi_spec = r#"{"openapi": "3.0.0", "paths": {"/files/trash": {"delete": {}}}}"#.into();
+        proxies
+            .update(&edited)
+            .await
+            .unwrap();
+        let check = |surface: &AgentSurface| {
+            let (providers, surface) = (providers.clone(), surface.clone());
+            let proxies: &dyn McpProxyStore = &proxies;
+            async move {
+                check_external_consent_bindings(
+                    Some(&providers),
+                    &surface,
+                    GRANTS_KEPT,
+                    &std::collections::HashMap::new(),
+                    crate::credential_providers::external::IssuerRules::default(),
+                    Some(proxies),
+                )
+                .await
+            }
+        };
+
+        let mut unrelated = stored.clone();
+        unrelated.name = "renamed, a save for another reason".into();
+        forget_mcp_proxy_pins(&mut unrelated);
+        assert_eq!(pins(&unrelated), [None, None], "a write from the stored surface sends no pin");
+        pin_mcp_proxy_grants(&mut unrelated, Some(&stored), Some(&proxies))
+            .await
+            .unwrap();
+        assert_eq!(pins(&unrelated), [Some(first.clone()), Some(first.clone())], "the stored pins are kept");
+        assert!(
+            check(&unrelated)
+                .await
+                .is_ok(),
+            "the save goes through"
+        );
+        assert_eq!(
+            check_proxy_pin(&edited, pins(&unrelated)[0].as_deref()),
+            Err(PROXY_CHANGED),
+            "and the Transit Point stays refused"
+        );
+        let warnings = stale_mcp_proxy_pin_warnings(Some(&proxies), &unrelated).await;
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("'drive'") && warnings[0].contains("grant_pin"), "{warnings:?}");
+
+        let mut echoed = stored.clone();
+        pin_mcp_proxy_grants(&mut echoed, Some(&stored), Some(&proxies))
+            .await
+            .expect("the stored pin, sent back after the proxy changed, is kept as if not sent");
+        assert_eq!(pins(&echoed), [Some(first.clone()), Some(first.clone())]);
+        assert_eq!(
+            check_proxy_pin(&edited, pins(&echoed)[0].as_deref()),
+            Err(PROXY_CHANGED),
+            "and approves nothing: the Transit Point stays refused"
+        );
+        assert_eq!(
+            stale_mcp_proxy_pin_warnings(Some(&proxies), &echoed)
+                .await
+                .len(),
+            2
+        );
+
+        let mut stale = stored.clone();
+        stale
+            .transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .transit_credentials
+            .as_mut()
+            .unwrap()
+            .mcp_proxy_pin = Some("sha256:another".into());
+        let (code, message) = refusal(pin_mcp_proxy_grants(&mut stale, Some(&stored), Some(&proxies)).await);
+        assert_eq!(code, MCP_PROXY_PIN_NOT_CURRENT, "a pin that is neither stored nor current");
+        assert!(message.starts_with("transit.points[0] ('drive')"), "{message}");
+
+        let mut approved = stored.clone();
+        forget_mcp_proxy_pins(&mut approved);
+        approved
+            .transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .transit_credentials
+            .as_mut()
+            .unwrap()
+            .mcp_proxy_pin = Some(edited.grant_pin());
+        pin_mcp_proxy_grants(&mut approved, Some(&stored), Some(&proxies))
+            .await
+            .unwrap();
+        assert_eq!(
+            pins(&approved),
+            [Some(edited.grant_pin()), Some(first.clone())],
+            "the binding the write sent the current pin for is pinned to the proxy as it is; the other keeps its pin"
+        );
+        assert_eq!(check_proxy_pin(&edited, pins(&approved)[0].as_deref()), Ok(()));
+        assert!(check(&approved).await.is_ok());
+        assert_eq!(
+            stale_mcp_proxy_pin_warnings(Some(&proxies), &approved)
+                .await
+                .len(),
+            1
+        );
+
+        let mut moved = stored.clone();
+        forget_mcp_proxy_pins(&mut moved);
+        let mut sheets = drive.clone();
+        sheets.id = "sheets".into();
+        sheets.name = "Sheets".into();
+        proxies
+            .create(&sheets)
+            .await
+            .unwrap();
+        moved
+            .transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .target_endpoint = "proxy://sheets".into();
+        pin_mcp_proxy_grants(&mut moved, Some(&stored), Some(&proxies))
+            .await
+            .unwrap();
+        assert_eq!(pins(&moved)[0], Some(sheets.grant_pin()), "another proxy: a new binding, pinned as it is");
+    }
+
+    /// An MCP Proxy store that cannot be read.
+    struct UnreadableProxies;
+
+    #[async_trait::async_trait]
+    impl McpProxyStore for UnreadableProxies {
+        async fn create(
+            &self,
+            _proxy: &crate::mcp_proxies::types::McpProxy,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("unreadable")
+        }
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<Option<crate::mcp_proxies::types::McpProxy>> {
+            anyhow::bail!("unreadable")
+        }
+        async fn list_all(&self) -> anyhow::Result<Vec<crate::mcp_proxies::types::McpProxy>> {
+            anyhow::bail!("unreadable")
+        }
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("unreadable")
+        }
+        async fn update(
+            &self,
+            _proxy: &crate::mcp_proxies::types::McpProxy,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("unreadable")
+        }
+    }
+
+    /// A save whose MCP Proxy cannot be read fails, rather than treating the
+    /// proxy as missing and dropping the pin the write sent; the answer names
+    /// the proxy, never the store's error.
+    #[tokio::test]
+    async fn a_save_fails_when_its_mcp_proxy_cannot_be_read() {
+        let mut surface = surface_with_points(
+            serde_json::json!([proxy_point(
+                "drive",
+                sending_pin(external("external-a", Some("owner")), "sha256:sent")
+            )]),
+            serde_json::json!([]),
+            None,
+        );
+        match pin_mcp_proxy_grants(&mut surface, None, Some(&UnreadableProxies)).await {
+            Err(SurfaceApiError::InternalError(message)) => {
+                assert!(message.contains("'drive'") && !message.contains("unreadable"), "{message}");
+            }
+            other => panic!("expected an internal error, got {other:?}"),
+        }
+    }
+
+    /// A grant binding is refused at save on a `proxy://` Transit Point whose
+    /// MCP Proxy's spec has a tool with a method override header parameter,
+    /// in any case, or a `_method` query parameter; another header, and a
+    /// header named `_method`, pass.
+    #[tokio::test]
+    async fn a_save_refuses_a_grant_through_an_mcp_proxy_whose_spec_overrides_the_method() {
+        use crate::credential_providers::external::PROXY_OVERRIDES_THE_METHOD;
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        let proxies = grant_proxies(&directory).await;
+        let spec = |name: &str, location: &str| {
+            format!(
+                r#"{{"openapi": "3.0.0", "info": {{"title": "Drive", "version": "1"}},
+                "paths": {{"/files": {{"get": {{"operationId": "search_files",
+                    "parameters": [{{"name": "{name}", "in": "{location}", "schema": {{"type": "string"}}}}],
+                    "responses": {{"200": {{"description": "Files"}}}}}}}}}}}}"#
+            )
+        };
+        let surface = || {
+            surface_with_points(
+                serde_json::json!([proxy_point("drive", external("external-a", Some("owner")))]),
+                serde_json::json!([]),
+                None,
+            )
+        };
+        let mut drive = proxies
+            .get("drive")
+            .await
+            .unwrap()
+            .unwrap();
+        for header in ["X-HTTP-Method-Override", "x-http-method", "X-Method-OVERRIDE"] {
+            drive.openapi_spec = spec(header, "header");
+            assert!(crate::mcp_proxies::handlers::spec_sends_a_method_override(&drive), "{header}: the spec loads");
+            proxies
+                .update(&drive)
+                .await
+                .unwrap();
+            let refused = checked_through(&providers, surface(), GRANTS_KEPT, Some(&proxies))
+                .await
+                .expect_err(header);
+            assert!(refused.ends_with(PROXY_OVERRIDES_THE_METHOD), "{header}: {refused}");
+        }
+        drive.openapi_spec = spec("_method", "query");
+        proxies
+            .update(&drive)
+            .await
+            .unwrap();
+        let refused = checked_through(&providers, surface(), GRANTS_KEPT, Some(&proxies))
+            .await
+            .expect_err("a _method query parameter");
+        assert!(refused.ends_with(PROXY_OVERRIDES_THE_METHOD), "{refused}");
+        for (name, location) in [("X-Request-Reason", "header"), ("_method", "header")] {
+            drive.openapi_spec = spec(name, location);
+            proxies
+                .update(&drive)
+                .await
+                .unwrap();
+            assert_eq!(
+                checked_through(&providers, surface(), GRANTS_KEPT, Some(&proxies)).await,
+                Ok(()),
+                "{name} in {location}"
+            );
+        }
+    }
+
+    /// A save that changes a binding's pin records it, with the Transit Point,
+    /// the proxy and both pins, when it is written: a new binding pinned, and
+    /// the proxy's current pin sent in place of the stored one. A save that
+    /// keeps the pin records nothing.
+    #[tokio::test]
+    async fn a_save_that_changes_a_pin_records_it() {
+        use crate::audit::context::in_management_request;
+        use crate::audit::events::Actor;
+        use crate::audit::producer::capture;
+        use crate::surfaces::AgentSurfaceStore;
+        let directory = tempfile::tempdir().unwrap();
+        let proxies = grant_proxies(&directory).await;
+        let surfaces = crate::surfaces::FileSystemAgentSurfaceStore::new(
+            directory
+                .path()
+                .join("surfaces"),
+        )
+        .await
+        .unwrap();
+        let drive = proxies
+            .get("drive")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut stored = surface_with_points(
+            serde_json::json!([proxy_point("drive", external("external-a", Some("owner")))]),
+            serde_json::json!([]),
+            None,
+        );
+        pin_mcp_proxy_grants(&mut stored, None, Some(&proxies))
+            .await
+            .unwrap();
+        let mut edited = drive.clone();
+        edited.name = "Drive, renamed".into();
+        proxies
+            .update(&edited)
+            .await
+            .unwrap();
+        let mut kept = stored.clone();
+        forget_mcp_proxy_pins(&mut kept);
+        pin_mcp_proxy_grants(&mut kept, Some(&stored), Some(&proxies))
+            .await
+            .unwrap();
+        let mut approved = stored.clone();
+        approved
+            .transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .transit_credentials
+            .as_mut()
+            .unwrap()
+            .mcp_proxy_pin = Some(edited.grant_pin());
+        pin_mcp_proxy_grants(&mut approved, Some(&stored), Some(&proxies))
+            .await
+            .unwrap();
+
+        let ((), records) = capture(in_management_request(Actor::user("u-1"), async {
+            for surface in [&stored, &kept, &approved] {
+                surfaces
+                    .save(surface)
+                    .await
+                    .unwrap();
+            }
+        }))
+        .await;
+        let changes: Vec<_> = records
+            .iter()
+            .filter(|record| crate::delegation_vault::audit::action_category(&record.event) == "mcp_proxy_pin_changed")
+            .map(|record| {
+                let change = serde_json::to_value(&record.event).unwrap()["mcp_proxy_pin_changed"].clone();
+                (
+                    change["transit_point_id"].clone(),
+                    change["mcp_proxy_id"].clone(),
+                    change["previous_pin"].clone(),
+                    change["pin"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            changes,
+            [
+                (
+                    serde_json::json!("tp-1"),
+                    serde_json::json!("drive"),
+                    serde_json::Value::Null,
+                    serde_json::json!(drive.grant_pin())
+                ),
+                (
+                    serde_json::json!("tp-1"),
+                    serde_json::json!("drive"),
+                    serde_json::json!(drive.grant_pin()),
+                    serde_json::json!(edited.grant_pin())
+                ),
+            ],
+            "{records:?}"
+        );
     }
 
     /// With `external_consent_issuers` set, a binding's provider must name a
@@ -3161,7 +5242,8 @@ mod tests {
                     &surface,
                     storage,
                     &std::collections::HashMap::new(),
-                    issuers.as_ref(),
+                    crate::credential_providers::external::IssuerRules::new(issuers.as_ref(), None),
+                    None,
                 )
                 .await
             }
@@ -3185,6 +5267,74 @@ mod tests {
                 "{message}"
             ),
             other => panic!("expected a 400, got {other:?}"),
+        }
+    }
+
+    /// `external_consent_issuer_patterns` alone limits issuers as the exact
+    /// list does: a binding whose provider's issuer matches a pattern is
+    /// saved, and one whose issuer matches none is refused.
+    #[tokio::test]
+    async fn a_binding_is_saved_only_while_its_providers_issuer_matches_an_operator_pattern() {
+        use crate::config::network::{IssuerPattern, IssuerTenant};
+        use crate::credential_providers::external::PermittedIssuers;
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        providers
+            .create(
+                serde_json::from_value(serde_json::json!({
+                    "id": "external-tenant", "tenant_id": "tenant-a", "name": "external-tenant",
+                    "provider_id": "external-tenant", "issuer": "https://203.0.113.30/1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b",
+                    "resource": "https://203.0.113.30/mcp",
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let storage = GrantStorage {
+            encrypted: true,
+            stable_ids: true,
+        };
+        let check = |provider: &str, patterns: Vec<IssuerPattern>| {
+            let providers = providers.clone();
+            let surface = surface_binding(external(provider, Some("owner")), serde_json::json!([]), None);
+            async move {
+                let issuers = PermittedIssuers::new(None, Some(patterns));
+                check_external_consent_bindings(
+                    Some(&providers),
+                    &surface,
+                    storage,
+                    &std::collections::HashMap::new(),
+                    issuers.rules(),
+                    None,
+                )
+                .await
+            }
+        };
+        let tenant_pattern = || {
+            vec![IssuerPattern {
+                issuer: "https://203.0.113.30/{tenant}".into(),
+                tenant: IssuerTenant::Uuid,
+                endpoint_origins: Vec::new(),
+                resource_origins: Vec::new(),
+            }]
+        };
+        assert!(
+            check("external-tenant", tenant_pattern())
+                .await
+                .is_ok()
+        );
+        for (provider, patterns) in [("external-a", tenant_pattern()), ("external-tenant", Vec::new())] {
+            match check(provider, patterns).await {
+                Err(SurfaceApiError::BadRequest(message)) => assert!(
+                    message.contains(
+                        "issuer is not permitted by the gateway's external_consent_issuers or \
+                         external_consent_issuer_patterns"
+                    ),
+                    "{provider}: {message}"
+                ),
+                other => panic!("{provider}: expected a 400, got {other:?}"),
+            }
         }
     }
 
@@ -3831,7 +5981,8 @@ mod tests {
                 stable_ids: true,
             },
             &std::collections::HashMap::new(),
-            Some(&std::collections::HashMap::new()),
+            crate::credential_providers::external::IssuerRules::new(Some(&std::collections::HashMap::new()), None),
+            None,
         )
         .await;
         match unlisted {

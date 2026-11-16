@@ -64,7 +64,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ###############################################################################
 FROM base AS chef
 WORKDIR /app
-RUN cargo install cargo-chef
+RUN cargo install cargo-chef --locked --version 0.1.78
 
 ###############################################################################
 # code — source tree (test targets stripped for binary-only builds)
@@ -146,15 +146,30 @@ RUN ./build.sh
 ###############################################################################
 # runtime — final image: binary + dashboard, running as a non-root user
 ###############################################################################
-FROM base AS runtime
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime
 
-# Drop git, patch remaining packages, and install the runtime CLIs the bootstrap
-# and backup sidecars need (S3 config fetch, backup restore). Baked in at build
+# Only the shared libraries the binary links against, the xmlsec1 CLI used for
+# SAML signature verification, and the CLIs the bootstrap and backup sidecars
+# need (S3 config fetch, backup restore). No compilers or -dev packages: the
+# image is built from a slim base, not the Rust build stage. Patched at build
 # time instead of installed at container startup.
 RUN apt-get update \
     && apt-get -y upgrade \
-    && apt-get -y remove git git-man \
-    && apt-get install -y --no-install-recommends curl awscli unzip tar \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libdbus-1-3 \
+        libssl3 \
+        libsasl2-2 \
+        libsasl2-modules \
+        libcurl4 \
+        libxml2 \
+        libxmlsec1 \
+        libxmlsec1-openssl \
+        xmlsec1 \
+        curl \
+        awscli \
+        unzip \
+        tar \
     && apt-get -y autoclean && apt-get -y clean \
     && rm -rf /var/lib/apt/lists/*
 

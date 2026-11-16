@@ -5,6 +5,7 @@ import {
   Authority,
   CliLoginRequest,
   CreateAccessTokenRequest,
+  CredentialRotation,
   DashboardStats,
   GatewayInfo,
   Issuer,
@@ -34,6 +35,16 @@ import type { GatewayListItem } from './utils/gateways';
 const API_BASE = '/api/v1';
 const ADMIN_API_BASE = '/api/admin';
 
+/** The most rotations the gateway returns per page. */
+const IDENTITY_ROTATIONS_PAGE = 1000;
+
+/** Rotations at history indices `[start, start + rotations.length)` of `total`, oldest first. */
+interface IdentityRotationsPage {
+  rotations: CredentialRotation[];
+  total: number;
+  start: number;
+}
+
 /**
  * A request the server answered with an error status. The message is the
  * formatted error text, as before; `status` lets a caller tell, say, a 403
@@ -44,7 +55,9 @@ export class ApiError extends Error {
   constructor(
     message: string,
     public readonly status: number,
-    public readonly code?: string
+    public readonly code?: string,
+    /** The raw response body, for a caller that reads more than the message from it. */
+    public readonly body?: string | null
   ) {
     super(message);
   }
@@ -165,13 +178,19 @@ class APIClient {
     url: string,
     options?: RequestInit & { timeout?: number; onResponse?: (response: Response) => void }
   ): Promise<T> {
-    const { onResponse, ...fetchOptions } = options ?? {};
+    const { onResponse, signal: callerSignal, ...fetchOptions } = options ?? {};
 
     // Setup timeout using AbortController
     const controller = new AbortController();
     const timeoutId = options?.timeout
       ? setTimeout(() => controller.abort(), options.timeout)
       : null;
+    const abortWithCaller = () => controller.abort();
+    if (callerSignal?.aborted) {
+      controller.abort();
+    } else {
+      callerSignal?.addEventListener('abort', abortWithCaller, { once: true });
+    }
 
     try {
       const response = await fetch(url, {
@@ -206,7 +225,8 @@ class APIClient {
         throw new ApiError(
           formatApiError(response.status, errorBody, response.statusText),
           response.status,
-          extractErrorCode(errorBody)
+          extractErrorCode(errorBody),
+          errorBody
         );
       }
 
@@ -218,7 +238,7 @@ class APIClient {
       const data = await response.json();
       return data;
     } catch (error: any) {
-      if (error.name === 'AbortError') {
+      if (error.name === 'AbortError' && !callerSignal?.aborted) {
         throw new Error('Request timeout - the webhook endpoint did not respond within 30 seconds');
       }
       throw error;
@@ -226,6 +246,7 @@ class APIClient {
       if (timeoutId) {
         clearTimeout(timeoutId);
       }
+      callerSignal?.removeEventListener('abort', abortWithCaller);
     }
   }
 
@@ -1059,9 +1080,28 @@ class APIClient {
     return response.data;
   }
 
-  async getIdentityVersionHistory(id: string): Promise<any> {
-    const response = await this.get<any>(`/identities/${encodeURIComponent(id)}/history`);
-    return response.data;
+  /**
+   * Every credential rotation of the identity, oldest first. The backend answers the newest
+   * page first; older pages are fetched with `before` until the first rotation is reached.
+   * Aborting `signal` stops the paging and rejects with an `AbortError`.
+   */
+  async getIdentityRotations(
+    identityHash: string,
+    signal?: AbortSignal
+  ): Promise<CredentialRotation[]> {
+    const base = `/identities/by-hash/${encodeURIComponent(identityHash)}/rotations?limit=${IDENTITY_ROTATIONS_PAGE}`;
+    let page = await this.request<IdentityRotationsPage>(base, { signal });
+    const rotations = [...(page.rotations ?? [])];
+    while (page.start > 0) {
+      const before = page.start;
+      page = await this.request<IdentityRotationsPage>(`${base}&before=${before}`, { signal });
+      // A page that does not move back would loop forever.
+      if (!(page.start < before)) {
+        throw new Error('The gateway returned an inconsistent rotation history.');
+      }
+      rotations.unshift(...(page.rotations ?? []));
+    }
+    return rotations;
   }
 
   async rotateIdentityKeys(id: string, params?: { pre_rotation_seconds?: number }): Promise<any> {
@@ -1195,6 +1235,8 @@ export interface ApiKeyRecord {
   issuer: { actor: string; method: string };
   rotated_from?: string;
   needs_rotation?: boolean;
+  /** True when the surface the key belongs to was deleted. */
+  surface_deleted?: boolean;
 }
 
 export interface ApiKeyCreated {
@@ -1333,7 +1375,7 @@ export interface CallerAuthentication {
   methods: unknown[];
   /** `null` on a PUT removes the stored setting; leaving it out keeps it. */
   protected_resource?: ProtectedResourceConfig | null;
-  /** `reject` refuses a missing or invalid credential with 401; `continue` forwards it to policy as `failed`. */
+  /** `reject` refuses a missing or invalid credential with 401; `continue` forwards it to policy as `failed` on a public Access Point only. */
   on_failure?: 'reject' | 'continue';
 }
 
@@ -1354,6 +1396,7 @@ export interface AgentSurface {
   };
   mcp_legacy_metadata_output?: 'compatibility' | 'canonical';
   mcp_http?: McpHttpConfig;
+  browser_origins?: string[];
   tags: string[];
   access_point: {
     name?: string;
@@ -1444,6 +1487,18 @@ export interface AgentSurface {
    * callers get 503 until one is added or Public access is turned on.
    */
   access_point_status?: AccessPointStatus;
+  /**
+   * Read-only, set by the gateway on surface responses: the status of each API
+   * key the surface names, and whether it stops the surface serving. Absent when
+   * the surface names none.
+   */
+  api_key_references?: ApiKeyReference[];
+  /**
+   * Read-only, present only beside `api_key_references`: whether this gateway
+   * last judged the surface's API keys fit to serve (`not_judged` before any
+   * request). It gives no reason.
+   */
+  serving_status?: SurfaceServingStatus;
 
   /** Non-blocking notes returned by a save; never sent back. */
   warnings?: SurfaceSaveWarning[];
@@ -1455,6 +1510,17 @@ export interface SurfaceSaveWarning {
 }
 
 export type AccessPointStatus = 'ready' | 'not_ready';
+
+export type ApiKeyReferenceStatus = 'active' | 'revoked' | 'missing' | 'unavailable' | 'unknown';
+
+export interface ApiKeyReference {
+  key_id: string;
+  status: ApiKeyReferenceStatus;
+  /** True when this reference stops the surface serving: the Builder blocks Save on it. */
+  blocking: boolean;
+}
+
+export type SurfaceServingStatus = 'serving' | 'not_serving' | 'not_judged';
 
 /**
  * A single surface variant. `overrides` is a partial surface delta
@@ -1620,14 +1686,17 @@ function withoutServerWrittenCanvases<S extends Partial<AgentSurface>>(surface: 
 
 /**
  * Drops fields the server writes and refuses on input: save `warnings`, the derived
- * `access_point_status`, `transit_point_source_auth` and `manifest_snapshot`, from the
- * policies and from the canvas blobs.
+ * `access_point_status`, `api_key_references`, `serving_status` and
+ * `transit_point_source_auth`, and `manifest_snapshot`, from the policies and from the
+ * canvas blobs.
  */
 export function stripServerWrittenFields(surface: Partial<AgentSurface>): Partial<AgentSurface> {
   if (!surface || typeof surface !== 'object') return surface;
   const {
     warnings: _warnings,
     access_point_status: _status,
+    api_key_references: _keyReferences,
+    serving_status: _servingStatus,
     ...rest
   } = withoutDerivedMarks(surface);
   const out: Partial<AgentSurface> = withoutServerWrittenCanvases(rest);

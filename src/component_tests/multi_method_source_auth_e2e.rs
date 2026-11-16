@@ -10,7 +10,6 @@ use serde_json::json;
 
 const API_KEY_SECRET_ID: &str = "multi-method-source-key";
 const API_KEY: &str = "partner-key";
-const DENY_FAILED_POLICY_ID: &str = "deny-failed-source-auth";
 const API_KEY_ONLY_POLICY_ID: &str = "allow-api-key-callers";
 
 fn write_policy(
@@ -40,12 +39,6 @@ fn write_policy(
 fn write_policies(temp_dir: &std::path::Path) {
     write_policy(
         temp_dir,
-        DENY_FAILED_POLICY_ID,
-        "Refuses callers whose source authentication failed",
-        "package surface.policy\n\ndefault allow := false\n\nallow if not deny\n\ndeny if input.source_auth.method == \"failed\"\n",
-    );
-    write_policy(
-        temp_dir,
         API_KEY_ONLY_POLICY_ID,
         "Admits only callers an API key method verified",
         "package surface.policy\n\ndefault allow := false\n\nallow if input.source_auth.method == \"api_key\"\n",
@@ -72,11 +65,15 @@ fn api_key_method() -> serde_json::Value {
     })
 }
 
+/// A gateway serving one surface with `methods` on a closed Access Point, which
+/// refuses a caller whose credential fails, or that is ambiguous, with `401`,
+/// or on a public one when `public`, which hands such a caller to `policy`.
 async fn start_gateway(
     fixture: &JwksFixture,
     target: &RecordingTarget,
     methods: impl Fn(&str) -> serde_json::Value,
     policy: Option<&'static str>,
+    public: bool,
 ) -> GatewayHarness {
     let target_url = target.url.clone();
     GatewayHarness::start(move |temp_dir, gw_config, bootstrap| {
@@ -90,6 +87,7 @@ async fn start_gateway(
         );
         write_policies(temp_dir);
         let mut surface = helpers::build_minimal_channel();
+        surface.access_point.public = Some(public);
         surface
             .access_point
             .caller_authentication =
@@ -144,23 +142,24 @@ async fn each_caller_authenticates_with_the_method_its_credential_belongs_to() {
         &fixture,
         &target,
         |strategy_id| json!([jwt_method(strategy_id, false), api_key_method()]),
-        Some(DENY_FAILED_POLICY_ID),
+        None,
+        false,
     )
     .await;
     let jwt = format!("Bearer {}", valid_jwt(&fixture.issuer));
 
     assert_eq!(send(&h, &[("authorization", jwt.clone())]).await, 200, "a JWT caller is authenticated");
     assert_eq!(send(&h, &[("x-api-key", API_KEY.to_string())]).await, 200, "an API-key caller is authenticated");
-    assert_eq!(send(&h, &[]).await, 403, "a caller with no credential fails source auth");
-    assert_eq!(send(&h, &[("x-api-key", "wrong".to_string())]).await, 403, "a wrong API key fails source auth");
+    assert_eq!(send(&h, &[]).await, 401, "a caller with no credential fails source auth");
+    assert_eq!(send(&h, &[("x-api-key", "wrong".to_string())]).await, 401, "a wrong API key fails source auth");
     assert_eq!(
         send(&h, &[("authorization", "Bearer not-a-jwt".to_string()), ("x-api-key", API_KEY.to_string())]).await,
-        403,
+        401,
         "a valid API key does not rescue a request whose JWT fails"
     );
     assert_eq!(
         send(&h, &[("authorization", jwt), ("x-api-key", API_KEY.to_string())]).await,
-        403,
+        401,
         "a caller presenting two valid credentials fails, so it can't choose the identity"
     );
     assert_eq!(
@@ -181,49 +180,71 @@ async fn each_caller_authenticates_with_the_method_its_credential_belongs_to() {
 async fn a_forwarded_jwt_reaches_the_target_only_when_the_jwt_method_verified_the_request() {
     let fixture = JwksFixture::start().await;
     let target = RecordingTarget::start(StatusCode::OK, &[]).await;
-    let h =
-        start_gateway(&fixture, &target, |strategy_id| json!([api_key_method(), jwt_method(strategy_id, true)]), None)
-            .await;
+    let h = start_gateway(
+        &fixture,
+        &target,
+        |strategy_id| json!([api_key_method(), jwt_method(strategy_id, true)]),
+        None,
+        false,
+    )
+    .await;
     let jwt = format!("Bearer {}", valid_jwt(&fixture.issuer));
 
     assert_eq!(send(&h, &[("authorization", jwt.clone())]).await, 200);
-    assert_eq!(send(&h, &[("authorization", jwt.clone()), ("x-api-key", API_KEY.to_string())]).await, 200);
+    assert_eq!(
+        send(&h, &[("authorization", jwt.clone()), ("x-api-key", API_KEY.to_string())]).await,
+        401,
+        "a request carrying two credentials is verified by neither method and is refused"
+    );
 
     let received = target.received();
-    assert_eq!(received.len(), 2);
+    assert_eq!(received.len(), 1);
     assert_eq!(received[0]["authorization"], jwt.as_str(), "the selected JWT method forwards its token");
-    assert!(
-        !received[1].contains_key("authorization"),
-        "a request carrying two credentials is verified by neither method, so the JWT stays at the gateway: {:?}",
-        received[1]
-    );
-    assert!(!received[1].contains_key("x-api-key"), "{:?}", received[1]);
 }
 
 /// With the forwarding JWT method primary, a request carrying a JWT and an API
-/// key selects that method but is ambiguous, so its JWT, verified by no method,
-/// stays at the gateway; a JWT alone is still forwarded.
+/// key selects that method but is ambiguous, so it is refused and its JWT never
+/// reaches the target; a JWT alone is still forwarded. A public Access Point
+/// forwards the ambiguous request without either credential.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_ambiguous_request_forwards_no_jwt_even_when_the_forwarding_method_is_primary() {
+async fn an_ambiguous_request_is_refused_even_when_the_forwarding_method_is_primary() {
     let fixture = JwksFixture::start().await;
     let target = RecordingTarget::start(StatusCode::OK, &[]).await;
-    let h =
-        start_gateway(&fixture, &target, |strategy_id| json!([jwt_method(strategy_id, true), api_key_method()]), None)
-            .await;
+    let h = start_gateway(
+        &fixture,
+        &target,
+        |strategy_id| json!([jwt_method(strategy_id, true), api_key_method()]),
+        None,
+        false,
+    )
+    .await;
     let jwt = format!("Bearer {}", valid_jwt(&fixture.issuer));
 
     assert_eq!(send(&h, &[("authorization", jwt.clone())]).await, 200);
-    assert_eq!(send(&h, &[("authorization", jwt.clone()), ("x-api-key", API_KEY.to_string())]).await, 200);
+    assert_eq!(send(&h, &[("authorization", jwt.clone()), ("x-api-key", API_KEY.to_string())]).await, 401);
 
     let received = target.received();
-    assert_eq!(received.len(), 2);
+    assert_eq!(received.len(), 1, "the ambiguous request never reaches the target");
     assert_eq!(received[0]["authorization"], jwt.as_str(), "the verified JWT is forwarded");
+
+    let public_target = RecordingTarget::start(StatusCode::OK, &[]).await;
+    let public = start_gateway(
+        &fixture,
+        &public_target,
+        |strategy_id| json!([jwt_method(strategy_id, true), api_key_method()]),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(send(&public, &[("authorization", jwt), ("x-api-key", API_KEY.to_string())]).await, 200);
+    let received = public_target.received();
+    assert_eq!(received.len(), 1, "a public Access Point forwards the ambiguous request");
     assert!(
-        !received[1].contains_key("authorization"),
-        "an ambiguous request's JWT is verified by no method and stays at the gateway: {:?}",
-        received[1].keys()
+        !received[0].contains_key("authorization"),
+        "its JWT, verified by no method, stays at the gateway: {:?}",
+        received[0].keys()
     );
-    assert!(!received[1].contains_key("x-api-key"), "{:?}", received[1].keys());
+    assert!(!received[0].contains_key("x-api-key"), "{:?}", received[0].keys());
 }
 
 /// Policy sees the method that verified each caller: on one two-method
@@ -238,6 +259,7 @@ async fn policy_sees_the_method_that_verified_the_caller() {
         &target,
         |strategy_id| json!([jwt_method(strategy_id, false), api_key_method()]),
         Some(API_KEY_ONLY_POLICY_ID),
+        false,
     )
     .await;
     let jwt = format!("Bearer {}", valid_jwt(&fixture.issuer));

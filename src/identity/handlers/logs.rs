@@ -8,7 +8,9 @@ use axum::{
 use serde::Serialize;
 use tracing::{error, info, warn};
 
+use crate::delegation_vault::read_scope::VaultReader;
 use crate::identity::state::IdentityApiState;
+use crate::observability::loggable;
 
 /// Result of truncating old log files
 #[derive(Debug, Serialize)]
@@ -120,13 +122,34 @@ fn truncate_old_log_files(log_dir: &str) -> anyhow::Result<TruncateLogsResult> {
 ///
 /// For large log files (multi-GB), this streams the content directly from disk
 /// without loading it entirely into memory.
-pub async fn download_logs(State(state): State<IdentityApiState>) -> Response {
-    let log_dir = match &state
-        .bootstrap_config
-        .logging
-        .log_directory
-    {
-        Some(dir) => dir.clone(),
+pub async fn download_logs(
+    State(state): State<IdentityApiState>,
+    reader: VaultReader,
+) -> Response {
+    log_archive(
+        state
+            .bootstrap_config
+            .logging
+            .log_directory
+            .clone(),
+        &reader,
+    )
+    .await
+}
+
+/// The server logs in `log_dir`, as a ZIP archive for `reader`. They hold
+/// every tenant's request and delegation detail, so only an appliance-wide
+/// caller downloads them; any other gets a bare 403, as from the middleware.
+async fn log_archive(
+    log_dir: Option<String>,
+    reader: &VaultReader,
+) -> Response {
+    if !reader.is_appliance_wide() {
+        warn!("Log download refused: only an appliance-wide caller downloads the server logs");
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let log_dir = match log_dir {
+        Some(dir) => dir,
         None => {
             return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "No log directory configured"})))
                 .into_response();
@@ -147,15 +170,12 @@ pub async fn download_logs(State(state): State<IdentityApiState>) -> Response {
             (StatusCode::OK, headers, Body::from(zip_bytes)).into_response()
         }
         Ok(Err(e)) => {
-            error!("Failed to build log archive: {:#}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to download logs: {}", e)})),
-            )
+            error!(error = %loggable::untrusted(&format!("{e:#}")), "Failed to build log archive");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to download logs"})))
                 .into_response()
         }
         Err(e) => {
-            error!("Log download task panicked: {:#}", e);
+            error!(error = %loggable::untrusted(&e.to_string()), "Log download task panicked");
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Log download task failed"})))
                 .into_response()
         }
@@ -232,4 +252,80 @@ fn build_log_zip_streamed(log_dir: &str) -> anyhow::Result<Vec<u8>> {
 
     let cursor = zip.finish()?;
     Ok(cursor.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::delegation_vault::test_support::{delegation, pattern, reader, tenant};
+
+    async fn body_of(response: Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    /// The logs hold every tenant's request and delegation detail, so a
+    /// resource-scoped token gets a bare 403 and only a session or an
+    /// appliance-wide token downloads them.
+    #[tokio::test]
+    async fn only_an_appliance_wide_caller_downloads_the_server_logs() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory
+                .path()
+                .join("agent-gateway.log"),
+            "a log line\n",
+        )
+        .unwrap();
+        let log_dir = Some(
+            directory
+                .path()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        for (caller, scoped) in [
+            ("a tenant token", reader(Some(tenant("tenant-a")), Some(pattern("tenant-a")), Some(delegation(true)))),
+            ("a token scoped by a resource pattern", reader(None, Some(pattern("tenant-a")), Some(delegation(true)))),
+            ("a token scoped by required headers alone", reader(None, None, Some(delegation(true)))),
+        ] {
+            let response = log_archive(log_dir.clone(), &scoped).await;
+            let status = response.status();
+            assert_eq!((status, body_of(response).await), (StatusCode::FORBIDDEN, Vec::new()), "{caller}");
+        }
+        for (caller, appliance_wide) in [
+            ("a session", reader(None, None, None)),
+            ("an appliance-wide token", reader(None, None, Some(delegation(false)))),
+        ] {
+            let response = log_archive(log_dir.clone(), &appliance_wide).await;
+            assert_eq!(response.status(), StatusCode::OK, "{caller}");
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/zip", "{caller}");
+            assert!(
+                body_of(response)
+                    .await
+                    .starts_with(b"PK"),
+                "{caller}: not a ZIP archive"
+            );
+        }
+    }
+
+    /// A failed download answers a fixed body; the error, which names the log
+    /// directory, goes to the log only.
+    #[tokio::test]
+    async fn a_failed_log_download_answers_without_its_detail() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory
+            .path()
+            .join("no-such-logs")
+            .to_string_lossy()
+            .into_owned();
+        let response = log_archive(Some(missing), &reader(None, None, None)).await;
+        let status = response.status();
+        let body = String::from_utf8(body_of(response).await).unwrap();
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"Failed to download logs"}"#)
+        );
+    }
 }

@@ -35,12 +35,10 @@ impl IntegrationPublisher for StreamPublisher {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing topic in stream configuration"))?;
 
-        // Validate platform is supported
         STREAM_PUBLISHER_REGISTRY
             .get(platform)
-            .ok_or_else(|| anyhow::anyhow!("Unsupported streaming platform: {}", platform))?;
-
-        Ok(())
+            .ok_or_else(|| anyhow::anyhow!("Unsupported streaming platform: {}", platform))?
+            .validate_config(config)
     }
 
     fn complete_template(

@@ -1,0 +1,18 @@
+branch: feat/surface-browser-origins
+changes:
+  added:
+    - timestamp: '2026-11-12T09:00:00Z'
+      title: Let a surface allow browser pages from its own origins
+      description: >-
+        A surface can list up to 20 exact https origins in browser_origins. A cross-origin
+        request, preflight included, to a path of that surface is then allowed from those
+        origins as well as from network.cors, so a page a surface owner hosts on their own
+        domain can call the surface with no gateway.json edit and no restart. An origin
+        listed on one surface gets nothing on another, credentials are never allowed
+        cross-origin, and a saved change applies from the next request. Origins are
+        validated and stored in normalised form when the surface is saved.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

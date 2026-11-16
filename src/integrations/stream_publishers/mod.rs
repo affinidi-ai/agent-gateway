@@ -19,6 +19,14 @@ pub use redis_streams::RedisPublisher;
 /// Trait for stream publishing implementations
 #[async_trait]
 pub trait StreamPublisher: Send + Sync {
+    /// Checks the platform's connection settings in an endpoint's configuration.
+    fn validate_config(
+        &self,
+        _config: &Value,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Publish an event to the stream for `integration_id`, through the endpoint `endpoint_id`,
     /// which owns any connection kept between events.
     async fn publish(

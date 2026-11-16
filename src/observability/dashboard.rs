@@ -12,7 +12,7 @@ use crate::auth_manager::middleware::{AuthGuardOk, RbacGuard, caller_allows};
 use crate::auth_manager::pat::PatContext;
 use crate::identity::IdentityStore;
 use crate::identity::display_name::{ManagedDisplayName, managed_surfaces_by_did, resolve_managed_display_name};
-use crate::identity::filesystem::IdentityOrigin;
+use crate::identity::filesystem::{CredentialRotation, IdentityOrigin, ManagedSlot};
 use crate::identity::target_card_names::{CardLocation, TargetCardNameService};
 use crate::integrations::filesystem::NotificationStore;
 use crate::mcp_proxies::filesystem::McpProxyStore;
@@ -31,6 +31,67 @@ static PROXY_START_TIME: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::
 
 pub fn init_start_time() {
     PROXY_START_TIME.get_or_init(SystemTime::now);
+}
+
+type ChangedAt = std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, DateTime<Utc>>>>;
+
+/// How long a surface delete or API key withdrawal is kept for dashboard deltas; a delta whose
+/// `since` is older re-sends every identity ([`identities_changed_since`]).
+const WITHDRAWN_MEMORY: chrono::TimeDelta = chrono::TimeDelta::hours(24);
+
+/// Notes `id` as changed now in `changes`, forgetting what changed longer than
+/// [`WITHDRAWN_MEMORY`] ago.
+fn record_changed(
+    changes: &ChangedAt,
+    id: &str,
+) {
+    if let Ok(mut changes) = changes.lock() {
+        let now = Utc::now();
+        changes.retain(|_, at| now - *at < WITHDRAWN_MEMORY);
+        changes.insert(id.to_string(), now);
+    }
+}
+
+static DELETED_SURFACES: ChangedAt = std::sync::LazyLock::new(Default::default);
+
+/// Notes that this node deleted `surface_id`, so the next dashboard delta re-sends the
+/// identities linked to it.
+pub(crate) fn record_surface_deleted(surface_id: &str) {
+    record_changed(&DELETED_SURFACES, surface_id);
+}
+
+static WITHDRAWN_API_KEYS: ChangedAt = std::sync::LazyLock::new(Default::default);
+
+/// Notes that this node revoked or deleted the API key `key_id`, so the next dashboard delta
+/// re-sends the identities whose DID comes from it.
+pub(crate) fn record_api_key_withdrawn(key_id: &str) {
+    record_changed(&WITHDRAWN_API_KEYS, key_id);
+}
+
+fn api_keys_withdrawn_since(since: DateTime<Utc>) -> std::collections::HashSet<String> {
+    WITHDRAWN_API_KEYS
+        .lock()
+        .map(|revoked| {
+            revoked
+                .iter()
+                .filter(|(_, at)| **at > since)
+                .map(|(id, _)| id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn surfaces_deleted_since(since: DateTime<Utc>) -> std::collections::HashSet<String> {
+    DELETED_SURFACES
+        .lock()
+        .map(|deleted| {
+            deleted
+                .iter()
+                .filter(|(_, at)| **at > since)
+                .map(|(id, _)| id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Clone)]
@@ -309,6 +370,13 @@ pub struct IdentityInfo {
     pub surface_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface_name: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    /// Every surface this identity is linked to was deleted.
+    pub surface_deleted: bool,
+    /// Every surface this identity is linked to was deleted, or the API key its DID comes from
+    /// is revoked or deleted.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub revoked: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_principal: Option<CredentialPrincipal>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -319,6 +387,11 @@ pub struct IdentityInfo {
     /// `trust_recorder` shows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_recorder_surface: Option<ManagedSurfaceInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<ManagedSlot>,
+    /// Number of credential rotations, listed by `GET /v1/identities/by-hash/{identity_hash}/rotations`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rotation_count: usize,
 }
 
 /// A live surface where a DID is the managed agent.
@@ -330,6 +403,10 @@ pub struct ManagedSurfaceInfo {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2025,8 +2102,28 @@ fn format_uptime(seconds: u64) -> String {
     }
 }
 
-/// Identities created, last used, whose caller or target Agent Card name changed, or whose
-/// Trust Recorder status changed after `since`.
+fn linked_surface_deleted(
+    identity: &IdentityInfo,
+    deleted_surfaces: &std::collections::HashSet<String>,
+) -> bool {
+    identity
+        .channel_config_id
+        .as_deref()
+        .into_iter()
+        .chain(
+            identity
+                .channel_usage
+                .iter()
+                .filter_map(|usage| usage["channel_config_id"].as_str()),
+        )
+        .any(|id| deleted_surfaces.contains(id))
+}
+
+/// Identities created, last used, whose caller or target Agent Card name changed, whose
+/// Trust Recorder status changed, whose last linked surface this node deleted, or
+/// revoked when this node revoked or deleted their API key, after `since`; every identity when
+/// `since` is older than [`WITHDRAWN_MEMORY`], as the deletes and withdrawals before it are
+/// forgotten.
 /// Newly issued identities have `last_used_at = None` until the first usage
 /// event, so falling back to `created_at` surfaces them on the very first
 /// request that creates them.
@@ -2037,6 +2134,11 @@ pub(crate) fn identities_changed_since(
     renamed_surfaces: &std::collections::HashSet<String>,
     recorder_changed_dids: &std::collections::HashSet<String>,
 ) -> Vec<IdentityInfo> {
+    if Utc::now() - since >= WITHDRAWN_MEMORY {
+        return identities;
+    }
+    let deleted_surfaces = &surfaces_deleted_since(since);
+    let withdrawn_api_keys = &api_keys_withdrawn_since(since);
     identities
         .into_iter()
         .filter(|id| {
@@ -2050,12 +2152,105 @@ pub(crate) fn identities_changed_since(
                     .surface_id
                     .as_ref()
                     .is_some_and(|surface_id| renamed_surfaces.contains(surface_id))
+                || (id.surface_deleted && linked_surface_deleted(id, deleted_surfaces))
+                || (id.revoked && api_key_id_of(id).is_some_and(|key_id| withdrawn_api_keys.contains(key_id)))
                 || DateTime::parse_from_rfc3339(ts)
                     .ok()
                     .map(|dt| dt.with_timezone(&Utc) > since)
                     .unwrap_or(false)
         })
         .collect()
+}
+
+/// The API key an identity's DID comes from, as its credential principal names it.
+fn api_key_id_of(identity: &IdentityInfo) -> Option<&str> {
+    let field = |key: &str| {
+        identity
+            .agent_identity
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    field("certificate_id")
+        .is_none()
+        .then(|| field("api_key_id"))
+        .flatten()
+}
+
+/// Marks revoked every identity whose every linked surface was deleted, or whose DID comes from
+/// an API key that `keys` lists as revoked or whose `atgk_` key id no key has, as a deleted key
+/// is. An API key marks none when `keys` is `None`.
+fn mark_revoked_identities(
+    identities: &mut [IdentityInfo],
+    keys: Option<&crate::identity::handlers::surface_tenancy::KeyListing>,
+) {
+    for identity in identities {
+        identity.revoked = identity.surface_deleted
+            || keys.is_some_and(|keys| {
+                api_key_id_of(identity).is_some_and(|key_id| {
+                    keys.is_revoked(key_id)
+                        || (key_id.starts_with(crate::api_keys::KEY_ID_PREFIX)
+                            && keys.status_of(key_id) == crate::identity::handlers::surface_tenancy::KeyStatus::Absent)
+                })
+            });
+    }
+}
+
+/// Every API key, read only when an identity's DID comes from an API key. `None` when the store
+/// is not set or any key folder cannot be read, so a store outage never reads as a deleted key.
+async fn identity_api_keys(
+    identities: &[IdentityInfo]
+) -> Option<crate::identity::handlers::surface_tenancy::KeyListing> {
+    if !identities
+        .iter()
+        .any(|identity| api_key_id_of(identity).is_some())
+    {
+        return None;
+    }
+    let store = crate::identity::provider_key_gate::gate().api_key_store()?;
+    match crate::identity::handlers::surface_tenancy::provider_key_listing_in(store.as_ref()).await {
+        Ok(listing) if listing.is_complete() => Some(listing),
+        Ok(listing) => {
+            tracing::warn!(skipped = ?listing.skipped(), "Some API key folders could not be loaded for the identity list");
+            None
+        }
+        Err(error) => {
+            tracing::warn!("Failed to list API keys for the identity list: {error:?}");
+            None
+        }
+    }
+}
+
+/// Whether an identity is linked to at least one surface and none of its linked surfaces
+/// exists. None counts as deleted when the surfaces could not be listed, so a failed
+/// listing never reads as a deletion.
+fn every_linked_surface_deleted<'a>(
+    surfaces_listed: bool,
+    linked_surface_ids: impl Iterator<Item = &'a str>,
+    surface_exists: impl Fn(&str) -> bool,
+) -> bool {
+    let mut linked = linked_surface_ids.peekable();
+    surfaces_listed && linked.peek().is_some() && linked.all(|id| !surface_exists(id))
+}
+
+/// The live surface an identity most recently used, ties broken by surface id, shown in place of
+/// a deleted primary surface.
+fn live_usage_surface(
+    usage: &[crate::identity::filesystem::ChannelUsage],
+    surface_exists: impl Fn(&str) -> bool,
+) -> Option<String> {
+    usage
+        .iter()
+        .filter(|cu| surface_exists(&cu.channel_config_id))
+        .max_by(|a, b| {
+            a.last_used_at
+                .cmp(&b.last_used_at)
+                .then_with(|| {
+                    b.channel_config_id
+                        .cmp(&a.channel_config_id)
+                })
+        })
+        .map(|cu| cu.channel_config_id.clone())
 }
 
 async fn build_identity_list(
@@ -2093,11 +2288,15 @@ pub(crate) async fn build_identity_list_with(
 
     // Includes both config surfaces and stored agent surfaces so identities
     // bound to a surface display the surface name instead of an empty cell.
-    let stored_surfaces = match agent_surface_store {
-        Some(store) => crate::surfaces::AgentSurfaceStore::list_all(store.as_ref())
-            .await
-            .unwrap_or_default(),
-        None => vec![],
+    let (stored_surfaces, surfaces_listed) = match agent_surface_store {
+        Some(store) => match crate::surfaces::AgentSurfaceStore::list_all(store.as_ref()).await {
+            Ok(surfaces) => (surfaces, true),
+            Err(e) => {
+                tracing::warn!("Failed to list agent surfaces for the identity list: {}", e);
+                (vec![], false)
+            }
+        },
+        None => (vec![], true),
     };
     let mut surfaces_by_id: std::collections::HashMap<&str, &crate::config::agent_surface::AgentSurface> =
         config_surfaces
@@ -2151,10 +2350,29 @@ pub(crate) async fn build_identity_list_with(
                 .map(|(count, chan)| (*count as u64, chan.clone()))
                 .unwrap_or((r.usage_count, None));
 
-            let channel_config_id = r
+            let primary_channel_id = r
                 .channel_config_id
                 .clone()
                 .or(metrics_channel_id);
+            let surface_exists = |id: &str| surfaces_by_id.contains_key(id);
+            let surface_deleted = every_linked_surface_deleted(
+                surfaces_listed,
+                primary_channel_id
+                    .as_deref()
+                    .into_iter()
+                    .chain(
+                        r.channel_usage
+                            .iter()
+                            .map(|cu| cu.channel_config_id.as_str()),
+                    ),
+                surface_exists,
+            );
+            let channel_config_id = match primary_channel_id {
+                Some(id) if surfaces_listed && !surface_exists(&id) => {
+                    live_usage_surface(&r.channel_usage, surface_exists).or(Some(id))
+                }
+                other => other,
+            };
             let surface = channel_config_id
                 .as_deref()
                 .and_then(|id| {
@@ -2207,7 +2425,13 @@ pub(crate) async fn build_identity_list_with(
                 origin,
                 card_name,
             );
-            let surface_id = managed_surface.map(|s| s.surface_id.clone());
+            let surface_id = managed_surface
+                .map(|s| s.surface_id.clone())
+                .or_else(|| {
+                    channel_config_id
+                        .clone()
+                        .filter(|_| is_managed && surface_deleted)
+                });
             let surface_name = managed_surface
                 .map(|s| s.name.trim().to_string())
                 .filter(|name| !name.is_empty());
@@ -2248,10 +2472,14 @@ pub(crate) async fn build_identity_list_with(
                 display_name_pending: naming.display_name_pending,
                 surface_id,
                 surface_name,
+                surface_deleted,
+                revoked: false,
                 credential_principal: principal,
                 managed_surfaces,
                 trust_recorder: None,
                 trust_recorder_surface: None,
+                slot: r.slot.clone(),
+                rotation_count: r.total_rotations(),
             }
         })
         .collect();
@@ -2271,6 +2499,8 @@ pub(crate) async fn build_identity_list_with(
             .take()
             .map(|p| principal_names.named(p));
     }
+    let keys = identity_api_keys(&identities).await;
+    mark_revoked_identities(&mut identities, keys.as_ref());
     if let Some(recorder_status) = recorder_status {
         for identity in &mut identities {
             let Some((status, surface)) = recorder_status_for(identity, &surfaces_by_id, recorder_status).await else {
@@ -2740,6 +2970,30 @@ fn strip_ansi_codes(s: &str) -> String {
 mod tests {
     use super::parse_plain_text_log_entry;
 
+    #[test]
+    fn a_recorded_change_forgets_changes_older_than_the_memory() {
+        static CHANGES: super::ChangedAt = std::sync::LazyLock::new(Default::default);
+        let now = chrono::Utc::now();
+        CHANGES
+            .lock()
+            .unwrap()
+            .extend([
+                ("stale".to_string(), now - super::WITHDRAWN_MEMORY - chrono::TimeDelta::minutes(1)),
+                ("recent".to_string(), now - chrono::TimeDelta::hours(1)),
+            ]);
+
+        super::record_changed(&CHANGES, "new");
+
+        let mut kept: Vec<_> = CHANGES
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["new", "recent"]);
+    }
+
     mod identity_naming {
         use std::collections::{HashMap, HashSet};
         use std::sync::Arc;
@@ -2754,7 +3008,7 @@ mod tests {
         };
         use crate::config::agent_surface::AgentSurface;
         use crate::identity::IdentityStore;
-        use crate::identity::filesystem::{AgentIdentityRecord, IdentityOrigin};
+        use crate::identity::filesystem::{AgentIdentityRecord, IdentityOrigin, ManagedSlot};
         use crate::identity::target_card_names::{NoTargetCards, TargetCardNameService};
         use crate::identity::test_helpers::{MockIdentityStore, test_surface_identity_record};
         use crate::metrics::MetricsStore;
@@ -2883,6 +3137,234 @@ mod tests {
                 row.get("name_conflict")
                     .is_none()
             );
+            assert!(
+                row.get("surface_deleted")
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_an_identity_whose_every_surface_is_deleted_is_marked_surface_deleted_and_keeps_the_surface_id() {
+            let rows = list(
+                vec![managed("did:example:oxygen", "oxygen"), caller(CALLER_DID)],
+                &[surface("nitrogen", "NITROGEN")],
+                &names(),
+            )
+            .await;
+
+            let managed_row = serde_json::to_value(&rows["did:example:oxygen"]).unwrap();
+            assert_eq!(managed_row["surface_deleted"], json!(true));
+            assert_eq!(managed_row["surface_id"], json!("oxygen"));
+            assert_eq!(managed_row["channel_config_id"], json!("oxygen"));
+            assert!(
+                managed_row
+                    .get("surface_name")
+                    .is_none()
+            );
+
+            let caller_row = serde_json::to_value(&rows[CALLER_DID]).unwrap();
+            assert_eq!(caller_row["surface_deleted"], json!(true));
+            assert_eq!(caller_row["channel_config_id"], json!("oxygen"));
+            assert!(
+                caller_row
+                    .get("surface_id")
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_an_identity_with_one_live_surface_left_is_not_marked_surface_deleted() {
+            let mut record = managed("did:example:oxygen", "oxygen");
+            record
+                .channel_usage
+                .push(crate::identity::filesystem::ChannelUsage {
+                    channel_config_id: "nitrogen".to_string(),
+                    usage_count: 1,
+                    last_used_at: Utc::now(),
+                    role: None,
+                });
+            let rows = list(vec![record], &[surface("nitrogen", "NITROGEN")], &names()).await;
+
+            let row = &rows["did:example:oxygen"];
+            assert!(!row.surface_deleted);
+            assert_eq!(row.surface_id.as_deref(), Some("nitrogen"));
+            assert_eq!(row.surface_name.as_deref(), Some("NITROGEN"));
+            assert_eq!(
+                row.channel_config_id
+                    .as_deref(),
+                Some("nitrogen")
+            );
+        }
+
+        #[test]
+        fn test_the_most_recently_used_live_surface_replaces_a_deleted_one() {
+            use crate::identity::filesystem::ChannelUsage;
+            let at = Utc::now();
+            let usage = |id: &str, minutes_ago: i64| ChannelUsage {
+                channel_config_id: id.to_string(),
+                usage_count: 1,
+                last_used_at: at - chrono::Duration::minutes(minutes_ago),
+                role: None,
+            };
+            let usages = [usage("gone", 0), usage("older", 10), usage("newer", 5), usage("tie-b", 5)];
+            let live = |id: &str| id != "gone";
+
+            assert_eq!(super::super::live_usage_surface(&usages, live).as_deref(), Some("newer"));
+            assert_eq!(super::super::live_usage_surface(&usages[..1], live), None);
+        }
+
+        #[tokio::test]
+        async fn test_an_identity_without_a_surface_link_is_not_marked_surface_deleted() {
+            let mut record = managed("did:example:oxygen", "oxygen");
+            record.channel_config_id = None;
+            record.channel_usage.clear();
+            let rows = list(vec![record], &[], &names()).await;
+
+            assert!(!rows["did:example:oxygen"].surface_deleted);
+        }
+
+        #[test]
+        fn test_a_failed_surface_listing_marks_no_surface_deleted() {
+            assert!(!super::super::every_linked_surface_deleted(false, ["oxygen"].into_iter(), |_| false));
+            assert!(super::super::every_linked_surface_deleted(true, ["oxygen"].into_iter(), |_| false));
+            assert!(!super::super::every_linked_surface_deleted(true, ["oxygen", "nitrogen"].into_iter(), |id| id
+                == "nitrogen"));
+            assert!(!super::super::every_linked_surface_deleted(true, std::iter::empty(), |_| false));
+        }
+
+        #[tokio::test]
+        async fn test_the_delta_resends_identities_whose_surface_this_node_deleted() {
+            let since = Utc::now();
+            let mut old = managed("did:example:argon", "argon-deleted-in-delta");
+            old.last_used_at = Some(since - chrono::Duration::hours(1));
+            let rows = || async {
+                list(vec![old.clone()], &[], &names())
+                    .await
+                    .into_values()
+                    .collect::<Vec<_>>()
+            };
+            let none = HashSet::new();
+            assert!(identities_changed_since(rows().await, since, &none, &none, &none).is_empty());
+
+            super::super::record_surface_deleted("argon-deleted-in-delta");
+            let delta = identities_changed_since(rows().await, since, &none, &none, &none);
+            assert_eq!(delta.len(), 1);
+            assert!(delta[0].surface_deleted);
+        }
+
+        #[tokio::test]
+        async fn test_a_delta_older_than_the_withdrawal_memory_resends_every_identity() {
+            let since = Utc::now() - super::super::WITHDRAWN_MEMORY - chrono::Duration::minutes(1);
+            let mut unchanged = managed("did:example:neon", "neon-unchanged");
+            unchanged.last_used_at = Some(since - chrono::Duration::hours(1));
+            let rows = list(vec![unchanged], &[], &names())
+                .await
+                .into_values()
+                .collect::<Vec<_>>();
+            let none = HashSet::new();
+
+            let delta = identities_changed_since(rows, since, &none, &none, &none);
+
+            assert_eq!(
+                delta
+                    .iter()
+                    .map(|identity| identity.did.as_str())
+                    .collect::<Vec<_>>(),
+                ["did:example:neon"]
+            );
+        }
+
+        #[tokio::test]
+        async fn test_an_identity_is_revoked_only_when_the_api_key_its_did_comes_from_is_revoked() {
+            let keyed = |did: &str, fields: &[(&str, &str)]| {
+                let mut record = managed(did, "oxygen");
+                for (key, value) in fields {
+                    record
+                        .identity_fields
+                        .insert(key.to_string(), json!(value));
+                }
+                record
+            };
+            let records = vec![
+                keyed("did:example:revoked", &[("api_key_id", "atgk_revoked")]),
+                keyed("did:example:deleted", &[("api_key_id", "atgk_deleted")]),
+                keyed("did:example:active", &[("api_key_id", "atgk_active")]),
+                keyed("did:example:secret", &[("api_key_id", "plain-secret")]),
+                keyed("did:example:certificate", &[("certificate_id", "cert"), ("api_key_id", "atgk_revoked")]),
+                keyed("did:example:plain", &[]),
+                managed("did:example:surface-gone", "gone"),
+            ];
+            let listing =
+                crate::identity::handlers::surface_tenancy::KeyListing::from(std::collections::HashMap::from([
+                    ("atgk_revoked".to_string(), vec!["oxygen".to_string()]),
+                    ("atgk_active".to_string(), vec!["oxygen".to_string()]),
+                ]))
+                .with(&["atgk_revoked"], &[]);
+            let mut rows: Vec<_> = list(records, &[surface("oxygen", "OXYGEN")], &names())
+                .await
+                .into_values()
+                .collect();
+
+            super::super::mark_revoked_identities(&mut rows, Some(&listing));
+
+            let mut revoked: Vec<&str> = rows
+                .iter()
+                .filter(|row| row.revoked)
+                .map(|row| row.did.as_str())
+                .collect();
+            revoked.sort();
+            assert_eq!(revoked, vec!["did:example:deleted", "did:example:revoked", "did:example:surface-gone"]);
+
+            super::super::mark_revoked_identities(&mut rows, None);
+            let still_revoked: Vec<&str> = rows
+                .iter()
+                .filter(|row| row.revoked)
+                .map(|row| row.did.as_str())
+                .collect();
+            assert_eq!(still_revoked, vec!["did:example:surface-gone"], "an unreadable key store marks no key revoked");
+            super::super::mark_revoked_identities(&mut rows, Some(&listing));
+            let serialized = |did: &str| {
+                serde_json::to_value(
+                    rows.iter()
+                        .find(|row| row.did == did)
+                        .unwrap(),
+                )
+                .unwrap()
+            };
+            assert_eq!(serialized("did:example:revoked")["revoked"], json!(true));
+            assert!(
+                serialized("did:example:active")
+                    .get("revoked")
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_the_delta_resends_identities_whose_api_key_this_node_revoked_or_deleted() {
+            let since = Utc::now();
+            let mut old = managed("did:example:neon", "neon");
+            old.identity_fields
+                .insert("api_key_id".to_string(), json!("atgk_revoked_in_delta"));
+            old.last_used_at = Some(since - chrono::Duration::hours(1));
+            let rows = || async {
+                let mut rows: Vec<_> = list(vec![old.clone()], &[surface("neon", "NEON")], &names())
+                    .await
+                    .into_values()
+                    .collect();
+                let listing = crate::identity::handlers::surface_tenancy::KeyListing::from(
+                    std::collections::HashMap::from([("atgk_revoked_in_delta".to_string(), vec!["neon".to_string()])]),
+                )
+                .with(&["atgk_revoked_in_delta"], &[]);
+                super::super::mark_revoked_identities(&mut rows, Some(&listing));
+                rows
+            };
+            let none = HashSet::new();
+            assert!(identities_changed_since(rows().await, since, &none, &none, &none).is_empty());
+
+            super::super::record_api_key_withdrawn("atgk_revoked_in_delta");
+            let delta = identities_changed_since(rows().await, since, &none, &none, &none);
+            assert_eq!(delta.len(), 1);
+            assert!(delta[0].revoked);
         }
 
         fn surface_with_recorder(
@@ -2897,6 +3379,7 @@ mod tests {
                     trust_registry_id: "tr-1".into(),
                     issuer_did: "did:example:issuer".into(),
                     authority_did: "did:example:authority".into(),
+                    authority_source: None,
                     include_owned_agent: true,
                     custom_resources: vec![],
                 }],
@@ -3300,7 +3783,12 @@ mod tests {
 
         #[tokio::test]
         async fn test_legacy_row_json_omits_new_fields() {
-            let rows = list(vec![test_surface_identity_record("did:example:legacy", "gone")], &[], &names()).await;
+            let rows = list(
+                vec![test_surface_identity_record("did:example:legacy", "neon")],
+                &[surface("neon", "NEON")],
+                &names(),
+            )
+            .await;
             let json = serde_json::to_value(&rows["did:example:legacy"]).unwrap();
             let keys: HashSet<&str> = json
                 .as_object()
@@ -3316,12 +3804,68 @@ mod tests {
                 "usage_count",
                 "last_used_at",
                 "channel_config_id",
+                "channel_name",
                 "is_local",
                 "verified",
                 "channel_usage",
             ]
             .into();
             assert_eq!(keys, expected);
+        }
+
+        #[tokio::test]
+        async fn test_identity_rows_match_the_dashboard_fixtures() {
+            const MANAGED_DID: &str = "did:webvh:zQmScid:gateway.example.com:surface:alpha";
+            let fixed_time = |mut record: AgentIdentityRecord| {
+                let time = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc);
+                record.created_at = time;
+                record.last_used_at = Some(time);
+                for usage in &mut record.channel_usage {
+                    usage.last_used_at = time;
+                }
+                record
+            };
+            let caller_names = names();
+            caller_names.lookup_or_spawn(CALLER_DID);
+            wait_for_caller_name(&caller_names).await;
+
+            const ROTATED_DID: &str = "did:webvh:zQmCert:gateway.example.com:surface:beta";
+            let mut payload = managed(MANAGED_DID, "alpha");
+            payload.slot = Some(ManagedSlot::Protected);
+            payload
+                .identity_fields
+                .insert("agentIdentity.llmInfo.model".to_string(), json!("gpt-4.1"));
+            let mut rotated = managed(ROTATED_DID, "alpha");
+            rotated.identity_hash = "rotated".to_string();
+            rotated.slot = Some(ManagedSlot::Protected);
+            rotated.identity_fields = HashMap::from([
+                ("credential_type".to_string(), json!("mtls")),
+                ("certificate_id".to_string(), json!("NITROGEN")),
+                ("fingerprint_sha256".to_string(), json!("bb")),
+            ]);
+            rotated.rotation_count = 1;
+
+            let rows = list(
+                vec![fixed_time(payload), fixed_time(rotated), fixed_time(caller(CALLER_DID))],
+                &[surface("alpha", "ALPHA"), surface("oxygen", "OXYGEN")],
+                &caller_names,
+            )
+            .await;
+
+            crate::identity::test_helpers::assert_web_fixture(
+                "identity-row-managed.json",
+                &serde_json::to_value(&rows[MANAGED_DID]).unwrap(),
+            );
+            crate::identity::test_helpers::assert_web_fixture(
+                "identity-row-managed-rotated.json",
+                &serde_json::to_value(&rows[ROTATED_DID]).unwrap(),
+            );
+            crate::identity::test_helpers::assert_web_fixture(
+                "identity-row-external-caller.json",
+                &serde_json::to_value(&rows[CALLER_DID]).unwrap(),
+            );
         }
 
         #[test]
@@ -3410,6 +3954,133 @@ mod tests {
 
         assert_eq!(entry.level, "DEBUG");
         assert_eq!(entry.message, "request details");
+    }
+
+    mod identity_rotations {
+        use super::super::{MAX_ROTATIONS_PAGE, RotationsPage, RotationsQuery, identity_rotations_page};
+        use crate::identity::IdentityStore;
+        use crate::identity::filesystem::CredentialRotation;
+        use crate::identity::test_helpers::{MockIdentityStore, test_surface_identity_record};
+
+        fn rotation(minute: i64) -> CredentialRotation {
+            CredentialRotation {
+                rotated_at: chrono::DateTime::from_timestamp(minute * 60, 0),
+                previous: std::collections::HashMap::new(),
+            }
+        }
+
+        fn history(len: i64) -> Vec<CredentialRotation> {
+            (0..len)
+                .map(rotation)
+                .collect()
+        }
+
+        fn query(
+            limit: Option<usize>,
+            before: Option<usize>,
+        ) -> RotationsQuery {
+            RotationsQuery { limit, before }
+        }
+
+        #[test]
+        fn returns_the_whole_history_oldest_first_by_default() {
+            let page = RotationsPage::of(history(3), &query(None, None));
+
+            assert_eq!(
+                page,
+                RotationsPage {
+                    rotations: history(3),
+                    total: 3,
+                    start: 0
+                }
+            );
+        }
+
+        #[test]
+        fn pages_back_from_the_newest_rotation() {
+            let newest = RotationsPage::of(history(5), &query(Some(2), None));
+            assert_eq!((newest.start, newest.total), (3, 5));
+            assert_eq!(newest.rotations, vec![rotation(3), rotation(4)]);
+
+            let older = RotationsPage::of(history(5), &query(Some(2), Some(newest.start)));
+            assert_eq!(older.start, 1);
+            assert_eq!(older.rotations, vec![rotation(1), rotation(2)]);
+
+            let oldest = RotationsPage::of(history(5), &query(Some(2), Some(older.start)));
+            assert_eq!(oldest.start, 0);
+            assert_eq!(oldest.rotations, vec![rotation(0)]);
+        }
+
+        #[test]
+        fn caps_the_limit_and_bounds_before() {
+            let capped = RotationsPage::of(history(1001), &query(Some(5000), None));
+            assert_eq!(capped.rotations.len(), MAX_ROTATIONS_PAGE);
+            assert_eq!(capped.start, 1);
+
+            let at_least_one = RotationsPage::of(history(3), &query(Some(0), None));
+            assert_eq!(at_least_one.rotations, vec![rotation(2)]);
+
+            let past_the_end = RotationsPage::of(history(3), &query(None, Some(99)));
+            assert_eq!(past_the_end.rotations, history(3));
+
+            let nothing_before_the_first = RotationsPage::of(history(3), &query(None, Some(0)));
+            assert!(
+                nothing_before_the_first
+                    .rotations
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn answers_the_rotations_of_a_known_identity() {
+            let store = MockIdentityStore::new();
+            let mut record = test_surface_identity_record("did:example:a", "alpha");
+            record.rotations = history(2);
+            store
+                .create(record)
+                .await
+                .unwrap();
+
+            let page = identity_rotations_page(&store, "did:example:a", &query(None, None))
+                .await
+                .unwrap();
+
+            assert_eq!(page.rotations, history(2));
+            assert_eq!(page.total, 2);
+        }
+
+        #[tokio::test]
+        async fn answers_404_for_an_unknown_identity() {
+            let store = MockIdentityStore::new();
+
+            let error = identity_rotations_page(&store, "unknown", &query(None, None))
+                .await
+                .unwrap_err();
+
+            assert_eq!(error, (axum::http::StatusCode::NOT_FOUND, "Identity not found".to_string()));
+        }
+
+        #[tokio::test]
+        async fn answers_an_empty_page_for_an_identity_without_rotations() {
+            let store = MockIdentityStore::new();
+            store
+                .create(test_surface_identity_record("did:example:b", "alpha"))
+                .await
+                .unwrap();
+
+            let page = identity_rotations_page(&store, "did:example:b", &query(None, None))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                page,
+                RotationsPage {
+                    rotations: vec![],
+                    total: 0,
+                    start: 0
+                }
+            );
+        }
     }
 
     mod log_access {
@@ -3884,6 +4555,80 @@ pub async fn get_surface_metrics(
         time_series,
         latency_time_series,
     }))
+}
+
+/// Most rotations one page of `GET /v1/identities/by-hash/{identity_hash}/rotations` returns.
+pub const MAX_ROTATIONS_PAGE: usize = 1000;
+
+#[derive(Debug, Deserialize)]
+pub struct RotationsQuery {
+    /// Rotations per page, at most [`MAX_ROTATIONS_PAGE`] (the default).
+    pub limit: Option<usize>,
+    /// Index into the history; the page ends before it. Defaults to the end of the history.
+    pub before: Option<usize>,
+}
+
+/// A page of an identity's rotation history: `rotations` are the history's entries
+/// `start..start + rotations.len()` of `total`, oldest first.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct RotationsPage {
+    pub rotations: Vec<CredentialRotation>,
+    pub total: usize,
+    pub start: usize,
+}
+
+impl RotationsPage {
+    fn of(
+        mut rotations: Vec<CredentialRotation>,
+        query: &RotationsQuery,
+    ) -> Self {
+        let total = rotations.len();
+        let end = query
+            .before
+            .unwrap_or(total)
+            .min(total);
+        let limit = query
+            .limit
+            .unwrap_or(MAX_ROTATIONS_PAGE)
+            .clamp(1, MAX_ROTATIONS_PAGE);
+        let start = end.saturating_sub(limit);
+        rotations.truncate(end);
+        Self {
+            rotations: rotations.split_off(start),
+            total,
+            start,
+        }
+    }
+}
+
+/// API endpoint to get a page of the credential rotations of the identity keyed by
+/// `identity_hash`, newest page first.
+pub async fn get_identity_rotations(
+    State(state): State<DashboardState>,
+    axum::extract::Path(identity_hash): axum::extract::Path<String>,
+    Query(query): Query<RotationsQuery>,
+) -> Result<Json<RotationsPage>, (axum::http::StatusCode, String)> {
+    identity_rotations_page(state.identity_store.as_ref(), &identity_hash, &query)
+        .await
+        .map(Json)
+}
+
+async fn identity_rotations_page(
+    identity_store: &dyn IdentityStore,
+    identity_hash: &str,
+    query: &RotationsQuery,
+) -> Result<RotationsPage, (axum::http::StatusCode, String)> {
+    match identity_store
+        .rotations(identity_hash)
+        .await
+    {
+        Ok(Some(rotations)) => Ok(RotationsPage::of(rotations, query)),
+        Ok(None) => Err((axum::http::StatusCode::NOT_FOUND, "Identity not found".to_string())),
+        Err(e) => {
+            error!(error = %e, "Failed to read identity rotations");
+            Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to read identity rotations".to_string()))
+        }
+    }
 }
 
 /// Hierarchical metrics response

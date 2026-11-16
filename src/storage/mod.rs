@@ -26,6 +26,7 @@ pub use did_logs::DidLogStorage;
 #[cfg(feature = "didwebvh")]
 pub use did_logs_file::FileDidLogStorage;
 pub use dynamodb_store::DynamoDbConfigStore;
+pub use dynamodb_store::start_logging_warnings;
 pub use filesystem::StorageBackend;
 pub use settings_store::SettingsStore;
 pub use settings_store::UserSettingsStore;

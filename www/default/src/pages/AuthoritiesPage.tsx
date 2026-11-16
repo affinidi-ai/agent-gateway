@@ -10,6 +10,8 @@ import { CopyButton } from '../components/shared/CopyButton';
 import { topAndTail } from '../utils/stringUtils';
 import { clearAuthoritiesCache } from '../utils/authoritiesCache';
 import { DOCS_URL } from '../config/docs';
+import { AuthorityInUseDialog } from '../components/authorities/AuthorityInUseDialog';
+import { authorityInUse, type AuthorityInUse } from '../components/authorities/authorityInUse';
 
 interface AuthoritiesPageProps {
   onEdit?: (id: string) => void;
@@ -31,6 +33,7 @@ const AuthoritiesPage: React.FC<AuthoritiesPageProps> = ({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const [inUse, setInUse] = useState<{ name: string; inUse: AuthorityInUse } | null>(null);
 
   const fetchAuthorities = async () => {
     try {
@@ -64,15 +67,17 @@ const AuthoritiesPage: React.FC<AuthoritiesPageProps> = ({
     onFilteredCountChange?.(filteredAuthorities.length);
   }, [filteredAuthorities.length, onFilteredCountChange]);
 
-  const handleDelete = async (id: string) => {
+  const handleDelete = async (authority: Authority) => {
     try {
-      await apiClient.delete(`/authorities/${id}`);
+      await apiClient.deleteAuthority(authority.id);
       clearAuthoritiesCache();
       setSuccess('Authority deleted successfully');
       setTimeout(() => setSuccess(null), 3000);
       fetchAuthorities();
     } catch (err: any) {
-      setError(err.message || 'Failed to delete authority');
+      const refused = authorityInUse(err);
+      if (refused) setInUse({ name: authority.name, inUse: refused });
+      else setError(err.message || 'Failed to delete authority');
     }
   };
 
@@ -204,7 +209,7 @@ const AuthoritiesPage: React.FC<AuthoritiesPageProps> = ({
                             </AppButton>
                             <DeleteButton
                               data-testid={`authorities-delete-button-${authority.id}`}
-                              onDelete={() => handleDelete(authority.id)}
+                              onDelete={() => handleDelete(authority)}
                             />
                           </div>
                         </td>
@@ -216,6 +221,13 @@ const AuthoritiesPage: React.FC<AuthoritiesPageProps> = ({
             )}
           </div>
         </div>
+      )}
+      {inUse && (
+        <AuthorityInUseDialog
+          authorityName={inUse.name}
+          inUse={inUse.inUse}
+          onClose={() => setInUse(null)}
+        />
       )}
     </div>
   );

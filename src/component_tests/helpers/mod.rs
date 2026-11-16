@@ -1016,6 +1016,8 @@ fn build_bootstrap_config(
         pinned_transit_token_max_lifetime_secs: None,
         pinned_external_consent_resource_origins: None,
         pinned_external_consent_issuers: None,
+        pinned_external_consent_issuer_patterns: None,
+        audit: Default::default(),
     }
 }
 
@@ -1101,7 +1103,9 @@ pub fn configure_admin_api(bootstrap: &BootstrapConfig) -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
         .default_headers(headers)
-        .timeout(Duration::from_secs(10))
+        // Generous because it asserts nothing: a management call that is merely
+        // slow on a loaded runner must not fail the test it appears in.
+        .timeout(Duration::from_secs(30))
         .build()
         .unwrap()
 }
@@ -1307,10 +1311,10 @@ pub fn build_identity_channel() -> AgentSurface {
 ///
 /// `from_api_key` is credential-derived: the DID comes from a peppered HMAC of
 /// the `api_key_id`, not from the response body, so no JSON schema is needed.
-/// An `atgk_`-prefixed key derives directly without any store lookup, which
-/// makes this the lightest e2e exercise of the credential-derived `Derived`
-/// path through the proxy (the inbound counterpart to the unit tests in
-/// `credential_identity.rs`).
+/// The surface serves only while an active key of that id belongs to it: set
+/// its `surface_id` and store the key in that surface's key folder. This is the
+/// lightest e2e exercise of the credential-derived `Derived` path through the
+/// proxy (the inbound counterpart to the unit tests in `credential_identity.rs`).
 pub fn build_api_key_identity_channel(api_key_id: &str) -> AgentSurface {
     let json = serde_json::json!({
         "name": "smoke-api-key-identity",
@@ -1564,11 +1568,19 @@ pub struct GatewayHarness {
     _gw_server: GatewayServer,
 }
 
+/// Wait until `port` serves requests, not merely until it answers. `/v1/health`
+/// is `503` until the gateway is Active and ready, and a caller that starts
+/// driving the management API at that point queues behind the rest of the
+/// startup: on a loaded runner booting several gateways at once that is long
+/// enough to time its first request out. Only `503` means "not yet": the
+/// outbound listener has no health route and answers `404`, which is ready
+/// enough for it, and a `503` left at the deadline stops the wait rather than
+/// hanging a listener that never reports ready.
 async fn wait_for_gateway_http(
     port: u16,
     label: &str,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let url = format!("http://127.0.0.1:{port}/v1/health");
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -1577,6 +1589,12 @@ async fn wait_for_gateway_http(
 
     loop {
         match client.get(&url).send().await {
+            Ok(response)
+                if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
             Ok(_) => break,
             // The port accepts connections but does not speak plain HTTP: a TLS listener.
             Err(error) if !error.is_connect() && !error.is_timeout() => break,

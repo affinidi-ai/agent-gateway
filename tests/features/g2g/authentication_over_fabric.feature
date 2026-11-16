@@ -20,21 +20,23 @@ Feature: Source authentication and target authentication over fabric
     And the response status is 200
     And the MCP response result matches MCP server "bravo" response result
 
-  Scenario: gateway 1 forwards callers without source authentication when no blocking policy is configured
+  Scenario: gateway 1 refuses a caller without an API key before forwarding over fabric
     Given a fabric with 2 gateways
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     And surface "charlie" requires "API Key" source authentication
     When the caller asks gateway 1 MCP surface "charlie" for available tools without an API key
-    Then MCP server "bravo" received the forwarded MCP request
-    And the response status is 200
+    Then the response status is 401
+    And the MCP response is a JSON-RPC error with code -32603
+    And MCP server "bravo" was not called
 
-  Scenario: gateway 2 withholds target authentication from a caller whose source authentication failed
+  Scenario: a public surface on gateway 2 withholds target authentication from a caller whose source authentication failed
     Given a fabric with 2 gateways
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
     And surface "alpha" requires "API Key" source authentication
     And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And surface "alpha" is stored with a public Access Point
     When the caller asks gateway 1 MCP surface "charlie" for available tools without an API key
     Then MCP server "bravo" received the forwarded MCP request
     And MCP server "bravo" did not receive header "x-target-api-key"
@@ -50,15 +52,15 @@ Feature: Source authentication and target authentication over fabric
     Then MCP server "bravo" received header "x-target-api-key" with value "bdd-target-secret"
     And the response status is 200
 
-  Scenario: gateway 2 withholds target authentication on an MCP proxy endpoint from a caller whose source authentication failed
+  Scenario: gateway 2 refuses a caller whose source authentication failed on an MCP proxy endpoint
     Given a fabric with 2 gateways
     And gateway 2 exposes MCP surface "alpha" backed by REST API "bravo" through an MCP proxy endpoint
     And surface "alpha" requires "API Key" source authentication
     And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     When the caller invokes MCP tool "ping" through gateway 1 surface "charlie"
-    Then the response status is 200
-    And REST API "bravo" did not receive header "x-target-api-key"
+    Then the response status is 401
+    And REST API "bravo" was not called
 
   Scenario: gateway 2 sends target authentication on an MCP proxy endpoint when the surface requires no caller authentication
     Given a fabric with 2 gateways
@@ -69,16 +71,15 @@ Feature: Source authentication and target authentication over fabric
     Then the response status is 200
     And REST API "bravo" received header "x-target-api-key" with value "bdd-target-secret"
 
-  Scenario: gateway 1 withholds its target authentication from a caller whose source authentication failed
+  Scenario: gateway 1 refuses a caller whose source authentication failed before sending its target authentication
     Given a fabric with 2 gateways
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     And surface "charlie" requires "API Key" source authentication
     And surface "charlie" injects target authentication from secret "bdd-sender-auth-secret" with value "bdd-sender-secret" as header "x-sender-api-key"
     When the caller asks gateway 1 MCP surface "charlie" for available tools without an API key
-    Then MCP server "bravo" received the forwarded MCP request
-    And MCP server "bravo" did not receive header "x-sender-api-key"
-    And the response status is 200
+    Then the response status is 401
+    And MCP server "bravo" was not called
 
   Scenario: gateway 1 sends its target authentication for an authenticated caller
     Given a fabric with 2 gateways
@@ -98,15 +99,41 @@ Feature: Source authentication and target authentication over fabric
     When the caller fetches the agent card from gateway 1 surface "charlie"
     Then managed agent "bravo" received header "x-target-api-key" with value "bdd-target-secret"
 
-  Scenario: gateway 1 blocks unverified callers when a gateway-level policy denies them
+  Scenario: a public surface on gateway 1 blocks unverified callers when a gateway-level policy denies them
     Given a fabric with 2 gateways
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     And surface "charlie" requires "API Key" source authentication
     And gateway 1 has a Gateway-level policy that denies unverified callers
+    And surface "charlie" is stored with a public Access Point
     When the caller asks gateway 1 MCP surface "charlie" for available tools without an API key
     Then the response status is 403
     And MCP server "bravo" was not called
+
+  Scenario: gateway 1 reports a Target credential that gateway 2 refuses
+    Given a fabric with 2 gateways
+    And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
+    And surface "alpha" requires "API Key" source authentication
+    And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And surface "charlie" injects target authentication from secret "bdd-gateway-1-key" with value "bdd-key-gateway-2-refuses" as header "x-api-key"
+    And the VP Audit Log of gateway 1 keeps every audit event
+    When the caller asks gateway 1 MCP surface "charlie" for available tools
+    Then the response status is 500
+    And the response says "target_auth_rejected"
+    And MCP server "bravo" was not called
+    And the VP Audit Log of gateway 1 records the Target credential as refused by the target
+
+  Scenario: a 401 from gateway 2's Target reaches the caller unchanged
+    Given a fabric with 2 gateways
+    And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
+    And MCP server "bravo" refuses every request with status 401
+    And surface "alpha" requires "API Key" source authentication
+    And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And surface "charlie" injects target authentication from secret "bdd-gateway-1-key" with value "bdd-source-api-key" as header "x-api-key"
+    And the VP Audit Log of gateway 1 keeps every audit event
+    When the caller asks gateway 1 MCP surface "charlie" for available tools
+    Then the response status is 401
+    And the VP Audit Log of gateway 1 records no Target credential refused by the target
 
   Scenario: gateway 2 rejects forwarding when target authentication credentials are missing
     Given a fabric with 2 gateways
@@ -114,7 +141,9 @@ Feature: Source authentication and target authentication over fabric
     And surface "alpha" is configured with missing target authentication secret "bdd-missing-target-auth-secret" for header "x-target-api-key" and fallback reject
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     When the caller asks gateway 1 MCP surface "charlie" for available tools
-    Then the response status is 502
+    Then the response status is 500
+    And the response says "Target authentication failed"
+    And the response reason is "target_auth_misconfigured"
     And MCP server "bravo" was not called
 
   Scenario: gateway 2 forwards over fabric when missing target authentication fallback is passthrough

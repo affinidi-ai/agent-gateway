@@ -180,6 +180,49 @@ fn client_writable(
         && scope_allows_resource(resource_scope(scope), tenant_context(context), ResourceKind::StsClients, &client.id)
 }
 
+/// Classifies each literal authority DID of the client's Trust Checks by the register it is in
+/// and refuses a link to an Authority it cannot use, as a surface save does. A DID that
+/// `stored` linked to an Authority stays linked. Without an Authority store nothing is
+/// classified or refused.
+async fn validate_authority_sources(
+    body: &mut StsClientRequest,
+    stored: Option<&[crate::trust_registry_verification::TrustCheckElement]>,
+    authorities: Option<&dyn crate::authorities::AuthorityStore>,
+    issuers: Option<&dyn crate::issuers::IssuerStore>,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    use crate::trust_registry_verification::authority_source::{AuthorityRegisters, trust_check_references};
+
+    let Some(authorities) = authorities else {
+        return Ok(());
+    };
+    if body
+        .trust_check_list
+        .is_empty()
+    {
+        return Ok(());
+    }
+    let registers = AuthorityRegisters::load(authorities, issuers)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to read the Authorities and Issuers for an STS client's Trust Checks");
+            (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Internal server error"))
+        })?;
+    registers.classify_trust_checks(&mut body.trust_check_list, body.tenant_id.as_deref(), stored);
+    registers
+        .check(&trust_check_references(&body.trust_check_list), body.tenant_id.as_deref())
+        .map_err(|message| (StatusCode::BAD_REQUEST, ErrorBody::json(message)))
+}
+
+/// [`validate_authority_sources`] against the gateway's Authority and Issuer stores.
+async fn validate_authority_sources_with_gateway_stores(
+    body: &mut StsClientRequest,
+    stored: Option<&[crate::trust_registry_verification::TrustCheckElement]>,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let authorities = crate::gateways::connection_points::get_authority_store();
+    let issuers = crate::gateways::connection_points::get_issuer_store();
+    validate_authority_sources(body, stored, authorities.as_deref(), issuers.as_deref()).await
+}
+
 async fn validate_secret_reference(
     owner_tenant_id: Option<&str>,
     secret_ref: Option<&str>,
@@ -289,6 +332,9 @@ pub async fn create_client(
         return response.into_response();
     }
     let _bindings = crate::identity::handlers::surface_grants::hold_provider_bindings().await;
+    if let Err(response) = validate_authority_sources_with_gateway_stores(&mut body, None).await {
+        return response.into_response();
+    }
     if let Err(response) = validate_secret_reference(
         body.tenant_id.as_deref(),
         body.client_secret_ref
@@ -452,6 +498,11 @@ pub async fn update_client(
         return response.into_response();
     }
     let _bindings = crate::identity::handlers::surface_grants::hold_provider_bindings().await;
+    if let Err(response) =
+        validate_authority_sources_with_gateway_stores(&mut body, Some(&existing.trust_check_list)).await
+    {
+        return response.into_response();
+    }
     if let Err(response) = validate_secret_reference(
         body.tenant_id.as_deref(),
         body.client_secret_ref
@@ -640,6 +691,102 @@ mod tests {
         result
             .err()
             .map(|(status, _)| status)
+    }
+
+    fn with_trust_check(source: Option<&str>) -> StsClientRequest {
+        let mut element = serde_json::json!({
+            "id": "acme-check", "trust_registry_id": "tr-1", "query_type": "recognition",
+            "query": {"authority_id": "did:web:acme", "entity_id": "{{ input.sts.client_id }}"}
+        });
+        if let Some(source) = source {
+            element["authority_source"] = serde_json::json!(source);
+        }
+        StsClientRequest {
+            tenant_id: Some("tenant-a".to_string()),
+            trust_check_list: vec![serde_json::from_value(element).unwrap()],
+            ..base_request()
+        }
+    }
+
+    async fn authorities(tenant_id: Option<&str>) -> (crate::authorities::FileSystemAuthorityStore, tempfile::TempDir) {
+        use crate::authorities::AuthorityStore;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::authorities::FileSystemAuthorityStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut authority = crate::authorities::types::Authority::new(
+            "authority-1".into(),
+            "Acme".into(),
+            "did:web:acme".into(),
+            None,
+            None,
+        );
+        authority.tenant_id = tenant_id.map(str::to_string);
+        store
+            .create(&authority)
+            .await
+            .unwrap();
+        (store, dir)
+    }
+
+    #[tokio::test]
+    async fn a_trust_check_naming_an_authority_of_the_clients_tenant_is_linked_to_it() {
+        let (store, _dir) = authorities(Some("tenant-a")).await;
+        let mut body = with_trust_check(None);
+
+        validate_authority_sources(&mut body, None, Some(&store), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            body.trust_check_list[0].authority_source,
+            Some(crate::trust_registry_verification::authority_source::AuthoritySource::Authority)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_link_to_an_authority_that_is_gone_or_of_another_tenant_is_refused() {
+        let (empty_dir, other_tenant) = (tempfile::TempDir::new().unwrap(), authorities(Some("tenant-b")).await);
+        let empty = crate::authorities::FileSystemAuthorityStore::new(empty_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        for store in [&empty, &other_tenant.0] {
+            let refusal = validate_authority_sources(&mut with_trust_check(Some("authority")), None, Some(store), None)
+                .await
+                .unwrap_err();
+            assert_eq!(refusal.0, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                refusal.1.0.error,
+                "Trust Check 'acme-check' uses Authority did:web:acme, which does not exist or belongs to another \
+                 tenant. Pick another Authority or remove the Trust Check"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_update_that_drops_the_source_of_a_link_keeps_it() {
+        let empty_dir = tempfile::TempDir::new().unwrap();
+        let empty = crate::authorities::FileSystemAuthorityStore::new(empty_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let stored = with_trust_check(Some("authority")).trust_check_list;
+
+        let refusal = validate_authority_sources(&mut with_trust_check(None), Some(&stored), Some(&empty), None).await;
+
+        assert_eq!(status_of(refusal), Some(StatusCode::BAD_REQUEST));
+    }
+
+    #[tokio::test]
+    async fn without_an_authority_store_nothing_is_classified_or_refused() {
+        let mut body = with_trust_check(Some("authority"));
+
+        assert_eq!(status_of(validate_authority_sources(&mut body, None, None, None).await), None);
+        assert_eq!(
+            body.trust_check_list[0].authority_source,
+            Some(crate::trust_registry_verification::authority_source::AuthoritySource::Authority)
+        );
     }
 
     #[tokio::test]

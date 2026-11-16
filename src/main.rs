@@ -394,6 +394,7 @@ async fn async_main() -> Result<()> {
     // Initialize logging
     // before this point consider using println
     let _guard: Option<WorkerGuard> = init_logging(&config, &bootstrap_config, otlp_auth_header)?;
+    storage::start_logging_warnings();
 
     let retired_a2a_switches =
         surfaces::RetiredA2aSwitches::read(&bootstrap_config).unwrap_or(surfaces::RetiredA2aSwitches {
@@ -483,8 +484,9 @@ async fn async_main() -> Result<()> {
     x402::init_gateway_facilitator_service().await;
     info!("Gateway facilitator service initialized - ready for ATM infrastructure");
 
-    // NOW load surfaces (after logging is initialized so errors are logged)
-    // Only for "local" configuration source
+    // Load local surfaces after logging is initialized so errors are logged;
+    // other sources loaded theirs with the configuration, before logging, so
+    // their legacy Access Point notices are logged here.
     if bootstrap_config.channel_config_source == "local" {
         info!("Loading surfaces from local storage (after logging initialized)");
         match load_surfaces(&bootstrap_config).await {
@@ -497,6 +499,8 @@ async fn async_main() -> Result<()> {
                 return Err(e.context("Failed to load surfaces from local storage"));
             }
         }
+    } else {
+        config::log_legacy_access_point_notices(&config.surfaces);
     }
 
     // Print ASCII art banner (always to terminal and logs)
@@ -714,6 +718,7 @@ async fn load_configuration(bootstrap: &BootstrapConfig) -> Result<GatewayConfig
                     info!("Successfully loaded configuration from DynamoDB");
                     config::fall_back_to_first_source_auth_methods_in_memory(&mut config.surfaces);
                     config::log_additional_source_auth_method_notices(&config.surfaces);
+                    config::log_unchecked_audience_warnings(&config.surfaces);
 
                     // Load x402 headers from x402.json
                     config.x402_headers = match bootstrap.load_x402_headers() {
@@ -777,6 +782,7 @@ async fn load_configuration(bootstrap: &BootstrapConfig) -> Result<GatewayConfig
                                 // A cache an older binary wrote can hold methods this one refuses.
                                 config::fall_back_to_first_source_auth_methods_in_memory(&mut config.surfaces);
                                 config::log_additional_source_auth_method_notices(&config.surfaces);
+                                config::log_unchecked_audience_warnings(&config.surfaces);
                                 config.tls = bootstrap.tls.clone();
                                 config.a2a = bootstrap.a2a.clone();
                                 config.logging = logging;
@@ -989,15 +995,49 @@ async fn load_surfaces(bootstrap: &BootstrapConfig) -> Result<Vec<crate::config:
     surfaces::strip_unsupported_header_metadata_mappings(&store, &mut channels).await?;
     surfaces::fall_back_to_first_source_auth_methods(&store, &mut channels, !crate::server::mode::is_standby()).await?;
     config::log_additional_source_auth_method_notices(&channels);
+    config::log_unchecked_audience_warnings(&channels);
+    config::log_legacy_access_point_notices(&channels);
     surfaces::clear_dangling_default_variants(&store, &mut channels).await?;
     surfaces::carry_over_a2a_settings(&store, &mut channels, !crate::server::mode::is_standby(), || {
         surfaces::RetiredA2aSwitches::read(bootstrap)
     })
     .await;
+    if let Some(registers) = authority_registers(bootstrap).await {
+        surfaces::record_authority_sources(&store, &mut channels, !crate::server::mode::is_standby(), &registers).await;
+    }
 
     info!("✅ Loaded {} surface(s) from local storage", channels.len());
 
     Ok(channels)
+}
+
+/// The Authorities and Issuers stored surfaces classify their authority DIDs against, or
+/// `None` when the Authorities cannot be read.
+async fn authority_registers(
+    bootstrap: &BootstrapConfig
+) -> Option<crate::trust_registry_verification::authority_source::AuthorityRegisters> {
+    let paths = &bootstrap.storage_paths;
+    let authorities = crate::authorities::FileSystemAuthorityStore::new(PathBuf::from(&paths.authorities))
+        .await
+        .inspect_err(
+            |error| warn!(%error, "Failed to open the Authority store; stored authority DIDs stay unclassified"),
+        )
+        .ok()?;
+    let issuers = crate::issuers::FileSystemIssuerStore::new(PathBuf::from(&paths.issuers))
+        .await
+        .inspect_err(
+            |error| warn!(%error, "Failed to open the Issuer store; no authority DID is classified as an Issuer"),
+        )
+        .ok();
+    crate::trust_registry_verification::authority_source::AuthorityRegisters::load(
+        &authorities,
+        issuers
+            .as_ref()
+            .map(|store| store as &dyn crate::issuers::IssuerStore),
+    )
+    .await
+    .inspect_err(|error| warn!(%error, "Failed to read the Authorities; stored authority DIDs stay unclassified"))
+    .ok()
 }
 
 /// Auto-disable surfaces whose access-point `(port, route)` claim duplicates
@@ -1005,9 +1045,10 @@ async fn load_surfaces(bootstrap: &BootstrapConfig) -> Result<Vec<crate::config:
 ///
 /// Duplicates can only reach disk by bypassing the API (hand-edited files,
 /// restores); refusing to boot over them would lock the operator out of the
-/// very UI needed to resolve the conflict. Instead the first copy in
-/// `surface_id` order — the one runtime routing would serve — stays active
-/// deterministically across restarts, later copies are
+/// very UI needed to resolve the conflict. Instead the copy runtime routing
+/// served stays active deterministically across restarts: routes are compared
+/// without a trailing `/`, but were ranked with it, so the copy with the longest
+/// stored route, then the first in `surface_id` order. The other copies are
 /// disabled and show up as such in the UI, and `ProxyConfig::validate`'s
 /// duplicate check (which ignores disabled surfaces) then passes. Re-enabling
 /// a disabled copy goes through full save-time validation, so the conflict
@@ -1023,28 +1064,48 @@ async fn disable_duplicate_route_surfaces(
     channels: &mut [crate::config::agent_surface::AgentSurface],
     network_config: &config::NetworkConfig,
 ) -> Result<()> {
-    let mut seen_route_port_combos = std::collections::HashSet::new();
-    for surface in channels.iter_mut() {
-        if surface.status == crate::config::agent_surface::SurfaceStatus::Disabled {
+    let combos: Vec<Option<String>> = channels
+        .iter()
+        .map(|surface| {
+            (surface.status != crate::config::agent_surface::SurfaceStatus::Disabled).then(|| {
+                let listen_address = surface.listen_address();
+                let listener = match network_config.map_url_to_port(listen_address) {
+                    Some(port) => format!("port {}", port),
+                    None => format!("address '{}'", listen_address),
+                };
+                format!("{}:{}", listener, config::route_claims::normalize_route(surface.route()))
+            })
+        })
+        .collect();
+    let surface_ids: Vec<String> = channels
+        .iter()
+        .map(|surface| surface.surface_id.clone())
+        .collect();
+    let mut served: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (index, combo) in combos.iter().enumerate() {
+        let Some(combo) = combo else {
             continue;
+        };
+        let kept = served
+            .entry(combo)
+            .or_insert(index);
+        if channels[index].route().len() > channels[*kept].route().len() {
+            *kept = index;
         }
-        let listen_address = surface.listen_address();
-        let route = surface.route();
-        let listener = match network_config.map_url_to_port(listen_address) {
-            Some(port) => format!("port {}", port),
-            None => format!("address '{}'", listen_address),
+    }
+    for (index, surface) in channels
+        .iter_mut()
+        .enumerate()
+    {
+        let Some(combo) = &combos[index] else {
+            continue;
         };
-        let normalized_route = if route.starts_with('/') {
-            route.to_string()
-        } else {
-            format!("/{}", route)
-        };
-        let combo = format!("{}:{}", listener, normalized_route);
-        if !seen_route_port_combos.insert(combo.clone()) {
+        if served[combo.as_str()] != index {
             error!(
                 surface = %surface.name,
                 surface_id = %surface.surface_id,
                 combo = %combo,
+                kept_surface_id = %surface_ids[served[combo.as_str()]],
                 "Duplicate access-point route+port found in storage — auto-disabling this surface so the gateway can boot; \
                  resolve the conflict and re-enable it via the UI or API"
             );
@@ -1480,6 +1541,8 @@ fn render_default_bootstrap_toml(
         pinned_transit_token_max_lifetime_secs: None,
         pinned_external_consent_resource_origins: None,
         pinned_external_consent_issuers: None,
+        pinned_external_consent_issuer_patterns: None,
+        audit: config::AuditConfig::default(),
     };
     let toml_str = toml::to_string_pretty(&config)?;
     Ok(toml_str)
@@ -1557,6 +1620,30 @@ mod duplicate_route_surface_tests {
         match persisted {
             Some(s) => assert_eq!(s.status, SurfaceStatus::Disabled),
             None => panic!("auto-disabled surface 's-b' must be persisted to the store"),
+        }
+    }
+
+    #[tokio::test]
+    async fn of_two_routes_that_differ_only_by_a_trailing_slash_the_served_one_stays_active() {
+        for (first_route, second_route, served) in
+            [("/agents/a", "/agents/a/", "s-b"), ("/agents/a/", "/agents/a", "s-a")]
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let store = test_store(dir.path()).await;
+            let mut channels = vec![surface("s-a", first_route), surface("s-b", second_route)];
+
+            disable_duplicate_route_surfaces(&store, &mut channels, &network_config())
+                .await
+                .expect("dedup should succeed");
+
+            for surface in &channels {
+                let expected = if surface.surface_id == served {
+                    SurfaceStatus::Active
+                } else {
+                    SurfaceStatus::Disabled
+                };
+                assert_eq!(surface.status, expected, "{} on {}", surface.surface_id, surface.route());
+            }
         }
     }
 

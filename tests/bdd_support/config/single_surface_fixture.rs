@@ -2,6 +2,9 @@ use std::collections::HashMap;
 
 use crate::bdd_support::config::config_tree::PolicyDefinitionFixture;
 
+/// The id the single-surface fixture stores its surface under.
+pub const SEEDED_SURFACE_ID: &str = "bdd-surface";
+
 /// The public https origin a surface's protected resource is published under.
 pub const PROTECTED_RESOURCE_PUBLIC_ORIGIN: &str = "https://gateway.bdd.example";
 
@@ -29,6 +32,8 @@ pub struct SurfaceConfigBuilder {
     pub managed_identity_strip_raw: bool,
     pub mcp_inbound_identity: bool,
     pub mcp_inbound_identity_strip_raw: bool,
+    /// The inbound identity is the `sub` claim of the caller's JWT (`from_jwt_claim`).
+    pub jwt_claim_inbound_identity: bool,
     pub target_auth: Option<SurfaceTargetAuthConfig>,
     pub target_auth_provider: Option<SurfaceTargetAuthProviderConfig>,
     pub mcp_tool_policy: Option<McpToolPolicyFixture>,
@@ -48,6 +53,23 @@ pub struct SurfaceConfigBuilder {
     pub credential_delegation: Option<SurfaceCredentialDelegationConfig>,
     pub oauth_provider_base_url: Option<String>,
     pub oauth_callback_base_url: Option<String>,
+    /// The RFC 9207 `iss` the surface's OAuth provider records as its authorization server's.
+    pub oauth_authorization_response_issuer: Option<String>,
+    /// OAuth providers the gateway has besides the surface's own, by provider id.
+    pub additional_oauth_providers: Vec<String>,
+    /// The surface's OAuth provider is stored as the admin API now creates one: with a
+    /// record id of its own, which its callback path ends in, instead of its provider id.
+    pub oauth_callback_path_ends_in_record_id: bool,
+    /// The callers' identity provider runs, and the gateway has an identity hash pepper.
+    pub identity_provider: bool,
+    /// The authorization and token endpoints of the callers' identity provider, once it runs.
+    pub identity_provider_endpoints: Option<IdentityProviderEndpoints>,
+    /// The surface's OAuth provider has its caller sign in at the identity provider first.
+    pub consent_confirmation: bool,
+    /// That provider refuses a consent link to a caller it cannot confirm.
+    pub consent_confirmation_required: bool,
+    /// The gateway runs without an identity hash pepper, even with the callers' identity provider.
+    pub identity_hash_pepper_unset: bool,
     pub mcp_identity_payload_schema: Option<serde_json::Value>,
     pub required_mcp_identity_field: Option<String>,
     pub constrained_mcp_identity_field: Option<String>,
@@ -65,11 +87,19 @@ pub struct SurfaceConfigBuilder {
     pub trust_recorder_entries: Vec<serde_json::Value>,
     pub transit_shared_policy: Option<RequestPolicyFixture>,
     pub mcp_http: Option<serde_json::Value>,
+    pub browser_origins: Vec<String>,
+    /// The `network.cors` origins `gateway.json` lists.
+    pub network_cors: Vec<String>,
     pub protected_resource: Option<ProtectedResourceFixture>,
     /// The outbound listener is also published at [`PROTECTED_RESOURCE_PUBLIC_ORIGIN`], the
     /// https origin a Transit Point's `mcp_http.authorization` resource must use.
     pub outbound_public_origin: bool,
     pub a2a_settings: Option<serde_json::Value>,
+    /// The stored `access_point.public`; `None` stores what the admin API
+    /// writes (see [`AccessPointFixture::public`](crate::bdd_support::config::agent_surface::AccessPointFixture)).
+    pub access_point_public: Option<bool>,
+    /// Store no `access_point.public`, as a legacy surface does.
+    pub legacy_access_point: bool,
     /// Requests the Access Point admits per minute.
     pub rate_limit_per_minute: Option<u32>,
     /// The gateway starts with the VP Audit Log keeping every audit event.
@@ -92,6 +122,97 @@ pub struct SurfaceConfigBuilder {
     pub control_key_rotation_days: Option<u32>,
     /// `[vta] connection_key_switch_timeout_secs`, so a rotation the trust agent refuses rolls back quickly.
     pub connection_key_switch_timeout_secs: Option<u64>,
+    /// The gateway serves a dashboard build from `www/` at `/`, falling back to its
+    /// `index.html` for every path no other route takes, as a deployed dashboard does.
+    pub serves_dashboard: bool,
+    /// Channel, MCP proxy and redirect prefixes `gateway.json` adds to the surface's.
+    pub gateway_prefixes: Vec<GatewayPrefixFixture>,
+    /// API key records stored before the gateway starts.
+    pub stored_api_keys: Vec<StoredApiKeyFixture>,
+    /// Further stored surfaces, disabled, by id.
+    pub other_stored_surfaces: Vec<String>,
+    /// Further stored surfaces, each on its own route and with its own status.
+    pub stored_surfaces_on_routes: Vec<StoredSurfaceFixture>,
+    /// The key id the seeded surface's protected Identity takes its DID from.
+    pub protected_identity_api_key_id: Option<String>,
+    /// When the API Key Provider's key was created; when the gateway starts if absent.
+    pub api_key_provider_key_created_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The gateway starts in Standby mode.
+    pub starts_standby: bool,
+    /// The Redis URL an integration stored before the gateway starts streams sign-in events to.
+    pub sign_in_event_stream: Option<String>,
+    /// A second integration streams sign-in events with Agent Watch's record template.
+    pub streams_sign_in_records: bool,
+    /// Console users sign in with SAML rather than passkeys.
+    pub signs_in_with_saml: bool,
+    /// The surface's `caller_key`, and the secret it names when that is stored.
+    pub caller_key: Option<CallerKeyFixture>,
+}
+
+/// A surface's `caller_key`: the secret its keys are derived from, stored with `secret_value`
+/// unless that is `None`, and the header they are sent in, the default when `None`.
+#[derive(Debug, Clone)]
+pub struct CallerKeyFixture {
+    pub secret_id: String,
+    pub secret_value: Option<String>,
+    pub header: Option<String>,
+}
+
+/// Where the gateway sends a person to sign in at the callers' identity provider, and
+/// exchanges the code it gets back.
+#[derive(Debug, Clone)]
+pub struct IdentityProviderEndpoints {
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+}
+
+/// A prefix the operator adds to `gateway.json`.
+#[derive(Debug, Clone)]
+pub enum GatewayPrefixFixture {
+    Channel(String),
+    McpProxy(String),
+    Redirect { prefix: String, target: String },
+}
+
+/// A surface stored before the gateway starts, on a route of its own that
+/// `gateway.json` does not add as a prefix.
+#[derive(Debug, Clone)]
+pub struct StoredSurfaceFixture {
+    pub id: String,
+    pub route: String,
+    /// `active` or `disabled`.
+    pub status: String,
+}
+
+/// An API key record stored before the gateway starts.
+#[derive(Debug, Clone)]
+pub struct StoredApiKeyFixture {
+    pub owner: String,
+    pub key_id: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Whether the gateway can load the owner's key folder.
+    pub loads: bool,
+}
+
+impl SurfaceConfigBuilder {
+    /// The stored id of the credential provider `provider_id`, which is also the last
+    /// segment of its callback path.
+    pub fn provider_record_id(
+        &self,
+        provider_id: &str,
+    ) -> String {
+        let own = self
+            .credential_delegation
+            .as_ref()
+            .filter(|delegation| delegation.provider_id == provider_id);
+        match own {
+            Some(_) if self.oauth_callback_path_ends_in_record_id => format!("0b6e4c2a-{provider_id}-record"),
+            Some(delegation) => delegation
+                .record_id()
+                .to_string(),
+            None => provider_id.to_string(),
+        }
+    }
 }
 
 /// The trust agent a gateway is configured against, and where it keeps its control key.
@@ -119,6 +240,7 @@ impl Default for SurfaceConfigBuilder {
             managed_identity_strip_raw: false,
             mcp_inbound_identity: false,
             mcp_inbound_identity_strip_raw: false,
+            jwt_claim_inbound_identity: false,
             target_auth: None,
             target_auth_provider: None,
             mcp_tool_policy: None,
@@ -139,10 +261,20 @@ impl Default for SurfaceConfigBuilder {
             credential_delegation: None,
             oauth_provider_base_url: None,
             oauth_callback_base_url: None,
+            oauth_authorization_response_issuer: None,
+            additional_oauth_providers: Vec::new(),
+            oauth_callback_path_ends_in_record_id: false,
+            identity_provider: false,
+            identity_provider_endpoints: None,
+            consent_confirmation: false,
+            consent_confirmation_required: false,
+            identity_hash_pepper_unset: false,
             mcp_identity_payload_schema: None,
             required_mcp_identity_field: None,
             constrained_mcp_identity_field: None,
             agent_card_path: None,
+            access_point_public: None,
+            legacy_access_point: false,
             transit_points: Vec::new(),
             transit_source_auth: false,
             transit_token_lifetime_secs: None,
@@ -152,6 +284,8 @@ impl Default for SurfaceConfigBuilder {
             trust_recorder_entries: Vec::new(),
             transit_shared_policy: None,
             mcp_http: None,
+            browser_origins: Vec::new(),
+            network_cors: Vec::new(),
             a2a_settings: None,
             rate_limit_per_minute: None,
             audit_log_keeps_every_event: false,
@@ -164,6 +298,18 @@ impl Default for SurfaceConfigBuilder {
             control_key_trust_agent: None,
             control_key_rotation_days: None,
             connection_key_switch_timeout_secs: None,
+            serves_dashboard: false,
+            gateway_prefixes: Vec::new(),
+            stored_api_keys: Vec::new(),
+            other_stored_surfaces: Vec::new(),
+            stored_surfaces_on_routes: Vec::new(),
+            protected_identity_api_key_id: None,
+            api_key_provider_key_created_at: None,
+            starts_standby: false,
+            sign_in_event_stream: None,
+            streams_sign_in_records: false,
+            signs_in_with_saml: false,
+            caller_key: None,
         }
     }
 }
@@ -361,6 +507,9 @@ pub struct JwtSourceAuthConfig {
     pub jwks_url: String,
     pub issuer: String,
     pub audiences: Vec<String>,
+    /// The claim `audiences` is matched against; `None` stores no
+    /// `audience_claim`, which the gateway reads as `aud`.
+    pub audience_claim: Option<String>,
     pub forward_header: bool,
 }
 
@@ -409,12 +558,57 @@ pub struct SurfaceTargetAuthProviderConfig {
     pub signing_key_is_service_account_file: bool,
     /// The `jwt_subject` a JWT Bearer provider stores; the grant's `sub` claim.
     pub jwt_subject: Option<String>,
+    pub client_authentication: Option<TargetAuthClientAuthentication>,
+    /// A JWT Bearer provider stores a client ID and a client secret although it sets no
+    /// client authentication.
+    pub stores_unused_client_references: bool,
+    /// The provider's stored record names no client secret, although its type needs one and
+    /// the secrets store holds it.
+    pub omits_client_secret_reference: bool,
+    /// The gateway's `insecure_token_endpoints` names this provider's token endpoint.
+    pub token_endpoint_listed_as_insecure: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetAuthProviderGrant {
     ClientCredentials,
+    AuthorizationCode,
     JwtBearer,
+}
+
+/// How a JWT Bearer provider's client identifies itself with its grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetAuthClientAuthentication {
+    ClientIdOnly,
+    HttpBasic,
+    FormBody,
+}
+
+impl TargetAuthClientAuthentication {
+    /// The choice a scenario names: "the client ID only", "HTTP Basic" or "the form body".
+    pub fn from_wording(wording: &str) -> Self {
+        match wording {
+            "the client ID only" => Self::ClientIdOnly,
+            "HTTP Basic" => Self::HttpBasic,
+            "the form body" => Self::FormBody,
+            other => panic!(
+                "unknown client authentication {other:?}: use \"the client ID only\", \"HTTP Basic\" or \"the form body\""
+            ),
+        }
+    }
+
+    /// The value the admin API takes for `client_authentication`.
+    pub fn api_value(self) -> &'static str {
+        match self {
+            Self::ClientIdOnly => "none",
+            Self::HttpBasic => "client_secret_basic",
+            Self::FormBody => "client_secret_post",
+        }
+    }
+
+    fn sends_secret(self) -> bool {
+        self != Self::ClientIdOnly
+    }
 }
 
 impl SurfaceTargetAuthProviderConfig {
@@ -429,7 +623,34 @@ impl SurfaceTargetAuthProviderConfig {
             authenticates_surface_target: true,
             signing_key_is_service_account_file: false,
             jwt_subject: Some("bdd-subject@example.com".to_string()),
+            client_authentication: None,
+            stores_unused_client_references: false,
+            omits_client_secret_reference: false,
+            token_endpoint_listed_as_insecure: false,
         }
+    }
+
+    pub fn stores_client_id(&self) -> bool {
+        self.grant != TargetAuthProviderGrant::JwtBearer
+            || self.stores_unused_client_references
+            || self
+                .client_authentication
+                .is_some()
+    }
+
+    /// The secrets store holds the client secret: the provider's record names it, or omits
+    /// the reference to it.
+    pub fn seeds_client_secret(&self) -> bool {
+        self.stores_client_secret() || self.omits_client_secret_reference
+    }
+
+    pub fn stores_client_secret(&self) -> bool {
+        !self.omits_client_secret_reference
+            && (self.grant != TargetAuthProviderGrant::JwtBearer
+                || self.stores_unused_client_references
+                || self
+                    .client_authentication
+                    .is_some_and(TargetAuthClientAuthentication::sends_secret))
     }
 }
 
@@ -517,11 +738,25 @@ pub struct SurfaceCustomMetadataConfig {
 
 #[derive(Debug, Clone)]
 pub struct SurfaceCredentialDelegationConfig {
+    /// The provider's `provider_id` slug, also its name.
     pub provider_id: String,
+    /// The provider's record id, when it is not its slug.
+    pub record_id: Option<String>,
+    /// The tenant that owns the provider; appliance-wide when `None`.
+    pub tenant_id: Option<String>,
     pub provider_kind: CredentialProviderKind,
     pub required_tool: Option<String>,
     pub inject_as: DelegatedCredentialInjection,
     pub scopes: Vec<String>,
+}
+
+impl SurfaceCredentialDelegationConfig {
+    /// The record id the surface binds the provider by.
+    pub fn record_id(&self) -> &str {
+        self.record_id
+            .as_deref()
+            .unwrap_or(&self.provider_id)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -619,6 +854,7 @@ mod tests {
             jwks_url: "https://issuer.example/.well-known/jwks.json".to_string(),
             issuer: "https://issuer.example".to_string(),
             audiences: Vec::new(),
+            audience_claim: None,
             forward_header: false,
         });
         let api_key = super::SurfaceSourceAuthConfig::ApiKey(super::ApiKeySourceAuthConfig {

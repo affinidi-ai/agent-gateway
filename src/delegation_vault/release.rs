@@ -264,6 +264,61 @@ pub struct ReleaseContext<'a> {
     pub refusal_limit: u32,
 }
 
+static USES_IN_FLIGHT: std::sync::LazyLock<dashmap::DashSet<String>> = std::sync::LazyLock::new(dashmap::DashSet::new);
+
+/// Held by the one task recording a grant's use, so concurrent requests
+/// before its write lands do not each spawn one.
+struct UseClaim(String);
+
+impl UseClaim {
+    fn take(grant_id: &str) -> Option<Self> {
+        USES_IN_FLIGHT
+            .insert(grant_id.to_string())
+            .then(|| Self(grant_id.to_string()))
+    }
+}
+
+impl Drop for UseClaim {
+    fn drop(&mut self) {
+        USES_IN_FLIGHT.remove(&self.0);
+    }
+}
+
+/// Record, on a task of its own, that `grant` was released into the request
+/// `request_id`, when its last recorded use is old enough
+/// ([`DelegatedGrant::use_is_due`]), so a busy route does not rewrite its grant
+/// on every call. A failure is logged with the request's surface variant.
+pub fn record_use_in_background(
+    vault: &Arc<dyn DelegationVaultStorage>,
+    grant: &DelegatedGrant,
+    request_id: Option<String>,
+) {
+    if !grant.use_is_due(Utc::now()) {
+        return;
+    }
+    let Some(claim) = UseClaim::take(&grant.id) else {
+        return;
+    };
+    let vault = Arc::clone(vault);
+    let id = grant.id.clone();
+    let surface_variant = crate::observability::policy_audit::current_request_variant();
+    tokio::spawn(async move {
+        let _claim = claim;
+        if let Err(error) = vault
+            .mark_grant_used(&id)
+            .await
+        {
+            tracing::warn!(
+                target: "credential_delegation",
+                request_id = request_id.as_deref(),
+                surface_variant = surface_variant.as_deref(),
+                error = %error,
+                "Failed to record a grant's use"
+            );
+        }
+    });
+}
+
 /// The refusals of a grant's refresh that make a call answer
 /// `connect_required`, as gateway.json's `external_consent_refresh_refusals`
 /// sets them, from 1 to 20.
@@ -346,9 +401,11 @@ impl ReleaseContext<'_> {
     /// The grant of `key` to retry a call with, after the vendor refused
     /// `rejected`, the grant it was sent, with a `Bearer` challenge: one
     /// another call refreshed or the person reconnected since, or one
-    /// refreshed now whatever its expiry. A grant that cannot be refreshed is
-    /// removed, and revoked at the vendor in the background, while it still
-    /// holds the token the vendor refused: someone must connect again. A
+    /// refreshed now whatever its expiry. A caller's grant that cannot be
+    /// refreshed is removed, and revoked at the vendor in the background,
+    /// while it still holds the token the vendor refused: someone must connect
+    /// again. An owner's is kept: any caller of the binding can send a request
+    /// the vendor refuses, so no such refusal ends the owner's grant. A
     /// refresh that fails for a reason a new connect would not fix keeps the
     /// grant, and so does one the authorization server keeps refusing, which
     /// asks for a new connect.
@@ -378,9 +435,10 @@ impl ReleaseContext<'_> {
         if matches!(*reason, "no_grant" | "invalid_grant" | "refresh_refused") {
             return outcome;
         }
-        if self
-            .remove(provider, key, rejected, "rejected_by_the_vendor")
-            .await
+        if subject == GrantSubject::Caller
+            && self
+                .remove(provider, key, rejected, "rejected_by_the_vendor")
+                .await
         {
             return outcome;
         }
@@ -681,11 +739,20 @@ impl ReleaseContext<'_> {
                         .expires_in
                         .map(|seconds| now + chrono::Duration::seconds(seconds)),
                 };
-                if !provider
-                    .scope_comparison
-                    .widened(&requested, &tokens.scopes)
-                    .is_empty()
-                {
+                let (wider, widened) = {
+                    let extra = provider
+                        .scope_comparison
+                        .widened(&requested, &tokens.scopes);
+                    (!extra.is_empty(), crate::credential_providers::scope_comparison::named_scopes(&extra))
+                };
+                if wider {
+                    tracing::warn!(
+                        target: "credential_delegation",
+                        grant_id = %before.id,
+                        credential_provider_id = %provider.id,
+                        widened_scopes = ?widened,
+                        "A refresh was refused: the vendor granted scopes beyond those asked for"
+                    );
                     let abandoned = self
                         .vault
                         .fail_grant_refresh(claim, FailedRefresh::Abandoned, now)
@@ -1123,5 +1190,19 @@ mod connect_hint_tests {
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
         );
         assert_ne!(connect_hint("owner"), connect_hint("another"));
+    }
+}
+
+#[cfg(test)]
+mod use_claim_tests {
+    use super::UseClaim;
+
+    #[test]
+    fn a_grant_has_one_use_claim_until_it_is_dropped() {
+        let first = UseClaim::take("claim-grant").expect("first claim");
+        assert!(UseClaim::take("claim-grant").is_none());
+        assert!(UseClaim::take("another-claim-grant").is_some());
+        drop(first);
+        assert!(UseClaim::take("claim-grant").is_some());
     }
 }

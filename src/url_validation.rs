@@ -304,8 +304,8 @@ pub fn validate_resolved_url(raw: &str) -> Result<Url, String> {
 /// cloud-provider metadata endpoint.
 ///
 /// Like [`validate_resolved_url`] but intentionally allows loopback and
-/// RFC 1918 private ranges. Use this for admin-configured JWKS URIs and other
-/// endpoints where same-machine or same-VPC access is legitimate, but DNS
+/// RFC 1918 private ranges. Use this for endpoints where same-machine or
+/// same-VPC access is legitimate, such as a test allow-list entry, but DNS
 /// rebinding to a cloud metadata endpoint must still be prevented.
 ///
 /// Blocks: cloud metadata IPs/hostnames (static + DNS), embedded credentials,
@@ -324,6 +324,15 @@ pub(crate) fn bdd_oauth_endpoint_allowlist() -> Option<String> {
     std::env::var("AG_BDD_OAUTH_ENDPOINT_ALLOWLIST")
         .ok()
         .filter(|value| !value.trim().is_empty())
+}
+
+/// Whether `url` is https, or an http URL the BDD exact endpoint allowlist
+/// names, which only `AG_TEST_MODE` admits.
+pub(crate) fn is_https_or_bdd_allowed(url: &Url) -> bool {
+    url.scheme() == "https"
+        || bdd_oauth_endpoint_allowlist().is_some_and(|allowlist| {
+            parse_oauth_endpoint_allowlist(&allowlist).is_ok_and(|allowed| allowed.contains(url))
+        })
 }
 
 fn parse_oauth_endpoint_allowlist(raw: &str) -> Result<Vec<Url>, String> {
@@ -368,6 +377,23 @@ fn validate_oauth_endpoint_url_inner(
 /// and still blocks cloud metadata endpoints.
 pub fn validate_oauth_endpoint_url(raw: &str) -> Result<Url, String> {
     validate_oauth_endpoint_url_inner(raw, bdd_oauth_endpoint_allowlist().as_deref())
+}
+
+/// [`validate_oauth_endpoint_url`] without resolving the host:
+/// [`validate_url_not_cloud_metadata`], with the same BDD exact endpoint
+/// allowlist fallback, for a check on a request path that must not wait on DNS.
+pub fn validate_oauth_endpoint_url_unresolved(raw: &str) -> Result<Url, String> {
+    validate_url_not_cloud_metadata(raw).or_else(|production_error| {
+        let Some(allowlist_raw) = bdd_oauth_endpoint_allowlist() else {
+            return Err(production_error);
+        };
+        let candidate = validate_url_not_cloud_metadata_host(raw)?;
+        if parse_oauth_endpoint_allowlist(&allowlist_raw)?.contains(&candidate) {
+            Ok(candidate)
+        } else {
+            Err(format!("{production_error}; the OAuth endpoint is not in the BDD exact endpoint allowlist"))
+        }
+    })
 }
 
 /// Defense-in-depth check for the forwarding layer. Only blocks cloud metadata

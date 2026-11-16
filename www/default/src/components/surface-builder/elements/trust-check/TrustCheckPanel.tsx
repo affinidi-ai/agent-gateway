@@ -4,6 +4,8 @@ import { AppButton } from '../../../shared/AppButton';
 import { managedAgentTargetLegTrustCheckAllowed } from '../edges/archetypes';
 import InfoBanner from '../../../shared/InfoBanner';
 import type { ConfigPanelProps } from '../types';
+import { useOptionalSurfaceMeta } from '../../SurfaceMetaContext';
+import MissingAuthorityWarning from '../_shared/MissingAuthorityWarning';
 import MigratedTrustCheckWarning from './MigratedTrustCheckWarning';
 import {
   MANAGED_AGENT_TRUST_CHECK_DUPLICATED_NOTE,
@@ -12,6 +14,7 @@ import {
   readOnlyTrustCheckProtocol,
   isManagedAgentTrustCheck,
   isMigratedTrustCheck,
+  missingTrustCheckAuthorities,
   readQueries,
   trustCheckLeg,
   type TrustCheckLeg,
@@ -19,6 +22,9 @@ import {
 } from './definition';
 
 const PREVIEW_MAX = 5;
+
+const AUTHORITY_DELETION_NOTE =
+  'When it is an Authority, the gateway also remembers that, and fails the check with AUTHORITY_NOT_FOUND once that Authority is deleted.';
 
 interface TrustCheckLegContext {
   title: string;
@@ -36,8 +42,7 @@ function describeLeg(leg: TrustCheckLeg): TrustCheckLegContext {
         'Verify the CALLER identity against a trust registry before the request reaches the agent.',
       where: 'Access Point → Managed Agent (request leg).',
       when: 'When policy needs to know that the caller is recognised or authorised by an authority in a trust registry (e.g. only accept requests from agents recognised by a partner ecosystem).',
-      example:
-        'Pick the trust anchor to check against: an Issuer (Department) or an Authority. Its DID is stored directly, so the gateway never derives the authority from the caller’s request payload.',
+      example: `Pick the trust anchor to check against: an Issuer (Department) or an Authority. Its DID is stored directly, so the gateway never derives the authority from the caller’s request payload. ${AUTHORITY_DELETION_NOTE}`,
     };
   }
   return {
@@ -48,8 +53,7 @@ function describeLeg(leg: TrustCheckLeg): TrustCheckLegContext {
         ? 'Managed Agent → Transit Point (target leg). Runs only for requests through this Transit Point.'
         : 'Managed Agent → its A2A Proxy or gateway target (target leg).',
     when: 'When policy needs to confirm the upstream you are about to call is recognised or authorised (e.g. only forward payment requests to issuers recognised by a payment authority).',
-    example:
-      'Pick the trust anchor to check against: an Issuer (Department) or an Authority. Its DID is stored directly, so the gateway never derives the authority from the target’s own agent card.',
+    example: `Pick the trust anchor to check against: an Issuer (Department) or an Authority. Its DID is stored directly, so the gateway never derives the authority from the target’s own agent card. ${AUTHORITY_DELETION_NOTE}`,
   };
 }
 
@@ -71,6 +75,8 @@ const TrustCheckPanel: React.FC<ConfigPanelProps> = ({
     !managedAgentTargetLegTrustCheckAllowed(managedAgentEndpoint);
   const readOnlyProtocol = readOnlyTrustCheckProtocol(node, allNodes);
   const queries = readQueries(config);
+  const authorityDids = useOptionalSurfaceMeta()?.authorityDids;
+  const missingAuthorities = missingTrustCheckAuthorities(config, authorityDids);
   const shown = queries.slice(0, PREVIEW_MAX);
   const remaining = queries.length - shown.length;
   const renderEmptyState = () => (
@@ -100,38 +106,14 @@ const TrustCheckPanel: React.FC<ConfigPanelProps> = ({
           const queryType: TrustCheckRecordType =
             q.query_type === 'recognition' ? 'recognition' : 'authorization';
           const typeLabel = queryType === 'recognition' ? 'Recognition' : 'Authorization';
-          const nameValue = typeof q.name === 'string' && q.name ? q.name : '';
           return (
             <li
               key={q.id || `idx-${idx}`}
               className="d-flex justify-content-between align-items-baseline gap-2 py-1"
+              data-testid={`trust-check-panel-query-${idx}`}
             >
               <span className="text-muted fw-semibold">Query {idx + 1}</span>
-              <span
-                className="text-end"
-                style={{
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                  minWidth: 0,
-                }}
-              >
-                <span className="fw-semibold">{typeLabel}</span>
-                {nameValue && (
-                  <span
-                    className="d-block text-muted fst-italic"
-                    style={{
-                      fontSize: '10px',
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                    }}
-                    title={nameValue}
-                  >
-                    {nameValue}
-                  </span>
-                )}
-              </span>
+              <span className="fw-semibold text-end">{typeLabel}</span>
             </li>
           );
         })}
@@ -152,6 +134,12 @@ const TrustCheckPanel: React.FC<ConfigPanelProps> = ({
           onKeep={() => updateField('trust_check_migrated', false)}
         />
       )}
+      <MissingAuthorityWarning
+        testid="trust-check-panel-authority-missing"
+        element="trust-check"
+        missing={missingAuthorities}
+        itemLabel={queries.length > 1 ? 'Query' : undefined}
+      />
       {notSavedForTarget && (
         <div role="status" data-testid="trust-check-panel-managed-agent-target-warning">
           <InfoBanner

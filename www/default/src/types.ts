@@ -14,12 +14,16 @@ export const PROTOCOLS = {
   didcomm: 'didcomm',
 } as const satisfies Record<ChannelProtocol, ChannelProtocol>;
 
+/** The claim a JWT Bearer method matches its `audiences` against; absent means `aud`. */
+export type JwtAudienceClaim = 'aud' | 'azp' | 'client_id';
+
 // Source Authentication configuration (replaces identity_config auth modes + source_authentication_strategy)
 export type SourceAuthConfig =
   | {
       type: 'jwt_bearer';
       jwt_verification_strategy_id: string;
       audiences: string[];
+      audience_claim?: JwtAudienceClaim;
       token_header: string;
       token_scheme: string;
       forward_header: boolean;
@@ -199,16 +203,34 @@ export interface Identity {
   display_name_pending?: boolean;
   surface_id?: string;
   surface_name?: string;
+  // Every surface this identity is linked to was deleted.
+  surface_deleted?: boolean;
+  // The API key this identity's DID comes from is revoked or deleted.
+  revoked?: boolean;
   credential_principal?: CredentialPrincipal;
   // Every live surface where this DID is the managed agent, sorted by name; omitted when empty.
   managed_surfaces?: ManagedSurfaceRef[];
   trust_recorder?: TrustRecorderStatus;
   trust_recorder_surface?: ManagedSurfaceRef;
+  slot?: ManagedSlot;
+  /** Credential rotations recorded for this identity; omitted when there are none. */
+  rotation_count?: number;
 }
 
 export interface ManagedSurfaceRef {
   surface_id: string;
   surface_name: string;
+}
+
+/** The surface slot whose identity setting created a managed identity. */
+export type ManagedSlot = { kind: 'protected' } | { kind: 'transit_point'; alias: string };
+
+/** A change of the stored certificate or API key behind an identity that kept its DID. */
+export interface CredentialRotation {
+  /** `null` when the change happened before the gateway recorded rotations. */
+  rotated_at: string | null;
+  /** The identity fields the change replaced, with their earlier values. */
+  previous?: Record<string, unknown>;
 }
 
 export type TrustRecorderState = 'recorded' | 'partial' | 'failed' | 'skipped' | 'not_attempted';
@@ -217,6 +239,7 @@ export type TrustRecorderReason =
   | 'registry_not_found'
   | 'registry_not_connected'
   | 'no_surface_issuer'
+  | 'authority_not_found'
   | 'no_response'
   | 'rejected'
   | 'error';
@@ -350,16 +373,6 @@ export interface DidWebVhIdentity {
     [key: string]: any;
   };
   trust_score?: TrustScoreResponse;
-}
-
-export interface VersionHistoryEntry {
-  version: number;
-  timestamp: string;
-  operation: 'birth' | 'update' | 'key_rotation' | 'transfer';
-  signer: string;
-  hash: string;
-  changes?: string[];
-  metadata?: Record<string, any>;
 }
 
 export interface PolicyConfig {
@@ -949,6 +962,12 @@ export interface Issuer {
 // `Issuer` directly. Prefer removing this alias in a follow-up release once
 // no dashboard code depends on it.
 export type Department = Issuer;
+
+/**
+ * Where the literal DID of a Trust Check's or Trust Recorder entry's trust anchor came from:
+ * the Authorities register, the Issuers register, or neither. Absent for a template value.
+ */
+export type AuthoritySource = 'authority' | 'issuer';
 
 // Authorities — local record book of external trust-anchor DIDs.
 // Mirrors `AuthorityResponse` from `src/authorities/types.rs`.

@@ -168,7 +168,7 @@ mod tests {
             .join("delegation-audit.jsonl");
         let published = Arc::new(Published::default());
         let factory = ProductionSinks {
-            audit_log: AuditLogSink::open(&path, 16).unwrap(),
+            audit_log: AuditLogSink::open(&path, 16, crate::audit::log_files::Rotation::default()).unwrap(),
             publish: recording(published.clone(), false),
         };
 

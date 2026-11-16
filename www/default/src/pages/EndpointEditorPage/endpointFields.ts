@@ -18,6 +18,8 @@ export interface FieldSpec {
   options?: { value: string; label: string }[];
   placeholder?: string;
   help?: string;
+  /** The value of a stored endpoint that leaves the field out, read from older fields. */
+  legacyValue?: (configuration: Record<string, unknown>) => string | undefined;
   /** Shown, and sent, only when this holds for the form's values. */
   shownWhen?: (values: Record<string, unknown>) => boolean;
 }
@@ -26,6 +28,9 @@ const platformIs =
   (...platforms: string[]) =>
   (values: Record<string, unknown>) =>
     platforms.includes(String(values.platform ?? 'kafka'));
+
+const kafkaWithSasl = (values: Record<string, unknown>) =>
+  platformIs('kafka')(values) && String(values.security_protocol ?? '').startsWith('sasl_');
 
 export const ENDPOINT_FIELDS: Record<EndpointType, FieldSpec[]> = {
   email: [
@@ -138,22 +143,40 @@ export const ENDPOINT_FIELDS: Record<EndpointType, FieldSpec[]> = {
       shownWhen: platformIs('kafka', 'pulsar'),
     },
     {
-      name: 'auth_type',
-      label: 'Authentication',
+      name: 'security_protocol',
+      label: 'Security protocol',
       kind: 'select',
-      defaultValue: 'none',
+      defaultValue: 'plaintext',
       options: [
-        { value: 'none', label: 'None' },
-        { value: 'sasl', label: 'SASL PLAIN' },
+        { value: 'plaintext', label: 'PLAINTEXT (no TLS, no authentication)' },
+        { value: 'ssl', label: 'SSL (TLS, no authentication)' },
+        { value: 'sasl_plaintext', label: 'SASL_PLAINTEXT (SASL, no TLS)' },
+        { value: 'sasl_ssl', label: 'SASL_SSL (SASL over TLS)' },
       ],
+      help: 'TLS verifies the brokers against the gateway host’s CA bundle; Amazon MSK with SCRAM is SASL_SSL.',
+      legacyValue: configuration =>
+        configuration.auth_type === 'sasl' && typeof configuration.sasl_username === 'string'
+          ? 'sasl_plaintext'
+          : undefined,
       shownWhen: platformIs('kafka'),
+    },
+    {
+      name: 'sasl_mechanism',
+      label: 'SASL mechanism',
+      kind: 'select',
+      defaultValue: 'PLAIN',
+      options: ['PLAIN', 'SCRAM-SHA-256', 'SCRAM-SHA-512'].map(mechanism => ({
+        value: mechanism,
+        label: mechanism,
+      })),
+      shownWhen: kafkaWithSasl,
     },
     {
       name: 'sasl_username',
       label: 'SASL username',
       kind: 'text',
       required: true,
-      shownWhen: values => platformIs('kafka')(values) && values.auth_type === 'sasl',
+      shownWhen: kafkaWithSasl,
     },
     {
       name: 'sasl_password',
@@ -161,7 +184,7 @@ export const ENDPOINT_FIELDS: Record<EndpointType, FieldSpec[]> = {
       kind: 'secret',
       required: true,
       secret: true,
-      shownWhen: values => platformIs('kafka')(values) && values.auth_type === 'sasl',
+      shownWhen: kafkaWithSasl,
     },
     {
       name: 'region',
@@ -227,7 +250,9 @@ export function initialForm(type: EndpointType, endpoint?: Endpoint): EndpointFo
       form.values[field.name] = Array.isArray(value) ? value.join('\n') : '';
     } else {
       form.values[field.name] =
-        value === undefined || value === null ? String(field.defaultValue ?? '') : String(value);
+        value === undefined || value === null
+          ? String(field.legacyValue?.(configuration) ?? field.defaultValue ?? '')
+          : String(value);
     }
   }
   return form;

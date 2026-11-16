@@ -132,6 +132,7 @@ impl Receiver {
                 let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
                     "surface_id": surface_id, "name": surface_id, "tenant_id": "tenant-a",
                     "access_point": {"listen_address": "127.0.0.1:8080", "route": format!("/{surface_id}"), "protocol": "a2a",
+                        "public": false,
                         "caller_authentication": {"methods": [{"type": "api_key", "secret_id": "callers",
                             "extraction": {"source": "http_header", "field": "x-api-key"}}]}},
                     "target": {"endpoint": target.url, "auth": target_auth},
@@ -144,6 +145,21 @@ impl Receiver {
                     .unwrap();
             }
         }
+        let card: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "card-own", "name": "card-own", "tenant_id": "tenant-a",
+            "access_point": {"listen_address": "127.0.0.1:8080", "route": "/card-own", "protocol": "a2a",
+                "agent_card_path": "/cards/me",
+                "caller_authentication": {"methods": [{"type": "api_key", "secret_id": "callers",
+                    "extraction": {"source": "http_header", "field": "x-api-key"}}]}},
+            "target": {"endpoint": target.url,
+                "auth": {"method": {"static_secret": {"secret_id": "own", "header_name": "x-target-key"}}}},
+            "outbound_credentials": [{"credential_provider_id": "own"}]
+        }))
+        .unwrap();
+        store
+            .save(&card)
+            .await
+            .unwrap();
         Self {
             target,
             surfaces_path,
@@ -159,15 +175,18 @@ impl Receiver {
         &self,
         surface_id: &str,
         caller_key: Option<&str>,
+        method: &str,
+        path: &str,
     ) -> ReceivedMessage {
-        self.forward_request_to(surface_id, caller_key, "/", &[])
+        self.forward_request_to(surface_id, caller_key, method, path, &[])
     }
 
-    /// [`Self::forward_request`] for `path`, carrying `extra_headers` from the peer.
+    /// [`Self::forward_request`] carrying `extra_headers` from the peer.
     fn forward_request_to(
         &self,
         surface_id: &str,
         caller_key: Option<&str>,
+        method: &str,
         path: &str,
         extra_headers: &[(&str, &str)],
     ) -> ReceivedMessage {
@@ -189,7 +208,7 @@ impl Receiver {
             None,
             Some(super::super::envelope_replay::now_secs() + 60),
             json!({
-                "channel_id": surface_id, "method": "POST", "path": path,
+                "channel_id": surface_id, "method": method, "path": path,
                 "headers": headers,
                 "body": {"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"message": {
                     "role": "user", "messageId": "m-1", "parts": [{"kind": "text", "text": "hello"}]
@@ -225,12 +244,25 @@ impl Receiver {
         mode: RuleMode,
         caller_key: Option<&str>,
     ) -> (u64, Option<(Option<String>, Option<String>)>, Vec<String>) {
+        self.receive_at(surface_id, mode, caller_key, "POST", "/")
+            .await
+    }
+
+    /// [`Self::receive_from`] for a `method` request to `path`.
+    async fn receive_at(
+        &self,
+        surface_id: &str,
+        mode: RuleMode,
+        caller_key: Option<&str>,
+        method: &str,
+        path: &str,
+    ) -> (u64, Option<(Option<String>, Option<String>)>, Vec<String>) {
         let policy: &'static CredentialPolicyConfig = Box::leak(Box::new(CredentialPolicyConfig {
             tenant_credential_isolation: mode,
             ..CredentialPolicyConfig::default()
         }));
         let called_before = self.target.received().len();
-        let message = self.forward_request(surface_id, caller_key);
+        let message = self.forward_request(surface_id, caller_key, method, path);
         let (result, events) = TEST_CREDENTIAL_POLICY
             .scope(
                 policy,
@@ -313,7 +345,7 @@ fn fabric_receive_sends_a_tenant_surface_only_credentials_the_isolation_mode_all
                 receiver
                     .receive("auth-other", mode)
                     .await,
-                (502, None, vec!["target_auth_failed (Rejected)".to_string()]),
+                (500, None, vec!["target_auth_failed (Rejected)".to_string()]),
                 "{mode:?}"
             );
             assert_eq!(
@@ -334,14 +366,14 @@ fn fabric_receive_sends_a_tenant_surface_only_credentials_the_isolation_mode_all
                 receiver
                     .receive_from("delegated-own", mode, None)
                     .await,
-                (403, None, none.clone()),
+                (401, None, none.clone()),
                 "{mode:?}: no verified caller"
             );
             assert_eq!(
                 receiver
                     .receive_from("delegated-own", mode, Some("a-key-the-surface-refuses"))
                     .await,
-                (403, None, none.clone()),
+                (401, None, none.clone()),
                 "{mode:?}: a caller the surface did not verify"
             );
         }
@@ -363,7 +395,7 @@ fn fabric_receive_sends_a_tenant_surface_only_credentials_the_isolation_mode_all
             receiver
                 .receive("auth-wide", RuleMode::Enforce)
                 .await,
-            (502, None, vec!["target_auth_failed (Rejected)".to_string()])
+            (500, None, vec!["target_auth_failed (Rejected)".to_string()])
         );
         assert_eq!(
             receiver
@@ -397,6 +429,7 @@ fn fabric_receive_keeps_the_target_credential_under_its_base_path_and_drops_a_ca
             let message = receiver.forward_request_to(
                 "scoped",
                 Some(CALLER_KEY),
+                "POST",
                 path,
                 &[("X-TARGET-KEY", "caller-chosen"), ("x_target_key", "caller-chosen")],
             );
@@ -441,7 +474,7 @@ fn fabric_receive_keeps_the_target_credential_under_its_base_path_and_drops_a_ca
         );
 
         for path in ["/%2e%2e/admin", "/x/../../admin", "/..;/admin", "/..%252Fadmin"] {
-            assert_eq!(receive(path).await, (502, vec!["target_auth_failed (Rejected)".to_string()]), "{path}");
+            assert_eq!(receive(path).await, (400, vec!["target_auth_failed (Rejected)".to_string()]), "{path}");
         }
         assert_eq!(
             receiver
@@ -450,6 +483,35 @@ fn fabric_receive_keeps_the_target_credential_under_its_base_path_and_drops_a_ca
                 .len(),
             1,
             "a path outside the base path never reaches the Target"
+        );
+    });
+}
+
+#[test]
+fn a_credentialed_card_fetch_carries_the_target_credential_and_no_delegated_one() {
+    isolated("AG_FABRIC_CARD_DELEGATION_CHILD", async {
+        let receiver = Receiver::new().await;
+        let api_key = vec!["api_key".to_string()];
+        assert_eq!(
+            receiver
+                .receive_at("card-own", RuleMode::Warn, Some(CALLER_KEY), "POST", "/")
+                .await,
+            (200, sent(Some("own-value"), Some("Bearer own-value")), api_key),
+            "a caller's request carries both credentials"
+        );
+        assert_eq!(
+            receiver
+                .receive_at("card-own", RuleMode::Warn, Some(CALLER_KEY), "GET", "/.well-known/agent-card.json")
+                .await,
+            (200, sent(Some("own-value"), None), Vec::<String>::new()),
+            "the gateway's own card fetch carries only the Target credential"
+        );
+        assert_eq!(
+            receiver
+                .receive_at("card-own", RuleMode::Warn, Some(CALLER_KEY), "GET", "/cards/me")
+                .await,
+            (200, sent(Some("own-value"), None), Vec::<String>::new()),
+            "a card fetch at the configured location carries only the Target credential"
         );
     });
 }

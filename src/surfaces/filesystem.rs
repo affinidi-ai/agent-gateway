@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use tracing::info;
 
 use crate::audit::context::current_actor;
-use crate::audit::{policy_changes, target_auth_changes};
+use crate::audit::{browser_origin_changes, mcp_proxy_pin_changes, policy_changes, target_auth_changes};
 use crate::config::agent_surface::AgentSurface;
 use crate::storage::filesystem::{StorageBackend, cached_storage};
 
@@ -53,8 +53,8 @@ impl FileSystemAgentSurfaceStore {
     }
 
     /// The stored surface a management request is about to change, so its
-    /// policy attachments and Target Authentication can be compared after the
-    /// write. Not read outside
+    /// policy attachments, Target Authentication and MCP Proxy pins can be
+    /// compared after the write. Not read outside
     /// one, or inside one under `without_actor` (a config reload), so `None`
     /// means either a new surface or a write that records nothing;
     /// `surface_written` checks the actor again and records nothing for the
@@ -90,6 +90,8 @@ impl AgentSurfaceStore for FileSystemAgentSurfaceStore {
             .await?;
         policy_changes::surface_written(before.as_ref(), Some(surface)).await;
         target_auth_changes::surface_written(before.as_ref(), Some(surface));
+        mcp_proxy_pin_changes::surface_written(before.as_ref(), Some(surface));
+        browser_origin_changes::surface_written(before.as_ref(), Some(surface));
         drop(write);
         crate::mcp::subscriptions::invalidate_access(crate::mcp::subscriptions::AccessScope::Surface(
             surface.surface_id.clone(),
@@ -103,6 +105,15 @@ impl AgentSurfaceStore for FileSystemAgentSurfaceStore {
     ) -> Result<Option<AgentSurface>> {
         self.storage
             .get(surface_id)
+            .await
+    }
+
+    async fn get_checked(
+        &self,
+        surface_id: &str,
+    ) -> Result<Option<AgentSurface>> {
+        self.storage
+            .get_checked(surface_id)
             .await
     }
 
@@ -121,6 +132,7 @@ impl AgentSurfaceStore for FileSystemAgentSurfaceStore {
         self.storage
             .delete(surface_id)
             .await?;
+        crate::observability::dashboard::record_surface_deleted(surface_id);
         policy_changes::surface_written(before.as_ref(), None).await;
         target_auth_changes::surface_written(before.as_ref(), None);
         drop(write);

@@ -19,6 +19,7 @@ import { WS_DASHBOARD, WS_NONE } from '../utils/wsSubscriptions';
 import { AppButton } from '../components/shared/AppButton';
 import FieldHelp from '../components/shared/FieldHelp';
 import { UI_COLORS, chartAreaFill } from '../utils/uiPalette';
+import { formatBytes } from '../utils/formatBytes';
 
 ChartJS.register(
   CategoryScale,
@@ -115,14 +116,6 @@ const formatUptime = (totalSeconds: number): string => {
   if (hours > 0) parts.push(`${hours}h`);
   if (minutes > 0 || parts.length === 0) parts.push(`${minutes}m`);
   return parts.join(' ');
-};
-
-const formatBytes = (bytes: number): string => {
-  if (bytes === 0) return '0 B';
-  if (bytes < 1024) return bytes.toFixed(0) + ' B';
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-  return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
 };
 
 const formatTime = (ts: string): string => {

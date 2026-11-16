@@ -1,0 +1,36 @@
+branch: fix/authority-dependency-protection
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-10T12:00:00Z'
+      title: ⭐ Refuse to delete an Authority that Trust Checks or Trust Recorder entries use
+      description: >-
+        DELETE /v1/authorities/{id} now answers 409 while a Trust Check or Trust Recorder entry on
+        a surface (base or variant) or a managed connection names the Authority's DID, listing
+        the surfaces and managed connections the caller may view with the Trust Checks and Trust
+        Recorder entries that name it, and counting the rest; records of a tenant that may not use
+        the Authority do not count. Before, the Authority was deleted
+        and the checks kept passing. force=true deletes it anyway only when the caller may view
+        every record that names it, and records an authority_force_deleted event in the VP Audit
+        Log. Moving an Authority, a surface or a managed connection to a tenant that would make
+        such a link cross-tenant is refused. The dashboard lists what uses the Authority in a
+        dialog.
+    - timestamp: '2026-11-10T12:00:00Z'
+      title: Fail Trust Checks and stop Trust Recorder entries whose Authority is gone
+      description: >-
+        Trust Checks and Trust Recorder entries now record in authority_source whether their DID
+        is linked to an Authority or found among the Issuers. The gateway sets it on every save and
+        on load and never drops a link to an Authority. A Trust Check linked to an Authority that
+        no longer exists fails with AUTHORITY_NOT_FOUND without querying its trust registry, and a
+        Trust Recorder entry in that state writes nothing and shows the recorder reason
+        authority_not_found, instead of both carrying on under a DID nothing vouches for. A save
+        linking to such an Authority, or to another tenant's, is refused with 400, and the
+        Surface Builder marks the element "Configuration required" and blocks Save until it names
+        another Authority or is removed. A record that named an Authority deleted before this
+        release has no link to it and keeps running; each load logs the DIDs a surface or managed
+        connection names that are in neither the Authorities nor the Issuers register, so it can be
+        found and fixed.
+  breaking: []

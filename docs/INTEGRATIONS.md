@@ -107,7 +107,7 @@ fields; and `variable_pattern`, the placeholder syntax in use (see _Templates_)
 | Family | Events |
 | --- | --- |
 | Gateway | `gateway.created`, `updated`, `deleted`, `status_changed`, `accessed` |
-| User | `user.created`, `approved`, `updated`, `deleted`, `login`, `accessed` |
+| User | `user.created`, `approved`, `updated`, `deleted`, `login`, `login_failed`, `accessed` |
 | Connection point | `connection_point.created`, `updated`, `deleted`, `connected` |
 | x402 | `x402.verification.failed`, `x402.settlement.failed`, `x402.transaction.completed`, `x402.cleanup.completed` |
 | MPP | `mpp.verification.failed`, `mpp.payment.verified`, `mpp.challenge.issued` |
@@ -118,11 +118,49 @@ This gateway verifies no x402 or MPP payment itself, so `x402.verification.faile
 `mpp.*` events stay in the catalog, where existing integrations name them, but are never raised.
 The other x402 events come from settling and pruning x402 payments recorded before.
 
-A passkey registration raises `user.created`, and an administrator's approval `user.approved`. A
+A passkey registration that creates an account raises `user.created` (registering a username that
+already has an account creates nothing and raises nothing), and an administrator's approval `user.approved`. A
 SAML sign-in that creates the user raises `user.created`; SAML users are approved on creation,
 so no `user.approved` follows. A later SAML sign-in that changes the user's role, status, or
 primary flag raises `user.updated`. Every SAML sign-in then raises `user.login`, in that order
 ([`saml/user_provisioning.rs`](../src/auth/saml/user_provisioning.rs)).
+
+### Sign-in events
+
+A console sign-in raises `user.login`, with `LOGIN_METHOD` set to `passkey` or `saml`. A failed one
+raises `user.login_failed` ([`user_integration_triggers.rs`](../src/integrations/user_integration_triggers.rs)):
+a passkey sign-in whose credential does not verify, and a SAML response the gateway rejects at the
+Assertion Consumer Service (bad or missing signature, untrusted certificate, wrong destination or
+audience, an unknown, used or expired AuthnRequest, expired conditions). A passkey sign-in whose
+challenge is unknown or expired has nothing to verify and raises nothing, and neither does a
+failure after verification, such as provisioning a SAML user or opening the session.
+
+`user.login_failed` carries the user variables of `user.login`, `LOGIN_METHOD`, and
+`FAILURE_REASON`:
+
+| `FAILURE_REASON` | Meaning |
+| --- | --- |
+| `invalid_credential` | The account exists and is approved, but the passkey presented is not one of its passkeys |
+| `not_approved` | The account exists but is not approved. A browser rarely sends this sign-in: the challenge for such an account names decoy credentials, not its passkeys, so the browser finds no passkey to use |
+| `unknown_user` | No account has the username the sign-in named, or the account was deleted before the sign-in finished |
+| `saml_rejected` | The SAML response was rejected |
+
+`USER_ID`, `USERNAME`, `USER_EMAIL`, `USER_ROLE`, `USER_STATUS` and `NEW_STATE` are set only when the
+account exists, from the account as stored. For `unknown_user` and `saml_rejected` they are absent:
+a template placeholder for them is empty and `EVENT_DATA` leaves them out, so neither the username a
+caller typed nor anything in a rejected SAML response leaves the appliance. With the default
+`webhook` or `stream` template, `data` holds `login_method`, `failure_reason` and, for an existing
+account, `user_id` and the other user fields. Each shape, `user.login` and `user.login_failed`
+with and without an account, is kept as a reference payload in the default envelope, with run-
+specific values as placeholders, under
+[`tests/fixtures/integration_events/`](../tests/fixtures/integration_events/); the behaviour
+tests compare an event of each shape with it. The caller's answer to a failed sign-in does not
+depend on the event: it is the same `401` whether the account exists or not.
+
+Anyone can fail a sign-in, so the background tasks of `user.login_failed`, routing it and each of
+its deliveries, are held to 10 of the 100 described under _How an event becomes a message_. Beyond
+that a failed sign-in event is not delivered and a warning is logged, and the other 90 stay free for
+every other event.
 
 The connection point management API raises `connection_point.created`, `updated` and `deleted`,
 as the gateway API raises the gateway events. `updated` is raised when a save changes the name,
@@ -268,6 +306,20 @@ delivered again once by its `event_id`, and counts requests by `request_id`.
 
 All four stream platforms are compiled into the binary; which one is used is a matter of
 configuration.
+
+A Kafka endpoint's connection settings are `brokers`, `security_protocol` (`plaintext`, `ssl`,
+`sasl_plaintext` or `sasl_ssl`) and, for a SASL protocol, `sasl_mechanism` (`PLAIN`,
+`SCRAM-SHA-256` or `SCRAM-SHA-512`), `sasl_username` and `sasl_password`
+([`stream_publishers/kafka.rs`](../src/integrations/stream_publishers/kafka.rs)). Both new
+fields are optional. Without `security_protocol` the older `auth_type` decides: `sasl` with a
+`sasl_username` is `sasl_plaintext`, with `PLAIN` unless `sasl_mechanism` names another, and
+anything else is `plaintext`. A SASL protocol needs a mechanism, a username and a password.
+A save that names an unknown protocol or mechanism, or a SASL protocol without one of the
+three, is refused with `400`, for example "security_protocol must be one of plaintext, ssl,
+sasl_plaintext or sasl_ssl"; an endpoint stored that way fails its deliveries and the startup
+check. `ssl` and `sasl_ssl` verify the brokers' certificates and host names against the gateway
+host's system CA store; there is no setting for a private CA. Amazon MSK with SASL/SCRAM is
+`sasl_ssl` with `SCRAM-SHA-512` on its SASL/SCRAM bootstrap brokers.
 
 A webhook request carries `X-Webhook-Timestamp`, the Unix time in seconds. With a
 `signing_secret` it also carries `X-Webhook-Signature-256`: `sha256=` and the hex
@@ -615,7 +667,10 @@ sidebar item and the pages need `integrations.view`, the editors and test sends
 
 - **Endpoints** show the fields of their type. Secret fields are never shown once stored: they
   can be kept, replaced or cleared, or point to an appliance-wide secret with
-  `$SECRET:<secret_id>`. A saved endpoint can send a test message.
+  `$SECRET:<secret_id>`. A saved endpoint can send a test message. A Kafka endpoint picks its
+  security protocol, all four of them, and for a SASL protocol its mechanism, username and
+  password. An endpoint stored without `security_protocol` opens with the protocol the gateway
+  uses for it, and saving writes `security_protocol` in place of `auth_type`.
 - **Event sets** pick events from the catalog, grouped by family and audit events by their
   audit group, with search. Audit events are picked and saved like any other.
 - **Integrations** join an endpoint and an event set and hold the template for the endpoint's

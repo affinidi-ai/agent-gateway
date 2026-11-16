@@ -1,0 +1,127 @@
+branch: feat/audit-memfix
+changes:
+  added:
+    - timestamp: '2026-11-07T10:00:00Z'
+      title: Let config.toml set the VP Audit Log's rotation size and retained files
+      description: >-
+        A new startup-only `[audit]` block sets `vp_audit_log_max_bytes` (8 MiB by default; `0`
+        switches rotation off, and a value between 1 and 65535 fails startup with
+        `audit.vp_audit_log_max_bytes must be 0 or at least 65536 bytes`) and `vp_audit_log_keep`
+        (`0` by default, which keeps every rotated file). Set `vp_audit_log_keep` to a positive
+        number to bound the history on disk: only the newest that many rotated files are kept and
+        the records in the rest are deleted outright, so forward anything that must outlive them
+        to a Governance Audit integration first.
+    - timestamp: '2026-11-07T10:00:00Z'
+      title: Show the counts of an incomplete audit read as lower bounds
+      description: >-
+        An audit response now says what a read did not return, in two fields. `truncated` means it
+        stopped before the end of the history: its scan limit —
+        `vp_audit_log_max_bytes` × (`vp_audit_log_keep` + 2) bytes, at most 256 MiB, which an
+        appliance keeping its whole history reaches once that history passes 256 MiB — or a
+        rotated file that is missing or unreadable. `dropped_records` counts the records in the
+        history it could not read, such as the half-written line an append interrupted by a crash
+        leaves behind. Either makes the counts lower bounds, so the Audit page and the Credentials
+        audit tab show every number from that read with a trailing `+`: `1243+` records,
+        `Page 5 of 687+`. A partial count is no longer presented as a complete one, and an Audit
+        page that finds nothing in such a read says the records it searched held none instead of
+        saying the log is empty and offering to turn auditing on.
+        `GET /api/admin/payments/audit`, which has no dashboard view, carries both fields for its
+        own counts.
+    - timestamp: '2026-11-07T10:00:00Z'
+      title: Show how large the VP Audit Log has grown on the Audit page
+      description: >-
+        The Audit page shows the size of the audit history on disk — the live log and every
+        rotated file — against the new, advisory `[audit] vp_audit_log_soft_cap_bytes` (1 GiB by
+        default; `0` shows the size alone). It enforces nothing: no record is deleted, no write is
+        refused and the log keeps growing past it. It is there because the default retention never
+        deletes anything, so the growth is worth watching; past the size the page names the two
+        things an operator can do about it. About the Audit Log explains what the size covers and
+        that the advisory size enforces nothing, so a filling bar does not read as a deadline.
+  changed:
+    - timestamp: '2026-11-07T10:00:00Z'
+      title: ⭐ Rotate the VP Audit Log instead of appending to one unbounded file
+      description: >-
+        The VP Audit Log was one file that grew for the life of the appliance. The live file is
+        now renamed aside once it reaches `[audit] vp_audit_log_max_bytes` (8 MiB by default) and
+        a fresh one is started, so the file an audit read walks stays small. Nothing is deleted by
+        default: every rotated file is kept beside the live one, so the appliance still holds
+        every audit record it has ever written, in `delegation-audit.jsonl.1`,
+        `.2` and so on with the highest the most recent. Rotation is one rename however long the
+        history is. On an appliance upgrading with a large audit log, the existing file becomes
+        the first rotated file whole, and audit reads examine its newest 256 MiB and report
+        `truncated` until it has aged out.
+    - timestamp: '2026-11-07T10:00:00Z'
+      title: Show every size in the dashboard in binary units
+      description: >-
+        The Metrics and Tasks pages formatted byte counts themselves, dividing by 1024 but
+        labelling the result KB, MB and GB, and to different numbers of decimals on each page.
+        Every size in the dashboard now comes from one formatter and reads in the units it is
+        actually measured in: `312 MiB`, `1.5 GiB`.
+    - timestamp: '2026-11-07T10:00:00Z'
+      title: Match an audit text search against the stored record only
+      description: >-
+        A text search now matches each record as it is stored, before the policy version and
+        content hash of a policy decision written before those fields existed are filled in from
+        its trace's signed presentation. Searching for one of those two values therefore no longer
+        finds such a row, where the previous whole-file read did; every other search is unchanged,
+        and a page still shows the values it filled in, within the bounds of the entry below.
+    - timestamp: '2026-11-07T11:30:00Z'
+      title: Bound what an audit page fills in from the signed presentations
+      description: >-
+        A policy decision written before the policy version and content hash were recorded with
+        the record takes both from its trace's signed presentation, which the previous whole-file
+        read always found. That look-up is now a second bounded walk: it stops at the read's scan
+        limit, and at 1024 embedded decisions across the page. Such a row can therefore come back
+        with no policy version and no content hash, and which of them are filled in follows the
+        order of the history rather than the row. A row recorded with the two fields — every
+        policy decision written since they existed — shows them with no look-up at all, and
+        filtering a read to one `trace_id` gives the walk that row alone to find.
+  fixed:
+    - timestamp: '2026-11-07T10:00:00Z'
+      title: ⭐ Keep the Audit page from running the gateway out of memory
+      description: >-
+        Opening the Audit page, the Credentials audit tab or the payments audit view read and
+        parsed the whole VP Audit Log on every request, so the gateway could be killed for using
+        too much memory once the log had grown. A read now walks the history backwards one line at
+        a time, on a blocking thread and one read at a time, and keeps only the page it returns,
+        so it costs the same memory whether the history is 1 MiB or 1 GiB. Filters and counts are
+        applied as each record is met, and a signed presentation is decoded only for the rows a
+        page shows.
+    - timestamp: '2026-11-07T10:00:00Z'
+      title: Answer an unreadable VP Audit Log with an error instead of an empty page
+      description: >-
+        The Audit page showed an empty log when the gateway could not read the audit file,
+        asserting that an administrator was seeing all of the evidence when it had seen none of
+        it. Both audit endpoints now answer a failed read with 500 and the JSON body
+        `{"error": "Failed to read the audit log"}`, what failed staying in the gateway's own log.
+        The Audit page and the Credentials audit tab show that failure, with a Retry, in place of
+        their empty state, so a read that returned nothing is never passed off as a log that holds
+        nothing. A live log that is not a regular file at all — a directory, a FIFO or a socket
+        left at its path — is answered the same way, rather than returning the rotated history as
+        though it were the whole log. A rotated file that cannot be
+        read no longer fails the read at all: the records behind it are still returned, and the
+        response is marked `truncated`.
+    - timestamp: '2026-11-07T13:20:00Z'
+      title: Show how many records each audit category holds
+      description: >-
+        The Audit page's Category filter counted every category and then showed the number for
+        none of them: a category with records displayed no count at all, and only an empty one
+        was marked, so the only number on the row was a zero. The count now shows on each
+        category, as a lower bound with a trailing `+` when the read did not reach the end of
+        the history. The Flow and Type filters were given a count of zero for every option even
+        though the gateway sends no count for them, which read as "none of these" and hid every
+        option behind the overflow menu; they now show no number at all.
+  removed: []
+  security:
+    - timestamp: '2026-11-07T10:45:00Z'
+      title: Take the patched actix releases for four advisories
+      description: >-
+        The gateway reaches `actix-web` and `actix-http` through its OpenAPI MCP support, and four
+        advisories published against them on 6 November are fixed in releases the project already
+        allowed: RUSTSEC-2026-0448 and RUSTSEC-2026-0455, where a compressed request body could
+        exhaust memory and CPU before any extractor limit applied, RUSTSEC-2026-0447, the same
+        through a different path, and RUSTSEC-2026-0446, request smuggling through malformed
+        chunked request trailers. Only the lock file changed: no dependency was added or removed
+        from `Cargo.toml`, and taking the patched releases moved a handful of transitive pins with
+        them.
+  breaking: []

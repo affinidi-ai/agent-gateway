@@ -141,9 +141,10 @@ implementation.
 | 1 | `www/default/src/api.ts` | Add the API calls. |
 | 2 | `www/default/src/pages/<Name>/` | Add the page. Keep the entry file orchestration-focused and put owned logic in sections, hooks, and helpers beside it. |
 | 3 | `www/default/src/routes.ts` | Register the route. |
-| 4 | the page | Give every interactive element a `data-testid` following the convention. |
-| 5 | `ui-tests/specs/` | Add a spec. |
-| 6 | `www/default/AGENTS.md` | Record any page-specific requirement that a future change must preserve. |
+| 4 | `src/proxy/paths.rs` | A new top-level segment goes in `SPA_RESERVED_TOP_LEVEL` and in the dashboard page list of the `channels` row of [`CONFIGURATION_REFERENCE.md`](../CONFIGURATION_REFERENCE.md); tests fail until both list it. A gateway whose configuration already uses that segment stops serving that prefix after the upgrade, so record it under `breaking` in the changelog fragment. |
+| 5 | the page | Give every interactive element a `data-testid` following the convention. |
+| 6 | `ui-tests/specs/` | Add a spec. |
+| 7 | `www/default/AGENTS.md` | Record any page-specific requirement that a future change must preserve. |
 
 **Watch for:** gate controls on the permissions from `PermissionsContext`. A view-only user
 should see the data and not the mutating controls.

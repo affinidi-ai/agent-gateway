@@ -7,7 +7,6 @@ This directory contains unit tests for the DID:webvh identity management UI comp
 The tests cover the following components:
 
 - **TrustScoreModal** - Trust score visualization with radar charts and component breakdown
-- **VersionHistoryModal** - Version history timeline with integrity verification
 - **CreateIdentityWizard** - 3-step wizard for creating new DID:webvh identities
 - **IdentitiesPage** - Main identity list page with trust scores and actions
 
@@ -53,7 +52,6 @@ npm test -- --watchAll=false
 ```bash
 npm test TrustScoreModal
 npm test CreateIdentityWizard
-npm test VersionHistoryModal
 npm test IdentitiesPage
 ```
 
@@ -92,36 +90,20 @@ npm test -- --coverage --watchAll=false
 - ✅ Closes modal when Cancel clicked
 - ✅ Toggles capabilities checkboxes
 
-### VersionHistoryModal Tests
-
-- ✅ Renders loading state initially
-- ✅ Loads and displays version history
-- ✅ Displays error message on API failure
-- ✅ Shows CURRENT badge for latest version
-- ✅ Displays version details correctly
-- ✅ Toggles version comparison UI
-- ✅ Runs version comparison when button clicked
-- ✅ Verifies chain integrity when Verify button clicked
-- ✅ Shows verification error when verification fails
-- ✅ Calls onHide when close button clicked
-- ✅ Does not load data when modal is not shown
-- ✅ Displays different operation badges (GENESIS, UPDATE, KEY ROTATION, TRANSFER)
-- ✅ Expands and collapses metadata sections
-
 ### IdentitiesPage Tests
 
 - ✅ Renders identities list
 - ✅ Displays trust score progress bars
 - ✅ Displays attestation icons (TEE, Cloud)
 - ✅ Opens trust score modal when button clicked
-- ✅ Opens version history modal when button clicked
+- ✅ Groups a surface's managed DIDs and lists their versions, rotations and changes
 - ✅ Opens create identity wizard when Create Identity clicked
 - ✅ Displays correct trust score colors (high score = green, low score = yellow/red)
 - ✅ Displays version badges
 - ✅ Handles empty identities list
 - ✅ Handles API error gracefully
 - ✅ Copies identity link to clipboard
-- ✅ Conditional rendering (no trust score button without score, no history button without uuid)
+- ✅ Conditional rendering (no trust score button without score)
 
 ## Mocking Strategy
 

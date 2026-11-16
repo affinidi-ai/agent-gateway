@@ -6,7 +6,14 @@ import InfoBanner from '../../../shared/InfoBanner';
 import type { ConfigPanelProps } from '../types';
 import { deepLinks } from '../../../../utils/deepLinks';
 import TrustRecorderLastOutcome from '../../../trust-recorder/TrustRecorderLastOutcome';
-import { readEntries, TRUST_RECORDER_ENTRIES_MAX, usesSurfaceIssuer } from './definition';
+import { useOptionalSurfaceMeta } from '../../SurfaceMetaContext';
+import MissingAuthorityWarning from '../_shared/MissingAuthorityWarning';
+import {
+  missingTrustRecorderAuthorities,
+  readEntries,
+  TRUST_RECORDER_ENTRIES_MAX,
+  usesSurfaceIssuer,
+} from './definition';
 import NoSurfaceIssuerWarning, { useSurfaceIssuerProblem } from './NoSurfaceIssuerWarning';
 
 const PREVIEW_MAX = 5;
@@ -35,6 +42,8 @@ function describeContext(): TrustRecorderContext {
 const TrustRecorderPanel: React.FC<ConfigPanelProps> = ({ config, openFullscreenEditor }) => {
   const entries = readEntries(config);
   const surfaceIssuerProblem = useSurfaceIssuerProblem();
+  const authorityDids = useOptionalSurfaceMeta()?.authorityDids;
+  const missingAuthorities = missingTrustRecorderAuthorities(config, authorityDids);
   const shown = entries.slice(0, PREVIEW_MAX);
   const remaining = entries.length - shown.length;
   const context = describeContext();
@@ -107,6 +116,12 @@ const TrustRecorderPanel: React.FC<ConfigPanelProps> = ({ config, openFullscreen
           written.
         </NoSurfaceIssuerWarning>
       )}
+      <MissingAuthorityWarning
+        testid="trust-recorder-panel-authority-missing"
+        element="trust-recorder"
+        missing={missingAuthorities}
+        itemLabel={entries.length > 1 ? 'Entry' : undefined}
+      />
     </div>
   );
 

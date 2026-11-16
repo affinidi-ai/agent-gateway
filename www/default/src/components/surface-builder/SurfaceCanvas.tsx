@@ -23,6 +23,10 @@ import {
   policyDefinitionMissing,
   policyDefinitionMissingReason,
 } from './elements/policy/status';
+import { apiKeyReferenceCanvasReason, type ApiKeyStatuses } from './elements/identity/apiKeyStatus';
+import { missingAuthorityCanvasReason } from './elements/missingAuthority';
+import type { AuthorityDids } from './elements/_shared/authorityReference';
+import { useOptionalSurfaceMeta } from './SurfaceMetaContext';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -286,6 +290,22 @@ export interface SurfaceCanvasProps {
    * owns the crosshairs button in its toolbar.
    */
   resetViewRef?: React.MutableRefObject<(() => void) | null>;
+}
+
+/**
+ * Short reason for a node whose stored reference the gateway refuses: an Identity's blocking API
+ * key, or a Trust Check or Trust Recorder entry whose Authority was deleted. The node is drawn
+ * unconfigured while it has one.
+ */
+function storedReferenceReason(
+  node: CanvasNode,
+  apiKeyStatuses: ApiKeyStatuses | undefined,
+  authorityDids: AuthorityDids
+): string | null {
+  return (
+    apiKeyReferenceCanvasReason(node, apiKeyStatuses) ??
+    missingAuthorityCanvasReason(node, authorityDids)
+  );
 }
 
 /**
@@ -969,6 +989,17 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
   useEffect(() => {
     surfacePolicyIdsRef.current = surfacePolicyIds;
   }, [surfacePolicyIds]);
+  const surfaceMeta = useOptionalSurfaceMeta();
+  const apiKeyStatuses = surfaceMeta?.apiKeyStatuses;
+  const apiKeyStatusesRef = useRef<ApiKeyStatuses | undefined>(undefined);
+  useEffect(() => {
+    apiKeyStatusesRef.current = apiKeyStatuses;
+  }, [apiKeyStatuses]);
+  const authorityDids = surfaceMeta?.authorityDids;
+  const authorityDidsRef = useRef<AuthorityDids>(undefined);
+  useEffect(() => {
+    authorityDidsRef.current = authorityDids;
+  }, [authorityDids]);
   const lastSizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
   // Captured on every rebuild so the surfaceSize-prop effect (driven by
   // undo/redo, where the parent reverts state.surfaceSize) can re-apply
@@ -3294,9 +3325,13 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
         if (d.type === 'surface') return false;
         if (!d.configured || featureErrorIds.has(d.id)) return true;
         const cn = nodes.find(n => n.id === d.id);
-        return policyDefinitionMissing(
-          { type: d.type, config: cn?.config },
-          surfacePolicyIdsRef.current
+        return (
+          policyDefinitionMissing(
+            { type: d.type, config: cn?.config },
+            surfacePolicyIdsRef.current
+          ) ||
+          (!!cn &&
+            storedReferenceReason(cn, apiKeyStatusesRef.current, authorityDidsRef.current) !== null)
         );
       })
       .each(function (d) {
@@ -3492,9 +3527,13 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
         if (d.type === 'surface') return false;
         if (!d.configured) return true;
         const cn = nodes.find(n => n.id === d.id);
-        return policyDefinitionMissing(
-          { type: d.type, config: cn?.config },
-          surfacePolicyIdsRef.current
+        return (
+          policyDefinitionMissing(
+            { type: d.type, config: cn?.config },
+            surfacePolicyIdsRef.current
+          ) ||
+          (!!cn &&
+            storedReferenceReason(cn, apiKeyStatusesRef.current, authorityDidsRef.current) !== null)
         );
       })
       .append('text')
@@ -3507,7 +3546,8 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
       .text(d => {
         const cn = nodes.find(n => n.id === d.id);
         const reason = cn
-          ? getIncompleteReason(d.type, cn.config, surfacePolicyIdsRef.current, cn)
+          ? getIncompleteReason(d.type, cn.config, surfacePolicyIdsRef.current, cn) ||
+            storedReferenceReason(cn, apiKeyStatusesRef.current, authorityDidsRef.current)
           : null;
         if (!reason) return '';
         return reason.length > 38 ? reason.substring(0, 36) + '…' : reason;
@@ -4509,7 +4549,10 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
       const ring = nodeG.select('.unconfigured-ring');
       const hasFeatureError = updateFeatureErrorIds.has(n.id);
       const policyMissing = policyDefinitionMissing(n, surfacePolicyIds);
-      const wantRing = (!n.configured || hasFeatureError || policyMissing) && n.type !== 'surface';
+      const referenceRefused = storedReferenceReason(n, apiKeyStatuses, authorityDids) !== null;
+      const wantRing =
+        (!n.configured || hasFeatureError || policyMissing || referenceRefused) &&
+        n.type !== 'surface';
       const useAnts = hasFeatureError && n.configured && !policyMissing;
       // A policy node with no policy selected or a missing attached policy
       // uses a dotted ring (distinct from the solid incomplete ring and the
@@ -4572,7 +4615,10 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
       // additions/removals shift the reason line correctly.
       const reasonEl = nodeG.select('.node-incomplete-reason');
       const reason =
-        n.type === 'surface' ? null : getIncompleteReason(n.type, n.config, surfacePolicyIds, n);
+        n.type === 'surface'
+          ? null
+          : getIncompleteReason(n.type, n.config, surfacePolicyIds, n) ||
+            storedReferenceReason(n, apiKeyStatuses, authorityDids);
       if (!reason) {
         if (!reasonEl.empty()) reasonEl.remove();
       } else {
@@ -4592,7 +4638,7 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
         }
       }
     });
-  }, [nodes, surfaceName, protocol, routingReady, surfacePolicyIds]);
+  }, [nodes, surfaceName, protocol, routingReady, surfacePolicyIds, apiKeyStatuses, authorityDids]);
 
   // ─── Single-selection highlight ─────────────────────────────────────
   // Mirror `selectedNodeId` onto a `.node-single-selected` class so the

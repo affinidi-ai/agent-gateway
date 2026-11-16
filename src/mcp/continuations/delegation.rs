@@ -50,6 +50,7 @@ fn verified_principal(identity: &AuthenticatedIdentity) -> Result<String, Contin
         subject,
         principal_claim,
         claims,
+        ..
     } = identity
     else {
         return Err(ContinuationError::BindingMismatch);
@@ -160,9 +161,11 @@ mod tests {
             "id": "provider", "name": "Provider", "provider_id": "provider", "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
         })).unwrap();
         let identity = AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": "https://gateway.example/oauth2/mcp", "sub": "user", "scope": "write read", "act": {"sub": "client"}, "exp": 100}),
+            verification: Default::default(),
         };
         let authorization = McpResourceServerConfig {
             resource: "https://gateway.example/mcp".into(),

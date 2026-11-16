@@ -53,6 +53,35 @@ describe('CredentialProvidersTab', () => {
     expect(screen.getAllByTestId('credential-provider-entra-resource-badge')).toHaveLength(1);
   });
 
+  it('flags an external consent Entra v2.0 provider only while it sends its resource', async () => {
+    const external = (name: string, send_resource?: boolean) => ({
+      ...item(
+        name,
+        'https://login.microsoftonline.com/t/oauth2/v2.0/token',
+        'https://graph.microsoft.com'
+      ),
+      provider_type: 'oauth2_authorization_code',
+      issuer: 'https://login.microsoftonline.com/t/v2.0',
+      ...(send_resource === undefined ? {} : { send_resource }),
+    });
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve([external('entra-sends'), external('entra-quiet', false)]),
+    });
+    render(
+      <MemoryRouter>
+        <CredentialProvidersTab />
+      </MemoryRouter>
+    );
+    const flagged = await screen.findByRole('row', { name: /^entra-sends/ });
+    const badge = within(flagged).getByTestId('credential-provider-entra-resource-badge');
+    expect(badge).toHaveAttribute(
+      'title',
+      expect.stringContaining('re-create the provider with send_resource set to false')
+    );
+    expect(screen.getAllByTestId('credential-provider-entra-resource-badge')).toHaveLength(1);
+  });
+
   it('says why a delete was refused, naming the surface that binds the provider', () => {
     const body = JSON.stringify({
       error: 'The credential provider is bound by an agent surface; remove the binding first',
@@ -66,5 +95,52 @@ describe('CredentialProvidersTab', () => {
       providerDeleteError(503, JSON.stringify({ error: 'The vault is unavailable' }), '')
     ).toBe('The vault is unavailable (503)');
     expect(providerDeleteError(500, '', '')).toBe('Request failed (500)');
+  });
+
+  describe('client authentication badge', () => {
+    const renderList = async (records: Record<string, unknown>[]) => {
+      mockFetch.mockResolvedValue({ ok: true, json: () => Promise.resolve(records) });
+      render(
+        <MemoryRouter>
+          <CredentialProvidersTab />
+        </MemoryRouter>
+      );
+      await screen.findByRole('row', { name: new RegExp(`^${records[0].name}`) });
+    };
+    const jwt = (name: string, extra: Record<string, unknown>) => ({
+      ...item(name, 'https://hydra.example/token', null),
+      provider_type: 'oauth2_jwt_bearer',
+      ...extra,
+    });
+
+    it.each([
+      ['none', 'Client ID only'],
+      ['client_secret_basic', 'HTTP Basic'],
+      ['client_secret_post', 'Form body'],
+    ])('badges a JWT Bearer provider whose client authentication is %s', async (method, label) => {
+      await renderList([jwt('hydra', { client_authentication: method })]);
+      const row = screen.getByRole('row', { name: /^hydra/ });
+      const badge = within(row).getByTestId('credential-provider-client-authentication-badge');
+      expect(badge).toHaveTextContent(label);
+      expect(badge).toHaveClass('text-bg-secondary');
+    });
+
+    it('shows no badge for a client authentication the dashboard does not know', async () => {
+      await renderList([jwt('odd', { client_authentication: 'private_key_jwt' })]);
+      expect(
+        screen.queryByTestId('credential-provider-client-authentication-badge')
+      ).not.toBeInTheDocument();
+    });
+
+    it('shows no badge without a client authentication or on another type', async () => {
+      await renderList([
+        jwt('google', {}),
+        item('cc', 'https://idp.example/token', null),
+        { ...item('cc2', 'https://idp.example/token', null), client_authentication: 'none' },
+      ]);
+      expect(
+        screen.queryByTestId('credential-provider-client-authentication-badge')
+      ).not.toBeInTheDocument();
+    });
   });
 });

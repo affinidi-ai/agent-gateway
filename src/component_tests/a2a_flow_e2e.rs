@@ -465,12 +465,10 @@ async fn outbound_a2a_message_send_happy_path() {
 
 // ── Tampered signature ───────────────────────────────────────────────────────
 
-/// A channel with JWT Bearer source auth no longer blocks an A2A request whose
-/// JWT signature has been tampered with: the caller-attributable failure is
-/// non-blocking, so with no denying policy configured the request is forwarded
-/// to the target with no asserted caller identity.
+/// A closed Access Point with JWT Bearer source auth refuses an A2A request
+/// whose JWT signature has been tampered with, with `401` before the target.
 #[tokio::test(flavor = "multi_thread")]
-async fn inbound_a2a_tampered_jwt_signature_forwarded_without_policy() {
+async fn inbound_a2a_tampered_jwt_signature_is_refused() {
     //
     // Given — channel requires JWT Bearer auth
     //
@@ -523,10 +521,16 @@ async fn inbound_a2a_tampered_jwt_signature_forwarded_without_policy() {
         .expect("request with tampered token failed");
 
     //
-    // Then — non-blocking: request is forwarded and the mock receives it
+    // Then — refused before the target
     //
-    assert_eq!(resp.status(), 200, "expected the failed-auth request to be forwarded, got {}", resp.status());
-    assert_mock_received_request(&h.mock, &request_str);
+    assert_eq!(resp.status(), 401, "expected the failed-auth request to be refused, got {}", resp.status());
+    assert_eq!(
+        h.mock
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the target is never called"
+    );
 }
 
 // ── Envelope structure enforcement ───────────────────────────────────────────
@@ -1103,11 +1107,10 @@ async fn inbound_a2a_retry_exhausted_returns_error() {
 
 // ── Auth: missing token ──────────────────────────────────────────────────────
 
-/// A channel requiring JWT Bearer auth no longer blocks a request with no
-/// Authorization header: the missing credential is a non-blocking, caller-
-/// attributable failure, so without a denying policy the request is forwarded.
+/// A closed Access Point requiring JWT Bearer auth refuses a request with no
+/// Authorization header with `401` before the target.
 #[tokio::test(flavor = "multi_thread")]
-async fn inbound_a2a_missing_auth_token_forwarded_without_policy() {
+async fn inbound_a2a_missing_auth_token_is_refused() {
     //
     // Given — channel requires JWT Bearer auth
     //
@@ -1133,18 +1136,23 @@ async fn inbound_a2a_missing_auth_token_forwarded_without_policy() {
         .expect("request without auth failed");
 
     //
-    // Then — non-blocking: request is forwarded and the mock receives it
+    // Then — refused before the target
     //
-    assert_eq!(resp.status(), 200, "expected the failed-auth request to be forwarded, got {}", resp.status());
-    assert_mock_received_request(&h.mock, &request_str);
+    assert_eq!(resp.status(), 401, "expected the failed-auth request to be refused, got {}", resp.status());
+    assert_eq!(
+        h.mock
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the target is never called"
+    );
 }
 
-/// A channel requiring JWT Bearer auth no longer blocks a request carrying a
-/// syntactically invalid token (not three dot-separated segments): the invalid
-/// credential is a non-blocking failure, so without a denying policy the
-/// request is forwarded.
+/// A closed Access Point requiring JWT Bearer auth refuses a request carrying a
+/// syntactically invalid token (not three dot-separated segments) with `401`
+/// before the target.
 #[tokio::test(flavor = "multi_thread")]
-async fn inbound_a2a_malformed_token_forwarded_without_policy() {
+async fn inbound_a2a_malformed_token_is_refused() {
     //
     // Given — channel requires JWT Bearer auth
     //
@@ -1171,17 +1179,22 @@ async fn inbound_a2a_malformed_token_forwarded_without_policy() {
         .expect("request with malformed token failed");
 
     //
-    // Then — non-blocking: request is forwarded and the mock receives it
+    // Then — refused before the target
     //
-    assert_eq!(resp.status(), 200, "expected the failed-auth request to be forwarded, got {}", resp.status());
-    assert_mock_received_request(&h.mock, &request_str);
+    assert_eq!(resp.status(), 401, "expected the failed-auth request to be refused, got {}", resp.status());
+    assert_eq!(
+        h.mock
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the target is never called"
+    );
 }
 
-/// A channel requiring JWT Bearer auth no longer blocks a request carrying a
-/// structurally valid but expired JWT: the invalid credential is a non-blocking
-/// failure, so without a denying policy the request is forwarded.
+/// A closed Access Point requiring JWT Bearer auth refuses a request carrying a
+/// structurally valid but expired JWT with `401` before the target.
 #[tokio::test(flavor = "multi_thread")]
-async fn inbound_a2a_expired_token_forwarded_without_policy() {
+async fn inbound_a2a_expired_token_is_refused() {
     //
     // Given — channel requires JWT Bearer auth
     //
@@ -1220,20 +1233,25 @@ async fn inbound_a2a_expired_token_forwarded_without_policy() {
         .expect("request with expired token failed");
 
     //
-    // Then — non-blocking: request is forwarded and the mock receives it
+    // Then — refused before the target
     //
-    assert_eq!(resp.status(), 200, "expected the failed-auth request to be forwarded, got {}", resp.status());
-    assert_mock_received_request(&h.mock, &request_str);
+    assert_eq!(resp.status(), 401, "expected the failed-auth request to be refused, got {}", resp.status());
+    assert_eq!(
+        h.mock
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the target is never called"
+    );
 }
 
 // ── Auth: error response body format ─────────────────────────────────────────
 
-/// When JWT auth fails (tampered signature) the failure is non-blocking, so with
-/// no denying policy the request is forwarded to the target instead of producing
-/// an error envelope. (The 401/500 `deny_response` envelope is covered by unit
-/// tests in `source_auth::errors`.)
+/// A closed Access Point answers a tampered JWT with an A2A
+/// `application/problem+json` refusal that says only that the caller credential
+/// is missing or invalid.
 #[tokio::test(flavor = "multi_thread")]
-async fn inbound_a2a_tampered_jwt_forwarded_reaches_target() {
+async fn inbound_a2a_tampered_jwt_is_refused_with_a_problem_document() {
     //
     // Given — channel requires JWT Bearer auth
     //
@@ -1283,10 +1301,27 @@ async fn inbound_a2a_tampered_jwt_forwarded_reaches_target() {
         .expect("request with tampered token failed");
 
     //
-    // Then — non-blocking: request is forwarded and the mock receives it
+    // Then — refused before the target
     //
-    assert_eq!(resp.status(), 200, "expected the failed-auth request to be forwarded, got {}", resp.status());
-    assert_mock_received_request(&h.mock, &request_str);
+    assert_eq!(resp.status(), 401, "expected the failed-auth request to be refused, got {}", resp.status());
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/problem+json")
+    );
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .expect("problem document");
+    assert_eq!(body["detail"], crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED);
+    assert_eq!(
+        h.mock
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the target is never called"
+    );
 }
 
 // ── Strict request-shape validation (opt-in) ─────────────────────────────────

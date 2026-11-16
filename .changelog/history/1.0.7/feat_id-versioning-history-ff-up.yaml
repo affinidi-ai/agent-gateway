@@ -1,0 +1,23 @@
+branch: feat/id-versioning-history-ff-up
+changes:
+  added:
+    - timestamp: '2026-11-10T11:18:07Z'
+      title: List a managed identity's credential rotations from a paged endpoint
+      description: >-
+        GET /api/v1/identities/by-hash/{identity_hash}/rotations returns an identity's credential
+        rotations oldest first, in pages of up to 1000 with limit and before, and 404 for an unknown
+        identity. The Identities page's Version History fetches them when it opens, with loading,
+        error and retry states.
+  changed:
+    - timestamp: '2026-11-10T11:18:07Z'
+      title: Send a rotation count instead of every rotation in identity rows
+      description: >-
+        Identities rows and WebSocket identity updates carry rotation_count instead of the full
+        rotations list, so their size no longer grows with every certificate renewal or API key
+        edit. Rotations are kept in a per-identity history stored apart from the identity record,
+        which the per-request usage update no longer rewrites. Records that kept rotations inline
+        still load, and their next write moves the rotations to the history.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

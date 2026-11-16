@@ -1,10 +1,10 @@
-Feature: New Access Points are closed by default
+Feature: Access Points that are not public refuse failed callers
   A surface created through the admin API has a closed Access Point. Until it
   has source authentication, or the operator marks it public, it is not ready
   and refuses every caller. Once it has source authentication, a caller whose
-  credential is missing or invalid is refused before the target. A stored
-  surface that was never marked closed or public keeps handing such callers to
-  policy.
+  credential is missing or invalid is refused before the target. A legacy
+  surface, stored without being marked closed or public, refuses such callers
+  too, while only a public Access Point hands them to policy.
 
   Scenario: A not-ready Access Point refuses callers
     Given an A2A surface targeting managed agent "bravo"
@@ -56,9 +56,66 @@ Feature: New Access Points are closed by default
     Then the response status is 200
     And managed agent "bravo" received the forwarded request
 
-  Scenario: A stored surface never marked closed or public hands a failed caller to policy
+  Scenario Outline: A legacy surface refuses a caller whose API key is missing or invalid
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface is stored as a legacy surface
+    And the surface requires "API Key" source authentication
+    When the caller sends a request to the surface <credential condition>
+    Then the response status is 401
+    And managed agent "bravo" was not called
+    And the response content type is "application/problem+json"
+    And the response says only that the caller credential is missing or invalid
+
+    Examples:
+      | credential condition    |
+      | without an API key      |
+      | with an invalid API key |
+
+  Scenario: A legacy MCP surface refuses a caller with a JSON-RPC error
+    Given MCP surface "alpha" targets MCP server "bravo"
+    And the surface is stored as a legacy surface
+    And the surface requires "API Key" source authentication
+    When the caller asks the MCP surface for available tools without an API key
+    Then the response status is 401
+    And the MCP response is a JSON-RPC error with code -32603
+    And the MCP response id matches the request id
+    And MCP server "bravo" was not called
+
+  Scenario: The gateway warns at start about a legacy surface that refuses failed callers
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface is stored as a legacy surface
+    And the surface requires "API Key" source authentication
+    And the gateway keeps its log of warnings
+    When the caller sends a request to the surface with a valid API key
+    Then the gateway log has a warning containing "is configured for authenticated callers only"
+
+  Scenario: The gateway does not warn at start about a public surface
     Given an A2A surface targeting managed agent "bravo"
     And the surface requires "API Key" source authentication
+    And the surface is stored with a public Access Point
+    And the gateway keeps its log of warnings
+    When the caller sends a request to the surface with a valid API key
+    Then the gateway log has no warning containing "is configured for authenticated callers only"
+
+  Scenario: A legacy surface admits a caller with a valid API key
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface is stored as a legacy surface
+    And the surface requires "API Key" source authentication
+    When the caller sends a request to the surface with a valid API key
+    Then the response status is 200
+    And managed agent "bravo" received the forwarded request
+
+  Scenario: A legacy surface without source authentication admits every caller
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface is stored as a legacy surface
+    When the caller sends a request to the surface
+    Then the response status is 200
+    And managed agent "bravo" received the forwarded request
+
+  Scenario: A stored public surface hands a caller without an API key to policy
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface requires "API Key" source authentication
+    And the surface is stored with a public Access Point
     When the caller sends a request to the surface without an API key
     Then the response status is 200
     And managed agent "bravo" received the forwarded request

@@ -3,6 +3,13 @@ import type { NodeDefinition, PayloadSlice } from '../types';
 import TrustRecorderPanel from './TrustRecorderPanel';
 import TrustRecorderFullscreenPanel from './TrustRecorderFullscreenPanel';
 import { DOCS_URL } from '../../../../config/docs';
+import type { AuthoritySource } from '../../../../types';
+import {
+  authoritySourceFor,
+  missingAuthorityDid,
+  type AuthorityDids,
+  type MissingAuthority,
+} from '../_shared/authorityReference';
 
 /**
  * One row of the Trust Recorder editor: which registry to write to, the
@@ -16,6 +23,8 @@ export interface TrustRecorderEntry {
   trust_registry_id: string;
   issuer_did: string;
   authority_did: string;
+  /** Where the literal `authority_did` came from; absent for the surface Issuer template. */
+  authority_source?: AuthoritySource;
   include_owned_agent: boolean;
   custom_resources: CustomResource[];
 }
@@ -92,25 +101,41 @@ export function readEntries(config: any): TrustRecorderEntry[] {
   if (!Array.isArray(raw)) return [];
   return raw
     .filter((e: any): e is Record<string, unknown> => !!e && typeof e === 'object')
-    .map((e: any) => ({
-      trust_registry_id: typeof e.trust_registry_id === 'string' ? e.trust_registry_id : '',
-      issuer_did: typeof e.issuer_did === 'string' ? e.issuer_did : '',
-      authority_did: typeof e.authority_did === 'string' ? e.authority_did : '',
-      include_owned_agent: e.include_owned_agent !== false,
-      custom_resources: Array.isArray(e.custom_resources)
-        ? e.custom_resources
-            .filter((r: any): r is Record<string, unknown> => !!r && typeof r === 'object')
-            .map((r: any) => ({
-              action: typeof r.action === 'string' ? r.action : '',
-              resource: typeof r.resource === 'string' ? r.resource : '',
-              entity_target: r.entity_target === 'issuer' ? 'issuer' : 'agent',
-              record_type:
-                typeof r.record_type === 'string' && r.record_type.trim().length > 0
-                  ? r.record_type
-                  : 'recognition',
-            }))
-        : [],
-    }));
+    .map((e: any) => {
+      const source = authoritySourceFor(e.authority_did, e.authority_source);
+      return {
+        trust_registry_id: typeof e.trust_registry_id === 'string' ? e.trust_registry_id : '',
+        issuer_did: typeof e.issuer_did === 'string' ? e.issuer_did : '',
+        authority_did: typeof e.authority_did === 'string' ? e.authority_did : '',
+        ...(source ? { authority_source: source } : {}),
+        include_owned_agent: e.include_owned_agent !== false,
+        custom_resources: Array.isArray(e.custom_resources)
+          ? e.custom_resources
+              .filter((r: any): r is Record<string, unknown> => !!r && typeof r === 'object')
+              .map((r: any) => ({
+                action: typeof r.action === 'string' ? r.action : '',
+                resource: typeof r.resource === 'string' ? r.resource : '',
+                entity_target: r.entity_target === 'issuer' ? 'issuer' : 'agent',
+                record_type:
+                  typeof r.record_type === 'string' && r.record_type.trim().length > 0
+                    ? r.record_type
+                    : 'recognition',
+              }))
+          : [],
+      };
+    });
+}
+
+/** The entries of a Trust Recorder node whose Authority the loaded register no longer has. */
+export function missingTrustRecorderAuthorities(
+  config: any,
+  authorityDids: AuthorityDids
+): MissingAuthority[] {
+  if (!authorityDids) return [];
+  return readEntries(config).flatMap((e, index) => {
+    const did = missingAuthorityDid(e.authority_did, e.authority_source, authorityDids);
+    return did ? [{ index, did }] : [];
+  });
 }
 
 export const trustRecorderDefinition: NodeDefinition = {

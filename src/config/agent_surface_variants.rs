@@ -1029,8 +1029,10 @@ mod tests {
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
             signing: None,
+            caller_key: None,
             trust_check_split: false,
             transit_point_source_auth: false,
+            browser_origins: Vec::new(),
         }
     }
 

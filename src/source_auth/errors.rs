@@ -57,6 +57,9 @@ impl From<JwtBearerError> for SourceAuthError {
             JwtBearerError::JwksFetchFailed(msg) => SourceAuthError::Internal {
                 reason: format!("JWKS fetch failed: {msg}"),
             },
+            JwtBearerError::JwksUriBlocked => SourceAuthError::Internal {
+                reason: "JWKS fetch failed: jwks_uri refused by egress policy".to_string(),
+            },
             JwtBearerError::Storage(msg) => SourceAuthError::Internal {
                 reason: format!("Storage error: {msg}"),
             },
@@ -70,8 +73,9 @@ impl From<JwtBearerError> for SourceAuthError {
 impl SourceAuthError {
     /// Whether this failure is attributable to the caller's credential (missing
     /// or invalid) rather than a server-side problem (config resolution, JWKS
-    /// fetch, storage). Caller-attributable failures are handed to the policy
-    /// layer instead of being blocked at the source-auth stage.
+    /// fetch, storage). A public Access Point hands caller-attributable
+    /// failures to the policy layer; every other Access Point refuses them
+    /// (see [`caller_refusal`]).
     pub fn is_caller_attributable(&self) -> bool {
         matches!(
             self,
@@ -109,9 +113,13 @@ pub type SourceAuthResult<T> = Result<T, SourceAuthError>;
 /// **401 Unauthorized**; server-side failures (config not found, internal) map
 /// to **500 Internal Server Error** — a 401 would misrepresent a server-side
 /// problem as the caller's fault. Note: caller-attributable failures are
-/// handed to the policy layer unless the Access Point rejects failed callers
-/// (see [`caller_refusal`]), so in practice this builder is reached for
-/// server-side (500) failures.
+/// refused through [`caller_refusal`], or handed to the policy layer on a public
+/// Access Point, so in practice this builder is reached for server-side (500)
+/// failures.
+///
+/// A caller-attributable failure reports [`CALLER_CREDENTIAL_REFUSED`] and a
+/// server-side failure reports [`INTERNAL_ERROR_DETAIL`], so no reason or
+/// internal identifier is sent to the caller. Call sites log the reason.
 ///
 /// - **A2A / AP2**: `application/problem+json` with the A2A `proxy-error` type
 ///   URI. JWT Bearer 401s include a `WWW-Authenticate: Bearer` header.
@@ -127,7 +135,11 @@ pub fn deny_response(
     auth_config: &SourceAuthConfig,
     error: &SourceAuthError,
 ) -> Response {
-    let detail = error.to_string();
+    let detail = if error.is_caller_attributable() {
+        CALLER_CREDENTIAL_REFUSED
+    } else {
+        INTERNAL_ERROR_DETAIL
+    };
     let status = error.http_status();
     let title = error.problem_title();
     // Only a genuine 401 warrants a `WWW-Authenticate` challenge; a 500 is a
@@ -135,8 +147,8 @@ pub fn deny_response(
     let challenge = status == StatusCode::UNAUTHORIZED;
 
     match protocol {
-        SurfaceProtocol::Mcp => mcp_deny(auth_config, &detail, status, title, challenge),
-        _ => a2a_deny(auth_config, &detail, status, title, challenge),
+        SurfaceProtocol::Mcp => mcp_deny(auth_config, detail, status, title, challenge),
+        _ => a2a_deny(auth_config, detail, status, title, challenge),
     }
 }
 
@@ -144,14 +156,17 @@ pub fn deny_response(
 /// credential failed is logged, never sent.
 pub const CALLER_CREDENTIAL_REFUSED: &str = "Caller credential missing or invalid";
 
+/// What a caller is told when source authentication fails on the server side.
+pub const INTERNAL_ERROR_DETAIL: &str = "Source authentication could not be completed.";
+
 /// The `WWW-Authenticate` challenge an MCP JWT Bearer refusal carries.
 const MCP_BEARER_CHALLENGE: &str = "Bearer realm=\"agent-gateway\"";
 
 /// The `401` for a caller whose credential is missing or invalid, on an Access
-/// Point whose caller authentication rejects such callers. An MCP caller gets a
-/// JSON-RPC error answering `mcp_request_id`; any other caller gets
-/// `application/problem+json`. A JWT Bearer refusal carries a
-/// `WWW-Authenticate: Bearer` challenge.
+/// Point whose caller authentication rejects such callers, or whose inbound
+/// identity is `from_jwt_claim`. An MCP caller gets a JSON-RPC error answering
+/// `mcp_request_id`; any other caller gets `application/problem+json`. A JWT
+/// Bearer refusal carries a `WWW-Authenticate: Bearer` challenge.
 pub fn caller_refusal(
     protocol: &SurfaceProtocol,
     auth_config: &SourceAuthConfig,
@@ -206,7 +221,8 @@ pub fn access_point_unavailable(
 
 /// Why an Access Point is not ready: it is closed and authenticates no caller
 /// ([`AgentSurface::refuses_every_request`]), or it derives a DID from an API
-/// key it may not use ([`crate::identity::provider_key_gate`]).
+/// key it may not use, that is revoked, or that does not exist
+/// ([`crate::identity::provider_key_gate`]).
 ///
 /// [`AgentSurface::refuses_every_request`]: crate::config::agent_surface::AgentSurface::refuses_every_request
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,6 +230,8 @@ pub enum NotReadyReason {
     NoSourceAuthentication,
     ProviderKeyTenant,
     ApiKeyStoreUnavailable,
+    ApiKeyRevoked,
+    ApiKeyMissing,
 }
 
 impl NotReadyReason {
@@ -222,6 +240,8 @@ impl NotReadyReason {
             Self::NoSourceAuthentication => "no source authentication",
             Self::ProviderKeyTenant => crate::identity::provider_key_gate::PROVIDER_KEY_TENANT_RULE,
             Self::ApiKeyStoreUnavailable => crate::identity::provider_key_gate::API_KEY_STORE_UNAVAILABLE,
+            Self::ApiKeyRevoked => crate::identity::provider_key_gate::API_KEY_REVOKED,
+            Self::ApiKeyMissing => crate::identity::provider_key_gate::API_KEY_MISSING,
         }
     }
 
@@ -337,6 +357,36 @@ mod tests {
         serde_json::from_slice(&bytes).expect("parse problem+json")
     }
 
+    #[tokio::test]
+    async fn an_access_point_whose_surface_names_its_revoked_api_key_is_not_ready_for_that_reason() {
+        use crate::api_keys::store::ApiKeyStore as _;
+        let gate = crate::identity::provider_key_gate::test_support::enforced_gate(
+            &[("own", Some("tenant-a"))],
+            &[("own", "atgk_errors_own")],
+        )
+        .await;
+        crate::config::credential_policy::use_thread_credential_policy(Default::default());
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "own", "name": "own", "tenant_id": "tenant-a",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/own", "protocol": "a2a", "public": true},
+            "target": {"endpoint": "http://127.0.0.1:9"},
+            "identity_slots": {"external": {"type": "from_api_key", "api_key_id": "atgk_errors_own"}}
+        }))
+        .unwrap();
+        assert_eq!(NotReadyReason::of(&surface).await, None, "an active own key is ready");
+
+        gate.api_keys
+            .revoke("own", "atgk_errors_own", "test")
+            .await
+            .unwrap();
+        gate.gate
+            .key_changed("atgk_errors_own");
+
+        let reason = NotReadyReason::of(&surface).await;
+        assert_eq!(reason, Some(NotReadyReason::ApiKeyRevoked));
+        assert_eq!(reason.unwrap().as_str(), "api_key_revoked");
+    }
+
     #[test]
     fn caller_attributable_classification() {
         assert!(SourceAuthError::MissingCredential { reason: "x".into() }.is_caller_attributable());
@@ -361,6 +411,13 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["status"], 401);
         assert_eq!(body["title"], "Unauthorized");
+        assert_eq!(body["detail"], CALLER_CREDENTIAL_REFUSED);
+        assert!(
+            !body
+                .to_string()
+                .contains("expired"),
+            "the refusal reason reached the caller: {body}"
+        );
     }
 
     #[tokio::test]
@@ -378,6 +435,13 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["status"], 500);
         assert_eq!(body["title"], "Internal Server Error");
+        assert_eq!(body["detail"], INTERNAL_ERROR_DETAIL);
+        assert!(
+            !body
+                .to_string()
+                .contains("jwks fetch failed"),
+            "the internal reason reached the caller: {body}"
+        );
     }
 
     #[tokio::test]
@@ -485,5 +549,12 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["status"], 500);
         assert_eq!(body["title"], "Internal Server Error");
+        assert_eq!(body["detail"], INTERNAL_ERROR_DETAIL);
+        assert!(
+            !body
+                .to_string()
+                .contains("missing"),
+            "the config id reached the caller: {body}"
+        );
     }
 }

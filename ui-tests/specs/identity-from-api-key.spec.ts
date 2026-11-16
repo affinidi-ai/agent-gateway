@@ -47,11 +47,11 @@ const SURFACE_FIXTURE = {
 };
 
 const API_KEYS_FIXTURE = [
-    {key_id: 'atgk_ui_test_agent', agent_id: 'agent-1', client_id: 'client-1', status: 'active'},
+    {key_id: 'atgk_ui_test_agent', agent_id: SURFACE_ID, client_id: 'client-1', status: 'active'},
 ];
 
 async function openSurface(page: Page) {
-    await page.route(/\/api\/v1\/api-keys(\?.*)?$/, async (route) => {
+    await page.route(new RegExp(`/api/v1/api-keys/${SURFACE_ID}(\\?.*)?$`), async (route) => {
         if (route.request().method() === 'GET') {
             await route.fulfill({json: API_KEYS_FIXTURE});
         } else {

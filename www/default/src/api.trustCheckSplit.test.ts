@@ -58,6 +58,34 @@ describe('access_point_status on surface writes', () => {
   });
 });
 
+describe('api_key_references and serving_status on surface writes', () => {
+  const read = {
+    ...surface,
+    api_key_references: [{ key_id: 'atgk_a', status: 'revoked', blocking: true }],
+    serving_status: 'not_serving',
+  };
+
+  it('are left out when creating or updating a surface', async () => {
+    await apiClient.createSurface(read);
+    await apiClient.updateSurface('s-1', read);
+    for (const [, init] of fetchMock.mock.calls) {
+      const body = JSON.parse(init.body);
+      expect(body).not.toHaveProperty('api_key_references');
+      expect(body).not.toHaveProperty('serving_status');
+      expect(body.target.endpoint).toBe('https://agent.example.com');
+    }
+  });
+
+  it('are left out of a write without a target', async () => {
+    await apiClient.updateSurface('s-1', {
+      name: 's',
+      api_key_references: [{ key_id: 'atgk_a', status: 'active', blocking: false }],
+      serving_status: 'serving',
+    } as any);
+    expect(sentBody()).toEqual({ name: 's', trust_check_split: true });
+  });
+});
+
 describe('trust_check_split on Surface Template writes', () => {
   const template = { id: 't-1', name: 't', kind: 'full' as const, surface };
 

@@ -206,15 +206,20 @@ Non-MCP endpoints reject the config. Every setting applies to every MCP
 endpoint, whichever revision a request carries, so `2024-11-05` clients also
 receive `403` (Origin), `431` (header budget) or `413` (body limit, 1 MiB by
 default). Size the limits and allowlist browser origins for each endpoint. The
-configured public HTTP(S) listener origins and explicit allowlist are trusted;
+configured public HTTP(S) listener origins, the explicit allowlist and, on a
+surface's Access Point and its framed Fabric stream receiver, the surface's
+`browser_origins` (see
+[Browser origins of a surface](CONFIGURATION_REFERENCE.md#browser-origins-of-a-surface))
+are trusted; an entry of `browser_origins` that is not an exact origin is ignored
+here rather than failing the endpoint;
 a public endpoint given as a bare listen address (for example `0.0.0.0:8443`)
 names no HTTP(S) origin and adds nothing to the allowlist. Any other public
 endpoint that is not an HTTP(S) origin, such as a URL missing its scheme, also
 adds nothing and is logged once as a warning. Request
 Host/Forwarded headers and CORS do not grant Origin authority. A framed Fabric
-stream receiver independently uses its stored Access Point URL and allowlist, so
-a browser Origin carried on a framed stream must be allowlisted on the
-receiving surface too. A buffered Fabric `ForwardRequest` receiver does not
+stream receiver independently uses its stored Access Point URL, allowlist and
+`browser_origins`, so a browser Origin carried on a framed stream must be
+allowlisted, or listed as a browser origin, on the receiving surface too. A buffered Fabric `ForwardRequest` receiver does not
 check the forwarded Origin, because the sending gateway already checked it
 against its own surface; header and body limits still apply, and the forwarded
 Origin still counts toward the header budget. A framed request the receiver refuses this way is
@@ -262,7 +267,7 @@ or tool-scoped credentials:
 
 | Body | Legacy result | Modern result |
 | --- | --- | --- |
-| JSON-RPC batch (top-level array) | HTTP `422` problem details | HTTP `400`, `-32600` |
+| JSON-RPC batch (top-level array) | HTTP `422` problem details, type `about:blank`, `code` `batch_not_supported` | HTTP `400`, `-32600` |
 | Not valid JSON, such as a batch behind a UTF-8 BOM | HTTP `200`, `-32700` | HTTP `400`, `-32700` |
 | JSON that is not an object | HTTP `200`, `-32600` | HTTP `400`, `-32600` |
 | Two keys of one object, at any depth, that are equal or differ only in case | HTTP `200`, `-32600` | HTTP `400`, `-32600` |
@@ -546,12 +551,37 @@ Owned tool catalogs are name-sorted and retain the available title,
 description, annotations, input schema and output schema. Modern REST execution
 reuses the OpenAPI library's parameter extraction and validation and returns
 structured JSON results, text or image content, and `isError` for HTTP failures.
+The bytes decide between text and file, not the `Content-Type`: a body that is
+valid UTF-8 is text whatever its type (JSON served as `application/octet-stream`
+or `application/x-amz-json-1.1` still yields structured results), and an empty
+body is the status text. A nonempty body that is neither an image nor UTF-8 is an
+embedded resource (`type: resource`) whose `blob` holds the body's bytes in base64
+and whose `mimeType` is the response's `Content-Type` (`application/octet-stream`
+when it sent none). Its `uri` is the backend URL called, without its query or
+fragment. A tool with a JSON output schema still answers it as a schema mismatch.
+The REST client bounds the body's bytes by `max_response_bytes` before encoding
+("REST tool response exceeds its configured limit"). A 2026-07-28 tool call also
+bounds the whole JSON-RPC response by it, base64 included, so an image or file
+larger than about three quarters of the limit is refused there as "MCP tool
+result exceeds the configured limit"; a legacy call has no such second bound.
 Argument failures are `400` / `-32602` before network execution;
 execution failures remain error tool results. Catalog locks are released
 before the REST call. Surface-backed dispatch runs after the shared request
 gates and credential preparation, with surface timeout/circuit-breaker
 controls and the common modern final-response pipeline. Standalone inbound
 headers are used for mirror validation, not as REST Target credentials.
+
+A Transit Point whose `target_endpoint` is `proxy://<id>` is answered by that
+MCP Proxy over session revisions only: `initialize` (`2024-11-05`),
+`tools/list` and `tools/call` after the Transit Point's own gates, a
+notification accepted with `202`, any method but `POST` answered `405`, and a
+`2026-07-28` request refused with `-32022` naming `2024-11-05`. Its tool calls,
+with or without a grant, go through pinned Strict egress with redirects refused,
+never through `rmcp-openapi`'s client. Its backend gets no credential but a
+`consent_mode: external` grant, sent only with a tool call, and with such a
+binding it answers nothing, `tools/list` and `initialize` included, while the
+proxy differs from the one the binding was pinned to; see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#through-an-mcp-proxy).
 
 The OpenAPI library rebuilds parameter schemas and can drop extension
 annotations. Modern catalog construction restores request-body and
@@ -608,7 +638,7 @@ with multipart fully bounded before sending. Request-body and parameter
 references are resolved only within the stored OpenAPI document with a fixed
 depth bound, never fetched over the network. Tests cover a real redirect
 destination, oversized streaming responses, credential conflicts, path escaping,
-images, forms and an actual owned multipart call. These checks do not
+images, binary files, forms and an actual owned multipart call. These checks do not
 establish full offline schema fidelity or complete client-security
 conformance, and the conformance harness scores owned endpoints only on the
 tool subset listed under [Conformance Harness](#conformance-harness).
@@ -1432,8 +1462,9 @@ token. It opts in with `caller_authentication.protected_resource`:
 
 The setting is valid only on an MCP Access Point whose first caller
 authentication method, the one enforced, is JWT Bearer reading the
-`Authorization` header with the `Bearer` scheme, without `forward_header` and
-with empty `audiences`, and it cannot be combined with `mcp_http.authorization`.
+`Authorization` header with the `Bearer` scheme, without `forward_header`, with
+empty `audiences` and with `audience_claim` `aud` (the default), and it cannot be
+combined with `mcp_http.authorization`.
 The token audience is bound to the resource instead, as the MCP authorization
 specification requires (RFC 8707): a token is accepted only when its `aud`
 names the resource advertised for the route called, `resource` on the base
@@ -1539,12 +1570,14 @@ the route or listen address the resource names is refused with `400`, which
 names the setting and asks for a new resource or `null`: dropping the setting
 would leave the JWT Bearer method, whose `audiences` stay empty, checking no
 audience at all. A PUT after which the setting itself no longer fits, one that
-switches the method, sets `forward_header` or `audiences`, or moves the
-protocol off MCP, drops it with a warning in the log instead of being refused
-over a setting the client did not send; the method then checks an audience
-only if the edit set `audiences`. `null` removes it, sent with PATCH, or with
-PUT in the same request as the rest of the edit, a route or listen address
-change included. A variant PUT
+switches the method, sets `forward_header`, `audiences` or an `audience_claim`
+other than `aud`, or moves the protocol off MCP, drops it with a warning in the
+log instead of being refused over a setting the client did not send; the save
+is then refused with `400` unless the edit set `audiences`, since the method
+must name an audience. `null` removes it, sent with PATCH, or with PUT in the
+same request as the rest of the edit, a route or listen address change
+included; that request must also list the JWT Bearer method's `audiences`, or
+it is refused for the same reason. A variant PUT
 (`PUT /v1/surfaces/{id}/variants/{variant_id}`) applies the same rules to the
 variant's own setting in the overrides it sends.
 
@@ -1561,8 +1594,10 @@ and stop serving it. Before rolling back to such a release, PATCH
 `{"access_point": {"caller_authentication": {"protected_resource": null}}}`
 onto every surface that sets it, and `{"overrides": {"access_point":
 {"caller_authentication": {"protected_resource": null}}}}` onto every variant
-that sets its own, then protect those Access Points another way: without the
-setting, their JWT Bearer method checks no audience.
+that sets its own. Each request must also send the `caller_authentication`
+methods with the JWT Bearer method's `audiences` listing the resource, since
+this release refuses a method without an audience; the older release then
+checks that audience in place of the setting.
 
 `make mcp-discovery` ([`scripts/mcp-discovery/`](../scripts/mcp-discovery/README.md))
 runs the flow end to end against Ory Hydra with a scripted client and the
@@ -2163,9 +2198,9 @@ Resolved Access Point, Transit Point and Fabric requests retain their selected s
 
 ### Resource Server, consent and credentials
 
-The opt-in `sts.mcp_issuer` profile uses a configured HTTPS origin and root or `/api` identity mount ending `/oauth2/mcp`. It shares STS signing, clients, policy, Trust Check and throttling, preserves legacy DID endpoints, and implements managed token-exchange/ID-JAG grants only. Its forms reject duplicate parameters, token exchange rejects subject and actor tokens whose JOSE `typ` is the ID-JAG media type whatever type the client declares (`declares_id_jag_typ`) and any the gateway signed under its DID or the profile issuer, resources/scopes require explicit client allowlists, ID-JAG `aud` and `resource` stay distinct, and access tokens use `at+jwt`. `sts.mcp_replay` is bounded embedded or conditional DynamoDB storage without fallback. Endpoint-local `mcp_http.authorization` enforces resource tokens for all request eras, supplies path-specific metadata and `401`/`403` challenges, feeds verified policy identity, and strips bearer tokens before forwarding. Fabric receive must enforce its own resource independently. No new browser AS flow follows from these settings, and they do not change which revisions an endpoint admits; full route/distributed conformance is not verified.
+The opt-in `sts.mcp_issuer` profile uses a configured HTTPS origin and root or `/api` identity mount ending `/oauth2/mcp`. It shares STS signing, clients, policy, Trust Check and throttling, preserves legacy DID endpoints, and implements managed token-exchange/ID-JAG grants only. Its forms reject duplicate parameters, token exchange rejects subject and actor tokens whose JOSE `typ` is the ID-JAG media type whatever type the client declares (`declares_id_jag_typ`) and any the gateway signed under its DID or the profile issuer, resources/scopes require explicit client allowlists, ID-JAG `aud` and `resource` stay distinct, and access tokens use `at+jwt`. `sts.mcp_replay` is bounded embedded or conditional DynamoDB storage without fallback. Endpoint-local `mcp_http.authorization` enforces resource tokens for all request eras, supplies path-specific metadata and `401`/`403` challenges, feeds verified policy identity, and strips bearer tokens before forwarding. It refuses a token minted for a managed connection that does not exist or whose tenant may not reach the surface or MCP Proxy ([tenant check of STS tokens](SOURCE_AUTH.md#tenant-check-of-sts-tokens)). Fabric receive must enforce its own resource independently. No new browser AS flow follows from these settings, and they do not change which revisions an endpoint admits; full route/distributed conformance is not verified.
 
-MCP Resource Server alignment must reuse the existing `src/sts/` architecture. It adds no gateway-hosted browser login, authorization-code grant or PKCE authorization endpoint. Preserve existing DID-issued flows and do not claim compatibility with authorization-code-only clients. `mcp::continuations` provides bounded mandatory AEAD state, authorization/request and vault-identity/scope binding, atomic embedded and DynamoDB stores, monotonic retry rounds and single-use dispatch claims. URL elicitation requires the request-local capability, and decline/cancel persists denial. Modern third-party consent references an existing JWT strategy through `CredentialProvider.consent_identity_strategy_id`, with tenant/PAT and ownership-reference checks. The existing provider callback verifies a nonce-bound OIDC ID token's signature, issuer, client audience, expiry and deterministic issuer/subject match to the initiating STS principal; no account-link registry, email matching, new hosted login or browser-held MCP bearer establishes consent. Callback tickets bind current surface/provider/strategy snapshots. Verified credentials are staged invisibly to ordinary vault lookup, then activated only after a ready retry wins its single-use claim. A vault revocation epoch and composite credential version prevent stale publication across filesystem instances; any revocation conservatively invalidates outstanding staged consents. Client acceptance and legacy vault records never establish modern readiness. Modern gateway consent (MRTR) needs `[mcp.continuations]` in the bootstrap config and `sts.mcp_issuer`; a modern request to an endpoint with `outbound_credentials` while continuations are not configured fails with `503` / `-32603` ("MCP credential service unavailable"), never falling back to legacy consent. Full callback-route coverage, remote-filesystem conformance and distributed refresh coordination are not verified; see `docs/MCP_METADATA.md`.
+MCP Resource Server alignment must reuse the existing `src/sts/` architecture. It adds no authorization-code grant or PKCE authorization endpoint. The gateway starts a browser sign-in only for legacy [consent confirmation](CREDENTIAL_DELEGATION.md#consent-confirmation), as a client of the callers' identity provider: that sign-in creates no session, asks only for `openid` (with `profile` for a claim other than `sub`), and drops the tokens once it has checked the ID token. Preserve existing DID-issued flows and do not claim compatibility with authorization-code-only clients. `mcp::continuations` provides bounded mandatory AEAD state, authorization/request and vault-identity/scope binding, atomic embedded and DynamoDB stores, monotonic retry rounds and single-use dispatch claims. URL elicitation requires the request-local capability, and decline/cancel persists denial. Modern third-party consent references an existing JWT strategy through `CredentialProvider.consent_identity_strategy_id`, with tenant/PAT and ownership-reference checks. The existing provider callback verifies a nonce-bound OIDC ID token's signature, issuer, client audience, expiry and deterministic issuer/subject match to the initiating STS principal; no account-link registry, email matching, new hosted login or browser-held MCP bearer establishes consent. Callback tickets bind current surface/provider/strategy snapshots. Verified credentials are staged invisibly to ordinary vault lookup, then activated only after a ready retry wins its single-use claim. A vault revocation epoch and composite credential version prevent stale publication across filesystem instances; any revocation conservatively invalidates outstanding staged consents. Client acceptance and legacy vault records never establish modern readiness. Modern gateway consent (MRTR) needs `[mcp.continuations]` in the bootstrap config and `sts.mcp_issuer`; a modern request to an endpoint with `outbound_credentials` while continuations are not configured fails with `503` / `-32603` ("MCP credential service unavailable"), never falling back to legacy consent. Full callback-route coverage, remote-filesystem conformance and distributed refresh coordination are not verified; see `docs/MCP_METADATA.md`.
 
 The direct modern branch uses shared `proxy::credential_delegation::modern` preparation after current policy checks and before payment. The Transit Point branch reuses it at the post-policy credential step, bound to that endpoint's independently verified resource token, agent DID and alias; prepared credentials are applied after caller-header filtering. Both require verified vault provenance, authenticate gateway continuation kinds, and protect opaque upstream state plus requested input keys without prefix-based ownership guesses. JSON/SSE terminal finalization wraps continuations separately from complete-only enrichment. Explicit test-local admission exercises direct forwarding and concurrent retries, while admitted Transit Point steps cover resource binding, credential delivery and replay. Distributed refresh coordination, full routed consent and Fabric consent conformance are not verified.
 

@@ -9,6 +9,22 @@ export interface UseAuditLog {
   filteredEntries: AuditEntry[];
   total: number;
   categoryCounts: Record<string, number>;
+  /**
+   * Whether `total`, `totalPages` and `categoryCounts` are lower bounds: the
+   * read stopped before the end of the history, or met records it could not
+   * read.
+   */
+  countsAreLowerBounds: boolean;
+  /** Bytes the audit history takes on disk. */
+  historyBytes: number;
+  /** Advisory size the history is shown against; `0` for none. */
+  softCapBytes: number;
+  /**
+   * Why the last read failed, or `null` when it succeeded. A failed read
+   * returns no records, which is not the same as a log that holds none, so the
+   * page shows this instead of its empty state.
+   */
+  error: string | null;
   page: number;
   totalPages: number;
   category: string;
@@ -68,6 +84,9 @@ export function useAuditLog(): UseAuditLog {
   const [entries, setEntries] = useState<AuditEntry[]>([]);
   const [total, setTotal] = useState(0);
   const [categoryCounts, setCategoryCounts] = useState<Record<string, number>>({});
+  const [countsAreLowerBounds, setCountsAreLowerBounds] = useState(false);
+  const [historyBytes, setHistoryBytes] = useState(0);
+  const [softCapBytes, setSoftCapBytes] = useState(0);
   const [page, setPage] = useState(1);
   const [category, setCategory] = useState(initial.category);
   const [search, setSearch] = useState(initial.filter);
@@ -76,6 +95,7 @@ export function useAuditLog(): UseAuditLog {
   const [flowFilter, setFlowFilter] = useState<FlowFilter>(initial.flow);
   const [scopeFilter, setScopeFilter] = useState<ScopeFilter>(initial.scope);
   const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [expandedIdx, setExpandedIdx] = useState<number | null>(null);
 
   const load = useCallback(
@@ -100,15 +120,30 @@ export function useAuditLog(): UseAuditLog {
         if (currentScope) params.set('scope', currentScope);
 
         const { data } = await apiClient.get<AuditResponse>(`/audit?${params.toString()}`);
+        setError(null);
         setEntries(data.events ?? []);
         setTotal(data.total ?? 0);
         setCategoryCounts(data.category_counts ?? {});
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : 'Failed to load audit entries';
+        // Either cause means the counts are lower bounds: the read stopped
+        // before the end of the history, or the history holds records it could
+        // not read.
+        setCountsAreLowerBounds((data.truncated ?? false) || (data.dropped_records ?? 0) > 0);
+        setHistoryBytes(data.history_bytes ?? 0);
+        setSoftCapBytes(data.soft_cap_bytes ?? 0);
+      } catch (failure) {
+        const msg = failure instanceof Error ? failure.message : 'Failed to load audit entries';
         showToast('error', msg);
+        // The gateway answers an unreadable audit log with an error rather than
+        // an empty page, so the page keeps the failure after the toast has
+        // faded instead of showing the empty state and telling an
+        // administrator there is nothing to see.
+        setError(msg);
         setEntries([]);
         setTotal(0);
         setCategoryCounts({});
+        setCountsAreLowerBounds(false);
+        setHistoryBytes(0);
+        setSoftCapBytes(0);
       } finally {
         setIsLoading(false);
       }
@@ -186,6 +221,9 @@ export function useAuditLog(): UseAuditLog {
     filteredEntries,
     total,
     categoryCounts,
+    countsAreLowerBounds,
+    historyBytes,
+    softCapBytes,
     page,
     totalPages,
     category,
@@ -196,6 +234,7 @@ export function useAuditLog(): UseAuditLog {
     flowFilter,
     scopeFilter,
     isLoading,
+    error,
     expandedIdx,
     setPage,
     setSearchInput,

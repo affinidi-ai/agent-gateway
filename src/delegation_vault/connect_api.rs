@@ -41,6 +41,7 @@ use crate::auth_manager::middleware::AuthGuardOk;
 use crate::auth_manager::pat::{PatDelegationContext, PatResourceScope};
 use crate::config::agent_surface::{AgentSurface, GrantSubject};
 use crate::credential_providers::CredentialProvider;
+use crate::credential_providers::scope_comparison::named_scopes;
 use crate::tenancy::{PatTenantContext, ResourceKind, can_mutate, scope_allows_resource};
 
 /// The most scopes a connect may ask for.
@@ -62,6 +63,46 @@ fn failed(
     reason: &'static str,
 ) -> Response {
     (status, Json(serde_json::json!({ "status": "failed", "reason": reason }))).into_response()
+}
+
+/// Why a claimed connect was not kept: the answer's status and fixed reason,
+/// and, for `scope_widened`, the scopes the vendor granted beyond those asked
+/// for, as [`named_scopes`] lets them be named.
+#[derive(Debug)]
+struct Unkept {
+    status: StatusCode,
+    reason: &'static str,
+    widened: Vec<String>,
+}
+
+impl From<(StatusCode, &'static str)> for Unkept {
+    fn from((status, reason): (StatusCode, &'static str)) -> Self {
+        Unkept {
+            status,
+            reason,
+            widened: Vec::new(),
+        }
+    }
+}
+
+impl Unkept {
+    /// The failed answer, naming the widened scopes when there are any: a
+    /// hint for the operator of which scopes the vendor added, in the
+    /// vendor's spelling, never its other words.
+    fn response(self) -> Response {
+        if self.widened.is_empty() {
+            return failed(self.status, self.reason);
+        }
+        (
+            self.status,
+            Json(serde_json::json!({
+                "status": "failed",
+                "reason": self.reason,
+                "widened_scopes": self.widened,
+            })),
+        )
+            .into_response()
+    }
 }
 
 /// Who calls the connect API, and what they may manage.
@@ -167,26 +208,55 @@ async fn permitted_provider(
         .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "provider_unavailable"))?
         .filter(|provider| provider.is_external_consent() && provider.tenant_id.as_deref() == tenant_id)
         .ok_or((StatusCode::CONFLICT, "provider_unavailable"))?;
-    if crate::credential_providers::external::issuer_permitted(
-        &provider,
-        state
-            .issuers
-            .as_ref()
-            .as_ref(),
-    )
-    .is_err()
-    {
+    let issuers = state.issuers.rules();
+    if crate::credential_providers::external::issuer_permitted(&provider, issuers).is_err() {
         warn!(
             target: "credential_delegation",
             credential_provider_id = %provider.id,
-            "The gateway's external_consent_issuers does not permit a provider's issuer; its connect is refused"
+            "The gateway's external_consent_issuers and external_consent_issuer_patterns do not permit a provider's \
+             issuer; its connect is refused"
         );
         return Err((StatusCode::FORBIDDEN, "issuer_not_permitted"));
     }
-    if !crate::credential_providers::external::resource_permitted(&provider, &state.resource_origins) {
+    if !crate::credential_providers::external::resource_permitted(&provider, &state.resource_origins, issuers) {
         return Err((StatusCode::FORBIDDEN, "resource_not_permitted"));
     }
     Ok(provider)
+}
+
+/// Whether the Transit Point `hop` of `surface` can be served as a call to it
+/// would be, in every view of the surface that has it: a `proxy://` Transit
+/// Point must meet the same rules
+/// ([`crate::credential_providers::external::check_proxy_transit_point`]),
+/// so no consent is run, and no refresh token kept, for a binding every call
+/// would refuse. Its binding's `mcp_proxy_pin` when it can, which the
+/// destination check compares with the proxy as it is now.
+fn servable_transit_point(
+    surface: &crate::config::agent_surface::AgentSurface,
+    hop: &str,
+) -> Result<Option<String>, &'static str> {
+    let views = crate::identity::handlers::surface_tenancy::resolved_views(surface)
+        .map_err(|_| "the surface's variants cannot be resolved")?;
+    let mut pin = None;
+    let mut found = false;
+    for view in &views {
+        for point in view
+            .transit_points()
+            .iter()
+            .filter(|point| point.id == hop)
+        {
+            crate::credential_providers::external::check_proxy_transit_point(view, point)?;
+            found = true;
+            pin = point
+                .transit_credentials
+                .as_ref()
+                .and_then(|binding| binding.mcp_proxy_pin.clone());
+        }
+    }
+    if !found {
+        return Err("the surface serves no Transit Point at this hop");
+    }
+    Ok(pin)
 }
 
 /// The revoker of grants made with `provider`, on behalf of `actor`.
@@ -310,21 +380,59 @@ pub async fn start_connect(
         Ok(provider) => provider,
         Err((status, code)) => return error(status, code, "The binding's provider cannot be connected"),
     };
-    if crate::credential_providers::external::check_grant_destination(
-        &provider,
-        &binding.target_endpoint,
-        state
-            .egress_allowlist
-            .as_deref(),
-    )
-    .await
-    .is_err()
-    {
-        return error(
-            StatusCode::CONFLICT,
-            "binding_not_servable",
-            "The binding's Transit Point or Target does not send grants to its provider's resource",
+    let exact_allowlist = state
+        .egress_allowlist
+        .as_deref();
+    let destination = if binding.hop == crate::delegation_vault::grants::ACCESS_POINT_TARGET_HOP {
+        crate::credential_providers::external::check_grant_destination(
+            &provider,
+            &binding.target_endpoint,
+            exact_allowlist,
+        )
+        .await
+    } else {
+        let proxies = state
+            .mcp_proxy_store
+            .as_deref()
+            .map(|store| store as &dyn crate::mcp_proxies::McpProxyStore);
+        match servable_transit_point(&surface, binding.hop) {
+            Ok(proxy_pin) => match crate::credential_providers::external::check_transit_grant_destination(
+                &provider,
+                &binding.target_endpoint,
+                proxy_pin.as_deref(),
+                proxies,
+                tenant_id,
+                exact_allowlist,
+            )
+            .await
+            {
+                Ok(destination) => {
+                    crate::credential_providers::external::check_transit_grant_spec(&binding.target_endpoint, proxies)
+                        .await
+                        .map(|()| destination)
+                }
+                Err(refused) => Err(refused),
+            },
+            Err(refused) => Err(refused),
+        }
+    };
+    if let Err(reason) = destination {
+        warn!(
+            target: "credential_delegation",
+            surface_id = %surface.surface_id,
+            hop = %binding.hop,
+            provider_id = %provider.id,
+            proxy_id = ?crate::mcp_proxies::types::transit_proxy_id(&binding.target_endpoint),
+            reason,
+            "A connect was refused: the binding cannot send grants to its provider's resource"
         );
+        let message = if reason == crate::credential_providers::external::PROXY_CHANGED {
+            "The binding's MCP Proxy has changed since the surface was saved: save the surface with the proxy's \
+             current grant_pin as mcp_proxy_pin to pin the binding to it"
+        } else {
+            "The binding's Transit Point or Target does not send grants to its provider's resource"
+        };
+        return error(StatusCode::CONFLICT, "binding_not_servable", message);
     }
     if provider
         .callback_url
@@ -466,9 +574,9 @@ pub async fn complete_connect(
         }
     };
     let outcome = redeem(&state, &manager, &claimed, &request, provider).await;
-    let (status, reason) = match &outcome {
-        Ok(_) => (StatusCode::OK, "connected"),
-        Err((status, reason)) => (*status, *reason),
+    let (status, reason, widened) = match &outcome {
+        Ok(_) => (StatusCode::OK, "connected", &[][..]),
+        Err(unkept) => (unkept.status, unkept.reason, unkept.widened.as_slice()),
     };
     info!(
         target: "credential_delegation",
@@ -477,6 +585,7 @@ pub async fn complete_connect(
         hop = ?claimed.hop,
         credential_provider_id = %claimed.credential_provider_id,
         outcome = reason,
+        widened_scopes = ?widened,
         "External consent connect completed"
     );
     match outcome {
@@ -490,7 +599,7 @@ pub async fn complete_connect(
             })),
         )
             .into_response(),
-        Err((status, reason)) => failed(status, reason),
+        Err(unkept) => unkept.response(),
     }
 }
 
@@ -537,7 +646,7 @@ async fn redeem(
     connect: &PendingConnect,
     request: &CompleteConnectRequest,
     provider: CredentialProvider,
-) -> Result<DelegatedGrant, (StatusCode, &'static str)> {
+) -> Result<DelegatedGrant, Unkept> {
     let verifier = connect
         .code_verifier
         .as_deref()
@@ -577,20 +686,30 @@ async fn redeem(
     grant.id = key.record_id();
     grant.requested_scopes = Some(connect.scopes.clone());
     grant.vendor_subject = answer.subject;
-    if !provider
-        .scope_comparison
-        .widened(&connect.scopes, &grant.scopes)
-        .is_empty()
-    {
+    let (wider, widened) = {
+        let extra = provider
+            .scope_comparison
+            .widened(&connect.scopes, &grant.scopes);
+        (!extra.is_empty(), named_scopes(&extra))
+    };
+    if wider {
         revoke_unkept(state, &provider, grant, &manager.actor);
-        return Err((StatusCode::BAD_GATEWAY, "scope_widened"));
+        return Err(Unkept {
+            status: StatusCode::BAD_GATEWAY,
+            reason: "scope_widened",
+            widened,
+        });
+    }
+    if provider.token_refresh_enabled && grant.expires_at.is_some() && grant.refresh_token.is_none() {
+        revoke_unkept(state, &provider, grant, &manager.actor);
+        return Err((StatusCode::BAD_GATEWAY, "no_refresh_token").into());
     }
     let Some(surfaces) = state
         .agent_surface_store
         .as_ref()
     else {
         revoke_unkept(state, &provider, grant, &manager.actor);
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "grants_unavailable"));
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "grants_unavailable").into());
     };
     let stored = match crate::identity::handlers::surface_grants::store_grant_while_bound(
         &state.vault_store,
@@ -608,7 +727,8 @@ async fn redeem(
                 GrantNotStored::BindingRemoved => (StatusCode::CONFLICT, "binding_removed"),
                 GrantNotStored::BindingNarrowed => (StatusCode::CONFLICT, "binding_changed"),
                 GrantNotStored::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "grants_unavailable"),
-            });
+            }
+            .into());
         }
     };
     if let Some(replaced) = stored.replaced {
@@ -1305,6 +1425,22 @@ mod tests {
                 egress_allowlist: Some(format!("{issuer},{vendor_origin}")),
                 resource_origins: Default::default(),
                 issuers: Default::default(),
+                mcp_proxy_store: None,
+                identity_strategies: Arc::new(
+                    crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore::new(
+                        directory
+                            .path()
+                            .join("strategies"),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+                verifier: Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(Arc::new(
+                    crate::jwt_bearer::JwksClient::new(),
+                ))),
+                provider_egress: crate::delegation_vault::oauth::TokenEgress::from_environment(),
+                gateway_mcp_issuer: None,
+                config_surfaces: None,
             };
             Self {
                 _directory: directory,
@@ -1509,6 +1645,156 @@ mod tests {
         );
     }
 
+    /// A Transit Point whose target is an MCP Proxy starts a connect only while
+    /// that proxy, of the surface's tenant and served only through surfaces,
+    /// sends its tool calls to the origin of the provider's resource, is still
+    /// the proxy the binding was pinned to, has no method override header in
+    /// its spec, and while the Transit Point meets every rule a call to it
+    /// does: a proxy edited to point elsewhere, to call other operations, to
+    /// take a method override header, or opened to direct callers, a binding never
+    /// pinned, and a Transit Point that does not speak MCP, has a target_auth
+    /// or puts the grant in `_meta`, are refused, so no consent is run for a
+    /// binding every call would refuse. A binding whose proxy changed since it
+    /// was pinned, or that was never pinned, is told a save re-pins it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_proxy_transit_point_connects_only_while_every_call_to_it_could_carry_the_grant() {
+        use crate::credential_providers::external::tests::grant_proxy;
+        use crate::mcp_proxies::McpProxyStore;
+        let mut fixture = Fixture::new(vec![token_answer("proxy-access")]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let proxies = Arc::new(
+            crate::mcp_proxies::FileSystemMcpProxyStore::new(directory.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let mut servable = grant_proxy("drive", Some("tenant-a"), &format!("{}/drive/v3", fixture.vendor_origin));
+        servable.openapi_spec =
+            r#"{"openapi": "3.0.0", "paths": {"/files": {"get": {"operationId": "search"}}}}"#.into();
+        proxies
+            .create(&servable)
+            .await
+            .unwrap();
+        fixture.state.mcp_proxy_store = Some(proxies.clone());
+        let point = json!({"id": "drive-hop", "alias": "drive", "target_endpoint": "proxy://drive",
+            "protocol": "mcp", "require_transit_token": true,
+            "transit_credentials": {"credential_provider_id": "vendor", "consent_mode": "external",
+                "subject": "owner", "scopes": ["read"]}});
+        let surfaces = fixture
+            .state
+            .agent_surface_store
+            .clone()
+            .unwrap();
+        let save = |point: serde_json::Value, pinned: bool| {
+            let (surfaces, proxies) = (surfaces.clone(), proxies.clone());
+            async move {
+                let mut surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+                    "surface_id": "drive-agent", "name": "drive-agent", "tenant_id": "tenant-a",
+                    "access_point": {"listen_address": "https://gateway.example", "route": "/drive", "protocol": "mcp"},
+                    "target": {"endpoint": "https://managed.example/agent"},
+                    "transit": {"points": [point]}
+                }))
+                .unwrap();
+                if pinned {
+                    crate::identity::handlers::surface_tenancy::pin_mcp_proxy_grants(
+                        &mut surface,
+                        None,
+                        Some(proxies.as_ref() as &dyn McpProxyStore),
+                    )
+                    .await
+                    .expect("a new binding is pinned");
+                }
+                surfaces
+                    .save(&surface)
+                    .await
+                    .unwrap();
+            }
+        };
+        let start = json!({"surface_id": "drive-agent", "hop": "drive-hop", "credential_provider_id": "vendor",
+            "subject": "owner", "redirect_uri": CALLBACK});
+        let refused = |case: &'static str| {
+            let (fixture, start) = (&fixture, start.clone());
+            async move {
+                let (status, refused) = fixture
+                    .start(Some("tenant-a"), start)
+                    .await;
+                assert_eq!(
+                    (status, refused["code"].clone()),
+                    (StatusCode::CONFLICT, json!("binding_not_servable")),
+                    "{case}"
+                );
+                refused["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            }
+        };
+        let re_pin = "save the surface with the proxy's current grant_pin";
+        save(point.clone(), true).await;
+        let (status, started) = fixture
+            .start(Some("tenant-a"), start.clone())
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{started}");
+
+        save(point.clone(), false).await;
+        let never_pinned = refused("a binding stored outside the API, never pinned").await;
+        assert!(never_pinned.contains(re_pin), "a binding without a pin is told to re-pin: {never_pinned}");
+        let mut with_target_auth = point.clone();
+        with_target_auth["target_auth"] =
+            json!({"method": {"static_secret": {"secret_id": "vendor-key", "header_name": "x-key"}}});
+        let mut a2a = point.clone();
+        a2a["protocol"] = json!("a2a");
+        let mut in_meta = point.clone();
+        in_meta["transit_credentials"]["inject_as"] = json!({"type": "meta", "field": "token"});
+        for (case, point) in
+            [("a target_auth", with_target_auth), ("protocol a2a", a2a), ("the grant in _meta", in_meta)]
+        {
+            save(point, true).await;
+            let message = refused(case).await;
+            assert!(!message.contains(re_pin), "{case}: a save would not fix it: {message}");
+        }
+
+        save(point.clone(), true).await;
+        let mut other_operations = servable.clone();
+        other_operations.openapi_spec =
+            r#"{"openapi": "3.0.0", "paths": {"/files/trash": {"delete": {"operationId": "search"}}}}"#.into();
+        let mut elsewhere = servable.clone();
+        elsewhere.base_url = "http://127.0.0.1:10/drive/v3".into();
+        let mut direct = servable.clone();
+        direct.direct_access = true;
+        for (case, proxy) in
+            [("other operations", other_operations.clone()), ("another origin", elsewhere), ("direct callers", direct)]
+        {
+            proxies
+                .update(&proxy)
+                .await
+                .unwrap();
+            let message = refused(case).await;
+            if case == "other operations" {
+                assert!(message.contains(re_pin), "{case}: only a re-pinning save is needed: {message}");
+            }
+        }
+        let mut overriding = servable.clone();
+        overriding.openapi_spec = r#"{"openapi": "3.0.0", "info": {"title": "Drive", "version": "1"},
+            "paths": {"/files": {"get": {"operationId": "search", "parameters": [{"name": "X-HTTP-Method-Override",
+                "in": "header", "schema": {"type": "string"}}], "responses": {"200": {"description": "Files"}}}}}}"#
+            .into();
+        proxies
+            .update(&overriding)
+            .await
+            .unwrap();
+        save(point.clone(), true).await;
+        refused("a spec with a method override header, pinned as it is").await;
+        proxies
+            .update(&other_operations)
+            .await
+            .unwrap();
+        save(point, true).await;
+        let (status, started) = fixture
+            .start(Some("tenant-a"), start)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "saved again, the surface is pinned to the proxy as it is: {started}");
+    }
+
     /// The Access Point Target's binding is connected under the hop `target`:
     /// its grant is kept, reported and removed as a Transit Point's is, and
     /// the hop serves only a surface whose Target holds the binding.
@@ -1703,7 +1989,8 @@ mod tests {
         );
 
         let mut state = fixture.state.clone();
-        state.issuers = Arc::new(Some(HashMap::new()));
+        state.issuers =
+            Arc::new(crate::credential_providers::external::PermittedIssuers::new(Some(HashMap::new()), None));
         let (status, answer) = read(
             start_connect(
                 State(state),
@@ -1722,6 +2009,120 @@ mod tests {
                 .token_requests()
                 .is_empty()
         );
+    }
+
+    /// `external_consent_issuer_patterns` alone limits issuers as the exact
+    /// list does: a connect for a provider whose issuer matches a pattern
+    /// starts, and its completion passes the rule and reaches the token
+    /// endpoint (here a loopback one Strict egress refuses, so nothing leaves);
+    /// once no pattern matches, the completion and a new start are refused
+    /// `issuer_not_permitted`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connect_runs_only_while_its_providers_issuer_matches_an_operator_pattern() {
+        use crate::config::network::{IssuerPattern, IssuerTenant};
+        use crate::credential_providers::external::PermittedIssuers;
+        let mut fixture = Fixture::new(vec![Answer::status(500)]).await;
+        let issuer = "https://203.0.113.10/1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b";
+        let mut provider = fixture
+            .state
+            .provider_store
+            .get("vendor")
+            .await
+            .unwrap()
+            .unwrap();
+        provider.issuer = Some(issuer.into());
+        provider.authorization_endpoint = Some(format!("{issuer}/authorize"));
+        provider.token_endpoint = Some("https://127.0.0.1:1/token".into());
+        provider.revocation_endpoint = None;
+        provider.resource = Some("https://203.0.113.10/mcp".into());
+        fixture
+            .state
+            .provider_store
+            .update(provider)
+            .await
+            .unwrap();
+        let surfaces = fixture
+            .state
+            .agent_surface_store
+            .clone()
+            .unwrap();
+        let mut surface = surfaces
+            .get("surface")
+            .await
+            .unwrap()
+            .unwrap();
+        for point in &mut surface
+            .transit
+            .as_mut()
+            .unwrap()
+            .points
+        {
+            point.target_endpoint = "https://203.0.113.10/mcp".into();
+        }
+        surfaces
+            .save(&surface)
+            .await
+            .unwrap();
+        let matching = Arc::new(PermittedIssuers::new(
+            None,
+            Some(vec![IssuerPattern {
+                issuer: "https://203.0.113.10/{tenant}".into(),
+                tenant: IssuerTenant::Uuid,
+                endpoint_origins: vec!["https://127.0.0.1:1".into()],
+                resource_origins: Vec::new(),
+            }]),
+        ));
+        let none_matching = Arc::new(PermittedIssuers::new(None, Some(Vec::new())));
+        let complete = |fixture: &Fixture, connect_id: String| {
+            let fixture_state = fixture.state.clone();
+            async move {
+                read(
+                    complete_connect(
+                        State(fixture_state),
+                        caller(),
+                        None,
+                        tenant_context(Some("tenant-a")),
+                        None,
+                        Path(connect_id),
+                        Json(serde_json::from_value(json!({"code": "c", "iss": issuer})).unwrap()),
+                    )
+                    .await,
+                )
+                .await
+            }
+        };
+
+        fixture.state.issuers = Arc::clone(&matching);
+        let (status, started) = fixture
+            .start(Some("tenant-a"), owner_start())
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{started}");
+        let connect_id = started["connect_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            complete(&fixture, connect_id).await,
+            (StatusCode::BAD_GATEWAY, json!({"status": "failed", "reason": "token_endpoint_unreachable"}))
+        );
+
+        let (status, started) = fixture
+            .start(Some("tenant-a"), owner_start())
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{started}");
+        let connect_id = started["connect_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        fixture.state.issuers = none_matching;
+        assert_eq!(
+            complete(&fixture, connect_id).await,
+            (StatusCode::FORBIDDEN, json!({"status": "failed", "reason": "issuer_not_permitted"}))
+        );
+        let (status, answer) = fixture
+            .start(Some("tenant-a"), owner_start())
+            .await;
+        assert_eq!((status, answer["code"].as_str()), (StatusCode::FORBIDDEN, Some("issuer_not_permitted")));
     }
 
     fn caller_extension() -> Option<Extension<AuthGuardOk>> {
@@ -1810,13 +2211,15 @@ mod tests {
     }
 
     /// A refused code, or an answer granting more than was asked, keeps no
-    /// grant; tokens granted beyond the request are revoked.
+    /// grant; tokens granted beyond the request are revoked. A wider answer
+    /// names the scopes beyond the request, those spelled as scope tokens
+    /// only, so the operator can see what the vendor added.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_or_wider_answer_keeps_no_grant() {
         let wider = Answer::json(
             200,
             json!({"access_token": "wide", "token_type": "Bearer", "refresh_token": "wide-refresh",
-                "scope": "read admin"}),
+                "scope": "read admin say\"hi\""}),
         );
         let fixture = Fixture::new(vec![
             Answer::json(400, json!({"error": "invalid_grant", "error_description": "vendor words"})),
@@ -1825,7 +2228,10 @@ mod tests {
         ])
         .await;
         let key = GrantKey::owner(Some("tenant-a"), "surface", "owner-hop", "vendor");
-        for reason in ["invalid_grant", "scope_widened"] {
+        for (reason, expected) in [
+            ("invalid_grant", json!({"status": "failed", "reason": "invalid_grant"})),
+            ("scope_widened", json!({"status": "failed", "reason": "scope_widened", "widened_scopes": ["admin"]})),
+        ] {
             let (_, started) = fixture
                 .start(Some("tenant-a"), owner_start())
                 .await;
@@ -1837,7 +2243,7 @@ mod tests {
                     json!({"code": "c", "iss": fixture.issuer()}),
                 )
                 .await;
-            assert_eq!((status, answer), (StatusCode::BAD_GATEWAY, json!({"status": "failed", "reason": reason})));
+            assert_eq!((status, answer), (StatusCode::BAD_GATEWAY, expected), "{reason}");
             assert!(
                 fixture
                     .state
@@ -1851,6 +2257,187 @@ mod tests {
         fixture
             .revoked_eventually("wide-refresh")
             .await;
+    }
+
+    /// Start an owner connect and complete it with a code.
+    async fn connect_owner(fixture: &Fixture) -> (StatusCode, serde_json::Value) {
+        let (_, started) = fixture
+            .start(Some("tenant-a"), owner_start())
+            .await;
+        fixture
+            .complete(
+                started["connect_id"]
+                    .as_str()
+                    .unwrap(),
+                json!({"code": "c", "iss": fixture.issuer()}),
+            )
+            .await
+    }
+
+    /// A provider that refreshes its grants keeps none that will expire with
+    /// no refresh token: the connect answers `no_refresh_token`, stores
+    /// nothing, and the access token is revoked; the log lines of the connect
+    /// and of the revocation, which runs on a task of its own, name the
+    /// reason, never the token. An empty refresh token is no token answer at
+    /// all. Every thread of the runtime writes its log lines to one capture,
+    /// so the revocation task's are read too.
+    #[test]
+    fn a_refreshing_provider_keeps_no_expiring_grant_without_a_refresh_token() {
+        use crate::component_tests::helpers::thread_subscriber::set_thread_default;
+
+        #[derive(Clone, Default)]
+        struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Lines {
+            fn write(
+                &mut self,
+                bytes: &[u8],
+            ) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let lines = Lines::default();
+        let subscriber = {
+            let lines = lines.clone();
+            move || {
+                let lines = lines.clone();
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::TRACE)
+                    .with_writer(move || lines.clone())
+                    .with_ansi(false)
+                    .finish()
+            }
+        };
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .on_thread_start({
+                let subscriber = subscriber.clone();
+                move || std::mem::forget(set_thread_default(subscriber()))
+            })
+            .build()
+            .unwrap();
+        let _main_thread = set_thread_default(subscriber());
+        let text = || String::from_utf8_lossy(&lines.0.lock().unwrap()).into_owned();
+        runtime.block_on(async {
+            let fixture = Fixture::new(vec![
+                Answer::json(
+                    200,
+                    json!({"access_token": "empty-refresh-access", "token_type": "Bearer", "expires_in": 3600,
+                        "refresh_token": "", "scope": "read"}),
+                ),
+                Answer::json(
+                    200,
+                    json!({"access_token": "no-refresh-access", "token_type": "Bearer", "expires_in": 3600,
+                        "scope": "read"}),
+                ),
+                Answer::status(200),
+            ])
+            .await;
+            let key = GrantKey::owner(Some("tenant-a"), "surface", "owner-hop", "vendor");
+            for expected in [
+                json!({"status": "failed", "reason": "invalid_token_response"}),
+                json!({"status": "failed", "reason": "no_refresh_token"}),
+            ] {
+                assert_eq!(connect_owner(&fixture).await, (StatusCode::BAD_GATEWAY, expected.clone()));
+                assert!(
+                    fixture
+                        .state
+                        .vault_store
+                        .grant(&key)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "{expected}"
+                );
+            }
+            fixture
+                .revoked_eventually("no-refresh-access")
+                .await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !text().contains("Revoked a delegated grant at its authorization server") {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("the revocation is logged: {}", text()));
+        });
+        let text = text();
+        assert!(text.contains("no_refresh_token"), "{text}");
+        assert!(!text.contains("no-refresh-access"), "{text}");
+        assert!(!text.contains("empty-refresh-access"), "{text}");
+    }
+
+    /// A grant without a refresh token is kept where it never needs one: at a
+    /// provider that does not refresh its grants, or when its access token
+    /// never expires. A refreshing provider keeps a grant that has one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_without_a_refresh_token_is_kept_only_where_it_is_never_refreshed() {
+        let key = GrantKey::owner(Some("tenant-a"), "surface", "owner-hop", "vendor");
+        for (case, answer, refreshes, refresh_token) in [
+            (
+                "a provider that does not refresh",
+                json!({"access_token": "access", "token_type": "Bearer", "expires_in": 3600, "scope": "read"}),
+                false,
+                None,
+            ),
+            (
+                "a token that never expires",
+                json!({"access_token": "access", "token_type": "Bearer", "scope": "read"}),
+                true,
+                None,
+            ),
+            (
+                "a refresh token",
+                json!({"access_token": "access", "token_type": "Bearer", "expires_in": 3600,
+                    "refresh_token": "access-refresh", "scope": "read"}),
+                true,
+                Some("access-refresh"),
+            ),
+        ] {
+            let fixture = Fixture::new(vec![Answer::json(200, answer)]).await;
+            let mut provider = fixture
+                .state
+                .provider_store
+                .get("vendor")
+                .await
+                .unwrap()
+                .unwrap();
+            provider.token_refresh_enabled = refreshes;
+            fixture
+                .state
+                .provider_store
+                .update(provider)
+                .await
+                .unwrap();
+            let (status, body) = connect_owner(&fixture).await;
+            assert_eq!(status, StatusCode::OK, "{case}: {body}");
+            assert_eq!(body["status"], "connected", "{case}");
+            let grant = fixture
+                .state
+                .vault_store
+                .grant(&key)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{case}: the grant is kept"));
+            assert_eq!(grant.refresh_token.as_deref(), refresh_token, "{case}");
+            assert!(
+                fixture
+                    .authorization_server
+                    .revoked_tokens()
+                    .is_empty(),
+                "{case}"
+            );
+        }
     }
 
     /// Set the provider's scope comparison, and the scopes the owner binding
@@ -2479,41 +3066,11 @@ mod tests {
         assert!(file.exists(), "nothing is purged by binding either");
     }
 
-    struct UnreadableSurfaces;
-
-    #[async_trait::async_trait]
-    impl crate::surfaces::AgentSurfaceStore for UnreadableSurfaces {
-        async fn save(
-            &self,
-            _surface: &AgentSurface,
-        ) -> anyhow::Result<()> {
-            anyhow::bail!("disk unavailable")
-        }
-
-        async fn get(
-            &self,
-            _surface_id: &str,
-        ) -> anyhow::Result<Option<AgentSurface>> {
-            anyhow::bail!("disk unavailable")
-        }
-
-        async fn list_all(&self) -> anyhow::Result<Vec<AgentSurface>> {
-            anyhow::bail!("disk unavailable")
-        }
-
-        async fn delete(
-            &self,
-            _surface_id: &str,
-        ) -> anyhow::Result<()> {
-            anyhow::bail!("disk unavailable")
-        }
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_binding_removal_answers_503_while_its_surface_cannot_be_read() {
         let fixture = Fixture::new(vec![]).await;
         let mut state = fixture.state.clone();
-        state.agent_surface_store = Some(Arc::new(UnreadableSurfaces));
+        state.agent_surface_store = Some(Arc::new(crate::delegation_vault::test_support::UnreadableSurfaces));
         let query = |credential_provider_id: Option<&str>| BindingGrantsQuery {
             surface_id: "surface".into(),
             hop: "owner-hop".into(),
