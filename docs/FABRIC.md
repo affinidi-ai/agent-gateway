@@ -502,13 +502,17 @@ Target's origin, still without the credential. A card path in another case, such
 `/.well-known/Agent-Card.json`, is not a public read, because the discovery path match is
 case-sensitive: it is a caller's request, source authentication runs on it, and it carries the
 credential when the caller authenticated. A credential that cannot be resolved under
-`target.auth.fallback: reject` answers `502` "Target authentication failed", the same text as the
-direct path and the MCP proxy path.
+`target.auth.fallback: reject` answers `500 target_auth_misconfigured` or `503
+target_auth_unavailable` with the detail "Target authentication failed", as the direct path and
+the MCP proxy path do (see [When a Target credential cannot be
+obtained](CREDENTIAL_DELEGATION.md#when-a-target-credential-cannot-be-obtained)).
 
-The sending gateway's agent card route gives its caller the same answer: a peer's `502` whose
-detail is exactly "Target authentication failed" or "Upstream redirected", the gateway's own fixed
-texts, is answered with that text, and any other refusal with its status and "Upstream error:
-<status>", never the peer's words. The sending gateway asks for `/.well-known/agent-card.json`, or
+The sending gateway's agent card route gives its caller the same answer: a peer's Target
+authentication refusal, whose `reason` is one of the gateway's own and matches its status, is
+answered with that status, the detail "Target authentication failed" and that `reason`; a peer's
+`502` whose detail is exactly "Target authentication failed" (from a gateway that sends no
+`reason`) or "Upstream redirected" is answered with that text; and any other refusal with its
+status and "Upstream error: <status>", never the peer's words. The sending gateway asks for `/.well-known/agent-card.json`, or
 the configured card location of its own surface, so give both surfaces the same `agent_card_path`:
 a location only the sending gateway configures is not a card fetch at the receiving gateway and
 gets no `target.auth`.

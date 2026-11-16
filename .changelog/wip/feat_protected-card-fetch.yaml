@@ -3,14 +3,15 @@ changes:
   added: []
   changed:
     - timestamp: '2026-11-03T12:00:00Z'
-      title: Answer 502 Target authentication failed on Fabric and MCP proxy paths
+      title: Answer Target authentication failed on Fabric and MCP proxy paths
       description: >-
         When the Target credential cannot be resolved and the fallback is reject, the Fabric
-        receiving gateway and the MCP proxy path now answer 502 with the text Target
-        authentication failed, the same text as the direct path, instead of Target
+        receiving gateway and the MCP proxy path now answer with the text Target authentication
+        failed, the same status, reason and text as the direct path, instead of Target
         authentication configuration error. The sending gateway's agent card route passes that
-        text, and Upstream redirected, on to its caller instead of Upstream error: 502 Bad
-        Gateway. Clients that match the old text must match the new one.
+        status, reason and text, and 502 Upstream redirected, on to its caller instead of
+        Upstream error with the peer's status. Clients that match the old text must match the
+        new one.
     - timestamp: '2026-11-03T12:30:00Z'
       title: Skip the sending gateway's surface policy for every public discovery read
       description: >-

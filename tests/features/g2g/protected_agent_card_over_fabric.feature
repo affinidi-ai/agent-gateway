@@ -32,8 +32,9 @@ Feature: Protected agent card fetch over Fabric
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     And the VP Audit Log of gateway 2 keeps every audit event
     When the caller sends a GET request to gateway 1 surface "charlie" path "/.well-known/agent-card.json"
-    Then the response status is 502
+    Then the response status is 500
     And the response detail is "Target authentication failed"
+    And the response reason is "target_auth_misconfigured"
     And managed agent "bravo" was not called
     And the VP Audit Log of gateway 2 records that the Target credential of surface "alpha" was not sent on a Fabric request, which was refused
 
@@ -70,8 +71,9 @@ Feature: Protected agent card fetch over Fabric
     And the credential provider of surface "alpha" is refusing token requests
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     When the caller sends a GET request to gateway 1 surface "charlie" path "/.well-known/agent-card.json"
-    Then the response status is 502
+    Then the response status is 500
     And the response detail is "Target authentication failed"
+    And the response reason is "target_auth_misconfigured"
     And the response does not say "bdd-target-client-secret-value"
     And the response does not say "invalid_client"
     And managed agent "bravo" was not called
@@ -95,8 +97,9 @@ Feature: Protected agent card fetch over Fabric
     And surface "alpha" is configured with missing target authentication secret "bdd-missing-target-auth-secret" for header "x-target-api-key" and fallback reject
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     When the caller sends a Fabric A2A request through gateway 1 surface "charlie"
-    Then the response status is 502
+    Then the response status is 500
     And the response says "Target authentication failed"
+    And the response reason is "target_auth_misconfigured"
     And managed agent "bravo" was not called
 
   Scenario: gateway 2 fetches the configured card location with its Target credential for a caller without an API key
