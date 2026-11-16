@@ -247,8 +247,8 @@ describe('EditCredentialProviderPage consent time limit', () => {
   it('refuses a limit the gateway would refuse before saving anything', async () => {
     await renderProvider(authorizationCode());
     expect(screen.getByTestId(LIMIT)).toHaveValue(null);
-    fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '30' } });
-    fireEvent.change(screen.getByTestId(UNIT), { target: { value: 'seconds' } });
+    fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '0' } });
+    fireEvent.change(screen.getByTestId(UNIT), { target: { value: 'minutes' } });
     fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
 
     expect(
@@ -257,6 +257,41 @@ describe('EditCredentialProviderPage consent time limit', () => {
       )
     ).toBeInTheDocument();
     expect(puts()).toHaveLength(0);
+  });
+
+  it('shows a refused limit under its field, marked invalid, and moves focus there', async () => {
+    await renderProvider(authorizationCode());
+    const input = screen.getByTestId(LIMIT);
+    expect(input).not.toHaveClass('is-invalid');
+    expect(input).not.toHaveAttribute('aria-invalid');
+    fireEvent.change(input, { target: { value: '366' } });
+    fireEvent.change(screen.getByTestId(UNIT), { target: { value: 'days' } });
+    fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
+
+    const message = await screen.findByTestId('credential-provider-consent-limit-error');
+    expect(message).toHaveTextContent(
+      /^Enter a limit from 1 minute to 365 days, or leave it empty\.$/
+    );
+    expect(message).toHaveClass('invalid-feedback');
+    expect(input).toHaveClass('is-invalid');
+    expect(input).toHaveAttribute('aria-invalid', 'true');
+    expect(input).toHaveAttribute('aria-describedby', message.id);
+    expect(input).toHaveFocus();
+    expect(puts()).toHaveLength(0);
+  });
+
+  it('clears the field error once the limit is changed', async () => {
+    await renderProvider(authorizationCode());
+    const input = screen.getByTestId(LIMIT);
+    fireEvent.change(input, { target: { value: '0' } });
+    fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
+    await screen.findByTestId('credential-provider-consent-limit-error');
+
+    fireEvent.change(input, { target: { value: '6' } });
+
+    expect(screen.queryByTestId('credential-provider-consent-limit-error')).toBeNull();
+    expect(input).not.toHaveClass('is-invalid');
+    expect(input).not.toHaveAttribute('aria-invalid');
   });
 
   it('says an empty limit leaves the gateway its own default and ceiling', async () => {

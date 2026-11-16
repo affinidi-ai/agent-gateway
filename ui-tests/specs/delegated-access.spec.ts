@@ -399,7 +399,7 @@ test.describe("Credential provider editor consent time limit", () => {
       .toEqual([2_592_000]);
   });
 
-  test("refuses a limit under a minute before saving anything", async ({
+  test("refuses a limit under a minute under its field before saving anything", async ({
     page,
   }) => {
     const saved: unknown[] = [];
@@ -424,10 +424,18 @@ test.describe("Credential provider editor consent time limit", () => {
     });
     await page.goto(`${BASE_URL}/credential-providers/p1`);
 
-    await page.getByTestId(LIMIT).fill("30");
-    await page.getByTestId(UNIT).selectOption("seconds");
+    await page.getByTestId(LIMIT).fill("0");
+    await page.getByTestId(UNIT).selectOption("minutes");
     await page.getByTestId("credential-provider-editor-save-button").click();
 
+    await expect(
+      page.getByTestId("credential-provider-consent-limit-error"),
+    ).toHaveText("Enter a limit from 1 minute to 365 days, or leave it empty.");
+    await expect(page.getByTestId(LIMIT)).toHaveAttribute(
+      "aria-invalid",
+      "true",
+    );
+    await expect(page.getByTestId(LIMIT)).toBeFocused();
     await expect(
       page.getByText(
         "Consent time limit must be a whole number from 1 minute to 365 days, or empty to set none.",

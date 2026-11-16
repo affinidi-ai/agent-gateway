@@ -1258,8 +1258,12 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   `max_consent_age_secs` loads in its largest whole unit (`consentLimitOf`). Save always sends
   `max_consent_age_secs` (`consentLimitSeconds`): the limit in seconds, or `0`, which removes it,
   for an empty field and for every other provider type, where the field is not shown. A limit
-  outside one minute to 365 days, or not a whole number, is refused before anything is sent
-  (`CONSENT_LIMIT_RANGE_MESSAGE`). The unit arithmetic and wording live in
+  outside one minute to 365 days, or not a whole number, is refused before anything is sent: the
+  banner at the top of the form summarises it (`CONSENT_LIMIT_RANGE_MESSAGE`), and the field is
+  marked invalid (`is-invalid`, `aria-invalid`, described by the message), says "Enter a limit
+  from 1 minute to 365 days, or leave it empty." under itself
+  (`credential-provider-consent-limit-error`, `invalid-feedback`) and takes the focus. Changing
+  the number or the unit clears the field's error. The unit arithmetic and wording live in
   `utils/consentLimit.ts`. On such a provider the help under **Enable automatic token refresh**
   says tokens are refreshed until the consent time limit below ends and the person then approves
   again; every other type keeps saying the connection works without reauthorizing.

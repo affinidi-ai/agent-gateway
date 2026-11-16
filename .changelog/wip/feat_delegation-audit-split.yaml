@@ -17,6 +17,14 @@ changes:
         connection keeps working without reauthorizing, which a consent time limit contradicts.
         It now says tokens are refreshed until the consent time limit ends, and that the person
         then approves again. Other provider types keep the old help.
+    - timestamp: '2026-11-16T15:20:00Z'
+      title: Show a refused consent time limit under its field and move focus there
+      description: >-
+        A consent time limit outside 1 minute to 365 days was reported only in the banner at the
+        top of the provider form, far from the field, which was not marked invalid. The field is
+        now marked invalid for assistive technology too, says "Enter a limit from 1 minute to 365
+        days, or leave it empty." under itself and takes the focus; the banner stays as a
+        summary.
   removed: []
   security: []
   breaking: []

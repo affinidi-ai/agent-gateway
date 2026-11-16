@@ -292,6 +292,10 @@ export function jwtFieldsOf(data: Record<string, unknown>): JwtFormFields {
 export const CONSENT_LIMIT_RANGE_MESSAGE =
   'Consent time limit must be a whole number from 1 minute to 365 days, or empty to set none.';
 
+/** What the consent time limit field says under itself while it holds a limit the gateway refuses. */
+export const CONSENT_LIMIT_FIELD_MESSAGE =
+  'Enter a limit from 1 minute to 365 days, or leave it empty.';
+
 export interface ConsentLimitFields {
   /** The number as typed; empty when the provider sets no limit. */
   consent_limit_amount: string;
