@@ -20,6 +20,16 @@ export interface DelegationToken {
   can_refresh: boolean;
 }
 
+/** What the credential tabs read of a provider in `GET /api/v1/credential-providers`. */
+export interface ProviderSummary {
+  id: string;
+  name: string;
+  provider_type?: string;
+  token_refresh_enabled?: boolean;
+  /** Set once the provider takes no new consent. */
+  deactivated_at?: string | null;
+}
+
 /** Where a stored consent stands against its time limit. */
 export type ConsentState = 'unlimited' | 'limited' | 'ending_soon' | 'ended';
 
@@ -54,6 +64,33 @@ export function isActiveDelegation(
 ): boolean {
   if (consentState(consentEnd(token.consent_expires_at), now) === 'ended') return false;
   return !token.is_expired || token.can_refresh;
+}
+
+/**
+ * The time limit a consent was given under, in seconds: from its consent time to the end the vault
+ * reports. `null` for a consent without a time limit.
+ */
+export function consentLimitSecs(
+  token: Pick<DelegationToken, 'consent_granted_at' | 'consent_expires_at'>
+): number | null {
+  const end = consentEnd(token.consent_expires_at);
+  const granted = new Date(token.consent_granted_at).getTime();
+  if (!end || Number.isNaN(granted)) return null;
+  const secs = Math.round((end.getTime() - granted) / 1000);
+  return secs > 0 ? secs : null;
+}
+
+/**
+ * Whether the gateway renews a delegation's access token by itself: its provider refreshes
+ * tokens, a refresh token is stored, and the consent has not ended.
+ */
+export function renewsAutomatically(
+  token: Pick<DelegationToken, 'can_refresh' | 'consent_expires_at'>,
+  provider: Pick<ProviderSummary, 'token_refresh_enabled'> | undefined,
+  now: Date
+): boolean {
+  if (!provider?.token_refresh_enabled || !token.can_refresh) return false;
+  return consentState(consentEnd(token.consent_expires_at), now) !== 'ended';
 }
 
 const DID_WEB = 'did:web:';

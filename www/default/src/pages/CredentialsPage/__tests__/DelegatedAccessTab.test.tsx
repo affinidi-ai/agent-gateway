@@ -102,11 +102,23 @@ describe('Delegated Access tab', () => {
 
   it('shows when each access ends and marks one ending within a day', async () => {
     await renderTab([
-      token('soon', { consent_expires_at: fromNow(3 * HOUR + 5 * 60_000) }),
-      token('later', { consent_expires_at: fromNow(12 * DAY + HOUR) }),
+      token('soon', {
+        consent_granted_at: fromNow(-(3 * HOUR - 5 * 60_000)),
+        consent_expires_at: fromNow(3 * HOUR + 5 * 60_000),
+      }),
+      token('later', {
+        consent_granted_at: fromNow(-(18 * DAY - HOUR)),
+        consent_expires_at: fromNow(12 * DAY + HOUR),
+      }),
       token('unlimited', { user_identity_hash: BOB }),
     ]);
 
+    expect(screen.getByTestId('delegated-access-ends-soon')).toHaveTextContent(
+      /^in 3 hours6-hour limit\S/
+    );
+    expect(screen.getByTestId('delegated-access-ends-later')).toHaveTextContent(
+      /^in 12 days30-day limit\S/
+    );
     expect(screen.getByTestId('delegated-access-ends-soon')).toHaveTextContent(/^in 3 hours/);
     expect(within(row('soon')).getByText('Ending soon')).toBeInTheDocument();
     expect(screen.getByTestId('delegated-access-ends-later')).toHaveTextContent(/^in 12 days/);

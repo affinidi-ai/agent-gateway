@@ -10,7 +10,15 @@ import { formatDateTime, topAndTail } from '../../utils/stringUtils';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { DOCS_URL } from '../../config/docs';
 import PaginationControls from './PaginationControls';
-import { DelegationToken, agentName, consentEnd, consentState, timeLeft } from './delegatedAccess';
+import {
+  DelegationToken,
+  agentName,
+  consentEnd,
+  consentState,
+  renewsAutomatically,
+  timeLeft,
+} from './delegatedAccess';
+import { useDelegationVault } from './useDelegationVault';
 
 interface CredentialTokensTabProps {
   externalSearchTerm?: string;
@@ -27,8 +35,7 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
   onViewActivity,
 }) => {
   const { hasPermission } = usePermissions();
-  const [tokens, setTokens] = useState<DelegationToken[]>([]);
-  const [loading, setLoading] = useState(true);
+  const { tokens, setTokens, providers, loading } = useDelegationVault();
   const [internalSearchTerm, setInternalSearchTerm] = useState('');
   const externalProvided = externalSearchTerm !== undefined;
   const searchTerm = externalProvided ? externalSearchTerm! : internalSearchTerm;
@@ -38,28 +45,8 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
   const canEditTokens = hasPermission('settings.edit');
 
   useEffect(() => {
-    loadTokens();
-  }, []);
-
-  useEffect(() => {
     setTokensPage(1);
   }, [searchTerm]);
-
-  const loadTokens = async () => {
-    setLoading(true);
-    try {
-      const response = await apiClient.fetch('/api/v1/delegation-vault');
-      if (response.ok) {
-        const data: DelegationToken[] = await response.json();
-        setTokens(data);
-      }
-    } catch (error) {
-      console.error('Failed to load delegation tokens:', error);
-      setTokens([]);
-    } finally {
-      setLoading(false);
-    }
-  };
 
   const handleRevokeToken = async (token: DelegationToken) => {
     try {
@@ -217,7 +204,7 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                   <th>Status</th>
                   <th>Consented</th>
                   <th>Last Used</th>
-                  <th>Token Expires</th>
+                  <th>Access Token</th>
                   <th>Actions</th>
                 </tr>
               </thead>
@@ -285,8 +272,13 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                       <td>
                         <small>{fmtDate(token.last_used_at)}</small>
                       </td>
-                      <td>
+                      <td data-testid={`credential-token-access-token-${token.id}`}>
                         <small>{fmtDate(token.expires_at)}</small>
+                        {renewsAutomatically(
+                          token,
+                          providers[token.credential_provider_id],
+                          new Date()
+                        ) && <div className="small text-muted">Renews automatically</div>}
                       </td>
                       <td onClick={e => e.stopPropagation()}>
                         {canEditTokens && (

@@ -32,6 +32,14 @@ changes:
         "pr-reviewer.example.com", without "did:web:" and wrapping when long; other DID methods
         stay shortened, and the full DID is in the tooltip. Credential Tokens also revokes one
         delegation with the same "Revoke" text button and named confirm as Delegated Access.
+    - timestamp: '2026-11-16T16:00:00Z'
+      title: Show each consent's limit, and when an access token renews by itself
+      description: >-
+        Delegated Access now shows, between the time left and the end date, the limit the consent
+        was given under, such as "6-hour limit", so "in 39 minutes" has context. On Credential
+        Tokens the "Token Expires" column is now "Access Token" and says "Renews automatically"
+        under the date while the provider refreshes tokens and the consent has not ended, so it no
+        longer reads as a second end date.
   fixed:
     - timestamp: '2026-11-16T15:10:00Z'
       title: Say that token refresh stops when a provider's consent time limit ends

@@ -41,15 +41,30 @@ const token = (id: string, user: string, extra: Record<string, unknown> = {}) =>
   ...extra,
 });
 
+const GITHUB = {
+  id: 'cp-github',
+  name: 'GitHub',
+  provider_type: 'oauth2_authorization_code',
+  token_refresh_enabled: true,
+};
+
 const renderTab = async (
   tokens: ReturnType<typeof token>[],
-  props: React.ComponentProps<typeof CredentialTokensTab> = {}
+  props: React.ComponentProps<typeof CredentialTokensTab> = {},
+  providers: unknown = [GITHUB]
 ) => {
-  mockFetch.mockImplementation((_url: string, options?: { method?: string }) =>
+  mockFetch.mockImplementation((url: string, options?: { method?: string }) =>
     Promise.resolve({
       ok: true,
       statusText: 'OK',
-      json: () => Promise.resolve(options?.method === 'DELETE' ? {} : tokens),
+      json: () =>
+        Promise.resolve(
+          options?.method === 'DELETE'
+            ? {}
+            : url === '/api/v1/credential-providers'
+              ? providers
+              : tokens
+        ),
     })
   );
   render(<CredentialTokensTab {...props} />);
@@ -83,6 +98,39 @@ describe('Credential Tokens tab', () => {
     expect(screen.getByText('3 active')).toBeInTheDocument();
     expect(screen.getByTestId('credential-tokens-consent-ended-count')).toHaveTextContent(
       '1 consent ended'
+    );
+  });
+
+  it('shows the access token expiry, and that it renews while the provider refreshes it', async () => {
+    await renderTab(
+      [
+        token('renews', ALICE),
+        token('no-refresh-token', ALICE, { can_refresh: false }),
+        token('other-provider', BOB, { credential_provider_id: 'cp-manual' }),
+        token('unknown-provider', BOB, { credential_provider_id: 'cp-deleted' }),
+        token('ended', BOB, { consent_expires_at: fromNow(-HOUR) }),
+      ],
+      {},
+      [GITHUB, { ...GITHUB, id: 'cp-manual', token_refresh_enabled: false }]
+    );
+    const accessToken = (id: string) => screen.getByTestId(`credential-token-access-token-${id}`);
+
+    expect(screen.getByRole('columnheader', { name: 'Access Token' })).toBeInTheDocument();
+    expect(screen.queryByRole('columnheader', { name: 'Token Expires' })).toBeNull();
+    expect(accessToken('renews')).toHaveTextContent(/^\S.+Renews automatically$/);
+    expect(accessToken('no-refresh-token')).not.toHaveTextContent('Renews automatically');
+    expect(accessToken('other-provider')).not.toHaveTextContent('Renews automatically');
+    expect(accessToken('unknown-provider')).not.toHaveTextContent('Renews automatically');
+    expect(accessToken('ended')).not.toHaveTextContent('Renews automatically');
+    expect(accessToken('ended')).toHaveTextContent(/^\S/);
+  });
+
+  it('keeps listing tokens while the providers cannot be read', async () => {
+    await renderTab([token('t1', ALICE)], {}, { error: 'forbidden' });
+
+    expect(row('t1')).toBeInTheDocument();
+    expect(screen.getByTestId('credential-token-access-token-t1')).not.toHaveTextContent(
+      'Renews automatically'
     );
   });
 

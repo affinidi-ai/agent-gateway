@@ -35,3 +35,9 @@ export function describeConsentLimit(secs: number): string {
   const { count, unit } = largestWholeUnit(secs);
   return `${count} ${count === 1 ? unit.slice(0, -1) : unit}`;
 }
+
+/** A consent time limit named as a span: "6-hour limit", "30-day limit". */
+export function consentLimitLabel(secs: number): string {
+  const { count, unit } = largestWholeUnit(secs);
+  return `${count}-${unit.slice(0, -1)} limit`;
+}

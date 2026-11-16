@@ -7,24 +7,19 @@ import { EmptyState } from '../../components/shared/EmptyState';
 import { apiClient } from '../../api';
 import { showToast } from '../../utils/toaster';
 import { formatDateTime, topAndTail } from '../../utils/stringUtils';
+import { consentLimitLabel } from '../../utils/consentLimit';
 import { DOCS_URL } from '../../config/docs';
 import PaginationControls from './PaginationControls';
 import {
   DelegationToken,
   agentName,
   consentEnd,
+  consentLimitSecs,
   consentState,
   isActiveDelegation,
   timeLeft,
 } from './delegatedAccess';
-
-interface ProviderSummary {
-  id: string;
-  name: string;
-  provider_type?: string;
-  /** Set once the provider takes no new consent. */
-  deactivated_at?: string | null;
-}
+import { useDelegationVault } from './useDelegationVault';
 
 interface DelegatedAccessTabProps {
   externalSearchTerm?: string;
@@ -41,37 +36,10 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
   onViewHistory,
 }) => {
   const { hasPermission } = usePermissions();
-  const [tokens, setTokens] = useState<DelegationToken[]>([]);
-  const [providers, setProviders] = useState<Record<string, ProviderSummary>>({});
-  const [loading, setLoading] = useState(true);
+  const { tokens, setTokens, providers, loading } = useDelegationVault();
   const [page, setPage] = useState(1);
   const searchTerm = (externalSearchTerm ?? '').trim().toLowerCase();
   const canRevoke = hasPermission('settings.edit');
-
-  useEffect(() => {
-    let alive = true;
-    const listOf = async <T,>(url: string): Promise<T[]> => {
-      try {
-        const response = await apiClient.fetch(url);
-        const data = response.ok ? await response.json() : [];
-        return Array.isArray(data) ? data : [];
-      } catch {
-        return [];
-      }
-    };
-    Promise.all([
-      listOf<DelegationToken>('/api/v1/delegation-vault'),
-      listOf<ProviderSummary>('/api/v1/credential-providers'),
-    ]).then(([vault, known]) => {
-      if (!alive) return;
-      setTokens(vault);
-      setProviders(Object.fromEntries(known.map(provider => [provider.id, provider])));
-      setLoading(false);
-    });
-    return () => {
-      alive = false;
-    };
-  }, []);
 
   useEffect(() => {
     setPage(1);
@@ -193,6 +161,7 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
               <tbody>
                 {paged.map(token => {
                   const end = consentEnd(token.consent_expires_at);
+                  const limitSecs = consentLimitSecs(token);
                   return (
                     <tr key={token.id} data-testid={`delegated-access-row-${token.id}`}>
                       <td>
@@ -235,6 +204,9 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
                         {end ? (
                           <>
                             <span>{timeLeft(end, now)}</span>
+                            {limitSecs !== null && (
+                              <div className="small text-muted">{consentLimitLabel(limitSecs)}</div>
+                            )}
                             <div className="small text-muted">{formatDateTime(end, true)}</div>
                           </>
                         ) : (

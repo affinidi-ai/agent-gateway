@@ -79,6 +79,7 @@ async function openCredentialTokens(
   page: Page,
   tokens: Record<string, unknown>[],
 ): Promise<string[]> {
+  await serveProviders(page);
   const revoked = await serveVault(page, tokens);
   await page.goto(`${BASE_URL}/credentials?tab=credential-tokens`);
   await expect(row(page, tokens[0].id as string)).toBeVisible();
@@ -106,7 +107,7 @@ test.describe("Credentials page Delegated Access tab", () => {
   }) => {
     await serveProviders(page);
     await serveVault(page, [
-      token("soon", ALICE, fromNow(3 * HOUR + 5 * 60_000)),
+      token("soon", ALICE, fromNow(5 * HOUR)),
       token("unlimited", BOB),
       token("ended", BOB, fromNow(-HOUR)),
       { ...token("dead", ALICE), is_expired: true, can_refresh: false },
@@ -120,7 +121,10 @@ test.describe("Credentials page Delegated Access tab", () => {
     );
     await expect(accessRow(page, "soon")).toContainText("Ending soon");
     await expect(page.getByTestId("delegated-access-ends-soon")).toContainText(
-      "in 3 hours",
+      "in 4 hours",
+    );
+    await expect(page.getByTestId("delegated-access-ends-soon")).toContainText(
+      "6-hour limit",
     );
     await expect(
       page.getByTestId("delegated-access-ends-unlimited"),
@@ -213,6 +217,15 @@ test.describe("Credentials page Credential Tokens tab", () => {
       page.getByTestId("credential-token-consent-end-ended"),
     ).toHaveText(/^Ended /);
     await expect(row(page, "ended")).toContainText("Consent ended");
+    await expect(
+      page.getByRole("columnheader", { name: "Access Token" }),
+    ).toBeVisible();
+    await expect(
+      page.getByTestId("credential-token-access-token-later"),
+    ).toContainText("Renews automatically");
+    await expect(
+      page.getByTestId("credential-token-access-token-ended"),
+    ).not.toContainText("Renews automatically");
   });
 
   test("names the agent by its host name and revokes one delegation on a second click", async ({

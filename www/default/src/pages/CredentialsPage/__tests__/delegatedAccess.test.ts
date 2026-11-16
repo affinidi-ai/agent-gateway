@@ -1,8 +1,10 @@
 import {
   agentName,
   consentEnd,
+  consentLimitSecs,
   consentState,
   isActiveDelegation,
+  renewsAutomatically,
   timeLeft,
 } from '../delegatedAccess';
 
@@ -55,6 +57,41 @@ describe('delegated access consent end', () => {
     expect(timeLeft(after(47 * HOUR), NOW)).toBe('in 47 hours');
     expect(timeLeft(after(2 * DAY), NOW)).toBe('in 2 days');
     expect(timeLeft(after(12 * DAY + 5 * HOUR), NOW)).toBe('in 12 days');
+  });
+
+  it('reads the limit a consent was given under from its start and end', () => {
+    const limited = (granted: Date, ends?: Date | string) => ({
+      consent_granted_at: granted.toISOString(),
+      consent_expires_at: ends instanceof Date ? ends.toISOString() : ends,
+    });
+    expect(consentLimitSecs(limited(after(-2 * HOUR), after(4 * HOUR)))).toBe(21_600);
+    expect(consentLimitSecs(limited(after(-HOUR), after(30 * DAY - HOUR + 1)))).toBe(2_592_000);
+    expect(consentLimitSecs(limited(after(-HOUR)))).toBeNull();
+    expect(consentLimitSecs(limited(after(-HOUR), 'not a time'))).toBeNull();
+    expect(consentLimitSecs(limited(after(HOUR), after(HOUR)))).toBeNull();
+    expect(
+      consentLimitSecs({ consent_granted_at: 'not a time', consent_expires_at: NOW.toISOString() })
+    ).toBeNull();
+  });
+
+  it('renews a token only while the provider refreshes, a refresh token is kept and the consent lasts', () => {
+    const delegation = (can_refresh: boolean, consent_expires_at?: string) => ({
+      can_refresh,
+      consent_expires_at,
+    });
+    const refreshing = { token_refresh_enabled: true };
+    const later = after(HOUR).toISOString();
+    expect(renewsAutomatically(delegation(true), refreshing, NOW)).toBe(true);
+    expect(renewsAutomatically(delegation(true, later), refreshing, NOW)).toBe(true);
+    expect(renewsAutomatically(delegation(false, later), refreshing, NOW)).toBe(false);
+    expect(
+      renewsAutomatically(delegation(true, later), { token_refresh_enabled: false }, NOW)
+    ).toBe(false);
+    expect(renewsAutomatically(delegation(true, later), {}, NOW)).toBe(false);
+    expect(renewsAutomatically(delegation(true, later), undefined, NOW)).toBe(false);
+    expect(renewsAutomatically(delegation(true, after(-HOUR).toISOString()), refreshing, NOW)).toBe(
+      false
+    );
   });
 
   it('names a did:web agent by its whole web address and shortens any other DID', () => {

@@ -1067,10 +1067,13 @@ on save (an issuer change a provider using the strategy would refuse) with the s
 The Credentials page keeps its **Credential Tokens** tab (`pages/CredentialsPage/CredentialTokensTab.tsx`,
 tab key `credential-tokens`) and has a **Delegated Access** tab beside it
 (`pages/CredentialsPage/DelegatedAccessTab.tsx`, tab key `delegated-access`, trigger
-`credentials-delegated-access-tab-trigger`). Both read `GET /api/v1/delegation-vault`; the shared
-rules live in `pages/CredentialsPage/delegatedAccess.ts` (`consentState`, `timeLeft`,
-`isActiveDelegation`, `agentName`) and the page links in `PaginationControls.tsx`. A new view of
-the vault is a new tab: an existing tab is never renamed or removed.
+`credentials-delegated-access-tab-trigger`). Both read `GET /api/v1/delegation-vault` and
+`GET /api/v1/credential-providers` through `useDelegationVault.ts`, and still list the tokens
+when the providers cannot be read; the shared rules live in
+`pages/CredentialsPage/delegatedAccess.ts` (`consentState`, `timeLeft`, `isActiveDelegation`,
+`consentLimitSecs`, `renewsAutomatically`, `agentName`) and the page links in
+`PaginationControls.tsx`. A new view of the vault is a new tab: an existing tab is never renamed
+or removed.
 
 Both tabs name an agent with `agentName`: a `did:web` DID shows as its whole web address, the host
 and any path with each `:` as `/` and percent escapes decoded ("pr-reviewer.example.com"),
@@ -1082,7 +1085,12 @@ Credential Tokens lists every agent-keyed token, service tokens included.
 - The **Consented** cell shows the consent time and, under it, the consent's end
   (`credential-token-consent-end-<id>`): "Ends <date> (in 3 hours)", "Ended <date>", or "No time
   limit" when the vault reports no `consent_expires_at`. The expanded row shows it as **Consent
-  Ends**, the date first. **Token Expires** is the access token's own expiry.
+  Ends**, the date first.
+- The **Access Token** column (`credential-token-access-token-<id>`) is the access token's own
+  expiry, with "Renews automatically" under it while the gateway renews the token by itself
+  (`renewsAutomatically`: the provider's `token_refresh_enabled` is on, a refresh token is
+  stored, and the consent has not ended). An ended consent, a provider that does not refresh and
+  one that cannot be read show no such line. The expanded row keeps **Token Expires**.
 - The status badge reads "Consent ended" once the end has passed and "Ending soon" within 24 hours
   of it; otherwise it is the access token's status (Active, Expired (refreshable), Expired). The
   header counts leave ended consents out of "active" and count them as "consent ended"
@@ -1105,8 +1113,11 @@ Delegated Access lists only active access: a token of an Authorization Code prov
 has not ended and whose access token is valid or refreshable. It has no history of its own.
 
 - Columns: User, System (the provider's name, else its `provider_id`), Agent, Access (scopes),
-  Status (Active, or Ending soon within 24 hours of the end), Ends (`delegated-access-ends-<id>`: the
-  time left over the date, or "No time limit"), Last Used and, with `settings.edit`, a text
+  Status (Active, or Ending soon within 24 hours of the end), Ends (`delegated-access-ends-<id>`:
+  the time left, then the limit the consent was given under, "6-hour limit" or "30-day limit"
+  (`consentLimitSecs`, from its consent time to its end, worded by `consentLimitLabel` in
+  `utils/consentLimit.ts`), then the date; or "No time limit"), Last Used and, with
+  `settings.edit`, a text
   **Revoke** button (`delegated-access-revoke-button-<id>`, the shared `TwoStepButton` with
   `confirmAs="danger"` and a `cancelTestId`). Its first click turns it into a danger button that
   names what it ends, "Revoke GitHub access?" with the provider's name as System shows it, and
