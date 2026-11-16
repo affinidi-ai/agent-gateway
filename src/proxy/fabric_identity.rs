@@ -32,6 +32,87 @@ pub enum ResponseAttribution {
     Untrusted,
 }
 
+/// Why the calling gateway refuses a fabric answer's identity presentation.
+/// The refusal is already recorded in the VP Audit Log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnswerIdentityRefusal {
+    /// The presentation failed verification, with the diagnostic.
+    Invalid(String),
+    /// No issuer of the connection vouches for the presentation.
+    Untrusted,
+}
+
+impl AnswerIdentityRefusal {
+    /// The detail of the `502` the caller receives.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Invalid(error) => format!("Backend agent identity verification failed: {error}"),
+            Self::Untrusted => {
+                "Managed agent identity verification failed: issuer is not trusted on this connection".to_string()
+            }
+        }
+    }
+}
+
+/// A fabric answer whose identity presentation the calling gateway checks.
+pub struct AnswerIdentityCheck<'a> {
+    pub response_body: &'a str,
+    pub surface: &'a crate::config::agent_surface::AgentSurface,
+    pub identity_selector: &'a Option<Arc<crate::identity::IdentitySelector>>,
+    pub listener_manager: Option<Arc<crate::gateways::ConnectionPointListenerManager>>,
+    /// The Remote gateway record the `fabric://` Target names.
+    pub gateway_id: &'a str,
+    pub facts: &'a crate::audit::request_events::RequestFacts<'a>,
+    /// The request's authenticated caller.
+    pub caller: Option<crate::delegation_vault::audit::AuditCallerContext>,
+}
+
+/// Verify the identity presentation on a fabric answer, check its issuer
+/// against the connection's issuers and record the outcome in the VP Audit
+/// Log. `Ok(None)` when the answer carries no presentation; a refusal is
+/// recorded before it is returned.
+pub async fn check_answer_identity(
+    check: AnswerIdentityCheck<'_>
+) -> Result<Option<ResponsePresentation>, AnswerIdentityRefusal> {
+    let presentation = match extract_fabric_backend_agent_identity(
+        check.response_body,
+        check.surface,
+        check.identity_selector,
+        check.facts.channel_name,
+    )
+    .await
+    {
+        Ok(Some(presentation)) => presentation,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            record_invalid_response_presentation(check.facts, &error);
+            return Err(AnswerIdentityRefusal::Invalid(error));
+        }
+    };
+    match record_response_presentation(
+        &presentation,
+        check.listener_manager,
+        check.gateway_id,
+        check.identity_selector,
+        check.surface,
+        check.facts,
+        check.caller,
+    )
+    .await
+    {
+        ResponseAttribution::Verified => Ok(Some(presentation)),
+        ResponseAttribution::Untrusted => Err(AnswerIdentityRefusal::Untrusted),
+    }
+}
+
+/// Whether a verified answer presentation is the answering agent's protected
+/// identity: only when that identity is taken from the agent's payload, which
+/// the paired gateway replaced with its presentation. A slot that derives the
+/// identity from a key, a token claim or a fixed value keeps it.
+pub fn presentation_sets_identity(managed_identity: Option<&crate::source_auth::ManagedIdentityConfig>) -> bool {
+    matches!(managed_identity, Some(crate::source_auth::ManagedIdentityConfig::PayloadExtraction(_)))
+}
+
 /// Extract and verify the identity presentation a paired gateway attached to
 /// a fabric answer.
 ///
@@ -223,7 +304,7 @@ pub async fn record_response_presentation(
 ) -> ResponseAttribution {
     let peer_issuers = match listener_manager {
         Some(manager) => manager
-            .peer_issuers_for_gateway_id(gateway_id)
+            .peer_issuers_vouching_for(gateway_id, &presentation.issuer_did)
             .await
             .unwrap_or_else(|reason| {
                 warn!(channel = facts.channel_name, gateway_id, %reason, "Fabric: issuers of the answering gateway unknown");
@@ -652,6 +733,104 @@ mod tests {
         }
         assert!(events[0].via_fabric);
         assert_eq!(events[0].trace_id.as_deref(), Some("trace-a"));
+    }
+
+    async fn checked(
+        response: &JsonValue,
+        selector: &Option<Arc<crate::identity::IdentitySelector>>,
+    ) -> (
+        Result<Option<ResponsePresentation>, AnswerIdentityRefusal>,
+        Vec<crate::delegation_vault::audit::DelegationAuditEvent>,
+    ) {
+        let body = response.to_string();
+        let surface = surface();
+        let facts = facts();
+        crate::audit::producer::capture(check_answer_identity(AnswerIdentityCheck {
+            response_body: &body,
+            surface: &surface,
+            identity_selector: selector,
+            listener_manager: None,
+            gateway_id: "gw-b",
+            facts: &facts,
+            caller: None,
+        }))
+        .await
+    }
+
+    fn failed_outcome(
+        events: &[crate::delegation_vault::audit::DelegationAuditEvent]
+    ) -> Option<crate::audit::events::IdentityBindingFailure> {
+        match events {
+            [event] if event.via_fabric => match &event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::IdentityBindingFailed { outcome, .. } => {
+                    Some(*outcome)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_answer_with_a_tampered_presentation_is_refused_as_invalid_and_recorded() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation().await;
+        let selector = selector_for(signed.issuer.clone());
+        let mut tampered = signed.presentation.clone();
+        tampered["holder"] = json!("did:web:someone-else");
+
+        let (result, events) = checked(&credential_response(&tampered), &selector).await;
+
+        assert!(matches!(result, Err(AnswerIdentityRefusal::Invalid(_))), "{result:?}");
+        assert_eq!(failed_outcome(&events), Some(crate::audit::events::IdentityBindingFailure::Invalid));
+    }
+
+    #[tokio::test]
+    async fn an_answer_whose_connection_issuers_cannot_be_established_is_refused_as_untrusted_and_recorded() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation().await;
+        let selector = selector_for(signed.issuer.clone());
+
+        let (result, events) = checked(&credential_response(&signed.presentation), &selector).await;
+
+        assert_eq!(result, Err(AnswerIdentityRefusal::Untrusted));
+        assert_eq!(failed_outcome(&events), Some(crate::audit::events::IdentityBindingFailure::Untrusted));
+    }
+
+    #[tokio::test]
+    async fn an_answer_without_a_presentation_passes_the_check_unrecorded() {
+        let response = v1_task(json!({ "role": "ROLE_AGENT", "parts": [{ "text": "done" }] }));
+
+        let (result, events) = checked(&response, &None).await;
+
+        assert_eq!(result, Ok(None));
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn only_a_payload_identity_is_taken_from_the_answer_presentation() {
+        let payload: crate::source_auth::ManagedIdentityConfig = serde_json::from_value(json!({
+            "type": "from_payload",
+            "meta_field": "agentIdentity",
+            "fields": ["agentIdentity.name"]
+        }))
+        .expect("payload identity");
+        let from_api_key: crate::source_auth::ManagedIdentityConfig =
+            serde_json::from_value(json!({ "type": "from_api_key", "api_key_id": "key-1" })).expect("API key identity");
+
+        assert!(presentation_sets_identity(Some(&payload)));
+        assert!(!presentation_sets_identity(Some(&from_api_key)));
+        assert!(!presentation_sets_identity(None));
+    }
+
+    #[test]
+    fn a_refused_answer_tells_the_caller_why() {
+        assert_eq!(
+            AnswerIdentityRefusal::Untrusted.detail(),
+            "Managed agent identity verification failed: issuer is not trusted on this connection"
+        );
+        assert_eq!(
+            AnswerIdentityRefusal::Invalid("bad signature".into()).detail(),
+            "Backend agent identity verification failed: bad signature"
+        );
     }
 
     #[tokio::test]

@@ -13542,10 +13542,12 @@ async fn handle_fabric_request_inner(
                     crate::proxy::paths::is_well_known_agent_card_path(uri.path()) && status < 400;
 
                 // ── Step 11: Verify the answering agent's identity presentation ─
-                let presented_identity = if state
+                let managed_identity = state
                     .surface
-                    .managed_identity()
-                    .is_some()
+                    .managed_identity();
+                let presented_identity = if managed_identity.is_some()
+                    && (200..300).contains(&status)
+                    && !response_body.is_empty()
                 {
                     let response_audit_facts = crate::audit::request_events::RequestFacts {
                         surface_id: config_id,
@@ -13553,64 +13555,40 @@ async fn handle_fabric_request_inner(
                         trace_id: Some(trace_id.as_str()),
                         via_fabric: true,
                     };
-                    match crate::proxy::fabric_identity::extract_fabric_backend_agent_identity(
-                        &response_body,
-                        &state.surface,
-                        &state.identity_selector,
-                        channel_name,
+                    let listener_manager = state
+                        .listener_manager
+                        .read()
+                        .await
+                        .clone();
+                    match crate::proxy::fabric_identity::check_answer_identity(
+                        crate::proxy::fabric_identity::AnswerIdentityCheck {
+                            response_body: &response_body,
+                            surface: &state.surface,
+                            identity_selector: &state.identity_selector,
+                            listener_manager,
+                            gateway_id,
+                            facts: &response_audit_facts,
+                            caller: authenticated_identity
+                                .as_ref()
+                                .map(crate::delegation_vault::audit::build_caller_context),
+                        },
                     )
                     .await
                     {
-                        Ok(Some(presentation)) => {
-                            let listener_manager = state
-                                .listener_manager
-                                .read()
-                                .await
-                                .clone();
-                            match crate::proxy::fabric_identity::record_response_presentation(
-                                &presentation,
-                                listener_manager,
-                                gateway_id,
-                                &state.identity_selector,
-                                &state.surface,
-                                &response_audit_facts,
-                                authenticated_identity
-                                    .as_ref()
-                                    .map(crate::delegation_vault::audit::build_caller_context),
-                            )
-                            .await
-                            {
-                                crate::proxy::fabric_identity::ResponseAttribution::Verified => {
-                                    Some(ProtectedAgentIdentity::Managed {
-                                        did: presentation.agent_did,
-                                        identity_fields: presentation.identity_fields,
-                                    })
-                                }
-                                crate::proxy::fabric_identity::ResponseAttribution::Untrusted => {
-                                    connection_guard
-                                        .decrement()
-                                        .await;
-                                    return Err(create_error_response(
-                                        StatusCode::BAD_GATEWAY,
-                                        "Managed agent identity verification failed: issuer is not trusted on this connection",
-                                    ));
-                                }
-                            }
-                        }
-                        Ok(None) => None,
-                        Err(e) => {
-                            error!(channel = channel_name, error = %e, "Fabric: Backend agent VP verification failed");
-                            crate::proxy::fabric_identity::record_invalid_response_presentation(
-                                &response_audit_facts,
-                                &e,
-                            );
+                        Ok(presentation) => presentation
+                            .filter(|_| {
+                                crate::proxy::fabric_identity::presentation_sets_identity(managed_identity.as_ref())
+                            })
+                            .map(|presentation| ProtectedAgentIdentity::Managed {
+                                did: presentation.agent_did,
+                                identity_fields: presentation.identity_fields,
+                            }),
+                        Err(refusal) => {
+                            error!(channel = channel_name, ?refusal, "Fabric: answer identity presentation refused");
                             connection_guard
                                 .decrement()
                                 .await;
-                            return Err(create_error_response(
-                                StatusCode::BAD_GATEWAY,
-                                &format!("Backend agent identity verification failed: {}", e),
-                            ));
+                            return Err(create_error_response(StatusCode::BAD_GATEWAY, &refusal.detail()));
                         }
                     }
                 } else {

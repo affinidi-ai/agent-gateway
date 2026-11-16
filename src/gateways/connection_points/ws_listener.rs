@@ -1370,10 +1370,13 @@ impl ConnectionPointListenerManager {
     }
 
     /// The issuers the Remote gateway `gateway_id` may present identities
-    /// from; see [`Self::peer_issuers`].
-    pub async fn peer_issuers_for_gateway_id(
+    /// from, to check `issuer_did` against. The issuers its record already
+    /// holds answer without the issuer exchange when they accept `issuer_did`;
+    /// otherwise see [`Self::peer_issuers`].
+    pub async fn peer_issuers_vouching_for(
         &self,
         gateway_id: &str,
+        issuer_did: &str,
     ) -> Result<crate::gateways::types::PeerIssuers, String> {
         let store = self
             .gateway_store
@@ -1384,6 +1387,15 @@ impl ConnectionPointListenerManager {
             .await
             .map_err(|e| format!("failed to load peer gateway {gateway_id}: {e}"))?
             .ok_or_else(|| format!("unknown peer gateway {gateway_id}"))?;
+        let recorded = crate::gateways::types::PeerIssuers {
+            attested: gateway.issuer_did.clone(),
+            trusted: gateway
+                .trusted_issuer_dids
+                .clone(),
+        };
+        if recorded.accepts(issuer_did) {
+            return Ok(recorded);
+        }
         self.peer_issuers(gateway)
             .await
     }
@@ -6054,7 +6066,7 @@ mod peer_issuer_tests {
         let (manager, _issuer_dir) = manager_with(root.path(), &gateway).await;
 
         let issuers = manager
-            .peer_issuers_for_gateway_id(&gateway.id)
+            .peer_issuers_vouching_for(&gateway.id, "did:web:peer-issuer")
             .await
             .unwrap();
 
@@ -6068,13 +6080,33 @@ mod peer_issuer_tests {
     }
 
     #[tokio::test]
+    async fn an_operator_trusted_issuer_is_vouched_for_without_the_issuer_exchange() {
+        let root = tempfile::tempdir().unwrap();
+        let gateway = peer(None, &["did:web:relay"]);
+        let (manager, _issuer_dir) = manager_with(root.path(), &gateway).await;
+
+        let issuers = manager
+            .peer_issuers_vouching_for(&gateway.id, "did:web:relay")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            issuers,
+            PeerIssuers {
+                attested: None,
+                trusted: vec!["did:web:relay".to_string()],
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn operator_trusted_issuers_stand_alone_when_the_issuer_exchange_fails() {
         let root = tempfile::tempdir().unwrap();
         let gateway = peer(None, &["did:web:relay"]);
         let (manager, _issuer_dir) = manager_with(root.path(), &gateway).await;
 
         let issuers = manager
-            .peer_issuers_for_gateway_id(&gateway.id)
+            .peer_issuers_vouching_for(&gateway.id, "did:web:another-issuer")
             .await
             .unwrap();
 
@@ -6094,7 +6126,7 @@ mod peer_issuer_tests {
         let (manager, _issuer_dir) = manager_with(root.path(), &gateway).await;
 
         let err = manager
-            .peer_issuers_for_gateway_id(&gateway.id)
+            .peer_issuers_vouching_for(&gateway.id, "did:web:peer-issuer")
             .await
             .unwrap_err();
 
@@ -6107,7 +6139,7 @@ mod peer_issuer_tests {
         let (manager, _issuer_dir) = manager_with(root.path(), &peer(Some("did:web:peer-issuer"), &[])).await;
 
         let err = manager
-            .peer_issuers_for_gateway_id("no-such-gateway")
+            .peer_issuers_vouching_for("no-such-gateway", "did:web:peer-issuer")
             .await
             .unwrap_err();
 

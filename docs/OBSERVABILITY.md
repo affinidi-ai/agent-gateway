@@ -794,7 +794,8 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
   `fabric://` Target. These record that a received presentation was checked; `vp_injected` records
   the gateway creating one, or the presentation itself once a received one verified.
   - `identity_binding_verified`: the presentation verified and a trust anchor vouches for its
-    issuer. Carries `agent_did`, `issuer_gateway` and the caller-context `assurance`.
+    issuer. Carries `agent_did`, `issuer_gateway` and the caller-context `assurance`; the record
+    for a presentation on an answer to a `fabric://` Target carries no `assurance`.
   - `identity_binding_failed`: `outcome` is `absent` (no presentation was sent), `invalid` (it
     failed verification, including an issuer the receiving connection does not trust) or
     `untrusted` (it verified, but no trust anchor was available to vouch for its issuer).

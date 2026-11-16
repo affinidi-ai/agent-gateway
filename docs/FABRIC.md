@@ -204,13 +204,18 @@ continues with no caller identity, only the audit record for the unverified DID 
 written, and no weaker identity source is consulted for that request, neither the identity
 binding VP nor a raw identity extension.
 
-The calling gateway checks the presentation on the answer the same way, when the calling
+The calling gateway checks the presentation on a `2xx` answer the same way, when the calling
 surface's Target is `fabric://` and the surface has a managed identity. The presentation must
 verify, which includes its holder being its credential's subject, and its issuer must be one of
 the issuers of the connection to the Remote gateway the Target names. The calling gateway
 establishes that gateway's issuer DID through the issuer exchange when its record does not hold
-one yet. A verified presentation from one of those issuers is the answering agent's identity, in
-place of the raw `agent-identity/v1` extension the paired gateway replaced with it. A presentation
+one yet, and skips the exchange when the issuers its record holds already include the
+presentation's issuer. When the surface takes the agent's identity from the payload, a verified
+presentation from one of those issuers is that identity, in place of the raw `agent-identity/v1`
+extension the paired gateway replaced with it; the surface's identity schema and rules apply to
+that raw payload, which the calling gateway never receives, so the issuer check stands in for
+them. A surface that takes the identity from a key, a token claim, a certificate or a fixed DID
+keeps it, and the presentation is still checked and recorded. A presentation
 that fails verification refuses the answer with `502` and records `identity_binding_failed` with
 outcome `invalid`. One whose issuer is not one of the connection's issuers, including when they
 cannot be established, also refuses the answer with `502`: the answering agent's DID is not
