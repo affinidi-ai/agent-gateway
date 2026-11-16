@@ -486,10 +486,10 @@ key, so a compromise is recovered by revoking the grant, not by rotating.
 
 3. **Run the grant command the gateway prints**, on the agent, as an
    administrator. This is the one consent step; the gateway never holds admin
-   on the agent. With provisioning enabled it confers exactly five
-   capabilities — `context-create`, `key-mint`, `sign`, `sign-jws`,
-   `sign-document` — scoped to one context, and uses `vta acl create` because
-   `vta import-did` carries no `--capabilities` flag.
+   on the agent. With provisioning enabled it confers exactly four
+   capabilities — `context-create`, `key-mint`, `sign-jws`, `sign-document` —
+   at the `initiator` role, scoped to one context, and uses `vta acl create`
+   because `vta import-did` carries no `--capabilities` flag.
 
    `sign-jws` and `sign-document` are **not** implied by `sign`: a grant
    carrying only `sign` passes pairing and then refuses every

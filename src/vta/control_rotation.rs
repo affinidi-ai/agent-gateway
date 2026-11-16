@@ -635,9 +635,10 @@ mod tests {
     /// new key, and the old key is refused afterwards.
     ///
     /// Needs a running vta-service whose access list holds the fixed test
-    /// control `did:key` (seed `[42u8; 32]`) as an admin:
-    /// `vta import-did --did did:key:z6MkgAnvkP45uNxwCKeNdt6wrYkEjpYX4f7Nrd8MQqFL8Fbn --role admin`.
-    /// The swap moves that entry away, so grant it again before the next run.
+    /// control `did:key` (seed `[42u8; 32]`), scoped like the gateway's own grant:
+    /// `vta acl create --did did:key:z6MkgAnvkP45uNxwCKeNdt6wrYkEjpYX4f7Nrd8MQqFL8Fbn --role initiator --contexts <context> --capabilities context-create,key-mint,sign-jws,sign-document --label agent-gateway`.
+    /// The swap keeps the entry's role and scope and moves it to the new key, so
+    /// grant the test key again before the next run.
     #[tokio::test]
     #[ignore = "requires a running vta-service with the test control did:key granted; run manually"]
     async fn live_swap_key_moves_the_access_entry_and_the_new_key_signs_in() {
