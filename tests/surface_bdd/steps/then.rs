@@ -1290,6 +1290,39 @@ async fn target_trust_check_reported_error_code(
     assert_trust_check_error_code(world, "target", &expected_code).await;
 }
 
+#[then(expr = "the target Trust Check reported error code {string} {int} times")]
+async fn target_trust_check_reported_error_code_times(
+    world: &mut SurfaceWorld,
+    expected_code: String,
+    expected_count: usize,
+) {
+    let reports_code = |event: &serde_json::Value| {
+        extract_trust_check_error_codes(std::slice::from_ref(event), "target")
+            .iter()
+            .any(|(_, code)| code.as_deref() == Some(expected_code.as_str()))
+    };
+    let mut events = Vec::new();
+    let mut reported = 0;
+    for _ in 0..20 {
+        let (found, read) = vp_audit_events_matching(world, reports_code).await;
+        events = read;
+        reported = events
+            .iter()
+            .filter(|event| reports_code(event))
+            .count();
+        if found && reported >= expected_count {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        reported,
+        expected_count,
+        "target-leg Trust Check audit events with error code {expected_code:?}; observed {:?}",
+        extract_trust_check_error_codes(&events, "target")
+    );
+}
+
 #[then(expr = "the caller Trust Check reported error code {string}")]
 async fn caller_trust_check_reported_error_code(
     world: &mut SurfaceWorld,
@@ -1313,6 +1346,38 @@ async fn no_trust_check_audit_event_is_recorded(world: &mut SurfaceWorld) {
         events
             .iter()
             .filter(|event| is_trust_check(event))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[then(expr = "the caller Trust Check reported error code {string} for authority {string}")]
+async fn caller_trust_check_reported_error_code_for_authority(
+    world: &mut SurfaceWorld,
+    expected_code: String,
+    authority: String,
+) {
+    let reports_code = |event: &serde_json::Value| {
+        event
+            .get("event")
+            .and_then(|action| action.get("trust_check"))
+            .is_some_and(|trust_check| {
+                trust_check["leg"] == "caller"
+                    && trust_check["authority_id"] == authority.as_str()
+                    && trust_check["error_code"] == expected_code.as_str()
+            })
+    };
+    let (found, events) = vp_audit_events_matching(world, reports_code).await;
+    assert!(
+        found,
+        "expected a caller-leg Trust Check audit event for authority {authority:?} with error code \
+         {expected_code:?}; observed {:?}",
+        events
+            .iter()
+            .filter_map(|event| {
+                event
+                    .get("event")
+                    .and_then(|action| action.get("trust_check"))
+            })
             .collect::<Vec<_>>()
     );
 }

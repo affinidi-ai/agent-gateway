@@ -2746,16 +2746,17 @@ async fn enrich_and_evaluate_surface_policies(
                 let mut merged = trust_check_results
                     .take()
                     .unwrap_or_default();
-                merged.target = target_elements
-                    .iter()
-                    .map(|elem| {
-                        crate::trust_registry_verification::synthesize_failure(
-                            elem,
-                            crate::trust_registry_verification::AGENT_CARD_UNAVAILABLE,
-                            "A2A proxy target agent card could not be synthesized".to_string(),
-                        )
-                    })
-                    .collect();
+                merged.target =
+                    crate::trust_registry_verification::trust_check_element::expand_authorities(target_elements)
+                        .iter()
+                        .map(|elem| {
+                            crate::trust_registry_verification::synthesize_failure(
+                                elem,
+                                crate::trust_registry_verification::AGENT_CARD_UNAVAILABLE,
+                                "A2A proxy target agent card could not be synthesized".to_string(),
+                            )
+                        })
+                        .collect();
                 trust_check_results = Some(merged);
             }
         }

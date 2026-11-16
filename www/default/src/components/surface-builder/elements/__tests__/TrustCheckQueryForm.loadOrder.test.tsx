@@ -18,7 +18,7 @@ const storedQuery = {
 describe('TrustCheckQueryForm loaded after the Trust Check definition', () => {
   it('still writes no authority_source when the caller-leg template default is picked', () => {
     expect(trustCheckDefinition.type).toBe('trust-check');
-    const updateAuthorityAt = jest.fn();
+    const setAuthoritiesAt = jest.fn();
     render(
       <MemoryRouter>
         <TrustCheckQueryForm
@@ -31,7 +31,7 @@ describe('TrustCheckQueryForm loaded after the Trust Check definition', () => {
           loadError={null}
           updateQueryAt={jest.fn()}
           updateQuerySubField={jest.fn()}
-          updateAuthorityAt={updateAuthorityAt}
+          setAuthoritiesAt={setAuthoritiesAt}
           updateEntityAt={jest.fn()}
           handleQueryTypeChangeAt={jest.fn()}
         />
@@ -41,10 +41,7 @@ describe('TrustCheckQueryForm loaded after the Trust Check definition', () => {
     fireEvent.click(screen.getByTestId('trust-check-query-0-authority'));
     fireEvent.click(screen.getByText('Agent identity credential issuer (default)'));
 
-    expect(updateAuthorityAt).toHaveBeenCalledWith(
-      0,
-      '{{ input.agent.identity_issuer_did }}',
-      undefined
-    );
+    const picks = setAuthoritiesAt.mock.calls[0][1];
+    expect(picks[picks.length - 1]).toEqual({ did: '{{ input.agent.identity_issuer_did }}' });
   });
 });

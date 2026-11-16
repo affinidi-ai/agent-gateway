@@ -3458,24 +3458,12 @@ impl std::fmt::Display for SurfaceStatus {
 
 use crate::trust_registry_verification::trust_check_element::TrustCheckElementValidationError;
 
-/// Maximum number of [`TrustCheckElement`]s allowed per leg
-/// (`AccessPoint.trust_check_list`, `Target.trust_check_list` and each
-/// `TransitPoint.trust_check_list`).
-///
-/// Kept in sync with the frontend constant of the same name in
-/// `www/default/src/components/surface-builder/elements/trust-check/TrustCheckPanel.tsx`,
-/// which caps the dashboard's "add query" button so a user can't build a
-/// list the API would 400. Bump both together.
-pub const TRUST_CHECK_LIST_MAX: usize = 10;
-
 /// Structured Trust Check list validation errors. Pure data — the API
 /// layer is responsible for mapping these into the public HTTP error
 /// shape. Scoped to Trust Check invariants today; broader surface-level
 /// validation lives in dedicated helpers under `identity/handlers/surfaces.rs`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TrustCheckValidationError {
-    #[error("{leg} trust_check_list has {got} elements (max {max})")]
-    TrustCheckListTooLong { leg: &'static str, got: usize, max: usize },
     #[error("{leg} trust_check_list contains duplicate element id '{id}'")]
     TrustCheckDuplicateId { leg: &'static str, id: String },
     #[error("{leg} trust_check_list[{index}] (id '{id}'): {source}")]
@@ -3515,22 +3503,16 @@ pub enum TrustCheckValidationError {
     },
 }
 
-/// Walk a `trust_check_list` slice: enforce the `TRUST_CHECK_LIST_MAX`
-/// cap, ensure element ids are unique within the list, and delegate the
-/// per-element shape check to [`TrustCheckElement::validate`]. The `leg`
-/// label rides into every error variant so the API surface can echo
-/// `caller` / `target` back to the operator.
+/// Walk a `trust_check_list` slice: ensure element ids are unique within
+/// the list and delegate the per-element shape check to
+/// [`TrustCheckElement::validate`]. Neither the number of elements nor the
+/// authorities they query is capped. The `leg` label rides into every error
+/// variant so the API surface can echo `caller` / `target` back to the
+/// operator.
 pub fn validate_trust_check_list(
     leg: &'static str,
     list: &[TrustCheckElement],
 ) -> Result<(), TrustCheckValidationError> {
-    if list.len() > TRUST_CHECK_LIST_MAX {
-        return Err(TrustCheckValidationError::TrustCheckListTooLong {
-            leg,
-            got: list.len(),
-            max: TRUST_CHECK_LIST_MAX,
-        });
-    }
     let mut seen = std::collections::HashSet::with_capacity(list.len());
     for (index, elem) in list.iter().enumerate() {
         if !seen.insert(elem.id.as_str()) {
@@ -7516,33 +7498,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_transit_point_trust_check_list_over_max() {
-        let list = (0..=TRUST_CHECK_LIST_MAX)
+    fn validate_accepts_a_long_transit_point_trust_check_list() {
+        let list = (0..30)
             .map(|i| transit_trust_check(&format!("check-{i}")))
             .collect();
         let surface = surface_with_transit_points(serde_json::json!([transit_point_json("partner-a", "a2a", list)]));
 
-        let err = surface
-            .validate()
-            .expect_err("eleven checks must be rejected");
-        assert_eq!(
-            err,
-            TrustCheckValidationError::TransitPointTrustCheckInvalid {
-                alias: "partner-a".to_string(),
-                source: Box::new(TrustCheckValidationError::TrustCheckListTooLong {
-                    leg: "target",
-                    got: TRUST_CHECK_LIST_MAX + 1,
-                    max: TRUST_CHECK_LIST_MAX,
-                }),
-            }
-        );
-        assert_eq!(
-            err.to_string(),
-            format!(
-                "transit point 'partner-a': target trust_check_list has {} elements (max {TRUST_CHECK_LIST_MAX})",
-                TRUST_CHECK_LIST_MAX + 1
-            )
-        );
+        assert_eq!(surface.validate(), Ok(()));
     }
 
     #[test]
@@ -7975,9 +7937,11 @@ mod tests {
             id: id.to_string(),
             trust_registry_id: "tr-1".to_string(),
             authority_source: None,
+            authority_sources: Default::default(),
             query_type: crate::trust_registry_verification::trust_check_element::TrqpQueryType::Recognition,
             query: crate::trust_registry_verification::trust_check_element::TrqpQueryParams {
                 authority_id: "did:web:authority.example".to_string(),
+                authority_ids: None,
                 entity_id: "{{ caller.did }}".to_string(),
                 action: None,
                 resource: None,
@@ -8082,28 +8046,32 @@ mod tests {
     }
 
     #[test]
-    fn validate_passes_at_max_elements_per_leg() {
-        let list: Vec<_> = (0..TRUST_CHECK_LIST_MAX)
+    fn validate_passes_many_elements_per_leg() {
+        let list: Vec<_> = (0..30)
             .map(|i| elem(&format!("tc-{i}")))
             .collect();
         let s = surface_with_lists(list.clone(), list);
         assert_eq!(s.validate(), Ok(()));
     }
 
+    fn multi_authority_elem(
+        id: &str,
+        count: usize,
+    ) -> TrustCheckElement {
+        let mut e = elem(id);
+        e.query.authority_id = String::new();
+        e.query.authority_ids = Some(
+            (0..count)
+                .map(|i| format!("did:web:{id}-{i}"))
+                .collect(),
+        );
+        e
+    }
+
     #[test]
-    fn validate_rejects_over_max_elements_on_caller_leg() {
-        let list: Vec<_> = (0..=TRUST_CHECK_LIST_MAX)
-            .map(|i| elem(&format!("tc-{i}")))
-            .collect();
-        let s = surface_with_lists(list, Vec::new());
-        match s.validate() {
-            Err(TrustCheckValidationError::TrustCheckListTooLong { leg, got, max }) => {
-                assert_eq!(leg, "caller");
-                assert_eq!(got, TRUST_CHECK_LIST_MAX + 1);
-                assert_eq!(max, TRUST_CHECK_LIST_MAX);
-            }
-            other => panic!("expected TrustCheckListTooLong on caller, got {other:?}"),
-        }
+    fn validate_passes_many_authorities_across_a_list() {
+        let list = vec![multi_authority_elem("tc-a", 40), multi_authority_elem("tc-b", 2), elem("tc-c")];
+        assert_eq!(validate_trust_check_list("target", &list), Ok(()));
     }
 
     #[test]
