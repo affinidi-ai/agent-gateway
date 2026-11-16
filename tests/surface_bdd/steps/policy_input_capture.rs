@@ -171,6 +171,38 @@ fn role_is_granted(
         .push((feature, role));
 }
 
+#[given(expr = "surface {string} has a request policy that denies with reason {string}")]
+async fn surface_has_denying_request_policy(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+    reason: String,
+) {
+    let surface_id = tracked_surface_id(world, &surface_name);
+    let policy_id = format!("bdd-capture-deny-{surface_id}");
+    let rego = format!("package surface.policy\n\ndefault allow := false\n\ndeny_reason := {reason:?}\n");
+    let admin = client(world, None).await;
+    let created = admin
+        .create_surface_policy_definition_recorded(&policy_id, "BDD denying policy", "Denies every request", &rego)
+        .await
+        .expect("create the denying policy definition");
+    assert!(created.status < 300, "creating the denying policy definition: {}", created.body);
+    let stored = admin
+        .get_surface_recorded(&surface_id)
+        .await
+        .expect("read the surface");
+    assert_eq!(stored.status, 200, "reading surface '{surface_name}': {}", stored.body);
+    let updated = admin
+        .update_surface_policy_reference_recorded(
+            &surface_id,
+            stored.body,
+            crate::bdd_support::admin_client::SurfacePolicySlot::Request,
+            &policy_id,
+        )
+        .await
+        .expect("attach the denying policy");
+    assert_eq!(updated.status, 200, "attaching the denying policy: {}", updated.body);
+}
+
 #[given("the operator watches the dashboard Capture view")]
 async fn operator_watches(world: &mut SurfaceWorld) {
     watch(world, None).await;
@@ -309,6 +341,91 @@ async fn named_capture_view_shows(
     text: String,
 ) {
     shows_capture(world, &operator, &slot, &surface_name, &decision, &text).await;
+}
+
+#[then(expr = "the Capture view shows the {string} policy of surface {string} running policy {string}")]
+async fn capture_view_names_policy(
+    world: &mut SurfaceWorld,
+    slot: String,
+    surface_name: String,
+    policy_name: String,
+) {
+    let surface_id = tracked_surface_id(world, &surface_name);
+    let matches = |capture: &Value| {
+        capture["config_id"] == surface_id.as_str()
+            && capture["slot"] == slot.as_str()
+            && capture["policies"]
+                .as_array()
+                .is_some_and(|policies| {
+                    policies
+                        .iter()
+                        .any(|policy| policy["name"] == policy_name.as_str())
+                })
+    };
+    for _ in 0..100 {
+        if received_of(world, THE_OPERATOR, CAPTURED)
+            .iter()
+            .any(matches)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "no {slot} policy capture of surface '{surface_name}' running policy {policy_name:?}: {:#?}",
+        received_of(world, THE_OPERATOR, CAPTURED)
+    );
+}
+
+#[then(expr = "no captured policy input of surface {string} contains {string}")]
+async fn no_capture_contains(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+    text: String,
+) {
+    let surface_id = tracked_surface_id(world, &surface_name);
+    let captures: Vec<Value> = received_of(world, THE_OPERATOR, CAPTURED)
+        .into_iter()
+        .filter(|capture| capture["config_id"] == surface_id.as_str())
+        .collect();
+    assert!(!captures.is_empty(), "no policy input of surface '{surface_name}' was captured");
+    for capture in &captures {
+        assert!(
+            !capture["input"]
+                .to_string()
+                .contains(&text),
+            "a captured input contains {text:?}: {capture:#}"
+        );
+    }
+}
+
+#[then(expr = "the Capture view shows the {string} policy of surface {string} denying with reason {string}")]
+async fn capture_view_shows_denial(
+    world: &mut SurfaceWorld,
+    slot: String,
+    surface_name: String,
+    reason: String,
+) {
+    let surface_id = tracked_surface_id(world, &surface_name);
+    let matches = |capture: &Value| {
+        capture["config_id"] == surface_id.as_str()
+            && capture["slot"] == slot.as_str()
+            && capture["decision"] == "deny"
+            && capture["reason"] == reason.as_str()
+    };
+    for _ in 0..100 {
+        if received_of(world, THE_OPERATOR, CAPTURED)
+            .iter()
+            .any(matches)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "no {slot} policy capture of surface '{surface_name}' denying with reason {reason:?}: {:#?}",
+        received_of(world, THE_OPERATOR, CAPTURED)
+    );
 }
 
 async fn assert_no_capture(

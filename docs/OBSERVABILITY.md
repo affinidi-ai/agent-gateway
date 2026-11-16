@@ -25,6 +25,7 @@ channel capacity and defaults to `500`.
 | `OnboardingAttempt` | Defined for wire compatibility but not emitted; onboarding uses `PayloadCaptured`. |
 | `RefreshDashboard` | Requests a complete dashboard refetch after settings updates, policy-definition create/update/delete, or Trust Registry connection-state changes. |
 | `DashboardDelta` | Carries a pre-serialized periodic dashboard delta in `Arc<String>`. |
+| `PolicyInputCaptured` | Emitted after each policy evaluation on a surface that a dashboard connection listens to; sent only to the listening connections. Carries the input with credentials masked, the policies the slot ran and the decision (see [`POLICY.md`](POLICY.md#policy-input-capture)). |
 
 Configuration reload does **not** emit `RefreshDashboard`. A dashboard observes reloaded state
 through periodic `DashboardDelta` broadcasts or an explicit refetch.
@@ -61,7 +62,17 @@ of dashboard sections included in subsequent `DashboardDelta` events. A connecti
 has ended, or whose user lacks `logs.view` or is not Approved, also loses the `logs` section and
 every `LogEntry` update; it checks the session and the user's role and status on connect and on
 each keep-alive ping, and an unauthenticated connection never gets log lines. The two dashboard
-routes that return log lines give them only to an appliance-wide caller (see [`RBAC.md`](RBAC.md#dashboard-log-lines)). Any broadcast
+routes that return log lines give them only to an appliance-wide caller (see [`RBAC.md`](RBAC.md#dashboard-log-lines)).
+
+A connection listens to a surface's policy input with a `capture_policy_input` command and stops
+with `stop_capturing_policy_input`, each naming the `surface_id`; the gateway answers each with a
+`policy_input_capture` message saying whether the connection now listens, and why not when it
+refuses. Listening needs a session whose user holds `surfaces.edit` and `policies.edit`. The
+permission is checked again on each keep-alive ping, and a connection that loses it stops
+listening to every surface and is told so. Only listening connections receive `PolicyInputCaptured`
+updates, at most 32 answers wait to be sent before the connection stops reading the client's
+commands, and closing the connection ends its listening (see
+[`POLICY.md`](POLICY.md#policy-input-capture)). Any broadcast
 receive error, including lag, ends the connection; socket closure does likewise.
 
 `DashboardDelta` is already serialized before broadcast and held in `Arc<String>`, reducing clone

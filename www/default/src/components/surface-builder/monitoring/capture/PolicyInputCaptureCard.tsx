@@ -2,7 +2,11 @@ import React, { useState } from 'react';
 import type { AgentSurface } from '../../../../api';
 import { formatTime } from '../../../../utils/stringUtils';
 import PolicyInputCaptureControl from '../PolicyInputCaptureControl';
-import { CapturedPolicyInput, MAX_POLICY_INPUTS } from './usePolicyInputCaptureStream';
+import {
+  CapturedPolicy,
+  CapturedPolicyInput,
+  MAX_POLICY_INPUTS,
+} from './usePolicyInputCaptureStream';
 
 interface PolicyInputCaptureCardProps {
   captures: CapturedPolicyInput[];
@@ -41,6 +45,34 @@ const decisionBadge = (decision: string) => {
   );
 };
 
+/** The name a captured policy is shown by: its name, else its id, else "inline policy". */
+export const policyLabel = (policy: CapturedPolicy): string =>
+  policy.name || policy.id || 'inline policy';
+
+const PolicyNames: React.FC<{ capture: CapturedPolicyInput }> = ({ capture }) => {
+  if (capture.policies.length === 0) return null;
+  return (
+    <div className="small text-muted">
+      {capture.policies.map((policy, index) => {
+        const denied = capture.decidedBy !== undefined && capture.decidedBy === policy.id;
+        return (
+          <span
+            key={`${policy.id ?? 'inline'}-${index}`}
+            className={`me-2 ${denied ? 'text-danger fw-semibold' : ''}`}
+            title={policy.id}
+            data-testid="policy-input-capture-policy"
+          >
+            <i className="fas fa-file-code me-1"></i>
+            {policyLabel(policy)}
+            {policy.version !== undefined && ` v${policy.version}`}
+            {denied && ' (denied)'}
+          </span>
+        );
+      })}
+    </div>
+  );
+};
+
 const copyText = async (text: string) => {
   try {
     await navigator.clipboard.writeText(text);
@@ -54,6 +86,9 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
   hasPolicy = true,
 }) => {
   const [openId, setOpenId] = useState<number | null>(null);
+  const [slot, setSlot] = useState<string>('');
+  const slots = Array.from(new Set(captures.map(capture => capture.slot))).sort();
+  const shown = slot ? captures.filter(capture => capture.slot === slot) : captures;
 
   return (
     <div className="card shadow mb-4" data-testid="policy-input-capture-card">
@@ -72,17 +107,38 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
         {!hasPolicy && (
           <div className="alert alert-info small py-2" data-testid="policy-input-capture-no-policy">
             This surface has no policy yet, so its requests have no policy evaluation to capture.
-            Only a gateway or appliance-wide policy, if one applies, shows here. To see the input
+            Only a gateway or appliance-wide policy, if one applies, shows here. To see the input of
             each request, add a request policy to the surface; one that allows everything is enough.
           </div>
         )}
         {captures.length === 0 ? (
           <p className="text-muted small mb-0" data-testid="policy-input-capture-empty">
             Listen to policy input, then send a request to this surface. The input and the decision
-            of each policy evaluation show here, live.
+            of each policy evaluation show here, live. On an appliance with several nodes, only
+            requests served by the node this dashboard is connected to show.
           </p>
         ) : (
           <div className="table-responsive">
+            <div className="d-flex align-items-center flex-wrap gap-2 mb-2 small text-muted">
+              <span data-testid="policy-input-capture-kept">
+                The last {MAX_POLICY_INPUTS} policy evaluations are kept; one request can run
+                several policies.
+              </span>
+              <select
+                className="form-select form-select-sm w-auto ms-auto"
+                aria-label="Show the evaluations of one policy slot"
+                data-testid="policy-input-capture-slot-filter"
+                value={slot}
+                onChange={e => setSlot(e.target.value)}
+              >
+                <option value="">All policy slots</option>
+                {slots.map(name => (
+                  <option key={name} value={name}>
+                    {name}
+                  </option>
+                ))}
+              </select>
+            </div>
             <table className="table table-sm align-middle mb-0">
               <thead>
                 <tr>
@@ -93,7 +149,7 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
                 </tr>
               </thead>
               <tbody>
-                {captures.map(capture => {
+                {shown.map(capture => {
                   const input = JSON.stringify(capture.input, null, 2);
                   const open = openId === capture.id;
                   return (
@@ -107,6 +163,7 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
                               {capture.surfaceVariant}
                             </span>
                           )}
+                          <PolicyNames capture={capture} />
                         </td>
                         <td>
                           {decisionBadge(capture.decision)}

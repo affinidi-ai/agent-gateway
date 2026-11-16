@@ -64,6 +64,11 @@ pub enum WsUpdate {
         slot: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         transit_point: Option<String>,
+        /// The policy definitions the slot evaluated.
+        policies: Vec<crate::policies::input_capture::CapturedPolicy>,
+        /// The policy, by id, that denied, when the slot evaluates a set of several.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        decided_by: Option<String>,
         input: Box<serde_json::Value>,
         /// `allow`, `deny` or `error`.
         decision: String,
@@ -133,6 +138,10 @@ struct WsSubscription {
 
 /// The most surfaces one connection may listen to the policy input of at once.
 const MAX_POLICY_INPUT_SURFACES: usize = 10;
+
+/// How many answers to a client's listen requests may wait to be sent before the
+/// connection stops reading the client's messages.
+const MAX_PENDING_ANSWERS: usize = 32;
 
 /// The longest surface id a policy input listen message may name.
 const MAX_SURFACE_ID_LEN: usize = 256;
@@ -347,6 +356,38 @@ async fn listen_to_policy_input(
         );
     }
     policy_input_listen_answer(&surface_id, true, None)
+}
+
+/// Check again whether `caller` may listen to policy input. When it may not, every
+/// listen of `subscription` stops, and the answers telling the client so are returned.
+async fn recheck_policy_input(
+    subscription: &RwLock<WsSubscription>,
+    caller: Option<&WsCaller>,
+) -> (bool, Vec<String>) {
+    if WsCaller::policy_input_allowed(caller).await {
+        return (true, Vec::new());
+    }
+    let stopped: Vec<String> = subscription
+        .write()
+        .await
+        .policy_input
+        .drain()
+        .map(|(surface_id, _)| surface_id)
+        .collect();
+    if !stopped.is_empty() {
+        info!(
+            user_id = caller
+                .map(|caller| caller.user_id.as_str())
+                .unwrap_or_default(),
+            surfaces = stopped.len(),
+            "Stopped listening to policy input: the user may no longer listen"
+        );
+    }
+    let answers = stopped
+        .iter()
+        .map(|surface_id| policy_input_listen_answer(surface_id, false, Some("needs surfaces.edit and policies.edit")))
+        .collect();
+    (false, answers)
 }
 
 /// Message sent by a client to configure its subscription.
@@ -598,7 +639,8 @@ async fn handle_socket(
     let subscription = Arc::new(RwLock::new(WsSubscription::new()));
     let caller = Arc::new(caller);
     // Answers to the client's own requests, sent by the send task.
-    let (answer_tx, mut answer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // Bounded, so a client that stops reading its socket is no longer read from either.
+    let (answer_tx, mut answer_rx) = tokio::sync::mpsc::channel::<String>(MAX_PENDING_ANSWERS);
 
     // Send initial connection confirmation
     if let Err(e) = sender
@@ -680,20 +722,11 @@ async fn handle_socket(
                 }
                 _ = ping_interval.tick() => {
                     logs_allowed = WsCaller::logs_allowed(caller).await;
-                    policy_input_allowed = WsCaller::policy_input_allowed(caller).await;
-                    if !policy_input_allowed {
-                        let stopped: Vec<String> = send_sub
-                            .write()
-                            .await
-                            .policy_input
-                            .drain()
-                            .map(|(surface_id, _)| surface_id)
-                            .collect();
-                        for surface_id in stopped {
-                            let answer = policy_input_listen_answer(&surface_id, false, Some("needs surfaces.edit and policies.edit"));
-                            if sender.send(Message::Text(answer.into())).await.is_err() {
-                                break;
-                            }
+                    let (allowed, stopped) = recheck_policy_input(&send_sub, caller).await;
+                    policy_input_allowed = allowed;
+                    for answer in stopped {
+                        if sender.send(Message::Text(answer.into())).await.is_err() {
+                            break;
                         }
                     }
                     if sender.send(Message::Ping("ping".into())).await.is_err() {
@@ -736,6 +769,7 @@ async fn handle_socket(
                             };
                             if answer_tx
                                 .send(answer)
+                                .await
                                 .is_err()
                             {
                                 break;
@@ -1130,6 +1164,8 @@ mod tests {
             engine: "alpha".to_string(),
             slot: "target".to_string(),
             transit_point: None,
+            policies: Vec::new(),
+            decided_by: None,
             input: Box::new(serde_json::json!({ "a2a": { "text": "hello" } })),
             decision: "allow".to_string(),
             reason: None,
@@ -1218,6 +1254,80 @@ mod tests {
         assert!(is_captured("ws-closed"));
         drop(subscription);
         assert!(!is_captured("ws-closed"));
+    }
+
+    #[tokio::test]
+    async fn a_listener_keeps_listening_while_it_may_and_is_stopped_and_told_once_it_loses_a_permission() {
+        use crate::auth::types::{UserRole, UserStatus};
+        use crate::policies::input_capture::is_captured;
+
+        for (role, status) in [(UserRole::User, UserStatus::Approved), (UserRole::Administrator, UserStatus::Disabled)]
+        {
+            let dir = TempDir::new().unwrap();
+            let caller = caller_for(guard_with_user(&dir, UserRole::Administrator).await, "user-1").await;
+            let subscription = tokio::sync::RwLock::new(super::WsSubscription::new());
+            super::listen_to_policy_input(&subscription, Some(&caller), listen_message("ws-revoked-a"), true).await;
+            super::listen_to_policy_input(&subscription, Some(&caller), listen_message("ws-revoked-b"), true).await;
+
+            let (allowed, answers) = super::recheck_policy_input(&subscription, Some(&caller)).await;
+            assert!(allowed);
+            assert!(answers.is_empty());
+            assert!(is_captured("ws-revoked-a"));
+
+            caller
+                .guard
+                .storage
+                .save_user(&user_data(role, status))
+                .await
+                .unwrap();
+            let (allowed, answers) = super::recheck_policy_input(&subscription, Some(&caller)).await;
+
+            assert!(!allowed);
+            let mut answers: Vec<serde_json::Value> = answers
+                .into_iter()
+                .map(answer)
+                .collect();
+            answers.sort_by_key(|answer| answer["surface_id"].to_string());
+            assert_eq!(answers.len(), 2, "{answers:?}");
+            for (answer, surface_id) in answers
+                .iter()
+                .zip(["ws-revoked-a", "ws-revoked-b"])
+            {
+                assert_eq!(answer["surface_id"], surface_id);
+                assert_eq!(answer["listening"], false);
+                assert_eq!(answer["error"], "needs surfaces.edit and policies.edit");
+            }
+            assert!(
+                subscription
+                    .read()
+                    .await
+                    .policy_input
+                    .is_empty()
+            );
+            assert!(!is_captured("ws-revoked-a"));
+            assert!(!is_captured("ws-revoked-b"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_listener_whose_session_ends_is_stopped_at_the_next_check() {
+        use crate::policies::input_capture::is_captured;
+
+        let dir = TempDir::new().unwrap();
+        let caller =
+            caller_for(guard_with_user(&dir, crate::auth::types::UserRole::Administrator).await, "user-1").await;
+        let subscription = tokio::sync::RwLock::new(super::WsSubscription::new());
+        super::listen_to_policy_input(&subscription, Some(&caller), listen_message("ws-session-ended"), true).await;
+
+        caller
+            .sessions
+            .remove_sessions_for_user("user-1")
+            .await;
+        let (allowed, answers) = super::recheck_policy_input(&subscription, Some(&caller)).await;
+
+        assert!(!allowed);
+        assert_eq!(answers.len(), 1);
+        assert!(!is_captured("ws-session-ended"));
     }
 
     #[tokio::test]

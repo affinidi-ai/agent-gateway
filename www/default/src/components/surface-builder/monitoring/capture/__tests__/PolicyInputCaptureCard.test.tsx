@@ -2,8 +2,8 @@ import React from 'react';
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import type { AgentSurface } from '../../../../../api';
-import PolicyInputCaptureCard, { surfaceHasPolicy } from '../PolicyInputCaptureCard';
-import { usePolicyInputCaptureStream } from '../usePolicyInputCaptureStream';
+import PolicyInputCaptureCard, { policyLabel, surfaceHasPolicy } from '../PolicyInputCaptureCard';
+import { MAX_POLICY_INPUTS, usePolicyInputCaptureStream } from '../usePolicyInputCaptureStream';
 
 jest.mock('../../PolicyInputCaptureControl', () => ({
   __esModule: true,
@@ -76,7 +76,7 @@ describe('PolicyInputCaptureCard', () => {
     captured({ config_id: 'surface-2' });
 
     expect(screen.getAllByTestId('policy-input-capture-row')).toHaveLength(1);
-    expect(screen.getByText('inbound')).toBeInTheDocument();
+    expect(screen.getByText('inbound', { selector: 'td' })).toBeInTheDocument();
     expect(screen.getByText('Deny')).toBeInTheDocument();
     expect(screen.getByTestId('policy-input-capture-reason')).toHaveTextContent(
       'only message/send is allowed'
@@ -84,6 +84,76 @@ describe('PolicyInputCaptureCard', () => {
 
     fireEvent.click(screen.getByTestId('policy-input-capture-toggle'));
     expect(screen.getByTestId('policy-input-capture-input')).toHaveTextContent('hello policy');
+  });
+
+  it('names the policy each captured evaluation ran, with its version', () => {
+    render(<Harness />);
+    captured({ policies: [{ id: 'allow-partners', name: 'Allow partners', version: 3 }] });
+
+    expect(screen.getByTestId('policy-input-capture-policy')).toHaveTextContent(
+      'Allow partners v3'
+    );
+  });
+
+  it('marks the policy of a set that denied', () => {
+    render(<Harness />);
+    captured({
+      plane: 'gateway',
+      slot: 'gateway',
+      decision: 'deny',
+      decided_by: 'block-nights',
+      policies: [
+        { id: 'allow-partners', name: 'Allow partners' },
+        { id: 'block-nights', name: 'Block nights' },
+      ],
+    });
+
+    const policies = screen.getAllByTestId('policy-input-capture-policy');
+    expect(policies).toHaveLength(2);
+    expect(policies[0]).toHaveTextContent('Allow partners');
+    expect(policies[0]).not.toHaveTextContent('(denied)');
+    expect(policies[1]).toHaveTextContent('Block nights (denied)');
+  });
+
+  it('falls back to the id, then to "inline policy", without a name', () => {
+    expect(policyLabel({ id: 'p-1' })).toBe('p-1');
+    expect(policyLabel({})).toBe('inline policy');
+  });
+
+  it('shows no policy line for a capture that lists none', () => {
+    render(<Harness />);
+    captured({});
+
+    expect(screen.queryByTestId('policy-input-capture-policy')).not.toBeInTheDocument();
+  });
+
+  it('shows only the evaluations of the chosen policy slot', () => {
+    render(<Harness />);
+    captured({ slot: 'inbound' });
+    captured({ slot: 'target' });
+    captured({ slot: 'target' });
+
+    fireEvent.change(screen.getByTestId('policy-input-capture-slot-filter'), {
+      target: { value: 'target' },
+    });
+    expect(screen.getAllByTestId('policy-input-capture-row')).toHaveLength(2);
+
+    fireEvent.change(screen.getByTestId('policy-input-capture-slot-filter'), {
+      target: { value: '' },
+    });
+    expect(screen.getAllByTestId('policy-input-capture-row')).toHaveLength(3);
+  });
+
+  it('keeps the last evaluations up to the cap and says how many it keeps', () => {
+    render(<Harness />);
+    for (let i = 0; i < MAX_POLICY_INPUTS + 3; i++) {
+      captured({ reason: `evaluation ${i}` });
+    }
+
+    expect(screen.getAllByTestId('policy-input-capture-row')).toHaveLength(MAX_POLICY_INPUTS);
+    expect(screen.getByTestId('policy-input-capture-kept')).toHaveTextContent(
+      `The last ${MAX_POLICY_INPUTS} policy evaluations are kept`
+    );
   });
 
   it('keeps nothing while paused', () => {

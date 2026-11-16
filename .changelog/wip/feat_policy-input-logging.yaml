@@ -8,9 +8,11 @@ changes:
         capture_policy_input message and stop with stop_capturing_policy_input. While at least one
         connection listens, each request and response policy evaluation on that surface (gateway,
         surface, Transit Point and appliance-wide planes, on the direct, Fabric and MCP proxy paths)
-        is sent to the listening connections only, as a policy_input_captured update with its input
-        and its allow, deny reason or error. Credential-named values, JWTs and Bearer or Basic values
-        are masked first. Listening needs surfaces.edit and policies.edit, is checked again on each
+        is sent to the listening connections only, as a policy_input_captured update with its input,
+        the id, name and version of each policy definition the slot evaluated, the member that denied
+        a gateway or appliance-wide set, and its allow, deny reason or error. Credential-named values, JWTs and Bearer or Basic values
+        are masked first (an authorization value, not message text that starts with Bearer or Basic),
+        and every query value in the request path is redacted. Listening needs surfaces.edit and policies.edit, is checked again on each
         keep-alive ping, and ends when the connection closes. Nothing is logged or stored, and the
         surface configuration is not changed. Policy authors can see the input structure again
         without the gateway logging it. See docs/POLICY.md.
@@ -19,9 +21,12 @@ changes:
       description: >-
         The Surface Builder's Capture view has a Policy Input card with a Listen to policy input
         button for users with both surfaces.edit and policies.edit. While listening, the card lists
-        each policy evaluation with its slot, decision and reason, and shows or copies its input to
+        each policy evaluation with its slot, the name and version of the policy it ran, its
+        decision and reason, and shows or copies its input to
         try in the policy Test panel. Stopping, leaving the view or reloading the page ends
-        listening. On a surface with no policy yet, it says a request policy must be added before
+        listening. It keeps the last 50 evaluations with a filter by policy slot, says when it is
+        waiting for the dashboard connection, and says that a multi-node appliance shows only this
+        node's requests. On a surface with no policy yet, it says a request policy must be added before
         there is anything to capture. It is for developing and testing policies only.
   changed: []
   fixed:

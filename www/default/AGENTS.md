@@ -634,35 +634,52 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   payload history. Its header holds the **Listen to policy input** button
   (`monitoring/PolicyInputCaptureControl.tsx`), shown only on a saved surface (never while
   creating). The Monitoring view itself has only the Capture button.
-- Capture is live and lasts only while the view is open: the button sends
-  `capture_policy_input` on the dashboard WebSocket through `actions.listenToPolicyInput` in
-  `AppContext`, and turns into **Stop listening** with a "Listening" indicator. Clicking it again,
-  leaving the Capture view (unmount) or reloading the page stops it; nothing is stored, so a
-  reload starts with listening off. `AppContext` sends the open listens again after a socket
-  reconnect. There is no duration and no admin API call.
+- Capture is live and lasts only while the view is open: the button turns into **Stop
+  listening**, and an effect keyed on the surface and the listening state sends
+  `capture_policy_input` (and its cleanup `stop_capturing_policy_input`) on the dashboard
+  WebSocket through `actions.listenToPolicyInput` in `AppContext`. Clicking again, leaving the
+  Capture view (unmount) or reloading the page stops it; a new surface id moves listening to that
+  surface. Nothing is stored, so a reload starts with listening off. `AppContext` keeps the open
+  listens in a `PolicyInputListens` (`context/policyInputListens.ts`) and sends them again after a
+  socket reconnect. There is no duration and no admin API call.
+- While listening, a green "Listening" indicator shows when the dashboard socket is connected
+  (`state.wsStatus === 'CONNECTED'`), and a warning "Waiting for the dashboard connection" in its
+  place otherwise.
 - The button needs both `surfaces.edit` and `policies.edit`; without either it is disabled with
-  "Needs permission to edit surfaces and policies" beside it. When the gateway answers a listen
-  with `listening: false` and an `error`, the button goes back to **Listen to policy input** and
-  the error shows inline beside it.
-- The card lists the last 20 `policy_input_captured` WebSocket updates of the surface (see
+  "Needs permission to edit surfaces and policies" beside it. When the gateway ends listening
+  (`listening: false`, such as a refusal or a permission lost at a keep-alive ping), the button
+  goes back to **Listen to policy input** without sending a stop of its own
+  (`listenToPolicyInput(id, false, false)`), and an `error` shows inline beside it until the user
+  clicks again or a later answer starts listening.
+- The card lists the last 50 `policy_input_captured` WebSocket updates of the surface (see
   `monitoring/capture/usePolicyInputCaptureStream.ts`), newest first: time, policy slot with a
-  variant badge, a decision badge (Allow green, Deny red, Error yellow) with the reason, a
-  **Show input** toggle that opens the input JSON, and a copy button for the input. With none it
-  says to listen and send a request. Pause and Clear Payloads apply to it too.
+  variant badge and, under it, the name and version of each policy the slot ran (`policies`; the
+  name, else the id, else "inline policy"; the member that denied a gateway or appliance-wide set
+  in red with "(denied)"), a decision badge (Allow green, Deny red, Error yellow) with the reason, a
+  **Show input** toggle that opens the input JSON, and a copy button for the input. Above the
+  list a line says the last 50 evaluations are kept and that one request can run several
+  policies, beside an "All policy slots" select that shows one slot's rows. With none it says to
+  listen and send a request, and that on an appliance with several nodes only requests served by
+  this dashboard's node show. Pause and Clear Payloads apply to it too.
 - While the surface has no Access Point, Target, response or Transit Point policy
   (`surfaceHasPolicy`), the card shows an info note above the list: the surface has nothing of
   its own to capture, only a gateway or appliance-wide policy shows, and a request policy (an
   allow-all one is enough) should be added first. The button's `FieldHelp` says the same.
-- The note that captures hold request data with credentials masked, reach only the listening
-  user, are neither logged nor stored, are for developing and testing policies only, and stop
-  when listening stops sits behind the button's `FieldHelp`.
+- The note that captures show each request and response policy evaluation (not MCP tool
+  policies), only those of this dashboard's node on a multi-node appliance, hold request data with
+  credentials masked, reach only the listening user, are neither logged nor stored, are for
+  developing and testing policies only, and stop when listening stops sits behind the button's
+  `FieldHelp`.
 
 | Policy input capture element                    | Test id                                                                |
 | ----------------------------------------------- | ---------------------------------------------------------------------- |
 | Control, button, listening, missing permission  | `policy-input-capture`, `policy-input-capture-listen`, `policy-input-capture-listening`, `policy-input-capture-not-allowed` |
+| Waiting for the connection                      | `policy-input-capture-waiting`                                         |
+| Kept count, slot filter                         | `policy-input-capture-kept`, `policy-input-capture-slot-filter`        |
 | Help and error                                  | `field-help-policy-input-capture`, `policy-input-capture-error`        |
 | Card, empty state, no-policy note, row          | `policy-input-capture-card`, `policy-input-capture-empty`, `policy-input-capture-no-policy`, `policy-input-capture-row` |
 | Reason, input toggle, input, copy               | `policy-input-capture-reason`, `policy-input-capture-toggle`, `policy-input-capture-input`, `policy-input-capture-copy` |
+| Policy the slot ran                             | `policy-input-capture-policy`                                          |
 
 ## Trust Check
 

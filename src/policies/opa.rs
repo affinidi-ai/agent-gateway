@@ -21,6 +21,8 @@ use tracing::{debug, error, info};
 /// so the engine only ever compiles the canonical package.
 pub struct OpaEngine {
     engine: RwLock<Engine>,
+    /// The policy definition the engine was compiled from, when known.
+    policy: Option<super::input_capture::CapturedPolicy>,
 }
 
 /// Policy evaluation decision
@@ -85,7 +87,21 @@ impl OpaEngine {
     pub fn new() -> Self {
         Self {
             engine: RwLock::new(Engine::new()),
+            policy: None,
         }
+    }
+
+    /// A new engine for the policy compiled from `definition`.
+    pub fn for_definition(definition: &super::policy_definitions::PolicyDefinition) -> Self {
+        Self {
+            engine: RwLock::new(Engine::new()),
+            policy: Some(super::input_capture::CapturedPolicy::of(definition)),
+        }
+    }
+
+    /// The policy definition this engine was compiled from, when known.
+    pub fn policy(&self) -> Option<&super::input_capture::CapturedPolicy> {
+        self.policy.as_ref()
     }
 
     /// Load a Rego policy from a string.
@@ -259,6 +275,36 @@ impl Default for OpaEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_engine_compiled_from_a_definition_names_it_and_a_bare_one_does_not() {
+        let definition = crate::policies::policy_definitions::PolicyDefinition {
+            id: "allow-partners".to_string(),
+            tenant_id: None,
+            name: "Allow partners".to_string(),
+            description: String::new(),
+            policy_type: crate::policies::policy_definitions::PolicyType::AgentSurface,
+            policy: "package surface.policy\ndefault allow = true".to_string(),
+            enabled: true,
+            created_at: "t".to_string(),
+            updated_at: None,
+            version: Some(4),
+            content_hash: None,
+            sample_input: None,
+        };
+
+        let engine = OpaEngine::for_definition(&definition);
+
+        assert_eq!(
+            engine.policy(),
+            Some(&crate::policies::input_capture::CapturedPolicy {
+                id: Some("allow-partners".to_string()),
+                name: Some("Allow partners".to_string()),
+                version: Some(4),
+            })
+        );
+        assert_eq!(OpaEngine::new().policy(), None);
+    }
 
     #[test]
     fn test_opa_basic_allow() {

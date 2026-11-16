@@ -50,6 +50,29 @@ impl Drop for Listening {
     }
 }
 
+/// A policy definition a captured evaluation ran: its id and name, and the version
+/// compiled. A legacy inline gateway policy has neither id nor name.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CapturedPolicy {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+}
+
+impl CapturedPolicy {
+    /// The policy compiled from `definition`.
+    pub fn of(definition: &super::policy_definitions::PolicyDefinition) -> Self {
+        Self {
+            id: Some(definition.id.clone()),
+            name: Some(definition.name.clone()),
+            version: definition.version,
+        }
+    }
+}
+
 pub(crate) fn is_captured(surface_id: &str) -> bool {
     LISTENERS
         .get(surface_id)
@@ -122,16 +145,20 @@ pub struct Capture {
     engine: String,
     slot: String,
     transit_point: Option<String>,
+    policies: Vec<CapturedPolicy>,
+    decided_by: Option<String>,
     input: Value,
 }
 
 /// Start capturing the evaluation of `input` by `plane` (`gateway`, `surface` or
-/// `appliance`), `engine` naming the evaluated policy slot, when its surface has policy
-/// input capture switched on.
+/// `appliance`), `engine` naming the evaluated policy slot, when a dashboard connection
+/// listens to its surface. `policies` lists the policy definitions the slot evaluates;
+/// it is called only when the evaluation is captured.
 pub fn begin(
     plane: &str,
     engine: &str,
     input: &Value,
+    policies: impl FnOnce() -> Vec<CapturedPolicy>,
 ) -> Option<Capture> {
     let surface_id = surface_of(input)?;
     if !is_captured(surface_id) {
@@ -140,17 +167,29 @@ pub fn begin(
     let (slot, transit_point) = slot_of(plane, engine, surface_id);
     let mut masked = input.clone();
     mask_credentials(&mut masked);
+    mask_request_path(&mut masked);
     Some(Capture {
         surface_id: surface_id.to_string(),
         plane: plane.to_string(),
         engine: engine.to_string(),
         slot,
         transit_point,
+        policies: policies(),
+        decided_by: None,
         input: masked,
     })
 }
 
 impl Capture {
+    /// Name the policy, by id, that decided a set of several: the one that denied.
+    pub fn decided_by(
+        mut self,
+        policy_id: Option<&str>,
+    ) -> Self {
+        self.decided_by = policy_id.map(str::to_string);
+        self
+    }
+
     /// Send the capture with its outcome, `Ok((allow, deny reason))` or the evaluation
     /// error, to the dashboard.
     pub fn finish(
@@ -178,6 +217,8 @@ impl Capture {
             engine: self.engine,
             slot: self.slot,
             transit_point: self.transit_point,
+            policies: self.policies,
+            decided_by: self.decided_by,
             input: Box::new(self.input),
             decision: decision.to_string(),
             reason,
@@ -198,6 +239,22 @@ pub fn finish(
                 .map(|decision| (decision.allow, decision.reason.as_deref()))
                 .map_err(String::as_str),
         );
+    }
+}
+
+/// Render `input.http.path` as the request log line does: capability ids shortened and
+/// every query value redacted, so a credential passed in the query string (a request
+/// received over Fabric carries the caller's full path and query) is not sent.
+fn mask_request_path(input: &mut Value) {
+    if let Some(Value::String(path)) = input.pointer_mut("/http/path") {
+        *path = match path.split_once('?') {
+            Some((path, query)) => format!(
+                "{}?{}",
+                crate::observability::loggable::path(path),
+                crate::observability::loggable::query(query)
+            ),
+            None => crate::observability::loggable::path(path),
+        };
     }
 }
 
@@ -222,10 +279,21 @@ pub fn mask_credentials(value: &mut Value) {
     }
 }
 
+/// Whether `text` is a credential: a JWT, or an authorization value, `Bearer` or `Basic`
+/// followed by one token. Text that merely starts with one of those words is not.
 fn is_credential_text(text: &str) -> bool {
     let trimmed = text.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    lower.starts_with("bearer ") || lower.starts_with("basic ") || is_jwt(trimmed)
+    is_jwt(trimmed) || is_authorization_value(trimmed)
+}
+
+fn is_authorization_value(text: &str) -> bool {
+    let Some((scheme, token)) = text.split_once(' ') else {
+        return false;
+    };
+    let token = token.trim();
+    (scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("basic"))
+        && !token.is_empty()
+        && !token.contains(char::is_whitespace)
 }
 
 fn is_jwt(text: &str) -> bool {
@@ -290,7 +358,7 @@ mod tests {
         });
 
         let update = serde_json::to_value(
-            begin("surface", "response:pil-allow-message-send", &input)
+            begin("surface", "response:pil-allow-message-send", &input, Vec::new)
                 .unwrap()
                 .into_update(Ok((false, Some("only message/send is allowed")))),
         )
@@ -300,6 +368,49 @@ mod tests {
         assert_eq!(update["slot"], "response");
         assert_eq!(update["input"]["response"]["body"]["result"], "done");
         assert_eq!(update["decision"], "deny");
+    }
+
+    #[test]
+    fn a_captured_request_path_keeps_its_parameter_names_but_not_their_values() {
+        let _listening = listen("input-capture-query");
+        let input = json!({
+            "channel": { "config_id": "input-capture-query" },
+            "http": { "method": "GET", "path": "/pay/orders?token=secret-token&page=2&flag" },
+        });
+
+        let update = update_json(
+            begin("surface", "input-capture-query", &input, Vec::new)
+                .unwrap()
+                .into_update(Ok((true, None))),
+        );
+
+        let path = update["input"]["http"]["path"]
+            .as_str()
+            .unwrap();
+        assert_eq!(path, format!("/pay/orders?token={REDACTED}&page={REDACTED}&{REDACTED}"));
+        assert!(
+            !update
+                .to_string()
+                .contains("secret-token"),
+            "{update}"
+        );
+    }
+
+    #[test]
+    fn a_captured_request_path_without_a_query_is_kept() {
+        let _listening = listen("input-capture-plain-path");
+        let input = json!({
+            "channel": { "config_id": "input-capture-plain-path" },
+            "http": { "method": "POST", "path": "/a2a/agent" },
+        });
+
+        let update = update_json(
+            begin("surface", "input-capture-plain-path", &input, Vec::new)
+                .unwrap()
+                .into_update(Ok((true, None))),
+        );
+
+        assert_eq!(update["input"]["http"]["path"], "/a2a/agent");
     }
 
     #[test]
@@ -321,6 +432,25 @@ mod tests {
         assert_eq!(input["source_auth"]["token"], REDACTED);
         assert_eq!(input["a2a"]["message"]["parts"][0]["text"], REDACTED);
         assert_eq!(input["a2a"]["message"]["parts"][1]["text"], REDACTED);
+    }
+
+    #[test]
+    fn an_authorization_value_is_masked_but_text_that_starts_with_its_scheme_is_kept() {
+        let mut input = json!({
+            "a2a": { "parts": [
+                { "text": "Bearer abc.def-123" },
+                { "text": "basic dXNlcjpwYXNz" },
+                { "text": "Basic plan question" },
+                { "text": "Bearer " },
+            ] },
+        });
+
+        mask_credentials(&mut input);
+
+        assert_eq!(input["a2a"]["parts"][0]["text"], REDACTED);
+        assert_eq!(input["a2a"]["parts"][1]["text"], REDACTED);
+        assert_eq!(input["a2a"]["parts"][2]["text"], "Basic plan question");
+        assert_eq!(input["a2a"]["parts"][3]["text"], "Bearer ");
     }
 
     #[test]
@@ -351,7 +481,7 @@ mod tests {
             "mcp": { "tool_name": "lookup" },
         });
 
-        let capture = begin("surface", "inbound:input-capture-sent", &input).unwrap();
+        let capture = begin("surface", "inbound:input-capture-sent", &input, Vec::new).unwrap();
         let update = update_json(capture.into_update(Ok((false, Some("only message/send is allowed")))));
 
         assert_eq!(update["type"], "policy_input_captured");
@@ -371,18 +501,65 @@ mod tests {
         );
     }
 
+    fn policy(
+        id: &str,
+        name: &str,
+    ) -> CapturedPolicy {
+        CapturedPolicy {
+            id: Some(id.to_string()),
+            name: Some(name.to_string()),
+            version: Some(3),
+        }
+    }
+
+    #[test]
+    fn a_capture_names_the_policies_its_slot_ran_and_the_one_that_denied() {
+        let _listening = listen("input-capture-named");
+        let input = json!({ "channel": { "config_id": "input-capture-named" } });
+
+        let update = update_json(
+            begin("gateway", "gw-1", &input, || vec![policy("p-1", "Allow partners"), policy("p-2", "Block nights")])
+                .unwrap()
+                .decided_by(Some("p-2"))
+                .into_update(Ok((false, Some("closed at night")))),
+        );
+
+        assert_eq!(
+            update["policies"],
+            json!([
+                { "id": "p-1", "name": "Allow partners", "version": 3 },
+                { "id": "p-2", "name": "Block nights", "version": 3 },
+            ])
+        );
+        assert_eq!(update["decided_by"], "p-2");
+    }
+
+    #[test]
+    fn the_policies_are_listed_only_for_a_captured_evaluation() {
+        let mut asked = false;
+        let unheard = json!({ "channel": { "config_id": "input-capture-unasked" } });
+
+        let capture = begin("surface", "input-capture-unasked", &unheard, || {
+            asked = true;
+            Vec::new()
+        });
+
+        assert!(capture.is_none());
+        assert!(!asked);
+    }
+
     #[test]
     fn an_allow_has_no_reason_and_an_error_carries_its_message() {
         let _listening = listen("input-capture-decided");
         let input = json!({ "channel": { "config_id": "input-capture-decided" } });
 
         let allow = update_json(
-            begin("surface", "input-capture-decided", &input)
+            begin("surface", "input-capture-decided", &input, Vec::new)
                 .unwrap()
                 .into_update(Ok((true, None))),
         );
         let error = update_json(
-            begin("surface", "input-capture-decided", &input)
+            begin("surface", "input-capture-decided", &input, Vec::new)
                 .unwrap()
                 .into_update(Err("no allow rule")),
         );
@@ -399,7 +576,7 @@ mod tests {
         let input = json!({ "channel": { "config_id": "input-capture-transit" } });
 
         let update = update_json(
-            begin("surface", "transit:input-capture-transit:tp-1", &input)
+            begin("surface", "transit:input-capture-transit:tp-1", &input, Vec::new)
                 .unwrap()
                 .into_update(Ok((true, None))),
         );
@@ -433,9 +610,9 @@ mod tests {
         let stopped = json!({ "channel": { "config_id": "input-capture-stopped" } });
         let unheard = json!({ "channel": { "config_id": "input-capture-unheard" } });
 
-        assert!(begin("surface", "input-capture-stopped", &stopped).is_none());
-        assert!(begin("gateway", "self", &unheard).is_none());
-        assert!(begin("gateway", "self", &json!({ "http": {} })).is_none());
+        assert!(begin("surface", "input-capture-stopped", &stopped, Vec::new).is_none());
+        assert!(begin("gateway", "self", &unheard, Vec::new).is_none());
+        assert!(begin("gateway", "self", &json!({ "http": {} }), Vec::new).is_none());
     }
 
     #[test]

@@ -5,8 +5,12 @@ import { SurfaceMetaProvider, type SurfaceMetaValue } from '../../SurfaceMetaCon
 import PolicyInputCaptureControl from '../PolicyInputCaptureControl';
 
 const mockListen = jest.fn();
+let mockWsStatus = 'CONNECTED';
 jest.mock('../../../../context/AppContext', () => ({
-  useApp: () => ({ actions: { listenToPolicyInput: mockListen } }),
+  useApp: () => ({
+    state: { wsStatus: mockWsStatus },
+    actions: { listenToPolicyInput: mockListen },
+  }),
 }));
 
 let mockGranted: Set<string>;
@@ -14,19 +18,16 @@ jest.mock('../../../../context/PermissionsContext', () => ({
   usePermissions: () => ({ hasPermission: (p: string) => mockGranted.has(p), loading: false }),
 }));
 
-function renderControl(meta: Partial<SurfaceMetaValue> = {}) {
-  const value = {
-    isCreate: false,
-    readOnly: false,
-    surfaceId: 'surface-1',
-    ...meta,
-  } as SurfaceMetaValue;
-  return render(
-    <SurfaceMetaProvider value={value}>
-      <PolicyInputCaptureControl />
-    </SurfaceMetaProvider>
-  );
-}
+const control = (
+  surfaceId: string | undefined = 'surface-1',
+  meta: Partial<SurfaceMetaValue> = {}
+) => (
+  <SurfaceMetaProvider
+    value={{ isCreate: false, readOnly: false, surfaceId, ...meta } as SurfaceMetaValue}
+  >
+    <PolicyInputCaptureControl />
+  </SurfaceMetaProvider>
+);
 
 const answer = (detail: Record<string, unknown>) =>
   act(() => {
@@ -41,17 +42,18 @@ const listenButton = () => screen.getByTestId('policy-input-capture-listen');
 
 beforeEach(() => {
   jest.clearAllMocks();
+  mockWsStatus = 'CONNECTED';
   mockGranted = new Set(['surfaces.edit', 'policies.edit']);
 });
 
 describe('PolicyInputCaptureControl', () => {
   it('is hidden while creating a surface', () => {
-    renderControl({ isCreate: true, surfaceId: undefined });
+    render(control('surface-1', { isCreate: true, surfaceId: undefined }));
     expect(screen.queryByTestId('policy-input-capture-listen')).not.toBeInTheDocument();
   });
 
   it('is hidden without a saved surface id', () => {
-    renderControl({ surfaceId: undefined });
+    render(control('surface-1', { surfaceId: undefined }));
     expect(screen.queryByTestId('policy-input-capture-listen')).not.toBeInTheDocument();
   });
 
@@ -59,7 +61,7 @@ describe('PolicyInputCaptureControl', () => {
     'is disabled and says why with only %s',
     permission => {
       mockGranted = new Set([permission]);
-      renderControl();
+      render(control());
       expect(listenButton()).toBeDisabled();
       expect(screen.getByTestId('policy-input-capture-not-allowed')).toHaveTextContent(
         'Needs permission to edit surfaces and policies'
@@ -67,8 +69,8 @@ describe('PolicyInputCaptureControl', () => {
     }
   );
 
-  it('starts listening, shows it, and stops on a second click', () => {
-    renderControl();
+  it('starts listening, shows it, and stops with one request on a second click', () => {
+    render(control());
     expect(listenButton()).toHaveTextContent('Listen to policy input');
 
     fireEvent.click(listenButton());
@@ -76,51 +78,86 @@ describe('PolicyInputCaptureControl', () => {
     expect(screen.getByTestId('policy-input-capture-listening')).toHaveTextContent('Listening');
     expect(listenButton()).toHaveTextContent('Stop listening');
 
+    mockListen.mockClear();
     fireEvent.click(listenButton());
-    expect(mockListen).toHaveBeenLastCalledWith('surface-1', false);
+    expect(mockListen).toHaveBeenCalledTimes(1);
+    expect(mockListen).toHaveBeenCalledWith('surface-1', false, true);
     expect(screen.queryByTestId('policy-input-capture-listening')).not.toBeInTheDocument();
   });
 
   it('stops listening when the view closes', () => {
-    const { unmount } = renderControl();
+    const { unmount } = render(control());
     fireEvent.click(listenButton());
     mockListen.mockClear();
 
     unmount();
 
-    expect(mockListen).toHaveBeenCalledWith('surface-1', false);
+    expect(mockListen).toHaveBeenCalledWith('surface-1', false, true);
   });
 
   it('does not stop listening on a re-render', () => {
-    const { rerender } = renderControl();
+    const { rerender } = render(control());
     fireEvent.click(listenButton());
     mockListen.mockClear();
 
-    rerender(
-      <SurfaceMetaProvider
-        value={{ isCreate: false, readOnly: false, surfaceId: 'surface-1' } as SurfaceMetaValue}
-      >
-        <PolicyInputCaptureControl />
-      </SurfaceMetaProvider>
-    );
+    rerender(control());
 
     expect(mockListen).not.toHaveBeenCalled();
   });
 
-  it('shows the gateway refusing to listen and goes back to not listening', () => {
-    renderControl();
+  it('moves listening to the new surface when the surface changes', () => {
+    const { rerender } = render(control('surface-1'));
     fireEvent.click(listenButton());
+    mockListen.mockClear();
+
+    rerender(control('surface-2'));
+
+    expect(mockListen).toHaveBeenCalledWith('surface-1', false, true);
+    expect(mockListen).toHaveBeenLastCalledWith('surface-2', true);
+  });
+
+  it('keeps showing why the gateway refused, without sending a stop of its own', () => {
+    render(control());
+    fireEvent.click(listenButton());
+    mockListen.mockClear();
 
     answer({ listening: false, error: 'needs surfaces.edit and policies.edit' });
 
+    expect(mockListen).toHaveBeenCalledWith('surface-1', false, false);
+    expect(screen.queryByTestId('policy-input-capture-listening')).not.toBeInTheDocument();
     expect(screen.getByTestId('policy-input-capture-error')).toHaveTextContent(
       'needs surfaces.edit and policies.edit'
     );
+
+    answer({ listening: false });
+    expect(screen.getByTestId('policy-input-capture-error')).toHaveTextContent(
+      'needs surfaces.edit and policies.edit'
+    );
+  });
+
+  it('clears the refusal once the user tries again', () => {
+    render(control());
+    fireEvent.click(listenButton());
+    answer({ listening: false, error: 'listening to too many surfaces on this connection' });
+
+    fireEvent.click(listenButton());
+
+    expect(screen.queryByTestId('policy-input-capture-error')).not.toBeInTheDocument();
+  });
+
+  it('says it is waiting while the dashboard connection is down', () => {
+    mockWsStatus = 'DISCONNECTED';
+    render(control());
+    fireEvent.click(listenButton());
+
     expect(screen.queryByTestId('policy-input-capture-listening')).not.toBeInTheDocument();
+    expect(screen.getByTestId('policy-input-capture-waiting')).toHaveTextContent(
+      'Waiting for the dashboard connection'
+    );
   });
 
   it('ignores answers about another surface', () => {
-    renderControl();
+    render(control());
     fireEvent.click(listenButton());
 
     answer({ surface_id: 'surface-2', listening: false, error: 'refused' });

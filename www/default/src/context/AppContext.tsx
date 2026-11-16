@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useReducer, useEffect, ReactNode } from 'react';
+import { PolicyInputListens } from './policyInputListens';
 import {
   DashboardStats,
   Settings,
@@ -520,7 +521,7 @@ interface AppContextType {
      * Start or stop listening to a surface's policy input on the dashboard WebSocket.
      * Listening is sent again after a reconnect and ends when the page unloads.
      */
-    listenToPolicyInput: (surfaceId: string, listening: boolean) => void;
+    listenToPolicyInput: (surfaceId: string, listening: boolean, notify?: boolean) => void;
   };
 }
 
@@ -588,7 +589,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
   const scheduledRefreshTimeoutRef = React.useRef<NodeJS.Timeout | null>(null);
   const wsKeepAliveRef = React.useRef<boolean>(false);
   const wsSubscriptionRef = React.useRef<string[]>([]);
-  const policyInputListensRef = React.useRef<Set<string>>(new Set());
+  const policyInputListensRef = React.useRef(new PolicyInputListens());
 
   // Keep refs in sync with state
   React.useLayoutEffect(() => {
@@ -896,9 +897,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
       if (wsSubscriptionRef.current.length > 0) {
         ws.send(JSON.stringify({ type: 'subscribe', sections: wsSubscriptionRef.current }));
       }
-      policyInputListensRef.current.forEach(surfaceId => {
-        ws.send(JSON.stringify({ type: 'capture_policy_input', surface_id: surfaceId }));
-      });
+      policyInputListensRef.current.resend(ws);
     };
 
     ws.onmessage = event => {
@@ -1358,20 +1357,8 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
         wsRef.current.send(JSON.stringify({ type: 'subscribe', sections }));
       }
     },
-    listenToPolicyInput: (surfaceId: string, listening: boolean) => {
-      if (listening) {
-        policyInputListensRef.current.add(surfaceId);
-      } else {
-        policyInputListensRef.current.delete(surfaceId);
-      }
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(
-          JSON.stringify({
-            type: listening ? 'capture_policy_input' : 'stop_capturing_policy_input',
-            surface_id: surfaceId,
-          })
-        );
-      }
+    listenToPolicyInput: (surfaceId: string, listening: boolean, notify = true) => {
+      policyInputListensRef.current.set(wsRef.current, surfaceId, listening, notify);
     },
   };
 

@@ -257,7 +257,7 @@ impl SurfacePolicyManager {
                 match policy_text {
                     Some(def) if !def.policy.is_empty() => {
                         info!(channel_id = %config_id, def_id = %def_id, "Compiling OPA policy for channel");
-                        let engine = OpaEngine::new();
+                        let engine = OpaEngine::for_definition(&def);
                         engine.load_policy(config_id, &def.policy)?;
                         let mut engines = self
                             .opa_engines
@@ -342,7 +342,7 @@ impl SurfacePolicyManager {
                 match policy_text {
                     Some(def) if !def.policy.is_empty() => {
                         info!(channel_id = %config_id, def_id = %def_id, key = %inbound_base_key, "Compiling inbound OPA policy for channel");
-                        let engine = OpaEngine::new();
+                        let engine = OpaEngine::for_definition(&def);
                         engine.load_policy(&inbound_base_key, &def.policy)?;
                         let mut engines = self
                             .opa_engines
@@ -393,7 +393,7 @@ impl SurfacePolicyManager {
                 match policy_text {
                     Some(def) if !def.policy.is_empty() => {
                         info!(channel_id = %config_id, variant_alias = %alias, def_id = %def_id, key = %variant_key, "Compiling variant inbound OPA policy");
-                        let engine = OpaEngine::new();
+                        let engine = OpaEngine::for_definition(&def);
                         engine.load_policy(&variant_key, &def.policy)?;
                         let mut engines = self
                             .opa_engines
@@ -439,7 +439,7 @@ impl SurfacePolicyManager {
             match store.get(def_id).await {
                 Some(def) if !def.policy.is_empty() => {
                     info!(channel_id = %config_id, def_id = %def_id, "Compiling outbound OPA policy for channel");
-                    let engine = OpaEngine::new();
+                    let engine = OpaEngine::for_definition(&def);
                     engine.load_policy(&outbound_key, &def.policy)?;
                     let mut engines = self
                         .opa_engines
@@ -492,7 +492,7 @@ impl SurfacePolicyManager {
             match policy_text {
                 Some(def) if !def.policy.is_empty() => {
                     info!(channel_id = %config_id, def_id = %def_id, "Compiling response OPA policy for channel");
-                    let engine = OpaEngine::new();
+                    let engine = OpaEngine::for_definition(&def);
                     engine.load_policy(&response_key, &def.policy)?;
                     let mut engines = self
                         .opa_engines
@@ -573,7 +573,7 @@ impl SurfacePolicyManager {
                 match policy_text {
                     Some(def) if !def.policy.is_empty() => {
                         info!(channel_id = %config_id, variant_alias = %variant.alias, def_id = %def_id, "Compiling per-variant target OPA policy");
-                        let engine = OpaEngine::new();
+                        let engine = OpaEngine::for_definition(&def);
                         engine.load_policy(&v_key, &def.policy)?;
                         let mut engines = self
                             .opa_engines
@@ -620,7 +620,7 @@ impl SurfacePolicyManager {
                     match policy_text {
                         Some(def) if !def.policy.is_empty() => {
                             info!(channel_id = %config_id, variant_alias = %variant.alias, def_id = %def_id, "Compiling per-variant response OPA policy");
-                            let engine = OpaEngine::new();
+                            let engine = OpaEngine::for_definition(&def);
                             engine.load_policy(&v_resp_key, &def.policy)?;
                             let mut engines = self
                                 .opa_engines
@@ -661,7 +661,7 @@ impl SurfacePolicyManager {
                 match policy_text {
                     Some(def) if !def.policy.is_empty() => {
                         info!(channel_id = %config_id, alias = %tp.alias, def_id = %def_id, "Compiling per-transit-point OPA policy");
-                        let engine = OpaEngine::new();
+                        let engine = OpaEngine::for_definition(&def);
                         engine.load_policy(&tp_key, &def.policy)?;
                         let mut engines = self
                             .opa_engines
@@ -710,7 +710,7 @@ impl SurfacePolicyManager {
                 match policy_text {
                     Some(def) if !def.policy.is_empty() => {
                         info!(channel_id = %config_id, alias = %tp.alias, def_id = %def_id, "Compiling per-transit-point response OPA policy");
-                        let engine = OpaEngine::new();
+                        let engine = OpaEngine::for_definition(&def);
                         engine.load_policy(&tp_resp_key, &def.policy)?;
                         let mut engines = self
                             .opa_engines
@@ -1230,7 +1230,13 @@ impl SurfacePolicyManager {
 
         if let Some(engine) = engine {
             debug!(channel_id = %channel_id, lookup_key = %lookup_key, "Evaluating OPA policy");
-            let capture = super::input_capture::begin("surface", &lookup_key, &input);
+            let capture = super::input_capture::begin("surface", &lookup_key, &input, || {
+                engine
+                    .policy()
+                    .cloned()
+                    .into_iter()
+                    .collect()
+            });
             let result = engine.evaluate(input);
             super::input_capture::finish(capture, &result);
             result
@@ -1276,7 +1282,13 @@ impl SurfacePolicyManager {
 
         if let Some(engine) = engine {
             debug!(channel_id = %channel_id, variant_alias = ?active_variant_alias, "Evaluating inbound OPA policy");
-            let capture = super::input_capture::begin("surface", &lookup_key, &input);
+            let capture = super::input_capture::begin("surface", &lookup_key, &input, || {
+                engine
+                    .policy()
+                    .cloned()
+                    .into_iter()
+                    .collect()
+            });
             let result = engine.evaluate(input);
             super::input_capture::finish(capture, &result);
             result

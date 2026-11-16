@@ -44,11 +44,16 @@ pub struct GatewayPolicyManager {
 struct CompiledGatewayPolicy {
     engine: regorus::Engine,
     policy_definition_id: Option<String>,
+    policy_name: Option<String>,
     version: Option<u32>,
     content_hash: String,
 }
 
 pub type GatewayPolicyEvidence = (Option<String>, Option<u32>, String);
+
+/// A snapshot of one compiled member of a gateway's policy set: its engine, policy
+/// definition id, version and content hash.
+type GatewayMember = (regorus::Engine, Option<String>, Option<u32>, String);
 pub type GatewayPolicyDecisionWithEvidence = (crate::policies::PolicyDecision, Option<GatewayPolicyEvidence>);
 
 impl GatewayPolicyManager {
@@ -214,6 +219,7 @@ impl GatewayPolicyManager {
             return Ok(vec![CompiledGatewayPolicy {
                 engine,
                 policy_definition_id: None,
+                policy_name: None,
                 version: None,
                 content_hash: hash,
             }]);
@@ -242,6 +248,7 @@ impl GatewayPolicyManager {
             compiled.push(CompiledGatewayPolicy {
                 engine,
                 policy_definition_id: Some(def_id.clone()),
+                policy_name: Some(def.name.clone()),
                 version: def.version,
                 content_hash: hash,
             });
@@ -277,16 +284,26 @@ impl GatewayPolicyManager {
     ) -> Result<GatewayPolicyDecisionWithEvidence, String> {
         // Snapshot the compiled set under a brief read lock; evaluation is then
         // lock-free on the cheap engine clones.
-        let members: Vec<(regorus::Engine, Option<String>, Option<u32>, String)> = {
+        let (members, capture): (Vec<GatewayMember>, _) = {
             let engines = self
                 .engines
                 .read()
                 .expect("engines lock poisoned");
             match engines.get(gateway_id) {
-                Some(set) if !set.is_empty() => set
-                    .iter()
-                    .map(|c| (c.engine.clone(), c.policy_definition_id.clone(), c.version, c.content_hash.clone()))
-                    .collect(),
+                Some(set) if !set.is_empty() => (
+                    set.iter()
+                        .map(|c| (c.engine.clone(), c.policy_definition_id.clone(), c.version, c.content_hash.clone()))
+                        .collect(),
+                    super::input_capture::begin("gateway", gateway_id, &input, || {
+                        set.iter()
+                            .map(|c| super::input_capture::CapturedPolicy {
+                                id: c.policy_definition_id.clone(),
+                                name: c.policy_name.clone(),
+                                version: c.version,
+                            })
+                            .collect()
+                    }),
+                ),
                 _ => {
                     // Fail-closed: an enforced gateway with no compiled engine
                     // (its policy failed to compile) denies; an unenforced
@@ -308,20 +325,25 @@ impl GatewayPolicyManager {
         };
 
         debug!(gateway_id = %gateway_id, member_count = members.len(), "Evaluating gateway-level OPA policy set");
-        let capture = super::input_capture::begin("gateway", gateway_id, &input);
         let result = Self::evaluate_members(&members, &input);
         if let Some(capture) = capture {
-            capture.finish(match &result {
-                Ok((decision, _)) => Ok((decision.allow, decision.reason.as_deref())),
-                Err(error) => Err(error.as_str()),
-            });
+            let decided_by = match &result {
+                Ok((decision, Some((policy_id, _, _)))) if !decision.allow => policy_id.as_deref(),
+                _ => None,
+            };
+            capture
+                .decided_by(decided_by)
+                .finish(match &result {
+                    Ok((decision, _)) => Ok((decision.allow, decision.reason.as_deref())),
+                    Err(error) => Err(error.as_str()),
+                });
         }
         result
     }
 
     /// Evaluate `input` against a snapshot of a gateway's compiled set, deny-overrides.
     fn evaluate_members(
-        members: &[(regorus::Engine, Option<String>, Option<u32>, String)],
+        members: &[GatewayMember],
         input: &serde_json::Value,
     ) -> Result<GatewayPolicyDecisionWithEvidence, String> {
         let input_json =

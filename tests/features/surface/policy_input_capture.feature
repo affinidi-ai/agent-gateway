@@ -17,12 +17,32 @@ Feature: Live policy input capture
     Then the response status is 200
     And the Capture view shows the "target" policy of surface "alpha" deciding "allow" on an input showing "hello policy"
 
+  Scenario: The Capture view names the policy each captured evaluation ran
+    Given the operator listens to the policy input of surface "alpha"
+    When the caller sends an A2A message/send request to surface "alpha" with text "hello policy"
+    Then the response status is 200
+    And the Capture view shows the "target" policy of surface "alpha" running policy "BDD audited policy"
+
   Scenario: The Capture view shows the input and decision of a response policy
     Given the operator has added the policy definition to surface "alpha" as its response policy
     And the operator listens to the policy input of surface "alpha"
     When the caller sends an A2A message/send request to surface "alpha" with text "hello policy"
     Then the response status is 200
     And the Capture view shows the "response" policy of surface "alpha" deciding "allow" on an input showing "status_code"
+
+  Scenario: The Capture view shows a caller's credential masked
+    Given the operator listens to the policy input of surface "alpha"
+    When the caller sends an A2A message/send request to surface "alpha" with text "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJiZGQifQ.c2lnbmF0dXJl"
+    Then the response status is 200
+    And the Capture view shows the "target" policy of surface "alpha" deciding "allow" on an input showing "<redacted>"
+    And no captured policy input of surface "alpha" contains "eyJhbGciOiJIUzI1NiJ9"
+
+  Scenario: The Capture view shows a denying policy's decision and reason
+    Given surface "alpha" has a request policy that denies with reason "only partners may call"
+    And the operator listens to the policy input of surface "alpha"
+    When the caller sends an A2A message/send request to surface "alpha" with text "hello policy"
+    Then the response status is 403
+    And the Capture view shows the "target" policy of surface "alpha" denying with reason "only partners may call"
 
   Scenario: The policy input is not captured unless the operator listens
     Given the operator watches the dashboard Capture view

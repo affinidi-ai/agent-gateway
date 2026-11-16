@@ -430,10 +430,26 @@ impl GlobalPolicyManager {
         let Some(query) = plane_query(plane) else {
             return GlobalDecision::allow();
         };
-        let capture = super::input_capture::begin("appliance", plane, input);
+        let capture = super::input_capture::begin("appliance", plane, input, || {
+            set.policies
+                .iter()
+                .map(|p| super::input_capture::CapturedPolicy {
+                    id: Some(p.policy_id.clone()),
+                    name: Some(p.policy_name.clone()),
+                    version: p.version,
+                })
+                .collect()
+        });
         let decision = Self::evaluate_set(set, plane, query, input);
         if let Some(capture) = capture {
-            capture.finish(Ok((decision.allow, decision.reason.as_deref())));
+            let decided_by = if decision.allow {
+                None
+            } else {
+                decision.policy_id.as_deref()
+            };
+            capture
+                .decided_by(decided_by)
+                .finish(Ok((decision.allow, decision.reason.as_deref())));
         }
         decision
     }

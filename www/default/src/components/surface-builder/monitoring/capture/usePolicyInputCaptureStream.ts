@@ -1,5 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 
+/** A policy definition a captured evaluation ran. */
+export interface CapturedPolicy {
+  id?: string;
+  name?: string;
+  version?: number;
+}
+
 /** One policy evaluation the gateway captured while policy input capture was on. */
 export interface CapturedPolicyInput {
   id: number;
@@ -9,12 +16,16 @@ export interface CapturedPolicyInput {
   slot: string;
   transitPoint?: string;
   surfaceVariant?: string;
+  /** The policy definitions the slot evaluated. */
+  policies: CapturedPolicy[];
+  /** The id of the policy that denied, when the slot evaluates several. */
+  decidedBy?: string;
   decision: 'allow' | 'deny' | 'error' | string;
   reason?: string;
   input: unknown;
 }
 
-export const MAX_POLICY_INPUTS = 20;
+export const MAX_POLICY_INPUTS = 50;
 
 /**
  * Subscribes to `policy_input_captured` ws-message custom events for the surface
@@ -43,6 +54,8 @@ export function usePolicyInputCaptureStream(configId: string, paused: boolean) {
         slot: data.slot,
         transitPoint: data.transit_point,
         surfaceVariant: data.surface_variant,
+        policies: Array.isArray(data.policies) ? data.policies : [],
+        decidedBy: data.decided_by,
         decision: data.decision,
         reason: data.reason,
         input: data.input,

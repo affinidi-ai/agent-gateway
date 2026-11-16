@@ -12,20 +12,31 @@ import { useOptionalSurfaceMeta } from '../SurfaceMetaContext';
 const PolicyInputCaptureControl: React.FC = () => {
   const meta = useOptionalSurfaceMeta();
   const { hasPermission } = usePermissions();
-  const { actions } = useApp();
+  const { state, actions } = useApp();
   const [listening, setListening] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const surfaceId = meta?.surfaceId;
   const listenRef = useRef(actions.listenToPolicyInput);
   listenRef.current = actions.listenToPolicyInput;
+  const listeningRef = useRef(listening);
+  listeningRef.current = listening;
+  // Set when the gateway ended listening, so stopping sends no request of its own.
+  const endedByGatewayRef = useRef(false);
 
   useEffect(() => {
     if (!surfaceId) return;
     const handler = (event: Event) => {
       const data = (event as CustomEvent).detail;
       if (!data || data.type !== 'policy_input_capture' || data.surface_id !== surfaceId) return;
-      setListening(data.listening === true);
-      setError(data.error ? `Could not listen to policy input: ${data.error}` : null);
+      if (data.error) {
+        setError(`Could not listen to policy input: ${data.error}`);
+      }
+      if (data.listening === true) {
+        setError(null);
+      } else if (listeningRef.current) {
+        endedByGatewayRef.current = true;
+        setListening(false);
+      }
     };
     window.addEventListener('ws-message', handler);
     return () => window.removeEventListener('ws-message', handler);
@@ -33,19 +44,22 @@ const PolicyInputCaptureControl: React.FC = () => {
 
   useEffect(() => {
     if (!surfaceId || !listening) return;
-    const listen = listenRef.current;
-    return () => listen(surfaceId, false);
+    listenRef.current(surfaceId, true);
+    return () => {
+      const endedByGateway = endedByGatewayRef.current;
+      endedByGatewayRef.current = false;
+      listenRef.current(surfaceId, false, !endedByGateway);
+    };
   }, [surfaceId, listening]);
 
   if (!meta || meta.isCreate || !surfaceId) return null;
 
   const allowed = hasPermission('surfaces.edit') && hasPermission('policies.edit');
+  const connected = state.wsStatus === 'CONNECTED';
 
   const toggle = () => {
     setError(null);
-    const next = !listening;
-    setListening(next);
-    listenRef.current(surfaceId, next);
+    setListening(current => !current);
   };
 
   return (
@@ -71,17 +85,24 @@ const PolicyInputCaptureControl: React.FC = () => {
         testId="field-help-policy-input-capture"
         ariaLabel="About listening to policy input"
       >
-        While you listen, the input and the decision of every policy evaluation on this surface
-        here, live. The input holds request data (messages, tool arguments, claims) with credentials
-        masked. Only you receive it, and nothing is logged or stored. Listening stops when you stop
-        it, leave this view or reload the page. A surface with no policy has nothing to capture, so
-        add one first; one that allows everything is enough. Use it only to develop and test
-        policies.
+        While you listen, the input and the decision of each request and response policy evaluation
+        on this surface show here, live. MCP tool policies are not shown. On an appliance with
+        several nodes, only requests served by the node this dashboard is connected to show. The
+        input holds request data (messages, tool arguments, claims) with credentials masked. Only
+        you receive it, and nothing is logged or stored. Listening stops when you stop it, leave
+        this view or reload the page. A surface with no policy has nothing to capture, so add one
+        first; one that allows everything is enough. Use it only to develop and test policies.
       </FieldHelp>
-      {listening && (
+      {listening && connected && (
         <span className="text-muted small" data-testid="policy-input-capture-listening">
           <span className="spinner-grow spinner-grow-sm text-success me-1" role="status" />
           Listening
+        </span>
+      )}
+      {listening && !connected && (
+        <span className="text-warning small" data-testid="policy-input-capture-waiting">
+          <i className="fas fa-plug me-1"></i>
+          Waiting for the dashboard connection; nothing is captured until it is back
         </span>
       )}
       {!allowed && (

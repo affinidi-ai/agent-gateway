@@ -158,6 +158,8 @@ it one `policy_input_captured` update, once the policy has decided:
 | `timestamp` | When the policy decided, RFC 3339 |
 | `slot` | The policy, in words: `inbound` (the Access Point policy), `target` (the Target's request policy), `inbound variant <alias>`, `target variant <alias>`, `outbound`, `transit <alias>`, `response` (the Target's response policy), `transit <alias> response`, `gateway` (the gateway-level policy) or `appliance <plane>` (an appliance-wide plane) |
 | `transit_point` | The Transit Point alias, for a Transit Point request or response policy |
+| `policies` | The policy definitions the slot evaluated, each `{"id", "name", "version"}`: one for a surface slot, every member of the set for the gateway and appliance-wide planes; a legacy inline gateway policy has neither `id` nor `name` |
+| `decided_by` | The `id` of the member that denied, when a gateway or appliance-wide set denies |
 | `plane` | `surface`, `gateway` or `appliance` |
 | `engine` | The compiled policy key: the surface id, `inbound:`, `outbound:`, `variant:` or `transit:<surface>:<alias>` for a surface request policy, `response:<policy definition id>` or `response:transit:<surface>:<alias>` for a response policy, the gateway id, or the appliance-wide plane |
 | `input` | The policy input, credentials masked: the request input of a request policy, `response`, `caller` and `surface` (with `transit` and `source_auth` on a Transit Point leg) for a response policy |
@@ -178,7 +180,11 @@ stored, so a capture is gone once it has been sent.
 
 Before a capture is sent, every credential in the input becomes `<redacted>`: the value of a key
 named like a credential (the [credential names](CONFIGURATION_REFERENCE.md#log-redaction) of log
-redaction, such as `token` or `api_key`), any JWT, and any `Bearer` or `Basic` value. Headers that
+redaction, such as `token` or `api_key`), any JWT, and any `Bearer` or `Basic` authorization value
+(the scheme followed by one token: `Bearer abc.def`, not message text such as `Basic plan question`). `http.path`
+is shown as the request log line shows it: query parameter names are kept and every query value
+becomes `<redacted>`, since a request received over Fabric carries the caller's full path and query,
+and capability ids in the path are shortened. Policies still see the full path. Headers that
 carry credentials never reach the policy input. Message bodies, tool arguments and claims are sent
 as they are. Policy input capture is meant for writing and testing policies: the captures hold
 caller data.
