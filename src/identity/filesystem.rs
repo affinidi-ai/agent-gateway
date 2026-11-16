@@ -255,6 +255,20 @@ impl StorableEntity for RotationHistory {
 }
 
 impl AgentIdentityRecord {
+    /// The record as a dashboard WebSocket frame carries it: everything but the
+    /// agent's private key.
+    ///
+    /// Every dashboard session receives these frames whatever its role, and the
+    /// key is the one field that lets a holder impersonate the agent. The
+    /// storage export redacts it for the same reason.
+    pub(crate) fn to_broadcast_json(&self) -> Option<JsonValue> {
+        let mut value = serde_json::to_value(self).ok()?;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("private_key");
+        }
+        Some(value)
+    }
+
     /// Stored origin, or `ExternalCaller` for legacy remote records; legacy local records stay unknown.
     pub fn effective_origin(&self) -> Option<IdentityOrigin> {
         match self.origin {
@@ -552,7 +566,7 @@ impl FilesystemIdentityStore {
 
         if is_new
             && let Some(ws) = &self.ws_state
-            && let Ok(identity_json) = serde_json::to_value(&record)
+            && let Some(identity_json) = record.to_broadcast_json()
         {
             info!(
                 did = %record.did,
@@ -685,7 +699,7 @@ impl IdentityStore for FilesystemIdentityStore {
 
             // Broadcast identity update via WebSocket
             if let Some(ws) = &self.ws_state {
-                if let Ok(identity_json) = serde_json::to_value(&record) {
+                if let Some(identity_json) = record.to_broadcast_json() {
                     info!(
                         did = %record.did,
                         usage_count = record.usage_count,
@@ -854,7 +868,7 @@ impl IdentityStore for FilesystemIdentityStore {
         self.persist(&mut record)
             .await?;
         if let Some(ws) = &self.ws_state
-            && let Ok(identity_json) = serde_json::to_value(&record)
+            && let Some(identity_json) = record.to_broadcast_json()
         {
             ws.broadcast(crate::server::WsUpdate::IdentityUpdated { identity: identity_json });
         }
@@ -1769,6 +1783,59 @@ mod tests {
                 .unwrap()
                 .total_rotations(),
             3
+        );
+    }
+
+    /// A legacy agent's key stays on disk, where it signs, and never reaches a
+    /// dashboard WebSocket frame: every session receives those, whatever its role.
+    #[tokio::test]
+    async fn no_identity_frame_carries_the_agents_private_key() {
+        const SECRET_SCALAR: &str = "c2VjcmV0LXNjYWxhci1vZi10aGUtYWdlbnQta2V5";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ws = Arc::new(crate::server::WsState::new(16));
+        let store = FilesystemIdentityStore::new_with_ws(temp_dir.path(), Some(Arc::clone(&ws)))
+            .await
+            .unwrap();
+        let mut updates = ws.subscribe();
+        let mut record = credential_record(mtls_fields("aa"), Some(at(0)));
+        record.private_key = Some(serde_json::json!({
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "cHVibGljLWhhbGY",
+            "d": SECRET_SCALAR,
+        }));
+
+        store
+            .create(record)
+            .await
+            .unwrap();
+        store
+            .update_usage("h", None, None)
+            .await
+            .unwrap();
+        store
+            .apply_managed_source("h", &observed(60), &mtls_fields("bb"))
+            .await
+            .unwrap();
+
+        let mut frames = Vec::new();
+        while let Ok(update) = updates.try_recv() {
+            frames.push(serde_json::to_string(&update).unwrap());
+        }
+        assert_eq!(frames.len(), 3, "a create and two updates: {frames:?}");
+        for frame in &frames {
+            assert!(!frame.contains(SECRET_SCALAR), "{frame}");
+            assert!(!frame.contains("private_key"), "{frame}");
+        }
+        assert!(
+            store
+                .find_by_hash("h")
+                .await
+                .unwrap()
+                .unwrap()
+                .private_key
+                .is_some(),
+            "the key the agent signs with is still stored"
         );
     }
 

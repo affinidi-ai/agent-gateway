@@ -328,6 +328,15 @@ changes:
         reaching a verification decision. It is now refused like any other
         unsigned presentation, and a presentation carrying several signatures
         has each of them checked for expiry instead of only the first.
+    - timestamp: '2026-11-17T09:00:00Z'
+      title: Keep agent private keys out of the dashboard's live identity updates
+      description: >-
+        An agent onboarded before trust agents held its key keeps that key on
+        the gateway, and every identity create or update sent the whole record,
+        key included, to every open dashboard session whatever its role. The
+        updates now carry the record without the key, and the WebSocket drops a
+        private key from any identity update before sending it. The stored key
+        is unchanged.
   breaking: []
   internal:
     - timestamp: '2026-10-23T07:00:00.000Z'
