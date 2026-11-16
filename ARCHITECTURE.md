@@ -198,7 +198,6 @@ flowchart TB
         D0[Credential injection] --> D1[Forward] --> D2["Response and<br/>agent-card rewrite"] --> D3[Metrics]
     end
     E --> I --> P --> F
-    E --> I --> P --> F
 ```
 
 Every Transit Point authenticates its caller in the first stage, with its `source_auth` or

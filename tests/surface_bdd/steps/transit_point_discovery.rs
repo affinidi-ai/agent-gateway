@@ -84,8 +84,11 @@ async fn send_discovery_request_through_transit_point(
         _ => panic!("Unsupported HTTP method: {}", method),
     };
 
-    // Add transit token header if requested (reuse existing with_transit_token helper style)
-    if include_token && let Some(transit_token) = world.transit_token.as_ref() {
+    if include_token {
+        let transit_token = world
+            .transit_token
+            .as_ref()
+            .expect("a request with the transit token needs a transit token set by an earlier step");
         request = request.header("X-Transit-Token", transit_token);
     }
 
