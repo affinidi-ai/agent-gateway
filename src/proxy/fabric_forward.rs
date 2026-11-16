@@ -24,6 +24,10 @@ use crate::gateways::ConnectionPointListenerManager;
 /// between the two gateways.
 const CAPABILITY_QUERY_ENVELOPE_LIFETIME_SECS: u64 = 300;
 
+/// The `ForwardResponse` envelope field in which a receiving gateway names the header of the
+/// caller credential it refused: `{"credential_header": "<lowercase name>"}`.
+pub(crate) const CALLER_REFUSAL_FIELD: &str = "caller_refusal";
+
 /// Outcome of a fabric forward: the remote `ForwardResponse` decoded into the
 /// HTTP primitives the caller needs to build its own response.
 pub(crate) struct FabricForwardResponse {
@@ -36,6 +40,25 @@ pub(crate) struct FabricForwardResponse {
     /// The remote gateway refused the request itself, answering with an error
     /// envelope rather than relaying its surface's answer.
     pub refused_by_gateway: bool,
+    /// The header of the caller credential the remote gateway verified and refused, when it
+    /// refused one ([`CALLER_REFUSAL_FIELD`]).
+    pub refused_credential_header: Option<String>,
+}
+
+impl FabricForwardResponse {
+    /// Whether the remote gateway answered `401` because it refused the credential this
+    /// gateway sent in `injected_header`.
+    pub(crate) fn refused_credential_in(
+        &self,
+        injected_header: &str,
+    ) -> bool {
+        refused_injected_credential(
+            self.status,
+            self.refused_credential_header
+                .as_deref(),
+            injected_header,
+        )
+    }
 }
 
 /// Typed failures for the fabric forward transport.
@@ -912,7 +935,26 @@ fn decode_forward_response(response_body: &serde_json::Value) -> FabricForwardRe
         headers,
         body,
         refused_by_gateway: error.is_some(),
+        refused_credential_header: refused_credential_header(response_body).map(str::to_string),
     }
+}
+
+/// The header of the caller credential a `ForwardResponse` says the remote gateway refused.
+pub(crate) fn refused_credential_header(response_body: &serde_json::Value) -> Option<&str> {
+    response_body
+        .get(CALLER_REFUSAL_FIELD)
+        .and_then(|refusal| refusal.get("credential_header"))
+        .and_then(serde_json::Value::as_str)
+}
+
+/// Whether a remote gateway answered `status` 401 because it refused the credential this
+/// gateway sent in `injected_header`, as its `refused_header` says.
+pub(crate) fn refused_injected_credential(
+    status: u16,
+    refused_header: Option<&str>,
+    injected_header: &str,
+) -> bool {
+    status == 401 && refused_header.is_some_and(|refused| refused.eq_ignore_ascii_case(injected_header))
 }
 
 #[cfg(test)]
@@ -960,6 +1002,7 @@ mod tests {
                     headers: HashMap::new(),
                     body: body.as_bytes().to_vec(),
                     refused_by_gateway,
+                    refused_credential_header: None,
                 })
             }
         })
@@ -1097,6 +1140,41 @@ mod tests {
         }));
         assert!(refused_with_body.refused_by_gateway, "an envelope with a body and an error");
         assert_eq!(refused_with_body.body, br#"{"error":"Forbidden"}"#.to_vec());
+    }
+
+    #[test]
+    fn a_remote_gateways_refusal_of_a_credential_names_its_header_outside_the_body() {
+        let refused = decode_forward_response(&serde_json::json!({
+            "status": 401, "headers": {}, "body": "{\"detail\":\"Caller credential missing or invalid\"}",
+            CALLER_REFUSAL_FIELD: {"credential_header": "x-api-key"}
+        }));
+        assert_eq!(
+            refused
+                .refused_credential_header
+                .as_deref(),
+            Some("x-api-key")
+        );
+        assert_eq!(refused.body, br#"{"detail":"Caller credential missing or invalid"}"#.to_vec());
+
+        let relayed = decode_forward_response(&serde_json::json!({"status": 401, "headers": {}, "body": "{}"}));
+        assert_eq!(relayed.refused_credential_header, None, "an older gateway or a relayed answer");
+    }
+
+    #[test]
+    fn only_a_401_naming_the_injected_header_refused_the_injected_credential() {
+        for (status, refused, injected, expected) in [
+            (401, Some("x-api-key"), "X-API-Key", true),
+            (401, Some("x-api-key"), "authorization", false),
+            (401, None, "x-api-key", false),
+            (403, Some("x-api-key"), "x-api-key", false),
+            (500, Some("x-api-key"), "x-api-key", false),
+        ] {
+            assert_eq!(
+                refused_injected_credential(status, refused, injected),
+                expected,
+                "{status} {refused:?} {injected}"
+            );
+        }
     }
 
     #[test]

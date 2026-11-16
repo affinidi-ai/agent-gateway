@@ -3675,6 +3675,7 @@ pub(crate) mod tests {
                         headers,
                         body,
                         refused_by_gateway: false,
+                        refused_credential_header: None,
                     }),
                     Err("timeout") => Err(FabricForwardError::NoResponse("gw".into())),
                     Err("reply not received") => Err(FabricForwardError::ReplyNotReceived("gw".into())),
@@ -5922,12 +5923,14 @@ pub(crate) mod tests {
             headers: HashMap::from([("payment-receipt".to_string(), vec![huge_header])]),
             body: Vec::new(),
             refused_by_gateway: false,
+            refused_credential_header: None,
         }));
         assert!(!oversized(&FabricForwardResponse {
             status: 200,
             headers: HashMap::new(),
             body: vec![0; MAX_RESPONSE_BODY_BYTES],
             refused_by_gateway: false,
+            refused_credential_header: None,
         }));
     }
 

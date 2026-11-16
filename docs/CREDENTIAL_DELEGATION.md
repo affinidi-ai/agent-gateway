@@ -753,7 +753,7 @@ give them different names to send both.
 
 A credential header value that is not ASCII is sent to an HTTP target byte for byte. A Fabric
 target can carry only text header values, so a Transit Point refuses a Fabric request whose
-`target_auth` header cannot be carried with `502`, and one whose delegated credential header
+`target_auth` header cannot be carried with `500 target_auth_misconfigured`, and one whose delegated credential header
 cannot be carried with `503`, rather than forwarding it without the credential.
 
 An Access Point and Fabric receive apply the same rule to the caller's headers: a caller
@@ -1023,7 +1023,8 @@ sends get no credential, a peer's read of the legacy `/.well-known/agent.json` i
 receiving gateway's own card read for its policy input is a card fetch too: it presents the
 credential at the configured card location, or else at `<target>/.well-known/agent.json`, of an
 `http(s)` Target (see [`FABRIC.md`](FABRIC.md#agent-card-fetch-over-fabric)). A token that
-cannot be obtained follows `fallback`: `reject` answers 502 "Target authentication failed",
+cannot be obtained follows `fallback`: `reject` refuses the request (see [When a Target
+credential cannot be obtained](#when-a-target-credential-cannot-be-obtained)),
 `passthrough` forwards without the credential, and either way a `target_auth_failed` record in the
 VP Audit Log names the cause. The policy card read is the exception: it writes no record, logs a
 warning and leaves the policy input without a card, or under `passthrough` reads the card without
@@ -1033,6 +1034,46 @@ above](#service-tokens)).
 The [agent card preview](PROTOCOLS.md#agent-card-preview) fetches the card with the same Target
 Authentication and reports whether the credential was sent or why it could not be obtained, never
 the token.
+
+### When a Target credential cannot be obtained
+
+With `fallback: reject`, a request whose Target credential cannot be obtained is refused with a
+status that says what kind of failure it is, the generic detail "Target authentication failed"
+and a fixed `reason`: a top-level field of the problem JSON, or `error.data.reason` in the
+JSON-RPC error of an MCP Transit Point. The cause itself reaches only the VP Audit Log.
+
+| Status | `reason` | When |
+| --- | --- | --- |
+| `500` | `target_auth_misconfigured` | The secret or provider does not exist or belongs to another tenant; the provider needs a user's consent or issues no service token; the header breaks a header rule; `target_https` or `target_source_auth` in `enforce` withholds the credential; the token endpoint is not https or the egress policy refuses it; the token endpoint refuses the request as a client error (`4xx` other than `429`) with an OAuth error, or grants other scopes than requested; the provider's settings are unusable. |
+| `503` | `target_auth_unavailable` | The secrets or credential store cannot be read; the token request fails otherwise: no connection, a timeout, a `5xx` or `429` answer whatever its body, or an answer without a usable token; the provider changed during the token request. |
+
+A request the token request retry backoff holds back fails as the request that started the
+backoff did, with the same status, and its `target_auth_failed` record names the same OAuth
+error.
+
+This holds on the direct path, a `proxy://` MCP Target, the Fabric send leg, Fabric receive
+(whose ForwardResponse carries the status and reason, which the sending gateway passes on; an
+MCP surface puts the reason in `error.data.reason`), a Transit Point
+and the agent card fetch. A Transit Point credential that cannot be sent as a header is refused
+with `500 target_auth_misconfigured` whatever the `fallback`. A request that would carry the
+credential outside the Target's base path is refused whatever the `fallback`, with `400
+target_path_refused`, whether the caller's path or an MCP proxy tool URL built from the caller's
+arguments leaves it (see [Target credential scope](PROTOCOLS.md)).
+
+### Target credential refused by the peer gateway
+
+On a `fabric://` route (an Access Point's Target or a Transit Point), when the peer gateway
+answers `401` and its `ForwardResponse` names, in `caller_refusal`, the header this gateway sent
+its Target credential in, the caller gets `500` with reason `target_auth_rejected` instead of the
+peer's `401`: the caller's own credential was not at fault. A peer MCP surface that checks bearer
+tokens as a Resource Server names `authorization` when it refuses a token that came, not when none
+came or the token lacks a scope. The VP Audit Log records a
+`target_auth_failed` refusal with outcome `refused_by_target` and `upstream_status` `401`. Any
+other `401` reaches the caller unchanged and is not recorded: one from the peer's Target, a peer
+that sent no `caller_refusal` (an older gateway, a missing credential, credentials for more than
+one method, a public Access Point), and any answer from a URL destination, which this gateway
+treats as a third-party API. A framed stream carries no `caller_refusal`, so its `401` reaches
+the caller unchanged too.
 
 `POST /v1/mcp-proxies/discover-tools`, the Surface Builder's design-time tool listing, still
 accepts only `static_secret` target authentication, so listing the tools of an MCP server behind
@@ -1102,7 +1143,7 @@ the request checks the header and format rules of the save: a `header_name` that
 field name or is reserved, or a `header_format` without exactly one `{value}` or with CR, LF or
 NUL, is never sent, on the direct path, a `proxy://` MCP Target, the Fabric send leg, Fabric
 receive, the agent card fetch and a Transit Point. It is treated as a credential that cannot be
-obtained: `fallback` `reject` answers 502 "Target authentication failed", `passthrough` forwards
+obtained: `fallback` `reject` answers `500 target_auth_misconfigured`, `passthrough` forwards
 the request without it, as for a secret that cannot be read, and either way a
 `target_auth_failed` record names the outcome. The agent card preview reports it as
 `invalid_header`. The rule against a header another credential on the leg sends is checked at
@@ -1128,7 +1169,7 @@ read a peer sends, its read of the legacy `/.well-known/agent.json` included, is
 request and never gets the credential, so a remote Target that serves its card only at that path
 and requires its credential there is reported as `AGENT_CARD_UNAVAILABLE`. A credential withheld
 under `enforce` is treated as one that cannot be resolved: no token is requested, and `target.auth.fallback` decides the
-request (`reject` answers 502, `passthrough` forwards it without the credential), on the direct
+request (`reject` answers `500 target_auth_misconfigured`, `passthrough` forwards it without the credential), on the direct
 path, a `proxy://` MCP Target, the Fabric send leg, Fabric receive, the agent card fetch and a
 Transit Point. The [agent card preview](PROTOCOLS.md#agent-card-preview) reports it as
 `forbidden`. A `target.auth` or Transit Point `target_auth` credential that is withheld or
@@ -1555,7 +1596,7 @@ grant.
 
 The Target credential is sent only to URLs under the Target endpoint, and a Target's redirect is
 returned, never followed. A request whose path climbs out, such as `{route}/%2e%2e/admin` against
-`https://api.example.com/base`, is refused with 502 and nothing is forwarded, whatever the
+`https://api.example.com/base`, is refused with `400 target_path_refused` and nothing is forwarded, whatever the
 `fallback`, and recorded in the VP Audit Log as a `target_auth_failed` refusal with outcome
 `rejected`. This covers the direct path, Fabric send and receive, Transit Points and MCP proxy
 tool calls; the rules and each path's answer are in
@@ -1730,7 +1771,7 @@ sends the secret nor read it. A tenant reassignment that would give a tenant pro
 appliance-wide Direct Line secret answers `409`, whether the proxy moves into a tenant or its
 secret becomes appliance-wide.
 
-A refused Target authentication follows the usual 502 "Target authentication failed" (or
+A refused Target authentication follows the usual `500 target_auth_misconfigured` (or
 `fallback`), and a `target_auth_failed` record in the VP Audit Log names the cause. A refused legacy binding records
 `provider_unavailable` with detail `provider_forbidden`, raised before any cached token is read
 or grant is requested, and answers as in

@@ -157,29 +157,61 @@ fn record_rejection(
 
 /// The Target credential was not sent: it could not be obtained, or a `[credential_policy]`
 /// rule in `enforce` withheld it. Recorded as a `forward` refusal with reason
-/// `target_auth_failed` whether `outcome` refused the request (`http_status` 502 on HTTP) or
-/// forwarded it without the credential (no `http_status`). `transit_point` names the Transit
-/// Point whose credential it was, absent for the Target; `provider_id` names the credential
-/// provider; `oauth_error` is the token endpoint's registered OAuth `error` code, or `other`,
-/// never its body.
+/// `target_auth_failed` whether `outcome` refused the request (`http_status` is the refusal's
+/// `status` on HTTP) or forwarded it without the credential (no `http_status`).
+/// `transit_point` names the Transit Point whose credential it was, absent for the Target;
+/// `provider_id` names the credential provider; `oauth_error` is the token endpoint's
+/// registered OAuth `error` code, or `other`, never its body.
 pub fn target_auth_failed(
     facts: &RequestFacts<'_>,
     transit_point: Option<&str>,
     provider_id: Option<&str>,
     outcome: TargetAuthOutcome,
+    status: u16,
     oauth_error: Option<crate::delegation_vault::oauth::OAuthErrorCode>,
 ) {
     emit("request_rejected", || {
         let mut record = facts.record(DelegationAuditAction::RequestRejected {
             stage: RejectionStage::Forward,
             reason: RejectionReason::TargetAuthFailed,
-            http_status: (outcome == TargetAuthOutcome::Rejected && !facts.via_fabric).then_some(502),
+            http_status: (outcome == TargetAuthOutcome::Rejected && !facts.via_fabric).then_some(status),
             rpc_error_code: None,
             requested_variant: None,
             target_auth: Some(crate::audit::events::TargetAuthRejection {
                 outcome,
                 transit_point: transit_point.map(str::to_string),
                 oauth_error: oauth_error.map(|code| code.to_string()),
+                upstream_status: None,
+            }),
+        });
+        record.provider_id = provider_id.map(str::to_string);
+        record
+    })
+}
+
+/// The Target credential was sent, and the peer gateway that checked it as its caller
+/// credential refused it with `upstream_status`. Recorded as a `forward` refusal with reason
+/// `target_auth_failed` and outcome `refused_by_target`; `http_status` is the `status` this
+/// gateway answered its caller with.
+pub fn target_credential_refused_by_target(
+    facts: &RequestFacts<'_>,
+    transit_point: Option<&str>,
+    provider_id: Option<&str>,
+    status: u16,
+    upstream_status: u16,
+) {
+    emit("request_rejected", || {
+        let mut record = facts.record(DelegationAuditAction::RequestRejected {
+            stage: RejectionStage::Forward,
+            reason: RejectionReason::TargetAuthFailed,
+            http_status: (!facts.via_fabric).then_some(status),
+            rpc_error_code: None,
+            requested_variant: None,
+            target_auth: Some(crate::audit::events::TargetAuthRejection {
+                outcome: TargetAuthOutcome::RefusedByTarget,
+                transit_point: transit_point.map(str::to_string),
+                oauth_error: None,
+                upstream_status: Some(upstream_status),
             }),
         });
         record.provider_id = provider_id.map(str::to_string);
@@ -620,10 +652,11 @@ mod tests {
                 None,
                 Some("machine"),
                 TargetAuthOutcome::Rejected,
+                500,
                 Some(crate::delegation_vault::oauth::OAuthErrorCode::new("invalid_client")),
             );
-            target_auth_failed(&facts(), Some("partner"), None, TargetAuthOutcome::Passthrough, None);
-            target_auth_failed(&fabric, None, Some("machine"), TargetAuthOutcome::Rejected, None);
+            target_auth_failed(&facts(), Some("partner"), None, TargetAuthOutcome::Passthrough, 503, None);
+            target_auth_failed(&fabric, None, Some("machine"), TargetAuthOutcome::Rejected, 503, None);
         })
         .await;
 
@@ -645,6 +678,7 @@ mod tests {
                 outcome,
                 transit_point: transit_point.map(str::to_string),
                 oauth_error: oauth_error.map(str::to_string),
+                upstream_status: None,
             })
         };
         let forward = (RejectionStage::Forward, RejectionReason::TargetAuthFailed);
@@ -654,7 +688,7 @@ mod tests {
                 (
                     forward.0,
                     forward.1,
-                    Some(502),
+                    Some(500),
                     Some("machine".to_string()),
                     detail(TargetAuthOutcome::Rejected, None, Some("invalid_client"))
                 ),
@@ -673,7 +707,7 @@ mod tests {
         assert_eq!(
             stored["event"]["request_rejected"],
             serde_json::json!({
-                "stage": "forward", "reason": "target_auth_failed", "http_status": 502,
+                "stage": "forward", "reason": "target_auth_failed", "http_status": 500,
                 "target_auth": {"outcome": "rejected", "oauth_error": "invalid_client"}
             })
         );
@@ -688,6 +722,7 @@ mod tests {
                 None,
                 Some("machine"),
                 TargetAuthOutcome::Rejected,
+                500,
                 Some(crate::delegation_vault::oauth::OAuthErrorCode::new("echoed client-id-12345")),
             );
         })
@@ -700,6 +735,23 @@ mod tests {
                 .contains("client-id-12345"),
             "{stored}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_target_credential_the_peer_gateway_refused_is_recorded_with_both_statuses() {
+        let ((), events) = crate::audit::producer::capture(async {
+            target_credential_refused_by_target(&facts(), Some("partner"), Some("machine"), 500, 401);
+        })
+        .await;
+        let stored = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(
+            stored["event"]["request_rejected"],
+            serde_json::json!({
+                "stage": "forward", "reason": "target_auth_failed", "http_status": 500,
+                "target_auth": {"outcome": "refused_by_target", "transit_point": "partner", "upstream_status": 401}
+            })
+        );
+        assert_eq!(stored["provider_id"], "machine");
     }
 
     #[test]

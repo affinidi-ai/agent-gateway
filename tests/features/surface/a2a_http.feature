@@ -115,8 +115,8 @@ Feature: A2A HTTP surface forwarding and identity
   Scenario: A missing target credential fails the agent card when fallback is reject
     Given the gateway authenticates to the managed agent with missing secret "bdd-missing-target-secret" in header "x-target-api-key", falling back to "reject"
     When the caller fetches the agent card
-    Then the response status is 502
-    And the response body is error "agent_card_target_auth_failed"
+    Then the response status is 500
+    And the response body is error "agent_card_target_auth_misconfigured"
     And managed agent "bravo" was not called
 
   Scenario: A missing target credential fetches the agent card without it when fallback is passthrough
@@ -156,8 +156,8 @@ Feature: A2A HTTP surface forwarding and identity
     And the credential provider is refusing token requests
     And the gateway's authentication to the managed agent falls back to "reject"
     When the caller fetches the agent card
-    Then the response status is 502
-    And the response body is error "agent_card_target_auth_failed"
+    Then the response status is 503
+    And the response body is error "agent_card_target_auth_unavailable"
     And managed agent "bravo" was not called
 
   Scenario: A refused provider token request fetches the agent card without it when fallback is passthrough

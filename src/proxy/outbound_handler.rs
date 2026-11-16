@@ -147,6 +147,13 @@ pub(crate) enum OutboundPipelineError {
     #[error("Target authentication credentials unavailable")]
     TargetAuthUnavailable { mcp_request_id: Option<serde_json::Value> },
 
+    /// The Transit Point's Target credential could not be obtained or sent;
+    /// `failure` sets the status and `reason` the caller is told.
+    /// `mcp_request_id` is set, to the id the JSON-RPC error answers, when the
+    /// Transit Point speaks MCP.
+    #[error("Target authentication failed")]
+    TargetAuthFailed { failure: crate::proxy::handler::TargetAuthFailure, mcp_request_id: Option<serde_json::Value> },
+
     /// The request's surface variant sets another policy, response policy,
     /// MCP tool gating or per-caller rate limit on its Transit Point than the
     /// base surface does; those are enforced only as the base surface
@@ -315,6 +322,7 @@ impl OutboundPipelineError {
             }
 
             Self::TransitPointUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::TargetAuthFailed { failure, .. } => failure.status(),
             Self::FabricChainTooLong { .. } => StatusCode::LOOP_DETECTED,
             Self::TransitVariantPolicyChanged { .. } => StatusCode::FORBIDDEN,
             Self::DelegationRefused { refusal, .. } => refusal.status_code(),
@@ -417,6 +425,21 @@ impl IntoResponse for OutboundPipelineError {
                 &refusal.to_string(),
                 reason,
             );
+        }
+        if let Self::TargetAuthFailed { failure, mcp_request_id } = &self {
+            return match mcp_request_id {
+                Some(id) => crate::mcp::request_validation::McpRequestValidationError {
+                    status: failure.status(),
+                    id: Some(id.clone()),
+                    code: crate::mcp::errors::error_codes::INTERNAL_ERROR,
+                    message: self.to_string(),
+                    data: Some(serde_json::json!({ "reason": failure.reason() })),
+                }
+                .into_response(),
+                None => {
+                    crate::a2a::create_error_response_with_reason(failure.status(), &self.to_string(), failure.reason())
+                }
+            };
         }
         if let Self::TransitCallerUnauthenticated { mcp_request_id: Some(id) } = &self {
             return crate::mcp::request_validation::McpRequestValidationError {
@@ -2900,14 +2923,7 @@ async fn transit_target_auth_header(
         Ok(Some((name, value))) => {
             match (axum::http::HeaderName::from_bytes(name.as_bytes()), axum::http::HeaderValue::from_str(&value)) {
                 (Ok(name), Ok(value)) => Ok(Some((name, value))),
-                _ => {
-                    crate::proxy::handler::record_target_auth_refusal(
-                        &transit_audit_facts(ctx),
-                        Some(&ctx.virtual_channel.alias),
-                        target_auth,
-                    );
-                    Err(target_auth_unavailable(ctx))
-                }
+                _ => Err(refuse_unsendable_target_credential(ctx, target_auth)),
             }
         }
         Ok(None) => Ok(None),
@@ -2920,7 +2936,7 @@ async fn transit_target_auth_header(
                 &error,
             );
             if matches!(target_auth.fallback, crate::config::TargetAuthFallback::Reject) {
-                return Err(target_auth_unavailable(ctx));
+                return Err(target_auth_failed(ctx, error.failure()));
             }
             Ok(None)
         }
@@ -5148,12 +5164,84 @@ pub(crate) fn delegation_agent_did(ctx: &OutboundPipelineContext) -> Option<&str
     })
 }
 
-/// Refuse a request whose target authentication credential cannot be resolved
-/// or sent.
+/// Refuse with `502` a request the Transit Point does not forward for a reason other than
+/// its Target credential: the egress policy blocks the target endpoint, or a credential
+/// header it carries cannot be sent.
 fn target_auth_unavailable(ctx: &OutboundPipelineContext) -> OutboundPipelineError {
     OutboundPipelineError::TargetAuthUnavailable {
         mcp_request_id: mcp_refusal_id(ctx),
     }
+}
+
+/// Refuse a request whose Target credential could not be obtained or sent, with the
+/// status and `reason` of `failure`.
+fn target_auth_failed(
+    ctx: &OutboundPipelineContext,
+    failure: crate::proxy::handler::TargetAuthFailure,
+) -> OutboundPipelineError {
+    OutboundPipelineError::TargetAuthFailed {
+        failure,
+        mcp_request_id: mcp_refusal_id(ctx),
+    }
+}
+
+/// Records and refuses a Transit Point request whose resolved Target credential cannot be
+/// sent as a header, whatever its `fallback`: a misconfigured credential.
+fn refuse_unsendable_target_credential(
+    ctx: &OutboundPipelineContext,
+    target_auth: &crate::config::TargetAuthConfig,
+) -> OutboundPipelineError {
+    record_and_refuse(ctx, target_auth, crate::proxy::handler::TargetAuthFailure::Misconfigured)
+}
+
+/// Records and refuses a Transit Point request whose path leaves the target endpoint's base
+/// path, whatever its `fallback`: the caller's error.
+fn refuse_path_outside_target_base(
+    ctx: &OutboundPipelineContext,
+    target_auth: &crate::config::TargetAuthConfig,
+) -> OutboundPipelineError {
+    record_and_refuse(ctx, target_auth, crate::proxy::handler::TargetAuthFailure::PathRefused)
+}
+
+fn record_and_refuse(
+    ctx: &OutboundPipelineContext,
+    target_auth: &crate::config::TargetAuthConfig,
+    failure: crate::proxy::handler::TargetAuthFailure,
+) -> OutboundPipelineError {
+    crate::proxy::handler::record_target_auth_refusal(
+        &transit_audit_facts(ctx),
+        Some(&ctx.virtual_channel.alias),
+        target_auth,
+        failure.status(),
+    );
+    target_auth_failed(ctx, failure)
+}
+
+/// Records and refuses with `500 target_auth_rejected` a Transit Point request whose peer
+/// gateway refused the Target credential sent in `injected`; any other answer is passed on.
+fn refuse_if_peer_refused_target_credential(
+    ctx: &OutboundPipelineContext,
+    response: &crate::proxy::fabric_forward::FabricForwardResponse,
+    injected: Option<&str>,
+) -> Result<(), OutboundPipelineError> {
+    let (Some(target_auth), Some(injected)) = (
+        ctx.virtual_channel
+            .target_auth
+            .as_ref(),
+        injected,
+    ) else {
+        return Ok(());
+    };
+    if !response.refused_credential_in(injected) {
+        return Ok(());
+    }
+    warn!(request_id = %ctx.request_id, header = injected, "The peer gateway refused the Transit Point's Target credential");
+    crate::proxy::handler::record_target_credential_refused_by_target(
+        &transit_audit_facts(ctx),
+        Some(&ctx.virtual_channel.alias),
+        target_auth,
+    );
+    Err(target_auth_failed(ctx, crate::proxy::handler::TargetAuthFailure::Rejected))
 }
 
 /// Refuse a request whose metadata or credentials cannot be injected, or whose
@@ -6527,11 +6615,7 @@ async fn fabric_forward_headers(
                             })
                     })
                 {
-                    crate::proxy::handler::record_target_auth_refusal(
-                        &transit_audit_facts(ctx),
-                        Some(&ctx.virtual_channel.alias),
-                        target_auth,
-                    );
+                    return Err(refuse_unsendable_target_credential(ctx, target_auth));
                 }
                 return Err(target_auth_unavailable(ctx));
             }
@@ -6595,12 +6679,7 @@ async fn step_forward_request_fabric(
         && !crate::proxy::paths::appended_path_stays_below_base(&path)
     {
         warn!(request_id = %ctx.request_id, "Refusing a Transit Point request that climbs out of its path: it would carry the Target credential");
-        crate::proxy::handler::record_target_auth_refusal(
-            &transit_audit_facts(ctx),
-            Some(&ctx.virtual_channel.alias),
-            target_auth,
-        );
-        return Err(target_auth_unavailable(ctx));
+        return Err(refuse_path_outside_target_base(ctx, target_auth));
     }
 
     let is_modern = matches!(
@@ -6657,6 +6736,17 @@ async fn step_forward_request_fabric(
         return Ok(UpstreamResponse::FabricStream(response));
     }
 
+    let injected_target_header = ctx
+        .virtual_channel
+        .target_auth
+        .as_ref()
+        .and_then(|target_auth| {
+            target_auth
+                .method
+                .header_name()
+        })
+        .filter(|name| headers_map.contains_key(&name.to_uppercase()))
+        .map(str::to_string);
     let result = forward_via_fabric(
         &state.listener_manager,
         FabricForwardRequest {
@@ -6681,6 +6771,8 @@ async fn step_forward_request_fabric(
             other => OutboundPipelineError::UpstreamConnectionFailed(other.to_string()),
         }
     })?;
+
+    refuse_if_peer_refused_target_credential(ctx, &result, injected_target_header.as_deref())?;
 
     let status = StatusCode::from_u16(result.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut header_map = reqwest::header::HeaderMap::new();
@@ -6752,10 +6844,10 @@ async fn step_forward_request_http(
             .as_deref(),
     );
 
-    if ctx
+    if let Some(target_auth) = ctx
         .virtual_channel
         .target_auth
-        .is_some()
+        .as_ref()
         && !crate::proxy::paths::is_target_credential_destination(
             &ctx.virtual_channel
                 .target_endpoint,
@@ -6767,18 +6859,7 @@ async fn step_forward_request_http(
         )
     {
         warn!(request_id = %ctx.request_id, "Refusing a Transit Point request outside its base path: it would carry the Target credential");
-        if let Some(target_auth) = ctx
-            .virtual_channel
-            .target_auth
-            .as_ref()
-        {
-            crate::proxy::handler::record_target_auth_refusal(
-                &transit_audit_facts(ctx),
-                Some(&ctx.virtual_channel.alias),
-                target_auth,
-            );
-        }
-        return Err(target_auth_unavailable(ctx));
+        return Err(refuse_path_outside_target_base(ctx, target_auth));
     }
 
     // Defense-in-depth SSRF guard at the forwarding layer. `pinned_forward_client`
@@ -23243,7 +23324,7 @@ mod tests {
                 vec![(
                     RejectionStage::Forward,
                     RejectionReason::TargetAuthFailed,
-                    refused.then_some(502),
+                    refused.then_some(500),
                     Some(outcome),
                     Some(request_id)
                 )],
@@ -23311,8 +23392,85 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            assert_eq!(records, vec![(Some(502), TargetAuthOutcome::Rejected, Some(alias))], "{fallback} {endpoint}");
+            assert_eq!(records, vec![(Some(400), TargetAuthOutcome::Rejected, Some(alias))], "{fallback} {endpoint}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fabric_transit_point_refuses_only_a_peer_401_naming_the_header_it_sent_its_target_credential_in() {
+        use crate::audit::request_events::{RejectionReason, TargetAuthOutcome};
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        let mut ctx =
+            credential_header_case(&state, None, &[], Method::POST, "/outbound/surfaces/order/partner-a/").await;
+        ctx.virtual_channel
+            .target_endpoint = "fabric://peer-gateway/partner".to_string();
+        ctx.virtual_channel
+            .target_auth = Some(
+            serde_json::from_value(json!({
+                "method": {"static_secret": {"secret_id": "target-key", "header_name": "X-Vendor-Key"}},
+                "fallback": "reject"
+            }))
+            .unwrap(),
+        );
+        let alias = ctx
+            .virtual_channel
+            .alias
+            .clone();
+        let peer_answer = |status: u16, refused: Option<&str>| crate::proxy::fabric_forward::FabricForwardResponse {
+            status,
+            headers: std::collections::HashMap::new(),
+            body: Vec::new(),
+            refused_by_gateway: false,
+            refused_credential_header: refused.map(str::to_string),
+        };
+
+        for (case, response, injected) in [
+            ("another header", peer_answer(401, Some("authorization")), Some("X-VENDOR-KEY")),
+            ("no refusal", peer_answer(401, None), Some("X-VENDOR-KEY")),
+            ("not a 401", peer_answer(403, Some("x-vendor-key")), Some("X-VENDOR-KEY")),
+            ("nothing injected", peer_answer(401, Some("x-vendor-key")), None),
+        ] {
+            let (passed, events) = crate::audit::producer::capture(async {
+                refuse_if_peer_refused_target_credential(&ctx, &response, injected)
+            })
+            .await;
+            assert!(passed.is_ok(), "{case}: {passed:?}");
+            assert!(events.is_empty(), "{case}: {events:?}");
+        }
+
+        let (refused, events) = crate::audit::producer::capture(async {
+            refuse_if_peer_refused_target_credential(
+                &ctx,
+                &peer_answer(401, Some("x-vendor-key")),
+                Some("X-VENDOR-KEY"),
+            )
+        })
+        .await;
+        let Err(error) = refused else {
+            panic!("a peer 401 naming the injected header must be refused");
+        };
+        assert_eq!(error.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(matches!(
+            error,
+            OutboundPipelineError::TargetAuthFailed {
+                failure: crate::proxy::handler::TargetAuthFailure::Rejected,
+                ..
+            }
+        ));
+        let records: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                    reason: RejectionReason::TargetAuthFailed,
+                    http_status,
+                    target_auth: Some(detail),
+                    ..
+                } => Some((*http_status, detail.outcome, detail.transit_point.clone(), detail.upstream_status)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(records, vec![(Some(500), TargetAuthOutcome::RefusedByTarget, Some(alias), Some(401))]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -23382,7 +23540,7 @@ mod tests {
                 assert!(refused, "{fallback} fabric={fabric}");
                 assert_eq!(
                     records(&events),
-                    vec![(Some(502), TargetAuthOutcome::Rejected, Some(alias))],
+                    vec![(Some(500), TargetAuthOutcome::Rejected, Some(alias))],
                     "{fallback} fabric={fabric}"
                 );
             }
@@ -24320,7 +24478,16 @@ mod tests {
         let mut target_auth = fabric(non_ascii_credential_context(&state).await);
         target_auth.delegated_credential_headers = HeaderMap::new();
         let result = fabric_forward_headers(&state, &mut target_auth).await;
-        assert!(matches!(result, Err(OutboundPipelineError::TargetAuthUnavailable { .. })), "{result:?}");
+        assert!(
+            matches!(
+                result,
+                Err(OutboundPipelineError::TargetAuthFailed {
+                    failure: crate::proxy::handler::TargetAuthFailure::Misconfigured,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
 
         let mut agent = fabric(test_pipeline_context());
         agent
@@ -24362,8 +24529,14 @@ mod tests {
                 send_through_the_pipeline(&state, "POST", "/outbound/mcp/partner", &protocol_request_body(protocol))
                     .await;
 
-            assert_eq!(status, StatusCode::BAD_GATEWAY, "{protocol}: {body}");
-            assert_refusal(protocol, protocol, &body, "Target authentication credentials unavailable");
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{protocol}: {body}");
+            assert_refusal(protocol, protocol, &body, "Target authentication failed");
+            let reason = if protocol == "mcp" {
+                &body["error"]["data"]["reason"]
+            } else {
+                &body["reason"]
+            };
+            assert_eq!(reason, "target_auth_unavailable", "{protocol}: {body}");
         }
         assert!(target.received().is_empty());
     }

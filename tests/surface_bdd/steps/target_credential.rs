@@ -393,6 +393,26 @@ fn response_mentions(
     assert_json_body_mentions(&response.body, &expected, "caller response");
 }
 
+#[then(expr = "the response reason is {string}")]
+fn response_reason_is(
+    world: &mut SurfaceWorld,
+    expected: String,
+) {
+    let response = world
+        .caller_response
+        .as_ref()
+        .expect("the caller must have received a response");
+    let body = &response.body;
+    let reason = body
+        .get("reason")
+        .or_else(|| body.pointer("/error/data/reason"));
+    assert_eq!(
+        reason.and_then(serde_json::Value::as_str),
+        Some(expected.as_str()),
+        "expected reason {expected:?} in the caller response, got {body}"
+    );
+}
+
 #[then(expr = "the response header {string} points at path {string} of managed agent {string}")]
 fn response_header_points_at_managed_agent(
     world: &mut SurfaceWorld,

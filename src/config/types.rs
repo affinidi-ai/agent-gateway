@@ -825,7 +825,7 @@ fn default_provider_header_format() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetAuthFallback {
-    /// Reject the request with 502 Bad Gateway
+    /// Reject the request: `500 target_auth_misconfigured` or `503 target_auth_unavailable`
     #[default]
     Reject,
     /// Pass through the request without injecting credentials

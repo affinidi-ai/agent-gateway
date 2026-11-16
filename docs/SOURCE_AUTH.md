@@ -485,6 +485,15 @@ and limit requests per client upstream of the gateway if credential guessing is 
 `Caller credential missing or invalid`; the reason is logged. Public discovery reads, the DID Auth ceremony and
 onboarding surfaces are unaffected.
 
+On Fabric receive, when the gateway verified exactly one credential, read from a header the
+request carries, and refuses it with `401` (plainly or with the protected resource discovery
+challenge), its `ForwardResponse` also names that header in the envelope field `caller_refusal`
+(`{"credential_header": "x-api-key"}`, lowercase), never in the body. A missing credential,
+credentials for more than one method, a credential read from the body or a client certificate,
+and a public Access Point get no `caller_refusal`. The sending gateway uses it to tell its own
+Target credential being refused from any other `401` (see [Target credential refused by the
+peer gateway](CREDENTIAL_DELEGATION.md#target-credential-refused-by-the-peer-gateway)).
+
 Create and update responses are the saved surface plus `access_point_status` and, when it
 names a key id, `api_key_references`. A save warns
 in `Warning` headers (code 299), before the Transit Point warnings described below, when the

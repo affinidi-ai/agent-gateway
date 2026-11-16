@@ -1207,6 +1207,22 @@ pub async fn response_status_is(
     );
 }
 
+#[then(expr = "the response reason is {string}")]
+pub async fn response_reason_is(
+    world: &mut G2gWorld,
+    expected: String,
+) {
+    let body = response_body(world);
+    let reason = body
+        .get("reason")
+        .or_else(|| body.pointer("/error/data/reason"));
+    assert_eq!(
+        reason.and_then(Value::as_str),
+        Some(expected.as_str()),
+        "expected reason {expected:?} in the caller response, got {body}"
+    );
+}
+
 #[then(expr = "the agent card points callers at gateway {int} surface {string}")]
 pub async fn agent_card_points_callers_at_surface(
     world: &mut G2gWorld,
@@ -1324,6 +1340,47 @@ pub async fn response_to_caller_did_not_carry_header(
     header: String,
 ) {
     assert_header_absent(&world.response_headers, &header, "the caller's response");
+}
+
+fn refused_by_target(event: &Value) -> bool {
+    event["event"]["request_rejected"]["target_auth"]["outcome"] == "refused_by_target"
+}
+
+#[then(expr = "the VP Audit Log of gateway {int} records the Target credential as refused by the target")]
+pub async fn vp_audit_log_records_target_credential_refused_by_target(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let (found, events) = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .wait_for_audit_event(|event| {
+            refused_by_target(event) && event["event"]["request_rejected"]["target_auth"]["upstream_status"] == 401
+        })
+        .await
+        .unwrap_or_else(|error| panic!("read the VP Audit Log of gateway {gateway}: {error:#}"));
+    assert!(found, "gateway {gateway} recorded no Target credential refused by the target: {events:?}");
+}
+
+#[then(expr = "the VP Audit Log of gateway {int} records no Target credential refused by the target")]
+pub async fn vp_audit_log_records_no_target_credential_refused_by_target(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let events = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .read_audit_events()
+        .await
+        .unwrap_or_else(|error| panic!("read the VP Audit Log of gateway {gateway}: {error:#}"));
+    assert!(
+        !events
+            .iter()
+            .any(refused_by_target),
+        "gateway {gateway} recorded a Target credential refused by the target: {events:?}"
+    );
 }
 
 #[then(regex = r"^all (\d+) responses have status (\d+)$")]

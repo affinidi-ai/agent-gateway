@@ -22,8 +22,8 @@ Feature: Credentials an A2A Transit Point sends to its external agent
     And the credential provider is refusing token requests
     And Transit Point "tr1" authenticates its callers with API key "caller-key-1"
     When managed agent "bravo" sends an A2A message/send request through Transit Point "tr1" with header "x-api-key" set to "caller-key-1"
-    Then the response status is 502
-    And the response mentions "Target authentication credentials unavailable"
+    Then the response status is 503
+    And the response reason is "target_auth_unavailable"
     And external agent "charlie" was not called
 
   Scenario: An A2A Transit Point without the managed agent's identity refuses to send a delegated credential

@@ -11,17 +11,26 @@ Feature: Credential provider token resilience
 
   Scenario: A refused token request holds back the next request
     Given the credential provider is refusing token requests
-    And the caller has sent a request to the surface and received status 502
+    And the caller has sent a request to the surface and received status 503
     When the caller sends a request to the surface
-    Then the response status is 502
+    Then the response status is 503
+    And the response reason is "target_auth_unavailable"
     And managed agent "bravo" was not called
     And the credential provider received 1 token request
     And the token request metric counts 1 "refused" request for provider type "oauth2_client_credentials"
     And the token request metric counts 0 "success" request for provider type "oauth2_client_credentials"
 
+  Scenario: A Target credential whose provider cannot issue a token refuses the call as unavailable
+    Given the credential provider's token endpoint is not listening
+    And the gateway's authentication to the managed agent falls back to "reject"
+    When the caller sends a request to the surface
+    Then the response status is 503
+    And the response reason is "target_auth_unavailable"
+    And managed agent "bravo" was not called
+
   Scenario: The next request asks for a token again once the backoff has passed
     Given the credential provider is refusing token requests
-    And the caller has sent a request to the surface and received status 502
+    And the caller has sent a request to the surface and received status 503
     And the credential provider accepts token requests
     And the caller has waited 2 seconds
     When the caller sends a request to the surface
@@ -40,7 +49,8 @@ Feature: Credential provider token resilience
     Given the gateway gives a token request 1 second before it gives up
     And the credential provider answers token requests only after 3000 ms
     When the caller sends a request to the surface
-    Then the response status is 502
+    Then the response status is 503
+    And the response reason is "target_auth_unavailable"
     And managed agent "bravo" was not called
     And the credential provider received 1 token request
     And the token request metric counts 1 "timeout" request for provider type "oauth2_client_credentials"
@@ -74,7 +84,8 @@ Feature: Credential provider token resilience
   Scenario: Only the OAuth error code of a refused token request is logged
     Given the credential provider refuses token requests with error "invalid_client" and description "bdd-echoed-secret-marker"
     When the caller sends a request to the surface
-    Then the response status is 502
+    Then the response status is 500
+    And the response reason is "target_auth_misconfigured"
     And the gateway log has a warning containing "invalid_client"
     And the gateway log does not contain "bdd-echoed-secret-marker"
     And the response body does not contain "bdd-echoed-secret-marker"

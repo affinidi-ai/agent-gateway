@@ -345,7 +345,7 @@ fn fabric_receive_sends_a_tenant_surface_only_credentials_the_isolation_mode_all
                 receiver
                     .receive("auth-other", mode)
                     .await,
-                (502, None, vec!["target_auth_failed (Rejected)".to_string()]),
+                (500, None, vec!["target_auth_failed (Rejected)".to_string()]),
                 "{mode:?}"
             );
             assert_eq!(
@@ -395,7 +395,7 @@ fn fabric_receive_sends_a_tenant_surface_only_credentials_the_isolation_mode_all
             receiver
                 .receive("auth-wide", RuleMode::Enforce)
                 .await,
-            (502, None, vec!["target_auth_failed (Rejected)".to_string()])
+            (500, None, vec!["target_auth_failed (Rejected)".to_string()])
         );
         assert_eq!(
             receiver
@@ -474,7 +474,7 @@ fn fabric_receive_keeps_the_target_credential_under_its_base_path_and_drops_a_ca
         );
 
         for path in ["/%2e%2e/admin", "/x/../../admin", "/..;/admin", "/..%252Fadmin"] {
-            assert_eq!(receive(path).await, (502, vec!["target_auth_failed (Rejected)".to_string()]), "{path}");
+            assert_eq!(receive(path).await, (400, vec!["target_auth_failed (Rejected)".to_string()]), "{path}");
         }
         assert_eq!(
             receiver

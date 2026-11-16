@@ -458,7 +458,7 @@ fn target_auth_outcomes(
 
 /// A Target credential that cannot be resolved fails the card fetch, at the
 /// well-known path or the configured card location, and any other request with
-/// the direct path's `502` text, before the Target is called, and each is
+/// the direct path's `500 target_auth_misconfigured`, before the Target is called, and each is
 /// recorded once as a rejected `target_auth_failed`.
 #[tokio::test]
 async fn an_unresolvable_target_credential_over_fabric_answers_target_authentication_failed() {
@@ -485,7 +485,7 @@ async fn an_unresolvable_target_credential_over_fabric_answers_target_authentica
             [(None, Some(crate::audit::request_events::TargetAuthOutcome::Rejected))],
             "{method} {path}"
         );
-        assert_eq!(response["status"], 502, "{method} {path}: {response}");
+        assert_eq!(response["status"], 500, "{method} {path}: {response}");
         assert_eq!(response["error"], "Target authentication failed", "{method} {path}");
         let body: Value = serde_json::from_str(
             response["body"]
@@ -494,6 +494,7 @@ async fn an_unresolvable_target_credential_over_fabric_answers_target_authentica
         )
         .unwrap();
         assert_eq!(body["detail"], "Target authentication failed", "{method} {path}");
+        assert_eq!(body["reason"], "target_auth_misconfigured", "{method} {path}");
     }
     assert!(target.received().is_empty(), "the Target was called");
 }
@@ -1075,7 +1076,7 @@ async fn an_agent_card_fetch_over_fabric_presents_the_credential_providers_token
 }
 
 /// A credential provider that refuses its token request fails a peer's agent
-/// card fetch with the direct path's `502` "Target authentication failed"
+/// card fetch with the direct path's `500 target_auth_misconfigured`
 /// before the Target is called, and records one rejected `target_auth_failed`
 /// naming the provider and the OAuth `error` code. Neither the token endpoint's
 /// `error_description` nor the client secret reaches the peer, the audit record
@@ -1107,7 +1108,7 @@ async fn a_refused_provider_token_fails_a_card_fetch_over_fabric_with_target_aut
         .with_subscriber(subscriber)
         .await;
 
-    assert_eq!(response["status"], 502, "{response}");
+    assert_eq!(response["status"], 500, "{response}");
     let body: Value = serde_json::from_str(
         response["body"]
             .as_str()
@@ -1115,6 +1116,7 @@ async fn a_refused_provider_token_fails_a_card_fetch_over_fabric_with_target_aut
     )
     .unwrap();
     assert_eq!(body["detail"], crate::proxy::handler::TARGET_AUTH_FAILED);
+    assert_eq!(body["reason"], "target_auth_misconfigured");
     assert_eq!(token_endpoint.requests(), 1, "token requests");
     assert!(target.received().is_empty(), "the Target was called");
     let rejections: Vec<_> = events
