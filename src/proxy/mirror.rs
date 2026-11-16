@@ -137,9 +137,16 @@ pub(crate) fn selected(percentage: u8) -> bool {
 
 /// Send `request` to its endpoint through the egress guard and return the status.
 ///
-/// DNS is resolved once, here, and shares the request's timeout; the response
-/// body is discarded.
+/// DNS is resolved once, here. The lookup and the send share one `timeout_secs` budget; the
+/// response body is discarded.
 pub(crate) async fn send(request: MirrorRequest) -> Result<StatusCode, MirrorError> {
+    send_with(request, egress::pinned_forward_client).await
+}
+
+async fn send_with(
+    request: MirrorRequest,
+    vetting: impl FnOnce(&str, Duration) -> Result<(reqwest::Client, PinnedTarget), EgressError> + Send + 'static,
+) -> Result<StatusCode, MirrorError> {
     let MirrorRequest {
         endpoint,
         method,
@@ -147,7 +154,8 @@ pub(crate) async fn send(request: MirrorRequest) -> Result<StatusCode, MirrorErr
         body,
         timeout,
     } = request;
-    let (client, target) = vet(move || egress::pinned_forward_client(&endpoint, timeout), timeout).await?;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let (client, target) = vet(move || vetting(&endpoint, timeout), deadline, timeout).await?;
     headers
         .entry(USER_AGENT)
         .or_insert(HeaderValue::from_static(GATEWAY_USER_AGENT));
@@ -155,22 +163,23 @@ pub(crate) async fn send(request: MirrorRequest) -> Result<StatusCode, MirrorErr
         .request(method, target.url)
         .headers(headers)
         .body(body)
-        .timeout(timeout)
+        .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
         .send()
         .await
         .map_err(|e| MirrorError::Send(e.without_url()))?;
     Ok(response.status())
 }
 
-/// Run the blocking vetting step off the async runtime, giving up after `timeout`.
+/// Run the blocking vetting step off the async runtime, giving up at `deadline`.
 ///
 /// A resolver that does not answer in time refuses the mirror, as a failed lookup does. The
 /// lookup itself cannot be cancelled and holds its blocking thread until the OS resolver returns.
 async fn vet(
     vetting: impl FnOnce() -> Result<(reqwest::Client, PinnedTarget), EgressError> + Send + 'static,
+    deadline: tokio::time::Instant,
     timeout: Duration,
 ) -> Result<(reqwest::Client, PinnedTarget), MirrorError> {
-    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(vetting)).await {
+    match tokio::time::timeout_at(deadline, tokio::task::spawn_blocking(vetting)).await {
         Err(_) => Err(MirrorError::Refused(EgressError::Dns(format!("no answer within {}s", timeout.as_secs())))),
         Ok(Err(e)) => Err(MirrorError::Internal(format!("egress task failed: {e}"))),
         Ok(Ok(Err(EgressError::Http(e)))) => Err(MirrorError::Internal(format!("egress client not built: {e}"))),
@@ -414,16 +423,44 @@ mod tests {
             std::thread::sleep(Duration::from_millis(400));
             Err(EgressError::Dns("late".into()))
         };
-        match vet(slow, Duration::from_millis(50)).await {
+        match vet(slow, tokio::time::Instant::now() + Duration::from_millis(50), Duration::from_millis(50)).await {
             Err(error @ MirrorError::Refused(EgressError::Dns(_))) => assert_eq!(error.kind(), "DNS resolution failed"),
             other => panic!("expected a DNS refusal, got {:?}", other.err()),
         }
     }
 
     #[tokio::test]
+    async fn the_lookup_and_the_send_share_one_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener
+            .local_addr()
+            .expect("addr");
+        tokio::spawn(async move {
+            let _held = listener.accept().await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let mut request = request(&format!("http://{addr}/mirror"));
+        request.timeout = Duration::from_millis(600);
+        let slow_lookup = |endpoint: &str, timeout: Duration| {
+            std::thread::sleep(Duration::from_millis(300));
+            egress::pinned_forward_client(endpoint, timeout)
+        };
+        let started = std::time::Instant::now();
+        let outcome = send_with(request, slow_lookup).await;
+        let elapsed = started.elapsed();
+        match outcome {
+            Err(error @ MirrorError::Send(_)) => assert_eq!(error.kind(), "timeout"),
+            other => panic!("expected a send timeout, got {other:?}"),
+        }
+        assert!(elapsed < Duration::from_millis(800), "the budget was spent twice: {elapsed:?}");
+    }
+
+    #[tokio::test]
     async fn a_vetting_task_that_panics_fails_closed_as_internal() {
         let panics = || -> Result<(reqwest::Client, PinnedTarget), EgressError> { panic!("resolver crashed") };
-        match vet(panics, Duration::from_secs(5)).await {
+        match vet(panics, tokio::time::Instant::now() + Duration::from_secs(5), Duration::from_secs(5)).await {
             Err(error @ MirrorError::Internal(_)) => assert_eq!(error.kind(), "internal error"),
             other => panic!("expected Internal, got {:?}", other.err()),
         }

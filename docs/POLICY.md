@@ -783,7 +783,7 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   (`target.networking.mirror.endpoint`, `src/proxy/mirror.rs`) on the direct, `fabric://` and owned MCP
   Proxy paths, so the mirror gets the same send-time check as the Target: a cloud metadata address is
   never contacted, the connection is pinned to the address resolved for that request, and a 3xx is
-  returned rather than followed. DNS shares the mirror's `timeout_secs`: a resolver that does not
+  returned rather than followed. The lookup and the send share one `timeout_secs` budget: a resolver that does not
   answer in time refuses the mirror, though the lookup keeps its blocking thread until the OS resolver
   returns. A refused mirror is never contacted: a direct or MCP Proxy request logs a warning and
   continues, and a `fabric://` request that waits for its mirror answers `503` with the failure class
