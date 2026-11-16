@@ -9,7 +9,14 @@ changes:
         danger button that says how many of that user's delegations the second click ends, such
         as "Revoke all 2 for this user?". It used to be small amber text that was hard to read and
         gave no count.
-  fixed: []
+  fixed:
+    - timestamp: '2026-11-16T15:10:00Z'
+      title: Say that token refresh stops when a provider's consent time limit ends
+      description: >-
+        The help under "Enable automatic token refresh" on an Authorization Code provider said the
+        connection keeps working without reauthorizing, which a consent time limit contradicts.
+        It now says tokens are refreshed until the consent time limit ends, and that the person
+        then approves again. Other provider types keep the old help.
   removed: []
   security: []
   breaking: []

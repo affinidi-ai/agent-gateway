@@ -1019,8 +1019,9 @@ const EditCredentialProviderPage: React.FC = () => {
               </label>
               <div>
                 <small className="form-text text-muted">
-                  Access tokens are refreshed automatically using the stored refresh token whenever
-                  one is available, so this connection keeps working without needing to reauthorize.
+                  {takesConsent(form.provider_type)
+                    ? 'Access tokens are refreshed automatically using the stored refresh token, until the consent time limit below ends. After that, the person approves again.'
+                    : 'Access tokens are refreshed automatically using the stored refresh token whenever one is available, so this connection keeps working without needing to reauthorize.'}
                 </small>
               </div>
             </div>

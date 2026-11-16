@@ -269,6 +269,22 @@ describe('EditCredentialProviderPage consent time limit', () => {
     ).toBeInTheDocument();
   });
 
+  it('says token refresh stops when the consent time limit ends', async () => {
+    await renderProvider(authorizationCode());
+    expect(
+      screen.getByText(
+        'Access tokens are refreshed automatically using the stored refresh token, until the consent time limit below ends. After that, the person approves again.'
+      )
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/without needing to reauthorize/)).not.toBeInTheDocument();
+  });
+
+  it('keeps the refresh help free of a consent limit on a provider nobody consents to', async () => {
+    await renderProvider(provider(null));
+    expect(screen.getByText(/without needing to reauthorize/)).toBeInTheDocument();
+    expect(screen.queryByText(/consent time limit below/)).not.toBeInTheDocument();
+  });
+
   it('says a deactivated provider takes no new consent, and never sends that state on save', async () => {
     await renderProvider(authorizationCode({ deactivated_at: '2026-11-13T10:00:00Z' }));
     expect(screen.getByTestId('credential-provider-deactivated-notice')).toHaveTextContent(

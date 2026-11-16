@@ -1260,7 +1260,9 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   for an empty field and for every other provider type, where the field is not shown. A limit
   outside one minute to 365 days, or not a whole number, is refused before anything is sent
   (`CONSENT_LIMIT_RANGE_MESSAGE`). The unit arithmetic and wording live in
-  `utils/consentLimit.ts`.
+  `utils/consentLimit.ts`. On such a provider the help under **Enable automatic token refresh**
+  says tokens are refreshed until the consent time limit below ends and the person then approves
+  again; every other type keeps saying the connection works without reauthorizing.
 - A provider a person consents to (`takesConsent`: Authorization Code, external consent or not)
   is deactivated, never deleted, from the dashboard. Its row on the Credential Providers tab has
   **Deactivate** (`credential-provider-deactivate-button-<id>`, the shared two-step
