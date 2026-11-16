@@ -392,6 +392,9 @@ test.describe("Credential Providers tab deactivation", () => {
     await expect(
       page.getByTestId("credential-provider-deactivated-badge-p1"),
     ).toHaveText("Deactivated");
+    await expect(
+      page.getByTestId("credential-provider-status-p1"),
+    ).toContainText("No new consent");
     await expect(page.getByTestId("credential-provider-row-p1")).toBeVisible();
     expect(calls).toEqual(["/api/v1/credential-providers/p1/deactivate"]);
 
@@ -399,6 +402,9 @@ test.describe("Credential Providers tab deactivation", () => {
     await expect(
       page.getByTestId("credential-provider-deactivated-badge-p1"),
     ).toHaveCount(0);
+    await expect(page.getByTestId("credential-provider-status-p1")).toHaveText(
+      "Active",
+    );
     await expect(deactivate).toBeVisible();
     expect(calls).toEqual([
       "/api/v1/credential-providers/p1/deactivate",

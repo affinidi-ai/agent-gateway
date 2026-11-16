@@ -40,6 +40,13 @@ changes:
         Tokens the "Token Expires" column is now "Access Token" and says "Renews automatically"
         under the date while the provider refreshes tokens and the consent has not ended, so it no
         longer reads as a second end date.
+    - timestamp: '2026-11-16T16:10:00Z'
+      title: Show a credential provider's status in its own column
+      description: >-
+        The Credential Providers list has a Status column with an "Active" badge, or a
+        "Deactivated" badge with "No new consent" under it, instead of a "Deactivated" badge in
+        the Type column. Deactivate and Activate now share one outline button style, so the
+        Status column, not the button, carries the colour.
   fixed:
     - timestamp: '2026-11-16T15:10:00Z'
       title: Say that token refresh stops when a provider's consent time limit ends

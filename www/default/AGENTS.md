@@ -1304,9 +1304,13 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   **Deactivate** (`credential-provider-deactivate-button-<id>`, the shared two-step
   `TwoStepButton`: the first click shows "Click again to deactivate", the second sends
   `POST /credential-providers/{id}/deactivate`) in place of the delete button, which only the
-  other provider types keep. A deactivated row shows a "Deactivated" badge
-  (`credential-provider-deactivated-badge-<id>`) and **Activate**
-  (`credential-provider-activate-button-<id>`, one click). The row stays in the list either way.
+  other provider types keep. A deactivated row shows **Activate**
+  (`credential-provider-activate-button-<id>`, one click). Deactivate and Activate share one
+  outline style (`btn-outline-secondary`, text only), since the colour belongs to the **Status**
+  column (`credential-provider-status-<id>`, after Type, for every provider): an "Active" badge
+  (`text-bg-success`), or a "Deactivated" badge (`credential-provider-deactivated-badge-<id>`,
+  `text-bg-secondary`) with "No new consent" under it. The Type column shows only the type. The
+  row stays in the list either way.
   The editor shows a warning (`credential-provider-deactivated-notice`) that nobody can consent
   again while access already given keeps working, and never sends `deactivated_at` on save. The
   Delegated Access tab marks the access of a deactivated provider "No new consent"

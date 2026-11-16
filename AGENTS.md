@@ -227,7 +227,9 @@ _Credential delegation audit_ in
 
 A credential provider a person consents to is deactivated, never deleted, from the dashboard:
 **Deactivate** (two clicks, in place) and **Activate** on the Credential Providers tab stop and
-restore new consent only, and the provider's row, its tokens and its audit records stay; see
+restore new consent only, and the provider's row, its tokens and its audit records stay. The two
+buttons share one outline style, and the list's Status column says "Active", or "Deactivated"
+with "No new consent" under it; see
 _Credential provider editor_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor) and
 [`docs/CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md#deactivating-a-provider).

@@ -213,6 +213,42 @@ describe('CredentialProvidersTab deactivation', () => {
     expect(screen.getByTestId('credential-provider-deactivate-button-github')).toBeInTheDocument();
   });
 
+  it('shows each provider status in a Status column, apart from its type', async () => {
+    await renderTab([consented('github'), consented('salesforce', '2026-11-13T10:00:00Z')]);
+    const status = (id: string) => screen.getByTestId(`credential-provider-status-${id}`);
+    const typeCell = (id: string) =>
+      within(screen.getByRole('row', { name: new RegExp(`^${id}`) })).getByText(
+        'Authorization Code'
+      );
+
+    expect(screen.getByRole('columnheader', { name: 'Status' })).toBeInTheDocument();
+    expect(status('github')).toHaveTextContent(/^Active$/);
+    expect(within(status('github')).getByText('Active')).toHaveClass('badge', 'text-bg-success');
+    expect(status('salesforce')).toHaveTextContent(/^DeactivatedNo new consent$/);
+    expect(screen.getByTestId('credential-provider-deactivated-badge-salesforce')).toHaveClass(
+      'badge',
+      'text-bg-secondary'
+    );
+    expect(status('salesforce')).toContainElement(
+      screen.getByTestId('credential-provider-deactivated-badge-salesforce')
+    );
+    expect(typeCell('salesforce')).not.toHaveTextContent('Deactivated');
+  });
+
+  it('gives Deactivate and Activate the same outline button style', async () => {
+    await renderTab([consented('github'), consented('salesforce', '2026-11-13T10:00:00Z')]);
+    const deactivate = screen.getByTestId('credential-provider-deactivate-button-github');
+    const activate = screen.getByTestId('credential-provider-activate-button-salesforce');
+
+    expect(deactivate).toHaveTextContent(/^Deactivate$/);
+    expect(deactivate.innerHTML).not.toContain('fa-');
+    for (const button of [deactivate, activate]) {
+      expect(button).toHaveClass('btn', 'btn-outline-secondary', 'btn-sm');
+      expect(button).not.toHaveClass('btn-outline-warning');
+      expect(button).not.toHaveClass('btn-outline-primary');
+    }
+  });
+
   it('keeps Delete, and offers no Deactivate, on a provider nobody consents to', async () => {
     await renderTab([item('billing', 'https://oauth2.googleapis.com/token', null)]);
 
