@@ -9438,7 +9438,6 @@ async fn proxy_charged_request(
                 response_json,
                 "success",
                 None,
-                identity_hash.clone(),
             )
             .await;
         }
@@ -16062,7 +16061,6 @@ async fn handle_mcp_proxy_request_inner(
                 Some(response_json.clone()),
                 "success", // MCP protocol doesn't have A2A extension validation
                 None,
-                None, // identity_hash - MCP channels might not have identity tracking
             )
             .await;
 
@@ -16146,7 +16144,6 @@ async fn handle_mcp_proxy_request_inner(
                 None,
                 "mcp_error", // Custom status to differentiate MCP errors from A2A validation failures
                 Some(format!("MCP Proxy Error: {}", e)),
-                None,
             )
             .await;
 

@@ -1690,8 +1690,8 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
 - The list filters client-side by text only: the display name (**Unnamed agent** included), every
   surface name in the record, and the runtime label (`agentMatchesFilter`).
 - Columns: Agent, Runtime & protocol, Identities, Used by surfaces, Trust registry, Last activity.
-  **Used by surfaces** lists every surface of the record, one per line, each a link to
-  `/surfaces/<surface_id>` that does not open the details. **Identities** lists every DID in
+  **Used by surfaces** shows a count badge and the surface names joined with commas on one
+  truncated line, with the full list in the tooltip. It has no links. **Identities** lists every DID in
   `identities`, one per line, shortened in the middle with the full value in the tooltip and a
   copy button, or **No DID** without any.
 - Raw API values are never shown. `pages/AgentsPage/agentLabels.ts` maps them: runtime `url`,
@@ -1732,7 +1732,7 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
 | List load error, no match       | `agents-load-error`, `agents-no-match`                                                          |
 | Name, unnamed                   | `agents-name`, `agents-unnamed`                                                                 |
 | Runtime, protocol, activity     | `agents-runtime`, `agents-protocol-badge`, `agents-last-activity`                               |
-| Surfaces, surface link          | `agents-surfaces`, `agents-surface-link`                                                        |
+| Surfaces, count, names          | `agents-surfaces`, `agents-surfaces-count`, `agents-surface-names`                              |
 | Identities, DID, copy, none     | `agents-identities`, `agents-did`, `agents-copy-did-button`, `agents-no-did`                    |
 | Trust registry                  | `agents-trust-recorded`, `agents-trust-not-recorded`                                            |
 | Back, details retry             | `agent-back-button`, `agent-retry-button`                                                       |

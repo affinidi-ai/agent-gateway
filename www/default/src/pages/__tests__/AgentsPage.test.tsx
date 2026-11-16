@@ -17,7 +17,6 @@ const LONG_DID = 'did:webvh:QmYAuadF1234567890:agent-gateway1.example.com:surfac
 
 const agent = (overrides: Partial<AgentRecord> = {}): AgentRecord => ({
   id: 'a1',
-  registration: 'unregistered',
   name: 'TimeAsker',
   protocol: 'a2a',
   runtime: 'url',

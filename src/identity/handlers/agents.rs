@@ -52,12 +52,6 @@ fn resource_scope(scope: &Option<Extension<PatResourceScope>>) -> Option<&PatRes
         .map(|Extension(scope)| scope)
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum AgentRegistration {
-    Unregistered,
-}
-
 /// How the gateway reaches the agent, from the `target.endpoint` scheme.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -117,7 +111,6 @@ pub struct AgentSurfaceSummary {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct AgentRecord<S> {
     pub id: String,
-    pub registration: AgentRegistration,
     pub name: Option<String>,
     pub protocol: SurfaceProtocol,
     pub runtime: AgentRuntime,
@@ -264,10 +257,13 @@ const UNPARSEABLE_ENDPOINT_HOST: &str = "redacted.invalid";
 /// `http`/`https` endpoint is parsed as a URL, which also lower-cases its host; the host of
 /// any other scheme keeps its case, since those ids are compared exactly. An `@` after the
 /// authority of another scheme may end a userinfo holding `/`, `?` or `#`, so such an
-/// endpoint is redacted whole.
+/// endpoint is redacted whole, as is a scheme-less endpoint with any `@`.
 fn normalise_endpoint(raw: &str) -> String {
     let raw = raw.trim();
     let Some((scheme, rest)) = raw.split_once("://") else {
+        if raw.contains('@') {
+            return UNPARSEABLE_ENDPOINT_HOST.to_string();
+        }
         return without_query(raw)
             .trim_end_matches('/')
             .to_string();
@@ -596,7 +592,6 @@ async fn agent_record<S>(
         .collect();
     AgentRecord {
         id: group.id.clone(),
-        registration: AgentRegistration::Unregistered,
         name: display_name(&data.by_activity(group), card_name),
         protocol: primary_protocol(group),
         runtime: AgentRuntime::from_endpoint(&group.endpoint),
@@ -1228,6 +1223,10 @@ mod tests {
             }
         }
         assert_eq!(normalise_endpoint("https://user:secret@host/a2a"), "https://host/a2a");
+        for raw in ["user:secret@host/a2a", "host/a2a?x=@pw"] {
+            assert_eq!(normalise_endpoint(raw), "redacted.invalid", "{raw}");
+        }
+        assert_eq!(normalise_endpoint("host/a2a/?x=1"), "host/a2a");
     }
 
     #[test]
@@ -1776,7 +1775,7 @@ mod tests {
         }
         assert_eq!(json["id"], group.id);
         assert_eq!(json["name"], "TimeAsker");
-        assert_eq!(json["registration"], "unregistered");
+        assert!(json.get("registration").is_none());
         assert_eq!(json["runtime"], "url");
         assert_eq!(json["protocol"], "a2a");
         assert_eq!(json["endpoint"], "https://agent.example/a2a");

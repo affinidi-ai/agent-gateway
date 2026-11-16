@@ -15,7 +15,6 @@ pub async fn broadcast_payload_capture_async(
     response_payload: Option<serde_json::Value>,
     validation_status: &str,
     validation_error: Option<String>,
-    _identity_hash: Option<String>,
 ) {
     broadcast_payload_capture_extended(
         ws_state,
@@ -106,7 +105,6 @@ mod tests {
             &serde_json::json!({"jsonrpc": "2.0"}),
             None,
             "valid",
-            None,
             None,
         )
         .await;

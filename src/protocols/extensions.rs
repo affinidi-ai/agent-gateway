@@ -200,7 +200,6 @@ pub async fn inspect_message_extensions(
                     None,
                     "Non-JSON Body",
                     None,
-                    None,
                 )
                 .await;
             }
@@ -272,7 +271,6 @@ pub async fn inspect_message_extensions(
                     None,
                     "Failed Validation",
                     Some(error_msg.clone()),
-                    None,
                 )
                 .await;
                 return Err(crate::a2a::errors::create_error_response(StatusCode::FORBIDDEN, &error_msg));
@@ -292,7 +290,6 @@ pub async fn inspect_message_extensions(
                     None,
                     "MCP Inspection",
                     None,
-                    None,
                 )
                 .await;
             } else {
@@ -305,7 +302,6 @@ pub async fn inspect_message_extensions(
                     &body_json,
                     None,
                     "MCP No Meta",
-                    None,
                     None,
                 )
                 .await;
@@ -364,7 +360,6 @@ pub async fn inspect_message_extensions(
                                 None,
                                 "Failed Validation",
                                 Some(error_msg.clone()),
-                                None,
                             )
                             .await;
                             return Err(crate::a2a::errors::create_error_response(StatusCode::FORBIDDEN, &error_msg));
@@ -401,7 +396,6 @@ pub async fn inspect_message_extensions(
                             None,
                             "Failed Validation",
                             Some(error_msg.clone()),
-                            None,
                         )
                         .await;
                         return Err(crate::a2a::create_identity_error_response(
@@ -451,7 +445,6 @@ pub async fn inspect_message_extensions(
                                 None,
                                 "success",
                                 None,
-                                Some(result.hash.clone()),
                             )
                             .await;
                             return Ok(Some(result));
@@ -472,7 +465,6 @@ pub async fn inspect_message_extensions(
                                 None,
                                 "Failed Validation",
                                 Some(error_msg.clone()),
-                                None,
                             )
                             .await;
                             return Err(crate::a2a::create_identity_error_response(
@@ -500,7 +492,6 @@ pub async fn inspect_message_extensions(
                     None,
                     "success",
                     None,
-                    None,
                 )
                 .await;
                 return Ok(None);
@@ -517,7 +508,6 @@ pub async fn inspect_message_extensions(
                 &body_json,
                 None,
                 "MCP No Meta",
-                None,
                 None,
             )
             .await;
@@ -548,7 +538,6 @@ pub async fn inspect_message_extensions(
                 None,
                 "Failed Validation",
                 Some(error_msg.clone()),
-                None,
             )
             .await;
             return Err(crate::a2a::create_identity_error_response(
@@ -606,7 +595,6 @@ pub async fn inspect_message_extensions(
             None,
             "Failed Validation",
             Some(error_msg.clone()),
-            None,
         )
         .await;
         return Err(crate::a2a::create_identity_error_response(
@@ -672,7 +660,6 @@ pub async fn inspect_message_extensions(
                     None,
                     "Failed Validation",
                     Some(error_msg.clone()),
-                    None,
                 )
                 .await;
                 return Err(crate::a2a::create_identity_error_response(
@@ -692,7 +679,6 @@ pub async fn inspect_message_extensions(
                 &body_json,
                 None,
                 "No Extensions",
-                None,
                 None,
             )
             .await;
@@ -807,9 +793,6 @@ pub async fn inspect_message_extensions(
                                 None,
                                 "Failed Validation",
                                 Some(error_msg.clone()),
-                                identity_result
-                                    .as_ref()
-                                    .map(|r| r.hash.clone()),
                             )
                             .await;
                             return Err(crate::a2a::errors::create_error_response(StatusCode::FORBIDDEN, &error_msg));
@@ -885,7 +868,6 @@ pub async fn inspect_message_extensions(
                             None,
                             "Failed Validation",
                             Some(error_msg.clone()),
-                            None,
                         )
                         .await;
                         return Err(crate::a2a::create_identity_error_response(
@@ -955,7 +937,6 @@ pub async fn inspect_message_extensions(
                                 None,
                                 "Failed Validation",
                                 Some(error_msg.clone()),
-                                None,
                             )
                             .await;
                             return Err(crate::a2a::create_identity_error_response(
@@ -1015,9 +996,6 @@ pub async fn inspect_message_extensions(
             None,
             "Failed Validation",
             Some(error_msg.clone()),
-            identity_result
-                .as_ref()
-                .map(|r| r.hash.clone()),
         )
         .await;
         return Err(crate::a2a::create_identity_error_response(

@@ -33,7 +33,6 @@ const mockedGetAgentCard = apiClient.getAgentCard as jest.Mock;
 
 const details = (overrides: Partial<AgentDetails> = {}): AgentDetails => ({
   id: 'a1',
-  registration: 'unregistered',
   name: 'TimeAsker',
   protocol: 'a2a',
   runtime: 'gateway',

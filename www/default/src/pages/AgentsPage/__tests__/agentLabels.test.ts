@@ -16,7 +16,6 @@ import {
 
 const agent = (overrides: Partial<AgentRecord> = {}): AgentRecord => ({
   id: 'a1',
-  registration: 'unregistered',
   name: 'TimeAsker',
   protocol: 'a2a',
   runtime: 'url',

@@ -112,7 +112,6 @@ export interface AgentIdentity {
 /** One managed agent of GET /v1/agents, across every surface that targets it. `id` is opaque. */
 export interface AgentRecord {
   id: string;
-  registration: 'unregistered';
   name: string | null;
   protocol: SurfaceProtocol;
   runtime: AgentRuntime;
