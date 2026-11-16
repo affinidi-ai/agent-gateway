@@ -81,7 +81,7 @@ static DID_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"did:[a-z]+:[A-Za-
 
 /// File names, in either the plaintext or the `.enc` form, of key files that are
 /// excluded from export wherever they are stored.
-const EXCLUDED_FILES: &[&str] = &["transit_token_key.json"];
+const EXCLUDED_FILES: &[&str] = &["transit_token_key.json", "login_decoy_credential_key.json"];
 
 /// Returns true if the given directory name should be excluded from export.
 pub fn is_excluded_dir(dir_name: &str) -> bool {
@@ -262,6 +262,17 @@ mod tests {
         }
         for name in ["key_.json", "key_a.json", "key_0.jsonl", "monkey_0.json", "did.json", "keys.json"] {
             assert!(!is_excluded_file(name), "{name} should be kept");
+        }
+    }
+
+    #[test]
+    fn the_login_decoy_credential_key_is_excluded_in_every_form() {
+        for name in [
+            "login_decoy_credential_key.json",
+            "login_decoy_credential_key.json.enc",
+            ".login_decoy_credential_key.json.3f2a.tmp",
+        ] {
+            assert!(is_excluded_file(name), "{name} should be excluded");
         }
     }
 

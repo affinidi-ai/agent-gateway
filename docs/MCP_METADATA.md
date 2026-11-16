@@ -206,15 +206,20 @@ Non-MCP endpoints reject the config. Every setting applies to every MCP
 endpoint, whichever revision a request carries, so `2024-11-05` clients also
 receive `403` (Origin), `431` (header budget) or `413` (body limit, 1 MiB by
 default). Size the limits and allowlist browser origins for each endpoint. The
-configured public HTTP(S) listener origins and explicit allowlist are trusted;
+configured public HTTP(S) listener origins, the explicit allowlist and, on a
+surface's Access Point and its framed Fabric stream receiver, the surface's
+`browser_origins` (see
+[Browser origins of a surface](CONFIGURATION_REFERENCE.md#browser-origins-of-a-surface))
+are trusted; an entry of `browser_origins` that is not an exact origin is ignored
+here rather than failing the endpoint;
 a public endpoint given as a bare listen address (for example `0.0.0.0:8443`)
 names no HTTP(S) origin and adds nothing to the allowlist. Any other public
 endpoint that is not an HTTP(S) origin, such as a URL missing its scheme, also
 adds nothing and is logged once as a warning. Request
 Host/Forwarded headers and CORS do not grant Origin authority. A framed Fabric
-stream receiver independently uses its stored Access Point URL and allowlist, so
-a browser Origin carried on a framed stream must be allowlisted on the
-receiving surface too. A buffered Fabric `ForwardRequest` receiver does not
+stream receiver independently uses its stored Access Point URL, allowlist and
+`browser_origins`, so a browser Origin carried on a framed stream must be
+allowlisted, or listed as a browser origin, on the receiving surface too. A buffered Fabric `ForwardRequest` receiver does not
 check the forwarded Origin, because the sending gateway already checked it
 against its own surface; header and body limits still apply, and the forwarded
 Origin still counts toward the header budget. A framed request the receiver refuses this way is

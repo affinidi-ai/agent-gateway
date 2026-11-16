@@ -1,0 +1,53 @@
+branch: fix/browser-origins-and-caller-key-reviews
+changes:
+  added:
+    - timestamp: '2026-11-12T12:00:00Z'
+      title: Count requests forwarded without a caller key because its secret is unreadable
+      description: >-
+        `agent_gateway_caller_key_secret_unreadable_total{surface_id,reason}` counts each request
+        on a surface with `caller_key` that is forwarded without its key because the secret could
+        not be read (no store, a store error, a missing secret, one outside the surface's tenant
+        or one under 32 bytes), so a sustained secrets-store failure can be alerted on rather than
+        found only in the logs.
+    - timestamp: '2026-11-12T12:00:00Z'
+      title: Audit each save that changes a surface's browser origins
+      description: >-
+        A create, PUT or PATCH that changes `browser_origins` records a `browser_origins_changed`
+        audit event (group Auth), with the list before and after it and the management caller,
+        when the VP Audit Log or an integration selects that event, so a standing grant of browser
+        access to an origin can be traced.
+  changed:
+    - timestamp: '2026-11-12T12:00:00Z'
+      title: Hold caller keys to credential_policy.target_https as Target credentials are
+      description: >-
+        On the Access Point and on Fabric receive, a caller key goes only to an `https://` URL
+        with a host while `credential_policy.target_https` is `enforce`, the test Target
+        credentials are held to; under `warn` an `http` Target gets it and a warning is logged.
+        Saving a `caller_key` whose Target, or a variant's, never receives a key (`fabric://`,
+        `proxy://`, `a2a-proxy://`, or bound by external consent) or is `http` answers with a
+        `Warning`; under `enforce` the save still succeeds and requests go on without the key.
+    - timestamp: '2026-11-12T12:00:00Z'
+      title: Refuse a REST MCP proxy tool argument that sets an x-caller-key header
+      description: >-
+        A REST MCP proxy tool argument for a header in the caller key family is refused as
+        invalid, so no caller can supply a caller key on any path.
+    - timestamp: '2026-11-12T12:00:00Z'
+      title: Keep browser origins across saves and hold every stored list to the same rules
+      description: >-
+        A PUT that leaves `browser_origins` out, as every Surface Builder save does, keeps the
+        stored list; `[]` clears it. Each entry is at most 256 bytes, and a refused one is quoted
+        escaped and capped in the `400` message and the log. A surface loaded from disk gets the
+        same rules: each entry is normalised, and an invalid one, a duplicate or one past the 20th
+        is dropped with a warning naming the surface and the stored file is rewritten without it.
+    - timestamp: '2026-11-12T12:00:00Z'
+      title: Apply browser origins to MCP calls and proxy routes of a served surface
+      description: >-
+        On an MCP surface the MCP Origin check admits the surface's `browser_origins`, on its
+        Access Point and its framed Fabric stream receiver, so a listed page's calls succeed and
+        not only its preflight; an entry that is not an exact origin is ignored there. A surface
+        under a `network.routes` entry of type `proxy` applies its list as `network.channels`
+        prefixes do, and a surface the gateway no longer serves opens no browser origin.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

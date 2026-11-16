@@ -277,15 +277,7 @@ impl StreamRuntime {
         }
         let deadline_ms = u64::try_from(now_ms + remaining_ms).map_err(|_| "Fabric stream deadline is out of range")?;
         let headers = wire::decode_headers(&request.headers)?;
-        let http_policy = crate::mcp::modern_http::EndpointHttpPolicy::new(
-            Some(&limits),
-            std::slice::from_ref(
-                &surface
-                    .access_point
-                    .listen_address,
-            ),
-            crate::mcp::request_validation::McpPathKind::FabricReceive,
-        )?;
+        let http_policy = open_http_policy(&surface, &limits)?;
         // The peer is authenticated and the route resolved, so a refused caller
         // header (such as an untrusted Origin) is answered on the stream the way
         // a direct endpoint answers it, instead of leaving the sender to time out.
@@ -971,10 +963,52 @@ pub(crate) fn global() -> Result<&'static Arc<StreamRuntime>, String> {
         .map_err(Clone::clone)
 }
 
+/// The MCP HTTP policy a framed stream Open to `surface` is admitted under, with `limits`: the
+/// caller's browser `Origin` must be the surface's Access Point URL, in its allowlist or in its
+/// `browser_origins`.
+fn open_http_policy(
+    surface: &crate::config::agent_surface::AgentSurface,
+    limits: &crate::config::McpHttpConfig,
+) -> Result<crate::mcp::modern_http::EndpointHttpPolicy, String> {
+    crate::mcp::modern_http::EndpointHttpPolicy::framed_fabric_receive(
+        surface,
+        Some(limits),
+        crate::mcp::request_validation::runtime_policy_for(crate::mcp::request_validation::McpPathKind::FabricReceive),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::gateways::connection_points::messages::MessageMetadata;
+
+    fn origin_headers(origin: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(axum::http::header::ORIGIN, origin.parse().unwrap());
+        headers
+    }
+
+    fn browser_origin_surface() -> crate::config::agent_surface::AgentSurface {
+        serde_json::from_value(serde_json::json!({
+            "surface_id": "surface-1", "name": "surface-1",
+            "access_point": { "listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp" },
+            "target": { "endpoint": "https://agent.example" },
+            "browser_origins": ["https://chat.example.com"],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_framed_open_admits_a_browser_origin_of_the_surface_and_refuses_another() {
+        let policy = open_http_policy(&browser_origin_surface(), &crate::config::McpHttpConfig::default()).unwrap();
+        assert_eq!(policy.validate_headers(&origin_headers("https://chat.example.com")), Ok(()));
+        assert_eq!(
+            policy
+                .validate_headers(&origin_headers("https://other.example.com"))
+                .map_err(|error| error.status),
+            Err(axum::http::StatusCode::FORBIDDEN)
+        );
+    }
 
     #[tokio::test]
     async fn incoming_open_uses_current_peer_offer_and_surface() {

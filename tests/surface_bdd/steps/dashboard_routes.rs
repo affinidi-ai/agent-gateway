@@ -143,6 +143,25 @@ fn dashboard_page_is_served(world: &mut SurfaceWorld) {
     );
 }
 
+#[then("the page says the Admin API path was not found")]
+fn page_says_api_path_not_found(world: &mut SurfaceWorld) {
+    let response = page_response(world);
+    assert_eq!(
+        response
+            .headers
+            .get("content-type")
+            .map(String::as_str),
+        Some("application/json"),
+        "{response:?}"
+    );
+    let body: serde_json::Value = response
+        .body
+        .as_str()
+        .and_then(|page| serde_json::from_str(page).ok())
+        .unwrap_or_else(|| panic!("not a JSON body: {response:?}"));
+    assert_eq!(body, serde_json::json!({"error": "Not found"}));
+}
+
 #[then(expr = "the browser is redirected to {string}")]
 fn browser_is_redirected(
     world: &mut SurfaceWorld,

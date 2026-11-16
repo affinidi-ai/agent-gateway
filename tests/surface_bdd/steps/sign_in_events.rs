@@ -36,11 +36,11 @@ fn gateway_port(world: &SurfaceWorld) -> u16 {
         .gateway_port
 }
 
-fn passkey_for(world: &SurfaceWorld) -> SoftPasskey {
+pub(crate) fn passkey_for(world: &SurfaceWorld) -> SoftPasskey {
     SoftPasskey::new("localhost", &format!("http://localhost:{}", gateway_port(world)))
 }
 
-async fn post_json(
+pub(crate) async fn post_json(
     world: &SurfaceWorld,
     path: &str,
     body: &Value,
@@ -166,7 +166,7 @@ fn integration_streams_sign_in_records(world: &mut SurfaceWorld) {
         .streams_sign_in_records = true;
 }
 
-async fn start_passkey_sign_in(
+pub(crate) async fn start_passkey_sign_in(
     world: &mut SurfaceWorld,
     username: String,
 ) {
@@ -176,6 +176,14 @@ async fn start_passkey_sign_in(
         .json()
         .await
         .expect("a sign-in challenge");
+    world
+        .sign_in_challenge_credentials
+        .push(
+            started["request_options"]["publicKey"]["allowCredentials"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+        );
     world.started_sign_in = Some(StartedSignIn {
         username,
         challenge_id: started["challenge_id"]
@@ -202,7 +210,7 @@ async fn passkey_sign_in_started_for_unknown_username(
     start_passkey_sign_in(world, username).await;
 }
 
-async fn finish_sign_in(
+pub(crate) async fn finish_sign_in(
     world: &mut SurfaceWorld,
     credential: Value,
 ) {

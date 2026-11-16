@@ -9,6 +9,8 @@ import {
   classifyTargetAuthoritySelection,
   missingTrustCheckAuthorities,
   queriesFromWire,
+  pickAuthorities,
+  type TrustCheckQueryConfig,
 } from '../trust-check/definition';
 import {
   missingTrustRecorderAuthorities,
@@ -140,6 +142,37 @@ describe('authority_source — wire round-trip', () => {
     expect(rebuilt.access_point.trust_recorder.entries[0]).not.toHaveProperty('authority_source');
   });
 
+  it('keeps a stored authority list and its sources through hydration and save', () => {
+    const payload = surface();
+    const listed = {
+      id: 'authority-recognised',
+      trust_registry_id: 'tr-1',
+      query_type: 'recognition',
+      authority_sources: { [AUTHORITY]: 'authority' },
+      query: { authority_ids: [AUTHORITY, ISSUER], entity_id: '{{ input.agent.did }}' },
+    };
+    payload.access_point.trust_check_list = [listed];
+    payload.transit.points[0].trust_check_list = [{ ...listed, id: 'tp-listed' }];
+    const nodes = hydrateSurfaceCanvas(payload as AgentSurface).nodes;
+    const rebuilt = rebuild(nodes);
+
+    for (const element of [
+      rebuilt.access_point.trust_check_list[0],
+      rebuilt.transit.points[0].trust_check_list[0],
+    ]) {
+      expect(element.query).toEqual({
+        authority_ids: [AUTHORITY, ISSUER],
+        entity_id: '{{ input.agent.did }}',
+      });
+      expect(element.authority_sources).toEqual({ [AUTHORITY]: 'authority' });
+      expect(element).not.toHaveProperty('authority_source');
+    }
+    const trustChecks = nodes.filter(n => n.type === 'trust-check');
+    expect(trustChecks.map(n => registry.getIncompleteReason(n.type, n.config, n))).toEqual(
+      trustChecks.map(() => null)
+    );
+  });
+
   it('sends no authority_source when none is stored', () => {
     const payload = surface();
     payload.access_point.trust_check_list = [check('plain', AUTHORITY)];
@@ -174,6 +207,94 @@ describe('authority_source — wire round-trip', () => {
     );
     expect(next).not.toHaveProperty('authority_source');
     expect(next.id).toBe('q');
+  });
+});
+
+describe('several Authorities per query', () => {
+  const LISTED = ['did:web:authority-a', 'did:web:authority-b', 'did:web:authority-c'];
+  const single = (authority_id: string, authority_source?: 'authority' | 'issuer') =>
+    ({
+      id: 'q',
+      trust_registry_id: 'tr-1',
+      query_type: 'recognition',
+      ...(authority_source ? { authority_source } : {}),
+      query: { authority_id, entity_id: '{{ input.agent.did }}' },
+    }) as TrustCheckQueryConfig;
+
+  /** Check each DID in the multi-select, in order. */
+  const listOf = (dids: string[], source: 'authority' | 'issuer' = 'authority') =>
+    pickAuthorities(
+      single(dids[0], source),
+      dids.map(did => ({ did, source }))
+    );
+
+  it('writes two or more picks as authority_ids, each with the register it came from', () => {
+    const q = pickAuthorities(single(AUTHORITY, 'authority'), [
+      { did: AUTHORITY, source: 'authority' },
+      { did: ISSUER, source: 'issuer' },
+    ]);
+    expect(q.query).toEqual({
+      authority_ids: [AUTHORITY, ISSUER],
+      entity_id: '{{ input.agent.did }}',
+    });
+    expect(q.authority_sources).toEqual({ [AUTHORITY]: 'authority', [ISSUER]: 'issuer' });
+    expect(q).not.toHaveProperty('authority_source');
+  });
+
+  it('writes one pick as authority_id, and none as an empty authority_id', () => {
+    const one = pickAuthorities(listOf(LISTED), [{ did: LISTED[1], source: 'authority' }]);
+    expect(one.query).toEqual({ authority_id: LISTED[1], entity_id: '{{ input.agent.did }}' });
+    expect(one.authority_source).toBe('authority');
+    expect(one).not.toHaveProperty('authority_sources');
+
+    const none = pickAuthorities(listOf(LISTED), []);
+    expect(none.query).toEqual({ authority_id: '', entity_id: '{{ input.agent.did }}' });
+    expect(none).not.toHaveProperty('authority_source');
+    expect(none).not.toHaveProperty('authority_sources');
+  });
+
+  it('records no source beside a template', () => {
+    const q = pickAuthorities(single(AUTHORITY, 'authority'), [
+      { did: AGENT_IDENTITY_ISSUER_DID_TEMPLATE },
+    ]);
+    expect(q.query?.authority_id).toBe(AGENT_IDENTITY_ISSUER_DID_TEMPLATE);
+    expect(q).not.toHaveProperty('authority_source');
+  });
+
+  it('saves the picked list and its sources, with no authority_id', () => {
+    const q = listOf(LISTED);
+    const nodes = [
+      {
+        id: 'tc',
+        type: 'trust-check',
+        slotId: 'request:trust-check-access_point_trust_check_list',
+        parentId: 'access-point',
+        config: { queries: [q] },
+      },
+    ] as unknown as CanvasNode[];
+    const [element] = rebuild(nodes).access_point.trust_check_list;
+    expect(element.query).toEqual({ authority_ids: LISTED, entity_id: '{{ input.agent.did }}' });
+    expect(element.authority_sources).toEqual(
+      Object.fromEntries(LISTED.map(d => [d, 'authority']))
+    );
+    expect(element).not.toHaveProperty('authority_source');
+  });
+
+  it('is incomplete while a stored list has an empty entry', () => {
+    const open = {
+      ...single(AUTHORITY),
+      query: { authority_ids: [AUTHORITY, ''], entity_id: '{{ input.agent.did }}' },
+    } as TrustCheckQueryConfig;
+    expect(registry.getIncompleteReason('trust-check', { queries: [open] })).toBe(
+      'Select an Issuer or Authority for every Authority row'
+    );
+  });
+
+  it('summarises the number of authorities', () => {
+    const q = listOf(LISTED);
+    expect(registry.get('trust-check')?.summary?.({ queries: [q] })).toBe(
+      'recognition · 3 authorities'
+    );
   });
 });
 
@@ -300,6 +421,24 @@ describe('missing Authority — nodes and Save', () => {
     expect(missingAuthorityCanvasReason(nodes[1], dids)).toBe('Authority deleted');
     expect(missingAuthorityCanvasReason(nodes[0], dids)).toBeNull();
     expect(firstMissingAuthorityNode(nodes, dids)?.node.id).toBe('tr');
+  });
+
+  it('flags a deleted Authority in a listed query and blocks Save', () => {
+    const listed = trustCheck([
+      check('a', AUTHORITY, 'authority'),
+      {
+        id: 'b',
+        trust_registry_id: 'tr-1',
+        query_type: 'recognition',
+        authority_sources: { [AUTHORITY]: 'authority', [GONE]: 'authority' },
+        query: { authority_ids: [AUTHORITY, GONE], entity_id: '{{ input.agent.did }}' },
+      },
+    ]);
+    expect(missingTrustCheckAuthorities(listed.config, dids)).toEqual([{ index: 1, did: GONE }]);
+    expect(missingAuthorityCanvasReason(listed, dids)).toBe('Authority deleted');
+    expect(firstMissingAuthorityNode([listed], dids)?.warning).toMatch(
+      new RegExp(`^Query 2: The Authority this Trust Check uses \\(${GONE}\\)`)
+    );
   });
 
   it('blocks nothing while the register is not loaded or nothing names a deleted Authority', () => {

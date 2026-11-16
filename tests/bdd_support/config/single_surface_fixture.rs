@@ -88,6 +88,8 @@ pub struct SurfaceConfigBuilder {
     pub transit_shared_policy: Option<RequestPolicyFixture>,
     pub mcp_http: Option<serde_json::Value>,
     pub browser_origins: Vec<String>,
+    /// The `network.cors` origins `gateway.json` lists.
+    pub network_cors: Vec<String>,
     pub protected_resource: Option<ProtectedResourceFixture>,
     /// The outbound listener is also published at [`PROTECTED_RESOURCE_PUBLIC_ORIGIN`], the
     /// https origin a Transit Point's `mcp_http.authorization` resource must use.
@@ -269,6 +271,7 @@ impl Default for SurfaceConfigBuilder {
             transit_shared_policy: None,
             mcp_http: None,
             browser_origins: Vec::new(),
+            network_cors: Vec::new(),
             a2a_settings: None,
             rate_limit_per_minute: None,
             audit_log_keeps_every_event: false,

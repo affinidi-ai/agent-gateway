@@ -134,6 +134,22 @@ evidence, and goes nowhere else: governance audit integrations get `AUDIT_VP_JWT
 `AUDIT_RECORD` without `vp_jwt` for a `payment` record, `GET /api/admin/payments/audit` strips it,
 and the ledger and payment integration events carry only fingerprints.
 
+## Caller key secret metric
+
+`agent_gateway_caller_key_secret_unreadable_total{surface_id,reason}` is a Prometheus counter
+incremented once for each request on a surface with `caller_key` that would have carried a caller
+key but is forwarded without one because the surface's secret could not be read. Each such request
+also logs a warning naming the surface and the reason. Alert on any increase: the Target then gets
+requests with no key it can encrypt with. A request withheld its key by
+`credential_policy.target_https` is not counted, nor is one to a Target that never receives a key
+(`fabric://`, `proxy://` or `a2a-proxy://`): its secret is not read. See
+[Caller keys](CREDENTIAL_DELEGATION.md#caller-keys).
+
+| Label | Value |
+| --- | --- |
+| `surface_id` | The surface ID |
+| `reason` | `no_store` (no secrets store), `store_failed` (the store returned an error), `missing` (no such secret), `outside_tenant` (the secret is outside the surface's tenant) or `too_short` (fewer than 32 bytes) |
+
 ## A2A protocol version metric
 
 `agent_gateway_a2a_protocol_version_total{channel_id,negotiated_version,method_era}` is a Prometheus
@@ -865,6 +881,17 @@ for when a save changes a pin.
   management caller as on policy change events, and the top level carries `surface_id` and
   `channel_name`. No record carries the proxy's spec, `base_url` or name. Each is also logged at
   info under `credential_delegation`.
+
+**Browser origin change events.** Raised by management API writes to a surface (group Auth); see
+[Browser origins of a surface](CONFIGURATION_REFERENCE.md#browser-origins-of-a-surface).
+
+- `browser_origins_changed`: a create, `PUT` or `PATCH` changed the surface's `browser_origins`.
+  It is recorded only when the VP Audit Log or an integration selects the event.
+  `previous_origins` is the list before the save (empty for a new surface) and `origins` the list
+  after it. `actor` names the management caller as on policy change events, and the top level
+  carries `surface_id` and `channel_name`. A save that leaves the list as it was, a new surface
+  without origins, and the load-time normalisation of a stored surface record none. Each is also
+  logged at info.
 
 A `2026-07-28` MCP proxy tool call whose path parameter makes a URL segment `.` or `..` (or an ambiguous one above a non-root `base_url` path) is answered `400` with `-32602` "Invalid tool arguments" before anything is sent, and writes no request event.
 
