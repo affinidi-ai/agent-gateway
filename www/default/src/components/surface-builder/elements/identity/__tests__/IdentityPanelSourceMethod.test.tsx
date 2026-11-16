@@ -91,12 +91,12 @@ describe('Identity source method selector', () => {
   });
 
   it('saves the method the admin picks', () => {
-    const { updateField } = renderPanel([JWT, SECOND_JWT, API_KEY], {
+    const { updateFields } = renderPanel([JWT, SECOND_JWT, API_KEY], {
       type: 'from_jwt_claim',
       source_method: 'users-jwt',
     });
     fireEvent.change(select()!, { target: { value: 'service-jwt' } });
-    expect(updateField).toHaveBeenCalledWith('source_method', 'service-jwt');
+    expect(updateFields).toHaveBeenCalledWith({ source_method: 'service-jwt' });
   });
 
   it('shows no selector with a single method', () => {
@@ -114,25 +114,66 @@ describe('Identity source method selector', () => {
     expect(select()).toBeNull();
   });
 
-  it('pre-selects the first JWT method when From JWT Claims is chosen beside other methods', () => {
-    const { updateFields, updateField } = renderPanel([API_KEY, JWT, SECOND_JWT], {
-      type: 'from_payload',
-    });
-    fireEvent.change(typeSelect(), { target: { value: 'from_jwt_claim' } });
-    expect(updateFields).toHaveBeenCalledWith({
+  it('shows the first JWT method as selected beside an API key method, with no Any option', () => {
+    renderPanel([API_KEY, JWT, SECOND_JWT], { type: 'from_jwt_claim' });
+    expect(select()).toHaveValue('users-jwt');
+    expect(
+      within(select()!)
+        .getAllByRole('option')
+        .map(option => option.textContent)
+    ).not.toContain('Any JWT Bearer method');
+  });
+
+  it('shows the first API key method as selected beside a JWT method', () => {
+    renderPanel([JWT, API_KEY], { type: 'from_api_key' });
+    expect(select()).toHaveValue('partner-key');
+  });
+
+  it('offers Any JWT Bearer method, selected, while every method is a JWT method', () => {
+    const { updateFields } = renderPanel([JWT, SECOND_JWT], { type: 'from_jwt_claim' });
+    expect(select()).toHaveValue('');
+    expect(
+      within(select()!)
+        .getAllByRole('option')
+        .map(option => option.textContent)
+    ).toEqual([
+      'Any JWT Bearer method',
+      "Method 1: JWT, reads the 'authorization' header",
+      "Method 2: JWT, reads the 'x-service-token' header",
+    ]);
+    fireEvent.change(select()!, { target: { value: 'users-jwt' } });
+    expect(updateFields).toHaveBeenCalledWith({ source_method: 'users-jwt' });
+  });
+
+  it('goes back to Any when a method was picked and every method is a JWT method', () => {
+    const { updateFields } = renderPanel([JWT, SECOND_JWT], {
       type: 'from_jwt_claim',
       source_method: 'users-jwt',
     });
-    expect(updateField).not.toHaveBeenCalled();
+    fireEvent.change(select()!, { target: { value: '' } });
+    expect(updateFields).toHaveBeenCalledWith({ source_method: undefined });
   });
 
-  it('pre-selects the first API key method when From API Key is chosen beside a JWT method', () => {
-    const { updateFields } = renderPanel([JWT, API_KEY], { type: 'from_payload' });
-    fireEvent.change(typeSelect(), { target: { value: 'from_api_key' } });
-    expect(updateFields).toHaveBeenCalledWith({
+  it('offers Any API key method while every method is an API key method', () => {
+    renderPanel([API_KEY, { ...API_KEY, id: 'other-key', extraction_field: 'X-Other' }], {
       type: 'from_api_key',
-      source_method: 'partner-key',
     });
+    expect(select()).toHaveValue('');
+    expect(screen.getByRole('option', { name: 'Any API key method' })).toBeInTheDocument();
+  });
+
+  it('says a stored method is now another kind when it was retyped', () => {
+    renderPanel([JWT, API_KEY], { type: 'from_jwt_claim', source_method: 'partner-key' });
+    expect(screen.getByRole('option', { name: 'Method 2 is now API Key' })).toBeDisabled();
+  });
+
+  it('clears the type change so a stale method cannot return', () => {
+    const { updateFields } = renderPanel([JWT, API_KEY], {
+      type: 'from_payload',
+      source_method: 'gone',
+    });
+    fireEvent.change(typeSelect(), { target: { value: 'from_jwt_claim' } });
+    expect(updateFields).toHaveBeenCalledWith({ type: 'from_jwt_claim', source_method: undefined });
   });
 
   it('forgets the method when another extraction type is chosen', () => {
@@ -161,8 +202,17 @@ describe('Identity source method selector', () => {
     );
   });
 
-  it('keeps a single method surface on the plain type update', () => {
-    const { updateField, updateFields } = renderPanel([JWT], { type: 'from_payload' });
+  it('shows no selector for a single method that still holds a stale selection', () => {
+    renderPanel([JWT], { type: 'from_jwt_claim', source_method: 'gone' });
+    expect(select()).toBeNull();
+  });
+
+  it('keeps a non-inbound identity on the plain type update', () => {
+    const { updateField, updateFields } = renderPanel(
+      [JWT, API_KEY],
+      { type: 'from_payload' },
+      protectedSlot
+    );
     fireEvent.change(typeSelect(), { target: { value: 'from_jwt_claim' } });
     expect(updateField).toHaveBeenCalledWith('type', 'from_jwt_claim');
     expect(updateFields).not.toHaveBeenCalled();

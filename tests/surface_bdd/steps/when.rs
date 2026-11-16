@@ -744,13 +744,21 @@ pub(crate) async fn build_new_surface_payload(
             .collect();
         access_point.insert("caller_authentication".to_string(), serde_json::json!({ "methods": methods }));
     }
-    if world
+    let inbound = if world
         .surface_config
         .jwt_claim_inbound_identity
     {
-        let mut slots = serde_json::json!({
-            "inbound": { "type": "from_jwt_claim", "claim": "sub", "namespace_claims": ["iss"] }
-        });
+        Some(serde_json::json!({ "type": "from_jwt_claim", "claim": "sub", "namespace_claims": ["iss"] }))
+    } else if world
+        .surface_config
+        .api_key_inbound_identity
+    {
+        Some(serde_json::json!({ "type": "from_api_key" }))
+    } else {
+        None
+    };
+    if let Some(inbound) = inbound {
+        let mut slots = serde_json::json!({ "inbound": inbound });
         if let Some(selected) = selected_source_method {
             slots["inbound_source_method"] = serde_json::json!(selected);
         }

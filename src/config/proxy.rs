@@ -407,7 +407,7 @@ fn validate_source_auth_surface(surface: &crate::config::agent_surface::AgentSur
         warn!("{error}; callers that authenticate with another method are refused until the surface is fixed");
     }
     if let Err(error) = validate_inbound_source_method(surface) {
-        warn!("{error}; callers are refused until the surface is fixed");
+        warn!("{error}; resolve it via the UI or API");
     }
     if surface.inbound_identity_from_api_key()
         && surface
@@ -452,6 +452,7 @@ pub struct SourceAuthFallback {
 pub fn fall_back_to_first_source_auth_method(
     surface: &mut crate::config::agent_surface::AgentSurface
 ) -> Vec<SourceAuthFallback> {
+    clear_unusable_method_ids(surface);
     let mut fallbacks = Vec::new();
     if let Err(error) = validate_stored_source_auth_methods(surface) {
         let mut first_only = surface.clone();
@@ -609,7 +610,10 @@ pub fn describe_source_auth_method(method: &crate::source_auth::SourceAuthConfig
             MtlsTrust::Ca { ca_certificate_ids, .. } => format!(", CA certificates {ca_certificate_ids:?}"),
         },
     };
-    format!("{} (reads {location}{reference})", method.method_tag())
+    let id = method
+        .id()
+        .map_or_else(String::new, |id| format!("id {id:?}, "));
+    format!("{} ({id}reads {location}{reference})", method.method_tag())
 }
 
 fn describe_credential_source(source: crate::source_auth::models::CredentialSource<'_>) -> String {
@@ -718,6 +722,21 @@ pub fn validate_source_auth_config(
         if !kept {
             let place = variant.map_or_else(String::new, |variant| format!("variant '{}' ", variant.alias));
             validate_session_ttl_bound(cfg.session_ttl_seconds, &surface.name, &place)?;
+        }
+    }
+    validate_method_ids(methods, &surface.name)?;
+    for variant in &surface.variants {
+        if let Some(authentication) = variant
+            .overrides
+            .access_point
+            .as_ref()
+            .and_then(|access_point| {
+                access_point
+                    .caller_authentication
+                    .as_ref()
+            })
+        {
+            validate_method_ids(&authentication.methods, &surface.name)?;
         }
     }
     validate_method_selection(methods, &surface.name)?;
@@ -926,6 +945,107 @@ fn validate_stored_source_auth_method(
     Ok(())
 }
 
+/// A save refuses a method id outside the documented format and two methods
+/// of one list that share an id. A stored surface is not held to this: see
+/// [`clear_unusable_method_ids`].
+fn validate_method_ids(
+    methods: &[crate::source_auth::SourceAuthConfig],
+    surface_name: &str,
+) -> anyhow::Result<()> {
+    for (position, method) in methods.iter().enumerate() {
+        let Some(id) = method.id() else {
+            continue;
+        };
+        if !is_valid_method_id(id) {
+            anyhow::bail!(
+                "Channel '{}': source authentication method {} ({}) has an invalid id; {METHOD_ID_FORMAT}",
+                surface_name,
+                position + 1,
+                method.method_tag()
+            );
+        }
+        if let Some(earlier_position) = methods[..position]
+            .iter()
+            .position(|earlier| earlier.id() == Some(id))
+        {
+            anyhow::bail!(
+                "Channel '{}': source authentication methods {} ({}) and {} ({}) share the id '{}'; each method needs its own id",
+                surface_name,
+                earlier_position + 1,
+                methods[earlier_position].method_tag(),
+                position + 1,
+                method.method_tag(),
+                id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Clear, in place, each method id of a stored surface (base and every variant
+/// overriding its caller authentication) that is outside the documented format
+/// or repeats an earlier one in its list, and log it. The method stays: a
+/// stored surface whose ids clash keeps serving every method, and the first
+/// holder of an id keeps it, so an `inbound_source_method` naming it still
+/// resolves.
+fn clear_unusable_method_ids(surface: &mut crate::config::agent_surface::AgentSurface) {
+    let name = surface.name.clone();
+    let mut lists: Vec<(String, &mut Vec<crate::source_auth::SourceAuthConfig>)> = Vec::new();
+    if let Some(authentication) = surface
+        .access_point
+        .caller_authentication
+        .as_mut()
+    {
+        lists.push((String::new(), &mut authentication.methods));
+    }
+    for variant in &mut surface.variants {
+        if let Some(authentication) = variant
+            .overrides
+            .access_point
+            .as_mut()
+            .and_then(|access_point| {
+                access_point
+                    .caller_authentication
+                    .as_mut()
+            })
+        {
+            lists.push((format!(" variant '{}'", variant.alias), &mut authentication.methods));
+        }
+    }
+    for (place, methods) in lists {
+        let mut seen: Vec<String> = Vec::new();
+        for (position, method) in methods.iter_mut().enumerate() {
+            let Some(id) = method
+                .id()
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if !is_valid_method_id(&id) || seen.contains(&id) {
+                warn!(
+                    "Channel '{name}'{place}: clearing the id {id:?} of source authentication method {} ({}); {METHOD_ID_FORMAT}, unique in its list",
+                    position + 1,
+                    method.method_tag()
+                );
+                method.clear_id();
+            } else {
+                seen.push(id);
+            }
+        }
+    }
+}
+
+const METHOD_ID_FORMAT: &str = "an id is 1 to 32 lowercase letters, digits and dashes";
+
+/// A method id, and the selection that names one, is 1 to 32 lowercase letters,
+/// digits and dashes, so it can appear in logs and error messages unescaped.
+fn is_valid_method_id(id: &str) -> bool {
+    (1..=32).contains(&id.len())
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
 /// A request selects its method by the credential it carries, so two methods
 /// reading the same location would be indistinguishable, and a method reading
 /// the request body, where no credential is looked for, could only ever be the
@@ -946,21 +1066,6 @@ fn validate_method_selection(
                 position + 1,
                 method.method_tag(),
                 describe(source)
-            );
-        }
-        if let Some(id) = method.id()
-            && let Some(earlier_position) = methods[..position]
-                .iter()
-                .position(|earlier| earlier.id() == Some(id))
-        {
-            anyhow::bail!(
-                "Channel '{}': source authentication methods {} ({}) and {} ({}) share the id '{}'; each method needs its own id",
-                surface_name,
-                earlier_position + 1,
-                methods[earlier_position].method_tag(),
-                position + 1,
-                method.method_tag(),
-                id
             );
         }
         if let Some(earlier_position) = methods[..position]
@@ -997,8 +1102,6 @@ fn validate_method_selection(
 /// `from_jwt_claim` or `from_api_key` identity is derived from: it must exist
 /// and be of the kind the identity reads.
 fn validate_inbound_source_method(surface: &crate::config::agent_surface::AgentSurface) -> anyhow::Result<()> {
-    use crate::source_auth::{ManagedIdentityConfig, SourceAuthConfig};
-
     let Some(selected) = surface
         .identity_slots
         .inbound_source_method
@@ -1006,19 +1109,17 @@ fn validate_inbound_source_method(surface: &crate::config::agent_surface::AgentS
     else {
         return Ok(());
     };
-    let (identity, accepts, needed): (&str, fn(&SourceAuthConfig) -> bool, &str) = match surface.inbound_identity() {
-        Some(ManagedIdentityConfig::FromJwtClaim { .. }) => {
-            ("from_jwt_claim", |method| matches!(method, SourceAuthConfig::JwtBearer(_)), "a jwt_bearer method")
-        }
-        Some(ManagedIdentityConfig::FromApiKey { .. }) => (
-            "from_api_key",
-            |method| matches!(method, SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_)),
-            "an api_key or api_key_provider method",
-        ),
-        _ => anyhow::bail!(
+    if !is_valid_method_id(selected) {
+        anyhow::bail!(
+            "Channel '{}': identity_slots.inbound_source_method must be 1 to 32 lowercase letters, digits and dashes",
+            surface.name
+        );
+    }
+    let Some(rule) = surface.inbound_credential_rule() else {
+        anyhow::bail!(
             "Channel '{}': identity_slots.inbound_source_method needs an inbound from_jwt_claim or from_api_key identity",
             surface.name
-        ),
+        );
     };
     let Some(method) = surface
         .source_auth_methods()
@@ -1031,22 +1132,14 @@ fn validate_inbound_source_method(surface: &crate::config::agent_surface::AgentS
             selected
         );
     };
-    if !accepts(method) {
+    if !(rule.accepts)(method) {
         anyhow::bail!(
-            "Channel '{}': identity_slots.inbound_source_method '{}' is {} {} method, but a {} identity needs {}",
+            "Channel '{}': identity_slots.inbound_source_method '{}' is {} method, but a {} identity needs {}",
             surface.name,
             selected,
-            if method
-                .method_tag()
-                .starts_with('a')
-            {
-                "an"
-            } else {
-                "a"
-            },
-            method.method_tag(),
-            identity,
-            needed
+            method.method_tag_with_article(),
+            rule.identity,
+            rule.needed
         );
     }
     Ok(())
@@ -1584,6 +1677,41 @@ mod tests {
     }
 
     #[test]
+    fn a_method_id_outside_the_documented_format_is_refused() {
+        let too_long = "a".repeat(33);
+        for bad in ["", "Upper", "has space", "line\r\nbreak", "under_score", too_long.as_str()] {
+            let surface =
+                surface_with_caller_auth(serde_json::json!([with_id(jwt_method(), bad)]), serde_json::json!({}));
+            assert_eq!(
+                save_error(&surface),
+                "Channel 'multi': source authentication method 1 (jwt_bearer) has an invalid id; an id is 1 to 32 lowercase letters, digits and dashes",
+                "id {bad:?}"
+            );
+        }
+        for good in ["a", "users-jwt", "method-0a1b2c3d", "a".repeat(32).as_str()] {
+            let surface =
+                surface_with_caller_auth(serde_json::json!([with_id(jwt_method(), good)]), serde_json::json!({}));
+            validate_source_auth_config(&surface, None).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_selection_outside_the_documented_format_is_refused() {
+        let too_long = "a".repeat(33);
+        for bad in ["", "Upper", "line\r\nbreak", too_long.as_str()] {
+            let surface = surface_with_caller_auth(
+                serde_json::json!([with_id(jwt_method(), "users-jwt")]),
+                selecting("from_jwt_claim", bad),
+            );
+            assert_eq!(
+                save_error(&surface),
+                "Channel 'multi': identity_slots.inbound_source_method must be 1 to 32 lowercase letters, digits and dashes",
+                "selection {bad:?}"
+            );
+        }
+    }
+
+    #[test]
     fn two_methods_sharing_an_id_are_refused() {
         let surface = surface_with_caller_auth(
             serde_json::json!([with_id(jwt_method(), "same"), with_id(api_key_method("X-API-Key"), "same")]),
@@ -1593,7 +1721,83 @@ mod tests {
             save_error(&surface),
             "Channel 'multi': source authentication methods 1 (jwt_bearer) and 2 (api_key) share the id 'same'; each method needs its own id"
         );
-        assert!(validate_source_auth_surface(&surface).is_err(), "boot refuses it too");
+    }
+
+    #[test]
+    fn a_variant_override_with_clashing_ids_is_refused_at_save() {
+        let mut surface = surface_with_caller_auth(serde_json::json!([jwt_method()]), serde_json::json!({}));
+        let methods = serde_json::json!([with_id(jwt_method(), "same"), with_id(api_key_method("X-API-Key"), "same")]);
+        surface.variants = serde_json::from_value(serde_json::json!([{
+            "id": "beta", "alias": "beta", "name": "Beta", "enabled": true,
+            "overrides": {"access_point": {"caller_authentication": {"methods": methods}}}
+        }]))
+        .unwrap();
+        assert_eq!(
+            save_error(&surface),
+            "Channel 'multi': source authentication methods 1 (jwt_bearer) and 2 (api_key) share the id 'same'; each method needs its own id"
+        );
+    }
+
+    #[test]
+    fn stored_methods_sharing_an_id_keep_serving_with_the_clashing_id_cleared() {
+        let mut surface = surface_with_caller_auth(
+            serde_json::json!([with_id(jwt_method(), "same"), with_id(api_key_method("X-API-Key"), "same")]),
+            selecting("from_jwt_claim", "same"),
+        );
+
+        validate_source_auth_surface(&surface).unwrap();
+        assert!(fall_back_to_first_source_auth_method(&mut surface).is_empty());
+
+        let methods = surface.source_auth_methods();
+        assert_eq!(methods.len(), 2, "no method is dropped");
+        assert_eq!(methods[0].id(), Some("same"), "the first method keeps its id");
+        assert_eq!(methods[1].id(), None, "the later one loses the clashing id");
+        assert_eq!(surface.inbound_source_method_refusal(&methods[0]), None);
+    }
+
+    #[test]
+    fn a_stored_method_id_outside_the_documented_format_is_cleared_not_the_method() {
+        let mut surface = surface_with_caller_auth(
+            serde_json::json!([with_id(jwt_method(), "line\r\nbreak"), api_key_method("X-API-Key")]),
+            serde_json::json!({}),
+        );
+
+        assert!(fall_back_to_first_source_auth_method(&mut surface).is_empty());
+
+        let methods = surface.source_auth_methods();
+        assert_eq!(methods.len(), 2);
+        assert_eq!(methods[0].id(), None);
+    }
+
+    #[test]
+    fn a_variant_override_clears_its_own_clashing_ids() {
+        let mut stored = surface_with_caller_auth(serde_json::json!([jwt_method()]), serde_json::json!({}));
+        let methods = serde_json::json!([with_id(jwt_method(), "same"), with_id(api_key_method("X-API-Key"), "same")]);
+        stored.variants = serde_json::from_value(serde_json::json!([{
+            "id": "beta", "alias": "beta", "name": "Beta", "enabled": true,
+            "overrides": {"access_point": {"caller_authentication": {"methods": methods}}}
+        }]))
+        .unwrap();
+
+        assert!(fall_back_to_first_source_auth_method(&mut stored).is_empty());
+
+        let resolved = stored
+            .resolve_variant(Some("beta"))
+            .unwrap();
+        assert_eq!(
+            resolved
+                .source_auth_methods()
+                .len(),
+            2
+        );
+        assert_eq!(resolved.source_auth_methods()[1].id(), None);
+    }
+
+    #[test]
+    fn a_described_method_names_its_id() {
+        let method: crate::source_auth::SourceAuthConfig =
+            serde_json::from_value(with_id(jwt_method(), "users-jwt")).unwrap();
+        assert!(describe_source_auth_method(&method).contains("id \"users-jwt\""));
     }
 
     #[test]

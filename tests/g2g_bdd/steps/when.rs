@@ -706,6 +706,25 @@ pub async fn mcp_list_tools_sent_with_api_key(
     send_rpc(world, gw_index, &surface_name, build_mcp_list_tools_body(), &[(header, api_key)]).await;
 }
 
+#[when(
+    regex = r#"^the caller asks gateway (\d+) MCP surface "([^"]+)" for available tools with a valid partner API key$"#
+)]
+pub async fn mcp_list_tools_sent_with_partner_api_key(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    surface_name: String,
+) {
+    world.start().await;
+    send_rpc(
+        world,
+        gw_index,
+        &surface_name,
+        build_mcp_list_tools_body(),
+        &[("x-partner-key".to_string(), "bdd-partner-api-key".to_string())],
+    )
+    .await;
+}
+
 #[when(regex = r#"^the caller asks gateway (\d+) MCP surface "([^"]+)" for available tools without an API key$"#)]
 pub async fn mcp_list_tools_sent_without_credentials(
     world: &mut G2gWorld,

@@ -3,7 +3,8 @@
  *
  * Asserts that on a surface with several Caller Context methods the inbound
  * Identity panel offers the methods its type can read, shows the stored
- * choice, and pre-selects the first matching method when the type changes.
+ * choice, selects the first matching method beside methods it cannot all read,
+ * and offers Any while every method is of the kind it reads.
  */
 
 import type {Page} from '@playwright/test';
@@ -29,7 +30,13 @@ const API_KEY_METHOD = {
     secret_id: 'partner-keys',
 };
 
-const surfaceFixture = (identitySlots: Record<string, unknown>) => ({
+const SECOND_JWT_METHOD = {
+    ...JWT_METHOD,
+    id: 'service-jwt',
+    token_header: 'X-Service-Token',
+};
+
+const surfaceFixture = (identitySlots: Record<string, unknown>, methods: unknown[]) => ({
     surface_id: SURFACE_ID,
     name: 'Identity source method fixture',
     description: 'Playwright fixture',
@@ -39,7 +46,7 @@ const surfaceFixture = (identitySlots: Record<string, unknown>) => ({
         listen_address: '0.0.0.0:0',
         route: '/ui-test-identity-source-method',
         protocol: 'a2a',
-        caller_authentication: {methods: [JWT_METHOD, API_KEY_METHOD]},
+        caller_authentication: {methods},
         publish_to_did_document: false,
         terminate_trace_id: false,
     },
@@ -52,10 +59,14 @@ const surfaceFixture = (identitySlots: Record<string, unknown>) => ({
     identity_slots: identitySlots,
 });
 
-async function openSurface(page: Page, identitySlots: Record<string, unknown>) {
+async function openSurface(
+    page: Page,
+    identitySlots: Record<string, unknown>,
+    methods: unknown[] = [JWT_METHOD, API_KEY_METHOD],
+) {
     await page.route(new RegExp(`/api/v1/surfaces/${SURFACE_ID}(\\?.*)?$`), async (route) => {
         if (route.request().method() === 'GET') {
-            await route.fulfill({json: surfaceFixture(identitySlots)});
+            await route.fulfill({json: surfaceFixture(identitySlots, methods)});
         } else {
             await route.fallback();
         }
@@ -79,7 +90,7 @@ test.describe('Identity — source method', () => {
         ]);
     });
 
-    test('pre-selects the API key method when From API Key is chosen', async ({page}) => {
+    test('selects the first API key method when From API Key is chosen beside a JWT method', async ({page}) => {
         await openSurface(page, {
             inbound: {type: 'from_jwt_claim', claim: 'oid'},
             inbound_source_method: 'users-jwt',
@@ -92,5 +103,38 @@ test.describe('Identity — source method', () => {
         await expect(select.locator('option')).toHaveText([
             "Method 2: API Key, reads the 'x-api-key' header",
         ]);
+    });
+
+    test('selects the first JWT method when no method is stored beside an API key method', async ({page}) => {
+        await openSurface(
+            page,
+            {inbound: {type: 'from_jwt_claim', claim: 'oid'}},
+            [API_KEY_METHOD, JWT_METHOD],
+        );
+
+        await expect(page.getByTestId('identity-panel-source-method-select')).toHaveValue('users-jwt');
+    });
+
+    test('offers Any JWT Bearer method while every method is a JWT method', async ({page}) => {
+        await openSurface(
+            page,
+            {inbound: {type: 'from_jwt_claim', claim: 'oid'}},
+            [JWT_METHOD, SECOND_JWT_METHOD],
+        );
+
+        const select = page.getByTestId('identity-panel-source-method-select');
+        await expect(select).toHaveValue('');
+        await expect(select.locator('option').first()).toHaveText('Any JWT Bearer method');
+    });
+
+    test('opens the new surface page without a page error', async ({page}) => {
+        const errors: string[] = [];
+        page.on('pageerror', (error) => errors.push(error.message));
+
+        await page.goto(`${BASE_URL}/surfaces/new`);
+        await page.waitForLoadState('networkidle');
+
+        await expect(page.locator('#root')).not.toBeEmpty();
+        expect(errors).toEqual([]);
     });
 });

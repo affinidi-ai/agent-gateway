@@ -921,6 +921,7 @@ fn audited_auth_failure_reason(failure: &str) -> &'static str {
     match failure {
         "a missing credential" => "missing_credential",
         "an invalid credential" => "invalid_credential",
+        "a valid credential of a method the inbound identity does not read" => "source_method_mismatch",
         other => panic!("no audited reason for the source authentication failure '{other}'"),
     }
 }

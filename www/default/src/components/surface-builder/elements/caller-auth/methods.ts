@@ -85,9 +85,10 @@ const METHOD_ID_ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789';
 
 /** A new method id: lowercase letters, digits and dashes, at most 32 characters. */
 export function newMethodId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
   const random = Array.from(
-    { length: 8 },
-    () => METHOD_ID_ALPHABET[Math.floor(Math.random() * METHOD_ID_ALPHABET.length)]
+    bytes,
+    byte => METHOD_ID_ALPHABET[byte % METHOD_ID_ALPHABET.length]
   ).join('');
   return `method-${random}`;
 }

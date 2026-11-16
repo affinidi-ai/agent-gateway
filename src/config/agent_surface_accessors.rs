@@ -21,6 +21,14 @@ use super::types::{
     TimeoutConfig,
 };
 
+/// The kind of Caller Context method an inbound identity reads, and how it
+/// is named in messages.
+pub struct InboundCredentialRule {
+    pub identity: &'static str,
+    pub accepts: fn(&crate::source_auth::SourceAuthConfig) -> bool,
+    pub needed: &'static str,
+}
+
 impl AgentSurface {
     // ── Identity / addressing ───────────────────────────────────────────────
 
@@ -114,11 +122,32 @@ impl AgentSurface {
         }
     }
 
+    /// The kind of Caller Context method the inbound identity reads, when it
+    /// reads a caller credential (`from_jwt_claim` or `from_api_key`).
+    pub fn inbound_credential_rule(&self) -> Option<InboundCredentialRule> {
+        use crate::source_auth::{ManagedIdentityConfig, SourceAuthConfig};
+
+        match self.inbound_identity()? {
+            ManagedIdentityConfig::FromJwtClaim { .. } => Some(InboundCredentialRule {
+                identity: "from_jwt_claim",
+                accepts: |method| matches!(method, SourceAuthConfig::JwtBearer(_)),
+                needed: "a jwt_bearer method",
+            }),
+            ManagedIdentityConfig::FromApiKey { .. } => Some(InboundCredentialRule {
+                identity: "from_api_key",
+                accepts: |method| matches!(method, SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_)),
+                needed: "an api_key or api_key_provider method",
+            }),
+            _ => None,
+        }
+    }
+
     /// Why a request verified by `method` gets no inbound identity: the
     /// identity names, in `identity_slots.inbound_source_method`, another
-    /// method to derive it from. `None` when no method is named or `method`
-    /// is the one. The caller is refused, never given an identity from a
-    /// credential the identity does not read.
+    /// method to derive it from, or a method it cannot read. `None` when no
+    /// method is named or `method` is the one. The caller is refused, never
+    /// given an identity from a credential the identity does not read. Ids are
+    /// quoted with `{:?}` so a stored one can't forge a log line.
     pub fn inbound_source_method_refusal(
         &self,
         method: &crate::source_auth::SourceAuthConfig,
@@ -127,16 +156,24 @@ impl AgentSurface {
             .identity_slots
             .inbound_source_method
             .as_deref()?;
-        if method.id() == Some(selected) {
-            return None;
+        if method.id() != Some(selected) {
+            return Some(format!(
+                "inbound identity is derived from method {selected:?}, but the caller authenticated with {} method {}",
+                method.method_tag(),
+                method
+                    .id()
+                    .map_or_else(|| "without an id".to_string(), |id| format!("{id:?}"))
+            ));
         }
-        Some(format!(
-            "inbound identity is derived from method '{selected}', but the caller authenticated with {} method {}",
-            method.method_tag(),
-            method
-                .id()
-                .map_or_else(|| "without an id".to_string(), |id| format!("'{id}'"))
-        ))
+        let rule = self.inbound_credential_rule()?;
+        (!(rule.accepts)(method)).then(|| {
+            format!(
+                "inbound {} identity needs {}, but {selected:?} is {} method",
+                rule.identity,
+                rule.needed,
+                method.method_tag_with_article()
+            )
+        })
     }
 
     #[inline]
@@ -2006,17 +2043,51 @@ mod tests {
     }
 
     #[test]
+    fn a_selection_of_a_method_the_identity_cannot_read_refuses_that_methods_callers() {
+        for (identity, selected, expected) in [
+            (
+                "from_jwt_claim",
+                "partner-key",
+                "inbound from_jwt_claim identity needs a jwt_bearer method, but \"partner-key\" is an api_key method",
+            ),
+            (
+                "from_api_key",
+                "users-jwt",
+                "inbound from_api_key identity needs an api_key or api_key_provider method, but \"users-jwt\" is a jwt_bearer method",
+            ),
+        ] {
+            let mut surface = two_method_surface(Some(selected));
+            surface.identity_slots.inbound =
+                Some(serde_json::from_value(serde_json::json!({"type": identity})).unwrap());
+            let named = surface
+                .source_auth_methods()
+                .iter()
+                .find(|method| method.id() == Some(selected))
+                .unwrap();
+            assert_eq!(surface.inbound_source_method_refusal(named), Some(expected.to_string()), "{identity}");
+        }
+    }
+
+    #[test]
+    fn a_selection_of_a_method_the_identity_reads_admits_its_callers() {
+        let mut surface = two_method_surface(Some("users-jwt"));
+        surface.identity_slots.inbound =
+            Some(serde_json::from_value(serde_json::json!({"type": "from_jwt_claim"})).unwrap());
+        assert_eq!(surface.inbound_source_method_refusal(&surface.source_auth_methods()[0]), None);
+    }
+
+    #[test]
     fn a_selected_source_method_admits_only_the_method_with_that_id() {
         let surface = two_method_surface(Some("users-jwt"));
         let methods = surface.source_auth_methods();
         assert_eq!(surface.inbound_source_method_refusal(&methods[0]), None);
         assert_eq!(
             surface.inbound_source_method_refusal(&methods[1]),
-            Some("inbound identity is derived from method 'users-jwt', but the caller authenticated with api_key method 'partner-key'".to_string())
+            Some("inbound identity is derived from method \"users-jwt\", but the caller authenticated with api_key method \"partner-key\"".to_string())
         );
         assert_eq!(
             surface.inbound_source_method_refusal(&methods[2]),
-            Some("inbound identity is derived from method 'users-jwt', but the caller authenticated with api_key method without an id".to_string())
+            Some("inbound identity is derived from method \"users-jwt\", but the caller authenticated with api_key method without an id".to_string())
         );
     }
 }

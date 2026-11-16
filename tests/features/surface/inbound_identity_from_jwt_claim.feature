@@ -61,6 +61,7 @@ Feature: Inbound identity derived from a JWT claim
 
   Scenario: A surface mixing JWT Bearer and API Key refuses a caller whose API key is not the source of the inbound identity
     Given an A2A surface targeting managed agent "bravo"
+    And the VP Audit Log keeps every audit event
     And the surface accepts "JWT Bearer" and "API Key" source authentication
     And the surface derives the inbound identity from a JWT claim of its "JWT Bearer" source authentication
     And the surface accepts JWT audience "bdd-test-audience"
@@ -70,6 +71,7 @@ Feature: Inbound identity derived from a JWT claim
     And managed agent "bravo" was not called
     And the response content type is "application/problem+json"
     And the response says only that the caller credential is missing or invalid
+    And the VP Audit Log records a blocking "API Key" source authentication failure for "a valid credential of a method the inbound identity does not read"
 
   Scenario: A surface mixing JWT Bearer and API Key is refused when its inbound identity names no source authentication method
     Given an A2A surface targeting managed agent "bravo"
@@ -80,7 +82,7 @@ Feature: Inbound identity derived from a JWT claim
     Then the admin API response status is 400
     And the admin API error response mentions "inbound_source_method"
 
-  Scenario: A surface mixing JWT Bearer and API Key is refused when its inbound identity names no source authentication method and none is selected
+  Scenario: A surface mixing JWT Bearer and API Key refuses From JWT Claims when no method is named
     Given an A2A surface targeting managed agent "bravo"
     And the surface accepts "JWT Bearer" and "API Key" source authentication
     And the surface derives the inbound identity from a JWT claim

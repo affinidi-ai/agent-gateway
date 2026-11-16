@@ -165,7 +165,7 @@ describe('identity From API Key — Caller Context dependency', () => {
       config: { methods: [{ method_type: 'api_key' }, { method_type: 'jwt_bearer' }] },
     };
     expect(fromApiKeyErrors([accessPoint, mixed, inbound], inbound)).toEqual([
-      INBOUND_API_KEY_NEEDS_API_KEY_CALLER,
+      `${INBOUND_API_KEY_NEEDS_API_KEY_CALLER}, or choose the Identity source method`,
     ]);
   });
 

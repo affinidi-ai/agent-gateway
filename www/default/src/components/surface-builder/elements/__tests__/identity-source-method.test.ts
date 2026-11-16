@@ -155,12 +155,13 @@ describe('inbound identity source method — payload', () => {
     expect(payload.identity_slots.inbound_source_method).toBe('partner-key');
   });
 
-  it('drops the selection and every method id from a template', () => {
+  it('keeps the selection and the method ids in a template', () => {
     const scrubbed: any = scrubVolatileTemplateFields(selected);
-    expect(scrubbed.identity_slots.inbound_source_method).toBeUndefined();
-    expect(scrubbed.access_point.caller_authentication.methods.some((m: any) => 'id' in m)).toBe(
-      false
-    );
+    expect(scrubbed.identity_slots.inbound_source_method).toBe('users-jwt');
+    expect(scrubbed.access_point.caller_authentication.methods.map((m: any) => m.id)).toEqual([
+      'users-jwt',
+      'partner-key',
+    ]);
   });
 });
 
@@ -175,10 +176,28 @@ describe('inbound identity source method — rules', () => {
     expect(errors(nodes)).toEqual([]);
   });
 
-  it('still refuses From JWT Claims beside an API key method with no selection', () => {
-    const { nodes } = rebuild(stored([JWT, API_KEY], { inbound: { type: 'from_jwt_claim' } }));
+  it('reads the first JWT method when none is named beside an API key method', () => {
+    const { nodes, payload } = rebuild(
+      stored([API_KEY, JWT], { inbound: { type: 'from_jwt_claim' } })
+    );
+    expect(errors(nodes)).toEqual([]);
+    expect(payload.identity_slots.inbound_source_method).toBe('users-jwt');
+  });
+
+  it('reads any method, and names none, while every method is a JWT method', () => {
+    const second = { ...JWT, id: 'other-jwt' };
+    const { nodes, payload } = rebuild(
+      stored([JWT, second], { inbound: { type: 'from_jwt_claim' } })
+    );
+    expect(errors(nodes)).toEqual([]);
+    expect(payload.identity_slots.inbound_source_method).toBeUndefined();
+  });
+
+  it('refuses From JWT Claims beside API key methods only, and points at the select', () => {
+    const second = { ...API_KEY, id: 'other-key' };
+    const { nodes } = rebuild(stored([API_KEY, second], { inbound: { type: 'from_jwt_claim' } }));
     expect(errors(nodes)).toEqual([
-      'From JWT Claims requires a Caller Context whose methods are all JWT Bearer. Remove the other methods, or change this extraction type.',
+      'From JWT Claims requires a Caller Context whose methods are all JWT Bearer. Remove the other methods, choose the Identity source method, or change this extraction type.',
     ]);
   });
 
@@ -192,9 +211,9 @@ describe('inbound identity source method — rules', () => {
     expect(errors(nodes)).toEqual([]);
   });
 
-  it('refuses a selection of a method that was removed', () => {
+  it('refuses a selection of a method that was removed while several remain', () => {
     const { nodes } = rebuild(
-      stored([JWT], {
+      stored([JWT, API_KEY], {
         inbound: { type: 'from_jwt_claim' },
         inbound_source_method: 'gone',
       })
@@ -202,6 +221,35 @@ describe('inbound identity source method — rules', () => {
     expect(errors(nodes)).toEqual([
       'The Caller Context method this Identity reads was removed. Select another method.',
     ]);
+  });
+
+  it('ignores a selection once one method is left', () => {
+    const { nodes, payload } = rebuild(
+      stored([JWT], {
+        inbound: { type: 'from_jwt_claim' },
+        inbound_source_method: 'gone',
+      })
+    );
+    expect(errors(nodes)).toEqual([]);
+    expect(payload.identity_slots.inbound_source_method).toBeUndefined();
+  });
+
+  it('lets the payload own the selection, so a stale canvas blob cannot bring it back', () => {
+    const removed = {
+      ...stored([JWT, API_KEY], { inbound: { type: 'from_jwt_claim' } }),
+      canvas: {
+        version: 1,
+        nodes: [
+          {
+            id: 'identity-inbound',
+            type: 'identity',
+            config: { type: 'from_jwt_claim', source_method: 'users-jwt' },
+          },
+        ],
+      },
+    };
+    const nodes = registry.nodesFromPayload(removed);
+    expect(inboundNode(nodes).config.source_method).toBeUndefined();
   });
 
   it('refuses a selection of a method of the wrong type', () => {

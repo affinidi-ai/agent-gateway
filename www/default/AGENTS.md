@@ -603,13 +603,19 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   Claims or From API Key shows an **Identity source method** select
   (`identity-panel-source-method-select`, `IdentitySourceMethodSelect.tsx`) listing only the
   methods of the kind it reads, as "Method <n>: <kind>, reads <location>", and writes
-  `identity_slots.inbound_source_method`; choosing the type pre-selects the first such method,
-  choosing another type clears it, and with none the panel says so
+  `identity_slots.inbound_source_method`. The shown value is the effective one
+  (`effectiveSourceMethod` in `sourceMethods.ts`): the stored choice; with none, **Any JWT Bearer
+  method** or **Any API key method** (no `inbound_source_method`) while every method is of the
+  kind it reads, and the first such method otherwise, which Save then writes, so adding a method
+  or applying a template needs no click. Choosing the type or another type clears the stored
+  choice, and with no method it can read the panel says so
   (`identity-panel-source-method-none`). The all-JWT and all-API-key rules apply only while no
-  method is selected; a selection naming a removed method or one of the wrong kind is a Save
-  error. The select never shows on a single method, on the protected or external Identity, or on
-  a Transit Point Identity, and a template drops the selection and every method id
-  (`scrubVolatileTemplateFields`).
+  method is in effect and their error names the select with several methods; a selection naming
+  a removed method or one of the wrong kind is a Save error, and a stored one beside a single
+  method is ignored. The payload owns the selection, so a stale canvas copy never brings it back.
+  The select never shows on a single method, on the protected or external Identity, or on a
+  Transit Point Identity, and a template keeps the selection and the method ids, which are local
+  to one surface.
 - **JWT Bearer audiences**: Accepted Audiences is required; with none listed, discovery off and
   Audience Claim `aud`, the method shows `caller-auth-audiences-missing-warning`. Save is not
   blocked for it, since the gateway keeps a method stored without audiences unchanged and refuses
