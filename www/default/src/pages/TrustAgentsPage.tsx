@@ -8,8 +8,13 @@ import { EmptyState } from '../components/shared/EmptyState';
 import { ROUTES, trustAgentResumePath } from '../routes';
 import { showToast } from '../utils/toaster';
 import { VtaConnectionsList } from './VtaConnectionsPage/VtaConnectionsList';
+import { ControlKeyCard } from './VtaConnectionsPage/ControlKeyCard';
 import { StrandedAgentsError, useVtaConnections } from './VtaConnectionsPage/useVtaConnections';
 import type { VtaConnection } from './VtaConnectionsPage/types';
+
+/** What connecting a Verifiable Trust Agent gives, shown at the top of the tab. */
+const INTRO =
+  "Connect a Verifiable Trust Agent to sign audit records with a key the gateway doesn't control. Anyone can verify your records without having to trust the gateway, and even if the gateway is compromised, its records can't be forged or altered. You keep full control of the agent.";
 
 interface TrustAgentsPageProps {
   /** The Connections page's shared filter; the tab then shows no filter of its own. */
@@ -20,7 +25,7 @@ interface TrustAgentsPageProps {
 }
 
 /**
- * The Trust Agents tab of Connections — the Verifiable Trust Agents this gateway
+ * The Verifiable Trust Agent tab of Connections — the agents this gateway
  * can sign through, and what state each connection's pairing is in.
  */
 const TrustAgentsPage: React.FC<TrustAgentsPageProps> = ({
@@ -32,6 +37,7 @@ const TrustAgentsPage: React.FC<TrustAgentsPageProps> = ({
   const { hasPermission } = usePermissions();
   const {
     connections,
+    deployment,
     loading,
     error,
     reload,
@@ -165,7 +171,7 @@ const TrustAgentsPage: React.FC<TrustAgentsPageProps> = ({
       onClick={() => navigate(ROUTES.TRUST_AGENT_CONNECT)}
       iconStart={<i className="fas fa-plus me-1" aria-hidden="true" />}
     >
-      Connect an agent
+      Add VTA
     </AppButton>
   ) : null;
 
@@ -173,11 +179,23 @@ const TrustAgentsPage: React.FC<TrustAgentsPageProps> = ({
     <div className={isEmbedded ? '' : 'container-fluid'} data-testid="page-trust-agents">
       {actionsContainer && connectButton && createPortal(connectButton, actionsContainer)}
 
+      <p className="text-muted mb-4" data-testid="trust-agents-intro">
+        {INTRO}
+      </p>
+
+      {deployment?.control_key && (
+        <ControlKeyCard
+          controlKey={deployment.control_key}
+          canRotate={canRotateKeys}
+          onRotated={reload}
+        />
+      )}
+
       <div className="card shadow mb-4">
         <div className="card-header py-3 d-flex justify-content-between align-items-center">
           <h6 className="m-0 font-weight-bold text-primary">
             <i className="fas fa-robot me-2" aria-hidden="true" />
-            Connections
+            Verifiable Trust Agents
             <Badge
               value={filtered.length}
               suffix={search ? ` of ${connections.length}` : undefined}
@@ -219,8 +237,8 @@ const TrustAgentsPage: React.FC<TrustAgentsPageProps> = ({
             <EmptyState
               icon="fa-robot"
               title="No Verifiable Trust Agent connected"
-              body="This gateway signs with its own key. Connect an agent to move signing to it — you keep administration of the agent, and the gateway only ever receives a grant for one context."
-              ctaLabel={canEdit ? 'Connect an agent' : undefined}
+              body={INTRO}
+              ctaLabel={canEdit ? 'Add VTA' : undefined}
               ctaIcon="fa-plus"
               onCtaClick={canEdit ? () => navigate(ROUTES.TRUST_AGENT_CONNECT) : undefined}
               ctaTestId="trust-agents-empty-connect-button"

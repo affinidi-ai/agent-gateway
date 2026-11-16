@@ -66,7 +66,7 @@ test.describe("Connections: control key rotation", () => {
         },
       });
     });
-    await page.goto(`${BASE_URL}/connections?tab=key-management`);
+    await page.goto(`${BASE_URL}/connections?tab=trust-agents`);
 
     await expect(page.getByTestId("vta-control-key-did")).toHaveAttribute(
       "title",
@@ -96,9 +96,9 @@ test.describe("Connections: control key rotation", () => {
     await page.route(/\/api\/v1\/vta\/status(\?.*)?$/, (route) =>
       route.fulfill({ json: deployment(null) }),
     );
-    await page.goto(`${BASE_URL}/connections?tab=key-management`);
+    await page.goto(`${BASE_URL}/connections?tab=trust-agents`);
 
-    await expect(page.getByTestId("key-management-panel")).toBeVisible();
+    await expect(page.getByTestId("page-trust-agents")).toBeVisible();
     await expect(page.getByTestId("vta-control-key")).toHaveCount(0);
   });
 

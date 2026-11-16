@@ -167,8 +167,8 @@ const ConnectTrustAgentWizardPage: React.FC = () => {
           <div className="card shadow" data-testid="wizard-step-details">
             <div className="card-header py-3">
               <h6 className="m-0 font-weight-bold text-primary">
-                <i className="fas fa-info-circle me-2" aria-hidden="true" /> Enter Trust Agent
-                Details
+                <i className="fas fa-info-circle me-2" aria-hidden="true" /> Enter Verifiable Trust
+                Agent Details
               </h6>
             </div>
             <div className="card-body">
@@ -311,7 +311,7 @@ const ConnectTrustAgentWizardPage: React.FC = () => {
       <div className="d-sm-flex align-items-center justify-content-between mb-4">
         <h1 className="h3 mb-0 text-gray-800">
           <i className="fas fa-robot me-2" aria-hidden="true"></i>
-          Connect a Trust Agent
+          Add a Verifiable Trust Agent
         </h1>
       </div>
 

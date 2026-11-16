@@ -202,7 +202,7 @@ Run live tests with `--test-threads=1`, or give each its own control key.
 A connection added from the dashboard authenticates as a `did:webvh` the gateway publishes at
 `/vta-auth/<id>/did.jsonl`. Its control key can be replaced **without a new grant**: the DID, and
 so the access entry on the trust agent, do not change. Use **Rotate control key** on the
-connection's row on **Connections → Trust Agents**, or
+connection's row on **Connections → Verifiable Trust Agent**, or
 `POST /v1/vta/connections/{id}/control-key/rotate` (key management edit rights).
 
 Three steps, each saved on the connection record before the action that follows it, so a
@@ -242,7 +242,7 @@ When the `[vta]` block authenticates as a `did:key` held in a file
 (`control_did_method = "did_key"`, `auth_key_source = "file://<path>"`, no `auth_did`), the
 gateway can move that key while it runs, with `acl/swap-key`:
 
-- **On demand**: the **Rotate control key** button on **Connections → Key Management** or
+- **On demand**: the **Rotate control key** button on **Connections → Verifiable Trust Agent** or
   `POST /v1/vta/control-key/rotate` (key management edit rights). It answers `404` when the
   gateway holds no such key, `409` while a rotation is running, `429` with a `Retry-After` within
   ten minutes of the last rotation, `503` on a standby gateway and `502` when the trust agent
@@ -294,14 +294,14 @@ credential is issued and signed by that trust agent, under the DID of the contex
 every other surface keeps the default signing. Each agent's own key, and the presentation it
 makes, stay in the default, so a request through such a surface can touch two signers.
 
-In the Surface Builder this is the **Signing** field: **Local** or **Remote**, and Remote picks
-one of the connected trust agents.
+In the Surface Builder this is the **Signing key source** field: **Gateway secret** or
+**Verifiable Trust Agent**, which picks one of the connected agents.
 
 An **Issuer** can set the same `signing` block, which then applies to every surface it owns
 that sets none of its own (`PUT /v1/issuers/{id}`, `signing`; an empty block clears it). A
 signing key resolves in this order, first match wins: a variant's block, the surface's block,
-the owning issuer's block, a tenant mapping, the appliance default (Connections → Key
-Management), then the gateway's own key. An issuer's `connection_id` must name a connection its
+the owning issuer's block, a tenant mapping, the gateway-wide default (Settings → Security →
+Audit signing), then the gateway's own key. An issuer's `connection_id` must name a connection its
 tenant may use, the same rule as a surface's.
 
 ## Bring up a local VTA (for the live e2e)
@@ -572,7 +572,7 @@ pinned to the former, so a passkey returns `401` on any other origin.
 
 #### 3. Connect the agent
 
-**Connections → Trust Agents → Connect an agent** opens the connect wizard (a full
+**Connections → Verifiable Trust Agent → Add VTA** opens the connect wizard (a full
 page, `/connections/trust-agents/connect`). Enter a name, the address `http://127.0.0.1:3000`, the
 DID from step 1, and context `gwtest`, then **Create and pair**.
 
@@ -587,7 +587,7 @@ signing*, pre-checked when no agent is the default yet. **Done** applies it.
 
 #### 4. Confirm the gateway signs through the agent
 
-**Connections → Key Management** should name the connection. Then, in the
+**Settings → Security → Audit signing** should show **Verifiable Trust Agent** with the connection. Then, in the
 browser console on `:8080`:
 
 ```js
@@ -623,17 +623,17 @@ attributing a credential to an issuer that did not sign it.
 separate question. `did:key:…` means it was minted inside the trust agent and
 the gateway never held a private half — the result you want. A
 `did:webvh:…:8443` means the gateway minted it locally, so check that an agent
-is the appliance default in Connections → Key Management.
+is the gateway-wide default in Settings → Security → Audit signing.
 
 This endpoint is **appliance-scoped**: it passes no surface, so a surface's own
-`Signing` does not apply here and changing it will not move these values.
+`Signing key source` does not apply here and changing it will not move these values.
 Use step 5 to exercise that setting.
 
 #### 5. Optional — a surface, end to end
 
 The step above exercises credential issuance. The **injected presentation** on a
 live request is the other half, and the only place a surface's own
-`Signing` applies.
+`Signing key source` applies.
 
 Point an `a2a` surface (not `mcp` — MCP validates every POST and a plain body
 is rejected `-32600`) at any A2A listener. It needs **both** of:
@@ -647,7 +647,7 @@ With the toggle alone the gateway logs *"inject_vp is enabled but no identity
 binding VP was produced"* and signs nothing, so the agent stays idle and looks
 broken when it is behaving correctly.
 
-Set **Signing** to **Remote** and pick the connection, send a valid `message/send` through the
+Set **Signing key source** to **Verifiable Trust Agent** and pick the connection, send a valid `message/send` through the
 surface's route, and inspect
 `message.metadata["https://fabric.affinidi.io/extensions/agent-identity-credential/v1"]`
 on what arrives: the embedded credential's issuer should be the agent.

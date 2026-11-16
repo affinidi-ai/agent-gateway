@@ -77,14 +77,14 @@ const mountSection = async (
 beforeEach(() => mockFetch.mockReset());
 
 describe('SurfaceSigningSection', () => {
-  it('offers exactly two types, Local and Remote', async () => {
+  it('offers exactly two key sources, Gateway secret and Verifiable Trust Agent', async () => {
     await mountSection([connection()]);
 
     expect(
       within(typeSelect())
         .getAllByRole('option')
         .map(o => o.textContent)
-    ).toEqual(["Local — this gateway's own key", 'Remote — a connected trust agent']);
+    ).toEqual(['Gateway secret', 'Verifiable Trust Agent']);
   });
 
   it('follows the appliance default and says so until a type is chosen', async () => {
@@ -92,7 +92,7 @@ describe('SurfaceSigningSection', () => {
 
     expect(typeSelect()).toHaveValue('local');
     expect(screen.getByTestId('surface-signing-inherited')).toHaveTextContent(
-      'Following the appliance default (local)'
+      'Following the gateway-wide default (Gateway secret)'
     );
     expect(screen.queryByTestId('surface-signing-reset')).not.toBeInTheDocument();
     expect(screen.queryByTestId('surface-signing-agent-select')).not.toBeInTheDocument();
@@ -122,7 +122,11 @@ describe('SurfaceSigningSection', () => {
     await userEvent.selectOptions(typeSelect(), 'remote');
     await screen.findByRole('option', { name: 'Custom VTA' });
 
-    expect(agentOptions()).toEqual(['Select a trust agent…', 'Configured VTA', 'Custom VTA']);
+    expect(agentOptions()).toEqual([
+      'Select a Verifiable Trust Agent…',
+      'Configured VTA',
+      'Custom VTA',
+    ]);
     const option = screen.getByRole('option', { name: 'Configured VTA' }) as HTMLOptionElement;
     expect(option.disabled).toBe(false);
 
@@ -144,7 +148,7 @@ describe('SurfaceSigningSection', () => {
     expect(setSigning).toHaveBeenLastCalledWith(undefined);
     expect(typeSelect()).toHaveValue('remote');
     expect(screen.getByTestId('surface-signing-pick-agent')).toHaveTextContent(
-      'follows the appliance default'
+      'follows the gateway-wide default'
     );
   });
 
@@ -155,7 +159,7 @@ describe('SurfaceSigningSection', () => {
     await userEvent.selectOptions(typeSelect(), 'remote');
     await screen.findByRole('option', { name: 'Custom VTA' });
 
-    expect(agentOptions()).toEqual(['Select a trust agent…', 'Custom VTA']);
+    expect(agentOptions()).toEqual(['Select a Verifiable Trust Agent…', 'Custom VTA']);
   });
 
   it('still lists a paired connection that has no key yet, disabled, with the reason', async () => {
@@ -220,7 +224,7 @@ describe('SurfaceSigningSection', () => {
 
     await waitFor(() => expect(typeSelect()).toHaveValue('remote'));
     expect(screen.getByTestId('surface-signing-inherited')).toHaveTextContent(
-      'Following its issuer, Research (remote)'
+      'Following its issuer, Research (Verifiable Trust Agent)'
     );
     await screen.findByRole('option', { name: 'Custom VTA' });
     expect(agentSelect()).toHaveValue('vta-custom');
@@ -245,7 +249,45 @@ describe('SurfaceSigningSection', () => {
     render(<SurfaceSigningSection setSigning={jest.fn()} subject="issuer" />);
 
     expect(await screen.findByTestId('surface-signing-inherited')).toHaveTextContent(
-      "Choose a type to set this issuer's own."
+      "Choose a source to set this issuer's own."
     );
+  });
+
+  describe('as the gateway-wide default', () => {
+    it('shows no inherited note and no way back to one, and renders its actions beside the source', async () => {
+      respond([connection()]);
+      render(
+        <SurfaceSigningSection
+          subject="gateway"
+          setSigning={jest.fn()}
+          actions={<button data-testid="beside-the-source">Connect my own VTA</button>}
+        />
+      );
+
+      await waitFor(() => expect(typeSelect()).toHaveValue('local'));
+      expect(screen.getByTestId('beside-the-source')).toBeInTheDocument();
+      expect(screen.queryByTestId('surface-signing-inherited')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('surface-signing-reset')).not.toBeInTheDocument();
+    });
+
+    it('asks for an agent before saving and reports that one is still to be picked', async () => {
+      respond([connection()]);
+      const pending = jest.fn();
+      render(
+        <SurfaceSigningSection
+          subject="gateway"
+          setSigning={jest.fn()}
+          onRemotePendingChange={pending}
+        />
+      );
+
+      await userEvent.selectOptions(typeSelect(), 'remote');
+
+      expect(screen.getByTestId('surface-signing-pick-agent')).toHaveTextContent(
+        'Choose a Verifiable Trust Agent before saving.'
+      );
+      expect(pending).toHaveBeenLastCalledWith(true);
+      expect(screen.queryByTestId('surface-signing-connect-link')).not.toBeInTheDocument();
+    });
   });
 });

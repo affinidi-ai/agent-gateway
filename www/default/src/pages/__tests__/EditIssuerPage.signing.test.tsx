@@ -80,7 +80,7 @@ describe('EditIssuerPage signing', () => {
 
     expect(typeSelect()).toHaveValue('local');
     expect(screen.getByTestId('surface-signing-inherited')).toHaveTextContent(
-      "Choose a type to set this issuer's own."
+      "Choose a source to set this issuer's own."
     );
   });
 

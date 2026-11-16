@@ -1,6 +1,6 @@
 /**
- * Connections → Trust Agents and Key Management: the list, the full-page connect wizard, and
- * where the old pages went.
+ * Connections → Verifiable Trust Agent, its full-page connect wizard, and Settings → Security →
+ * Audit signing.
  *
  * Every `/vta` call is served by `page.route` mocks, so the spec needs no trust agent. Every
  * control is located by test id.
@@ -73,54 +73,59 @@ async function mockTrustAgents(
   );
 }
 
-test.describe("Connections: Trust Agents and Key Management tabs", () => {
-  test("lists the trust agents beside the other connections", async ({
+const INTRO =
+  "Connect a Verifiable Trust Agent to sign audit records with a key the gateway doesn't control. Anyone can verify your records without having to trust the gateway, and even if the gateway is compromised, its records can't be forged or altered. You keep full control of the agent.";
+
+test.describe("Connections: Verifiable Trust Agent tab", () => {
+  test("lists the agents beside the other connections, with what connecting one gives", async ({
     page,
   }) => {
     await mockTrustAgents(page, [agent()]);
 
     await page.goto(`${BASE_URL}/connections`);
-
     await expect(page.getByTestId("connections-tab-trust-agents")).toHaveText(
-      /Trust Agents/,
+      /Verifiable Trust Agent/,
     );
-    await expect(page.getByTestId("connections-tab-key-management")).toHaveText(
-      /Key Management/,
-    );
+    await expect(
+      page.getByTestId("connections-tab-key-management"),
+    ).toHaveCount(0);
 
     await page.getByTestId("connections-tab-trust-agents").click();
     await expect(page).toHaveURL(/tab=trust-agents/);
     await expect(page.getByTestId("page-trust-agents")).toBeVisible();
+    await expect(page.getByTestId("trust-agents-intro")).toHaveText(INTRO);
     await expect(page.getByText("Production agent")).toBeVisible();
+    await expect(page.getByText(/Signing locally/)).toHaveCount(0);
   });
 
-  test("filters the list with the Connections filter box", async ({ page }) => {
-    await mockTrustAgents(page, [
-      agent(),
-      agent({ id: "agent-2", name: "Staging agent" }),
-    ]);
+  test("has Add VTA and no filter box beside it", async ({ page }) => {
+    await mockTrustAgents(page, [agent()]);
     await page.goto(`${BASE_URL}/connections?tab=trust-agents`);
-    await expect(page.getByText("Staging agent")).toBeVisible();
 
-    await page.getByTestId("connections-search-input").fill("staging");
+    await expect(page.getByTestId("trust-agents-connect-button")).toHaveText(
+      /Add VTA/,
+    );
+    await expect(page.getByTestId("connections-search-input")).toHaveCount(0);
 
-    await expect(page.getByText("Staging agent")).toBeVisible();
-    await expect(page.getByText("Production agent")).toHaveCount(0);
+    await page.goto(`${BASE_URL}/connections?tab=trust-registries`);
+    await expect(page.getByTestId("connections-search-input")).toBeVisible();
   });
 
-  test("says so when there is no trust agent, and offers the wizard", async ({
+  test("says so when there is no agent, and offers Add VTA", async ({
     page,
   }) => {
     await mockTrustAgents(page, []);
     await page.goto(`${BASE_URL}/connections?tab=trust-agents`);
 
-    await page.getByTestId("trust-agents-empty-connect-button").click();
+    const add = page.getByTestId("trust-agents-empty-connect-button");
+    await expect(add).toHaveText(/Add VTA/);
+    await add.click();
 
-    await expect(page).toHaveURL(/\/trust-agents\/connect$/);
+    await expect(page).toHaveURL(/\/connections\/trust-agents\/connect$/);
     await expect(page.getByTestId("wizard-add-trust-agent")).toBeVisible();
   });
 
-  test("has no sidebar entry of its own for trust agents", async ({ page }) => {
+  test("has no sidebar entry of its own", async ({ page }) => {
     await mockTrustAgents(page, [agent()]);
 
     await page.goto(`${BASE_URL}/connections?tab=trust-agents`);
@@ -129,24 +134,89 @@ test.describe("Connections: Trust Agents and Key Management tabs", () => {
     await expect(page.locator('a[href="/trust-agent"]')).toHaveCount(0);
     await expect(page.getByTestId("nav-trust-agent")).toHaveCount(0);
   });
+});
 
-  test("shows signing in Key Management, and Settings no longer has its own card", async ({
+test.describe("Settings → Security → Audit signing", () => {
+  test("is the first section, labelled as the gateway-wide default, with the same choice as a surface", async ({
     page,
   }) => {
     await mockTrustAgents(page, [agent()]);
 
-    await page.goto(`${BASE_URL}/connections?tab=key-management`);
+    await page.goto(`${BASE_URL}/settings`);
+    await page.getByTestId("settings-security-tab-trigger").click();
 
-    await expect(page.getByTestId("key-management-panel")).toBeVisible();
-    await expect(page.getByTestId("key-management-signing-with")).toContainText(
-      "local",
+    const section = page.getByTestId("audit-signing-settings");
+    await expect(section).toBeVisible();
+    await expect(section).toContainText("Audit signing");
+    await expect(page.getByTestId("audit-signing-scope")).toHaveText(
+      "Gateway-wide default",
     );
+    await expect(section).toContainText("Signing key source");
+    await expect(section).not.toContainText("Signing with");
     await expect(
-      page.getByTestId("key-management-connect-button"),
-    ).toBeVisible();
+      section.getByTestId("surface-signing-type-select").locator("option"),
+    ).toHaveText(["Gateway secret", "Verifiable Trust Agent"]);
+    await expect(page.getByTestId("audit-signing-connect-button")).toHaveText(
+      /Connect my own VTA/,
+    );
+    await expect(page.getByTestId("key-management-settings")).toHaveCount(0);
+
+    const first = await page
+      .locator('[data-testid="audit-signing-settings"]')
+      .evaluate(
+        (el) =>
+          el.parentElement?.firstElementChild === el ||
+          el.parentElement?.querySelector(".card") === el,
+      );
+    expect(first, "Audit signing is the first section of the tab").toBe(true);
+  });
+
+  test("saves a Verifiable Trust Agent as the gateway-wide default", async ({
+    page,
+  }) => {
+    await mockTrustAgents(page, [agent()]);
+    const posts: unknown[] = [];
+    await page.route(/\/api\/v1\/settings$/, (route) => {
+      if (route.request().method() === "POST") {
+        posts.push(route.request().postDataJSON());
+        return json(route, {});
+      }
+      return route.fallback();
+    });
 
     await page.goto(`${BASE_URL}/settings`);
-    await expect(page.getByTestId("key-management-settings")).toHaveCount(0);
+    await page.getByTestId("settings-security-tab-trigger").click();
+    const section = page.getByTestId("audit-signing-settings");
+    await section
+      .getByTestId("surface-signing-type-select")
+      .selectOption("remote");
+    await expect(page.getByTestId("audit-signing-save-button")).toBeDisabled();
+    await section
+      .getByTestId("surface-signing-agent-select")
+      .selectOption("agent-1");
+    await page.getByTestId("audit-signing-save-button").click();
+
+    await expect(page.getByTestId("audit-signing-saved")).toBeVisible();
+    expect(posts).toEqual([
+      {
+        default_signing: {
+          backend: "vta",
+          connection_id: "agent-1",
+          context_id: "gateway",
+          key_id: "key-1",
+        },
+      },
+    ]);
+  });
+
+  test("Connect my own VTA opens the wizard", async ({ page }) => {
+    await mockTrustAgents(page, [agent()]);
+    await page.goto(`${BASE_URL}/settings`);
+    await page.getByTestId("settings-security-tab-trigger").click();
+
+    await page.getByTestId("audit-signing-connect-button").click();
+
+    await expect(page).toHaveURL(/\/connections\/trust-agents\/connect$/);
   });
 });
 

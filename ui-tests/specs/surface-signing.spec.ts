@@ -1,5 +1,6 @@
 /**
- * Surface Builder → Surface → Signing: Local or Remote, and a connected trust agent for Remote.
+ * Surface Builder → Surface → Signing key source: Gateway secret or Verifiable Trust Agent, and a
+ * connected agent for the latter.
  *
  * The trust agent calls are served by `page.route` mocks, so the spec needs no trust agent. Every
  * control is located by test id.
@@ -63,26 +64,26 @@ async function openSurfacePanel(
 }
 
 test.describe("Surface signing", () => {
-  test("offers Local and Remote, and follows the appliance default until chosen", async ({
+  test("offers Gateway secret and Verifiable Trust Agent, and follows the gateway-wide default until chosen", async ({
     page,
   }) => {
     await openSurfacePanel(page, [agent()]);
 
     const type = page.getByTestId("surface-signing-type-select");
     await expect(type.locator("option")).toHaveText([
-      "Local — this gateway's own key",
-      "Remote — a connected trust agent",
+      "Gateway secret",
+      "Verifiable Trust Agent",
     ]);
     await expect(type).toHaveValue("local");
     await expect(page.getByTestId("surface-signing-inherited")).toContainText(
-      "Following the appliance default (local)",
+      "Following the gateway-wide default (Gateway secret)",
     );
     await expect(page.getByTestId("surface-signing-agent-select")).toHaveCount(
       0,
     );
   });
 
-  test("Remote lists the connected trust agents and links to the connect wizard in a new tab", async ({
+  test("Verifiable Trust Agent lists the connected agents and links to the connect wizard in a new tab", async ({
     page,
   }) => {
     await openSurfacePanel(page, [
@@ -97,7 +98,7 @@ test.describe("Surface signing", () => {
     const picker = page.getByTestId("surface-signing-agent-select");
     await expect(picker).toBeVisible();
     await expect(picker.locator("option")).toHaveText([
-      "Select a trust agent…",
+      "Select a Verifiable Trust Agent…",
       "Production agent",
       "No key yet — not ready: connect it and provision a key first",
     ]);
@@ -105,7 +106,10 @@ test.describe("Surface signing", () => {
     await expect(page.getByTestId("surface-signing-pick-agent")).toBeVisible();
 
     const link = page.getByTestId("surface-signing-connect-link");
-    await expect(link).toHaveAttribute("href", "/connections/trust-agents/connect");
+    await expect(link).toHaveAttribute(
+      "href",
+      "/connections/trust-agents/connect",
+    );
     await expect(link).toHaveAttribute("target", "_blank");
   });
 
@@ -129,7 +133,7 @@ test.describe("Surface signing", () => {
     await expect(page.locator("body")).toContainText("agent-1");
   });
 
-  test("shows Remote when the appliance default signs through a trust agent", async ({
+  test("shows Verifiable Trust Agent when the gateway-wide default signs through one", async ({
     page,
   }) => {
     await openSurfacePanel(page, [agent()], "vta");
@@ -138,11 +142,11 @@ test.describe("Surface signing", () => {
       "remote",
     );
     await expect(page.getByTestId("surface-signing-inherited")).toContainText(
-      "Following the appliance default (remote)",
+      "Following the gateway-wide default (Verifiable Trust Agent)",
     );
   });
 
-  test("a chosen trust agent can be handed back to the appliance default", async ({
+  test("a chosen agent can be handed back to the gateway-wide default", async ({
     page,
   }) => {
     await openSurfacePanel(page, [agent()]);

@@ -89,9 +89,11 @@ test.describe("Issuer signing", () => {
     await expect(page.getByTestId("issuers-signing-inherit")).toHaveText(
       "Default",
     );
-    await expect(page.getByTestId("issuers-signing-local")).toHaveText("Local");
+    await expect(page.getByTestId("issuers-signing-local")).toHaveText(
+      "Gateway secret",
+    );
     await expect(page.getByTestId("issuers-signing-remote")).toHaveText(
-      "Remote · Production agent",
+      "VTA · Production agent",
     );
   });
 

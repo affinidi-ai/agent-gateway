@@ -177,20 +177,24 @@ changes:
         rather than refused. The gateway will not sign if the agent's own
         context is not the holder the presentation names.
     - timestamp: '2026-11-16T12:05:00Z'
-      title: Manage trust agents and key management from the Connections page
+      title: Add Verifiable Trust Agents in Connections and set audit signing in Settings
       description: >-
-        Trust Agents and Key Management are now tabs of Connections, beside
-        Gateways, Mediators and Registries, and the separate Trust Agent page and
-        the Key management card in Settings are gone. Connect an agent opens a
-        full-page wizard with a step bar instead of a pop-up. The Mediators and Registries
-        tabs now show only to users who may view them.
+        Verifiable Trust Agents are now a tab of Connections, beside Gateways,
+        Mediators and Registries, opening with what connecting one gives, with
+        Add VTA and no filter box; the separate Trust Agent page and its signing
+        banner are gone. Add VTA opens a full-page wizard with a step bar instead
+        of a pop-up. The gateway-wide default moves to Settings, Security, Audit
+        signing, which holds only the signing key source and Connect my own VTA.
+        The Mediators and Registries tabs now show only to users who may view
+        them.
     - timestamp: '2026-11-16T12:10:00Z'
-      title: Pick Local or Remote signing for a surface, then a connected trust agent
+      title: Choose a surface's signing key source, Gateway secret or Verifiable Trust Agent
       description: >-
-        The Surface Builder's signing choice is now two options, Local and
-        Remote, and Remote lists the connected trust agents with a link to
-        connect another. A surface that sets nothing shows what it follows, its
-        issuer's choice or the appliance default, and can be handed back to it.
+        The Surface Builder's signing choice is now a Signing key source with two
+        options, Gateway secret and Verifiable Trust Agent, which lists the
+        connected agents with a link to add another. A surface that sets nothing
+        shows what it follows, its issuer's source or the gateway-wide default,
+        and can be handed back to it.
   fixed:
     - timestamp: '2026-11-10T14:00:00Z'
       title: Retry a trust agent call whose session a key change ended

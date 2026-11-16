@@ -174,11 +174,17 @@ test.describe("Connections against a real trust agent", () => {
     expect(after.pairing.granted_contexts).toEqual([CONTEXT]);
     expect(after.keys?.active?.key_id).toBeTruthy();
 
-    // Key Management names the agent once the wizard's "use for all signing" was applied.
-    await page.goto(`${BASE_URL}/connections?tab=key-management`);
-    await expect(page.getByTestId("key-management-signing-with")).toContainText(
-      NAME,
-    );
+    // Audit signing shows the agent as the gateway-wide default once the wizard's
+    // "use for all signing" was applied.
+    await page.goto(`${BASE_URL}/settings`);
+    await page.getByTestId("settings-security-tab-trigger").click();
+    const auditSigning = page.getByTestId("audit-signing-settings");
+    await expect(
+      auditSigning.getByTestId("surface-signing-type-select"),
+    ).toHaveValue("remote");
+    await expect(
+      auditSigning.getByTestId("surface-signing-agent-select"),
+    ).toHaveValue(state.id);
 
     // An issuer takes the agent to sign for its surfaces, from the issuer editor.
     await page.goto(`${BASE_URL}/identities?tab=issuers`);
@@ -204,7 +210,7 @@ test.describe("Connections against a real trust agent", () => {
       context_id: CONTEXT,
     });
     await expect(page.getByTestId(`issuers-signing-${issuer.id}`)).toHaveText(
-      `Remote · ${NAME}`,
+      `VTA · ${NAME}`,
     );
   });
 });

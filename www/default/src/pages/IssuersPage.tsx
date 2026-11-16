@@ -30,11 +30,11 @@ const signingLabel = (
   agentNames: Record<string, string>
 ): React.ReactNode => {
   if (isSigningEmpty(signing)) return <span className="text-muted">Default</span>;
-  if (signing?.backend === 'local') return 'Local';
+  if (signing?.backend === 'local') return 'Gateway secret';
   const name = signing?.connection_id
     ? (agentNames[signing.connection_id] ?? signing.connection_id)
     : null;
-  return name ? `Remote · ${name}` : 'Remote';
+  return name ? `VTA · ${name}` : 'VTA';
 };
 
 interface IssuersPageProps {
@@ -221,7 +221,7 @@ const IssuersPage: React.FC<IssuersPageProps> = ({
                     <tr>
                       <th>Name</th>
                       <th style={{ width: '35%' }}>DID</th>
-                      <th>Signing</th>
+                      <th>Signing key source</th>
                       <th>Trust Registry Status</th>
                       <th>Actions</th>
                     </tr>

@@ -28,9 +28,7 @@ jest.mock(
       <div data-testid="stub-trust-agents" data-has-actions={String(!!actionsContainer)} />
     )
 );
-jest.mock('../VtaConnectionsPage/KeyManagementPanel', () => ({
-  KeyManagementPanel: () => <div data-testid="stub-key-management" />,
-}));
+
 jest.mock(
   '../PaymentGatewaysPage',
   () =>
@@ -130,45 +128,45 @@ describe('ConnectionsPage', () => {
     expect(activeTab()).toContain('Payment Gateways');
   });
 
-  describe('Trust Agents and Key Management', () => {
-    it('shows both tabs to a user with vta_connections.view', () => {
+  describe('Verifiable Trust Agent', () => {
+    it('shows the tab to a user with vta_connections.view, and no Key Management tab', () => {
       mockPermissions = { 'gateways.view': true, 'vta_connections.view': true };
       renderPage();
 
-      expect(screen.getByTestId('connections-tab-trust-agents')).toHaveTextContent('Trust Agents');
-      expect(screen.getByTestId('connections-tab-key-management')).toHaveTextContent(
-        'Key Management'
+      expect(screen.getByTestId('connections-tab-trust-agents')).toHaveTextContent(
+        'Verifiable Trust Agent'
       );
-    });
-
-    it('hides both tabs without vta_connections.view', () => {
-      renderPage();
-
-      expect(screen.queryByTestId('connections-tab-trust-agents')).not.toBeInTheDocument();
       expect(screen.queryByTestId('connections-tab-key-management')).not.toBeInTheDocument();
     });
 
-    it('opens Trust Agents from ?tab= and hands it the actions banner', () => {
+    it('hides the tab without vta_connections.view', () => {
+      renderPage();
+
+      expect(screen.queryByTestId('connections-tab-trust-agents')).not.toBeInTheDocument();
+    });
+
+    it('opens from ?tab= and hands the tab the actions banner', () => {
       mockPermissions = { 'vta_connections.view': true };
       renderPage('/connections?tab=trust-agents');
 
-      expect(activeTab()).toContain('Trust Agents');
+      expect(activeTab()).toContain('Verifiable Trust Agent');
       expect(screen.getByTestId('stub-trust-agents')).toHaveAttribute('data-has-actions', 'true');
     });
 
-    it('opens Key Management from ?tab= and shows its panel', () => {
-      mockPermissions = { 'vta_connections.view': true };
-      renderPage('/connections?tab=key-management');
+    it('shows no filter box on the Verifiable Trust Agent tab, and the box on the others', () => {
+      mockPermissions = { 'gateways.view': true, 'vta_connections.view': true };
+      renderPage('/connections?tab=trust-agents');
+      expect(screen.queryByTestId('connections-search-input')).not.toBeInTheDocument();
 
-      expect(activeTab()).toContain('Key Management');
-      expect(screen.getByTestId('stub-key-management')).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId('connections-gateways-tab-trigger'));
+      expect(screen.getByTestId('connections-search-input')).toBeInTheDocument();
     });
 
-    it('opens on Trust Agents for a user who may see only trust agents, with no other tab', () => {
+    it('opens on the Verifiable Trust Agent tab for a user who may see only trust agents', () => {
       mockPermissions = { 'vta_connections.view': true };
       renderPage();
 
-      expect(activeTab()).toContain('Trust Agents');
+      expect(activeTab()).toContain('Verifiable Trust Agent');
       expect(screen.queryByTestId('stub-gateways')).not.toBeInTheDocument();
       expect(screen.queryByTestId('stub-mediators')).not.toBeInTheDocument();
       expect(screen.queryByTestId('stub-registries')).not.toBeInTheDocument();
@@ -190,9 +188,9 @@ describe('ConnectionsPage', () => {
       mockPermissions = { 'gateways.view': true, 'vta_connections.view': true };
       renderPage();
 
-      fireEvent.click(screen.getByTestId('connections-tab-key-management'));
+      fireEvent.click(screen.getByTestId('connections-tab-trust-agents'));
 
-      expect(screen.getByTestId('where')).toHaveTextContent('?tab=key-management');
+      expect(screen.getByTestId('where')).toHaveTextContent('?tab=trust-agents');
     });
   });
 });

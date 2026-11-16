@@ -1547,54 +1547,39 @@ parts `IdentityNameCell`, `IdentitySurfaceCell`, `IdentityOriginBadge`,
 | Tooltip last attempt, reason   | `identities-recorder-last-attempt`, `identities-recorder-reason`         |
 | Tooltip registry entry         | `identities-recorder-entry-<registry id>`                                |
 
-## Trust Agents and Key Management tabs
+## Verifiable Trust Agent tab and Audit signing
 
 There is no Trust Agent page and no `/trust-agent` address: the sidebar has no entry for it, and
-trust agents are **connections**, so they live on the Connections page (see _Connections page_) as two tabs, both shown only with `vta_connections.view`:
+Verifiable Trust Agents are **connections**, so they live on the Connections page as the
+**Verifiable Trust Agent** tab (`connections-tab-trust-agents`, `?tab=trust-agents`), shown only
+with `vta_connections.view`. The gateway-wide signing default is set in **Settings → Security →
+Audit signing**, not on Connections.
 
-- **Trust Agents** (`pages/TrustAgentsPage.tsx`, `data-testid="page-trust-agents"`) lists the
-  Verifiable Trust Agent connections the way the other tabs list theirs: it takes the shared
-  filter (`externalSearchTerm`, matching name, DID and address), reports its counts
-  (`onCountChange`) and portals **Connect an agent** (`trust-agents-connect-button`, shown only
-  with `vta_connections.edit`) into the tab banner through `actionsContainer`. With no
-  connection an `EmptyState` says the gateway signs with its own key and has the same action
-  (`trust-agents-empty-connect-button`).
-- **Key Management** (`pages/VtaConnectionsPage/KeyManagementPanel.tsx`,
-  `data-testid="key-management-panel"`) states which signing tier the gateway is on and what
-  signs for it. It was a collapsible card under Settings; Settings no longer has it.
+### Verifiable Trust Agent tab
 
-### Key Management tab
+`pages/TrustAgentsPage.tsx` (`data-testid="page-trust-agents"`) lists the connections the way the
+other tabs list theirs, reports its counts (`onCountChange`) and portals **Add VTA**
+(`trust-agents-connect-button`, shown only with `vta_connections.edit`) into the tab banner
+through `actionsContainer`. The Connections filter box is not shown on this tab. The tab opens with
+this text (`trust-agents-intro`), which the empty state also uses with the same **Add VTA**
+action (`trust-agents-empty-connect-button`):
 
-The tier banner (`VtaTierBanner`) reads `GET /v1/vta/status` and never derives anything itself:
+> Connect a Verifiable Trust Agent to sign audit records with a key the gateway doesn't control.
+> Anyone can verify your records without having to trust the gateway, and even if the gateway is
+> compromised, its records can't be forged or altered. You keep full control of the agent.
 
-- `custody_claim` is computed by the backend. It is false for local signing and for a trust
-  agent the operator runs, and the banner then does not claim custody. Local signing reads
-  "signed with this gateway's own keys"; an enabled (`self-hosted`) tier is a trust agent the
-  operator runs. Never write copy that implies custody while it is false.
-- Under the banner, while `control_key` of the status is present (the gateway holds a rotatable
-  `did:key` control key for a `[vta]` connection), the **Control key** card (`ControlKeyCard`,
-  `data-testid="vta-control-key"`) shows the key this gateway signs in to its trust agent with
-  (shortened, full value in the `title`, with a copy button: `vta-control-key-did`), when it was
-  last rotated or "Never rotated" (`vta-control-key-rotated-at`), and when it is next due or
-  "Automatic rotation is off" when `rotation_days` is 0 (`vta-control-key-next`), from
-  `control_key.rotated_at`, `next_rotation_at` and `rotation_days`. The card is not rendered
-  while `control_key` is absent. **Rotate control key** (`vta-control-key-rotate`) is shown only
-  with `key_management.edit`. It asks first (an inline confirmation, `vta-control-key-confirm` /
-  `-cancel`) and then posts to `POST /v1/vta/control-key/rotate`; a `429` reads "Try again in N
-  minutes" from `Retry-After`, any other refusal shows the gateway's message, and a success
-  toasts the new DID and reloads the tab's status. The card says rotation changes no signing
-  key; keep that true.
-- The **Signing** card reports what is in force: a default chosen in the picker
-  (`DefaultSigningPicker`, stored in `default_signing`, shown with `settings.edit` and
-  `vta_connections.view`) wins over what the configuration resolves to (`default_resolution` of
-  `GET /v1/vta/status`), in `key-management-signing-with`. The picker's first option clears the
-  stored choice, which hands signing back to the configuration, so it is named for what that
-  resolves to: "The configured agent (from the [vta] block)" or "This gateway's own key
-  (local)". The `[vta]` connection is not listed again, and the confirmation stays visible after
-  a save because the picker stays mounted. **Connect my own trust agent**
-  (`key-management-connect-button`, `vta_connections.edit`) opens the connect wizard.
-
-### Trust Agents tab rows
+The tab shows no signing tier banner. Under the text, while `control_key` of `GET /v1/vta/status`
+is present (the gateway holds a rotatable `did:key` control key for a `[vta]` connection), the
+**Control key** card (`ControlKeyCard`, `data-testid="vta-control-key"`) shows the key this
+gateway signs in to its trust agent with (shortened, full value in the `title`, with a copy
+button: `vta-control-key-did`), when it was last rotated or "Never rotated"
+(`vta-control-key-rotated-at`), and when it is next due or "Automatic rotation is off" when
+`rotation_days` is 0 (`vta-control-key-next`). The card is not rendered while `control_key` is
+absent. **Rotate control key** (`vta-control-key-rotate`) is shown only with
+`key_management.edit`. It asks first (an inline confirmation, `vta-control-key-confirm` /
+`-cancel`) and then posts to `POST /v1/vta/control-key/rotate`; a `429` reads "Try again in N
+minutes" from `Retry-After`, any other refusal shows the gateway's message, and a success toasts
+the new DID and reloads. The card says rotation changes no signing key; keep that true.
 
 The table reads `GET /v1/vta/connections`:
 
@@ -1614,62 +1599,76 @@ The table reads `GET /v1/vta/connections`:
 - The `vta-bootstrap` record is the `[vta]` configuration block's; the backend reports its
   pairing state, and the tab offers no Revoke on it (`canRevoke`) or Verify (`canVerify`), since
   the server refuses both. It has no row rotate button either: its control key is rotated from
-  the Control key card on the Key Management tab.
-- A row opens the connect wizard at its grant step (`/connections/trust-agents/connect?id=<id>`), or at the
-  last step when it is already connected.
+  the Control key card.
+- A row opens the connect wizard at its grant step, or at the last step when it is connected.
 
-### Connect Trust Agent wizard
+### Add a Verifiable Trust Agent wizard
 
-`/connections/trust-agents/connect` (`pages/ConnectTrustAgentWizardPage.tsx`, `vta_connections.edit`, root
-`wizard-add-trust-agent`) is a full page with the shared step bar
+`/connections/trust-agents/connect` (`pages/ConnectTrustAgentWizardPage.tsx`,
+`vta_connections.edit`, root `wizard-add-trust-agent`) is a full page with the shared step bar
 (`components/shared/WizardProgress.tsx`), like the other connect wizards: nothing opens in a
-pop-up. Steps, with the shared navigation test ids (`wizard-next`, `wizard-back`,
-`wizard-cancel`, `wizard-submit`):
+pop-up. It sits under `/connections` so it needs no reserved top-level path of its own. Steps,
+with the shared navigation test ids (`wizard-next`, `wizard-back`, `wizard-cancel`,
+`wizard-submit`):
 
 1. **Enter Details** (`wizard-step-details`, fields `wizard-trust-agent-name-input`,
    `-endpoint-input`, `-did-input`, `-context-input`, all required: the grant is scoped to the one
    context, so it is asked for up front). **Create and pair** posts the connection (always over
    HTTPS) and puts no key material in the form; a refusal shows in `wizard-trust-agent-error`.
 2. **Grant Access** (`wizard-step-grant`) shows the `vta acl create` command to run on your own
-   trust agent. It grants the `initiator` role in that one context with four capabilities, never
+   agent. It grants the `initiator` role in that one context with four capabilities, never
    administration, and the copy says so. An expired command offers a new one; **Finish later**
    leaves with the connection saved.
 3. **Verify** (`wizard-step-verify`) checks the grant; a refusal shows its reason and a retry.
 4. **Complete** (`wizard-step-complete`) mints the connection's signing key and offers **Use this
-   agent for all signing**, pre-checked only when the appliance has no stored default yet
+   agent for all signing**, pre-checked only when the gateway has no stored default yet
    (`default_signing.connection_id` in `GET /v1/settings`): connecting a second agent must never
-   silently repoint signing away from one. **Done** returns to the Trust Agents tab.
+   silently repoint signing away from one. **Done** returns to the tab.
 
 `?id=` resumes a created connection at the grant step, or at the last step when it is connected.
 
-### Where a trust agent can be chosen
+### Audit signing
 
-- The Surface Builder's **Signing** (`SurfaceSigningSection`) is an Endpoint-Type-style select
-  with two options, **Local** (this gateway's own key) and **Remote** (a connected trust agent)
-  (`surface-signing-type-select`). Remote shows a **Trust agent** select
-  (`surface-signing-agent-select`) of the connections, a link that opens the connect wizard in a
-  new tab (`surface-signing-connect-link`) and a Refresh (`surface-signing-refresh`). Only a
-  connected, enabled connection with an active key can be chosen; a paired one without a key is
-  listed disabled with the reason. The `[vta]` block's own record (`vta-bootstrap`) is offered
-  once it is connected and shows its signing key (`keys.active`); while it is not connected it is
-  left out rather than shown as "not ready", unless the surface already saved it, so the select
-  is never blank. A surface that sets nothing follows its issuer's choice, then the appliance
-  default: the type shown is the one it follows, with a note (`surface-signing-inherited`) saying
-  which, and **Use the appliance default** (`surface-signing-reset`) takes an own choice back.
-  Remote with no agent yet stores nothing and says what applies meanwhile
-  (`surface-signing-pick-agent`).
-- The Identities page's **Issuers** tab lists a **Signing** column (`issuers-signing-<id>`:
-  Default, Local, or Remote with the agent's name), and the issuer editor
-  (`data-testid="issuer-signing"`) uses the same section, worded for an issuer: the choice applies
+**Settings → Security** opens with **Audit signing** (`pages/SettingsPage/AuditSigningSection.tsx`,
+`data-testid="audit-signing-settings"`), labelled as the **Gateway-wide default**
+(`audit-signing-scope`). It holds only the **Signing key source** choice (`SurfaceSigningSection`
+with `subject="gateway"`), with **Connect my own VTA** as a button beside it
+(`audit-signing-connect-button`, `vta_connections.edit`, opens the wizard), and **Save**
+(`audit-signing-save-button`, `settings.edit`, disabled until something changed and while
+Verifiable Trust Agent is chosen without an agent; `audit-signing-saved` after a save). Saving
+posts `default_signing` to `POST /v1/settings`: `{ "backend": "local" }` for Gateway secret, or
+the chosen agent with its context and key. No text sits above the choice, and there is no
+inherited note: the gateway default inherits from nothing. Without `settings.edit` the choice is
+read-only and there is no Save or Connect.
+
+### Signing key source
+
+Wherever a signing key is chosen, the field is **Signing key source** (`SurfaceSigningSection`,
+`surface-signing-type-select`) with two options, **Gateway secret** (this gateway's own key) and
+**Verifiable Trust Agent** (`SIGNING_TYPE_LABELS`). Verifiable Trust Agent shows an **Agent**
+select (`surface-signing-agent-select`) of the connections; for a surface or issuer it also shows
+**Add VTA**, which opens the wizard in a new tab (`surface-signing-connect-link`), and a Refresh
+(`surface-signing-refresh`). Only a connected, enabled connection with an active key can be chosen;
+a paired one without a key is listed disabled with the reason. The `[vta]` block's own record
+(`vta-bootstrap`) is offered once it is connected; while it is not, it is left out unless the
+surface already saved it, so the select is never blank. Verifiable Trust Agent with no agent yet
+stores nothing and says what applies meanwhile (`surface-signing-pick-agent`).
+
+- **Surface Builder → Surface**: a surface that sets nothing follows its issuer's source, then
+  the gateway-wide default; the source shown is the one it follows, with a note
+  (`surface-signing-inherited`) saying which, and **Use the gateway-wide default**
+  (`surface-signing-reset`) takes an own choice back.
+- **Identity → Issuers**: the list has a **Signing key source** column (`issuers-signing-<id>`:
+  Default, Gateway secret, or `VTA · <agent name>`), and the issuer editor
+  (`data-testid="issuer-signing"`) uses the same field, worded for an issuer: the choice applies
   to every surface the issuer owns that sets none of its own. Saving an issuer sends its
   `signing`; an empty block clears it.
 
 ## Connections page
 
 `/connections` (`pages/ConnectionsPage.tsx`) has the tabs **Gateways**, **Payment Gateways**,
-**Mediators**, **Registries**, **Trust Agents** and **Key Management**, kept in `?tab=`
-(`gateways`, `payment-gateways`, `mediators`, `trust-registries`, `trust-agents`,
-`key-management`). The active tab follows the URL, so a link to another tab of
+**Mediators**, **Registries** and **Verifiable Trust Agent**, kept in `?tab=`
+(`gateways`, `payment-gateways`, `mediators`, `trust-registries`, `trust-agents`). The active tab follows the URL, so a link to another tab of
 the page switches it; an unknown or hidden value opens the first tab shown. The page (route and
 sidebar entry) opens with `gateways.view`, `vta_connections.view`, or also with
 `payment_gateways.view` while `agent_pay_delegation` is on (`ProtectedRoute` accepts a list, any
@@ -1677,9 +1676,9 @@ one of which is enough; the route waits for the settings before deciding). Each 
 with its own view permission: **Gateways** `gateways.view`, **Payment Gateways**
 (`connections-tab-payment-gateways`) `payment_gateways.view` and `agent_pay_delegation` on (see
 _Feature flags_), **Mediators** `mediators.view`, **Registries** `trust_registries.view`,
-**Trust Agents** (`connections-tab-trust-agents`) and **Key Management**
-(`connections-tab-key-management`) `vta_connections.view`; see _Trust Agents and Key Management
-tabs_. One filter box serves every tab; each tab reports its
+**Verifiable Trust Agent** (`connections-tab-trust-agents`) `vta_connections.view`; see
+_Verifiable Trust Agent tab and Audit signing_. One filter box serves every tab but the
+Verifiable Trust Agent one, which shows none; each tab reports its
 filtered and total counts (`onCountChange`) for the badge, and a tab given `actionsContainer`
 portals its add button into the tab banner.
 

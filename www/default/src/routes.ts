@@ -11,7 +11,6 @@ export const ROUTES = {
   PAYMENT_GATEWAYS_TAB: '/connections?tab=payment-gateways',
   TRUST_AGENT_CONNECT: '/connections/trust-agents/connect',
   TRUST_AGENTS_TAB: '/connections?tab=trust-agents',
-  KEY_MANAGEMENT_TAB: '/connections?tab=key-management',
 } as const;
 
 /** The connect wizard, resumed at the grant step of a trust agent connection that was created. */

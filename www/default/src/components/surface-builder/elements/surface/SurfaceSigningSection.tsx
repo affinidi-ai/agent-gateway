@@ -9,12 +9,26 @@ import { ROUTES } from '../../../../routes';
 
 type SigningType = 'local' | 'remote';
 
+/** The two signing key sources, worded the same wherever one is chosen. */
+export const SIGNING_TYPE_LABELS: Record<SigningType, string> = {
+  local: 'Gateway secret',
+  remote: 'Verifiable Trust Agent',
+};
+
 interface Props {
   signing?: SurfaceSigning;
   setSigning: (value: SurfaceSigning | undefined) => void;
   disabled?: boolean;
-  /** What the choice is for: one surface, or every surface an issuer owns. */
-  subject?: 'surface' | 'issuer';
+  /**
+   * What the choice is for: one surface, every surface an issuer owns, or the gateway-wide
+   * default. The gateway default has nothing to inherit, so it shows no inherited note and no
+   * way back to one.
+   */
+  subject?: 'surface' | 'issuer' | 'gateway';
+  /** Rendered beside the source select, such as a button that connects an agent. */
+  actions?: React.ReactNode;
+  /** Reports whether Verifiable Trust Agent is chosen with no agent picked yet. */
+  onRemotePendingChange?: (pending: boolean) => void;
   /** The issuer that owns this surface, whose own choice a surface that sets nothing follows. */
   owner?: { name: string; signing?: SurfaceSigning };
 }
@@ -25,7 +39,7 @@ interface Props {
  *
  * A surface that sets nothing inherits the appliance default, and says so rather than hiding that
  * nothing is configured: the type shown is the one the default resolves to, and it only becomes
- * the surface's own once the operator picks one. **Use the appliance default** takes it back.
+ * the surface's own once the operator picks one. **Use the gateway-wide default** takes it back.
  *
  * Only `connected` + `enabled` connections carrying an active key can be chosen, mirroring the
  * backend's `assert_usable`. A connection that is paired but has no key is listed and disabled
@@ -37,6 +51,8 @@ export const SurfaceSigningSection: React.FC<Props> = ({
   disabled,
   subject = 'surface',
   owner,
+  actions,
+  onRemotePendingChange,
 }) => {
   const [connections, setConnections] = useState<VtaConnection[]>([]);
   const [loadError, setLoadError] = useState(false);
@@ -73,6 +89,10 @@ export const SurfaceSigningSection: React.FC<Props> = ({
       alive = false;
     };
   }, [loadConnections]);
+
+  useEffect(() => {
+    onRemotePendingChange?.(remotePending);
+  }, [remotePending, onRemotePendingChange]);
 
   const inherited = !signing?.backend;
   // What this surface follows while it sets nothing: its issuer's choice, then the appliance default.
@@ -139,44 +159,54 @@ export const SurfaceSigningSection: React.FC<Props> = ({
     setSigning(undefined);
   };
 
+  const inheritable = subject !== 'gateway';
+  const followed = ownerSigning
+    ? SIGNING_TYPE_LABELS[ownerSigning.backend === 'local' ? 'local' : 'remote']
+    : null;
+  const help =
+    (subject === 'gateway'
+      ? 'Which key signs audit records and credentials for every surface that sets no source of its own, and every issuer. '
+      : subject === 'issuer'
+        ? 'Which key signs credentials for the surfaces this issuer owns. A surface that sets its own source keeps it. '
+        : 'Which key signs credentials issued for this surface. ') +
+    "Gateway secret is this gateway's own key. Verifiable Trust Agent signs through an agent you have connected (Connections → Verifiable Trust Agent), with a key the gateway does not control. " +
+    (subject === 'gateway'
+      ? ''
+      : subject === 'issuer'
+        ? 'An issuer that sets neither follows the gateway-wide default (Settings → Security → Audit signing).'
+        : "A surface that sets neither follows its issuer's source, then the gateway-wide default (Settings → Security → Audit signing).");
+
   return (
     <Form.Group className="mb-3">
       <div className="d-flex align-items-center gap-1 mb-1">
         <Form.Label htmlFor="surface-signing-type-select" className="mb-0">
-          Signing
+          Signing key source
         </Form.Label>
-        <FieldHelp
-          text={
-            (subject === 'issuer'
-              ? 'Which backend signs credentials issued for the surfaces this issuer owns. A surface that sets its own signing keeps it. '
-              : 'Which backend signs credentials issued for this surface. ') +
-            "Local uses this gateway's own key. Remote signs through a trust agent you have connected (Connections → Trust Agents), in the context and with the key of that connection. " +
-            (subject === 'issuer'
-              ? 'An issuer that sets neither follows the appliance default (Connections → Key Management).'
-              : "A surface that sets neither follows its issuer's choice, then the appliance default (Connections → Key Management).")
-          }
-        />
+        <FieldHelp text={help} />
       </div>
-      <Form.Select
-        id="surface-signing-type-select"
-        data-testid="surface-signing-type-select"
-        value={type}
-        disabled={disabled}
-        onChange={event => chooseType(event.target.value)}
-      >
-        <option value="local">Local — this gateway&apos;s own key</option>
-        <option value="remote">Remote — a connected trust agent</option>
-      </Form.Select>
+      <div className="d-flex align-items-center gap-2">
+        <Form.Select
+          id="surface-signing-type-select"
+          data-testid="surface-signing-type-select"
+          value={type}
+          disabled={disabled}
+          onChange={event => chooseType(event.target.value)}
+        >
+          <option value="local">{SIGNING_TYPE_LABELS.local}</option>
+          <option value="remote">{SIGNING_TYPE_LABELS.remote}</option>
+        </Form.Select>
+        {actions}
+      </div>
 
-      {inherited && !remotePending && (
+      {inheritable && inherited && !remotePending && (
         <Form.Text className="d-block text-muted" data-testid="surface-signing-inherited">
-          {ownerSigning
-            ? `Following its issuer, ${owner?.name} (${ownerSigning.backend === 'local' ? 'local' : 'remote'}).`
-            : `Following the appliance default (${defaultBackend === 'local' ? 'local' : 'remote'}).`}{' '}
-          Choose a type to set {subject === 'issuer' ? "this issuer's" : "this surface's"} own.
+          {followed
+            ? `Following its issuer, ${owner?.name} (${followed}).`
+            : `Following the gateway-wide default (${SIGNING_TYPE_LABELS[defaultBackend === 'local' ? 'local' : 'remote']}).`}{' '}
+          Choose a source to set {subject === 'issuer' ? "this issuer's" : "this surface's"} own.
         </Form.Text>
       )}
-      {!inherited && (
+      {inheritable && !inherited && (
         <button
           type="button"
           className="btn btn-link btn-sm p-0"
@@ -184,14 +214,14 @@ export const SurfaceSigningSection: React.FC<Props> = ({
           disabled={disabled}
           onClick={useDefault}
         >
-          Use the appliance default
+          Use the gateway-wide default
         </button>
       )}
 
       {type === 'remote' && (
         <div className="mt-2">
           <Form.Label htmlFor="surface-signing-agent-select" className="small text-muted mb-1">
-            Trust agent
+            Agent
           </Form.Label>
           <Form.Select
             id="surface-signing-agent-select"
@@ -201,7 +231,7 @@ export const SurfaceSigningSection: React.FC<Props> = ({
             disabled={disabled}
             onChange={event => chooseAgent(event.target.value)}
           >
-            <option value="">Select a trust agent…</option>
+            <option value="">Select a Verifiable Trust Agent…</option>
             {connections.filter(listed).map(connection => (
               <option key={connection.id} value={connection.id} disabled={!ready(connection)}>
                 {connection.name}
@@ -209,29 +239,34 @@ export const SurfaceSigningSection: React.FC<Props> = ({
               </option>
             ))}
           </Form.Select>
-          <Form.Text className="d-block text-muted">
-            <a
-              href={ROUTES.TRUST_AGENT_CONNECT}
-              target="_blank"
-              rel="noopener noreferrer"
-              data-testid="surface-signing-connect-link"
-            >
-              Connect a trust agent
-            </a>{' '}
-            ·{' '}
-            <button
-              type="button"
-              className="btn btn-link btn-sm p-0 align-baseline"
-              data-testid="surface-signing-refresh"
-              onClick={() => void loadConnections()}
-            >
-              Refresh
-            </button>
-          </Form.Text>
+          {subject !== 'gateway' && (
+            <Form.Text className="d-block text-muted">
+              <a
+                href={ROUTES.TRUST_AGENT_CONNECT}
+                target="_blank"
+                rel="noopener noreferrer"
+                data-testid="surface-signing-connect-link"
+              >
+                Add VTA
+              </a>{' '}
+              ·{' '}
+              <button
+                type="button"
+                className="btn btn-link btn-sm p-0 align-baseline"
+                data-testid="surface-signing-refresh"
+                onClick={() => void loadConnections()}
+              >
+                Refresh
+              </button>
+            </Form.Text>
+          )}
           {selectedAgent === '' && (
             <Form.Text className="d-block text-warning" data-testid="surface-signing-pick-agent">
-              Choose a trust agent. Until then this {subject} follows{' '}
-              {ownerSigning ? 'its issuer' : 'the appliance default'}.
+              {subject === 'gateway'
+                ? 'Choose a Verifiable Trust Agent before saving.'
+                : `Choose a Verifiable Trust Agent. Until then this ${subject} follows ${
+                    ownerSigning ? 'its issuer' : 'the gateway-wide default'
+                  }.`}
             </Form.Text>
           )}
         </div>
@@ -239,7 +274,8 @@ export const SurfaceSigningSection: React.FC<Props> = ({
 
       {loadError && (
         <Form.Text className="text-muted">
-          Trust agents could not be listed, so only the local key can be chosen here.
+          Verifiable Trust Agents could not be listed, so only the gateway secret can be chosen
+          here.
         </Form.Text>
       )}
       {signing?.backend === 'vta' && signing.context_id && (

@@ -9,15 +9,8 @@ import MediatorsPage from './MediatorsPage';
 import PaymentGatewaysPage from './PaymentGatewaysPage';
 import TrustAgentsPage from './TrustAgentsPage';
 import TrustRegistriesPage from './TrustRegistriesPage';
-import { KeyManagementPanel } from './VtaConnectionsPage/KeyManagementPanel';
 
-type TabKey =
-  | 'gateways'
-  | 'payment-gateways'
-  | 'mediators'
-  | 'trust-registries'
-  | 'trust-agents'
-  | 'key-management';
+type TabKey = 'gateways' | 'payment-gateways' | 'mediators' | 'trust-registries' | 'trust-agents';
 
 interface TabCount {
   filtered: number;
@@ -30,7 +23,6 @@ const ALL_TABS: TabKey[] = [
   'mediators',
   'trust-registries',
   'trust-agents',
-  'key-management',
 ];
 
 const ConnectionsPage: React.FC = () => {
@@ -48,7 +40,7 @@ const ConnectionsPage: React.FC = () => {
       (tab !== 'payment-gateways' || showPaymentGateways) &&
       (tab !== 'mediators' || showMediators) &&
       (tab !== 'trust-registries' || showRegistries) &&
-      ((tab !== 'trust-agents' && tab !== 'key-management') || showTrustAgents)
+      (tab !== 'trust-agents' || showTrustAgents)
   );
   const tabFromUrl = searchParams.get('tab') as TabKey | null;
   // The tab follows the URL, so a link to another tab of this page switches it.
@@ -64,7 +56,6 @@ const ConnectionsPage: React.FC = () => {
     mediators: { filtered: 0, total: 0 },
     'trust-registries': { filtered: 0, total: 0 },
     'trust-agents': { filtered: 0, total: 0 },
-    'key-management': { filtered: 0, total: 0 },
   });
 
   // Stable per-tab count setters so the embedded pages' useEffect deps
@@ -122,12 +113,14 @@ const ConnectionsPage: React.FC = () => {
     <div className="container-fluid" data-testid="page-connections">
       <div className="d-sm-flex align-items-center justify-content-between mb-4">
         <div className="d-flex align-items-center">
-          <SearchInput
-            value={searchTerm}
-            onChange={setSearchTerm}
-            data-testid="connections-search-input"
-            placeholder="Filter Connections..."
-          />
+          {activeTab !== 'trust-agents' && (
+            <SearchInput
+              value={searchTerm}
+              onChange={setSearchTerm}
+              data-testid="connections-search-input"
+              placeholder="Filter Connections..."
+            />
+          )}
         </div>
       </div>
 
@@ -226,29 +219,15 @@ const ConnectionsPage: React.FC = () => {
               tabAttrs={{ 'data-testid': 'connections-tab-trust-agents' }}
               title={
                 <>
-                  <i className="fas fa-robot"></i> Trust Agents {tabBadge('trust-agents')}
+                  <i className="fas fa-robot"></i> Verifiable Trust Agent
                 </>
               }
             >
               <TrustAgentsPage
-                externalSearchTerm={searchTerm}
+                externalSearchTerm=""
                 onCountChange={setTrustAgentsCount}
                 actionsContainer={activeTab === 'trust-agents' ? actionsContainer : null}
               />
-            </Tab>
-          )}
-
-          {showTrustAgents && (
-            <Tab
-              eventKey="key-management"
-              tabAttrs={{ 'data-testid': 'connections-tab-key-management' }}
-              title={
-                <>
-                  <i className="fas fa-key"></i> Key Management
-                </>
-              }
-            >
-              {activeTab === 'key-management' && <KeyManagementPanel />}
             </Tab>
           )}
         </Tabs>
