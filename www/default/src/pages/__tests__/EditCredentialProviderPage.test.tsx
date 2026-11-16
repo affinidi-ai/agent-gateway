@@ -474,7 +474,26 @@ describe('EditCredentialProviderPage consent time limit', () => {
       await pause();
       fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '0' } });
       await pause();
+
+      expect(impactCalls()).toHaveLength(0);
+      expect(screen.queryByTestId(IMPACT)).toBeNull();
+    });
+
+    it('asks when a stored limit is removed, since the gateway default may be the shorter', async () => {
+      await renderWithImpact(authorizationCode({ max_consent_age_secs: 21_600 }));
       fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '' } });
+
+      expect(await screen.findByTestId(IMPACT)).toHaveTextContent(
+        /^Saving ends 2 active GitHub consents now\./
+      );
+      expect(impactCalls().map(([url]) => url)).toEqual([
+        '/api/v1/credential-providers/p1/consent-impact?max_consent_age_secs=0',
+      ]);
+    });
+
+    it('asks nothing while the field stays empty on a provider without a stored limit', async () => {
+      await renderWithImpact(authorizationCode());
+      fireEvent.change(screen.getByTestId(UNIT), { target: { value: 'days' } });
       await pause();
 
       expect(impactCalls()).toHaveLength(0);

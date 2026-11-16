@@ -4,11 +4,21 @@ changes:
     - timestamp: '2026-11-16T15:30:00Z'
       title: Warn how many active consents a shorter consent time limit ends
       description: >-
-        When an admin shortens a stored provider's consent time limit, or sets one where none
-        was, the provider form now asks the gateway how many active consents saving would end
-        and, when that is at least one, says so under the field, naming the provider, for example
-        "Saving ends 2 active GitHub consents now". It asks once the field has stopped changing,
-        and shows nothing when no consent ends or the gateway cannot say.
+        When an admin shortens a stored provider's consent time limit, sets one where none was,
+        or removes a stored one, since the gateway's default may then be the shorter, the provider
+        form now asks the gateway how many active consents saving would end and, when that is at
+        least one, says so under the field, naming the provider, for example "Saving ends 2
+        active GitHub consents now". It asks once the field has stopped changing, and shows
+        nothing when no consent ends or the gateway cannot say.
+    - timestamp: '2026-11-16T17:30:00Z'
+      title: Count the consents a shorter consent time limit would end before saving it
+      description: >-
+        GET /api/v1/credential-providers/{id}/consent-impact?max_consent_age_secs=<seconds>
+        answers {"active_consents", "ending_consents"}: the provider's consents that have not
+        ended, which are its agent-keyed tokens and the grants by binding their surface still
+        serves, and how many of them saving the limit asked about would end. 0 asks about a
+        provider with no limit of its own. It changes nothing, needs credential_providers.edit,
+        and is refused as the save would be. The provider form's warning reads it.
   changed:
     - timestamp: '2026-11-16T17:10:00Z'
       title: Drop the names of now-logged events from stored audit selections

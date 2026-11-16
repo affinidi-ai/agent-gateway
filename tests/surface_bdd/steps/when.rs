@@ -1996,6 +1996,30 @@ pub(crate) async fn list_delegation_vault(world: &mut SurfaceWorld) -> Vec<serde
         .unwrap_or_else(|| panic!("the delegation vault is listed as an array, got {}", response.body))
 }
 
+#[when(expr = "the operator asks what a consent time limit of {int} seconds on OAuth provider {string} would end")]
+async fn operator_asks_what_a_consent_time_limit_would_end(
+    world: &mut SurfaceWorld,
+    seconds: u64,
+    provider: String,
+) {
+    ensure_admin_session(world).await;
+    let id = world
+        .surface_config
+        .provider_record_id(&provider);
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_recorded_json::<serde_json::Value>(
+            reqwest::Method::GET,
+            &format!("/v1/credential-providers/{id}/consent-impact?max_consent_age_secs={seconds}"),
+            None,
+        )
+        .await
+        .expect("ask the admin API what a consent time limit would end");
+    record_admin_response(world, response);
+}
+
 /// Deactivates credential provider `provider`, or activates it again, as an
 /// operator does through the admin API.
 pub(crate) async fn set_oauth_provider_active(

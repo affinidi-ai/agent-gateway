@@ -10,8 +10,9 @@ const isProviderSegment = (id: string) => id !== '.' && id !== '..';
 
 /**
  * How many active consents of a stored provider saving `limitSecs` ends at once, from
- * `GET /credential-providers/{id}/consent-impact`. `null` for a new provider, for a limit that
- * shortens nothing, while the limit is still changing, and when the gateway cannot say.
+ * `GET /credential-providers/{id}/consent-impact`; `0` asks about the provider without a limit of
+ * its own. `null` for a new provider, for a limit that shortens nothing, while the limit is
+ * still changing, and when the gateway cannot say.
  */
 export function useConsentImpact(
   providerId: string | undefined,

@@ -74,5 +74,9 @@ pub fn create_credential_providers_router(
             "/api/v1/credential-providers/{id}/activate",
             maybe_gate(gate, post(handlers::activate_provider), Feature::CredentialProvidersEdit),
         )
+        .route(
+            "/api/v1/credential-providers/{id}/consent-impact",
+            maybe_gate(gate, get(handlers::consent_impact), Feature::CredentialProvidersEdit),
+        )
         .with_state(state)
 }

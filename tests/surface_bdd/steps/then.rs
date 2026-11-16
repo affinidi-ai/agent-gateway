@@ -2520,6 +2520,15 @@ fn consent_required_error_says_how_long_a_new_consent_lasts(
     assert_eq!(entry["max_consent_age_secs"], serde_json::json!(seconds), "{entry}");
 }
 
+#[then(expr = "the delegation vault holds {int} delegated credential(s)")]
+async fn delegation_vault_holds_delegated_credentials(
+    world: &mut SurfaceWorld,
+    count: usize,
+) {
+    let held = crate::steps::when::list_delegation_vault(world).await;
+    assert_eq!(held.len(), count, "{held:?}");
+}
+
 #[then("the delegation vault holds no delegated credential")]
 async fn delegation_vault_holds_no_delegated_credential(world: &mut SurfaceWorld) {
     let held = crate::steps::when::list_delegation_vault(world).await;
@@ -3847,6 +3856,18 @@ async fn delegation_audit_trail_contains_event(
     })
     .await;
     assert!(found, "expected delegation audit event '{event}' for provider '{provider}' ({record_id}), got {events:?}");
+}
+
+#[then(expr = "the gateway counts {int} active consent(s), of which the limit would end {int}")]
+fn gateway_counts_active_and_ending_consents(
+    world: &mut SurfaceWorld,
+    active: u64,
+    ending: u64,
+) {
+    assert_eq!(
+        get_admin_response(world).body,
+        serde_json::json!({"active_consents": active, "ending_consents": ending})
+    );
 }
 
 /// The `consent_granted` record of a consent given under a time limit names

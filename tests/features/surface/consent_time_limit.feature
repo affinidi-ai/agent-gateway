@@ -69,6 +69,25 @@ Feature: Consent time limit
     And OAuth provider "calendar" was not asked to refresh delegated credentials
     And MCP server "bravo" was not called
 
+  Scenario Outline: The operator is told how many active consents a time limit would end before saving it
+    Given OAuth provider "calendar" limits a consent to 21600 seconds
+    And caller "alice" has started OAuth consent for provider "calendar"
+    And caller "alice" has completed OAuth consent for provider "calendar"
+    And the caller's consent was given 7200 seconds ago
+    When the operator asks what a consent time limit of <limit> seconds on OAuth provider "calendar" would end
+    Then the admin API response status is 200
+    And the gateway counts 1 active consent, of which the limit would end <ended>
+    And the delegation vault holds 1 delegated credential
+
+    Examples:
+      | limit | ended |
+      | 3600  | 1     |
+      | 14400 | 0     |
+
+  Scenario: A consent time limit outside the range is refused before it is counted
+    When the operator asks what a consent time limit of 30 seconds on OAuth provider "calendar" would end
+    Then the admin API response status is 400
+
   Scenario: Without a time limit a consent is used however old
     Given caller "alice" has started OAuth consent for provider "calendar"
     And caller "alice" has completed OAuth consent for provider "calendar"

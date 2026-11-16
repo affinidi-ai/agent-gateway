@@ -2325,6 +2325,18 @@ limit as set now, whichever comes first. So:
 - a limit that is lengthened or removed never extends a consent already given, whose stored
   end still holds.
 
+Before a shorter limit is saved,
+`GET /api/v1/credential-providers/{id}/consent-impact?max_consent_age_secs=<seconds>` says what
+it would end. It answers `{"active_consents": <n>, "ending_consents": <n>}`: the provider's
+consents that have not ended (its agent-keyed tokens, and its grants by binding that their
+surface still serves), and how many of them are older than the limit asked about, so that saving
+it ends them. `0` asks about a provider with no limit of its own, as a save takes it. The
+request changes nothing. It needs `credential_providers.edit` and is refused as the save would
+be: `400` for a limit outside the range, or for any limit on a provider nobody consents to, and
+`404` or `403` for a provider the caller may not change. Asked with `0`, a provider nobody
+consents to counts no consent, since its tokens are service tokens. The credential provider
+editor shows the count as a warning under **Consent time limit**.
+
 A consent time more than five minutes ahead of the gateway's clock counts as ended whenever a
 limit applies, and so does one that no limit can be added to.
 

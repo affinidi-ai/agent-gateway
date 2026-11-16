@@ -335,12 +335,12 @@ describe('credential provider form', () => {
     expect(seconds('nonsense', 'hours', 'api_key')).toBe(0);
   });
 
-  it('asks what a save ends only for a limit shorter than the stored one, or a first one', () => {
+  it('asks what a save ends for a shorter limit, a first one, or a stored one removed', () => {
     expect(shortensConsentLimit(3_600, 21_600)).toBe(true);
     expect(shortensConsentLimit(3_600, undefined)).toBe(true);
     expect(shortensConsentLimit(21_600, 21_600)).toBe(false);
     expect(shortensConsentLimit(86_400, 21_600)).toBe(false);
-    expect(shortensConsentLimit(0, 21_600)).toBe(false);
+    expect(shortensConsentLimit(0, 21_600)).toBe(true);
     expect(shortensConsentLimit(0, undefined)).toBe(false);
     expect(shortensConsentLimit(null, 21_600)).toBe(false);
   });
