@@ -39,8 +39,8 @@ changes:
       description: >-
         A new **Agents** sidebar entry, above **Surfaces**, opens `/agent-registry` and lists one
         row per managed agent with its name ("Unnamed agent" when it has none), runtime and
-        protocol, identities, every surface using it as a link, Trust Registry Recorded or Not
-        recorded, and last activity, with a search over the agent and surface names and the runtime.
+        protocol, identities, the number of surfaces using it as a badge followed by their names on
+        one line (the full list on hover), Trust Registry Recorded or Not recorded, and last activity, with a search over the agent and surface names and the runtime.
         No surface status is shown. The page is not served at `/agents`, which is a gateway channel
         prefix, and `agent-registry` is reserved so no channel prefix can take it. The details page
         has **Overview**, **Agent Card**, **Connection**, **Surfaces** and **Traffic** tabs.
