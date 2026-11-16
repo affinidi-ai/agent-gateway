@@ -16,7 +16,9 @@ permissions:
 
 concurrency:
   group: codeql-${{ github.ref }}
-  cancel-in-progress: true
+  # Queue instead of cancelling: a manual run must not kill a long scheduled
+  # scan (the Rust job) that is still in progress.
+  cancel-in-progress: false
 
 jobs:
   analyze:
