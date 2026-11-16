@@ -219,7 +219,9 @@ existing tab is never renamed or removed. See _Credential Tokens and Delegated A
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-tokens-and-delegated-access-tabs).
 
 The credential delegation records are read in the Audit Log; the Credentials page's **Credential
-Delegation Audit** tab is a link to it, filtered to the delegation categories. The Audit Log
+Delegation Audit** tab is a link to it, filtered to the delegation categories: the audited ones
+(consent granted or expired, a token or a user's tokens revoked). What the gateway does on each
+call, such as a token injected or refreshed, is in its log and has no category. The Audit Log
 shows a caller's Principal beside Subject when its strategy names a claim other than `sub`; see
 _Credential delegation audit_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-delegation-audit).

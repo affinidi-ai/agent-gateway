@@ -33,6 +33,32 @@ describe('credential delegation records in the Audit Log', () => {
     }
   });
 
+  it('offers no category for the delegation events the gateway only logs', () => {
+    const logged = [
+      'token_injected',
+      'token_refreshed',
+      'refresh_failed',
+      'consent_required',
+      'token_not_found',
+    ];
+    const offered: string[] = CATEGORY_OPTIONS.map(option => option.value);
+    for (const category of logged) {
+      expect(offered).not.toContain(category);
+      expect(DELEGATION_CATEGORIES).not.toContain(category);
+    }
+    expect([...DELEGATION_CATEGORIES]).toEqual([
+      'consent_granted',
+      'consent_expired',
+      'token_revoked',
+      'user_tokens_revoked',
+    ]);
+  });
+
+  it('still names a record of a logged event that an older gateway audited', () => {
+    expect(categoryLabel('token_injected')).toBe('Token Injected');
+    expect(categoryLabel('consent_required')).toBe('Consent Required');
+  });
+
   it('marks an expired consent as a warning, not as a refusal', () => {
     expect(categoryBadgeClass('consent_expired')).toBe('badge-warning');
     expect(categoryBadgeClass('token_revoked')).toBe('badge-danger');

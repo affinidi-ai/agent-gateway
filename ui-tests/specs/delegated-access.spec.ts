@@ -335,14 +335,12 @@ test.describe("Credentials page Credential Delegation Audit tab", () => {
 
     await expect(page.getByTestId("page-audit")).toBeVisible();
     const categories = new URL(page.url()).searchParams.get("category") ?? "";
-    expect(categories.split(",")).toEqual(
-      expect.arrayContaining([
-        "token_injected",
-        "consent_granted",
-        "consent_expired",
-        "token_revoked",
-      ]),
-    );
+    expect(categories.split(",")).toEqual([
+      "consent_granted",
+      "consent_expired",
+      "token_revoked",
+      "user_tokens_revoked",
+    ]);
   });
 });
 

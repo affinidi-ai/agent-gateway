@@ -34,9 +34,7 @@ jest.mock(
   )
 );
 
-const DELEGATION =
-  'token_injected%2Ctoken_refreshed%2Crefresh_failed%2Ctoken_not_found%2Cconsent_granted' +
-  '%2Cconsent_required%2Cconsent_expired%2Ctoken_revoked%2Cuser_tokens_revoked';
+const DELEGATION = 'consent_granted%2Cconsent_expired%2Ctoken_revoked%2Cuser_tokens_revoked';
 
 const AuditLog: React.FC = () => {
   const location = useLocation();

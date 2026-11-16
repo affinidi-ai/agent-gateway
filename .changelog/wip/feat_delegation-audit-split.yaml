@@ -19,6 +19,13 @@ changes:
         save, where any other unknown name is still refused with 400, so an upgraded gateway keeps
         saving its settings. An event set left with no other event is refused as empty, and the
         startup check of stored definitions reports it until it is changed or deleted.
+    - timestamp: '2026-11-16T17:20:00Z'
+      title: Offer only audited delegation events in the Audit Log's category filter
+      description: >-
+        The Audit Log's category filter and the Credentials page's Credential Delegation Audit
+        link no longer offer the delegation events the gateway now only logs. The link opens the
+        Audit Log filtered to consent granted, consent expired, token revoked and user tokens
+        revoked. Records of the other events written before keep their labels.
     - timestamp: '2026-11-16T15:00:00Z'
       title: Confirm a revoke-all with a danger button that says how many it ends
       description: >-

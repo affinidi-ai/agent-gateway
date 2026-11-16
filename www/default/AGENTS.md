@@ -1142,6 +1142,13 @@ opening `/credentials?tab=credential-audit`, goes to the Audit Log with the dele
 selected. Every link from the Credentials page into the audit is built by `auditLogPath` from
 `DELEGATION_CATEGORIES` or `DELEGATION_ENDED_CATEGORIES` (`pages/AuditPage/auditHelpers.ts`).
 
+The delegation categories are the ones the gateway audits: `consent_granted`, `consent_expired`,
+`token_revoked` and `user_tokens_revoked`. What the gateway does with a credential on each call
+(`token_injected`, `token_refreshed`, `refresh_failed`, `consent_required`, `token_not_found`
+and the elicitation events) is written to its log and is no audit event, so the Audit Log
+offers no category for it and no link selects it. A record of one that an older gateway
+audited is still shown, with its label (`categoryLabel`).
+
 - The Audit Log offers each delegation category in its Category filter, labels and narrates
   `consent_expired` ("Consent expired", a warning, apart from a revocation), and shows it with
   the other delegation events.
