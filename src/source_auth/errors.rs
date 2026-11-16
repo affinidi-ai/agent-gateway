@@ -148,7 +148,7 @@ pub fn deny_response(
 
     match protocol {
         SurfaceProtocol::Mcp => mcp_deny(auth_config, detail, status, title, challenge),
-        _ => a2a_deny(auth_config, detail, status, title, challenge),
+        _ => a2a_deny(challenge && matches!(auth_config, SourceAuthConfig::JwtBearer(_)), detail, status, title),
     }
 }
 
@@ -172,6 +172,25 @@ pub fn caller_refusal(
     auth_config: &SourceAuthConfig,
     mcp_request_id: Option<serde_json::Value>,
 ) -> Response {
+    refuse_caller(protocol, matches!(auth_config, SourceAuthConfig::JwtBearer(_)), mcp_request_id)
+}
+
+/// The `401` for a caller whose credential verified, but is not of the method
+/// the inbound identity is derived from. Same body as [`caller_refusal`] and
+/// never a `WWW-Authenticate` challenge: fetching another token of the same
+/// method would be refused again.
+pub fn mismatched_caller_refusal(
+    protocol: &SurfaceProtocol,
+    mcp_request_id: Option<serde_json::Value>,
+) -> Response {
+    refuse_caller(protocol, false, mcp_request_id)
+}
+
+fn refuse_caller(
+    protocol: &SurfaceProtocol,
+    bearer_challenge: bool,
+    mcp_request_id: Option<serde_json::Value>,
+) -> Response {
     let status = StatusCode::UNAUTHORIZED;
     match protocol {
         SurfaceProtocol::Mcp => {
@@ -182,7 +201,7 @@ pub fn caller_refusal(
                 CALLER_CREDENTIAL_REFUSED,
                 None,
             );
-            if matches!(auth_config, SourceAuthConfig::JwtBearer(_)) {
+            if bearer_challenge {
                 response.headers_mut().insert(
                     axum::http::header::WWW_AUTHENTICATE,
                     axum::http::HeaderValue::from_static(MCP_BEARER_CHALLENGE),
@@ -190,7 +209,7 @@ pub fn caller_refusal(
             }
             response
         }
-        _ => a2a_deny(auth_config, CALLER_CREDENTIAL_REFUSED, status, "Unauthorized", true),
+        _ => a2a_deny(bearer_challenge, CALLER_CREDENTIAL_REFUSED, status, "Unauthorized"),
     }
 }
 
@@ -289,11 +308,10 @@ pub fn refuse_unavailable_access_point(
 }
 
 fn a2a_deny(
-    auth_config: &SourceAuthConfig,
+    bearer_challenge: bool,
     detail: &str,
     status: StatusCode,
     title: &str,
-    challenge: bool,
 ) -> Response {
     let body = serde_json::json!({
         "type": "https://a2a-protocol.org/errors/proxy-error",
@@ -306,7 +324,7 @@ fn a2a_deny(
         .status(status)
         .header("content-type", "application/problem+json");
 
-    if challenge && matches!(auth_config, SourceAuthConfig::JwtBearer(_)) {
+    if bearer_challenge {
         builder = builder.header("www-authenticate", "Bearer");
     }
 
@@ -506,6 +524,29 @@ mod tests {
             assert_eq!(body.get("id").cloned(), id);
             assert_eq!(body["error"]["code"], crate::mcp::errors::error_codes::INTERNAL_ERROR);
             assert_eq!(body["error"]["message"], CALLER_CREDENTIAL_REFUSED);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_caller_refused_for_its_method_gets_the_same_body_and_no_challenge() {
+        for protocol in [SurfaceProtocol::A2a, SurfaceProtocol::Ap2, SurfaceProtocol::Mcp] {
+            let resp = mismatched_caller_refusal(&protocol, Some(serde_json::json!("call-1")));
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            assert!(
+                resp.headers()
+                    .get("www-authenticate")
+                    .is_none(),
+                "{protocol:?}"
+            );
+            let body = body_json(resp).await;
+            if protocol == SurfaceProtocol::Mcp {
+                assert_eq!(body["jsonrpc"], "2.0");
+                assert_eq!(body["id"], "call-1");
+                assert_eq!(body["error"]["message"], CALLER_CREDENTIAL_REFUSED);
+            } else {
+                assert_eq!(body["detail"], CALLER_CREDENTIAL_REFUSED);
+                assert_eq!(body["status"], 401);
+            }
         }
     }
 

@@ -1,31 +1,28 @@
 import * as Cap from '../capabilities';
-import type { DependencyNode, NodeDefinition, PayloadSlice } from '../types';
+import type { DependencyNode, NodeDefinition, PayloadSlice, SurfaceContext } from '../types';
 import { findSlotById } from '../edges/archetypes';
 import { registry } from '../registry';
 import IdentityPanel from './IdentityPanel';
 import IdentityPayloadFullscreenPanel from './IdentityPayloadFullscreenPanel';
-import { isInboundIdentity, SOURCE_METHOD_TYPES } from './placement';
+import { callerAuthMethods, isInboundIdentity } from './placement';
+import { effectiveSourceMethod, readsEveryMethod, readsMethod } from './sourceMethods';
 import { DOCS_URL } from '../../../../config/docs';
-import { readMethods } from '../caller-auth/methods';
 
 export const INBOUND_API_KEY_NEEDS_API_KEY_CALLER =
   "Identity 'From API Key' needs every Caller Context method to be API Key or API Key Provider";
 
-const INBOUND_API_KEY_CALLER_METHODS = new Set<unknown>(['api_key', 'api_key_provider']);
-
 const REMOVED_SOURCE_METHOD =
   'The Caller Context method this Identity reads was removed. Select another method.';
 
-const callerAuthMethods = (allNodes: DependencyNode[]) => {
-  const callerAuth = allNodes.find(n => n.type === 'caller-auth');
-  return callerAuth ? readMethods(callerAuth.config) : [];
+const effectiveMethod = (c: Record<string, any>, ctx: SurfaceContext, node?: DependencyNode) =>
+  isInboundIdentity(node) ? effectiveSourceMethod(c, callerAuthMethods(ctx.allNodes)) : undefined;
+
+const selectedMethod = (c: Record<string, any>, ctx: SurfaceContext, node?: DependencyNode) => {
+  const id = effectiveMethod(c, ctx, node);
+  return id ? callerAuthMethods(ctx.allNodes).find(method => method.id === id) : undefined;
 };
 
-const selectedMethod = (c: Record<string, any>, allNodes: DependencyNode[]) =>
-  callerAuthMethods(allNodes).find(method => method.id === c.source_method);
-
-const readsSelectedMethod = (c: Record<string, any>, node?: DependencyNode) =>
-  !!c.source_method && SOURCE_METHOD_TYPES.has(c.type) && isInboundIdentity(node);
+const CHOOSE_SOURCE_METHOD = 'choose the Identity source method';
 
 function identityConfigFromSlice(slice: any) {
   if (!slice || typeof slice !== 'object') return slice;
@@ -143,61 +140,43 @@ export const identityDefinition: NodeDefinition = {
     {
       description:
         'from_jwt_claim derives the DID from a validated JWT, so the surface must authenticate every caller with JWT Bearer',
-      condition: (c, _ctx, node) => c.type === 'from_jwt_claim' && !readsSelectedMethod(c, node),
-      check: (_c, ctx) =>
-        ctx.allNodes.some(n => {
-          const methods = n.type === 'caller-auth' ? readMethods(n.config) : [];
-          return methods.length > 0 && methods.every(m => m.method_type === 'jwt_bearer');
-        }),
+      condition: (c, ctx, node) => c.type === 'from_jwt_claim' && !effectiveMethod(c, ctx, node),
+      check: (_c, ctx) => readsEveryMethod('from_jwt_claim', callerAuthMethods(ctx.allNodes)),
       severity: 'error',
-      message:
-        'From JWT Claims requires a Caller Context whose methods are all JWT Bearer. Remove the other methods, or change this extraction type.',
+      message: (_c, ctx) =>
+        callerAuthMethods(ctx.allNodes).length > 1
+          ? `From JWT Claims requires a Caller Context whose methods are all JWT Bearer. Remove the other methods, ${CHOOSE_SOURCE_METHOD}, or change this extraction type.`
+          : 'From JWT Claims requires a Caller Context whose methods are all JWT Bearer. Remove the other methods, or change this extraction type.',
     },
     {
       description:
         'An inbound Identity that names a Caller Context method needs that method to exist',
-      condition: (c, _ctx, node) => readsSelectedMethod(c, node),
-      check: (c, ctx) => !!selectedMethod(c, ctx.allNodes),
+      condition: (c, ctx, node) => !!effectiveMethod(c, ctx, node),
+      check: (c, ctx, node) => !!selectedMethod(c, ctx, node),
       severity: 'error',
       message: REMOVED_SOURCE_METHOD,
     },
     {
-      description: 'From JWT Claims reads a JWT Bearer method',
-      condition: (c, ctx, node) =>
-        c.type === 'from_jwt_claim' &&
-        readsSelectedMethod(c, node) &&
-        !!selectedMethod(c, ctx.allNodes),
-      check: (c, ctx) => selectedMethod(c, ctx.allNodes)?.method_type === 'jwt_bearer',
+      description: 'An inbound Identity reads a method of the kind its extraction type needs',
+      condition: (c, ctx, node) => !!selectedMethod(c, ctx, node),
+      check: (c, ctx, node) => readsMethod(c.type, selectedMethod(c, ctx, node)!),
       severity: 'error',
-      message: 'From JWT Claims reads a JWT Bearer method. Select a JWT Bearer method.',
-    },
-    {
-      description: 'Inbound From API Key reads an API Key or API Key Provider method',
-      condition: (c, ctx, node) =>
-        c.type === 'from_api_key' &&
-        readsSelectedMethod(c, node) &&
-        !!selectedMethod(c, ctx.allNodes),
-      check: (c, ctx) =>
-        INBOUND_API_KEY_CALLER_METHODS.has(selectedMethod(c, ctx.allNodes)?.method_type),
-      severity: 'error',
-      message:
-        'From API Key reads an API Key or API Key Provider method. Select an API Key or API Key Provider method.',
+      message: c =>
+        c.type === 'from_jwt_claim'
+          ? 'From JWT Claims reads a JWT Bearer method. Select a JWT Bearer method.'
+          : 'From API Key reads an API Key or API Key Provider method. Select an API Key or API Key Provider method.',
     },
     {
       description:
         'Inbound from_api_key identifies each caller by the key it presents, so every Caller Context method must be API Key or API Key Provider',
-      condition: (c, _ctx, node) =>
-        c.type === 'from_api_key' && isInboundIdentity(node) && !readsSelectedMethod(c, node),
-      check: (_c, ctx) => {
-        const callerAuth = ctx.allNodes.find(n => n.type === 'caller-auth');
-        const methods = callerAuth ? readMethods(callerAuth.config) : [];
-        return (
-          methods.length > 0 &&
-          methods.every(method => INBOUND_API_KEY_CALLER_METHODS.has(method.method_type))
-        );
-      },
+      condition: (c, ctx, node) =>
+        c.type === 'from_api_key' && isInboundIdentity(node) && !effectiveMethod(c, ctx, node),
+      check: (_c, ctx) => readsEveryMethod('from_api_key', callerAuthMethods(ctx.allNodes)),
       severity: 'error',
-      message: INBOUND_API_KEY_NEEDS_API_KEY_CALLER,
+      message: (_c, ctx) =>
+        callerAuthMethods(ctx.allNodes).length > 1
+          ? `${INBOUND_API_KEY_NEEDS_API_KEY_CALLER}, or ${CHOOSE_SOURCE_METHOD}`
+          : INBOUND_API_KEY_NEEDS_API_KEY_CALLER,
     },
   ],
   ConfigPanel: IdentityPanel,
@@ -217,16 +196,12 @@ export const identityDefinition: NodeDefinition = {
   // identity is fully configured.
   configFromPayload: (slice: any, payload?: any) => {
     const config = identityConfigFromSlice(slice);
-    const selected = payload?.identity_slots?.inbound_source_method;
-    if (
-      config &&
-      typeof selected === 'string' &&
-      selected &&
-      payload.identity_slots.inbound === slice
-    ) {
-      return { ...config, source_method: selected };
-    }
-    return config;
+    if (!config || payload?.identity_slots?.inbound !== slice) return config;
+    const selected = payload.identity_slots.inbound_source_method;
+    return {
+      ...config,
+      source_method: typeof selected === 'string' && selected ? selected : undefined,
+    };
   },
   buildPayload: ctx => {
     const nodes = ctx.nodesOfType('identity');
@@ -266,13 +241,12 @@ export const identityDefinition: NodeDefinition = {
       if (!value) continue;
       if (path === 'identity_slots.inbound') delete value.api_key_id;
       slices.push({ path, value });
-      if (
-        path === 'identity_slots.inbound' &&
-        SOURCE_METHOD_TYPES.has(ic.type) &&
-        typeof ic.source_method === 'string' &&
-        ic.source_method
-      ) {
-        slices.push({ path: 'identity_slots.inbound_source_method', value: ic.source_method });
+      const sourceMethod =
+        path === 'identity_slots.inbound'
+          ? effectiveSourceMethod(ic, callerAuthMethods(ctx.allNodes))
+          : undefined;
+      if (sourceMethod) {
+        slices.push({ path: 'identity_slots.inbound_source_method', value: sourceMethod });
       }
     }
     return slices.length > 0 ? slices : undefined;

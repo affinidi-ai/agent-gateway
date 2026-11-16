@@ -19,7 +19,7 @@ pub fn api_key_source_auth_method_json(
 /// The id a BDD surface gives the caller authentication method of this type, so an
 /// identity can name it.
 pub fn source_method_id(method_type: &str) -> String {
-    format!("bdd-{method_type}")
+    format!("bdd-{}", method_type.replace('_', "-"))
 }
 
 pub fn caller_authentication_method_json(config: &SurfaceSourceAuthConfig) -> Value {

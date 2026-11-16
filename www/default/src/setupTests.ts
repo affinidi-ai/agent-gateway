@@ -9,6 +9,13 @@ import { TextDecoder, TextEncoder } from 'util';
 // jsdom lacks TextEncoder/TextDecoder, which react-router 7 needs
 Object.assign(global, { TextDecoder, TextEncoder });
 
+// jsdom has no Web Crypto; the browser has it
+Object.defineProperty(globalThis, 'crypto', {
+  configurable: true,
+  writable: true,
+  value: require('crypto').webcrypto,
+});
+
 // Mock window.matchMedia (required for Bootstrap modals in tests)
 Object.defineProperty(window, 'matchMedia', {
   writable: true,

@@ -4182,10 +4182,16 @@ impl AgentSurface {
     /// before policy and the Target: on every Access Point that is not public
     /// (closed or legacy, whatever `on_failure` stores), and on a public one
     /// whose inbound identity is `from_jwt_claim`, which derives no caller
-    /// identity without a valid JWT, or that is edited by hand to
-    /// `on_failure: reject`.
+    /// identity without a valid JWT, that names the method its inbound identity
+    /// is derived from (`identity_slots.inbound_source_method`, which already
+    /// refuses a valid credential of another method), or that is edited by hand
+    /// to `on_failure: reject`.
     pub fn rejects_failed_caller_authentication(&self) -> bool {
         self.access_point.public != Some(true)
+            || self
+                .identity_slots
+                .inbound_source_method
+                .is_some()
             || self
                 .inbound_identity()
                 .is_some_and(|identity| {
@@ -5135,6 +5141,30 @@ mod tests {
                 .resolve_variant(Some("beta"))
                 .unwrap()
                 .rejects_failed_caller_authentication()
+        );
+    }
+
+    #[test]
+    fn a_public_access_point_naming_the_inbound_identity_method_refuses_failed_callers() {
+        let build = |slots: serde_json::Value| {
+            let mut stored = surface_with_access_point(
+                serde_json::json!({"public": true, "caller_authentication": api_key_caller_authentication()}),
+            );
+            stored["identity_slots"] = slots;
+            serde_json::from_value::<super::AgentSurface>(stored).unwrap()
+        };
+
+        assert!(
+            !build(serde_json::json!({"inbound": {"type": "from_api_key"}})).rejects_failed_caller_authentication(),
+            "without a named method a public from_api_key surface leaves failed callers to policy"
+        );
+        assert!(
+            build(serde_json::json!({
+                "inbound": {"type": "from_api_key"},
+                "inbound_source_method": "partner-key"
+            }))
+            .rejects_failed_caller_authentication(),
+            "naming a method refuses them, as from_jwt_claim does"
         );
     }
 

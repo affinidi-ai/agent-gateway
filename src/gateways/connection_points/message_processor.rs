@@ -5160,9 +5160,8 @@ async fn process_charged_forward_request(
                                 true,
                                 None,
                             );
-                            let refusal = crate::source_auth::errors::caller_refusal(
+                            let refusal = crate::source_auth::errors::mismatched_caller_refusal(
                                 &surface.access_point.protocol,
-                                &resolved_auth_config,
                                 refused_mcp_request_id(&surface, &body_bytes),
                             );
                             return axum_response_to_forward_result(refusal).await;

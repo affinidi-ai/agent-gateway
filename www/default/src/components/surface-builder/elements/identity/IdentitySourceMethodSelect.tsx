@@ -2,6 +2,8 @@ import React from 'react';
 import { Form } from 'react-bootstrap';
 import FieldHelp from '../../../shared/FieldHelp';
 import {
+  ANY_API_KEY_METHOD,
+  ANY_JWT_METHOD,
   NO_SOURCE_METHOD,
   NO_SOURCE_METHOD_API_KEY,
   type SourceMethodChoice,
@@ -11,6 +13,10 @@ interface Props {
   identityType: 'from_jwt_claim' | 'from_api_key';
   choices: SourceMethodChoice[];
   value: string;
+  /** Every method is one the identity can read, so it may read any of them. */
+  anyMethod: boolean;
+  /** What a stored id that is no longer a choice shows as. */
+  unlistedLabel: string;
   onChange: (id: string) => void;
 }
 
@@ -23,6 +29,8 @@ const IdentitySourceMethodSelect: React.FC<Props> = ({
   identityType,
   choices,
   value,
+  anyMethod,
+  unlistedLabel,
   onChange,
 }) => {
   if (choices.length === 0) {
@@ -47,7 +55,8 @@ const IdentitySourceMethodSelect: React.FC<Props> = ({
           ariaLabel="About the identity source method"
         >
           The Caller Context method this identity is derived from. A caller who authenticates with
-          another method is refused.
+          another method is refused. While every method is one this identity can read, Any serves
+          the callers of all of them.
         </FieldHelp>
       </label>
       <Form.Select
@@ -58,10 +67,16 @@ const IdentitySourceMethodSelect: React.FC<Props> = ({
         value={value}
         onChange={e => onChange(e.target.value)}
       >
-        {!value && <option value="">Select a method</option>}
+        {anyMethod ? (
+          <option value="">
+            {identityType === 'from_jwt_claim' ? ANY_JWT_METHOD : ANY_API_KEY_METHOD}
+          </option>
+        ) : (
+          !value && <option value="">Select a method</option>
+        )}
         {value && !listed && (
           <option value={value} disabled>
-            Method no longer available
+            {unlistedLabel}
           </option>
         )}
         {choices.map(choice => (

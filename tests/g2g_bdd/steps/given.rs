@@ -683,6 +683,19 @@ pub async fn surface_requires_api_key(
     });
 }
 
+#[given(expr = "surface {string} derives its inbound identity from a partner API key")]
+fn surface_derives_inbound_identity_from_a_partner_api_key(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    let (_, surface_id) = world.surface(&surface_name);
+    surface_spec_mut(world, &surface_name).partner_api_key = Some(SourceAuthSpec::ApiKey {
+        header_name: "x-partner-key".to_string(),
+        secret_id: format!("{surface_id}-partner-key"),
+        valid_key: "bdd-partner-api-key".to_string(),
+    });
+}
+
 #[given(expr = "surface {string} is stored as a legacy surface")]
 fn surface_is_stored_as_a_legacy_surface(
     world: &mut G2gWorld,

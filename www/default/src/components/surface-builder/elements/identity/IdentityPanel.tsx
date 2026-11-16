@@ -10,10 +10,16 @@ import { deepLinks } from '../../../../utils/deepLinks';
 import { HEADER_METADATA_EXTENSION_URI } from '../_shared/headerMetadataMapping';
 import { transitPointProtocol } from '../transit-point/TransitPointPanel';
 import FieldHelp from '../../../shared/FieldHelp';
-import { isInboundIdentity, SOURCE_METHOD_TYPES } from './placement';
+import { isInboundIdentity } from './placement';
 import { readMethods } from '../caller-auth/methods';
 import IdentitySourceMethodSelect from './IdentitySourceMethodSelect';
-import { sourceMethodChoices } from './sourceMethods';
+import {
+  effectiveSourceMethod,
+  readsEveryMethod,
+  sourceMethodChoices,
+  SOURCE_METHOD_TYPES,
+  unlistedMethodLabel,
+} from './sourceMethods';
 import {
   apiKeyReferenceWarningText,
   storedApiKeyProblem,
@@ -272,12 +278,10 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
             if (nextType !== '' && !isSelectableExtractionType(nextType, extractionTypeOptions)) {
               return;
             }
-            if (choosesSourceMethod && SOURCE_METHOD_TYPES.has(nextType)) {
-              updateFields({
-                type: nextType,
-                source_method: sourceMethodChoices(nextType, callerMethods)[0]?.id,
-              });
-            } else if (choosesSourceMethod && SOURCE_METHOD_TYPES.has(extractionType)) {
+            if (
+              isInbound &&
+              (SOURCE_METHOD_TYPES.has(nextType) || SOURCE_METHOD_TYPES.has(extractionType))
+            ) {
               updateFields({ type: nextType, source_method: undefined });
             } else {
               updateField('type', nextType);
@@ -319,8 +323,10 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
           <IdentitySourceMethodSelect
             identityType={extractionType}
             choices={sourceMethodChoices(extractionType, callerMethods)}
-            value={config.source_method ?? ''}
-            onChange={id => updateField('source_method', id)}
+            value={effectiveSourceMethod(config, callerMethods) ?? ''}
+            anyMethod={readsEveryMethod(extractionType, callerMethods)}
+            unlistedLabel={unlistedMethodLabel(config.source_method ?? '', callerMethods)}
+            onChange={id => updateFields({ source_method: id || undefined })}
           />
         )}
 

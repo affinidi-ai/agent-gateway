@@ -46,6 +46,28 @@ impl SourceAuthConfig {
         }
     }
 
+    /// The tag with its indefinite article, for messages: `an api_key`, `a jwt_bearer`.
+    pub fn method_tag_with_article(&self) -> String {
+        let tag = self.method_tag();
+        let article = if tag.starts_with('a') {
+            "an"
+        } else {
+            "a"
+        };
+        format!("{article} {tag}")
+    }
+
+    /// Drop the method's id; the method itself is unchanged.
+    pub fn clear_id(&mut self) {
+        match self {
+            SourceAuthConfig::JwtBearer(config) => config.id = None,
+            SourceAuthConfig::ApiKey(config) => config.id = None,
+            SourceAuthConfig::ApiKeyProvider(config) => config.id = None,
+            SourceAuthConfig::DidAuth(config) => config.id = None,
+            SourceAuthConfig::Mtls(config) => config.id = None,
+        }
+    }
+
     /// Snake_case identifier for the configured authentication method, matching
     /// the serde `type` discriminant. Used to label a failed source-auth
     /// attempt when handing the outcome to the policy layer.

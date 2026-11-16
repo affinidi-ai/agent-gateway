@@ -2383,301 +2383,295 @@ async fn proxy_charged_request(
             req.extensions()
                 .get::<crate::source_auth::models::PeerCertInfo>(),
         );
-    let authenticated_identity: Option<crate::source_auth::AuthenticatedIdentity> =
-        if let Some(authorization) = &resource_authorization {
-            let Some((profile, issuer, middleware)) = state
-                .network_config
-                .sts
-                .mcp_issuer
-                .as_ref()
-                .zip(state.vc_issuer.as_deref())
-                .zip(
-                    state
-                        .source_auth_middleware
-                        .as_ref(),
-                )
-                .map(|((profile, issuer), middleware)| (profile, issuer, middleware))
-            else {
-                let error = crate::protocols::protected_resource::ResourceTokenError::Unavailable;
-                crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
-                return Ok(authorization.challenge(error));
-            };
-            let public_origins = state
-                .network_config
-                .map_url_to_port(
-                    &state
-                        .surface
-                        .access_point
-                        .listen_address,
-                )
-                .and_then(|port| {
-                    state
-                        .network_config
-                        .get_listener_by_port(port)
-                })
-                .map(|listener| listener.external_urls.clone())
-                .unwrap_or_default();
-            let expected_path = match state
-                .active_variant_alias
-                .as_deref()
-            {
-                Some(alias) => format!(
-                    "{}${alias}",
-                    state
-                        .surface
-                        .access_point
-                        .route
-                ),
-                None => state
+    let authenticated_identity: Option<crate::source_auth::AuthenticatedIdentity> = if let Some(authorization) =
+        &resource_authorization
+    {
+        let Some((profile, issuer, middleware)) = state
+            .network_config
+            .sts
+            .mcp_issuer
+            .as_ref()
+            .zip(state.vc_issuer.as_deref())
+            .zip(
+                state
+                    .source_auth_middleware
+                    .as_ref(),
+            )
+            .map(|((profile, issuer), middleware)| (profile, issuer, middleware))
+        else {
+            let error = crate::protocols::protected_resource::ResourceTokenError::Unavailable;
+            crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
+            return Ok(authorization.challenge(error));
+        };
+        let public_origins = state
+            .network_config
+            .map_url_to_port(
+                &state
+                    .surface
+                    .access_point
+                    .listen_address,
+            )
+            .and_then(|port| {
+                state
+                    .network_config
+                    .get_listener_by_port(port)
+            })
+            .map(|listener| listener.external_urls.clone())
+            .unwrap_or_default();
+        let expected_path = match state
+            .active_variant_alias
+            .as_deref()
+        {
+            Some(alias) => format!(
+                "{}${alias}",
+                state
                     .surface
                     .access_point
                     .route
-                    .clone(),
-            };
-            if state
+            ),
+            None => state
                 .surface
                 .access_point
-                .protocol
-                != crate::config::agent_surface::SurfaceProtocol::Mcp
-                || state
-                    .surface
-                    .has_source_auth()
-                || authorization
-                    .validate_endpoint(&public_origins, &expected_path)
-                    .is_err()
-                || profile
-                    .validate_network(&state.network_config)
-                    .is_err()
-            {
-                let error = crate::protocols::protected_resource::ResourceTokenError::Unavailable;
+                .route
+                .clone(),
+        };
+        if state
+            .surface
+            .access_point
+            .protocol
+            != crate::config::agent_surface::SurfaceProtocol::Mcp
+            || state
+                .surface
+                .has_source_auth()
+            || authorization
+                .validate_endpoint(&public_origins, &expected_path)
+                .is_err()
+            || profile
+                .validate_network(&state.network_config)
+                .is_err()
+        {
+            let error = crate::protocols::protected_resource::ResourceTokenError::Unavailable;
+            crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
+            return Ok(authorization.challenge(error));
+        }
+        match authorization
+            .authenticate(
+                &headers,
+                profile,
+                issuer,
+                middleware.jwks_client(),
+                middleware.token_reach(
+                    &channel_name,
+                    state
+                        .surface
+                        .tenant_id
+                        .as_deref(),
+                ),
+            )
+            .await
+        {
+            Ok(identity) => Some(identity),
+            Err(error) => {
                 crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
                 return Ok(authorization.challenge(error));
             }
-            match authorization
-                .authenticate(
-                    &headers,
-                    profile,
-                    issuer,
-                    middleware.jwks_client(),
-                    middleware.token_reach(
+        }
+    } else if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+        && let (Some(selection), installed_middleware) = (selected_source_auth, &state.source_auth_middleware)
+    {
+        let auth_config = selection.method;
+        let sa_middleware = match crate::source_auth::middleware::require_installed(installed_middleware.clone()) {
+            Ok(middleware) => middleware,
+            Err(e) => {
+                channel_warn!(config_id, "Source authentication unavailable (reason={}) — blocking", e);
+                connection_guard
+                    .decrement()
+                    .await;
+                return Err(crate::source_auth::errors::deny_response(
+                    &state
+                        .surface
+                        .access_point
+                        .protocol,
+                    auth_config,
+                    &e,
+                ));
+            }
+        };
+        let resolved_auth_config = match resolve_direct_surface_auth_config(
+            auth_config,
+            protected_resource.as_ref(),
+            state.vc_issuer.as_deref(),
+            &state.surface.surface_id,
+        )
+        .await
+        {
+            Ok(config) => config,
+            Err(e) => {
+                // Setup/config-resolution failure is a server-side problem,
+                // not a caller decision — keep blocking.
+                channel_warn!(config_id, "Source authentication setup failed (reason={}) — blocking", e);
+                crate::audit::request_events::auth_failed(
+                    &audit_facts,
+                    crate::audit::request_events::source_auth_scheme(auth_config),
+                    "setup_failed",
+                    true,
+                    client_ip,
+                );
+                connection_guard
+                    .decrement()
+                    .await;
+                return Err(crate::source_auth::errors::deny_response(
+                    &state
+                        .surface
+                        .access_point
+                        .protocol,
+                    auth_config,
+                    &e,
+                ));
+            }
+        };
+        let peer_cert = req
+            .extensions()
+            .get::<crate::source_auth::models::PeerCertInfo>();
+        let view = crate::didauth::sessions::SessionView {
+            surface_id: &state.surface.surface_id,
+            variant_id: state
+                .active_variant_id
+                .as_deref(),
+            tenant_id: state
+                .surface
+                .tenant_id
+                .as_deref(),
+        };
+        let verified = if selection.ambiguous {
+            Err(crate::source_auth::errors::SourceAuthError::AmbiguousCredentials)
+        } else {
+            sa_middleware
+                .authenticate(&resolved_auth_config, &headers, &channel_name, view, peer_cert)
+                .await
+        };
+        match verified {
+            Ok(identity) => {
+                if let Some(reason) = state
+                    .surface
+                    .inbound_source_method_refusal(auth_config)
+                {
+                    channel_warn!(config_id, "Caller refused: {}", reason);
+                    crate::metrics::backends::prometheus::track_managed_identity_resolve(
                         &channel_name,
                         state
                             .surface
-                            .tenant_id
-                            .as_deref(),
-                    ),
-                )
-                .await
-            {
-                Ok(identity) => Some(identity),
-                Err(error) => {
-                    crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
-                    return Ok(authorization.challenge(error));
+                            .inbound_identity_mode_label(),
+                        "source_method_mismatch",
+                        0.0,
+                    );
+                    crate::audit::request_events::auth_failed(
+                        &audit_facts,
+                        crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
+                        "source_method_mismatch",
+                        true,
+                        client_ip,
+                    );
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Ok(refuse_mismatched_caller(&state.surface, &state.network_config, mcp_versions, req).await);
                 }
+                Some(identity)
             }
-        } else if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
-            && let (Some(selection), installed_middleware) = (selected_source_auth, &state.source_auth_middleware)
-        {
-            let auth_config = selection.method;
-            let sa_middleware = match crate::source_auth::middleware::require_installed(installed_middleware.clone()) {
-                Ok(middleware) => middleware,
-                Err(e) => {
-                    channel_warn!(config_id, "Source authentication unavailable (reason={}) — blocking", e);
+            // Caller-attributable failure (missing/invalid credential). An
+            // Access Point that publishes protected resource metadata answers
+            // it with its challenge, so the caller can fetch a token and
+            // retry. Every other Access Point that is not public refuses it
+            // here, before policy, and so does a public one whose inbound
+            // identity is `from_jwt_claim` or whose `on_failure` is
+            // `reject`. Any other public one records the outcome for the
+            // policy layer and continues with no asserted caller identity.
+            Err(e) if e.is_caller_attributable() => {
+                // On an Access Point that publishes protected resource
+                // metadata a failed JWT gets the discovery challenge, and a
+                // failure of any other method a plain refusal, so a bad
+                // credential never gets further than none.
+                let challenged = protected_resource.is_some()
+                    && matches!(auth_config, crate::source_auth::SourceAuthConfig::JwtBearer(_));
+                let refused = !challenged
+                    && (protected_resource.is_some()
+                        || state
+                            .surface
+                            .rejects_failed_caller_authentication());
+                channel_warn!(
+                    config_id,
+                    "Source authentication failed (reason={}) — {}",
+                    e,
+                    if challenged {
+                        "sending the discovery challenge"
+                    } else if refused {
+                        "refusing the caller"
+                    } else {
+                        "deferring to policy"
+                    }
+                );
+                crate::audit::request_events::auth_failed(
+                    &audit_facts,
+                    crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
+                    crate::audit::request_events::source_auth_reason(&e),
+                    challenged || refused,
+                    client_ip,
+                );
+                if challenged && let Some(protected_resource) = &protected_resource {
                     connection_guard
                         .decrement()
                         .await;
-                    return Err(crate::source_auth::errors::deny_response(
-                        &state
-                            .surface
-                            .access_point
-                            .protocol,
-                        auth_config,
-                        &e,
-                    ));
+                    return Ok(protected_resource.caller_challenge(&e));
                 }
-            };
-            let resolved_auth_config = match resolve_direct_surface_auth_config(
-                auth_config,
-                protected_resource.as_ref(),
-                state.vc_issuer.as_deref(),
-                &state.surface.surface_id,
-            )
-            .await
-            {
-                Ok(config) => config,
-                Err(e) => {
-                    // Setup/config-resolution failure is a server-side problem,
-                    // not a caller decision — keep blocking.
-                    channel_warn!(config_id, "Source authentication setup failed (reason={}) — blocking", e);
-                    crate::audit::request_events::auth_failed(
-                        &audit_facts,
-                        crate::audit::request_events::source_auth_scheme(auth_config),
-                        "setup_failed",
-                        true,
-                        client_ip,
-                    );
+                if refused {
                     connection_guard
                         .decrement()
                         .await;
-                    return Err(crate::source_auth::errors::deny_response(
-                        &state
-                            .surface
-                            .access_point
-                            .protocol,
-                        auth_config,
-                        &e,
-                    ));
-                }
-            };
-            let peer_cert = req
-                .extensions()
-                .get::<crate::source_auth::models::PeerCertInfo>();
-            let view = crate::didauth::sessions::SessionView {
-                surface_id: &state.surface.surface_id,
-                variant_id: state
-                    .active_variant_id
-                    .as_deref(),
-                tenant_id: state
-                    .surface
-                    .tenant_id
-                    .as_deref(),
-            };
-            let verified = if selection.ambiguous {
-                Err(crate::source_auth::errors::SourceAuthError::AmbiguousCredentials)
-            } else {
-                sa_middleware
-                    .authenticate(&resolved_auth_config, &headers, &channel_name, view, peer_cert)
-                    .await
-            };
-            match verified {
-                Ok(identity) => {
-                    if let Some(reason) = state
-                        .surface
-                        .inbound_source_method_refusal(auth_config)
-                    {
-                        channel_warn!(config_id, "Caller refused: {}", reason);
-                        crate::metrics::backends::prometheus::track_managed_identity_resolve(
-                            &channel_name,
-                            state
-                                .surface
-                                .inbound_identity_mode_label(),
-                            "source_method_mismatch",
-                            0.0,
-                        );
-                        crate::audit::request_events::auth_failed(
-                            &audit_facts,
-                            crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
-                            "source_method_mismatch",
-                            true,
-                            client_ip,
-                        );
-                        connection_guard
-                            .decrement()
-                            .await;
-                        return Ok(refuse_failed_caller(
-                            &state.surface,
-                            &state.network_config,
-                            mcp_versions,
-                            &resolved_auth_config,
-                            req,
-                        )
-                        .await);
-                    }
-                    Some(identity)
-                }
-                // Caller-attributable failure (missing/invalid credential). An
-                // Access Point that publishes protected resource metadata answers
-                // it with its challenge, so the caller can fetch a token and
-                // retry. Every other Access Point that is not public refuses it
-                // here, before policy, and so does a public one whose inbound
-                // identity is `from_jwt_claim` or whose `on_failure` is
-                // `reject`. Any other public one records the outcome for the
-                // policy layer and continues with no asserted caller identity.
-                Err(e) if e.is_caller_attributable() => {
-                    // On an Access Point that publishes protected resource
-                    // metadata a failed JWT gets the discovery challenge, and a
-                    // failure of any other method a plain refusal, so a bad
-                    // credential never gets further than none.
-                    let challenged = protected_resource.is_some()
-                        && matches!(auth_config, crate::source_auth::SourceAuthConfig::JwtBearer(_));
-                    let refused = !challenged
-                        && (protected_resource.is_some()
-                            || state
-                                .surface
-                                .rejects_failed_caller_authentication());
-                    channel_warn!(
-                        config_id,
-                        "Source authentication failed (reason={}) — {}",
-                        e,
-                        if challenged {
-                            "sending the discovery challenge"
-                        } else if refused {
-                            "refusing the caller"
-                        } else {
-                            "deferring to policy"
-                        }
-                    );
-                    crate::audit::request_events::auth_failed(
-                        &audit_facts,
-                        crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
-                        crate::audit::request_events::source_auth_reason(&e),
-                        challenged || refused,
-                        client_ip,
-                    );
-                    if challenged && let Some(protected_resource) = &protected_resource {
-                        connection_guard
-                            .decrement()
-                            .await;
-                        return Ok(protected_resource.caller_challenge(&e));
-                    }
-                    if refused {
-                        connection_guard
-                            .decrement()
-                            .await;
-                        return Ok(refuse_failed_caller(
-                            &state.surface,
-                            &state.network_config,
-                            mcp_versions,
-                            &resolved_auth_config,
-                            req,
-                        )
-                        .await);
-                    }
-                    source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
-                        attempted_method: resolved_auth_config
-                            .method_tag()
-                            .to_string(),
-                        reason: e.to_string(),
-                    });
-                    None
-                }
-                // Server-side failure (config not found, internal) — keep
-                // blocking (500).
-                Err(e) => {
-                    channel_warn!(config_id, "Source authentication error (reason={}) — blocking", e);
-                    crate::audit::request_events::auth_failed(
-                        &audit_facts,
-                        crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
-                        crate::audit::request_events::source_auth_reason(&e),
-                        true,
-                        client_ip,
-                    );
-                    connection_guard
-                        .decrement()
-                        .await;
-                    return Err(crate::source_auth::errors::deny_response(
-                        &state
-                            .surface
-                            .access_point
-                            .protocol,
+                    return Ok(refuse_failed_caller(
+                        &state.surface,
+                        &state.network_config,
+                        mcp_versions,
                         &resolved_auth_config,
-                        &e,
-                    ));
+                        req,
+                    )
+                    .await);
                 }
+                source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
+                    attempted_method: resolved_auth_config
+                        .method_tag()
+                        .to_string(),
+                    reason: e.to_string(),
+                });
+                None
             }
-        } else {
-            None
-        };
+            // Server-side failure (config not found, internal) — keep
+            // blocking (500).
+            Err(e) => {
+                channel_warn!(config_id, "Source authentication error (reason={}) — blocking", e);
+                crate::audit::request_events::auth_failed(
+                    &audit_facts,
+                    crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
+                    crate::audit::request_events::source_auth_reason(&e),
+                    true,
+                    client_ip,
+                );
+                connection_guard
+                    .decrement()
+                    .await;
+                return Err(crate::source_auth::errors::deny_response(
+                    &state
+                        .surface
+                        .access_point
+                        .protocol,
+                    &resolved_auth_config,
+                    &e,
+                ));
+            }
+        }
+    } else {
+        None
+    };
 
     // Merged source-auth context for policy inputs: the verified identity on
     // success, or a `Failed` marker on a non-blocking caller-attributable
@@ -10025,6 +10019,19 @@ async fn refuse_failed_caller(
 ) -> Response {
     let mcp_request_id = refused_mcp_request_id(surface, network_config, versions, req).await;
     crate::source_auth::errors::caller_refusal(&surface.access_point.protocol, auth_config, mcp_request_id)
+}
+
+/// Refuses a caller whose credential verified but belongs to a method other
+/// than the one the inbound identity reads; no challenge, since another token
+/// of the same method would be refused again.
+async fn refuse_mismatched_caller(
+    surface: &crate::config::agent_surface::AgentSurface,
+    network_config: &crate::config::NetworkConfig,
+    versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    req: Request,
+) -> Response {
+    let mcp_request_id = refused_mcp_request_id(surface, network_config, versions, req).await;
+    crate::source_auth::errors::mismatched_caller_refusal(&surface.access_point.protocol, mcp_request_id)
 }
 
 /// Refuses a request to an Access Point that is not ready, recording the
