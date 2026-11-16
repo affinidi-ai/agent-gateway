@@ -1,0 +1,15 @@
+branch: feat/delegation-audit-split
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-16T15:00:00Z'
+      title: Confirm a revoke-all with a danger button that says how many it ends
+      description: >-
+        On the Credential Tokens tab, the first click on a user's revoke-all now turns it into a
+        danger button that says how many of that user's delegations the second click ends, such
+        as "Revoke all 2 for this user?". It used to be small amber text that was hard to read and
+        gave no count.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

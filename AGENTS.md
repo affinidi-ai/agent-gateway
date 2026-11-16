@@ -207,7 +207,8 @@ see _JWT verification strategy editor_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#jwt-verification-strategy-editor).
 
 The Credentials page keeps its **Credential Tokens** tab, which shows when each consent ends and
-confirms every revoke in place (two clicks, never a modal or a browser dialog), and has a
+confirms every revoke in place (two clicks, never a modal or a browser dialog; revoke-all asks
+with a danger button that names how many delegations it ends), and has a
 **Delegated Access** tab beside it that lists only active access and opens the Audit Log as its
 history. A new view is a new tab; an existing tab is never renamed or removed. See _Credential
 Tokens and Delegated Access tabs_ in

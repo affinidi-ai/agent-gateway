@@ -92,6 +92,14 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
 
   const fmtDate = (d: string | null) => (d ? formatDateTime(d, true) : '—');
 
+  /** The confirm of revoking every delegation of a user, with how many it ends. */
+  const revokeAllLabel = (userHash: string) => {
+    const count = tokens.filter(t => t.user_identity_hash === userHash).length;
+    return count === 1
+      ? "Revoke this user's only delegation?"
+      : `Revoke all ${count} for this user?`;
+  };
+
   /** The end of a token's consent: as a sentence for the list, or as a value for the detail. */
   const consentEndText = (token: DelegationToken, form: 'sentence' | 'value') => {
     const end = consentEnd(token.consent_expires_at);
@@ -238,22 +246,25 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                         </code>
                       </td>
                       <td>
-                        <code className="text-muted" title={token.user_identity_hash}>
-                          {topAndTail(token.user_identity_hash, 8, 8)}
-                        </code>
-                        {canEditTokens && (
-                          <TwoStepButton
-                            icon="fa-ban"
-                            confirmLabel="Click again to revoke all"
-                            title="Revoke all for this user"
-                            confirmTitle="Click again to revoke every delegation of this user"
-                            ariaLabel={`Revoke all delegations for user ${topAndTail(token.user_identity_hash, 8, 8)}`}
-                            confirmAriaLabel={`Click again to revoke all delegations for user ${topAndTail(token.user_identity_hash, 8, 8)}`}
-                            className="btn btn-link btn-sm p-0 ms-1 border-0 text-warning text-decoration-none"
-                            data-testid={`credential-token-revoke-user-button-${token.id}`}
-                            onConfirm={() => handleRevokeByUser(token.user_identity_hash)}
-                          />
-                        )}
+                        <div className="d-flex flex-wrap align-items-center gap-1">
+                          <code className="text-muted" title={token.user_identity_hash}>
+                            {topAndTail(token.user_identity_hash, 8, 8)}
+                          </code>
+                          {canEditTokens && (
+                            <TwoStepButton
+                              icon="fa-ban"
+                              confirmAs="danger"
+                              confirmLabel={revokeAllLabel(token.user_identity_hash)}
+                              title="Revoke all for this user"
+                              confirmTitle="Click again to revoke every delegation of this user"
+                              ariaLabel={`Revoke all delegations for user ${topAndTail(token.user_identity_hash, 8, 8)}`}
+                              confirmAriaLabel={`${revokeAllLabel(token.user_identity_hash)} User ${topAndTail(token.user_identity_hash, 8, 8)}`}
+                              className="btn btn-link btn-sm p-0 border-0 text-warning text-decoration-none"
+                              data-testid={`credential-token-revoke-user-button-${token.id}`}
+                              onConfirm={() => handleRevokeByUser(token.user_identity_hash)}
+                            />
+                          )}
+                        </div>
                       </td>
                       <td>
                         {token.scopes.map(scope => (

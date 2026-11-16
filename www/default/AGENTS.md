@@ -1085,8 +1085,9 @@ Credential Tokens lists every agent-keyed token, service tokens included.
 - No modal and no browser dialog confirms a revoke. The row's **Revoke delegation** is the two-step
   `DeleteButton`. **Revoke all for this user** (`credential-token-revoke-user-button-<id>`) is the
   shared `components/shared/TwoStepButton`, for a two-step action that is not a delete: the first
-  click shows "Click again to revoke all", the second sends the `DELETE`, and a click elsewhere
-  cancels.
+  click turns it into a danger button (`confirmAs="danger"`, never small or amber text) that says
+  how many of the user's listed delegations it ends, "Revoke all 2 for this user?" or "Revoke
+  this user's only delegation?", the second sends the `DELETE`, and a click elsewhere cancels.
 - The expanded row links to the user's delegation records in the Audit Log
   (`credential-token-view-activity-button-<id>`): the Audit Log opens with the user identity hash
   as its text filter and the delegation categories selected. The link is shown only to a user

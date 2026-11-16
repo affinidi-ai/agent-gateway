@@ -199,7 +199,7 @@ test.describe("Credentials page Credential Tokens tab", () => {
     const button = page.getByTestId("credential-token-revoke-user-button-t1");
 
     await button.click();
-    await expect(button).toHaveText("Click again to revoke all");
+    await expect(button).toHaveText("Revoke all 2 for this user?");
     expect(revoked).toEqual([]);
 
     await button.click();
@@ -220,12 +220,12 @@ test.describe("Credentials page Credential Tokens tab", () => {
     const button = page.getByTestId("credential-token-revoke-user-button-t1");
 
     await button.click();
-    await expect(button).toHaveText("Click again to revoke all");
+    await expect(button).toHaveText("Revoke this user's only delegation?");
     // The confirmation starts listening for a click elsewhere 100 ms after it opens.
     await page.waitForTimeout(300);
     await page.getByTestId("credentials-search-input").click();
 
-    await expect(button).not.toContainText("Click again to revoke all");
+    await expect(button).not.toContainText("Revoke this user's only delegation?");
     await expect(row(page, "t1")).toBeVisible();
     expect(revoked).toEqual([]);
   });

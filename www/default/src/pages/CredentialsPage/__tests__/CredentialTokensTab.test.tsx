@@ -101,7 +101,9 @@ describe('Credential Tokens tab', () => {
     const button = () => screen.getByTestId('credential-token-revoke-user-button-t1');
 
     fireEvent.click(button());
-    expect(button()).toHaveTextContent('Click again to revoke all');
+    expect(button()).toHaveTextContent(/^Revoke all 2 for this user\?$/);
+    expect(button()).toHaveClass('btn-danger');
+    expect(button()).not.toHaveClass('text-warning');
     expect(deletes()).toHaveLength(0);
 
     fireEvent.click(button());
@@ -120,6 +122,9 @@ describe('Credential Tokens tab', () => {
   it('keeps every delegation when the first click is not confirmed', async () => {
     await renderTab([token('t1', ALICE)]);
     fireEvent.click(screen.getByTestId('credential-token-revoke-user-button-t1'));
+    expect(screen.getByTestId('credential-token-revoke-user-button-t1')).toHaveTextContent(
+      "Revoke this user's only delegation?"
+    );
     fireEvent.click(row('t1'));
 
     expect(deletes()).toHaveLength(0);
