@@ -13,8 +13,9 @@ changes:
         as `redacted.invalid`, never raw. Each surface with such an endpoint is an agent of its own,
         with an id hashed from the surface id, not the endpoint. A record carries the
         Agent Card name (else the canvas target name of the most recently active surface), the
-        credential-free endpoint, runtime, primary protocol, the union of its surfaces' tags and
-        managed identities, every surface using it, whether any of its current identities was
+        credential-free endpoint, runtime, primary protocol, the union of its surfaces' tags, each
+        surface's own DID and current managed identity (the most recently used one, not the earlier
+        DIDs of its version history; every JWT-claim DID counts), every surface using it, whether any of its current identities was
         recorded to a Trust Registry, and the latest activity across its surfaces.
         `GET /v1/agents/{id}` adds each surface's protocol and route and the Access Point (inbound)
         request totals and p95 latency across them over the metrics retention window; Transit Point
@@ -47,7 +48,7 @@ changes:
         **Connection** shows how the gateway reaches the agent, with a URL endpoint's credentials,
         query string and fragment removed, and "Can't be shown" for an endpoint the API redacted.
         The Agent Card opens as a visual preview with a JSON view, and every value is shown as plain
-        text. **Overview** lists every identity of the agent, and last activity and traffic are
+        text. **Overview** lists every current identity of the agent, and last activity and traffic are
         labelled with the metrics retention window the API returns. Needs surface view permission.
   changed: []
   fixed: []

@@ -39,6 +39,7 @@ use crate::trust_registry_verification::recorder_status::{RecorderState, TrustRe
 const AGENT_CARD_CACHE_TTL: Duration = Duration::from_secs(300);
 const AGENT_CARD_FAILURE_CACHE_TTL: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_AGENT_CARD_FETCHES: usize = 4;
+const JWT_CLAIM_CREDENTIAL_TYPE: &str = "jwt_claim";
 
 fn tenant_context(context: &Option<Extension<PatTenantContext>>) -> Option<&PatTenantContext> {
     context
@@ -448,8 +449,58 @@ impl RegistryData<'_> {
         surfaces
     }
 
-    /// Each surface's own agent DID plus the managed identities used on the group's
-    /// surfaces, once per DID. Caller identities are never managed, so never included.
+    /// A JWT-claim DID is one parallel agent per claim value, not a version of the
+    /// surface's managed agent.
+    fn is_jwt_claim(
+        &self,
+        did: &str,
+    ) -> bool {
+        self.identity_records
+            .iter()
+            .any(|record| {
+                record.did == did
+                    && record
+                        .identity_fields
+                        .get("credential_type")
+                        .and_then(Value::as_str)
+                        == Some(JWT_CLAIM_CREDENTIAL_TYPE)
+            })
+    }
+
+    /// When `did` was last used on `surface_id`, else when it was created.
+    fn last_use_on(
+        &self,
+        did: &str,
+        surface_id: &str,
+    ) -> Option<DateTime<Utc>> {
+        self.identity_records
+            .iter()
+            .filter(|record| record.did == did)
+            .filter_map(|record| {
+                record
+                    .channel_usage
+                    .iter()
+                    .find(|usage| usage.channel_config_id == surface_id)
+                    .map(|usage| usage.last_used_at)
+                    .or_else(|| {
+                        (record
+                            .channel_config_id
+                            .as_deref()
+                            == Some(surface_id))
+                        .then(|| {
+                            record
+                                .last_used_at
+                                .unwrap_or(record.created_at)
+                        })
+                    })
+            })
+            .max()
+    }
+
+    /// Each surface's own agent DID plus the current managed identity of each of the group's
+    /// surfaces, once per DID. A surface's managed DIDs are versions of one managed agent, so
+    /// only the most recently used one is current; JWT-claim DIDs are each their own agent and
+    /// all count. Caller identities are never managed, so never included.
     fn identities(
         &self,
         group: &AgentGroup<'_>,
@@ -469,15 +520,34 @@ impl RegistryData<'_> {
         {
             sources.insert(did, IdentitySource::Surface);
         }
+        let mut current: HashMap<&str, (Option<DateTime<Utc>>, &str)> = HashMap::new();
         for (did, ids) in self.managed_surfaces_by_did {
-            if ids
+            let ids: Vec<&str> = ids
                 .iter()
-                .any(|id| surface_ids.contains(id.as_str()))
-            {
+                .map(String::as_str)
+                .filter(|id| surface_ids.contains(id))
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
+            if self.is_jwt_claim(did) {
                 sources
                     .entry(did.as_str())
                     .or_insert(IdentitySource::Managed);
+                continue;
             }
+            for id in ids {
+                let candidate = (self.last_use_on(did, id), did.as_str());
+                current
+                    .entry(id)
+                    .and_modify(|best| *best = (*best).max(candidate))
+                    .or_insert(candidate);
+            }
+        }
+        for (_, did) in current.into_values() {
+            sources
+                .entry(did)
+                .or_insert(IdentitySource::Managed);
         }
         sources
             .into_iter()
@@ -1474,30 +1544,81 @@ mod tests {
         );
     }
 
+    /// A managed identity last used on `surface_id` `minutes_ago`.
+    fn managed_used(
+        did: &str,
+        surface_id: &str,
+        minutes_ago: i64,
+    ) -> AgentIdentityRecord {
+        let mut record = managed(did, surface_id);
+        let at = Utc::now() - Duration::minutes(minutes_ago);
+        record.last_used_at = Some(at);
+        record.channel_usage[0].last_used_at = at;
+        record
+    }
+
+    fn jwt_claim(record: AgentIdentityRecord) -> AgentIdentityRecord {
+        let mut record = record;
+        record
+            .identity_fields
+            .insert("credential_type".to_string(), serde_json::json!(JWT_CLAIM_CREDENTIAL_TYPE));
+        record
+    }
+
+    #[tokio::test]
+    async fn test_only_the_most_recently_used_managed_did_of_a_surface_is_an_identity() {
+        let mut fixture = Fixture::new();
+        fixture.records = vec![
+            managed_used("did:old", "s-oxygen", 30),
+            managed_used("did:current", "s-oxygen", 5),
+            managed_used("did:older", "s-oxygen", 60),
+        ];
+        let agent = fixture
+            .only(&[surface("s-oxygen")], None)
+            .await;
+        assert_eq!(dids(&agent), vec!["did:current"], "earlier DIDs of the surface are its version history");
+    }
+
+    #[tokio::test]
+    async fn test_every_jwt_claim_did_of_a_surface_is_an_identity() {
+        let mut fixture = Fixture::new();
+        fixture.records = vec![
+            jwt_claim(managed_used("did:claim-a", "s-oxygen", 30)),
+            jwt_claim(managed_used("did:claim-b", "s-oxygen", 5)),
+            managed_used("did:old", "s-oxygen", 20),
+            managed_used("did:current", "s-oxygen", 10),
+        ];
+        let agent = fixture
+            .only(&[surface("s-oxygen")], None)
+            .await;
+        assert_eq!(dids(&agent), vec!["did:claim-a", "did:claim-b", "did:current"]);
+    }
+
     #[tokio::test]
     async fn test_identities_are_the_union_across_surfaces_once_per_did() {
         let mut fixture = Fixture::new();
-        let did_b = managed("did:b", "s-oxygen");
+        let did_b = managed_used("did:b", "s-oxygen", 5);
         let created_b = did_b.created_at;
         let mut caller = test_surface_identity_record("did:caller", "s-oxygen");
         caller.origin = Some(IdentityOrigin::ExternalCaller);
         fixture.records = vec![
-            managed("did:a", "s-oxygen"),
+            managed_used("did:a", "s-oxygen", 30),
             did_b,
-            managed("did:b", "s-helium"),
-            managed("did:c", "s-helium"),
+            managed_used("did:b", "s-helium", 5),
+            managed_used("did:c", "s-helium", 30),
+            managed_used("did:d", "s-neon", 5),
             caller,
         ];
         let mut helium = surface("s-helium");
         helium.agent_did = Some("did:c".to_string());
         let agent = fixture
-            .only(&[surface("s-oxygen"), helium], None)
+            .only(&[surface("s-oxygen"), helium, surface("s-neon")], None)
             .await;
-        assert_eq!(dids(&agent), vec!["did:a", "did:b", "did:c"]);
-        let did_c = &agent.identities[2];
+        assert_eq!(dids(&agent), vec!["did:b", "did:c", "did:d"]);
+        let did_c = &agent.identities[1];
         assert_eq!(did_c.source, IdentitySource::Surface, "a surface's own DID is reported as surface");
-        assert_eq!(agent.identities[1].source, IdentitySource::Managed);
-        assert!(agent.identities[1].created_at <= Some(created_b));
+        assert_eq!(agent.identities[0].source, IdentitySource::Managed);
+        assert!(agent.identities[0].created_at <= Some(created_b));
     }
 
     #[tokio::test]
