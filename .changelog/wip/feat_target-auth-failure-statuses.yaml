@@ -9,7 +9,9 @@ changes:
         is the header the sending gateway put its own Target credential in, the sending gateway
         answers its caller 500 target_auth_rejected instead of the peer's 401, which the caller read
         as its own credential failing, and records target_auth_failed with outcome refused_by_target
-        and upstream_status 401 in the VP Audit Log. Any other 401 passes through unchanged.
+        and upstream_status 401 in the VP Audit Log. Any other 401 passes through unchanged. A peer
+        MCP surface that checks bearer tokens as a Resource Server names the authorization header
+        when it refuses a token that came.
   changed:
     - timestamp: '2026-11-13T00:00:00Z'
       title: Answer a Target credential that cannot be obtained with 500 or 503 and a reason
@@ -21,7 +23,8 @@ changes:
         is unreachable, times out or answers 5xx or 429) instead of 502, which callers read as an
         outage of the next hop although it was never called. A request the token retry backoff
         holds back fails as the request that started it. The reason is a top-level field of the problem JSON, or error.data.reason for an MCP
-        Transit Point; the cause stays in the VP Audit Log, whose http_status now reports the status
+        Transit Point or MCP surface, and a gateway sending over Fabric passes on the peer's status
+        and reason; the cause stays in the VP Audit Log, whose http_status now reports the status
         answered. The dashboard's reject option reads Reject request. Callers or alerts that expect
         502 for these failures now get 500 or 503; a refusal by the Target's egress policy still
         answers 502.

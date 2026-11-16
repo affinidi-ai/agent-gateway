@@ -3200,6 +3200,12 @@ fn refused_credential_header<'a>(
     method.credential_header_name()
 }
 
+/// The header of the bearer token a protected MCP surface verified and refused with `401`;
+/// `None` when no token came or the refusal is not of the token itself.
+fn refused_bearer_header(error: crate::protocols::protected_resource::ResourceTokenError) -> Option<&'static str> {
+    (error == crate::protocols::protected_resource::ResourceTokenError::Invalid).then_some("authorization")
+}
+
 /// Marks this gateway's own refusal of a caller credential in the ForwardResponse envelope,
 /// beside `status`, so the sending gateway learns which header held the refused credential.
 /// The HTTP body is left as it is.
@@ -5053,7 +5059,8 @@ async fn process_charged_forward_request(
                 Ok(identity) => identity,
                 Err(error) => {
                     token_refused(error);
-                    return axum_response_to_forward_result(authorization.challenge(error)).await;
+                    let refusal = axum_response_to_forward_result(authorization.challenge(error)).await;
+                    return with_caller_refusal(refusal, refused_bearer_header(error));
                 }
             };
             if let Some(headers) = headers.as_mut() {
@@ -9687,6 +9694,19 @@ mod tests {
                 .is_none(),
             "{response_body}"
         );
+    }
+
+    #[test]
+    fn only_a_refused_bearer_token_names_its_header_as_the_refused_credential() {
+        use crate::protocols::protected_resource::ResourceTokenError;
+        for (error, expected) in [
+            (ResourceTokenError::Invalid, Some("authorization")),
+            (ResourceTokenError::Missing, None),
+            (ResourceTokenError::InsufficientScope, None),
+            (ResourceTokenError::Unavailable, None),
+        ] {
+            assert_eq!(refused_bearer_header(error), expected, "{error:?}");
+        }
     }
 
     #[test]

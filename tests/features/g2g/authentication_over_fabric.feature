@@ -143,6 +143,7 @@ Feature: Source authentication and target authentication over fabric
     When the caller asks gateway 1 MCP surface "charlie" for available tools
     Then the response status is 500
     And the response says "Target authentication failed"
+    And the response reason is "target_auth_misconfigured"
     And MCP server "bravo" was not called
 
   Scenario: gateway 2 forwards over fabric when missing target authentication fallback is passthrough

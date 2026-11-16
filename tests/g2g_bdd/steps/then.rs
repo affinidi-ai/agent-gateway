@@ -1207,6 +1207,22 @@ pub async fn response_status_is(
     );
 }
 
+#[then(expr = "the response reason is {string}")]
+pub async fn response_reason_is(
+    world: &mut G2gWorld,
+    expected: String,
+) {
+    let body = response_body(world);
+    let reason = body
+        .get("reason")
+        .or_else(|| body.pointer("/error/data/reason"));
+    assert_eq!(
+        reason.and_then(Value::as_str),
+        Some(expected.as_str()),
+        "expected reason {expected:?} in the caller response, got {body}"
+    );
+}
+
 #[then(expr = "the agent card points callers at gateway {int} surface {string}")]
 pub async fn agent_card_points_callers_at_surface(
     world: &mut G2gWorld,

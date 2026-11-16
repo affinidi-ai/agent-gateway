@@ -740,7 +740,7 @@ give them different names to send both.
 
 A credential header value that is not ASCII is sent to an HTTP target byte for byte. A Fabric
 target can carry only text header values, so a Transit Point refuses a Fabric request whose
-`target_auth` header cannot be carried with `502`, and one whose delegated credential header
+`target_auth` header cannot be carried with `500 target_auth_misconfigured`, and one whose delegated credential header
 cannot be carried with `503`, rather than forwarding it without the credential.
 
 An Access Point and Fabric receive apply the same rule to the caller's headers: a caller
@@ -1039,7 +1039,8 @@ backoff did, with the same status, and its `target_auth_failed` record names the
 error.
 
 This holds on the direct path, a `proxy://` MCP Target, the Fabric send leg, Fabric receive
-(whose ForwardResponse carries the status, which the sending gateway passes on), a Transit Point
+(whose ForwardResponse carries the status and reason, which the sending gateway passes on; an
+MCP surface puts the reason in `error.data.reason`), a Transit Point
 and the agent card fetch. A Transit Point credential that cannot be sent as a header is refused
 with `500 target_auth_misconfigured` whatever the `fallback`. A request that would carry the
 credential outside the Target's base path is refused whatever the `fallback`, with `400
@@ -1051,7 +1052,9 @@ arguments leaves it (see [Target credential scope](PROTOCOLS.md)).
 On a `fabric://` route (an Access Point's Target or a Transit Point), when the peer gateway
 answers `401` and its `ForwardResponse` names, in `caller_refusal`, the header this gateway sent
 its Target credential in, the caller gets `500` with reason `target_auth_rejected` instead of the
-peer's `401`: the caller's own credential was not at fault. The VP Audit Log records a
+peer's `401`: the caller's own credential was not at fault. A peer MCP surface that checks bearer
+tokens as a Resource Server names `authorization` when it refuses a token that came, not when none
+came or the token lacks a scope. The VP Audit Log records a
 `target_auth_failed` refusal with outcome `refused_by_target` and `upstream_status` `401`. Any
 other `401` reaches the caller unchanged and is not recorded: one from the peer's Target, a peer
 that sent no `caller_refusal` (an older gateway, a missing credential, credentials for more than
@@ -1580,7 +1583,7 @@ grant.
 
 The Target credential is sent only to URLs under the Target endpoint, and a Target's redirect is
 returned, never followed. A request whose path climbs out, such as `{route}/%2e%2e/admin` against
-`https://api.example.com/base`, is refused with 502 and nothing is forwarded, whatever the
+`https://api.example.com/base`, is refused with `400 target_path_refused` and nothing is forwarded, whatever the
 `fallback`, and recorded in the VP Audit Log as a `target_auth_failed` refusal with outcome
 `rejected`. This covers the direct path, Fabric send and receive, Transit Points and MCP proxy
 tool calls; the rules and each path's answer are in

@@ -991,6 +991,19 @@ impl TargetAuthFailure {
     pub(crate) fn response(self) -> Response {
         crate::a2a::create_error_response_with_reason(self.status(), TARGET_AUTH_FAILED, self.reason())
     }
+
+    /// The failure a peer gateway refused with over Fabric: its problem JSON `body` names one
+    /// of these reasons with the matching `status`. Any other answer is `None`.
+    pub(crate) fn relayed(
+        status: u16,
+        body: &str,
+    ) -> Option<Self> {
+        let body: serde_json::Value = serde_json::from_str(body).ok()?;
+        let reason = body.get("reason")?.as_str()?;
+        [Self::Misconfigured, Self::Unavailable, Self::PathRefused, Self::Rejected]
+            .into_iter()
+            .find(|failure| failure.reason() == reason && failure.status().as_u16() == status)
+    }
 }
 
 /// Records in the VP Audit Log that the Target credential of `target_auth` was not sent
@@ -13363,6 +13376,7 @@ async fn handle_fabric_request_inner(
                     }
 
                     channel_error!(config_id, "❌ Gateway forwarding error: {}", error);
+                    let relayed_failure = TargetAuthFailure::relayed(status, &response_body);
 
                     // For MCP requests, return the error as a properly formatted JSON-RPC error response
                     // instead of converting it to an HTTP error (which causes a 500)
@@ -13379,6 +13393,18 @@ async fn handle_fabric_request_inner(
                         } else {
                             -32603
                         };
+                        let jsonrpc_error = || {
+                            let mut jsonrpc_error = serde_json::json!({
+                                "code": jsonrpc_error_code,
+                                "message": error
+                                    .as_str()
+                                    .unwrap_or("Gateway forwarding failed")
+                            });
+                            if let Some(failure) = relayed_failure {
+                                jsonrpc_error["data"] = serde_json::json!({ "reason": failure.reason() });
+                            }
+                            serde_json::json!({ "jsonrpc": "2.0", "id": null, "error": jsonrpc_error }).to_string()
+                        };
 
                         // Try to parse the response_body as JSON to see if it's already a JSON-RPC error
                         let error_response =
@@ -13390,34 +13416,10 @@ async fn handle_fabric_request_inner(
                                 {
                                     response_body
                                 } else {
-                                    // Create a JSON-RPC error response
-                                    let error_msg = error
-                                        .as_str()
-                                        .unwrap_or("Gateway forwarding failed");
-                                    serde_json::json!({
-                                        "jsonrpc": "2.0",
-                                        "id": null,
-                                        "error": {
-                                            "code": jsonrpc_error_code,
-                                            "message": error_msg
-                                        }
-                                    })
-                                    .to_string()
+                                    jsonrpc_error()
                                 }
                             } else {
-                                // Create a JSON-RPC error response
-                                let error_msg = error
-                                    .as_str()
-                                    .unwrap_or("Gateway forwarding failed");
-                                serde_json::json!({
-                                    "jsonrpc": "2.0",
-                                    "id": null,
-                                    "error": {
-                                        "code": jsonrpc_error_code,
-                                        "message": error_msg
-                                    }
-                                })
-                                .to_string()
+                                jsonrpc_error()
                             };
 
                         // Build response with headers from the forward response.
@@ -13459,6 +13461,9 @@ async fn handle_fabric_request_inner(
                     connection_guard
                         .decrement()
                         .await;
+                    if let Some(failure) = relayed_failure {
+                        return Err(failure.response());
+                    }
                     return Err(create_error_response(
                         error_status,
                         error
@@ -17297,6 +17302,25 @@ pub(crate) mod target_auth_tests {
             assert_eq!(body["status"], status.as_u16(), "{failure:?}");
             assert_eq!(body["detail"], TARGET_AUTH_FAILED, "{failure:?}");
             assert_eq!(body["reason"], reason, "{failure:?}");
+        }
+    }
+
+    #[test]
+    fn a_peer_gateways_target_auth_refusal_is_read_only_from_a_known_reason_with_its_status() {
+        use crate::proxy::handler::TargetAuthFailure;
+        let problem =
+            |reason: &str| serde_json::json!({"detail": "Target authentication failed", "reason": reason}).to_string();
+        for (status, body, expected) in [
+            (500, problem("target_auth_misconfigured"), Some(TargetAuthFailure::Misconfigured)),
+            (503, problem("target_auth_unavailable"), Some(TargetAuthFailure::Unavailable)),
+            (400, problem("target_path_refused"), Some(TargetAuthFailure::PathRefused)),
+            (500, problem("target_auth_rejected"), Some(TargetAuthFailure::Rejected)),
+            (503, problem("target_auth_misconfigured"), None),
+            (500, problem("anything_else"), None),
+            (500, serde_json::json!({"detail": "Target authentication failed"}).to_string(), None),
+            (500, "not json".to_string(), None),
+        ] {
+            assert_eq!(TargetAuthFailure::relayed(status, &body), expected, "{status} {body}");
         }
     }
 
