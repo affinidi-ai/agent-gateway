@@ -3708,7 +3708,7 @@ async fn step_trust_check(
             crate::trust_registry_verification::metadata_gate::synthesize_metadata_gate_failures(
                 origin,
                 crate::trust_registry_verification::TrustCheckLeg::Target,
-                &target_elements,
+                &crate::trust_registry_verification::trust_check_element::expand_authorities(&target_elements),
                 &wrapped_input,
             );
         if synthesized_by_index
@@ -16754,9 +16754,11 @@ mod tests {
             id: id.to_string(),
             trust_registry_id: "tr-test".to_string(),
             authority_source: None,
+            authority_sources: Default::default(),
             query_type: TrqpQueryType::Recognition,
             query: TrqpQueryParams {
                 authority_id: "did:test:authority".to_string(),
+                authority_ids: None,
                 entity_id: "{{ input.agent.did }}".to_string(),
                 action: None,
                 resource: None,
@@ -16778,9 +16780,11 @@ mod tests {
             id: id.to_string(),
             trust_registry_id: "tr-test".to_string(),
             authority_source: None,
+            authority_sources: Default::default(),
             query_type: TrqpQueryType::Recognition,
             query: TrqpQueryParams {
                 authority_id: "did:test:authority".to_string(),
+                authority_ids: None,
                 entity_id: "{{ input.agent.provider_did }}".to_string(),
                 action: None,
                 resource: None,

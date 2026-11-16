@@ -1,0 +1,32 @@
+branch: fix/legacy-notice-follow-ups
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-12T10:00:00Z'
+      title: Reword the start-up log line about a surface that refuses failed callers
+      description: >-
+        The warning logged at start for a surface stored without a Public access setting that
+        authenticates callers now says it is configured for authenticated callers only, that a
+        request without valid credentials is denied with 401, and that switching the Access
+        Point to Public access allows those callers.
+  fixed:
+    - timestamp: '2026-11-11T13:00:00Z'
+      title: Log a DynamoDB public attribute the gateway ignored, also at start
+      description: >-
+        A surface built from DynamoDB takes access_point.public from an optional public
+        attribute on its item, a boolean or the string true or false. Any other value, such as
+        yes, True or a number, is ignored and the surface keeps no Public access setting, so it refuses failed
+        callers. The warning saying so was raised while the DynamoDB configuration was read,
+        before the gateway installs its log subscriber, so it never reached the log at start
+        and an operator whose opt-out had no effect got no reason. The gateway now holds such
+        warnings until logging starts and logs them then, naming the item and the type of value it held, never the value, and
+        logs later ones at once.
+  removed:
+    - timestamp: '2026-11-12T09:00:00Z'
+      title: Remove the unset Public access note and Close button from the dashboard
+      description: >-
+        The Access Point panel no longer shows the note under the Public access switch for a
+        surface stored without that setting, nor its Close Access Point button. The gateway's own warnings about such
+        a surface are unchanged. Set Public access or access_point.public to choose.
+  security: []
+  breaking: []

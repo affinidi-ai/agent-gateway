@@ -21,9 +21,6 @@ import {
 const PUBLIC_ACCESS_HELP =
   'Let anyone call this Access Point without credentials. Leave this off unless your agent is meant to be public.';
 
-export const LEGACY_ACCESS_POINT_TEXT =
-  'Legacy: this Access Point is neither closed nor public. A caller whose credential is missing or invalid is refused, and without caller authentication every caller is admitted.';
-export const CLOSE_ACCESS_POINT_LABEL = 'Close Access Point';
 export const CLOSING_ACCESS_POINT_TEXT =
   'Closed when you save: a caller whose credential is missing or invalid is refused, and without a Caller Context every caller is refused.';
 
@@ -44,9 +41,8 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
   const a2aValidation = a2aView.envelopeOnly
     ? A2A_PROXY_SETTINGS.validation
     : selectedA2aValidation(config);
-  // A surface stored without `public` stays legacy until the operator closes
-  // it, or turns Public access on; turning the switch off again returns it to
-  // the stored, legacy state.
+  // A surface stored without `public` keeps it unset until the operator turns
+  // Public access on; turning the switch off again returns it to the stored state.
   const meta = useOptionalSurfaceMeta();
   const legacy = meta?.legacyAccessPoint === true;
 
@@ -84,27 +80,6 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
                 updateField('public', e.target.checked ? true : legacy ? undefined : false)
               }
             />
-            {legacy && typeof config.public !== 'boolean' && (
-              <Form.Text
-                className="d-block text-warning"
-                style={{ fontSize: '10px' }}
-                data-testid="access-point-legacy-notice"
-              >
-                <i className="fas fa-exclamation-triangle me-1" aria-hidden="true" />
-                {LEGACY_ACCESS_POINT_TEXT}
-                {!meta?.readOnly && (
-                  <button
-                    type="button"
-                    className="btn btn-link btn-sm p-0 ms-1 align-baseline"
-                    style={{ fontSize: '10px' }}
-                    data-testid="access-point-close-button"
-                    onClick={() => updateField('public', false)}
-                  >
-                    {CLOSE_ACCESS_POINT_LABEL}
-                  </button>
-                )}
-              </Form.Text>
-            )}
             {legacy && config.public === false && (
               <Form.Text
                 className="d-block text-muted"

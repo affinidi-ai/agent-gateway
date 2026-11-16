@@ -38,5 +38,5 @@ src/server/websocket.rs:generic-api-key:721
 # --- Placeholder DIDs in behaviour test steps: public identifiers, not keys ---
 # The agent card steps name a made-up presentation holder as a did:key. A DID is
 # a public identifier and this one stands for no key at all.
-tests/surface_bdd/steps/given.rs:generic-api-key:3848
-tests/surface_bdd/steps/given.rs:generic-api-key:3849
+tests/surface_bdd/steps/given.rs:generic-api-key:3939
+tests/surface_bdd/steps/given.rs:generic-api-key:3940

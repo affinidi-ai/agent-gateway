@@ -13,6 +13,12 @@ pub const MAX_CALLER_KEY_HEADER_LEN: usize = 64;
 /// The fewest bytes a caller key secret holds: fewer would let whoever sees the keys guess it.
 pub const MIN_SECRET_BYTES: usize = 32;
 
+/// Whether a secret value is long enough to derive caller keys from: [`MIN_SECRET_BYTES`] or
+/// more. A save and every derivation check it the same way.
+pub fn long_enough(secret: &str) -> bool {
+    secret.len() >= MIN_SECRET_BYTES
+}
+
 /// Whether a header named `name` belongs to the caller key family, which only the gateway
 /// sets: once lower-cased, with `_` read as `-` as some servers do, it is `x-caller-key` or
 /// starts with `x-caller-key-`. A caller's, an agent's or a peer gateway's copy of such a
@@ -210,6 +216,17 @@ mod tests {
             ["x-caller-keys", "x-caller-ke", "x-caller", "caller-key", "x-api-key", "x-caller-did", "xx-caller-key", ""]
         {
             assert!(!is_caller_key_header(name), "{name}");
+        }
+    }
+
+    /// A look-alike with a non-ASCII letter or hyphen is no HTTP header name, so it never
+    /// reaches a request; and it is not read as one of the caller key family either.
+    #[test]
+    fn a_non_ascii_look_alike_is_neither_a_header_name_nor_a_caller_key_header() {
+        for name in ["\u{0445}-caller-key", "x\u{2010}caller\u{2010}key", "\u{FF58}-caller-key", "x-caller-k\u{0435}y"]
+        {
+            assert!(!is_caller_key_header(name), "{name}");
+            assert!(axum::http::HeaderName::from_bytes(name.as_bytes()).is_err(), "{name}");
         }
     }
 

@@ -83,9 +83,10 @@ storage next to `_storage`, never inside it: a restore empties `_storage`. A ful
 covers `_storage` except `logs/` and `system_metrics/`. Back up `config.toml`,
 `gateway.json`, the other configuration files and the TLS certificates separately. See
 [Locating the files](CONFIGURATION_REFERENCE.md#locating-the-files). Where
-`[storage_paths] vc_keys` points, the gateway creates its transit token key on its first
-start by linking a complete copy into place, so that instances starting together create one
-key between them. Local disks, EFS and NFS support hard links. Where the link fails, as it
+`[storage_paths] vc_keys` points, the gateway creates its transit token key and its login
+decoy credential key on its first start (the decoy key on its first start in passkey sign-in
+mode), each by linking a complete copy into place, so that
+instances starting together create one key between them. Local disks, EFS and NFS support hard links. Where the link fails, as it
 does on a volume without them such as an Azure Files SMB share, the gateway logs a warning
 and creates the key file exclusively instead, filling it in place; instances still share one
 key, and one reading the file while another fills it waits up to 5 seconds for it to be
@@ -148,7 +149,8 @@ you open any listener:
   is listed, the gateway sees every caller as the balancer's address, so the STS token
   endpoint throttle, which is on by default, counts them all as one source: a burst of
   failed client logins through the balancer locks every STS client out for
-  `lockout_secs`. The SAML and CLI login limits, when enabled, share one budget the same way. The
+  `lockout_secs`. The passkey, SAML and CLI login limits, when enabled, share one budget the
+  same way. The
   balancer must append the caller's address to `X-Forwarded-For` or overwrite it, and set
   or strip `X-Forwarded-Host` and `X-Forwarded-Proto` rather than pass a caller's through.
 - **Register the first administrator before anyone else can reach the gateway.** The

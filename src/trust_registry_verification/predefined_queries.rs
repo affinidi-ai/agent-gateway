@@ -475,6 +475,7 @@ mod tests {
     fn tr_parity_validator_requires_action_and_resource_for_authorization() {
         let mut q = TrqpQueryParams {
             authority_id: "a".to_string(),
+            authority_ids: None,
             entity_id: "b".to_string(),
             action: None,
             resource: None,
@@ -490,6 +491,7 @@ mod tests {
     fn tr_parity_validator_allows_blank_action_resource_for_recognition() {
         let q = TrqpQueryParams {
             authority_id: "a".to_string(),
+            authority_ids: None,
             entity_id: "b".to_string(),
             action: None,
             resource: None,

@@ -561,6 +561,15 @@ pub struct McpProxyPinChangeDetails {
     pub pin: String,
 }
 
+/// A management save that changed which browser origins a surface lets pages call it from
+/// (`browser_origins`): the list before the save, empty for a new surface, and after it.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct BrowserOriginsChangeDetails {
+    pub actor: Actor,
+    pub previous_origins: Vec<String>,
+    pub origins: Vec<String>,
+}
+
 /// A secret deleted with `force=true` through the management API. Names the secret by its id
 /// and each record that still used it by kind and id; never the secret's value or a record's
 /// name.
@@ -828,6 +837,8 @@ pub enum DelegationAuditAction {
     AuthorityForceDeleted(Box<AuthorityForceDeleteDetails>),
     /// A save changed the pin of a `proxy://` Transit Point's external consent binding.
     McpProxyPinChanged(Box<McpProxyPinChangeDetails>),
+    /// A save changed a surface's `browser_origins`.
+    BrowserOriginsChanged(Box<BrowserOriginsChangeDetails>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -885,6 +896,7 @@ impl DelegationAuditAction {
                 | Self::SecretForceDeleted(_)
                 | Self::AuthorityForceDeleted(_)
                 | Self::McpProxyPinChanged(_)
+                | Self::BrowserOriginsChanged(_)
         )
     }
 }
@@ -1771,6 +1783,7 @@ pub fn action_category(action: &DelegationAuditAction) -> &'static str {
         DelegationAuditAction::SecretForceDeleted(_) => "secret_force_deleted",
         DelegationAuditAction::AuthorityForceDeleted(_) => "authority_force_deleted",
         DelegationAuditAction::McpProxyPinChanged(_) => "mcp_proxy_pin_changed",
+        DelegationAuditAction::BrowserOriginsChanged(_) => "browser_origins_changed",
     }
 }
 

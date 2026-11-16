@@ -541,15 +541,18 @@ async fn a_transit_point_workload_binding_names_each_provider_key() {
     assert_ne!(bound[0], bound[1]);
 }
 
-/// A revoked provider key identifies no caller: a closed Access Point refuses
-/// it with `401` before policy, and it gets no DID, while an active key gets
-/// one and reaches the policy that wants a caller.
+/// A revoked provider key identifies no caller and gets no DID, while an active
+/// key gets one. A closed Access Point refuses the revoked key with `401` before
+/// policy; a public one hands it to policy as a failed caller, with the
+/// attempted method and no caller identity.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_revoked_provider_key_identifies_no_caller() {
     const POLICY: &str = "revoked-key-policy";
-    let cases = [(
-        "revoked-key-needs-caller",
-        r#"package surface.policy
+    let cases = [
+        (
+            "revoked-key-needs-caller",
+            false,
+            r#"package surface.policy
 
 default allow := false
 
@@ -559,9 +562,26 @@ allow if {
     input.agent.did == input.extension_identity.did
 }
 "#,
-        [401, 200],
-    )];
-    for (surface_id, rego, [revoked_status, active_status]) in cases {
+            [401, 200],
+        ),
+        (
+            "revoked-key-sees-failure",
+            true,
+            r#"package surface.policy
+
+default allow := false
+
+allow if {
+    input.source_auth.method == "failed"
+    input.source_auth.attempted_method == "api_key_provider"
+    not input.agent.did
+    not input.extension_identity
+}
+"#,
+            [200, 403],
+        ),
+    ];
+    for (surface_id, public, rego, [revoked_status, active_status]) in cases {
         let mut keys = Vec::new();
         let mut identities_dir = String::new();
         let h = GatewayHarness::start(|dir, gw_config, bootstrap| {
@@ -571,7 +591,9 @@ allow if {
                 .identities
                 .clone();
             write_policy(dir, POLICY, rego);
-            gw_config.surfaces = vec![provider_caller_surface(surface_id, "/smoke", POLICY, None)];
+            let mut surface = provider_caller_surface(surface_id, "/smoke", POLICY, None);
+            surface.access_point.public = Some(public);
+            gw_config.surfaces = vec![surface];
         })
         .await;
 

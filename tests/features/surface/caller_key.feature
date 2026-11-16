@@ -33,7 +33,7 @@ Feature: Caller keys
     When the caller sends a request to the surface with a valid token and header "<header>" set to "forged"
     Then the response status is 200
     And managed agent "bravo" received the caller key of "test-user" in header "x-caller-key" on every request
-    And managed agent "bravo" did not receive header "x_caller_key"
+    And managed agent "bravo" received no header with value "forged"
 
     Examples:
       | header              |
@@ -99,3 +99,34 @@ Feature: Caller keys
     Then the response status is 200
     And managed agent "bravo" did not receive header "x-caller-key"
     And the gateway log has a warning containing "Forwarding without the caller key"
+
+  Scenario: A caller key sent to a plain http Target is logged while https Targets are not enforced
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface requires "JWT Bearer" source authentication
+    And the surface derives caller keys from secret "caller-keys"
+    And the gateway keeps its log of warnings
+    When the caller sends a request to the surface with a valid token
+    Then the response status is 200
+    And managed agent "bravo" received the caller key of "test-user" in header "x-caller-key" on every request
+    And the gateway log has a warning containing "Caller key sent to a Target that is not https; it will be withheld once credential_policy.target_https is enforce"
+
+  Scenario: A caller key is withheld from a plain http Target when https Targets are enforced
+    Given the gateway enforces the credential rule "target_https"
+    And an A2A surface targeting managed agent "bravo"
+    And the surface requires "JWT Bearer" source authentication
+    And the surface derives caller keys from secret "caller-keys"
+    And the gateway keeps its log of warnings
+    When the caller sends a request to the surface with a valid token
+    Then the response status is 200
+    And managed agent "bravo" did not receive header "x-caller-key"
+    And the gateway log has a warning containing "Caller key withheld: the Target is not https and credential_policy.target_https is enforce"
+
+  Scenario: The REST API behind a proxy:// MCP Target gets no caller key
+    Given REST API "bravo" exposes a Weather OpenAPI
+    And MCP surface "alpha" exists for route "/example" targeting an MCP proxy endpoint backed by REST API "bravo"
+    And the surface requires "JWT Bearer" source authentication
+    And the surface derives caller keys from secret "caller-keys"
+    When the caller invokes the MCP tool "get_weather" for city "Paris" with a valid token
+    Then the response status is 200
+    And REST API "bravo" received "GET /weather/Paris"
+    And REST API "bravo" did not receive header "x-caller-key"

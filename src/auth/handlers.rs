@@ -9,7 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use webauthn_rs::prelude::*;
 
 use super::state::{AuthState, ChallengeState};
@@ -119,6 +119,9 @@ pub async fn register_start(
     State(auth_state): State<Arc<AuthState>>,
     Json(req): Json<RegisterStartRequest>,
 ) -> Result<Json<RegisterStartResponse>, (StatusCode, String)> {
+    if !is_username_length_allowed(&req.username) {
+        return Err((StatusCode::BAD_REQUEST, "Username is too long".to_string()));
+    }
     let existing_user = auth_state
         .storage
         .load_user(&req.username)
@@ -140,7 +143,7 @@ pub async fn register_start(
     }
 
     if let Some(existing_user) = &existing_user {
-        error!("Registration requested for the username of existing user_id: {}", existing_user.user_id);
+        warn!("Registration requested for the username of existing user_id: {}", existing_user.user_id);
     }
 
     // Generate registration challenge
@@ -163,27 +166,59 @@ pub async fn register_start(
         auth_sel.authenticator_attachment = None;
     }
 
-    // Store challenge state
-    let challenge_id = uuid::Uuid::new_v4().to_string();
-    let challenge_state = ChallengeState {
-        registration_state: existing_user
-            .is_none()
-            .then_some(reg_state),
-        authentication_state: None,
-        username: req.username.clone(),
-        created_at: chrono::Utc::now(),
-    };
-
-    auth_state
-        .challenges
-        .write()
-        .await
-        .insert(challenge_id.clone(), challenge_state);
+    let challenge_id = auth_state
+        .store_challenge(ChallengeState {
+            registration_state: Some(reg_state),
+            authentication_state: None,
+            username: req.username.clone(),
+            created_at: chrono::Utc::now(),
+        })
+        .await;
 
     Ok(Json(RegisterStartResponse {
         challenge_id,
         creation_options: ccr,
     }))
+}
+
+/// How long after the username check a finished registration is answered, whether it created an
+/// account or found the username taken.
+///
+/// A taken username stores nothing, while a new account is answered only after its user record
+/// and its Terms acceptance are written: about 1.3 ms more on a local SSD, and more on slower
+/// volumes. If each answered as soon as its work was done, the faster answer would tell that the
+/// username is taken. Both instead wait until this long after the check, which covers those
+/// writes on all but very slow storage, so neither answers sooner than the other. The other work
+/// a new account starts, such as notifying administrators, runs after the answer.
+const REGISTRATION_ANSWER_TIME: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Refuses a passkey sign-in or registration start from a client IP over its
+/// `passkey_login_throttle` limit with `429` and `Retry-After`; other requests pass.
+pub async fn throttle_passkey_start(
+    State(throttle): State<Arc<crate::sts::throttle::TokenEndpointThrottle>>,
+    client_ip: Option<Extension<crate::source_auth::client_ip::ClientIp>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some(retry_after) =
+        throttle.record_client_attempt(client_ip.map(|Extension(crate::source_auth::client_ip::ClientIp(ip))| ip))
+    {
+        warn!("Throttling passkey sign-in or registration starts from a source over its limit");
+        let mut response = (StatusCode::TOO_MANY_REQUESTS, "Too many sign-in attempts; retry later").into_response();
+        let headers = response.headers_mut();
+        headers.insert(axum::http::header::RETRY_AFTER, HeaderValue::from(retry_after));
+        headers.insert(axum::http::header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
+    next.run(request).await
+}
+
+/// The longest username, in bytes, that sign-in and registration accept. Every challenge keeps
+/// its username until it is finished or expires, so this bounds what an unfinished one holds.
+const MAX_USERNAME_BYTES: usize = 256;
+
+fn is_username_length_allowed(username: &str) -> bool {
+    username.len() <= MAX_USERNAME_BYTES
 }
 
 /// Complete passkey registration
@@ -194,23 +229,17 @@ pub async fn register_finish(
 ) -> Result<StatusCode, RegisterFinishError> {
     info!("Completing passkey registration for challenge: {}", req.challenge_id);
 
-    // Retrieve challenge state
-    let mut challenges = auth_state
-        .challenges
-        .write()
-        .await;
-    let challenge_state = challenges
-        .remove(&req.challenge_id)
+    let challenge_state = auth_state
+        .take_challenge(&req.challenge_id)
+        .await
         .ok_or_else(|| {
-            error!("Challenge not found: {}", req.challenge_id);
+            error!("Challenge not found or expired: {}", req.challenge_id);
             StatusCode::BAD_REQUEST
         })?;
 
     let reg_state = challenge_state
         .registration_state
         .ok_or(StatusCode::BAD_REQUEST)?;
-
-    drop(challenges); // Release lock
 
     // Get username from challenge state
     let username = challenge_state
@@ -238,14 +267,48 @@ pub async fn register_finish(
         .storage
         .user_write_guard()
         .await;
-    let user = auth_state
+    let answer_at = tokio::time::Instant::now() + REGISTRATION_ANSWER_TIME;
+    // The user limit is checked before the username, so a full appliance refuses a taken
+    // username and a free one alike.
+    let user_count = auth_state
         .storage
-        .prepare_user_with_passkey(username.as_str(), passkey)
+        .list_users()
         .await
         .map_err(|e| {
-            error!("Failed to prepare passkey user: {}", e);
+            error!("Failed to count users: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        })?
+        .len();
+    if user_count > 0
+        && let Err(e) = crate::config::global_limits().check_can_add("users", user_count)
+    {
+        drop(user_write_guard);
+        crate::config::log_limit_reached("users", &e);
+        return Err(StatusCode::FORBIDDEN.into());
+    }
+    // A username that already has an account, approved or awaiting approval, is answered as a
+    // new registration awaiting approval and nothing is stored, so the answer does not tell
+    // whether the account exists.
+    if let Some(existing_user) = auth_state
+        .storage
+        .load_user(&username)
+        .await
+        .map_err(|e| {
+            error!("Failed to check whether user exists: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    {
+        drop(user_write_guard);
+        warn!(
+            user_id = %existing_user.user_id,
+            "Registration finished for the username of an existing account; nothing stored"
+        );
+        tokio::time::sleep_until(answer_at).await;
+        return Ok(StatusCode::OK);
+    }
+    let user = auth_state
+        .storage
+        .prepare_user_with_passkey(username.as_str(), passkey, user_count == 0);
 
     auth_state
         .terms_manager
@@ -271,6 +334,19 @@ pub async fn register_finish(
     info!("User registration complete - role: {:?}, status: {:?}, user_id: {}", user.role, user.status, user.user_id);
 
     crate::integrations::trigger_user_created(&user);
+    tokio::spawn(announce_new_user(auth_state, metrics_store, user));
+    tokio::time::sleep_until(answer_at).await;
+
+    Ok(StatusCode::OK)
+}
+
+/// Records the new user in the metrics and notifies: the first user, an administrator, gets the
+/// welcome, and a user awaiting approval is announced to every administrator.
+async fn announce_new_user(
+    auth_state: Arc<AuthState>,
+    metrics_store: Option<Arc<MetricsStore>>,
+    user: crate::auth::storage::UserData,
+) {
     let notif_store_guard = auth_state
         .notification_store
         .read()
@@ -334,9 +410,9 @@ pub async fn register_finish(
                             "New User Awaiting Approval".to_string(),
                             format!(
                                 "User '{}' has registered and is awaiting approval. Please review and approve this user in the User Management section.",
-                                username
+                                user.username
                             ),
-                            serde_json::json!({"username": username, "user_id": user.user_id, "action": crate::integrations::types::NotificationAction::UserApproval}),
+                            serde_json::json!({"username": user.username, "user_id": user.user_id, "action": crate::integrations::types::NotificationAction::UserApproval}),
                         );
                         notification.user_id = admin_user.user_id;
                         if let Err(e) = notif_store
@@ -352,8 +428,6 @@ pub async fn register_finish(
             error!("Notification store not available - cannot notify admins");
         }
     }
-
-    Ok(StatusCode::OK)
 }
 
 /// Start passkey authentication
@@ -361,57 +435,49 @@ pub async fn login_start(
     State(auth_state): State<Arc<AuthState>>,
     Json(req): Json<LoginStartRequest>,
 ) -> Result<Json<LoginStartResponse>, StatusCode> {
-    let is_approved = auth_state
+    if !is_username_length_allowed(&req.username) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let user = auth_state
         .storage
-        .is_user_approved(&req.username)
+        .load_user(&req.username)
         .await
         .map_err(|e| {
-            error!("Failed to check user approval status: {}", e);
+            error!("Failed to load the user signing in: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+    let passkeys = user
+        .filter(|user| user.status == crate::auth::UserStatus::Approved)
+        .map(|user| user.passkeys)
+        .unwrap_or_default();
+    if passkeys.is_empty() {
+        warn!("Sign-in requested for a username without an approved account that has passkeys");
+    }
 
-    let passkeys = auth_state
-        .storage
-        .get_passkeys(&req.username)
-        .await
-        .map_err(|e| {
-            error!("Failed to load passkeys: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    let passkeys = if !is_approved {
-        error!("Sign-in requested for a user that is not approved");
-        Vec::new()
-    } else if passkeys.is_empty() {
-        error!("Sign-in requested for a user without passkeys");
-        Vec::new()
-    } else {
-        passkeys
-    };
-
-    // Generate authentication challenge
-    let (rcr, auth_state_data) = auth_state
+    let (mut rcr, auth_state_data) = auth_state
         .webauthn
         .start_passkey_authentication(&passkeys)
         .map_err(|e| {
             error!("Failed to start passkey authentication: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+    // A username with no passkey to sign in with is named decoy credentials, so the challenge
+    // looks like one for an account; the challenge state holds no credential they could match.
+    if passkeys.is_empty() {
+        rcr.public_key
+            .allow_credentials = auth_state
+            .decoy_credentials
+            .credentials_for(&req.username);
+    }
 
-    // Store challenge state
-    let challenge_id = uuid::Uuid::new_v4().to_string();
-    let challenge_state = ChallengeState {
-        registration_state: None,
-        authentication_state: Some(auth_state_data),
-        username: req.username.clone(),
-        created_at: chrono::Utc::now(),
-    };
-
-    auth_state
-        .challenges
-        .write()
-        .await
-        .insert(challenge_id.clone(), challenge_state);
+    let challenge_id = auth_state
+        .store_challenge(ChallengeState {
+            registration_state: None,
+            authentication_state: Some(auth_state_data),
+            username: req.username.clone(),
+            created_at: chrono::Utc::now(),
+        })
+        .await;
 
     Ok(Json(LoginStartResponse {
         challenge_id,
@@ -427,23 +493,17 @@ pub async fn login_finish(
 ) -> Result<impl IntoResponse, SessionFinalizationError> {
     info!("Completing passkey authentication for challenge: {}", req.challenge_id);
 
-    // Retrieve challenge state
-    let mut challenges = auth_state
-        .challenges
-        .write()
-        .await;
-    let challenge_state = challenges
-        .remove(&req.challenge_id)
+    let challenge_state = auth_state
+        .take_challenge(&req.challenge_id)
+        .await
         .ok_or_else(|| {
-            error!("Challenge not found: {}", req.challenge_id);
+            error!("Challenge not found or expired: {}", req.challenge_id);
             StatusCode::BAD_REQUEST
         })?;
 
     let auth_state_data = challenge_state
         .authentication_state
         .ok_or(StatusCode::BAD_REQUEST)?;
-
-    drop(challenges); // Release lock
 
     // Get username from challenge state
     let username = challenge_state
@@ -615,16 +675,17 @@ pub async fn logout(
 #[cfg(test)]
 mod tests {
     use super::{
-        LoginFinishRequest, LoginFinishResponse, LoginStartRequest, RegisterStartRequest, login_finish, login_start,
-        register_start,
+        LoginFinishRequest, LoginFinishResponse, LoginStartRequest, MAX_USERNAME_BYTES, RegisterStartRequest,
+        login_finish, login_start, register_start,
     };
     use crate::auth::{
         AuthState,
+        state::MAX_PENDING_CHALLENGES,
         storage::UserData,
         types::{UserRole, UserStatus},
     };
     use crate::integrations::delivery::dispatch::dispatched;
-    use axum::{Json, extract::State, response::IntoResponse};
+    use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
 
@@ -650,6 +711,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             std::sync::Arc::new(crate::terms::TermsManager::disabled()),
+            crate::auth::decoy_credential::DecoyCredentialKey::generate().unwrap(),
         )
         .await
         .unwrap();
@@ -687,6 +749,47 @@ mod tests {
             .await
             .unwrap();
         user_id
+    }
+
+    async fn add_passkey(
+        state: &AuthState,
+        user_id: &str,
+    ) {
+        let passkey: webauthn_rs::prelude::Passkey = serde_json::from_value(serde_json::json!({
+            "cred": {
+                "cred_id": "AAECAwQFBgcICQoLDA0ODw",
+                "cred": {
+                    "type_": "ES256",
+                    "key": {"EC_EC2": {
+                        "curve": "SECP256R1",
+                        "x": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                        "y": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+                    }}
+                },
+                "counter": 0,
+                "transports": null,
+                "user_verified": true,
+                "backup_eligible": false,
+                "backup_state": false,
+                "registration_policy": "required",
+                "extensions": {},
+                "attestation": {"data": "None", "metadata": "None"},
+                "attestation_format": "none"
+            }
+        }))
+        .expect("a stored passkey");
+        let mut user = state
+            .storage
+            .load_user_by_id(user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        user.passkeys.push(passkey);
+        state
+            .storage
+            .save_user(&user)
+            .await
+            .unwrap();
     }
 
     /// A well-formed assertion signed by no passkey the gateway holds.
@@ -823,39 +926,274 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unavailable_users_receive_login_challenges() {
+    async fn login_challenges_name_stable_decoys_whether_or_not_the_user_exists() {
         let (_temp_dir, state) = test_auth_state().await;
         save_user(&state, "pending-user", UserStatus::New).await;
         save_user(&state, "passkeyless-user", UserStatus::Approved).await;
 
         for username in ["missing-user", "pending-user", "passkeyless-user"] {
-            let Json(response) =
-                login_start(State(state.clone()), Json(LoginStartRequest { username: username.to_string() }))
-                    .await
-                    .unwrap();
+            let first = named_credentials(&state, username).await;
+            let again = named_credentials(&state, username).await;
 
-            assert!(
+            assert_eq!(first, again, "{username}");
+            assert_eq!(
+                serde_json::Value::Array(first),
+                serde_json::to_value(
+                    state
+                        .decoy_credentials
+                        .credentials_for(username)
+                )
+                .unwrap(),
+                "{username}"
+            );
+        }
+        assert_ne!(named_credentials(&state, "missing-user").await, named_credentials(&state, "pending-user").await);
+    }
+
+    #[tokio::test]
+    async fn a_username_longer_than_the_limit_is_refused_by_sign_in_and_registration() {
+        let (_temp_dir, state) = test_auth_state().await;
+        let longest = "a".repeat(MAX_USERNAME_BYTES);
+        let too_long = "a".repeat(MAX_USERNAME_BYTES + 1);
+
+        let sign_in = |username: String| login_start(State(state.clone()), Json(LoginStartRequest { username }));
+        let register = |username: String| register_start(State(state.clone()), Json(RegisterStartRequest { username }));
+
+        assert!(
+            sign_in(longest.clone())
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            sign_in(too_long.clone())
+                .await
+                .err(),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        assert!(
+            register(longest)
+                .await
+                .is_ok()
+        );
+        assert_eq!(register(too_long).await.err(), Some((StatusCode::BAD_REQUEST, "Username is too long".to_string())));
+        assert!(
+            state
+                .challenges
+                .read()
+                .await
+                .len()
+                == 2
+        );
+    }
+
+    async fn passkey_start_statuses(
+        enabled: bool,
+        sources: &[[u8; 4]],
+    ) -> Vec<(StatusCode, Option<String>, Option<String>)> {
+        use tower::ServiceExt;
+        let throttle =
+            crate::sts::throttle::TokenEndpointThrottle::per_client_ip(&crate::config::types::LoginThrottleConfig {
+                enabled,
+                per_ip: crate::config::types::RateLimitConfig {
+                    requests: 2,
+                    window_secs: 60,
+                    burst: None,
+                },
+            });
+        let app = axum::Router::new()
+            .route("/auth/login/start", axum::routing::post(|| async { StatusCode::OK }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                std::sync::Arc::new(throttle),
+                super::throttle_passkey_start,
+            ));
+        let mut statuses = Vec::new();
+        for source in sources {
+            let request = axum::http::Request::post("/auth/login/start")
+                .extension(crate::source_auth::client_ip::ClientIp(std::net::IpAddr::from(*source)))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app
+                .clone()
+                .oneshot(request)
+                .await
+                .unwrap();
+            let header = |name| {
                 response
-                    .request_options
-                    .public_key
-                    .allow_credentials
-                    .is_empty()
-            );
-            assert!(
-                state
-                    .challenges
-                    .read()
-                    .await
-                    .get(&response.challenge_id)
-                    .is_some_and(|challenge| challenge
-                        .authentication_state
-                        .is_some())
-            );
+                    .headers()
+                    .get(name)
+                    .map(|value: &axum::http::HeaderValue| {
+                        value
+                            .to_str()
+                            .unwrap()
+                            .to_string()
+                    })
+            };
+            statuses.push((
+                response.status(),
+                header(axum::http::header::RETRY_AFTER),
+                header(axum::http::header::CACHE_CONTROL),
+            ));
+        }
+        statuses
+    }
+
+    #[tokio::test]
+    async fn a_source_over_its_passkey_start_limit_is_refused_until_its_window_rolls_off() {
+        let statuses =
+            passkey_start_statuses(true, &[[10, 0, 0, 1], [10, 0, 0, 1], [10, 0, 0, 1], [10, 0, 0, 2]]).await;
+
+        assert_eq!(statuses[0], (StatusCode::OK, None, None));
+        assert_eq!(statuses[1], (StatusCode::OK, None, None));
+        assert_eq!(statuses[2].0, StatusCode::TOO_MANY_REQUESTS);
+        let retry_after: u64 = statuses[2]
+            .1
+            .as_deref()
+            .expect("a Retry-After header")
+            .parse()
+            .unwrap();
+        assert!((1..=60).contains(&retry_after), "{retry_after}");
+        assert_eq!(statuses[2].2.as_deref(), Some("no-store"));
+        assert_eq!(statuses[3], (StatusCode::OK, None, None));
+    }
+
+    #[tokio::test]
+    async fn a_disabled_passkey_start_throttle_limits_no_source() {
+        let statuses = passkey_start_statuses(false, &[[10, 0, 0, 1]; 4]).await;
+
+        assert!(
+            statuses
+                .iter()
+                .all(|status| *status == (StatusCode::OK, None, None)),
+            "{statuses:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_login_challenge_names_the_passkeys_of_an_approved_user() {
+        let (_temp_dir, state) = test_auth_state().await;
+        let user_id = save_user(&state, "passkey-user", UserStatus::Approved).await;
+        add_passkey(&state, &user_id).await;
+
+        let named = named_credentials(&state, "passkey-user").await;
+
+        assert_eq!(named.len(), 1, "{named:?}");
+        assert_eq!(named[0]["id"], "AAECAwQFBgcICQoLDA0ODw");
+    }
+
+    /// The credentials a sign-in challenge for `username` names, as the browser receives them.
+    async fn named_credentials(
+        state: &Arc<AuthState>,
+        username: &str,
+    ) -> Vec<serde_json::Value> {
+        let Json(response) =
+            login_start(State(state.clone()), Json(LoginStartRequest { username: username.to_string() }))
+                .await
+                .unwrap();
+        assert!(
+            state
+                .challenges
+                .read()
+                .await
+                .get(&response.challenge_id)
+                .is_some_and(|challenge| challenge
+                    .authentication_state
+                    .is_some())
+        );
+        serde_json::to_value(&response.request_options).unwrap()["publicKey"]["allowCredentials"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn challenge_created(age: chrono::TimeDelta) -> crate::auth::state::ChallengeState {
+        crate::auth::state::ChallengeState {
+            registration_state: None,
+            authentication_state: None,
+            username: "alice".to_string(),
+            created_at: chrono::Utc::now() - age,
         }
     }
 
     #[tokio::test]
-    async fn existing_username_receives_unfinishable_registration_challenge() {
+    async fn a_challenge_is_taken_once_while_fresh_and_refused_once_expired() {
+        let (_temp_dir, state) = test_auth_state().await;
+        let fresh = state
+            .store_challenge(challenge_created(chrono::TimeDelta::minutes(5)))
+            .await;
+        let expired = state
+            .store_challenge(challenge_created(chrono::TimeDelta::minutes(7)))
+            .await;
+
+        assert!(
+            state
+                .take_challenge(&fresh)
+                .await
+                .is_some()
+        );
+        assert!(
+            state
+                .take_challenge(&fresh)
+                .await
+                .is_none()
+        );
+        assert!(
+            state
+                .take_challenge(&expired)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_challenge_store_drops_the_expired_challenges_first() {
+        let (_temp_dir, state) = test_auth_state().await;
+        let expired = state
+            .store_challenge(challenge_created(chrono::TimeDelta::minutes(7)))
+            .await;
+        for _ in 1..MAX_PENDING_CHALLENGES {
+            state
+                .store_challenge(challenge_created(chrono::TimeDelta::minutes(1)))
+                .await;
+        }
+
+        let newest = state
+            .store_challenge(challenge_created(chrono::TimeDelta::zero()))
+            .await;
+
+        let stored = state.challenges.read().await;
+        assert!(!stored.contains_key(&expired));
+        assert!(stored.contains_key(&newest));
+        assert_eq!(stored.len(), MAX_PENDING_CHALLENGES);
+    }
+
+    #[tokio::test]
+    async fn a_full_challenge_store_of_fresh_challenges_drops_the_oldest() {
+        let (_temp_dir, state) = test_auth_state().await;
+        let oldest = state
+            .store_challenge(challenge_created(chrono::TimeDelta::minutes(3)))
+            .await;
+        let older = state
+            .store_challenge(challenge_created(chrono::TimeDelta::minutes(2)))
+            .await;
+        for _ in 2..MAX_PENDING_CHALLENGES {
+            state
+                .store_challenge(challenge_created(chrono::TimeDelta::minutes(1)))
+                .await;
+        }
+
+        let newest = state
+            .store_challenge(challenge_created(chrono::TimeDelta::zero()))
+            .await;
+
+        let stored = state.challenges.read().await;
+        assert!(!stored.contains_key(&oldest));
+        assert!(stored.contains_key(&older));
+        assert!(stored.contains_key(&newest));
+        assert_eq!(stored.len(), MAX_PENDING_CHALLENGES);
+    }
+
+    #[tokio::test]
+    async fn existing_username_receives_a_registration_challenge_like_a_new_one() {
         let (_temp_dir, state) = test_auth_state().await;
         save_user(&state, "existing-user", UserStatus::Approved).await;
 
@@ -876,7 +1214,7 @@ mod tests {
                 .get(&response.challenge_id)
                 .is_some_and(|challenge| challenge
                     .registration_state
-                    .is_none())
+                    .is_some())
         );
     }
 

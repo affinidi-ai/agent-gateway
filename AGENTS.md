@@ -239,10 +239,15 @@ Authority and the surface has no Issuer or its Issuer no longer exists; see _Tru
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder).
 
 Trust Checks and Trust Recorder entries keep `authority_source` through every save and the
-Authority pickers set it. One whose Authority was deleted from the Authorities register is drawn
+Authority pickers set it. One whose Authority, or any Authority a query lists, was deleted from
+the Authorities register is drawn
 unconfigured with a "Configuration required" warning and blocks Save, and a refused Authority
 delete lists what uses the Authority in a dialog with no way to delete it anyway; see _Trust
 Check_ and _Authority delete_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#authority-delete).
+A Trust Check query that lists several authorities (`query.authority_ids`) keeps its list and
+`authority_sources` through every dashboard save, and the fullscreen editor picks that list in one
+multi-select of the Issuers and Authorities registers; see _Authority lists_ under _Trust Check_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#trust-check).
 
 The Audit Log names the surface variant of each request record and describes `request_rejected`
 records, and the Metrics page badges configured variant aliases only; see _Audit page: surface
@@ -309,8 +314,7 @@ The Access Point panel's **Public access** switch writes `access_point.public`. 
 surface with no Caller Context saves but is not ready (unless it sends a Target credential,
 or has an `a2a-proxy://` Target, while `credential_policy.target_source_auth` is `enforce`,
 which refuses the save), shown as "Not ready for external access" under the Access Point URL
-with a **Configure Authentication** action. Saving a public surface, a not-ready one, or a
-surface without `public` and without a Caller Context, warns after the save; see
+with a **Configure Authentication** action; see
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Dashboard shows the metrics **Delete** button only to users with `settings.edit`; see

@@ -1,0 +1,16 @@
+branch: fix/release-version-step-failure
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-12T00:00:00Z'
+      title: Let the chosen release type decide the next version again
+      description: >-
+        Prepare release refused a patch or minor release while a pending changelog fragment had a
+        breaking or added entry. The release type chosen when the workflow is started decides the
+        version again, whatever categories the fragments use. A run that cannot work out the next
+        version now stops at that step with its own error instead of failing later on an empty
+        version in Cargo.toml.
+  removed: []
+  security: []
+  breaking: []

@@ -443,14 +443,15 @@ asks the provider for a new token, with these limits:
 The refused request is answered as the Target answered it and is not retried. A `401` without
 `invalid_token`, a `403`, a static secret or `api_key` credential, and a provider token sent in
 another header or scheme change nothing: a Bearer challenge speaks only about the `Authorization`
-Bearer token, which in that case may be the caller's. The direct path, Fabric receive and the
-agent card fetch check the answer, and so does a `proxy://` MCP Target, direct or on Fabric
-receive, legacy or `2026-07-28`: its tool call's REST backend answers the token, while the
-caller gets that answer as a tool result with `isError` set. A Transit Point and the Fabric send
-leg do not: their refusals leave the token in place until it is renewed. The Target and a Transit
-Point that use the same provider and scopes on one surface share one cached token, so only the
-Target's own answers can drop it. To keep a Transit Point's token unusable at the Target, give the
-Transit Point a provider whose `resource` names its own server.
+Bearer token, which in that case may be the caller's. The direct path, Fabric receive, the
+receiving gateway's card read for its policy input and the agent card fetch check the answer, and
+so does a `proxy://` MCP Target, direct or on Fabric receive, legacy or `2026-07-28`: its tool
+call's REST backend answers the token, while the caller gets that answer as a tool result with
+`isError` set. A Transit Point and the Fabric send leg do not: their refusals leave the token in
+place until it is renewed. The Target and a Transit Point that use the same provider and scopes on
+one surface share one cached token, so only the Target's own answers can drop it. To keep a Transit
+Point's token unusable at the Target, give the Transit Point a provider whose `resource` names its
+own server.
 
 ### Logging token endpoint errors
 
@@ -1017,11 +1018,16 @@ provider with different scopes each keep their own token. The token shows in the
 request the gateway vetted (`CallerAssertion`), so a provider token is never spent on an
 unauthenticated discovery request, except on the gateway's own agent card fetch. On Fabric
 receive that fetch is only a `GET` of exactly `/.well-known/agent-card.json` or the surface's
-configured card location; a `HEAD`, a query, `/discovery` and every other discovery read get no
-credential, the legacy
-`/.well-known/agent.json` fallback of a Fabric card read included. A token that
+configured card location; a `HEAD`, a query, `/discovery` and every other discovery read a peer
+sends get no credential, a peer's read of the legacy `/.well-known/agent.json` included. The
+receiving gateway's own card read for its policy input is a card fetch too: it presents the
+credential at the configured card location, or else at `<target>/.well-known/agent.json`, of an
+`http(s)` Target (see [`FABRIC.md`](FABRIC.md#agent-card-fetch-over-fabric)). A token that
 cannot be obtained follows `fallback`: `reject` answers 502 "Target authentication failed",
-`passthrough` forwards without the credential, and either way a `target_auth_failed` record in the VP Audit Log names the cause. A `401` from the
+`passthrough` forwards without the credential, and either way a `target_auth_failed` record in the
+VP Audit Log names the cause. The policy card read is the exception: it writes no record, logs a
+warning and leaves the policy input without a card, or under `passthrough` reads the card without
+the credential ([`POLICY.md`](POLICY.md#other-pinned-egress-sinks)). A `401` from the
 target evicts the cached token only when it refuses that token as `invalid_token` ([see
 above](#service-tokens)).
 The [agent card preview](PROTOCOLS.md#agent-card-preview) fetches the card with the same Target
@@ -1116,10 +1122,12 @@ withholds the credential logs none for a rule still in `warn`.
 
 The gateway's own agent card fetch has no caller to check, so `target_source_auth` never
 withholds its credential; `target_https` does. On Fabric receive only a `GET` of exactly
-`/.well-known/agent-card.json` or the surface's configured card location counts as that fetch;
-any other discovery read, the `/.well-known/agent.json` fallback included, is a caller's request
-and never gets the credential, so a remote Target that serves its card only at that path and requires its credential there is reported as `AGENT_CARD_UNAVAILABLE`. A credential withheld under `enforce` is treated
-as one that cannot be resolved: no token is requested, and `target.auth.fallback` decides the
+`/.well-known/agent-card.json` or the surface's configured card location counts as that fetch,
+beside the receiving gateway's own card read for its policy input (above). Any other discovery
+read a peer sends, its read of the legacy `/.well-known/agent.json` included, is a caller's
+request and never gets the credential, so a remote Target that serves its card only at that path
+and requires its credential there is reported as `AGENT_CARD_UNAVAILABLE`. A credential withheld
+under `enforce` is treated as one that cannot be resolved: no token is requested, and `target.auth.fallback` decides the
 request (`reject` answers 502, `passthrough` forwards it without the credential), on the direct
 path, a `proxy://` MCP Target, the Fabric send leg, Fabric receive, the agent card fetch and a
 Transit Point. The [agent card preview](PROTOCOLS.md#agent-card-preview) reports it as
@@ -1569,7 +1577,9 @@ its own, so no field can be read as part of another. The claim is the first of
 without a string `iss`, or without any of the claims as such a string, gets no key. The same
 caller on the same surface gets the same key on every request, every variant of the surface
 included; another caller, another issuer, another surface, another secret, another key source
-or another audience set gives another key. The setting and its rules
+or another audience set gives another key. The gateway's own agent card fetch is not a
+caller's request and carries no caller key, over Fabric at a configured card location
+included (see [`FABRIC.md`](FABRIC.md#agent-card-fetch-over-fabric)). The setting and its rules
 are in [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#surface-caller-keys), and the
 derivation in [`proxy/caller_key.rs`](../src/proxy/caller_key.rs).
 
@@ -1591,7 +1601,11 @@ derivation in [`proxy/caller_key.rs`](../src/proxy/caller_key.rs).
 - **Where it is sent.** On the request to an HTTP(S) Target, from the Access Point and on Fabric
   receive, where the receiving gateway derives it for the JWT it verified. A `fabric://` Target
   is not sent the sending gateway's key; a `proxy://` MCP proxy's backend and an `a2a-proxy://`
-  backend are sent none.
+  backend are sent none, and a REST MCP proxy tool argument cannot set a header of the caller key
+  family. As a Target credential, the key follows `credential_policy.target_https`: under
+  `enforce` only an `https://` URL with a host gets it, and under `warn` an `http` Target gets it
+  with a logged warning. A save warns
+  when a Target of the surface or a variant is `http` or never receives a key.
 - **A caller cannot supply one.** A surface's caller key header is always of the caller key
   family: `x-caller-key`, or `x-caller-key-` followed by lower-case words, such as
   `x-caller-key-memory`. The Access Point, mirror, Fabric send and receive, Transit Point, agent
@@ -1607,7 +1621,17 @@ derivation in [`proxy/caller_key.rs`](../src/proxy/caller_key.rs).
   that read such a header from its callers must take it under another name.
 - **When the secret cannot be read.** A missing secret, one outside the surface's tenant, one of
   fewer than 32 bytes, or a secrets store that fails, leaves the header out and logs a warning
-  naming the surface and the reason, never the secret. The request is forwarded.
+  naming the surface and the reason, never the secret, and counts it in
+  `agent_gateway_caller_key_secret_unreadable_total` (see
+  [Caller key secret metric](OBSERVABILITY.md#caller-key-secret-metric)). The request is
+  forwarded.
+- **A Target must refuse a request without the key.** A verified caller's request can reach the
+  Target without a key: when the secret cannot be read, and when `credential_policy.target_https`
+  withholds it. A Target that relies on the key to keep each caller's data apart must refuse
+  such a request, never treat it as anonymous or store the caller's data unkeyed.
+- **The secret must be random.** A save checks only its length, so a typed 32-character
+  passphrase passes; anyone who guesses the secret can derive every caller's key. Make it at
+  least 32 random bytes, such as the output of `openssl rand -base64 32`.
 - **The secret stays in the store.** The surface holds only its `secret_id`; the value is read
   from the secrets store for each derivation, and is never logged or returned by the admin API. Deleting a secret a
   surface's `caller_key` names is refused with `409` unless forced, as for any other secret a

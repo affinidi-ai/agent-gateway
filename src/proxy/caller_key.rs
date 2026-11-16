@@ -20,7 +20,7 @@ use tracing::warn;
 use zeroize::Zeroizing;
 
 use crate::config::agent_surface::AgentSurface;
-use crate::config::caller_key::{CallerKeyConfig, MIN_SECRET_BYTES};
+use crate::config::caller_key::{CallerKeyConfig, long_enough};
 use crate::secrets::SecretsStore;
 use crate::source_auth::{AuthenticatedIdentity, JwtVerification};
 
@@ -155,6 +155,17 @@ impl Unreadable {
             Self::TooShort => "the secret is too short",
         }
     }
+
+    /// The `reason` label of `agent_gateway_caller_key_secret_unreadable_total`.
+    fn label(self) -> &'static str {
+        match self {
+            Self::NoStore => "no_store",
+            Self::StoreFailed => "store_failed",
+            Self::Missing => "missing",
+            Self::OutsideTenant => "outside_tenant",
+            Self::TooShort => "too_short",
+        }
+    }
 }
 
 /// The value of `config`'s secret, when `surface` may use it and it is long enough.
@@ -177,23 +188,82 @@ async fn read_secret(
         return Err(Unreadable::OutsideTenant);
     }
     let value = Zeroizing::new(secret.value);
-    if value.len() < MIN_SECRET_BYTES {
+    if !long_enough(&value) {
         return Err(Unreadable::TooShort);
     }
     Ok(value)
 }
 
-/// The caller key header, name and value, for a request on `surface` from `identity`: only on
-/// a surface with `caller_key`, from a caller whose JWT was verified on this request and names
-/// it. When the secret cannot be read the request goes on without it, and a warning names the
-/// surface.
+/// Whether a caller key sent to `endpoint` would cross the network in clear: an `http` URL.
+pub(crate) fn sent_in_clear(endpoint: &str) -> bool {
+    url::Url::parse(endpoint.trim()).is_ok_and(|url| url.scheme() == "http")
+}
+
+/// Whether the caller key may go to `endpoint` under `credential_policy.target_https`, by the
+/// test a Target credential is held to ([`crate::config::target_auth_rules::is_https_target`]):
+/// always to an `https` URL, and to an `http` one only while the rule is not `enforce`, logged
+/// once per surface, variant, endpoint and mode. Any other endpoint, such as a `fabric://`,
+/// `proxy://` or `a2a-proxy://` one, never receives the key, so it is never derived for one and
+/// its secret is not read.
+fn target_https_allows(
+    surface_id: &str,
+    endpoint: &str,
+    mode: crate::config::credential_policy::RuleMode,
+) -> bool {
+    static WARNED: std::sync::LazyLock<dashmap::DashSet<String>> = std::sync::LazyLock::new(Default::default);
+    if crate::config::target_auth_rules::is_https_target(endpoint) {
+        return true;
+    }
+    if !sent_in_clear(endpoint) {
+        return false;
+    }
+    let enforced = mode.is_enforced();
+    let variant = crate::observability::policy_audit::current_request_variant();
+    let leg = format!(
+        "{surface_id}\n{}\n{}\n{enforced}",
+        variant
+            .as_deref()
+            .unwrap_or_default(),
+        endpoint.trim()
+    );
+    if WARNED.insert(leg) {
+        if enforced {
+            warn!(
+                surface_id = %surface_id,
+                surface_variant = variant.as_deref(),
+                "Caller key withheld: the Target is not https and credential_policy.target_https is enforce"
+            );
+        } else {
+            warn!(
+                surface_id = %surface_id,
+                surface_variant = variant.as_deref(),
+                "Caller key sent to a Target that is not https; it will be withheld once credential_policy.target_https is enforce"
+            );
+        }
+    }
+    !enforced
+}
+
+/// The caller key header, name and value, for a request on `surface` from `identity` to the
+/// Target at `endpoint`: only on a surface with `caller_key`, from a caller whose JWT was
+/// verified on this request and names it, to an `https` URL, or to an `http` one while
+/// `credential_policy.target_https` is not `enforce`. When the secret cannot be read the
+/// request goes on without it, and a warning names the surface.
 pub(crate) async fn caller_key_header(
     surface: &AgentSurface,
+    endpoint: &str,
     identity: Option<&AuthenticatedIdentity>,
     secrets: Option<&Arc<dyn SecretsStore>>,
 ) -> Option<(String, String)> {
     let config = surface.caller_key.as_ref()?;
     let caller = KeyedCaller::of(identity?, &config.identity_claims)?;
+    if !target_https_allows(
+        &surface.surface_id,
+        endpoint,
+        crate::config::credential_policy::credential_policy().target_https,
+    ) {
+        return None;
+    }
     let secret = match read_secret(surface, config, secrets).await {
         Ok(secret) => secret,
         Err(unreadable) => {
@@ -201,6 +271,10 @@ pub(crate) async fn caller_key_header(
                 surface = %surface.surface_id,
                 reason = unreadable.reason(),
                 "Forwarding without the caller key: its secret cannot be read"
+            );
+            crate::metrics::backends::prometheus::track_caller_key_secret_unreadable(
+                &surface.surface_id,
+                unreadable.label(),
             );
             return None;
         }
@@ -324,7 +398,7 @@ mod tests {
         secrets: &[(&str, &str, Option<&str>)],
     ) -> Option<(String, String)> {
         let (_dir, secrets) = store(secrets).await;
-        caller_key_header(surface, identity, Some(&secrets)).await
+        caller_key_header(surface, &surface.target.endpoint, identity, Some(&secrets)).await
     }
 
     /// RFC 5869 HKDF-SHA256 computed independently of the `hkdf` crate, from HMAC-SHA256:
@@ -600,6 +674,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_mtls_caller_gets_no_key() {
+        let configured = surface("surface-1", serde_json::json!({ "secret_id": "caller-keys" }));
+        let mtls = AuthenticatedIdentity::Mtls {
+            principal: "alice".to_string(),
+            fingerprint: "ab".repeat(32),
+            subject_dn: "CN=alice".to_string(),
+            issuer_dn: "CN=Partner CA".to_string(),
+            trust_anchor_fingerprint: "cd".repeat(32),
+            sans: crate::source_auth::models::MtlsSans {
+                uri: vec!["spiffe://partner.example/alice".to_string()],
+                ..Default::default()
+            },
+            source: crate::source_auth::models::PeerCertSource::DirectTls,
+        };
+        assert_eq!(header_for(&configured, Some(&mtls), &[("caller-keys", SECRET, None)]).await, None);
+    }
+
+    #[tokio::test]
     async fn a_surface_without_caller_key_sends_none() {
         let secrets = [("caller-keys", SECRET, None)];
         let mut plain = surface("surface-1", serde_json::json!({ "secret_id": "caller-keys" }));
@@ -608,9 +700,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unreadable_secret_is_counted_by_reason_and_a_readable_one_is_not() {
+        let surface_id = format!("surface-{}", uuid::Uuid::new_v4());
+        let configured = surface(&surface_id, serde_json::json!({ "secret_id": "caller-keys" }));
+        let count = |reason: &str| {
+            crate::metrics::backends::prometheus::CALLER_KEY_SECRET_UNREADABLE
+                .with_label_values(&[surface_id.as_str(), reason])
+                .get()
+        };
+        assert!(
+            header_for(&configured, Some(&alice()), &[])
+                .await
+                .is_none()
+        );
+        assert!(
+            header_for(&configured, Some(&alice()), &[("caller-keys", "short", None)])
+                .await
+                .is_none()
+        );
+        assert!(
+            header_for(&configured, Some(&alice()), &[("caller-keys", SECRET, None)])
+                .await
+                .is_some()
+        );
+        assert_eq!((count("missing"), count("too_short"), count("no_store")), (1, 1, 0));
+    }
+
+    #[tokio::test]
     async fn an_unreadable_secret_sends_no_key() {
         let configured = surface("surface-1", serde_json::json!({ "secret_id": "caller-keys" }));
-        assert_eq!(caller_key_header(&configured, Some(&alice()), None).await, None, "no store");
+        assert_eq!(
+            caller_key_header(&configured, "https://agent.example", Some(&alice()), None).await,
+            None,
+            "no store"
+        );
         let short = "0123456789abcdef0123456789abcde";
         for (secrets, why) in [
             (&[][..], "no such secret"),
@@ -631,6 +754,66 @@ mod tests {
                 .await
                 .is_some(),
             "the surface's own tenant's secret"
+        );
+    }
+
+    #[test]
+    fn only_an_http_target_receives_the_key_in_clear() {
+        assert!(sent_in_clear("http://agent.example/a2a"));
+        assert!(sent_in_clear(" HTTP://agent.example "));
+        for endpoint in [
+            "https://agent.example",
+            "fabric://did:example:peer/surface",
+            "proxy://memory",
+            "a2a-proxy://agent",
+            "not a url",
+        ] {
+            assert!(!sent_in_clear(endpoint), "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn target_https_withholds_the_key_from_an_http_target_only_under_enforce() {
+        use crate::config::credential_policy::RuleMode;
+        assert!(target_https_allows("surface-https", "https://agent.example", RuleMode::Enforce));
+        assert!(target_https_allows("surface-https", "https://agent.example", RuleMode::Warn));
+        assert!(!target_https_allows("surface-http", "http://agent.example", RuleMode::Enforce));
+        assert!(
+            !target_https_allows("surface-http", "http://agent.example", RuleMode::Enforce),
+            "withheld on every request, not only the first"
+        );
+        assert!(target_https_allows("surface-http", "http://agent.example", RuleMode::Warn));
+    }
+
+    /// The key goes only to an `http` or `https` Target: every other endpoint, which a Target
+    /// credential is also withheld from under `enforce`, never receives it, in either mode, so
+    /// its secret is never read and nothing is counted for it.
+    #[test]
+    fn the_key_is_never_derived_for_an_endpoint_that_is_neither_http_nor_https() {
+        use crate::config::credential_policy::RuleMode;
+        for endpoint in ["fabric://gateway/surface", "proxy://memory", "a2a-proxy://agent", "not a url", "https://"] {
+            assert!(
+                !crate::config::target_auth_rules::is_https_target(endpoint),
+                "a Target credential is withheld from {endpoint}"
+            );
+            for mode in [RuleMode::Enforce, RuleMode::Warn] {
+                assert!(!target_https_allows("surface-other", endpoint, mode), "{endpoint} under {mode:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_proxy_target_is_never_counted_as_missing_its_caller_key() {
+        let surface_id = format!("surface-{}", uuid::Uuid::new_v4());
+        let configured = surface(&surface_id, serde_json::json!({ "secret_id": "caller-keys" }));
+        let (_dir, secrets) = store(&[]).await;
+        assert_eq!(caller_key_header(&configured, "proxy://memory", Some(&alice()), Some(&secrets)).await, None);
+        assert_eq!(
+            crate::metrics::backends::prometheus::CALLER_KEY_SECRET_UNREADABLE
+                .with_label_values(&[surface_id.as_str(), "missing"])
+                .get(),
+            0,
+            "the missing secret is never read for a Target that would not receive the key"
         );
     }
 }

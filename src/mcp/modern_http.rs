@@ -63,6 +63,40 @@ impl EndpointHttpPolicy {
         })
     }
 
+    /// Also admits the surface's `browser_origins`, the pages its owner lets call
+    /// it. An entry that is not an exact serialized `https` origin is skipped, so
+    /// it can never fail the endpoint.
+    pub(crate) fn with_browser_origins(
+        mut self,
+        browser_origins: &[String],
+    ) -> Self {
+        if let Some(origins) = self.origins.as_mut() {
+            origins.admit_browser_origins(browser_origins);
+        }
+        self
+    }
+
+    /// The policy a framed Fabric receive to `surface` admits a caller under, with `config`
+    /// and `versions`: the caller's browser `Origin` must be the surface's Access Point URL, in
+    /// its allowlist or in its `browser_origins`. The framed stream Open and the request it
+    /// carries both use it, so they admit the same origins.
+    pub(crate) fn framed_fabric_receive(
+        surface: &crate::config::agent_surface::AgentSurface,
+        config: Option<&crate::config::McpHttpConfig>,
+        versions: McpVersionPolicy<'static>,
+    ) -> Result<Self, String> {
+        Ok(Self::with_versions(
+            config,
+            std::slice::from_ref(
+                &surface
+                    .access_point
+                    .listen_address,
+            ),
+            versions,
+        )?
+        .with_browser_origins(&surface.browser_origins))
+    }
+
     /// Skips the Origin allowlist while keeping the header and body limits.
     /// Only for buffered Fabric `ForwardRequest` receive, whose Origin the
     /// sending gateway already checked; never for a browser-reachable route.
@@ -353,6 +387,18 @@ fn is_bare_listen_address(value: &str) -> bool {
 }
 
 impl OriginPolicy {
+    fn admit_browser_origins(
+        &mut self,
+        browser_origins: &[String],
+    ) {
+        for origin in browser_origins {
+            if origin.starts_with("https://") && parsed_origin(origin).as_deref() == Some(origin.as_str()) {
+                self.allowed
+                    .insert(origin.clone());
+            }
+        }
+    }
+
     pub fn new(
         public_endpoints: &[String],
         allowed_origins: &[String],
@@ -956,6 +1002,44 @@ mod tests {
             );
             assert_eq!(policy.validate(&headers), Err(INVALID_ORIGIN), "{origin}");
         }
+    }
+
+    #[test]
+    fn a_surface_browser_origin_is_admitted_and_a_malformed_one_is_ignored() {
+        let origin_of = |origin: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::ORIGIN, origin.parse().unwrap());
+            headers
+        };
+        let browser_origins: Vec<String> = [
+            "https://chat.example.com",
+            "https://Chat.Example.com:443/",
+            "http://plain.example.com",
+            "https://*.example.com",
+            "not an origin",
+        ]
+        .map(String::from)
+        .to_vec();
+        let policy = EndpointHttpPolicy::new(None, &[], crate::mcp::request_validation::McpPathKind::DirectAccessPoint)
+            .unwrap()
+            .with_browser_origins(&browser_origins);
+        assert_eq!(policy.validate_headers(&origin_of("https://chat.example.com")), Ok(()));
+        for origin in [
+            "https://other.example.com",
+            "https://sub.example.com",
+            "http://plain.example.com",
+            "https://Chat.Example.com:443",
+        ] {
+            assert_eq!(policy.validate_headers(&origin_of(origin)), Err(INVALID_ORIGIN), "{origin}");
+        }
+
+        let without =
+            EndpointHttpPolicy::new(None, &[], crate::mcp::request_validation::McpPathKind::DirectAccessPoint).unwrap();
+        assert_eq!(
+            without.validate_headers(&origin_of("https://chat.example.com")),
+            Err(INVALID_ORIGIN),
+            "not admitted unless the surface lists it"
+        );
     }
 
     #[test]

@@ -1694,8 +1694,7 @@ const SurfaceDetailPage: React.FC = () => {
     savedAccessPointStatus(surface, variantSnapshots.activeVariantId),
     accessPointStatus(livePayload as Partial<AgentSurface>)
   );
-  // Stored without `public`: Public access shows a legacy state, which the
-  // operator can close.
+  // Stored without `public`: turning Public access off keeps `public` unset.
   const legacyAccessPoint = !!surface && typeof surface.access_point?.public !== 'boolean';
   const refusingRequests = surface?.serving_status === 'not_serving';
 

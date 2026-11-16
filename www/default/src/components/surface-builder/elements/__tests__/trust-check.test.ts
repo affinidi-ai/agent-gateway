@@ -660,6 +660,96 @@ describe('trustCheckDefinition — multiple queries per node', () => {
   it('flags an empty queries[] as incomplete', () => {
     expect(trustCheckDefinition.incompleteReason({ queries: [] })).toMatch(/at least one/i);
   });
+
+  describe('Authorities in total across the queries', () => {
+    const listing = (n: number, prefix: string) => ({
+      trust_registry_id: 'tr-1',
+      query_type: 'recognition',
+      authority_sources: Object.fromEntries(
+        Array.from({ length: n }, (_, i) => [`did:web:${prefix}-${i}`, 'authority'])
+      ),
+      query: {
+        authority_ids: Array.from({ length: n }, (_, i) => `did:web:${prefix}-${i}`),
+        entity_id: '{{ input.agent.did }}',
+      },
+    });
+    const singleQuery = {
+      trust_registry_id: 'tr-1',
+      query_type: 'recognition',
+      authority_source: 'authority',
+      query: { authority_id: 'did:web:one', entity_id: '{{ input.agent.did }}' },
+    };
+
+    it('accepts any number of Authorities in total', () => {
+      expect(
+        trustCheckDefinition.incompleteReason({
+          queries: [listing(30, 'a'), listing(20, 'b'), singleQuery],
+        })
+      ).toBeNull();
+    });
+  });
+
+  describe('templates in an Authority list', () => {
+    const listOf = (ids: string[]) => ({
+      trust_registry_id: 'tr-1',
+      query_type: 'recognition',
+      query: { authority_ids: ids, entity_id: '{{ input.agent.did }}' },
+    });
+
+    it('flags a target-leg list holding a template as incomplete', () => {
+      expect(
+        trustCheckDefinition.incompleteReason({
+          _edge: 'ma-tp',
+          queries: [listOf(['did:web:one', AGENT_IDENTITY_ISSUER_DID_TEMPLATE])],
+        })
+      ).toMatch(/every Authority row/);
+    });
+
+    it('accepts a caller-leg list of the known templates and a literal DID', () => {
+      expect(
+        trustCheckDefinition.incompleteReason({
+          queries: [
+            listOf([
+              AGENT_IDENTITY_ISSUER_DID_TEMPLATE,
+              INPUT_GATEWAY_SOURCE_ID_TEMPLATE,
+              'did:web:one',
+            ]),
+          ],
+        })
+      ).toBeNull();
+    });
+
+    it('flags a caller-leg list holding a legacy template as incomplete', () => {
+      expect(
+        trustCheckDefinition.incompleteReason({
+          queries: [listOf(['did:web:one', '{{ input.agent.provider_did }}'])],
+        })
+      ).toMatch(/Replace the caller-leg Authority template/);
+    });
+  });
+
+  it.each([
+    ['Transit Point', TP_SLOT, 'tp-1'],
+    ['Managed Agent', MA_SLOT, 'target'],
+  ])(
+    'flags a blank Authority on a newly dropped %s Trust Check (no _edge yet)',
+    (_leg, slotId, parentId) => {
+      const blank = {
+        trust_registry_id: 'tr-1',
+        query_type: 'authorization',
+        query: { action: 'issue', resource: 'payment' },
+      };
+      expect(
+        trustCheckDefinition.incompleteReason({ queries: [blank] }, { id: 'tc', slotId, parentId })
+      ).toBe('Select an Issuer or Authority for the target-leg Authority');
+      expect(
+        trustCheckDefinition.incompleteReason(
+          { queries: [blank] },
+          { id: 'tc', slotId: AP_SLOT, parentId: 'access-point' }
+        )
+      ).toBeNull();
+    }
+  );
 });
 
 describe('trustCheckDefinition — hydrate → buildPayload round-trip', () => {

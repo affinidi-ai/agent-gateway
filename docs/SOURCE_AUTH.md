@@ -386,17 +386,18 @@ To find the affected surfaces and callers:
   whose base or enabled variant now refuses such a caller (one that authenticates callers without protected
   resource metadata, `on_failure: reject` or an inbound `from_jwt_claim` identity, which refused
   already), naming the surface:
-  `This Access Point is neither closed nor public, and it refuses callers whose credential is
-  missing or invalid with 401, as a closed one does …`;
-- the dashboard's Access Point panel shows such a surface as legacy, with a **Close Access
-  Point** button.
+  `This Access Point is configured for authenticated callers only. Any request without valid
+  credentials is denied with a 401 Unauthorized response. To allow requests from those callers,
+  switch the Access Point to Public access.`.
 
 To keep handing failed callers to policy, mark the surface public (`access_point.public: true`,
 the **Public access** switch). To make the refusal explicit in storage, close it
-(`access_point.public: false`, **Close Access Point**). Either writes `public`, which releases
+(`access_point.public: false`, set through the API or the JSON editor). Either writes `public`, which releases
 before v1.0.4 cannot load (see [Upgrading and rolling back](#upgrading-and-rolling-back)). A
 surface built from DynamoDB takes the same setting from an optional `public` attribute on its
-item: a boolean, or the string `"true"` or `"false"`.
+item: a boolean, or the string `"true"` or `"false"`. Any other value is ignored, so the surface
+keeps no Public access setting, and the gateway logs a warning naming the item and the type of value it held (never
+the value), at start and on a later load.
 
 #### Not ready Access Points
 
@@ -1012,7 +1013,7 @@ Which requests carry one:
 | Pipeline | Issues a transit token |
 | --- | --- |
 | Access Point (direct HTTP: MCP, A2A, HTTP) | For every request it forwards to the managed agent of a surface with Transit Points, an anonymous caller's included, but not for an agent card fetch |
-| Fabric receive, buffered and framed stream | For every request a paired gateway sends that it forwards to an HTTP or HTTPS Target of a surface with Transit Points, but not for a public discovery `GET` such as an agent card fetch. The token lists every Transit Point of the surface, as the Access Point's does; which partners reach a surface is set by peer exposure (see [`FABRIC.md`](FABRIC.md#which-transit-points-a-partner-can-drive)). When one should be issued and cannot be, the request is refused with `503` |
+| Fabric receive, buffered and framed stream | For every request a paired gateway sends that it forwards to an HTTP or HTTPS Target of a surface with Transit Points, but not for a public discovery `GET` such as an agent card fetch, or the gateway's own agent card fetch at a configured card location. The token lists every Transit Point of the surface, as the Access Point's does; which partners reach a surface is set by peer exposure (see [`FABRIC.md`](FABRIC.md#which-transit-points-a-partner-can-drive)). When one should be issued and cannot be, the request is refused with `503` |
 | `proxy://` and `a2a-proxy://` Targets, on either path | Never: the gateway runs the MCP Proxy and there is no agent, and an A2A Proxy's backend, such as Direct Line, must never see one |
 | Fabric send, the STS, the management API | Never |
 

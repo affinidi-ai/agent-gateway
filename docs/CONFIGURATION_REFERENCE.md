@@ -109,18 +109,39 @@ of their own. Both are counted on each gateway node. See
 A browser page can call a surface only from an allowed origin. `network.cors` in `gateway.json` lists
 origins allowed for every path the gateway serves and is read once, at startup. A surface owner who hosts
 a static page on their own domain, such as a chat page for an A2A agent, lists that origin on the surface
-instead, in `browser_origins`, with no `gateway.json` edit and no restart.
+instead, in `browser_origins`, with no `gateway.json` edit and no restart. On an MCP surface the same
+list also passes the MCP Origin check, so nothing else needs setting there either.
 
 | Field | Behaviour |
 | --- | --- |
-| `browser_origins` | A list of at most 20 exact origins: `https`, a host, an optional port, and nothing else. A wildcard, a path (a trailing `/` included), a query, a fragment, userinfo and any other scheme are refused with a `400` naming `browser_origins`. Each is stored in the form the URL parser normalises it to (the host in lower case, the default port `443` dropped), and a duplicate is dropped. Absent or empty, the surface behaves as before. Set it on the surface itself; a variant has no list of its own and uses its surface's. |
+| `browser_origins` | A list of at most 20 exact origins, each at most 256 bytes: `https`, a host, an optional port, and nothing else. A wildcard, a path (a trailing `/` included), a query, a fragment, userinfo, any other scheme and a longer entry are refused with a `400` naming `browser_origins` and quoting the entry escaped. Each is stored in the form the URL parser normalises it to (the host in lower case, the default port `443` dropped), and a duplicate is dropped. Absent or empty, the surface behaves as before. A `PUT` that leaves it out keeps the stored list, so a Surface Builder save keeps it; `[]` clears it, with `PUT` or `PATCH`. Set it on the surface itself; a variant has no list of its own and uses its surface's. |
+
+The same rules hold for a surface stored on disk, such as one edited by hand under `_storage/`: on load
+each entry is normalised, and an invalid entry, a duplicate or one past the 20th is dropped and logged as
+a warning naming the surface, as is the whole field when it is not a list; the surface itself still loads, and its stored file is rewritten without the
+dropped entries. The drop is logged, not audited: no `browser_origins_changed` event is recorded for it.
 
 A cross-origin request, a preflight included, to a path that belongs to a surface is allowed when its
 `Origin` is in `network.cors` or in that surface's `browser_origins`. A path belongs to the surface whose
-route is the longest prefix of it, as when the gateway serves the request. A path that belongs to no
-surface uses `network.cors` only, and the public discovery documents keep their any-origin rule for
-`GET` and `HEAD`. An origin on one surface's list gets nothing on another surface, and a disabled or
-deleted surface allows none.
+route is the longest prefix of it, as when the gateway serves the request, under a `network.channels`
+prefix or a `network.routes` entry of type `proxy`. A path that belongs to no surface uses `network.cors`
+only, and the public discovery documents keep their any-origin rule for `GET` and `HEAD`. An origin on one
+surface's list gets nothing on another surface, and a disabled or deleted surface allows none, from the
+moment the gateway stops serving it. Protected resource metadata
+(`/.well-known/oauth-protected-resource`) is not a surface path: where a channel prefix of `/` or
+`/.well-known` also serves it, only `network.cors` applies to it, and elsewhere any origin may read it.
+
+On an MCP surface a request's `Origin`, when present, must also pass the MCP Origin check (see
+[`MCP_METADATA.md`](MCP_METADATA.md)): it admits the gateway's own external URLs,
+`mcp_http.allowed_origins` and the surface's `browser_origins`, and refuses any other with `403`. Over a
+framed Fabric stream the receiving surface's lists decide.
+
+Each save that changes the list records a `browser_origins_changed` audit event with the list before and
+after it, when the VP Audit Log or an integration selects that event (see
+[`OBSERVABILITY.md`](OBSERVABILITY.md)). A tenant-scoped PAT that may update the surface
+may set the list: whoever owns a surface decides which pages may call it, as they decide its other
+settings, and the list opens the surface to those pages only, never to another surface. An origin whose
+domain later changes hands keeps its access until it is removed from the list.
 
 `Access-Control-Allow-Credentials` is never sent, so a page's cookies and HTTP credentials do not go with
 the request; it authenticates the way any other caller does, with the credential the surface's Access Point
@@ -220,13 +241,14 @@ Network topology and the surfaces served. The largest configuration file; the ex
 | --- | --- |
 | `listeners` | Named bind addresses and ports. Access Points and Transit Points reference these. A `listener_type` must be `inbound` or `outbound`, in lower case, and is `inbound` when left out. A `bind_address` must be an IPv4 or IPv6 address such as `0.0.0.0`, `127.0.0.1`, `::` or `::1`, and an IPv6 address may be written in brackets, such as `[::1]`, which names the same socket as `::1`; a host name such as `localhost` is not accepted. Any other `listener_type` or `bind_address` stops the gateway from loading its network configuration. The gateway binds only configured addresses, never an address no listener names. Each port is served by one listener task, and the first listener configured on the port decides whether it is inbound or outbound, whether it uses TLS and, for an outbound port, the one address it binds; the other listeners on the port do not change these, so an inbound listener on an outbound port is not served. An inbound port binds the distinct `bind_address` of every inbound listener on it, each on its own address; one of them that an unspecified address on the same port already covers, such as `127.0.0.1` beside `0.0.0.0`, is served through that one, and a bind the operating system reports in use is skipped only when a listener already bound on the port accepts its connections: an IPv6 wildcard covers an IPv4 address only when its socket is dual-stack. An IPv4 caller accepted on an IPv6 address, such as `::` on a dual-stack host, is reported in IPv4 form (`a.b.c.d`, not `::ffff:a.b.c.d`) as the resolved client IP, which the login limits and request records use, and matches the IPv4 entries of `client_ip.trusted_proxies` and `tls.client_auth.trusted_proxies`; an IPv4-mapped address in `X-Forwarded-For` is read the same way. |
 | `channels` | Route prefixes. The legacy wire name for surface routes. The dashboard offers them as an Access Point's **Surface Prefix**, in this order, and preselects the first for a new surface. A prefix, an `mcp_proxies` prefix, a `proxy` route, or a `redirect` route with a `target`, whose first segment is a page of the dashboard is not served, since it would answer a reload of that page instead of the dashboard. The gateway still starts and serves everything else; it logs an error naming each prefix it skips and the page that prefix would hide, a configuration reload reports the same in its `warning`, and the dashboard does not offer a skipped prefix as a **Surface Prefix**. The whole first segment counts, so a prefix below a page, such as `/settings/old`, is skipped too, even where the dashboard has no route under it today. Rename such a prefix (for example to `/svc/<name>`) and the clients that call it, then reload. The dashboard pages are `/access-tokens`, `/api-keys`, `/apikeys`, `/audit`, `/authorities`, `/certificates`, `/cli-consent`, `/connections`, `/connection-points`, `/credential-providers`, `/credentials`, `/dashboard`, `/delegation-vault`, `/departments`, `/gateways`, `/identities`, `/integrations`, `/issuers`, `/jwt-verification-strategies`, `/logs`, `/mediators`, `/metrics`, `/notifications`, `/oidc-providers`, `/onboard`, `/payment-gateways`, `/policies`, `/policy-definitions`, `/profile`, `/proxies`, `/secrets`, `/settings`, `/sts-clients`, `/surfaces`, `/system-metrics`, `/tasks`, `/trust-registries`, `/users`, `/x402payments` (`SPA_RESERVED_TOP_LEVEL` in [`src/proxy/paths.rs`](../src/proxy/paths.rs)). `/payments` is not one of them. A channel prefix serves surfaces at and below it, and a `proxy` route below its prefix (an empty prefix, below `/`): these are the surface prefixes, except one the gateway does not serve because it hides a dashboard page. The admin API stores a new or changed Access Point route without a trailing `/`, and refuses one that is not a plain path (letters, digits and `-._~!&'()*+,;=:@` in segments that are not empty, `.` or `..`; no `$` or `%`, so a route cannot spell another surface's variant URL), that no surface prefix serves, or that a more specific entry here serves (an MCP proxy prefix serves the paths below it, a `redirect` only its own path), naming the entry or listing the surface prefixes. It reads this file as it is on disk, as the dashboard does for its **Surface Prefix** choices, which are the `channels` prefixes. The rule holds for a surface reached only over Fabric, or used only for its Transit Points, too, though Fabric finds a surface by id (see [`FABRIC.md`](FABRIC.md#fabric-receive-pipeline)). A disabled surface is not checked, and neither is the route an active surface already had, so a surface stored before these checks can still be edited. At startup the gateway logs a `WARN` for each stored active surface no surface prefix serves, or whose route is not a plain path once a trailing `/` is dropped; it keeps serving such a route as before, so move it or disable the surface. |
-| `routes` | Route categories and their types, prefixes, and fallbacks. A `proxy` route, or a `redirect` route with a `target`, whose first segment is a dashboard page is not served, as for `channels`. Every prefix but a `redirect`'s is read without a trailing `/`, so a channel at `/agents/` serves `/agents/foo`; a root prefix (`""` or `/`) is kept as written. No two entries of `channels`, `mcp_proxies` and `routes` may serve the same path: two entries on one prefix clash unless one is a `redirect`, which serves only its prefix, and the other a `proxy` route or an `mcp_proxies` prefix, which serve only the paths below theirs. An `identity_api`, `onboarding`, `static` or `connection_point` route at `/`, the static fallback, and an entry the gateway does not serve (one that hides a dashboard page, a `redirect` without a `target`, a `static` route without a `path`) are exempt. A `gateway.json` with a clashing pair stops the gateway from starting, and a reload refuses it, naming each pair; before upgrading, check for prefixes that become equal once a trailing `/` is dropped. |
+| `routes` | Route categories and their types, prefixes, and fallbacks. A `proxy` route, or a `redirect` route with a `target`, whose first segment is a dashboard page is not served, as for `channels`. Every prefix but a `redirect`'s is read without a trailing `/`, so a channel at `/agents/` serves `/agents/foo`; a root prefix (`""` or `/`) is kept as written. No two entries of `channels`, `mcp_proxies` and `routes` may serve the same path: two entries on one prefix clash unless one is a `redirect`, which serves only its prefix, and the other a `proxy` route or an `mcp_proxies` prefix, which serve only the paths below theirs. An `identity_api`, `onboarding`, `static` or `connection_point` route at `/`, the static fallback, and an entry the gateway does not serve (one that hides a dashboard page, a `redirect` without a `target`, a `static` route without a `path`) are exempt. A `gateway.json` with a clashing pair stops the gateway from starting, and a reload refuses it, naming each pair; before upgrading, check for prefixes that become equal once a trailing `/` is dropped. The static fallback serves the dashboard for every path no route matched, except a path at or below a non-root `identity_api` prefix, which is answered `404` with `{"error":"Not found"}` on every inbound listener, whether or not that listener serves the identity API. |
 | `mcp_proxies` | Route prefixes for MCP proxy endpoints. A prefix whose first segment is a dashboard page is not served, as for `channels`. |
 | `did` | The domain used when generating `did:web` and `did:webvh` identifiers |
 | `webauthn` | Relying-party ID and external origin for passkey registration |
 | `integration` | Notification and webhook integration settings |
 | `sts` | Security Token Service runtime settings. See [`STS.md`](STS.md). |
 | `cli_login_throttle` | Optional per-client-IP limit on each `fabric` CLI login endpoint: `enabled` (default `false`) and `per_ip` `{requests, window_secs}` (default 20 per 60 seconds). Behind a load balancer, set `client_ip.trusted_proxies` first. |
+| `passkey_login_throttle` | Optional per-client-IP limit on starting a passkey sign-in or registration (`POST /api/auth/login/start` and `/api/auth/register/start`, one budget for both): `enabled` (default `false`) and `per_ip` `{requests, window_secs}` (default 20 per 60 seconds). A client over it gets `429` with `Retry-After`. Behind a load balancer, set `client_ip.trusted_proxies` first: until then every caller shares the balancer's budget, and one client can use it up for all. |
 | `transit_token_max_lifetime_secs` | The longest lifetime, in seconds, a surface may set for its transit tokens in `transit.transit_token_lifetime_secs`, and the longest the Access Point issues, from 30 to 900; 300 when unset. Read once, when the gateway starts: anything but a whole number from 30 to 900 stops it from starting, and a change takes a restart, as a reload keeps the startup value and logs a warning while the file differs from it. A stored surface lifetime above it gets tokens living this long, with a warning; it never stops the gateway. A Transit Point does not read it, so instances with different values accept each other's tokens. The shortest lifetime, 30, is fixed. Upgrade every instance that shares surface storage before raising it above 300 or setting any surface lifetime: an earlier release refuses tokens living longer than 300 seconds and drops a stored surface lifetime when it saves the surface. See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token-lifetime). |
 | `payment_gate` | `breaker_failures` (default `5`, 1 to 1000) consecutive failed calls to one agent-pay gateway open its circuit breaker for `breaker_open_secs` (default `30`, 1 to 3600); the gate then answers `503` at once. Read at startup. Opening and closing are logged and counted (see [`OBSERVABILITY.md`](OBSERVABILITY.md#settlement-breaker-and-ledger-metrics)). |
 | `payment_ledger` | `retention_days` (default `7`, 1 to 400): how long the payments ledger keeps its hourly segments. `max_size_mb` (default `2048`, 16 to 1,048,576): the oldest segments are deleted early while the ledger is larger. Neither deletes a segment holding a payment still awaiting capture or void. Read at startup; a value out of range is clamped and logged as a warning. See [Taking the payment](#taking-the-payment). |
@@ -296,6 +318,34 @@ records rather than file content; see [`src/config/agent_surface.rs`](../src/con
 registration to succeed. A mismatch is the most common local-setup failure, and
 [`development/GETTING_STARTED.md`](development/GETTING_STARTED.md) treats the generated
 value as the source of truth.
+
+A passkey sign-in challenge (`POST /auth/login/start` under the `identity_api` prefix,
+`/api` by default) names the passkeys of an approved account. For any other username
+(unknown, not approved, or without passkeys) it names decoy credentials instead, with no
+transports: usually one 20-byte ID, sometimes one of 16, 32 or 64 bytes, sometimes two or
+three. They are derived from the username with the key in `login_decoy_credential_key.json`
+under `[storage_paths] vc_keys`, which the gateway creates on its first start in passkey sign-in
+mode the way it creates the transit token key, so a username gets the same decoys on every challenge and the answer
+does not tell whether it has an account. No authenticator holds a decoy, so the browser finds
+no passkey for it and offers another device or a security key instead, and the sign-in goes no
+further. An approved account whose passkeys differ in count or length from what decoys take can
+still be told apart. A key file that cannot be read stops the gateway from starting in passkey
+mode. To replace the key, stop every instance, delete both `login_decoy_credential_key.json`
+and `login_decoy_credential_key.json.enc`, and start them again; every username then gets new
+decoys. The `.atgx` export leaves the key file out.
+
+Registering a passkey (`POST /auth/register/finish`) for a username that already has an
+account, approved or awaiting approval, checks the passkey and the accepted Terms as for a new
+account and is answered `200` like one, but stores nothing: the existing account and its
+passkeys are unchanged, and the new passkey cannot sign in. Both answers are sent 25 ms after the
+username is checked, so the time saved by storing nothing does not tell the username is taken;
+administrators are notified of a new account after it is answered.
+
+A sign-in or registration challenge can be finished for 6 minutes, the 5 minutes the browser
+gives the user and a minute for the answer to arrive; after that the finish is refused with `400`
+and the passkey ceremony starts again. At most 10,000 unfinished challenges are kept; when full,
+the expired ones are dropped, and then the oldest. Sign-in and registration refuse a username
+longer than 256 bytes with `400`, so no challenge holds a larger one.
 
 ### Log redaction
 
@@ -1021,7 +1071,7 @@ admin API; a variant cannot override it.
 
 | Field | Default | Behaviour |
 | --- | --- | --- |
-| `secret_id` | Required | The `secret_id` of a secret in the secrets store, as `target.auth` `static_secret` names one. The value never appears in the surface, its API responses or the logs. A save refuses a secret that does not exist, one the surface's tenant may not use, and one of fewer than 32 bytes. |
+| `secret_id` | Required | The `secret_id` of a secret in the secrets store, as `target.auth` `static_secret` names one. The value never appears in the surface, its API responses or the logs. A save refuses a secret that does not exist, one the surface's tenant may not use, and one of fewer than 32 bytes. The secret is the only thing that keeps anyone from deriving every caller's key, so make it at least 32 random bytes, such as the output of `openssl rand -base64 32`, never a typed passphrase. |
 | `header` | `x-caller-key` | The header the Target receives the key in: `x-caller-key`, or `x-caller-key-` followed by words of lower-case letters and digits joined by single hyphens, such as `x-caller-key-memory`, at most 64 characters. A save refuses any other name, and a header the surface or one of its variants already reads or sends: a source authentication credential header, a Target or delegated credential header, or a header metadata mapping header, compared ignoring case and `_` against `-`. |
 | `identity_claims` | `["sub"]` | The JWT claims that name the caller, in order: the first the token carries as a non-empty string is used. Each is 1 to 128 printable ASCII characters without spaces, named once, and not a claim that names the token, issuer, audience, client, tenant, session or lifetime (`iss`, `aud`, `tid`, `azp` and the others `principal_claim` refuses). |
 
@@ -1046,7 +1096,13 @@ credential or whose credential failed on a public Access Point, and no token wit
 `iss` or any of the claims. No header of the caller key family, `x-caller-key` or a name
 starting `x-caller-key-` once lower-cased with `_` read as `-`, that a caller, an agent or a peer
 gateway sends is forwarded, on any surface, whether or not it sets `caller_key`; a caller that
-used such a header for its own purposes can no longer send it through. A PUT that leaves
+used such a header for its own purposes can no longer send it through. The key follows
+`credential_policy.target_https` as a Target credential does: under `enforce` it goes only to an
+`https://` URL with a host, and under `warn` an `http` Target gets it with a logged warning. A save answers with a `Warning` when
+the surface's Target, or a variant's, is `http`, or is one that never receives a key
+(`fabric://`, `proxy://`, `a2a-proxy://`, or bound by external consent). Unlike a Target
+credential, which an enforced rule refuses at save, a `caller_key` on an `http` Target under
+`enforce` saves with that `Warning`, and its requests are forwarded without the key. A PUT that leaves
 `caller_key` out keeps the stored one, so a Surface Builder save keeps it; `null` removes it. See
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#caller-keys).
 

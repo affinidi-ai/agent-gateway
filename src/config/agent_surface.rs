@@ -152,10 +152,23 @@ pub struct AgentSurface {
 /// The most `browser_origins` a surface may list.
 pub const MAX_BROWSER_ORIGINS: usize = 20;
 
+/// The longest `browser_origins` entry, in bytes.
+pub const MAX_BROWSER_ORIGIN_BYTES: usize = 256;
+
 /// Parses one `browser_origins` entry into the serialisation a browser sends in
-/// `Origin`: `https`, a host, an optional non-default port, and nothing else.
+/// `Origin`: `https`, a host, an optional non-default port, and nothing else. An
+/// entry is named in a refusal only as [`crate::observability::loggable::untrusted`]
+/// renders it.
 pub fn normalize_browser_origin(origin: &str) -> Result<String, String> {
-    let invalid = |why: &str| format!("browser_origins: '{origin}' is not an allowed origin: {why}");
+    let invalid = |why: &str| {
+        format!(
+            "browser_origins: {} is not an allowed origin: {why}",
+            crate::observability::loggable::untrusted(origin)
+        )
+    };
+    if origin.len() > MAX_BROWSER_ORIGIN_BYTES {
+        return Err(invalid(&format!("it is longer than {MAX_BROWSER_ORIGIN_BYTES} bytes")));
+    }
     if origin.contains('*') {
         return Err(invalid("wildcards are not allowed"));
     }
@@ -193,6 +206,72 @@ pub fn normalize_browser_origins(origins: &mut Vec<String>) -> Result<(), String
     }
     *origins = normalized;
     Ok(())
+}
+
+/// Normalises a stored surface's `browser_origins` as it is loaded, so a surface
+/// file written outside the admin API follows the same rules: each entry as
+/// [`normalize_browser_origin`] renders it, an entry it refuses, a duplicate, or
+/// one past [`MAX_BROWSER_ORIGINS`] dropped with a warning naming the surface. A
+/// value that is not a list, `null` included, is removed the same way. The
+/// surface itself is never refused. Returns whether the record changed.
+fn normalize_stored_browser_origins(value: &mut serde_json::Value) -> bool {
+    let surface_id = value
+        .get("surface_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let Some(field) = value.get_mut("browser_origins") else {
+        return false;
+    };
+    if !field.is_array() {
+        tracing::warn!(
+            surface_id = %surface_id,
+            origin = %crate::observability::loggable::untrusted(&field.to_string()),
+            reason = "not a list",
+            "Dropping a stored browser_origins entry"
+        );
+        if let Some(record) = value.as_object_mut() {
+            record.remove("browser_origins");
+        }
+        return true;
+    }
+    let Some(stored) = field.as_array_mut() else {
+        return false;
+    };
+    let drop = |entry: &str, reason: &str| {
+        tracing::warn!(
+            surface_id = %surface_id,
+            origin = %crate::observability::loggable::untrusted(entry),
+            reason,
+            "Dropping a stored browser_origins entry"
+        );
+    };
+    let mut kept: Vec<serde_json::Value> = Vec::new();
+    for entry in stored.iter() {
+        let Some(entry) = entry.as_str() else {
+            drop(&entry.to_string(), "not a string");
+            continue;
+        };
+        match normalize_browser_origin(entry) {
+            Err(why) => drop(entry, &why),
+            Ok(origin)
+                if kept
+                    .iter()
+                    .any(|kept| kept.as_str() == Some(origin.as_str())) =>
+            {
+                drop(entry, "a duplicate");
+            }
+            Ok(_) if kept.len() == MAX_BROWSER_ORIGINS => {
+                drop(entry, &format!("more than {MAX_BROWSER_ORIGINS} origins"));
+            }
+            Ok(origin) => kept.push(serde_json::Value::String(origin)),
+        }
+    }
+    if *stored == kept {
+        return false;
+    }
+    *stored = kept;
+    true
 }
 
 /// Three independent identity slots covering the proxy pipeline edges.
@@ -601,9 +680,9 @@ pub const LEGACY_OPEN_ACCESS_POINT_WARNING: &str = "This Access Point is neither
 /// What the gateway logs at start for each legacy surface (no `public`) that
 /// refuses a caller whose credential is missing or invalid only because it is
 /// not public; see [`AgentSurface::legacy_access_point_notice`].
-pub const LEGACY_ACCESS_POINT_REFUSES_FAILED_CALLERS_NOTICE: &str = "This Access Point is neither closed nor \
-     public, and it refuses callers whose credential is missing or invalid with 401, as a closed one does. Set \
-     access_point.public to true to hand them to policy, or to false to close it.";
+pub const LEGACY_ACCESS_POINT_REFUSES_FAILED_CALLERS_NOTICE: &str = "This Access Point is configured for \
+     authenticated callers only. Any request without valid credentials is denied with a 401 Unauthorized response. \
+     To allow requests from those callers, switch the Access Point to Public access.";
 
 /// What the Gateway needs to know about the caller.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -2459,7 +2538,8 @@ impl StorableEntity for AgentSurface {
         let embedded = rewrite_reference_transit_tokens(value);
         let marked = mark_transit_point_source_auth(value);
         let migrated = migrate_legacy_agent_pay_policies(value);
-        Ok(stripped || split || embedded || marked || migrated)
+        let origins = normalize_stored_browser_origins(value);
+        Ok(stripped || split || embedded || marked || migrated || origins)
     }
 }
 
@@ -3378,24 +3458,12 @@ impl std::fmt::Display for SurfaceStatus {
 
 use crate::trust_registry_verification::trust_check_element::TrustCheckElementValidationError;
 
-/// Maximum number of [`TrustCheckElement`]s allowed per leg
-/// (`AccessPoint.trust_check_list`, `Target.trust_check_list` and each
-/// `TransitPoint.trust_check_list`).
-///
-/// Kept in sync with the frontend constant of the same name in
-/// `www/default/src/components/surface-builder/elements/trust-check/TrustCheckPanel.tsx`,
-/// which caps the dashboard's "add query" button so a user can't build a
-/// list the API would 400. Bump both together.
-pub const TRUST_CHECK_LIST_MAX: usize = 10;
-
 /// Structured Trust Check list validation errors. Pure data — the API
 /// layer is responsible for mapping these into the public HTTP error
 /// shape. Scoped to Trust Check invariants today; broader surface-level
 /// validation lives in dedicated helpers under `identity/handlers/surfaces.rs`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TrustCheckValidationError {
-    #[error("{leg} trust_check_list has {got} elements (max {max})")]
-    TrustCheckListTooLong { leg: &'static str, got: usize, max: usize },
     #[error("{leg} trust_check_list contains duplicate element id '{id}'")]
     TrustCheckDuplicateId { leg: &'static str, id: String },
     #[error("{leg} trust_check_list[{index}] (id '{id}'): {source}")]
@@ -3435,22 +3503,16 @@ pub enum TrustCheckValidationError {
     },
 }
 
-/// Walk a `trust_check_list` slice: enforce the `TRUST_CHECK_LIST_MAX`
-/// cap, ensure element ids are unique within the list, and delegate the
-/// per-element shape check to [`TrustCheckElement::validate`]. The `leg`
-/// label rides into every error variant so the API surface can echo
-/// `caller` / `target` back to the operator.
+/// Walk a `trust_check_list` slice: ensure element ids are unique within
+/// the list and delegate the per-element shape check to
+/// [`TrustCheckElement::validate`]. Neither the number of elements nor the
+/// authorities they query is capped. The `leg` label rides into every error
+/// variant so the API surface can echo `caller` / `target` back to the
+/// operator.
 pub fn validate_trust_check_list(
     leg: &'static str,
     list: &[TrustCheckElement],
 ) -> Result<(), TrustCheckValidationError> {
-    if list.len() > TRUST_CHECK_LIST_MAX {
-        return Err(TrustCheckValidationError::TrustCheckListTooLong {
-            leg,
-            got: list.len(),
-            max: TRUST_CHECK_LIST_MAX,
-        });
-    }
     let mut seen = std::collections::HashSet::with_capacity(list.len());
     for (index, elem) in list.iter().enumerate() {
         if !seen.insert(elem.id.as_str()) {
@@ -4537,6 +4599,123 @@ mod tests {
     }
 
     #[test]
+    fn a_browser_origin_longer_than_256_bytes_is_refused_before_it_is_parsed() {
+        let host = "a".repeat(MAX_BROWSER_ORIGIN_BYTES - "https://.com".len());
+        let longest = format!("https://{host}.com");
+        assert_eq!(longest.len(), MAX_BROWSER_ORIGIN_BYTES);
+        assert_eq!(normalize_browser_origin(&longest), Ok(longest.clone()));
+        let too_long = format!("https://{host}a.com");
+        assert_eq!(too_long.len(), MAX_BROWSER_ORIGIN_BYTES + 1);
+        let error = normalize_browser_origin(&too_long).expect_err("257 bytes");
+        assert!(error.ends_with("it is longer than 256 bytes"), "{error}");
+    }
+
+    #[test]
+    fn a_refused_browser_origin_is_named_escaped_and_quoted_once() {
+        let error = normalize_browser_origin("https://chat.example.com\r\nforged: line").expect_err("CR/LF");
+        assert!(!error.contains('\r') && !error.contains('\n'), "{error:?}");
+        assert_eq!(
+            error,
+            r#"browser_origins: "https://chat.example.com\r\nforged: line" is not an allowed origin: not a valid URL"#
+        );
+        assert_eq!(
+            normalize_browser_origin("http://chat.example.com"),
+            Err(r#"browser_origins: "http://chat.example.com" is not an allowed origin: the scheme must be https"#
+                .to_string())
+        );
+    }
+
+    fn stored_origins(origins: serde_json::Value) -> (bool, serde_json::Value) {
+        let mut stored = serde_json::json!({ "surface_id": "s-1", "browser_origins": origins });
+        let changed = normalize_stored_browser_origins(&mut stored);
+        (changed, stored["browser_origins"].clone())
+    }
+
+    #[test]
+    fn a_stored_browser_origin_is_normalised_on_load_and_an_invalid_one_dropped() {
+        assert_eq!(
+            stored_origins(serde_json::json!([
+                "https://Chat.Example.COM",
+                "http://plain.example.com",
+                "https://chat.example.com:443",
+                "https://*.example.com",
+                7,
+                "https://app.example.com"
+            ])),
+            (true, serde_json::json!(["https://chat.example.com", "https://app.example.com"]))
+        );
+    }
+
+    #[test]
+    fn stored_browser_origins_past_twenty_are_dropped_on_load() {
+        let origins: Vec<String> = (0..MAX_BROWSER_ORIGINS + 2)
+            .map(|index| format!("https://page{index}.example.com"))
+            .collect();
+        let (changed, kept) = stored_origins(serde_json::json!(origins));
+        assert!(changed);
+        assert_eq!(kept, serde_json::json!(origins[..MAX_BROWSER_ORIGINS]));
+    }
+
+    #[test]
+    fn a_valid_stored_list_or_none_is_left_as_it_is() {
+        let valid = serde_json::json!(["https://chat.example.com", "https://app.example.com:8443"]);
+        assert_eq!(stored_origins(valid.clone()), (false, valid));
+        let mut without = serde_json::json!({ "surface_id": "s-1" });
+        assert!(!normalize_stored_browser_origins(&mut without));
+        assert_eq!(without, serde_json::json!({ "surface_id": "s-1" }));
+    }
+
+    #[test]
+    fn loading_a_stored_surface_normalises_its_browser_origins() {
+        let mut stored = serde_json::json!({
+            "surface_id": "s-1",
+            "name": "s-1",
+            "access_point": { "listen_address": "0.0.0.0:9000", "route": "/agent", "protocol": "a2a" },
+            "target": { "endpoint": "https://agent.example" },
+            "browser_origins": ["https://Chat.Example.com", "http://plain.example.com"],
+        });
+        assert!(AgentSurface::migrate_raw_json(&mut stored).unwrap(), "re-persisted");
+        let surface: AgentSurface = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(surface.browser_origins, ["https://chat.example.com"]);
+        assert!(!AgentSurface::migrate_raw_json(&mut stored).unwrap(), "normalised once");
+    }
+
+    /// A hand-edited `browser_origins` that is not a list would fail to deserialise; it is
+    /// removed instead, so the surface still loads, without browser origins.
+    #[test]
+    fn a_stored_browser_origins_that_is_not_a_list_is_removed_and_the_surface_loads() {
+        for value in [
+            serde_json::json!("https://chat.example.com"),
+            serde_json::Value::Null,
+            serde_json::json!({ "origin": "https://chat.example.com" }),
+            serde_json::json!(7),
+        ] {
+            let mut stored = serde_json::json!({
+                "surface_id": "s-1",
+                "name": "s-1",
+                "access_point": { "listen_address": "0.0.0.0:9000", "route": "/agent", "protocol": "a2a" },
+                "target": { "endpoint": "https://agent.example" },
+                "browser_origins": value,
+            });
+            assert!(AgentSurface::migrate_raw_json(&mut stored).unwrap(), "re-persisted: {value}");
+            assert!(
+                stored
+                    .get("browser_origins")
+                    .is_none(),
+                "{value}"
+            );
+            let surface: AgentSurface = serde_json::from_value(stored.clone()).expect("the surface loads");
+            assert!(
+                surface
+                    .browser_origins
+                    .is_empty(),
+                "{value}"
+            );
+            assert!(!AgentSurface::migrate_raw_json(&mut stored).unwrap(), "normalised once: {value}");
+        }
+    }
+
+    #[test]
     fn a_surface_without_browser_origins_stores_no_such_field() {
         let mut surface = AgentSurface::default();
         let value = serde_json::to_value(&surface).unwrap();
@@ -4861,17 +5040,29 @@ mod tests {
             None,
             "an inbound from_jwt_claim identity refuses failed callers on any Access Point"
         );
-        let mut from_jwt_claim = surface_with_access_point(serde_json::json!({"caller_authentication": {"methods": [
-            {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []}
-        ]}}));
-        from_jwt_claim["identity_slots"] =
-            serde_json::json!({"inbound": {"type": "from_jwt_claim", "claim": "oid", "namespace_claims": []}});
+        let jwt_variant = |identity_slots: serde_json::Value| {
+            let mut overrides = serde_json::json!({"access_point": {"caller_authentication": {"methods": [
+                {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []}
+            ]}}});
+            if !identity_slots.is_null() {
+                overrides["identity_slots"] = identity_slots;
+            }
+            serde_json::json!([{"id": "beta", "alias": "beta", "name": "Beta", "enabled": true, "overrides": overrides}])
+        };
         assert_eq!(
-            serde_json::from_value::<super::AgentSurface>(from_jwt_claim)
-                .unwrap()
-                .legacy_access_point_notice(),
+            notice(serde_json::json!({}), jwt_variant(serde_json::Value::Null)),
+            Some(super::LEGACY_ACCESS_POINT_REFUSES_FAILED_CALLERS_NOTICE),
+            "a variant that authenticates callers with a JWT is newly refused"
+        );
+        assert_eq!(
+            notice(
+                serde_json::json!({}),
+                jwt_variant(
+                    serde_json::json!({"inbound": {"type": "from_jwt_claim", "claim": "oid", "namespace_claims": []}})
+                )
+            ),
             None,
-            "an inbound from_jwt_claim identity refuses failed callers on any Access Point"
+            "a variant with an inbound from_jwt_claim identity already refused failed callers"
         );
         for status in ["disabled", "deleted"] {
             let mut stopped = surface_with_access_point(
@@ -7307,33 +7498,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_transit_point_trust_check_list_over_max() {
-        let list = (0..=TRUST_CHECK_LIST_MAX)
+    fn validate_accepts_a_long_transit_point_trust_check_list() {
+        let list = (0..30)
             .map(|i| transit_trust_check(&format!("check-{i}")))
             .collect();
         let surface = surface_with_transit_points(serde_json::json!([transit_point_json("partner-a", "a2a", list)]));
 
-        let err = surface
-            .validate()
-            .expect_err("eleven checks must be rejected");
-        assert_eq!(
-            err,
-            TrustCheckValidationError::TransitPointTrustCheckInvalid {
-                alias: "partner-a".to_string(),
-                source: Box::new(TrustCheckValidationError::TrustCheckListTooLong {
-                    leg: "target",
-                    got: TRUST_CHECK_LIST_MAX + 1,
-                    max: TRUST_CHECK_LIST_MAX,
-                }),
-            }
-        );
-        assert_eq!(
-            err.to_string(),
-            format!(
-                "transit point 'partner-a': target trust_check_list has {} elements (max {TRUST_CHECK_LIST_MAX})",
-                TRUST_CHECK_LIST_MAX + 1
-            )
-        );
+        assert_eq!(surface.validate(), Ok(()));
     }
 
     #[test]
@@ -7766,9 +7937,11 @@ mod tests {
             id: id.to_string(),
             trust_registry_id: "tr-1".to_string(),
             authority_source: None,
+            authority_sources: Default::default(),
             query_type: crate::trust_registry_verification::trust_check_element::TrqpQueryType::Recognition,
             query: crate::trust_registry_verification::trust_check_element::TrqpQueryParams {
                 authority_id: "did:web:authority.example".to_string(),
+                authority_ids: None,
                 entity_id: "{{ caller.did }}".to_string(),
                 action: None,
                 resource: None,
@@ -7873,28 +8046,32 @@ mod tests {
     }
 
     #[test]
-    fn validate_passes_at_max_elements_per_leg() {
-        let list: Vec<_> = (0..TRUST_CHECK_LIST_MAX)
+    fn validate_passes_many_elements_per_leg() {
+        let list: Vec<_> = (0..30)
             .map(|i| elem(&format!("tc-{i}")))
             .collect();
         let s = surface_with_lists(list.clone(), list);
         assert_eq!(s.validate(), Ok(()));
     }
 
+    fn multi_authority_elem(
+        id: &str,
+        count: usize,
+    ) -> TrustCheckElement {
+        let mut e = elem(id);
+        e.query.authority_id = String::new();
+        e.query.authority_ids = Some(
+            (0..count)
+                .map(|i| format!("did:web:{id}-{i}"))
+                .collect(),
+        );
+        e
+    }
+
     #[test]
-    fn validate_rejects_over_max_elements_on_caller_leg() {
-        let list: Vec<_> = (0..=TRUST_CHECK_LIST_MAX)
-            .map(|i| elem(&format!("tc-{i}")))
-            .collect();
-        let s = surface_with_lists(list, Vec::new());
-        match s.validate() {
-            Err(TrustCheckValidationError::TrustCheckListTooLong { leg, got, max }) => {
-                assert_eq!(leg, "caller");
-                assert_eq!(got, TRUST_CHECK_LIST_MAX + 1);
-                assert_eq!(max, TRUST_CHECK_LIST_MAX);
-            }
-            other => panic!("expected TrustCheckListTooLong on caller, got {other:?}"),
-        }
+    fn validate_passes_many_authorities_across_a_list() {
+        let list = vec![multi_authority_elem("tc-a", 40), multi_authority_elem("tc-b", 2), elem("tc-c")];
+        assert_eq!(validate_trust_check_list("target", &list), Ok(()));
     }
 
     #[test]

@@ -37,6 +37,62 @@ pub(super) fn validate_caller_key(surface: &AgentSurface) -> Result<(), SurfaceA
     Ok(())
 }
 
+/// The save warnings of a surface's `caller_key`, for the surface and each variant as it
+/// resolves: a Target that never receives a caller key (`fabric://`, `proxy://`,
+/// `a2a-proxy://`, or bound by external consent), and an `http` Target, which receives it in
+/// clear while `credential_policy.target_https` is `warn` and none while it is `enforce`.
+pub(super) fn caller_key_warnings(surface: &AgentSurface) -> Vec<String> {
+    target_warnings(surface, crate::config::credential_policy::credential_policy().target_https)
+}
+
+fn target_warnings(
+    surface: &AgentSurface,
+    target_https: crate::config::credential_policy::RuleMode,
+) -> Vec<String> {
+    if surface.caller_key.is_none() {
+        return Vec::new();
+    }
+    let places = std::iter::once(None).chain(
+        surface
+            .variants
+            .iter()
+            .map(|variant| Some(variant.alias.as_str())),
+    );
+    let views = super::surface_tenancy::resolved_views(surface).unwrap_or_default();
+    places
+        .zip(views)
+        .filter_map(|(alias, view)| {
+            let place = alias
+                .map(|alias| format!(" in variant '{alias}'"))
+                .unwrap_or_default();
+            let endpoint = view.target.endpoint.trim();
+            let never = ["fabric://", "proxy://", "a2a-proxy://"]
+                .into_iter()
+                .find(|scheme| endpoint.starts_with(scheme))
+                .map(|scheme| format!("its {scheme} Target"))
+                .or_else(|| {
+                    crate::proxy::target_grant::binds_the_target(&view)
+                        .then(|| "its Target, bound by external consent,".to_string())
+                });
+            if let Some(target) = never {
+                Some(format!("caller_key has no effect{place}: {target} is never sent a caller key"))
+            } else if !crate::proxy::caller_key::sent_in_clear(endpoint) {
+                None
+            } else if target_https.is_enforced() {
+                Some(format!(
+                    "caller_key has no effect{place}: the Target is not https, and no caller key is sent while \
+                     credential_policy.target_https is enforce"
+                ))
+            } else {
+                Some(format!(
+                    "caller_key{place} sends caller keys in clear to a Target that is not https; they will be \
+                     withheld once credential_policy.target_https is enforce"
+                ))
+            }
+        })
+        .collect()
+}
+
 /// What else on `view` reads or sends `header`, if anything.
 fn header_user(
     view: &AgentSurface,
@@ -87,7 +143,7 @@ pub(super) async fn validate_caller_key_secret(
         .map_err(|error| super::surface_tenancy::internal("Secret", error))?
         .ok_or_else(|| super::surface_tenancy::inaccessible("Secret"))?;
     let value = zeroize::Zeroizing::new(secret.value);
-    if value.len() >= crate::config::caller_key::MIN_SECRET_BYTES {
+    if crate::config::caller_key::long_enough(&value) {
         Ok(())
     } else {
         Err(SurfaceApiError::BadRequest(format!(
@@ -226,6 +282,80 @@ mod tests {
                 "caller_key.header x-caller-key-vendor is already used by a Target or delegated credential in variant 'beta'"
                     .to_string()
             )
+        );
+    }
+
+    fn keyed(target: serde_json::Value) -> AgentSurface {
+        surface(serde_json::json!({ "caller_key": { "secret_id": "caller-keys" }, "target": target }))
+    }
+
+    #[test]
+    fn a_caller_key_to_an_https_target_or_none_at_all_saves_without_a_warning() {
+        use crate::config::credential_policy::RuleMode;
+        for mode in [RuleMode::Warn, RuleMode::Enforce] {
+            assert!(
+                target_warnings(&keyed(serde_json::json!({ "endpoint": "https://agent.example" })), mode).is_empty()
+            );
+            let mut plain = keyed(serde_json::json!({ "endpoint": "http://agent.example" }));
+            plain.caller_key = None;
+            assert!(target_warnings(&plain, mode).is_empty(), "no caller_key");
+        }
+    }
+
+    #[test]
+    fn a_caller_key_its_target_never_receives_warns() {
+        use crate::config::credential_policy::RuleMode;
+        for (endpoint, target) in [
+            ("fabric://did:example:peer/surface", "its fabric:// Target"),
+            ("proxy://memory", "its proxy:// Target"),
+            ("a2a-proxy://agent", "its a2a-proxy:// Target"),
+        ] {
+            assert_eq!(
+                target_warnings(&keyed(serde_json::json!({ "endpoint": endpoint })), RuleMode::Warn),
+                [format!("caller_key has no effect: {target} is never sent a caller key")]
+            );
+        }
+        let mut bound = keyed(serde_json::json!({ "endpoint": "https://vendor.example" }));
+        bound.outbound_credentials = serde_json::from_value(serde_json::json!([
+            { "credential_provider_id": "vendor", "consent_mode": "external", "subject": "owner" }
+        ]))
+        .expect("binding parses");
+        assert_eq!(
+            target_warnings(&bound, RuleMode::Warn),
+            ["caller_key has no effect: its Target, bound by external consent, is never sent a caller key"]
+        );
+    }
+
+    #[test]
+    fn a_caller_key_to_an_http_target_warns_by_target_https_mode() {
+        use crate::config::credential_policy::RuleMode;
+        let http = keyed(serde_json::json!({ "endpoint": "http://agent.example" }));
+        assert_eq!(
+            target_warnings(&http, RuleMode::Warn),
+            ["caller_key sends caller keys in clear to a Target that is not https; they will be withheld once \
+              credential_policy.target_https is enforce"]
+        );
+        assert_eq!(
+            target_warnings(&http, RuleMode::Enforce),
+            ["caller_key has no effect: the Target is not https, and no caller key is sent while \
+              credential_policy.target_https is enforce"]
+        );
+    }
+
+    #[test]
+    fn a_variant_whose_target_is_not_https_warns_by_name() {
+        use crate::config::credential_policy::RuleMode;
+        let with_variant = surface(serde_json::json!({
+            "caller_key": { "secret_id": "caller-keys" },
+            "variants": [ {
+                "id": "variant-1", "alias": "beta", "name": "Beta",
+                "overrides": { "target": { "endpoint": "http://beta.example" } }
+            } ]
+        }));
+        assert_eq!(
+            target_warnings(&with_variant, RuleMode::Enforce),
+            ["caller_key has no effect in variant 'beta': the Target is not https, and no caller key is sent \
+              while credential_policy.target_https is enforce"]
         );
     }
 

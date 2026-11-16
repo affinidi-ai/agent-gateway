@@ -228,6 +228,12 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         "A surface save pinned a Transit Point's grant binding to its MCP Proxy as the proxy is now",
         Delegation,
     ),
+    event(
+        "browser_origins_changed",
+        "Browser Origins Changed",
+        "A surface save changed the browser origins whose pages may call the surface",
+        Auth,
+    ),
 ];
 
 /// The event's bit in a selection bitmap: its position in [`AUDIT_EVENTS`].
@@ -308,6 +314,7 @@ mod tests {
         assert_eq!(group_of("auth_failed"), Some(AuditEventGroup::Auth));
         assert_eq!(group_of("target_auth_changed"), Some(AuditEventGroup::Auth));
         assert_eq!(group_of("secret_force_deleted"), Some(AuditEventGroup::Auth));
+        assert_eq!(group_of("browser_origins_changed"), Some(AuditEventGroup::Auth));
         assert_eq!(group_of("identity_binding_failed"), Some(AuditEventGroup::Identity));
         assert_eq!(group_of("identity_binding_verified"), Some(AuditEventGroup::Identity));
         for request in ["request_rejected", "rate_limited"] {
