@@ -125,10 +125,35 @@ describe('Credential Tokens tab', () => {
     expect(accessToken('ended')).toHaveTextContent(/^\S/);
   });
 
+  it("names each token's provider by its name, else by its provider id", async () => {
+    await renderTab([
+      token('known', ALICE),
+      token('gone', BOB, { credential_provider_id: 'cp-deleted', provider_id: 'legacy' }),
+    ]);
+
+    expect(within(row('known')).getAllByRole('cell')[0]).toHaveTextContent(/^GitHub$/);
+    expect(within(row('gone')).getAllByRole('cell')[0]).toHaveTextContent(/^legacy$/);
+  });
+
+  it("finds a token by its provider's name", async () => {
+    await renderTab(
+      [
+        token('scm', ALICE, { credential_provider_id: 'cp-scm', provider_id: 'scm' }),
+        token('other', BOB),
+      ],
+      { externalSearchTerm: 'source control' },
+      [GITHUB, { ...GITHUB, id: 'cp-scm', name: 'Source Control' }]
+    );
+
+    expect(row('scm')).toBeInTheDocument();
+    expect(screen.queryByTestId('credential-token-row-other')).toBeNull();
+  });
+
   it('keeps listing tokens while the providers cannot be read', async () => {
     await renderTab([token('t1', ALICE)], {}, { error: 'forbidden' });
 
     expect(row('t1')).toBeInTheDocument();
+    expect(within(row('t1')).getAllByRole('cell')[0]).toHaveTextContent(/^github$/);
     expect(screen.getByTestId('credential-token-access-token-t1')).not.toHaveTextContent(
       'Renews automatically'
     );
@@ -182,7 +207,7 @@ describe('Credential Tokens tab', () => {
     expect(button).toHaveTextContent(/^Revoke$/);
 
     fireEvent.click(button);
-    expect(button).toHaveTextContent(/^Revoke github access\?$/);
+    expect(button).toHaveTextContent(/^Revoke GitHub access\?$/);
     expect(button).toHaveClass('btn-danger');
     expect(row('t1')).not.toHaveClass('table-active');
     fireEvent.click(screen.getByTestId('credential-token-revoke-cancel-button-t1'));

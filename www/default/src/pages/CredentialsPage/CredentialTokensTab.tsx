@@ -15,6 +15,7 @@ import {
   agentName,
   consentEnd,
   consentState,
+  providerName,
   renewsAutomatically,
   timeLeft,
 } from './delegatedAccess';
@@ -123,6 +124,7 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
 
     const searchLower = trimmedSearch.toLowerCase();
     return (
+      providerName(t, providers).toLowerCase().includes(searchLower) ||
       t.provider_id.toLowerCase().includes(searchLower) ||
       t.agent_did.toLowerCase().includes(searchLower) ||
       t.user_identity_hash.toLowerCase().includes(searchLower) ||
@@ -224,7 +226,7 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                           className={`fas fa-chevron-${expandedTokenId === token.id ? 'down' : 'right'} me-2 text-muted`}
                           style={{ fontSize: '0.7rem' }}
                         ></i>
-                        <strong>{token.provider_id}</strong>
+                        <strong>{providerName(token, providers)}</strong>
                       </td>
                       <td>
                         <code className="text-muted text-break" title={token.agent_did}>
@@ -285,7 +287,7 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                           <TwoStepButton
                             label="Revoke"
                             confirmAs="danger"
-                            confirmLabel={`Revoke ${token.provider_id} access?`}
+                            confirmLabel={`Revoke ${providerName(token, providers)} access?`}
                             title="Revoke delegation"
                             confirmTitle="Click again to revoke this delegation"
                             className="btn btn-outline-danger btn-sm text-nowrap"

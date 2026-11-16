@@ -208,15 +208,14 @@ see _JWT verification strategy editor_ in
 
 The Credentials page keeps its **Credential Tokens** tab, which shows when each consent ends and
 confirms every revoke in place (two clicks, never a modal or a browser dialog; revoke-all asks
-with a danger button that names how many delegations it ends), and has a
-**Delegated Access** tab beside it that lists only active access, revokes it with a text
-**Revoke** whose confirm names the provider beside a Cancel, and opens the Audit Log as its
-history. Both tabs show an agent with a `did:web` DID by its whole host name, the full DID in
-the tooltip, and revoke one entry with the same text **Revoke**. Delegated Access shows the
-limit each consent was given under in its Ends column, and the Credential Tokens **Access Token**
-column says "Renews automatically" while the gateway refreshes the token. A new view is a new tab; an
-existing tab is never renamed or removed. See _Credential
-Tokens and Delegated Access tabs_ in
+with a danger button that names how many delegations it ends), and has a **Delegated Access**
+tab beside it that lists only active access, revokes it with a text **Revoke** whose confirm
+names the provider beside a Cancel, and opens the Audit Log as its history. Both tabs name a
+provider by its name, show an agent with a `did:web` DID by its whole host name, the full DID in
+the tooltip, and revoke one entry with the same text **Revoke**. Delegated Access shows the limit
+each consent was given under in its Ends column, and the Credential Tokens **Access Token** column
+says "Renews automatically" while the gateway refreshes the token. A new view is a new tab; an
+existing tab is never renamed or removed. See _Credential Tokens and Delegated Access tabs_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-tokens-and-delegated-access-tabs).
 
 The credential delegation records are read in the Audit Log; the Credentials page's **Credential

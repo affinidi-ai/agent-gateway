@@ -1071,7 +1071,7 @@ tab key `credential-tokens`) and has a **Delegated Access** tab beside it
 `GET /api/v1/credential-providers` through `useDelegationVault.ts`, and still list the tokens
 when the providers cannot be read; the shared rules live in
 `pages/CredentialsPage/delegatedAccess.ts` (`consentState`, `timeLeft`, `isActiveDelegation`,
-`consentLimitSecs`, `renewsAutomatically`, `agentName`) and the page links in
+`consentLimitSecs`, `renewsAutomatically`, `agentName`, `providerName`) and the page links in
 `PaginationControls.tsx`. A new view of the vault is a new tab: an existing tab is never renamed
 or removed.
 
@@ -1082,6 +1082,9 @@ full DID is the cell's tooltip. Both revoke one entry with the same text **Revok
 
 Credential Tokens lists every agent-keyed token, service tokens included.
 
+- The **Provider** column shows the provider's name, else its `provider_id` (`providerName`,
+  shared with Delegated Access's System column), and the search matches the name too; the
+  expanded row keeps **Provider ID**.
 - The **Consented** cell shows the consent time and, under it, the consent's end
   (`credential-token-consent-end-<id>`): "Ends <date> (in 3 hours)", "Ended <date>", or "No time
   limit" when the vault reports no `consent_expires_at`. The expanded row shows it as **Consent

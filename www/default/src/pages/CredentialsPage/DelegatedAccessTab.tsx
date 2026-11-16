@@ -17,6 +17,7 @@ import {
   consentLimitSecs,
   consentState,
   isActiveDelegation,
+  providerName,
   timeLeft,
 } from './delegatedAccess';
 import { useDelegationVault } from './useDelegationVault';
@@ -45,8 +46,7 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
     setPage(1);
   }, [searchTerm]);
 
-  const systemOf = (token: DelegationToken) =>
-    providers[token.credential_provider_id]?.name ?? token.provider_id;
+  const systemOf = (token: DelegationToken) => providerName(token, providers);
 
   /** A token of a provider nobody consents to is a service token, not a person's delegation. */
   const consentedTo = (token: DelegationToken) => {

@@ -53,6 +53,12 @@ changes:
         The provider form's consent time limit unit menu no longer offers seconds, since the
         shortest limit is one minute. A stored limit that is not a whole number of minutes, which
         only the API can set, still loads in seconds and saves unchanged.
+    - timestamp: '2026-11-16T16:30:00Z'
+      title: Name the provider on Credential Tokens by its name, not its id
+      description: >-
+        The Provider column of Credential Tokens showed the provider's id, such as "github", while
+        Delegated Access showed its name. It now shows the name, such as "GitHub", falling back to
+        the id when the provider is unknown, and the search finds a token by that name too.
   fixed:
     - timestamp: '2026-11-16T15:10:00Z'
       title: Say that token refresh stops when a provider's consent time limit ends

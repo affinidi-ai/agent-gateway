@@ -238,11 +238,14 @@ test.describe("Credentials page Credential Tokens tab", () => {
     await expect(row(page, "t1").getByTitle(AGENT_DID)).toHaveText(
       "agent.example.com",
     );
+    await expect(row(page, "t1").getByRole("cell").first()).toHaveText(
+      "GitHub",
+    );
     const button = page.getByTestId("credential-token-revoke-button-t1");
     await expect(button).toHaveText("Revoke");
 
     await button.click();
-    await expect(button).toHaveText("Revoke github access?");
+    await expect(button).toHaveText("Revoke GitHub access?");
     expect(revoked).toEqual([]);
 
     await button.click();

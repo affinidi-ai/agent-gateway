@@ -30,6 +30,14 @@ export interface ProviderSummary {
   deactivated_at?: string | null;
 }
 
+/** A token's provider by its name, else by its `provider_id` when the provider is unknown. */
+export function providerName(
+  token: Pick<DelegationToken, 'credential_provider_id' | 'provider_id'>,
+  providers: Record<string, Pick<ProviderSummary, 'name'>>
+): string {
+  return providers[token.credential_provider_id]?.name ?? token.provider_id;
+}
+
 /** Where a stored consent stands against its time limit. */
 export type ConsentState = 'unlimited' | 'limited' | 'ending_soon' | 'ended';
 
