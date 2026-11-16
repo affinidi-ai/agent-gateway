@@ -16,6 +16,9 @@ use crate::config::MirrorConfig;
 use crate::egress::{self, EgressError, PinnedTarget};
 use crate::http_client::GATEWAY_USER_AGENT;
 
+/// The longest `timeout_secs` a mirror is given, in seconds. A larger stored value is cut to it.
+pub(crate) const MAX_TIMEOUT_SECS: u64 = crate::http_client::EXTERNAL_TIMEOUT_SECS;
+
 /// One copy of a live request, addressed to a surface's mirror endpoint.
 pub(crate) struct MirrorRequest {
     endpoint: String,
@@ -37,7 +40,11 @@ impl MirrorRequest {
             method,
             headers: HeaderMap::new(),
             body: body.into(),
-            timeout: Duration::from_secs(config.timeout_secs),
+            timeout: Duration::from_secs(
+                config
+                    .timeout_secs
+                    .min(MAX_TIMEOUT_SECS),
+            ),
         }
     }
 
@@ -48,11 +55,12 @@ impl MirrorRequest {
         name: &str,
         value: impl AsRef<[u8]>,
     ) -> Self {
-        if let (Ok(name), Ok(value)) =
-            (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_bytes(value.as_ref()))
-        {
-            self.headers
-                .append(name, value);
+        match (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_bytes(value.as_ref())) {
+            (Ok(name), Ok(value)) => {
+                self.headers
+                    .append(name, value);
+            }
+            _ => tracing::warn!(header = name, "A mirror request header is not valid and was left out"),
         }
         self
     }
@@ -107,6 +115,13 @@ impl MirrorError {
             MirrorError::Send(e) if e.is_request() => "invalid request",
             MirrorError::Send(_) => "network error",
         }
+    }
+}
+
+impl MirrorError {
+    /// The text of the `503` a `fabric://` caller gets when a mirror it waited for failed.
+    pub(crate) fn caller_message(&self) -> String {
+        format!("Traffic mirroring failed ({}): the mirror request did not complete", self.kind())
     }
 }
 
@@ -405,6 +420,32 @@ mod tests {
         assert_eq!(err.kind(), "connection refused");
     }
 
+    #[tokio::test]
+    async fn the_caller_message_names_the_class_and_never_calls_a_refusal_unreachable() {
+        let refused = send(request("http://169.254.169.254/latest/meta-data/"))
+            .await
+            .expect_err("refused");
+        assert_eq!(
+            refused.caller_message(),
+            "Traffic mirroring failed (blocked by egress policy): the mirror request did not complete"
+        );
+        assert_eq!(
+            MirrorError::Refused(EgressError::Dns("no answer within 5s".into())).caller_message(),
+            "Traffic mirroring failed (DNS resolution failed): the mirror request did not complete"
+        );
+        assert_eq!(
+            MirrorError::Internal("egress task failed".into()).caller_message(),
+            "Traffic mirroring failed (internal error): the mirror request did not complete"
+        );
+        let refused_connection = send(request("http://127.0.0.1:1/secret-path"))
+            .await
+            .expect_err("nothing listens");
+        assert_eq!(
+            refused_connection.caller_message(),
+            "Traffic mirroring failed (connection refused): the mirror request did not complete"
+        );
+    }
+
     #[test]
     fn an_internal_failure_is_not_called_a_policy_refusal() {
         let error = MirrorError::Internal("egress task failed".into());
@@ -427,6 +468,16 @@ mod tests {
             Err(error @ MirrorError::Refused(EgressError::Dns(_))) => assert_eq!(error.kind(), "DNS resolution failed"),
             other => panic!("expected a DNS refusal, got {:?}", other.err()),
         }
+    }
+
+    #[tokio::test]
+    async fn a_stored_timeout_above_the_ceiling_is_cut_to_it_and_does_not_overflow_the_deadline() {
+        let config: MirrorConfig =
+            serde_json::from_value(serde_json::json!({ "endpoint": "http://127.0.0.1:1/", "timeout_secs": u64::MAX }))
+                .expect("mirror config");
+        let request = MirrorRequest::new(&config, Method::POST, Bytes::new());
+        assert_eq!(request.timeout, Duration::from_secs(MAX_TIMEOUT_SECS));
+        assert!(matches!(send(request).await, Err(MirrorError::Send(_))));
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@ use cucumber::{given, then, when};
 use serde_json::{Value, json};
 
 use crate::bdd_support::actors::TargetActorKind;
+use crate::bdd_support::collaborators::assert_header_value;
 use crate::bdd_support::mock_server::MockResponse;
 use crate::steps::given::install_replacement_mock;
 use crate::steps::when::{
@@ -44,6 +45,22 @@ async fn surface_mirroring_to_endpoint_create_request_submitted(
     endpoint: String,
 ) {
     create_mirrored_surface(world, &route, &endpoint).await;
+}
+
+#[when(
+    expr = "the operator attempts to create a surface for route {string} that mirrors traffic with a timeout of {int} seconds"
+)]
+async fn surface_mirroring_with_timeout_create_request_submitted(
+    world: &mut SurfaceWorld,
+    route: String,
+    timeout_secs: u64,
+) {
+    configure_unseeded_route(world, &route);
+    let mut payload = build_primary_target_surface_payload(world, &route).await;
+    payload["target"]["networking"] = json!({
+        "mirror": { "endpoint": "http://10.1.2.3/copy", "percentage": 100, "timeout_secs": timeout_secs }
+    });
+    create_surface(world, payload).await;
 }
 
 #[given(expr = "a surface for route {string} mirrors every request to the mirror endpoint {string}")]
@@ -169,4 +186,26 @@ async fn mirror_endpoint_received_forwarded_request(
         .request_count()
         .await;
     assert_eq!(received, 1, "mirror endpoint '{mirror_name}' should have received the copy once");
+}
+
+#[then(expr = "the mirror endpoint {string} received header {string} with value {string}")]
+async fn mirror_endpoint_received_header(
+    world: &mut SurfaceWorld,
+    mirror_name: String,
+    header: String,
+    expected: String,
+) {
+    let request = the_mirrored_request(world, &mirror_name).await;
+    assert_header_value(&request.headers, &header, &expected, &format!("mirror endpoint '{mirror_name}'"));
+}
+
+async fn the_mirrored_request(
+    world: &SurfaceWorld,
+    mirror_name: &str,
+) -> crate::bdd_support::mock_server::ReceivedRequest {
+    world
+        .mock_for_target(mirror_name)
+        .last_request()
+        .await
+        .unwrap_or_else(|| panic!("mirror endpoint '{mirror_name}' received no request"))
 }

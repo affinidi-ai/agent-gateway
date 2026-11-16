@@ -5,7 +5,6 @@ Feature: Stored surfaces that mirror traffic
 
   Scenario: A stored surface that mirrors traffic to a cloud metadata service still serves its callers
     Given an A2A surface targeting managed agent "bravo"
-    And the surface is stored with a public Access Point
     And the surface is stored with a mirror to "http://169.254.169.254/latest/meta-data/"
     When the caller sends a request to the surface without an API key
     Then the response status is 200
@@ -13,7 +12,6 @@ Feature: Stored surfaces that mirror traffic
 
   Scenario: A stored surface whose mirror endpoint is refused cannot be saved again
     Given an A2A surface targeting managed agent "bravo"
-    And the surface is stored with a public Access Point
     And the surface is stored with a mirror to "http://169.254.169.254/latest/meta-data/"
     When the operator renames the stored surface
     Then the admin API response status is 400

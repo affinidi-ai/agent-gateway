@@ -199,6 +199,31 @@ fn forwards_ap_caller_header(
     ) && !is_credential_header(name, credential_headers)
 }
 
+/// Whether a caller header goes on to an Access Point's Target: what
+/// [`forwards_ap_caller_header`] forwards, or, for a Target bound by external consent
+/// (`bound_target`), only what [`crate::proxy::target_grant::forwards_caller_header`] forwards.
+/// A traffic mirror is sent the same headers, so it is never given one the Target is refused.
+fn forwards_target_header(
+    name: &str,
+    bound_target: bool,
+    source_auth_headers: &[&str],
+    header_metadata_mapping: Option<&crate::config::header_metadata_mapping::HeaderMetadataMappingConfig>,
+    forwarded_source_auth_header: Option<&str>,
+    credential_headers: &[&str],
+) -> bool {
+    if bound_target {
+        crate::proxy::target_grant::forwards_caller_header(name, source_auth_headers, header_metadata_mapping)
+    } else {
+        forwards_ap_caller_header(
+            name,
+            source_auth_headers,
+            header_metadata_mapping,
+            forwarded_source_auth_header,
+            credential_headers,
+        )
+    }
+}
+
 /// Whether `name` is one of `credential_headers`, the headers the gateway fills with a
 /// credential, compared without regard to case or to `_` against `-`, since some servers read
 /// both spellings as one. A caller's header of that name is never forwarded, whether or not the
@@ -6538,17 +6563,14 @@ async fn proxy_charged_request(
     let bound_target = crate::proxy::target_grant::binds_the_target(&state.surface);
     let credential_headers = target_credential_header_names(&state.surface);
     let forwards_header = |name: &str| {
-        if bound_target {
-            crate::proxy::target_grant::forwards_caller_header(name, &source_cred_headers, header_metadata_mapping)
-        } else {
-            forwards_ap_caller_header(
-                name,
-                &source_cred_headers,
-                header_metadata_mapping,
-                forwarded_source_auth_header,
-                &credential_headers,
-            )
-        }
+        forwards_target_header(
+            name,
+            bound_target,
+            &source_cred_headers,
+            header_metadata_mapping,
+            forwarded_source_auth_header,
+            &credential_headers,
+        )
     };
 
     // Build upstream request. The forward send uses the per-request pinned,
@@ -7601,7 +7623,14 @@ async fn proxy_charged_request(
         let mirror_endpoint_for_log = loggable::url(&mirror_config.endpoint);
         let mirror_request = mirror::MirrorRequest::new(mirror_config, method.clone(), body_bytes.clone())
             .headers_from(&headers, |name| {
-                should_forward_ap_request_header_with_mapping(name, &source_cred_headers, header_metadata_mapping, None)
+                forwards_target_header(
+                    name,
+                    bound_target,
+                    &source_cred_headers,
+                    header_metadata_mapping,
+                    None,
+                    &credential_headers,
+                )
             })
             .mirrored(Some(&trace_id));
 
@@ -12119,13 +12148,17 @@ async fn handle_fabric_request_inner(
                 .surface
                 .access_point
                 .header_metadata_mapping_if_supported();
+            let bound_target = crate::proxy::target_grant::binds_the_target(&state.surface);
+            let credential_headers = target_credential_header_names(&state.surface);
             let mirror_request = mirror::MirrorRequest::new(mirror_config, method.clone(), body_bytes.to_vec())
                 .headers_from(&headers, |name| {
-                    should_forward_ap_request_header_with_mapping(
+                    forwards_target_header(
                         name,
+                        bound_target,
                         &source_cred_headers,
                         header_metadata_mapping,
                         None,
+                        &credential_headers,
                     )
                 })
                 .mirrored(Some(&trace_id))
@@ -12157,10 +12190,7 @@ async fn handle_fabric_request_inner(
                         connection_guard
                             .decrement()
                             .await;
-                        return Err(create_error_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            &format!("Traffic mirroring failed ({error_type}): the mirror request did not complete"),
-                        ));
+                        return Err(create_error_response(StatusCode::SERVICE_UNAVAILABLE, &e.caller_message()));
                     }
                 }
             } else {
@@ -24144,6 +24174,33 @@ allow if {
         assert!(text.contains("error=error sending request "), "{text}");
         assert!(!text.contains("endpoint-key-value"), "a log holds the target's query value: {text}");
         assert!(!text.contains("for url"), "a log holds the reqwest error URL: {text}");
+    }
+}
+
+#[cfg(test)]
+mod target_header_filter_tests {
+    use super::forwards_target_header;
+
+    #[test]
+    fn a_header_named_like_a_target_credential_header_is_not_forwarded() {
+        for name in ["x-target-key", "X-Target-Key", "x_target_key"] {
+            assert!(!forwards_target_header(name, false, &[], None, None, &["X-Target-Key"]), "{name}");
+        }
+        assert!(forwards_target_header("accept-language", false, &[], None, None, &["X-Target-Key"]));
+    }
+
+    #[test]
+    fn a_target_bound_by_consent_is_forwarded_only_the_protocol_headers() {
+        assert!(!forwards_target_header("accept-language", true, &[], None, None, &[]));
+        assert!(!forwards_target_header("x-forwarded-for", true, &[], None, None, &[]));
+        assert!(forwards_target_header("mcp-session-id", true, &[], None, None, &[]));
+    }
+
+    #[test]
+    fn the_forwarded_token_header_goes_on_only_when_the_caller_names_it() {
+        assert!(forwards_target_header("x-jwt", false, &[], None, Some("x-jwt"), &[]));
+        assert!(!forwards_target_header("x-jwt", false, &["x-jwt"], None, None, &[]));
+        assert!(forwards_target_header("x-jwt", false, &["x-jwt"], None, Some("x-jwt"), &[]));
     }
 }
 

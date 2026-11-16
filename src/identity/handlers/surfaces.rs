@@ -429,10 +429,10 @@ fn validate_resolved_variants(surface: &AgentSurface) -> Result<(), SurfaceApiEr
     Ok(())
 }
 
-/// Refuse a traffic mirror endpoint that is not an http(s) URL or that names a
-/// cloud-provider metadata host. Static only: resolves no DNS. Loopback and
-/// private addresses are allowed, as for the Target. The reason never repeats
-/// the URL.
+/// Refuse a traffic mirror whose endpoint the Target's static check refuses (not an http(s)
+/// URL, embedded credentials, a cloud-provider metadata host) or whose `timeout_secs` is zero
+/// or above [`crate::proxy::mirror::MAX_TIMEOUT_SECS`]. Static only: resolves no DNS. Loopback
+/// and private addresses are allowed, as for the Target. The reason never repeats the URL.
 fn validate_mirror_endpoint(
     surface: &AgentSurface,
     label: &str,
@@ -445,9 +445,16 @@ fn validate_mirror_endpoint(
     } else {
         format!("{label}: ")
     };
-    crate::url_validation::validate_url_not_cloud_metadata_host(&mirror.endpoint)
-        .map(|_| ())
-        .map_err(|reason| SurfaceApiError::BadRequest(format!("{prefix}target.networking.mirror.endpoint: {reason}")))
+    crate::url_validation::validate_url_not_cloud_metadata_host(&mirror.endpoint).map_err(|reason| {
+        SurfaceApiError::BadRequest(format!("{prefix}target.networking.mirror.endpoint: {reason}"))
+    })?;
+    let max = crate::proxy::mirror::MAX_TIMEOUT_SECS;
+    if !(1..=max).contains(&mirror.timeout_secs) {
+        return Err(SurfaceApiError::BadRequest(format!(
+            "{prefix}target.networking.mirror.timeout_secs: must be between 1 and {max} seconds"
+        )));
+    }
+    Ok(())
 }
 
 /// Validate Trust Check list invariants (caller + target legs, plus
@@ -8794,6 +8801,58 @@ mod validation_tests {
             assert!(msg.contains(reason), "{endpoint}: {msg}");
             assert!(!msg.contains("pw@"), "{msg}");
         }
+    }
+
+    fn mirror_with_timeout(timeout_secs: u64) -> AgentSurface {
+        let mut s = base_surface();
+        s.target.networking = Some(
+            serde_json::from_value(serde_json::json!({
+                "mirror": { "endpoint": "https://mirror.example.com/copy", "timeout_secs": timeout_secs }
+            }))
+            .expect("networking"),
+        );
+        s
+    }
+
+    #[test]
+    fn mirror_timeout_outside_one_to_the_ceiling_is_refused_naming_the_field() {
+        for timeout_secs in [0, crate::proxy::mirror::MAX_TIMEOUT_SECS + 1, u64::MAX] {
+            let msg = bad_request(validate_mirror_endpoint(&mirror_with_timeout(timeout_secs), ""));
+            assert_eq!(
+                msg,
+                format!(
+                    "target.networking.mirror.timeout_secs: must be between 1 and {} seconds",
+                    crate::proxy::mirror::MAX_TIMEOUT_SECS
+                ),
+                "{timeout_secs}"
+            );
+        }
+    }
+
+    #[test]
+    fn mirror_timeout_from_one_second_to_the_ceiling_is_accepted() {
+        for timeout_secs in [1, 5, crate::proxy::mirror::MAX_TIMEOUT_SECS] {
+            validate_mirror_endpoint(&mirror_with_timeout(timeout_secs), "")
+                .unwrap_or_else(|e| panic!("{timeout_secs}s must be accepted: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn resolved_variants_refuse_a_variant_mirror_timeout_above_the_ceiling() {
+        let mut s = surface_with_variant_mirror("https://mirror.example.com/copy", true);
+        s.variants[0]
+            .overrides
+            .target
+            .as_mut()
+            .expect("target override")
+            .networking = Some(
+            serde_json::from_value(serde_json::json!({
+                "mirror": { "endpoint": "https://mirror.example.com/copy", "timeout_secs": 3600 }
+            }))
+            .expect("networking"),
+        );
+        let msg = bad_request(validate_resolved_variants(&s));
+        assert!(msg.starts_with("Variant 'shadow': target.networking.mirror.timeout_secs: "), "{msg}");
     }
 
     #[test]
