@@ -669,7 +669,7 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   in red with "(denied)"), a decision badge (Allow green, Deny red, Error yellow) with the reason, a
   **Show input** toggle that opens the input JSON, and a copy button for the input. Above the
   list an "All policy slots" select shows one slot's rows (the header's hint says the last 50
-  evaluations are kept and that one request can run several policies); a chosen slot that has
+  evaluations are kept and that one request can add several rows); a chosen slot that has
   left the list (cleared or rolled off) falls back to all slots. With none it says to
   listen and send a request, and that on an appliance with several nodes only requests served by
   this dashboard's node show. Pause and Clear Payloads apply to it too.

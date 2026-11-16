@@ -97,8 +97,8 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
             </span>
           )}
           <small className="text-muted ms-2" data-testid="policy-input-capture-kept">
-            The last {MAX_POLICY_INPUTS} policy evaluations are kept; one request can run several
-            policies
+            The last {MAX_POLICY_INPUTS} policy evaluations are kept; one request can add several
+            rows
           </small>
         </h6>
         <PolicyInputCaptureControl />
