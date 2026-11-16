@@ -2507,12 +2507,36 @@ async fn get_path_and_record(
     path: &str,
     headers: Vec<(String, String)>,
 ) {
+    request_path_and_record(world, reqwest::Method::GET, path, headers).await;
+}
+
+#[when(expr = "the caller sends a {word} request to the surface route path {string}")]
+async fn caller_sends_method_request_to_route_path(
+    world: &mut SurfaceWorld,
+    method: String,
+    path: String,
+) {
+    let full_path = format!("{}{}", world.surface_config.route, path);
+    if method.eq_ignore_ascii_case("POST") {
+        send_request_to_path_and_record(world, &full_path, vec![]).await;
+        return;
+    }
+    let method = reqwest::Method::from_bytes(method.as_bytes()).expect("step method must be a valid HTTP method");
+    request_path_and_record(world, method, &full_path, vec![]).await;
+}
+
+async fn request_path_and_record(
+    world: &mut SurfaceWorld,
+    method: reqwest::Method,
+    path: &str,
+    headers: Vec<(String, String)>,
+) {
     ensure_gateway_running(world).await;
 
     let infra = world.infra.as_ref().unwrap();
     let url = format!("http://127.0.0.1:{}{}", infra.gateway_port, path);
 
-    let mut req = reqwest::Client::new().get(&url);
+    let mut req = reqwest::Client::new().request(method, &url);
     for (name, value) in &headers {
         req = req.header(name.as_str(), value.as_str());
     }
