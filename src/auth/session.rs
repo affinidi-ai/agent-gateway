@@ -614,7 +614,11 @@ mod tests {
                 .await
                 .is_none()
         );
-        assert!(!manager.is_live(&access_token).await);
+        assert!(
+            !manager
+                .is_live(&access_token)
+                .await
+        );
         assert_eq!(
             manager
                 .validate_session_record(TOKEN)
