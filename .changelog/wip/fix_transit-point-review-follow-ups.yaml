@@ -4,34 +4,18 @@ changes:
   changed: []
   fixed: []
   removed: []
-  security:
-    - timestamp: '2026-11-10T16:31:39+02:00'
-      title: ⭐ Never forward Transit Point discovery reads to target unauthenticated
-      description: >-
-        Previously, GET/HEAD requests for discovery documents on Transit Points
-        (/.well-known/agent-card.json, /agent.json, /discovery, etc.) bypassed all
-        security controls and were forwarded to the target without validation. This allowed
-        unauthenticated reconnaissance of targets on trusted networks (internal VPC,
-        localhost sidecars). An attacker with network access to a target could enumerate
-        its capabilities and identify attack vectors. Now all discovery reads require transit
-        token validation and pass through the full security pipeline including trust checks
-        and OPA policy evaluation. Targets can no longer be discovered without explicit
-        authorization from the gateway (except on Transit Points with `require_transit_token: false`).
-        Unit tests and BDD scenarios verify that discovery reads require valid transit tokens
-        and carry no credentials to targets.
+  security: []
   breaking:
     - timestamp: '2026-11-10T16:31:39+02:00'
-      title: Transit Point discovery reads now require a transit token
+      title: ⭐ Require a transit token on Transit Point discovery reads
       description: >-
-        Clients that call GET or HEAD on discovery documents (/.well-known/agent-card.json,
-        /agent.json, /discovery, etc.) on a Transit Point configured with
-        `require_transit_token: true` (the default) will now receive 401 Unauthorized if no
-        valid transit token is provided. This affects managed agents resolving peer cards
-        before holding a token, browser-based discovery calls, and integration tests that
-        fetch discovery without authentication. Additionally, existing OPA policies now
-        evaluate discovery reads and must allow them (previously they were skipped). Remedy:
-        (1) provide a valid transit token in the X-Transit-Token header on discovery reads,
-        (2) set `require_transit_token: false` on Transit Points that serve discovery to
-        unauthenticated clients, or (3) update OPA policies to explicitly allow discovery
-        reads. Access Point discovery (/.well-known/agent-card.json on an Access Point)
-        remains public and unaffected.
+        A GET or HEAD of a discovery document (such as /.well-known/agent-card.json,
+        agent.json or discovery) through a Transit Point that requires a transit token is
+        refused with 401 without a valid X-Transit-Token, so a target on a trusted network no
+        longer serves its metadata to anyone who reaches the Transit Point. Discovery reads
+        also pass Trust Check and the gateway, surface and Transit Point policies, which must
+        allow them, and still reach the target without a caller credential. Send the transit
+        token on discovery reads, set require_transit_token to false on a Transit Point that
+        must serve them without one (an invalid token is then ignored, not refused), or allow
+        them in policy. An Access Point's discovery
+        documents stay public.

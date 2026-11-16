@@ -2384,6 +2384,18 @@ fn named_mcp_server_received_header(
     );
 }
 
+#[then(expr = "MCP server {string} received the discovery read without header {string}")]
+fn named_mcp_server_received_the_discovery_read_without_header(
+    world: &mut SurfaceWorld,
+    server_name: String,
+    header_name: String,
+) {
+    let context = format!("MCP server '{}'", server_name);
+    let target = get_observed_target_for_actor(world, &server_name, TargetActorKind::McpServer);
+    let request = get_observed_target_request(target, &context);
+    assert_collaborator_header_absent(&request.headers, &header_name, &context);
+}
+
 #[then(expr = "MCP server {string} did not receive header {string}")]
 fn named_mcp_server_did_not_receive_header(
     world: &mut SurfaceWorld,

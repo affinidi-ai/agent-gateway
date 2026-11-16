@@ -73,6 +73,5 @@ ignore = [
     "RUSTSEC-2026-0398",
     # https://rustsec.org/advisories/RUSTSEC-2026-0403
     "RUSTSEC-2026-0403",
-
 ]
 informational_warnings = ["unmaintained", "unsound", "notice"]

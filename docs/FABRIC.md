@@ -434,9 +434,11 @@ request received by the destination gateway:
    has Transit Points and the Target is an HTTP or HTTPS URL, the request carries a transit token
    this gateway issued for it, naming the peer, the hop count and, when step 5 verified one, the
    caller the surface's own source authentication verified, so the agent can call its own Transit
-   Points (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A public discovery `GET`, such as
-   an agent card fetch, carries none, nor does a request relayed to an MCP Target over the legacy
-   HTTP+SSE transport. The surface's `target.auth` goes only with a request whose caller was
+   Points (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A public discovery `GET` of the
+   surface, such as an agent card fetch, carries none, nor does a request relayed to an MCP Target
+   over the legacy HTTP+SSE transport. That is the token handed to this surface's Target; a
+   discovery read the agent sends through one of its own Transit Points still needs its own
+   token (see [Chains across gateways](#chains-across-gateways)). The surface's `target.auth` goes only with a request whose caller was
    vetted, and with a `GET` of exactly `/.well-known/agent-card.json` or the surface's configured
    card location, the sending gateway's own card fetch; any other discovery read, the
    `/.well-known/agent.json` fallback included, gets none (see

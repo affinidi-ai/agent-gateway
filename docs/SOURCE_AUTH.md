@@ -1092,48 +1092,30 @@ A `2026-07-28` MCP request must also carry exactly one token, and allows no cloc
 The refusal says only that the transit token is missing or invalid; which check it failed is
 logged.
 
-#### Discovery document authentication on Transit Points
+#### Discovery reads on a Transit Point
 
-Discovery documents (agent cards, UCP well-known, and similar metadata files) requested from
-a Transit Point must include a valid transit token, matching the security model of all
-other Transit Point requests. A `GET` or `HEAD` of a discovery document path — `.well-known/agent-card.json`,
+A discovery read is a `GET` or `HEAD` whose path below the Transit Point, which is the path the
+target receives below its endpoint, is exactly one of `.well-known/agent-card.json`,
 `.well-known/agent.json`, `.well-known/agent-card`, `.well-known/ucp`, `agent-card.json`,
-`agent.json` or `discovery` — with at most one trailing slash, is treated as a Transit Point
-request requiring:
+`agent.json` or `discovery`, with at most one trailing slash. A document below another segment,
+such as `admin/discovery`, and a spelling with percent-escapes, `;` parameters, `\` or `.` and
+`..` segments are not discovery reads, whatever the target resolves them to.
 
-1. **Transit token validation**: The `X-Transit-Token` header must be present and valid (via
-   `step_validate_transit_token`), unless the Transit Point has `require_transit_token: false`,
-   in which case the token is optional but still validated if present.
-2. **Trust context and trust check**: The request goes through trust context collection and
-   Trust Check (target leg), just like non-discovery requests.
-3. **OPA evaluation**: Gateway, surface, and Transit Point policies are all evaluated.
-4. **Caller assertion**: Discovery reads are reported to the target as `CallerAssertion::Unauthenticated`,
-   meaning no caller identity is sent to the target. This preserves the metadata-only nature of
-   discovery while ensuring the gateway validates the request.
+A discovery read needs a transit token like any other Transit Point request: without a valid one
+it is refused with `401` on a Transit Point that requires one, and a Transit Point with
+`require_transit_token: false` forwards it without one and still checks one the agent sends: a
+valid token names the caller to policy, and an invalid one is ignored, leaving the caller
+anonymous. It then runs the rest of the
+outbound pipeline, Trust Check and the gateway, surface and Transit Point policies included,
+except identity resolution, since it has no body to resolve an identity from. It is forwarded
+without any caller credential, delegated or `target_auth`, and without caller identity headers
+(see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#when-a-credential-cannot-be-resolved)).
 
-A document below another segment (such as `admin/discovery`) or with a spelling that uses
-percent-escapes, `;` parameters, `\` or `.` and `..` segments is not treated as a discovery
-read, whatever the target might resolve it to, so it needs a transit token just like any other
-non-discovery request.
+Transit Point policies see the caller the token carries in `input.transit.caller`, a discovery
+read's included, and a client the Transit Point verified itself apart from it, in
+`input.transit.client`; see [`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input).
 
-Policy sees the caller the token carries in `input.transit.caller` (with `verification` as
-`transit_token`, `unverified`, or `anonymous` depending on the token's content), and a client
-the Transit Point verified itself, in `input.transit.client` (see
-[`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input)). For a discovery read with a
-valid token, the caller is not anonymous but named by the token; policy can enforce rules on
-that caller. The target service receives no caller identity header.
-
-This closes the security gap where unauthenticated requests could reach a target service via
-discovery paths. A target service on a trusted network (localhost or VPC) should not serve
-metadata without verifying the request comes through a properly validated gateway path.
-
-**Differences from Access Point discovery**:
-- Access Point discovery (`.well-known/agent-card.json` on an Access Point) remains fully public:
-  no authentication is required.
-- Transit Point discovery (same paths requested through a Transit Point) requires the
-  transit token and passes through policy when the Transit Point is configured to require it. The caller is identified by the token; policy sees
-  the named principal in `input.transit.caller`, but the target receives no caller identity.
-- Deeper paths like `/x/discovery` require authentication and continue to require it.
+An Access Point's discovery documents stay public; only the Transit Point needs the token.
 
 The signing key is 32 random bytes the gateway creates on its first start, in
 `transit_token_key.json` under `[storage_paths] vc_keys`, readable by the owner only and

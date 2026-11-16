@@ -1055,6 +1055,14 @@ fn transit_point_requires_a_transit_token(
     transit_point_config_mut(world, &transit_point).require_transit_token = true;
 }
 
+#[given(expr = "Transit Point {string} does not require a transit token")]
+fn transit_point_does_not_require_a_transit_token(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+) {
+    transit_point_config_mut(world, &transit_point).require_transit_token = false;
+}
+
 /// The audience a Transit Point's JWT callers' tokens are issued for.
 pub(crate) const TRANSIT_AUDIENCE: &str = "bdd-transit-audience";
 
@@ -1319,6 +1327,27 @@ async fn managed_agent_holds_a_transit_token_for_another_surface(
         &token,
         serde_json::json!({ "surface_id": surface_id }),
     ));
+}
+
+#[given(expr = "managed agent {string} holds a transit token whose signature was altered")]
+async fn managed_agent_holds_a_transit_token_with_an_altered_signature(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    managed_agent_holds_the_access_points_transit_token(world, agent_name).await;
+    let token = world
+        .transit_token
+        .clone()
+        .unwrap();
+    let (signed, signature) = token
+        .rsplit_once('.')
+        .expect("a transit token is a JWT");
+    let replacement = if signature.starts_with('A') {
+        'B'
+    } else {
+        'A'
+    };
+    world.transit_token = Some(format!("{signed}.{replacement}{}", &signature[1..]));
 }
 
 fn unix_now() -> u64 {

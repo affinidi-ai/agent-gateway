@@ -1146,7 +1146,6 @@ async fn outbound_proxy_handler_in_request_scope(
     step_inject_custom_metadata(&state, &mut ctx).await?;
 
     // [8] Trust Context Collection
-    // Applies to all Transit Point requests, including discovery reads.
     step_collect_trust_context(&state, &mut ctx).await?;
 
     // [8b] Trust Check stage (target leg) — runs before any OPA so all
@@ -1279,13 +1278,6 @@ async fn validate_transit_token(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
-    // Transit token validation is required for all Transit Point requests,
-    // including discovery reads. Discovery reads do not authenticate a caller
-    // to the target (see `transit_caller_assertion`), but the transit token
-    // proves the request originates from this gateway's managed agent and must
-    // be verified. This closes the security gap where unauthenticated discovery
-    // requests could reach the target without any access control.
-
     let modern = matches!(
         ctx.mcp_classification
             .as_ref(),
@@ -5224,8 +5216,8 @@ fn refuse_partner_consent(ctx: &OutboundPipelineContext) -> OutboundPipelineErro
 /// The caller is the one [`delegation_caller_hash`] names. The channel's `outbound_credentials`
 /// bindings determine which credential providers to look up. A binding that applies
 /// but cannot be resolved refuses the request; it is never forwarded without the
-/// credential. A public discovery read carries no caller, so, as with target
-/// authentication, no caller's credential is released for it.
+/// credential. A discovery read is forwarded without a caller credential, so, as with
+/// target authentication, no caller's credential is released for it.
 async fn step_inject_credentials(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
@@ -7019,9 +7011,7 @@ fn compute_outbound_remainder_path(
 }
 
 /// Whether the request is a discovery read of the Transit Point's target:
-/// a `GET` or `HEAD` of a discovery document at the target's root. It is
-/// authenticated by the gateway (requires a valid transit token and passes through
-/// all security gates), but carries no caller credential to the target.
+/// a `GET` or `HEAD` of a discovery document at the target's root.
 fn is_transit_discovery_read(ctx: &OutboundPipelineContext) -> bool {
     crate::proxy::paths::is_transit_discovery_request(
         ctx.original_method.as_str(),
@@ -7036,11 +7026,8 @@ fn is_transit_discovery_read(ctx: &OutboundPipelineContext) -> bool {
     )
 }
 
-/// A discovery read is authenticated by the gateway (requires a valid transit token and
-/// passes through all security gates), but is reported to the target as unauthenticated:
-/// no caller identity is sent to the target. This preserves the metadata-only nature of
-/// discovery while ensuring the gateway validates the request. Any other Transit Point
-/// request is reported as authenticated.
+/// A discovery read is forwarded without a caller credential; any other Transit
+/// Point request carries one.
 fn transit_caller_assertion(ctx: &OutboundPipelineContext) -> crate::proxy::handler::CallerAssertion {
     if is_transit_discovery_read(ctx) {
         crate::proxy::handler::CallerAssertion::Unauthenticated
@@ -15813,121 +15800,124 @@ mod tests {
         );
     }
 
-    /// Discovery reads (GET/HEAD of discovery documents at the Transit Point's
-    /// root) now require a transit token like all other requests, and carry no
-    /// caller credential to the target. This test verifies the security fix:
-    /// discovery reads are rejected without a token, rejected with an invalid token,
-    /// and pass through policy like any other request.
-    #[tokio::test]
-    async fn discovery_reads_require_transit_token_and_carry_no_credential() {
+    const TRANSIT_TEST_BASE: &str = "/outbound/surfaces/order/partner-a";
+    const TRANSIT_TEST_SURFACE: &str = "test-surf-001";
+
+    const TRANSIT_DISCOVERY_READS: [(Method, &str); 5] = [
+        (Method::GET, ".well-known/agent-card.json"),
+        (Method::HEAD, ".well-known/agent-card.json"),
+        (Method::GET, "agent.json"),
+        (Method::GET, "discovery"),
+        (Method::HEAD, "discovery/"),
+    ];
+
+    fn transit_token_test_state() -> (OutboundProxyState, crate::proxy::transit_token::TransitTokenIssuer) {
         let mut state = test_outbound_state();
         let issuer = crate::proxy::transit_token::TransitTokenIssuer::new(
             crate::proxy::transit_token::TransitTokenKey::generate().unwrap(),
             "gw-test".to_string(),
         );
         state.transit_token_issuer = Some(Arc::new(issuer.clone()));
-        let base = "/outbound/surfaces/order/partner-a";
-        let surface_id = "test-surf-001"; // Match the surface ID in ctx
+        (state, issuer)
+    }
 
-        for (method, path, discovery) in [
-            (Method::GET, ".well-known/agent-card.json", true),
-            (Method::HEAD, ".well-known/agent-card.json", true),
-            (Method::GET, "agent.json", true),
-            (Method::GET, "discovery", true),
-            (Method::HEAD, "discovery/", true),
-            (Method::GET, "message/send", false),
-            (Method::POST, "agent.json", false),
-            (Method::GET, "x/admin/discovery", false),
-            (Method::HEAD, "x/admin/discovery", false),
-            (Method::GET, "admin/.well-known/agent-card.json", false),
-            (Method::GET, "admin%2Fdiscovery", false),
-            (Method::GET, "admin/%2e%2e/discovery", false),
-            (Method::GET, "admin/../discovery", false),
-            (Method::GET, "admin;/discovery", false),
-            (Method::GET, "discovery;x=1", false),
-        ] {
-            // Test 1: Valid token — request succeeds
-            {
-                let mut ctx = test_pipeline_context();
-                ctx.original_method = method.clone();
-                ctx.request_path = format!("{base}/{path}");
+    /// A Transit Point request for `path`, carrying a token `issuer` issued for
+    /// `token_surface_id` when one is given.
+    fn transit_request(
+        issuer: &crate::proxy::transit_token::TransitTokenIssuer,
+        method: &Method,
+        path: &str,
+        token_surface_id: Option<&str>,
+    ) -> OutboundPipelineContext {
+        let mut ctx = test_pipeline_context();
+        ctx.original_method = method.clone();
+        ctx.request_path = format!("{TRANSIT_TEST_BASE}/{path}");
+        Arc::make_mut(&mut ctx.surface).surface_id = TRANSIT_TEST_SURFACE.into();
+        if let Some(surface_id) = token_surface_id {
+            let token = issuer
+                .issue(
+                    surface_id,
+                    Some("did:web:gateway.example"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    vec!["partner-a".to_string()],
+                )
+                .unwrap();
+            ctx.original_headers
+                .insert("X-Transit-Token", token.parse().unwrap());
+        }
+        ctx
+    }
 
-                // Set the surface ID to match the token
-                Arc::make_mut(&mut ctx.surface).surface_id = surface_id.into();
+    async fn transit_token_refusal(
+        state: &OutboundProxyState,
+        ctx: &mut OutboundPipelineContext,
+    ) -> String {
+        match step_validate_transit_token(state, ctx).await {
+            Err(OutboundPipelineError::TransitTokenInvalid(reason)) => reason,
+            other => panic!("expected a transit token refusal, got {other:?}"),
+        }
+    }
 
-                // Issue a valid token for this surface with partner-a as allowed
-                let token = issuer
-                    .issue(
-                        surface_id,
-                        Some("did:web:gateway.example"),
-                        None,
-                        None,
-                        None,
-                        None,
-                        vec!["partner-a".to_string()],
-                    )
-                    .unwrap();
-                ctx.original_headers
-                    .insert("X-Transit-Token", token.parse().unwrap());
+    /// Only a `GET` or `HEAD` of a discovery document at the Transit Point's
+    /// root, as its target receives the path, carries no caller credential;
+    /// every request with a valid transit token passes the token check.
+    #[tokio::test]
+    async fn only_a_discovery_read_at_the_transit_point_root_carries_no_credential() {
+        let (state, issuer) = transit_token_test_state();
+        let other_requests = [
+            (Method::GET, "message/send"),
+            (Method::POST, "agent.json"),
+            (Method::GET, "x/admin/discovery"),
+            (Method::HEAD, "x/admin/discovery"),
+            (Method::GET, "admin/.well-known/agent-card.json"),
+            (Method::GET, "admin%2Fdiscovery"),
+            (Method::GET, "admin/%2e%2e/discovery"),
+            (Method::GET, "admin/../discovery"),
+            (Method::GET, "admin;/discovery"),
+            (Method::GET, "discovery;x=1"),
+        ];
+        for (method, path, discovery) in TRANSIT_DISCOVERY_READS
+            .iter()
+            .map(|(method, path)| (method, *path, true))
+            .chain(
+                other_requests
+                    .iter()
+                    .map(|(method, path)| (method, *path, false)),
+            )
+        {
+            let mut ctx = transit_request(&issuer, method, path, Some(TRANSIT_TEST_SURFACE));
 
-                let result = step_validate_transit_token(&state, &mut ctx).await;
+            let result = step_validate_transit_token(&state, &mut ctx).await;
 
-                // All requests now require a valid transit token
-                assert!(result.is_ok(), "{method} {path}: {result:?}");
-                // But only discovery reads carry no credential to the target
-                assert_eq!(transit_caller_assertion(&ctx).permits_target_credential(), !discovery, "{method} {path}");
-            }
+            assert!(result.is_ok(), "{method} {path}: {result:?}");
+            assert_eq!(transit_caller_assertion(&ctx).permits_target_credential(), !discovery, "{method} {path}");
+        }
+    }
 
-            // Test 2: No token — request is rejected (critical security fix)
-            if discovery {
-                let mut ctx = test_pipeline_context();
-                ctx.original_method = method.clone();
-                ctx.request_path = format!("{base}/{path}");
-                Arc::make_mut(&mut ctx.surface).surface_id = surface_id.into();
-                // No X-Transit-Token header
-                let result = step_validate_transit_token(&state, &mut ctx).await;
-                assert!(result.is_err(), "Discovery read without token should fail: {method} {path}");
-                match result.unwrap_err() {
-                    OutboundPipelineError::TransitTokenInvalid(msg) => {
-                        assert!(
-                            msg.contains("missing") || msg.contains("invalid"),
-                            "Expected missing/invalid token error for {method} {path}"
-                        );
-                    }
-                    other => panic!("Expected TransitTokenInvalid for discovery without token, got: {:?}", other),
-                }
-            }
+    #[tokio::test]
+    async fn a_discovery_read_without_a_transit_token_is_refused() {
+        let (state, issuer) = transit_token_test_state();
+        for (method, path) in &TRANSIT_DISCOVERY_READS {
+            let mut ctx = transit_request(&issuer, method, path, None);
 
-            // Test 3: Invalid token (wrong surface) — request is rejected
-            if discovery {
-                let mut ctx = test_pipeline_context();
-                ctx.original_method = method.clone();
-                ctx.request_path = format!("{base}/{path}");
-                Arc::make_mut(&mut ctx.surface).surface_id = "different-surface".into();
+            let reason = transit_token_refusal(&state, &mut ctx).await;
 
-                let token = issuer
-                    .issue(
-                        surface_id, // Token is for surface_id, but context is for different-surface
-                        Some("did:web:gateway.example"),
-                        None,
-                        None,
-                        None,
-                        None,
-                        vec!["partner-a".to_string()],
-                    )
-                    .unwrap();
-                ctx.original_headers
-                    .insert("X-Transit-Token", token.parse().unwrap());
+            assert_eq!(reason, "missing X-Transit-Token header", "{method} {path}");
+        }
+    }
 
-                let result = step_validate_transit_token(&state, &mut ctx).await;
-                assert!(result.is_err(), "Discovery read with token for wrong surface should fail: {method} {path}");
-                match result.unwrap_err() {
-                    OutboundPipelineError::TransitTokenInvalid(msg) => {
-                        assert!(!msg.is_empty(), "Error message should explain token mismatch");
-                    }
-                    other => panic!("Expected TransitTokenInvalid for wrong surface, got: {:?}", other),
-                }
-            }
+    #[tokio::test]
+    async fn a_discovery_read_with_a_transit_token_for_another_surface_is_refused() {
+        let (state, issuer) = transit_token_test_state();
+        for (method, path) in &TRANSIT_DISCOVERY_READS {
+            let mut ctx = transit_request(&issuer, method, path, Some("another-surface"));
+
+            let reason = transit_token_refusal(&state, &mut ctx).await;
+
+            assert_eq!(reason, "transit token was issued for another surface", "{method} {path}");
         }
     }
 
@@ -24036,8 +24026,8 @@ mod tests {
         );
     }
 
-    /// A discovery read now requires a transit token (like all other requests),
-    /// but it carries no caller credential to the target.
+    /// A discovery read needs a transit token but carries no caller credential
+    /// to the target.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_discovery_read_through_a_credentialed_transit_point_requires_token_but_carries_no_credential() {
         let directory = tempfile::tempdir().unwrap();
