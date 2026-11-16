@@ -340,6 +340,9 @@ pub struct KeyDirectory {
     /// hot-reloadable everywhere else in the gateway, and a key mapping that
     /// needed a restart to take effect silently signed with the wrong key.
     surfaces: Option<Arc<dyn crate::surfaces::AgentSurfaceStore>>,
+    /// Read at resolution time for the issuer that owns a surface, whose `signing` is the default
+    /// for every surface it owns that sets none of its own.
+    issuers: Option<Arc<dyn crate::issuers::IssuerStore>>,
     /// An appliance-wide override set in the dashboard, consulted **after**
     /// scoped mappings and **before** the `[vta]`-derived defaults.
     ///
@@ -436,6 +439,7 @@ impl KeyDirectory {
             client,
             connections: None,
             surfaces: None,
+            issuers: None,
             provisioner: None,
             appliance_default: None,
             cache: RwLock::new(HashMap::new()),
@@ -620,6 +624,32 @@ impl KeyDirectory {
         self
     }
 
+    /// Attach the issuer store so the `signing` of the issuer that owns a surface is honoured as
+    /// that surface's default, read at resolution time like the surface itself.
+    pub fn with_issuer_store(
+        mut self,
+        issuers: Arc<dyn crate::issuers::IssuerStore>,
+    ) -> Self {
+        self.issuers = Some(issuers);
+        self
+    }
+
+    /// The `signing` of the issuer that owns `surface`, when it has one.
+    async fn issuer_signing(
+        &self,
+        surface: &crate::config::agent_surface::AgentSurface,
+    ) -> Option<crate::config::agent_surface::SurfaceSigningConfig> {
+        let store = self.issuers.as_ref()?;
+        let issuer_id = surface.issuer_id.as_deref()?;
+        store
+            .get(issuer_id)
+            .await
+            .ok()
+            .flatten()?
+            .signing
+            .filter(|signing| !signing.is_empty())
+    }
+
     /// The mapping a surface declares **right now**, if it declares one.
     ///
     /// A miss — no store, no such surface, nothing declared, or a block this
@@ -650,10 +680,21 @@ impl KeyDirectory {
             })
             .and_then(|v| v.overrides.signing.as_ref())
             .filter(|s| !s.is_empty());
-        let signing = variant_signing.or(surface
+        // A surface that sets nothing follows the issuer that owns it, before the appliance default.
+        let issuer_signing;
+        let signing = match variant_signing.or(surface
             .signing
             .as_ref()
-            .filter(|s| !s.is_empty()))?;
+            .filter(|s| !s.is_empty()))
+        {
+            Some(own) => own,
+            None => {
+                issuer_signing = self
+                    .issuer_signing(&surface)
+                    .await?;
+                &issuer_signing
+            }
+        };
 
         signing_key_ref(signing, purpose).ok()
     }
@@ -802,8 +843,8 @@ impl KeyDirectory {
 
     /// Resolve which key signs for `purpose` at `scope`.
     ///
-    /// First match wins, in the order **variant → surface → tenant → appliance
-    /// default → local**, mirroring the surface-variant override semantics used
+    /// First match wins, in the order **variant → surface → issuer → tenant →
+    /// appliance default → local**, mirroring the surface-variant override semantics used
     /// everywhere else in the gateway. The final fallback is the legacy local
     /// key, so a gateway with nothing configured resolves exactly what it
     /// signed with before this module existed.
@@ -1254,6 +1295,7 @@ mod tests {
             vta,
             connections: None,
             surfaces: None,
+            issuers: None,
             provisioner: None,
             appliance_default: None,
             cache: RwLock::new(HashMap::new()),
@@ -1762,6 +1804,167 @@ mod tests {
                 ScopedDiIssuer::Local
             ),
             "an explicit local must be answered as local, not as an absence"
+        );
+    }
+
+    async fn directory_with_issuer(
+        issuer_signing: Option<crate::config::agent_surface::SurfaceSigningConfig>,
+        surface_signing: Option<crate::config::agent_surface::SurfaceSigningConfig>,
+    ) -> (KeyDirectory, Arc<crate::issuers::FileSystemIssuerStore>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let surfaces = Arc::new(
+            crate::surfaces::FileSystemAgentSurfaceStore::new(tmp.path().join("surfaces"))
+                .await
+                .expect("surface store"),
+        );
+        let issuers = Arc::new(
+            crate::issuers::FileSystemIssuerStore::new(tmp.path().join("issuers"))
+                .await
+                .expect("issuer store"),
+        );
+        let mut issuer = crate::issuers::types::Issuer::new(
+            "issuer-a".into(),
+            "Issuer A".into(),
+            "did:example:issuer".into(),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        );
+        issuer.signing = issuer_signing;
+        crate::issuers::IssuerStore::create(issuers.as_ref(), &issuer)
+            .await
+            .expect("save the issuer");
+        crate::surfaces::AgentSurfaceStore::save(
+            surfaces.as_ref(),
+            &crate::config::agent_surface::AgentSurface {
+                surface_id: "surface-a".to_string(),
+                issuer_id: Some("issuer-a".to_string()),
+                signing: surface_signing,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("save the surface");
+        let dir = KeyDirectory::build(&VtaConfig::default(), StubAuthority::new("did:key:local", vec!["local-1"]))
+            .await
+            .expect("a disabled [vta] block builds")
+            .with_surface_store(surfaces as Arc<dyn crate::surfaces::AgentSurfaceStore>)
+            .with_issuer_store(Arc::clone(&issuers) as Arc<dyn crate::issuers::IssuerStore>);
+        (dir, issuers, tmp)
+    }
+
+    fn issuer_agent_signing(connection: &str) -> crate::config::agent_surface::SurfaceSigningConfig {
+        crate::config::agent_surface::SurfaceSigningConfig {
+            backend: Some(crate::config::agent_surface::SigningBackendKind::Vta),
+            connection_id: Some(connection.to_string()),
+            context_id: Some("ctx-a".to_string()),
+            key_id: Some("key-a".to_string()),
+        }
+    }
+
+    fn issuer_local_signing() -> crate::config::agent_surface::SurfaceSigningConfig {
+        crate::config::agent_surface::SurfaceSigningConfig {
+            backend: Some(crate::config::agent_surface::SigningBackendKind::Local),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_surface_that_sets_nothing_signs_through_the_trust_agent_of_its_issuer() {
+        let (dir, _issuers, _tmp) = directory_with_issuer(Some(issuer_agent_signing("vta-issuer")), None).await;
+
+        for purpose in [KeyPurpose::Jwt, KeyPurpose::Credential] {
+            let resolved = dir
+                .resolve_and_provision(purpose, &KeyScope::surface("surface-a"))
+                .await
+                .expect("resolves");
+            assert!(
+                matches!(&resolved.backend, KeyBackend::Vta { connection_id } if connection_id == "vta-issuer"),
+                "{purpose:?} must follow the issuer's agent, got {:?}",
+                resolved.backend
+            );
+            assert_eq!(resolved.context, Some(ContextId::from("ctx-a")));
+        }
+        assert!(
+            dir.has_explicit_mapping(KeyPurpose::Jwt, &KeyScope::surface("surface-a"))
+                .await,
+            "the issuer's choice is a decision somebody made, so it is not silently replaced when the agent is unreachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_surface_with_its_own_signing_wins_over_its_issuer() {
+        let (dir, _issuers, _tmp) =
+            directory_with_issuer(Some(issuer_agent_signing("vta-issuer")), Some(issuer_agent_signing("vta-surface")))
+                .await;
+
+        let resolved = dir
+            .resolve_and_provision(KeyPurpose::Jwt, &KeyScope::surface("surface-a"))
+            .await
+            .expect("resolves");
+
+        assert!(
+            matches!(&resolved.backend, KeyBackend::Vta { connection_id } if connection_id == "vta-surface"),
+            "got {:?}",
+            resolved.backend
+        );
+    }
+
+    #[tokio::test]
+    async fn an_issuer_asking_for_the_local_key_is_answered_as_local() {
+        let (dir, _issuers, _tmp) = directory_with_issuer(Some(issuer_local_signing()), None).await;
+
+        assert!(matches!(
+            dir.di_vc_issuer_for(&KeyScope::surface("surface-a"))
+                .await,
+            ScopedDiIssuer::Local
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_issuer_without_signing_leaves_its_surfaces_on_the_appliance_default() {
+        let (dir, _issuers, _tmp) = directory_with_issuer(None, None).await;
+
+        let resolved = dir
+            .resolve_and_provision(KeyPurpose::Jwt, &KeyScope::surface("surface-a"))
+            .await
+            .expect("resolves");
+
+        assert_eq!(resolved.backend, KeyBackend::Local);
+        assert!(
+            !dir.has_explicit_mapping(KeyPurpose::Jwt, &KeyScope::surface("surface-a"))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_change_to_the_issuer_is_honoured_without_a_restart() {
+        let (dir, issuers, _tmp) = directory_with_issuer(None, None).await;
+        let scope = KeyScope::surface("surface-a");
+        assert_eq!(
+            dir.resolve_and_provision(KeyPurpose::Jwt, &scope)
+                .await
+                .expect("resolves")
+                .backend,
+            KeyBackend::Local
+        );
+
+        let mut issuer = crate::issuers::IssuerStore::get(issuers.as_ref(), "issuer-a")
+            .await
+            .expect("read")
+            .expect("present");
+        issuer.signing = Some(issuer_agent_signing("vta-later"));
+        crate::issuers::IssuerStore::update(issuers.as_ref(), &issuer)
+            .await
+            .expect("update the issuer");
+
+        let resolved = dir
+            .resolve_and_provision(KeyPurpose::Jwt, &scope)
+            .await
+            .expect("resolves");
+        assert!(
+            matches!(&resolved.backend, KeyBackend::Vta { connection_id } if connection_id == "vta-later"),
+            "got {:?}",
+            resolved.backend
         );
     }
 

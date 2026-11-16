@@ -119,6 +119,8 @@ pub struct SurfaceWorld {
     pub surface_under_test_id: Option<String>,
     /// Trust agent connection ids the gateway assigned, by the name a scenario gave them.
     pub trust_agent_connections: HashMap<String, String>,
+    /// Issuer ids the gateway assigned, by the name a scenario gave them.
+    pub issuers: HashMap<String, String>,
     /// The mock trust agent a scenario about the control key rotation configures the gateway against.
     pub trust_agent: Option<crate::bdd_support::trust_agent::MockTrustAgent>,
     pub custom_trust_agent: Option<crate::bdd_support::custom_trust_agent::CustomTrustAgent>,
@@ -226,6 +228,7 @@ impl SurfaceWorld {
             created_surface_id: None,
             surface_under_test_id: None,
             trust_agent_connections: HashMap::new(),
+            issuers: HashMap::new(),
             trust_agent: None,
             custom_trust_agent: None,
             admin_response: None,

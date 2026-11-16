@@ -1965,6 +1965,11 @@ pub async fn create_identity_api_router(
                     .didwebvh_log_storage
                     .clone(),
             ))
+            .layer(Extension(
+                state
+                    .vta_connection_store
+                    .clone(),
+            ))
     } else {
         Router::new()
     };
@@ -2550,6 +2555,10 @@ pub async fn create_identity_api_router(
         // because it is what a synchronous `resolve` sees.
         key_directory = key_directory
             .with_surface_store(std::sync::Arc::clone(store) as std::sync::Arc<dyn crate::surfaces::AgentSurfaceStore>);
+        if let Some(issuers) = state.issuer_store.as_ref() {
+            key_directory = key_directory
+                .with_issuer_store(std::sync::Arc::clone(issuers) as std::sync::Arc<dyn crate::issuers::IssuerStore>);
+        }
     }
     if let Some(store) = state
         .agent_surface_store
@@ -2626,12 +2635,20 @@ pub async fn create_identity_api_router(
         // The key inventory reports which surface maps to which context
         // (VTA-20); without the store it reports connections only, rather
         // than failing.
-        match state
+        let router = match state
             .agent_surface_store
             .clone()
         {
             Some(store) => {
                 let store: std::sync::Arc<dyn crate::surfaces::AgentSurfaceStore> = store;
+                router.layer(Extension(store))
+            }
+            None => router,
+        };
+        // A surface that sets no signing of its own follows its issuer's, so the inventory reads them.
+        match state.issuer_store.clone() {
+            Some(store) => {
+                let store: std::sync::Arc<dyn crate::issuers::IssuerStore> = store;
                 router.layer(Extension(store))
             }
             None => router,

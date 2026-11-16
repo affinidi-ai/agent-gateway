@@ -1435,6 +1435,7 @@ pub async fn key_inventory(
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
     State(state): State<VtaConnectionAdminState>,
     surfaces: Option<Extension<Arc<dyn crate::surfaces::AgentSurfaceStore>>>,
+    issuers: Option<Extension<Arc<dyn crate::issuers::IssuerStore>>>,
     pat: Option<Extension<PatContext>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
@@ -1478,6 +1479,14 @@ pub async fn key_inventory(
         None => Vec::new(),
     };
 
+    let issuer_list = match issuers.as_ref() {
+        Some(Extension(store)) => store
+            .list_all()
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+
     let known_contexts: Vec<String> = match &state.provisioner {
         Some(provisioner) => {
             provisioner
@@ -1489,7 +1498,13 @@ pub async fn key_inventory(
 
     (
         StatusCode::OK,
-        Json(crate::vta::inventory::build(&state.vta_config, &connections, &surface_list, &known_contexts)),
+        Json(crate::vta::inventory::build(
+            &state.vta_config,
+            &connections,
+            &surface_list,
+            &issuer_list,
+            &known_contexts,
+        )),
     )
         .into_response()
 }

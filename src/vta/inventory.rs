@@ -67,6 +67,10 @@ pub struct SurfaceMapping {
     pub key_id: Option<String>,
     /// Whether this level declares nothing and therefore inherits.
     pub inherits: bool,
+    /// The name of the issuer whose `signing` this surface follows, when it sets none of its own
+    /// and the issuer that owns it does. The backend and key fields above are then the issuer's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via_issuer: Option<String>,
     /// The context name this surface/variant would use if one were
     /// provisioned, derived from its stable ids.
     pub derived_context: String,
@@ -127,8 +131,19 @@ fn mapping_for(
     variant_id: Option<&str>,
     variant_alias: Option<&str>,
     signing: Option<&crate::config::agent_surface::SurfaceSigningConfig>,
+    issuer: Option<&crate::issuers::types::Issuer>,
 ) -> SurfaceMapping {
-    let declared = signing.filter(|s| !s.is_empty());
+    let own = signing.filter(|s| !s.is_empty());
+    let followed = match own {
+        Some(_) => None,
+        None => issuer.filter(|issuer| {
+            issuer
+                .signing
+                .as_ref()
+                .is_some_and(|s| !s.is_empty())
+        }),
+    };
+    let declared = own.or(followed.and_then(|issuer| issuer.signing.as_ref()));
     SurfaceMapping {
         surface_id: surface.surface_id.clone(),
         surface_name: surface.name.clone(),
@@ -148,7 +163,8 @@ fn mapping_for(
         connection_id: declared.and_then(|s| s.connection_id.clone()),
         context_id: declared.and_then(|s| s.context_id.clone()),
         key_id: declared.and_then(|s| s.key_id.clone()),
-        inherits: declared.is_none(),
+        inherits: own.is_none(),
+        via_issuer: followed.map(|issuer| issuer.name.clone()),
         derived_context: derived_context_name(surface.tenant_id.as_deref(), &surface.surface_id, variant_id),
     }
 }
@@ -161,12 +177,21 @@ pub fn build(
     config: &VtaConfig,
     connections: &[VtaConnection],
     surfaces: &[AgentSurface],
+    issuers: &[crate::issuers::types::Issuer],
     known_contexts: &[String],
 ) -> KeyInventory {
     let mappings: Vec<SurfaceMapping> = surfaces
         .iter()
         .flat_map(|surface| {
-            let base = mapping_for(surface, None, None, surface.signing.as_ref());
+            let owner = surface
+                .issuer_id
+                .as_deref()
+                .and_then(|id| {
+                    issuers
+                        .iter()
+                        .find(|issuer| issuer.id == id)
+                });
+            let base = mapping_for(surface, None, None, surface.signing.as_ref(), owner);
             let variants = surface
                 .variants
                 .iter()
@@ -179,6 +204,7 @@ pub fn build(
                             .overrides
                             .signing
                             .as_ref(),
+                        None,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -289,7 +315,7 @@ mod tests {
 
     #[test]
     fn an_unmapped_surface_is_reported_as_inheriting_rather_than_resolved() {
-        let inventory = build(&vta_config(), &[], &[surface("s1", None)], &[]);
+        let inventory = build(&vta_config(), &[], &[surface("s1", None)], &[], &[]);
         let mapping = &inventory.mappings[0];
         // Showing the resolved value would hide that nothing is configured,
         // which is exactly what an operator is trying to find out.
@@ -301,7 +327,7 @@ mod tests {
 
     #[test]
     fn an_empty_signing_block_still_counts_as_inheriting() {
-        let inventory = build(&vta_config(), &[], &[surface("s1", Some(SurfaceSigningConfig::default()))], &[]);
+        let inventory = build(&vta_config(), &[], &[surface("s1", Some(SurfaceSigningConfig::default()))], &[], &[]);
         assert!(inventory.mappings[0].inherits);
     }
 
@@ -313,7 +339,7 @@ mod tests {
             context_id: Some("ctx-sales".to_string()),
             key_id: Some("k-sales".to_string()),
         };
-        let inventory = build(&vta_config(), &[], &[surface("s1", Some(signing))], &[]);
+        let inventory = build(&vta_config(), &[], &[surface("s1", Some(signing))], &[], &[]);
         let mapping = &inventory.mappings[0];
         assert!(!mapping.inherits);
         assert_eq!(mapping.backend, "vta");
@@ -358,7 +384,7 @@ mod tests {
             )
             .unwrap();
 
-        let inventory = build(&vta_config(), &[connection], &[], &[]);
+        let inventory = build(&vta_config(), &[connection], &[], &[], &[]);
         let keys = &inventory.connections[0].keys;
         assert_eq!(keys.len(), 2, "the retired key is still published");
         assert_eq!(keys[0].key_id, "k2");
@@ -371,7 +397,7 @@ mod tests {
     #[test]
     fn a_context_no_surface_claims_is_reported_as_orphaned() {
         let known = vec!["ctx:_global/s1".to_string(), "ctx:_global/deleted".to_string()];
-        let inventory = build(&vta_config(), &[], &[surface("s1", None)], &known);
+        let inventory = build(&vta_config(), &[], &[surface("s1", None)], &[], &known);
         // Reported, not reclaimed: artifacts the orphan's key signed must stay
         // verifiable.
         assert_eq!(inventory.orphaned_contexts, vec!["ctx:_global/deleted".to_string()]);
@@ -380,9 +406,9 @@ mod tests {
     #[test]
     fn the_custody_claim_is_computed_here_and_follows_the_tier() {
         let config = vta_config();
-        assert!(build(&config, &[], &[], &[]).custody_claim, "a separately-operated VTA supports the claim");
+        assert!(build(&config, &[], &[], &[], &[]).custody_claim, "a separately-operated VTA supports the claim");
 
-        let local = build(&VtaConfig::default(), &[], &[], &[]);
+        let local = build(&VtaConfig::default(), &[], &[], &[], &[]);
         assert_eq!(local.tier, "local");
         assert!(!local.custody_claim);
     }
@@ -395,9 +421,79 @@ mod tests {
             pairing: Default::default(),
             ..connection("c2")
         };
-        let inventory = build(&vta_config(), &[connection("c0"), disabled, unpaired], &[], &[]);
+        let inventory = build(&vta_config(), &[connection("c0"), disabled, unpaired], &[], &[], &[]);
         assert!(inventory.connections[0].usable);
         assert!(!inventory.connections[1].usable, "disabled cannot sign");
         assert!(!inventory.connections[2].usable, "unpaired cannot sign");
+    }
+
+    fn issuer_with(signing: Option<SurfaceSigningConfig>) -> crate::issuers::types::Issuer {
+        let mut issuer = crate::issuers::types::Issuer::new(
+            "issuer-a".into(),
+            "Research".into(),
+            "did:example:issuer".into(),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        );
+        issuer.signing = signing;
+        issuer
+    }
+
+    fn remote(connection: &str) -> SurfaceSigningConfig {
+        SurfaceSigningConfig {
+            backend: Some(SigningBackendKind::Vta),
+            connection_id: Some(connection.to_string()),
+            context_id: Some("ctx-issuer".to_string()),
+            key_id: Some("key-issuer".to_string()),
+        }
+    }
+
+    fn owned_by_issuer(signing: Option<SurfaceSigningConfig>) -> AgentSurface {
+        let mut surface = surface("s1", signing);
+        surface.issuer_id = Some("issuer-a".to_string());
+        surface
+    }
+
+    #[test]
+    fn a_surface_that_sets_nothing_reports_the_signing_of_its_issuer_and_says_so() {
+        let inventory = build(&vta_config(), &[], &[owned_by_issuer(None)], &[issuer_with(Some(remote("c1")))], &[]);
+
+        let mapping = &inventory.mappings[0];
+        assert_eq!(mapping.backend, "vta");
+        assert_eq!(
+            mapping
+                .connection_id
+                .as_deref(),
+            Some("c1")
+        );
+        assert_eq!(mapping.context_id.as_deref(), Some("ctx-issuer"));
+        assert_eq!(mapping.key_id.as_deref(), Some("key-issuer"));
+        assert_eq!(mapping.via_issuer.as_deref(), Some("Research"));
+        assert!(mapping.inherits, "the surface itself still declares nothing");
+    }
+
+    #[test]
+    fn a_surface_with_its_own_signing_ignores_its_issuer() {
+        let own = SurfaceSigningConfig {
+            backend: Some(SigningBackendKind::Local),
+            ..Default::default()
+        };
+        let inventory =
+            build(&vta_config(), &[], &[owned_by_issuer(Some(own))], &[issuer_with(Some(remote("c1")))], &[]);
+
+        let mapping = &inventory.mappings[0];
+        assert_eq!(mapping.backend, "local");
+        assert_eq!(mapping.via_issuer, None);
+        assert!(!mapping.inherits);
+    }
+
+    #[test]
+    fn an_issuer_without_signing_leaves_its_surface_inheriting_the_appliance_default() {
+        let inventory = build(&vta_config(), &[], &[owned_by_issuer(None)], &[issuer_with(None)], &[]);
+
+        let mapping = &inventory.mappings[0];
+        assert_eq!(mapping.backend, "inherit");
+        assert_eq!(mapping.via_issuer, None);
+        assert!(mapping.inherits);
     }
 }
