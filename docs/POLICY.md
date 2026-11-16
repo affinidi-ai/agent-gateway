@@ -137,11 +137,14 @@ request on the dashboard WebSocket, with no admin API route and nothing stored o
 - `{"type": "capture_policy_input", "surface_id": "<id>"}` starts listening, and
   `{"type": "stop_capturing_policy_input", "surface_id": "<id>"}` stops it.
 - The gateway answers each with `{"type": "policy_input_capture", "surface_id", "listening"}`, and
-  an `error` when it refuses: `needs surfaces.edit and policies.edit`, `invalid surface id` (empty
-  or over 256 characters) or `listening to too many surfaces on this connection` (more than 10).
+  an `error` when it refuses or ends a listen: `your dashboard session has ended; sign in again`
+  (the connection has no live session), `needs surfaces.edit and policies.edit`, `invalid surface
+  id` (empty or over 256 bytes) or `listening to too many surfaces on this connection` (more than
+  10). The answer to a stop has no `error`.
 - Starting needs a dashboard session whose user holds `surfaces.edit` and `policies.edit`
-  ([`RBAC.md`](RBAC.md#policy-input-capture)). The permissions are checked again on each keep-alive
-  ping; once either is gone the connection stops listening to every surface and is told so.
+  ([`RBAC.md`](RBAC.md#policy-input-capture)). The session and permissions are checked again on each
+  keep-alive ping; once the session ends or either permission is gone, the connection stops
+  listening to every surface and is told why.
 - Listening ends when the connection closes, so reloading or leaving the page ends it. The
   dashboard sends its listens again after a reconnect.
 
@@ -180,8 +183,9 @@ stored, so a capture is gone once it has been sent.
 
 Before a capture is sent, every credential in the input becomes `<redacted>`: the value of a key
 named like a credential (the [credential names](CONFIGURATION_REFERENCE.md#log-redaction) of log
-redaction, such as `token` or `api_key`), any JWT, and any `Bearer` or `Basic` authorization value
-(the scheme followed by one token: `Bearer abc.def`, not message text such as `Basic plan question`). `http.path`
+redaction, such as `token` or `api_key`), any JWT, and any `Bearer` or `Basic` authorization value:
+the scheme, whitespace, then one token of at least 12 letters, digits or `-._~+/=`. Message text
+such as `Basic plan` or `Bearer abc and more words` is kept. `http.path`
 is shown as the request log line shows it: query parameter names are kept and every query value
 becomes `<redacted>`, since a request received over Fabric carries the caller's full path and query,
 and capability ids in the path are shortened. Policies still see the full path. Headers that

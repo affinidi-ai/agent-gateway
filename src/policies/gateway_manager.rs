@@ -811,6 +811,95 @@ allow if {
     }
 
     #[tokio::test]
+    async fn a_captured_gateway_set_names_every_member_and_only_a_denying_one_decides() {
+        use crate::policies::input_capture::{listen, received_captures, test_dashboard};
+        use crate::policies::policy_definitions::PolicyDefinition;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            FileSystemPolicyDefinitionStore::new(
+                tmp.path()
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        for (id, name, allow) in [("gw-cap-allow", "Allow partners", true), ("gw-cap-deny", "Block nights", false)] {
+            store
+                .save(PolicyDefinition {
+                    id: id.into(),
+                    tenant_id: None,
+                    name: name.into(),
+                    description: String::new(),
+                    policy_type: PolicyType::Gateway,
+                    policy: format!("package gateway.policy\ndefault allow = {allow}"),
+                    enabled: true,
+                    created_at: "t".into(),
+                    updated_at: None,
+                    version: None,
+                    content_hash: None,
+                    sample_input: None,
+                })
+                .await
+                .unwrap();
+        }
+        let manager = GatewayPolicyManager::new();
+        manager.set_policy_definition_store(store);
+        for (gateway_id, ids) in [("gw-cap-set", vec!["gw-cap-deny".to_string()]), ("gw-cap-allow-only", Vec::new())] {
+            let gateway = create_test_gateway(
+                gateway_id,
+                GatewayType::SelfGateway,
+                Some(GatewayOpaPolicyConfig {
+                    enabled: true,
+                    policy: String::new(),
+                    policy_definition_id: Some("gw-cap-allow".to_string()),
+                    policy_definition_ids: ids,
+                }),
+            );
+            manager
+                .update_gateway_policy(&gateway)
+                .await
+                .unwrap();
+        }
+        let mut dashboard = test_dashboard();
+        let _listening = listen("gw-cap-surface");
+        let input = serde_json::json!({ "channel": { "config_id": "gw-cap-surface" } });
+
+        manager
+            .evaluate_with_evidence("gw-cap-set", input.clone())
+            .unwrap();
+        let denied = received_captures(&mut dashboard, "gw-cap-surface");
+        manager
+            .evaluate_with_evidence("gw-cap-allow-only", input)
+            .unwrap();
+        let allowed = received_captures(&mut dashboard, "gw-cap-surface");
+
+        assert_eq!(denied.len(), 1, "{denied:?}");
+        assert_eq!(denied[0]["decision"], "deny");
+        let names: Vec<&str> = denied[0]["policies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|policy| {
+                policy["name"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(names, ["Allow partners", "Block nights"]);
+        assert_eq!(denied[0]["decided_by"], "gw-cap-deny");
+        assert_eq!(allowed.len(), 1, "{allowed:?}");
+        assert_eq!(allowed[0]["decision"], "allow");
+        assert_eq!(allowed[0]["policies"][0]["id"], "gw-cap-allow");
+        assert!(
+            allowed[0]
+                .get("decided_by")
+                .is_none(),
+            "{allowed:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn multi_policy_set_denies_when_any_member_denies() {
         use crate::policies::policy_definitions::{PolicyDefinition, content_hash};
         let tmp = tempfile::tempdir().unwrap();

@@ -135,6 +135,20 @@ describe('PolicyInputCaptureControl', () => {
     );
   });
 
+  it('stays listening when the answer to an earlier stop arrives after listening again', () => {
+    render(control());
+    fireEvent.click(listenButton());
+    fireEvent.click(listenButton());
+    fireEvent.click(listenButton());
+    mockListen.mockClear();
+
+    answer({ listening: false });
+
+    expect(listenButton()).toHaveTextContent('Stop listening');
+    expect(screen.getByTestId('policy-input-capture-listening')).toBeInTheDocument();
+    expect(mockListen).not.toHaveBeenCalled();
+  });
+
   it('clears the refusal once the user tries again', () => {
     render(control());
     fireEvent.click(listenButton());

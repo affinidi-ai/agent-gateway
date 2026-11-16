@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
 import type { AgentSurface } from '../../../../api';
-import { formatTime } from '../../../../utils/stringUtils';
+import { formatDateTime } from '../../../../utils/stringUtils';
+import { showToast } from '../../../../utils/toaster';
+import { CopyButton } from '../../../shared/CopyButton';
 import PolicyInputCaptureControl from '../PolicyInputCaptureControl';
 import {
   CapturedPolicy,
@@ -73,14 +75,6 @@ const PolicyNames: React.FC<{ capture: CapturedPolicyInput }> = ({ capture }) =>
   );
 };
 
-const copyText = async (text: string) => {
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch (e) {
-    console.error('Failed to copy to clipboard:', e);
-  }
-};
-
 const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
   captures,
   hasPolicy = true,
@@ -88,7 +82,9 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
   const [openId, setOpenId] = useState<number | null>(null);
   const [slot, setSlot] = useState<string>('');
   const slots = Array.from(new Set(captures.map(capture => capture.slot))).sort();
-  const shown = slot ? captures.filter(capture => capture.slot === slot) : captures;
+  // A chosen slot that has left the list (cleared or rolled off) shows every slot again.
+  const activeSlot = slots.includes(slot) ? slot : '';
+  const shown = activeSlot ? captures.filter(capture => capture.slot === activeSlot) : captures;
 
   return (
     <div className="card shadow mb-4" data-testid="policy-input-capture-card">
@@ -100,12 +96,21 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
               {captures.length}/{MAX_POLICY_INPUTS}
             </span>
           )}
+          <small className="text-muted ms-2" data-testid="policy-input-capture-kept">
+            The last {MAX_POLICY_INPUTS} policy evaluations are kept; one request can run several
+            policies
+          </small>
         </h6>
         <PolicyInputCaptureControl />
       </div>
       <div className="card-body">
         {!hasPolicy && (
-          <div className="alert alert-info small py-2" data-testid="policy-input-capture-no-policy">
+          <div
+            className="alert alert-info mb-3"
+            style={{ fontSize: '14px' }}
+            data-testid="policy-input-capture-no-policy"
+          >
+            <i className="fas fa-info-circle me-2"></i>
             This surface has no policy yet, so its requests have no policy evaluation to capture.
             Only a gateway or appliance-wide policy, if one applies, shows here. To see the input of
             each request, add a request policy to the surface; one that allows everything is enough.
@@ -118,17 +123,13 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
             requests served by the node this dashboard is connected to show.
           </p>
         ) : (
-          <div className="table-responsive">
-            <div className="d-flex align-items-center flex-wrap gap-2 mb-2 small text-muted">
-              <span data-testid="policy-input-capture-kept">
-                The last {MAX_POLICY_INPUTS} policy evaluations are kept; one request can run
-                several policies.
-              </span>
+          <>
+            <div className="d-flex justify-content-end mb-2">
               <select
-                className="form-select form-select-sm w-auto ms-auto"
+                className="form-select form-select-sm w-auto"
                 aria-label="Show the evaluations of one policy slot"
                 data-testid="policy-input-capture-slot-filter"
-                value={slot}
+                value={activeSlot}
                 onChange={e => setSlot(e.target.value)}
               >
                 <option value="">All policy slots</option>
@@ -139,82 +140,85 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
                 ))}
               </select>
             </div>
-            <table className="table table-sm align-middle mb-0">
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Policy</th>
-                  <th>Decision</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody>
-                {shown.map(capture => {
-                  const input = JSON.stringify(capture.input, null, 2);
-                  const open = openId === capture.id;
-                  return (
-                    <React.Fragment key={capture.id}>
-                      <tr data-testid="policy-input-capture-row">
-                        <td className="text-nowrap">{formatTime(capture.timestamp)}</td>
-                        <td>
-                          {capture.slot}
-                          {capture.surfaceVariant && capture.surfaceVariant !== '_base_' && (
-                            <span className="badge text-bg-secondary ms-2">
-                              {capture.surfaceVariant}
-                            </span>
-                          )}
-                          <PolicyNames capture={capture} />
-                        </td>
-                        <td>
-                          {decisionBadge(capture.decision)}
-                          {capture.reason && (
-                            <small
-                              className="text-muted ms-2"
-                              data-testid="policy-input-capture-reason"
+            <div className="table-responsive">
+              <table className="table table-hover table-sm">
+                <thead>
+                  <tr>
+                    <th>Timestamp</th>
+                    <th>Policy</th>
+                    <th>Decision</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {shown.map(capture => {
+                    const input = JSON.stringify(capture.input, null, 2);
+                    const open = openId === capture.id;
+                    return (
+                      <React.Fragment key={capture.id}>
+                        <tr data-testid="policy-input-capture-row">
+                          <td className="text-nowrap timestamp-cell">
+                            {formatDateTime(capture.timestamp, true)}
+                          </td>
+                          <td>
+                            <span className="badge text-bg-secondary">{capture.slot}</span>
+                            {capture.surfaceVariant && capture.surfaceVariant !== '_base_' && (
+                              <span className="badge text-bg-secondary ms-2">
+                                {capture.surfaceVariant}
+                              </span>
+                            )}
+                            <PolicyNames capture={capture} />
+                          </td>
+                          <td>
+                            {decisionBadge(capture.decision)}
+                            {capture.reason && (
+                              <small
+                                className="text-muted ms-2"
+                                data-testid="policy-input-capture-reason"
+                              >
+                                {capture.reason}
+                              </small>
+                            )}
+                          </td>
+                          <td className="text-end text-nowrap">
+                            <button
+                              type="button"
+                              className="btn btn-sm btn-outline-secondary"
+                              data-testid="policy-input-capture-toggle"
+                              onClick={() => setOpenId(open ? null : capture.id)}
                             >
-                              {capture.reason}
-                            </small>
-                          )}
-                        </td>
-                        <td className="text-end text-nowrap">
-                          <button
-                            type="button"
-                            className="btn btn-sm btn-outline-secondary"
-                            data-testid="policy-input-capture-toggle"
-                            onClick={() => setOpenId(open ? null : capture.id)}
-                          >
-                            {open ? 'Hide input' : 'Show input'}
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn-sm btn-outline-secondary ms-2"
-                            title="Copy the input, to try it in the policy Test panel"
-                            data-testid="policy-input-capture-copy"
-                            onClick={() => copyText(input)}
-                          >
-                            <i className="fas fa-copy"></i>
-                          </button>
-                        </td>
-                      </tr>
-                      {open && (
-                        <tr>
-                          <td colSpan={4}>
-                            <pre
-                              className="mb-0 small"
-                              style={{ maxHeight: 400, overflow: 'auto' }}
-                              data-testid="policy-input-capture-input"
-                            >
-                              {input}
-                            </pre>
+                              {open ? 'Hide input' : 'Show input'}
+                            </button>
+                            <CopyButton
+                              text={input}
+                              title="Copy the input"
+                              onCopyError={() =>
+                                showToast('error', 'Could not copy to the clipboard')
+                              }
+                              data-testid="policy-input-capture-copy"
+                            />
                           </td>
                         </tr>
-                      )}
-                    </React.Fragment>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+                        {open && (
+                          <tr>
+                            <td colSpan={4}>
+                              <pre
+                                className="mb-0 small"
+                                style={{ maxHeight: 400, overflow: 'auto' }}
+                                data-testid="policy-input-capture-input"
+                              >
+                                {input}
+                              </pre>
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </>
         )}
       </div>
     </div>

@@ -76,7 +76,7 @@ describe('PolicyInputCaptureCard', () => {
     captured({ config_id: 'surface-2' });
 
     expect(screen.getAllByTestId('policy-input-capture-row')).toHaveLength(1);
-    expect(screen.getByText('inbound', { selector: 'td' })).toBeInTheDocument();
+    expect(screen.getByText('inbound', { selector: '.badge' })).toBeInTheDocument();
     expect(screen.getByText('Deny')).toBeInTheDocument();
     expect(screen.getByTestId('policy-input-capture-reason')).toHaveTextContent(
       'only message/send is allowed'
@@ -142,6 +142,29 @@ describe('PolicyInputCaptureCard', () => {
       target: { value: '' },
     });
     expect(screen.getAllByTestId('policy-input-capture-row')).toHaveLength(3);
+  });
+
+  it('shows every slot again when the chosen slot has left the list', () => {
+    const Clearable: React.FC = () => {
+      const { captures, clear } = usePolicyInputCaptureStream('surface-1', false);
+      return (
+        <>
+          <button onClick={clear}>clear</button>
+          <PolicyInputCaptureCard captures={captures} />
+        </>
+      );
+    };
+    render(<Clearable />);
+    captured({ slot: 'target' });
+    fireEvent.change(screen.getByTestId('policy-input-capture-slot-filter'), {
+      target: { value: 'target' },
+    });
+
+    fireEvent.click(screen.getByText('clear'));
+    captured({ slot: 'inbound' });
+
+    expect(screen.getAllByTestId('policy-input-capture-row')).toHaveLength(1);
+    expect(screen.getByTestId('policy-input-capture-slot-filter')).toHaveValue('');
   });
 
   it('keeps the last evaluations up to the cap and says how many it keeps', () => {

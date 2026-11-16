@@ -647,18 +647,30 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   place otherwise.
 - The button needs both `surfaces.edit` and `policies.edit`; without either it is disabled with
   "Needs permission to edit surfaces and policies" beside it. When the gateway ends listening
-  (`listening: false`, such as a refusal or a permission lost at a keep-alive ping), the button
+  (`listening: false` with an `error`, such as a refusal, an ended session or a permission lost at
+  a keep-alive ping), the button
   goes back to **Listen to policy input** without sending a stop of its own
   (`listenToPolicyInput(id, false, false)`), and an `error` shows inline beside it until the user
-  clicks again or a later answer starts listening.
+  clicks again or a later answer starts listening. A `listening: false` answer without an `error`
+  answers this page's own stop and changes nothing, so a stop answered after the user listened
+  again doesn't turn the button off.
+- The card follows the Capture view's existing cards, Payload History in particular: a
+  `card shadow mb-4` whose `text-primary` `h6` header holds the icon, the title, a `count/max`
+  `text-bg-primary` badge and a muted hint, with the listen control on the right; a
+  `table table-hover table-sm` with a **Timestamp** column rendered by `formatDateTime(…, true)`
+  (`timestamp-cell`) and the policy slot as a `text-bg-secondary` badge, like a payload's Channel;
+  the no-policy note as an `alert alert-info` with an icon, like the route and Target lines. The
+  input's copy button is the shared `CopyButton`, which shows a check when it copied; a failed
+  copy shows an error toast. The rest of the Capture view keeps its own markup.
 - The card lists the last 50 `policy_input_captured` WebSocket updates of the surface (see
   `monitoring/capture/usePolicyInputCaptureStream.ts`), newest first: time, policy slot with a
   variant badge and, under it, the name and version of each policy the slot ran (`policies`; the
   name, else the id, else "inline policy"; the member that denied a gateway or appliance-wide set
   in red with "(denied)"), a decision badge (Allow green, Deny red, Error yellow) with the reason, a
   **Show input** toggle that opens the input JSON, and a copy button for the input. Above the
-  list a line says the last 50 evaluations are kept and that one request can run several
-  policies, beside an "All policy slots" select that shows one slot's rows. With none it says to
+  list an "All policy slots" select shows one slot's rows (the header's hint says the last 50
+  evaluations are kept and that one request can run several policies); a chosen slot that has
+  left the list (cleared or rolled off) falls back to all slots. With none it says to
   listen and send a request, and that on an appliance with several nodes only requests served by
   this dashboard's node show. Pause and Clear Payloads apply to it too.
 - While the surface has no Access Point, Target, response or Transit Point policy

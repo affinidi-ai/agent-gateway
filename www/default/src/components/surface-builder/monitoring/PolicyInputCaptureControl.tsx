@@ -33,7 +33,9 @@ const PolicyInputCaptureControl: React.FC = () => {
       }
       if (data.listening === true) {
         setError(null);
-      } else if (listeningRef.current) {
+      } else if (data.error && listeningRef.current) {
+        // Only a refusal or a revoke carries an error; the answer to this page's own
+        // stop does not, and may arrive after the user has listened again.
         endedByGatewayRef.current = true;
         setListening(false);
       }

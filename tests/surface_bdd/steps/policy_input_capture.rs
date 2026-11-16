@@ -203,6 +203,19 @@ async fn surface_has_denying_request_policy(
     assert_eq!(updated.status, 200, "attaching the denying policy: {}", updated.body);
 }
 
+#[given(expr = "Transit Point {string} has a policy that allows every request")]
+fn transit_point_allows_every_request(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+) {
+    crate::steps::given::transit_point_config_mut(world, &transit_point).policy =
+        Some(crate::bdd_support::config::config_tree::PolicyDefinitionFixture::new(
+            format!("bdd-transit-allow-{transit_point}"),
+            "BDD Transit Point allow-all policy",
+            "package surface.policy\n\ndefault allow := true\n",
+        ));
+}
+
 #[given("the operator watches the dashboard Capture view")]
 async fn operator_watches(world: &mut SurfaceWorld) {
     watch(world, None).await;

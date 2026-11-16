@@ -73,6 +73,31 @@ impl CapturedPolicy {
     }
 }
 
+/// A receiver of the dashboard WebSocket the captures go to, for tests, which share one
+/// dashboard created on first use.
+#[cfg(test)]
+pub(crate) fn test_dashboard() -> tokio::sync::broadcast::Receiver<WsUpdate> {
+    DASHBOARD
+        .get_or_init(|| Arc::new(WsState::new(4096)))
+        .subscribe()
+}
+
+/// The captures of `surface_id` that `dashboard` has received so far, as JSON.
+#[cfg(test)]
+pub(crate) fn received_captures(
+    dashboard: &mut tokio::sync::broadcast::Receiver<WsUpdate>,
+    surface_id: &str,
+) -> Vec<Value> {
+    let mut captures = Vec::new();
+    while let Ok(update) = dashboard.try_recv() {
+        let update = serde_json::to_value(update).expect("a capture serializes");
+        if update["type"] == "policy_input_captured" && update["config_id"] == surface_id {
+            captures.push(update);
+        }
+    }
+    captures
+}
+
 pub(crate) fn is_captured(surface_id: &str) -> bool {
     LISTENERS
         .get(surface_id)
@@ -286,14 +311,20 @@ fn is_credential_text(text: &str) -> bool {
     is_jwt(trimmed) || is_authorization_value(trimmed)
 }
 
+/// The shortest token an authorization value is taken to carry. Shorter words after
+/// `Bearer` or `Basic` ("Basic plan") are message text, not a credential.
+const MIN_AUTHORIZATION_TOKEN_LEN: usize = 12;
+
 fn is_authorization_value(text: &str) -> bool {
-    let Some((scheme, token)) = text.split_once(' ') else {
+    let Some((scheme, token)) = text.split_once(char::is_whitespace) else {
         return false;
     };
     let token = token.trim();
     (scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("basic"))
-        && !token.is_empty()
-        && !token.contains(char::is_whitespace)
+        && token.len() >= MIN_AUTHORIZATION_TOKEN_LEN
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._~+/=".contains(&b))
 }
 
 fn is_jwt(text: &str) -> bool {
@@ -438,19 +469,28 @@ mod tests {
     fn an_authorization_value_is_masked_but_text_that_starts_with_its_scheme_is_kept() {
         let mut input = json!({
             "a2a": { "parts": [
-                { "text": "Bearer abc.def-123" },
+                { "text": "Bearer abc.def-123_xyz" },
                 { "text": "basic dXNlcjpwYXNz" },
+                { "text": "Bearer\tabcdefghijklmnop" },
                 { "text": "Basic plan question" },
+                { "text": "Basic plan" },
+                { "text": "Bearer arms" },
+                { "text": "Bearer abcdefghijklmnop and more words" },
                 { "text": "Bearer " },
             ] },
         });
 
         mask_credentials(&mut input);
 
-        assert_eq!(input["a2a"]["parts"][0]["text"], REDACTED);
-        assert_eq!(input["a2a"]["parts"][1]["text"], REDACTED);
-        assert_eq!(input["a2a"]["parts"][2]["text"], "Basic plan question");
-        assert_eq!(input["a2a"]["parts"][3]["text"], "Bearer ");
+        let parts = &input["a2a"]["parts"];
+        assert_eq!(parts[0]["text"], REDACTED);
+        assert_eq!(parts[1]["text"], REDACTED);
+        assert_eq!(parts[2]["text"], REDACTED);
+        assert_eq!(parts[3]["text"], "Basic plan question");
+        assert_eq!(parts[4]["text"], "Basic plan");
+        assert_eq!(parts[5]["text"], "Bearer arms");
+        assert_eq!(parts[6]["text"], "Bearer abcdefghijklmnop and more words");
+        assert_eq!(parts[7]["text"], "Bearer ");
     }
 
     #[test]

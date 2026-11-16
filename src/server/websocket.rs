@@ -136,6 +136,12 @@ struct WsSubscription {
     policy_input: HashMap<String, crate::policies::input_capture::Listening>,
 }
 
+/// Why a listen was refused or ended: the connection's session has ended, or it has none.
+const SESSION_ENDED: &str = "your dashboard session has ended; sign in again";
+
+/// Why a listen was refused or ended: the user lacks a permission listening needs.
+const PERMISSION_MISSING: &str = "needs surfaces.edit and policies.edit";
+
 /// The most surfaces one connection may listen to the policy input of at once.
 const MAX_POLICY_INPUT_SURFACES: usize = 10;
 
@@ -253,6 +259,26 @@ impl WsCaller {
 
     /// Whether `caller` may receive captured policy input: its session is still live
     /// and its user holds `surfaces.edit` and `policies.edit`.
+    /// Why `caller` may not listen to policy input: its session has ended (or it has
+    /// none), or its user lacks a permission. `None` when it may listen.
+    async fn policy_input_refusal(caller: Option<&Self>) -> Option<&'static str> {
+        let Some(live) = caller else {
+            return Some(SESSION_ENDED);
+        };
+        if !live
+            .sessions
+            .is_live(&live.session_token)
+            .await
+        {
+            return Some(SESSION_ENDED);
+        }
+        if Self::policy_input_allowed(caller).await {
+            None
+        } else {
+            Some(PERMISSION_MISSING)
+        }
+    }
+
     async fn policy_input_allowed(caller: Option<&Self>) -> bool {
         Self::allowed(caller, &[crate::rbac::Feature::SurfacesEdit, crate::rbac::Feature::PoliciesEdit]).await
     }
@@ -329,8 +355,8 @@ async fn listen_to_policy_input(
         info!(surface_id = %surface_id, "Stopped listening to policy input");
         return policy_input_listen_answer(&surface_id, false, None);
     }
-    if !WsCaller::policy_input_allowed(caller).await {
-        return policy_input_listen_answer(&surface_id, false, Some("needs surfaces.edit and policies.edit"));
+    if let Some(refusal) = WsCaller::policy_input_refusal(caller).await {
+        return policy_input_listen_answer(&surface_id, false, Some(refusal));
     }
     let mut subscription = subscription.write().await;
     if !subscription.listens_to(&surface_id) {
@@ -364,9 +390,9 @@ async fn recheck_policy_input(
     subscription: &RwLock<WsSubscription>,
     caller: Option<&WsCaller>,
 ) -> (bool, Vec<String>) {
-    if WsCaller::policy_input_allowed(caller).await {
+    let Some(refusal) = WsCaller::policy_input_refusal(caller).await else {
         return (true, Vec::new());
-    }
+    };
     let stopped: Vec<String> = subscription
         .write()
         .await
@@ -385,7 +411,7 @@ async fn recheck_policy_input(
     }
     let answers = stopped
         .iter()
-        .map(|surface_id| policy_input_listen_answer(surface_id, false, Some("needs surfaces.edit and policies.edit")))
+        .map(|surface_id| policy_input_listen_answer(surface_id, false, Some(refusal)))
         .collect();
     (false, answers)
 }
@@ -1327,6 +1353,7 @@ mod tests {
 
         assert!(!allowed);
         assert_eq!(answers.len(), 1);
+        assert_eq!(answer(answers[0].clone())["error"], super::SESSION_ENDED);
         assert!(!is_captured("ws-session-ended"));
     }
 
@@ -1348,6 +1375,7 @@ mod tests {
         let anonymous =
             answer(super::listen_to_policy_input(&subscription, None, listen_message("ws-anonymous"), true).await);
         assert_eq!(anonymous["listening"], false);
+        assert_eq!(anonymous["error"], super::SESSION_ENDED);
         assert!(!is_captured("ws-anonymous"));
 
         let dir = TempDir::new().unwrap();

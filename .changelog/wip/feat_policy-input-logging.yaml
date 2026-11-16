@@ -11,8 +11,9 @@ changes:
         is sent to the listening connections only, as a policy_input_captured update with its input,
         the id, name and version of each policy definition the slot evaluated, the member that denied
         a gateway or appliance-wide set, and its allow, deny reason or error. Credential-named values, JWTs and Bearer or Basic values
-        are masked first (an authorization value, not message text that starts with Bearer or Basic),
-        and every query value in the request path is redacted. Listening needs surfaces.edit and policies.edit, is checked again on each
+        are masked first (a Bearer or Basic scheme followed by one token of at least 12 token
+        characters; message text such as "Basic plan" is kept), and every query value in the
+        request path is redacted. Listening needs surfaces.edit and policies.edit, is checked again on each
         keep-alive ping, and ends when the connection closes. Nothing is logged or stored, and the
         surface configuration is not changed. Policy authors can see the input structure again
         without the gateway logging it. See docs/POLICY.md.
