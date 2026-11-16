@@ -11,9 +11,13 @@ const CARD_VIEWS: { key: CardView; label: string }[] = [
   { key: 'json', label: 'JSON' },
 ];
 
-const UNAVAILABLE_TEXT: Record<'no_agent_card' | 'unsupported_runtime', string> = {
+type UnavailableReason = Extract<AgentCardResponse, { available: false }>['reason'];
+
+const UNAVAILABLE_TEXT: Record<UnavailableReason, string> = {
   no_agent_card: "This agent doesn't publish an Agent Card",
   unsupported_runtime: "Agent Card isn't available for this runtime",
+  operator_only:
+    'Only an appliance operator can read the Agent Card of an agent behind appliance-wide surfaces',
 };
 
 /**
@@ -82,11 +86,7 @@ const AgentCardTab: React.FC<{ agentId: string }> = ({ agentId }) => {
   const json = JSON.stringify(response.card, null, 2);
   return (
     <div className="card" data-testid="agent-card-tab">
-      <div className="card-header py-2 d-flex flex-wrap gap-2 align-items-center justify-content-between">
-        {/* <span className="badge text-bg-warning" data-testid="agent-card-unverified">
-          <i className="fas fa-exclamation-triangle me-1" aria-hidden="true" />
-          Published by the agent, not verified
-        </span> */}
+      <div className="card-header py-2 d-flex flex-wrap gap-2 align-items-center justify-content-end">
         <span className="d-flex align-items-center gap-2">
           <span className="btn-group btn-group-sm" role="group" aria-label="Agent Card view">
             {CARD_VIEWS.map(v => (

@@ -5,43 +5,50 @@ changes:
       title: Add a read-only Agents API with one record per managed agent
       description: >-
         `GET /v1/agents` lists one record per managed agent behind the non-deleted, non-MCP surfaces
-        the caller can access. Surfaces whose targets share an endpoint (ignoring credentials, query,
-        fragment, scheme and host case and a trailing slash) and Agent Card path are one agent, with
-        an opaque id hashed from that target. A record carries the Agent Card name (else the canvas
-        target name of the most recently active surface), the credential-free endpoint, runtime,
-        primary protocol, the union of its surfaces' tags and managed identities, every surface using
-        it, whether any of its current identities was recorded to a Trust Registry, and the latest
-        activity across its surfaces. `GET /v1/agents/{id}` adds each surface's protocol and route and
-        the traffic summed across them over the metrics retention window, with p95 latency taken from
-        the raw inbound latencies. Both routes need surface view permission, group only surfaces in
-        the caller's tenant and PAT resource scope, return 404 for an id outside it, and are not
-        served when no auth backend is configured.
+        the caller can access, with the metrics retention window as `window_minutes`. Surfaces whose
+        targets share an endpoint and Agent Card path are one agent, with an opaque id hashed from
+        that target. The endpoint drops credentials, query, fragment and a trailing slash, and its
+        scheme case; an `http` or `https` endpoint is parsed as a URL, which also drops host case,
+        and one that does not parse, or of another scheme with an `@` after its authority, is shown
+        as `redacted.invalid`, never raw. Each surface with such an endpoint is an agent of its own,
+        with an id hashed from the surface id, not the endpoint. A record carries the
+        Agent Card name (else the canvas target name of the most recently active surface), the
+        credential-free endpoint, runtime, primary protocol, the union of its surfaces' tags and
+        managed identities, every surface using it, whether any of its current identities was
+        recorded to a Trust Registry, and the latest activity across its surfaces.
+        `GET /v1/agents/{id}` adds each surface's protocol and route and the Access Point (inbound)
+        request totals and p95 latency across them over the metrics retention window; Transit Point
+        (outbound) calls are not counted. Both routes need surface view permission, group only
+        surfaces in the caller's tenant and PAT resource scope, return 404 for an id outside it, and
+        are not served when no auth backend is configured.
     - timestamp: '2026-10-29T15:00:00Z'
       title: Add GET /v1/agents/{id}/agent-card to show the managed agent's own Agent Card
       description: >-
-        Returns the card the agent publishes at its target endpoint, marked unverified by the
-        dashboard, or `available: false` with `no_agent_card` (protocol is not A2A or AP2) or
-        `unsupported_runtime` (A2A Proxy or remote gateway target). The card is fetched through the
-        egress policy with the same timeout and size limit as target card names, redirects are not
-        followed. Fetched cards are cached per agent for 5 minutes and failed fetches for 30
-        seconds. A failed fetch returns a generic 502. The surface's public card route is never called, so viewing a card issues no
-        DID, writes no Trust Registry record and records no request. Same permission, tenant and PAT
-        scoping as the other Agents API routes.
+        Returns the card the agent publishes at its target endpoint, or `available: false` with
+        `no_agent_card` (protocol is not A2A or AP2), `unsupported_runtime` (A2A Proxy or remote
+        gateway target) or `operator_only` (a tenant token whose own surfaces cannot reach the card
+        and an appliance-wide surface can; nothing is fetched). A tenant token's card is read only
+        through its own tenant's surfaces. The card is fetched through the egress policy with the same timeout and
+        size limit as target card names, redirects are not followed. Fetched cards are cached per
+        agent for 5 minutes and failed fetches for 30 seconds, and expired entries are dropped. A
+        failed fetch returns a generic 502. The surface's public card route is never called, so
+        viewing a card issues no DID, writes no Trust Registry record and records no request. Same
+        permission, tenant and PAT scoping as the other Agents API routes.
     - timestamp: '2026-10-29T18:00:00Z'
       title: Add the read-only Agents page and agent details to the dashboard
       description: >-
         A new **Agents** sidebar entry, above **Surfaces**, opens `/agent-registry` and lists one
         row per managed agent with its name ("Unnamed agent" when it has none), runtime and
         protocol, identities, every surface using it as a link, Trust Registry Recorded or Not
-        recorded, and last activity, with a search over the agent and surface names. No surface
-        status is shown. The page is not served at `/agents`, which is a gateway channel prefix, and
-        `agent-registry` is reserved so no channel prefix can take it. The details page has
-        **Overview**, **Agent Card**, **Connection**, **Surfaces** and **Traffic** tabs.
-        **Connection** shows how the gateway reaches the agent, with a URL endpoint's credentials
-        and query string hidden. The Agent Card opens as a visual preview with a JSON view, every
-        value is shown as plain text, and it is labelled as published by the agent and not verified;
-        **Overview** lists every identity of the agent, and traffic is labelled with the metrics retention window. Needs surface
-        view permission.
+        recorded, and last activity, with a search over the agent and surface names and the runtime.
+        No surface status is shown. The page is not served at `/agents`, which is a gateway channel
+        prefix, and `agent-registry` is reserved so no channel prefix can take it. The details page
+        has **Overview**, **Agent Card**, **Connection**, **Surfaces** and **Traffic** tabs.
+        **Connection** shows how the gateway reaches the agent, with a URL endpoint's credentials,
+        query string and fragment removed, and "Can't be shown" for an endpoint the API redacted.
+        The Agent Card opens as a visual preview with a JSON view, and every value is shown as plain
+        text. **Overview** lists every identity of the agent, and last activity and traffic are
+        labelled with the metrics retention window the API returns. Needs surface view permission.
   changed: []
   fixed: []
   removed: []
@@ -53,6 +60,18 @@ changes:
         every DID's per-surface traffic with the last request payload seen for it. It is replaced by
         the scoped Agents API, and the gateway no longer keeps the per-identity last payload in
         memory.
+    - timestamp: '2026-11-16T13:00:00Z'
+      title: Stop sending target endpoint userinfo with target Agent Card fetches
+      description: >-
+        The background fetch of a target's Agent Card name for the dashboard used the surface's
+        target endpoint as configured, so `https://user:pass@host` sent those credentials to the
+        target. The userinfo is now dropped before the fetch, and an endpoint that does not parse as
+        a URL is not fetched.
+    - timestamp: '2026-11-16T12:00:00Z'
+      title: Update quinn to fix a receive loop that can spin on a truncated datagram
+      description: >-
+        The transitive QUIC dependencies quinn and quinn-udp move to 0.11.12 and 0.5.16. quinn-udp
+        0.5.14 could spin in its receive loop after a truncated datagram, which cargo audit reports.
   breaking:
     - timestamp: '2026-11-13T12:00:00Z'
       title: Reserve the agent-registry path for the dashboard

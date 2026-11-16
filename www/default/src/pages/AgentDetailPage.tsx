@@ -11,7 +11,9 @@ import SurfacesTab from './AgentDetailPage/SurfacesTab';
 import TrafficTab from './AgentDetailPage/TrafficTab';
 import './AgentsPage/AgentRegistry.css';
 
-/** Read-only details of one agent: Overview, Agent Card, Surfaces and Traffic. */
+const tabAttrs = (key: string) => ({ 'data-testid': `agent-tab-${key}` });
+
+/** Read-only details of one agent: Overview, Agent Card, Connection, Surfaces and Traffic. */
 const AgentDetailPage: React.FC = () => {
   const { agentId = '' } = useParams<{ agentId: string }>();
   const navigate = useNavigate();
@@ -108,6 +110,7 @@ const AgentDetailPage: React.FC = () => {
           >
             <Tab
               eventKey="overview"
+              tabAttrs={tabAttrs('overview')}
               title={
                 <>
                   <i className="fas fa-info-circle" /> Overview
@@ -118,6 +121,7 @@ const AgentDetailPage: React.FC = () => {
             </Tab>
             <Tab
               eventKey="agent-card"
+              tabAttrs={tabAttrs('agent-card')}
               title={
                 <>
                   <i className="fas fa-id-card" /> Agent Card
@@ -128,6 +132,7 @@ const AgentDetailPage: React.FC = () => {
             </Tab>
             <Tab
               eventKey="connection"
+              tabAttrs={tabAttrs('connection')}
               title={
                 <>
                   <i className="fas fa-plug" /> Connection
@@ -138,6 +143,7 @@ const AgentDetailPage: React.FC = () => {
             </Tab>
             <Tab
               eventKey="surfaces"
+              tabAttrs={tabAttrs('surfaces')}
               title={
                 <>
                   <i className="fas fa-layer-group" /> Surfaces ({agent.surfaces.length})
@@ -148,6 +154,7 @@ const AgentDetailPage: React.FC = () => {
             </Tab>
             <Tab
               eventKey="traffic"
+              tabAttrs={tabAttrs('traffic')}
               title={
                 <>
                   <i className="fas fa-chart-bar" /> Traffic

@@ -18,16 +18,7 @@ const ConnectionTab: React.FC<{ agent: AgentRecord }> = ({ agent }) => {
       rows = [
         {
           label: 'Endpoint',
-          value: (
-            <>
-              <code className="text-break">{target.display}</code>
-              {target.redacted && (
-                <div className="text-muted small" data-testid="agent-connection-redacted">
-                  Credentials, query string and fragment are hidden.
-                </div>
-              )}
-            </>
-          ),
+          value: <code className="text-break">{target.display}</code>,
           testId: 'agent-connection-endpoint',
         },
       ];

@@ -1685,7 +1685,7 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
   MCP surfaces front tool servers, not agents, so `/v1/agents` leaves them out (`is_listed` in
   `src/identity/handlers/agents.rs`) and their details and card return 404. The page adds no
   protocol filter of its own.
-- The Agent Registry shows no status anywhere: no list column, filter or dimmed rows, no
+- The Agents page shows no status anywhere: no list column, filter or dimmed rows, no
   details header badge, and no per-surface status in the Surfaces tab.
 - The list filters client-side by text only: the display name (**Unnamed agent** included), every
   surface name in the record, and the runtime label (`agentMatchesFilter`).
@@ -1705,35 +1705,48 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
   the surface** (`source: "surface"`) or **Managed identity, issued by this gateway**
   (`"managed"`), followed by its creation time when `created_at` is set.
 - Agent `id` is opaque and never read as a surface id; surface links come from `surfaces[]`.
-- The **Connection** tab is read-only and built from `endpoint` by `connectionTarget`. A URL is
-  shown without credentials, query string or fragment, with a note when any was removed. An
+- The **Connection** tab is read-only and built from `endpoint` by `connectionTarget`. The API
+  returns a URL endpoint without credentials, query string or fragment, and `connectionTarget`
+  drops any that arrive; there is no "hidden" note. An endpoint whose host is `redacted.invalid`
+  (the API could not strip its credentials) shows **Can't be shown** (`agent-connection-endpoint`),
+  like any endpoint `connectionTarget` cannot parse. An
   `a2a-proxy://` or `fabric://` target links to its A2A proxy or remote gateway page only when
   the viewer has `a2a_proxies.edit` or `gateways.edit`, which those pages need; otherwise the
   id is plain text.
-- The Agent Card is untrusted: render it as plain text only (no HTML, Markdown or links), labelled
-  **Published by the agent, not verified**. The tab opens on a visual **Preview**
+- The Agent Card is untrusted: render it as plain text only (no HTML, Markdown or links). The tab
+  opens on a visual **Preview**
   (`AgentDetailPage/AgentCardPreview.tsx`, reading known A2A card fields defensively, with the URL
   as text) and toggles to the raw **JSON**.
 - Activity and traffic exist only inside the metrics retention window, so labels name it
-  (`None in last 6h`, `Requests (last 6h)`) and the 7-day card shows `—`. **Failed requests** is
-  `failed` + `gateway_faults`.
+  (`None in last 6h`, `Requests (last 6h)`) from the `window_minutes` that `GET /v1/agents` and
+  `GET /v1/agents/{id}` (`traffic.window_minutes`) return, and the 7-day card shows `—`.
+  **Failed requests** is `failed` + `gateway_faults`. Traffic counts Access Point (inbound)
+  requests only; Transit Point (outbound) calls are not counted.
+- The API returns agent totals only, so **Requests by surface** shows only for an agent with a
+  single surface.
 
-| Element                         | Test id                                                                          |
-| ------------------------------- | -------------------------------------------------------------------------------- |
-| Pages                           | `page-agents`, `page-agent-details`                                              |
-| List row, filter, count, retry  | `agents-row-<id>`, `agents-filter-input`, `agents-count`, `agents-retry-button`  |
-| Name, unnamed                   | `agents-name`, `agents-unnamed`                                                  |
-| Surfaces, surface link          | `agents-surfaces`, `agents-surface-link`                                         |
-| Identities, DID, copy, none     | `agents-identities`, `agents-did`, `agents-copy-did-button`, `agents-no-did`     |
-| Trust registry                  | `agents-trust-recorded`, `agents-trust-not-recorded`                             |
-| Back, details retry             | `agent-back-button`, `agent-retry-button`                                        |
-| Details header                  | `agent-details-header`, `-name`, `-runtime`                                      |
-| Overview identities             | `agent-overview-identities`, `agent-overview-identity`, `-identity-source`       |
-| Details surfaces                | `agent-surfaces-tab`, `agent-surfaces-row-<surface_id>`, `agent-surfaces-link`   |
-| Agent Card states               | `agent-card-json`, `agent-card-unverified`, `agent-card-retry-button`            |
-| Agent Card view toggle, preview | `agent-card-view-preview`, `-view-json`, `agent-card-preview`, `-preview-name`   |
-| Traffic cards                   | `agent-traffic-requests`, `-requests-7d`, `-failed`, `-p95`                      |
-| Connection                      | `agent-connection-tab`, `-endpoint`, `-redacted`, `-proxy-link`, `-gateway-link` |
+| Element                         | Test id                                                                                         |
+| ------------------------------- | ----------------------------------------------------------------------------------------------- |
+| Pages                           | `page-agents`, `page-agent-details`                                                             |
+| List row, filter, count, retry  | `agents-row-<id>`, `agents-filter-input`, `agents-count`, `agents-retry-button`                 |
+| List load error, no match       | `agents-load-error`, `agents-no-match`                                                          |
+| Name, unnamed                   | `agents-name`, `agents-unnamed`                                                                 |
+| Runtime, protocol, activity     | `agents-runtime`, `agents-protocol-badge`, `agents-last-activity`                               |
+| Surfaces, surface link          | `agents-surfaces`, `agents-surface-link`                                                        |
+| Identities, DID, copy, none     | `agents-identities`, `agents-did`, `agents-copy-did-button`, `agents-no-did`                    |
+| Trust registry                  | `agents-trust-recorded`, `agents-trust-not-recorded`                                            |
+| Back, details retry             | `agent-back-button`, `agent-retry-button`                                                       |
+| Details not found, load error   | `agent-not-found`, `agent-load-error`                                                           |
+| Details header                  | `agent-details-header`, `-name`, `-runtime`                                                     |
+| Details tabs                    | `agent-details-tabs`, `agent-tab-<overview\|agent-card\|connection\|surfaces\|traffic>`         |
+| Overview identities             | `agent-overview-identities`, `agent-overview-identity`, `-identity-source`                      |
+| Details surfaces                | `agent-surfaces-tab`, `agent-surfaces-row-<surface_id>`, `agent-surfaces-link`                  |
+| Agent Card states               | `agent-card-tab`, `-loading`, `-error`, `-retry-button`, `agent-card-<no_agent_card\|unsupported_runtime\|operator_only>` |
+| Agent Card JSON, copy           | `agent-card-json`, `agent-card-copy-button`                                                     |
+| Agent Card view toggle, preview | `agent-card-view-preview`, `-view-json`, `agent-card-preview`, `-preview-name`, `-preview-skills`, `-preview-empty` |
+| Traffic cards                   | `agent-traffic-tab`, `agent-traffic-requests`, `-requests-7d`, `-failed`, `-p95`                |
+| Traffic by surface              | `agent-traffic-by-surface`, `agent-traffic-surface-link`                                        |
+| Connection                      | `agent-connection-tab`, `-runtime`, `-endpoint`, `-proxy`, `-proxy-link`, `-gateway`, `-gateway-link`, `-remote-surface` |
 
 ## Remote gateway Issuer DIDs
 

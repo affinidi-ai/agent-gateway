@@ -29,15 +29,16 @@ use crate::identity::display_name::managed_surfaces_by_did;
 use crate::identity::filesystem::AgentIdentityRecord;
 use crate::identity::state::IdentityApiState;
 use crate::identity::target_card_names::{CardLocation, TargetCardNameService, TargetCardSource};
-use crate::metrics::SurfaceStats;
+use crate::metrics::{InboundTraffic, SurfaceStats};
 use crate::observability::caller_names::{AGENT_CARD_FETCH_TIMEOUT, AGENT_CARD_MAX_BYTES};
 use crate::proxy::upstream_body::UpstreamBodyLimits;
 use crate::surfaces::AgentSurfaceStore;
-use crate::tenancy::{PatTenantContext, ResourceKind, can_access, scope_allows_resource};
+use crate::tenancy::{PatTenantContext, ResourceKind, can_access, can_mutate, scope_allows_resource};
 use crate::trust_registry_verification::recorder_status::{RecorderState, TrustRecorderStatusStore, global_store};
 
 const AGENT_CARD_CACHE_TTL: Duration = Duration::from_secs(300);
 const AGENT_CARD_FAILURE_CACHE_TTL: Duration = Duration::from_secs(30);
+const MAX_CONCURRENT_AGENT_CARD_FETCHES: usize = 4;
 
 fn tenant_context(context: &Option<Extension<PatTenantContext>>) -> Option<&PatTenantContext> {
     context
@@ -128,8 +129,8 @@ pub struct AgentRecord<S> {
     pub last_activity_at: Option<DateTime<Utc>>,
 }
 
-/// Request totals over the metrics retention window, summed across the
-/// agent's surfaces. `p95_latency_ms` is taken from the raw inbound latencies.
+/// Access Point (inbound) request totals and p95 latency over the metrics retention
+/// window, across the agent's surfaces. Transit Point (outbound) calls are not counted.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AgentTraffic {
     pub window_minutes: u64,
@@ -146,9 +147,11 @@ pub struct AgentDetails {
     pub traffic: AgentTraffic,
 }
 
+/// `window_minutes` is the metrics retention window `last_activity_at` is read from.
 #[derive(Debug, Serialize)]
 pub struct AgentListResponse {
     pub agents: Vec<AgentRecord<AgentSurfaceRef>>,
+    pub window_minutes: u64,
 }
 
 /// Why the agent's own Agent Card can't be fetched.
@@ -157,6 +160,8 @@ pub struct AgentListResponse {
 pub enum AgentCardUnavailable {
     NoAgentCard,
     UnsupportedRuntime,
+    /// A tenant token whose only card location is an appliance-wide surface's target.
+    OperatorOnly,
 }
 
 /// The card as published by the agent at its target endpoint. Not verified.
@@ -251,9 +256,15 @@ fn without_query(value: &str) -> &str {
         .unwrap_or(value.len())]
 }
 
-/// Lower-cases scheme and host and drops userinfo, query, fragment and trailing slashes, for
-/// every scheme alike. Userinfo is cut before the query, so a `?` or `#` in a password never
-/// leaves part of it behind.
+/// Stands in for the host of an endpoint whose userinfo can't be told apart, so no part of
+/// the raw value is returned.
+const UNPARSEABLE_ENDPOINT_HOST: &str = "redacted.invalid";
+
+/// Drops userinfo, query, fragment and trailing slashes and lower-cases the scheme. An
+/// `http`/`https` endpoint is parsed as a URL, which also lower-cases its host; the host of
+/// any other scheme keeps its case, since those ids are compared exactly. An `@` after the
+/// authority of another scheme may end a userinfo holding `/`, `?` or `#`, so such an
+/// endpoint is redacted whole.
 fn normalise_endpoint(raw: &str) -> String {
     let raw = raw.trim();
     let Some((scheme, rest)) = raw.split_once("://") else {
@@ -261,18 +272,42 @@ fn normalise_endpoint(raw: &str) -> String {
             .trim_end_matches('/')
             .to_string();
     };
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme == "http" || scheme == "https" {
+        return normalise_http_endpoint(raw, &scheme);
+    }
     let authority_end = rest
-        .find('/')
+        .find(['/', '?', '#'])
         .unwrap_or(rest.len());
+    if rest[authority_end..].contains('@') {
+        return format!("{scheme}://{UNPARSEABLE_ENDPOINT_HOST}");
+    }
     let host_start = rest[..authority_end]
         .rfind('@')
         .map_or(0, |at| at + 1);
-    let rest = without_query(&rest[host_start..]);
-    let (host, path) = rest.split_at(
-        rest.find('/')
-            .unwrap_or(rest.len()),
-    );
-    format!("{}://{}{}", scheme.to_ascii_lowercase(), host.to_ascii_lowercase(), path)
+    let host = &rest[host_start..authority_end];
+    let path = without_query(&rest[authority_end..]);
+    format!("{scheme}://{host}{path}")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn normalise_http_endpoint(
+    raw: &str,
+    scheme: &str,
+) -> String {
+    let unparseable = || format!("{scheme}://{UNPARSEABLE_ENDPOINT_HOST}");
+    let Ok(url) = url::Url::parse(raw) else {
+        return unparseable();
+    };
+    let Some(host) = url.host_str() else {
+        return unparseable();
+    };
+    let port = url
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    format!("{}://{host}{port}{}", url.scheme(), url.path())
         .trim_end_matches('/')
         .to_string()
 }
@@ -294,6 +329,26 @@ fn agent_id(
     format!("{digest:x}")
 }
 
+fn is_redacted_endpoint(endpoint: &str) -> bool {
+    endpoint
+        .split_once("://")
+        .is_some_and(|(_, host)| host == UNPARSEABLE_ENDPOINT_HOST)
+}
+
+/// A redacted endpoint can't tell its targets apart, so its surface is an agent of its own,
+/// with an id hashed from the surface id rather than the raw endpoint, which may hold
+/// credentials.
+fn surface_agent_id(
+    surface: &AgentSurface,
+    endpoint: &str,
+) -> String {
+    if is_redacted_endpoint(endpoint) {
+        let digest = Sha256::digest(format!("unparseable\n{}\n{}", surface.surface_id, card_path(surface)).as_bytes());
+        return format!("{digest:x}");
+    }
+    agent_id(endpoint, card_path(surface))
+}
+
 /// The surfaces behind one managed agent, ordered by name then id.
 struct AgentGroup<'a> {
     id: String,
@@ -305,7 +360,7 @@ fn group_surfaces<'a>(surfaces: impl IntoIterator<Item = &'a AgentSurface>) -> V
     let mut groups: BTreeMap<String, AgentGroup<'a>> = BTreeMap::new();
     for surface in surfaces {
         let endpoint = normalise_endpoint(&surface.target.endpoint);
-        let id = agent_id(&endpoint, card_path(surface));
+        let id = surface_agent_id(surface, &endpoint);
         groups
             .entry(id.clone())
             .or_insert_with(|| AgentGroup {
@@ -580,25 +635,15 @@ fn sort_agents<S>(agents: &mut [AgentRecord<S>]) {
 }
 
 fn traffic(
-    stats: &[&SurfaceStats],
+    inbound: InboundTraffic,
     window_minutes: u64,
-    p95_latency_ms: Option<u64>,
 ) -> AgentTraffic {
     AgentTraffic {
         window_minutes,
-        total_requests: stats
-            .iter()
-            .map(|s| s.total_connections)
-            .sum(),
-        failed: stats
-            .iter()
-            .map(|s| s.failed)
-            .sum(),
-        gateway_faults: stats
-            .iter()
-            .map(|s| s.gateway_faults)
-            .sum(),
-        p95_latency_ms,
+        total_requests: inbound.total,
+        failed: inbound.failed,
+        gateway_faults: inbound.gateway_faults,
+        p95_latency_ms: inbound.p95_latency_ms,
     }
 }
 
@@ -657,7 +702,7 @@ async fn stats_by_surface(state: &IdentityApiState) -> HashMap<String, SurfaceSt
 fn recorder_store() -> Option<Arc<TrustRecorderStatusStore>> {
     let store = global_store();
     if store.is_none() {
-        warn!("Trust Recorder status store unavailable; Agent Registry shows every agent as not recorded");
+        warn!("Trust Recorder status store unavailable; the Agents API reports every agent as not recorded");
     }
     store
 }
@@ -676,8 +721,14 @@ pub async fn list_agents(
 ) -> Result<Json<AgentListResponse>, AgentApiError> {
     let live_surfaces = all_surfaces(&state).await?;
     let groups = listed_groups(&live_surfaces, tenant_context(&context), resource_scope(&scope));
+    let window_minutes = state
+        .metrics_store
+        .retention_minutes();
     if groups.is_empty() {
-        return Ok(Json(AgentListResponse { agents: Vec::new() }));
+        return Ok(Json(AgentListResponse {
+            agents: Vec::new(),
+            window_minutes,
+        }));
     }
 
     let records = identity_records(&state).await?;
@@ -697,10 +748,10 @@ pub async fn list_agents(
     sort_agents(&mut agents);
 
     debug!(count = agents.len(), "Listed agents");
-    Ok(Json(AgentListResponse { agents }))
+    Ok(Json(AgentListResponse { agents, window_minutes }))
 }
 
-/// One agent record with every surface and the traffic summed across them.
+/// One agent record with every surface and the Access Point traffic across them.
 pub async fn get_agent(
     Path(id): Path<String>,
     State(state): State<IdentityApiState>,
@@ -725,36 +776,42 @@ pub async fn get_agent(
         .iter()
         .map(|surface| surface.surface_id.as_str())
         .collect();
-    let group_stats: Vec<&SurfaceStats> = surface_ids
-        .iter()
-        .filter_map(|id| stats.get(*id))
-        .collect();
-    let p95_latency_ms = state
+    let inbound = state
         .metrics_store
-        .inbound_p95_latency_ms(&surface_ids)
+        .inbound_traffic(&surface_ids)
         .await;
 
     Ok(Json(AgentDetails {
         agent,
         traffic: traffic(
-            &group_stats,
+            inbound,
             state
                 .metrics_store
                 .retention_minutes(),
-            p95_latency_ms,
         ),
     }))
 }
 
 /// Where the agent publishes its own card, read through the first surface that can reach
-/// it. `no_agent_card` when no surface speaks A2A or AP2.
-fn agent_card_location(group: &AgentGroup<'_>) -> Result<CardLocation, AgentCardUnavailable> {
-    if let Some(location) = group
-        .surfaces
-        .iter()
-        .find_map(|surface| CardLocation::for_surface(surface))
-    {
-        return Ok(location);
+/// it. A tenant token reads it only through its own tenant's surfaces, and gets
+/// `operator_only` when only an appliance-wide surface could. `no_agent_card` when no
+/// surface speaks A2A or AP2.
+fn agent_card_location(
+    group: &AgentGroup<'_>,
+    context: Option<&PatTenantContext>,
+) -> Result<CardLocation, AgentCardUnavailable> {
+    let mut operator_only = false;
+    for surface in &group.surfaces {
+        let Some(location) = CardLocation::for_surface(surface) else {
+            continue;
+        };
+        if can_mutate(surface.tenant_id.as_deref(), context) {
+            return Ok(location);
+        }
+        operator_only = true;
+    }
+    if operator_only {
+        return Err(AgentCardUnavailable::OperatorOnly);
     }
     let has_card = group
         .surfaces
@@ -798,9 +855,12 @@ struct CachedCard {
 /// Fetch results per agent. A card is reused until `ttl` passes and a failure
 /// until `failure_ttl` passes, or until the agent's card location changes.
 /// Caching failures stops repeated views of an unreachable agent from each
-/// waiting for the fetch timeout.
+/// waiting for the fetch timeout. Concurrent misses for one agent share one fetch,
+/// and at most [`MAX_CONCURRENT_AGENT_CARD_FETCHES`] fetches run at once.
 pub struct AgentCardCache {
     entries: DashMap<String, CachedCard>,
+    fetching: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    permits: tokio::sync::Semaphore,
     source: Arc<dyn TargetCardSource>,
     ttl: Duration,
     failure_ttl: Duration,
@@ -821,33 +881,82 @@ impl AgentCardCache {
     ) -> Self {
         Self {
             entries: DashMap::new(),
+            fetching: DashMap::new(),
+            permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_AGENT_CARD_FETCHES),
             source,
             ttl,
             failure_ttl,
         }
     }
 
+    /// The cached result for `agent_id` if it is fresh and was fetched from `location`.
+    fn cached(
+        &self,
+        agent_id: &str,
+        location: &CardLocation,
+    ) -> Option<Option<Value>> {
+        self.entries
+            .get(agent_id)
+            .filter(|cached| cached.location == *location && self.is_fresh(cached))
+            .map(|cached| cached.card.clone())
+    }
+
+    fn is_fresh(
+        &self,
+        cached: &CachedCard,
+    ) -> bool {
+        let ttl = if cached.card.is_some() {
+            self.ttl
+        } else {
+            self.failure_ttl
+        };
+        cached.fetched_at.elapsed() < ttl
+    }
+
+    /// Expired entries are dropped on each store, so the cache holds no more than the agents
+    /// viewed within the TTL.
     pub async fn get(
         &self,
         agent_id: &str,
         location: &CardLocation,
     ) -> Option<Value> {
-        if let Some(cached) = self.entries.get(agent_id)
-            && cached.location == *location
-        {
-            let ttl = if cached.card.is_some() {
-                self.ttl
-            } else {
-                self.failure_ttl
-            };
-            if cached.fetched_at.elapsed() < ttl {
-                return cached.card.clone();
-            }
+        if let Some(card) = self.cached(agent_id, location) {
+            return card;
         }
+        let lock = self
+            .fetching
+            .entry(agent_id.to_string())
+            .or_default()
+            .clone();
+        let card = self
+            .fetch_once(agent_id, location, &lock)
+            .await;
+        drop(lock);
+        self.fetching
+            .remove_if(agent_id, |_, lock| Arc::strong_count(lock) == 1);
+        card
+    }
+
+    /// Fetches and stores the card unless a caller that held the lock first already did.
+    async fn fetch_once(
+        &self,
+        agent_id: &str,
+        location: &CardLocation,
+        lock: &tokio::sync::Mutex<()>,
+    ) -> Option<Value> {
+        let _fetching = lock.lock().await;
+        if let Some(card) = self.cached(agent_id, location) {
+            return card;
+        }
+        let Ok(_permit) = self.permits.acquire().await else {
+            return None;
+        };
         let card = self
             .source
             .fetch_agent_card(location)
             .await;
+        self.entries
+            .retain(|_, cached| self.is_fresh(cached));
         self.entries.insert(
             agent_id.to_string(),
             CachedCard {
@@ -862,9 +971,10 @@ impl AgentCardCache {
 
 async fn agent_card_response(
     group: &AgentGroup<'_>,
+    context: Option<&PatTenantContext>,
     cache: &AgentCardCache,
 ) -> Result<AgentCardResponse, AgentApiError> {
-    let location = match agent_card_location(group) {
+    let location = match agent_card_location(group, context) {
         Ok(location) => location,
         Err(reason) => return Ok(AgentCardResponse::unavailable(reason)),
     };
@@ -890,7 +1000,7 @@ pub async fn get_agent_card(
 ) -> Result<Json<AgentCardResponse>, AgentApiError> {
     let live_surfaces = all_surfaces(&state).await?;
     let group = listed_group(&live_surfaces, &id, tenant_context(&context), resource_scope(&scope))?;
-    agent_card_response(&group, AgentCardCache::global())
+    agent_card_response(&group, tenant_context(&context), AgentCardCache::global())
         .await
         .map(Json)
 }
@@ -1065,14 +1175,59 @@ mod tests {
             ("https://user:secret@Bravo.example/a2a/?k=1", "https://bravo.example/a2a"),
             ("https://bravo.example/a2a", "https://bravo.example/a2a"),
             ("HTTPS://BRAVO.example:8443/A2A#frag", "https://bravo.example:8443/A2A"),
-            ("https://u:p?ss#w@bravo.example/a2a", "https://bravo.example/a2a"),
             ("https://bravo.example/", "https://bravo.example"),
             ("  http://localhost:9002//  ", "http://localhost:9002"),
-            ("A2A-Proxy://Proxy-1/?x=1", "a2a-proxy://proxy-1"),
-            ("fabric://key@Gateway-1/channel-1/", "fabric://gateway-1/channel-1"),
+            ("A2A-Proxy://Proxy-1/?x=1", "a2a-proxy://Proxy-1"),
+            ("fabric://key@Gateway-1/channel-1/", "fabric://Gateway-1/channel-1"),
         ] {
             assert_eq!(normalise_endpoint(raw), expected, "{raw}");
         }
+    }
+
+    #[test]
+    fn test_normalise_endpoint_ends_the_authority_at_query_or_fragment() {
+        for (raw, expected) in [
+            ("https://evil.example?x=@good.example", "https://evil.example"),
+            ("https://evil.example#@good.example", "https://evil.example"),
+            ("https://evil.example\\@good.example/a2a", "https://evil.example/@good.example/a2a"),
+            ("a2a-proxy://evil?x=1", "a2a-proxy://evil"),
+            ("fabric://evil#frag", "fabric://evil"),
+        ] {
+            assert_eq!(normalise_endpoint(raw), expected, "{raw}");
+            assert_ne!(
+                agent_id(&normalise_endpoint(raw), ""),
+                agent_id(&normalise_endpoint(&raw.replace("evil", "good")), ""),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalise_endpoint_redacts_other_schemes_with_an_at_after_the_authority() {
+        for (raw, expected) in [
+            ("fabric://ab/cd@gw/ch", "fabric://redacted.invalid"),
+            ("a2a-proxy://evil?x=@good", "a2a-proxy://redacted.invalid"),
+            ("fabric://us?er#pw@gw/ch", "fabric://redacted.invalid"),
+            ("fabric://key@Gateway-1/channel-1", "fabric://Gateway-1/channel-1"),
+        ] {
+            let normalised = normalise_endpoint(raw);
+            assert_eq!(normalised, expected, "{raw}");
+            for forbidden in ["cd", "us", "pw", "key"] {
+                assert!(!normalised.contains(forbidden), "{raw} leaves {forbidden} in {normalised}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_normalise_endpoint_never_returns_credentials_of_an_unparseable_url() {
+        for raw in ["https://user:pa/ss@host/a2a", "https://u:p?ss#w@bravo.example/a2a", "http://user:secret@"] {
+            let normalised = normalise_endpoint(raw);
+            assert_eq!(normalised, format!("{}://redacted.invalid", &raw[..raw.find(':').expect("scheme")]), "{raw}");
+            for forbidden in ["user", "pa", "ss", "secret", "bravo", "host"] {
+                assert!(!normalised.contains(forbidden), "{raw} leaves {forbidden} in {normalised}");
+            }
+        }
+        assert_eq!(normalise_endpoint("https://user:secret@host/a2a"), "https://host/a2a");
     }
 
     #[test]
@@ -1130,6 +1285,46 @@ mod tests {
             .collect();
         grouped.sort();
         assert_eq!(grouped, vec![vec!["s-argon-name", "s-neon-name"], vec!["s-helium-name"], vec!["s-oxygen-name"]]);
+    }
+
+    #[tokio::test]
+    async fn test_each_surface_with_a_redacted_endpoint_is_an_agent_of_its_own() {
+        let agents = Fixture::new()
+            .agents(
+                &[
+                    targeting("s-oxygen", "fabric://ab/cd@gw/ch"),
+                    targeting("s-helium", "fabric://us?er#pw@gw/ch"),
+                    targeting("s-neon", "https://bravo.example/a2a"),
+                    targeting("s-argon", "https://user:secret@bravo.example/a2a"),
+                ],
+                None,
+                &no_card,
+            )
+            .await;
+        assert_eq!(agents.len(), 3);
+        let mut grouped: Vec<Vec<&str>> = agents
+            .iter()
+            .map(surface_names)
+            .collect();
+        grouped.sort();
+        assert_eq!(grouped, vec![vec!["s-argon-name", "s-neon-name"], vec!["s-helium-name"], vec!["s-oxygen-name"]]);
+        let redacted: Vec<_> = agents
+            .iter()
+            .filter(|agent| agent.endpoint == "fabric://redacted.invalid")
+            .collect();
+        assert_eq!(redacted.len(), 2);
+        assert_ne!(redacted[0].id, redacted[1].id);
+        for agent in redacted {
+            assert_ne!(agent.id, agent_id("fabric://redacted.invalid", ""));
+            assert_eq!(agent.id.len(), 64);
+            let surface_id = &agent.surfaces[0].surface_id;
+            let digest = Sha256::digest(format!("unparseable\n{surface_id}\n").as_bytes());
+            assert_eq!(agent.id, format!("{digest:x}"));
+        }
+        let text = serde_json::to_string(&agents).expect("serialize");
+        for forbidden in ["cd@", "us?er", "pw@", "secret"] {
+            assert!(!text.contains(forbidden), "response contains {forbidden}: {text}");
+        }
     }
 
     #[test]
@@ -1517,11 +1712,15 @@ mod tests {
     }
 
     #[test]
-    fn test_traffic_sums_counts_and_keeps_window() {
-        let a = stats("s1", 10, 2, 1, None);
-        let b = stats("s2", 5, 1, 0, None);
+    fn test_traffic_takes_inbound_counts_and_keeps_window() {
+        let inbound = InboundTraffic {
+            total: 15,
+            failed: 3,
+            gateway_faults: 1,
+            p95_latency_ms: Some(120),
+        };
         assert_eq!(
-            traffic(&[&a, &b], 360, Some(120)),
+            traffic(inbound, 360),
             AgentTraffic {
                 window_minutes: 360,
                 total_requests: 15,
@@ -1530,7 +1729,7 @@ mod tests {
                 p95_latency_ms: Some(120),
             }
         );
-        assert_eq!(traffic(&[], 360, None).total_requests, 0);
+        assert_eq!(traffic(InboundTraffic::default(), 360).total_requests, 0);
     }
 
     #[tokio::test]
@@ -1553,7 +1752,7 @@ mod tests {
         let group = &group_surfaces(&live)[0];
         let details = AgentDetails {
             agent: agent_record(group, &data, None, &no_card, surface_summary).await,
-            traffic: traffic(&[], 360, None),
+            traffic: traffic(InboundTraffic::default(), 360),
         };
 
         let json = serde_json::to_value(&details).expect("serialize");
@@ -1621,10 +1820,11 @@ mod tests {
         );
     }
 
-    /// Returns `card` (or nothing when `None`) and counts the fetches.
+    /// Returns `card` (or nothing when `None`), counts the fetches and keeps the last endpoint.
     struct CountingSource {
         card: std::sync::Mutex<Option<Value>>,
         fetches: std::sync::atomic::AtomicUsize,
+        last_endpoint: std::sync::Mutex<Option<String>>,
     }
 
     impl CountingSource {
@@ -1632,12 +1832,20 @@ mod tests {
             Arc::new(Self {
                 card: std::sync::Mutex::new(card),
                 fetches: std::sync::atomic::AtomicUsize::new(0),
+                last_endpoint: std::sync::Mutex::new(None),
             })
         }
 
         fn fetches(&self) -> usize {
             self.fetches
                 .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn last_endpoint(&self) -> Option<String> {
+            self.last_endpoint
+                .lock()
+                .expect("lock")
+                .clone()
         }
 
         fn set_card(
@@ -1655,10 +1863,14 @@ mod tests {
     impl TargetCardSource for CountingSource {
         async fn fetch_agent_card(
             &self,
-            _location: &CardLocation,
+            location: &CardLocation,
         ) -> Option<Value> {
             self.fetches
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self
+                .last_endpoint
+                .lock()
+                .expect("lock") = Some(location.endpoint.clone());
             self.card
                 .lock()
                 .expect("lock")
@@ -1667,7 +1879,15 @@ mod tests {
     }
 
     fn location_of(surfaces: &[AgentSurface]) -> Result<CardLocation, AgentCardUnavailable> {
-        agent_card_location(&group_surfaces(surfaces)[0])
+        agent_card_location(&group_surfaces(surfaces)[0], None)
+    }
+
+    fn in_tenant(
+        mut surface: AgentSurface,
+        tenant_id: &str,
+    ) -> AgentSurface {
+        surface.tenant_id = Some(tenant_id.to_string());
+        surface
     }
 
     #[test]
@@ -1706,8 +1926,49 @@ mod tests {
             .agent_card_path
             .clone();
         let location = location_of(&[didcomm, a2a]).expect("location");
-        assert_eq!(location.endpoint, "https://user:pw@agent.example/a2a", "fetched with the raw endpoint");
+        assert_eq!(location.endpoint, "https://agent.example/a2a", "fetched without userinfo");
         assert_eq!(location.card_path.as_deref(), Some("/cards/time.json"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_card_response_tenant_on_appliance_wide_surface_is_operator_only() {
+        let source = CountingSource::new(Some(serde_json::json!({ "name": "TimeAsker" })));
+        let cache = AgentCardCache::new(source.clone(), AGENT_CARD_CACHE_TTL, AGENT_CARD_FAILURE_CACHE_TTL);
+        let live = [targeting("s1", "https://user:pw@agent.example/a2a")];
+        let group = &group_surfaces(&live)[0];
+        let response = agent_card_response(group, Some(&tenant("t1")), &cache)
+            .await
+            .expect("response");
+        assert_eq!(
+            serde_json::to_value(&response).expect("serialize"),
+            serde_json::json!({ "available": false, "reason": "operator_only" })
+        );
+        assert_eq!(source.fetches(), 0, "nothing fetched for the tenant");
+
+        let response = agent_card_response(group, None, &cache)
+            .await
+            .expect("response");
+        assert!(response.available, "the operator still reads the card");
+        assert_eq!(source.fetches(), 1);
+        assert_eq!(source.last_endpoint().as_deref(), Some("https://agent.example/a2a"), "no userinfo is sent");
+    }
+
+    #[tokio::test]
+    async fn test_agent_card_response_tenant_reads_through_its_own_surface() {
+        let source = CountingSource::new(Some(serde_json::json!({ "name": "TimeAsker" })));
+        let cache = AgentCardCache::new(source.clone(), AGENT_CARD_CACHE_TTL, AGENT_CARD_FAILURE_CACHE_TTL);
+        let live = [
+            targeting("a-appliance", "https://root:secret@agent.example/a2a"),
+            in_tenant(targeting("b-other", "https://other@agent.example/a2a/"), "t2"),
+            in_tenant(targeting("c-own", "https://own@agent.example/a2a/"), "t1"),
+        ];
+        let groups = group_surfaces(&live);
+        assert_eq!(groups.len(), 1, "one managed agent");
+        let response = agent_card_response(&groups[0], Some(&tenant("t1")), &cache)
+            .await
+            .expect("response");
+        assert!(response.available);
+        assert_eq!(source.last_endpoint().as_deref(), Some("https://agent.example/a2a/"), "the own surface's location");
     }
 
     #[tokio::test]
@@ -1717,7 +1978,7 @@ mod tests {
         let mut didcomm = surface("s1");
         didcomm.access_point.protocol = SurfaceProtocol::DIDComm;
         let live = [didcomm];
-        let response = agent_card_response(&group_surfaces(&live)[0], &cache)
+        let response = agent_card_response(&group_surfaces(&live)[0], None, &cache)
             .await
             .expect("response");
         assert_eq!(
@@ -1725,7 +1986,7 @@ mod tests {
             serde_json::json!({ "available": false, "reason": "no_agent_card" })
         );
         let live = [targeting("s2", "a2a-proxy://proxy-1")];
-        let response = agent_card_response(&group_surfaces(&live)[0], &cache)
+        let response = agent_card_response(&group_surfaces(&live)[0], None, &cache)
             .await
             .expect("response");
         assert_eq!(
@@ -1744,7 +2005,7 @@ mod tests {
             AGENT_CARD_FAILURE_CACHE_TTL,
         );
         let live = [surface("s1")];
-        let response = agent_card_response(&group_surfaces(&live)[0], &cache)
+        let response = agent_card_response(&group_surfaces(&live)[0], None, &cache)
             .await
             .expect("response");
         assert_eq!(
@@ -1757,7 +2018,7 @@ mod tests {
     async fn test_agent_card_fetch_failure_is_generic_502() {
         let cache = AgentCardCache::new(CountingSource::new(None), AGENT_CARD_CACHE_TTL, AGENT_CARD_FAILURE_CACHE_TTL);
         let live = [surface("s1")];
-        let error = agent_card_response(&group_surfaces(&live)[0], &cache)
+        let error = agent_card_response(&group_surfaces(&live)[0], None, &cache)
             .await
             .expect_err("fetch fails");
         let response = error.into_response();
@@ -1838,6 +2099,79 @@ mod tests {
         );
     }
 
+    /// Fails every fetch, holding each one until the test releases it.
+    struct GatedSource {
+        fetches: std::sync::atomic::AtomicUsize,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait]
+    impl TargetCardSource for GatedSource {
+        async fn fetch_agent_card(
+            &self,
+            _location: &CardLocation,
+        ) -> Option<Value> {
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.release
+                .acquire()
+                .await
+                .expect("open")
+                .forget();
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn test_agent_card_cache_shares_concurrent_fetches_per_agent() {
+        let source = Arc::new(GatedSource {
+            fetches: std::sync::atomic::AtomicUsize::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let cache = Arc::new(AgentCardCache::new(source.clone(), AGENT_CARD_CACHE_TTL, AGENT_CARD_FAILURE_CACHE_TTL));
+        let location = location_of(&[surface("s1")]).expect("location");
+        let mut views = tokio::task::JoinSet::new();
+        for id in ["a1", "a1", "a1", "a1", "a1", "a2"] {
+            let (cache, location) = (cache.clone(), location.clone());
+            views.spawn(async move { cache.get(id, &location).await });
+        }
+        while source
+            .fetches
+            .load(std::sync::atomic::Ordering::SeqCst)
+            < 2
+        {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        source.release.add_permits(10);
+        while let Some(card) = views.join_next().await {
+            assert_eq!(card.expect("view"), None);
+        }
+        assert_eq!(
+            source
+                .fetches
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one fetch per agent"
+        );
+        assert_eq!(
+            cache
+                .get("a1", &location)
+                .await,
+            None,
+            "the failure is cached"
+        );
+        assert_eq!(
+            source
+                .fetches
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert!(cache.fetching.is_empty(), "no per-agent locks are left behind");
+    }
+
     #[tokio::test]
     async fn test_agent_card_cache_refetches_after_ttls() {
         let source = CountingSource::new(None);
@@ -1863,6 +2197,29 @@ mod tests {
             .await
             .expect("card");
         assert_eq!(source.fetches(), 3, "an expired card is fetched again");
+    }
+
+    #[tokio::test]
+    async fn test_agent_card_cache_drops_expired_entries_on_store() {
+        let source = CountingSource::new(Some(serde_json::json!({ "name": "TimeAsker" })));
+        let cache = AgentCardCache::new(source.clone(), std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let location = location_of(&[surface("s1")]).expect("location");
+        for id in ["a1", "a2", "a3"] {
+            cache
+                .get(id, &location)
+                .await
+                .expect("card");
+        }
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.entries.contains_key("a3"));
+
+        let kept = AgentCardCache::new(source, AGENT_CARD_CACHE_TTL, AGENT_CARD_FAILURE_CACHE_TTL);
+        for id in ["a1", "a2"] {
+            kept.get(id, &location)
+                .await
+                .expect("card");
+        }
+        assert_eq!(kept.entries.len(), 2, "unexpired entries are kept");
     }
 
     async fn spawn_card_server(router: axum::Router) -> String {

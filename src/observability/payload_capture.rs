@@ -15,7 +15,7 @@ pub async fn broadcast_payload_capture_async(
     response_payload: Option<serde_json::Value>,
     validation_status: &str,
     validation_error: Option<String>,
-    identity_hash: Option<String>,
+    _identity_hash: Option<String>,
 ) {
     broadcast_payload_capture_extended(
         ws_state,
@@ -28,7 +28,6 @@ pub async fn broadcast_payload_capture_async(
         response_payload,
         validation_status,
         validation_error,
-        identity_hash,
     )
     .await;
 }
@@ -47,7 +46,6 @@ pub async fn broadcast_payload_capture_extended(
     outbound_response: Option<serde_json::Value>,
     validation_status: &str,
     validation_error: Option<String>,
-    _identity_hash: Option<String>,
 ) {
     // Always store the latest payload for this channel (regardless of identity)
     if let Some(metrics) = metrics_store {

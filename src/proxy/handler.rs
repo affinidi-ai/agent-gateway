@@ -14180,7 +14180,6 @@ async fn handle_fabric_request_inner(
                         outbound_response,
                         validation_status,
                         None, // validation_error
-                        identity_hash.clone(),
                     )
                     .await;
 

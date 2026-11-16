@@ -6,7 +6,6 @@ import { Badge } from '../components/shared/Badge';
 import { EmptyState } from '../components/shared/EmptyState';
 import SearchInput from '../components/shared/SearchInput';
 import { DOCS_URL } from '../config/docs';
-import { useApp } from '../context/AppContext';
 import AgentsTable from './AgentsPage/AgentsTable';
 import { agentMatchesFilter } from './AgentsPage/agentLabels';
 import './AgentsPage/AgentRegistry.css';
@@ -17,10 +16,9 @@ import './AgentsPage/AgentRegistry.css';
  */
 const AgentsPage: React.FC = () => {
   const navigate = useNavigate();
-  const { state } = useApp();
-  const retentionMinutes = state.settings?.metrics_retention;
 
   const [agents, setAgents] = useState<AgentRecord[]>([]);
+  const [retentionMinutes, setRetentionMinutes] = useState<number | undefined>(undefined);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
@@ -29,7 +27,9 @@ const AgentsPage: React.FC = () => {
     try {
       setLoading(true);
       setError(null);
-      setAgents(await apiClient.listAgents());
+      const response = await apiClient.listAgents();
+      setAgents(response.agents);
+      setRetentionMinutes(response.window_minutes);
     } catch (err) {
       setError(err instanceof Error && err.message ? err.message : 'Failed to load agents');
     } finally {

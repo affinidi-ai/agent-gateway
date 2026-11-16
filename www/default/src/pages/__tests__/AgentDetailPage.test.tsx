@@ -109,8 +109,19 @@ describe('AgentDetailPage', () => {
     expect(screen.getByTestId('agent-connection-endpoint')).toHaveTextContent(
       'https://agent.example.com/a2a'
     );
-    expect(screen.getByTestId('agent-connection-redacted')).toBeInTheDocument();
     expect(screen.queryByText(/s3cret|pw@/)).not.toBeInTheDocument();
+  });
+
+  it("shows Can't be shown for a redacted endpoint", async () => {
+    mockedGetAgent.mockResolvedValue(
+      details({ runtime: 'gateway', endpoint: 'fabric://redacted.invalid' })
+    );
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Connection/);
+
+    expect(screen.getByTestId('agent-connection-endpoint')).toHaveTextContent("Can't be shown");
+    expect(screen.queryByText(/redacted\.invalid/)).not.toBeInTheDocument();
   });
 
   it('shows the header and Overview values from the agent record', async () => {
@@ -195,7 +206,7 @@ describe('AgentDetailPage', () => {
     expect(screen.getByTestId('list-route')).toBeInTheDocument();
   });
 
-  it('previews the card as plain text, labelled not verified', async () => {
+  it('previews the card as plain text', async () => {
     mockedGetAgent.mockResolvedValue(details());
     mockedGetAgentCard.mockResolvedValue({
       available: true,
@@ -231,7 +242,6 @@ describe('AgentDetailPage', () => {
     expect(within(preview).getByTestId('agent-card-preview-skills')).toHaveTextContent(
       'Skills (1)Get timeCurrent time'
     );
-    expect(screen.getByTestId('agent-card-unverified')).toBeInTheDocument();
   });
 
   it('previews a sparse card with fallbacks', async () => {
@@ -261,7 +271,7 @@ describe('AgentDetailPage', () => {
     expect(screen.getByTestId('agent-card-json')).toHaveTextContent('"card"');
   });
 
-  it('shows the card JSON as plain text, labelled not verified', async () => {
+  it('shows the card JSON as plain text', async () => {
     mockedGetAgent.mockResolvedValue(details());
     mockedGetAgentCard.mockResolvedValue({
       available: true,
@@ -278,22 +288,23 @@ describe('AgentDetailPage', () => {
     expect(json).toHaveTextContent('<img src=x onerror=alert(1)>');
     expect(within(json).queryByRole('img')).not.toBeInTheDocument();
     expect(within(json).queryByRole('link')).not.toBeInTheDocument();
-    // expect(screen.getByTestId('agent-card-unverified')).toHaveTextContent(
-    //   'Published by the agent, not verified'
-    // );
     expect(screen.getByTestId('agent-card-copy-button')).toHaveTextContent('Copy JSON');
   });
 
   it.each([
     ['unsupported_runtime', "Agent Card isn't available for this runtime"],
     ['no_agent_card', "This agent doesn't publish an Agent Card"],
+    [
+      'operator_only',
+      'Only an appliance operator can read the Agent Card of an agent behind appliance-wide surfaces',
+    ],
   ])('shows the %s state', async (reason, text) => {
     mockedGetAgent.mockResolvedValue(details());
     mockedGetAgentCard.mockResolvedValue({ available: false, reason });
     renderPage();
     await screen.findByTestId('agent-details-name');
     openTab(/Agent Card/);
-    expect(await screen.findByText(text)).toBeInTheDocument();
+    expect(await screen.findByTestId(`agent-card-${reason}`)).toHaveTextContent(text);
   });
 
   it('retries a failed card load', async () => {
@@ -350,5 +361,26 @@ describe('AgentDetailPage', () => {
     expect(screen.getByTestId('agent-traffic-failed')).toHaveTextContent('3');
     expect(screen.getByTestId('agent-traffic-p95')).toHaveTextContent('140 ms');
     expect(screen.getByTestId('agent-traffic-by-surface')).toHaveTextContent('RICK');
+    expect(screen.getByTestId('agent-traffic-surface-link')).toHaveAttribute(
+      'href',
+      '/surfaces/s1'
+    );
+  });
+
+  it('shows no per-surface breakdown for an agent with several surfaces', async () => {
+    mockedGetAgent.mockResolvedValue(
+      details({
+        surfaces: [
+          { surface_id: 's1', name: 'helium', protocol: 'ap2', route: '/helium' },
+          { surface_id: 's2', name: 'oxygen', protocol: 'a2a', route: '/oxygen' },
+        ],
+      })
+    );
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    fireEvent.click(screen.getByTestId('agent-tab-traffic'));
+
+    expect(screen.getByTestId('agent-traffic-requests')).toHaveTextContent('12');
+    expect(screen.queryByTestId('agent-traffic-by-surface')).not.toBeInTheDocument();
   });
 });

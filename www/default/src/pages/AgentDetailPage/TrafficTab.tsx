@@ -11,13 +11,12 @@ interface TrafficTabProps {
 
 /**
  * Totals cover only the metrics retention window, so every card names that
- * window. The gateway keeps no 7-day history.
+ * window. The gateway keeps no 7-day history. The API returns agent totals
+ * only, so the per-surface breakdown shows only for a single-surface agent.
  */
 const TrafficTab: React.FC<TrafficTabProps> = ({ traffic, surfaces }) => {
   const windowLabel = formatWindow(traffic.window_minutes);
   const failed = traffic.failed + traffic.gateway_faults;
-  // The contract carries agent totals only; with one surface per agent in
-  // iteration 1, that surface has all of them.
   const perSurface =
     surfaces.length === 1 ? [{ ...surfaces[0], count: traffic.total_requests }] : [];
 
@@ -63,7 +62,10 @@ const TrafficTab: React.FC<TrafficTabProps> = ({ traffic, surfaces }) => {
             return (
               <div key={surface.surface_id} className="mb-2">
                 <div className="d-flex justify-content-between small">
-                  <Link to={`/surfaces/${encodeURIComponent(surface.surface_id)}`}>
+                  <Link
+                    to={`/surfaces/${encodeURIComponent(surface.surface_id)}`}
+                    data-testid="agent-traffic-surface-link"
+                  >
                     {surface.name}
                   </Link>
                   <span>{surface.count}</span>

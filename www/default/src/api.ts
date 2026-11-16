@@ -124,6 +124,12 @@ export interface AgentRecord {
   last_activity_at: string | null;
 }
 
+/** GET /v1/agents. `window_minutes` is the metrics retention window of `last_activity_at`. */
+export interface AgentListResponse {
+  agents: AgentRecord[];
+  window_minutes: number;
+}
+
 export interface AgentSurfaceSummary extends AgentSurfaceRef {
   protocol: SurfaceProtocol;
   route: string;
@@ -146,7 +152,7 @@ export interface AgentDetails extends AgentRecord {
 /** The agent's own card, as published by the agent. Untrusted and not verified. */
 export type AgentCardResponse =
   | { available: true; card: unknown }
-  | { available: false; reason: 'no_agent_card' | 'unsupported_runtime' };
+  | { available: false; reason: 'no_agent_card' | 'unsupported_runtime' | 'operator_only' };
 
 class SessionManager {
   private static readonly YES_VALUE = '1';
@@ -619,9 +625,8 @@ class APIClient {
   }
 
   // Agents (read-only)
-  async listAgents(): Promise<AgentRecord[]> {
-    const { agents } = await this.request<{ agents: AgentRecord[] }>('/agents');
-    return agents;
+  async listAgents(): Promise<AgentListResponse> {
+    return this.request<AgentListResponse>('/agents');
   }
 
   async getAgent(id: string): Promise<AgentDetails> {

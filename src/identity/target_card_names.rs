@@ -28,18 +28,33 @@ pub struct CardLocation {
 }
 
 impl CardLocation {
+    /// The endpoint never carries userinfo, so a card fetch sends no credential.
     pub fn for_surface(surface: &AgentSurface) -> Option<Self> {
         let has_card = matches!(surface.access_point.protocol, SurfaceProtocol::A2a | SurfaceProtocol::Ap2);
         let endpoint = surface.target.endpoint.trim();
         let is_http = endpoint.starts_with("http://") || endpoint.starts_with("https://");
-        (has_card && is_http).then(|| Self {
-            endpoint: endpoint.to_string(),
+        if !(has_card && is_http) {
+            return None;
+        }
+        Some(Self {
+            endpoint: without_userinfo(endpoint)?,
             card_path: surface
                 .access_point
                 .agent_card_path
                 .clone(),
         })
     }
+}
+
+/// `None` when the endpoint doesn't parse, since its userinfo can't then be told apart.
+fn without_userinfo(endpoint: &str) -> Option<String> {
+    let mut url = url::Url::parse(endpoint).ok()?;
+    if url.username().is_empty() && url.password().is_none() {
+        return Some(endpoint.to_string());
+    }
+    url.set_username("").ok()?;
+    url.set_password(None).ok()?;
+    Some(url.to_string())
 }
 
 #[async_trait]
@@ -317,6 +332,20 @@ mod tests {
         s.access_point.agent_card_path = Some("/card.json".into());
         let loc = CardLocation::for_surface(&s).unwrap();
         assert_eq!(loc.card_path.as_deref(), Some("/card.json"));
+    }
+
+    #[test]
+    fn test_location_drops_userinfo() {
+        for (raw, expected) in [
+            ("https://user:pw@agent.example/a2a", Some("https://agent.example/a2a")),
+            ("https://user@agent.example:8443/a2a?x=1", Some("https://agent.example:8443/a2a?x=1")),
+            ("https://:pw@agent.example", Some("https://agent.example/")),
+            ("http://localhost:9000", Some("http://localhost:9000")),
+            ("http://user:pw@", None),
+        ] {
+            let loc = CardLocation::for_surface(&surface(SurfaceProtocol::A2a, raw));
+            assert_eq!(loc.map(|loc| loc.endpoint).as_deref(), expected, "{raw}");
+        }
     }
 
     #[tokio::test]

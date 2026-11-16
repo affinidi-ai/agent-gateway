@@ -89,6 +89,20 @@ Authentication, so a `surfaces.view` holder can cause a credentialed fetch; each
 gets `operator_only` instead of a fetch on an appliance-wide surface. See
 [`PROTOCOLS.md`](PROTOCOLS.md#agent-card-preview).
 
+## Agents API
+
+`GET /v1/agents`, `GET /v1/agents/{id}` and `GET /v1/agents/{id}/agent-card` are read-only and
+need `surfaces.view`. They group only the surfaces in the caller's tenant and PAT resource scope,
+return `404` for an agent id outside it, and are not served when no auth backend is configured.
+`GET /v1/agents/{id}/agent-card` makes the gateway fetch the agent's own card from its target
+endpoint on request, without the surface's Target Authentication and without any userinfo the
+endpoint holds. Unlike the agent card preview, that fetch is not audited and not rate limited: a
+card is cached per agent for 5 minutes and a failed fetch for 30 seconds. A tenant's token sees the
+agents of appliance-wide surfaces, but the card is fetched only through a surface of its own
+tenant: when only an appliance-wide surface could reach it, the answer is `available: false` with
+`operator_only` and nothing is fetched, as in the preview. See [`POLICY.md`](POLICY.md) for the
+egress rules it follows.
+
 ## Payments admin API
 
 The x402 (`/api/admin/x402/...`) and MPP (`/api/admin/mpp/...`) admin routers require

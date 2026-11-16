@@ -3,12 +3,7 @@ import { fireEvent, render, screen, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import AgentsPage from '../AgentsPage';
-import { useApp } from '../../context/AppContext';
-import { AgentRecord, apiClient } from '../../api';
-
-jest.mock('../../context/AppContext', () => ({
-  useApp: jest.fn(),
-}));
+import { AgentListResponse, AgentRecord, apiClient } from '../../api';
 
 jest.mock('../../api', () => ({
   apiClient: {
@@ -16,7 +11,6 @@ jest.mock('../../api', () => ({
   },
 }));
 
-const mockedUseApp = useApp as jest.Mock;
 const mockedListAgents = apiClient.listAgents as jest.Mock;
 
 const LONG_DID = 'did:webvh:QmYAuadF1234567890:agent-gateway1.example.com:surface:abcdef12';
@@ -36,6 +30,8 @@ const agent = (overrides: Partial<AgentRecord> = {}): AgentRecord => ({
   ...overrides,
 });
 
+const list = (...agents: AgentRecord[]): AgentListResponse => ({ agents, window_minutes: 360 });
+
 const renderPage = () =>
   render(
     <MemoryRouter initialEntries={['/agent-registry']}>
@@ -50,21 +46,22 @@ const renderPage = () =>
 describe('AgentsPage', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockedUseApp.mockReturnValue({ state: { settings: { metrics_retention: 360 } } });
   });
 
   it('lists rows with a count badge and display labels', async () => {
-    mockedListAgents.mockResolvedValue([
-      agent(),
-      agent({
-        id: 'a2',
-        name: null,
-        surfaces: [{ surface_id: 's2', name: 'Frank 003' }],
-        runtime: 'a2a-proxy',
-        identities: [],
-        trust_registry: { recorded: false },
-      }),
-    ]);
+    mockedListAgents.mockResolvedValue(
+      list(
+        agent(),
+        agent({
+          id: 'a2',
+          name: null,
+          surfaces: [{ surface_id: 's2', name: 'Frank 003' }],
+          runtime: 'a2a-proxy',
+          identities: [],
+          trust_registry: { recorded: false },
+        })
+      )
+    );
     renderPage();
 
     const first = await screen.findByTestId('agents-row-a1');
@@ -96,8 +93,17 @@ describe('AgentsPage', () => {
     expect(screen.queryByText('a2a-proxy')).not.toBeInTheDocument();
   });
 
+  it('labels last activity with the window the API returns', async () => {
+    mockedListAgents.mockResolvedValue({ agents: [agent()], window_minutes: 90 });
+    renderPage();
+    const row = await screen.findByTestId('agents-row-a1');
+
+    expect(within(row).getByTestId('agents-last-activity')).toHaveTextContent('None in last 90m');
+    expect(within(row).queryByText('None in last 6h')).not.toBeInTheDocument();
+  });
+
   it('shows no status column, status filter or dimmed rows', async () => {
-    mockedListAgents.mockResolvedValue([agent()]);
+    mockedListAgents.mockResolvedValue(list(agent()));
     renderPage();
     const row = await screen.findByTestId('agents-row-a1');
 
@@ -111,14 +117,16 @@ describe('AgentsPage', () => {
   });
 
   it('lists every identity of the agent', async () => {
-    mockedListAgents.mockResolvedValue([
-      agent({
-        identities: [
-          { did: 'did:web:a.example', created_at: null, source: 'surface' },
-          { did: 'did:web:b.example', created_at: '2026-10-22T11:24:02Z', source: 'managed' },
-        ],
-      }),
-    ]);
+    mockedListAgents.mockResolvedValue(
+      list(
+        agent({
+          identities: [
+            { did: 'did:web:a.example', created_at: null, source: 'surface' },
+            { did: 'did:web:b.example', created_at: '2026-10-22T11:24:02Z', source: 'managed' },
+          ],
+        })
+      )
+    );
     renderPage();
     const row = await screen.findByTestId('agents-row-a1');
 
@@ -131,14 +139,16 @@ describe('AgentsPage', () => {
   });
 
   it('links every surface that uses the agent', async () => {
-    mockedListAgents.mockResolvedValue([
-      agent({
-        surfaces: [
-          { surface_id: 's1', name: 'helium' },
-          { surface_id: 's 2', name: 'oxygen' },
-        ],
-      }),
-    ]);
+    mockedListAgents.mockResolvedValue(
+      list(
+        agent({
+          surfaces: [
+            { surface_id: 's1', name: 'helium' },
+            { surface_id: 's 2', name: 'oxygen' },
+          ],
+        })
+      )
+    );
     renderPage();
     const row = await screen.findByTestId('agents-row-a1');
 
@@ -149,10 +159,12 @@ describe('AgentsPage', () => {
   });
 
   it('filters by name client-side', async () => {
-    mockedListAgents.mockResolvedValue([
-      agent(),
-      agent({ id: 'a2', name: 'Treasury', surfaces: [{ surface_id: 's2', name: 'Ops' }] }),
-    ]);
+    mockedListAgents.mockResolvedValue(
+      list(
+        agent(),
+        agent({ id: 'a2', name: 'Treasury', surfaces: [{ surface_id: 's2', name: 'Ops' }] })
+      )
+    );
     renderPage();
     await screen.findByTestId('agents-row-a1');
 
@@ -166,15 +178,17 @@ describe('AgentsPage', () => {
   });
 
   it('filters by any surface name and by Unnamed agent', async () => {
-    mockedListAgents.mockResolvedValue([
-      agent({
-        surfaces: [
-          { surface_id: 's1', name: 'helium' },
-          { surface_id: 's2', name: 'oxygen' },
-        ],
-      }),
-      agent({ id: 'a2', name: null, surfaces: [{ surface_id: 's3', name: 'Ops' }] }),
-    ]);
+    mockedListAgents.mockResolvedValue(
+      list(
+        agent({
+          surfaces: [
+            { surface_id: 's1', name: 'helium' },
+            { surface_id: 's2', name: 'oxygen' },
+          ],
+        }),
+        agent({ id: 'a2', name: null, surfaces: [{ surface_id: 's3', name: 'Ops' }] })
+      )
+    );
     renderPage();
     await screen.findByTestId('agents-row-a1');
     const input = screen.getByTestId('agents-filter-input');
@@ -189,15 +203,17 @@ describe('AgentsPage', () => {
   });
 
   it('filters by runtime label', async () => {
-    mockedListAgents.mockResolvedValue([
-      agent(),
-      agent({
-        id: 'a2',
-        name: 'Treasury',
-        surfaces: [{ surface_id: 's2', name: 'Ops' }],
-        runtime: 'gateway',
-      }),
-    ]);
+    mockedListAgents.mockResolvedValue(
+      list(
+        agent(),
+        agent({
+          id: 'a2',
+          name: 'Treasury',
+          surfaces: [{ surface_id: 's2', name: 'Ops' }],
+          runtime: 'gateway',
+        })
+      )
+    );
     renderPage();
     await screen.findByTestId('agents-row-a1');
 
@@ -207,14 +223,14 @@ describe('AgentsPage', () => {
   });
 
   it('shows the empty state', async () => {
-    mockedListAgents.mockResolvedValue([]);
+    mockedListAgents.mockResolvedValue(list());
     renderPage();
     expect(await screen.findByText('No agents yet')).toBeInTheDocument();
   });
 
   it('shows the error state and retries', async () => {
     mockedListAgents.mockRejectedValueOnce(new Error('Internal Server Error'));
-    mockedListAgents.mockResolvedValueOnce([agent()]);
+    mockedListAgents.mockResolvedValueOnce(list(agent()));
     renderPage();
 
     expect(await screen.findByTestId('agents-load-error')).toBeInTheDocument();
@@ -224,14 +240,14 @@ describe('AgentsPage', () => {
   });
 
   it('opens the details on row click', async () => {
-    mockedListAgents.mockResolvedValue([agent()]);
+    mockedListAgents.mockResolvedValue(list(agent()));
     renderPage();
     fireEvent.click(await screen.findByTestId('agents-row-a1'));
     expect(screen.getByTestId('details-route')).toBeInTheDocument();
   });
 
   it('links Used by surfaces to the surface without opening the details', async () => {
-    mockedListAgents.mockResolvedValue([agent()]);
+    mockedListAgents.mockResolvedValue(list(agent()));
     renderPage();
     const link = await screen.findByTestId('agents-surface-link');
     expect(link).toHaveTextContent('RICK');

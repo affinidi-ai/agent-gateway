@@ -4,7 +4,8 @@ Feature: Management route permissions
   Both permissions belong to administrators by default. A personal access token with feature
   scopes also needs the permission among its scopes. Downloading the server logs needs
   audit.view, and since the logs hold every tenant's request and delegation detail, a tenant's
-  access token or one scoped by required headers alone cannot download them.
+  access token or one scoped by required headers alone cannot download them. Listing and reading
+  agents needs surfaces.view, and a tenant's token sees only the agents of its own surfaces.
 
   Scenario: An administrator downloads the server logs
     Given a log file "agent-gateway.log"
@@ -126,6 +127,47 @@ Feature: Management route permissions
     When operator "ada" sends a welcome notification titled "Welcome aboard" to operator "uma"
     Then the admin API response status is 204
     And operator "uma" has a notification titled "Welcome aboard"
+
+  Scenario: A personal access token without surfaces.view cannot list the agents
+    Given operator "ada" has the "administrator" role
+    And operator "ada" holds a personal access token with scopes "settings.edit"
+    When the personal access token lists the agents
+    Then the admin API response status is 403
+
+  Scenario: A personal access token with surfaces.view lists the agents
+    Given an A2A surface targeting managed agent "bravo"
+    And operator "ada" has the "administrator" role
+    And operator "ada" holds a personal access token with scopes "surfaces.view"
+    When the personal access token lists the agents
+    Then the admin API response status is 200
+    And the agents list names the surface
+
+  Scenario: A token of the surface's tenant lists its agent
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface belongs to tenant "tenant-a"
+    When a token of tenant "tenant-a" lists the agents
+    Then the admin API response status is 200
+    And the agents list names the surface
+
+  Scenario: A token of the surface's tenant reads its agent
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface belongs to tenant "tenant-a"
+    When a token of tenant "tenant-a" reads the agent of the surface
+    Then the admin API response status is 200
+    And the agent answer names the surface
+
+  Scenario: A token of another tenant does not list the surface's agent
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface belongs to tenant "tenant-a"
+    When a token of tenant "tenant-b" lists the agents
+    Then the admin API response status is 200
+    And the agents list is empty
+
+  Scenario: A token of another tenant cannot read the surface's agent
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface belongs to tenant "tenant-a"
+    When a token of tenant "tenant-b" reads the agent of the surface
+    Then the admin API response status is 404
 
   Scenario: A base user cannot validate a credential provider
     Given operator "uma" has the "user" role

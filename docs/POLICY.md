@@ -855,7 +855,30 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   policy: loopback and private targets are allowed, cloud metadata is blocked,
   and redirects are not followed. The fetch has a 5-second timeout and a 64 KiB
   limit and always runs in the background for the dashboard, never on the
-  request path. See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#agent-card-names).
+  request path. `GET /v1/agents` starts it on a cache miss for every agent it
+  lists, so a tenant's list can start it for an appliance-wide surface's agent
+  and see that card's `name`, though the tenant's own card read answers
+  `operator_only`. See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#agent-card-names).
+- The **Agents API Agent Card fetch** (`GET /v1/agents/{id}/agent-card`,
+  `src/identity/handlers/agents.rs`) reads the managed agent's own card on
+  request, through the same `outbound_handler.rs::fetch_agent_card` with the
+  purpose `agent-registry-card`, so it shares the forward step's policy:
+  loopback and private targets are allowed, cloud metadata is blocked, and
+  redirects are not followed. It reads the operator-configured HTTP(S) target
+  of the agent's first A2A or AP2 surface without the surface's Target
+  Authentication, never through the surface's public card route. A tenant's
+  token reads it only through a surface of its own tenant, and gets
+  `available: false` with `operator_only` and no fetch when only an
+  appliance-wide surface could reach the card, as the surface's card preview
+  does. Userinfo in the endpoint (`https://user:pass@host`) is dropped before
+  this fetch and the target card name fetch, so neither sends it; an endpoint
+  that does not parse as a URL is not fetched. The fetch has
+  a 5-second timeout and a 64 KiB limit; a card is cached per agent for 5
+  minutes and a failed fetch for 30 seconds, and a failure returns a generic
+  `502`. Concurrent views of one agent share one fetch, and at most 4 fetches
+  run at once. Unlike the surface's [Agent card preview](RBAC.md#agent-card-preview),
+  it is not audited and not rate limited; the failure cache bounds how often one
+  agent's target is read. See [`RBAC.md`](RBAC.md#agents-api).
 - The dashboard's **caller Agent Card fetch**
   (`src/observability/caller_names.rs`) reads a URL taken from the caller's own
   DID document, so the caller chooses it. It goes through

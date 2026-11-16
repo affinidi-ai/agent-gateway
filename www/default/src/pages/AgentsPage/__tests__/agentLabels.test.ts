@@ -84,12 +84,10 @@ describe('agentLabels', () => {
     expect(connectionTarget('http://localhost:9002')).toEqual({
       kind: 'url',
       display: 'http://localhost:9002',
-      redacted: false,
     });
     expect(connectionTarget('https://user:pw@agent.example.com/a2a?api_key=s3cret#x')).toEqual({
       kind: 'url',
       display: 'https://agent.example.com/a2a',
-      redacted: true,
     });
     expect(connectionTarget('a2a-proxy://proxy-1')).toEqual({
       kind: 'a2a-proxy',
@@ -108,6 +106,14 @@ describe('agentLabels', () => {
     expect(connectionTarget('a2a-proxy://')).toEqual({ kind: 'unknown' });
     expect(connectionTarget('ftp://files.example.com/agent')).toEqual({ kind: 'unknown' });
     expect(connectionTarget('not a url')).toEqual({ kind: 'unknown' });
+  });
+
+  it.each([
+    'https://redacted.invalid',
+    'fabric://redacted.invalid',
+    'a2a-proxy://redacted.invalid',
+  ])('treats the redacted endpoint %s as unknown', endpoint => {
+    expect(connectionTarget(endpoint)).toEqual({ kind: 'unknown' });
   });
 
   it('filters on the display name, every surface name and the runtime label', () => {

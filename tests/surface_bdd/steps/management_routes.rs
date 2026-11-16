@@ -6,11 +6,14 @@ use reqwest::{Method, header};
 use serde_json::{Value, json};
 
 use crate::bdd_support::admin_client::{AdminApiClient, RecordedResponse, recorded_response};
-use crate::steps::when::{ensure_gateway_running, gateway_is_running};
+use crate::steps::when::{ensure_admin_session, ensure_gateway_running, gateway_is_running};
 use crate::world::SurfaceWorld;
 
 const WELCOME_TEMPLATE_PATH: &str = "/v1/notifications/user-welcome-template";
 const PROBE_TOKEN_ENDPOINT: &str = "https://192.0.2.1/token";
+const AGENTS_PATH: &str = "/v1/agents";
+const SURFACE_ID: &str = "bdd-surface";
+const TENANT_HEADER: &str = "x-external-account";
 
 /// Who calls a management route in a scenario.
 enum Caller<'a> {
@@ -182,6 +185,78 @@ async fn send_welcome_notification(
     record(world, caller, Method::POST, "/v1/notifications/send-welcome", Some(&request)).await;
 }
 
+/// Sends `GET path` with a personal access token of `tenant`, limited to that tenant's
+/// surfaces, and records the answer.
+async fn get_as_tenant(
+    world: &mut SurfaceWorld,
+    tenant: &str,
+    path: &str,
+) {
+    ensure_admin_session(world).await;
+    let request = json!({
+        "name": "agents token",
+        "scopes": [],
+        "resource_pattern": "TENANT:${x-external-account}:surfaces:.*",
+        "required_headers": [{"name": TENANT_HEADER, "pattern": tenant}],
+    });
+    let mut headers = header::HeaderMap::new();
+    headers.insert(TENANT_HEADER, header::HeaderValue::from_str(tenant).expect("a tenant header"));
+    let client = world
+        .admin_client
+        .as_ref()
+        .expect("the operator session must exist")
+        .personal_access_token_client(&request, headers)
+        .await;
+    let port = world
+        .infra
+        .as_ref()
+        .expect("the gateway must be running")
+        .gateway_port;
+    let response = client
+        .get(format!("http://127.0.0.1:{port}/api{path}"))
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("{path} with a token of tenant {tenant}: {error}"));
+    world.admin_response = Some(
+        recorded_response(response)
+            .await
+            .unwrap_or_else(|error| panic!("reading the {path} response: {error}")),
+    );
+}
+
+/// The id of the agent in an agents list that the surface under test uses.
+fn agent_of_surface(body: &Value) -> Option<&str> {
+    body["agents"]
+        .as_array()?
+        .iter()
+        .find(|agent| {
+            agent["surfaces"]
+                .as_array()
+                .is_some_and(|surfaces| {
+                    surfaces
+                        .iter()
+                        .any(|surface| surface["surface_id"] == SURFACE_ID)
+                })
+        })?["id"]
+        .as_str()
+}
+
+/// The id of the surface's agent, as the operator lists it.
+async fn agent_id_of_surface(world: &mut SurfaceWorld) -> String {
+    ensure_admin_session(world).await;
+    let listed = world
+        .admin_client
+        .as_ref()
+        .expect("the operator session must exist")
+        .send_recorded_json::<Value>(Method::GET, AGENTS_PATH, None)
+        .await
+        .expect("listing the agents as the operator");
+    assert_eq!(listed.status, 200, "listing the agents as the operator: {}", listed.body);
+    agent_of_surface(&listed.body)
+        .unwrap_or_else(|| panic!("the operator's agents list has no agent of {SURFACE_ID}: {}", listed.body))
+        .to_string()
+}
+
 #[given(expr = "a log file {string}")]
 async fn log_file(
     world: &mut SurfaceWorld,
@@ -324,6 +399,53 @@ async fn operator_validates_credential_provider(
     });
     record(world, Caller::Operator(&operator), Method::POST, "/v1/credential-providers/validate", Some(&provider))
         .await;
+}
+
+#[when("the personal access token lists the agents")]
+async fn personal_access_token_lists_agents(world: &mut SurfaceWorld) {
+    record(world, Caller::PersonalAccessToken, Method::GET, AGENTS_PATH, None).await;
+}
+
+#[when(expr = "a token of tenant {string} lists the agents")]
+async fn tenant_token_lists_agents(
+    world: &mut SurfaceWorld,
+    tenant: String,
+) {
+    get_as_tenant(world, &tenant, AGENTS_PATH).await;
+}
+
+#[when(expr = "a token of tenant {string} reads the agent of the surface")]
+async fn tenant_token_reads_agent_of_surface(
+    world: &mut SurfaceWorld,
+    tenant: String,
+) {
+    let id = agent_id_of_surface(world).await;
+    get_as_tenant(world, &tenant, &format!("{AGENTS_PATH}/{id}")).await;
+}
+
+#[then("the agents list names the surface")]
+fn agents_list_names_surface(world: &mut SurfaceWorld) {
+    let body = &management_response(world).body;
+    assert!(agent_of_surface(body).is_some(), "the agents list has no agent of {SURFACE_ID}: {body}");
+    assert!(body["window_minutes"].is_u64(), "the agents list names its window: {body}");
+}
+
+#[then("the agents list is empty")]
+fn agents_list_is_empty(world: &mut SurfaceWorld) {
+    let body = &management_response(world).body;
+    assert_eq!(body["agents"], json!([]), "the agents list: {body}");
+}
+
+#[then("the agent answer names the surface")]
+fn agent_answer_names_surface(world: &mut SurfaceWorld) {
+    let body = &management_response(world).body;
+    let surface_ids: Vec<&str> = body["surfaces"]
+        .as_array()
+        .expect("an agent lists its surfaces")
+        .iter()
+        .filter_map(|surface| surface["surface_id"].as_str())
+        .collect();
+    assert_eq!(surface_ids, vec![SURFACE_ID], "the agent's surfaces: {body}");
 }
 
 #[then(expr = "the response reports {int} removed log file(s)")]

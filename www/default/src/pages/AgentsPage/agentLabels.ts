@@ -77,16 +77,26 @@ export function trustRegistryLabel(trust: AgentTrustRegistry): string {
 
 /** What `target.endpoint` points at, safe to display. */
 export type AgentConnectionTarget =
-  | { kind: 'url'; display: string; redacted: boolean }
+  | { kind: 'url'; display: string }
   | { kind: 'a2a-proxy'; proxyId: string }
   | { kind: 'gateway'; gatewayId: string; channelId: string | null }
   | { kind: 'unknown' };
 
+/** The host the API puts in an endpoint it can't show without its credentials. */
+const REDACTED_HOST = 'redacted.invalid';
+
+function isRedacted(endpoint: string): boolean {
+  const authority = endpoint.split('://')[1]?.split(/[/?#]/)[0];
+  return authority?.toLowerCase() === REDACTED_HOST;
+}
+
 /**
- * Splits the endpoint by scheme. A URL drops its credentials, query string and
- * fragment, which can carry secrets; `redacted` says something was removed.
+ * Splits the endpoint by scheme. The API returns a URL without credentials,
+ * query string or fragment; any that arrive are dropped here too. A redacted
+ * endpoint is `unknown`, so it is never shown as a real host.
  */
 export function connectionTarget(endpoint: string): AgentConnectionTarget {
+  if (isRedacted(endpoint)) return { kind: 'unknown' };
   if (endpoint.startsWith('a2a-proxy://')) {
     const proxyId = endpoint.slice('a2a-proxy://'.length).replace(/\/+$/, '');
     return proxyId ? { kind: 'a2a-proxy', proxyId } : { kind: 'unknown' };
@@ -100,11 +110,7 @@ export function connectionTarget(endpoint: string): AgentConnectionTarget {
   try {
     const url = new URL(endpoint);
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return { kind: 'unknown' };
-    return {
-      kind: 'url',
-      display: `${url.origin}${url.pathname === '/' ? '' : url.pathname}`,
-      redacted: Boolean(url.username || url.password || url.search || url.hash),
-    };
+    return { kind: 'url', display: `${url.origin}${url.pathname === '/' ? '' : url.pathname}` };
   } catch {
     return { kind: 'unknown' };
   }

@@ -1641,13 +1641,15 @@ impl MetricsStore {
         self.metrics_retention_minutes
     }
 
-    /// p95 of the retained Access Point (inbound) latencies across `surface_ids`;
-    /// `None` without samples.
-    pub async fn inbound_p95_latency_ms(
+    /// Totals and p95 latency of the retained Access Point (inbound) connections across
+    /// `surface_ids`, in one pass.
+    pub async fn inbound_traffic(
         &self,
         surface_ids: &[&str],
-    ) -> Option<u64> {
-        let mut latencies: Vec<u64> = self
+    ) -> InboundTraffic {
+        let mut traffic = InboundTraffic::default();
+        let mut latencies: Vec<u64> = Vec::new();
+        for conn in self
             .connections
             .read()
             .await
@@ -1660,13 +1662,20 @@ impl MetricsStore {
                             .as_str(),
                     )
             })
-            .filter_map(|conn| conn.latency_ms)
-            .collect();
-        if latencies.is_empty() {
-            return None;
+        {
+            traffic.total += 1;
+            match conn.status {
+                ConnectionStatus::Success => {}
+                ConnectionStatus::Failed => traffic.failed += 1,
+                ConnectionStatus::GatewayFault => traffic.gateway_faults += 1,
+            }
+            latencies.extend(conn.latency_ms);
         }
-        latencies.sort_unstable();
-        Some(percentile(&latencies, 95))
+        if !latencies.is_empty() {
+            latencies.sort_unstable();
+            traffic.p95_latency_ms = Some(percentile(&latencies, 95));
+        }
+        traffic
     }
 
     /// Get latency statistics by channel and source-destination pairs
@@ -2866,8 +2875,16 @@ mod tests {
         }
     }
 
+    fn with_status(
+        mut metric: super::ConnectionMetric,
+        status: super::ConnectionStatus,
+    ) -> super::ConnectionMetric {
+        metric.status = status;
+        metric
+    }
+
     #[tokio::test]
-    async fn inbound_p95_latency_uses_only_access_point_samples_of_the_given_surfaces() {
+    async fn inbound_traffic_counts_only_access_point_rows_of_the_given_surfaces() {
         let store = MetricsStore::new(1000);
         {
             let mut connections = store
@@ -2876,27 +2893,39 @@ mod tests {
                 .await;
             connections.extend((1..=20).map(|ms| metric("s1", Some(ms * 10), None)));
             connections.push(metric("s1", Some(9_000), Some("tp-1")));
-            connections.push(metric("s2", Some(8_000), None));
-            connections.push(metric("s1", None, None));
+            connections.push(with_status(metric("s1", None, Some("tp-1")), super::ConnectionStatus::Failed));
+            connections.push(with_status(metric("s1", None, Some("tp-1")), super::ConnectionStatus::GatewayFault));
+            connections.push(with_status(metric("s2", Some(8_000), None), super::ConnectionStatus::Failed));
+            connections.push(with_status(metric("s1", None, None), super::ConnectionStatus::GatewayFault));
         }
 
         assert_eq!(
             store
-                .inbound_p95_latency_ms(&["s1"])
+                .inbound_traffic(&["s1"])
                 .await,
-            Some(190)
+            super::InboundTraffic {
+                total: 21,
+                failed: 0,
+                gateway_faults: 1,
+                p95_latency_ms: Some(190),
+            }
         );
         assert_eq!(
             store
-                .inbound_p95_latency_ms(&["s1", "s2"])
+                .inbound_traffic(&["s1", "s2"])
                 .await,
-            Some(200)
+            super::InboundTraffic {
+                total: 22,
+                failed: 1,
+                gateway_faults: 1,
+                p95_latency_ms: Some(200),
+            }
         );
         assert_eq!(
             store
-                .inbound_p95_latency_ms(&["s3"])
+                .inbound_traffic(&["s3"])
                 .await,
-            None
+            super::InboundTraffic::default()
         );
     }
 
