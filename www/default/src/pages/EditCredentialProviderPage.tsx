@@ -15,7 +15,8 @@ import ConsentConfirmationSection from './EditCredentialProviderPage/ConsentConf
 import JwtAssertionSection from './EditCredentialProviderPage/JwtAssertionSection';
 import { SecretOption as Secret, SecretOptions } from './EditCredentialProviderPage/SecretSelect';
 import { splitByTenant, type OwnerTenant } from '../utils/tenantScope';
-import { CONSENT_LIMIT_UNITS } from '../utils/consentLimit';
+import { CONSENT_LIMIT_UNITS, storedConsentLimit } from '../utils/consentLimit';
+import { useConsentImpact } from './EditCredentialProviderPage/useConsentImpact';
 import {
   CONSENT_LIMIT_FIELD_MESSAGE,
   CONSENT_LIMIT_RANGE_MESSAGE,
@@ -29,6 +30,7 @@ import {
   consentConfirmationField,
   consentConfirmationFieldsOf,
   consentConfirmationRedirectUri,
+  consentImpactMessage,
   missingConsentConfirmationField,
   clientAuthenticationOf,
   consentLimitOf,
@@ -125,6 +127,7 @@ const EditCredentialProviderPage: React.FC = () => {
   const offeredSecretCount = splitByTenant(secrets, ownerTenant).offered.length;
   const [routingConfig, setRoutingConfig] = useState<RoutingConfig | null>(null);
   const [consentLimitRefused, setConsentLimitRefused] = useState(false);
+  const [storedConsentLimitSecs, setStoredConsentLimitSecs] = useState<number | undefined>();
   const formRef = useRef<HTMLFormElement>(null);
   const consentLimitRef = useRef<HTMLInputElement>(null);
 
@@ -187,6 +190,7 @@ const EditCredentialProviderPage: React.FC = () => {
       }
 
       setOwnerTenant(data.tenant_id ?? null);
+      setStoredConsentLimitSecs(storedConsentLimit(data.max_consent_age_secs));
       setForm({
         name: data.name ?? '',
         provider_id: data.provider_id ?? '',
@@ -415,6 +419,12 @@ const EditCredentialProviderPage: React.FC = () => {
   }, [saving, handleSubmit]);
 
   const typeFields = providerTypeFields(form.provider_type, form.client_authentication);
+  const endingConsents = useConsentImpact(
+    isNew ? undefined : id,
+    consentLimitSeconds(form),
+    storedConsentLimitSecs
+  );
+  const consentImpact = consentImpactMessage(endingConsents, form.name.trim() || form.provider_id);
 
   if (loading) {
     return (
@@ -1091,6 +1101,16 @@ const EditCredentialProviderPage: React.FC = () => {
                   Leave empty to set no limit on this provider. A default or a ceiling in the
                   gateway's configuration still applies. From 1 minute to 365 days.
                 </small>
+                {consentImpact && (
+                  <div
+                    className="form-text text-warning-emphasis"
+                    role="status"
+                    data-testid="credential-provider-consent-limit-impact"
+                  >
+                    <i className="fas fa-exclamation-triangle me-1" aria-hidden="true" />
+                    {consentImpact}
+                  </div>
+                )}
               </div>
             )}
 

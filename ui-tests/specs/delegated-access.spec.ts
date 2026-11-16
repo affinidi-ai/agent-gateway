@@ -399,6 +399,58 @@ test.describe("Credential provider editor consent time limit", () => {
       .toEqual([2_592_000]);
   });
 
+  test("warns how many active consents saving a shorter limit ends", async ({
+    page,
+  }) => {
+    const asked: (string | null)[] = [];
+    await page.route("**/api/v1/credential-providers/p1", async (route) => {
+      await route.fulfill({
+        json: {
+          id: "p1",
+          name: "GitHub",
+          provider_id: "github",
+          provider_type: "oauth2_authorization_code",
+          token_endpoint: "https://github.com/login/oauth/access_token",
+          client_id_secret_ref: "CLIENT_ID",
+          client_secret_secret_ref: "CLIENT_SECRET",
+          default_scopes: ["repo"],
+          token_refresh_enabled: true,
+          callback_path: "/v1/identity/oauth/callback/p1",
+          max_consent_age_secs: 21_600,
+        },
+      });
+    });
+    await page.route(
+      "**/api/v1/credential-providers/p1/consent-impact?**",
+      async (route) => {
+        asked.push(
+          new URL(route.request().url()).searchParams.get(
+            "max_consent_age_secs",
+          ),
+        );
+        await route.fulfill({
+          json: { active_consents: 5, ending_consents: 2 },
+        });
+      },
+    );
+    await page.goto(`${BASE_URL}/credential-providers/p1`);
+    await expect(page.getByTestId(LIMIT)).toHaveValue("6");
+
+    await page.getByTestId(LIMIT).fill("1");
+
+    await expect(
+      page.getByTestId("credential-provider-consent-limit-impact"),
+    ).toHaveText(
+      "Saving ends 2 active GitHub consents now. Those people approve again next time their agent needs GitHub.",
+    );
+    expect(asked).toEqual(["3600"]);
+
+    await page.getByTestId(LIMIT).fill("12");
+    await expect(
+      page.getByTestId("credential-provider-consent-limit-impact"),
+    ).toHaveCount(0);
+  });
+
   test("refuses a limit under a minute under its field before saving anything", async ({
     page,
   }) => {

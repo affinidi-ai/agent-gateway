@@ -337,6 +337,33 @@ export function consentLimitSeconds(
   return secs >= MIN_CONSENT_LIMIT_SECS && secs <= MAX_CONSENT_LIMIT_SECS ? secs : null;
 }
 
+/**
+ * Whether saving `limitSecs` can end consents already given: a limit, shorter than the stored
+ * one or set where none was. A longer limit never extends a consent, so it ends none.
+ */
+export function shortensConsentLimit(
+  limitSecs: number | null,
+  storedSecs: number | undefined
+): boolean {
+  if (limitSecs === null || limitSecs <= 0) return false;
+  return storedSecs === undefined || limitSecs < storedSecs;
+}
+
+/** `ending_consents` of a `GET /credential-providers/{id}/consent-impact` answer, when it has one. */
+export function endingConsentsOf(answer: unknown): number | null {
+  if (!answer || typeof answer !== 'object') return null;
+  const ending = (answer as { ending_consents?: unknown }).ending_consents;
+  return typeof ending === 'number' && Number.isInteger(ending) && ending >= 0 ? ending : null;
+}
+
+/** The warning that saving ends `ending` active consents of the provider; none when it ends none. */
+export function consentImpactMessage(ending: number | null, providerName: string): string | null {
+  if (!ending) return null;
+  return ending === 1
+    ? `Saving ends 1 active ${providerName} consent now. That person approves again next time their agent needs ${providerName}.`
+    : `Saving ends ${ending} active ${providerName} consents now. Those people approve again next time their agent needs ${providerName}.`;
+}
+
 export const PROVIDER_TYPE_LABELS: Record<CredentialProviderType, string> = {
   oauth2_authorization_code: 'Authorization Code',
   oauth2_client_credentials: 'Client Credentials',

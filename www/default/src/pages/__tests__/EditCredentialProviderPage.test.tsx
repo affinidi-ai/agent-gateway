@@ -341,6 +341,154 @@ describe('EditCredentialProviderPage consent time limit', () => {
     expect((await savedBody()).max_consent_age_secs).toBe(0);
   });
 
+  describe('warning before a shorter limit', () => {
+    const IMPACT = 'credential-provider-consent-limit-impact';
+    const impactCalls = () =>
+      mockFetch.mock.calls.filter(([url]) => String(url).includes('/consent-impact'));
+    const pause = () => new Promise(resolve => setTimeout(resolve, 600));
+
+    const renderWithImpact = async (
+      record: Record<string, unknown>,
+      impact: () => Promise<unknown> = () =>
+        Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ active_consents: 5, ending_consents: 2 }),
+        })
+    ) => {
+      mockFetch.mockImplementation((url: string) => {
+        if (url.includes('/consent-impact')) return impact();
+        return Promise.resolve(
+          url.startsWith('/api/v1/credential-providers/')
+            ? { ok: true, json: () => Promise.resolve(record), text: () => Promise.resolve('') }
+            : { ok: false, json: () => Promise.resolve([]) }
+        );
+      });
+      render(
+        <MemoryRouter initialEntries={['/credential-providers/p1']}>
+          <Routes>
+            <Route path="/credential-providers/:id" element={<EditCredentialProviderPage />} />
+          </Routes>
+        </MemoryRouter>
+      );
+      await screen.findByDisplayValue(record.name as string);
+    };
+
+    it('says how many active consents saving a shorter limit ends', async () => {
+      await renderWithImpact(authorizationCode({ max_consent_age_secs: 21_600 }));
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '1' } });
+
+      expect(await screen.findByTestId(IMPACT)).toHaveTextContent(
+        /^Saving ends 2 active GitHub consents now\. Those people approve again next time their agent needs GitHub\.$/
+      );
+      expect(impactCalls().map(([url]) => url)).toEqual([
+        '/api/v1/credential-providers/p1/consent-impact?max_consent_age_secs=3600',
+      ]);
+    });
+
+    it('speaks of one person when saving ends one consent', async () => {
+      await renderWithImpact(authorizationCode({ max_consent_age_secs: 21_600 }), () =>
+        Promise.resolve({ ok: true, json: () => Promise.resolve({ ending_consents: 1 }) })
+      );
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '1' } });
+
+      expect(await screen.findByTestId(IMPACT)).toHaveTextContent(
+        /^Saving ends 1 active GitHub consent now\. That person approves again/
+      );
+    });
+
+    it('asks when a limit is set where none was', async () => {
+      await renderWithImpact(authorizationCode());
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '6' } });
+
+      expect(await screen.findByTestId(IMPACT)).toBeInTheDocument();
+      expect(impactCalls().map(([url]) => url)).toEqual([
+        '/api/v1/credential-providers/p1/consent-impact?max_consent_age_secs=21600',
+      ]);
+    });
+
+    it('asks once, after a pause, for a limit typed in several keystrokes', async () => {
+      await renderWithImpact(authorizationCode({ max_consent_age_secs: 2_592_000 }));
+      expect(screen.getByTestId(UNIT)).toHaveValue('days');
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '1' } });
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '12' } });
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '20' } });
+
+      await screen.findByTestId(IMPACT);
+      await pause();
+      expect(impactCalls().map(([url]) => url)).toEqual([
+        '/api/v1/credential-providers/p1/consent-impact?max_consent_age_secs=1728000',
+      ]);
+    });
+
+    it('shows no warning when saving ends no consent', async () => {
+      await renderWithImpact(authorizationCode({ max_consent_age_secs: 21_600 }), () =>
+        Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ active_consents: 5, ending_consents: 0 }),
+        })
+      );
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '1' } });
+
+      await waitFor(() => expect(impactCalls()).toHaveLength(1));
+      await pause();
+      expect(screen.queryByTestId(IMPACT)).toBeNull();
+    });
+
+    it.each([
+      ['is refused', () => Promise.resolve({ ok: false, json: () => Promise.resolve({}) })],
+      ['fails', () => Promise.reject(new Error('offline'))],
+    ])('shows no warning when the call %s', async (_case, impact) => {
+      await renderWithImpact(authorizationCode({ max_consent_age_secs: 21_600 }), impact);
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '1' } });
+
+      await waitFor(() => expect(impactCalls()).toHaveLength(1));
+      await pause();
+      expect(screen.queryByTestId(IMPACT)).toBeNull();
+    });
+
+    it('asks nothing for a limit that is not shorter, or one the gateway would refuse', async () => {
+      await renderWithImpact(authorizationCode({ max_consent_age_secs: 21_600 }));
+      fireEvent.change(screen.getByTestId(UNIT), { target: { value: 'days' } });
+      await pause();
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '0' } });
+      await pause();
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '' } });
+      await pause();
+
+      expect(impactCalls()).toHaveLength(0);
+      expect(screen.queryByTestId(IMPACT)).toBeNull();
+    });
+
+    it('takes the warning away once the limit is no longer shorter', async () => {
+      await renderWithImpact(authorizationCode({ max_consent_age_secs: 21_600 }));
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '1' } });
+      await screen.findByTestId(IMPACT);
+
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '6' } });
+
+      expect(screen.queryByTestId(IMPACT)).toBeNull();
+    });
+  });
+
+  it('asks nothing about consents a new provider would end', async () => {
+    mockFetch.mockImplementation(() =>
+      Promise.resolve({ ok: false, json: () => Promise.resolve([]) })
+    );
+    render(
+      <MemoryRouter initialEntries={['/credential-providers/new']}>
+        <Routes>
+          <Route path="/credential-providers/:id" element={<EditCredentialProviderPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+    fireEvent.change(await screen.findByTestId(LIMIT), { target: { value: '1' } });
+    await new Promise(resolve => setTimeout(resolve, 600));
+
+    expect(
+      mockFetch.mock.calls.filter(([url]) => String(url).includes('/consent-impact'))
+    ).toHaveLength(0);
+  });
+
   it('offers the limit on an external consent provider and saves it', async () => {
     await renderProvider(
       authorizationCode({

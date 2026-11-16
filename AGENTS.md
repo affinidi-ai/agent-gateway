@@ -230,7 +230,9 @@ _Credential provider editor_ in
 The credential provider editor's **Consent time limit** (Authorization Code providers only)
 writes `max_consent_age_secs`, `0` when empty, and says an empty field sets no limit on the
 provider while the gateway's own default and ceiling still apply. A refused limit is shown
-under the field, which is marked invalid and takes the focus. On such a provider the token
+under the field, which is marked invalid and takes the focus. A limit shorter than the stored
+one warns under the field how many active consents saving ends, from
+`GET /credential-providers/{id}/consent-impact`. On such a provider the token
 refresh help says refresh stops when the limit ends. The Surface Builder keeps and
 shows a binding's own limit, which is set through the API; see _Credential provider editor_ and
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).

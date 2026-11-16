@@ -1263,7 +1263,16 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   marked invalid (`is-invalid`, `aria-invalid`, described by the message), says "Enter a limit
   from 1 minute to 365 days, or leave it empty." under itself
   (`credential-provider-consent-limit-error`, `invalid-feedback`) and takes the focus. Changing
-  the number or the unit clears the field's error. The unit arithmetic and wording live in
+  the number or the unit clears the field's error. On a stored provider, a limit shorter than the
+  stored one, or one set where none was, is sent to
+  `GET /credential-providers/{id}/consent-impact?max_consent_age_secs=<seconds>` once the field
+  has stayed unchanged for 400 ms (`EditCredentialProviderPage/useConsentImpact.ts`). While its
+  `ending_consents` is above 0, a warning under the field
+  (`credential-provider-consent-limit-impact`, `form-text text-warning-emphasis`,
+  `role="status"`) says how many active consents saving ends now and that those people approve
+  again, with the provider's name (`consentImpactMessage`, singular for one). There is no warning
+  and no request for a new provider or a limit that is longer, equal, empty or refused, and no
+  warning for 0 or a failed request. The unit arithmetic and wording live in
   `utils/consentLimit.ts`. On such a provider the help under **Enable automatic token refresh**
   says tokens are refreshed until the consent time limit below ends and the person then approves
   again; every other type keeps saying the connection works without reauthorizing.

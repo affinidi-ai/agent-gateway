@@ -1,6 +1,14 @@
 branch: feat/delegation-audit-split
 changes:
-  added: []
+  added:
+    - timestamp: '2026-11-16T15:30:00Z'
+      title: Warn how many active consents a shorter consent time limit ends
+      description: >-
+        When an admin shortens a stored provider's consent time limit, or sets one where none
+        was, the provider form now asks the gateway how many active consents saving would end
+        and, when that is at least one, says so under the field, naming the provider, for example
+        "Saving ends 2 active GitHub consents now". It asks once the field has stopped changing,
+        and shows nothing when no consent ends or the gateway cannot say.
   changed:
     - timestamp: '2026-11-16T15:00:00Z'
       title: Confirm a revoke-all with a danger button that says how many it ends
