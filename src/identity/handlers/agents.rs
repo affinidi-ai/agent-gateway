@@ -1775,7 +1775,10 @@ mod tests {
         }
         assert_eq!(json["id"], group.id);
         assert_eq!(json["name"], "TimeAsker");
-        assert!(json.get("registration").is_none());
+        assert!(
+            json.get("registration")
+                .is_none()
+        );
         assert_eq!(json["runtime"], "url");
         assert_eq!(json["protocol"], "a2a");
         assert_eq!(json["endpoint"], "https://agent.example/a2a");

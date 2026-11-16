@@ -6,6 +6,7 @@ Feature: Management route permissions
   audit.view, and since the logs hold every tenant's request and delegation detail, a tenant's
   access token or one scoped by required headers alone cannot download them. Listing and reading
   agents needs surfaces.view, and a tenant's token sees only the agents of its own surfaces.
+  A tenant's token reads an agent card only through a surface of its own tenant.
 
   Scenario: An administrator downloads the server logs
     Given a log file "agent-gateway.log"
@@ -168,6 +169,24 @@ Feature: Management route permissions
     And the surface belongs to tenant "tenant-a"
     When a token of tenant "tenant-b" reads the agent of the surface
     Then the admin API response status is 404
+
+  Scenario: A token limited to another surface of its tenant cannot read the surface's agent
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface belongs to tenant "tenant-a"
+    When a token of tenant "tenant-a" limited to surface "other-surface" reads the agent of the surface
+    Then the admin API response status is 404
+
+  Scenario: A token of another tenant cannot read the agent card of the surface's agent
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface belongs to tenant "tenant-a"
+    When a token of tenant "tenant-b" reads the agent card of the surface's agent
+    Then the admin API response status is 404
+
+  Scenario: A tenant token reads no agent card through an appliance-wide surface
+    Given an A2A surface targeting managed agent "bravo"
+    When a token of tenant "tenant-a" reads the agent card of the surface's agent
+    Then the admin API response status is 200
+    And the agent card is unavailable because only an operator may read it
 
   Scenario: A base user cannot validate a credential provider
     Given operator "uma" has the "user" role

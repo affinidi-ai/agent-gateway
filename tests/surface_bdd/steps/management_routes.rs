@@ -14,6 +14,8 @@ const PROBE_TOKEN_ENDPOINT: &str = "https://192.0.2.1/token";
 const AGENTS_PATH: &str = "/v1/agents";
 const SURFACE_ID: &str = "bdd-surface";
 const TENANT_HEADER: &str = "x-external-account";
+/// A personal access token resource pattern that matches every surface id.
+const ALL_SURFACES: &str = ".*";
 
 /// Who calls a management route in a scenario.
 enum Caller<'a> {
@@ -185,18 +187,19 @@ async fn send_welcome_notification(
     record(world, caller, Method::POST, "/v1/notifications/send-welcome", Some(&request)).await;
 }
 
-/// Sends `GET path` with a personal access token of `tenant`, limited to that tenant's
-/// surfaces, and records the answer.
+/// Sends `GET path` with a personal access token of `tenant`, limited to the tenant's
+/// surfaces that `surfaces` matches, and records the answer.
 async fn get_as_tenant(
     world: &mut SurfaceWorld,
     tenant: &str,
+    surfaces: &str,
     path: &str,
 ) {
     ensure_admin_session(world).await;
     let request = json!({
         "name": "agents token",
         "scopes": [],
-        "resource_pattern": "TENANT:${x-external-account}:surfaces:.*",
+        "resource_pattern": format!("TENANT:${{x-external-account}}:surfaces:{surfaces}"),
         "required_headers": [{"name": TENANT_HEADER, "pattern": tenant}],
     });
     let mut headers = header::HeaderMap::new();
@@ -411,7 +414,7 @@ async fn tenant_token_lists_agents(
     world: &mut SurfaceWorld,
     tenant: String,
 ) {
-    get_as_tenant(world, &tenant, AGENTS_PATH).await;
+    get_as_tenant(world, &tenant, ALL_SURFACES, AGENTS_PATH).await;
 }
 
 #[when(expr = "a token of tenant {string} reads the agent of the surface")]
@@ -420,7 +423,26 @@ async fn tenant_token_reads_agent_of_surface(
     tenant: String,
 ) {
     let id = agent_id_of_surface(world).await;
-    get_as_tenant(world, &tenant, &format!("{AGENTS_PATH}/{id}")).await;
+    get_as_tenant(world, &tenant, ALL_SURFACES, &format!("{AGENTS_PATH}/{id}")).await;
+}
+
+#[when(expr = "a token of tenant {string} limited to surface {string} reads the agent of the surface")]
+async fn surface_limited_tenant_token_reads_agent_of_surface(
+    world: &mut SurfaceWorld,
+    tenant: String,
+    surface: String,
+) {
+    let id = agent_id_of_surface(world).await;
+    get_as_tenant(world, &tenant, &regex::escape(&surface), &format!("{AGENTS_PATH}/{id}")).await;
+}
+
+#[when(expr = "a token of tenant {string} reads the agent card of the surface's agent")]
+async fn tenant_token_reads_agent_card_of_surface(
+    world: &mut SurfaceWorld,
+    tenant: String,
+) {
+    let id = agent_id_of_surface(world).await;
+    get_as_tenant(world, &tenant, ALL_SURFACES, &format!("{AGENTS_PATH}/{id}/agent-card")).await;
 }
 
 #[then("the agents list names the surface")]
@@ -446,6 +468,16 @@ fn agent_answer_names_surface(world: &mut SurfaceWorld) {
         .filter_map(|surface| surface["surface_id"].as_str())
         .collect();
     assert_eq!(surface_ids, vec![SURFACE_ID], "the agent's surfaces: {body}");
+}
+
+#[then("the agent card is unavailable because only an operator may read it")]
+fn agent_card_is_operator_only(world: &mut SurfaceWorld) {
+    let body = &management_response(world).body;
+    assert_eq!(
+        (&body["available"], &body["reason"], body.get("card")),
+        (&json!(false), &json!("operator_only"), None),
+        "the agent card answer: {body}"
+    );
 }
 
 #[then(expr = "the response reports {int} removed log file(s)")]
