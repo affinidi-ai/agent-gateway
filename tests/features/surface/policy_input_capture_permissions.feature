@@ -40,3 +40,9 @@ Feature: Listening to policy input needs both surfaces.edit and policies.edit
     Then operator "pete" may not listen to policy input
     And the Capture view shows the "target" policy of surface "alpha" deciding "allow" on an input showing "hello policy"
     And the Capture view of operator "pete" shows no policy input
+
+  Scenario: An operator whose role holds neither surfaces.edit nor policies.edit may not listen to policy input
+    Given A2A surface "alpha" exists for route "/example" with managed agent "bravo" as its target
+    And operator "uma" has the "user" role
+    When operator "uma" asks to listen to the policy input of surface "alpha"
+    Then operator "uma" may not listen to policy input

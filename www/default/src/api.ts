@@ -1562,6 +1562,8 @@ export interface AgentSurface {
     /** Only `embedded` exists; the gateway refuses `reference` on save. */
     transit_token_mode?: 'embedded';
     rate_limit?: { requests: number; window_secs: number };
+    /** The policy definition evaluated on every Transit Point request. */
+    opa_policy_definition_id?: string;
   };
   /**
    * Opaque dashboard-owned blob persisting canvas layout (positions,
@@ -1654,6 +1656,8 @@ export interface TransitPoint {
   mcp_http?: McpHttpConfig;
   target_auth?: any;
   policy?: { policy_definition_id: string };
+  /** Evaluated on this Transit Point's response, before it goes back to the caller. */
+  response_policy?: { policy_definition_id: string };
   networking?: any;
   identity_injection?: { inject_vp: boolean };
   transit_credentials?: any;

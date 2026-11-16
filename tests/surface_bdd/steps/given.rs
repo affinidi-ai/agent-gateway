@@ -3326,6 +3326,18 @@ fn configure_mcp_surface_protocol(world: &mut SurfaceWorld) {
     world.surface_config.protocol = "mcp".to_string();
 }
 
+#[given(expr = "the {string} role is granted {string}")]
+fn role_is_granted(
+    world: &mut SurfaceWorld,
+    role: String,
+    feature: String,
+) {
+    world
+        .surface_config
+        .rbac_permissions
+        .push((feature, role));
+}
+
 #[given(expr = "operator {string} has the {string} role")]
 async fn operator_has_role(
     world: &mut SurfaceWorld,

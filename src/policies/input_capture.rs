@@ -4,50 +4,58 @@
 //! listening connections receive it; capture stops when the last of them stops listening
 //! or closes. Nothing is written to the log or stored.
 
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use chrono::Utc;
 use dashmap::DashMap;
 use regex::Regex;
 use serde_json::Value;
+use tokio::sync::mpsc;
 
 use crate::observability::loggable::REDACTED;
-use crate::server::{WsState, WsUpdate};
+use crate::server::WsUpdate;
 
-/// How many dashboard connections listen to each surface's policy input, by surface id.
-static LISTENERS: LazyLock<DashMap<String, usize>> = LazyLock::new(DashMap::new);
+/// Where a dashboard connection receives its captures: each one a serialized
+/// `policy_input_captured` update. A capture that finds it full is dropped.
+pub type CaptureSender = mpsc::Sender<Arc<str>>;
 
-/// The dashboard WebSocket the captures are sent to.
-static DASHBOARD: OnceLock<Arc<WsState>> = OnceLock::new();
+/// The connections listening to each surface's policy input, by surface id: one entry
+/// per listen, with the id of its [`Listening`].
+static LISTENERS: LazyLock<DashMap<String, Vec<(u64, CaptureSender)>>> = LazyLock::new(DashMap::new);
 
-/// Send captures to the dashboard WebSocket `ws_state`.
-pub fn init(ws_state: Arc<WsState>) {
-    let _ = DASHBOARD.set(ws_state);
-}
+static NEXT_LISTEN_ID: AtomicU64 = AtomicU64::new(0);
 
 /// A dashboard connection listening to one surface's policy input. The surface is
 /// captured while at least one exists; dropping it stops listening.
 #[derive(Debug)]
 pub struct Listening {
     surface_id: String,
+    id: u64,
 }
 
-/// Start listening to the policy input of `surface_id`.
-pub fn listen(surface_id: &str) -> Listening {
-    *LISTENERS
+/// Start listening to the policy input of `surface_id`, its captures sent to `captures`.
+pub fn listen(
+    surface_id: &str,
+    captures: CaptureSender,
+) -> Listening {
+    let id = NEXT_LISTEN_ID.fetch_add(1, Ordering::Relaxed);
+    LISTENERS
         .entry(surface_id.to_string())
-        .or_insert(0) += 1;
+        .or_default()
+        .push((id, captures));
     Listening {
         surface_id: surface_id.to_string(),
+        id,
     }
 }
 
 impl Drop for Listening {
     fn drop(&mut self) {
-        if let Some(mut count) = LISTENERS.get_mut(&self.surface_id) {
-            *count = count.saturating_sub(1);
+        if let Some(mut listeners) = LISTENERS.get_mut(&self.surface_id) {
+            listeners.retain(|(id, _)| *id != self.id);
         }
-        LISTENERS.remove_if(&self.surface_id, |_, count| *count == 0);
+        LISTENERS.remove_if(&self.surface_id, |_, listeners| listeners.is_empty());
     }
 }
 
@@ -74,27 +82,19 @@ impl CapturedPolicy {
     }
 }
 
-/// A receiver of the dashboard WebSocket the captures go to, for tests, which share one
-/// dashboard created on first use.
+/// A listen to `surface_id` for tests, with the receiver of its captures.
 #[cfg(test)]
-pub(crate) fn test_dashboard() -> tokio::sync::broadcast::Receiver<WsUpdate> {
-    DASHBOARD
-        .get_or_init(|| Arc::new(WsState::new(4096)))
-        .subscribe()
+pub(crate) fn listening(surface_id: &str) -> (Listening, mpsc::Receiver<Arc<str>>) {
+    let (captures, received) = mpsc::channel(64);
+    (listen(surface_id, captures), received)
 }
 
-/// The captures of `surface_id` that `dashboard` has received so far, as JSON.
+/// The captures `received` has been sent so far, as JSON.
 #[cfg(test)]
-pub(crate) fn received_captures(
-    dashboard: &mut tokio::sync::broadcast::Receiver<WsUpdate>,
-    surface_id: &str,
-) -> Vec<Value> {
+pub(crate) fn received_captures(received: &mut mpsc::Receiver<Arc<str>>) -> Vec<Value> {
     let mut captures = Vec::new();
-    while let Ok(update) = dashboard.try_recv() {
-        let update = serde_json::to_value(update).expect("a capture serializes");
-        if update["type"] == "policy_input_captured" && update["config_id"] == surface_id {
-            captures.push(update);
-        }
+    while let Ok(capture) = received.try_recv() {
+        captures.push(serde_json::from_str(&capture).expect("a capture is JSON"));
     }
     captures
 }
@@ -102,7 +102,7 @@ pub(crate) fn received_captures(
 pub(crate) fn is_captured(surface_id: &str) -> bool {
     LISTENERS
         .get(surface_id)
-        .is_some_and(|count| *count > 0)
+        .is_some_and(|listeners| !listeners.is_empty())
 }
 
 /// The surface a policy input belongs to: `input.channel.config_id` for a request
@@ -190,7 +190,16 @@ pub fn begin(
     if !is_captured(surface_id) {
         return None;
     }
-    let (slot, transit_point) = slot_of(plane, engine, surface_id);
+    let (slot, transit_point) = if plane == "gateway"
+        && input
+            .pointer("/gateway/direction")
+            .and_then(Value::as_str)
+            == Some("outbound")
+    {
+        ("gateway outbound".to_string(), None)
+    } else {
+        slot_of(plane, engine, surface_id)
+    };
     let mut masked = input.clone();
     mask_credentials(&mut masked);
     mask_request_path(&mut masked);
@@ -217,13 +226,23 @@ impl Capture {
     }
 
     /// Send the capture with its outcome, `Ok((allow, deny reason))` or the evaluation
-    /// error, to the dashboard.
+    /// error, to the connections listening to its surface, serialized once for all of them.
     pub fn finish(
         self,
         outcome: Result<(bool, Option<&str>), &str>,
     ) {
-        if let Some(ws_state) = DASHBOARD.get() {
-            ws_state.broadcast(self.into_update(outcome));
+        let surface_id = self.surface_id.clone();
+        let capture: Arc<str> = match serde_json::to_string(&self.into_update(outcome)) {
+            Ok(json) => json.into(),
+            Err(error) => {
+                tracing::error!("Failed to serialize a policy input capture: {}", error);
+                return;
+            }
+        };
+        if let Some(listeners) = LISTENERS.get(&surface_id) {
+            for (_, captures) in listeners.iter() {
+                let _ = captures.try_send(Arc::clone(&capture));
+            }
         }
     }
 
@@ -309,9 +328,12 @@ pub fn mask_credentials(value: &mut Value) {
     }
 }
 
-/// A JWT anywhere in a text.
-static EMBEDDED_JWT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\beyJ[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]*").expect("valid JWT pattern"));
+/// A JWT anywhere in a text, with the `~`-separated disclosures and key binding JWT
+/// that follow it in an SD-JWT.
+static EMBEDDED_JWT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\beyJ[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]*(?:~[A-Za-z0-9_=.-]*)*")
+        .expect("valid JWT pattern")
+});
 
 /// `Bearer` or `Basic`, whitespace and the token after it, anywhere in a text.
 static AUTHORIZATION: LazyLock<Regex> = LazyLock::new(|| {
@@ -421,8 +443,8 @@ mod tests {
 
     #[test]
     fn a_surface_is_captured_while_any_connection_listens() {
-        let first = listen("input-capture-listened");
-        let second = listen("input-capture-listened");
+        let first = listening("input-capture-listened");
+        let second = listening("input-capture-listened");
         assert!(is_captured("input-capture-listened"));
 
         drop(first);
@@ -432,6 +454,63 @@ mod tests {
         assert!(!is_captured("input-capture-listened"));
         assert!(!LISTENERS.contains_key("input-capture-listened"));
         assert!(!is_captured("input-capture-never-listened"));
+    }
+
+    #[test]
+    fn an_outbound_gateway_evaluation_has_its_own_slot() {
+        let _listening = listening("input-capture-gateway-direction");
+        let input = |direction: &str| {
+            json!({
+                "channel": { "config_id": "input-capture-gateway-direction" },
+                "gateway": { "direction": direction },
+            })
+        };
+
+        let outbound = begin("gateway", "gw-1", &input("outbound"), Vec::new).unwrap();
+        let inbound = begin("gateway", "gw-1", &input("inbound"), Vec::new).unwrap();
+        let surface = begin("surface", "input-capture-gateway-direction", &input("outbound"), Vec::new).unwrap();
+
+        assert_eq!(outbound.slot, "gateway outbound");
+        assert_eq!(inbound.slot, "gateway");
+        assert_eq!(surface.slot, "target");
+    }
+
+    #[test]
+    fn a_capture_reaches_only_the_listeners_of_its_surface() {
+        let (_first, mut first) = listening("input-capture-delivered");
+        let (_second, mut second) = listening("input-capture-delivered");
+        let (_other, mut other) = listening("input-capture-other");
+        let input = json!({ "channel": { "config_id": "input-capture-delivered" } });
+
+        begin("surface", "input-capture-delivered", &input, Vec::new)
+            .unwrap()
+            .finish(Ok((true, None)));
+
+        for received in [&mut first, &mut second] {
+            let captures = received_captures(received);
+            assert_eq!(captures.len(), 1, "{captures:?}");
+            assert_eq!(captures[0]["type"], "policy_input_captured");
+            assert_eq!(captures[0]["config_id"], "input-capture-delivered");
+            assert_eq!(captures[0]["decision"], "allow");
+        }
+        assert!(received_captures(&mut other).is_empty());
+    }
+
+    #[test]
+    fn a_capture_is_dropped_for_a_listener_whose_queue_is_full_and_still_reaches_the_others() {
+        let (full_queue, mut full) = mpsc::channel(1);
+        let _full = listen("input-capture-full", full_queue);
+        let (_open, mut open) = listening("input-capture-full");
+        let input = json!({ "channel": { "config_id": "input-capture-full" } });
+
+        for _ in 0..3 {
+            begin("surface", "input-capture-full", &input, Vec::new)
+                .unwrap()
+                .finish(Ok((true, None)));
+        }
+
+        assert_eq!(received_captures(&mut full).len(), 1);
+        assert_eq!(received_captures(&mut open).len(), 3);
     }
 
     #[test]
@@ -451,7 +530,7 @@ mod tests {
 
     #[test]
     fn a_response_policy_evaluation_is_captured() {
-        let _listening = listen("input-capture-response");
+        let _listening = listening("input-capture-response");
         let input = json!({
             "response": { "status_code": 200, "body": { "result": "done" } },
             "surface": { "id": "input-capture-response" },
@@ -472,7 +551,7 @@ mod tests {
 
     #[test]
     fn a_captured_request_path_keeps_its_parameter_names_but_not_their_values() {
-        let _listening = listen("input-capture-query");
+        let _listening = listening("input-capture-query");
         let input = json!({
             "channel": { "config_id": "input-capture-query" },
             "http": { "method": "GET", "path": "/pay/orders?token=secret-token&page=2&flag" },
@@ -498,7 +577,7 @@ mod tests {
 
     #[test]
     fn a_captured_request_path_without_a_query_is_kept() {
-        let _listening = listen("input-capture-plain-path");
+        let _listening = listening("input-capture-plain-path");
         let input = json!({
             "channel": { "config_id": "input-capture-plain-path" },
             "http": { "method": "POST", "path": "/a2a/agent" },
@@ -550,6 +629,26 @@ mod tests {
         assert_eq!(parts[0]["text"], format!("Authorization: Bearer {REDACTED} please"));
         assert_eq!(parts[1]["text"], format!("send basic {REDACTED} to it"));
         assert_eq!(parts[2]["text"], format!("the token is {REDACTED} ok"));
+    }
+
+    #[test]
+    fn an_sd_jwt_is_masked_with_its_disclosures_whole_or_inside_text() {
+        let sd_jwt = format!("{JWT}~WyJzYWx0IiwiZW1haWwiLCJhQGV4YW1wbGUudGVzdCJd~{JWT}");
+        let mut input = json!({
+            "source_auth": { "presented": sd_jwt },
+            "a2a": { "parts": [{ "text": format!("here is {sd_jwt} for you") }] },
+        });
+
+        mask_credentials(&mut input);
+
+        assert_eq!(input["source_auth"]["presented"], REDACTED);
+        assert_eq!(input["a2a"]["parts"][0]["text"], format!("here is {REDACTED} for you"));
+        assert!(
+            !input
+                .to_string()
+                .contains("WyJzYWx0"),
+            "{input}"
+        );
     }
 
     #[test]
@@ -664,7 +763,7 @@ mod tests {
 
     #[test]
     fn a_captured_input_is_sent_with_its_credentials_masked_and_its_decision() {
-        let _listening = listen("input-capture-sent");
+        let _listening = listening("input-capture-sent");
         let input = json!({
             "channel": { "config_id": "input-capture-sent" },
             "source_auth": { "method": "jwt", "token": JWT },
@@ -704,7 +803,7 @@ mod tests {
 
     #[test]
     fn a_capture_names_the_policies_its_slot_ran_and_the_one_that_denied() {
-        let _listening = listen("input-capture-named");
+        let _listening = listening("input-capture-named");
         let input = json!({ "channel": { "config_id": "input-capture-named" } });
 
         let update = update_json(
@@ -740,7 +839,7 @@ mod tests {
 
     #[test]
     fn an_allow_has_no_reason_and_an_error_carries_its_message() {
-        let _listening = listen("input-capture-decided");
+        let _listening = listening("input-capture-decided");
         let input = json!({ "channel": { "config_id": "input-capture-decided" } });
 
         let allow = update_json(
@@ -762,7 +861,7 @@ mod tests {
 
     #[test]
     fn a_transit_point_policy_names_its_alias() {
-        let _listening = listen("input-capture-transit");
+        let _listening = listening("input-capture-transit");
         let input = json!({ "channel": { "config_id": "input-capture-transit" } });
 
         let update = update_json(
@@ -796,7 +895,7 @@ mod tests {
 
     #[test]
     fn nothing_is_captured_for_a_surface_nobody_listens_to() {
-        drop(listen("input-capture-stopped"));
+        drop(listening("input-capture-stopped"));
         let stopped = json!({ "channel": { "config_id": "input-capture-stopped" } });
         let unheard = json!({ "channel": { "config_id": "input-capture-unheard" } });
 

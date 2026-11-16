@@ -140,8 +140,8 @@ request on the dashboard WebSocket, with no admin API route and nothing stored o
 - The gateway answers each with `{"type": "policy_input_capture", "surface_id", "listening"}`, and
   an `error` when it refuses or ends a listen: `your dashboard session has ended; sign in again`
   (the connection has no live session), `needs surfaces.edit and policies.edit`, `invalid surface
-  id` (empty or over 256 bytes) or `listening to too many surfaces on this connection` (more than
-  10). The answer to a stop has no `error`.
+  id` (empty, over 256 bytes or holding a control character) or `listening to too many surfaces on this connection` (more than
+  10). The answer to a stop has no `error`, even when its surface id is not valid.
 - Starting needs a dashboard session whose user holds `surfaces.edit` and `policies.edit`
   ([`RBAC.md`](RBAC.md#policy-input-capture)). The session and permissions are checked again on each
   keep-alive ping; once the session ends or either permission is gone, the connection stops
@@ -150,7 +150,8 @@ request on the dashboard WebSocket, with no admin API route and nothing stored o
   dashboard sends its listens again after a reconnect.
 
 A surface's policy input is captured while at least one connection listens to it, and only the
-listening connections receive the captures. Capture runs on the node the dashboard is connected to:
+listening connections receive the captures, each through its own queue of at most 64; a capture
+that finds a connection's queue full is dropped for that connection. Capture runs on the node the dashboard is connected to:
 requests another node of the appliance serves are not captured there.
 
 While a connection listens, each evaluation of a request or response policy on the surface sends
@@ -160,7 +161,7 @@ it one `policy_input_captured` update, once the policy has decided:
 | --- | --- |
 | `config_id` | The surface id |
 | `timestamp` | When the policy decided, RFC 3339 |
-| `slot` | The policy, in words: `inbound` (the Access Point policy), `target` (the Target's request policy), `inbound variant <alias>`, `target variant <alias>`, `outbound`, `transit <alias>`, `response` (the Target's response policy), `transit <alias> response`, `gateway` (the gateway-level policy) or `appliance <plane>` (an appliance-wide plane) |
+| `slot` | The policy, in words: `inbound` (the Access Point policy), `target` (the Target's request policy), `inbound variant <alias>`, `target variant <alias>`, `outbound`, `transit <alias>`, `response` (the Target's response policy), `transit <alias> response`, `gateway` (the gateway-level policy on an inbound request), `gateway outbound` (the gateway-level policy on an outbound request, `input.gateway.direction` `outbound`) or `appliance <plane>` (an appliance-wide plane) |
 | `transit_point` | The Transit Point alias, for a Transit Point request or response policy |
 | `policies` | The policy definitions the slot evaluated, each `{"id", "name", "version"}`: one for a surface slot, every member of the set for the gateway and appliance-wide planes; a legacy inline gateway policy has neither `id` nor `name` |
 | `decided_by` | The `id` of the member that denied, when a gateway or appliance-wide set denies |
@@ -173,7 +174,9 @@ it one `policy_input_captured` update, once the policy has decided:
 
 Policies run appliance-wide, gateway, Access Point, Target, and a deny ends the chain, so a slot
 after it sends nothing. Captures are sent on the direct, Fabric and MCP proxy paths alike. MCP tool
-policies and the `tools/list` filtering of a surface policy are not captured. A surface with no
+policies, the `tools/list` filtering of a surface policy, and a fail-closed deny of a slot whose
+policy did not compile (no policy is evaluated, so there is no input to show) are not captured. A
+surface with no
 policy of its own has no surface evaluation to capture, so only a gateway or appliance-wide policy
 that applies to it is shown; to see the input of each request, add a request policy first (one that
 allows everything is enough). The Capture view says so while the surface has none.
@@ -197,7 +200,9 @@ and capability ids in the path are shortened. Masking matches these shapes only,
 another shape, such as an opaque key under a field name that is not a credential name, is sent as
 it is. Policies still see the full path. Headers that
 carry credentials never reach the policy input. Message bodies, tool arguments and claims are sent
-as they are. Policy input capture is meant for writing and testing policies: the captures hold
+with only this masking applied. The operator's log redaction rules (`logging.redaction.rules`, such
+as the email and phone number patterns) apply to the log only, not to captures, so a value they
+remove from the log shows in full in a capture. Policy input capture is meant for writing and testing policies: the captures hold
 caller data.
 
 ## Appliance-wide (global) enforcement

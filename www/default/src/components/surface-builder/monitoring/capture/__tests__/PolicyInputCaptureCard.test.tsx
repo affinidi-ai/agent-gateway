@@ -51,6 +51,36 @@ describe('PolicyInputCaptureCard', () => {
     expect(screen.queryByTestId('policy-input-capture-no-policy')).not.toBeInTheDocument();
   });
 
+  it('finds a shared Transit Point policy, a Transit Point response policy and a variant policy', () => {
+    const policy = { policy_definition_id: 'policy-1' };
+    const surface = (extra: Record<string, unknown>) =>
+      ({
+        access_point: {},
+        target: { endpoint: 'https://agent.example' },
+        ...extra,
+      }) as unknown as AgentSurface;
+
+    expect(
+      surfaceHasPolicy(surface({ transit: { points: [], opa_policy_definition_id: 'policy-1' } }))
+    ).toBe(true);
+    expect(
+      surfaceHasPolicy(surface({ transit: { points: [{ name: 'tp', response_policy: policy }] } }))
+    ).toBe(true);
+    expect(
+      surfaceHasPolicy(
+        surface({
+          variants: [{ alias: 'beta', overrides: { access_point: { inbound_policy: policy } } }],
+        })
+      )
+    ).toBe(true);
+    expect(
+      surfaceHasPolicy(
+        surface({ variants: [{ alias: 'beta', overrides: { target: { policy } } }] })
+      )
+    ).toBe(true);
+    expect(surfaceHasPolicy(surface({ variants: [{ alias: 'beta', overrides: {} }] }))).toBe(false);
+  });
+
   it('finds a policy on the Access Point, Target, response or a Transit Point', () => {
     const policy = { policy_definition_id: 'policy-1' };
     const surface = (extra: Record<string, unknown>) =>

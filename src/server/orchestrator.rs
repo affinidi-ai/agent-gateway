@@ -987,7 +987,6 @@ pub async fn run_axum_proxy(
 
         // Initialize WebSocket log broadcasting so all log entries are sent via WebSocket
         crate::observability::init_websocket_log_broadcast(state.clone());
-        crate::policies::input_capture::init(state.clone());
         info!("📡 WebSocket log broadcasting initialized");
 
         Some(state)

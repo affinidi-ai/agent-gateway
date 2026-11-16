@@ -159,18 +159,6 @@ async fn listens(
     assert_eq!(answer["listening"], true, "listening to policy input: {answer}");
 }
 
-#[given(expr = "the {string} role is granted {string}")]
-fn role_is_granted(
-    world: &mut SurfaceWorld,
-    role: String,
-    feature: String,
-) {
-    world
-        .surface_config
-        .rbac_permissions
-        .push((feature, role));
-}
-
 #[given(expr = "surface {string} has a request policy that denies with reason {string}")]
 async fn surface_has_denying_request_policy(
     world: &mut SurfaceWorld,
@@ -297,6 +285,26 @@ async fn named_operator_may_not_listen(
     assert_eq!(answer["error"], "needs surfaces.edit and policies.edit", "{answer}");
 }
 
+/// Wait until `operator`'s Capture view has received a capture `matches` accepts,
+/// panicking with `missing` and everything it received when none arrives.
+async fn wait_for_capture(
+    world: &SurfaceWorld,
+    operator: &str,
+    matches: impl Fn(&Value) -> bool,
+    missing: &str,
+) {
+    for _ in 0..100 {
+        if received_of(world, operator, CAPTURED)
+            .iter()
+            .any(&matches)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{missing}: {:#?}", received_of(world, operator, CAPTURED));
+}
+
 async fn shows_capture(
     world: &SurfaceWorld,
     operator: &str,
@@ -314,19 +322,10 @@ async fn shows_capture(
                 .to_string()
                 .contains(text)
     };
-    for _ in 0..100 {
-        if received_of(world, operator, CAPTURED)
-            .iter()
-            .any(matches)
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!(
-        "no {slot} policy capture of surface '{surface_name}' ({surface_id}) deciding {decision:?} on an input showing {text:?}: {:#?}",
-        received_of(world, operator, CAPTURED)
+    let missing = format!(
+        "no {slot} policy capture of surface '{surface_name}' ({surface_id}) deciding {decision:?} on an input showing {text:?}"
     );
+    wait_for_capture(world, operator, matches, &missing).await;
 }
 
 #[then(
@@ -375,19 +374,8 @@ async fn capture_view_names_policy(
                         .any(|policy| policy["name"] == policy_name.as_str())
                 })
     };
-    for _ in 0..100 {
-        if received_of(world, THE_OPERATOR, CAPTURED)
-            .iter()
-            .any(matches)
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!(
-        "no {slot} policy capture of surface '{surface_name}' running policy {policy_name:?}: {:#?}",
-        received_of(world, THE_OPERATOR, CAPTURED)
-    );
+    let missing = format!("no {slot} policy capture of surface '{surface_name}' running policy {policy_name:?}");
+    wait_for_capture(world, THE_OPERATOR, matches, &missing).await;
 }
 
 #[then(expr = "no captured policy input of surface {string} contains {string}")]
@@ -426,19 +414,8 @@ async fn capture_view_shows_denial(
             && capture["decision"] == "deny"
             && capture["reason"] == reason.as_str()
     };
-    for _ in 0..100 {
-        if received_of(world, THE_OPERATOR, CAPTURED)
-            .iter()
-            .any(matches)
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!(
-        "no {slot} policy capture of surface '{surface_name}' denying with reason {reason:?}: {:#?}",
-        received_of(world, THE_OPERATOR, CAPTURED)
-    );
+    let missing = format!("no {slot} policy capture of surface '{surface_name}' denying with reason {reason:?}");
+    wait_for_capture(world, THE_OPERATOR, matches, &missing).await;
 }
 
 async fn assert_no_capture(

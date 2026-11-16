@@ -812,7 +812,7 @@ allow if {
 
     #[tokio::test]
     async fn a_captured_gateway_set_names_every_member_and_only_a_denying_one_decides() {
-        use crate::policies::input_capture::{listen, received_captures, test_dashboard};
+        use crate::policies::input_capture::{listening, received_captures};
         use crate::policies::policy_definitions::PolicyDefinition;
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(
@@ -861,18 +861,17 @@ allow if {
                 .await
                 .unwrap();
         }
-        let mut dashboard = test_dashboard();
-        let _listening = listen("gw-cap-surface");
+        let (_listening, mut dashboard) = listening("gw-cap-surface");
         let input = serde_json::json!({ "channel": { "config_id": "gw-cap-surface" } });
 
         manager
             .evaluate_with_evidence("gw-cap-set", input.clone())
             .unwrap();
-        let denied = received_captures(&mut dashboard, "gw-cap-surface");
+        let denied = received_captures(&mut dashboard);
         manager
             .evaluate_with_evidence("gw-cap-allow-only", input)
             .unwrap();
-        let allowed = received_captures(&mut dashboard, "gw-cap-surface");
+        let allowed = received_captures(&mut dashboard);
 
         assert_eq!(denied.len(), 1, "{denied:?}");
         assert_eq!(denied[0]["decision"], "deny");

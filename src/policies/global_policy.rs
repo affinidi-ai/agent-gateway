@@ -817,7 +817,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_captured_appliance_set_names_every_member_and_only_a_denying_one_decides() {
-        use crate::policies::input_capture::{listen, received_captures, test_dashboard};
+        use crate::policies::input_capture::{listening, received_captures};
         let allow = gw_def("cap-allow", "package gateway.policy\ndefault allow = true");
         let deny = gw_def("cap-deny", "package gateway.policy\ndefault allow = false");
         let manager = GlobalPolicyManager::new();
@@ -837,20 +837,19 @@ pub(crate) mod tests {
                 );
             assignments
         };
-        let mut dashboard = test_dashboard();
-        let _listening = listen("appliance-cap-surface");
+        let (_listening, mut dashboard) = listening("appliance-cap-surface");
         let input = serde_json::json!({ "channel": { "config_id": "appliance-cap-surface" } });
 
         manager
             .refresh(&assign(&["cap-allow", "cap-deny"]))
             .await;
         manager.evaluate_global(PLANE_GATEWAY, &input);
-        let denied = received_captures(&mut dashboard, "appliance-cap-surface");
+        let denied = received_captures(&mut dashboard);
         manager
             .refresh(&assign(&["cap-allow"]))
             .await;
         manager.evaluate_global(PLANE_GATEWAY, &input);
-        let allowed = received_captures(&mut dashboard, "appliance-cap-surface");
+        let allowed = received_captures(&mut dashboard);
 
         assert_eq!(denied.len(), 1, "{denied:?}");
         assert_eq!(denied[0]["decision"], "deny");

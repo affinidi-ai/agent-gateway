@@ -25,7 +25,7 @@ channel capacity and defaults to `500`.
 | `OnboardingAttempt` | Defined for wire compatibility but not emitted; onboarding uses `PayloadCaptured`. |
 | `RefreshDashboard` | Requests a complete dashboard refetch after settings updates, policy-definition create/update/delete, or Trust Registry connection-state changes. |
 | `DashboardDelta` | Carries a pre-serialized periodic dashboard delta in `Arc<String>`. |
-| `PolicyInputCaptured` | Emitted after each policy evaluation on a surface that a dashboard connection listens to; sent only to the listening connections. Carries the input with credentials masked, the policies the slot ran and the decision (see [`POLICY.md`](POLICY.md#policy-input-capture)). |
+| `PolicyInputCaptured` | Emitted after each policy evaluation on a surface that a dashboard connection listens to. It never goes through the broadcast: it is serialized once and queued only for the listening connections. Carries the input with credentials masked, the policies the slot ran and the decision (see [`POLICY.md`](POLICY.md#policy-input-capture)). |
 
 Configuration reload does **not** emit `RefreshDashboard`. A dashboard observes reloaded state
 through periodic `DashboardDelta` broadcasts or an explicit refetch.
@@ -69,11 +69,14 @@ with `stop_capturing_policy_input`, each naming the `surface_id`; the gateway an
 `policy_input_capture` message saying whether the connection now listens, and why not when it
 refuses. Listening needs a session whose user holds `surfaces.edit` and `policies.edit`. The
 permission is checked again on each keep-alive ping, and a connection that loses it stops
-listening to every surface and is told so. Only listening connections receive `PolicyInputCaptured`
-updates, at most 32 answers wait to be sent before the connection stops reading the client's
-commands, and closing the connection ends its listening (see
-[`POLICY.md`](POLICY.md#policy-input-capture)). Any broadcast
-receive error, including lag, ends the connection; socket closure does likewise.
+listening to every surface and is told so, and the captures still queued for it are dropped. Each
+listening connection has its own queue of at most 64 `PolicyInputCaptured` updates; a capture that
+finds it full is dropped for that connection only, so a busy listened surface never reaches the
+broadcast or another connection. At most 32 answers wait to be sent before the connection stops
+reading the client's commands, and closing the connection ends its listening (see
+[`POLICY.md`](POLICY.md#policy-input-capture)). A connection that falls more than
+`websocket_broadcast_buffer` broadcast updates behind skips the ones it missed and keeps reading;
+only a closed broadcast channel or socket ends it.
 
 `DashboardDelta` is already serialized before broadcast and held in `Arc<String>`, reducing clone
 cost across subscribers. Other variants are serialized per connection.

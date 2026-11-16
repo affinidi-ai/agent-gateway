@@ -8,10 +8,14 @@ changes:
         capture_policy_input message and stop with stop_capturing_policy_input. While at least one
         connection listens, each request and response policy evaluation on that surface (gateway,
         surface, Transit Point and appliance-wide planes, on the direct, Fabric and MCP proxy paths)
-        is sent to the listening connections only, as a policy_input_captured update with its input,
+        is serialized once and queued for the listening connections only (up to 64 per connection,
+        then dropped for that connection), never through the shared dashboard broadcast, as a
+        policy_input_captured update with its input,
         the id, name and version of each policy definition the slot evaluated, the member that denied
-        a gateway or appliance-wide set, and its allow, deny reason or error. Credential-named values, JWTs and Bearer or Basic values
-        are masked first, also inside longer text (a Bearer token of at least 12 token characters,
+        a gateway or appliance-wide set, and its allow, deny reason or error. The gateway policy of
+        an outbound request shows as its own gateway outbound slot. A listen naming a surface id
+        that is empty, over 256 bytes or holds a control character is refused. Credential-named values, JWTs and Bearer or Basic values
+        are masked first, also inside longer text, and an SD-JWT with its disclosures (a Bearer token of at least 12 token characters,
         or 6 with a digit or symbol, and a Basic token that decodes to user:password; message text
         such as "Basic authentication" is kept), and every query value in the request path and in
         any absolute URL is redacted. Listening needs surfaces.edit and policies.edit, is checked again on each

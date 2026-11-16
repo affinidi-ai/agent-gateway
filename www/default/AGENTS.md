@@ -676,8 +676,10 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   the title and count badge, then a warning line (`text-warning` with a triangle icon,
   `policy-input-capture-warning`): "For developing and testing policies only", then the muted
   hint line; the Listen control sits on the right.
-- While the surface has no Access Point, Target, response or Transit Point policy
-  (`surfaceHasPolicy`), the card shows an info note above the list: the surface has nothing of
+- While the surface has no policy the gateway captures (`surfaceHasPolicy`: an Access Point,
+  Target or Target response policy, the shared Transit Point policy
+  `transit.opa_policy_definition_id`, a Transit Point policy or response policy, or a variant's
+  Access Point or Target policy), the card shows an info note above the list: the surface has nothing of
   its own to capture, only a gateway or appliance-wide policy shows, and a request policy (an
   allow-all one is enough) should be added first. The button's `FieldHelp` says the same.
 - The note that captures show each request and response policy evaluation (not MCP tool

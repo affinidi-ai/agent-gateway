@@ -37,6 +37,13 @@ Feature: Live policy input capture
     And the Capture view shows the "target" policy of surface "alpha" deciding "allow" on an input showing "<redacted>"
     And no captured policy input of surface "alpha" contains "eyJhbGciOiJIUzI1NiJ9"
 
+  Scenario: The Capture view masks a JWT inside a caller's message and keeps the words around it
+    Given the operator listens to the policy input of surface "alpha"
+    When the caller sends an A2A message/send request to surface "alpha" with text "my token is eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJiZGQifQ.c2lnbmF0dXJl please check"
+    Then the response status is 200
+    And the Capture view shows the "target" policy of surface "alpha" deciding "allow" on an input showing "my token is <redacted> please check"
+    And no captured policy input of surface "alpha" contains "eyJhbGciOiJIUzI1NiJ9"
+
   Scenario: The Capture view shows a denying policy's decision and reason
     Given surface "alpha" has a request policy that denies with reason "only partners may call"
     And the operator listens to the policy input of surface "alpha"
@@ -65,8 +72,3 @@ Feature: Live policy input capture
     Then the response status is 200
     And the Capture view shows the "target" policy of surface "alpha" deciding "allow" on an input showing "hello policy"
     And the Capture view of operator "olga" shows no policy input
-
-  Scenario: An operator who may not edit surfaces and policies cannot listen to policy input
-    Given operator "uma" has the "user" role
-    When operator "uma" asks to listen to the policy input of surface "alpha"
-    Then operator "uma" may not listen to policy input
