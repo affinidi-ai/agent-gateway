@@ -179,6 +179,14 @@ describe('PolicyInputCaptureCard', () => {
     );
   });
 
+  it('warns that it is for developing and testing policies before anything is captured', () => {
+    render(<Harness />);
+
+    expect(screen.getByTestId('policy-input-capture-warning')).toHaveTextContent(
+      'For developing and testing policies only'
+    );
+  });
+
   it('keeps nothing while paused', () => {
     render(<Harness paused />);
     captured({});

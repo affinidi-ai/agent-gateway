@@ -87,13 +87,13 @@ const PolicyInputCaptureControl: React.FC = () => {
         testId="field-help-policy-input-capture"
         ariaLabel="About listening to policy input"
       >
-        While you listen, the input and the decision of each request and response policy evaluation
-        on this surface show here, live. MCP tool policies are not shown. On an appliance with
-        several nodes, only requests served by the node this dashboard is connected to show. The
-        input holds request data (messages, tool arguments, claims) with credentials masked. Only
-        you receive it, and nothing is logged or stored. Listening stops when you stop it, leave
-        this view or reload the page. A surface with no policy has nothing to capture, so add one
-        first; one that allows everything is enough. Use it only to develop and test policies.
+        For developing and testing policies. While you listen, the input and the decision of each
+        request and response policy evaluation on this surface show here, live. MCP tool policies
+        are not shown. On an appliance with several nodes, only requests served by the node this
+        dashboard is connected to show. The input holds request data (messages, tool arguments,
+        claims) with credentials masked. Only you receive it, and nothing is logged or stored.
+        Listening stops when you stop it, leave this view or reload the page. A surface with no
+        policy has nothing to capture, so add one first; one that allows everything is enough.
       </FieldHelp>
       {listening && connected && (
         <span className="text-muted small" data-testid="policy-input-capture-listening">

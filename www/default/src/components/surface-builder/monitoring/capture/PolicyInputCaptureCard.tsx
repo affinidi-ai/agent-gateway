@@ -89,18 +89,24 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
   return (
     <div className="card shadow mb-4" data-testid="policy-input-capture-card">
       <div className="card-header py-3 d-flex align-items-center justify-content-between flex-wrap gap-2">
-        <h6 className="m-0 font-weight-bold text-primary">
-          <i className="fas fa-gavel"></i> Policy Input
-          {captures.length > 0 && (
-            <span className="badge text-bg-primary ms-2" style={{ verticalAlign: 'middle' }}>
-              {captures.length}/{MAX_POLICY_INPUTS}
-            </span>
-          )}
-          <small className="text-muted ms-2" data-testid="policy-input-capture-kept">
+        <div>
+          <h6 className="m-0 font-weight-bold text-primary">
+            <i className="fas fa-gavel"></i> Policy Input
+            {captures.length > 0 && (
+              <span className="badge text-bg-primary ms-2" style={{ verticalAlign: 'middle' }}>
+                {captures.length}/{MAX_POLICY_INPUTS}
+              </span>
+            )}
+          </h6>
+          <small className="d-block text-warning mt-1" data-testid="policy-input-capture-warning">
+            <i className="fas fa-exclamation-triangle me-1"></i>
+            For developing and testing policies only
+          </small>
+          <small className="d-block text-muted" data-testid="policy-input-capture-kept">
             The last {MAX_POLICY_INPUTS} policy evaluations are kept; one request can add several
             rows
           </small>
-        </h6>
+        </div>
         <PolicyInputCaptureControl />
       </div>
       <div className="card-body">
