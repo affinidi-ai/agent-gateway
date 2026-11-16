@@ -601,8 +601,8 @@ impl TargetCardFetch<'_> {
 
     /// The surface's target credential for the gateway's own card fetch, or `None`
     /// when the surface has none. Honours `target.auth.fallback` exactly as the
-    /// forwarded path does: `reject` fails the card with 502 rather than asking the
-    /// target without the credential it requires.
+    /// forwarded path does: `reject` fails the card with the error's status and reason
+    /// rather than asking the target without the credential it requires.
     async fn target_credential(&self) -> Result<Option<super::TargetCredential>, CardFailure> {
         let state = self.state;
         let channel_name = self.channel_name();
@@ -632,10 +632,10 @@ impl TargetCardFetch<'_> {
                     &e,
                 );
                 match target_auth.fallback {
-                    crate::config::TargetAuthFallback::Reject => Err(self.fail(
-                        FetchFault::CredentialRejected(e),
-                        create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED),
-                    )),
+                    crate::config::TargetAuthFallback::Reject => {
+                        let refusal = e.failure().response();
+                        Err(self.fail(FetchFault::CredentialRejected(e), refusal))
+                    }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(
                             channel = channel_name,
@@ -1374,7 +1374,12 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(failure.fault, FetchFault::CredentialRejected(TargetAuthError::StoreUnavailable), "{mode:?}");
-            assert_eq!(failure.response.status(), StatusCode::BAD_GATEWAY, "{mode:?}");
+            assert_eq!(failure.response.status(), StatusCode::SERVICE_UNAVAILABLE, "{mode:?}");
+            let body = axum::body::to_bytes(failure.response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["reason"], "target_auth_unavailable", "{mode:?}");
         }
     }
 

@@ -833,6 +833,24 @@ pub async fn mcp_server_publishes_tool_catalog(
     set_target_response(world, &server_name, build_mcp_tool_catalog_response());
 }
 
+#[given(expr = "MCP server {string} refuses every request with status {int}")]
+pub async fn mcp_server_refuses_every_request(
+    world: &mut G2gWorld,
+    server_name: String,
+    status: u16,
+) {
+    world
+        .topology
+        .actors
+        .expect_target_kind(&server_name, TargetActorKind::McpServer);
+    let (gw_index, surface_id) = world.target(&server_name);
+    world
+        .topology
+        .plan_mut(gw_index)
+        .mock_statuses
+        .insert(surface_id, status);
+}
+
 #[given(expr = "MCP server {string} supports initialization")]
 pub async fn mcp_server_supports_initialization(
     world: &mut G2gWorld,

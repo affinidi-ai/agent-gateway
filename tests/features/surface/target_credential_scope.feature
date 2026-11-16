@@ -34,8 +34,8 @@ Feature: Target credential scope on the direct path
 
   Scenario Outline: A request whose path leaves the Target base path is refused before the Target
     When the caller sends a request to the surface path "<path>" exactly as written
-    Then the response status is 502
-    And the response mentions "Target authentication failed"
+    Then the response status is 400
+    And the response reason is "target_path_refused"
     And managed agent "bravo" was not called
 
     Examples:
@@ -53,8 +53,8 @@ Feature: Target credential scope on the direct path
     Given the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "X-Transit-Token"
     And the VP Audit Log keeps every audit event
     When the caller sends a request to the surface
-    Then the response status is 502
-    And the response mentions "Target authentication failed"
+    Then the response status is 500
+    And the response reason is "target_auth_misconfigured"
     And managed agent "bravo" was not called
     And the VP Audit Log records a Target credential that was not sent, with outcome "rejected" and no OAuth error
 

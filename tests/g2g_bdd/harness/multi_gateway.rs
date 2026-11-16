@@ -117,6 +117,8 @@ pub struct GatewayPlan {
     pub surfaces: Vec<SurfaceSpec>,
     pub mock_responses: HashMap<String, serde_json::Value>,
     pub mock_response_delays: HashMap<String, (u64, u64)>,
+    /// Surfaces whose mock answers with this status instead of 200.
+    pub mock_statuses: HashMap<String, u16>,
     /// Surfaces whose mock gzip-compresses its replies, always or only when the
     /// request accepts gzip.
     pub mock_gzip: HashMap<String, crate::bdd_support::mock_server::MockStream>,
@@ -1018,6 +1020,12 @@ async fn spawn_node(
                 .get(&surface.surface_id)
             {
                 response.stream = *stream;
+            }
+            if let Some(status) = plan
+                .mock_statuses
+                .get(&surface.surface_id)
+            {
+                response.status = *status;
             }
             let mock = MockServer::start(response).await;
             if let Some((min_ms, max_ms)) = plan

@@ -236,6 +236,10 @@ fn fabric_route_probe_stage(
         return None;
     }
 
+    if route_refuses_by_design(topology, link, target) {
+        return None;
+    }
+
     if topology
         .gateway_policies
         .contains_key(&link.to_gw)
@@ -251,6 +255,38 @@ fn fabric_route_probe_stage(
         Some(_) => None,
         None => Some(FabricRouteProbeStage::AfterPolicies),
     }
+}
+
+/// A route that never answers `200`, so no probe can show it ready: the target's mock
+/// answers another status, or the sending surface's Target credential goes in the header the
+/// receiving surface checks with a value it does not accept.
+fn route_refuses_by_design(
+    topology: &TopologyBuilder,
+    link: &FabricLink,
+    target: &SurfaceSpec,
+) -> bool {
+    let mock_refuses = topology
+        .plans
+        .get(&link.to_gw)
+        .and_then(|plan| {
+            plan.mock_statuses
+                .get(&link.to_surface)
+        })
+        .is_some_and(|status| *status != 200);
+    let source = surface_spec(topology, link.from_gw, &link.from_surface);
+    let credential_refused = match (&source.target_auth, &target.source_auth) {
+        (Some(target_auth), Some(SourceAuthSpec::ApiKey { header_name, valid_key, .. })) => {
+            target_auth
+                .header_name
+                .eq_ignore_ascii_case(header_name)
+                && target_auth
+                    .secret_value
+                    .as_deref()
+                    != Some(valid_key.as_str())
+        }
+        _ => false,
+    };
+    mock_refuses || credential_refused
 }
 
 fn surface_spec<'a>(

@@ -925,6 +925,72 @@ impl TargetAuthError {
             _ => None,
         }
     }
+
+    /// How a request refused over this error is reported to its caller: a failure a later
+    /// request may get past is `Unavailable`, one only an operator can fix is `Misconfigured`.
+    pub(crate) fn failure(&self) -> TargetAuthFailure {
+        use crate::delegation_vault::service_token::ServiceTokenError as Token;
+        match self {
+            Self::StoreUnavailable
+            | Self::ServiceToken(Token::TokenRequestFailed | Token::ProviderChanged | Token::StoreUnavailable) => {
+                TargetAuthFailure::Unavailable
+            }
+            Self::SecretNotFound
+            | Self::ProviderNotFound
+            | Self::ProviderNeedsConsent
+            | Self::Withheld(_)
+            | Self::InvalidHeader
+            | Self::ServiceToken(
+                Token::Unsupported
+                | Token::SecretUnavailable
+                | Token::TokenRequestRejected(_)
+                | Token::TokenEndpointRefused
+                | Token::TokenEndpointNotHttps
+                | Token::ScopeMismatch
+                | Token::ProviderMisconfigured,
+            ) => TargetAuthFailure::Misconfigured,
+        }
+    }
+}
+
+/// Why a request was refused because its Target credential could not be sent, as the
+/// caller is told: a status and a fixed `reason`, never the cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetAuthFailure {
+    /// `500 target_auth_misconfigured`: the credential's configuration is wrong.
+    Misconfigured,
+    /// `503 target_auth_unavailable`: the credential cannot be obtained for now.
+    Unavailable,
+    /// `400 target_path_refused`: the caller's path leaves the Target's base path, so the
+    /// credential would reach another resource.
+    PathRefused,
+    /// `500 target_auth_rejected`: the peer gateway refused the credential this gateway sent
+    /// as its caller credential.
+    Rejected,
+}
+
+impl TargetAuthFailure {
+    pub(crate) fn status(self) -> StatusCode {
+        match self {
+            Self::Misconfigured | Self::Rejected => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::PathRefused => StatusCode::BAD_REQUEST,
+        }
+    }
+
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::Misconfigured => "target_auth_misconfigured",
+            Self::Unavailable => "target_auth_unavailable",
+            Self::PathRefused => "target_path_refused",
+            Self::Rejected => "target_auth_rejected",
+        }
+    }
+
+    /// The problem JSON with the generic [`TARGET_AUTH_FAILED`] detail and this `reason`.
+    pub(crate) fn response(self) -> Response {
+        crate::a2a::create_error_response_with_reason(self.status(), TARGET_AUTH_FAILED, self.reason())
+    }
 }
 
 /// Records in the VP Audit Log that the Target credential of `target_auth` was not sent
@@ -941,24 +1007,59 @@ pub(crate) fn record_target_auth_failure(
         crate::config::TargetAuthFallback::Reject => TargetAuthOutcome::Rejected,
         crate::config::TargetAuthFallback::Passthrough => TargetAuthOutcome::Passthrough,
     };
-    record_target_auth_outcome(facts, transit_point, target_auth, outcome, error.oauth_error());
+    record_target_auth_outcome(
+        facts,
+        transit_point,
+        target_auth,
+        outcome,
+        error.failure().status(),
+        error.oauth_error(),
+    );
 }
 
-/// Records in the VP Audit Log that a request was refused over the Target credential of
-/// `target_auth` whatever its `fallback`: it would have carried the credential outside the
-/// Target's base path, or the credential cannot be sent as a header. Nothing is forwarded.
+/// Records in the VP Audit Log that a request was refused with `status` over the Target
+/// credential of `target_auth` whatever its `fallback`: it would have carried the credential
+/// outside the Target's base path, or the credential cannot be sent as a header. Nothing is
+/// forwarded.
 pub(crate) fn record_target_auth_refusal(
     facts: &crate::audit::request_events::RequestFacts<'_>,
     transit_point: Option<&str>,
     target_auth: &crate::config::TargetAuthConfig,
+    status: StatusCode,
 ) {
     record_target_auth_outcome(
         facts,
         transit_point,
         target_auth,
         crate::audit::request_events::TargetAuthOutcome::Rejected,
+        status,
         None,
     );
+}
+
+/// Records in the VP Audit Log that the peer gateway refused the Target credential of
+/// `target_auth` with `401`, so the request was answered with `500 target_auth_rejected`.
+pub(crate) fn record_target_credential_refused_by_target(
+    facts: &crate::audit::request_events::RequestFacts<'_>,
+    transit_point: Option<&str>,
+    target_auth: &crate::config::TargetAuthConfig,
+) {
+    crate::audit::request_events::target_credential_refused_by_target(
+        facts,
+        transit_point,
+        target_auth_provider_id(target_auth),
+        TargetAuthFailure::Rejected
+            .status()
+            .as_u16(),
+        StatusCode::UNAUTHORIZED.as_u16(),
+    );
+}
+
+fn target_auth_provider_id(target_auth: &crate::config::TargetAuthConfig) -> Option<&str> {
+    match &target_auth.method {
+        crate::config::TargetAuthMethod::CredentialProvider { provider_id, .. } => Some(provider_id.as_str()),
+        _ => None,
+    }
 }
 
 fn record_target_auth_outcome(
@@ -966,13 +1067,17 @@ fn record_target_auth_outcome(
     transit_point: Option<&str>,
     target_auth: &crate::config::TargetAuthConfig,
     outcome: crate::audit::request_events::TargetAuthOutcome,
+    status: StatusCode,
     oauth_error: Option<crate::delegation_vault::oauth::OAuthErrorCode>,
 ) {
-    let provider_id = match &target_auth.method {
-        crate::config::TargetAuthMethod::CredentialProvider { provider_id, .. } => Some(provider_id.as_str()),
-        _ => None,
-    };
-    crate::audit::request_events::target_auth_failed(facts, transit_point, provider_id, outcome, oauth_error);
+    crate::audit::request_events::target_auth_failed(
+        facts,
+        transit_point,
+        target_auth_provider_id(target_auth),
+        outcome,
+        status.as_u16(),
+        oauth_error,
+    );
 }
 
 /// A Target credential header the gateway attaches, and the issued service token behind it,
@@ -6697,8 +6802,9 @@ async fn proxy_charged_request(
                 channel = channel_name,
                 "Refusing a request outside the Target base path: it would carry the Target credential"
             );
-            record_target_auth_refusal(&audit_facts, None, target_auth);
-            return Ok(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED));
+            let refusal = TargetAuthFailure::PathRefused;
+            record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
+            return Ok(refusal.response());
         }
         let caller_assertion = CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed);
         let mcp_proxy_base_url = match state.mcp_proxy_store.as_ref() {
@@ -6731,10 +6837,9 @@ async fn proxy_charged_request(
             Err(e) => {
                 error!(channel = channel_name, error = %e, "Failed to resolve target authentication");
                 record_target_auth_failure(&audit_facts, None, target_auth, &e);
-                // Check fallback behavior
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
-                        return Ok(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED));
+                        return Ok(e.failure().response());
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(
@@ -12568,17 +12673,19 @@ async fn handle_fabric_request_inner(
     };
     // Inject target authentication credentials into the forwarded headers so
     // GW2 delivers them to the upstream service.
+    let mut injected_target_header: Option<String> = None;
     if let Some(target_auth) = state.surface.target_auth() {
         if !crate::proxy::paths::appended_path_stays_below_base(uri.path()) {
             warn!(
                 channel = channel_name,
                 "Refusing a Fabric request that climbs out of its path: it would carry the Target credential"
             );
-            record_target_auth_refusal(&fabric_send_facts, None, target_auth);
+            let refusal = TargetAuthFailure::PathRefused;
+            record_target_auth_refusal(&fabric_send_facts, None, target_auth, refusal.status());
             connection_guard
                 .decrement()
                 .await;
-            return Err(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED));
+            return Err(refusal.response());
         }
         match inject_target_auth_header(
             target_auth,
@@ -12599,6 +12706,7 @@ async fn handle_fabric_request_inner(
                     stream_headers.insert(name, value);
                 }
                 headers_map.insert(header_name.to_uppercase(), header_value);
+                injected_target_header = Some(header_name);
                 channel_info!(config_id, "Injected target auth header into fabric ForwardRequest");
             }
             Ok(None) => {}
@@ -12610,7 +12718,7 @@ async fn handle_fabric_request_inner(
                         connection_guard
                             .decrement()
                             .await;
-                        return Err(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED));
+                        return Err(e.failure().response());
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(
@@ -13118,6 +13226,12 @@ async fn handle_fabric_request_inner(
         .then(|| crate::a2a::url_rewriter::extended_agent_card_request_id(&original_body_bytes))
         .flatten();
     let is_extended_card_rpc_request = extended_card_rpc_id.is_some();
+    let sent_target_credential = state
+        .surface
+        .target_auth()
+        .cloned()
+        .zip(injected_target_header);
+    let refusal_trace_id = trace_id.clone();
     let mut process_response = async move |forward_result: Result<
         Option<crate::gateways::connection_points::messages::ReceivedMessage>,
         String,
@@ -13170,6 +13284,27 @@ async fn handle_fabric_request_inner(
                     .get("status")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(500) as u16;
+
+                if let Some((target_auth, injected)) = &sent_target_credential
+                    && crate::proxy::fabric_forward::refused_injected_credential(
+                        status,
+                        crate::proxy::fabric_forward::refused_credential_header(&response_msg.message_body),
+                        injected,
+                    )
+                {
+                    channel_warn!(config_id, "The peer gateway refused the Target credential sent in {}", injected);
+                    let facts = crate::audit::request_events::RequestFacts {
+                        surface_id: config_id,
+                        channel_name,
+                        trace_id: Some(&refusal_trace_id),
+                        via_fabric: false,
+                    };
+                    record_target_credential_refused_by_target(&facts, None, target_auth);
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Err(TargetAuthFailure::Rejected.response());
+                }
 
                 let response_headers = response_msg
                     .message_body
@@ -15641,7 +15776,7 @@ async fn handle_mcp_proxy_request_inner(
                 record_target_auth_failure(&audit_facts, None, target_auth, &e);
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
-                        return Err(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED));
+                        return Err(e.failure().response());
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(
@@ -15982,10 +16117,11 @@ async fn handle_mcp_proxy_request_inner(
             Ok(axum::response::Json(response_json).into_response())
         }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::OutsideTargetBase) => {
+            let refusal = TargetAuthFailure::Misconfigured;
             if let Some(target_auth) = state.surface.target_auth() {
-                record_target_auth_refusal(&audit_facts, None, target_auth);
+                record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
             }
-            Err(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED))
+            Err(refusal.response())
         }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::Failed(e)) => {
             error!(
@@ -16626,6 +16762,8 @@ pub(crate) fn compute_transit_token_caller_context(
 #[cfg(test)]
 mod fabric_send_policy_tests;
 #[cfg(test)]
+pub(crate) mod early_response_tests;
+#[cfg(test)]
 mod target_auth_audit_tests;
 #[cfg(test)]
 pub(crate) mod variant_routing_tests;
@@ -17103,6 +17241,65 @@ pub(crate) mod target_auth_tests {
             .collect();
         stored.sort();
         assert_eq!(stored, vec![vec!["read".to_string()], vec!["write".to_string()]]);
+    }
+
+    #[test]
+    fn each_target_auth_error_is_reported_as_misconfigured_or_unavailable() {
+        use crate::config::target_auth_rules::TargetCredentialRule;
+        use crate::delegation_vault::oauth::OAuthErrorCode;
+        use crate::proxy::handler::TargetAuthFailure;
+        let unavailable = [
+            TargetAuthError::StoreUnavailable,
+            TargetAuthError::ServiceToken(ServiceTokenError::TokenRequestFailed),
+            TargetAuthError::ServiceToken(ServiceTokenError::ProviderChanged),
+            TargetAuthError::ServiceToken(ServiceTokenError::StoreUnavailable),
+        ];
+        let misconfigured = [
+            TargetAuthError::SecretNotFound,
+            TargetAuthError::ProviderNotFound,
+            TargetAuthError::ProviderNeedsConsent,
+            TargetAuthError::Withheld(TargetCredentialRule::Https),
+            TargetAuthError::Withheld(TargetCredentialRule::SourceAuth),
+            TargetAuthError::InvalidHeader,
+            TargetAuthError::ServiceToken(ServiceTokenError::Unsupported),
+            TargetAuthError::ServiceToken(ServiceTokenError::SecretUnavailable),
+            TargetAuthError::ServiceToken(ServiceTokenError::TokenRequestRejected(OAuthErrorCode::new(
+                "invalid_client",
+            ))),
+            TargetAuthError::ServiceToken(ServiceTokenError::TokenEndpointRefused),
+            TargetAuthError::ServiceToken(ServiceTokenError::TokenEndpointNotHttps),
+            TargetAuthError::ServiceToken(ServiceTokenError::ScopeMismatch),
+            TargetAuthError::ServiceToken(ServiceTokenError::ProviderMisconfigured),
+        ];
+        for error in unavailable {
+            assert_eq!(error.failure(), TargetAuthFailure::Unavailable, "{error:?}");
+        }
+        for error in misconfigured {
+            assert_eq!(error.failure(), TargetAuthFailure::Misconfigured, "{error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_target_auth_failure_answers_its_status_and_reason_with_the_generic_detail() {
+        use crate::proxy::handler::{TARGET_AUTH_FAILED, TargetAuthFailure};
+        use axum::http::StatusCode;
+        for (failure, status, reason) in [
+            (TargetAuthFailure::Misconfigured, StatusCode::INTERNAL_SERVER_ERROR, "target_auth_misconfigured"),
+            (TargetAuthFailure::Unavailable, StatusCode::SERVICE_UNAVAILABLE, "target_auth_unavailable"),
+            (TargetAuthFailure::PathRefused, StatusCode::BAD_REQUEST, "target_path_refused"),
+            (TargetAuthFailure::Rejected, StatusCode::INTERNAL_SERVER_ERROR, "target_auth_rejected"),
+        ] {
+            let response = failure.response();
+            assert_eq!(response.status(), status, "{failure:?}");
+            assert_eq!(response.headers()["content-type"], "application/problem+json", "{failure:?}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["status"], status.as_u16(), "{failure:?}");
+            assert_eq!(body["detail"], TARGET_AUTH_FAILED, "{failure:?}");
+            assert_eq!(body["reason"], reason, "{failure:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -24478,7 +24675,7 @@ mod fabric_send_tests {
         for path in ["/%2e%2e/admin", "/x/../../admin", "/..;/admin", "/%2E%2E/%2e%2e/admin"] {
             assert_eq!(
                 fabric_send_status_with_passthrough_target_auth(path).await,
-                axum::http::StatusCode::BAD_GATEWAY,
+                axum::http::StatusCode::BAD_REQUEST,
                 "{path}"
             );
         }

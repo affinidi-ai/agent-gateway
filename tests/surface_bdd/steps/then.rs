@@ -1686,11 +1686,19 @@ fn response_body_is_error(
             "status": 403,
             "detail": "Request blocked by surface policy"
         }),
-        "agent_card_target_auth_failed" => serde_json::json!({
+        "agent_card_target_auth_misconfigured" => serde_json::json!({
             "type": "https://a2a-protocol.org/errors/proxy-error",
-            "title": "Bad Gateway",
-            "status": 502,
-            "detail": "Target authentication failed"
+            "title": "Internal Server Error",
+            "status": 500,
+            "detail": "Target authentication failed",
+            "reason": "target_auth_misconfigured"
+        }),
+        "agent_card_target_auth_unavailable" => serde_json::json!({
+            "type": "https://a2a-protocol.org/errors/proxy-error",
+            "title": "Service Unavailable",
+            "status": 503,
+            "detail": "Target authentication failed",
+            "reason": "target_auth_unavailable"
         }),
         "agent_card_upstream_redirected" => serde_json::json!({
             "type": "https://a2a-protocol.org/errors/proxy-error",

@@ -271,8 +271,8 @@ Feature: Routing through a proxy:// MCP target
     And the surface requires "API Key" source authentication
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     When the caller invokes the MCP tool "get_weather" for city "../../../api/weather/Paris" with a valid API key
-    Then the response status is 502
-    And the response mentions "Target authentication failed"
+    Then the response status is 500
+    And the response reason is "target_auth_misconfigured"
     And REST API "bravo" was not called
 
   Scenario: A credentialed tool call whose path leaves the MCP proxy base path is refused before the REST API
@@ -280,8 +280,8 @@ Feature: Routing through a proxy:// MCP target
     And the surface requires "API Key" source authentication
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     When the caller invokes the MCP tool "get_weather" for city "../../admin" with a valid API key
-    Then the response status is 502
-    And the response mentions "Target authentication failed"
+    Then the response status is 500
+    And the response reason is "target_auth_misconfigured"
     And REST API "bravo" was not called
 
   Scenario: A credentialed tool call with a braced path value is refused as invalid arguments, not as leaving the base path
@@ -319,8 +319,8 @@ Feature: Routing through a proxy:// MCP target
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     And the gateway enforces the credential rule "target_https"
     When the caller invokes the MCP tool "get_weather" for city "Paris" with a valid API key
-    Then the response status is 502
-    And the response mentions "Target authentication"
+    Then the response status is 500
+    And the response reason is "target_auth_misconfigured"
     And REST API "bravo" was not called
 
   Scenario: An MCP proxy tool call goes out without the Target credential when https Targets are enforced and fallback is passthrough

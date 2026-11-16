@@ -3186,6 +3186,43 @@ async fn axum_response_to_forward_result(response: axum::http::Response<axum::bo
     }
 }
 
+/// The header of the one caller credential this gateway verified and refused: the method
+/// read it from a header the request carries, and no other method's credential came with
+/// it. `None` for a missing credential, ambiguous credentials, or one not read from a header.
+fn refused_credential_header<'a>(
+    method: &'a crate::source_auth::SourceAuthConfig,
+    ambiguous: bool,
+    headers: &axum::http::HeaderMap,
+) -> Option<&'a str> {
+    if ambiguous || !method.is_presented(headers, false) {
+        return None;
+    }
+    method.credential_header_name()
+}
+
+/// Marks this gateway's own refusal of a caller credential in the ForwardResponse envelope,
+/// beside `status`, so the sending gateway learns which header held the refused credential.
+/// The HTTP body is left as it is.
+fn with_caller_refusal(
+    result: ProcessingResult,
+    credential_header: Option<&str>,
+) -> ProcessingResult {
+    match (result, credential_header) {
+        (
+            ProcessingResult::RequiresResponse {
+                response_type,
+                mut response_body,
+            },
+            Some(header),
+        ) => {
+            response_body[crate::proxy::fabric_forward::CALLER_REFUSAL_FIELD] =
+                serde_json::json!({ "credential_header": header.to_ascii_lowercase() });
+            ProcessingResult::RequiresResponse { response_type, response_body }
+        }
+        (result, _) => result,
+    }
+}
+
 async fn process_modern_fabric_response<Process, ProcessFuture>(
     response: reqwest::Response,
     headers: axum::http::HeaderMap,
@@ -5111,8 +5148,12 @@ async fn process_charged_forward_request(
                             refused,
                             None,
                         );
+                        let refused_header =
+                            refused_credential_header(auth_config, selection.ambiguous, &axum_headers);
                         if challenged && let Some(protected_resource) = &protected_resource {
-                            return axum_response_to_forward_result(protected_resource.fabric_refusal(&e)).await;
+                            let refusal =
+                                axum_response_to_forward_result(protected_resource.fabric_refusal(&e)).await;
+                            return with_caller_refusal(refusal, refused_header);
                         }
                         if refused {
                             let refusal = crate::source_auth::errors::caller_refusal(
@@ -5120,7 +5161,7 @@ async fn process_charged_forward_request(
                                 &resolved_auth_config,
                                 refused_mcp_request_id(&surface, &body_bytes),
                             );
-                            return axum_response_to_forward_result(refusal).await;
+                            return with_caller_refusal(axum_response_to_forward_result(refusal).await, refused_header);
                         }
                         source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
                             attempted_method: resolved_auth_config.method_tag().to_string(),
@@ -6023,8 +6064,9 @@ async fn process_charged_forward_request(
             surface.agent_card_location_path(),
         ) {
             channel_warn!(config_id, "Refusing a request outside the Target base path: it would carry the Target credential");
-            crate::proxy::handler::record_target_auth_refusal(&audit_facts, None, target_auth);
-            return target_auth_failed_result();
+            let refusal = crate::proxy::handler::TargetAuthFailure::PathRefused;
+            crate::proxy::handler::record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
+            return target_auth_failure_result(refusal);
         }
         // Build a secrets store from the storage path passed via message context
         let secrets_store: Option<Arc<dyn crate::secrets::SecretsStore>> = match message
@@ -6080,7 +6122,7 @@ async fn process_charged_forward_request(
                 crate::proxy::handler::record_target_auth_failure(&audit_facts, None, target_auth, &e);
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
-                        return target_auth_failed_result();
+                        return target_auth_failure_result(e.failure());
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         channel_warn!(
@@ -8427,20 +8469,23 @@ fn fabric_mcp_tool_policy_error(
     mcp_forward_error_response(id, crate::mcp::error_codes::INTERNAL_ERROR, "Internal error: policy evaluation failed")
 }
 
-/// The 502 a Fabric receive answers when the Target credential cannot be sent.
-fn target_auth_failed_result() -> ProcessingResult {
+/// What a Fabric receive answers when the Target credential cannot be sent: the failure's
+/// status and `reason`, with the generic detail.
+fn target_auth_failure_result(failure: crate::proxy::handler::TargetAuthFailure) -> ProcessingResult {
+    let status = failure.status();
     ProcessingResult::RequiresResponse {
         response_type: MessageType::ForwardResponse.to_string(),
         response_body: serde_json::json!({
-            "status": 502,
+            "status": status.as_u16(),
             "headers": {
                 "content-type": "application/problem+json",
             },
             "body": serde_json::json!({
                 "type": "about:blank",
-                "title": "Bad Gateway",
-                "status": 502,
+                "title": status.canonical_reason().unwrap_or("Error"),
+                "status": status.as_u16(),
                 "detail": TARGET_AUTH_FAILED,
+                "reason": failure.reason(),
             }).to_string(),
             "error": TARGET_AUTH_FAILED,
         }),
@@ -9034,7 +9079,7 @@ async fn handle_mcp_proxy_forward(
                 crate::proxy::handler::record_target_auth_failure(&audit_facts, None, target_auth, &e);
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
-                        return target_auth_failed_result();
+                        return target_auth_failure_result(e.failure());
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         channel_warn!(
@@ -9241,10 +9286,11 @@ async fn handle_mcp_proxy_forward(
             }
         }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::OutsideTargetBase) => {
+            let refusal = crate::proxy::handler::TargetAuthFailure::Misconfigured;
             if let Some(target_auth) = surface.target_auth() {
-                crate::proxy::handler::record_target_auth_refusal(&audit_facts, None, target_auth);
+                crate::proxy::handler::record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
             }
-            target_auth_failed_result()
+            target_auth_failure_result(refusal)
         }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::Failed(error_msg)) => {
             let config_id = surface
@@ -9594,6 +9640,54 @@ mod tests {
     use crate::gateways::connection_points::messages::{MessageMetadata, ReceivedMessage};
     use axum::body::Body;
     use axum::http::{Response, StatusCode};
+
+    fn api_key_method() -> crate::source_auth::SourceAuthConfig {
+        serde_json::from_value(serde_json::json!({
+            "type": "api_key", "secret_id": "caller-key",
+            "extraction": {"source": "http_header", "field": "X-API-Key"}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn only_a_presented_unambiguous_header_credential_is_named_as_refused() {
+        let method = api_key_method();
+        let mut presented = axum::http::HeaderMap::new();
+        presented.insert("x-api-key", axum::http::HeaderValue::from_static("wrong"));
+
+        assert_eq!(refused_credential_header(&method, false, &presented), Some("X-API-Key"));
+        assert_eq!(refused_credential_header(&method, true, &presented), None, "ambiguous credentials");
+        assert_eq!(
+            refused_credential_header(&method, false, &axum::http::HeaderMap::new()),
+            None,
+            "a missing credential"
+        );
+    }
+
+    #[test]
+    fn a_caller_refusal_is_marked_in_the_envelope_and_never_in_the_body() {
+        let refusal = || ProcessingResult::RequiresResponse {
+            response_type: MessageType::ForwardResponse.to_string(),
+            response_body: serde_json::json!({"status": 401, "headers": {}, "body": "{\"detail\":\"refused\"}"}),
+        };
+        let ProcessingResult::RequiresResponse { response_body, .. } =
+            with_caller_refusal(refusal(), Some("X-API-Key"))
+        else {
+            panic!("expected RequiresResponse");
+        };
+        assert_eq!(response_body["caller_refusal"], serde_json::json!({"credential_header": "x-api-key"}));
+        assert_eq!(response_body["body"], "{\"detail\":\"refused\"}");
+
+        let ProcessingResult::RequiresResponse { response_body, .. } = with_caller_refusal(refusal(), None) else {
+            panic!("expected RequiresResponse");
+        };
+        assert!(
+            response_body
+                .get("caller_refusal")
+                .is_none(),
+            "{response_body}"
+        );
+    }
 
     #[test]
     fn a_gateway_info_query_is_answered_with_null_info() {

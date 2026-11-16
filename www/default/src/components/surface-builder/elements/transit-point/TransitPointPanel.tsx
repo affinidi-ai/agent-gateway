@@ -484,7 +484,7 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
               value={config.auth_fallback || 'reject'}
               onChange={e => updateField('auth_fallback', e.target.value)}
             >
-              <option value="reject">Reject (502)</option>
+              <option value="reject">Reject request</option>
               <option value="passthrough">Passthrough (no credential injected)</option>
             </Form.Select>
           </Form.Group>

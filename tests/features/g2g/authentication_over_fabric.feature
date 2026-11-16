@@ -110,13 +110,38 @@ Feature: Source authentication and target authentication over fabric
     Then the response status is 403
     And MCP server "bravo" was not called
 
+  Scenario: gateway 1 reports a Target credential that gateway 2 refuses
+    Given a fabric with 2 gateways
+    And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
+    And surface "alpha" requires "API Key" source authentication
+    And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And surface "charlie" injects target authentication from secret "bdd-gateway-1-key" with value "bdd-key-gateway-2-refuses" as header "x-api-key"
+    And the VP Audit Log of gateway 1 keeps every audit event
+    When the caller asks gateway 1 MCP surface "charlie" for available tools
+    Then the response status is 500
+    And the response says "target_auth_rejected"
+    And MCP server "bravo" was not called
+    And the VP Audit Log of gateway 1 records the Target credential as refused by the target
+
+  Scenario: a 401 from gateway 2's Target reaches the caller unchanged
+    Given a fabric with 2 gateways
+    And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
+    And MCP server "bravo" refuses every request with status 401
+    And surface "alpha" requires "API Key" source authentication
+    And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And surface "charlie" injects target authentication from secret "bdd-gateway-1-key" with value "bdd-source-api-key" as header "x-api-key"
+    And the VP Audit Log of gateway 1 keeps every audit event
+    When the caller asks gateway 1 MCP surface "charlie" for available tools
+    Then the response status is 401
+    And the VP Audit Log of gateway 1 records no Target credential refused by the target
+
   Scenario: gateway 2 rejects forwarding when target authentication credentials are missing
     Given a fabric with 2 gateways
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
     And surface "alpha" is configured with missing target authentication secret "bdd-missing-target-auth-secret" for header "x-target-api-key" and fallback reject
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     When the caller asks gateway 1 MCP surface "charlie" for available tools
-    Then the response status is 502
+    Then the response status is 500
     And the response says "Target authentication failed"
     And MCP server "bravo" was not called
 

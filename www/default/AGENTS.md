@@ -1095,6 +1095,12 @@ the token's own `sub`; a **Principal** row (`credential-audit-caller-principal`)
 the caller's grants are keyed by, `caller.principal`, only when the JWT strategy names a claim
 other than `sub`.
 
+## Target authentication fallback
+
+The Target authentication fallback select on the Managed Agent and on a Transit Point offers
+**Reject request** and a pass-through option. The reject label names no status: the gateway
+answers `500 target_auth_misconfigured` or `503 target_auth_unavailable` depending on the cause.
+
 ## Credential provider editor
 
 `/credential-providers/new` and `/credential-providers/:id` (`EditCredentialProviderPage.tsx`)

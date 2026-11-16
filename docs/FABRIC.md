@@ -421,7 +421,13 @@ request received by the destination gateway:
    is answered here with a `401` before policy, without `resource_metadata`, and a failed
    credential of another method with a plain `401`: the sending Gateway strips the caller's
    own `Authorization` header, so only a credential it injects, issued for this surface's
-   resource, can pass. There is no A2A counterpart:
+   resource, can pass. A buffered `ForwardResponse` refusing one credential read from a header
+   names that header in the envelope field `caller_refusal`, beside `status`, `headers`, `body`
+   and `error`, never in the body; a framed stream carries no such field. The sending gateway
+   answers its caller `500 target_auth_rejected` when that header is the one its own Target
+   credential went in, and drops the field either way (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md)). A
+   receiving gateway that relays another peer's answer builds its own `ForwardResponse`, so a
+   `caller_refusal` never crosses more than one hop. There is no A2A counterpart:
    `A2A-Version` is negotiated and A2A requests are validated on the sending gateway, not here
    (see below).
 6. Build policy input containing the authenticated sending Gateway and any source-auth result. An

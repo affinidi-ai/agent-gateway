@@ -76,7 +76,8 @@ Feature: JWT Bearer client authentication
     And the credential provider is refusing token requests
     And the gateway keeps its log of warnings
     When the caller sends a request to the surface
-    Then the response status is 502
+    Then the response status is 503
+    And the response reason is "target_auth_unavailable"
     And the credential provider received 1 token request
     And the credential provider's latest token request carries HTTP Basic credentials for client "bdd-target-client" and secret "bdd-target-client-secret-value"
     And the gateway log shows no credential provider secret or token

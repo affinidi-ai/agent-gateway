@@ -764,8 +764,14 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     own card fetch with no triggering request (the preview), where `trace_id` is absent; a card
     fetch that serves a caller's `/.well-known/agent-card.json` request carries that request's
     trace id. The record carries `provider_id` for a credential provider and a
-    `target_auth` object: `outcome` is `rejected` (the request was refused, `http_status` `502`
-    on HTTP) or `passthrough` (forwarded without the credential, no `http_status`),
+    `target_auth` object: `outcome` is `rejected` (the request was refused, `http_status` on
+    HTTP is the status answered: `500` or `503` for a credential that could not be obtained or
+    sent, `400` for a caller's path outside the Target base path, `500` for an MCP proxy tool
+    URL outside it), `passthrough` (forwarded without the credential, no `http_status`) or
+    `refused_by_target` (the credential was sent and the peer gateway refused it as its caller
+    credential; `upstream_status` is the peer's status, `401`, and `http_status` `500`; see
+    [Target credential refused by the peer
+    gateway](CREDENTIAL_DELEGATION.md#target-credential-refused-by-the-peer-gateway)),
     `transit_point` names the Transit Point by alias when the credential was a Transit Point's
     `target_auth` (absent for the Target), and
     `oauth_error` is present when the token endpoint answered with an OAuth `error` code: the

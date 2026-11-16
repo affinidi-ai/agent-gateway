@@ -167,6 +167,10 @@ The endpoint editor picks a Kafka endpoint's security protocol (`plaintext`, `ss
 `SCRAM-SHA-256` or `SCRAM-SHA-512`); see
 _Endpoint editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#endpoint-editor).
 
+The Target authentication fallback select on the Managed Agent and on a Transit Point labels
+its reject option **Reject request**, with no status; see _Target authentication fallback_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#target-authentication-fallback).
+
 The credential provider editor's **Client authentication** select (JWT Bearer) keeps its
 explanation behind `FieldHelp`; see _Credential provider editor_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).

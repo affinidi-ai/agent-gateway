@@ -1326,6 +1326,47 @@ pub async fn response_to_caller_did_not_carry_header(
     assert_header_absent(&world.response_headers, &header, "the caller's response");
 }
 
+fn refused_by_target(event: &Value) -> bool {
+    event["event"]["request_rejected"]["target_auth"]["outcome"] == "refused_by_target"
+}
+
+#[then(expr = "the VP Audit Log of gateway {int} records the Target credential as refused by the target")]
+pub async fn vp_audit_log_records_target_credential_refused_by_target(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let (found, events) = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .wait_for_audit_event(|event| {
+            refused_by_target(event) && event["event"]["request_rejected"]["target_auth"]["upstream_status"] == 401
+        })
+        .await
+        .unwrap_or_else(|error| panic!("read the VP Audit Log of gateway {gateway}: {error:#}"));
+    assert!(found, "gateway {gateway} recorded no Target credential refused by the target: {events:?}");
+}
+
+#[then(expr = "the VP Audit Log of gateway {int} records no Target credential refused by the target")]
+pub async fn vp_audit_log_records_no_target_credential_refused_by_target(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let events = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .read_audit_events()
+        .await
+        .unwrap_or_else(|error| panic!("read the VP Audit Log of gateway {gateway}: {error:#}"));
+    assert!(
+        !events
+            .iter()
+            .any(refused_by_target),
+        "gateway {gateway} recorded a Target credential refused by the target: {events:?}"
+    );
+}
+
 #[then(regex = r"^all (\d+) responses have status (\d+)$")]
 pub async fn all_concurrent_responses_have_status(
     world: &mut G2gWorld,
