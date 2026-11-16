@@ -11,9 +11,10 @@ changes:
         is sent to the listening connections only, as a policy_input_captured update with its input,
         the id, name and version of each policy definition the slot evaluated, the member that denied
         a gateway or appliance-wide set, and its allow, deny reason or error. Credential-named values, JWTs and Bearer or Basic values
-        are masked first (a Bearer or Basic scheme followed by one token of at least 12 token
-        characters; message text such as "Basic plan" is kept), and every query value in the
-        request path is redacted. Listening needs surfaces.edit and policies.edit, is checked again on each
+        are masked first, also inside longer text (a Bearer token of at least 12 token characters,
+        or 6 with a digit or symbol, and a Basic token that decodes to user:password; message text
+        such as "Basic authentication" is kept), and every query value in the request path and in
+        any absolute URL is redacted. Listening needs surfaces.edit and policies.edit, is checked again on each
         keep-alive ping, and ends when the connection closes. Nothing is logged or stored, and the
         surface configuration is not changed. Policy authors can see the input structure again
         without the gateway logging it. See docs/POLICY.md.
@@ -38,6 +39,13 @@ changes:
         number pattern turned ids like bf983d36-0281-4579-... into bf983d[REDACTED-PHONE], so the
         [CHANNEL:<id>] prefix no longer matched and that surface's Monitoring log stayed empty. A
         rule that matches a whole UUID still masks it.
+    - timestamp: '2026-11-16T00:00:00Z'
+      title: Keep a dashboard connected when it falls behind the live update stream
+      description: >-
+        A dashboard WebSocket connection that fell more than websocket_broadcast_buffer updates
+        behind was closed, and the page showed its reconnect dialog. It now skips the updates it
+        missed and keeps reading; only a closed update channel ends it. Policy input capture adds
+        one update per policy evaluation while someone listens, which made falling behind likelier.
   removed: []
   security: []
   breaking: []

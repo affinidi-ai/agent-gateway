@@ -8,6 +8,7 @@ use std::sync::{Arc, LazyLock, OnceLock};
 
 use chrono::Utc;
 use dashmap::DashMap;
+use regex::Regex;
 use serde_json::Value;
 
 use crate::observability::loggable::REDACTED;
@@ -299,32 +300,100 @@ pub fn mask_credentials(value: &mut Value) {
         Value::Array(items) => items
             .iter_mut()
             .for_each(mask_credentials),
-        Value::String(text) if is_credential_text(text) => *text = REDACTED.to_string(),
+        Value::String(text) => {
+            if let Some(masked) = mask_text(text) {
+                *text = masked;
+            }
+        }
         _ => {}
     }
 }
 
-/// Whether `text` is a credential: a JWT, or an authorization value, `Bearer` or `Basic`
-/// followed by one token. Text that merely starts with one of those words is not.
-fn is_credential_text(text: &str) -> bool {
+/// A JWT anywhere in a text.
+static EMBEDDED_JWT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\beyJ[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]*").expect("valid JWT pattern"));
+
+/// `Bearer` or `Basic`, whitespace and the token after it, anywhere in a text.
+static AUTHORIZATION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(bearer|basic)(\s+)([A-Za-z0-9\-._~+/]+=*)").expect("valid authorization pattern")
+});
+
+/// An absolute URL with a query string, anywhere in a text.
+static URL_QUERY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\b([a-z][a-z0-9+.\-]*://[^\s?#"'<>]+)\?([^\s#"'<>]+)"#).expect("valid URL pattern")
+});
+
+/// `text` with its credentials masked, or `None` when it holds none. A text that is
+/// one JWT or one authorization value becomes [`REDACTED`] whole; inside longer text
+/// each JWT and authorization token becomes [`REDACTED`], and each URL keeps its query
+/// parameter names with their values redacted.
+fn mask_text(text: &str) -> Option<String> {
     let trimmed = text.trim();
-    is_jwt(trimmed) || is_authorization_value(trimmed)
+    if is_jwt(trimmed) || is_authorization_value(trimmed) {
+        return Some(REDACTED.to_string());
+    }
+    let masked = EMBEDDED_JWT
+        .replace_all(text, regex::NoExpand(REDACTED))
+        .into_owned();
+    let masked = AUTHORIZATION
+        .replace_all(&masked, |caps: &regex::Captures<'_>| {
+            if is_authorization_token(&caps[1], &caps[3]) {
+                format!("{}{}{REDACTED}", &caps[1], &caps[2])
+            } else {
+                caps[0].to_string()
+            }
+        })
+        .into_owned();
+    let masked = URL_QUERY
+        .replace_all(&masked, |caps: &regex::Captures<'_>| {
+            format!("{}?{}", &caps[1], crate::observability::loggable::query(&caps[2]))
+        })
+        .into_owned();
+    (masked != text).then_some(masked)
 }
 
-/// The shortest token an authorization value is taken to carry. Shorter words after
-/// `Bearer` or `Basic` ("Basic plan") are message text, not a credential.
+/// The shortest `Bearer` token taken as a credential when it is only letters. Shorter
+/// words ("Bearer arms") are message text.
 const MIN_AUTHORIZATION_TOKEN_LEN: usize = 12;
 
+/// The shortest `Bearer` token taken as a credential when it holds a digit or one of
+/// `-._~+/=`.
+const MIN_MARKED_TOKEN_LEN: usize = 6;
+
 fn is_authorization_value(text: &str) -> bool {
-    let Some((scheme, token)) = text.split_once(char::is_whitespace) else {
-        return false;
-    };
-    let token = token.trim();
-    (scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("basic"))
-        && token.len() >= MIN_AUTHORIZATION_TOKEN_LEN
-        && token
+    text.split_once(char::is_whitespace)
+        .is_some_and(|(scheme, token)| is_authorization_token(scheme, token.trim()))
+}
+
+/// Whether `token` after `scheme` is a credential. A `Basic` token is one when it
+/// decodes as base64 to `user:password`, so text such as "Basic authentication" is
+/// kept. A `Bearer` token is one at [`MIN_AUTHORIZATION_TOKEN_LEN`] characters, or at
+/// [`MIN_MARKED_TOKEN_LEN`] when it holds a digit or a symbol.
+fn is_authorization_token(
+    scheme: &str,
+    token: &str,
+) -> bool {
+    if token.is_empty()
+        || !token
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-._~+/=".contains(&b))
+    {
+        return false;
+    }
+    if scheme.eq_ignore_ascii_case("basic") {
+        use base64::Engine;
+        return base64::engine::general_purpose::STANDARD
+            .decode(token)
+            .ok()
+            .and_then(|decoded| String::from_utf8(decoded).ok())
+            .is_some_and(|decoded| decoded.contains(':'));
+    }
+    scheme.eq_ignore_ascii_case("bearer")
+        && (token.len() >= MIN_AUTHORIZATION_TOKEN_LEN
+            || (token.len() >= MIN_MARKED_TOKEN_LEN
+                && token
+                    .bytes()
+                    .any(|b| !b.is_ascii_alphabetic())))
 }
 
 fn is_jwt(text: &str) -> bool {
@@ -466,6 +535,87 @@ mod tests {
     }
 
     #[test]
+    fn a_credential_inside_longer_text_is_masked_and_the_text_around_it_kept() {
+        let mut input = json!({
+            "a2a": { "parts": [
+                { "text": "Authorization: Bearer abc123def456ghi please" },
+                { "text": "send basic dXNlcjpwYXNz to it" },
+                { "text": format!("the token is {JWT} ok") },
+            ] },
+        });
+
+        mask_credentials(&mut input);
+
+        let parts = &input["a2a"]["parts"];
+        assert_eq!(parts[0]["text"], format!("Authorization: Bearer {REDACTED} please"));
+        assert_eq!(parts[1]["text"], format!("send basic {REDACTED} to it"));
+        assert_eq!(parts[2]["text"], format!("the token is {REDACTED} ok"));
+    }
+
+    #[test]
+    fn a_short_bearer_token_with_a_digit_or_symbol_is_masked_and_a_short_word_kept() {
+        let mut input = json!({
+            "a2a": { "parts": [
+                { "text": "Bearer ab12cd" },
+                { "text": "Bearer k-9_x." },
+                { "text": "Bearer arms" },
+                { "text": "Bearer abcde1" },
+                { "text": "Bearer ab1" },
+            ] },
+        });
+
+        mask_credentials(&mut input);
+
+        let parts = &input["a2a"]["parts"];
+        assert_eq!(parts[0]["text"], REDACTED);
+        assert_eq!(parts[1]["text"], REDACTED);
+        assert_eq!(parts[2]["text"], "Bearer arms");
+        assert_eq!(parts[3]["text"], REDACTED);
+        assert_eq!(parts[4]["text"], "Bearer ab1");
+    }
+
+    #[test]
+    fn basic_followed_by_words_is_kept_and_only_a_base64_user_and_password_masked() {
+        let mut input = json!({
+            "a2a": { "parts": [
+                { "text": "Basic authentication" },
+                { "text": "Basic understanding of the API" },
+                { "text": "Basic YWxpY2U6czNjcmV0" },
+                { "text": "Basic YWxpY2VzM2NyZXQ=" },
+            ] },
+        });
+
+        mask_credentials(&mut input);
+
+        let parts = &input["a2a"]["parts"];
+        assert_eq!(parts[0]["text"], "Basic authentication");
+        assert_eq!(parts[1]["text"], "Basic understanding of the API");
+        assert_eq!(parts[2]["text"], REDACTED);
+        assert_eq!(parts[3]["text"], "Basic YWxpY2VzM2NyZXQ=");
+    }
+
+    #[test]
+    fn a_url_anywhere_in_the_input_keeps_its_query_names_and_loses_their_values() {
+        let mut input = json!({
+            "mcp": { "arguments": {
+                "endpoint": "https://api.example.test/v1/items?api_key=k-secret&page=2#top",
+                "note": "call back on https://cb.example.test/done?code=abc123 when ready",
+                "plain": "https://api.example.test/v1/items",
+            } },
+        });
+
+        mask_credentials(&mut input);
+
+        let arguments = &input["mcp"]["arguments"];
+        assert_eq!(
+            arguments["endpoint"],
+            format!("https://api.example.test/v1/items?api_key={REDACTED}&page={REDACTED}#top")
+        );
+        assert_eq!(arguments["note"], format!("call back on https://cb.example.test/done?code={REDACTED} when ready"));
+        assert_eq!(arguments["plain"], "https://api.example.test/v1/items");
+    }
+
+    #[test]
     fn an_authorization_value_is_masked_but_text_that_starts_with_its_scheme_is_kept() {
         let mut input = json!({
             "a2a": { "parts": [
@@ -489,7 +639,7 @@ mod tests {
         assert_eq!(parts[3]["text"], "Basic plan question");
         assert_eq!(parts[4]["text"], "Basic plan");
         assert_eq!(parts[5]["text"], "Bearer arms");
-        assert_eq!(parts[6]["text"], "Bearer abcdefghijklmnop and more words");
+        assert_eq!(parts[6]["text"], format!("Bearer {REDACTED} and more words"));
         assert_eq!(parts[7]["text"], "Bearer ");
     }
 

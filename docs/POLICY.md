@@ -131,7 +131,8 @@ rejects any tenant-scoped PAT with 403. See
 ## Policy input capture
 
 The gateway does not log the policy input. To write a policy against real requests, an operator
-listens to the policy input of one surface from its Capture view in the dashboard. Listening is a
+listens to the policy input of one surface from its Capture view in the dashboard. It is meant for
+developing and testing policies, not for monitoring. Listening is a
 request on the dashboard WebSocket, with no admin API route and nothing stored on the surface:
 
 - `{"type": "capture_policy_input", "surface_id": "<id>"}` starts listening, and
@@ -183,12 +184,18 @@ stored, so a capture is gone once it has been sent.
 
 Before a capture is sent, every credential in the input becomes `<redacted>`: the value of a key
 named like a credential (the [credential names](CONFIGURATION_REFERENCE.md#log-redaction) of log
-redaction, such as `token` or `api_key`), any JWT, and any `Bearer` or `Basic` authorization value:
-the scheme, whitespace, then one token of at least 12 letters, digits or `-._~+/=`. Message text
-such as `Basic plan` or `Bearer abc and more words` is kept. `http.path`
+redaction, such as `token` or `api_key`), any JWT, and the token of any `Bearer` or `Basic`
+authorization value, also inside longer text (`Authorization: Bearer <redacted> please`). A
+`Bearer` token is one of letters, digits or `-._~+/=` that is at least 12 characters long, or at
+least 6 with a digit or one of those symbols; a `Basic` token is one that decodes as base64 to
+`user:password`. Message text such as `Basic authentication` or `Bearer arms` is kept. In every
+absolute URL in the input, query parameter names are kept and every query value becomes
+`<redacted>`. `http.path`
 is shown as the request log line shows it: query parameter names are kept and every query value
 becomes `<redacted>`, since a request received over Fabric carries the caller's full path and query,
-and capability ids in the path are shortened. Policies still see the full path. Headers that
+and capability ids in the path are shortened. Masking matches these shapes only, so a credential in
+another shape, such as an opaque key under a field name that is not a credential name, is sent as
+it is. Policies still see the full path. Headers that
 carry credentials never reach the policy input. Message bodies, tool arguments and claims are sent
 as they are. Policy input capture is meant for writing and testing policies: the captures hold
 caller data.

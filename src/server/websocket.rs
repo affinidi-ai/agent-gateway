@@ -651,6 +651,12 @@ fn normalize_origin(origin: &str) -> Option<String> {
     }
 }
 
+/// Whether a connection keeps reading the update channel after `error`: one that fell
+/// behind skips the updates it missed, and only a closed channel ends it.
+fn keeps_reading(error: &broadcast::error::RecvError) -> bool {
+    matches!(error, broadcast::error::RecvError::Lagged(_))
+}
+
 /// Handle a WebSocket connection
 async fn handle_socket(
     socket: WebSocket,
@@ -737,7 +743,10 @@ async fn handle_socket(
                                 break;
                             }
                         }
-                        Err(_) => break, // Channel closed
+                        Err(error) if keeps_reading(&error) => {
+                            debug!("WebSocket client fell behind the update channel: {}", error);
+                        }
+                        Err(_) => break,
                     }
                 }
                 // Send periodic pings to keep connection alive
@@ -1200,6 +1209,22 @@ mod tests {
 
         assert!(!super::admits(&captured, true, false));
         assert!(super::admits(&captured, false, true));
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_falls_behind_keeps_reading_and_only_a_closed_channel_ends_it() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<u8>(1);
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+
+        let lagged = rx.recv().await.unwrap_err();
+        assert!(matches!(lagged, tokio::sync::broadcast::error::RecvError::Lagged(1)));
+        assert!(super::keeps_reading(&lagged));
+        assert_eq!(rx.recv().await.unwrap(), 2);
+
+        drop(tx);
+        let closed = rx.recv().await.unwrap_err();
+        assert!(!super::keeps_reading(&closed));
     }
 
     #[tokio::test]
