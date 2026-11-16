@@ -1042,9 +1042,9 @@ This holds on the direct path, a `proxy://` MCP Target, the Fabric send leg, Fab
 (whose ForwardResponse carries the status, which the sending gateway passes on), a Transit Point
 and the agent card fetch. A Transit Point credential that cannot be sent as a header is refused
 with `500 target_auth_misconfigured` whatever the `fallback`. A request that would carry the
-credential outside the Target's base path is refused whatever the `fallback`: with `400
-target_path_refused` when the caller's path leaves it, and with `500 target_auth_misconfigured`
-when an MCP proxy tool's URL does (see [Target credential scope](PROTOCOLS.md)).
+credential outside the Target's base path is refused whatever the `fallback`, with `400
+target_path_refused`, whether the caller's path or an MCP proxy tool URL built from the caller's
+arguments leaves it (see [Target credential scope](PROTOCOLS.md)).
 
 ### Target credential refused by the peer gateway
 

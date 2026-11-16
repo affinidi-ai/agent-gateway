@@ -9286,7 +9286,7 @@ async fn handle_mcp_proxy_forward(
             }
         }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::OutsideTargetBase) => {
-            let refusal = crate::proxy::handler::TargetAuthFailure::Misconfigured;
+            let refusal = crate::proxy::handler::TargetAuthFailure::PathRefused;
             if let Some(target_auth) = surface.target_auth() {
                 crate::proxy::handler::record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
             }

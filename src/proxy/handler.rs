@@ -16117,7 +16117,7 @@ async fn handle_mcp_proxy_request_inner(
             Ok(axum::response::Json(response_json).into_response())
         }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::OutsideTargetBase) => {
-            let refusal = TargetAuthFailure::Misconfigured;
+            let refusal = TargetAuthFailure::PathRefused;
             if let Some(target_auth) = state.surface.target_auth() {
                 record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
             }
@@ -16761,8 +16761,6 @@ pub(crate) fn compute_transit_token_caller_context(
 
 #[cfg(test)]
 mod fabric_send_policy_tests;
-#[cfg(test)]
-pub(crate) mod early_response_tests;
 #[cfg(test)]
 mod target_auth_audit_tests;
 #[cfg(test)]

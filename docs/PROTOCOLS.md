@@ -861,23 +861,22 @@ every path on its origin. A `GET` or `HEAD` of the configured agent card locatio
 origin is also allowed; any other method there is refused.
 
 A path the caller sent is the caller's error, so it is refused with `400` and reason
-`target_path_refused`; a tool URL comes from the MCP proxy's definition, so it is refused with
-`500` and reason `target_auth_misconfigured`. Every refusal carries the detail "Target
-authentication failed".
+`target_path_refused`. On an MCP proxy the tool URL is built from the caller's tool arguments,
+so it is refused the same way. Every refusal carries the detail "Target authentication failed".
 
 | Path | Checked URL | Refusal |
 | --- | --- | --- |
 | Direct forward | The Target endpoint joined with the request path | `400 target_path_refused` |
 | Fabric send (an Access Point with a `fabric://` Target) | The path after the route, which must not climb above the peer gateway's base | `400 target_path_refused` |
 | Fabric receive | The receiving surface's Target joined with the forwarded path | ForwardResponse `400 target_path_refused` |
-| MCP proxy `tools/call` (direct or over Fabric) | The REST URL the OpenAPI tool resolves, against the proxy's `base_url` with a trailing `/` added when missing | `500 target_auth_misconfigured` |
+| MCP proxy `tools/call` (direct or over Fabric) | The REST URL the OpenAPI tool resolves, against the proxy's `base_url` with a trailing `/` added when missing | `400 target_path_refused` |
 | Transit Point to an `http(s)` destination | The destination endpoint joined with the path after the Transit Point's listen prefix | `400 target_path_refused` |
 | Transit Point to a `fabric://` destination | The path after the listen prefix, which must not climb above the peer gateway's base | `400 target_path_refused` |
 
 On the MCP proxy, a path parameter value containing another path parameter's `{name}`
 placeholder is also refused while the credential is attached, because the OpenAPI client
 substitutes parameters one at a time and the value would be rewritten into another parameter's
-place. It is refused as leaving the base: a `500 target_auth_misconfigured` and a
+place. It is refused as leaving the base: a `400 target_path_refused` and a
 `target_auth_failed` record in the VP Audit Log with outcome `rejected`, whatever the `fallback`.
 Any other value containing `{` or `}` is refused as invalid arguments by the gateway's REST client,
 which sends the tool call, encodes each path parameter as one segment, refuses a braced or `.`

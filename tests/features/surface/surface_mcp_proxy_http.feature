@@ -271,8 +271,8 @@ Feature: Routing through a proxy:// MCP target
     And the surface requires "API Key" source authentication
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     When the caller invokes the MCP tool "get_weather" for city "../../../api/weather/Paris" with a valid API key
-    Then the response status is 500
-    And the response reason is "target_auth_misconfigured"
+    Then the response status is 400
+    And the response reason is "target_path_refused"
     And REST API "bravo" was not called
 
   Scenario: A credentialed tool call whose path leaves the MCP proxy base path is refused before the REST API
@@ -280,8 +280,8 @@ Feature: Routing through a proxy:// MCP target
     And the surface requires "API Key" source authentication
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     When the caller invokes the MCP tool "get_weather" for city "../../admin" with a valid API key
-    Then the response status is 500
-    And the response reason is "target_auth_misconfigured"
+    Then the response status is 400
+    And the response reason is "target_path_refused"
     And REST API "bravo" was not called
 
   Scenario: A credentialed tool call with a braced path value is refused as invalid arguments, not as leaving the base path

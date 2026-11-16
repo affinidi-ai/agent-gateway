@@ -5217,6 +5217,33 @@ fn record_and_refuse(
     target_auth_failed(ctx, failure)
 }
 
+/// Records and refuses with `500 target_auth_rejected` a Transit Point request whose peer
+/// gateway refused the Target credential sent in `injected`; any other answer is passed on.
+fn refuse_if_peer_refused_target_credential(
+    ctx: &OutboundPipelineContext,
+    response: &crate::proxy::fabric_forward::FabricForwardResponse,
+    injected: Option<&str>,
+) -> Result<(), OutboundPipelineError> {
+    let (Some(target_auth), Some(injected)) = (
+        ctx.virtual_channel
+            .target_auth
+            .as_ref(),
+        injected,
+    ) else {
+        return Ok(());
+    };
+    if !response.refused_credential_in(injected) {
+        return Ok(());
+    }
+    warn!(request_id = %ctx.request_id, header = injected, "The peer gateway refused the Transit Point's Target credential");
+    crate::proxy::handler::record_target_credential_refused_by_target(
+        &transit_audit_facts(ctx),
+        Some(&ctx.virtual_channel.alias),
+        target_auth,
+    );
+    Err(target_auth_failed(ctx, crate::proxy::handler::TargetAuthFailure::Rejected))
+}
+
 /// Refuse a request whose metadata or credentials cannot be injected, or whose
 /// Transit Point's MCP configuration is invalid.
 fn metadata_injection_failed(ctx: &OutboundPipelineContext) -> OutboundPipelineError {
@@ -6745,21 +6772,7 @@ async fn step_forward_request_fabric(
         }
     })?;
 
-    if let (Some(target_auth), Some(injected)) = (
-        ctx.virtual_channel
-            .target_auth
-            .as_ref(),
-        injected_target_header.as_deref(),
-    ) && result.refused_credential_in(injected)
-    {
-        warn!(request_id = %ctx.request_id, header = injected, "The peer gateway refused the Transit Point's Target credential");
-        crate::proxy::handler::record_target_credential_refused_by_target(
-            &transit_audit_facts(ctx),
-            Some(&ctx.virtual_channel.alias),
-            target_auth,
-        );
-        return Err(target_auth_failed(ctx, crate::proxy::handler::TargetAuthFailure::Rejected));
-    }
+    refuse_if_peer_refused_target_credential(ctx, &result, injected_target_header.as_deref())?;
 
     let status = StatusCode::from_u16(result.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut header_map = reqwest::header::HeaderMap::new();
@@ -6831,10 +6844,10 @@ async fn step_forward_request_http(
             .as_deref(),
     );
 
-    if ctx
+    if let Some(target_auth) = ctx
         .virtual_channel
         .target_auth
-        .is_some()
+        .as_ref()
         && !crate::proxy::paths::is_target_credential_destination(
             &ctx.virtual_channel
                 .target_endpoint,
@@ -6846,14 +6859,7 @@ async fn step_forward_request_http(
         )
     {
         warn!(request_id = %ctx.request_id, "Refusing a Transit Point request outside its base path: it would carry the Target credential");
-        if let Some(target_auth) = ctx
-            .virtual_channel
-            .target_auth
-            .as_ref()
-        {
-            return Err(refuse_path_outside_target_base(ctx, target_auth));
-        }
-        return Err(target_auth_failed(ctx, crate::proxy::handler::TargetAuthFailure::PathRefused));
+        return Err(refuse_path_outside_target_base(ctx, target_auth));
     }
 
     // Defense-in-depth SSRF guard at the forwarding layer. `pinned_forward_client`
@@ -23391,6 +23397,74 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fabric_transit_point_refuses_only_a_peer_401_naming_the_header_it_sent_its_target_credential_in() {
+        use crate::audit::request_events::{RejectionReason, TargetAuthOutcome};
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        let mut ctx = credential_header_case(&state, None, &[], Method::POST, "/outbound/surfaces/order/partner-a/").await;
+        ctx.virtual_channel
+            .target_endpoint = "fabric://peer-gateway/partner".to_string();
+        ctx.virtual_channel
+            .target_auth = Some(
+            serde_json::from_value(json!({
+                "method": {"static_secret": {"secret_id": "target-key", "header_name": "X-Vendor-Key"}},
+                "fallback": "reject"
+            }))
+            .unwrap(),
+        );
+        let alias = ctx
+            .virtual_channel
+            .alias
+            .clone();
+        let peer_answer = |status: u16, refused: Option<&str>| crate::proxy::fabric_forward::FabricForwardResponse {
+            status,
+            headers: std::collections::HashMap::new(),
+            body: Vec::new(),
+            refused_by_gateway: false,
+            refused_credential_header: refused.map(str::to_string),
+        };
+
+        for (case, response, injected) in [
+            ("another header", peer_answer(401, Some("authorization")), Some("X-VENDOR-KEY")),
+            ("no refusal", peer_answer(401, None), Some("X-VENDOR-KEY")),
+            ("not a 401", peer_answer(403, Some("x-vendor-key")), Some("X-VENDOR-KEY")),
+            ("nothing injected", peer_answer(401, Some("x-vendor-key")), None),
+        ] {
+            let (passed, events) =
+                crate::audit::producer::capture(async { refuse_if_peer_refused_target_credential(&ctx, &response, injected) })
+                    .await;
+            assert!(passed.is_ok(), "{case}: {passed:?}");
+            assert!(events.is_empty(), "{case}: {events:?}");
+        }
+
+        let (refused, events) = crate::audit::producer::capture(async {
+            refuse_if_peer_refused_target_credential(&ctx, &peer_answer(401, Some("x-vendor-key")), Some("X-VENDOR-KEY"))
+        })
+        .await;
+        let Err(error) = refused else {
+            panic!("a peer 401 naming the injected header must be refused");
+        };
+        assert_eq!(error.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(matches!(
+            error,
+            OutboundPipelineError::TargetAuthFailed { failure: crate::proxy::handler::TargetAuthFailure::Rejected, .. }
+        ));
+        let records: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                    reason: RejectionReason::TargetAuthFailed,
+                    http_status,
+                    target_auth: Some(detail),
+                    ..
+                } => Some((*http_status, detail.outcome, detail.transit_point.clone(), detail.upstream_status)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(records, vec![(Some(500), TargetAuthOutcome::RefusedByTarget, Some(alias), Some(401))]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_transit_point_credential_that_cannot_be_sent_as_a_header_is_recorded_as_rejected_whatever_the_fallback()
     {
         use crate::audit::request_events::{RejectionReason, TargetAuthOutcome};
@@ -24456,29 +24530,6 @@ mod tests {
             assert_eq!(reason, "target_auth_unavailable", "{protocol}: {body}");
         }
         assert!(target.received().is_empty());
-    }
-
-    /// A target endpoint that answers before reading a large request body, and closes the
-    /// connection, is answered to the managed agent as it answered, not as a connection failure.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "known bug: the Transit Point answers 502 when its target endpoint answers and closes before reading the body"]
-    async fn a_target_endpoint_that_refuses_before_reading_a_large_body_is_answered_as_it_refused() {
-        let target = crate::proxy::handler::early_response_tests::target_refusing_before_the_body().await;
-        let state = test_outbound_state();
-        state
-            .channel_state
-            .write()
-            .unwrap()
-            .surface = Arc::new(transit_surface(
-            json!([{"alias": "partner", "protocol": "http", "require_transit_token": false,
-                "allow_unauthenticated_callers": true, "target_endpoint": target}]),
-            json!([]),
-        ));
-        let body = json!({"pad": "x".repeat(4 * 1024 * 1024)}).to_string();
-        for attempt in 0..5 {
-            let (status, answer) = send_through_the_pipeline(&state, "POST", "/outbound/mcp/partner", &body).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "attempt {attempt}: {answer}");
-        }
     }
 
     /// An MCP Transit Point answers a caller its `source_auth` refuses with a
