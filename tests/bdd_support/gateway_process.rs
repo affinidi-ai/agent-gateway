@@ -142,12 +142,17 @@ impl GatewayProcess {
     ) -> Result<()> {
         wait_for_gateway_process(&mut self.child, port, timeout).await
     }
+
+    /// Stop the process and wait for it to exit.
+    pub fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Drop for GatewayProcess {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stop();
     }
 }
 

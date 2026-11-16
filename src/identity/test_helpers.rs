@@ -527,6 +527,16 @@ pub struct SignedAgentPresentation {
 }
 
 pub async fn signed_agent_presentation() -> SignedAgentPresentation {
+    signed_agent_presentation_about(None).await
+}
+
+/// A [`signed_agent_presentation`] whose credential names `subject_did`
+/// instead of the presentation's holder.
+pub async fn signed_agent_presentation_for_another_subject(subject_did: &str) -> SignedAgentPresentation {
+    signed_agent_presentation_about(Some(subject_did)).await
+}
+
+async fn signed_agent_presentation_about(subject_did: Option<&str>) -> SignedAgentPresentation {
     use crate::identity::ssi::vc_issuer::{AgentIdentity, IssueVcPayload, LocalVcIssuer, LocalVcSigner, VcIssuer};
     use crate::identity::ssi::vp_issuer::{Credentials, LocalVpIssuer, LocalVpSigner, VpIssuer, VpIssuerPayload};
     use std::borrow::Cow;
@@ -548,7 +558,7 @@ pub async fn signed_agent_presentation() -> SignedAgentPresentation {
     let signer = Arc::new(LocalVcSigner::new(config.clone()));
     let credential = LocalVcIssuer::new(config, signer)
         .issue(IssueVcPayload::AgentIdentity(AgentIdentity {
-            did: Cow::Borrowed(&holder_did),
+            did: Cow::Borrowed(subject_did.unwrap_or(&holder_did)),
             identity_fields: Cow::Owned(HashMap::new()),
             workload_binding: None,
             display_name: None,

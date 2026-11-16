@@ -469,7 +469,10 @@ record names the Target (`target_endpoint`), `channel_name`, `protocol` and `mcp
 the caller the receiving surface verified as `caller` and the paired gateway that sent the
 request as `caller.peer_gateway` (its issuer DID, else its Remote gateway record id). A
 `vp_injected` record of a Fabric request also carries `via_fabric: true`, with the DID of the
-agent its presentation is for as `agent_did`.
+agent its presentation is for as `agent_did`. `vp_injected` also records a presentation a gateway
+received over Fabric and verified: on the request, detail `request_path_fabric_received`, and on
+the answer to a `fabric://` Target, detail `response_path_fabric_received` (see
+[`FABRIC.md`](FABRIC.md#peer-issuer-dids)).
 
 **File size.** The VP Audit Log is rotated: once the live file reaches
 `[audit] vp_audit_log_max_bytes` (8 MiB by default) it is renamed to the next free position,
@@ -786,9 +789,10 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
   gateway faults (a failed egress check task) are not recorded.
 - `identity_binding_verified` and `identity_binding_failed`: the outcome of checking the identity
   presentation (identity binding VP) a request carries, recorded wherever the gateway checks one:
-  A2A requests on the direct path, MCP requests at admission, Transit Point MCP requests, and, on
-  the fabric receive path, when a surface policy relies on the presentation. These record that a
-  received presentation was checked; `vp_injected` records the gateway creating one.
+  A2A requests on the direct path, MCP requests at admission, Transit Point MCP requests, on
+  the fabric receive path when a surface policy relies on the presentation, and on the answer to a
+  `fabric://` Target. These record that a received presentation was checked; `vp_injected` records
+  the gateway creating one, or the presentation itself once a received one verified.
   - `identity_binding_verified`: the presentation verified and a trust anchor vouches for its
     issuer. Carries `agent_did`, `issuer_gateway` and the caller-context `assurance`.
   - `identity_binding_failed`: `outcome` is `absent` (no presentation was sent), `invalid` (it

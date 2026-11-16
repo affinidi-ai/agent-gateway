@@ -1369,6 +1369,55 @@ impl ConnectionPointListenerManager {
         }
     }
 
+    /// The issuers the Remote gateway `gateway_id` may present identities
+    /// from; see [`Self::peer_issuers`].
+    pub async fn peer_issuers_for_gateway_id(
+        &self,
+        gateway_id: &str,
+    ) -> Result<crate::gateways::types::PeerIssuers, String> {
+        let store = self
+            .gateway_store
+            .as_ref()
+            .ok_or_else(|| "gateway store not available".to_string())?;
+        let gateway = store
+            .get(gateway_id)
+            .await
+            .map_err(|e| format!("failed to load peer gateway {gateway_id}: {e}"))?
+            .ok_or_else(|| format!("unknown peer gateway {gateway_id}"))?;
+        self.peer_issuers(gateway)
+            .await
+    }
+
+    /// The issuers a paired gateway may present identities from: its attested
+    /// issuer DID (fetched on demand when missing) plus the issuer DIDs an
+    /// operator trusts for that connection. A peer with neither is refused; a
+    /// peer with operator-trusted issuers is accepted even when the attestation
+    /// exchange fails, so a legacy peer can be trusted by hand.
+    pub async fn peer_issuers(
+        &self,
+        gateway: crate::gateways::types::Gateway,
+    ) -> Result<crate::gateways::types::PeerIssuers, String> {
+        let trusted = gateway.trusted_issuer_dids;
+        let attested = match gateway.issuer_did {
+            Some(issuer_did) => Some(issuer_did),
+            None => match self
+                .ensure_peer_issuer_did(&gateway.id)
+                .await
+            {
+                Ok(issuer_did) => Some(issuer_did),
+                Err(e) if !trusted.is_empty() => {
+                    warn!(
+                        gateway_id = gateway.id,
+                        "peer issuer DID not established ({e}); accepting only operator-trusted issuers for this connection"
+                    );
+                    None
+                }
+                Err(e) => return Err(format!("peer issuer DID not established for gateway {}: {e}", gateway.id)),
+            },
+        };
+        Ok(crate::gateways::types::PeerIssuers { attested, trusted })
+    }
+
     /// Return the peer's verified issuer DID for a Remote gateway, running the
     /// `gateway-issuer-request` exchange over the pairing's Connection Point
     /// when the record does not hold it yet, and persisting the result.
@@ -5957,6 +6006,112 @@ mod restart_listener_tests {
             .await;
 
         assert_eq!(result.err().as_deref(), Some("Connection point 'cp-1' has no running listener; not restarting it"));
+    }
+}
+
+#[cfg(test)]
+mod peer_issuer_tests {
+    use std::sync::Arc;
+
+    use crate::gateways::test_helpers::test_listener_manager;
+    use crate::gateways::types::{Gateway, GatewayType, PeerIssuers};
+    use crate::gateways::{ConnectionPointListenerManager, FileSystemGatewayStore, GatewayStore};
+
+    fn peer(
+        issuer_did: Option<&str>,
+        trusted: &[&str],
+    ) -> Gateway {
+        let mut gateway = Gateway::new("Peer".into(), String::new(), "did:example:peer".into(), GatewayType::Remote);
+        gateway.issuer_did = issuer_did.map(str::to_string);
+        gateway.trusted_issuer_dids = trusted
+            .iter()
+            .map(|did| did.to_string())
+            .collect();
+        gateway
+    }
+
+    async fn manager_with(
+        root: &std::path::Path,
+        gateway: &Gateway,
+    ) -> (ConnectionPointListenerManager, tempfile::TempDir) {
+        let store = Arc::new(
+            FileSystemGatewayStore::new(root.join("gateways"), Some("did:web:gateway.example".into()))
+                .await
+                .unwrap(),
+        );
+        store
+            .create(gateway)
+            .await
+            .unwrap();
+        let (manager, issuer_dir) = test_listener_manager(root).await;
+        (manager.with_gateway_store(store), issuer_dir)
+    }
+
+    #[tokio::test]
+    async fn a_recorded_issuer_and_the_operator_trusted_issuers_are_the_connections_issuers() {
+        let root = tempfile::tempdir().unwrap();
+        let gateway = peer(Some("did:web:peer-issuer"), &["did:web:relay"]);
+        let (manager, _issuer_dir) = manager_with(root.path(), &gateway).await;
+
+        let issuers = manager
+            .peer_issuers_for_gateway_id(&gateway.id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            issuers,
+            PeerIssuers {
+                attested: Some("did:web:peer-issuer".to_string()),
+                trusted: vec!["did:web:relay".to_string()],
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_trusted_issuers_stand_alone_when_the_issuer_exchange_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let gateway = peer(None, &["did:web:relay"]);
+        let (manager, _issuer_dir) = manager_with(root.path(), &gateway).await;
+
+        let issuers = manager
+            .peer_issuers_for_gateway_id(&gateway.id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            issuers,
+            PeerIssuers {
+                attested: None,
+                trusted: vec!["did:web:relay".to_string()],
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_without_any_issuer_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let gateway = peer(None, &[]);
+        let (manager, _issuer_dir) = manager_with(root.path(), &gateway).await;
+
+        let err = manager
+            .peer_issuers_for_gateway_id(&gateway.id)
+            .await
+            .unwrap_err();
+
+        assert!(err.starts_with(&format!("peer issuer DID not established for gateway {}", gateway.id)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_gateway_has_no_issuers() {
+        let root = tempfile::tempdir().unwrap();
+        let (manager, _issuer_dir) = manager_with(root.path(), &peer(Some("did:web:peer-issuer"), &[])).await;
+
+        let err = manager
+            .peer_issuers_for_gateway_id("no-such-gateway")
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, "unknown peer gateway no-such-gateway");
     }
 }
 

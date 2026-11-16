@@ -1649,25 +1649,9 @@ async fn resolve_peer_issuers(from_did: Option<&str>) -> Result<crate::gateways:
         .find_gateway_by_did(from_did)
         .await
         .ok_or_else(|| format!("unknown peer gateway {from_did}"))?;
-    let trusted = gateway.trusted_issuer_dids;
-    let attested = match gateway.issuer_did {
-        Some(issuer_did) => Some(issuer_did),
-        None => match manager
-            .ensure_peer_issuer_did(&gateway.id)
-            .await
-        {
-            Ok(issuer_did) => Some(issuer_did),
-            Err(e) if !trusted.is_empty() => {
-                warn!(
-                    gateway_id = gateway.id,
-                    "peer issuer DID not established ({e}); accepting only operator-trusted issuers for this connection"
-                );
-                None
-            }
-            Err(e) => return Err(format!("peer issuer DID not established for gateway {}: {e}", gateway.id)),
-        },
-    };
-    Ok(crate::gateways::types::PeerIssuers { attested, trusted })
+    manager
+        .peer_issuers(gateway)
+        .await
 }
 
 fn forbidden_forward_response(message: &str) -> Value {

@@ -204,6 +204,21 @@ continues with no caller identity, only the audit record for the unverified DID 
 written, and no weaker identity source is consulted for that request, neither the identity
 binding VP nor a raw identity extension.
 
+The calling gateway checks the presentation on the answer the same way, when the calling
+surface's Target is `fabric://` and the surface has a managed identity. The presentation must
+verify, which includes its holder being its credential's subject, and its issuer must be one of
+the issuers of the connection to the Remote gateway the Target names. The calling gateway
+establishes that gateway's issuer DID through the issuer exchange when its record does not hold
+one yet. A verified presentation from one of those issuers is the answering agent's identity, in
+place of the raw `agent-identity/v1` extension the paired gateway replaced with it. A presentation
+that fails verification refuses the answer with `502` and records `identity_binding_failed` with
+outcome `invalid`. One whose issuer is not one of the connection's issuers, including when they
+cannot be established, also refuses the answer with `502`: the answering agent's DID is not
+stored, and the VP Audit Log records `identity_binding_failed` with outcome `untrusted`. A verified
+one records `identity_binding_verified` and the received presentation (`vp_injected`, detail
+`response_path_fabric_received`), both with `via_fabric: true` and the request's trace id. Answers
+to a Transit Point over Fabric and to MCP requests over Fabric are not checked.
+
 The presentation the receiving gateway signs for its agent's response, when the Target has a
 Workload Binding, names the caller as the user the agent acted for (`userIdentity`, with
 `delegated: true`) only when a presentation from one of the connection's issuers proved the

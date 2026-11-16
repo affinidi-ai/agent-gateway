@@ -1811,52 +1811,6 @@ impl VCIssuer {
         Ok(())
     }
 
-    pub async fn verify_agent_presentation(
-        &self,
-        vp_input: &str,
-    ) -> Result<(String, std::collections::HashMap<String, serde_json::Value>)> {
-        let (did, fields, _) = self
-            .verify_agent_presentation_with_credentials(vp_input)
-            .await?;
-        Ok((did, fields))
-    }
-
-    /// Same as `verify_agent_presentation` but additionally returns the raw
-    /// `verifiableCredential` entries from the inbound VP, so a downstream
-    /// gateway can flatten them into a re-issued chained VP.
-    pub async fn verify_agent_presentation_with_credentials(
-        &self,
-        vp_input: &str,
-    ) -> Result<(String, std::collections::HashMap<String, serde_json::Value>, Vec<serde_json::Value>)> {
-        let vp: serde_json::Value = serde_json::from_str(vp_input).context("Failed to parse VP as JSON")?;
-
-        let result = self
-            .verifier
-            .verify_vp(&vp)
-            .await
-            .context("VP verification failed");
-
-        if let Err(e) = &result {
-            // `{:#}` prints the full anyhow cause chain inline on one line so
-            // the tracing formatter surfaces the real reason (the `{:?}` form
-            // spills the `Caused by:` chain onto lines the log viewer drops).
-            warn!("VP verification error: {:#}", e);
-        }
-
-        let result = result?;
-
-        self.validate_vp_challenge(result.challenge.as_ref())
-            .await?;
-
-        let identity_fields = result
-            .credentials
-            .first()
-            .map(|vc| vc.identity_fields.clone())
-            .unwrap_or_default();
-
-        Ok((result.holder_did, identity_fields, result.raw_credentials))
-    }
-
     /// Verify an agent presentation and return the full set of parts the
     /// Workload Binding verifier needs: the VP holder DID, the primary VC
     /// subject id (`credentialSubject.id`), the primary VC issuer DID, the
