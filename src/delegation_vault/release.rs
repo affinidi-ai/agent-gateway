@@ -298,17 +298,30 @@ pub struct ReleaseContext<'a> {
     pub max_consent_age_secs: Option<u64>,
 }
 
-static USES_IN_FLIGHT: std::sync::LazyLock<dashmap::DashSet<String>> = std::sync::LazyLock::new(dashmap::DashSet::new);
+/// The grants whose use is being recorded, each with the address of the vault
+/// that holds it: a grant's id is derived from its key, so two vaults in one
+/// process can hold grants of the same id.
+static USES_IN_FLIGHT: std::sync::LazyLock<dashmap::DashSet<(usize, String)>> =
+    std::sync::LazyLock::new(dashmap::DashSet::new);
 
-/// Held by the one task recording a grant's use, so concurrent requests
-/// before its write lands do not each spawn one.
-struct UseClaim(String);
+/// Held by the one task recording a grant's use in its vault, so concurrent
+/// requests before its write lands do not each spawn one.
+struct UseClaim((usize, String));
 
 impl UseClaim {
-    fn take(grant_id: &str) -> Option<Self> {
+    fn take(
+        vault: &Arc<dyn DelegationVaultStorage>,
+        grant_id: &str,
+    ) -> Option<Self> {
+        let claimed = (
+            Arc::as_ptr(vault)
+                .cast::<()>()
+                .addr(),
+            grant_id.to_string(),
+        );
         USES_IN_FLIGHT
-            .insert(grant_id.to_string())
-            .then(|| Self(grant_id.to_string()))
+            .insert(claimed.clone())
+            .then(|| Self(claimed))
     }
 }
 
@@ -330,7 +343,7 @@ pub fn record_use_in_background(
     if !grant.use_is_due(Utc::now()) {
         return;
     }
-    let Some(claim) = UseClaim::take(&grant.id) else {
+    let Some(claim) = UseClaim::take(vault, &grant.id) else {
         return;
     };
     let vault = Arc::clone(vault);
@@ -1296,14 +1309,75 @@ mod connect_hint_tests {
 
 #[cfg(test)]
 mod use_claim_tests {
-    use super::UseClaim;
+    use super::{UseClaim, record_use_in_background};
+    use crate::delegation_vault::grants::tests::{grant, key};
+    use crate::delegation_vault::storage::{DelegationVaultStorage, FileSystemDelegationVaultStore};
+    use std::sync::Arc;
 
-    #[test]
-    fn a_grant_has_one_use_claim_until_it_is_dropped() {
-        let first = UseClaim::take("claim-grant").expect("first claim");
-        assert!(UseClaim::take("claim-grant").is_none());
-        assert!(UseClaim::take("another-claim-grant").is_some());
+    async fn vault(directory: &std::path::Path) -> Arc<dyn DelegationVaultStorage> {
+        crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig {
+            enabled: true,
+            key_env_var: "AG_TEST_MASTER_KEY".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        Arc::new(
+            FileSystemDelegationVaultStore::new(directory.into())
+                .await
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_grant_has_one_use_claim_in_its_vault_until_it_is_dropped() {
+        let (directory, other_directory) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let vault = vault(directory.path()).await;
+        let other = self::vault(other_directory.path()).await;
+        let first = UseClaim::take(&vault, "claim-grant").expect("first claim");
+        assert!(UseClaim::take(&vault, "claim-grant").is_none());
+        assert!(UseClaim::take(&Arc::clone(&vault), "claim-grant").is_none(), "the same vault, shared");
+        assert!(UseClaim::take(&vault, "another-claim-grant").is_some());
+        assert!(UseClaim::take(&other, "claim-grant").is_some(), "another vault's grant of the same id");
         drop(first);
-        assert!(UseClaim::take("claim-grant").is_some());
+        assert!(UseClaim::take(&vault, "claim-grant").is_some());
+    }
+
+    /// Two vaults in one process hold grants of the same id, since the id is
+    /// derived from the grant's key. A use being recorded in one of them does
+    /// not keep the other from recording its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_use_being_recorded_in_one_vault_does_not_stop_another_vaults_record() {
+        let (directory, other_directory) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let other = vault(other_directory.path()).await;
+        let vault = vault(directory.path()).await;
+        let stored = vault
+            .store_grant(grant(&key(), "access"))
+            .await
+            .unwrap()
+            .grant;
+        let _in_flight = UseClaim::take(&other, &stored.id).expect("the other vault's claim");
+
+        record_use_in_background(&vault, &stored, None);
+
+        // The recording task holds the vault's claim until its write has
+        // landed, and the vault is left alone meanwhile: a record is skipped
+        // while the vault is busy.
+        for _ in 0..200 {
+            if UseClaim::take(&vault, &stored.id).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            vault
+                .grant(&key())
+                .await
+                .unwrap()
+                .unwrap()
+                .last_used_at
+                .is_some(),
+            "the vault records its grant's use"
+        );
     }
 }
