@@ -58,7 +58,7 @@
 
 .protocol-description {
   font-size: 13px;
-  color: #858796;
+  color: var(--muted-text);
   text-align: center;
   max-width: 250px;
 }

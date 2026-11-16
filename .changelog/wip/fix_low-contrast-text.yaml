@@ -1,0 +1,16 @@
+branch: fix/low-contrast-text
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-11T05:30:00Z'
+      title: Fix low-contrast text across the dashboard
+      description: >-
+        Warning, success and danger text, links, muted captions, placeholders, filled buttons and
+        wizard steps now meet WCAG AA contrast in the light and dark themes through shared
+        text-safe colour tokens. The Logs tab banner and log viewer follow the dashboard theme
+        instead of the operating system colour scheme, which showed near-white text on a light
+        banner.
+  removed: []
+  security: []
+  breaking: []
