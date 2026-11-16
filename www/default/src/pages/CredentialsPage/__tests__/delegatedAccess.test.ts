@@ -1,4 +1,10 @@
-import { consentEnd, consentState, isActiveDelegation, timeLeft } from '../delegatedAccess';
+import {
+  agentName,
+  consentEnd,
+  consentState,
+  isActiveDelegation,
+  timeLeft,
+} from '../delegatedAccess';
 
 const NOW = new Date('2026-11-13T10:00:00Z');
 const after = (ms: number) => new Date(NOW.getTime() + ms);
@@ -49,5 +55,19 @@ describe('delegated access consent end', () => {
     expect(timeLeft(after(47 * HOUR), NOW)).toBe('in 47 hours');
     expect(timeLeft(after(2 * DAY), NOW)).toBe('in 2 days');
     expect(timeLeft(after(12 * DAY + 5 * HOUR), NOW)).toBe('in 12 days');
+  });
+
+  it('names a did:web agent by its whole web address and shortens any other DID', () => {
+    expect(agentName('did:web:pr-reviewer.example.com')).toBe('pr-reviewer.example.com');
+    expect(agentName('did:web:agents.example.com:tenants:sales:crm-assistant')).toBe(
+      'agents.example.com/tenants/sales/crm-assistant'
+    );
+    expect(agentName('did:web:localhost%3A8443')).toBe('localhost:8443');
+    expect(agentName('did:web:odd%zz.example.com')).toBe('odd%zz.example.com');
+    expect(agentName('did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK')).toBe(
+      'did:key:z6Mk...pbnnEGta2doK'
+    );
+    expect(agentName('did:web:')).toBe('did:web:');
+    expect(agentName('did:web:example.com::path')).toBe('did:web:example.com::path');
   });
 });

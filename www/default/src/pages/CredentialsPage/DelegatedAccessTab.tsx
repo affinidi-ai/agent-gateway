@@ -11,6 +11,7 @@ import { DOCS_URL } from '../../config/docs';
 import PaginationControls from './PaginationControls';
 import {
   DelegationToken,
+  agentName,
   consentEnd,
   consentState,
   isActiveDelegation,
@@ -212,8 +213,8 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
                         )}
                       </td>
                       <td>
-                        <code className="text-muted" title={token.agent_did}>
-                          {topAndTail(token.agent_did, 12, 12)}
+                        <code className="text-muted text-break" title={token.agent_did}>
+                          {agentName(token.agent_did)}
                         </code>
                       </td>
                       <td>

@@ -24,6 +24,14 @@ changes:
         click turns it into a danger button that names what it ends, such as "Revoke Salesforce
         access?", with a Cancel beside it; the second click revokes. It still confirms in place,
         with no dialog.
+    - timestamp: '2026-11-16T15:50:00Z'
+      title: Show an agent by its whole did:web host name on the credential tabs
+      description: >-
+        Delegated Access and Credential Tokens cut an agent's DID in the middle, which hid the
+        agent's name. A did:web agent now shows its whole web address, such as
+        "pr-reviewer.example.com", without "did:web:" and wrapping when long; other DID methods
+        stay shortened, and the full DID is in the tooltip. Credential Tokens also revokes one
+        delegation with the same "Revoke" text button and named confirm as Delegated Access.
   fixed:
     - timestamp: '2026-11-16T15:10:00Z'
       title: Say that token refresh stops when a provider's consent time limit ends

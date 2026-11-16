@@ -1,3 +1,5 @@
+import { topAndTail } from '../../utils/stringUtils';
+
 /** An agent-keyed vault token as `GET /api/v1/delegation-vault` lists it; never a secret. */
 export interface DelegationToken {
   id: string;
@@ -52,6 +54,28 @@ export function isActiveDelegation(
 ): boolean {
   if (consentState(consentEnd(token.consent_expires_at), now) === 'ended') return false;
   return !token.is_expired || token.can_refresh;
+}
+
+const DID_WEB = 'did:web:';
+
+function decodeDidWebPart(part: string): string {
+  try {
+    return decodeURIComponent(part);
+  } catch {
+    return part;
+  }
+}
+
+/**
+ * An agent's DID as both tabs show it: a `did:web` DID as its whole web address, the host and
+ * any path ("pr-reviewer.example.com", "agents.example.com/tenants/sales"), never cut; any other
+ * DID shortened in the middle. The full DID belongs in the tooltip.
+ */
+export function agentName(did: string): string {
+  const parts = did.startsWith(DID_WEB) ? did.slice(DID_WEB.length).split(':') : [];
+  return parts.length > 0 && parts.every(Boolean)
+    ? parts.map(decodeDidWebPart).join('/')
+    : topAndTail(did, 12, 12);
 }
 
 /** How long until `end`, in the largest unit that has passed whole: "in 3 hours", "in 12 days". */

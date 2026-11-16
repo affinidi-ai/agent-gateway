@@ -156,6 +156,14 @@ describe('Delegated Access tab', () => {
     expect(rowIds()).toEqual(['t1']);
   });
 
+  it('names the agent by its host name, with the whole DID in the tooltip', async () => {
+    await renderTab([token('t1', { agent_did: 'did:web:pr-reviewer.example.com' })]);
+
+    expect(within(row('t1')).getByTitle('did:web:pr-reviewer.example.com')).toHaveTextContent(
+      /^pr-reviewer\.example\.com$/
+    );
+  });
+
   it('offers no revoke to a user who may not edit', async () => {
     mockHasPermission.mockReturnValue(false);
     await renderTab([token('t1')]);

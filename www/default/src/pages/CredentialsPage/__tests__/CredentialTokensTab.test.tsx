@@ -119,6 +119,40 @@ describe('Credential Tokens tab', () => {
     confirm.mockRestore();
   });
 
+  it('names the agent by its host name, with the whole DID in the tooltip', async () => {
+    await renderTab([token('t1', ALICE, { agent_did: 'did:web:pr-reviewer.example.com' })]);
+
+    expect(within(row('t1')).getByTitle('did:web:pr-reviewer.example.com')).toHaveTextContent(
+      /^pr-reviewer\.example\.com$/
+    );
+  });
+
+  it('revokes one delegation with a text button whose second click names it', async () => {
+    const confirm = jest.spyOn(window, 'confirm');
+    await renderTab([token('t1', ALICE), token('t2', BOB)]);
+    const button = screen.getByTestId('credential-token-revoke-button-t1');
+    expect(button).toHaveTextContent(/^Revoke$/);
+
+    fireEvent.click(button);
+    expect(button).toHaveTextContent(/^Revoke github access\?$/);
+    expect(button).toHaveClass('btn-danger');
+    expect(row('t1')).not.toHaveClass('table-active');
+    fireEvent.click(screen.getByTestId('credential-token-revoke-cancel-button-t1'));
+    expect(button).toHaveTextContent(/^Revoke$/);
+    expect(deletes()).toHaveLength(0);
+
+    fireEvent.click(button);
+    fireEvent.click(button);
+    await waitFor(() => expect(deletes()).toHaveLength(1));
+    expect(deletes()[0][0]).toBe('/api/v1/delegation-vault/t1');
+    await waitFor(() =>
+      expect(screen.queryByTestId('credential-token-row-t1')).not.toBeInTheDocument()
+    );
+    expect(screen.getByTestId('credential-token-row-t2')).toBeInTheDocument();
+    expect(confirm).not.toHaveBeenCalled();
+    confirm.mockRestore();
+  });
+
   it('keeps every delegation when the first click is not confirmed', async () => {
     await renderTab([token('t1', ALICE)]);
     fireEvent.click(screen.getByTestId('credential-token-revoke-user-button-t1'));

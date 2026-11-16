@@ -2,7 +2,6 @@ import React, { useEffect, useState } from 'react';
 import { usePermissions } from '../../context/PermissionsContext';
 import { AppButton } from '../../components/shared/AppButton';
 import { Badge } from '../../components/shared/Badge';
-import { DeleteButton } from '../../components/shared/DeleteButton';
 import { TwoStepButton } from '../../components/shared/TwoStepButton';
 import { CopyButton } from '../../components/shared/CopyButton';
 import { apiClient } from '../../api';
@@ -11,7 +10,7 @@ import { formatDateTime, topAndTail } from '../../utils/stringUtils';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { DOCS_URL } from '../../config/docs';
 import PaginationControls from './PaginationControls';
-import { DelegationToken, consentEnd, consentState, timeLeft } from './delegatedAccess';
+import { DelegationToken, agentName, consentEnd, consentState, timeLeft } from './delegatedAccess';
 
 interface CredentialTokensTabProps {
   externalSearchTerm?: string;
@@ -241,8 +240,8 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                         <strong>{token.provider_id}</strong>
                       </td>
                       <td>
-                        <code className="text-muted" title={token.agent_did}>
-                          {topAndTail(token.agent_did, 12, 12)}
+                        <code className="text-muted text-break" title={token.agent_did}>
+                          {agentName(token.agent_did)}
                         </code>
                       </td>
                       <td>
@@ -291,11 +290,16 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                       </td>
                       <td onClick={e => e.stopPropagation()}>
                         {canEditTokens && (
-                          <DeleteButton
-                            data-testid={`credential-token-revoke-button-${token.id}`}
-                            onDelete={() => handleRevokeToken(token)}
-                            className="btn-sm"
+                          <TwoStepButton
+                            label="Revoke"
+                            confirmAs="danger"
+                            confirmLabel={`Revoke ${token.provider_id} access?`}
                             title="Revoke delegation"
+                            confirmTitle="Click again to revoke this delegation"
+                            className="btn btn-outline-danger btn-sm text-nowrap"
+                            cancelTestId={`credential-token-revoke-cancel-button-${token.id}`}
+                            data-testid={`credential-token-revoke-button-${token.id}`}
+                            onConfirm={() => handleRevokeToken(token)}
                           />
                         )}
                       </td>

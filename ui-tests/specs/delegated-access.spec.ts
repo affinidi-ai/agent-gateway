@@ -7,6 +7,7 @@ const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
 const fromNow = (ms: number) => new Date(Date.now() + ms).toISOString();
 
+const AGENT_DID = "did:web:agent.example.com";
 const ALICE = `sha256:${"a".repeat(64)}`;
 const BOB = `sha256:${"b".repeat(64)}`;
 
@@ -16,7 +17,7 @@ const token = (
   consentExpiresAt?: string,
 ): Record<string, unknown> => ({
   id,
-  agent_did: "did:web:agent.example.com",
+  agent_did: AGENT_DID,
   user_identity_hash: user,
   credential_provider_id: "cp-github",
   provider_id: "github",
@@ -114,6 +115,9 @@ test.describe("Credentials page Delegated Access tab", () => {
 
     await expect(accessRow(page, "soon")).toBeVisible();
     await expect(accessRow(page, "soon")).toContainText("GitHub");
+    await expect(accessRow(page, "soon").getByTitle(AGENT_DID)).toHaveText(
+      "agent.example.com",
+    );
     await expect(accessRow(page, "soon")).toContainText("Ending soon");
     await expect(page.getByTestId("delegated-access-ends-soon")).toContainText(
       "in 3 hours",
@@ -209,6 +213,29 @@ test.describe("Credentials page Credential Tokens tab", () => {
       page.getByTestId("credential-token-consent-end-ended"),
     ).toHaveText(/^Ended /);
     await expect(row(page, "ended")).toContainText("Consent ended");
+  });
+
+  test("names the agent by its host name and revokes one delegation on a second click", async ({
+    page,
+  }) => {
+    const revoked = await openCredentialTokens(page, [
+      token("t1", ALICE),
+      token("t2", BOB),
+    ]);
+    await expect(row(page, "t1").getByTitle(AGENT_DID)).toHaveText(
+      "agent.example.com",
+    );
+    const button = page.getByTestId("credential-token-revoke-button-t1");
+    await expect(button).toHaveText("Revoke");
+
+    await button.click();
+    await expect(button).toHaveText("Revoke github access?");
+    expect(revoked).toEqual([]);
+
+    await button.click();
+    await expect(row(page, "t1")).toHaveCount(0);
+    await expect(row(page, "t2")).toBeVisible();
+    expect(revoked).toEqual(["/api/v1/delegation-vault/t1"]);
   });
 
   test("revokes every delegation of a user on a second click, with no dialog", async ({

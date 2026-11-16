@@ -1069,8 +1069,13 @@ tab key `credential-tokens`) and has a **Delegated Access** tab beside it
 (`pages/CredentialsPage/DelegatedAccessTab.tsx`, tab key `delegated-access`, trigger
 `credentials-delegated-access-tab-trigger`). Both read `GET /api/v1/delegation-vault`; the shared
 rules live in `pages/CredentialsPage/delegatedAccess.ts` (`consentState`, `timeLeft`,
-`isActiveDelegation`) and the page links in `PaginationControls.tsx`. A new view of the vault is a
-new tab: an existing tab is never renamed or removed.
+`isActiveDelegation`, `agentName`) and the page links in `PaginationControls.tsx`. A new view of
+the vault is a new tab: an existing tab is never renamed or removed.
+
+Both tabs name an agent with `agentName`: a `did:web` DID shows as its whole web address, the host
+and any path with each `:` as `/` and percent escapes decoded ("pr-reviewer.example.com"),
+never cut, and wraps in its cell (`text-break`); any other DID is shortened in the middle. The
+full DID is the cell's tooltip. Both revoke one entry with the same text **Revoke** button.
 
 Credential Tokens lists every agent-keyed token, service tokens included.
 
@@ -1082,9 +1087,12 @@ Credential Tokens lists every agent-keyed token, service tokens included.
   of it; otherwise it is the access token's status (Active, Expired (refreshable), Expired). The
   header counts leave ended consents out of "active" and count them as "consent ended"
   (`credential-tokens-consent-ended-count`).
-- No modal and no browser dialog confirms a revoke. The row's **Revoke delegation** is the two-step
-  `DeleteButton`. **Revoke all for this user** (`credential-token-revoke-user-button-<id>`) is the
-  shared `components/shared/TwoStepButton`, for a two-step action that is not a delete: the first
+- No modal and no browser dialog confirms a revoke. The row's **Revoke**
+  (`credential-token-revoke-button-<id>`) works as on Delegated Access: its first click asks with
+  a danger button that names the provider, beside **Cancel**
+  (`credential-token-revoke-cancel-button-<id>`). **Revoke all for this user**
+  (`credential-token-revoke-user-button-<id>`) is the shared `components/shared/TwoStepButton`,
+  for a two-step action that is not a delete: the first
   click turns it into a danger button (`confirmAs="danger"`, never small or amber text) that says
   how many of the user's listed delegations it ends, "Revoke all 2 for this user?" or "Revoke
   this user's only delegation?", the second sends the `DELETE`, and a click elsewhere cancels.
