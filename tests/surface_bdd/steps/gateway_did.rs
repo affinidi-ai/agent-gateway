@@ -139,7 +139,10 @@ fn did_log_versions(world: &SurfaceWorld) -> Vec<Value> {
         .collect()
 }
 
-fn lists_signing_key_for_assertions(document: &Value) -> bool {
+fn lists_signing_key_under(
+    document: &Value,
+    relationship: &str,
+) -> bool {
     let did = document["id"]
         .as_str()
         .expect("the DID document names its DID");
@@ -150,17 +153,25 @@ fn lists_signing_key_for_assertions(document: &Value) -> bool {
         .flatten()
         .any(|method| method["id"] == signing_key_id.as_str() && method["type"] == "Multikey");
     assert!(publishes_multikey, "the DID document must publish {signing_key_id} as a Multikey: {document}");
-    document["assertionMethod"]
+    document[relationship]
         .as_array()
         .into_iter()
         .flatten()
         .any(|id| *id == signing_key_id.as_str())
 }
 
-#[then("the DID document lists the gateway signing key under assertionMethod")]
+fn assert_lists_signing_key_for_assertions_and_authentication(document: &Value) {
+    for relationship in ["assertionMethod", "authentication"] {
+        assert!(
+            lists_signing_key_under(document, relationship),
+            "{relationship} must list the signing key: {document}"
+        );
+    }
+}
+
+#[then("the DID document lists the gateway signing key under assertionMethod and authentication")]
 fn did_document_lists_signing_key(world: &mut SurfaceWorld) {
-    let document = response_body(world);
-    assert!(lists_signing_key_for_assertions(document), "assertionMethod must list the signing key: {document}");
+    assert_lists_signing_key_for_assertions_and_authentication(response_body(world));
 }
 
 #[then(expr = "the gateway DID log has {int} version(s)")]
@@ -186,16 +197,18 @@ fn gateway_did_log_keeps_its_did(world: &mut SurfaceWorld) {
 #[then("the first version of the gateway DID log does not list the gateway signing key under assertionMethod")]
 fn first_version_lacks_signing_key(world: &mut SurfaceWorld) {
     let versions = did_log_versions(world);
-    assert!(!lists_signing_key_for_assertions(&versions[0]["state"]));
+    assert!(!lists_signing_key_under(&versions[0]["state"], "assertionMethod"));
 }
 
-#[then("the latest version of the gateway DID log lists the gateway signing key under assertionMethod")]
+#[then(
+    "the latest version of the gateway DID log lists the gateway signing key under assertionMethod and authentication"
+)]
 fn latest_version_lists_signing_key(world: &mut SurfaceWorld) {
     let versions = did_log_versions(world);
     let latest = versions
         .last()
         .expect("the gateway DID log has a version");
-    assert!(lists_signing_key_for_assertions(&latest["state"]), "assertionMethod must list the signing key");
+    assert_lists_signing_key_for_assertions_and_authentication(&latest["state"]);
 }
 
 #[then("the gateway DID log verifies as a did:webvh log")]

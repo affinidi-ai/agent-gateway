@@ -478,22 +478,67 @@ async fn sync_gateway_did_log(
     debug!("Gateway DID registered for resolution via /v1/resolve");
 }
 
-/// On the Active node, lists the gateway signing key under `assertionMethod` in the gateway
-/// DID document when it is missing, then brings the resolver index up to the gateway DID log.
+/// Longest wait for the gateway DID lock before a repair is left to the next start or
+/// promotion; promotion waits for the repair.
+#[cfg(feature = "didwebvh")]
+const GATEWAY_DID_REPAIR_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// On the Active node, lists the gateway signing key under `assertionMethod` and
+/// `authentication` in the gateway DID document where it is missing, then brings the resolver
+/// index up to the gateway DID log.
 /// A Standby node shares both with the Active node, so it writes neither.
 #[cfg(feature = "didwebvh")]
 async fn repair_and_sync_gateway_did(
     issuer: &crate::identity::VCIssuer,
     storage: &Arc<dyn crate::storage::DidLogStorage>,
 ) {
+    repair_and_sync_gateway_did_within(issuer, storage, GATEWAY_DID_REPAIR_LOCK_TIMEOUT).await;
+}
+
+/// Runs under the gateway DID lock, so two nodes Active at once repair the gateway DID and
+/// sync the index one after the other, and the second finds nothing left to do. A volume
+/// without the lock runs both unlocked, as before the lock; a lock held past `lock_timeout`
+/// leaves the repair to the next start or promotion and still syncs the index.
+#[cfg(feature = "didwebvh")]
+async fn repair_and_sync_gateway_did_within(
+    issuer: &crate::identity::VCIssuer,
+    storage: &Arc<dyn crate::storage::DidLogStorage>,
+    lock_timeout: std::time::Duration,
+) {
+    use crate::storage::file_lock::LockOutcome;
+
     if crate::server::mode::is_standby() {
         return;
     }
-    if let Err(e) = issuer
-        .authorize_signing_key_for_assertions()
-        .await
+    let lock = issuer
+        .lock_gateway_did(lock_timeout)
+        .await;
+    if crate::server::mode::is_standby() {
+        return;
+    }
+    let repair = match &lock {
+        LockOutcome::Acquired(_) => true,
+        LockOutcome::Unavailable(e) => {
+            warn!("Gateway DID lock unavailable ({e:#}); repairing the gateway DID without it");
+            true
+        }
+        LockOutcome::TimedOut => {
+            warn!(
+                "Timed out waiting for the gateway DID lock; the gateway DID repair runs again on the next start or \
+                 promotion"
+            );
+            false
+        }
+    };
+    if repair
+        && let Err(e) = issuer
+            .authorize_signing_key()
+            .await
     {
-        warn!("Could not list the gateway signing key under assertionMethod in the gateway DID document: {e:#}");
+        warn!(
+            "Could not list the gateway signing key under assertionMethod and authentication in the gateway DID \
+             document: {e:#}"
+        );
     }
 
     let gateway_did = issuer
@@ -2649,7 +2694,7 @@ pub async fn run_axum_proxy(
             // Register the gateway's own DID in log storage so /v1/resolve can find it.
             // The VCIssuer stores the gateway DID at {vc_keys}/did.jsonl, while the resolver
             // uses FileDidLogStorage keyed by DID. A Standby node repairs the document and
-            // registers it when it is promoted.
+            // registers it when it is promoted. Both run under the gateway DID lock.
             if let Some(ref issuer) = vc_issuer {
                 repair_and_sync_gateway_did(issuer, &storage).await;
             }
@@ -4490,7 +4535,7 @@ pub async fn run_axum_proxy(
                             }
 
                             // A node that booted Standby lists the gateway signing key under
-                            // assertionMethod in the gateway DID document now.
+                            // assertionMethod and authentication in the gateway DID document now.
                             #[cfg(feature = "didwebvh")]
                             if let Some(storage) = &identity_state_for_mode.didwebvh_log_storage {
                                 repair_and_sync_gateway_did(&identity_state_for_mode.vc_issuer, storage).await;
@@ -5238,6 +5283,131 @@ mod tests {
         );
     }
 
+    /// Two nodes that are both Active for a moment repair the gateway DID once between them:
+    /// the log gains one version and the resolver index holds each version once.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_active_nodes_repair_the_gateway_did_once() {
+        let (first, keys) = crate::identity::test_helpers::test_vc_issuer_without_assertion_multikey().await;
+        let second = crate::identity::VCIssuer::new(
+            keys.path(),
+            "example.com",
+            std::sync::Arc::new(crate::identity::test_helpers::MockIdentityStore::new()),
+            std::sync::Arc::new(crate::identity::test_helpers::MockVpChallengeStore::new()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let did = first
+            .get_issuer_did()
+            .await
+            .unwrap();
+        let index_dir = tempfile::tempdir().unwrap();
+        let storage = index(index_dir.path());
+
+        in_mode(crate::server::mode::ServerMode::Active, async {
+            tokio::join!(
+                super::repair_and_sync_gateway_did(&first, &storage),
+                super::repair_and_sync_gateway_did(&second, &storage)
+            )
+        })
+        .await;
+
+        let log = std::fs::read_to_string(keys.path().join("did.jsonl")).unwrap();
+        assert_eq!(log.lines().count(), 2, "the gateway DID log must gain exactly one version");
+        assert_eq!(
+            storage
+                .load_all(&did)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "the resolver index must hold each version once"
+        );
+    }
+
+    /// A repair that cannot take the gateway DID lock in time is skipped, and runs again on the
+    /// next start or promotion; the resolver index is still synced and the node still starts.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn repair_is_skipped_while_another_node_holds_the_gateway_did_lock() {
+        let (issuer, keys) = crate::identity::test_helpers::test_vc_issuer_without_assertion_multikey().await;
+        let log_before = std::fs::read_to_string(keys.path().join("did.jsonl")).unwrap();
+        let crate::storage::file_lock::LockOutcome::Acquired(_held) = issuer
+            .lock_gateway_did(std::time::Duration::ZERO)
+            .await
+        else {
+            panic!("the lock must be free");
+        };
+        let index_dir = tempfile::tempdir().unwrap();
+        let storage = index(index_dir.path());
+
+        in_mode(
+            crate::server::mode::ServerMode::Active,
+            super::repair_and_sync_gateway_did_within(&issuer, &storage, std::time::Duration::from_millis(50)),
+        )
+        .await;
+
+        assert_eq!(std::fs::read_to_string(keys.path().join("did.jsonl")).unwrap(), log_before);
+        let did = issuer
+            .get_issuer_did()
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .load_all(&did)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the resolver index must still be brought up to the gateway DID log"
+        );
+    }
+
+    /// A node demoted to Standby while it waited for the gateway DID lock writes neither the
+    /// gateway DID log nor the resolver index once it takes the lock.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn node_demoted_while_waiting_for_the_lock_writes_nothing() {
+        let (issuer, keys) = crate::identity::test_helpers::test_vc_issuer_without_assertion_multikey().await;
+        let did = issuer
+            .get_issuer_did()
+            .await
+            .unwrap();
+        let log_before = std::fs::read_to_string(keys.path().join("did.jsonl")).unwrap();
+        let index_dir = tempfile::tempdir().unwrap();
+        let storage = index(index_dir.path());
+        let crate::storage::file_lock::LockOutcome::Acquired(held) = issuer
+            .lock_gateway_did(std::time::Duration::ZERO)
+            .await
+        else {
+            panic!("the lock must be free");
+        };
+
+        in_mode(crate::server::mode::ServerMode::Active, async {
+            let demote = async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                crate::server::mode::set_server_mode(crate::server::mode::ServerMode::Standby);
+                drop(held);
+            };
+            tokio::join!(
+                super::repair_and_sync_gateway_did_within(&issuer, &storage, std::time::Duration::from_secs(5)),
+                demote
+            );
+        })
+        .await;
+
+        assert_eq!(std::fs::read_to_string(keys.path().join("did.jsonl")).unwrap(), log_before);
+        assert!(
+            storage
+                .load_all(&did)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     /// An index that holds a version twice, as two nodes writing it at once can leave it, is
     /// rebuilt from the gateway DID log.
     #[cfg(feature = "didwebvh")]
@@ -5263,7 +5433,7 @@ mod tests {
         }
         assert!(
             issuer
-                .authorize_signing_key_for_assertions()
+                .authorize_signing_key()
                 .await
                 .unwrap()
         );
@@ -5308,7 +5478,7 @@ mod tests {
             .unwrap();
         assert!(
             issuer
-                .authorize_signing_key_for_assertions()
+                .authorize_signing_key()
                 .await
                 .unwrap()
         );

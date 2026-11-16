@@ -77,24 +77,11 @@ impl DidLogStorage for FileDidLogStorage {
         raw_lines: &[&str],
     ) -> Result<()> {
         let path = self.path_for(did);
-        if let Some(parent) = path.parent() {
-            create_dir_all(parent)
-                .await
-                .with_context(|| format!("create dir {:?}", parent))?;
-        }
-
         let mut content = raw_lines.join("\n");
         content.push('\n');
-        let temp_path = path.with_extension(format!("jsonl.{}.tmp", uuid::Uuid::new_v4()));
-        if let Err(e) = tokio::fs::write(&temp_path, content).await {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(e).with_context(|| format!("write {:?}", temp_path));
-        }
-        if let Err(e) = tokio::fs::rename(&temp_path, &path).await {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(e).with_context(|| format!("replace {:?}", path));
-        }
-        Ok(())
+        crate::storage::did_artifacts::replace_file(&path, content.as_bytes())
+            .await
+            .with_context(|| format!("replace {:?}", path))
     }
 
     async fn load_all(

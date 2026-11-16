@@ -13,7 +13,7 @@ use super::{DelegationToken, VaultLookupResult};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
@@ -1036,43 +1036,18 @@ impl FileSystemDelegationVaultStore {
     }
 
     async fn open_mutation_lock(&self) -> Result<File> {
-        let path = self
-            .mutation_lock_path
-            .clone();
-        tokio::task::spawn_blocking(move || {
-            OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(path)
-                .context("Failed to open delegation vault mutation lock")
-        })
-        .await
-        .context("Delegation vault mutation lock task failed")?
+        crate::storage::file_lock::open_lock_file(&self.mutation_lock_path)
+            .await
+            .context("Failed to open delegation vault mutation lock")
     }
 
     async fn mutation_lock(&self) -> Result<File> {
-        let file = self
-            .open_mutation_lock()
-            .await?;
-        tokio::time::timeout(std::time::Duration::from_secs(5), async move {
-            let mut retry = tokio::time::interval(std::time::Duration::from_millis(10));
-            retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                match file.try_lock() {
-                    Ok(()) => return Ok(file),
-                    Err(std::fs::TryLockError::WouldBlock) => {
-                        retry.tick().await;
-                    }
-                    Err(std::fs::TryLockError::Error(error)) => {
-                        return Err(error).context("Failed to lock delegation vault mutations");
-                    }
-                }
-            }
-        })
-        .await
-        .context("Delegation vault mutation lock timed out")?
+        use crate::storage::file_lock::{LockOutcome, lock_exclusive};
+        match lock_exclusive(&self.mutation_lock_path, std::time::Duration::from_secs(5)).await {
+            LockOutcome::Acquired(file) => Ok(file),
+            LockOutcome::Unavailable(error) => Err(error.context("Failed to lock delegation vault mutations")),
+            LockOutcome::TimedOut => anyhow::bail!("Delegation vault mutation lock timed out"),
+        }
     }
 
     async fn store_locked(
@@ -2775,7 +2750,7 @@ mod tests {
                     .unwrap_err()
                     .is_cancelled()
             );
-            let probe = OpenOptions::new()
+            let probe = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(&other.mutation_lock_path)

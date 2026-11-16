@@ -31,15 +31,49 @@ pub async fn test_vc_issuer() -> (VCIssuer, tempfile::TempDir) {
 /// the way an upgraded gateway does.
 #[cfg(feature = "didwebvh")]
 pub async fn test_vc_issuer_without_assertion_multikey() -> (VCIssuer, tempfile::TempDir) {
-    use crate::encryption::secret_file::write_secret_file;
-    use crate::identity::vc_issuer::{gateway_did_document, public_key_agreement_jwk};
-    use affinidi_tdk_common::secrets_resolver::secrets::Secret;
-
     crate::gateways::did_cache::init_shared_resolver()
         .await
         .expect("init_shared_resolver failed");
     let temp_dir = tempfile::tempdir().unwrap();
     let dir = temp_dir.path();
+    seed_did_web_gateway_without_assertion_multikey(dir).await;
+
+    let issuer = VCIssuer::new(
+        dir,
+        "example.com",
+        Arc::new(MockIdentityStore::new()),
+        Arc::new(MockVpChallengeStore::new()),
+        None,
+        None,
+    )
+    .await
+    .expect("VCIssuer::new failed");
+    (issuer, temp_dir)
+}
+
+/// Writes into `dir` the issuer files of a `did:web` gateway for `example.com` whose DID
+/// document lists only `#key-1` under `assertionMethod` and `authentication`, and returns its
+/// signing key.
+#[cfg(feature = "didwebvh")]
+pub async fn seed_did_web_gateway_without_assertion_multikey(dir: &std::path::Path) -> ssi::jwk::JWK {
+    seed_did_web_gateway(dir, |document, did| {
+        document["assertionMethod"] = serde_json::json!([format!("{did}#key-1")]);
+        document["authentication"] = serde_json::json!([format!("{did}#key-1")]);
+    })
+    .await
+}
+
+/// Writes into `dir` the issuer files of a `did:web` gateway for `example.com`, its DID
+/// document as `edit` leaves it, and returns its signing key.
+#[cfg(feature = "didwebvh")]
+pub async fn seed_did_web_gateway(
+    dir: &std::path::Path,
+    edit: impl FnOnce(&mut serde_json::Value, &str),
+) -> ssi::jwk::JWK {
+    use crate::encryption::secret_file::write_secret_file;
+    use crate::identity::vc_issuer::{gateway_did_document, public_key_agreement_jwk};
+    use affinidi_tdk_common::secrets_resolver::secrets::Secret;
+
     let did = "did:web:example.com";
     let signing_key = test_signing_key();
     let x25519 = Secret::generate_x25519(Some(&format!("{did}#key-x25519-1")), None).unwrap();
@@ -64,22 +98,11 @@ pub async fn test_vc_issuer_without_assertion_multikey() -> (VCIssuer, tempfile:
         public_key_agreement_jwk(&p256, "P-256").unwrap(),
     )
     .unwrap();
-    document["assertionMethod"] = serde_json::json!([format!("{did}#key-1")]);
+    edit(&mut document, did);
     crate::storage::did_artifacts::write_did_document(dir, &document.to_string())
         .await
         .unwrap();
-
-    let issuer = VCIssuer::new(
-        dir,
-        "example.com",
-        Arc::new(MockIdentityStore::new()),
-        Arc::new(MockVpChallengeStore::new()),
-        None,
-        None,
-    )
-    .await
-    .expect("VCIssuer::new failed");
-    (issuer, temp_dir)
+    signing_key
 }
 
 /// [`test_vc_issuer`] over `identity_store`.

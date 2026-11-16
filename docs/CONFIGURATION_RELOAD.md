@@ -239,12 +239,18 @@ boots Active; a Standby node and a configuration reload revoke none (see
 [Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live)).
 
 The gateway DID log is shared storage too, so only an Active node adds the gateway signing key to
-the gateway DID document's `assertionMethod` when the document leaves it out: a node that boots
+the gateway DID document's `assertionMethod` and `authentication` when the document leaves it
+out: a node that boots
 Active does it at startup, and a Standby node when it becomes Active (see
 [Resolvable identities](CAPABILITIES.md#resolvable-identities)). After that repair the same
 Active node brings the `/v1/resolve` index up to the gateway DID log; a Standby node writes
 neither. An index that does not match the start of the log is rebuilt from the log and logged as
-a warning.
+a warning. The repair and the index update run under the gateway DID lock in the `vc_keys`
+folder (see [Storage](DEPLOYMENT_REQUIREMENTS.md#storage)), so two nodes Active at once, as
+during a failover, make them one after the other and the second finds nothing left to do. A
+node that waits more than 5 seconds for the lock leaves the repair to its next start or
+promotion and still brings the index up to the log; one on a volume without file locks makes
+both without the lock.
 
 Both modes build the source authentication middleware at startup, so a node whose JWT
 verification strategy store cannot be opened refuses to start in either mode (see

@@ -96,12 +96,45 @@ restart; a key file that holds no content, which a first start killed while fill
 leaves behind, is removed and created again instead, but only by an instance that found it
 unchanged across those 5 seconds, so a file another instance is filling is left alone. See
 [Transit token](SOURCE_AUTH.md#transit-token) for the whole
-rule and the error. No configuration beyond the mount
+rule and the error. The gateway's own DID and its signing and key agreement keys are created,
+and a `did:web` gateway is moved to `did:webvh`, under an exclusive lock on the
+`.gateway_did.lock` file in that folder, so instances starting together publish one DID with
+the one signing key they all hold: the first creates them and the others wait, then load what
+it wrote. A gateway whose keys and `did:webvh` DID are already in place loads them without
+the lock and creates nothing; an Active node takes the lock briefly to repair the DID document
+(see [Server mode](CONFIGURATION_RELOAD.md#server-mode)). Several instances need file locks
+that hold across hosts (see [Shared storage for several instances](#shared-storage-for-several-instances)).
+Where the lock cannot be taken at all the gateway logs a warning and goes on without it, as a
+single instance can. A start still waiting after 30 seconds for an
+instance that holds the lock loads the DID if that instance has finished publishing it, and
+otherwise stops with an error and is restarted. No configuration beyond the mount
 is needed: the gateway reacts to what the volume does. Mount an SMB share with options that
 keep the key file readable by its owner only (`file_mode=0600`, `dir_mode=0700`, and `uid`
 and `gid` matching the user the gateway runs as, or your platform's equivalent for the
 share). A mount that applies its own mode instead leaves the key readable by others on the
 host; the gateway warns about it and starts.
+
+### Shared storage for several instances
+
+Instances that share one `_storage` volume, such as an Active node and its Standby nodes, take
+turns through advisory file locks on that volume: the gateway DID lock (`.gateway_did.lock` in
+`vc_keys`) and the delegation vault's mutation lock (see
+[Credential delegation](CREDENTIAL_DELEGATION.md)). The file server must grant each lock to one
+host at a time:
+
+| Volume | Locks hold across hosts |
+| --- | --- |
+| Local disk (one host) | Yes |
+| Amazon EFS, NFSv4 | Yes |
+| NFS mounted with `nolock`, `local_lock=flock` or `local_lock=all` | No: each host grants its own locks |
+| Azure Files (SMB) | Not verified |
+
+The gateway cannot tell when a mount grants locks only on its own host: the lock is taken
+without an error, so nodes on different hosts may each create their own gateway DID or write
+the vault at the same time. Mount NFS without those options. On a volume that refuses locks
+outright, creating or repairing the gateway DID logs a warning and goes on without the lock, and
+a vault change fails. A lock held by a host that stopped is released when the file server's
+lease for that host expires.
 
 Back up with full `.agbak` archives from the dashboard or the management API; see
 [Storage export and backup](development/DEVELOPMENT.md#storage-export-and-backup). Treat
