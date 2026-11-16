@@ -172,16 +172,30 @@ pub(super) async fn send(
     router: crate::state::MultiSurfaceProxyState,
     path: &str,
 ) -> (axum::http::StatusCode, Vec<DelegationAuditEvent>) {
-    let request = axum::http::Request::builder()
-        .method("POST")
-        .uri(path)
-        .header("content-type", "application/json")
-        .body(axum::body::Body::from(
+    send_method(router, axum::http::Method::POST, path).await
+}
+
+/// [`send`] with `method`; only a `POST` carries the A2A message body.
+pub(super) async fn send_method(
+    router: crate::state::MultiSurfaceProxyState,
+    method: axum::http::Method,
+    path: &str,
+) -> (axum::http::StatusCode, Vec<DelegationAuditEvent>) {
+    let body = if method == axum::http::Method::POST {
+        axum::body::Body::from(
             json!({"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"message": {
                 "role": "user", "messageId": "m-1", "parts": [{"kind": "text", "text": "hello"}]
             }}})
             .to_string(),
-        ))
+        )
+    } else {
+        axum::body::Body::empty()
+    };
+    let request = axum::http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(body)
         .unwrap();
     let (response, events) =
         crate::audit::producer::capture(Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(

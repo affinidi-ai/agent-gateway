@@ -663,18 +663,16 @@ impl CallerAssertion {
         }
     }
 
-    /// A request received over Fabric. Only a `GET` of exactly the default card location or the
-    /// surface's own one is the sending gateway's card fetch; any other request, a `HEAD` or
-    /// another discovery read included, is a caller's, as [`Self::for_forwarded_request`] decides.
+    /// A request received over Fabric. The sending gateway's card fetch
+    /// ([`is_fabric_card_fetch`]) is the gateway's own; any other request, a `HEAD` or another
+    /// discovery read included, is a caller's, as [`Self::for_forwarded_request`] decides.
     pub(crate) fn for_fabric_received_request(
         surface: &crate::config::agent_surface::AgentSurface,
         method: &str,
         path: &str,
         source_auth_failed: bool,
     ) -> Self {
-        if method.eq_ignore_ascii_case("GET")
-            && (path == DEFAULT_AGENT_CARD_PATH || path == agent_card_fabric_forward_path(surface))
-        {
+        if is_fabric_card_fetch(surface, method, path) {
             Self::GatewayOriginated
         } else {
             Self::for_forwarded_request(method, path, source_auth_failed)
@@ -894,6 +892,10 @@ pub(crate) fn a2a_proxy_target_caller(
 }
 
 pub(crate) const TARGET_AUTH_FAILED: &str = "Target authentication failed";
+
+/// The detail of the `502` the gateway answers when the Target redirects the gateway's own agent
+/// card fetch, which never follows a redirect.
+pub(crate) const UPSTREAM_REDIRECTED: &str = "Upstream redirected";
 
 /// Why a target credential could not be resolved. Rendered to the caller only as a
 /// generic failure; the variant is logged.
@@ -11588,7 +11590,7 @@ async fn handle_fabric_request_inner(
 
     // Surface-Level OPA Policy check (fabric:// path)
     if state.surface.opa_enabled()
-        && !(fabric_target_url.ends_with("/agent.json") || fabric_target_url.ends_with("/agent-card.json"))
+        && !crate::proxy::paths::is_public_request(method.as_str(), &fabric_target_url)
         && state
             .policy_manager
             .as_ref()
@@ -14783,6 +14785,19 @@ async fn evaluate_mcp_tool_policies(
 
 const DEFAULT_AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
 
+/// Whether a request received over Fabric is the sending gateway's own agent card fetch: a `GET`
+/// whose path is exactly `/.well-known/agent-card.json` or the surface's configured card
+/// location, the paths a sending gateway's card fetch asks for. Another method, a query, another
+/// spelling of the path, or the legacy `/.well-known/agent.json` is not.
+pub(crate) fn is_fabric_card_fetch(
+    surface: &crate::config::agent_surface::AgentSurface,
+    method: &str,
+    path: &str,
+) -> bool {
+    method.eq_ignore_ascii_case("GET")
+        && (path == DEFAULT_AGENT_CARD_PATH || path == agent_card_fabric_forward_path(surface))
+}
+
 fn agent_card_fabric_forward_path(surface: &crate::config::agent_surface::AgentSurface) -> String {
     if surface.override_agent_card_location()
         && let Some(custom_path) = surface.agent_card_location_path()
@@ -14873,7 +14888,7 @@ async fn pinned_target_client(
 /// credential. The caller is anonymous, so only content negotiation passes;
 /// nothing the caller sends can override the credential or ride along on a
 /// request the gateway has authenticated.
-fn is_forwarded_on_credentialed_card_fetch(name: &str) -> bool {
+pub(crate) fn is_forwarded_on_credentialed_card_fetch(name: &str) -> bool {
     ["accept", "accept-language", "user-agent"]
         .iter()
         .any(|allowed| name.eq_ignore_ascii_case(allowed))
@@ -15626,10 +15641,7 @@ async fn handle_mcp_proxy_request_inner(
                 record_target_auth_failure(&audit_facts, None, target_auth, &e);
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
-                        return Err(create_error_response(
-                            StatusCode::BAD_GATEWAY,
-                            "Target authentication configuration error",
-                        ));
+                        return Err(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED));
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(
@@ -16612,6 +16624,8 @@ pub(crate) fn compute_transit_token_caller_context(
 }
 
 #[cfg(test)]
+mod fabric_send_policy_tests;
+#[cfg(test)]
 mod target_auth_audit_tests;
 #[cfg(test)]
 pub(crate) mod variant_routing_tests;
@@ -16710,6 +16724,71 @@ mod caller_assertion_tests {
         ] {
             assert_eq!(CallerAssertion::for_forwarded_request(method, path, false), expected, "{method} {path}");
         }
+    }
+
+    fn surface_with_card_location(card_location: Option<&str>) -> crate::config::agent_surface::AgentSurface {
+        let mut value = serde_json::json!({
+            "surface_id": "card", "name": "card",
+            "access_point": {"listen_address": "127.0.0.1:8080", "route": "/card", "protocol": "a2a"},
+            "target": {"endpoint": "https://agent.example/base"}
+        });
+        if let Some(location) = card_location {
+            value["access_point"]["agent_card_path"] = serde_json::json!(location);
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn only_an_exact_card_get_over_fabric_is_the_sending_gateways_card_fetch() {
+        let default = surface_with_card_location(None);
+        let configured = surface_with_card_location(Some("cards/me"));
+        for (surface, method, path) in [
+            (&default, "GET", "/.well-known/agent-card.json"),
+            (&default, "get", "/.well-known/agent-card.json"),
+            (&configured, "GET", "/cards/me"),
+            (&configured, "GET", "/.well-known/agent-card.json"),
+        ] {
+            assert!(super::is_fabric_card_fetch(surface, method, path), "{method} {path}");
+            assert_eq!(
+                CallerAssertion::for_fabric_received_request(surface, method, path, true),
+                CallerAssertion::GatewayOriginated,
+                "{method} {path}: the fetch is the gateway's own, whatever the caller"
+            );
+        }
+        for (surface, method, path) in [
+            (&default, "HEAD", "/.well-known/agent-card.json"),
+            (&default, "POST", "/.well-known/agent-card.json"),
+            (&default, "GET", "/.well-known/agent.json"),
+            (&default, "GET", "/.well-known/agent-card.json?view=full"),
+            (&default, "GET", "/x/../.well-known/agent-card.json"),
+            (&default, "GET", "/x/%2e%2e/.well-known/agent-card.json"),
+            (&default, "GET", "/%2Ewell-known/agent-card.json"),
+            (&default, "GET", "/.well-known/Agent-Card.json"),
+            (&default, "GET", "/.well-known/agent-card.json/"),
+            (&default, "GET", "/discovery"),
+            (&default, "GET", "/.well-known/ucp"),
+            (&default, "GET", "/cards/me"),
+            (&configured, "HEAD", "/cards/me"),
+            (&configured, "GET", "/cards/me/"),
+            (&configured, "GET", "/cards/ME"),
+        ] {
+            assert!(!super::is_fabric_card_fetch(surface, method, path), "{method} {path}");
+            assert_ne!(
+                CallerAssertion::for_fabric_received_request(surface, method, path, false),
+                CallerAssertion::GatewayOriginated,
+                "{method} {path}"
+            );
+        }
+        assert_eq!(
+            CallerAssertion::for_fabric_received_request(&default, "HEAD", "/.well-known/agent-card.json", false),
+            CallerAssertion::Unauthenticated,
+            "a HEAD of the card path is a caller's discovery read"
+        );
+        assert_eq!(
+            CallerAssertion::for_fabric_received_request(&default, "GET", "/cards/me", true),
+            CallerAssertion::Unauthenticated,
+            "a path that is no card location keeps the failed caller's rule"
+        );
     }
 }
 
@@ -23953,7 +24032,7 @@ mod fabric_send_tests {
 
     const TARGET_URL: &str = "https://backend.internal/a2a";
 
-    fn run_on_large_stack<F>(test: F)
+    pub(super) fn run_on_large_stack<F>(test: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {

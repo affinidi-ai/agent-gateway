@@ -111,7 +111,7 @@ pub(super) fn surface(
 
 /// The receiving gateway's stores under `root`, the peer paired, the caller
 /// key the surface checks stored, and `surface` saved.
-async fn receiver(
+pub(super) async fn receiver(
     root: &std::path::Path,
     surface: &AgentSurface,
 ) -> (Gateway, tempfile::TempDir) {

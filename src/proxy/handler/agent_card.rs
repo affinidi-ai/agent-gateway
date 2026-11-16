@@ -12,7 +12,7 @@ use axum::response::Response;
 use serde_json::Value as JsonValue;
 use tracing::{debug, error, info, warn};
 
-use super::{CallerAssertion, TARGET_AUTH_FAILED, TargetAuthContext, TargetAuthError};
+use super::{CallerAssertion, TARGET_AUTH_FAILED, TargetAuthContext, TargetAuthError, UPSTREAM_REDIRECTED};
 use crate::a2a::create_error_response;
 use crate::observability::loggable;
 use crate::proxy::backend_identity::ProtectedAgentIdentity;
@@ -786,7 +786,7 @@ impl TargetCardFetch<'_> {
             .is_redirection()
         {
             error!(channel = channel_name, status = %response.status(), "Upstream redirected the agent card fetch - gateway fault");
-            return Err(self.fail(fault, create_error_response(StatusCode::BAD_GATEWAY, "Upstream redirected")));
+            return Err(self.fail(fault, create_error_response(StatusCode::BAD_GATEWAY, UPSTREAM_REDIRECTED)));
         }
         if !response.status().is_success() {
             error!(channel = channel_name, status = %response.status(), "Upstream returned error for agent card - gateway fault");
@@ -911,15 +911,17 @@ fn fabric_card_result(
         FabricCardOutcome::Failed(error) => {
             Err((FetchFault::Unreachable, StatusCode::BAD_GATEWAY, format!("Failed to fetch from upstream: {error}")))
         }
-        FabricCardOutcome::Refused { status } => {
+        FabricCardOutcome::Refused { status, body } => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let detail = peer_gateway_card_refusal(status, &body)
+                .map_or_else(|| format!("Upstream error: {status}"), str::to_string);
             Err((
                 FetchFault::Status {
                     status: status.as_u16(),
                     credential_sent: false,
                 },
                 status,
-                format!("Upstream error: {status}"),
+                detail,
             ))
         }
         FabricCardOutcome::TooLarge => {
@@ -942,6 +944,26 @@ fn fabric_card_timeout_secs(state: &ProxyState) -> u64 {
         .surface
         .timeout()
         .map_or(a2a, |timeout| timeout.request_secs.min(a2a))
+}
+
+/// The fixed text a peer gateway answered its `502` with when it could not make its own card
+/// fetch: [`TARGET_AUTH_FAILED`] or [`UPSTREAM_REDIRECTED`]. A caller over Fabric then gets the
+/// same text as on the direct path. Only these constants are ever returned, so nothing the peer or
+/// its Target wrote reaches the caller; any other answer gets `None`.
+fn peer_gateway_card_refusal(
+    status: StatusCode,
+    body: &[u8],
+) -> Option<&'static str> {
+    if status != StatusCode::BAD_GATEWAY {
+        return None;
+    }
+    let problem: JsonValue = serde_json::from_slice(body).ok()?;
+    let detail = problem
+        .get("detail")?
+        .as_str()?;
+    [TARGET_AUTH_FAILED, UPSTREAM_REDIRECTED]
+        .into_iter()
+        .find(|fixed| *fixed == detail)
 }
 
 /// The caller's headers a card fetch over Fabric carries: those the Access Point forwards,
@@ -988,7 +1010,7 @@ mod tests {
             ),
             (
                 "refused",
-                FabricCardOutcome::Refused { status: 404 },
+                FabricCardOutcome::Refused { status: 404, body: Vec::new() },
                 FetchFault::Status {
                     status: 404,
                     credential_sent: false,
@@ -997,8 +1019,21 @@ mod tests {
                 "Upstream error: 404 Not Found",
             ),
             (
+                "refused by the peer gateway's own card fetch",
+                FabricCardOutcome::Refused {
+                    status: 502,
+                    body: problem(serde_json::json!(super::TARGET_AUTH_FAILED)),
+                },
+                FetchFault::Status {
+                    status: 502,
+                    credential_sent: false,
+                },
+                StatusCode::BAD_GATEWAY,
+                super::TARGET_AUTH_FAILED,
+            ),
+            (
                 "not a status",
-                FabricCardOutcome::Refused { status: 1 },
+                FabricCardOutcome::Refused { status: 1, body: Vec::new() },
                 FetchFault::Status {
                     status: 502,
                     credential_sent: false,
@@ -1423,6 +1458,45 @@ mod tests {
                 .agent_card_path = agent_card_path.map(str::to_string);
 
             assert_eq!(card_target_url(&surface), expected, "{case}");
+        }
+    }
+
+    fn problem(detail: JsonValue) -> Vec<u8> {
+        json!({"type": "about:blank", "title": "Bad Gateway", "status": 502, "detail": detail})
+            .to_string()
+            .into_bytes()
+    }
+
+    #[test]
+    fn a_peer_gateways_own_card_refusal_is_answered_with_the_same_fixed_text() {
+        for fixed in [TARGET_AUTH_FAILED, UPSTREAM_REDIRECTED] {
+            assert_eq!(peer_gateway_card_refusal(StatusCode::BAD_GATEWAY, &problem(json!(fixed))), Some(fixed));
+        }
+    }
+
+    #[test]
+    fn no_other_peer_answer_is_taken_as_a_fixed_refusal() {
+        let cases: [(&str, StatusCode, Vec<u8>); 7] = [
+            ("another status", StatusCode::UNAUTHORIZED, problem(json!(TARGET_AUTH_FAILED))),
+            ("a gateway timeout", StatusCode::GATEWAY_TIMEOUT, problem(json!(UPSTREAM_REDIRECTED))),
+            ("another detail", StatusCode::BAD_GATEWAY, problem(json!("Upstream error: 502"))),
+            (
+                "the fixed text with more after it",
+                StatusCode::BAD_GATEWAY,
+                problem(json!("Target authentication failed: token=leaked")),
+            ),
+            ("a detail in another case", StatusCode::BAD_GATEWAY, problem(json!("upstream redirected"))),
+            ("a detail that is not a string", StatusCode::BAD_GATEWAY, problem(json!({"text": TARGET_AUTH_FAILED}))),
+            (
+                "a body that is not JSON",
+                StatusCode::BAD_GATEWAY,
+                TARGET_AUTH_FAILED
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        ];
+        for (case, status, body) in cases {
+            assert_eq!(peer_gateway_card_refusal(status, &body), None, "{case}");
         }
     }
 }
