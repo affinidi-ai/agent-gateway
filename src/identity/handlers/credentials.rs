@@ -568,13 +568,22 @@ async fn resolve_didwebvh_with_deactivation_support(
     anyhow::Error,
 > {
     use crate::identity::didwebvh::types::{DidResolutionMetadata, LogEntry};
-    use crate::identity::didwebvh::verifier::DidWebvhVerifier;
 
-    let entries: Vec<LogEntry> = log_storage
-        .load_all(did)
+    // Verified the way every other resolution path verifies, with the library that writes the
+    // gateway's logs, so a log that fails verification is never served as current.
+    let raw = log_storage
+        .load_all_raw(did)
         .await?;
-    let verifier = DidWebvhVerifier::new();
-    verifier.verify(&entries)?;
+    if raw.is_empty() {
+        anyhow::bail!("did log empty");
+    }
+    crate::identity::didwebvh::resolver::verify_log_with_library(did, &raw)
+        .await
+        .map_err(|e| anyhow::anyhow!("did log failed verification: {e}"))?;
+    let entries: Vec<LogEntry> = raw
+        .iter()
+        .map(|line| serde_json::from_str(line))
+        .collect::<Result<_, _>>()?;
 
     let birth = entries
         .first()
@@ -1189,6 +1198,64 @@ pub async fn serve_surface_did_witness(axum::extract::Path(_surface_id): axum::e
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "didwebvh")]
+    async fn stored_log(
+        tamper: bool
+    ) -> (std::sync::Arc<dyn crate::storage::DidLogStorage>, String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let jwk = serde_json::to_value(ssi::jwk::JWK::generate_ed25519().unwrap()).unwrap();
+        let document = serde_json::json!({
+            "id": "did:webvh:{SCID}:example.com",
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "verificationMethod": [],
+            "authentication": []
+        });
+        let created = crate::identity::didwebvh::create::create_webvh_did(&jwk, document, "https://example.com/")
+            .await
+            .unwrap();
+        let line = if tamper {
+            let mut line: serde_json::Value = serde_json::from_str(&created.log_entry_json).unwrap();
+            line["state"]["alsoKnownAs"] = serde_json::json!(["did:example:someone-else"]);
+            line.to_string()
+        } else {
+            created.log_entry_json.clone()
+        };
+        let storage = crate::storage::did_logs_file::FileDidLogStorage::new(dir.path());
+        crate::storage::DidLogStorage::append_raw(&storage, &created.final_did, &line)
+            .await
+            .unwrap();
+        (std::sync::Arc::new(storage), created.final_did, dir)
+    }
+
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn a_did_log_that_verifies_resolves_to_its_latest_document() {
+        let (storage, did, _dir) = stored_log(false).await;
+
+        let (document, metadata) = super::resolve_didwebvh_with_deactivation_support(storage, &did)
+            .await
+            .expect("a log the gateway wrote verifies");
+
+        assert_eq!(document.id.as_str(), did);
+        assert!(!metadata.deactivated);
+    }
+
+    /// The verifier reports a broken proof in its report rather than as an
+    /// error, so a resolver that ignored the verdict served a tampered log as
+    /// the current document.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn a_did_log_that_fails_verification_is_not_resolved() {
+        let (storage, did, _dir) = stored_log(true).await;
+
+        let refused = super::resolve_didwebvh_with_deactivation_support(storage, &did).await;
+
+        let error = refused
+            .expect_err("a tampered log must not resolve")
+            .to_string();
+        assert!(error.contains("failed verification"), "{error}");
+    }
+
     use super::connection_auth_did_response;
     use crate::identity::FilesystemIdentityStore;
     use crate::identity::didwebvh::types::{LogEntry, LogParameters};

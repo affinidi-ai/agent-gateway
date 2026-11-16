@@ -337,6 +337,14 @@ changes:
         updates now carry the record without the key, and the WebSocket drops a
         private key from any identity update before sending it. The stored key
         is unchanged.
+    - timestamp: '2026-11-17T09:05:00Z'
+      title: Refuse to resolve a did:webvh log that fails verification
+      description: >-
+        The DID resolution endpoint's deactivation-aware path checked a stored
+        did:webvh log but ignored the result, so a tampered or corrupt log
+        resolved as the current document. It now verifies the log with the same
+        library as every other resolution path and answers invalidDid when
+        verification fails.
   breaking: []
   internal:
     - timestamp: '2026-10-23T07:00:00.000Z'
