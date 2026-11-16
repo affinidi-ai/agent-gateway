@@ -23401,7 +23401,8 @@ mod tests {
         use crate::audit::request_events::{RejectionReason, TargetAuthOutcome};
         let directory = tempfile::tempdir().unwrap();
         let state = delegation_state(directory.path(), &[]).await;
-        let mut ctx = credential_header_case(&state, None, &[], Method::POST, "/outbound/surfaces/order/partner-a/").await;
+        let mut ctx =
+            credential_header_case(&state, None, &[], Method::POST, "/outbound/surfaces/order/partner-a/").await;
         ctx.virtual_channel
             .target_endpoint = "fabric://peer-gateway/partner".to_string();
         ctx.virtual_channel
@@ -23430,15 +23431,20 @@ mod tests {
             ("not a 401", peer_answer(403, Some("x-vendor-key")), Some("X-VENDOR-KEY")),
             ("nothing injected", peer_answer(401, Some("x-vendor-key")), None),
         ] {
-            let (passed, events) =
-                crate::audit::producer::capture(async { refuse_if_peer_refused_target_credential(&ctx, &response, injected) })
-                    .await;
+            let (passed, events) = crate::audit::producer::capture(async {
+                refuse_if_peer_refused_target_credential(&ctx, &response, injected)
+            })
+            .await;
             assert!(passed.is_ok(), "{case}: {passed:?}");
             assert!(events.is_empty(), "{case}: {events:?}");
         }
 
         let (refused, events) = crate::audit::producer::capture(async {
-            refuse_if_peer_refused_target_credential(&ctx, &peer_answer(401, Some("x-vendor-key")), Some("X-VENDOR-KEY"))
+            refuse_if_peer_refused_target_credential(
+                &ctx,
+                &peer_answer(401, Some("x-vendor-key")),
+                Some("X-VENDOR-KEY"),
+            )
         })
         .await;
         let Err(error) = refused else {
@@ -23447,7 +23453,10 @@ mod tests {
         assert_eq!(error.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(matches!(
             error,
-            OutboundPipelineError::TargetAuthFailed { failure: crate::proxy::handler::TargetAuthFailure::Rejected, .. }
+            OutboundPipelineError::TargetAuthFailed {
+                failure: crate::proxy::handler::TargetAuthFailure::Rejected,
+                ..
+            }
         ));
         let records: Vec<_> = events
             .iter()
