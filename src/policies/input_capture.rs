@@ -17,12 +17,62 @@ use crate::observability::loggable::REDACTED;
 use crate::server::WsUpdate;
 
 /// Where a dashboard connection receives its captures: each one a serialized
-/// `policy_input_captured` update. A capture that finds it full is dropped.
+/// `policy_input_captured` update, or a `policy_input_skipped` update counting the
+/// captures dropped because it was full.
 pub type CaptureSender = mpsc::Sender<Arc<str>>;
 
+/// One listen: the id of its [`Listening`], where its captures go, and how many it has
+/// missed since it was last told.
+struct Listener {
+    id: u64,
+    captures: CaptureSender,
+    skipped: AtomicU64,
+}
+
+impl Listener {
+    /// Queue `capture`, first telling the listener how many captures it missed. A capture
+    /// that finds the queue full is counted as missed instead.
+    fn send(
+        &self,
+        surface_id: &str,
+        capture: &Arc<str>,
+    ) {
+        let skipped = self
+            .skipped
+            .load(Ordering::Relaxed);
+        if skipped > 0 {
+            let notice = serde_json::json!({
+                "type": "policy_input_skipped",
+                "config_id": surface_id,
+                "skipped": skipped,
+            })
+            .to_string();
+            if self
+                .captures
+                .try_send(notice.into())
+                .is_err()
+            {
+                self.skipped
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            self.skipped
+                .fetch_sub(skipped, Ordering::Relaxed);
+        }
+        if self
+            .captures
+            .try_send(Arc::clone(capture))
+            .is_err()
+        {
+            self.skipped
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// The connections listening to each surface's policy input, by surface id: one entry
-/// per listen, with the id of its [`Listening`].
-static LISTENERS: LazyLock<DashMap<String, Vec<(u64, CaptureSender)>>> = LazyLock::new(DashMap::new);
+/// per listen.
+static LISTENERS: LazyLock<DashMap<String, Vec<Listener>>> = LazyLock::new(DashMap::new);
 
 static NEXT_LISTEN_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -43,7 +93,11 @@ pub fn listen(
     LISTENERS
         .entry(surface_id.to_string())
         .or_default()
-        .push((id, captures));
+        .push(Listener {
+            id,
+            captures,
+            skipped: AtomicU64::new(0),
+        });
     Listening {
         surface_id: surface_id.to_string(),
         id,
@@ -53,7 +107,7 @@ pub fn listen(
 impl Drop for Listening {
     fn drop(&mut self) {
         if let Some(mut listeners) = LISTENERS.get_mut(&self.surface_id) {
-            listeners.retain(|(id, _)| *id != self.id);
+            listeners.retain(|listener| listener.id != self.id);
         }
         LISTENERS.remove_if(&self.surface_id, |_, listeners| listeners.is_empty());
     }
@@ -240,8 +294,8 @@ impl Capture {
             }
         };
         if let Some(listeners) = LISTENERS.get(&surface_id) {
-            for (_, captures) in listeners.iter() {
-                let _ = captures.try_send(Arc::clone(&capture));
+            for listener in listeners.iter() {
+                listener.send(&surface_id, &capture);
             }
         }
     }
@@ -347,15 +401,21 @@ static URL_QUERY: LazyLock<Regex> = LazyLock::new(|| {
 
 /// `text` with its credentials masked, or `None` when it holds none. A text that is
 /// one JWT or one authorization value becomes [`REDACTED`] whole; inside longer text
-/// each JWT and authorization token becomes [`REDACTED`], and each URL keeps its query
-/// parameter names with their values redacted.
+/// each URL keeps its query parameter names with their values redacted, then each JWT
+/// and authorization token becomes [`REDACTED`]. Queries go first, so a JWT in a query
+/// cannot end the query before the parameters after it.
 fn mask_text(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if is_jwt(trimmed) || is_authorization_value(trimmed) {
         return Some(REDACTED.to_string());
     }
+    let masked = URL_QUERY
+        .replace_all(text, |caps: &regex::Captures<'_>| {
+            format!("{}?{}", &caps[1], crate::observability::loggable::query(&caps[2]))
+        })
+        .into_owned();
     let masked = EMBEDDED_JWT
-        .replace_all(text, regex::NoExpand(REDACTED))
+        .replace_all(&masked, regex::NoExpand(REDACTED))
         .into_owned();
     let masked = AUTHORIZATION
         .replace_all(&masked, |caps: &regex::Captures<'_>| {
@@ -364,11 +424,6 @@ fn mask_text(text: &str) -> Option<String> {
             } else {
                 caps[0].to_string()
             }
-        })
-        .into_owned();
-    let masked = URL_QUERY
-        .replace_all(&masked, |caps: &regex::Captures<'_>| {
-            format!("{}?{}", &caps[1], crate::observability::loggable::query(&caps[2]))
         })
         .into_owned();
     (masked != text).then_some(masked)
@@ -511,6 +566,37 @@ mod tests {
 
         assert_eq!(received_captures(&mut full).len(), 1);
         assert_eq!(received_captures(&mut open).len(), 3);
+    }
+
+    #[test]
+    fn a_listener_that_missed_captures_is_told_how_many_before_the_next_one() {
+        let (queue, mut received) = mpsc::channel(2);
+        let _listening = listen("input-capture-skipped", queue);
+        let input = json!({ "channel": { "config_id": "input-capture-skipped" } });
+        let capture = || {
+            begin("surface", "input-capture-skipped", &input, Vec::new)
+                .unwrap()
+                .finish(Ok((true, None)))
+        };
+
+        for _ in 0..4 {
+            capture();
+        }
+        let first = received_captures(&mut received);
+        capture();
+        let after = received_captures(&mut received);
+
+        assert_eq!(first.len(), 2, "{first:?}");
+        assert!(
+            first
+                .iter()
+                .all(|update| update["type"] == "policy_input_captured")
+        );
+        assert_eq!(after.len(), 2, "{after:?}");
+        assert_eq!(after[0]["type"], "policy_input_skipped");
+        assert_eq!(after[0]["config_id"], "input-capture-skipped");
+        assert_eq!(after[0]["skipped"], 2);
+        assert_eq!(after[1]["type"], "policy_input_captured");
     }
 
     #[test]
@@ -691,6 +777,31 @@ mod tests {
         assert_eq!(parts[1]["text"], "Basic understanding of the API");
         assert_eq!(parts[2]["text"], REDACTED);
         assert_eq!(parts[3]["text"], "Basic YWxpY2VzM2NyZXQ=");
+    }
+
+    #[test]
+    fn a_jwt_in_a_url_query_does_not_shield_the_parameters_after_it() {
+        let mut input = json!({
+            "mcp": { "arguments": {
+                "callback": format!("https://app.example.test/cb?id_token={JWT}&state=s1&code=abc123"),
+                "note": format!("open https://app.example.test/cb?token={JWT}&code=abc123 now"),
+            } },
+        });
+
+        mask_credentials(&mut input);
+
+        let arguments = &input["mcp"]["arguments"];
+        assert_eq!(
+            arguments["callback"],
+            format!("https://app.example.test/cb?id_token={REDACTED}&state={REDACTED}&code={REDACTED}")
+        );
+        assert_eq!(arguments["note"], format!("open https://app.example.test/cb?token={REDACTED}&code={REDACTED} now"));
+        assert!(
+            !input
+                .to_string()
+                .contains("abc123"),
+            "{input}"
+        );
     }
 
     #[test]

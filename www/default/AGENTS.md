@@ -672,7 +672,10 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   evaluations are kept and that one request can add several rows); a chosen slot that has
   left the list (cleared or rolled off) falls back to all slots. With none it says to
   listen and send a request, and that on an appliance with several nodes only requests served by
-  this dashboard's node show. Pause and Clear Payloads apply to it too. The header stacks
+  this dashboard's node show. Pause and Clear Payloads apply to it too. When the gateway reports
+  captures it dropped for this dashboard (`policy_input_skipped`), a warning alert
+  (`policy-input-capture-skipped`) above the list says how many evaluations were not shown;
+  Clear Payloads resets it. The header stacks
   the title and count badge, then a warning line (`text-warning` with a triangle icon,
   `policy-input-capture-warning`): "For developing and testing policies only", then the muted
   hint line; the Listen control sits on the right.

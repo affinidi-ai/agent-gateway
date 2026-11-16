@@ -11,8 +11,8 @@ jest.mock('../../PolicyInputCaptureControl', () => ({
 }));
 
 const Harness: React.FC<{ paused?: boolean }> = ({ paused = false }) => {
-  const { captures } = usePolicyInputCaptureStream('surface-1', paused);
-  return <PolicyInputCaptureCard captures={captures} />;
+  const { captures, skipped } = usePolicyInputCaptureStream('surface-1', paused);
+  return <PolicyInputCaptureCard captures={captures} skipped={skipped} />;
 };
 
 const captured = (detail: Record<string, unknown>) =>
@@ -214,6 +214,27 @@ describe('PolicyInputCaptureCard', () => {
 
     expect(screen.getByTestId('policy-input-capture-warning')).toHaveTextContent(
       'For developing and testing policies only'
+    );
+  });
+
+  it('says how many evaluations the gateway skipped for this dashboard', () => {
+    render(<Harness />);
+    expect(screen.queryByTestId('policy-input-capture-skipped')).not.toBeInTheDocument();
+
+    const skipped = (configId: string, count: number) =>
+      act(() => {
+        window.dispatchEvent(
+          new CustomEvent('ws-message', {
+            detail: { type: 'policy_input_skipped', config_id: configId, skipped: count },
+          })
+        );
+      });
+    skipped('surface-1', 3);
+    skipped('surface-2', 7);
+    skipped('surface-1', 2);
+
+    expect(screen.getByTestId('policy-input-capture-skipped')).toHaveTextContent(
+      '5 policy evaluations were not shown'
     );
   });
 

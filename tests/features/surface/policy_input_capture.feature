@@ -72,3 +72,11 @@ Feature: Live policy input capture
     Then the response status is 200
     And the Capture view shows the "target" policy of surface "alpha" deciding "allow" on an input showing "hello policy"
     And the Capture view of operator "olga" shows no policy input
+
+  Scenario: The Capture view shows an appliance-wide policy's denial and names the policy that denied
+    Given an appliance-wide surface policy "BDD appliance-wide policy" denies every request
+    And the operator listens to the policy input of surface "alpha"
+    When the caller sends an A2A message/send request to surface "alpha" with text "hello policy"
+    Then the response status is 403
+    And the Capture view shows the "appliance agent_surface" policy of surface "alpha" denying with reason "Blocked by appliance-wide policy"
+    And the Capture view shows the "appliance agent_surface" policy of surface "alpha" running policy "BDD appliance-wide policy"

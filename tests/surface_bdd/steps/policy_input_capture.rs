@@ -159,21 +159,22 @@ async fn listens(
     assert_eq!(answer["listening"], true, "listening to policy input: {answer}");
 }
 
-#[given(expr = "surface {string} has a request policy that denies with reason {string}")]
-async fn surface_has_denying_request_policy(
+/// Create the policy definition `policy_id` from `rego` and make it the request policy
+/// of `surface_name`, through the admin API.
+async fn attach_request_policy(
     world: &mut SurfaceWorld,
-    surface_name: String,
-    reason: String,
+    surface_name: &str,
+    policy_id: &str,
+    policy_name: &str,
+    rego: &str,
 ) {
-    let surface_id = tracked_surface_id(world, &surface_name);
-    let policy_id = format!("bdd-capture-deny-{surface_id}");
-    let rego = format!("package surface.policy\n\ndefault allow := false\n\ndeny_reason := {reason:?}\n");
+    let surface_id = tracked_surface_id(world, surface_name);
     let admin = client(world, None).await;
     let created = admin
-        .create_surface_policy_definition_recorded(&policy_id, "BDD denying policy", "Denies every request", &rego)
+        .create_surface_policy_definition_recorded(policy_id, policy_name, policy_name, rego)
         .await
-        .expect("create the denying policy definition");
-    assert!(created.status < 300, "creating the denying policy definition: {}", created.body);
+        .expect("create the request policy definition");
+    assert!(created.status < 300, "creating the request policy definition: {}", created.body);
     let stored = admin
         .get_surface_recorded(&surface_id)
         .await
@@ -184,11 +185,61 @@ async fn surface_has_denying_request_policy(
             &surface_id,
             stored.body,
             crate::bdd_support::admin_client::SurfacePolicySlot::Request,
-            &policy_id,
+            policy_id,
         )
         .await
-        .expect("attach the denying policy");
-    assert_eq!(updated.status, 200, "attaching the denying policy: {}", updated.body);
+        .expect("attach the request policy");
+    assert_eq!(updated.status, 200, "attaching the request policy: {}", updated.body);
+}
+
+#[given(expr = "surface {string} has a request policy that denies with reason {string}")]
+async fn surface_has_denying_request_policy(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+    reason: String,
+) {
+    let surface_id = tracked_surface_id(world, &surface_name);
+    let rego = format!("package surface.policy\n\ndefault allow := false\n\ndeny_reason := {reason:?}\n");
+    attach_request_policy(world, &surface_name, &format!("bdd-capture-deny-{surface_id}"), "BDD denying policy", &rego)
+        .await;
+}
+
+#[given(expr = "surface {string} has a request policy that allows every request")]
+async fn surface_has_allowing_request_policy(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+) {
+    let surface_id = tracked_surface_id(world, &surface_name);
+    attach_request_policy(
+        world,
+        &surface_name,
+        &format!("bdd-capture-allow-{surface_id}"),
+        "BDD allow-all policy",
+        "package surface.policy\n\ndefault allow := true\n",
+    )
+    .await;
+}
+
+#[given(expr = "an appliance-wide surface policy {string} denies every request")]
+async fn appliance_wide_policy_denies(
+    world: &mut SurfaceWorld,
+    policy_name: String,
+) {
+    let policy_id = "bdd-capture-appliance-deny";
+    let rego = "package surface.policy\n\ndefault allow := false\n";
+    let admin = client(world, None).await;
+    let created = admin
+        .create_surface_policy_definition_recorded(policy_id, &policy_name, "Denies every request", rego)
+        .await
+        .expect("create the appliance-wide policy definition");
+    assert!(created.status < 300, "creating the appliance-wide policy definition: {}", created.body);
+    let assignments =
+        json!({ "assignments": { "agent_surface": [{ "policy_id": policy_id, "monitor_only": false }] } });
+    let assigned = admin
+        .send_recorded_json(reqwest::Method::PUT, "/v1/policy-assignments", Some(&assignments))
+        .await
+        .expect("assign the appliance-wide policy");
+    assert_eq!(assigned.status, 200, "assigning the appliance-wide policy: {}", assigned.body);
 }
 
 #[given(expr = "Transit Point {string} has a policy that allows every request")]

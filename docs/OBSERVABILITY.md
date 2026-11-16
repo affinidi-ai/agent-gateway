@@ -9,8 +9,8 @@ for the checked-out source revision.
 
 [`WsState`](../src/server/websocket.rs) wraps a Tokio broadcast sender. Each connected dashboard
 WebSocket subscribes independently after any configured authentication check; a slow receiver that
-lags is disconnected rather than blocking producers. `websocket_broadcast_buffer` controls the
-channel capacity and defaults to `500`.
+lags skips the updates it missed and keeps reading rather than blocking producers.
+`websocket_broadcast_buffer` controls the channel capacity and defaults to `500`.
 
 `WsUpdate` currently defines these event shapes:
 
@@ -72,7 +72,8 @@ permission is checked again on each keep-alive ping, and a connection that loses
 listening to every surface and is told so, and the captures still queued for it are dropped. Each
 listening connection has its own queue of at most 64 `PolicyInputCaptured` updates; a capture that
 finds it full is dropped for that connection only, so a busy listened surface never reaches the
-broadcast or another connection. At most 32 answers wait to be sent before the connection stops
+broadcast or another connection. The connection is told how many it missed with a
+`{"type": "policy_input_skipped", "config_id", "skipped"}` message queued before its next capture. At most 32 answers wait to be sent before the connection stops
 reading the client's commands, and closing the connection ends its listening (see
 [`POLICY.md`](POLICY.md#policy-input-capture)). A connection that falls more than
 `websocket_broadcast_buffer` broadcast updates behind skips the ones it missed and keeps reading;

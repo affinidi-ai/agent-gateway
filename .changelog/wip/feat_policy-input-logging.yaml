@@ -9,7 +9,8 @@ changes:
         connection listens, each request and response policy evaluation on that surface (gateway,
         surface, Transit Point and appliance-wide planes, on the direct, Fabric and MCP proxy paths)
         is serialized once and queued for the listening connections only (up to 64 per connection,
-        then dropped for that connection), never through the shared dashboard broadcast, as a
+        then dropped for that connection, which is told how many it missed), never through the
+        shared dashboard broadcast, as a
         policy_input_captured update with its input,
         the id, name and version of each policy definition the slot evaluated, the member that denied
         a gateway or appliance-wide set, and its allow, deny reason or error. The gateway policy of
@@ -32,8 +33,10 @@ changes:
         try in the policy Test panel. Stopping, leaving the view or reloading the page ends
         listening. It keeps the last 50 evaluations with a filter by policy slot, says when it is
         waiting for the dashboard connection, and says that a multi-node appliance shows only this
-        node's requests. On a surface with no policy yet, it says a request policy must be added before
-        there is anything to capture. It is for developing and testing policies only.
+        node's requests. It warns how many evaluations were not shown when the surface sent them
+        faster than the dashboard could receive them. On a surface with no policy yet, it says a
+        request policy must be added before there is anything to capture. It is for developing and
+        testing policies only.
   changed: []
   fixed:
     - timestamp: '2026-11-13T00:00:00Z'
@@ -48,8 +51,8 @@ changes:
       description: >-
         A dashboard WebSocket connection that fell more than websocket_broadcast_buffer updates
         behind was closed, and the page showed its reconnect dialog. It now skips the updates it
-        missed and keeps reading; only a closed update channel ends it. Policy input capture adds
-        one update per policy evaluation while someone listens, which made falling behind likelier.
+        missed and keeps reading; only a closed update channel ends it. A burst of dashboard
+        updates no longer forces a slow connection to reconnect.
   removed: []
   security: []
   breaking: []

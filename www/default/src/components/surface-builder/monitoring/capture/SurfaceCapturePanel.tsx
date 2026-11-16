@@ -285,6 +285,7 @@ const SurfaceCapturePanel: React.FC<SurfaceCapturePanelProps> = ({
 
       <PolicyInputCaptureCard
         captures={policyInputs.captures}
+        skipped={policyInputs.skipped}
         hasPolicy={!surface || surfaceHasPolicy(surface)}
       />
 

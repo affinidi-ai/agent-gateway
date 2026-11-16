@@ -14,6 +14,8 @@ interface PolicyInputCaptureCardProps {
   captures: CapturedPolicyInput[];
   /** Whether the surface has a policy of its own; without one it has nothing to capture. */
   hasPolicy?: boolean;
+  /** How many evaluations the gateway dropped for this dashboard because it fell behind. */
+  skipped?: number;
 }
 
 /**
@@ -87,6 +89,7 @@ const PolicyNames: React.FC<{ capture: CapturedPolicyInput }> = ({ capture }) =>
 const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
   captures,
   hasPolicy = true,
+  skipped = 0,
 }) => {
   const [openId, setOpenId] = useState<number | null>(null);
   const [slot, setSlot] = useState<string>('');
@@ -119,6 +122,17 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
         <PolicyInputCaptureControl />
       </div>
       <div className="card-body">
+        {skipped > 0 && (
+          <div
+            className="alert alert-warning mb-3"
+            style={{ fontSize: '14px' }}
+            data-testid="policy-input-capture-skipped"
+          >
+            <i className="fas fa-exclamation-triangle me-2"></i>
+            {skipped} policy {skipped === 1 ? 'evaluation was' : 'evaluations were'} not shown: the
+            surface sent them faster than this dashboard could receive them.
+          </div>
+        )}
         {!hasPolicy && (
           <div
             className="alert alert-info mb-3"
