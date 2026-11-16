@@ -688,9 +688,10 @@ identity from them and places the presentation on the status message. The callin
 the presentation, or a raw identity extension, only from the status message, and never from
 artifacts: the peer gateway never places a presentation in an artifact, so one found there, or a
 raw identity there, did not come from it and is ignored
-([`src/proxy/fabric_identity.rs`](../src/proxy/fabric_identity.rs)). A presentation must verify
-and come from one of the issuers of the connection to the peer gateway; it is then the answering
-Managed Agent's identity, and one that does not refuses the answer with `502` (see
+([`src/proxy/fabric_identity.rs`](../src/proxy/fabric_identity.rs)). On a `2xx` answer a
+presentation must verify and come from one of the issuers of the connection to the peer gateway,
+or the answer is refused with `502`. It is the answering Managed Agent's identity only when the
+calling surface takes that identity from the payload (see
 [`FABRIC.md`](FABRIC.md#peer-issuer-dids)).
 
 Neither remaining location proves authorship: A2A artifacts carry no author, and the Gateway does not

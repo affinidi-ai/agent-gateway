@@ -6081,15 +6081,36 @@ mod peer_issuer_tests {
 
     #[tokio::test]
     async fn an_operator_trusted_issuer_is_vouched_for_without_the_issuer_exchange() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         let root = tempfile::tempdir().unwrap();
-        let gateway = peer(None, &["did:web:relay"]);
+        let mut gateway = peer(None, &["did:web:relay"]);
+        gateway.did = "did:example:peer-trusted-by-hand".to_string();
         let (manager, _issuer_dir) = manager_with(root.path(), &gateway).await;
+        // With a listener for the peer, an issuer exchange sends its request
+        // and waits for the peer's answer.
+        let mut listener = crate::gateways::test_helpers::test_listener("peer-trusted-by-hand").await;
+        listener.gateway_id = gateway.id.clone();
+        manager
+            .register_test_listener(listener)
+            .await;
+        let issuer_requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&issuer_requests);
+        crate::comm::didcomm::client::test_send_hook::install(&gateway.did, move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
 
-        let issuers = manager
-            .peer_issuers_vouching_for(&gateway.id, "did:web:relay")
-            .await
+        let vouched = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            manager.peer_issuers_vouching_for(&gateway.id, "did:web:relay"),
+        )
+        .await;
+        crate::comm::didcomm::client::test_send_hook::uninstall(&gateway.did);
+
+        let issuers = vouched
+            .expect("a trusted issuer is answered without waiting for an issuer exchange")
             .unwrap();
-
+        assert_eq!(issuer_requests.load(Ordering::SeqCst), 0, "no issuer request is sent to the peer");
         assert_eq!(
             issuers,
             PeerIssuers {

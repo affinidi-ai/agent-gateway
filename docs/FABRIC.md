@@ -215,7 +215,8 @@ presentation from one of those issuers is that identity, in place of the raw `ag
 extension the paired gateway replaced with it; the surface's identity schema and rules apply to
 that raw payload, which the calling gateway never receives, so the issuer check stands in for
 them. A surface that takes the identity from a key, a token claim, a certificate or a fixed DID
-keeps it, and the presentation is still checked and recorded. A presentation
+keeps it: the presentation is still checked and recorded, but the answering agent's DID is not
+stored as an identity of the surface. A presentation
 that fails verification refuses the answer with `502` and records `identity_binding_failed` with
 outcome `invalid`. One whose issuer is not one of the connection's issuers, including when they
 cannot be established, also refuses the answer with `502`: the answering agent's DID is not

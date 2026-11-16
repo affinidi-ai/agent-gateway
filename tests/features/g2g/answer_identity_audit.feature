@@ -46,6 +46,19 @@ Feature: The identity on a Fabric answer is audited by the calling gateway
     And the VP Audit Log of gateway 1 records a failed identity binding because "its issuer is not trusted on that connection"
     And the VP Audit Log of gateway 1 records no identity presentation received on the answer
 
+  Scenario: An answer to a surface with a fixed managed identity is recorded as verified
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And gateway 2 surface "alpha" has managed identity enabled
+    And managed agent "bravo" response contains the agent-identity extension
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And gateway 1 surface "charlie" takes its managed identity from the fixed DID "did:example:charlie-agent"
+    And the VP Audit Log of gateway 1 keeps every audit event
+    When the caller sends a Fabric A2A request through gateway 1 surface "charlie"
+    Then the response status is 200
+    And the VP Audit Log of gateway 1 records a verified identity binding issued by gateway 2
+    And the VP Audit Log of gateway 1 records the identity presentation received on the answer
+
   Scenario: An answer carrying the agent identity without a presentation records no identity for the answer
     Given a fabric with 2 gateways
     And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"

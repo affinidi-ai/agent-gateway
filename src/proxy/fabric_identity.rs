@@ -26,7 +26,7 @@ pub struct ResponsePresentation {
 /// Whether the connection's issuers vouch for a response presentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseAttribution {
-    /// The issuer is one of the connection's issuers; the DID is stored as verified.
+    /// The issuer is one of the connection's issuers.
     Verified,
     /// The issuer is not one of them; the answer is refused.
     Untrusted,
@@ -58,7 +58,9 @@ impl AnswerIdentityRefusal {
 pub struct AnswerIdentityCheck<'a> {
     pub response_body: &'a str,
     pub surface: &'a crate::config::agent_surface::AgentSurface,
-    pub identity_selector: &'a Option<Arc<crate::identity::IdentitySelector>>,
+    /// The gateway's VC issuer, which verifies the presentation; without one
+    /// no presentation is checked.
+    pub vc_issuer: Option<&'a Arc<crate::identity::VCIssuer>>,
     pub listener_manager: Option<Arc<crate::gateways::ConnectionPointListenerManager>>,
     /// The Remote gateway record the `fabric://` Target names.
     pub gateway_id: &'a str,
@@ -69,7 +71,9 @@ pub struct AnswerIdentityCheck<'a> {
 
 /// Verify the identity presentation on a fabric answer, check its issuer
 /// against the connection's issuers and record the outcome in the VP Audit
-/// Log. `Ok(None)` when the answer carries no presentation; a refusal is
+/// Log. A verified presentation that sets the surface's identity (see
+/// [`presentation_sets_identity`]) also stores the answering agent's DID as
+/// verified. `Ok(None)` when the answer carries no presentation; a refusal is
 /// recorded before it is returned.
 pub async fn check_answer_identity(
     check: AnswerIdentityCheck<'_>
@@ -77,7 +81,7 @@ pub async fn check_answer_identity(
     let presentation = match extract_fabric_backend_agent_identity(
         check.response_body,
         check.surface,
-        check.identity_selector,
+        check.vc_issuer,
         check.facts.channel_name,
     )
     .await
@@ -93,15 +97,50 @@ pub async fn check_answer_identity(
         &presentation,
         check.listener_manager,
         check.gateway_id,
-        check.identity_selector,
         check.surface,
         check.facts,
         check.caller,
     )
     .await
     {
-        ResponseAttribution::Verified => Ok(Some(presentation)),
+        ResponseAttribution::Verified => {
+            if let Some(vc_issuer) = check.vc_issuer
+                && presentation_sets_identity(
+                    check
+                        .surface
+                        .managed_identity()
+                        .as_ref(),
+                )
+            {
+                store_answering_agent(&presentation, vc_issuer, check.surface, check.facts.channel_name).await;
+            }
+            Ok(Some(presentation))
+        }
         ResponseAttribution::Untrusted => Err(AnswerIdentityRefusal::Untrusted),
+    }
+}
+
+/// Store the agent that answered with `presentation` as a verified identity
+/// of `surface`.
+async fn store_answering_agent(
+    presentation: &ResponsePresentation,
+    vc_issuer: &Arc<crate::identity::VCIssuer>,
+    surface: &crate::config::agent_surface::AgentSurface,
+    channel_name: &str,
+) {
+    if let Err(e) = vc_issuer
+        .get_identity_store()
+        .store_external_did(
+            &presentation.agent_did,
+            presentation
+                .identity_fields
+                .clone(),
+            Some(surface.surface_id.clone()),
+            true,
+        )
+        .await
+    {
+        warn!(channel = channel_name, error = %e, "Fabric: Failed to store verified server DID");
     }
 }
 
@@ -124,7 +163,7 @@ pub fn presentation_sets_identity(managed_identity: Option<&crate::source_auth::
 pub async fn extract_fabric_backend_agent_identity(
     response_body: &str,
     surface: &crate::config::agent_surface::AgentSurface,
-    response_identity_selector: &Option<Arc<crate::identity::IdentitySelector>>,
+    vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
     channel_name: &str,
 ) -> Result<Option<ResponsePresentation>, String> {
     info!(channel = channel_name, "Fabric: Checking for backend agent identity in response");
@@ -149,7 +188,7 @@ pub async fn extract_fabric_backend_agent_identity(
     // Dispatch to protocol-specific extractor
     match surface.access_point.protocol {
         crate::config::agent_surface::SurfaceProtocol::A2a | crate::config::agent_surface::SurfaceProtocol::Ap2 => {
-            extract_a2a_fabric_identity(&response_json, response_identity_selector, channel_name).await
+            extract_a2a_fabric_identity(&response_json, vc_issuer, channel_name).await
         }
         crate::config::agent_surface::SurfaceProtocol::Mcp => {
             // MCP not yet implemented for fabric VP verification
@@ -166,7 +205,7 @@ pub async fn extract_fabric_backend_agent_identity(
 /// credential there.
 async fn extract_a2a_fabric_identity(
     response_json: &JsonValue,
-    response_identity_selector: &Option<Arc<crate::identity::IdentitySelector>>,
+    vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
     channel_name: &str,
 ) -> Result<Option<ResponsePresentation>, String> {
     use crate::proxy::backend_identity::{
@@ -179,7 +218,7 @@ async fn extract_a2a_fabric_identity(
     ) {
         Ok(credential_ext) => {
             info!(channel = channel_name, "Fabric: Found VP credential extension from GW2");
-            verify_fabric_credential(&credential_ext, response_identity_selector, channel_name).await
+            verify_fabric_credential(&credential_ext, vc_issuer, channel_name).await
         }
         Err(IdentityExtractionError::DeclaredButMissing) => {
             warn!(channel = channel_name, "Fabric: VP credential extension declared but not found in metadata");
@@ -198,7 +237,7 @@ async fn extract_a2a_fabric_identity(
 /// carries no credential to name an issuer.
 async fn verify_fabric_credential(
     credential_ext: &JsonValue,
-    response_identity_selector: &Option<Arc<crate::identity::IdentitySelector>>,
+    vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
     channel_name: &str,
 ) -> Result<Option<ResponsePresentation>, String> {
     let Some(vp_jwt) = credential_ext
@@ -216,12 +255,11 @@ async fn verify_fabric_credential(
         return Ok(None);
     };
 
-    let Some(selector) = response_identity_selector else {
-        warn!(channel = channel_name, "Fabric: No response identity selector available for VP verification");
+    let Some(vc_issuer) = vc_issuer else {
+        warn!(channel = channel_name, "Fabric: No VC issuer available for VP verification");
         return Ok(None);
     };
-    let verified = selector
-        .get_vc_issuer()
+    let verified = vc_issuer
         .verify_agent_presentation_full(vp_jwt)
         .await
         .map_err(|e| {
@@ -247,13 +285,10 @@ async fn verify_fabric_credential(
 }
 
 /// Check `presentation`'s issuer against `peer_issuers`, the issuers of the
-/// connection the answer came over, and store the answering agent's DID as
-/// verified when one of them issued it.
-pub async fn attribute_response_presentation(
+/// connection the answer came over.
+pub fn attribute_response_presentation(
     presentation: &ResponsePresentation,
     peer_issuers: &crate::gateways::types::PeerIssuers,
-    response_identity_selector: &Option<Arc<crate::identity::IdentitySelector>>,
-    surface: &crate::config::agent_surface::AgentSurface,
     channel_name: &str,
 ) -> ResponseAttribution {
     use crate::protocols::extensions::{BindingIssuerDecision, evaluate_binding_issuer_trust};
@@ -266,23 +301,6 @@ pub async fn attribute_response_presentation(
             "Fabric: response VP issuer is not one of the connection's issuers; the answer is refused"
         );
         return ResponseAttribution::Untrusted;
-    }
-
-    if let Some(selector) = response_identity_selector
-        && let Err(e) = selector
-            .get_vc_issuer()
-            .get_identity_store()
-            .store_external_did(
-                &presentation.agent_did,
-                presentation
-                    .identity_fields
-                    .clone(),
-                Some(surface.surface_id.clone()),
-                true,
-            )
-            .await
-    {
-        warn!(channel = channel_name, error = %e, "Fabric: Failed to store verified server DID");
     }
     ResponseAttribution::Verified
 }
@@ -297,7 +315,6 @@ pub async fn record_response_presentation(
     presentation: &ResponsePresentation,
     listener_manager: Option<Arc<crate::gateways::ConnectionPointListenerManager>>,
     gateway_id: &str,
-    response_identity_selector: &Option<Arc<crate::identity::IdentitySelector>>,
     surface: &crate::config::agent_surface::AgentSurface,
     facts: &crate::audit::request_events::RequestFacts<'_>,
     caller: Option<crate::delegation_vault::audit::AuditCallerContext>,
@@ -312,14 +329,7 @@ pub async fn record_response_presentation(
             }),
         None => crate::gateways::types::PeerIssuers::default(),
     };
-    let attribution = attribute_response_presentation(
-        presentation,
-        &peer_issuers,
-        response_identity_selector,
-        surface,
-        facts.channel_name,
-    )
-    .await;
+    let attribution = attribute_response_presentation(presentation, &peer_issuers, facts.channel_name);
 
     match attribution {
         ResponseAttribution::Verified => {
@@ -427,17 +437,13 @@ mod tests {
 
     async fn extract(
         response: &JsonValue,
-        selector: &Option<Arc<crate::identity::IdentitySelector>>,
+        vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
     ) -> Result<Option<ResponsePresentation>, String> {
-        extract_a2a_fabric_identity(response, selector, "a-party").await
+        extract_a2a_fabric_identity(response, vc_issuer, "a-party").await
     }
 
     fn caller() -> crate::delegation_vault::audit::AuditCallerContext {
         serde_json::from_value(json!({ "auth_method": "api_key", "sub": "caller-a" })).expect("caller context")
-    }
-
-    fn selector_for(issuer: Arc<crate::identity::VCIssuer>) -> Option<Arc<crate::identity::IdentitySelector>> {
-        Some(Arc::new(crate::identity::IdentitySelector::new(&json!({}), issuer).expect("selector")))
     }
 
     fn credential_response(presentation: &JsonValue) -> JsonValue {
@@ -453,9 +459,9 @@ mod tests {
 
     async fn presented(
         response: &JsonValue,
-        selector: &Option<Arc<crate::identity::IdentitySelector>>,
+        vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
     ) -> ResponsePresentation {
-        match extract(response, selector).await {
+        match extract(response, vc_issuer).await {
             Ok(Some(presentation)) => presentation,
             other => panic!("expected a verified presentation, got {other:?}"),
         }
@@ -464,9 +470,9 @@ mod tests {
     #[tokio::test]
     async fn a_verified_presentation_names_its_holder_and_issuer_and_keeps_the_vp() {
         let signed = crate::identity::test_helpers::signed_agent_presentation().await;
-        let selector = selector_for(signed.issuer.clone());
+        let selector = Some(&signed.issuer);
 
-        let presentation = presented(&credential_response(&signed.presentation), &selector).await;
+        let presentation = presented(&credential_response(&signed.presentation), selector).await;
 
         assert_eq!(presentation.agent_did, signed.holder_did);
         assert_eq!(presentation.issuer_did, signed.issuer_did);
@@ -482,9 +488,9 @@ mod tests {
     async fn a_presentation_whose_holder_is_not_its_credential_subject_is_rejected() {
         let signed =
             crate::identity::test_helpers::signed_agent_presentation_for_another_subject("did:web:someone-else").await;
-        let selector = selector_for(signed.issuer.clone());
+        let selector = Some(&signed.issuer);
 
-        match extract(&credential_response(&signed.presentation), &selector).await {
+        match extract(&credential_response(&signed.presentation), selector).await {
             Err(message) => assert!(
                 message.starts_with("VP verification failed for server agent identity"),
                 "unexpected error: {message}"
@@ -494,64 +500,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_presentation_from_a_connection_issuer_is_attributed_and_stored_as_verified() {
+    async fn a_presentation_from_a_connection_issuer_is_attributed() {
         let signed = crate::identity::test_helpers::signed_agent_presentation().await;
-        let selector = selector_for(signed.issuer.clone());
-        let presentation = presented(&credential_response(&signed.presentation), &selector).await;
+        let presentation = presented(&credential_response(&signed.presentation), Some(&signed.issuer)).await;
 
-        let attribution = attribute_response_presentation(
-            &presentation,
-            &issuers(&signed.issuer_did),
-            &selector,
-            &surface(),
-            "a-party",
-        )
-        .await;
+        let attribution = attribute_response_presentation(&presentation, &issuers(&signed.issuer_did), "a-party");
 
         assert_eq!(attribution, ResponseAttribution::Verified);
-        let stored = signed
-            .issuer
-            .get_identity_store()
-            .find_by_did(&signed.holder_did)
-            .await
-            .unwrap();
-        assert!(stored.is_some(), "the answering agent's DID is stored");
     }
 
     #[tokio::test]
-    async fn a_presentation_from_another_issuer_is_untrusted_and_not_stored() {
+    async fn a_presentation_from_another_issuer_is_untrusted() {
         let signed = crate::identity::test_helpers::signed_agent_presentation().await;
-        let selector = selector_for(signed.issuer.clone());
-        let presentation = presented(&credential_response(&signed.presentation), &selector).await;
+        let presentation = presented(&credential_response(&signed.presentation), Some(&signed.issuer)).await;
 
-        let attribution =
-            attribute_response_presentation(&presentation, &issuers("did:web:other"), &selector, &surface(), "a-party")
-                .await;
+        let attribution = attribute_response_presentation(&presentation, &issuers("did:web:other"), "a-party");
 
         assert_eq!(attribution, ResponseAttribution::Untrusted);
-        let stored = signed
-            .issuer
-            .get_identity_store()
-            .find_by_did(&signed.holder_did)
-            .await
-            .unwrap();
-        assert!(stored.is_none(), "an untrusted presentation stores no identity");
     }
 
     #[tokio::test]
     async fn a_connection_without_issuers_vouches_for_no_presentation() {
         let signed = crate::identity::test_helpers::signed_agent_presentation().await;
-        let selector = selector_for(signed.issuer.clone());
-        let presentation = presented(&credential_response(&signed.presentation), &selector).await;
+        let presentation = presented(&credential_response(&signed.presentation), Some(&signed.issuer)).await;
 
-        let attribution = attribute_response_presentation(
-            &presentation,
-            &crate::gateways::types::PeerIssuers::default(),
-            &selector,
-            &surface(),
-            "a-party",
-        )
-        .await;
+        let attribution =
+            attribute_response_presentation(&presentation, &crate::gateways::types::PeerIssuers::default(), "a-party");
 
         assert_eq!(attribution, ResponseAttribution::Untrusted);
     }
@@ -596,8 +570,8 @@ mod tests {
     async fn a_presentation_from_the_answering_gateways_issuer_is_recorded_as_verified_and_received() {
         use crate::delegation_vault::audit::DelegationAuditAction;
         let signed = crate::identity::test_helpers::signed_agent_presentation().await;
-        let selector = selector_for(signed.issuer.clone());
-        let presentation = presented(&credential_response(&signed.presentation), &selector).await;
+        let selector = Some(&signed.issuer);
+        let presentation = presented(&credential_response(&signed.presentation), selector).await;
         let root = tempfile::tempdir().unwrap();
         let (manager, gateway_id, _issuer_dir) = manager_with_peer(root.path(), &signed.issuer_did).await;
 
@@ -605,7 +579,6 @@ mod tests {
             &presentation,
             Some(manager),
             &gateway_id,
-            &selector,
             &surface(),
             &facts(),
             Some(caller()),
@@ -654,8 +627,8 @@ mod tests {
     async fn a_presentation_from_another_issuer_is_recorded_as_an_untrusted_identity_binding_only() {
         use crate::delegation_vault::audit::DelegationAuditAction;
         let signed = crate::identity::test_helpers::signed_agent_presentation().await;
-        let selector = selector_for(signed.issuer.clone());
-        let presentation = presented(&credential_response(&signed.presentation), &selector).await;
+        let selector = Some(&signed.issuer);
+        let presentation = presented(&credential_response(&signed.presentation), selector).await;
         let root = tempfile::tempdir().unwrap();
         let (manager, gateway_id, _issuer_dir) = manager_with_peer(root.path(), "did:web:not-the-issuer").await;
 
@@ -663,7 +636,6 @@ mod tests {
             &presentation,
             Some(manager),
             &gateway_id,
-            &selector,
             &surface(),
             &facts(),
             Some(caller()),
@@ -690,14 +662,13 @@ mod tests {
     #[tokio::test]
     async fn without_a_fabric_listener_manager_no_issuer_vouches_for_the_answer() {
         let signed = crate::identity::test_helpers::signed_agent_presentation().await;
-        let selector = selector_for(signed.issuer.clone());
-        let presentation = presented(&credential_response(&signed.presentation), &selector).await;
+        let selector = Some(&signed.issuer);
+        let presentation = presented(&credential_response(&signed.presentation), selector).await;
 
         let (attribution, _events) = crate::audit::producer::capture(record_response_presentation(
             &presentation,
             None,
             "gw-b",
-            &selector,
             &surface(),
             &facts(),
             None,
@@ -737,7 +708,7 @@ mod tests {
 
     async fn checked(
         response: &JsonValue,
-        selector: &Option<Arc<crate::identity::IdentitySelector>>,
+        vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
     ) -> (
         Result<Option<ResponsePresentation>, AnswerIdentityRefusal>,
         Vec<crate::delegation_vault::audit::DelegationAuditEvent>,
@@ -748,13 +719,89 @@ mod tests {
         crate::audit::producer::capture(check_answer_identity(AnswerIdentityCheck {
             response_body: &body,
             surface: &surface,
-            identity_selector: selector,
+            vc_issuer,
             listener_manager: None,
             gateway_id: "gw-b",
             facts: &facts,
             caller: None,
         }))
         .await
+    }
+
+    /// `surface()` taking its managed identity from the target's
+    /// `identity_injection`.
+    fn surface_with_identity(identity_injection: JsonValue) -> crate::config::agent_surface::AgentSurface {
+        serde_json::from_value(json!({
+            "name": "a-party",
+            "access_point": { "listen_address": "http://localhost:8700", "route": "/agents/a", "protocol": "a2a" },
+            "target": { "endpoint": "fabric://gw-2/b-party", "identity_injection": identity_injection }
+        }))
+        .expect("surface JSON")
+    }
+
+    /// Check a verified, trusted answer presentation on `surface` and report
+    /// whether the answering agent's DID was stored.
+    async fn stored_after_a_trusted_answer(surface: crate::config::agent_surface::AgentSurface) -> bool {
+        let signed = crate::identity::test_helpers::signed_agent_presentation().await;
+        let root = tempfile::tempdir().unwrap();
+        let (manager, gateway_id, _issuer_dir) = manager_with_peer(root.path(), &signed.issuer_did).await;
+        let body = credential_response(&signed.presentation).to_string();
+        let facts = facts();
+
+        let (result, events) = crate::audit::producer::capture(check_answer_identity(AnswerIdentityCheck {
+            response_body: &body,
+            surface: &surface,
+            vc_issuer: Some(&signed.issuer),
+            listener_manager: Some(manager),
+            gateway_id: &gateway_id,
+            facts: &facts,
+            caller: None,
+        }))
+        .await;
+
+        assert!(matches!(result, Ok(Some(_))), "{result:?}");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(
+                    event.event,
+                    crate::delegation_vault::audit::DelegationAuditAction::IdentityBindingVerified { .. }
+                )),
+            "the answer's identity is recorded as verified: {events:?}"
+        );
+        signed
+            .issuer
+            .get_identity_store()
+            .find_by_did(&signed.holder_did)
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn a_trusted_answer_on_a_payload_identity_surface_stores_the_answering_agent() {
+        let surface = surface_with_identity(json!({
+            "inject_vp": true,
+            "type": "from_payload",
+            "meta_field": "agentIdentity",
+            "fields": ["agentIdentity.name"]
+        }));
+
+        assert!(stored_after_a_trusted_answer(surface).await);
+    }
+
+    #[tokio::test]
+    async fn a_trusted_answer_on_a_fixed_identity_surface_is_recorded_but_not_stored() {
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "name": "a-party",
+            "access_point": { "listen_address": "http://localhost:8700", "route": "/agents/a", "protocol": "a2a" },
+            "target": { "endpoint": "fabric://gw-2/b-party" },
+            "identity_slots": { "protected": { "type": "static", "did": "did:example:charlie-agent" } }
+        }))
+        .expect("surface JSON");
+        assert!(matches!(surface.managed_identity(), Some(crate::source_auth::ManagedIdentityConfig::Static { .. })));
+
+        assert!(!stored_after_a_trusted_answer(surface).await);
     }
 
     fn failed_outcome(
@@ -774,11 +821,11 @@ mod tests {
     #[tokio::test]
     async fn an_answer_with_a_tampered_presentation_is_refused_as_invalid_and_recorded() {
         let signed = crate::identity::test_helpers::signed_agent_presentation().await;
-        let selector = selector_for(signed.issuer.clone());
+        let selector = Some(&signed.issuer);
         let mut tampered = signed.presentation.clone();
         tampered["holder"] = json!("did:web:someone-else");
 
-        let (result, events) = checked(&credential_response(&tampered), &selector).await;
+        let (result, events) = checked(&credential_response(&tampered), selector).await;
 
         assert!(matches!(result, Err(AnswerIdentityRefusal::Invalid(_))), "{result:?}");
         assert_eq!(failed_outcome(&events), Some(crate::audit::events::IdentityBindingFailure::Invalid));
@@ -787,9 +834,9 @@ mod tests {
     #[tokio::test]
     async fn an_answer_whose_connection_issuers_cannot_be_established_is_refused_as_untrusted_and_recorded() {
         let signed = crate::identity::test_helpers::signed_agent_presentation().await;
-        let selector = selector_for(signed.issuer.clone());
+        let selector = Some(&signed.issuer);
 
-        let (result, events) = checked(&credential_response(&signed.presentation), &selector).await;
+        let (result, events) = checked(&credential_response(&signed.presentation), selector).await;
 
         assert_eq!(result, Err(AnswerIdentityRefusal::Untrusted));
         assert_eq!(failed_outcome(&events), Some(crate::audit::events::IdentityBindingFailure::Untrusted));
@@ -799,7 +846,7 @@ mod tests {
     async fn an_answer_without_a_presentation_passes_the_check_unrecorded() {
         let response = v1_task(json!({ "role": "ROLE_AGENT", "parts": [{ "text": "done" }] }));
 
-        let (result, events) = checked(&response, &None).await;
+        let (result, events) = checked(&response, None).await;
 
         assert_eq!(result, Ok(None));
         assert!(events.is_empty(), "{events:?}");
@@ -837,14 +884,14 @@ mod tests {
     async fn a_raw_identity_without_a_presentation_is_left_to_protected_identity_resolution() {
         let response = v1_task(agent_message(IDENTITY_URI, json!({ "did": "did:web:agent" })));
 
-        assert_eq!(extract(&response, &None).await, Ok(None));
+        assert_eq!(extract(&response, None).await, Ok(None));
     }
 
     #[tokio::test]
     async fn an_answer_without_an_identity_carries_no_presentation() {
         let response = v1_task(json!({ "role": "ROLE_AGENT", "parts": [{ "text": "done" }] }));
 
-        assert_eq!(extract(&response, &None).await, Ok(None));
+        assert_eq!(extract(&response, None).await, Ok(None));
     }
 
     #[tokio::test]
@@ -856,14 +903,14 @@ mod tests {
             "metadata": {}
         }));
 
-        assert_eq!(extract(&response, &None).await, Ok(None));
+        assert_eq!(extract(&response, None).await, Ok(None));
     }
 
     #[tokio::test]
     async fn credential_without_presentation_is_rejected() {
         let response = v1_task(agent_message(CREDENTIAL_URI, json!({ "did": "did:web:agent" })));
 
-        match extract(&response, &None).await {
+        match extract(&response, None).await {
             Err(message) => assert!(message.contains("missing verifiablePresentation"), "unexpected error: {message}"),
             other => panic!("expected the credential to be rejected, got {other:?}"),
         }
@@ -872,14 +919,13 @@ mod tests {
     #[tokio::test]
     async fn unverifiable_credential_in_a_wrapped_v1_task_is_rejected() {
         let (issuer, _tmp) = crate::identity::test_helpers::test_vc_issuer().await;
-        let schema = json!({ "type": "object", "properties": { "name": { "type": "string", "x-identity": true } } });
-        let selector = crate::identity::IdentitySelector::new(&schema, Arc::new(issuer)).expect("selector");
+        let issuer = Arc::new(issuer);
         let response = v1_task(agent_message(
             CREDENTIAL_URI,
             json!({ "verifiablePresentation": "not-a-presentation", "did": "did:web:agent" }),
         ));
 
-        match extract(&response, &Some(Arc::new(selector))).await {
+        match extract(&response, Some(&issuer)).await {
             Err(message) => assert!(message.contains("VP verification failed"), "unexpected error: {message}"),
             other => panic!("expected the credential to be rejected, got {other:?}"),
         }
@@ -900,14 +946,13 @@ mod tests {
     #[tokio::test]
     async fn credential_only_in_an_artifact_is_ignored() {
         let (issuer, _tmp) = crate::identity::test_helpers::test_vc_issuer().await;
-        let schema = json!({ "type": "object", "properties": { "name": { "type": "string", "x-identity": true } } });
-        let selector = crate::identity::IdentitySelector::new(&schema, Arc::new(issuer)).expect("selector");
+        let issuer = Arc::new(issuer);
         let response = v1_task_with_artifact(agent_message(
             CREDENTIAL_URI,
             json!({ "verifiablePresentation": "not-a-presentation", "did": "did:web:agent" }),
         ));
 
         // Had the artifact been read, the bad presentation would fail verification.
-        assert_eq!(extract(&response, &Some(Arc::new(selector))).await, Ok(None));
+        assert_eq!(extract(&response, Some(&issuer)).await, Ok(None));
     }
 }

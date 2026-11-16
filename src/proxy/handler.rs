@@ -13564,7 +13564,7 @@ async fn handle_fabric_request_inner(
                         crate::proxy::fabric_identity::AnswerIdentityCheck {
                             response_body: &response_body,
                             surface: &state.surface,
-                            identity_selector: &state.identity_selector,
+                            vc_issuer: state.vc_issuer.as_ref(),
                             listener_manager,
                             gateway_id,
                             facts: &response_audit_facts,

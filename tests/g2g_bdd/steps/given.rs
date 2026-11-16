@@ -1369,6 +1369,16 @@ async fn vp_audit_log_of_gateway_keeps_every_audit_event(
         .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must keep every audit event: {error:#}"));
 }
 
+#[given(expr = "gateway {int} surface {string} takes its managed identity from the fixed DID {string}")]
+pub fn surface_takes_managed_identity_from_fixed_did(
+    world: &mut G2gWorld,
+    _gw: usize,
+    surface_name: String,
+    did: String,
+) {
+    surface_spec_mut(world, &surface_name).fixed_managed_identity = Some(did);
+}
+
 #[given(expr = "gateway {int} surface {string} has managed identity enabled")]
 pub async fn surface_has_managed_identity_enabled(
     world: &mut G2gWorld,
