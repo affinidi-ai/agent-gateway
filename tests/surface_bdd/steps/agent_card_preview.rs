@@ -63,7 +63,7 @@ fn gateway_logs_audit_events(world: &mut SurfaceWorld) {
         .keeps_gateway_log = true;
     world
         .surface_config
-        .logs_audit_events = true;
+        .logs_at_info = true;
 }
 
 #[given(expr = "managed agent {string} serves an Agent Card that names its own address")]

@@ -240,15 +240,15 @@ async fn header_scoped_token_has_tried_to_revoke_user_tokens(world: &mut Surface
 
 /// The gateway rereads its VP Audit Log on every read, so records appended to
 /// it are shown from the next read on.
-#[given("the audit log holds a token injection of each credential provider and a revoke naming no provider")]
-fn audit_log_holds_token_injections_and_a_revoke(world: &mut SurfaceWorld) {
+#[given("the audit log holds a consent granted for each credential provider and a revoke naming no provider")]
+fn audit_log_holds_consents_granted_and_a_revoke(world: &mut SurfaceWorld) {
     let timestamp = chrono::Utc::now().to_rfc3339();
     let mut records: Vec<Value> = world
         .credential_provider_ids
         .values()
         .map(|id| {
             json!({
-                "timestamp": timestamp, "event": "token_injected", "agent_did": AGENT_DID,
+                "timestamp": timestamp, "event": "consent_granted", "agent_did": AGENT_DID,
                 "user_identity_hash": USER, "provider_id": id,
             })
         })
@@ -483,8 +483,8 @@ fn audit_page(world: &SurfaceWorld) -> (&Value, &Vec<Value>) {
     (page, events)
 }
 
-#[then(expr = "the audit read shows only the token injection of credential provider {string}")]
-fn audit_read_shows_only_the_token_injection_of(
+#[then(expr = "the audit read shows only the consent granted for credential provider {string}")]
+fn audit_read_shows_only_the_consent_granted_for(
     world: &mut SurfaceWorld,
     provider: String,
 ) {
@@ -494,12 +494,12 @@ fn audit_read_shows_only_the_token_injection_of(
         .iter()
         .map(|event| (&event["event"], &event["provider_id"]))
         .collect();
-    assert_eq!(shown, [(&json!("token_injected"), &json!(id))], "{page}");
+    assert_eq!(shown, [(&json!("consent_granted"), &json!(id))], "{page}");
     assert_eq!((&page["total"], &page["total_pages"]), (&json!(1), &json!(1)), "{page}");
-    assert_eq!(page["category_counts"], json!({"token_injected": 1}), "{page}");
+    assert_eq!(page["category_counts"], json!({"consent_granted": 1}), "{page}");
 }
 
-#[then("the audit read shows the token injection of every credential provider and the revoke naming no provider")]
+#[then("the audit read shows the consent granted for every credential provider and the revoke naming no provider")]
 fn audit_read_shows_every_record(world: &mut SurfaceWorld) {
     let (page, events) = audit_page(world);
     for id in world
@@ -509,8 +509,8 @@ fn audit_read_shows_every_record(world: &mut SurfaceWorld) {
         assert!(
             events
                 .iter()
-                .any(|event| event["event"] == "token_injected" && event["provider_id"] == id.as_str()),
-            "no token injection of credential provider {id}: {page}"
+                .any(|event| event["event"] == "consent_granted" && event["provider_id"] == id.as_str()),
+            "no consent granted for credential provider {id}: {page}"
         );
     }
     assert!(

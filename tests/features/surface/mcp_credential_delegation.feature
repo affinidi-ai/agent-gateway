@@ -7,6 +7,7 @@ Feature: MCP credential delegation
     And MCP server "bravo" supports tool invocation
     And the surface requires "JWT Bearer" source authentication
     And the VP Audit Log keeps every audit event
+    And the gateway keeps its log of delegation events
 
   Scenario: Missing delegated credentials ask the caller for consent before the MCP server is reached
     Given the surface requires delegated credentials from OAuth provider "calendar"
@@ -18,7 +19,7 @@ Feature: MCP credential delegation
     And the consent required error names neither the caller's identity hash nor the managed agent's DID
     And the response includes an authorization URL for OAuth provider "calendar"
     And the response includes delegated credential scopes "calendar.read calendar.write"
-    And the delegation audit trail contains event "consent_required" for OAuth provider "calendar"
+    And the gateway log records delegation event "consent_required" for OAuth provider "calendar"
     And MCP server "bravo" was not called
 
   Scenario: A delegated credential that cannot be resolved refuses the MCP tool call before the MCP server is reached
@@ -119,7 +120,8 @@ Feature: MCP credential delegation
     Then the response status is 200
     And MCP server "bravo" received MCP method "tools/call"
     And MCP server "bravo" received delegated credential for OAuth provider "calendar"
-    And the delegation audit trail contains event "token_injected" for OAuth provider "calendar"
+    And the gateway log records delegation event "token_injected" for OAuth provider "calendar"
+    And the gateway log does not contain "bdd-delegated-access-token"
     And the delegation audit trail does not expose delegated credential secrets
     And the MCP response does not expose delegated credential secrets
 
@@ -132,7 +134,7 @@ Feature: MCP credential delegation
     Then the response status is 200
     And MCP server "bravo" received the later MCP tool call
     And the MCP response does not ask caller "alice" for consent
-    And the delegation audit trail contains event "token_injected" for OAuth provider "calendar" on the later MCP tool call
+    And the gateway log records 2 delegation events "token_injected" for OAuth provider "calendar"
 
   Scenario: Delegated credentials are scoped to the authenticated caller
     Given the surface requires delegated credentials from OAuth provider "calendar"
@@ -163,8 +165,10 @@ Feature: MCP credential delegation
     Then the response status is 200
     And OAuth provider "calendar" received the refresh request
     And MCP server "bravo" received delegated credential for OAuth provider "calendar"
-    And the delegation audit trail contains event "token_refreshed" for OAuth provider "calendar"
-    And the delegation audit trail contains event "token_injected" for OAuth provider "calendar"
+    And the gateway log records delegation event "token_refreshed" for OAuth provider "calendar"
+    And the gateway log records delegation event "token_injected" for OAuth provider "calendar"
+    And the gateway log does not contain "bdd-delegated-access-token"
+    And the gateway log does not contain "bdd-delegated-refresh-token"
     And the delegation audit trail does not expose delegated credential secrets
     And the MCP response does not expose delegated credential secrets
 
@@ -177,6 +181,7 @@ Feature: MCP credential delegation
     When caller "alice" invokes MCP tool "schedule_meeting" with a valid token
     Then the response status is 401
     And the response is a consent required error for OAuth provider "calendar"
+    And the gateway log records delegation event "refresh_failed" for OAuth provider "calendar"
     And MCP server "bravo" was not called
 
   Scenario: An unmatched MCP tool call passes through without delegated credentials
@@ -201,6 +206,8 @@ Feature: MCP credential delegation
     Then the response status is 200
     And MCP server "bravo" received delegated credential for API-key provider "maps"
     And the MCP response does not ask caller "alice" for consent
+    And the gateway log records delegation event "token_injected" for API-key provider "maps"
+    And the gateway log does not contain "bdd-delegated-api-key"
 
   Scenario: A delegated credential injects as a custom header when configured
     Given the surface requires delegated credentials from OAuth provider "calendar"

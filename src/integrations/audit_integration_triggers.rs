@@ -734,8 +734,12 @@ mod tests {
         Box::new(PolicyChangeDetails::new(Actor::user("u-1"), PolicyChangeSource::Api))
     }
 
+    /// The events the gateway only logs ([`crate::audit::catalog::LOGGED_EVENTS`])
+    /// are audit records of no category, so an integration is offered none of
+    /// them.
     #[test]
     fn the_event_catalog_lists_every_audit_record_category_the_gateway_produces() {
+        use crate::audit::catalog::{LOGGED_EVENTS, is_logged_only};
         let unproduced = ["request_failed", "request_completed"];
         let actions = every_action();
         actions
@@ -744,9 +748,12 @@ mod tests {
         let produced: HashSet<String> = actions
             .iter()
             .map(action_category)
-            .filter(|category| !unproduced.contains(category))
+            .filter(|category| !unproduced.contains(category) && !is_logged_only(category))
             .map(|category| format!("audit.{category}"))
             .collect();
+        for logged in LOGGED_EVENTS {
+            assert!(find_event(&format!("audit.{logged}")).is_none(), "{logged} is offered to integrations");
+        }
 
         let listed_ids: HashSet<String> = crate::integrations::events::catalog()
             .iter()
@@ -761,7 +768,7 @@ mod tests {
     fn every_audit_event_sits_in_its_audit_group() {
         let group_of = |id: &str| find_event(id).and_then(|event| event.group);
         assert_eq!(group_of("audit.policy_decision"), Some("policies"));
-        assert_eq!(group_of("audit.token_injected"), Some("delegation"));
+        assert_eq!(group_of("audit.consent_granted"), Some("delegation"));
         assert!(
             crate::integrations::events::catalog()
                 .iter()

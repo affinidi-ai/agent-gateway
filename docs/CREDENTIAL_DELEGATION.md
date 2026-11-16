@@ -17,7 +17,7 @@ for the operator procedure. This page documents the implementation in
 | Credential provider | A configured OAuth 2.0 or API-key provider, such as Google or GitHub. Defined once and referenced by any number of surfaces. |
 | Outbound credential binding | An entry in a surface's `outbound_credentials` naming a provider, the scopes, when it applies, and how the token is injected. |
 | Delegation vault | Where obtained tokens are kept, one per agent, user, and provider. |
-| Delegation audit log | A record of every lookup, consent prompt, refresh, and injection. |
+| Delegation audit log | A record of what was decided about delegated access: a consent given, ended, refused or revoked. Each lookup, consent prompt, refresh and injection is written to the gateway log instead ([`OBSERVABILITY.md`](OBSERVABILITY.md)). |
 
 ## Credential providers
 
@@ -1397,7 +1397,7 @@ pins, never the proxy's spec, `base_url` or name.
 the method `tools/call`, is released the grant. `initialize`, `tools/list`, notifications, other
 methods, a `GET` and a body that is not one object never carry it, so they neither refresh it nor
 record a use, and they are answered before the person has connected (while the pin holds). The
-`token_injected` audit record and the grant's last use are written only when a tool call that
+`token_injected` log line and the grant's last use are written only when a tool call that
 carries the grant went out to the backend, after the proxy, the pin, the call's URL and Strict
 egress passed: once for the call, and once more for its retry after a refresh. A call refused
 by any of them records nothing.
@@ -1505,7 +1505,7 @@ At run time a request to the Target:
   counted against `external_consent_refresh_refusals`; a `403` whose challenge says
   `insufficient_scope` answers `scope_insufficient`; anything a new connect would not fix
   answers `connector_unavailable` and keeps the grant;
-- marks the grant used, at most hourly as every release does, and audits it `token_injected`,
+- marks the grant used, at most hourly as every release does, and logs it as `token_injected`,
   with the binding's subject in the detail
   (`grant_by_binding:owner:target` or `grant_by_binding:caller:target`), under the identity hash
   of the caller it was released for, on the first send and on the one retry alike;
@@ -1750,7 +1750,7 @@ prompt on: `on_demand`, the default, degrades to the 401 response, and `fail` re
 
 A user who declines or cancels the elicitation, or does not answer before
 `elicit_timeout_secs`, has the call refused the same way, whatever `elicit_fallback` says;
-the delegation audit records `elicitation_declined`, `elicitation_cancelled` or
+the gateway log records `elicitation_declined`, `elicitation_cancelled` or
 `elicitation_timed_out`.
 
 ### When a credential cannot be resolved
@@ -2391,12 +2391,12 @@ surface, the scopes, the token or grant id, and in `detail`
 `consent_granted_at:<time>,consent_expired_at:<time>,source:<source>`, where `source` is
 `release` for a request that needed the credential and `sweep` for the hourly removal, which
 names no surface for an agent-keyed token. A request served by a
-binding that only finds the consent too old records nothing but its usual `consent_required`.
+binding that only finds the consent too old audits nothing: it logs its usual `consent_required`.
 For a grant by binding the vendor revocation that follows is recorded as its own
 `token_revoked`, whose `detail` ends `,consent_expired`, so it reads as the outcome of the
 expiry and not as someone's revocation. `consent_expired` is selected for the VP Audit Log and
-for integrations like every other delegation event
-([`OBSERVABILITY.md`](OBSERVABILITY.md)).
+for integrations like every other audited delegation event
+([`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)).
 
 ## Delegation vault
 
@@ -2680,7 +2680,7 @@ revoked; when the person connected again while it ran, the call uses the new gra
   token never expires, or one connected while its provider's `token_refresh_enabled` was
   `false`.
 
-Each refresh is audited, `token_refreshed` or `refresh_failed` with the cause in `detail`.
+Each refresh is logged, `token_refreshed` or `refresh_failed` with the cause in `detail`.
 
 ### The connect API
 

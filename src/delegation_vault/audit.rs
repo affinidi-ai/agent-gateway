@@ -1239,12 +1239,43 @@ pub fn submit(event: DelegationAuditEvent) {
 }
 
 /// Builds an audit record with `build` and submits it, only when an audit sink
-/// selects `category`. Non-blocking; returns at once.
+/// selects `category`. An event the gateway only logs
+/// ([`crate::audit::catalog::LOGGED_EVENTS`]) is written to the gateway log
+/// instead. Non-blocking; returns at once.
 pub fn emit(
     category: &'static str,
     build: impl FnOnce() -> DelegationAuditEvent,
 ) {
     crate::audit::producer::producer().emit(category, build);
+}
+
+/// Writes `event` to the gateway log. The delegation events in
+/// [`crate::audit::catalog::LOGGED_EVENTS`] are kept there and in no audit
+/// sink. The line names the caller by identity hash only, and no credential.
+pub fn log_event(event: &DelegationAuditEvent) {
+    let text = |value: &Option<String>| -> String {
+        value
+            .clone()
+            .unwrap_or_else(|| "-".to_string())
+    };
+    info!(
+        target: "credential_delegation",
+        event = %action_category(&event.event),
+        agent_did = %text(&event.agent_did),
+        user_hash = %text(&event.user_identity_hash),
+        provider_id = %text(&event.provider_id),
+        surface_id = %text(&event.surface_id),
+        surface_variant = %text(&event.surface_variant),
+        token_id = %text(&event.token_id),
+        scopes = %event.scopes.as_ref().map_or_else(|| "-".to_string(), |scopes| scopes.join(",")),
+        mcp_tool_name = %text(&event.mcp_tool_name),
+        via_fabric = event.via_fabric,
+        target_endpoint = %text(&event.target_endpoint),
+        protocol = %text(&event.protocol),
+        request_id = %text(&event.request_id),
+        detail = %text(&event.detail),
+        "Delegation event"
+    );
 }
 
 /// Convenience: build an audit event with common fields pre-filled

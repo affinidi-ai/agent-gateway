@@ -55,7 +55,7 @@ impl EventSet {
     pub fn has_audit_events(&self) -> bool {
         self.events
             .iter()
-            .any(|event| event.starts_with(AUDIT_EVENT_PREFIX))
+            .any(|event| event.starts_with(AUDIT_EVENT_PREFIX) && !is_only_logged(event))
     }
 
     /// Template variables in `content` that no event of the set fills, sorted.
@@ -105,18 +105,30 @@ fn collect_template_variables(
     }
 }
 
-/// The distinct `events`, when there is at least one and every one is in the catalog.
+/// Whether `event` is an audit event the gateway used to offer and now only writes to its
+/// log ([`crate::audit::catalog::LOGGED_EVENTS`]). A set stored before may still name it.
+pub fn is_only_logged(event: &str) -> bool {
+    event
+        .strip_prefix(AUDIT_EVENT_PREFIX)
+        .is_some_and(crate::audit::catalog::is_logged_only)
+}
+
+/// The distinct `events`, when there is at least one and every one is in the catalog. An
+/// event the gateway now only logs is left out.
 pub fn validate_events(events: Vec<String>) -> Result<HashSet<String>, EventSetError> {
-    if events.is_empty() {
-        return Err(EventSetError::Empty);
-    }
     // Sized by what it keeps, never by the caller's list: it grows to at most the catalog.
     let mut unique = HashSet::new();
     for event in events {
+        if is_only_logged(&event) {
+            continue;
+        }
         if find_event(&event).is_none() {
             return Err(EventSetError::UnknownEvent(event));
         }
         unique.insert(event);
+    }
+    if unique.is_empty() {
+        return Err(EventSetError::Empty);
     }
     Ok(unique)
 }
@@ -242,6 +254,41 @@ mod tests {
         );
     }
 
+    /// A set saved while the per-call delegation events were audit events still
+    /// names them; a save keeps the rest.
+    #[test]
+    fn drops_the_audit_events_the_gateway_now_only_logs() {
+        assert_eq!(
+            validate_events(events(&[
+                "audit.token_injected",
+                "audit.consent_granted",
+                "gateway.created",
+                "audit.consent_required"
+            ])),
+            Ok(unique(&["audit.consent_granted", "gateway.created"]))
+        );
+        for logged in crate::audit::catalog::LOGGED_EVENTS {
+            assert!(is_only_logged(&format!("audit.{logged}")), "{logged}");
+        }
+        assert!(!is_only_logged("audit.consent_granted"));
+    }
+
+    #[test]
+    fn a_set_of_nothing_but_events_the_gateway_now_only_logs_is_empty() {
+        assert_eq!(
+            validate_events(events(&["audit.token_injected", "audit.token_refreshed"])),
+            Err(EventSetError::Empty)
+        );
+    }
+
+    #[test]
+    fn only_an_audit_event_is_one_the_gateway_now_only_logs() {
+        for id in ["token_injected", "gateway.token_injected"] {
+            assert!(!is_only_logged(id), "{id}");
+            assert_eq!(validate_events(events(&[id])), Err(EventSetError::UnknownEvent(id.to_string())));
+        }
+    }
+
     #[test]
     fn contains_only_its_own_events() {
         let set = EventSet::new("Ops".to_string(), String::new(), events(&["gateway.created"])).expect("valid set");
@@ -258,6 +305,11 @@ mod tests {
     fn knows_whether_it_holds_audit_events() {
         assert!(set(&["gateway.created", "audit.trust_check"]).has_audit_events());
         assert!(!set(&["gateway.created", "user.login"]).has_audit_events());
+        let mut stored_before = set(&["gateway.created"]);
+        stored_before
+            .events
+            .insert("audit.token_injected".to_string());
+        assert!(!stored_before.has_audit_events(), "an event the gateway now only logs is no audit event");
     }
 
     #[test]

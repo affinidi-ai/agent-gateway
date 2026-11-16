@@ -1051,9 +1051,20 @@ fn credential_delegation_audit_log_includes_caller_name(
     assert_audit_response_contains_text(world, &name, "Credential Delegation Audit Log caller name");
 }
 
-#[then("the Credential Delegation Audit Log includes a token injection")]
-fn credential_delegation_audit_log_includes_token_injection(world: &mut SurfaceWorld) {
-    assert_audit_response_contains_text(world, "token_injected", "Credential Delegation Audit Log token injection");
+#[then(expr = "the Credential Delegation Audit Log includes a record of MCP tool {string}")]
+fn credential_delegation_audit_log_includes_record_of_tool(
+    world: &mut SurfaceWorld,
+    tool: String,
+) {
+    let body = &get_admin_response(world).body;
+    let recorded = body["events"]
+        .as_array()
+        .is_some_and(|events| {
+            events
+                .iter()
+                .any(|event| event["mcp_tool_name"] == tool.as_str())
+        });
+    assert!(recorded, "the Credential Delegation Audit Log has no record of MCP tool {tool:?}: {body}");
 }
 
 #[then("the Credential Delegation Audit Log does not include OAuth access tokens")]
@@ -3946,15 +3957,53 @@ async fn eventually_delegation_audit_events(
     (false, events)
 }
 
-#[then(
-    expr = "the delegation audit trail contains event {string} for OAuth provider {string} on the later MCP tool call"
-)]
-async fn delegation_audit_trail_contains_later_event(
+/// The trail is read once it has settled, so a record written a moment after
+/// the gateway answered is seen.
+#[then(expr = "the delegation audit trail holds no record of event {string}")]
+async fn delegation_audit_trail_holds_no_record_of_event(
     world: &mut SurfaceWorld,
     event: String,
+) {
+    let events = read_delegation_audit_events(world).await;
+    assert!(!events.is_empty(), "the delegation audit trail is empty, so it shows nothing about {event:?}");
+    let found: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|entry| entry["event"] == event.as_str())
+        .collect();
+    assert!(found.is_empty(), "expected no delegation audit record of event '{event}', got {found:?}");
+}
+
+/// A consent names its caller by identity hash, so two callers behind one
+/// Agent DID are two hashes under one DID.
+#[then(
+    expr = "the delegation audit trail records a consent to OAuth provider {string} by two callers of one Agent DID"
+)]
+async fn delegation_audit_trail_records_consents_of_two_callers(
+    world: &mut SurfaceWorld,
     provider: String,
 ) {
-    delegation_audit_trail_contains_event(world, event, provider).await;
+    let record_id = world
+        .surface_config
+        .provider_record_id(&provider);
+    let named = |events: &[serde_json::Value], field: &str| -> std::collections::BTreeSet<String> {
+        events
+            .iter()
+            .filter(|entry| entry["event"] == "consent_granted" && entry["provider_id"] == record_id.as_str())
+            .filter_map(|entry| entry[field].as_str())
+            .map(str::to_string)
+            .collect()
+    };
+    let (found, events) =
+        eventually_delegation_audit_events(world, |events| named(events, "user_identity_hash").len() == 2).await;
+    assert!(found, "expected a consent to provider '{provider}' ({record_id}) by two callers, got {events:?}");
+    let agents = named(&events, "agent_did");
+    assert_eq!(agents.len(), 1, "the callers use one Agent DID: {events:?}");
+    assert!(
+        agents
+            .iter()
+            .all(|did| did.starts_with("did:")),
+        "{agents:?}"
+    );
 }
 
 #[then("the delegation audit trail does not expose delegated credential secrets")]
@@ -4018,54 +4067,6 @@ async fn delegation_audit_trail_identifies_mcp_tool(
     })
     .await;
     assert!(found, "expected delegation audit trail to identify MCP tool '{tool}', got {events:?}");
-}
-
-#[then(expr = "the delegation audit trail contains distinct authenticated caller records for {string} and {string}")]
-async fn delegation_audit_trail_contains_distinct_callers(
-    world: &mut SurfaceWorld,
-    first: String,
-    second: String,
-) {
-    delegation_audit_trail_identifies_caller(world, first).await;
-    delegation_audit_trail_identifies_caller(world, second).await;
-}
-
-#[then(expr = "both audit records are bound to caller Agent identity {string}")]
-async fn both_audit_records_are_bound_to_agent_identity(
-    world: &mut SurfaceWorld,
-    identity: String,
-) {
-    let (found, events) = eventually_delegation_audit_events(world, |events| {
-        events
-            .iter()
-            .filter(|event| event_contains_text(event, &identity))
-            .count()
-            >= 2
-    })
-    .await;
-    assert!(found, "expected at least two audit records bound to caller Agent identity '{identity}', got {events:?}");
-}
-
-#[then("both audit records identify the same caller Agent DID")]
-async fn both_audit_records_identify_same_caller_agent_did(world: &mut SurfaceWorld) {
-    let (found, events) = eventually_delegation_audit_events(world, |events| {
-        events
-            .iter()
-            .filter_map(extract_holder_did_from_audit_event)
-            .count()
-            >= 2
-    })
-    .await;
-    assert!(found, "expected at least two audit records with caller Agent DIDs, got {events:?}");
-    let dids = events
-        .iter()
-        .filter_map(extract_holder_did_from_audit_event)
-        .collect::<Vec<_>>();
-    assert!(
-        dids.iter()
-            .all(|did| did == &dids[0]),
-        "expected audit records to identify the same caller Agent DID, got {dids:?}"
-    );
 }
 
 #[then(expr = "the VP received by MCP server {string} includes selected caller identity field {string}")]
@@ -4177,16 +4178,6 @@ fn event_contains_text(
     expanded_audit_event_material(event).contains(needle)
 }
 
-fn extract_holder_did_from_audit_event(event: &serde_json::Value) -> Option<String> {
-    let vp = event
-        .get("vp_jwt")
-        .or_else(|| event.get("workload_binding_vp"))?;
-    let decoded = expand_encoded_value(vp);
-    find_string_field(&decoded, "holder")
-        .or_else(|| find_string_field(&decoded, "did"))
-        .filter(|value| value.starts_with("did:"))
-}
-
 fn expanded_audit_event_material(event: &serde_json::Value) -> String {
     expand_encoded_value(event).to_string()
 }
@@ -4223,28 +4214,6 @@ fn decode_jwt_payload(text: &str) -> Option<serde_json::Value> {
         .decode(parts[1])
         .ok()?;
     serde_json::from_slice::<serde_json::Value>(&payload).ok()
-}
-
-fn find_string_field(
-    value: &serde_json::Value,
-    field: &str,
-) -> Option<String> {
-    match value {
-        serde_json::Value::Object(map) => {
-            if let Some(found) = map
-                .get(field)
-                .and_then(|value| value.as_str())
-            {
-                return Some(found.to_string());
-            }
-            map.values()
-                .find_map(|value| find_string_field(value, field))
-        }
-        serde_json::Value::Array(items) => items
-            .iter()
-            .find_map(|value| find_string_field(value, field)),
-        _ => None,
-    }
 }
 
 #[then(expr = "agent {string} received the forwarded request")]

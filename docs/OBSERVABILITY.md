@@ -455,19 +455,40 @@ tokens never read that store and read the log as usual.
 `audit_enabled` is on (Settings › VP Audit); turning it off pauses the log without losing the
 selection. An integration receives the audit events its event set holds, as `audit.<event>`
 next to any other events. Both take event names from the audit event catalog
-(`src/audit/catalog.rs`), for example `policy_decision`, `auth_failed`, `token_injected`; an
-unknown name is rejected (400). `GET /v1/settings/audit-events` lists the catalog in order, each
+(`src/audit/catalog.rs`), for example `policy_decision`, `auth_failed`, `consent_granted`; an
+unknown name is rejected (400), except the name of an event the gateway now only logs (below),
+which is dropped. `GET /v1/settings/audit-events` lists the catalog in order, each
 entry with its `event` name, `label`, `description`, `group` and `group_label`, and
 `GET /v1/integrations/catalog` lists the same events as `audit.<event>` with their group.
 
-**Delegation events.** `token_injected`, `token_refreshed`, `refresh_failed` and the other
-delegated credential events name the agent half of the credential's vault key as `agent_did`.
+**Delegation events: audited or logged.** What a person or an operator decided about delegated
+access is audited: `consent_granted`, `consent_expired`, `token_revoked`, `user_tokens_revoked`,
+`delegation_failed`, `connector_call` and `mcp_proxy_pin_changed`. What the gateway does with a
+stored credential on each call is written to the gateway log and is no audit event, so neither
+the VP Audit Log nor an integration is offered it: `token_injected`, `token_refreshed`,
+`refresh_failed`, `consent_required`, `token_not_found`, `elicitation_sent`,
+`elicitation_accepted`, `elicitation_declined`, `elicitation_cancelled` and
+`elicitation_timed_out` (`LOGGED_EVENTS` in `src/audit/catalog.rs`). Each is one `INFO` line of
+the `credential_delegation` target:
+
+```text
+Delegation event event=token_injected agent_did=<agent> user_hash=<identity hash> provider_id=<provider record id> surface_id=<surface> surface_variant=<variant> token_id=<token or grant id> scopes=<comma-separated> mcp_tool_name=<tool> via_fabric=<true|false> target_endpoint=<target> protocol=<protocol> request_id=<request> detail=<detail>
+```
+
+A field the event does not have is `-`. The line names the caller by identity hash only and
+carries no credential; it is kept as long as the gateway's logs are (`retention.local_logs_hours`,
+24 hours by default). A selection made before may still name one of these events, and the name
+selects nothing: the gateway drops it from the stored `audit_events` when it loads its settings
+and from any `audit_events` or event set it is asked to save, where any other unknown name is
+refused. An event set left with no other event is refused as empty, and reported by the startup
+check of stored definitions until it is changed or deleted. Records of these events written to
+the VP Audit Log before stay there and stay readable.
+
+Delegated credential events name the agent half of the credential's vault key as `agent_did`.
 For a delegated credential released on Fabric receive (`via_fabric: true`) it is the receiving
 surface's id (see
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)), and the
-record names the Target (`target_endpoint`), `channel_name`, `protocol` and `mcp_tool_name`, with
-the caller the receiving surface verified as `caller` and the paired gateway that sent the
-request as `caller.peer_gateway` (its issuer DID, else its Remote gateway record id). A
+event names the Target (`target_endpoint`), `protocol` and `mcp_tool_name`. A
 `vp_injected` record of a Fabric request also carries `via_fabric: true`, with the DID of the
 agent its presentation is for as `agent_did`.
 
@@ -929,16 +950,15 @@ the `owner`'s, one account for every caller, or the caller's own.
   compressed although none was accepted, or a body that times out, is too large or cannot be
   read) and the caller is answered with an error: the vendor has acted on the call. A call the
   vendor rejected for its token and the gateway retried with a refreshed one is one record,
-  carrying the retry's answer. The call's earlier `token_injected` records, one per send,
-  remain. A call that got no answer from the vendor at all records no `connector_call`.
+  carrying the retry's answer. Each send is also logged as `token_injected`. A call that got no answer from the vendor at all records no `connector_call`.
 - `outcome` `refused`: the call was refused, before it was forwarded or because the vendor
   rejected the grant; `reason` is the fixed reason the caller was told (`connect_required`,
   `scope_insufficient`, `connector_unavailable`) or `caller_not_identified`, and `cause` the
   fixed cause inside it, as the gateway's log names it (for example `provider_of_another_tenant`,
   `grant_beyond_the_bindings_scopes`, `invalid_credential_header`).
 - The record names the caller by the hash alone: no `caller` context, argument, token or text
-  from the vendor. The Access Point's Target grant keeps its own records (`token_injected`,
-  `request_rejected`).
+  from the vendor. The Access Point's Target grant is recorded on its own: logged as
+  `token_injected`, audited as `request_rejected`.
 - A call refused before the grant step records no `connector_call`: for example by its transit
   token, the hop limit, the trust check, a policy, the Transit Point's rate limit (recorded as
   `rate_limited`) or its tool gate (recorded as `policy_decision`). A `2026-07-28` MCP request is

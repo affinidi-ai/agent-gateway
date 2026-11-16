@@ -5900,7 +5900,7 @@ async fn step_inject_external_grant(
     // that carries it is sent ([`record_mcp_proxy_grant_sent`]).
     if !through_proxy {
         crate::delegation_vault::release::record_use_in_background(vault, &grant, Some(ctx.request_id.clone()));
-        audit_grant_injected(ctx, &caller, &provider, &grant, subject);
+        log_grant_injected(ctx, &caller, &provider, &grant, subject);
     }
     ctx.released_grant = Some(Box::new(ReleasedGrant {
         grant,
@@ -5938,11 +5938,11 @@ fn record_mcp_proxy_grant_sent(
         );
     }
     let caller = delegation_caller_hash(ctx).unwrap_or_default();
-    audit_grant_injected(ctx, &caller, &released.provider, &released.grant, released.subject);
+    log_grant_injected(ctx, &caller, &released.provider, &released.grant, released.subject);
 }
 
-/// Audit that a grant by binding was injected into a request.
-fn audit_grant_injected(
+/// Log that a grant by binding was injected into a request.
+fn log_grant_injected(
     ctx: &OutboundPipelineContext,
     caller: &str,
     provider: &crate::credential_providers::CredentialProvider,
@@ -7216,7 +7216,7 @@ async fn step_answer_a_refused_grant(
     // sent ([`record_mcp_proxy_grant_sent`]).
     if !is_mcp_proxy_transit_point(ctx) {
         let caller = delegation_caller_hash(ctx).unwrap_or_default();
-        audit_grant_injected(ctx, &caller, &provider, &fresh, subject);
+        log_grant_injected(ctx, &caller, &provider, &fresh, subject);
     }
     ctx.released_grant = Some(Box::new(ReleasedGrant {
         grant: fresh,

@@ -3340,9 +3340,9 @@ fn vp_audit_log_holds_a_line_that_is_not_a_record(world: &mut SurfaceWorld) {
 }
 
 #[given(
-    expr = "the Credential Delegation Audit Log contains a token injection for caller {string} with email {string} and name {string}"
+    expr = "caller {string} with email {string} and name {string} has consented to and used a delegated credential"
 )]
-async fn credential_delegation_audit_log_contains_token_injection_for_caller(
+async fn caller_has_consented_to_and_used_a_delegated_credential(
     world: &mut SurfaceWorld,
     caller: String,
     email: String,
@@ -3366,7 +3366,7 @@ async fn credential_delegation_audit_log_contains_token_injection_for_caller(
     oauth_provider_ready_to_exchange_code(world, "calendar".to_string()).await;
     caller_has_completed_oauth_consent(world, caller.clone(), "calendar".to_string()).await;
     caller_has_invoked_mcp_tool_with_valid_token_and_identity(world, caller, "schedule_meeting".to_string()).await;
-    wait_for_audit_events(world, "/v1/delegation-audit?page_size=100").await;
+    wait_for_audit_record_of_tool(world, "schedule_meeting").await;
 }
 
 #[given(expr = "an API-key delegated credential was injected for caller {string}")]
@@ -3388,12 +3388,15 @@ async fn api_key_delegated_credential_was_injected(
 
     enable_every_audit_event(world).await;
     caller_has_invoked_mcp_tool_with_valid_token_and_identity(world, caller, "lookup_place".to_string()).await;
-    wait_for_audit_events(world, "/v1/delegation-audit?page_size=100").await;
+    wait_for_audit_record_of_tool(world, "lookup_place").await;
 }
 
-async fn wait_for_audit_events(
+/// Audit records reach the log shortly after the request that produced them,
+/// so this reads the Credential Delegation Audit Log again until it holds a
+/// record of a call to MCP tool `tool`, for up to five seconds.
+async fn wait_for_audit_record_of_tool(
     world: &mut SurfaceWorld,
-    path: &str,
+    tool: &str,
 ) {
     crate::steps::when::ensure_admin_session(world).await;
     let client = world
@@ -3401,23 +3404,25 @@ async fn wait_for_audit_events(
         .as_ref()
         .expect("admin client must exist");
     let mut last_body = None;
-    for _ in 0..10 {
+    for _ in 0..50 {
         let response = client
-            .send_recorded_json::<serde_json::Value>(reqwest::Method::GET, path, None)
+            .send_recorded_json::<serde_json::Value>(reqwest::Method::GET, "/v1/delegation-audit?page_size=100", None)
             .await
             .expect("audit setup read should return an HTTP response");
-        let has_events = response
-            .body
-            .get("events")
-            .and_then(|events| events.as_array())
-            .is_some_and(|events| !events.is_empty());
-        if has_events {
+        let recorded = response.body["events"]
+            .as_array()
+            .is_some_and(|events| {
+                events
+                    .iter()
+                    .any(|event| event["mcp_tool_name"] == tool)
+            });
+        if recorded {
             return;
         }
         last_body = Some(response.body);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    panic!("audit setup did not produce events at {path}; last response body: {last_body:?}");
+    panic!("the audit log holds no record of MCP tool {tool:?}; last response body: {last_body:?}");
 }
 
 #[given(expr = "MCP surface {string} targets MCP server {string}")]

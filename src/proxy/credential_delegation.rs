@@ -807,7 +807,7 @@ pub async fn resolve_delegation_credentials(
                     );
                 }
 
-                // Audit: token injected
+                // Logged: token injected
                 audit::emit("token_injected", || {
                     let mut evt = audit::audit_event(
                         DelegationAuditAction::TokenInjected,
@@ -961,7 +961,7 @@ pub async fn resolve_delegation_credentials(
                                     ""
                                 };
 
-                                // Audit: token refreshed
+                                // Logged: token refreshed
                                 audit::emit("token_refreshed", || {
                                     let mut evt = audit::audit_event(
                                         DelegationAuditAction::TokenRefreshed,
@@ -1009,7 +1009,7 @@ pub async fn resolve_delegation_credentials(
                                     error = %e,
                                     "Token refresh failed — requesting new consent"
                                 );
-                                // Audit: refresh failed
+                                // Logged: refresh failed
                                 audit::emit("refresh_failed", || {
                                     let mut evt = audit::audit_event(
                                         DelegationAuditAction::RefreshFailed,
@@ -1172,7 +1172,7 @@ pub async fn resolve_delegation_credentials(
                     error = %e,
                     "Vault lookup failed"
                 );
-                // Audit: token not found (vault error)
+                // Logged: token not found (vault error)
                 audit::emit("token_not_found", || {
                     let mut evt = audit::audit_event(
                         DelegationAuditAction::TokenNotFound,
@@ -2887,7 +2887,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refused_refresh_logs_and_audits_only_the_oauth_error_code() {
+    async fn a_refused_refresh_logs_only_the_oauth_error_code_and_audits_nothing() {
         let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
         let directory = tempfile::tempdir().unwrap();
         let secrets: Arc<dyn SecretsStore> = Arc::new(
@@ -2945,23 +2945,24 @@ mod tests {
             policy: Default::default(),
         };
 
-        let (results, events) = crate::audit::producer::capture(egress.scope(resolve_delegation_credentials(
-            &[make_binding("cp-1")],
-            "sha256:user1",
-            "did:web:agent.example",
-            "ch-1",
-            crate::tenancy::SurfaceTenancy::configured(None),
-            None,
-            &vault,
-            &providers,
-            &secrets,
-            "https://gw.example.com",
-            false,
-            access_point(None, None),
-            None,
-            None,
-        )))
-        .await;
+        let (results, crate::audit::producer::Recorded { audited, logged }) =
+            crate::audit::producer::capture_apart(egress.scope(resolve_delegation_credentials(
+                &[make_binding("cp-1")],
+                "sha256:user1",
+                "did:web:agent.example",
+                "ch-1",
+                crate::tenancy::SurfaceTenancy::configured(None),
+                None,
+                &vault,
+                &providers,
+                &secrets,
+                "https://gw.example.com",
+                false,
+                access_point(None, None),
+                None,
+                None,
+            )))
+            .await;
 
         let expected = "Token refresh failed (HTTP 400 Bad Request): invalid_grant";
         assert_eq!(results.len(), 1);
@@ -2973,11 +2974,12 @@ mod tests {
                 .as_deref(),
             Some(expected)
         );
-        let refresh_failed: Vec<_> = events
+        assert!(audited.is_empty(), "a refused refresh is logged, not audited: {audited:?}");
+        let refresh_failed: Vec<_> = logged
             .iter()
             .filter(|event| matches!(event.event, DelegationAuditAction::RefreshFailed))
             .collect();
-        assert_eq!(refresh_failed.len(), 1, "{events:?}");
+        assert_eq!(refresh_failed.len(), 1, "{logged:?}");
         assert_eq!(
             refresh_failed[0]
                 .detail
@@ -2990,9 +2992,13 @@ mod tests {
             .find(|line| line.contains("Token refresh failed — requesting new consent"))
             .unwrap_or_else(|| panic!("the refused refresh is logged: {text}"));
         assert!(line.contains("invalid_grant"), "{line}");
+        let event_line = text
+            .lines()
+            .find(|line| line.contains("Delegation event") && line.contains("event=refresh_failed"))
+            .unwrap_or_else(|| panic!("the refused refresh is logged as a delegation event: {text}"));
+        assert!(event_line.contains(&format!("detail={expected}")), "{event_line}");
         for marker in ["description-marker", "uri-marker"] {
             assert!(!text.contains(marker), "{marker} reached the log: {text}");
-            assert!(!format!("{events:?}").contains(marker), "{marker} reached the audit: {events:?}");
         }
     }
 
@@ -4706,15 +4712,17 @@ mod tests {
 
     // ── Consent time limits ───────────────────────────────────────────────
 
+    use crate::audit::producer::Recorded;
+
     /// What the resolver answers for one binding of provider `cp-1`, whose
     /// provider limits consents to `provider_secs`, with `token` stored in a
-    /// vault on disk: the resolutions, the audit records written, and the
-    /// token as the vault holds it afterwards.
+    /// vault on disk: the resolutions, what was audited and what was logged,
+    /// and the token as the vault holds it afterwards.
     async fn resolve_with_stored_consent(
         token: DelegationToken,
         binding: OutboundCredentialBinding,
         provider_secs: Option<u64>,
-    ) -> (Vec<DelegationResolution>, Vec<audit::DelegationAuditEvent>, Option<DelegationToken>) {
+    ) -> (Vec<DelegationResolution>, Recorded, Option<DelegationToken>) {
         let mut provider = make_credential_provider("cp-1", CredentialProviderType::OAuth2AuthorizationCode);
         provider.max_consent_age_secs = provider_secs;
         resolve_with_provider(token, binding, provider).await
@@ -4725,7 +4733,7 @@ mod tests {
         token: DelegationToken,
         binding: OutboundCredentialBinding,
         provider: CredentialProvider,
-    ) -> (Vec<DelegationResolution>, Vec<audit::DelegationAuditEvent>, Option<DelegationToken>) {
+    ) -> (Vec<DelegationResolution>, Recorded, Option<DelegationToken>) {
         let directory = tempfile::tempdir().unwrap();
         let vault: Arc<dyn DelegationVaultStorage> = Arc::new(
             crate::delegation_vault::storage::FileSystemDelegationVaultStore::new(directory.path().into())
@@ -4738,28 +4746,29 @@ mod tests {
             .unwrap();
         let providers: Arc<dyn CredentialProviderStorage> = MockProviderStore::with_stored(provider);
         let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
-        let (results, events) = crate::audit::producer::capture(resolve_delegation_credentials(
-            &[binding],
-            "sha256:user1",
-            "did:web:agent.example",
-            "ch-1",
-            crate::tenancy::SurfaceTenancy::configured(None),
-            None,
-            &vault,
-            &providers,
-            &secrets,
-            "https://gw.example.com",
-            false,
-            ConsentCaller::TransitOrFabric,
-            None,
-            None,
-        ))
-        .await;
+        let (results, crate::audit::producer::Recorded { audited, logged }) =
+            crate::audit::producer::capture_apart(resolve_delegation_credentials(
+                &[binding],
+                "sha256:user1",
+                "did:web:agent.example",
+                "ch-1",
+                crate::tenancy::SurfaceTenancy::configured(None),
+                None,
+                &vault,
+                &providers,
+                &secrets,
+                "https://gw.example.com",
+                false,
+                ConsentCaller::TransitOrFabric,
+                None,
+                None,
+            ))
+            .await;
         let kept = vault
             .get(&stored.id)
             .await
             .unwrap();
-        (results, events, kept)
+        (results, Recorded { audited, logged }, kept)
     }
 
     /// A token whose consent was given `age` ago, and ends `ends_in` from now
@@ -4811,8 +4820,13 @@ mod tests {
             Some("consent_expired")
         );
         assert!(kept.is_none(), "the token, with its refresh token, is removed");
-        assert_eq!(categories(&events), vec!["consent_expired"], "an expiry, never a revocation or an injection");
-        let expired = &events[0];
+        assert_eq!(
+            categories(&events.audited),
+            vec!["consent_expired"],
+            "an expiry, never a revocation or an injection"
+        );
+        assert!(events.logged.is_empty(), "{:?}", categories(&events.logged));
+        let expired = &events.audited[0];
         assert_eq!(
             expired
                 .user_identity_hash
@@ -4854,7 +4868,8 @@ mod tests {
                 "no refresh was tried, so none failed"
             );
             assert!(kept.is_none(), "{has_refresh}");
-            assert_eq!(categories(&events), vec!["consent_expired"], "{has_refresh}");
+            assert_eq!(categories(&events.audited), vec!["consent_expired"], "{has_refresh}");
+            assert!(events.logged.is_empty(), "{:?}", categories(&events.logged));
         }
     }
 
@@ -4865,7 +4880,8 @@ mod tests {
 
         assert_eq!(consent_required(&results[0].result), (Some("consent_expired"), Some(3_600)));
         assert!(kept.is_none());
-        assert_eq!(categories(&events), vec!["consent_expired"]);
+        assert_eq!(categories(&events.audited), vec!["consent_expired"]);
+        assert!(events.logged.is_empty(), "{:?}", categories(&events.logged));
     }
 
     #[tokio::test]
@@ -4878,7 +4894,8 @@ mod tests {
         assert_eq!(result_tag(&results[0].result), "Inject");
         assert_eq!(results[0].action.outcome, DelegationActionOutcome::TokenInjected);
         assert!(kept.is_some());
-        assert_eq!(categories(&events), vec!["token_injected"]);
+        assert!(events.audited.is_empty(), "an injection is logged, not audited: {:?}", categories(&events.audited));
+        assert_eq!(categories(&events.logged), vec!["token_injected"]);
     }
 
     fn deactivated_provider() -> CredentialProvider {
@@ -4897,7 +4914,8 @@ mod tests {
         assert_eq!(result_tag(&results[0].result), "Inject");
         assert_eq!(results[0].action.outcome, DelegationActionOutcome::TokenInjected);
         assert!(kept.is_some());
-        assert_eq!(categories(&events), vec!["token_injected"]);
+        assert!(events.audited.is_empty(), "an injection is logged, not audited: {:?}", categories(&events.audited));
+        assert_eq!(categories(&events.logged), vec!["token_injected"]);
     }
 
     /// A caller with no credential of a deactivated provider is not asked for
@@ -4924,7 +4942,7 @@ mod tests {
             Some("provider_deactivated")
         );
         assert!(kept.is_some(), "another caller's consent is left alone");
-        assert!(events.is_empty(), "{:?}", categories(&events));
+        assert!(events.audited.is_empty() && events.logged.is_empty(), "{events:?}");
 
         let active = make_credential_provider("cp-1", CredentialProviderType::OAuth2AuthorizationCode);
         let (results, _, _) = resolve_with_provider(someone_else(), make_binding("cp-1"), active).await;
@@ -4947,7 +4965,8 @@ mod tests {
             Some("provider_deactivated")
         );
         assert!(kept.is_none(), "the ended consent is removed");
-        assert_eq!(categories(&events), vec!["consent_expired"]);
+        assert_eq!(categories(&events.audited), vec!["consent_expired"]);
+        assert!(events.logged.is_empty(), "{:?}", categories(&events.logged));
     }
 
     #[tokio::test]
@@ -4957,7 +4976,8 @@ mod tests {
 
         assert_eq!(result_tag(&results[0].result), "Inject");
         assert!(kept.is_some());
-        assert_eq!(categories(&events), vec!["token_injected"]);
+        assert!(events.audited.is_empty(), "an injection is logged, not audited: {:?}", categories(&events.audited));
+        assert_eq!(categories(&events.logged), vec!["token_injected"]);
     }
 
     #[tokio::test]
@@ -4976,7 +4996,7 @@ mod tests {
             Some("consent_too_old")
         );
         assert!(kept.is_some(), "the consent has not ended, so the token stays");
-        assert!(events.is_empty(), "nothing ended: {:?}", categories(&events));
+        assert!(events.audited.is_empty(), "nothing ended: {:?}", categories(&events.audited));
 
         let DelegationLookupResult::ConsentRequired { authorization_url, .. } = &results[0].result else {
             unreachable!()

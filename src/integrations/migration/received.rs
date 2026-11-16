@@ -340,7 +340,7 @@ mod tests {
     const REMOVED_AUDIT_EVENT: &str = "audit.pre_authorize_blocked";
 
     #[test]
-    fn the_live_versions_events_are_in_the_catalog_except_the_one_removed_since() {
+    fn the_live_versions_events_are_in_the_catalog_except_those_removed_or_only_logged_since() {
         let known: Vec<&str> = catalog()
             .iter()
             .map(|event| event.id.as_str())
@@ -359,7 +359,11 @@ mod tests {
             .map(|event| event.to_string());
 
         for event in delivered.chain(audit) {
-            assert_eq!(known.contains(&event.as_str()), event != REMOVED_AUDIT_EVENT, "{event}");
+            assert_eq!(
+                known.contains(&event.as_str()),
+                event != REMOVED_AUDIT_EVENT && !crate::integrations::definitions::event_set::is_only_logged(&event),
+                "{event}"
+            );
         }
     }
 
@@ -508,7 +512,24 @@ mod tests {
 
         let off =
             received_events(&audit, &records, &AuditForwarding::from_settings(false, &["policy_decision".into()]));
-        assert_eq!(off.events.len(), 15, "the 16 ungated ones but the one removed since");
+        assert_eq!(
+            off.events,
+            [
+                "audit.trace_terminated",
+                "audit.consent_granted",
+                "audit.token_revoked",
+                "audit.user_tokens_revoked",
+                "audit.payment"
+            ],
+            "the ungated ones but the one removed since and the ten the gateway now only logs"
+        );
+        assert!(
+            off.notes
+                .iter()
+                .any(|note| note.contains("audit.token_injected")),
+            "{:?}",
+            off.notes
+        );
         assert!(
             !off.events
                 .contains(&"audit.policy_decision".to_string())
@@ -526,7 +547,7 @@ mod tests {
             &records,
             &AuditForwarding::from_settings(true, &["policy_decision".into(), "vp_injected".into()]),
         );
-        assert_eq!(on.events.len(), 17);
+        assert_eq!(on.events.len(), 7);
         assert!(
             on.events
                 .contains(&"audit.policy_decision".to_string())

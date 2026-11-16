@@ -10,6 +10,15 @@ changes:
         "Saving ends 2 active GitHub consents now". It asks once the field has stopped changing,
         and shows nothing when no consent ends or the gateway cannot say.
   changed:
+    - timestamp: '2026-11-16T17:10:00Z'
+      title: Drop the names of now-logged events from stored audit selections
+      description: >-
+        A VP Audit selection (audit_events) or an integration event set saved before may still
+        name a delegation event the gateway now only writes to its log. The gateway drops such a
+        name when it loads its settings and from any audit_events or event set it is asked to
+        save, where any other unknown name is still refused with 400, so an upgraded gateway keeps
+        saving its settings. An event set left with no other event is refused as empty, and the
+        startup check of stored definitions reports it until it is changed or deleted.
     - timestamp: '2026-11-16T15:00:00Z'
       title: Confirm a revoke-all with a danger button that says how many it ends
       description: >-
@@ -77,4 +86,22 @@ changes:
         summary.
   removed: []
   security: []
-  breaking: []
+  breaking:
+    - timestamp: '2026-11-16T17:00:00Z'
+      title: ⭐ Write per-call delegation events to the gateway log, not the audit
+      description: >-
+        Ten delegation events are no longer audit events: token_injected, token_refreshed,
+        refresh_failed, consent_required, token_not_found, elicitation_sent, elicitation_accepted,
+        elicitation_declined, elicitation_cancelled and elicitation_timed_out. The VP Audit Log
+        and integrations are offered none of them, and GET /v1/settings/audit-events and the
+        integration event catalog no longer list them. Each is now one INFO line of the gateway
+        log, "Delegation event event=<name> ...", naming the agent, the caller's identity hash,
+        the provider, the surface, the token or grant, its scopes and the MCP tool, and no
+        credential. What was decided about delegated access stays audited: consent_granted,
+        consent_expired, token_revoked, user_tokens_revoked, delegation_failed, connector_call and
+        mcp_proxy_pin_changed. Upgrade note: the gateway log is kept for
+        retention.local_logs_hours, 24 hours by default, so after that nothing on the gateway
+        records which calls used a person's credential. An integration or SIEM that received
+        these events receives them no longer; forward the gateway log, or raise the retention, to
+        keep them. Records of these events written before stay in the VP Audit Log and stay
+        readable.

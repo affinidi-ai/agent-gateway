@@ -54,7 +54,11 @@ its publisher when saved, so a webhook or Slack URL that fails the checks under 
 requests_ is refused with `400`.
 
 **Event sets** need at least one event, every one from the catalog; repeats are dropped. A
-request listing more events than the catalog holds is refused with `400`.
+request listing more events than the catalog holds is refused with `400`. An audit event the
+gateway now only writes to its log, such as `audit.token_injected` (see
+[Delegation events: audited or logged](OBSERVABILITY.md#governance-audit-forwarding)), is the exception:
+a set stored before may still name it, so a save drops it instead of refusing it, and a set left
+with no other event is refused as empty.
 
 **Integrations** need an existing endpoint and event set. Their template must be a JSON object
 whose variables some event of the event set fills, and the audit delivery limits are accepted
@@ -778,7 +782,9 @@ endpoint, an event set and an integration, all three with the old integration's 
 - **Dropped:**
   - Kinesis `access_key` and `secret_key`, which nothing read;
   - webhook headers the gateway sets itself, or whose value is not text;
-  - `pre_authorize_blocked`, which no longer exists.
+  - `pre_authorize_blocked`, which no longer exists, and the delegation events the gateway now
+    only writes to its log (`token_injected`, `consent_required` and the others listed under
+    [Delegation events: audited or logged](OBSERVABILITY.md#governance-audit-forwarding)).
 - **Disabled:**
   - an endpoint that fails the current checks, such as a URL now refused, is written disabled
     with the reason;
@@ -846,7 +852,8 @@ migrated definitions that do not pass their checks.
 would:
 
 - each endpoint's configuration, with its `$SECRET:` references resolved;
-- each event set's events, against the catalog;
+- each event set's events, against the catalog (an audit event the gateway now only logs
+  passes, since a save drops it, unless the set holds nothing else);
 - each integration's endpoint and event set, which must exist, and its template, which must
   fit the event set.
 
