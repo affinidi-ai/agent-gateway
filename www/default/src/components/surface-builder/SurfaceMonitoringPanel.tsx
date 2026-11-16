@@ -223,11 +223,6 @@ const SurfaceMonitoringPanel: React.FC<SurfaceMonitoringPanelProps> = ({
           surfaceId={surfaceId}
           surface={surface}
           onClose={() => setCaptureMode(false)}
-          onPolicyInputCaptureChange={until =>
-            setSurface(current =>
-              current ? { ...current, policy_input_capture_until: until } : current
-            )
-          }
         />
       </div>
     );

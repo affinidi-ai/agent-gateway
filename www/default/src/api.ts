@@ -724,23 +724,6 @@ class APIClient {
     return response.status ?? null;
   }
 
-  async setSurfacePolicyInputCapture(
-    surfaceId: string,
-    minutes: number
-  ): Promise<PolicyInputCaptureState> {
-    return this.request<PolicyInputCaptureState>(
-      `/surfaces/${encodeURIComponent(surfaceId)}/policy-input-capture`,
-      { method: 'PUT', body: JSON.stringify({ minutes }) }
-    );
-  }
-
-  async clearSurfacePolicyInputCapture(surfaceId: string): Promise<PolicyInputCaptureState> {
-    return this.request<PolicyInputCaptureState>(
-      `/surfaces/${encodeURIComponent(surfaceId)}/policy-input-capture`,
-      { method: 'DELETE' }
-    );
-  }
-
   async deleteSurface(surfaceId: string): Promise<void> {
     await this.request(`/surfaces/${encodeURIComponent(surfaceId)}`, {
       method: 'DELETE',
@@ -1508,12 +1491,6 @@ export interface CallerAuthentication {
   on_failure?: 'reject' | 'continue';
 }
 
-export interface PolicyInputCaptureState {
-  surface_id: string;
-  /** When policy input capture stops (RFC 3339); `null` while off. */
-  policy_input_capture_until: string | null;
-}
-
 export interface AgentSurface {
   surface_id: string;
   tenant_id?: string | null;
@@ -1627,8 +1604,6 @@ export interface AgentSurface {
    * request). It gives no reason.
    */
   serving_status?: SurfaceServingStatus;
-  /** Read-only: when policy input capture stops (RFC 3339); absent or `null` while off. */
-  policy_input_capture_until?: string | null;
 
   /** Non-blocking notes returned by a save; never sent back. */
   warnings?: SurfaceSaveWarning[];

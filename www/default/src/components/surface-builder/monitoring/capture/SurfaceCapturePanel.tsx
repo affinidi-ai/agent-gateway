@@ -8,7 +8,7 @@ import CaptureDetailsModal from './CaptureDetailsModal';
 import CaptureHistoryTable from './CaptureHistoryTable';
 import CapturePipelineView from './CapturePipelineView';
 import CaptureSchemaModal from './CaptureSchemaModal';
-import PolicyInputCaptureCard from './PolicyInputCaptureCard';
+import PolicyInputCaptureCard, { surfaceHasPolicy } from './PolicyInputCaptureCard';
 import { CapturedPayload } from './types';
 import { useSurfaceCaptureStream } from './useSurfaceCaptureStream';
 import { usePolicyInputCaptureStream } from './usePolicyInputCaptureStream';
@@ -17,8 +17,6 @@ export interface SurfaceCapturePanelProps {
   surfaceId: string;
   surface: AgentSurface | null;
   onClose: () => void;
-  /** Called after policy input capture is switched on or off. */
-  onPolicyInputCaptureChange?: (until: string | null) => void;
 }
 
 const buildRouteDisplay = (surface: AgentSurface | null): string => {
@@ -32,7 +30,6 @@ const SurfaceCapturePanel: React.FC<SurfaceCapturePanelProps> = ({
   surfaceId,
   surface,
   onClose,
-  onPolicyInputCaptureChange,
 }) => {
   const { state, actions } = useApp();
   const stream = useSurfaceCaptureStream(surfaceId);
@@ -288,8 +285,7 @@ const SurfaceCapturePanel: React.FC<SurfaceCapturePanelProps> = ({
 
       <PolicyInputCaptureCard
         captures={policyInputs.captures}
-        captureUntil={surface?.policy_input_capture_until}
-        onCaptureChange={onPolicyInputCaptureChange}
+        hasPolicy={!surface || surfaceHasPolicy(surface)}
       />
 
       <CaptureHistoryTable captured={stream.captured} onSelectRow={stream.loadCapture} />

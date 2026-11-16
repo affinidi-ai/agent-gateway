@@ -104,12 +104,6 @@ bucket for the point, and `per_caller_rate_limit` gives each caller the point id
 of their own. Both are counted on each gateway node. See
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point).
 
-## Policy input capture of a surface
-
-| Field | Behaviour |
-| --- | --- |
-| `policy_input_capture_until` | RFC 3339 time until which each request policy evaluation on the surface is sent, with its input and decision, to the dashboard's Capture view. Set and cleared only through `PUT` and `DELETE /v1/surfaces/{id}/policy-input-capture`, at most 60 minutes ahead; a surface write ignores it. Absent or past, nothing is captured. See [`POLICY.md`](POLICY.md#policy-input-capture). |
-
 ## Browser origins of a surface
 
 A browser page can call a surface only from an allowed origin. `network.cors` in `gateway.json` lists

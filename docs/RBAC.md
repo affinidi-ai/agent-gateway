@@ -120,9 +120,9 @@ its own tenant: when only an appliance-wide surface could reach it, the answer i
 
 ## Policy input capture
 
-`PUT` and `DELETE /v1/surfaces/{id}/policy-input-capture` need both `surfaces.edit` and
-`policies.edit`; a caller missing either gets `403`. Only dashboard sessions whose user holds both
-receive the captured policy input on the dashboard WebSocket. See [`POLICY.md`](POLICY.md#policy-input-capture).
+Listening to a surface's policy input on the dashboard WebSocket needs both `surfaces.edit` and
+`policies.edit`; a session missing either is refused, and one that loses either stops listening at
+the next keep-alive ping. Only the listening session receives the captured policy input. See [`POLICY.md`](POLICY.md#policy-input-capture).
 
 ## Payments admin API
 

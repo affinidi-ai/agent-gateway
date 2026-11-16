@@ -18,7 +18,6 @@ pub mod policy_validation;
 pub mod settings;
 mod surface_caller_key;
 pub(crate) mod surface_grants;
-pub mod surface_policy_input_capture;
 mod surface_target_auth;
 pub(crate) mod surface_tenancy;
 pub mod surfaces;

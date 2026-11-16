@@ -2,58 +2,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cucumber::{given, then, when};
-use futures::StreamExt;
-use reqwest::Method;
+use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-use crate::bdd_support::admin_client::RecordedResponse;
 use crate::steps::given::tracked_surface_id;
-use crate::steps::policy_changes::{client, send};
-use crate::world::SurfaceWorld;
+use crate::steps::policy_changes::client;
+use crate::world::{DashboardSocket, SurfaceWorld};
 
 const CAPTURED: &str = "policy_input_captured";
+const LISTEN_ANSWER: &str = "policy_input_capture";
 const THE_OPERATOR: &str = "";
-
-fn capture_path(
-    world: &SurfaceWorld,
-    surface_name: &str,
-) -> String {
-    format!("/v1/surfaces/{}/policy-input-capture", tracked_surface_id(world, surface_name))
-}
-
-async fn switch_on(
-    world: &mut SurfaceWorld,
-    operator: Option<&str>,
-    surface_name: &str,
-    minutes: i64,
-) -> RecordedResponse {
-    let path = capture_path(world, surface_name);
-    send(world, operator, Method::PUT, &path, Some(&json!({ "minutes": minutes }))).await
-}
-
-async fn switch_off(
-    world: &mut SurfaceWorld,
-    surface_name: &str,
-) -> RecordedResponse {
-    let path = capture_path(world, surface_name);
-    send(world, None, Method::DELETE, &path, None).await
-}
-
-async fn stored_surface(
-    world: &mut SurfaceWorld,
-    surface_name: &str,
-) -> Value {
-    let surface_id = tracked_surface_id(world, surface_name);
-    let response = client(world, None)
-        .await
-        .get_surface_recorded(&surface_id)
-        .await
-        .unwrap_or_else(|error| panic!("read surface '{surface_name}' through admin API: {error}"));
-    assert_eq!(response.status, 200, "read surface '{surface_name}': {}", response.body);
-    response.body
-}
 
 fn text_of(message: Message) -> Option<Value> {
     match message {
@@ -62,12 +22,22 @@ fn text_of(message: Message) -> Option<Value> {
     }
 }
 
-/// Open the dashboard WebSocket as `operator` and collect the policy input captures it
-/// receives, from the moment the gateway confirms the connection.
+/// Open the dashboard WebSocket as `operator`, once, and collect the policy input
+/// captures and listen answers it receives from the moment the gateway confirms the
+/// connection.
 async fn watch(
     world: &mut SurfaceWorld,
     operator: Option<&str>,
 ) {
+    let key = operator
+        .unwrap_or(THE_OPERATOR)
+        .to_string();
+    if world
+        .dashboard_sockets
+        .contains_key(&key)
+    {
+        return;
+    }
     let client = client(world, operator).await;
     let token = client
         .session_token()
@@ -85,7 +55,7 @@ async fn watch(
     let (socket, _) = tokio_tungstenite::connect_async(request)
         .await
         .expect("open the dashboard WebSocket");
-    let (write, mut read) = socket.split();
+    let (mut write, mut read) = socket.split();
     loop {
         let message = tokio::time::timeout(Duration::from_secs(5), read.next())
             .await
@@ -96,40 +66,109 @@ async fn watch(
             break;
         }
     }
-    let captures = Arc::new(Mutex::new(Vec::new()));
-    let received = Arc::clone(&captures);
-    tokio::spawn(async move {
-        let _keep_open = write;
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let collected = Arc::clone(&received);
+    let reader = tokio::spawn(async move {
         while let Some(Ok(message)) = read.next().await {
-            if let Some(update) = text_of(message).filter(|update| update["type"] == CAPTURED) {
-                received
+            if let Some(update) =
+                text_of(message).filter(|update| update["type"] == CAPTURED || update["type"] == LISTEN_ANSWER)
+            {
+                collected
                     .lock()
-                    .expect("captures lock")
+                    .expect("dashboard messages lock")
                     .push(update);
             }
         }
     });
+    let (outgoing, mut to_send) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let writer = tokio::spawn(async move {
+        while let Some(text) = to_send.recv().await {
+            if write
+                .send(Message::Text(text.into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
     world
-        .dashboard_captures
-        .insert(
-            operator
-                .unwrap_or(THE_OPERATOR)
-                .to_string(),
-            captures,
-        );
+        .dashboard_sockets
+        .insert(key, DashboardSocket::new(received, outgoing, reader, writer));
 }
 
-fn captures_of(
-    world: &SurfaceWorld,
+fn socket<'a>(
+    world: &'a SurfaceWorld,
     operator: &str,
-) -> Vec<Value> {
+) -> &'a DashboardSocket {
     world
-        .dashboard_captures
+        .dashboard_sockets
         .get(operator)
         .unwrap_or_else(|| panic!("operator '{operator}' must be watching the dashboard Capture view"))
-        .lock()
-        .expect("captures lock")
-        .clone()
+}
+
+fn received_of(
+    world: &SurfaceWorld,
+    operator: &str,
+    message_type: &str,
+) -> Vec<Value> {
+    socket(world, operator)
+        .received()
+        .into_iter()
+        .filter(|message| message["type"] == message_type)
+        .collect()
+}
+
+/// Ask, as `operator`, to start or stop listening to the policy input of `surface_name`,
+/// and return the gateway's answer.
+async fn ask_to_listen(
+    world: &mut SurfaceWorld,
+    operator: Option<&str>,
+    surface_name: &str,
+    start: bool,
+) -> Value {
+    watch(world, operator).await;
+    let key = operator.unwrap_or(THE_OPERATOR);
+    let surface_id = tracked_surface_id(world, surface_name);
+    let answered = received_of(world, key, LISTEN_ANSWER).len();
+    let message_type = if start {
+        "capture_policy_input"
+    } else {
+        "stop_capturing_policy_input"
+    };
+    socket(world, key).send(json!({ "type": message_type, "surface_id": surface_id }).to_string());
+    for _ in 0..100 {
+        if let Some(answer) = received_of(world, key, LISTEN_ANSWER)
+            .into_iter()
+            .nth(answered)
+        {
+            assert_eq!(answer["surface_id"], surface_id.as_str(), "listen answer: {answer}");
+            return answer;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the gateway did not answer the request to listen to the policy input of surface '{surface_name}'");
+}
+
+async fn listens(
+    world: &mut SurfaceWorld,
+    operator: Option<&str>,
+    surface_name: &str,
+) {
+    let answer = ask_to_listen(world, operator, surface_name, true).await;
+    assert_eq!(answer["listening"], true, "listening to policy input: {answer}");
+}
+
+#[given(expr = "the {string} role is granted {string}")]
+fn role_is_granted(
+    world: &mut SurfaceWorld,
+    role: String,
+    feature: String,
+) {
+    world
+        .surface_config
+        .rbac_permissions
+        .push((feature, role));
 }
 
 #[given("the operator watches the dashboard Capture view")]
@@ -145,77 +184,103 @@ async fn named_operator_watches(
     watch(world, Some(&operator)).await;
 }
 
-#[given(expr = "the operator has switched on policy input capture for surface {string} for {int} minutes")]
-async fn operator_has_switched_on(
-    world: &mut SurfaceWorld,
-    surface_name: String,
-    minutes: i64,
-) {
-    let response = switch_on(world, None, &surface_name, minutes).await;
-    assert_eq!(response.status, 200, "switching on policy input capture: {}", response.body);
-}
-
-#[given(expr = "the operator has switched off policy input capture for surface {string}")]
-async fn operator_has_switched_off(
+#[given(expr = "the operator listens to the policy input of surface {string}")]
+async fn operator_listens(
     world: &mut SurfaceWorld,
     surface_name: String,
 ) {
-    let response = switch_off(world, &surface_name).await;
-    assert_eq!(response.status, 200, "switching off policy input capture: {}", response.body);
+    listens(world, None, &surface_name).await;
 }
 
-#[when(expr = "the operator switches on policy input capture for surface {string} for {int} minutes")]
-async fn operator_switches_on(
-    world: &mut SurfaceWorld,
-    surface_name: String,
-    minutes: i64,
-) {
-    world.admin_response = Some(switch_on(world, None, &surface_name, minutes).await);
-}
-
-#[when(expr = "operator {string} switches on policy input capture for surface {string} for {int} minutes")]
-async fn named_operator_switches_on(
+#[given(expr = "operator {string} listens to the policy input of surface {string}")]
+async fn named_operator_listens(
     world: &mut SurfaceWorld,
     operator: String,
     surface_name: String,
-    minutes: i64,
 ) {
-    world.admin_response = Some(switch_on(world, Some(&operator), &surface_name, minutes).await);
+    listens(world, Some(&operator), &surface_name).await;
 }
 
-#[when(expr = "the operator saves surface {string} with a policy input capture end of its own")]
-async fn operator_saves_surface_with_own_end(
+#[given(expr = "the operator has stopped listening to the policy input of surface {string}")]
+async fn operator_has_stopped_listening(
     world: &mut SurfaceWorld,
     surface_name: String,
 ) {
-    let mut surface = stored_surface(world, &surface_name).await;
-    surface["policy_input_capture_until"] = json!("2099-01-01T00:00:00Z");
-    let surface_id = tracked_surface_id(world, &surface_name);
-    let response = client(world, None)
-        .await
-        .update_surface_recorded(&surface_id, &surface)
-        .await
-        .unwrap_or_else(|error| panic!("save surface '{surface_name}' through admin API: {error}"));
-    world.admin_response = Some(response);
+    let answer = ask_to_listen(world, None, &surface_name, false).await;
+    assert_eq!(answer["listening"], false, "stopping listening to policy input: {answer}");
 }
 
-#[then(expr = "surface {string} captures its policy input for at most {int} minutes")]
-async fn surface_captures_policy_input_for_at_most(
+async fn asks_to_listen(
     world: &mut SurfaceWorld,
-    surface_name: String,
-    minutes: i64,
+    operator: String,
+    surface_name: &str,
 ) {
-    let surface = stored_surface(world, &surface_name).await;
-    let until = surface["policy_input_capture_until"]
-        .as_str()
-        .unwrap_or_else(|| panic!("surface '{surface_name}' has no policy input capture end: {surface}"));
-    let until = chrono::DateTime::parse_from_rfc3339(until)
-        .unwrap_or_else(|error| panic!("policy input capture end {until:?}: {error}"))
-        .with_timezone(&chrono::Utc);
-    let now = chrono::Utc::now();
-    assert!(
-        until > now && until <= now + chrono::Duration::minutes(minutes),
-        "surface '{surface_name}' captures its policy input until {until}, expected within {minutes} minutes of {now}"
+    let answer = ask_to_listen(world, Some(&operator), surface_name, true).await;
+    world
+        .dashboard_listen_answers
+        .insert(operator, answer);
+}
+
+#[given(expr = "operator {string} has asked to listen to the policy input of surface {string}")]
+async fn named_operator_has_asked_to_listen(
+    world: &mut SurfaceWorld,
+    operator: String,
+    surface_name: String,
+) {
+    asks_to_listen(world, operator, &surface_name).await;
+}
+
+#[when(expr = "operator {string} asks to listen to the policy input of surface {string}")]
+async fn named_operator_asks_to_listen(
+    world: &mut SurfaceWorld,
+    operator: String,
+    surface_name: String,
+) {
+    asks_to_listen(world, operator, &surface_name).await;
+}
+
+#[then(expr = "operator {string} may not listen to policy input")]
+async fn named_operator_may_not_listen(
+    world: &mut SurfaceWorld,
+    operator: String,
+) {
+    let answer = world
+        .dashboard_listen_answers
+        .get(&operator)
+        .unwrap_or_else(|| panic!("operator '{operator}' must have asked to listen to policy input"));
+    assert_eq!(answer["listening"], false, "{answer}");
+    assert_eq!(answer["error"], "needs surfaces.edit and policies.edit", "{answer}");
+}
+
+async fn shows_capture(
+    world: &SurfaceWorld,
+    operator: &str,
+    slot: &str,
+    surface_name: &str,
+    decision: &str,
+    text: &str,
+) {
+    let surface_id = tracked_surface_id(world, surface_name);
+    let matches = |capture: &Value| {
+        capture["config_id"] == surface_id.as_str()
+            && capture["slot"] == slot
+            && capture["decision"] == decision
+            && capture["input"]
+                .to_string()
+                .contains(text)
+    };
+    for _ in 0..100 {
+        if received_of(world, operator, CAPTURED)
+            .iter()
+            .any(matches)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "no {slot} policy capture of surface '{surface_name}' ({surface_id}) deciding {decision:?} on an input showing {text:?}: {:#?}",
+        received_of(world, operator, CAPTURED)
     );
 }
 
@@ -229,28 +294,21 @@ async fn capture_view_shows(
     decision: String,
     text: String,
 ) {
-    let surface_id = tracked_surface_id(world, &surface_name);
-    let matches = |capture: &Value| {
-        capture["config_id"] == surface_id.as_str()
-            && capture["slot"] == slot.as_str()
-            && capture["decision"] == decision.as_str()
-            && capture["input"]
-                .to_string()
-                .contains(&text)
-    };
-    for _ in 0..100 {
-        if captures_of(world, THE_OPERATOR)
-            .iter()
-            .any(matches)
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!(
-        "no {slot} policy capture of surface '{surface_name}' ({surface_id}) deciding {decision:?} on an input showing {text:?}: {:#?}",
-        captures_of(world, THE_OPERATOR)
-    );
+    shows_capture(world, THE_OPERATOR, &slot, &surface_name, &decision, &text).await;
+}
+
+#[then(
+    expr = "the Capture view of operator {string} shows the {string} policy of surface {string} deciding {string} on an input showing {string}"
+)]
+async fn named_capture_view_shows(
+    world: &mut SurfaceWorld,
+    operator: String,
+    slot: String,
+    surface_name: String,
+    decision: String,
+    text: String,
+) {
+    shows_capture(world, &operator, &slot, &surface_name, &decision, &text).await;
 }
 
 async fn assert_no_capture(
@@ -258,7 +316,7 @@ async fn assert_no_capture(
     operator: &str,
 ) {
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let captures = captures_of(world, operator);
+    let captures = received_of(world, operator, CAPTURED);
     assert!(captures.is_empty(), "expected no policy input capture, received: {captures:#?}");
 }
 

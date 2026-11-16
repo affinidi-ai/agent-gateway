@@ -154,6 +154,9 @@ pub struct SurfaceConfigBuilder {
     pub streams_sign_in_records: bool,
     /// Console users sign in with SAML rather than passkeys.
     pub signs_in_with_saml: bool,
+    /// `rbac.json` permissions the gateway starts with, feature name to required role,
+    /// on top of the defaults.
+    pub rbac_permissions: Vec<(String, String)>,
     /// The surface's `caller_key`, and the secret it names when that is stored.
     pub caller_key: Option<CallerKeyFixture>,
 }
@@ -313,6 +316,7 @@ impl Default for SurfaceConfigBuilder {
             sign_in_event_stream: None,
             streams_sign_in_records: false,
             signs_in_with_saml: false,
+            rbac_permissions: Vec::new(),
             caller_key: None,
         }
     }

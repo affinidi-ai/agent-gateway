@@ -50,9 +50,9 @@ pub enum WsUpdate {
         #[serde(skip_serializing_if = "Option::is_none")]
         surface_variant: Option<String>,
     },
-    /// A policy evaluation on a surface with policy input capture switched on: its input,
-    /// credentials masked, and its outcome. Sent only to connections whose user holds
-    /// `surfaces.edit` and `policies.edit`.
+    /// A policy evaluation on a surface whose policy input a connection listens to: its
+    /// input, credentials masked, and its outcome. Sent only to the connections listening
+    /// to that surface, while their user holds `surfaces.edit` and `policies.edit`.
     PolicyInputCaptured {
         config_id: String,
         timestamp: String,
@@ -127,11 +127,31 @@ impl WsState {
 /// When `sections` is empty, all sections are forwarded (backward compatible).
 struct WsSubscription {
     sections: HashSet<String>,
+    /// The surfaces whose policy input this connection listens to.
+    policy_input: HashMap<String, crate::policies::input_capture::Listening>,
 }
+
+/// The most surfaces one connection may listen to the policy input of at once.
+const MAX_POLICY_INPUT_SURFACES: usize = 10;
+
+/// The longest surface id a policy input listen message may name.
+const MAX_SURFACE_ID_LEN: usize = 256;
 
 impl WsSubscription {
     fn new() -> Self {
-        Self { sections: HashSet::new() }
+        Self {
+            sections: HashSet::new(),
+            policy_input: HashMap::new(),
+        }
+    }
+
+    /// Whether this connection listens to the policy input of `surface_id`.
+    fn listens_to(
+        &self,
+        surface_id: &str,
+    ) -> bool {
+        self.policy_input
+            .contains_key(surface_id)
     }
 
     /// Returns true if the client is interested in `section`.
@@ -253,6 +273,80 @@ impl WsCaller {
         }
         true
     }
+}
+
+/// A client's request to start or stop listening to a surface's policy input.
+#[derive(Deserialize)]
+struct PolicyInputListenMessage {
+    surface_id: String,
+}
+
+/// The answer to a [`PolicyInputListenMessage`]: whether the connection now listens to the
+/// surface's policy input, and why not when it was refused.
+fn policy_input_listen_answer(
+    surface_id: &str,
+    listening: bool,
+    error: Option<&str>,
+) -> String {
+    let mut answer = serde_json::json!({
+        "type": "policy_input_capture",
+        "surface_id": surface_id,
+        "listening": listening,
+    });
+    if let Some(error) = error {
+        answer["error"] = serde_json::json!(error);
+    }
+    answer.to_string()
+}
+
+/// Start or stop listening to a surface's policy input for `subscription`, answering the
+/// client. Listening needs `surfaces.edit` and `policies.edit`.
+async fn listen_to_policy_input(
+    subscription: &RwLock<WsSubscription>,
+    caller: Option<&WsCaller>,
+    message: PolicyInputListenMessage,
+    start: bool,
+) -> String {
+    let surface_id = message.surface_id;
+    if surface_id.is_empty() || surface_id.len() > MAX_SURFACE_ID_LEN {
+        return policy_input_listen_answer("", false, Some("invalid surface id"));
+    }
+    if !start {
+        subscription
+            .write()
+            .await
+            .policy_input
+            .remove(&surface_id);
+        info!(surface_id = %surface_id, "Stopped listening to policy input");
+        return policy_input_listen_answer(&surface_id, false, None);
+    }
+    if !WsCaller::policy_input_allowed(caller).await {
+        return policy_input_listen_answer(&surface_id, false, Some("needs surfaces.edit and policies.edit"));
+    }
+    let mut subscription = subscription.write().await;
+    if !subscription.listens_to(&surface_id) {
+        if subscription
+            .policy_input
+            .len()
+            >= MAX_POLICY_INPUT_SURFACES
+        {
+            return policy_input_listen_answer(
+                &surface_id,
+                false,
+                Some("listening to too many surfaces on this connection"),
+            );
+        }
+        let listening = crate::policies::input_capture::listen(&surface_id);
+        subscription
+            .policy_input
+            .insert(surface_id.clone(), listening);
+        info!(
+            surface_id = %surface_id,
+            user_id = caller.map(|caller| caller.user_id.as_str()).unwrap_or_default(),
+            "Listening to policy input"
+        );
+    }
+    policy_input_listen_answer(&surface_id, true, None)
 }
 
 /// Message sent by a client to configure its subscription.
@@ -502,6 +596,9 @@ async fn handle_socket(
 
     // Per-connection subscription – shared between send & recv tasks.
     let subscription = Arc::new(RwLock::new(WsSubscription::new()));
+    let caller = Arc::new(caller);
+    // Answers to the client's own requests, sent by the send task.
+    let (answer_tx, mut answer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     // Send initial connection confirmation
     if let Err(e) = sender
@@ -527,11 +624,13 @@ async fn handle_socket(
 
     // Spawn a task to handle outgoing messages and keep-alive pings
     let send_sub = Arc::clone(&subscription);
+    let send_caller = Arc::clone(&caller);
     let mut send_task = tokio::spawn(async move {
+        let caller = (*send_caller).as_ref();
         let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut logs_allowed = WsCaller::logs_allowed(caller.as_ref()).await;
-        let mut policy_input_allowed = WsCaller::policy_input_allowed(caller.as_ref()).await;
+        let mut logs_allowed = WsCaller::logs_allowed(caller).await;
+        let mut policy_input_allowed = WsCaller::policy_input_allowed(caller).await;
 
         loop {
             tokio::select! {
@@ -540,6 +639,11 @@ async fn handle_socket(
                     match update_result {
                         Ok(update) => {
                             if !admits(&update, logs_allowed, policy_input_allowed) {
+                                continue;
+                            }
+                            if let WsUpdate::PolicyInputCaptured { config_id, .. } = &update
+                                && !send_sub.read().await.listens_to(config_id)
+                            {
                                 continue;
                             }
                             // DashboardDelta is already serialized; apply per-client
@@ -569,9 +673,29 @@ async fn handle_socket(
                     }
                 }
                 // Send periodic pings to keep connection alive
+                Some(answer) = answer_rx.recv() => {
+                    if sender.send(Message::Text(answer.into())).await.is_err() {
+                        break;
+                    }
+                }
                 _ = ping_interval.tick() => {
-                    logs_allowed = WsCaller::logs_allowed(caller.as_ref()).await;
-                    policy_input_allowed = WsCaller::policy_input_allowed(caller.as_ref()).await;
+                    logs_allowed = WsCaller::logs_allowed(caller).await;
+                    policy_input_allowed = WsCaller::policy_input_allowed(caller).await;
+                    if !policy_input_allowed {
+                        let stopped: Vec<String> = send_sub
+                            .write()
+                            .await
+                            .policy_input
+                            .drain()
+                            .map(|(surface_id, _)| surface_id)
+                            .collect();
+                        for surface_id in stopped {
+                            let answer = policy_input_listen_answer(&surface_id, false, Some("needs surfaces.edit and policies.edit"));
+                            if sender.send(Message::Text(answer.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
                     if sender.send(Message::Ping("ping".into())).await.is_err() {
                         break;
                     }
@@ -584,17 +708,39 @@ async fn handle_socket(
     // Handle incoming messages from client (ping/pong, close, and subscribe)
     let recv_sub = Arc::clone(&subscription);
     let recv_user_id = user_id.clone();
+    let recv_caller = Arc::clone(&caller);
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
                 Message::Text(text) => {
                     // Try to parse as a subscribe command
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if value
+                        let message_type = value
                             .get("type")
                             .and_then(|t| t.as_str())
-                            == Some("subscribe")
+                            .map(str::to_string);
+                        if let Some(start @ ("capture_policy_input" | "stop_capturing_policy_input")) =
+                            message_type.as_deref()
                         {
+                            let answer = match serde_json::from_value::<PolicyInputListenMessage>(value) {
+                                Ok(message) => {
+                                    listen_to_policy_input(
+                                        &recv_sub,
+                                        (*recv_caller).as_ref(),
+                                        message,
+                                        start == "capture_policy_input",
+                                    )
+                                    .await
+                                }
+                                Err(_) => policy_input_listen_answer("", false, Some("invalid surface id")),
+                            };
+                            if answer_tx
+                                .send(answer)
+                                .is_err()
+                            {
+                                break;
+                            }
+                        } else if message_type.as_deref() == Some("subscribe") {
                             if let Ok(sub_msg) = serde_json::from_value::<SubscribeMessage>(value) {
                                 let sections: HashSet<String> = sub_msg
                                     .sections
@@ -1014,9 +1160,137 @@ mod tests {
         assert!(!super::WsCaller::policy_input_allowed(None).await);
     }
 
+    #[tokio::test]
+    async fn a_connection_whose_user_holds_only_one_of_surfaces_edit_and_policies_edit_reads_no_policy_input() {
+        use crate::auth::types::UserRole;
+
+        for (granted, allowed) in [
+            (&["surfaces.edit"][..], false),
+            (&["policies.edit"][..], false),
+            (&["surfaces.edit", "policies.edit"][..], true),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let guard = guard_with_user_and_permissions(&dir, UserRole::PowerUser, granted).await;
+            let poweruser = caller_for(guard, "user-1").await;
+            assert_eq!(super::WsCaller::policy_input_allowed(Some(&poweruser)).await, allowed, "{granted:?}");
+        }
+    }
+
+    fn listen_message(surface_id: &str) -> super::PolicyInputListenMessage {
+        super::PolicyInputListenMessage {
+            surface_id: surface_id.to_string(),
+        }
+    }
+
+    fn answer(text: String) -> serde_json::Value {
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_connection_captures_a_surface_while_it_listens_and_stops_when_it_stops_or_closes() {
+        use crate::auth::types::UserRole;
+        use crate::policies::input_capture::is_captured;
+
+        let dir = TempDir::new().unwrap();
+        let admin = caller_for(guard_with_user(&dir, UserRole::Administrator).await, "user-1").await;
+        let subscription = tokio::sync::RwLock::new(super::WsSubscription::new());
+
+        let started =
+            answer(super::listen_to_policy_input(&subscription, Some(&admin), listen_message("ws-listen"), true).await);
+        assert_eq!(started["type"], "policy_input_capture");
+        assert_eq!(started["surface_id"], "ws-listen");
+        assert_eq!(started["listening"], true);
+        assert!(is_captured("ws-listen"));
+        assert!(
+            subscription
+                .read()
+                .await
+                .listens_to("ws-listen")
+        );
+
+        let stopped = answer(
+            super::listen_to_policy_input(&subscription, Some(&admin), listen_message("ws-listen"), false).await,
+        );
+        assert_eq!(stopped["listening"], false);
+        assert!(!is_captured("ws-listen"));
+
+        super::listen_to_policy_input(&subscription, Some(&admin), listen_message("ws-closed"), true).await;
+        assert!(is_captured("ws-closed"));
+        drop(subscription);
+        assert!(!is_captured("ws-closed"));
+    }
+
+    #[tokio::test]
+    async fn a_connection_without_both_permissions_or_a_valid_surface_id_cannot_listen() {
+        use crate::auth::types::UserRole;
+        use crate::policies::input_capture::is_captured;
+
+        let dir = TempDir::new().unwrap();
+        let user = caller_for(guard_with_user(&dir, UserRole::User).await, "user-1").await;
+        let subscription = tokio::sync::RwLock::new(super::WsSubscription::new());
+
+        let refused =
+            answer(super::listen_to_policy_input(&subscription, Some(&user), listen_message("ws-refused"), true).await);
+        assert_eq!(refused["listening"], false);
+        assert_eq!(refused["error"], "needs surfaces.edit and policies.edit");
+        assert!(!is_captured("ws-refused"));
+
+        let anonymous =
+            answer(super::listen_to_policy_input(&subscription, None, listen_message("ws-anonymous"), true).await);
+        assert_eq!(anonymous["listening"], false);
+        assert!(!is_captured("ws-anonymous"));
+
+        let dir = TempDir::new().unwrap();
+        let admin = caller_for(guard_with_user(&dir, UserRole::Administrator).await, "user-1").await;
+        let empty = answer(super::listen_to_policy_input(&subscription, Some(&admin), listen_message(""), true).await);
+        assert_eq!(empty["error"], "invalid surface id");
+        let long_id = "s".repeat(super::MAX_SURFACE_ID_LEN + 1);
+        let long =
+            answer(super::listen_to_policy_input(&subscription, Some(&admin), listen_message(&long_id), true).await);
+        assert_eq!(long["error"], "invalid surface id");
+        assert!(!is_captured(&long_id));
+    }
+
+    #[tokio::test]
+    async fn a_connection_listens_to_at_most_the_maximum_number_of_surfaces() {
+        use crate::auth::types::UserRole;
+
+        let dir = TempDir::new().unwrap();
+        let admin = caller_for(guard_with_user(&dir, UserRole::Administrator).await, "user-1").await;
+        let subscription = tokio::sync::RwLock::new(super::WsSubscription::new());
+        for i in 0..super::MAX_POLICY_INPUT_SURFACES {
+            let started = answer(
+                super::listen_to_policy_input(
+                    &subscription,
+                    Some(&admin),
+                    listen_message(&format!("ws-max-{i}")),
+                    true,
+                )
+                .await,
+            );
+            assert_eq!(started["listening"], true);
+        }
+
+        let over = answer(
+            super::listen_to_policy_input(&subscription, Some(&admin), listen_message("ws-max-over"), true).await,
+        );
+
+        assert_eq!(over["listening"], false);
+        assert!(!crate::policies::input_capture::is_captured("ws-max-over"));
+    }
+
     async fn guard_with_user(
         dir: &TempDir,
         role: crate::auth::types::UserRole,
+    ) -> crate::auth_manager::middleware::RbacGuard {
+        guard_with_user_and_permissions(dir, role, &["logs.view"]).await
+    }
+
+    /// A guard for a user with `role`, where `poweruser` may use each feature in `poweruser_features`.
+    async fn guard_with_user_and_permissions(
+        dir: &TempDir,
+        role: crate::auth::types::UserRole,
+        poweruser_features: &[&str],
     ) -> crate::auth_manager::middleware::RbacGuard {
         let storage = crate::auth::storage::PasskeyStorage::new(
             dir.path()
@@ -1035,8 +1309,10 @@ mod tests {
             .await
             .unwrap();
         let mut rbac = crate::rbac::RbacConfig::default();
-        rbac.permissions
-            .insert("logs.view".to_string(), "poweruser".to_string());
+        for feature in poweruser_features {
+            rbac.permissions
+                .insert(feature.to_string(), "poweruser".to_string());
+        }
         crate::auth_manager::middleware::RbacGuard::new(std::sync::Arc::new(storage), std::sync::Arc::new(rbac))
     }
 

@@ -102,6 +102,55 @@ pub fn get_default_temp_dir() -> TempDir {
     }
 }
 
+/// An operator's open dashboard WebSocket: the messages it received and a way to send.
+/// Dropping it closes the connection.
+#[derive(Debug)]
+pub struct DashboardSocket {
+    received: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    outgoing: tokio::sync::mpsc::UnboundedSender<String>,
+    reader: tokio::task::JoinHandle<()>,
+    writer: tokio::task::JoinHandle<()>,
+}
+
+impl DashboardSocket {
+    pub fn new(
+        received: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        outgoing: tokio::sync::mpsc::UnboundedSender<String>,
+        reader: tokio::task::JoinHandle<()>,
+        writer: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            received,
+            outgoing,
+            reader,
+            writer,
+        }
+    }
+
+    pub fn received(&self) -> Vec<serde_json::Value> {
+        self.received
+            .lock()
+            .expect("dashboard messages lock")
+            .clone()
+    }
+
+    pub fn send(
+        &self,
+        text: String,
+    ) {
+        self.outgoing
+            .send(text)
+            .expect("the dashboard WebSocket is open");
+    }
+}
+
+impl Drop for DashboardSocket {
+    fn drop(&mut self) {
+        self.reader.abort();
+        self.writer.abort();
+    }
+}
+
 #[derive(Debug, World)]
 #[world(init = Self::new)]
 pub struct SurfaceWorld {
@@ -130,8 +179,10 @@ pub struct SurfaceWorld {
     pub gateway_issuer_did: Option<String>,
     pub operator_roles: HashMap<String, String>,
     pub operator_clients: HashMap<String, AdminApiClient>,
-    /// Policy input captures each operator's dashboard WebSocket received, by operator.
-    pub dashboard_captures: HashMap<String, std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>>,
+    /// Each operator's open dashboard WebSocket, by operator.
+    pub dashboard_sockets: HashMap<String, DashboardSocket>,
+    /// The answer each operator got to its last request to listen to policy input.
+    pub dashboard_listen_answers: HashMap<String, serde_json::Value>,
     pub human_clients: HashMap<String, Vec<AdminApiClient>>,
     pub terms_enabled: bool,
     pub affinidi_cache_seeded: bool,
@@ -237,7 +288,8 @@ impl SurfaceWorld {
             gateway_issuer_did: None,
             operator_roles: HashMap::new(),
             operator_clients: HashMap::new(),
-            dashboard_captures: HashMap::new(),
+            dashboard_sockets: HashMap::new(),
+            dashboard_listen_answers: HashMap::new(),
             human_clients: HashMap::new(),
             terms_enabled: false,
             affinidi_cache_seeded: false,

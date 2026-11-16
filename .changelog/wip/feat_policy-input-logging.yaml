@@ -2,25 +2,27 @@ branch: feat/policy-input-logging
 changes:
   added:
     - timestamp: '2026-11-12T00:00:00Z'
-      title: ⭐ Capture a surface's OPA policy input on demand for up to 60 minutes
+      title: ⭐ Capture a surface's OPA policy input live while a dashboard user listens
       description: >-
-        PUT /v1/surfaces/{id}/policy-input-capture with {"minutes": 1-60} sends each request and response
-        policy evaluation on that surface (gateway, surface, Transit Point and appliance-wide planes,
-        on the direct, Fabric and MCP proxy paths) to the dashboard as a policy_input_captured WebSocket
-        update with its input and its allow, deny reason or error, until the stored
-        policy_input_capture_until passes or DELETE on the same path stops it. Credential-named
-        values, JWTs and Bearer or Basic values are masked first. Nothing is logged or stored, and
-        only dashboard sessions whose user holds surfaces.edit and policies.edit receive the
-        updates; both routes need the same two permissions. Policy authors can see the input
-        structure again without the gateway logging it. See docs/POLICY.md.
+        A dashboard WebSocket connection can listen to one surface's policy input with a
+        capture_policy_input message and stop with stop_capturing_policy_input. While at least one
+        connection listens, each request and response policy evaluation on that surface (gateway,
+        surface, Transit Point and appliance-wide planes, on the direct, Fabric and MCP proxy paths)
+        is sent to the listening connections only, as a policy_input_captured update with its input
+        and its allow, deny reason or error. Credential-named values, JWTs and Bearer or Basic values
+        are masked first. Listening needs surfaces.edit and policies.edit, is checked again on each
+        keep-alive ping, and ends when the connection closes. Nothing is logged or stored, and the
+        surface configuration is not changed. Policy authors can see the input structure again
+        without the gateway logging it. See docs/POLICY.md.
     - timestamp: '2026-11-12T00:00:00Z'
-      title: Show captured policy input and decisions in a surface's Capture view
+      title: Show captured policy input and decisions live in a surface's Capture view
       description: >-
-        The Surface Builder's Capture view has a Policy Input card with a Capture policy input
-        switch that turns capture on for 30 minutes, shows when it stops, and turns it
-        off again, for users with both surfaces.edit and policies.edit. While on, the card lists
-        each policy evaluation with its slot, decision and reason, and shows or copies its input
-        to try in the policy Test panel. It is for developing and testing policies only.
+        The Surface Builder's Capture view has a Policy Input card with a Listen to policy input
+        button for users with both surfaces.edit and policies.edit. While listening, the card lists
+        each policy evaluation with its slot, decision and reason, and shows or copies its input to
+        try in the policy Test panel. Stopping, leaving the view or reloading the page ends
+        listening. On a surface with no policy yet, it says a request policy must be added before
+        there is anything to capture. It is for developing and testing policies only.
   changed: []
   fixed:
     - timestamp: '2026-11-13T00:00:00Z'

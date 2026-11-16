@@ -20,13 +20,13 @@ use crate::tenancy::{
 };
 use crate::trust_registry_verification::recorder_status::{RecorderStatus, global_store};
 
-pub(super) fn tenant_context(context: &Option<Extension<PatTenantContext>>) -> Option<&PatTenantContext> {
+fn tenant_context(context: &Option<Extension<PatTenantContext>>) -> Option<&PatTenantContext> {
     context
         .as_ref()
         .map(|Extension(context)| context)
 }
 
-pub(super) fn resource_scope(scope: &Option<Extension<PatResourceScope>>) -> Option<&PatResourceScope> {
+fn resource_scope(scope: &Option<Extension<PatResourceScope>>) -> Option<&PatResourceScope> {
     scope
         .as_ref()
         .map(|Extension(scope)| scope)
@@ -37,7 +37,7 @@ pub(super) fn resource_scope(scope: &Option<Extension<PatResourceScope>>) -> Opt
 /// [`PatResourceScope`].
 /// The management caller a surface change is audited under: the console user,
 /// and the access token when the request came with one.
-pub(super) fn management_actor(
+fn management_actor(
     caller: &Option<Extension<AuthGuardOk>>,
     delegation: &Option<Extension<PatDelegationContext>>,
 ) -> Option<crate::delegation_vault::audit::AuditCallerContext> {
@@ -2749,7 +2749,7 @@ fn agent_pay_policies_mut(
 /// and a snapshot refresh) together with applying them to the running gateway,
 /// so a snapshot refresh never overwrites a concurrent edit and the running
 /// gateway ends up with what was stored last.
-pub(super) static SURFACE_WRITES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static SURFACE_WRITES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Re-fetch the manifest of every payment surface an `agent_pay` policy
 /// points at and store a change in what it offers, or in its points' labels or
@@ -4323,9 +4323,6 @@ async fn validate_and_save_surface(
     let allowlist = crate::egress::bdd_egress_allowlist();
     surface.trust_check_split = surface.has_trust_check_lists();
     surface.transit_point_source_auth = surface.has_transit_point_source_auth();
-    surface.policy_input_capture_until = existing
-        .and_then(|existing| existing.policy_input_capture_until)
-        .filter(|until| *until > chrono::Utc::now());
     let _write = SURFACE_WRITES.lock().await;
     super::surface_grants::write_surface(
         &super::surface_grants::GrantRemoval::of(state, allowlist.as_deref(), actor),
@@ -4768,7 +4765,7 @@ pub struct DeleteSurfaceResponse {
 }
 
 /// Action being applied to the running gateway after a surface mutation.
-pub(super) enum SurfaceChange<'a> {
+enum SurfaceChange<'a> {
     /// Create or update — the new surface is materialised into a single
     /// `ChannelMapping` and slotted into the existing port listener
     /// without restarting other channels' tasks.
@@ -4803,7 +4800,7 @@ pub(super) enum SurfaceChange<'a> {
 /// `/v1/config/reload` explicitly.
 ///
 /// Holds the surface reload lock; see [`apply_surface_change_while_locked`].
-pub(super) async fn apply_surface_change(
+async fn apply_surface_change(
     state: &IdentityApiState,
     change: SurfaceChange<'_>,
 ) {
@@ -5144,7 +5141,7 @@ pub(crate) fn surface_visible(
     can_access(tenant_id, context) && scope_allows_resource(scope, context, ResourceKind::Surfaces, surface_id)
 }
 
-pub(super) fn surface_writable(
+fn surface_writable(
     tenant_id: Option<&str>,
     surface_id: &str,
     context: Option<&PatTenantContext>,
@@ -8610,7 +8607,6 @@ mod validation_tests {
             caller_key: None,
             trust_check_split: false,
             transit_point_source_auth: false,
-            policy_input_capture_until: None,
             browser_origins: Vec::new(),
         }
     }

@@ -147,13 +147,6 @@ pub struct AgentSurface {
     /// ignored.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub transit_point_source_auth: bool,
-
-    /// Until when the policy input of each evaluation on this surface is sent to the
-    /// dashboard's Capture view (see [`crate::policies::input_capture`]). Set only
-    /// through `PUT /v1/surfaces/{id}/policy-input-capture`; a value a surface write
-    /// sends is ignored.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy_input_capture_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// The most `browser_origins` a surface may list.
@@ -6837,7 +6830,6 @@ mod tests {
             caller_key: None,
             trust_check_split: false,
             transit_point_source_auth: false,
-            policy_input_capture_until: None,
             browser_origins: Vec::new(),
         };
 
@@ -6990,7 +6982,6 @@ mod tests {
             caller_key: None,
             trust_check_split: false,
             transit_point_source_auth: false,
-            policy_input_capture_until: None,
             browser_origins: Vec::new(),
         };
 
@@ -8536,7 +8527,6 @@ mod tests {
             caller_key: None,
             trust_check_split: false,
             transit_point_source_auth: false,
-            policy_input_capture_until: None,
             browser_origins: Vec::new(),
         };
         let value = serde_json::to_value(&surface).expect("surface must serialize");

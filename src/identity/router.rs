@@ -727,13 +727,6 @@ pub fn create_identity_api_router(
                 "/v1/surfaces/{surface_id}",
                 delete(handlers::delete_surface).layer(require_feature(s.clone(), r.clone(), Feature::SurfacesDelete)),
             )
-            .route(
-                "/v1/surfaces/{surface_id}/policy-input-capture",
-                put(handlers::surface_policy_input_capture::enable_policy_input_capture)
-                    .delete(handlers::surface_policy_input_capture::disable_policy_input_capture)
-                    .layer(require_feature(s.clone(), r.clone(), Feature::PoliciesEdit))
-                    .layer(require_feature(s.clone(), r.clone(), Feature::SurfacesEdit)),
-            )
             // H1 — surface variants
             .route(
                 "/v1/surfaces/{surface_id}/variants",

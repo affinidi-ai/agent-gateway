@@ -1,15 +1,12 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import '@testing-library/jest-dom';
-import { apiClient } from '../../../../api';
 import { SurfaceMetaProvider, type SurfaceMetaValue } from '../../SurfaceMetaContext';
 import PolicyInputCaptureControl from '../PolicyInputCaptureControl';
 
-jest.mock('../../../../api', () => ({
-  apiClient: {
-    setSurfacePolicyInputCapture: jest.fn(),
-    clearSurfacePolicyInputCapture: jest.fn(),
-  },
+const mockListen = jest.fn();
+jest.mock('../../../../context/AppContext', () => ({
+  useApp: () => ({ actions: { listenToPolicyInput: mockListen } }),
 }));
 
 let mockGranted: Set<string>;
@@ -17,14 +14,7 @@ jest.mock('../../../../context/PermissionsContext', () => ({
   usePermissions: () => ({ hasPermission: (p: string) => mockGranted.has(p), loading: false }),
 }));
 
-const setCapture = apiClient.setSurfacePolicyInputCapture as jest.Mock;
-const clearCapture = apiClient.clearSurfacePolicyInputCapture as jest.Mock;
-
-function renderControl(
-  meta: Partial<SurfaceMetaValue>,
-  initialUntil?: string | null,
-  onChange?: (until: string | null) => void
-) {
+function renderControl(meta: Partial<SurfaceMetaValue> = {}) {
   const value = {
     isCreate: false,
     readOnly: false,
@@ -33,12 +23,21 @@ function renderControl(
   } as SurfaceMetaValue;
   return render(
     <SurfaceMetaProvider value={value}>
-      <PolicyInputCaptureControl initialUntil={initialUntil} onChange={onChange} />
+      <PolicyInputCaptureControl />
     </SurfaceMetaProvider>
   );
 }
 
-const inMinutes = (m: number) => new Date(Date.now() + m * 60_000).toISOString();
+const answer = (detail: Record<string, unknown>) =>
+  act(() => {
+    window.dispatchEvent(
+      new CustomEvent('ws-message', {
+        detail: { type: 'policy_input_capture', surface_id: 'surface-1', ...detail },
+      })
+    );
+  });
+
+const listenButton = () => screen.getByTestId('policy-input-capture-listen');
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -48,75 +47,85 @@ beforeEach(() => {
 describe('PolicyInputCaptureControl', () => {
   it('is hidden while creating a surface', () => {
     renderControl({ isCreate: true, surfaceId: undefined });
-    expect(screen.queryByTestId('policy-input-capture-switch')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('policy-input-capture-listen')).not.toBeInTheDocument();
   });
 
   it('is hidden without a saved surface id', () => {
     renderControl({ surfaceId: undefined });
-    expect(screen.queryByTestId('policy-input-capture-switch')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('policy-input-capture-listen')).not.toBeInTheDocument();
   });
 
-  it('is disabled without policies.edit', () => {
-    mockGranted = new Set(['surfaces.edit']);
-    renderControl({});
-    expect(screen.getByTestId('policy-input-capture-switch')).toBeDisabled();
+  it.each([['surfaces.edit'], ['policies.edit']])(
+    'is disabled and says why with only %s',
+    permission => {
+      mockGranted = new Set([permission]);
+      renderControl();
+      expect(listenButton()).toBeDisabled();
+      expect(screen.getByTestId('policy-input-capture-not-allowed')).toHaveTextContent(
+        'Needs permission to edit surfaces and policies'
+      );
+    }
+  );
+
+  it('starts listening, shows it, and stops on a second click', () => {
+    renderControl();
+    expect(listenButton()).toHaveTextContent('Listen to policy input');
+
+    fireEvent.click(listenButton());
+    expect(mockListen).toHaveBeenLastCalledWith('surface-1', true);
+    expect(screen.getByTestId('policy-input-capture-listening')).toHaveTextContent('Listening');
+    expect(listenButton()).toHaveTextContent('Stop listening');
+
+    fireEvent.click(listenButton());
+    expect(mockListen).toHaveBeenLastCalledWith('surface-1', false);
+    expect(screen.queryByTestId('policy-input-capture-listening')).not.toBeInTheDocument();
   });
 
-  it('shows the stored state but is disabled in read-only mode', () => {
-    renderControl({ readOnly: true }, inMinutes(10));
-    expect(screen.getByTestId('policy-input-capture-switch')).toBeChecked();
-    expect(screen.getByTestId('policy-input-capture-switch')).toBeDisabled();
-    expect(screen.getByTestId('policy-input-capture-until')).toHaveTextContent('On until');
+  it('stops listening when the view closes', () => {
+    const { unmount } = renderControl();
+    fireEvent.click(listenButton());
+    mockListen.mockClear();
+
+    unmount();
+
+    expect(mockListen).toHaveBeenCalledWith('surface-1', false);
   });
 
-  it('shows a stored end time in the past as off', () => {
-    renderControl({}, inMinutes(-1));
-    expect(screen.getByTestId('policy-input-capture-switch')).not.toBeChecked();
-    expect(screen.queryByTestId('policy-input-capture-until')).not.toBeInTheDocument();
-  });
+  it('does not stop listening on a re-render', () => {
+    const { rerender } = renderControl();
+    fireEvent.click(listenButton());
+    mockListen.mockClear();
 
-  it('says for how long capture runs while it is off', () => {
-    renderControl({});
-    expect(screen.getByTestId('policy-input-capture-duration')).toHaveTextContent('for 30 minutes');
-  });
-
-  it('switching on sends 30 minutes and shows the end time', async () => {
-    const until = inMinutes(30);
-    const onChange = jest.fn();
-    setCapture.mockResolvedValue({
-      surface_id: 'surface-1',
-      policy_input_capture_until: until,
-    });
-    renderControl({}, undefined, onChange);
-
-    fireEvent.click(screen.getByTestId('policy-input-capture-switch'));
-
-    expect(await screen.findByTestId('policy-input-capture-until')).toHaveTextContent('On until');
-    expect(setCapture).toHaveBeenCalledWith('surface-1', 30);
-    expect(screen.getByTestId('policy-input-capture-switch')).toBeChecked();
-    expect(onChange).toHaveBeenCalledWith(until);
-  });
-
-  it('switching off sends DELETE and shows it off', async () => {
-    clearCapture.mockResolvedValue({ surface_id: 'surface-1', policy_input_capture_until: null });
-    renderControl({}, inMinutes(10));
-
-    fireEvent.click(screen.getByTestId('policy-input-capture-switch'));
-
-    await waitFor(() =>
-      expect(screen.getByTestId('policy-input-capture-switch')).not.toBeChecked()
+    rerender(
+      <SurfaceMetaProvider
+        value={{ isCreate: false, readOnly: false, surfaceId: 'surface-1' } as SurfaceMetaValue}
+      >
+        <PolicyInputCaptureControl />
+      </SurfaceMetaProvider>
     );
-    expect(clearCapture).toHaveBeenCalledWith('surface-1');
-    expect(screen.queryByTestId('policy-input-capture-until')).not.toBeInTheDocument();
+
+    expect(mockListen).not.toHaveBeenCalled();
   });
 
-  it('shows an inline error when the request fails and stays off', async () => {
-    setCapture.mockRejectedValue(new Error('Forbidden'));
-    renderControl({});
+  it('shows the gateway refusing to listen and goes back to not listening', () => {
+    renderControl();
+    fireEvent.click(listenButton());
 
-    fireEvent.click(screen.getByTestId('policy-input-capture-switch'));
+    answer({ listening: false, error: 'needs surfaces.edit and policies.edit' });
 
-    expect(await screen.findByTestId('policy-input-capture-error')).toHaveTextContent('Forbidden');
-    expect(screen.getByTestId('policy-input-capture-switch')).not.toBeChecked();
+    expect(screen.getByTestId('policy-input-capture-error')).toHaveTextContent(
+      'needs surfaces.edit and policies.edit'
+    );
+    expect(screen.queryByTestId('policy-input-capture-listening')).not.toBeInTheDocument();
+  });
+
+  it('ignores answers about another surface', () => {
+    renderControl();
+    fireEvent.click(listenButton());
+
+    answer({ surface_id: 'surface-2', listening: false, error: 'refused' });
+
+    expect(screen.getByTestId('policy-input-capture-listening')).toBeInTheDocument();
+    expect(screen.queryByTestId('policy-input-capture-error')).not.toBeInTheDocument();
   });
 });

@@ -631,33 +631,37 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
 
 - The surface's Capture view (`monitoring/capture/SurfaceCapturePanel.tsx`) has a **Policy Input**
   card (`monitoring/capture/PolicyInputCaptureCard.tsx`) between the latest payload and the
-  payload history. Its header holds the **Capture policy input** switch
+  payload history. Its header holds the **Listen to policy input** button
   (`monitoring/PolicyInputCaptureControl.tsx`), shown only on a saved surface (never while
-  creating). Read-only mode shows the state with the controls disabled. The Monitoring view
-  itself has only the Capture button.
-- The switch needs both `surfaces.edit` and `policies.edit`; without either the controls are
-  disabled.
-- While off, "for 30 minutes" sits beside the switch; switching on sends
-  `PUT /v1/surfaces/{id}/policy-input-capture` with `{"minutes": 30}`. There is no duration
-  choice in the dashboard; the API still takes 1 to 60 minutes. While on, it shows "On until
-  HH:MM" (local time) in place of that text, and switching off sends `DELETE` to the same path.
-  It starts from the stored surface's `policy_input_capture_until`, shows off once that time
-  passes, and reports the new end time back to the Monitoring view so reopening Capture keeps it.
+  creating). The Monitoring view itself has only the Capture button.
+- Capture is live and lasts only while the view is open: the button sends
+  `capture_policy_input` on the dashboard WebSocket through `actions.listenToPolicyInput` in
+  `AppContext`, and turns into **Stop listening** with a "Listening" indicator. Clicking it again,
+  leaving the Capture view (unmount) or reloading the page stops it; nothing is stored, so a
+  reload starts with listening off. `AppContext` sends the open listens again after a socket
+  reconnect. There is no duration and no admin API call.
+- The button needs both `surfaces.edit` and `policies.edit`; without either it is disabled with
+  "Needs permission to edit surfaces and policies" beside it. When the gateway answers a listen
+  with `listening: false` and an `error`, the button goes back to **Listen to policy input** and
+  the error shows inline beside it.
 - The card lists the last 20 `policy_input_captured` WebSocket updates of the surface (see
   `monitoring/capture/usePolicyInputCaptureStream.ts`), newest first: time, policy slot with a
   variant badge, a decision badge (Allow green, Deny red, Error yellow) with the reason, a
   **Show input** toggle that opens the input JSON, and a copy button for the input. With none it
-  says to switch capture on and send a request. Pause and Clear Payloads apply to it too.
-- The note that captures hold request data with credentials masked, reach only users who may
-  edit surfaces and policies, are neither logged nor stored, are for developing and testing
-  policies only, and stop by themselves sits behind the switch's `FieldHelp`. A failed request
-  shows an inline error beside the switch.
+  says to listen and send a request. Pause and Clear Payloads apply to it too.
+- While the surface has no Access Point, Target, response or Transit Point policy
+  (`surfaceHasPolicy`), the card shows an info note above the list: the surface has nothing of
+  its own to capture, only a gateway or appliance-wide policy shows, and a request policy (an
+  allow-all one is enough) should be added first. The button's `FieldHelp` says the same.
+- The note that captures hold request data with credentials masked, reach only the listening
+  user, are neither logged nor stored, are for developing and testing policies only, and stop
+  when listening stops sits behind the button's `FieldHelp`.
 
 | Policy input capture element                    | Test id                                                                |
 | ----------------------------------------------- | ---------------------------------------------------------------------- |
-| Control, switch, duration, end time             | `policy-input-capture`, `policy-input-capture-switch`, `policy-input-capture-duration`, `policy-input-capture-until` |
+| Control, button, listening, missing permission  | `policy-input-capture`, `policy-input-capture-listen`, `policy-input-capture-listening`, `policy-input-capture-not-allowed` |
 | Help and error                                  | `field-help-policy-input-capture`, `policy-input-capture-error`        |
-| Card, empty state, row                          | `policy-input-capture-card`, `policy-input-capture-empty`, `policy-input-capture-row` |
+| Card, empty state, no-policy note, row          | `policy-input-capture-card`, `policy-input-capture-empty`, `policy-input-capture-no-policy`, `policy-input-capture-row` |
 | Reason, input toggle, input, copy               | `policy-input-capture-reason`, `policy-input-capture-toggle`, `policy-input-capture-input`, `policy-input-capture-copy` |
 
 ## Trust Check

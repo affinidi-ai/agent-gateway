@@ -1,14 +1,23 @@
 import React, { useState } from 'react';
+import type { AgentSurface } from '../../../../api';
 import { formatTime } from '../../../../utils/stringUtils';
 import PolicyInputCaptureControl from '../PolicyInputCaptureControl';
 import { CapturedPolicyInput, MAX_POLICY_INPUTS } from './usePolicyInputCaptureStream';
 
 interface PolicyInputCaptureCardProps {
   captures: CapturedPolicyInput[];
-  /** The stored surface's `policy_input_capture_until`. */
-  captureUntil?: string | null;
-  onCaptureChange?: (until: string | null) => void;
+  /** Whether the surface has a policy of its own; without one it has nothing to capture. */
+  hasPolicy?: boolean;
 }
+
+/** Whether `surface` has an Access Point, Target, response or Transit Point policy. */
+export const surfaceHasPolicy = (surface: AgentSurface): boolean =>
+  Boolean(
+    surface.access_point?.inbound_policy ||
+    surface.target?.policy ||
+    surface.target?.response_policy ||
+    surface.transit?.points?.some(point => point.policy)
+  );
 
 const decisionBadge = (decision: string) => {
   if (decision === 'allow') {
@@ -42,8 +51,7 @@ const copyText = async (text: string) => {
 
 const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
   captures,
-  captureUntil,
-  onCaptureChange,
+  hasPolicy = true,
 }) => {
   const [openId, setOpenId] = useState<number | null>(null);
 
@@ -58,13 +66,20 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
             </span>
           )}
         </h6>
-        <PolicyInputCaptureControl initialUntil={captureUntil} onChange={onCaptureChange} />
+        <PolicyInputCaptureControl />
       </div>
       <div className="card-body">
+        {!hasPolicy && (
+          <div className="alert alert-info small py-2" data-testid="policy-input-capture-no-policy">
+            This surface has no policy yet, so its requests have no policy evaluation to capture.
+            Only a gateway or appliance-wide policy, if one applies, shows here. To see the input
+            each request, add a request policy to the surface; one that allows everything is enough.
+          </div>
+        )}
         {captures.length === 0 ? (
           <p className="text-muted small mb-0" data-testid="policy-input-capture-empty">
-            Switch on Capture policy input, then send a request to this surface. The input and the
-            decision of each policy evaluation show here.
+            Listen to policy input, then send a request to this surface. The input and the decision
+            of each policy evaluation show here, live.
           </p>
         ) : (
           <div className="table-responsive">

@@ -1,23 +1,20 @@
-//! Policy input capture: while a surface's `policy_input_capture_until` lies in the
-//! future, each policy evaluation on it is sent to the dashboard's Capture view as a
-//! `policy_input_captured` WebSocket update with its input, credentials masked, and its
-//! outcome. Nothing is written to the log or stored. Only dashboard sessions whose user
-//! holds `surfaces.edit` and `policies.edit` receive the update.
+//! Policy input capture: while a dashboard connection listens to a surface's policy
+//! input, each policy evaluation on that surface is sent as a `policy_input_captured`
+//! WebSocket update with its input, credentials masked, and its outcome. Only the
+//! listening connections receive it; capture stops when the last of them stops listening
+//! or closes. Nothing is written to the log or stored.
 
 use std::sync::{Arc, LazyLock, OnceLock};
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use dashmap::DashMap;
 use serde_json::Value;
 
 use crate::observability::loggable::REDACTED;
 use crate::server::{WsState, WsUpdate};
 
-/// The longest an operator may switch policy input capture on for, in minutes.
-pub const MAX_MINUTES: i64 = 60;
-
-/// Surfaces whose policy input is captured, keyed by surface id, with the time it stops.
-static CAPTURED_UNTIL: LazyLock<DashMap<String, DateTime<Utc>>> = LazyLock::new(DashMap::new);
+/// How many dashboard connections listen to each surface's policy input, by surface id.
+static LISTENERS: LazyLock<DashMap<String, usize>> = LazyLock::new(DashMap::new);
 
 /// The dashboard WebSocket the captures are sent to.
 static DASHBOARD: OnceLock<Arc<WsState>> = OnceLock::new();
@@ -27,31 +24,36 @@ pub fn init(ws_state: Arc<WsState>) {
     let _ = DASHBOARD.set(ws_state);
 }
 
-/// Track the policy input capture setting of an installed surface.
-pub fn track(
-    surface_id: &str,
-    until: Option<DateTime<Utc>>,
-) {
-    match until {
-        Some(until) => {
-            CAPTURED_UNTIL.insert(surface_id.to_string(), until);
-        }
-        None => forget(surface_id),
+/// A dashboard connection listening to one surface's policy input. The surface is
+/// captured while at least one exists; dropping it stops listening.
+#[derive(Debug)]
+pub struct Listening {
+    surface_id: String,
+}
+
+/// Start listening to the policy input of `surface_id`.
+pub fn listen(surface_id: &str) -> Listening {
+    *LISTENERS
+        .entry(surface_id.to_string())
+        .or_insert(0) += 1;
+    Listening {
+        surface_id: surface_id.to_string(),
     }
 }
 
-/// Stop capturing the policy input of a removed surface.
-pub fn forget(surface_id: &str) {
-    CAPTURED_UNTIL.remove(surface_id);
+impl Drop for Listening {
+    fn drop(&mut self) {
+        if let Some(mut count) = LISTENERS.get_mut(&self.surface_id) {
+            *count = count.saturating_sub(1);
+        }
+        LISTENERS.remove_if(&self.surface_id, |_, count| *count == 0);
+    }
 }
 
-pub(crate) fn is_captured_at(
-    surface_id: &str,
-    now: DateTime<Utc>,
-) -> bool {
-    CAPTURED_UNTIL
+pub(crate) fn is_captured(surface_id: &str) -> bool {
+    LISTENERS
         .get(surface_id)
-        .is_some_and(|until| *until > now)
+        .is_some_and(|count| *count > 0)
 }
 
 /// The surface a policy input belongs to: `input.channel.config_id` for a request
@@ -132,7 +134,7 @@ pub fn begin(
     input: &Value,
 ) -> Option<Capture> {
     let surface_id = surface_of(input)?;
-    if !is_captured_at(surface_id, Utc::now()) {
+    if !is_captured(surface_id) {
         return None;
     }
     let (slot, transit_point) = slot_of(plane, engine, surface_id);
@@ -245,31 +247,23 @@ fn is_jwt(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
     use serde_json::json;
 
     const JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbHBoYSJ9.sig";
 
     #[test]
-    fn a_surface_is_captured_only_until_its_time() {
-        let now = Utc::now();
-        track("input-capture-until", Some(now + Duration::minutes(5)));
+    fn a_surface_is_captured_while_any_connection_listens() {
+        let first = listen("input-capture-listened");
+        let second = listen("input-capture-listened");
+        assert!(is_captured("input-capture-listened"));
 
-        assert!(is_captured_at("input-capture-until", now));
-        assert!(!is_captured_at("input-capture-until", now + Duration::minutes(6)));
-    }
+        drop(first);
+        assert!(is_captured("input-capture-listened"));
 
-    #[test]
-    fn a_surface_without_a_time_or_forgotten_is_not_captured() {
-        let now = Utc::now();
-        track("input-capture-cleared", Some(now + Duration::minutes(5)));
-        track("input-capture-cleared", None);
-        track("input-capture-forgotten", Some(now + Duration::minutes(5)));
-        forget("input-capture-forgotten");
-
-        assert!(!is_captured_at("input-capture-cleared", now));
-        assert!(!is_captured_at("input-capture-forgotten", now));
-        assert!(!is_captured_at("input-capture-never-set", now));
+        drop(second);
+        assert!(!is_captured("input-capture-listened"));
+        assert!(!LISTENERS.contains_key("input-capture-listened"));
+        assert!(!is_captured("input-capture-never-listened"));
     }
 
     #[test]
@@ -289,7 +283,7 @@ mod tests {
 
     #[test]
     fn a_response_policy_evaluation_is_captured() {
-        track("input-capture-response", Some(Utc::now() + Duration::minutes(5)));
+        let _listening = listen("input-capture-response");
         let input = json!({
             "response": { "status_code": 200, "body": { "result": "done" } },
             "surface": { "id": "input-capture-response" },
@@ -350,7 +344,7 @@ mod tests {
 
     #[test]
     fn a_captured_input_is_sent_with_its_credentials_masked_and_its_decision() {
-        track("input-capture-sent", Some(Utc::now() + Duration::minutes(5)));
+        let _listening = listen("input-capture-sent");
         let input = json!({
             "channel": { "config_id": "input-capture-sent" },
             "source_auth": { "method": "jwt", "token": JWT },
@@ -379,7 +373,7 @@ mod tests {
 
     #[test]
     fn an_allow_has_no_reason_and_an_error_carries_its_message() {
-        track("input-capture-decided", Some(Utc::now() + Duration::minutes(5)));
+        let _listening = listen("input-capture-decided");
         let input = json!({ "channel": { "config_id": "input-capture-decided" } });
 
         let allow = update_json(
@@ -401,7 +395,7 @@ mod tests {
 
     #[test]
     fn a_transit_point_policy_names_its_alias() {
-        track("input-capture-transit", Some(Utc::now() + Duration::minutes(5)));
+        let _listening = listen("input-capture-transit");
         let input = json!({ "channel": { "config_id": "input-capture-transit" } });
 
         let update = update_json(
@@ -434,13 +428,13 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_captured_for_an_expired_or_untracked_surface() {
-        track("input-capture-expired", Some(Utc::now() - Duration::seconds(1)));
-        let expired = json!({ "channel": { "config_id": "input-capture-expired" } });
-        let untracked = json!({ "channel": { "config_id": "input-capture-untracked" } });
+    fn nothing_is_captured_for_a_surface_nobody_listens_to() {
+        drop(listen("input-capture-stopped"));
+        let stopped = json!({ "channel": { "config_id": "input-capture-stopped" } });
+        let unheard = json!({ "channel": { "config_id": "input-capture-unheard" } });
 
-        assert!(begin("surface", "input-capture-expired", &expired).is_none());
-        assert!(begin("gateway", "self", &untracked).is_none());
+        assert!(begin("surface", "input-capture-stopped", &stopped).is_none());
+        assert!(begin("gateway", "self", &unheard).is_none());
         assert!(begin("gateway", "self", &json!({ "http": {} })).is_none());
     }
 

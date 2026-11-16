@@ -1,7 +1,8 @@
 import React from 'react';
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import '@testing-library/jest-dom';
-import PolicyInputCaptureCard from '../PolicyInputCaptureCard';
+import type { AgentSurface } from '../../../../../api';
+import PolicyInputCaptureCard, { surfaceHasPolicy } from '../PolicyInputCaptureCard';
 import { usePolicyInputCaptureStream } from '../usePolicyInputCaptureStream';
 
 jest.mock('../../PolicyInputCaptureControl', () => ({
@@ -38,6 +39,35 @@ describe('PolicyInputCaptureCard', () => {
     render(<Harness />);
     expect(screen.getByTestId('policy-input-capture-empty')).toBeInTheDocument();
     expect(screen.getByTestId('policy-input-capture')).toBeInTheDocument();
+  });
+
+  it('says a surface needs a policy only while it has none', () => {
+    const { rerender } = render(<PolicyInputCaptureCard captures={[]} hasPolicy={false} />);
+    expect(screen.getByTestId('policy-input-capture-no-policy')).toHaveTextContent(
+      'This surface has no policy yet'
+    );
+
+    rerender(<PolicyInputCaptureCard captures={[]} hasPolicy />);
+    expect(screen.queryByTestId('policy-input-capture-no-policy')).not.toBeInTheDocument();
+  });
+
+  it('finds a policy on the Access Point, Target, response or a Transit Point', () => {
+    const policy = { policy_definition_id: 'policy-1' };
+    const surface = (extra: Record<string, unknown>) =>
+      ({
+        access_point: {},
+        target: { endpoint: 'https://agent.example' },
+        ...extra,
+      }) as unknown as AgentSurface;
+
+    expect(surfaceHasPolicy(surface({}))).toBe(false);
+    expect(surfaceHasPolicy(surface({ transit: { points: [{ name: 'tp' }] } }))).toBe(false);
+    expect(surfaceHasPolicy(surface({ access_point: { inbound_policy: policy } }))).toBe(true);
+    expect(surfaceHasPolicy(surface({ target: { endpoint: 'x', policy } }))).toBe(true);
+    expect(surfaceHasPolicy(surface({ target: { endpoint: 'x', response_policy: policy } }))).toBe(
+      true
+    );
+    expect(surfaceHasPolicy(surface({ transit: { points: [{ name: 'tp', policy }] } }))).toBe(true);
   });
 
   it('lists each captured evaluation of its surface with its decision and input', () => {

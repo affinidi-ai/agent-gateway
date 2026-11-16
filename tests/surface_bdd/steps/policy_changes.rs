@@ -51,7 +51,7 @@ pub(crate) async fn client(
     }
 }
 
-pub(crate) async fn send(
+async fn send(
     world: &mut SurfaceWorld,
     operator: Option<&str>,
     method: Method,

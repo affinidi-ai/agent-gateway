@@ -1018,7 +1018,6 @@ mod tests {
             caller_key: None,
             trust_check_split: false,
             transit_point_source_auth: false,
-            policy_input_capture_until: None,
             browser_origins: Vec::new(),
         }
     }

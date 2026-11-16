@@ -131,26 +131,26 @@ rejects any tenant-scoped PAT with 403. See
 ## Policy input capture
 
 The gateway does not log the policy input. To write a policy against real requests, an operator
-switches on policy input capture for one surface, for a bounded time, and watches the surface's
-Capture view in the dashboard:
+listens to the policy input of one surface from its Capture view in the dashboard. Listening is a
+request on the dashboard WebSocket, with no admin API route and nothing stored on the surface:
 
-- `PUT /v1/surfaces/{id}/policy-input-capture` with `{"minutes": n}`, `n` from 1 to 60, captures
-  the surface's policy input until `n` minutes from now, replacing an earlier end. Any other `n` is
-  refused with `400`.
-- `DELETE /v1/surfaces/{id}/policy-input-capture` stops it.
-- Both need `surfaces.edit` and `policies.edit` ([`RBAC.md`](RBAC.md#policy-input-capture)), and a
-  tenant token may change only a surface it may write. Both answer
-  `{"surface_id", "policy_input_capture_until"}`.
+- `{"type": "capture_policy_input", "surface_id": "<id>"}` starts listening, and
+  `{"type": "stop_capturing_policy_input", "surface_id": "<id>"}` stops it.
+- The gateway answers each with `{"type": "policy_input_capture", "surface_id", "listening"}`, and
+  an `error` when it refuses: `needs surfaces.edit and policies.edit`, `invalid surface id` (empty
+  or over 256 characters) or `listening to too many surfaces on this connection` (more than 10).
+- Starting needs a dashboard session whose user holds `surfaces.edit` and `policies.edit`
+  ([`RBAC.md`](RBAC.md#policy-input-capture)). The permissions are checked again on each keep-alive
+  ping; once either is gone the connection stops listening to every surface and is told so.
+- Listening ends when the connection closes, so reloading or leaving the page ends it. The
+  dashboard sends its listens again after a reconnect.
 
-The end time is stored on the surface as `policy_input_capture_until` and shown in
-`GET /v1/surfaces/{id}`. A surface `POST`, `PUT` or `PATCH` ignores a value it sends and keeps the
-stored one while it lies in the future; a past one is dropped. Switching capture on or off reaches
-other nodes as any surface change does (within `cache_refresh_interval_secs`, or on reload or
-restart when it is `0`); capture stops by itself at the end time on every node, with no further
-write.
+A surface's policy input is captured while at least one connection listens to it, and only the
+listening connections receive the captures. Capture runs on the node the dashboard is connected to:
+requests another node of the appliance serves are not captured there.
 
-While it is on, each evaluation of a request or response policy on the surface sends one
-`policy_input_captured` update on the dashboard WebSocket, once the policy has decided:
+While a connection listens, each evaluation of a request or response policy on the surface sends
+it one `policy_input_captured` update, once the policy has decided:
 
 | Field | Value |
 | --- | --- |
@@ -167,13 +167,14 @@ While it is on, each evaluation of a request or response policy on the surface s
 
 Policies run appliance-wide, gateway, Access Point, Target, and a deny ends the chain, so a slot
 after it sends nothing. Captures are sent on the direct, Fabric and MCP proxy paths alike. MCP tool
-policies and the `tools/list` filtering of a surface policy are not captured.
+policies and the `tools/list` filtering of a surface policy are not captured. A surface with no
+policy of its own has no surface evaluation to capture, so only a gateway or appliance-wide policy
+that applies to it is shown; to see the input of each request, add a request policy first (one that
+allows everything is enough). The Capture view says so while the surface has none.
 
-Only a dashboard WebSocket opened with a session (`websocket_require_auth`, on by default) whose
-user holds `surfaces.edit` and `policies.edit` receives the updates; the permissions are checked
-again on each keep-alive ping. A socket without a session never receives them. Nothing is written
-to the log or stored, so a capture nobody watches is gone, and only the node that served the
-request sends it: a dashboard connected to another node of the appliance does not see it.
+Only a dashboard WebSocket opened with a session (`websocket_require_auth`, on by default) can
+listen; a socket without a session never receives captures. Nothing is written to the log or
+stored, so a capture is gone once it has been sent.
 
 Before a capture is sent, every credential in the input becomes `<redacted>`: the value of a key
 named like a credential (the [credential names](CONFIGURATION_REFERENCE.md#log-redaction) of log
@@ -181,10 +182,6 @@ redaction, such as `token` or `api_key`), any JWT, and any `Bearer` or `Basic` v
 carry credentials never reach the policy input. Message bodies, tool arguments and claims are sent
 as they are. Policy input capture is meant for writing and testing policies: the captures hold
 caller data.
-
-A release older than this one refuses to load a surface stored with `policy_input_capture_until`.
-Switch capture off with `DELETE` on every surface before rolling back, and do not switch it on while
-nodes of an older release share the storage.
 
 ## Appliance-wide (global) enforcement
 
