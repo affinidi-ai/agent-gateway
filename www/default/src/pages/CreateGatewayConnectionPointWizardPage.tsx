@@ -3,6 +3,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { apiClient } from '../api';
 import './OnboardWizard.css';
 import MediatorAccessStep, { MediatorAccessRefusal } from '../components/shared/MediatorAccessStep';
+import { AppButton } from '../components/shared/AppButton';
 import {
   CONNECTION_POINT_DID_LABELS,
   MediatorAccess,
@@ -56,19 +57,24 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
   const [continuing, setContinuing] = useState(false);
   const [refusal, setRefusal] = useState<MediatorAccessRefusal | null>(null);
   const [continueError, setContinueError] = useState('');
+  // The first, automatic try failed for a reason other than a refusal.
+  const [firstTryError, setFirstTryError] = useState('');
+  const [retrying, setRetrying] = useState(false);
   const autoTried = useRef<string | null>(null);
 
   /**
    * Continues a paused connection point. `auto` is the wizard's own first try,
    * made behind the usual spinner: a mediator that admits the DIDs goes straight
    * to Complete, as before the pause existed, and only a refusal shows the
-   * Mediator Access step (without a "still refuses" alert).
+   * Mediator Access step (without a "still refuses" alert). Any other failure of
+   * the first try offers to try again, since nothing says the DIDs are refused.
    */
   const tryContinue = async (connectionPointId: string, auto: boolean) => {
     try {
       if (!auto) setContinuing(true);
       setRefusal(null);
       setContinueError('');
+      setFirstTryError('');
       const response = await apiClient.post(`/connection-points/${connectionPointId}/continue`, {});
       setWizardState(prev => ({
         ...prev,
@@ -78,9 +84,15 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
       }));
     } catch (err: any) {
       const refused = mediatorAccessRefusal(err, CONNECTION_POINT_DID_LABELS);
-      if (refused && !auto) setRefusal(refused);
-      if (!refused) setContinueError(err.message || 'Failed to continue. Please try again.');
-      setWizardState(prev => ({ ...prev, currentStep: 'mediator-access' }));
+      const message = err.message || 'Failed to continue. Please try again.';
+      if (refused) {
+        if (!auto) setRefusal(refused);
+        setWizardState(prev => ({ ...prev, currentStep: 'mediator-access' }));
+      } else if (auto) {
+        setFirstTryError(message);
+      } else {
+        setContinueError(message);
+      }
     } finally {
       setContinuing(false);
     }
@@ -212,6 +224,15 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
 
   const handleContinue = () => tryContinue(wizardState.connectionPoint.id, false);
 
+  const handleRetryFirstTry = async () => {
+    setRetrying(true);
+    try {
+      await tryContinue(wizardState.connectionPoint.id, true);
+    } finally {
+      setRetrying(false);
+    }
+  };
+
   const handleFinish = () => {
     navigate('/connections?tab=gateways');
   };
@@ -232,6 +253,51 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
             <p className="text-muted">
               {resumeId ? 'Loading the connection point...' : 'Creating connection point...'}
             </p>
+          </div>
+        </div>
+      );
+    }
+
+    if (firstTryError && wizardState.currentStep === 'enter-details') {
+      return (
+        <div className="card shadow" data-testid="wizard-step-first-try-failed">
+          <div className="card-header py-3">
+            <h6 className="m-0 font-weight-bold text-primary">
+              <i className="fas fa-plug me-2" aria-hidden="true"></i>
+              Connection Point Saved, Not Connected Yet
+            </h6>
+          </div>
+          <div className="card-body">
+            <div className="alert alert-danger" role="alert" data-testid="first-try-error">
+              {firstTryError}
+            </div>
+            <p className="mb-0">
+              The connection point is saved. Select <strong>Try Again</strong>, or select{' '}
+              <strong>Continue Later</strong> and continue from Connections.
+            </p>
+            <div className="d-flex justify-content-end gap-2 mt-4">
+              <AppButton
+                type="button"
+                variant="secondary"
+                size="md"
+                onClick={handleCancel}
+                iconStart={<i className="fas fa-clock" aria-hidden="true"></i>}
+                data-testid="first-try-later-button"
+              >
+                Continue Later
+              </AppButton>
+              <AppButton
+                type="button"
+                variant="primary"
+                size="md"
+                onClick={handleRetryFirstTry}
+                loading={retrying}
+                iconStart={<i className="fas fa-redo" aria-hidden="true"></i>}
+                data-testid="first-try-retry-button"
+              >
+                Try Again
+              </AppButton>
+            </div>
           </div>
         </div>
       );

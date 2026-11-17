@@ -679,6 +679,31 @@ pub(crate) async fn accept_pending_oob(
     world.response_body = Some(response.body);
 }
 
+#[when(regex = r"^the gateways pair$")]
+pub async fn the_gateways_pair(world: &mut G2gWorld) {
+    world.start().await;
+}
+
+#[when(regex = r"^gateway (\d+) deletes the gateway it accepted last$")]
+pub async fn gateway_deletes_the_gateway_it_accepted_last(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let gateway_id = world
+        .accepted_gateway_id
+        .clone()
+        .expect("a step must accept an invitation before this one");
+    let deleted = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .delete_gateway_recorded(&gateway_id)
+        .await
+        .expect("delete request completes at the transport layer");
+    world.response_status = Some(deleted.status);
+    world.response_body = Some(deleted.body);
+}
+
 #[when(regex = r"^gateway (\d+) accepts the invitation again$")]
 pub async fn gateway_accepts_the_invitation_again(
     world: &mut G2gWorld,

@@ -133,7 +133,8 @@ already used with `This invitation can't be used any more. Ask for a new one.`, 
 which. Other refusals get no reply. The answer is best effort: a failed send is logged as a
 warning and changes nothing else. The acceptor takes a rejection only from the inviter its
 setup went to, on that attempt's temporary Connection Point, and only while its gateway is
-`pending`; the gateway turns `failed` with `Connection rejected: <reason>` as its description,
+`pending`; the gateway turns `failed`, its description starting with `Connection rejected: <reason>`
+and keeping the operator's text after it,
 its temporary Connection Point and listener are removed, and it can be deleted. With no
 Connection Point left to derive a status from, the gateway list keeps showing it `failed`.
 
@@ -381,9 +382,13 @@ A paused Connection Point is stored with `awaiting_mediator_access: true`, no in
 listener. A paused acceptance is a gateway with status `awaiting-mediator-access` and a temporary
 Connection Point that keeps the invitation, its secret and the reserved permanent DID. Both keep
 their keys and state on disk, survive a restart, and last until the invitation expires: the
-Connection Point's own expiry, and for an acceptance the invitation's `expires_time`, else seven
-days. The same expiry bounds an acceptance's wait for approval, with or without the pause. A
-restart removes a paused gateway whose invitation has expired. `GET …/{id}/mediator-access`
+Connection Point's own expiry, and for an acceptance the invitation's `expires_time`, capped at
+seven days, or seven days without one. The startup cleanup of orphaned key directories keeps the
+keys of a reserved permanent DID while a stored Connection Point reserves it. The same expiry
+bounds an acceptance's wait for approval, with or without the pause: a `pending` acceptance whose
+temporary Connection Point is unexpired survives a restart, and its listener is started again. A
+restart removes a paused gateway whose invitation has expired, and a `pending` one with no
+unexpired temporary Connection Point; one whose Connection Points cannot be read is kept. `GET …/{id}/mediator-access`
 returns the DIDs of a pause again: their role (`connection_point`, `temporary`, `permanent`), the
 mediator that must admit each, and the expiry.
 

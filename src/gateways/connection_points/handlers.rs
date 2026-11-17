@@ -911,6 +911,8 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
                 .unwrap_or_else(|| chrono::Duration::try_hours(24).unwrap()),
     );
 
+    // The reserved DID's announcement fails until the record that reserves it is stored.
+    let mut reservation = None;
     let reserved_permanent = if req.await_mediator_access {
         let permanent_cp_id = uuid::Uuid::new_v4().to_string();
         if !scope_allows_resource(
@@ -944,20 +946,18 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
             (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to generate the permanent DID: {}", e))
         })?;
         info!("✓ Reserved permanent DID {} for the paired gateway", permanent_did);
-        if let Some(hook) = event_hook.as_ref() {
-            hook.emit(
-                crate::event_hook::EventKind::CreationStarted,
-                crate::event_hook::ConnectionPointPayload::minted(
-                    &permanent_cp_id,
-                    &req.name,
-                    &req.description,
-                    &req.gateway_id,
-                    &req.mediator_id,
-                    &mediator.did,
-                    &permanent_did,
-                ),
-            );
-        }
+        reservation = Some(crate::event_hook::CreationGuard::start(
+            event_hook.clone(),
+            crate::event_hook::ConnectionPointPayload::minted(
+                &permanent_cp_id,
+                &req.name,
+                &req.description,
+                &req.gateway_id,
+                &req.mediator_id,
+                &mediator.did,
+                &permanent_did,
+            ),
+        ));
         Some(super::types::ReservedPermanent {
             cp_id: permanent_cp_id,
             did: permanent_did,
@@ -1072,6 +1072,9 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
             error!("Failed to create connection point: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create connection point: {}", e))
         })?;
+    if let Some(reservation) = reservation {
+        reservation.hand_over();
+    }
 
     if connection_point.awaiting_mediator_access {
         info!("Connection point {} saved, waiting for mediator access", connection_point.id);

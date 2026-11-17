@@ -2122,7 +2122,9 @@ of the step bar too.
   Connection Point then calls `POST /connection-points/{id}/continue` behind its saving
   spinner; Add Gateway moves to the connect step, which calls `POST /gateways/{id}/continue`.
   Success goes on as before; a `409 mediator_access_refused` opens the step without a
-  refusal message.
+  refusal message. Any other failure of that first try in Create Connection Point shows
+  "Connection Point Saved, Not Connected Yet" with the error, **Continue Later** and
+  **Try Again** (`first-try-retry-button`), not the step: nothing says the DIDs were refused.
 - The card header is "Add These DIDs to the DIDComm Mediator's Allow List" (`fa-user-shield`).
   The text opens with "This {name} Mediator most probably uses Explicit Allow, …" ("Mediator"
   is left out when the name already ends in it), then says what to do when the mediator is

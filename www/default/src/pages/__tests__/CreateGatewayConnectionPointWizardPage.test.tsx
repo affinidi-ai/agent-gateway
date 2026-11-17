@@ -175,3 +175,25 @@ test('continuing from Connections shows the DIDs at once, without testing the co
   expect(screen.getByText('Copy All DIDs as a Bundle')).toBeInTheDocument();
   expect(post).not.toHaveBeenCalled();
 });
+
+test('another failure of the first try offers to try again instead of the DIDs to allow', async () => {
+  post
+    .mockResolvedValueOnce(paused)
+    .mockRejectedValueOnce(new Error('Mediator unreachable (502)'))
+    .mockResolvedValueOnce({ data: { connection_point: { id: 'cp-1', name: 'Partner link' } } });
+  renderWizard();
+
+  fireEvent.click(screen.getByText('pick mediator'));
+  fireEvent.click(screen.getByText('create'));
+
+  expect(await screen.findByTestId('first-try-error')).toHaveTextContent(
+    'Mediator unreachable (502)'
+  );
+  expect(screen.queryByTestId('mediator-access-explanation')).not.toBeInTheDocument();
+  expect(screen.queryByText('Mediator Access')).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByTestId('first-try-retry-button'));
+
+  expect(await screen.findByText('created Partner link')).toBeInTheDocument();
+  expect(post).toHaveBeenLastCalledWith('/connection-points/cp-1/continue', {});
+});

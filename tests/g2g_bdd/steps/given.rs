@@ -1608,6 +1608,29 @@ pub async fn gateway_has_deleted_the_gateway_it_accepted(
     assert!((200..300).contains(&deleted.status), "delete refused: {} {}", deleted.status, deleted.body);
 }
 
+#[given(regex = r"^gateway (\d+) has accepted the invitation again and been refused$")]
+pub async fn gateway_has_been_refused_on_the_invitation_again(
+    world: &mut G2gWorld,
+    acceptor: usize,
+) {
+    super::when::gateway_accepts_the_invitation_again(world, acceptor).await;
+    let gateway_id = world
+        .accepted_gateway_id
+        .clone()
+        .expect("accepting the invitation again records the gateway");
+    world
+        .harness()
+        .gw(acceptor)
+        .admin
+        .wait_for_gateway_status(
+            &gateway_id,
+            crate::bdd_support::admin_client::GatewayStatus::Failed,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("setup failed: gateway {acceptor} never marked {gateway_id} failed: {error:#}"));
+}
+
 #[given(expr = "the mediator has lost every account it held")]
 pub async fn mediator_lost_every_account(world: &mut G2gWorld) {
     world.start().await;

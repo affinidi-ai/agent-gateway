@@ -3745,6 +3745,20 @@ enum RejectedPairing {
     Ignored,
 }
 
+/// The description of a gateway whose pairing the inviter rejected: the reason in
+/// front of the description the operator gave, which is kept.
+fn rejected_description(
+    reason: &str,
+    operator_description: &str,
+) -> String {
+    let operator_description = operator_description.trim();
+    if operator_description.is_empty() {
+        format!("Connection rejected: {reason}")
+    } else {
+        format!("Connection rejected: {reason} — {operator_description}")
+    }
+}
+
 /// Mark the pending gateway of the acceptance waiting on `connection_point` failed with the
 /// inviter's reason, when `from_did` is the inviter its connection-setup went to. The sender is
 /// authcrypt-verified, so another DID cannot fail someone else's pairing.
@@ -3806,7 +3820,7 @@ async fn fail_rejected_pairing<S: GatewayStore + ?Sized>(
         .take(MAX_REJECTION_REASON_CHARS)
         .collect();
     gateway.status = crate::gateways::types::GatewayStatus::Failed;
-    gateway.description = format!("Connection rejected: {}", reason);
+    gateway.description = rejected_description(&reason, &gateway.description);
     gateway.updated_at = Utc::now();
     if let Err(e) = gateway_store
         .update(&gateway)
@@ -4326,12 +4340,29 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
     connection_point.last_used_at = Some(chrono::Utc::now());
     connection_point.mediator_did = Some(connection_mediator_did.clone());
 
-    let announcement = crate::event_hook::CreationGuard::start(
-        listener_manager
-            .event_hook()
-            .cloned(),
-        crate::event_hook::ConnectionPointPayload::from_record(&connection_point, None),
-    );
+    // A permanent DID the acceptance reserved was announced when it paused.
+    let announced_at_pause = match pending_conn
+        .temporary_cp_id
+        .as_deref()
+    {
+        Some(temporary_id) => cp_store
+            .get(temporary_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|point| point.reserved_permanent)
+            .is_some_and(|reserved| reserved.cp_id == cp_id),
+        None => false,
+    };
+    let hook = listener_manager
+        .event_hook()
+        .cloned();
+    let minted = crate::event_hook::ConnectionPointPayload::from_record(&connection_point, None);
+    let announcement = if announced_at_pause {
+        crate::event_hook::CreationGuard::resume(hook, minted)
+    } else {
+        crate::event_hook::CreationGuard::start(hook, minted)
+    };
     let saved = crate::event_hook::ConnectionPointPayload::from_record(&connection_point, None);
     let record = connection_point.clone();
     let point_store = cp_store.clone();
@@ -4961,7 +4992,7 @@ async fn listen_for_connection_accepted<S: GatewayStore, CS: super::ConnectionPo
                 {
                     info!("   Updating gateway {} to Failed status", gateway.id);
                     gateway.status = crate::gateways::types::GatewayStatus::Failed;
-                    gateway.description = format!("Connection rejected: {}", reason);
+                    gateway.description = rejected_description(reason, &gateway.description);
 
                     if let Err(e) = gateway_store
                         .update(&gateway)
@@ -5850,7 +5881,8 @@ mod tests {
         assert_eq!(gateway.status, GatewayStatus::Failed);
         assert_eq!(
             gateway.description,
-            "Connection rejected: This invitation can't be used any more. Ask for a new one."
+            "Connection rejected: This invitation can't be used any more. Ask for a new one. — Partner gateway",
+            "the reason goes in front of the operator's description"
         );
         assert!(
             acceptance
@@ -5974,7 +6006,10 @@ mod tests {
             .unwrap()
             .unwrap()
             .description;
-        assert_eq!(description, format!("Connection rejected: {}", "x".repeat(super::MAX_REJECTION_REASON_CHARS)));
+        assert_eq!(
+            description,
+            format!("Connection rejected: {} — Partner gateway", "x".repeat(super::MAX_REJECTION_REASON_CHARS))
+        );
     }
 
     #[tokio::test]
