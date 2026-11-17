@@ -2221,8 +2221,8 @@ mod tests {
         assert_eq!(
             json["surfaces"],
             serde_json::json!([
-                { "surface_id": "s1", "name": "s1-name", "protocol": "a2a", "route": "/s1" },
-                { "surface_id": "s2", "name": "s2-name", "protocol": "ap2", "route": "/s2" },
+                { "surface_id": "s1", "name": "s1-name", "protocol": "a2a", "route": "/s1", "public_url": null },
+                { "surface_id": "s2", "name": "s2-name", "protocol": "ap2", "route": "/s2", "public_url": null },
             ])
         );
         assert_eq!(json["traffic"]["p95_latency_ms"], serde_json::Value::Null);
