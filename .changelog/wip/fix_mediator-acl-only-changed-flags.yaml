@@ -87,5 +87,13 @@ changes:
         accepts, and shows the issuer DIDs and surfaces only once it does. Rows waiting for
         approval or mediator access keep their own action.
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-11-17T12:00:00Z'
+      title: Update actix-http to 3.22.0 and libz-sys to 1.1.33 for new advisories
+      description: >-
+        Bumps actix-http from 3.21.0 to 3.22.0, past the fixes for three HTTP/1.1
+        advisories (bare LF in chunked trailers, malformed quoted chunk extensions,
+        and partial keep-alive requests bypassing the header timeout), and libz-sys
+        from 1.1.31 to 1.1.33 for a zlib heap buffer overflow advisory. Restores a
+        passing cargo audit.
   breaking: []
