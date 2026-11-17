@@ -222,16 +222,18 @@ async fn surface_has_allowing_request_policy(
     .await;
 }
 
-#[given(expr = "an appliance-wide surface policy {string} denies every request")]
-async fn appliance_wide_policy_denies(
+/// Create the surface policy definition `policy_id` from `rego` and enforce it as the
+/// only appliance-wide surface policy, through the admin API.
+async fn enforce_appliance_wide_policy(
     world: &mut SurfaceWorld,
-    policy_name: String,
+    policy_id: &str,
+    policy_name: &str,
+    description: &str,
+    rego: &str,
 ) {
-    let policy_id = "bdd-capture-appliance-deny";
-    let rego = "package surface.policy\n\ndefault allow := false\n";
     let admin = client(world, None).await;
     let created = admin
-        .create_surface_policy_definition_recorded(policy_id, &policy_name, "Denies every request", rego)
+        .create_surface_policy_definition_recorded(policy_id, policy_name, description, rego)
         .await
         .expect("create the appliance-wide policy definition");
     assert!(created.status < 300, "creating the appliance-wide policy definition: {}", created.body);
@@ -242,6 +244,32 @@ async fn appliance_wide_policy_denies(
         .await
         .expect("assign the appliance-wide policy");
     assert_eq!(assigned.status, 200, "assigning the appliance-wide policy: {}", assigned.body);
+}
+
+#[given(expr = "an appliance-wide surface policy {string} denies every request")]
+async fn appliance_wide_policy_denies(
+    world: &mut SurfaceWorld,
+    policy_name: String,
+) {
+    enforce_appliance_wide_policy(
+        world,
+        "bdd-capture-appliance-deny",
+        &policy_name,
+        "Denies every request",
+        "package surface.policy\n\ndefault allow := false\n",
+    )
+    .await;
+}
+
+#[given(expr = "an appliance-wide surface policy {string} fails to evaluate")]
+async fn appliance_wide_policy_fails_to_evaluate(
+    world: &mut SurfaceWorld,
+    policy_name: String,
+) {
+    // Compiles, but the two rules give `allow` two values for every input,
+    // which is an evaluation error rather than a decision.
+    let rego = "package surface.policy\n\nallow := true if {\n    true\n}\n\nallow := false if {\n    true\n}\n";
+    enforce_appliance_wide_policy(world, "bdd-capture-appliance-error", &policy_name, "Fails to evaluate", rego).await;
 }
 
 #[given(expr = "Transit Point {string} has a policy that allows every request")]
@@ -496,6 +524,25 @@ async fn no_capture_contains(
     }
 }
 
+async fn shows_decision_with_reason(
+    world: &SurfaceWorld,
+    slot: &str,
+    surface_name: &str,
+    decision: &str,
+    reason: &str,
+) {
+    let surface_id = tracked_surface_id(world, surface_name);
+    let matches = |capture: &Value| {
+        capture["config_id"] == surface_id.as_str()
+            && capture["slot"] == slot
+            && capture["decision"] == decision
+            && capture["reason"] == reason
+    };
+    let missing =
+        format!("no {slot} policy capture of surface '{surface_name}' deciding {decision:?} with reason {reason:?}");
+    wait_for_capture(world, THE_OPERATOR, matches, &missing).await;
+}
+
 #[then(expr = "the Capture view shows the {string} policy of surface {string} denying with reason {string}")]
 async fn capture_view_shows_denial(
     world: &mut SurfaceWorld,
@@ -503,15 +550,17 @@ async fn capture_view_shows_denial(
     surface_name: String,
     reason: String,
 ) {
-    let surface_id = tracked_surface_id(world, &surface_name);
-    let matches = |capture: &Value| {
-        capture["config_id"] == surface_id.as_str()
-            && capture["slot"] == slot.as_str()
-            && capture["decision"] == "deny"
-            && capture["reason"] == reason.as_str()
-    };
-    let missing = format!("no {slot} policy capture of surface '{surface_name}' denying with reason {reason:?}");
-    wait_for_capture(world, THE_OPERATOR, matches, &missing).await;
+    shows_decision_with_reason(world, &slot, &surface_name, "deny", &reason).await;
+}
+
+#[then(expr = "the Capture view shows the {string} policy of surface {string} failing with error {string}")]
+async fn capture_view_shows_error(
+    world: &mut SurfaceWorld,
+    slot: String,
+    surface_name: String,
+    reason: String,
+) {
+    shows_decision_with_reason(world, &slot, &surface_name, "error", &reason).await;
 }
 
 async fn assert_no_capture(

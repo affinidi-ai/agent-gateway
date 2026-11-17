@@ -440,30 +440,47 @@ impl GlobalPolicyManager {
                 })
                 .collect()
         });
-        let decision = Self::evaluate_set(set, plane, query, input);
+        let (decision, error) = Self::evaluate_set(set, plane, query, input);
         if let Some(capture) = capture {
             let decided_by = if decision.allow {
                 None
             } else {
                 decision.policy_id.as_deref()
             };
+            let outcome = match error {
+                Some(reason) => Err(reason),
+                None => Ok((decision.allow, decision.reason.as_deref())),
+            };
             capture
                 .decided_by(decided_by)
-                .finish(Ok((decision.allow, decision.reason.as_deref())));
+                .finish(outcome);
         }
         decision
     }
 
-    /// Evaluate `input` against a plane's compiled set, deny-overrides.
+    /// Evaluate `input` against a plane's compiled set, deny-overrides. The second value
+    /// is the deny reason when the deny comes from an error rather than a decision.
     fn evaluate_set(
         set: &GlobalSet,
         plane: &str,
         query: String,
         input: &serde_json::Value,
-    ) -> GlobalDecision {
+    ) -> (GlobalDecision, Option<&'static str>) {
+        let errored = |reason: &'static str, p: Option<&GlobalCompiledPolicy>| {
+            (
+                GlobalDecision::deny(
+                    reason,
+                    p.map(|p| p.policy_id.clone()),
+                    p.map(|p| p.policy_name.clone()),
+                    p.and_then(|p| p.version),
+                    p.map(|p| p.content_hash.clone()),
+                ),
+                Some(reason),
+            )
+        };
         let input_json = match serde_json::to_string(input) {
             Ok(j) => j,
-            Err(_) => return GlobalDecision::deny("Failed to serialize policy input", None, None, None, None),
+            Err(_) => return errored("Failed to serialize policy input", None),
         };
         let first_policy = set.policies.first();
         for p in &set.policies {
@@ -475,13 +492,7 @@ impl GlobalPolicyManager {
                 if p.monitor_only {
                     continue;
                 }
-                return GlobalDecision::deny(
-                    "Appliance-wide policy input error",
-                    Some(p.policy_id.clone()),
-                    Some(p.policy_name.clone()),
-                    p.version,
-                    Some(p.content_hash.clone()),
-                );
+                return errored("Appliance-wide policy input error", Some(p));
             }
             let allow = match engine.eval_bool_query(query.clone(), false) {
                 Ok(a) => a,
@@ -493,35 +504,33 @@ impl GlobalPolicyManager {
                     false
                 }
                 Err(_) if p.monitor_only => continue,
-                Err(_) => {
-                    return GlobalDecision::deny(
-                        "Appliance-wide policy evaluation error",
-                        Some(p.policy_id.clone()),
-                        Some(p.policy_name.clone()),
-                        p.version,
-                        Some(p.content_hash.clone()),
-                    );
-                }
+                Err(_) => return errored("Appliance-wide policy evaluation error", Some(p)),
             };
             if !allow {
                 if p.monitor_only {
                     warn!(policy_id = %p.policy_id, plane = %plane, "monitor-only appliance-wide policy would deny");
                     continue;
                 }
-                return GlobalDecision::deny(
-                    "Blocked by appliance-wide policy",
-                    Some(p.policy_id.clone()),
-                    Some(p.policy_name.clone()),
-                    p.version,
-                    Some(p.content_hash.clone()),
+                return (
+                    GlobalDecision::deny(
+                        "Blocked by appliance-wide policy",
+                        Some(p.policy_id.clone()),
+                        Some(p.policy_name.clone()),
+                        p.version,
+                        Some(p.content_hash.clone()),
+                    ),
+                    None,
                 );
             }
         }
-        GlobalDecision::allow_with(
-            first_policy.map(|p| p.policy_id.clone()),
-            first_policy.map(|p| p.policy_name.clone()),
-            first_policy.and_then(|p| p.version),
-            first_policy.map(|p| p.content_hash.clone()),
+        (
+            GlobalDecision::allow_with(
+                first_policy.map(|p| p.policy_id.clone()),
+                first_policy.map(|p| p.policy_name.clone()),
+                first_policy.and_then(|p| p.version),
+                first_policy.map(|p| p.content_hash.clone()),
+            ),
+            None,
         )
     }
 }
@@ -869,6 +878,75 @@ pub(crate) mod tests {
                 .is_none(),
             "{allowed:?}"
         );
+    }
+
+    async fn captured_appliance_evaluation(
+        rego: &str,
+        surface_id: &str,
+    ) -> (GlobalDecision, Vec<serde_json::Value>) {
+        use crate::policies::input_capture::{listening, received_captures};
+        let manager = GlobalPolicyManager::new();
+        manager.set_policy_definition_store(store_with(vec![gw_def("cap-member", rego)]).await);
+        let mut assignments = GlobalPolicyAssignments::default();
+        assignments
+            .assignments
+            .insert(
+                PLANE_GATEWAY.to_string(),
+                vec![GlobalAssignment {
+                    policy_id: "cap-member".to_string(),
+                    monitor_only: false,
+                }],
+            );
+        manager
+            .refresh(&assignments)
+            .await;
+        let (_listening, mut dashboard) = listening(surface_id);
+        let input = serde_json::json!({ "channel": { "config_id": surface_id } });
+        let decision = manager.evaluate_global(PLANE_GATEWAY, &input);
+        (decision, received_captures(&mut dashboard))
+    }
+
+    #[tokio::test]
+    async fn a_captured_appliance_member_that_fails_to_evaluate_is_an_error_and_still_denies() {
+        let conflicting =
+            "package gateway.policy\n\nallow := true if {\n    true\n}\n\nallow := false if {\n    true\n}\n";
+
+        let (decision, captures) = captured_appliance_evaluation(conflicting, "appliance-cap-error").await;
+
+        assert!(!decision.allow);
+        assert_eq!(decision.policy_id.as_deref(), Some("cap-member"));
+        assert_eq!(decision.reason.as_deref(), Some("Appliance-wide policy evaluation error"));
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        assert_eq!(captures[0]["decision"], "error");
+        assert_eq!(captures[0]["reason"], "Appliance-wide policy evaluation error");
+        assert_eq!(captures[0]["decided_by"], "cap-member");
+    }
+
+    #[tokio::test]
+    async fn a_captured_appliance_member_that_denies_is_a_deny() {
+        let (decision, captures) =
+            captured_appliance_evaluation("package gateway.policy\ndefault allow = false", "appliance-cap-deny").await;
+
+        assert!(!decision.allow);
+        assert_eq!(decision.policy_id.as_deref(), Some("cap-member"));
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        assert_eq!(captures[0]["decision"], "deny");
+        assert_eq!(captures[0]["reason"], "Blocked by appliance-wide policy");
+        assert_eq!(captures[0]["decided_by"], "cap-member");
+    }
+
+    #[tokio::test]
+    async fn a_captured_appliance_member_without_allow_is_a_deny_not_an_error() {
+        let (decision, captures) =
+            captured_appliance_evaluation("package surface.policy\ndefault allow = true", "appliance-cap-no-value")
+                .await;
+
+        assert!(!decision.allow);
+        assert_eq!(decision.policy_id.as_deref(), Some("cap-member"));
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        assert_eq!(captures[0]["decision"], "deny");
+        assert_eq!(captures[0]["reason"], "Blocked by appliance-wide policy");
+        assert_eq!(captures[0]["decided_by"], "cap-member");
     }
 
     #[tokio::test]
