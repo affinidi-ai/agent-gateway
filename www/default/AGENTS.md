@@ -34,7 +34,20 @@ Applies to:
    explicitly requested.
 8. Header topbar controls must use the shared topbar action button pattern, a single
    reusable component plus shared CSS state rules, rather than ad-hoc per-button markup.
-9. Mediator lists may contain directory entries (`directory:*` ids), and stored records
+9. Theme-dependent styles hang off `body.dark-theme`, never `@media (prefers-color-scheme)`:
+   the dashboard theme is the operator's choice and need not match the operating system, so a
+   media query paints light text on a light surface (or the reverse). `themeSelectors.test.ts`
+   fails on any stylesheet that uses it.
+10. Text and icons on a light surface use the text-safe tokens in `dashboard.css`
+   (`--warning-text`, `--success-text`, `--danger-text`, `--accent-blue-text`,
+   `--accent-teal-text`, `--accent-purple-text`, `--muted-text`), which `body.dark-theme` swaps for
+   lighter values; solid buttons and badges under white text use `--primary-solid`,
+   `--success-solid`, `--warning-solid` and `--danger-solid`. The brand colours `--warning`,
+   `--success`, `--danger` and `--accent-blue` stay for borders, tints and text on dark
+   surfaces. Normal text needs 4.5:1 and informational icons 3:1 in both themes; do not use
+   `#9ca3af`, `--gray-400`, `--gray-500` on a dark surface, or an `opacity` below 1 for text.
+   Purely decorative icons, such as the large stat card and empty state icons, are exempt.
+11. Mediator lists may contain directory entries (`directory:*` ids), and stored records
    created from them carry `provided: true`. The Create Connection Point wizard pre-selects the
    first `directory:` entry (else the only mediator, else nothing; never a stored provided
    record) and marks it in no other way. The dropdown lists a directory mediator once, as its

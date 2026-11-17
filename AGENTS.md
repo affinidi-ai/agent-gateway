@@ -80,6 +80,8 @@ Frontend work spans two concerns:
 
 For frontend work under `www/default/` (the current dashboard shipped to users), use the scoped frontend instructions at [`www/default/AGENTS.md`](www/default/AGENTS.md).
 
+Theme styles hang off `body.dark-theme`, never `prefers-color-scheme`, and text and icons use the text-safe colour tokens (`--warning-text`, `--success-text`, `--danger-text`, `--accent-blue-text`, `--muted-text`) with `--*-solid` backgrounds under white text, so normal text keeps 4.5:1 in both themes; see working rules 9 and 10 in [`www/default/AGENTS.md`](www/default/AGENTS.md#working-rules).
+
 Laptop viewport rules (the Audit Log stacking breakpoint and scroll on select, wrapping badges in list tables, and the page header and chart rules for Tasks, Metrics, Identities and Connection Points) live under _Laptop layouts_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#laptop-layouts).
 
 The Surface Builder's **Send delegated credentials over Fabric** switch is per route
