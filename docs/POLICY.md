@@ -193,14 +193,17 @@ stored, so a capture is gone once it has been sent.
 
 Before a capture is sent, every credential in the input becomes `<redacted>`: the value of a key
 named like a credential (the [credential names](CONFIGURATION_REFERENCE.md#log-redaction) of log
-redaction, such as `token` or `api_key`), any JWT, and the token of any `Bearer` or `Basic`
+redaction, such as `token` or `api_key`), any JWT (three dot-separated base64url segments whose
+first decodes to a JSON object), and the token of any `Bearer` or `Basic`
 authorization value, also inside longer text (`Authorization: Bearer <redacted> please`). A
 `Bearer` token is one of letters, digits or `-._~+/=` that is at least 12 characters long, or at
 least 6 with a digit or one of those symbols; a `Basic` token is one that decodes as base64 to
 `user:password`. Message text such as `Basic authentication` or `Bearer arms` is kept. In every
 absolute URL in the input, query parameter names are kept and every query value becomes
 `<redacted>`, and the userinfo (user name and password) becomes `<redacted>`
-(`https://<redacted>@host/path`), up to the last `@` before the path, query or fragment. `http.path`
+(`https://<redacted>@host/path`), up to the last `@` before the path, query or fragment. A deny
+reason and an evaluation error get the same masking, since a policy can build its reason from
+input text and an engine error can quote it. `http.path`
 is shown as the request log line shows it: query parameter names are kept and every query value
 becomes `<redacted>`, since a request received over Fabric carries the caller's full path and query,
 and capability ids in the path are shortened. Masking matches these shapes only, so a credential in

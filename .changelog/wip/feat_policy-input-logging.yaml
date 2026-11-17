@@ -22,7 +22,9 @@ changes:
         are masked first, also inside longer text, and an SD-JWT with its disclosures (a Bearer token of at least 12 token characters,
         or 6 with a digit or symbol, and a Basic token that decodes to user:password; message text
         such as "Basic authentication" is kept), and every query value in the request path and in
-        any absolute URL is redacted, as are the user name and password in any absolute URL. Listening needs surfaces.edit and policies.edit, is checked again on each
+        any absolute URL is redacted, as are the user name and password in any absolute URL. A JWT
+        is recognised by its header decoding to a JSON object, whatever whitespace that JSON holds,
+        and the deny reason and evaluation error are masked the same way as the input. Listening needs surfaces.edit and policies.edit, is checked again on each
         keep-alive ping before any queued capture is sent (captures still queued when access is
         lost are discarded), and ends when the connection closes. Nothing is logged or stored, and the
         surface configuration is not changed. Policy authors can see the input structure again

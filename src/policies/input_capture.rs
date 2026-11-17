@@ -325,8 +325,8 @@ impl Capture {
     ) -> WsUpdate {
         let (decision, reason) = match outcome {
             Ok((true, _)) => ("allow", None),
-            Ok((false, reason)) => ("deny", reason.map(str::to_string)),
-            Err(error) => ("error", Some(error.to_string())),
+            Ok((false, reason)) => ("deny", reason.map(mask_outcome_text)),
+            Err(error) => ("error", Some(mask_outcome_text(error))),
         };
         WsUpdate::PolicyInputCaptured {
             config_id: self.surface_id,
@@ -376,6 +376,12 @@ fn mask_request_path(input: &mut Value) {
     }
 }
 
+/// A deny reason or evaluation error with the masking of [`mask_text`], since a policy can
+/// build its reason from input text and an engine error can quote it.
+fn mask_outcome_text(text: &str) -> String {
+    mask_text(text).unwrap_or_else(|| text.to_string())
+}
+
 /// Replace every credential in `value` with [`REDACTED`]: the value of a key named like a
 /// credential, a JWT, and a `Bearer` or `Basic` authorization value.
 pub fn mask_credentials(value: &mut Value) {
@@ -401,10 +407,11 @@ pub fn mask_credentials(value: &mut Value) {
     }
 }
 
-/// A JWT anywhere in a text, with the `~`-separated disclosures and key binding JWT
-/// that follow it in an SD-JWT.
+/// A JWT candidate anywhere in a text, with the `~`-separated disclosures and key binding
+/// JWT that follow it in an SD-JWT. A header starting with `{` encodes to `ey` or `ew`;
+/// [`is_jwt_header`] decides whether the candidate is one.
 static EMBEDDED_JWT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\beyJ[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]*(?:~[A-Za-z0-9_=.-]*)*")
+    Regex::new(r"\b(e[wy][A-Za-z0-9_=-]+)\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]*(?:~[A-Za-z0-9_=.-]*)*")
         .expect("valid JWT pattern")
 });
 
@@ -415,7 +422,7 @@ static AUTHORIZATION: LazyLock<Regex> = LazyLock::new(|| {
 
 /// An absolute URL with a query string, anywhere in a text.
 static URL_QUERY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)\b([a-z][a-z0-9+.\-]*://[^\s?#"'<>]+)\?([^\s#"'<>]+)"#).expect("valid URL pattern")
+    Regex::new(r#"(?i)\b([a-z][a-z0-9+.\-]*://[^\s?#"<>]+)\?([^\s#"<>]+)"#).expect("valid URL pattern")
 });
 
 /// The scheme and userinfo of an absolute URL, anywhere in a text. The userinfo may hold
@@ -442,7 +449,13 @@ fn mask_text(text: &str) -> Option<String> {
         .replace_all(&masked, |caps: &regex::Captures<'_>| format!("{}{REDACTED}@", &caps[1]))
         .into_owned();
     let masked = EMBEDDED_JWT
-        .replace_all(&masked, regex::NoExpand(REDACTED))
+        .replace_all(&masked, |caps: &regex::Captures<'_>| {
+            if is_jwt_header(&caps[1]) {
+                REDACTED.to_string()
+            } else {
+                caps[0].to_string()
+            }
+        })
         .into_owned();
     let masked = AUTHORIZATION
         .replace_all(&masked, |caps: &regex::Captures<'_>| {
@@ -500,10 +513,20 @@ fn is_authorization_token(
                     .any(|b| !b.is_ascii_alphabetic())))
 }
 
+/// Whether `segment` is base64url of a JSON object, as a JWT header is, whatever
+/// whitespace the JSON holds.
+fn is_jwt_header(segment: &str) -> bool {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(segment.trim_end_matches('='))
+        .ok()
+        .is_some_and(|decoded| serde_json::from_slice::<serde_json::Map<String, Value>>(&decoded).is_ok())
+}
+
 fn is_jwt(text: &str) -> bool {
     let segments: Vec<&str> = text.split('.').collect();
     segments.len() == 3
-        && segments[0].starts_with("eyJ")
+        && is_jwt_header(segments[0])
         && segments[..2]
             .iter()
             .all(|segment| !segment.is_empty())
@@ -1232,6 +1255,73 @@ mod tests {
         assert!(allow.get("reason").is_none(), "{allow}");
         assert_eq!(error["decision"], "error");
         assert_eq!(error["reason"], "no allow rule");
+    }
+
+    #[test]
+    fn a_deny_reason_or_error_holding_a_credential_is_masked() {
+        let _listening = listening("input-capture-masked-outcome");
+        let input = json!({ "channel": { "config_id": "input-capture-masked-outcome" } });
+        let reason = format!("caller sent Bearer {JWT}");
+        let error = format!("invalid token {JWT} at https://h.example.test/p?key=k-secret");
+
+        let deny = update_json(
+            begin("surface", "input-capture-masked-outcome", &input, Vec::new)
+                .unwrap()
+                .into_update(Ok((false, Some(reason.as_str())))),
+        );
+        let failed = update_json(
+            begin("surface", "input-capture-masked-outcome", &input, Vec::new)
+                .unwrap()
+                .into_update(Err(error.as_str())),
+        );
+
+        assert_eq!(deny["reason"], format!("caller sent Bearer {REDACTED}"));
+        assert_eq!(failed["reason"], format!("invalid token {REDACTED} at https://h.example.test/p?key={REDACTED}"));
+    }
+
+    #[test]
+    fn a_url_with_an_apostrophe_still_has_its_query_masked() {
+        let mut input = json!({
+            "a2a": { "parts": [
+                { "text": "use https://svc:pa'ss@host.example.test/path?api_key=k-secret&page=2 now" },
+                { "text": "see https://host.example.test/it's?token=t-secret&page=2" },
+                { "text": "search https://host.example.test/s?q=it's&token=t-secret" },
+            ] },
+        });
+
+        mask_credentials(&mut input);
+
+        let parts = &input["a2a"]["parts"];
+        assert_eq!(
+            parts[0]["text"],
+            format!("use https://{REDACTED}@host.example.test/path?api_key={REDACTED}&page={REDACTED} now")
+        );
+        assert_eq!(parts[1]["text"], format!("see https://host.example.test/it's?token={REDACTED}&page={REDACTED}"));
+        assert_eq!(parts[2]["text"], format!("search https://host.example.test/s?q={REDACTED}&token={REDACTED}"));
+    }
+
+    #[test]
+    fn a_jwt_whose_header_json_holds_whitespace_is_masked_and_similar_words_kept() {
+        use base64::Engine;
+        let encode = |json: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+        let spaced = format!("{}.{}.c2ln", encode(r#"{ "alg": "HS256", "typ": "JWT" }"#), encode(r#"{"sub":"x"}"#));
+        let newline = format!("{}.{}.c2ln", encode("{\n  \"alg\": \"HS256\"\n}"), encode(r#"{"sub":"x"}"#));
+        assert!(spaced.starts_with("eyAi"), "{spaced}");
+        assert!(newline.starts_with("ewo"), "{newline}");
+        let mut input = json!({
+            "a2a": { "parts": [
+                { "text": spaced },
+                { "text": format!("the token is {newline} ok") },
+                { "text": "see ewe.com.au or eyes.on.it" },
+            ] },
+        });
+
+        mask_credentials(&mut input);
+
+        let parts = &input["a2a"]["parts"];
+        assert_eq!(parts[0]["text"], REDACTED);
+        assert_eq!(parts[1]["text"], format!("the token is {REDACTED} ok"));
+        assert_eq!(parts[2]["text"], "see ewe.com.au or eyes.on.it");
     }
 
     #[test]
