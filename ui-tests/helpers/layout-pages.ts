@@ -50,7 +50,6 @@ const CREDENTIALS_TABS = tabs('credentials', [
     'credential-tokens',
     'delegated-access',
     'sts-clients',
-    'credential-audit',
 ]);
 const CREDENTIALS = ['credentials-search-input', ...CREDENTIALS_TABS];
 
@@ -156,7 +155,9 @@ const SIDEBAR_PAGES: LayoutPage[] = [
         testIds: ['page-credentials', `credential-token-row-${FIXTURE_ID.delegationToken}`],
         actions: [
             ...CREDENTIALS,
+            `credential-token-expand-button-${FIXTURE_ID.delegationToken}`,
             `credential-token-revoke-user-button-${FIXTURE_ID.delegationToken}`,
+            `credential-token-limit-button-${FIXTURE_ID.delegationToken}`,
             `credential-token-revoke-button-${FIXTURE_ID.delegationToken}`,
         ],
     },

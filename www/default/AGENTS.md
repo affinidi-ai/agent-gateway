@@ -1067,26 +1067,94 @@ on save (an issuer change a provider using the strategy would refuse) with the s
 The Credentials page keeps its **Credential Tokens** tab (`pages/CredentialsPage/CredentialTokensTab.tsx`,
 tab key `credential-tokens`) and has a **Delegated Access** tab beside it
 (`pages/CredentialsPage/DelegatedAccessTab.tsx`, tab key `delegated-access`, trigger
-`credentials-delegated-access-tab-trigger`). Both read `GET /api/v1/delegation-vault`; the shared
-rules live in `pages/CredentialsPage/delegatedAccess.ts` (`consentState`, `timeLeft`,
-`isActiveDelegation`) and the page links in `PaginationControls.tsx`. A new view of the vault is a
-new tab: an existing tab is never renamed or removed.
+`credentials-delegated-access-tab-trigger`). The page calls `useDelegationVault()` once and
+hands its `vault` to both tabs, so a revoke or a limit made on one is what the other shows. The
+hook reads `GET /api/v1/delegation-vault` and `GET /api/v1/credential-providers` and owns the
+three changes to the tokens (`revoke`, `revokeUser`, `limitConsent`); a tab keeps only its
+toasts. The tabs still list the tokens when the providers cannot be read. A vault read the
+gateway refuses, or that gets no answer, shows `VaultReadError.tsx` in place of the list: the
+reason and **Retry** (`credential-tokens-read-error`, `delegated-access-read-error`, each with
+`-retry`), never the empty state, since a failed read says nothing about what the vault holds;
+Delegated Access then shows no count in its header.
+The shared rules live in `pages/CredentialsPage/delegatedAccess.ts` (`consentState`, `timeLeft`,
+`isActiveDelegation`, `consentLimitSecs`, `limitOutcome`, `canLimitConsent`,
+`renewsAutomatically`, `agentName`, `providerName`, `matchesSearch`, `tokenStatus`,
+`consentEndSentence`, `consentEndValue`, `revokeAllLabel`, `shownTime`) and the page links in
+`PaginationControls.tsx`, whose `clampPage` keeps the page shown inside the list, so revoking
+the last entry of the last page shows the page before it. A new view of the vault is a new tab,
+and both of these tabs stay.
+
+Both tabs name an agent with `AgentName.tsx`, which shows `agentName`: a `did:web` DID as its
+whole web address, the host and any path with each `:` as `/` and its port's `%3A` as `:`
+("pr-reviewer.example.com"), never cut; any other DID, and a `did:web` one with another percent
+escape or an unprintable character, shortened in the middle. The name is one chip that wraps
+after a dot or a slash, and inside a part (`text-break`) only when that part is wider than the
+cell. The full DID is the chip's tooltip.
+
+Both revoke one entry with the same text **Revoke** button, and show it, like every other
+control that changes a delegation, only to a user with `delegation_vault.delete`, the
+permission the routes ask for; without it the Actions column is not shown. A refused revoke
+toasts "Not revoked: " and the gateway's words, or its status where it gave none, and the entry
+stays. Escape cancels a two-step confirm, as a click elsewhere does (`useTwoStepDelete`).
 
 Credential Tokens lists every agent-keyed token, service tokens included.
 
+- The **Provider** column shows the provider's name, else its `provider_id` (`providerName`,
+  shared with Delegated Access's System column), and the search matches the name too; the
+  expanded row keeps **Provider ID**.
 - The **Consented** cell shows the consent time and, under it, the consent's end
   (`credential-token-consent-end-<id>`): "Ends <date> (in 3 hours)", "Ended <date>", or "No time
   limit" when the vault reports no `consent_expires_at`. The expanded row shows it as **Consent
-  Ends**, the date first. **Token Expires** is the access token's own expiry.
+  Ends**, the date first.
+- The **Access Token** column (`credential-token-access-token-<id>`) is the access token's own
+  expiry, with "Renews automatically" under it while the gateway renews the token by itself
+  (`renewsAutomatically`: the provider's `token_refresh_enabled` is on, a refresh token is
+  stored, and the consent has not ended). An ended consent, a provider that does not refresh and
+  one that cannot be read show no such line. The expanded row keeps **Token Expires**.
 - The status badge reads "Consent ended" once the end has passed and "Ending soon" within 24 hours
-  of it; otherwise it is the access token's status (Active, Expired (refreshable), Expired). The
-  header counts leave ended consents out of "active" and count them as "consent ended"
-  (`credential-tokens-consent-ended-count`).
-- No modal and no browser dialog confirms a revoke. The row's **Revoke delegation** is the two-step
-  `DeleteButton`. **Revoke all for this user** (`credential-token-revoke-user-button-<id>`) is the
-  shared `components/shared/TwoStepButton`, for a two-step action that is not a delete: the first
-  click shows "Click again to revoke all", the second sends the `DELETE`, and a click elsewhere
-  cancels.
+  of it; otherwise it is the access token's status (Active, Expired (refreshable), Expired)
+  (`tokenStatus`). The card header shows the title alone: no count of tokens and no count per
+  status.
+- A row opens its detail (`CredentialTokenDetail.tsx`, id and test id
+  `credential-token-detail-<id>`) on a
+  click anywhere in it, and from the chevron button in its first cell
+  (`credential-token-expand-button-<id>`, `aria-expanded`, `aria-controls` the detail), which
+  is how a keyboard reaches it.
+- **Limit duration** (`credential-token-limit-button-<id>`, `aria-expanded`, `aria-controls`
+  the panel, tooltip "Set how long after its consent this delegation ends") sits over
+  **Revoke** in the Actions cell, the two stacked at one width (`d-grid gap-1`), on a consent
+  an operator can limit (`canLimitConsent`: an Authorization Code provider's token whose
+  delegation is still active). It opens `ConsentLimitPanel.tsx` in a row of its own under the
+  token's row (`credential-token-limit-panel-<id>`, a `role="group"` named by its title), never
+  a modal or a browser dialog. The number takes the focus when the panel opens, and a second
+  click or **Cancel** (`credential-token-limit-cancel-<id>`) closes it; Cancel and a save put
+  the focus back on **Limit duration**. The panel is titled "Limit duration · <provider name>"
+  and reads "The agent may act for this person for at most [number] [minutes | hours | days]
+  after consent." (`credential-token-limit-input-<id>`, `credential-token-limit-unit-<id>`),
+  starting from the limit that applies now, or empty and in hours for a consent without one. A
+  line under it (`credential-token-limit-preview-<id>`, `aria-live`) says what the limit would
+  do, by `limitOutcome`: "Consent given <date>. With this limit it ends <date> (in 59
+  minutes).", "It already ends <date>. A limit only brings the end forward.", "This consent is
+  already older than that. Use Revoke to end it now.", or "Enter a whole number from 1 minute
+  to 365 days." **Save limit** (`credential-token-limit-save-<id>`, the shared `AppButton`,
+  `loading` while it saves, so it sends once) is enabled only for the first, sends
+  `PUT /api/v1/delegation-vault/{id}/consent-limit` with `max_consent_age_secs`
+  (`vault.limitConsent`), puts the answered `consent_expires_at` in the row, closes the panel
+  and toasts "Limit saved. <provider> access ends <date>." A refusal is shown under the field
+  (`credential-token-limit-error-<id>`, the input `is-invalid`, `aria-invalid` and described by
+  it) in the gateway's words, or as "The gateway could not be reached." when there was no
+  answer, and the panel stays open. A save that finishes after another row's panel was opened
+  updates its own row and leaves that panel open.
+- No modal and no browser dialog confirms a revoke. The row's **Revoke**
+  (`credential-token-revoke-button-<id>`) works as on Delegated Access: its first click asks with
+  a danger button that names the provider, beside **Cancel**
+  (`credential-token-revoke-cancel-button-<id>`). **Revoke all for this user**
+  (`credential-token-revoke-user-button-<id>`) is the shared `components/shared/TwoStepButton`,
+  for a two-step action that is not a delete: the first
+  click turns it into a danger button (`confirmAs="danger"`, never small or amber text) that says
+  how many of the user's listed delegations it ends, "Revoke all 2 for this user?" or "Revoke
+  this user's only delegation?" (`revokeAllLabel`), the second sends the `DELETE`, and a click
+  elsewhere or Escape cancels.
 - The expanded row links to the user's delegation records in the Audit Log
   (`credential-token-view-activity-button-<id>`): the Audit Log opens with the user identity hash
   as its text filter and the delegation categories selected. The link is shown only to a user
@@ -1096,11 +1164,19 @@ Delegated Access lists only active access: a token of an Authorization Code prov
 has not ended and whose access token is valid or refreshable. It has no history of its own.
 
 - Columns: User, System (the provider's name, else its `provider_id`), Agent, Access (scopes),
-  Status (Active, or Ending soon within 24 hours of the end), Ends (`delegated-access-ends-<id>`: the
-  time left over the date, or "No time limit"), Last Used and, with `settings.edit`, the two-step
-  **Revoke access** `DeleteButton` (`delegated-access-revoke-button-<id>`). Rows are
-  `delegated-access-row-<id>`; the header counts those ending soon
-  (`delegated-access-ending-soon-count`).
+  Status (Active, or Ending soon within 24 hours of the end), Ends (`delegated-access-ends-<id>`:
+  the time left, then the limit that applies to the consent, "6-hour limit" or "30-day limit"
+  (`consentLimitSecs`, from its consent time to the end the vault reports, so the sooner one
+  when the limit was shortened since; worded by `consentLimitLabel` in
+  `utils/consentLimit.ts`), then the date; or "No time limit"), Last Used and, with
+  `delegation_vault.delete`, a text
+  **Revoke** button (`delegated-access-revoke-button-<id>`, the shared `TwoStepButton` with
+  `confirmAs="danger"` and a `cancelTestId`). Its first click turns it into a danger button that
+  names what it ends, "Revoke GitHub access?" with the provider's name as System shows it, and
+  offers **Cancel** beside or under it (`delegated-access-revoke-cancel-button-<id>`, focus back
+  on Revoke); the second click sends the `DELETE`, and Cancel or a click elsewhere cancels. No
+  modal and no browser dialog. Rows are `delegated-access-row-<id>`; the header counts those
+  ending soon (`delegated-access-ending-soon-count`).
 - **History** (`delegated-access-history-button`) opens the Audit Log on the records of access
   that ended: `consent_expired`, `token_revoked` and `user_tokens_revoked`. It is shown only to a
   user with `audit.view`.
@@ -1109,15 +1185,25 @@ has not ended and whose access token is valid or refreshable. It has no history 
 ## Credential delegation audit
 
 The credential delegation records are read in the Audit Log (`pages/AuditPage`), not on the
-Credentials page. The **Credential Delegation Audit** tab stays in the Credentials tab row
-(`credentials-credential-audit-tab-trigger`, shown with `audit.view`) as a link: selecting it, or
-opening `/credentials?tab=credential-audit`, goes to the Audit Log with the delegation categories
-selected. Every link from the Credentials page into the audit is built by `auditLogPath` from
-`DELEGATION_CATEGORIES` or `DELEGATION_ENDED_CATEGORIES` (`pages/AuditPage/auditHelpers.ts`).
+Credentials page, and the Credentials tab row has no audit tab and no link in its place: a
+stored `/credentials?tab=credential-audit` opens the first tab, as any unknown tab does. The
+two ways from the Credentials page into the audit are **History** on Delegated Access and the
+link in a token's expanded row on Credential Tokens, both shown with `audit.view` and built by
+`auditLogPath` from `DELEGATION_ENDED_CATEGORIES` or `DELEGATION_CATEGORIES`
+(`pages/AuditPage/auditHelpers.ts`).
+
+The delegation categories are the ones the gateway audits: `consent_granted`, `consent_expired`,
+`consent_limited`, `token_revoked` and `user_tokens_revoked`. What the gateway does with a credential on each call
+(`token_injected`, `token_refreshed`, `refresh_failed`, `consent_required`, `token_not_found`
+and the elicitation events) is written to its log and is no audit event, so the Audit Log
+offers no category for it and no link selects it. A record of one that an older gateway
+audited is still shown, with its label (`categoryLabel`).
 
 - The Audit Log offers each delegation category in its Category filter, labels and narrates
-  `consent_expired` ("Consent expired", a warning, apart from a revocation), and shows it with
-  the other delegation events.
+  `consent_expired` ("Consent expired", a warning, apart from a revocation) and
+  `consent_limited` ("Consent limited", a warning: an operator made one consent end sooner,
+  with its new end and the one before it from the record's `detail`, and it was not revoked),
+  and shows them with the other delegation events.
 - Its Identity group shows **Subject**, the token's own `sub`, and a **Principal** row with the
   value the caller's grants are keyed by, `caller.principal`, only when the JWT strategy names a
   claim other than `sub`.
@@ -1250,24 +1336,50 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   description, default scopes and token refresh (`externalProviderUpdate`).
 - An Authorization Code provider, external consent or not, has a **Consent time limit**: a whole
   number (`credential-provider-consent-limit-input`, placeholder "Not set") and a unit select
-  (`credential-provider-consent-limit-unit-select`: seconds, minutes, hours or days, hours by
-  default), with its explanation behind `FieldHelp` (`field-help-consent-limit`). The line under
+  (`credential-provider-consent-limit-unit-select`: minutes, hours or days, hours by default;
+  seconds only while the stored limit is not a whole number of minutes, `consentLimitUnitsFor`,
+  so such a limit loads and saves unchanged), with its explanation behind `FieldHelp`
+  (`field-help-consent-limit`). The line under
   it says an empty field sets no limit on the provider and that the gateway's own default and
   ceiling still apply, never that an empty field means no limit. A stored
   `max_consent_age_secs` loads in its largest whole unit (`consentLimitOf`). Save always sends
   `max_consent_age_secs` (`consentLimitSeconds`): the limit in seconds, or `0`, which removes it,
   for an empty field and for every other provider type, where the field is not shown. A limit
-  outside one minute to 365 days, or not a whole number, is refused before anything is sent
-  (`CONSENT_LIMIT_RANGE_MESSAGE`). The unit arithmetic and wording live in
-  `utils/consentLimit.ts`.
+  outside one minute to 365 days, or not a whole number, is refused before anything is sent: the
+  banner at the top of the form summarises it (`CONSENT_LIMIT_RANGE_MESSAGE`), and the field is
+  marked invalid (`is-invalid`, `aria-invalid`, described by the message), says "Enter a limit
+  from 1 minute to 365 days, or leave it empty." under itself
+  (`credential-provider-consent-limit-error`, `invalid-feedback`) and takes the focus. Changing
+  the number or the unit clears the field's error. On a stored provider, a limit shorter than the
+  stored one, one set where none was, or an emptied field where a limit was stored (sent as `0`,
+  since the gateway's default may then be the shorter) is sent to
+  `GET /credential-providers/{id}/consent-impact?max_consent_age_secs=<seconds>` once the field
+  has stayed unchanged for 400 ms (`EditCredentialProviderPage/useConsentImpact.ts`). While its
+  `ending_consents` is above 0, a warning under the field
+  (`credential-provider-consent-limit-impact`, the editor's `alert alert-warning`, inside the
+  `role="status"` region `credential-provider-consent-limit-impact-region`, which is there
+  before the warning is so that it is announced) says how many active consents saving ends now and that those people approve
+  again, with the provider's name (`consentImpactMessage`, singular for one). There is no warning
+  and no request for a new provider, for a limit that is longer, equal or refused, or for an
+  empty field where no limit was stored, and no warning for 0 or a failed request. The unit arithmetic and wording live in
+  `utils/consentLimit.ts`, with the range's wording (`CONSENT_LIMIT_RANGE`), which the line
+  under the field states only while the field is not refused, since the error then states it.
+  On such a provider the help under **Enable automatic token refresh** says tokens are
+  refreshed for as long as the consent lasts, pointing at the Consent time limit below, and
+  that the person approves again when it ends, whether or not a limit is set; every other type
+  keeps saying the connection works without reauthorizing.
 - A provider a person consents to (`takesConsent`: Authorization Code, external consent or not)
   is deactivated, never deleted, from the dashboard. Its row on the Credential Providers tab has
   **Deactivate** (`credential-provider-deactivate-button-<id>`, the shared two-step
   `TwoStepButton`: the first click shows "Click again to deactivate", the second sends
   `POST /credential-providers/{id}/deactivate`) in place of the delete button, which only the
-  other provider types keep. A deactivated row shows a "Deactivated" badge
-  (`credential-provider-deactivated-badge-<id>`) and **Activate**
-  (`credential-provider-activate-button-<id>`, one click). The row stays in the list either way.
+  other provider types keep. A deactivated row shows **Activate**
+  (`credential-provider-activate-button-<id>`, one click). Deactivate and Activate share one
+  outline style (`btn-outline-secondary`, text only), since the colour belongs to the **Status**
+  column (`credential-provider-status-<id>`, after Type, for every provider): an "Active" badge
+  (`text-bg-success`), or a "Deactivated" badge (`credential-provider-deactivated-badge-<id>`,
+  `text-bg-secondary`) with "No new consent" under it. The Type column shows only the type. The
+  row stays in the list either way.
   The editor shows a warning (`credential-provider-deactivated-notice`) that nobody can consent
   again while access already given keeps working, and never sends `deactivated_at` on save. The
   Delegated Access tab marks the access of a deactivated provider "No new consent"
@@ -2043,9 +2155,6 @@ room for its text.
 - **Connection Points actions**: the row actions sit in a 6rem wide wrapping block (two
   buttons per line) with no left margins, so the Actions column stays near 120px and the
   Name and Mediator columns keep their room. Add a new row action inside that block.
-- **Credential Audit columns**: only Time, Event and the chevron column keep a fixed width.
-  Intent takes what its content needs, and its badge wraps (`text-wrap text-break`), so
-  Downstream Provider and Agent Surface keep room for their linked names.
 
 ## Validation
 

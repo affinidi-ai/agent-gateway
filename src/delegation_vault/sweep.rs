@@ -85,6 +85,125 @@ pub struct SweepReport {
     pub ended_consent_grants: usize,
 }
 
+/// The consents to one credential provider that have not ended, and how many
+/// of them a consent time limit would end at once.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ConsentImpact {
+    pub active_consents: usize,
+    pub ending_consents: usize,
+}
+
+/// What the hourly pass would end at once, as of `now`, were the consent time
+/// limit of `provider` `tried_secs`: counted over its consents that have not
+/// ended under the limits as they are, which are its agent-keyed tokens and
+/// those of its grants by binding that `surfaces` still serve. A provider
+/// nobody consents to has none: its tokens are service tokens. Nothing is
+/// changed.
+pub async fn consent_impact(
+    vault: &dyn DelegationVaultStorage,
+    surfaces: Option<&dyn AgentSurfaceStore>,
+    provider: &CredentialProvider,
+    tried_secs: Option<u64>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<ConsentImpact> {
+    let mut impact = ConsentImpact::default();
+    if !provider.takes_consent() {
+        return Ok(impact);
+    }
+    let (as_stored, as_tried) =
+        (ConsentLimits::of(None, provider.max_consent_age_secs), ConsentLimits::of(None, tried_secs));
+    for token in vault
+        .list_all()
+        .await?
+        .iter()
+        .filter(|token| token.credential_provider_id == provider.id)
+    {
+        impact.count(!token_consent_ended(as_stored, token, now), token_consent_ended(as_tried, token, now));
+    }
+    let Some(surfaces) = surfaces.filter(|_| provider.is_external_consent()) else {
+        return Ok(impact);
+    };
+    let mut read = HashMap::new();
+    for grant in vault
+        .provider_grants(&provider.id)
+        .await?
+    {
+        if !read.contains_key(&grant.surface_id) {
+            let surface = surfaces
+                .get_checked(&grant.surface_id)
+                .await?;
+            read.insert(grant.surface_id.clone(), surface);
+        }
+        let Some(surface) = read
+            .get(&grant.surface_id)
+            .and_then(Option::as_ref)
+            .filter(|surface| grant_is_served(surface, &grant, &provider.default_scopes))
+        else {
+            continue;
+        };
+        let ended_under =
+            |provider_secs| grant_consent_ended(grant_limits(surface, &grant, provider_secs), &grant, now);
+        impact.count(!ended_under(provider.max_consent_age_secs), ended_under(tried_secs));
+    }
+    Ok(impact)
+}
+
+impl ConsentImpact {
+    /// Counts one consent that is `active`, and whether the limit tried ends it.
+    fn count(
+        &mut self,
+        active: bool,
+        ended_by_tried: bool,
+    ) {
+        if active {
+            self.active_consents += 1;
+            self.ending_consents += usize::from(ended_by_tried);
+        }
+    }
+}
+
+/// Whether the consent of the agent-keyed `token` is past `limits` at `now`,
+/// for every binding.
+fn token_consent_ended(
+    limits: ConsentLimits,
+    token: &super::DelegationToken,
+    now: DateTime<Utc>,
+) -> bool {
+    limits.judge(token.consent_granted_at, token.consent_expires_at, now) == ConsentAge::Ended
+}
+
+/// Whether the consent of `grant` is past `limits` at `now`. A grant has one
+/// binding, so one too old for its binding has ended.
+fn grant_consent_ended(
+    limits: ConsentLimits,
+    grant: &DelegatedGrant,
+    now: DateTime<Utc>,
+) -> bool {
+    limits.judge(grant.created_at, grant.consent_expires_at, now) != ConsentAge::Current
+}
+
+/// The limits on the consent of `grant`: those of the bindings of `surface`
+/// that hold it and of a provider that sets `provider_secs`.
+fn grant_limits(
+    surface: &AgentSurface,
+    grant: &DelegatedGrant,
+    provider_secs: Option<u64>,
+) -> ConsentLimits {
+    ConsentLimits::of(crate::identity::handlers::surface_grants::binding_max_consent_age(surface, grant), provider_secs)
+}
+
+/// Whether `grant` is one `surface` serves under the id this gateway derives
+/// for it, with `default_scopes` its provider's. Any other is the daily
+/// sweep's to remove.
+fn grant_is_served(
+    surface: &AgentSurface,
+    grant: &DelegatedGrant,
+    default_scopes: &[String],
+) -> bool {
+    grant.key().record_id() == grant.id
+        && crate::identity::handlers::surface_grants::serves_grant(surface, grant, default_scopes)
+}
+
 /// One binding's grants, read under the lock of its surface, which is held
 /// while they are decided on.
 struct BindingGrants {
@@ -362,7 +481,7 @@ impl Sweeper {
                 }
             };
             let limits = ConsentLimits::of_provider(provider.as_ref());
-            if limits.judge(token.consent_granted_at, token.consent_expires_at, now) != ConsentAge::Ended {
+            if !token_consent_ended(limits, &token, now) {
                 continue;
             }
             let ended_at = limits.ends_at(token.consent_granted_at, token.consent_expires_at);
@@ -420,18 +539,17 @@ impl Sweeper {
             let default_scopes = provider
                 .as_ref()
                 .map_or(&[][..], |provider| &provider.default_scopes);
-            if grant.key().record_id() != grant.id
-                || !crate::identity::handlers::surface_grants::serves_grant(&surface, &grant, default_scopes)
-            {
+            if !grant_is_served(&surface, &grant, default_scopes) {
                 continue;
             }
-            let limits = ConsentLimits::of(
-                crate::identity::handlers::surface_grants::binding_max_consent_age(&surface, &grant),
+            let limits = grant_limits(
+                &surface,
+                &grant,
                 provider
                     .as_ref()
                     .and_then(|provider| provider.max_consent_age_secs),
             );
-            if limits.judge(grant.created_at, grant.consent_expires_at, now) == ConsentAge::Current {
+            if !grant_consent_ended(limits, &grant, now) {
                 continue;
             }
             let ended_at = limits.ends_for_binding_at(grant.created_at, grant.consent_expires_at);
@@ -1833,6 +1951,123 @@ mod tests {
             )]
         );
         revoked(&server, &["older", "older-refresh"]).await;
+    }
+
+    /// A tried limit is counted against the consents that have not ended: the
+    /// provider's agent-keyed tokens, and its grants their surface serves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tried_limit_counts_the_active_consents_the_hourly_pass_would_end() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = RecordingServer::start(200).await;
+        let sweeper = sweeper(&directory, &server, true).await;
+        limit_provider(&sweeper, 6 * 3_600).await;
+        let now = Utc::now();
+        for token in [
+            token("recent", "vendor", now, 30, false),
+            token("older", "vendor", now, 180, false),
+            token("ended", "vendor", now, 420, false),
+            token("another-provider", "elsewhere", now, 180, false),
+        ] {
+            sweeper
+                .vault
+                .store(token)
+                .await
+                .unwrap();
+        }
+        let connected = |hop: &str| {
+            let key = GrantKey::owner(Some("tenant-a"), "surface", hop, "vendor");
+            let mut grant = crate::delegation_vault::grants::tests::grant(&key, hop);
+            grant.created_at = now - chrono::Duration::hours(3);
+            grant.consent_expires_at = Some(grant.created_at + chrono::Duration::hours(6));
+            grant
+        };
+        for grant in [connected("served"), connected("removed-hop")] {
+            sweeper
+                .vault
+                .store_grant(grant)
+                .await
+                .unwrap();
+        }
+        let provider = sweeper
+            .providers
+            .get("vendor")
+            .await
+            .unwrap()
+            .unwrap();
+        let impact = |tried_secs: Option<u64>| {
+            consent_impact(sweeper.vault.as_ref(), Some(sweeper.surfaces.as_ref()), &provider, tried_secs, now)
+        };
+
+        let two_hours = impact(Some(2 * 3_600))
+            .await
+            .unwrap();
+        let five_hours = impact(Some(5 * 3_600))
+            .await
+            .unwrap();
+        let unlimited = impact(None).await.unwrap();
+        limit_binding(&sweeper, 3_600).await;
+        let past_its_binding = impact(Some(2 * 3_600))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            two_hours,
+            ConsentImpact {
+                active_consents: 3,
+                ending_consents: 2
+            },
+            "the token and the served grant given three hours ago end"
+        );
+        assert_eq!(
+            five_hours,
+            ConsentImpact {
+                active_consents: 3,
+                ending_consents: 0
+            }
+        );
+        assert_eq!(
+            unlimited,
+            ConsentImpact {
+                active_consents: 3,
+                ending_consents: 0
+            }
+        );
+        assert_eq!(
+            past_its_binding,
+            ConsentImpact {
+                active_consents: 2,
+                ending_consents: 1
+            },
+            "a grant older than its binding allows has already ended"
+        );
+        assert_eq!(
+            stored_token_ids(&sweeper)
+                .await
+                .len(),
+            4,
+            "counting removes nothing"
+        );
+    }
+
+    /// A provider nobody consents to has no consents to count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_nobody_consents_to_has_no_consents_to_end() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = RecordingServer::start(200).await;
+        let sweeper = sweeper(&directory, &server, true).await;
+        let now = Utc::now();
+        sweeper
+            .vault
+            .store(token("service", "service-account", now, 600, false))
+            .await
+            .unwrap();
+        let provider = crate::delegation_vault::test_support::provider("service-account", None);
+
+        let impact = consent_impact(sweeper.vault.as_ref(), None, &provider, Some(3_600), now)
+            .await
+            .unwrap();
+
+        assert_eq!(impact, ConsentImpact::default(), "its token is a service token, which nobody consented to");
     }
 
     /// An agent-keyed token with the consent given `minutes_ago` to

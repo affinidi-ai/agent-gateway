@@ -7,9 +7,12 @@ import {
   consentConfirmationField,
   consentConfirmationFieldsOf,
   consentConfirmationRedirectUri,
+  consentImpactMessage,
   consentLimitOf,
   consentLimitSeconds,
+  endingConsentsOf,
   missingConsentConfirmationField,
+  shortensConsentLimit,
   callbackUrlFor,
   callbackUrlToSave,
   isHttpsAddress,
@@ -330,6 +333,38 @@ describe('credential provider form', () => {
     expect(seconds('0', 'hours')).toBeNull();
     expect(seconds('6', 'hours', 'oauth2_client_credentials')).toBe(0);
     expect(seconds('nonsense', 'hours', 'api_key')).toBe(0);
+  });
+
+  it('asks what a save ends for a shorter limit, a first one, or a stored one removed', () => {
+    expect(shortensConsentLimit(3_600, 21_600)).toBe(true);
+    expect(shortensConsentLimit(3_600, undefined)).toBe(true);
+    expect(shortensConsentLimit(21_600, 21_600)).toBe(false);
+    expect(shortensConsentLimit(86_400, 21_600)).toBe(false);
+    expect(shortensConsentLimit(0, 21_600)).toBe(true);
+    expect(shortensConsentLimit(0, undefined)).toBe(false);
+    expect(shortensConsentLimit(null, 21_600)).toBe(false);
+  });
+
+  it('reads how many consents a save ends, and nothing from an answer without a count', () => {
+    expect(endingConsentsOf({ active_consents: 5, ending_consents: 2 })).toBe(2);
+    expect(endingConsentsOf({ active_consents: 5, ending_consents: 0 })).toBe(0);
+    expect(endingConsentsOf({ active_consents: 5 })).toBeNull();
+    expect(endingConsentsOf({ ending_consents: '2' })).toBeNull();
+    expect(endingConsentsOf({ ending_consents: -1 })).toBeNull();
+    expect(endingConsentsOf({ ending_consents: 1.5 })).toBeNull();
+    expect(endingConsentsOf([])).toBeNull();
+    expect(endingConsentsOf(null)).toBeNull();
+  });
+
+  it('says how many active consents a save ends, and nothing when it ends none', () => {
+    expect(consentImpactMessage(2, 'GitHub')).toBe(
+      'Saving ends 2 active GitHub consents now. Those people approve again next time their agent needs GitHub.'
+    );
+    expect(consentImpactMessage(1, 'GitHub')).toBe(
+      'Saving ends 1 active GitHub consent now. That person approves again next time their agent needs GitHub.'
+    );
+    expect(consentImpactMessage(0, 'GitHub')).toBeNull();
+    expect(consentImpactMessage(null, 'GitHub')).toBeNull();
   });
 
   it('loads the JWT settings of a stored provider and drops an unknown algorithm', () => {

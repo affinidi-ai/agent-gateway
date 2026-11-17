@@ -86,27 +86,9 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         Identity,
     ),
     event(
-        "token_injected",
-        "Token Injected",
-        "A delegated credential from the vault was injected on the caller's behalf",
-        Delegation,
-    ),
-    event(
         "connector_call",
         "Connector Call",
         "A call through a connector's Transit Point was forwarded with a grant, or refused before it was",
-        Delegation,
-    ),
-    event(
-        "token_refreshed",
-        "Token Refreshed",
-        "An expired delegated credential was refreshed and injected",
-        Delegation,
-    ),
-    event(
-        "refresh_failed",
-        "Refresh Failed",
-        "A delegated credential could not be refreshed, so consent is required again",
         Delegation,
     ),
     event(
@@ -116,30 +98,19 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         Delegation,
     ),
     event(
-        "consent_required",
-        "Consent Required",
-        "The caller was asked to grant consent before the request could proceed",
-        Delegation,
-    ),
-    event(
         "consent_expired",
         "Consent Expired",
         "A consent reached its time limit and the stored credential was removed; not a revocation",
         Delegation,
     ),
-    event("token_revoked", "Token Revoked", "A delegation token was revoked through the management API", Delegation),
-    event("user_tokens_revoked", "User Tokens Revoked", "Every delegation token for a user was revoked", Delegation),
-    event("token_not_found", "Token Not Found", "A delegation token lookup found no match", Delegation),
-    event("elicitation_sent", "Elicitation Sent", "An MCP elicitation request was sent to the client", Delegation),
-    event("elicitation_accepted", "Elicitation Accepted", "The client accepted an MCP elicitation", Delegation),
-    event("elicitation_declined", "Elicitation Declined", "The client declined an MCP elicitation", Delegation),
-    event("elicitation_cancelled", "Elicitation Cancelled", "The client cancelled an MCP elicitation", Delegation),
     event(
-        "elicitation_timed_out",
-        "Elicitation Timed Out",
-        "The client did not answer an MCP elicitation in time",
+        "consent_limited",
+        "Consent Limited",
+        "An operator brought the end of one stored consent forward through the management API; also recorded wherever Token Revoked is selected",
         Delegation,
     ),
+    event("token_revoked", "Token Revoked", "A delegation token was revoked through the management API", Delegation),
+    event("user_tokens_revoked", "User Tokens Revoked", "Every delegation token for a user was revoked", Delegation),
     event(
         "payment",
         "Payment Event",
@@ -242,6 +213,34 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
     ),
 ];
 
+/// The delegation events that are written to the gateway log and offered to
+/// no audit sink: what the gateway does with a stored credential on each call.
+/// What a person or an operator decided (a consent given, ended, refused or
+/// revoked) is in [`AUDIT_EVENTS`].
+pub const LOGGED_EVENTS: &[&str] = &[
+    "token_injected",
+    "token_refreshed",
+    "refresh_failed",
+    "consent_required",
+    "token_not_found",
+    "elicitation_sent",
+    "elicitation_accepted",
+    "elicitation_declined",
+    "elicitation_cancelled",
+    "elicitation_timed_out",
+];
+
+/// Events a sink receives together: one that selects the first also receives
+/// the second. An operator's limit on a consent ends access sooner, as a
+/// revocation does, so a selection made before `consent_limited` existed that
+/// audits revocations audits limits too.
+pub const RECEIVED_WITH: &[(&str, &str)] = &[("token_revoked", "consent_limited")];
+
+/// Whether `category` is one of the [`LOGGED_EVENTS`].
+pub fn is_logged_only(category: &str) -> bool {
+    LOGGED_EVENTS.contains(&category)
+}
+
 /// The event's bit in a selection bitmap: its position in [`AUDIT_EVENTS`].
 pub fn event_bit(category: &str) -> Option<u32> {
     AUDIT_EVENTS
@@ -275,6 +274,53 @@ mod tests {
             "{} events do not fit in a u64",
             AUDIT_EVENTS.len()
         );
+    }
+
+    /// What a person or an operator decided about delegated access is audited;
+    /// what the gateway does with a credential on each call is logged.
+    #[test]
+    fn the_delegation_events_are_split_between_the_audit_and_the_log() {
+        let audited: Vec<&str> = AUDIT_EVENTS
+            .iter()
+            .filter(|event| event.group == Delegation)
+            .map(|event| event.category)
+            .collect();
+        assert_eq!(
+            audited,
+            [
+                "connector_call",
+                "consent_granted",
+                "consent_expired",
+                "consent_limited",
+                "token_revoked",
+                "user_tokens_revoked",
+                "delegation_failed",
+                "mcp_proxy_pin_changed"
+            ]
+        );
+        assert_eq!(
+            LOGGED_EVENTS,
+            [
+                "token_injected",
+                "token_refreshed",
+                "refresh_failed",
+                "consent_required",
+                "token_not_found",
+                "elicitation_sent",
+                "elicitation_accepted",
+                "elicitation_declined",
+                "elicitation_cancelled",
+                "elicitation_timed_out"
+            ]
+        );
+        for logged in LOGGED_EVENTS {
+            assert!(is_logged_only(logged), "{logged}");
+            assert_eq!(event_bit(logged), None, "{logged} can be selected by no audit sink");
+        }
+        for event in AUDIT_EVENTS {
+            assert!(!is_logged_only(event.category), "{}", event.category);
+        }
+        assert!(!is_logged_only("not_an_event"));
     }
 
     #[test]
@@ -327,21 +373,12 @@ mod tests {
             assert_eq!(group_of(request), Some(AuditEventGroup::Requests), "{request}");
         }
         for delegation in [
-            "token_injected",
             "connector_call",
-            "token_refreshed",
-            "token_not_found",
             "token_revoked",
             "user_tokens_revoked",
-            "refresh_failed",
-            "consent_required",
             "consent_expired",
+            "consent_limited",
             "consent_granted",
-            "elicitation_sent",
-            "elicitation_accepted",
-            "elicitation_declined",
-            "elicitation_cancelled",
-            "elicitation_timed_out",
             "mcp_proxy_pin_changed",
         ] {
             assert_eq!(group_of(delegation), Some(AuditEventGroup::Delegation), "{delegation}");

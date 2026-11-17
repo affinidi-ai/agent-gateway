@@ -11,7 +11,7 @@ use super::{
     refuse_while_used, require_known_id, validate_text,
 };
 use crate::auth_manager::middleware::AuthGuardOk;
-use crate::integrations::definitions::event_set::validate_events;
+use crate::integrations::definitions::event_set::{is_logged_audit_event_id, validate_events};
 use crate::integrations::definitions::{EventSet, EventSetError};
 use crate::integrations::events::catalog;
 
@@ -123,9 +123,14 @@ pub async fn delete_event_set(
 }
 
 /// Refuses a list longer than the catalog: an event set holds each catalog event at most once.
+/// The events the gateway now only logs are not counted, since a save drops them.
 fn within_catalog(events: &[String]) -> Result<(), ApiError> {
     let most = catalog().len();
-    if events.len() > most {
+    let offered = events
+        .iter()
+        .filter(|event| !is_logged_audit_event_id(event))
+        .count();
+    if offered > most {
         return Err((StatusCode::BAD_REQUEST, format!("An event set holds at most {most} events")));
     }
     Ok(())
@@ -275,6 +280,63 @@ mod tests {
         assert_eq!(create_body, json!(format!("An event set holds at most {} events", every_event.len())));
         assert_eq!(update_status, StatusCode::BAD_REQUEST);
         assert_eq!(every_status, StatusCode::CREATED, "every catalog event once fits");
+    }
+
+    /// A stored set, or a client's list, may still name a delegation event the
+    /// gateway used to audit and now only logs.
+    #[tokio::test]
+    async fn a_save_drops_the_events_the_gateway_now_only_logs() {
+        let f = Fixture::new().await;
+        let kept = std::collections::HashSet::from(["gateway.created".to_string()]);
+
+        let created = create(&f, &["gateway.created", "audit.token_injected"]).await;
+        let (update_status, updated) = f
+            .call(
+                ADMIN,
+                "PUT",
+                &format!("/v1/integrations/event-sets/{}", id(&created)),
+                Some(json!({"name": "Ops events", "events": ["audit.consent_required", "gateway.created"]})),
+            )
+            .await;
+        let mut every_event_and_the_logged_ones: Vec<String> = crate::integrations::events::catalog()
+            .iter()
+            .map(|event| event.id.to_string())
+            .collect();
+        let every_event = every_event_and_the_logged_ones.len();
+        every_event_and_the_logged_ones.extend(
+            crate::audit::catalog::LOGGED_EVENTS
+                .iter()
+                .map(|logged| format!("audit.{logged}")),
+        );
+        let (all_status, all) = f
+            .call(
+                ADMIN,
+                "POST",
+                "/v1/integrations/event-sets",
+                Some(json!({"name": "All", "events": every_event_and_the_logged_ones})),
+            )
+            .await;
+        let (none_status, none) = f
+            .call(
+                ADMIN,
+                "POST",
+                "/v1/integrations/event-sets",
+                Some(json!({"name": "None", "events": ["audit.token_injected"]})),
+            )
+            .await;
+
+        let events_of = |body: JsonValue| {
+            serde_json::from_value::<EventSet>(body)
+                .expect("event set")
+                .events
+        };
+        assert_eq!(events_of(created), kept);
+        assert_eq!(update_status, StatusCode::OK, "{updated}");
+        assert_eq!(events_of(updated), kept);
+        assert_eq!(all_status, StatusCode::CREATED, "{all}");
+        assert_eq!(events_of(all).len(), every_event);
+        assert_eq!(none_status, StatusCode::BAD_REQUEST, "{none}");
+        assert_eq!(none, json!("An event set needs at least one event"));
     }
 
     #[tokio::test]

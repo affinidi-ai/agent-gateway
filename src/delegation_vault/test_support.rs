@@ -96,6 +96,10 @@ impl InMemoryProviders {
         Self { providers: None }
     }
 
+    pub(crate) fn of(providers: Vec<CredentialProvider>) -> Self {
+        Self { providers: Some(providers) }
+    }
+
     fn providers(&self) -> anyhow::Result<&[CredentialProvider]> {
         self.providers
             .as_deref()

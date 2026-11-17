@@ -7,6 +7,7 @@ import CredentialProvidersTab from './SettingsPage/CredentialProvidersTab';
 import CredentialTokensTab from './CredentialsPage/CredentialTokensTab';
 import DelegatedAccessTab from './CredentialsPage/DelegatedAccessTab';
 import StsClientsTab from './CredentialsPage/StsClientsTab';
+import { useDelegationVault } from './CredentialsPage/useDelegationVault';
 import { usePermissions } from '../context/PermissionsContext';
 import {
   DELEGATION_CATEGORIES,
@@ -19,14 +20,12 @@ type TabKey =
   | 'credential-providers'
   | 'credential-tokens'
   | 'delegated-access'
-  | 'credential-audit'
   | 'sts-clients';
 const VALID_TABS: TabKey[] = [
   'jwt-verification',
   'credential-providers',
   'credential-tokens',
   'delegated-access',
-  'credential-audit',
   'sts-clients',
 ];
 
@@ -41,24 +40,13 @@ const CredentialsPage: React.FC = () => {
   const { hasPermission, loading: permissionsLoading } = usePermissions();
   const canViewAudit = !permissionsLoading && hasPermission('audit.view');
   const canViewSts = !permissionsLoading && hasPermission('sts_clients.view');
+  const vault = useDelegationVault();
 
   const [strategiesCount, setStrategiesCount] = useState(0);
   const [providersCount, setProvidersCount] = useState(0);
   const [tokensCount, setTokensCount] = useState(0);
   const [delegationsCount, setDelegationsCount] = useState(0);
   const [stsClientsCount, setStsClientsCount] = useState(0);
-
-  // The delegation records are read in the Audit Log. Its tab here is a link, so a stored
-  // address of the tab leads there too.
-  useEffect(() => {
-    if (permissionsLoading || activeTab !== 'credential-audit') return;
-    setActiveTab('jwt-verification');
-    if (canViewAudit) {
-      navigate(auditLogPath(DELEGATION_CATEGORIES), { replace: true });
-    } else {
-      setSearchParams({ tab: 'jwt-verification' }, { replace: true });
-    }
-  }, [activeTab, canViewAudit, navigate, permissionsLoading, setSearchParams]);
 
   useEffect(() => {
     if (!permissionsLoading && !canViewSts && activeTab === 'sts-clients') {
@@ -99,10 +87,6 @@ const CredentialsPage: React.FC = () => {
         activeKey={activeTab}
         onSelect={k => {
           const next = (k as TabKey) || 'jwt-verification';
-          if (next === 'credential-audit') {
-            navigate(auditLogPath(DELEGATION_CATEGORIES));
-            return;
-          }
           setActiveTab(next);
           setSearchParams({ tab: next }, { replace: true });
         }}
@@ -148,6 +132,7 @@ const CredentialsPage: React.FC = () => {
           }
         >
           <CredentialTokensTab
+            vault={vault}
             externalSearchTerm={searchTerm}
             onFilteredCountChange={setTokensCount}
             onViewActivity={canViewAudit ? viewActivity : undefined}
@@ -164,6 +149,7 @@ const CredentialsPage: React.FC = () => {
           }
         >
           <DelegatedAccessTab
+            vault={vault}
             externalSearchTerm={searchTerm}
             onFilteredCountChange={setDelegationsCount}
             onViewHistory={canViewAudit ? viewHistory : undefined}
@@ -185,22 +171,6 @@ const CredentialsPage: React.FC = () => {
               onFilteredCountChange={setStsClientsCount}
             />
           </Tab>
-        )}
-
-        {canViewAudit && (
-          <Tab
-            eventKey="credential-audit"
-            tabAttrs={{
-              'data-testid': 'credentials-credential-audit-tab-trigger',
-              title: 'Opens the Audit Log, filtered to credential delegation',
-            }}
-            title={
-              <>
-                <i className="fas fa-clipboard-list"></i> Credential Delegation Audit{' '}
-                <i className="fas fa-arrow-up-right-from-square fa-xs" aria-hidden="true"></i>
-              </>
-            }
-          />
         )}
       </Tabs>
     </div>

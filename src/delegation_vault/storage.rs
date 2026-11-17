@@ -111,6 +111,19 @@ pub trait DelegationVaultStorage: Send + Sync {
         id: &str,
     ) -> Result<()>;
 
+    /// Bring the end of the consent of the agent-keyed token `id`, given at `granted_at`,
+    /// forward to `end`, and return the token as it is stored then. `None` when nothing was
+    /// changed: no token has this id, its consent is another one, given at another time, or
+    /// it already ends at `end` or before. The access and refresh tokens are left as they are.
+    async fn limit_consent(
+        &self,
+        _id: &str,
+        _granted_at: DateTime<Utc>,
+        _end: DateTime<Utc>,
+    ) -> Result<Option<DelegationToken>> {
+        anyhow::bail!("This vault does not limit a stored consent")
+    }
+
     async fn access_revision(&self) -> Result<Option<uuid::Uuid>> {
         anyhow::bail!("This vault does not support subscription access validation")
     }
@@ -1445,12 +1458,48 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
             );
             token.updated_at = next_version(current.updated_at)?;
             token.last_used_at = current.last_used_at;
+            // A refresh carries the consent's end as it read it. One brought forward since
+            // stays brought forward.
+            token.consent_expires_at =
+                super::consent_age::earlier(current.consent_expires_at, token.consent_expires_at);
             store
                 .storage
                 .save_atomic(&token)
                 .await
                 .context("Failed to update delegation token")?;
             Ok(token)
+        })
+        .await
+    }
+
+    async fn limit_consent(
+        &self,
+        id: &str,
+        granted_at: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Option<DelegationToken>> {
+        let id = id.to_string();
+        self.mutate(move |store| async move {
+            let Some(mut token) = store
+                .storage
+                .get(&id)
+                .await?
+                .filter(|token| {
+                    token.consent_granted_at == granted_at
+                        && token
+                            .consent_expires_at
+                            .is_none_or(|stored| end < stored)
+                })
+            else {
+                return Ok(None);
+            };
+            token.consent_expires_at = Some(end);
+            store
+                .storage
+                .save_atomic(&token)
+                .await
+                .context("Failed to limit the consent of a delegation token")?;
+            Ok(Some(token))
         })
         .await
     }
@@ -2283,6 +2332,154 @@ fn newest_first(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn limiting_a_consent_only_brings_its_stored_end_forward() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileSystemDelegationVaultStore::new(directory.path().into())
+            .await
+            .unwrap();
+        let token = store
+            .store(super::super::tests::make_token(Some(3600), true))
+            .await
+            .unwrap();
+        let granted = token.consent_granted_at;
+        let stored_end = || async {
+            store
+                .get(&token.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .consent_expires_at
+        };
+        let limit = |id: &'static str, granted_at, hours| {
+            let store = store.clone();
+            let id = if id.is_empty() {
+                token.id.clone()
+            } else {
+                id.to_string()
+            };
+            async move {
+                store
+                    .limit_consent(&id, granted_at, granted + Duration::hours(hours))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let limited = limit("", granted, 6)
+            .await
+            .expect("a consent without an end takes one");
+        assert_eq!(limited.consent_expires_at, Some(granted + Duration::hours(6)));
+        assert_eq!(stored_end().await, Some(granted + Duration::hours(6)));
+
+        let sooner = limit("", granted, 2)
+            .await
+            .expect("a sooner end is stored");
+        assert_eq!(sooner.consent_expires_at, Some(granted + Duration::hours(2)));
+        assert_eq!(sooner.access_token, token.access_token);
+        assert_eq!(sooner.refresh_token, token.refresh_token);
+        assert_eq!(sooner.updated_at, token.updated_at, "a refresh under way still finds the token it read");
+
+        assert!(
+            limit("", granted, 9)
+                .await
+                .is_none(),
+            "an end is never moved later"
+        );
+        assert!(
+            limit("", granted, 2)
+                .await
+                .is_none(),
+            "the same end changes nothing"
+        );
+        assert!(
+            limit("", granted + Duration::seconds(1), 1)
+                .await
+                .is_none(),
+            "a limit worked out for another consent time is not applied"
+        );
+        assert!(
+            limit("no-such-token", granted, 1)
+                .await
+                .is_none()
+        );
+        assert_eq!(stored_end().await, Some(granted + Duration::hours(2)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_limit_worked_out_before_a_new_consent_does_not_cut_the_new_consent_short() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileSystemDelegationVaultStore::new(directory.path().into())
+            .await
+            .unwrap();
+        let mut first = super::super::tests::make_token(Some(3600), true);
+        first.consent_granted_at = Utc::now() - Duration::hours(3);
+        first.consent_expires_at = Some(first.consent_granted_at + Duration::hours(6));
+        let first = store
+            .store(first)
+            .await
+            .unwrap();
+
+        let mut again = super::super::tests::make_token(Some(3600), true);
+        again.consent_expires_at = Some(again.consent_granted_at + Duration::hours(6));
+        let again = store
+            .store(again)
+            .await
+            .unwrap();
+        assert_eq!(again.id, first.id, "a new consent by the same person replaces the token under its id");
+
+        let limited = store
+            .limit_consent(&first.id, first.consent_granted_at, first.consent_granted_at + Duration::hours(4))
+            .await
+            .unwrap();
+
+        assert!(limited.is_none(), "the consent the limit was worked out for is gone");
+        let stored = store
+            .get(&first.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.consent_granted_at, again.consent_granted_at);
+        assert_eq!(stored.consent_expires_at, again.consent_expires_at);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refresh_that_read_a_token_before_its_consent_was_limited_keeps_the_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileSystemDelegationVaultStore::new(directory.path().into())
+            .await
+            .unwrap();
+        let mut token = super::super::tests::make_token(Some(-10), true);
+        let granted = token.consent_granted_at;
+        token.consent_expires_at = Some(granted + Duration::hours(6));
+        let read_before_the_limit = store
+            .store(token)
+            .await
+            .unwrap();
+        store
+            .limit_consent(&read_before_the_limit.id, granted, granted + Duration::hours(2))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut refreshed = read_before_the_limit.clone();
+        refreshed.access_token = "gho_refreshed_access_token".to_string();
+        refreshed.expires_at = Some(Utc::now() + Duration::hours(1));
+        let updated = store
+            .update(refreshed)
+            .await
+            .expect("the refresh completes");
+
+        assert_eq!(updated.access_token, "gho_refreshed_access_token");
+        assert_eq!(updated.consent_expires_at, Some(granted + Duration::hours(2)));
+        let stored = store
+            .get(&read_before_the_limit.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.consent_expires_at, Some(granted + Duration::hours(2)));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn storing_a_token_removes_only_the_expired_rows_of_one_agent_provider_and_purpose() {

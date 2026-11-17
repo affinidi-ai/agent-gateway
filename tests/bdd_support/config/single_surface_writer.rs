@@ -690,7 +690,7 @@ fn write_single_surface_config_inner(
         &surface_config.enforced_credential_rules,
         surface_config.token_request_timeout_secs,
     );
-    if surface_config.logs_audit_events {
+    if surface_config.logs_at_info {
         log_info(base_dir);
     } else if surface_config.keeps_gateway_log {
         log_warnings(base_dir);

@@ -7,7 +7,7 @@ use crate::{
 };
 use axum::{
     Router,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 
 /// Create the delegation vault management API router.
@@ -15,7 +15,8 @@ use axum::{
 ///
 /// Every route is RBAC-gated when `gate` is `Some`: the reads (list/get of the
 /// agent-keyed tokens) require `DelegationVaultView`; the
-/// revokes (single + mass by-user) and the removals of grants by binding (one
+/// revokes (single + mass by-user), the limit on one consent, which ends it
+/// sooner, and the removals of grants by binding (one
 /// grant, or one binding's) require `DelegationVaultDelete`; starting and
 /// completing an external consent connect, and the report of a surface's
 /// grants by binding, require `DelegationVaultConnect`, so a token provisioned
@@ -36,6 +37,10 @@ pub fn create_delegation_vault_router(
         .route(
             "/api/v1/delegation-vault/{id}",
             maybe_gate(g, delete(handlers::revoke_token), Feature::DelegationVaultDelete),
+        )
+        .route(
+            "/api/v1/delegation-vault/{id}/consent-limit",
+            maybe_gate(g, put(handlers::limit_consent), Feature::DelegationVaultDelete),
         )
         .route(
             "/api/v1/delegation-vault/by-user/{user_hash}",
@@ -118,10 +123,13 @@ mod tests {
     /// Minimal in-memory delegation vault backing the handler under test.
     /// Only the reads/deletes exercised by the management routes are real.
     /// An `unreadable` vault fails every read and delete with
-    /// [`VAULT_READ_FAILURE`].
+    /// [`VAULT_READ_FAILURE`]. A token in `given_again_after_a_read` takes the
+    /// place of the one with its id right after the next read, as a consent
+    /// given again between a handler's read and its write does.
     struct InMemoryVault {
         tokens: Mutex<Vec<DelegationToken>>,
         unreadable: bool,
+        given_again_after_a_read: Mutex<Option<DelegationToken>>,
     }
 
     /// The detail of a failed read or delete of an `unreadable`
@@ -148,13 +156,21 @@ mod tests {
             if self.unreadable {
                 anyhow::bail!(VAULT_READ_FAILURE);
             }
-            Ok(self
-                .tokens
-                .lock()
-                .unwrap()
+            let mut tokens = self.tokens.lock().unwrap();
+            let read = tokens
                 .iter()
                 .find(|t| t.id == id)
-                .cloned())
+                .cloned();
+            if let Some(again) = self
+                .given_again_after_a_read
+                .lock()
+                .unwrap()
+                .take()
+            {
+                tokens.retain(|t| t.id != again.id);
+                tokens.push(again);
+            }
+            Ok(read)
         }
 
         async fn lookup(
@@ -215,6 +231,28 @@ mod tests {
             _id: &str,
         ) -> anyhow::Result<()> {
             Ok(())
+        }
+
+        async fn limit_consent(
+            &self,
+            id: &str,
+            granted_at: chrono::DateTime<Utc>,
+            end: chrono::DateTime<Utc>,
+        ) -> anyhow::Result<Option<DelegationToken>> {
+            let mut guard = self.tokens.lock().unwrap();
+            Ok(guard
+                .iter_mut()
+                .find(|token| {
+                    token.id == id
+                        && token.consent_granted_at == granted_at
+                        && token
+                            .consent_expires_at
+                            .is_none_or(|stored| end < stored)
+                })
+                .map(|token| {
+                    token.consent_expires_at = Some(end);
+                    token.clone()
+                }))
         }
     }
 
@@ -350,6 +388,7 @@ mod tests {
             vault_store: Arc::new(InMemoryVault {
                 tokens: Mutex::new(tokens),
                 unreadable: false,
+                given_again_after_a_read: Mutex::new(None),
             }),
             provider_store: Arc::new(providers),
             secrets_store: Arc::new(StubSecretsStore),
@@ -3440,6 +3479,7 @@ mod tests {
                 let vault = Arc::new(InMemoryVault {
                     tokens: Mutex::new(Vec::new()),
                     unreadable: false,
+                    given_again_after_a_read: Mutex::new(None),
                 });
                 let mut fixture = Self {
                     providers,
@@ -3987,6 +4027,7 @@ mod tests {
             ("GET", "/api/v1/delegation-vault"),
             ("GET", "/api/v1/delegation-vault/t1"),
             ("DELETE", "/api/v1/delegation-vault/t1"),
+            ("PUT", "/api/v1/delegation-vault/t1/consent-limit"),
             ("DELETE", "/api/v1/delegation-vault/by-user/sha256:user-1"),
             ("DELETE", "/api/v1/delegation-vault/grants/grant-1"),
             ("DELETE", "/api/v1/delegation-vault/grants?surface_id=s&transit_point_id=tp&credential_provider_id=p"),
@@ -4283,6 +4324,299 @@ mod tests {
         assert_eq!(caller.token_id.as_deref(), Some("pat-9"));
     }
 
+    // ── One consent is limited by an appliance-wide admin, and only brought forward ──
+
+    /// `cp-consent`, a provider a person consents to, whose consents last six
+    /// hours.
+    fn consent_provider() -> CredentialProvider {
+        let mut provider: CredentialProvider = serde_json::from_value(serde_json::json!({
+            "id": "cp-consent", "name": "GitHub", "provider_id": "github",
+            "provider_type": "oauth2_authorization_code",
+            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+        }))
+        .unwrap();
+        provider.max_consent_age_secs = Some(21_600);
+        provider
+    }
+
+    /// A token of [`consent_provider`] whose consent was given an hour ago and
+    /// ends five hours from now.
+    fn consented_an_hour_ago(id: &str) -> DelegationToken {
+        let granted = Utc::now() - chrono::Duration::hours(1);
+        DelegationToken {
+            consent_granted_at: granted,
+            consent_expires_at: Some(granted + chrono::Duration::hours(6)),
+            ..seed_token_of(id, "cp-consent")
+        }
+    }
+
+    /// The vault's routes over `tokens` and the providers `cp-consent` and the
+    /// service provider `cp-global`, as an admin session reaches them, and
+    /// the vault behind them.
+    async fn admin_over(tokens: Vec<DelegationToken>) -> (Router, Arc<dyn DelegationVaultStorage>, tempfile::TempDir) {
+        let state = state_with_providers(
+            tokens,
+            InMemoryProviders::of(vec![
+                consent_provider(),
+                crate::delegation_vault::test_support::provider("cp-global", None),
+            ]),
+        );
+        let vault = state.vault_store.clone();
+        let (storage, dir) = storage_with_user("admin-1", UserRole::Administrator).await;
+        let app = create_delegation_vault_router(state, Some(gate_for(storage)))
+            .layer(Extension(AuthGuardOk("admin-1".to_string())));
+        (app, vault, dir)
+    }
+
+    /// The answer to limiting the consent of token `id` with the JSON `body`.
+    async fn limit_response(
+        app: Router,
+        id: &str,
+        body: &str,
+    ) -> (u16, serde_json::Value) {
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/api/v1/delegation-vault/{id}/consent-limit"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app
+            .oneshot(request)
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    async fn stored(
+        vault: &Arc<dyn DelegationVaultStorage>,
+        id: &str,
+    ) -> DelegationToken {
+        vault
+            .get(id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_admin_brings_the_end_of_one_consent_forward_and_the_audit_names_who_did_it() {
+        let token = consented_an_hour_ago("t1");
+        let other = consented_an_hour_ago("t2");
+        let granted = token.consent_granted_at;
+        let (app, vault, _dir) = admin_over(vec![token.clone(), other.clone()]).await;
+
+        let ((status, body), events) =
+            capture(async { limit_response(app, "t1", r#"{"max_consent_age_secs": 7200}"#).await }).await;
+
+        assert_eq!(status, StatusCode::OK.as_u16(), "{body}");
+        let end = granted + chrono::Duration::hours(2);
+        assert_eq!(serde_json::from_value::<chrono::DateTime<Utc>>(body["consent_expires_at"].clone()).unwrap(), end);
+        assert_eq!(body["id"], "t1");
+        assert!(
+            body.get("access_token")
+                .is_none()
+                && body
+                    .get("refresh_token")
+                    .is_none(),
+            "{body}"
+        );
+        let limited = stored(&vault, "t1").await;
+        assert_eq!(limited.consent_expires_at, Some(end));
+        assert_eq!(limited.access_token, token.access_token, "the credential itself is left alone");
+        assert_eq!(
+            stored(&vault, "t2")
+                .await
+                .consent_expires_at,
+            other.consent_expires_at,
+            "another consent keeps its end"
+        );
+
+        assert_eq!(events.len(), 1, "{events:?}");
+        let event = &events[0];
+        assert!(matches!(event.event, DelegationAuditAction::ConsentLimited));
+        assert_eq!(event.token_id.as_deref(), Some("t1"));
+        assert_eq!(event.agent_did.as_deref(), Some(token.agent_did.as_str()));
+        assert_eq!(
+            event
+                .user_identity_hash
+                .as_deref(),
+            Some(
+                token
+                    .user_identity_hash
+                    .as_str()
+            )
+        );
+        assert_eq!(event.provider_id.as_deref(), Some("cp-consent"));
+        assert_eq!(
+            event.detail.as_deref(),
+            Some(
+                crate::delegation_vault::consent_age::limit_detail(
+                    granted,
+                    end,
+                    Some(granted + chrono::Duration::hours(6))
+                )
+                .as_str()
+            )
+        );
+        let caller = event
+            .caller
+            .as_ref()
+            .expect("the record names who limited the consent");
+        assert_eq!(caller.sub.as_deref(), Some("admin-1"));
+    }
+
+    #[tokio::test]
+    async fn a_limit_that_would_extend_a_consent_or_end_it_now_is_refused_and_changes_nothing() {
+        let token = consented_an_hour_ago("t1");
+        let (app, vault, _dir) = admin_over(vec![token.clone()]).await;
+
+        for (body, code) in [
+            (r#"{"max_consent_age_secs": 21600}"#, "limit_not_sooner"),
+            (r#"{"max_consent_age_secs": 86400}"#, "limit_not_sooner"),
+            (r#"{"max_consent_age_secs": 1800}"#, "consent_older_than_limit"),
+            (r#"{"max_consent_age_secs": 59}"#, "invalid_limit"),
+            (r#"{"max_consent_age_secs": 31536001}"#, "invalid_limit"),
+            (r#"{"max_consent_age_secs": "7200"}"#, "invalid_limit"),
+            (r#"{}"#, "invalid_limit"),
+        ] {
+            let ((status, answer), events) = capture(async { limit_response(app.clone(), "t1", body).await }).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST.as_u16(), "{body}: {answer}");
+            assert_eq!(answer["code"], code, "{body}: {answer}");
+            assert!(answer["error"].is_string(), "{body}: {answer}");
+            assert!(events.is_empty(), "{body}: {events:?}");
+        }
+        assert_eq!(
+            stored(&vault, "t1")
+                .await
+                .consent_expires_at,
+            token.consent_expires_at
+        );
+    }
+
+    /// A limit that changes nothing is refused and writes no record, so the
+    /// audit never names an end that is not stored.
+    #[tokio::test]
+    async fn a_second_limit_that_is_no_sooner_is_refused_and_audits_nothing() {
+        let token = consented_an_hour_ago("t1");
+        let granted = token.consent_granted_at;
+        let (app, vault, _dir) = admin_over(vec![token]).await;
+
+        let ((first, _), events) =
+            capture(async { limit_response(app.clone(), "t1", r#"{"max_consent_age_secs": 7200}"#).await }).await;
+        assert_eq!(first, StatusCode::OK.as_u16());
+        assert_eq!(events.len(), 1);
+
+        let ((second, answer), events) =
+            capture(async { limit_response(app, "t1", r#"{"max_consent_age_secs": 10800}"#).await }).await;
+        assert_eq!(second, StatusCode::BAD_REQUEST.as_u16(), "{answer}");
+        assert_eq!(answer["code"], "limit_not_sooner");
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(
+            stored(&vault, "t1")
+                .await
+                .consent_expires_at,
+            Some(granted + chrono::Duration::hours(2))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_limit_on_a_consent_that_was_given_again_meanwhile_is_a_conflict_and_changes_nothing() {
+        let read = consented_an_hour_ago("t1");
+        let given_again = DelegationToken {
+            consent_granted_at: Utc::now(),
+            consent_expires_at: Some(Utc::now() + chrono::Duration::hours(6)),
+            ..read.clone()
+        };
+        let vault = Arc::new(InMemoryVault {
+            tokens: Mutex::new(vec![read]),
+            unreadable: false,
+            given_again_after_a_read: Mutex::new(Some(given_again.clone())),
+        });
+        let state = DelegationVaultState {
+            vault_store: vault.clone(),
+            ..state_with_providers(Vec::new(), InMemoryProviders::of(vec![consent_provider()]))
+        };
+        let (storage, _dir) = storage_with_user("admin-1", UserRole::Administrator).await;
+        let app = create_delegation_vault_router(state, Some(gate_for(storage)))
+            .layer(Extension(AuthGuardOk("admin-1".to_string())));
+
+        let ((status, answer), events) =
+            capture(async { limit_response(app, "t1", r#"{"max_consent_age_secs": 7200}"#).await }).await;
+
+        assert_eq!(status, StatusCode::CONFLICT.as_u16(), "{answer}");
+        assert_eq!(answer["code"], "consent_changed");
+        assert!(events.is_empty(), "{events:?}");
+        let held = vault
+            .get("t1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.consent_granted_at, given_again.consent_granted_at);
+        assert_eq!(held.consent_expires_at, given_again.consent_expires_at);
+    }
+
+    #[tokio::test]
+    async fn only_a_stored_consent_a_person_gave_is_limited() {
+        let (app, vault, _dir) =
+            admin_over(vec![seed_token_of("service", "cp-global"), seed_token_of("orphan", "cp-deleted")]).await;
+        let limit = r#"{"max_consent_age_secs": 7200}"#;
+
+        for id in ["service", "orphan"] {
+            let ((status, answer), events) = capture(async { limit_response(app.clone(), id, limit).await }).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST.as_u16(), "{id}: {answer}");
+            assert_eq!(answer["code"], "not_a_consent", "{id}: {answer}");
+            assert!(events.is_empty(), "{id}: {events:?}");
+            assert_eq!(
+                stored(&vault, id)
+                    .await
+                    .consent_expires_at,
+                None,
+                "{id}"
+            );
+        }
+        let (status, answer) = limit_response(app, "no-such-token", limit).await;
+        assert_eq!(status, StatusCode::NOT_FOUND.as_u16(), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn only_an_appliance_wide_caller_with_the_delete_permission_limits_a_consent() {
+        let limit = r#"{"max_consent_age_secs": 7200}"#;
+        let token = consented_an_hour_ago("t1");
+        let (app, vault, _dir) = admin_over(vec![token.clone()]).await;
+
+        for (caller, scoped) in [
+            ("a tenant token", as_tenant(app.clone(), "tenant-a")),
+            ("a token scoped by required headers alone", as_header_scoped(app.clone())),
+            (
+                "an access token without delegation_vault.delete",
+                app.clone()
+                    .layer(Extension(PatContext(Some(vec!["delegation_vault.view".to_string()])))),
+            ),
+        ] {
+            let (status, _) = limit_response(scoped, "t1", limit).await;
+            assert_eq!(status, StatusCode::FORBIDDEN.as_u16(), "{caller}");
+        }
+        let ungated = create_delegation_vault_router(state_with(vec![consented_an_hour_ago("t1")]), None);
+        assert_eq!(
+            limit_response(ungated, "t1", limit)
+                .await
+                .0,
+            StatusCode::FORBIDDEN.as_u16()
+        );
+
+        assert_eq!(
+            stored(&vault, "t1")
+                .await
+                .consent_expires_at,
+            token.consent_expires_at,
+            "nobody above changed the consent"
+        );
+    }
+
     // ── Fail closed: an ungated build still rejects a revoke with no caller ──
 
     #[tokio::test]
@@ -4374,6 +4708,7 @@ mod tests {
             vault_store: Arc::new(InMemoryVault {
                 tokens: Mutex::new(vec![seed_token("t1")]),
                 unreadable: true,
+                given_again_after_a_read: Mutex::new(None),
             }),
             ..state_with(Vec::new())
         };
@@ -4398,6 +4733,7 @@ mod tests {
             vault_store: Arc::new(InMemoryVault {
                 tokens: Mutex::new(vec![seed_token("t1")]),
                 unreadable: true,
+                given_again_after_a_read: Mutex::new(None),
             }),
             ..state_with(Vec::new())
         };
@@ -4411,7 +4747,18 @@ mod tests {
                 "{uri}"
             );
         }
+        let (status, answer) = limit_response(app, "t1", r#"{"max_consent_age_secs": 7200}"#).await;
+        assert_eq!(
+            (status, answer),
+            (StatusCode::INTERNAL_SERVER_ERROR.as_u16(), serde_json::json!({"error": "Failed to limit"}))
+        );
         let text = logs.text();
+        assert!(
+            text.lines()
+                .any(|line| line.contains("Consent limit failed")
+                    && line.contains(&format!("error={VAULT_READ_FAILURE:?}"))),
+            "{text}"
+        );
         let failures: Vec<&str> = text
             .lines()
             .filter(|line| line.contains("revoke failed"))

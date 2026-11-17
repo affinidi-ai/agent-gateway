@@ -248,6 +248,7 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
                   <th>Name</th>
                   <th>Provider ID</th>
                   <th>Type</th>
+                  <th>Status</th>
                   <th>Scopes</th>
                   <th>Token Refresh</th>
                   <th>Updated</th>
@@ -303,14 +304,21 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
                             {CLIENT_AUTHENTICATION_LABELS[provider.client_authentication]}
                           </span>
                         )}
-                      {provider.deactivated_at && (
-                        <span
-                          className="badge text-bg-secondary ms-1"
-                          title="Takes no new consent. Access already given keeps working."
-                          data-testid={`credential-provider-deactivated-badge-${provider.id}`}
-                        >
-                          Deactivated
-                        </span>
+                    </td>
+                    <td data-testid={`credential-provider-status-${provider.id}`}>
+                      {provider.deactivated_at ? (
+                        <>
+                          <span
+                            className="badge text-bg-secondary"
+                            title="Takes no new consent. Access already given keeps working."
+                            data-testid={`credential-provider-deactivated-badge-${provider.id}`}
+                          >
+                            Deactivated
+                          </span>
+                          <div className="small text-muted">No new consent</div>
+                        </>
+                      ) : (
+                        <span className="badge text-bg-success">Active</span>
                       )}
                     </td>
                     <td>
@@ -347,12 +355,11 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
                         takesConsent(provider.provider_type) &&
                         !provider.deactivated_at && (
                           <TwoStepButton
-                            icon="fa-ban"
                             label="Deactivate"
                             confirmLabel="Click again to deactivate"
                             title={`Deactivate "${provider.name}": no new consent, access already given keeps working`}
                             confirmTitle={`Click again to deactivate "${provider.name}"`}
-                            className="btn btn-outline-warning btn-sm text-nowrap"
+                            className="btn app-button btn-outline-secondary btn-sm text-nowrap"
                             data-testid={`credential-provider-deactivate-button-${provider.id}`}
                             onConfirm={() => setActive(provider, false)}
                           />
@@ -361,7 +368,7 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
                         takesConsent(provider.provider_type) &&
                         provider.deactivated_at && (
                           <AppButton
-                            variant="outline-primary"
+                            variant="outline-secondary"
                             size="sm"
                             className="text-nowrap"
                             data-testid={`credential-provider-activate-button-${provider.id}`}

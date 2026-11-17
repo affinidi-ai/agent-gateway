@@ -7,7 +7,7 @@ use super::{
 };
 use axum::{
     Extension, Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -1516,6 +1516,64 @@ pub async fn activate_provider(
     set_provider_active(&state, &id, &context, &scope, caller.as_ref(), true).await
 }
 
+/// The consent time limit a caller asks about before saving it.
+#[derive(Debug, serde::Deserialize)]
+pub struct ConsentImpactQuery {
+    /// Seconds, as a save takes them: `0` for no limit on the provider.
+    max_consent_age_secs: u64,
+}
+
+/// GET /api/v1/credential-providers/{id}/consent-impact?max_consent_age_secs=<seconds>
+///
+/// How many consents to provider `id` have not ended, and how many of them
+/// saving the limit asked about would end at once. Answered only to a caller
+/// who may save it, and refused as that save would be.
+pub async fn consent_impact(
+    State(state): State<CredentialProviderState>,
+    Path(id): Path<String>,
+    Query(query): Query<ConsentImpactQuery>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> Response {
+    let provider = match changeable_provider(&state, &id, &context, &scope).await {
+        Ok(provider) => provider,
+        Err(refused) => return *refused,
+    };
+    let tried_secs = (query.max_consent_age_secs > 0).then_some(query.max_consent_age_secs);
+    let mut tried = provider.clone();
+    tried.max_consent_age_secs = tried_secs;
+    if let Some(refused) = consent_limit_error(&tried) {
+        return refused;
+    }
+    let Some(vault) = state.vault.as_deref() else {
+        return (StatusCode::OK, Json(crate::delegation_vault::sweep::ConsentImpact::default())).into_response();
+    };
+    match crate::delegation_vault::sweep::consent_impact(
+        vault,
+        state.surfaces.as_deref(),
+        &provider,
+        tried_secs,
+        Utc::now(),
+    )
+    .await
+    {
+        Ok(impact) => (StatusCode::OK, Json(impact)).into_response(),
+        Err(error) => {
+            warn!(
+                target: "credential_delegation",
+                provider_id = %provider.id,
+                error = %error,
+                "Failed to count the consents a consent time limit would end"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to count the provider's consents"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Deactivate provider `id`, or make it active again, for the caller of
 /// `context` and `scope`. A deactivated provider takes no new consent; the
 /// credentials people already consented to, and the provider's record, are
@@ -2342,6 +2400,116 @@ mod jwt_provider_tests {
             body["error"],
             "max_consent_age_secs is set only on an oauth2_authorization_code provider, the type a person consents to"
         );
+    }
+
+    async fn impact(
+        state: &CredentialProviderState,
+        id: &str,
+        secs: u64,
+        context: Option<Extension<PatTenantContext>>,
+    ) -> (StatusCode, Value) {
+        let query = Query(ConsentImpactQuery { max_consent_age_secs: secs });
+        body_of(consent_impact(State(state.clone()), Path(id.into()), query, context, None).await).await
+    }
+
+    /// A consent to provider `id`, given `hours_ago`, as the vault stores it.
+    fn consent_given(
+        id: &str,
+        hours_ago: i64,
+    ) -> crate::delegation_vault::DelegationToken {
+        let given = Utc::now() - chrono::Duration::hours(hours_ago);
+        serde_json::from_value(json!({
+            "id": format!("token-{hours_ago}"), "agent_did": "did:web:agent.example",
+            "user_identity_hash": format!("sha256:user-{hours_ago}"), "credential_provider_id": id,
+            "provider_id": "github", "access_token": format!("access-{hours_ago}"), "token_type": "Bearer",
+            "scopes": ["repo"], "consent_granted_at": given, "created_at": given, "updated_at": given,
+        }))
+        .unwrap()
+    }
+
+    /// Before a shorter consent time limit is saved, the gateway says how many
+    /// of the provider's active consents saving it would end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_consent_time_limit_is_counted_against_the_active_consents_before_it_is_saved() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = with_key_material(&directory).await;
+        let vault = Arc::new(
+            crate::delegation_vault::storage::FileSystemDelegationVaultStore::new(directory.path().join("vault"))
+                .await
+                .unwrap(),
+        );
+        state.vault = Some(vault.clone());
+        let (status, body) =
+            create(&state, with(authorization_code("github"), json!({"max_consent_age_secs": 21_600}))).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for hours_ago in [1, 3, 7] {
+            crate::delegation_vault::storage::DelegationVaultStorage::store(
+                vault.as_ref(),
+                consent_given(&id, hours_ago),
+            )
+            .await
+            .unwrap();
+        }
+
+        let shorter = impact(&state, &id, 7_200, None).await;
+        let longer = impact(&state, &id, 86_400, None).await;
+        let none = impact(&state, &id, 0, None).await;
+
+        assert_eq!(shorter, (StatusCode::OK, json!({"active_consents": 2, "ending_consents": 1})));
+        assert_eq!(longer, (StatusCode::OK, json!({"active_consents": 2, "ending_consents": 0})));
+        assert_eq!(none, (StatusCode::OK, json!({"active_consents": 2, "ending_consents": 0})));
+        let stored = get_provider(State(state.clone()), Path(id.clone()), None, None)
+            .await
+            .into_response();
+        assert_eq!(body_of(stored).await.1["max_consent_age_secs"], 21_600, "asking saves nothing");
+    }
+
+    /// The question is refused as the save it is asked for would be, and is
+    /// answered only for a provider the caller may change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_consent_impact_is_refused_as_the_save_would_be() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (_, consented) = create(&state, authorization_code("github")).await;
+        let consented = consented["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, service) = create(&state, jwt_bearer("vertex")).await;
+        assert_eq!(status, StatusCode::CREATED, "{service}");
+        let service = service["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let tenant = Some(Extension(PatTenantContext {
+            token_id: "token-tenant-a".into(),
+            tenant_id: "tenant-a".into(),
+        }));
+
+        let without_vault = impact(&state, &consented, 3_600, None).await;
+        let too_short = impact(&state, &consented, 30, None).await;
+        let no_consent = impact(&state, &service, 3_600, None).await;
+        let no_consent_and_no_limit = impact(&state, &service, 0, None).await;
+        let missing = impact(&state, "no-such-provider", 3_600, None).await;
+        let not_the_tenants = impact(&state, &consented, 3_600, tenant).await;
+
+        assert_eq!(without_vault, (StatusCode::OK, json!({"active_consents": 0, "ending_consents": 0})));
+        assert_eq!(
+            too_short,
+            (StatusCode::BAD_REQUEST, json!({"error": "max_consent_age_secs must be from 60 to 31536000, got 30"}))
+        );
+        assert_eq!(no_consent.0, StatusCode::BAD_REQUEST, "{}", no_consent.1);
+        assert_eq!(
+            no_consent.1["error"],
+            "max_consent_age_secs is set only on an oauth2_authorization_code provider, the type a person consents to"
+        );
+        assert_eq!(no_consent_and_no_limit, (StatusCode::OK, json!({"active_consents": 0, "ending_consents": 0})));
+        assert_eq!(missing, (StatusCode::NOT_FOUND, json!({"error": "Credential provider not found"})));
+        assert_eq!(not_the_tenants.0, StatusCode::FORBIDDEN, "{}", not_the_tenants.1);
     }
 
     async fn set_active(

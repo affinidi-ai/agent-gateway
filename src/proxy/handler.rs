@@ -5372,15 +5372,17 @@ async fn proxy_charged_request(
     // "deferred request VP injection" site below, after the resolver has
     // produced the per-binding `delegationAction` summary.
 
-    // ── Capture buffer for delegation audit events ─────────────────────
+    // ── Capture buffer for delegation audit records ────────────────────
     //
-    // The per-binding audit events (TokenInjected/Refreshed/ConsentRequired/
-    // elicitation_*) are emitted by `resolve_delegation_credentials` *before*
-    // we know the final `delegationAction` summary. We buffer them via a
-    // tokio task-local queue, then re-stamp each with the canonical identity
-    // VP after the deferred mint below. When workload-binding attestation is
-    // explicitly configured, that VP carries `workloadBinding.delegationAction`;
-    // otherwise it stays in the legacy `identityFields` shape.
+    // The audit records `resolve_delegation_credentials` submits, such as
+    // `consent_expired`, are submitted *before* we know the final
+    // `delegationAction` summary. We buffer them via a tokio task-local
+    // queue, then re-stamp each with the canonical identity VP after the
+    // deferred mint below. When workload-binding attestation is explicitly
+    // configured, that VP carries `workloadBinding.delegationAction`;
+    // otherwise it stays in the legacy `identityFields` shape. The events it
+    // only logs (`token_injected`, `consent_required` and the like) are
+    // written to the gateway log at once, without the VP.
     let deferred_audit = crate::audit::producer::DeferredAudit::new(crate::audit::producer::producer());
 
     // Note: outbound request body VP injection is deferred to after credential

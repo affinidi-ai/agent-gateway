@@ -4,14 +4,14 @@ import { useState, useEffect, useCallback, useRef } from 'react';
  * Hook for implementing a two-step delete pattern
  * First click: Delete icon changes to warning triangle
  * Second click: Executes the delete (shows spinner while processing)
- * Click anywhere else: Cancels the delete
+ * Click anywhere else, or Escape: Cancels the delete
  */
 export function useTwoStepDelete(onDelete: () => void | Promise<void>) {
   const [isConfirming, setIsConfirming] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const buttonRef = useRef<HTMLButtonElement>(null);
 
-  // Handle click outside to cancel
+  // Handle click outside, or Escape, to cancel
   useEffect(() => {
     if (!isConfirming) return;
 
@@ -20,15 +20,20 @@ export function useTwoStepDelete(onDelete: () => void | Promise<void>) {
         setIsConfirming(false);
       }
     };
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setIsConfirming(false);
+    };
 
     // Add listener after a small delay to avoid immediate cancellation
     const timeoutId = setTimeout(() => {
       document.addEventListener('mousedown', handleClickOutside);
     }, 100);
+    document.addEventListener('keydown', handleEscape);
 
     return () => {
       clearTimeout(timeoutId);
       document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('keydown', handleEscape);
     };
   }, [isConfirming]);
 

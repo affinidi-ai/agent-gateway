@@ -15,8 +15,14 @@ import ConsentConfirmationSection from './EditCredentialProviderPage/ConsentConf
 import JwtAssertionSection from './EditCredentialProviderPage/JwtAssertionSection';
 import { SecretOption as Secret, SecretOptions } from './EditCredentialProviderPage/SecretSelect';
 import { splitByTenant, type OwnerTenant } from '../utils/tenantScope';
-import { CONSENT_LIMIT_UNITS } from '../utils/consentLimit';
 import {
+  CONSENT_LIMIT_RANGE,
+  consentLimitUnitsFor,
+  storedConsentLimit,
+} from '../utils/consentLimit';
+import { useConsentImpact } from './EditCredentialProviderPage/useConsentImpact';
+import {
+  CONSENT_LIMIT_FIELD_MESSAGE,
   CONSENT_LIMIT_RANGE_MESSAGE,
   ClientAuthentication,
   ConsentLimitFields,
@@ -28,6 +34,7 @@ import {
   consentConfirmationField,
   consentConfirmationFieldsOf,
   consentConfirmationRedirectUri,
+  consentImpactMessage,
   missingConsentConfirmationField,
   clientAuthenticationOf,
   consentLimitOf,
@@ -123,7 +130,10 @@ const EditCredentialProviderPage: React.FC = () => {
   const tokenEndpointIsHttp = /^http:\/\//i.test(form.token_endpoint.trim());
   const offeredSecretCount = splitByTenant(secrets, ownerTenant).offered.length;
   const [routingConfig, setRoutingConfig] = useState<RoutingConfig | null>(null);
+  const [consentLimitRefused, setConsentLimitRefused] = useState(false);
+  const [storedConsentLimitSecs, setStoredConsentLimitSecs] = useState<number | undefined>();
   const formRef = useRef<HTMLFormElement>(null);
+  const consentLimitRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     loadSecrets();
@@ -184,6 +194,7 @@ const EditCredentialProviderPage: React.FC = () => {
       }
 
       setOwnerTenant(data.tenant_id ?? null);
+      setStoredConsentLimitSecs(storedConsentLimit(data.max_consent_age_secs));
       setForm({
         name: data.name ?? '',
         provider_id: data.provider_id ?? '',
@@ -228,6 +239,9 @@ const EditCredentialProviderPage: React.FC = () => {
     e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>
   ) => {
     const { name, value, type } = e.target;
+    if (name === 'consent_limit_amount' || name === 'consent_limit_unit') {
+      setConsentLimitRefused(false);
+    }
     if (type === 'checkbox') {
       setForm(prev => ({ ...prev, [name]: (e.target as HTMLInputElement).checked }));
     } else if (name === 'name' && isNew) {
@@ -299,9 +313,12 @@ const EditCredentialProviderPage: React.FC = () => {
       const consentLimit = consentLimitSeconds(form);
       if (consentLimit === null) {
         setError(CONSENT_LIMIT_RANGE_MESSAGE);
+        setConsentLimitRefused(true);
+        consentLimitRef.current?.focus();
         return;
       }
 
+      setConsentLimitRefused(false);
       setError(null);
 
       const scopes = form.default_scopes
@@ -406,6 +423,12 @@ const EditCredentialProviderPage: React.FC = () => {
   }, [saving, handleSubmit]);
 
   const typeFields = providerTypeFields(form.provider_type, form.client_authentication);
+  const endingConsents = useConsentImpact(
+    isNew ? undefined : id,
+    consentLimitSeconds(form),
+    storedConsentLimitSecs
+  );
+  const consentImpact = consentImpactMessage(endingConsents, form.name.trim() || form.provider_id);
 
   if (loading) {
     return (
@@ -1019,8 +1042,9 @@ const EditCredentialProviderPage: React.FC = () => {
               </label>
               <div>
                 <small className="form-text text-muted">
-                  Access tokens are refreshed automatically using the stored refresh token whenever
-                  one is available, so this connection keeps working without needing to reauthorize.
+                  {takesConsent(form.provider_type)
+                    ? 'Access tokens are refreshed automatically using the stored refresh token for as long as the consent lasts (see Consent time limit below). When the consent ends, the person approves again.'
+                    : 'Access tokens are refreshed automatically using the stored refresh token whenever one is available, so this connection keeps working without needing to reauthorize.'}
                 </small>
               </div>
             </div>
@@ -1039,15 +1063,18 @@ const EditCredentialProviderPage: React.FC = () => {
                 </div>
                 <div className="input-group" style={{ maxWidth: '22rem' }}>
                   <input
+                    ref={consentLimitRef}
                     id="consent_limit_amount"
                     name="consent_limit_amount"
                     type="number"
                     min={1}
                     step={1}
-                    className="form-control"
+                    className={`form-control${consentLimitRefused ? ' is-invalid' : ''}`}
                     placeholder="Not set"
                     value={form.consent_limit_amount}
                     onChange={handleChange}
+                    aria-invalid={consentLimitRefused || undefined}
+                    aria-describedby={consentLimitRefused ? 'consent_limit_error' : undefined}
                     data-testid="credential-provider-consent-limit-input"
                   />
                   <select
@@ -1058,17 +1085,38 @@ const EditCredentialProviderPage: React.FC = () => {
                     onChange={handleChange}
                     data-testid="credential-provider-consent-limit-unit-select"
                   >
-                    {CONSENT_LIMIT_UNITS.map(unit => (
+                    {consentLimitUnitsFor(storedConsentLimitSecs).map(unit => (
                       <option key={unit} value={unit}>
                         {unit}
                       </option>
                     ))}
                   </select>
                 </div>
+                {consentLimitRefused && (
+                  <div
+                    id="consent_limit_error"
+                    className="invalid-feedback d-block"
+                    data-testid="credential-provider-consent-limit-error"
+                  >
+                    {CONSENT_LIMIT_FIELD_MESSAGE}
+                  </div>
+                )}
                 <small className="form-text text-muted">
                   Leave empty to set no limit on this provider. A default or a ceiling in the
-                  gateway's configuration still applies. From 1 minute to 365 days.
+                  gateway's configuration still applies.
+                  {!consentLimitRefused && ` From ${CONSENT_LIMIT_RANGE}.`}
                 </small>
+                <div role="status" data-testid="credential-provider-consent-limit-impact-region">
+                  {consentImpact && (
+                    <div
+                      className="alert alert-warning py-2 mt-2"
+                      data-testid="credential-provider-consent-limit-impact"
+                    >
+                      <i className="fas fa-exclamation-triangle me-2" aria-hidden="true" />
+                      {consentImpact}
+                    </div>
+                  )}
+                </div>
               </div>
             )}
 

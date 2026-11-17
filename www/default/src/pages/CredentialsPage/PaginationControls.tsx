@@ -7,6 +7,11 @@ interface PaginationControlsProps {
   onPageChange: (page: number) => void;
 }
 
+/** The page to show of `total` items: `page`, or the last one once the list no longer reaches it. */
+export function clampPage(page: number, pageSize: number, total: number): number {
+  return Math.min(Math.max(1, page), Math.max(1, Math.ceil(total / pageSize)));
+}
+
 /** The range shown and the page links of a list paged in the browser; nothing for one page. */
 const PaginationControls: React.FC<PaginationControlsProps> = ({
   page,

@@ -20,13 +20,9 @@ export const CATEGORY_OPTIONS = [
   { value: 'trust_check', label: 'Trust Checks' },
   { value: 'trace_terminated', label: 'Trace Terminated', lowFrequency: true },
   { value: 'vp_injected', label: 'VP Injected', lowFrequency: true },
-  { value: 'token_injected', label: 'Token Injected', lowFrequency: true },
-  { value: 'token_refreshed', label: 'Token Refreshed', lowFrequency: true },
-  { value: 'refresh_failed', label: 'Refresh Failed', lowFrequency: true },
-  { value: 'token_not_found', label: 'Token Not Found', lowFrequency: true },
   { value: 'consent_granted', label: 'Consent Granted', lowFrequency: true },
-  { value: 'consent_required', label: 'Consent Required', lowFrequency: true },
   { value: 'consent_expired', label: 'Consent Expired', lowFrequency: true },
+  { value: 'consent_limited', label: 'Consent Limited', lowFrequency: true },
   { value: 'token_revoked', label: 'Token Revoked', lowFrequency: true },
   { value: 'user_tokens_revoked', label: 'User Tokens Revoked', lowFrequency: true },
   { value: 'policy_created', label: 'Policy Created', lowFrequency: true },
@@ -38,15 +34,15 @@ export const CATEGORY_OPTIONS = [
   { value: 'policy_change_refused', label: 'Policy Change Refused', lowFrequency: true },
 ] as const;
 
-/** The categories of the credential delegation records, which the Credentials page links to. */
+/**
+ * The categories of the credential delegation records, which the Credentials page links to.
+ * What the gateway does on each call (a token injected or refreshed, a consent asked for) is
+ * in its log, not in the audit, so it is no category here.
+ */
 export const DELEGATION_CATEGORIES = [
-  'token_injected',
-  'token_refreshed',
-  'refresh_failed',
-  'token_not_found',
   'consent_granted',
-  'consent_required',
   'consent_expired',
+  'consent_limited',
   'token_revoked',
   'user_tokens_revoked',
 ] as const;
@@ -87,6 +83,7 @@ const CATEGORY_BADGE: Record<string, string> = {
   consent_granted: 'badge-success',
   consent_required: 'badge-warning',
   consent_expired: 'badge-warning',
+  consent_limited: 'badge-warning',
   refresh_failed: 'badge-danger',
   token_revoked: 'badge-danger',
   user_tokens_revoked: 'badge-danger',
@@ -202,6 +199,8 @@ export function categoryLabel(name: string): string {
       return 'Consent Required';
     case 'consent_expired':
       return 'Consent Expired';
+    case 'consent_limited':
+      return 'Consent Limited';
     case 'refresh_failed':
       return 'Refresh Failed';
     case 'token_revoked':

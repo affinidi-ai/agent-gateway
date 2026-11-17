@@ -27,6 +27,7 @@ use super::read_scope::VaultReadScope;
 use crate::audit::log_files;
 use crate::audit::pipeline::PipelineControl;
 use crate::metrics::backends::prometheus::set_audit_pipeline_started;
+use crate::observability::loggable;
 use crate::server::mode::ServerMode;
 
 /// Global audit file path — for reading the log
@@ -633,6 +634,9 @@ pub enum DelegationAuditAction {
     /// A consent reached its time limit: the stored credential was removed,
     /// and the person is asked again. Never a revocation.
     ConsentExpired,
+    /// An operator brought the end of one stored consent forward. The
+    /// credential stays until that end.
+    ConsentLimited,
     /// A token was revoked via management API
     TokenRevoked,
     /// All tokens for a user were revoked
@@ -1239,12 +1243,57 @@ pub fn submit(event: DelegationAuditEvent) {
 }
 
 /// Builds an audit record with `build` and submits it, only when an audit sink
-/// selects `category`. Non-blocking; returns at once.
+/// selects `category`. An event the gateway only logs
+/// ([`crate::audit::catalog::LOGGED_EVENTS`]) is written to the gateway log
+/// instead. Non-blocking; returns at once.
 pub fn emit(
     category: &'static str,
     build: impl FnOnce() -> DelegationAuditEvent,
 ) {
     crate::audit::producer::producer().emit(category, build);
+}
+
+/// Writes `event` to the gateway log. The delegation events in
+/// [`crate::audit::catalog::LOGGED_EVENTS`] are kept there and in no audit
+/// sink. The line says who caused the event without naming a person: the
+/// caller's identity hash, how the caller authenticated and, for a request a
+/// paired gateway sent, that gateway. It carries no credential: the Target URL
+/// is written as [`loggable::url`] renders it. What a caller, a paired gateway
+/// or a vendor chooses (the tool, the sending gateway, the requesting agent's
+/// DID, the scopes, the detail) is each one [`loggable::untrusted`] token.
+pub fn log_event(event: &DelegationAuditEvent) {
+    fn or_dash(value: &Option<String>) -> &str {
+        value
+            .as_deref()
+            .unwrap_or("-")
+    }
+    let rendered = |value: Option<&str>, render: fn(&str) -> String| value.map_or_else(|| "-".to_string(), render);
+    let caller = event.caller.as_ref();
+    let scopes = event
+        .scopes
+        .as_ref()
+        .map(|scopes| scopes.join(","));
+    info!(
+        target: "credential_delegation",
+        event = %action_category(&event.event),
+        agent_did = %or_dash(&event.agent_did),
+        user_hash = %or_dash(&event.user_identity_hash),
+        provider_id = %or_dash(&event.provider_id),
+        surface_id = %or_dash(&event.surface_id),
+        surface_variant = %or_dash(&event.surface_variant),
+        token_id = %or_dash(&event.token_id),
+        scopes = %rendered(scopes.as_deref(), loggable::untrusted),
+        mcp_tool_name = %rendered(event.mcp_tool_name.as_deref(), loggable::untrusted),
+        via_fabric = event.via_fabric,
+        target_endpoint = %rendered(event.target_endpoint.as_deref(), loggable::url),
+        protocol = %or_dash(&event.protocol),
+        request_id = %or_dash(&event.request_id),
+        caller_method = %caller.map_or("-", |caller| caller.auth_method.as_str()),
+        peer_gateway = %rendered(caller.and_then(|caller| caller.peer_gateway.as_deref()), loggable::untrusted),
+        agent_identity_did = %rendered(event.agent_identity_did.as_deref(), loggable::untrusted),
+        detail = %rendered(event.detail.as_deref(), loggable::untrusted),
+        "Delegation event"
+    );
 }
 
 /// Convenience: build an audit event with common fields pre-filled
@@ -1757,6 +1806,7 @@ pub fn action_category(action: &DelegationAuditAction) -> &'static str {
         DelegationAuditAction::RefreshFailed => "refresh_failed",
         DelegationAuditAction::ConsentRequired => "consent_required",
         DelegationAuditAction::ConsentExpired => "consent_expired",
+        DelegationAuditAction::ConsentLimited => "consent_limited",
         DelegationAuditAction::TokenRevoked => "token_revoked",
         DelegationAuditAction::UserTokensRevoked => "user_tokens_revoked",
         DelegationAuditAction::TokenNotFound => "token_not_found",
@@ -4603,5 +4653,127 @@ mod tests {
     fn emitting_before_the_pipeline_starts_does_not_panic() {
         emit("token_injected", || audit_event(DelegationAuditAction::TokenInjected, None, None, None, None));
         submit(audit_event(DelegationAuditAction::TokenInjected, None, None, None, None));
+    }
+
+    /// The line [`log_event`] writes for `event`, as the gateway's log file
+    /// renders it.
+    fn logged(event: &DelegationAuditEvent) -> String {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        log_event(event);
+        let text = logs.text();
+        assert_eq!(text.lines().count(), 1, "one event is one line: {text:?}");
+        text
+    }
+
+    fn injected() -> DelegationAuditEvent {
+        audit_event(
+            DelegationAuditAction::TokenInjected,
+            Some("did:web:agent.example"),
+            Some("sha256:caller"),
+            Some("github"),
+            Some("surface-a"),
+        )
+    }
+
+    fn has_field(
+        line: &str,
+        field: &str,
+    ) -> bool {
+        line.split_whitespace()
+            .any(|logged| logged == field)
+    }
+
+    #[test]
+    fn a_logged_delegation_event_names_its_target_without_the_credentials_in_its_url() {
+        let mut event = injected();
+        event.target_endpoint =
+            Some("https://operator:hunter2@vendor.example/mcp?key=opaque-credential&region=eu#section".to_string());
+
+        let line = logged(&event);
+
+        assert!(
+            has_field(&line, "target_endpoint=https://vendor.example/mcp?key=<redacted>&region=<redacted>"),
+            "{line}"
+        );
+        for secret in ["opaque-credential", "hunter2", "operator"] {
+            assert!(!line.contains(secret), "{secret} is logged: {line}");
+        }
+    }
+
+    #[test]
+    fn a_caller_or_a_vendor_cannot_forge_a_log_line_or_a_field() {
+        let mut event = injected();
+        event.mcp_tool_name =
+            Some("read\nINFO Delegation event event=consent_granted user_hash=sha256:other".to_string());
+        event.detail = Some("refused\r\nWARN forged".to_string());
+        event.agent_identity_did = Some("did:web:agent.example\nWARN forged".to_string());
+        event.scopes = Some(vec!["repo\u{1b}[2K".to_string(), "x".repeat(10_000)]);
+
+        let line = logged(&event);
+
+        assert!(
+            line.contains(
+                r#"mcp_tool_name="read\nINFO Delegation event event=consent_granted user_hash=sha256:other""#
+            ),
+            "{line}"
+        );
+        assert!(line.contains(r#"detail="refused\r\nWARN forged""#), "{line}");
+        assert!(line.contains(r#"agent_identity_did="did:web:agent.example\nWARN forged""#), "{line}");
+        assert!(line.contains(r#"scopes="repo\u{1b}[2K,xxxx"#), "{line}");
+        assert!(!line.contains('\u{1b}'), "{line:?}");
+        assert!(line.len() < 2_000, "an oversized value is cut: {} characters", line.len());
+    }
+
+    #[test]
+    fn a_logged_delegation_event_says_how_its_caller_authenticated_and_which_gateway_sent_it() {
+        let mut event = injected();
+        event.via_fabric = true;
+        event.caller = Some(
+            serde_json::from_value(serde_json::json!({
+                "auth_method": "jwt_bearer",
+                "sub": "alice-subject",
+                "email": "alice@corp.example",
+                "name": "Alice Example",
+                "peer_gateway": "did:web:partner.example"
+            }))
+            .unwrap(),
+        );
+
+        let line = logged(&event);
+
+        assert!(has_field(&line, "caller_method=jwt_bearer"), "{line}");
+        assert!(has_field(&line, r#"peer_gateway="did:web:partner.example""#), "{line}");
+        assert!(has_field(&line, "via_fabric=true"), "{line}");
+        for personal in ["alice-subject", "alice@corp.example", "Alice Example"] {
+            assert!(!line.contains(personal), "{personal} is logged: {line}");
+        }
+    }
+
+    #[test]
+    fn a_logged_delegation_event_keeps_a_fabric_target_and_marks_the_fields_it_does_not_have() {
+        let mut event = injected();
+        event.target_endpoint = Some("fabric://partner-gateway/partner-surface".to_string());
+
+        let line = logged(&event);
+
+        for field in [
+            "event=token_injected",
+            "agent_did=did:web:agent.example",
+            "user_hash=sha256:caller",
+            "provider_id=github",
+            "target_endpoint=fabric://partner-gateway/partner-surface",
+            "mcp_tool_name=-",
+            "token_id=-",
+            "scopes=-",
+            "caller_method=-",
+            "peer_gateway=-",
+            "agent_identity_did=-",
+            "detail=-",
+        ] {
+            assert!(has_field(&line, field), "{field}: {line}");
+        }
+
+        event.target_endpoint = None;
+        assert!(has_field(&logged(&event), "target_endpoint=-"));
     }
 }

@@ -237,6 +237,28 @@ describe('EditCredentialProviderPage consent time limit', () => {
     expect((await savedBody()).max_consent_age_secs).toBe(2_592_000);
   });
 
+  it('offers minutes, hours and days, and no seconds', async () => {
+    await renderProvider(authorizationCode({ max_consent_age_secs: 21_600 }));
+    const units = within(screen.getByTestId(UNIT))
+      .getAllByRole('option')
+      .map(option => option.getAttribute('value'));
+
+    expect(units).toEqual(['minutes', 'hours', 'days']);
+  });
+
+  it('keeps a stored limit that is not a whole number of minutes, in seconds, unchanged', async () => {
+    await renderProvider(authorizationCode({ max_consent_age_secs: 90 }));
+    expect(screen.getByTestId(LIMIT)).toHaveValue(90);
+    expect(screen.getByTestId(UNIT)).toHaveValue('seconds');
+    expect(
+      within(screen.getByTestId(UNIT))
+        .getAllByRole('option')
+        .map(option => option.getAttribute('value'))
+    ).toEqual(['seconds', 'minutes', 'hours', 'days']);
+
+    expect((await savedBody()).max_consent_age_secs).toBe(90);
+  });
+
   it('shows no limit as an empty field and saves 0, which removes a stored one', async () => {
     await renderProvider(authorizationCode({ max_consent_age_secs: 3_600 }));
     fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '' } });
@@ -247,8 +269,8 @@ describe('EditCredentialProviderPage consent time limit', () => {
   it('refuses a limit the gateway would refuse before saving anything', async () => {
     await renderProvider(authorizationCode());
     expect(screen.getByTestId(LIMIT)).toHaveValue(null);
-    fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '30' } });
-    fireEvent.change(screen.getByTestId(UNIT), { target: { value: 'seconds' } });
+    fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '0' } });
+    fireEvent.change(screen.getByTestId(UNIT), { target: { value: 'minutes' } });
     fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
 
     expect(
@@ -259,6 +281,41 @@ describe('EditCredentialProviderPage consent time limit', () => {
     expect(puts()).toHaveLength(0);
   });
 
+  it('shows a refused limit under its field, marked invalid, and moves focus there', async () => {
+    await renderProvider(authorizationCode());
+    const input = screen.getByTestId(LIMIT);
+    expect(input).not.toHaveClass('is-invalid');
+    expect(input).not.toHaveAttribute('aria-invalid');
+    fireEvent.change(input, { target: { value: '366' } });
+    fireEvent.change(screen.getByTestId(UNIT), { target: { value: 'days' } });
+    fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
+
+    const message = await screen.findByTestId('credential-provider-consent-limit-error');
+    expect(message).toHaveTextContent(
+      /^Enter a limit from 1 minute to 365 days, or leave it empty\.$/
+    );
+    expect(message).toHaveClass('invalid-feedback');
+    expect(input).toHaveClass('is-invalid');
+    expect(input).toHaveAttribute('aria-invalid', 'true');
+    expect(input).toHaveAttribute('aria-describedby', message.id);
+    expect(input).toHaveFocus();
+    expect(puts()).toHaveLength(0);
+  });
+
+  it('clears the field error once the limit is changed', async () => {
+    await renderProvider(authorizationCode());
+    const input = screen.getByTestId(LIMIT);
+    fireEvent.change(input, { target: { value: '0' } });
+    fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
+    await screen.findByTestId('credential-provider-consent-limit-error');
+
+    fireEvent.change(input, { target: { value: '6' } });
+
+    expect(screen.queryByTestId('credential-provider-consent-limit-error')).toBeNull();
+    expect(input).not.toHaveClass('is-invalid');
+    expect(input).not.toHaveAttribute('aria-invalid');
+  });
+
   it('says an empty limit leaves the gateway its own default and ceiling', async () => {
     await renderProvider(authorizationCode());
     expect(screen.getByTestId(LIMIT)).toHaveAttribute('placeholder', 'Not set');
@@ -267,6 +324,37 @@ describe('EditCredentialProviderPage consent time limit', () => {
         "Leave empty to set no limit on this provider. A default or a ceiling in the gateway's configuration still applies. From 1 minute to 365 days."
       )
     ).toBeInTheDocument();
+  });
+
+  it('states the range of a limit once while the field is refused', async () => {
+    await renderProvider(authorizationCode());
+    fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '0' } });
+    fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
+    await screen.findByTestId('credential-provider-consent-limit-error');
+
+    expect(
+      screen.getByText(
+        "Leave empty to set no limit on this provider. A default or a ceiling in the gateway's configuration still applies."
+      )
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/From 1 minute to 365 days\.$/)).toBeNull();
+  });
+
+  it('says token refresh lasts as long as the consent, with or without a limit set', async () => {
+    await renderProvider(authorizationCode());
+    expect(screen.getByTestId(LIMIT)).toHaveValue(null);
+    expect(
+      screen.getByText(
+        'Access tokens are refreshed automatically using the stored refresh token for as long as the consent lasts (see Consent time limit below). When the consent ends, the person approves again.'
+      )
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/without needing to reauthorize/)).not.toBeInTheDocument();
+  });
+
+  it('keeps the refresh help free of a consent limit on a provider nobody consents to', async () => {
+    await renderProvider(provider(null));
+    expect(screen.getByText(/without needing to reauthorize/)).toBeInTheDocument();
+    expect(screen.queryByText(/consent time limit below/i)).not.toBeInTheDocument();
   });
 
   it('says a deactivated provider takes no new consent, and never sends that state on save', async () => {
@@ -288,6 +376,184 @@ describe('EditCredentialProviderPage consent time limit', () => {
     expect(screen.queryByTestId(LIMIT)).not.toBeInTheDocument();
 
     expect((await savedBody()).max_consent_age_secs).toBe(0);
+  });
+
+  describe('warning before a shorter limit', () => {
+    const IMPACT = 'credential-provider-consent-limit-impact';
+    const impactCalls = () =>
+      mockFetch.mock.calls.filter(([url]) => String(url).includes('/consent-impact'));
+    const pause = () => new Promise(resolve => setTimeout(resolve, 600));
+
+    const renderWithImpact = async (
+      record: Record<string, unknown>,
+      impact: () => Promise<unknown> = () =>
+        Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ active_consents: 5, ending_consents: 2 }),
+        })
+    ) => {
+      mockFetch.mockImplementation((url: string) => {
+        if (url.includes('/consent-impact')) return impact();
+        return Promise.resolve(
+          url.startsWith('/api/v1/credential-providers/')
+            ? { ok: true, json: () => Promise.resolve(record), text: () => Promise.resolve('') }
+            : { ok: false, json: () => Promise.resolve([]) }
+        );
+      });
+      render(
+        <MemoryRouter initialEntries={['/credential-providers/p1']}>
+          <Routes>
+            <Route path="/credential-providers/:id" element={<EditCredentialProviderPage />} />
+          </Routes>
+        </MemoryRouter>
+      );
+      await screen.findByDisplayValue(record.name as string);
+    };
+
+    it('says how many active consents saving a shorter limit ends', async () => {
+      await renderWithImpact(authorizationCode({ max_consent_age_secs: 21_600 }));
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '1' } });
+
+      expect(await screen.findByTestId(IMPACT)).toHaveTextContent(
+        /^Saving ends 2 active GitHub consents now\. Those people approve again next time their agent needs GitHub\.$/
+      );
+      expect(impactCalls().map(([url]) => url)).toEqual([
+        '/api/v1/credential-providers/p1/consent-impact?max_consent_age_secs=3600',
+      ]);
+    });
+
+    it('announces the warning in a status region that is there before the warning is', async () => {
+      await renderWithImpact(authorizationCode({ max_consent_age_secs: 21_600 }));
+      const region = screen.getByTestId('credential-provider-consent-limit-impact-region');
+      expect(region).toHaveAttribute('role', 'status');
+      expect(region).toBeEmptyDOMElement();
+
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '1' } });
+
+      expect(await within(region).findByTestId(IMPACT)).toHaveClass('alert', 'alert-warning');
+    });
+
+    it('speaks of one person when saving ends one consent', async () => {
+      await renderWithImpact(authorizationCode({ max_consent_age_secs: 21_600 }), () =>
+        Promise.resolve({ ok: true, json: () => Promise.resolve({ ending_consents: 1 }) })
+      );
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '1' } });
+
+      expect(await screen.findByTestId(IMPACT)).toHaveTextContent(
+        /^Saving ends 1 active GitHub consent now\. That person approves again/
+      );
+    });
+
+    it('asks when a limit is set where none was', async () => {
+      await renderWithImpact(authorizationCode());
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '6' } });
+
+      expect(await screen.findByTestId(IMPACT)).toBeInTheDocument();
+      expect(impactCalls().map(([url]) => url)).toEqual([
+        '/api/v1/credential-providers/p1/consent-impact?max_consent_age_secs=21600',
+      ]);
+    });
+
+    it('asks once, after a pause, for a limit typed in several keystrokes', async () => {
+      await renderWithImpact(authorizationCode({ max_consent_age_secs: 2_592_000 }));
+      expect(screen.getByTestId(UNIT)).toHaveValue('days');
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '1' } });
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '12' } });
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '20' } });
+
+      await screen.findByTestId(IMPACT);
+      await pause();
+      expect(impactCalls().map(([url]) => url)).toEqual([
+        '/api/v1/credential-providers/p1/consent-impact?max_consent_age_secs=1728000',
+      ]);
+    });
+
+    it('shows no warning when saving ends no consent', async () => {
+      await renderWithImpact(authorizationCode({ max_consent_age_secs: 21_600 }), () =>
+        Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ active_consents: 5, ending_consents: 0 }),
+        })
+      );
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '1' } });
+
+      await waitFor(() => expect(impactCalls()).toHaveLength(1));
+      await pause();
+      expect(screen.queryByTestId(IMPACT)).toBeNull();
+    });
+
+    it.each([
+      ['is refused', () => Promise.resolve({ ok: false, json: () => Promise.resolve({}) })],
+      ['fails', () => Promise.reject(new Error('offline'))],
+    ])('shows no warning when the call %s', async (_case, impact) => {
+      await renderWithImpact(authorizationCode({ max_consent_age_secs: 21_600 }), impact);
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '1' } });
+
+      await waitFor(() => expect(impactCalls()).toHaveLength(1));
+      await pause();
+      expect(screen.queryByTestId(IMPACT)).toBeNull();
+    });
+
+    it('asks nothing for a limit that is not shorter, or one the gateway would refuse', async () => {
+      await renderWithImpact(authorizationCode({ max_consent_age_secs: 21_600 }));
+      fireEvent.change(screen.getByTestId(UNIT), { target: { value: 'days' } });
+      await pause();
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '0' } });
+      await pause();
+
+      expect(impactCalls()).toHaveLength(0);
+      expect(screen.queryByTestId(IMPACT)).toBeNull();
+    });
+
+    it('asks when a stored limit is removed, since the gateway default may be the shorter', async () => {
+      await renderWithImpact(authorizationCode({ max_consent_age_secs: 21_600 }));
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '' } });
+
+      expect(await screen.findByTestId(IMPACT)).toHaveTextContent(
+        /^Saving ends 2 active GitHub consents now\./
+      );
+      expect(impactCalls().map(([url]) => url)).toEqual([
+        '/api/v1/credential-providers/p1/consent-impact?max_consent_age_secs=0',
+      ]);
+    });
+
+    it('asks nothing while the field stays empty on a provider without a stored limit', async () => {
+      await renderWithImpact(authorizationCode());
+      fireEvent.change(screen.getByTestId(UNIT), { target: { value: 'days' } });
+      await pause();
+
+      expect(impactCalls()).toHaveLength(0);
+      expect(screen.queryByTestId(IMPACT)).toBeNull();
+    });
+
+    it('takes the warning away once the limit is no longer shorter', async () => {
+      await renderWithImpact(authorizationCode({ max_consent_age_secs: 21_600 }));
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '1' } });
+      await screen.findByTestId(IMPACT);
+
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '6' } });
+
+      expect(screen.queryByTestId(IMPACT)).toBeNull();
+    });
+  });
+
+  it('asks nothing about consents a new provider would end', async () => {
+    mockFetch.mockImplementation(() =>
+      Promise.resolve({ ok: false, json: () => Promise.resolve([]) })
+    );
+    render(
+      <MemoryRouter initialEntries={['/credential-providers/new']}>
+        <Routes>
+          <Route path="/credential-providers/:id" element={<EditCredentialProviderPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+    fireEvent.change(await screen.findByTestId(LIMIT), { target: { value: '1' } });
+    await new Promise(resolve => setTimeout(resolve, 600));
+
+    expect(
+      mockFetch.mock.calls.filter(([url]) => String(url).includes('/consent-impact'))
+    ).toHaveLength(0);
   });
 
   it('offers the limit on an external consent provider and saves it', async () => {
