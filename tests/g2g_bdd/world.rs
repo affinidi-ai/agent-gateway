@@ -314,7 +314,11 @@ fn surface_spec<'a>(
 }
 
 fn source_auth_headers(surface: &SurfaceSpec) -> Vec<(String, String)> {
-    match &surface.source_auth {
+    match surface
+        .partner_api_key
+        .as_ref()
+        .or(surface.source_auth.as_ref())
+    {
         Some(SourceAuthSpec::ApiKey { header_name, valid_key, .. }) => {
             vec![(header_name.clone(), valid_key.clone())]
         }
