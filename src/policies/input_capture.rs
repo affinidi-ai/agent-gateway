@@ -275,6 +275,7 @@ pub fn begin(
     };
     let mut masked = input.clone();
     mask_credentials(&mut masked);
+    apply_redaction_rules(&mut masked, &crate::observability::opentelemetry::log_redactor());
     mask_request_path(&mut masked);
     Some(Capture {
         surface_id: surface_id.to_string(),
@@ -376,10 +377,36 @@ fn mask_request_path(input: &mut Value) {
     }
 }
 
-/// A deny reason or evaluation error with the masking of [`mask_text`], since a policy can
-/// build its reason from input text and an engine error can quote it.
+/// A deny reason or evaluation error with the masking of [`mask_text`] and then the log
+/// redaction rules applied, since a policy can build its reason from input text and an
+/// engine error can quote it.
 fn mask_outcome_text(text: &str) -> String {
-    mask_text(text).unwrap_or_else(|| text.to_string())
+    let masked = mask_text(text).unwrap_or_else(|| text.to_string());
+    crate::observability::opentelemetry::log_redactor()
+        .redact(&masked)
+        .into_owned()
+}
+
+/// Apply the operator's log redaction rules (`logging.redaction.rules`) to every string
+/// in `value`, so a capture masks at least what the log masks.
+fn apply_redaction_rules(
+    value: &mut Value,
+    redactor: &crate::observability::LogRedactor,
+) {
+    match value {
+        Value::Object(map) => map
+            .values_mut()
+            .for_each(|entry| apply_redaction_rules(entry, redactor)),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| apply_redaction_rules(item, redactor)),
+        Value::String(text) => {
+            if let std::borrow::Cow::Owned(redacted) = redactor.redact(text) {
+                *text = redacted;
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Replace every credential in `value` with [`REDACTED`]: the value of a key named like a
@@ -425,6 +452,12 @@ static URL_QUERY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)\b([a-z][a-z0-9+.\-]*://[^\s?#"<>]+)\?([^\s#"<>]+)"#).expect("valid URL pattern")
 });
 
+/// An absolute URL whose fragment holds `name=value` parameters, as an OAuth redirect's
+/// does, anywhere in a text. A plain anchor such as `#top` is not matched.
+static URL_FRAGMENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\b([a-z][a-z0-9+.\-]*://[^\s#"<>]+)#([^\s"<>=]*=[^\s"<>]*)"#).expect("valid URL fragment pattern")
+});
+
 /// The scheme and userinfo of an absolute URL, anywhere in a text. The userinfo may hold
 /// `@` and `'`, so it runs to the last `@` before the host.
 static URL_USERINFO: LazyLock<Regex> =
@@ -432,16 +465,22 @@ static URL_USERINFO: LazyLock<Regex> =
 
 /// `text` with its credentials masked, or `None` when it holds none. A text that is
 /// one JWT or one authorization value becomes [`REDACTED`] whole; inside longer text
-/// each URL keeps its query parameter names with their values redacted and loses its
-/// userinfo, then each JWT and authorization token becomes [`REDACTED`]. Queries go
-/// first, so a JWT in a query cannot end the query before the parameters after it.
+/// each URL keeps its fragment and query parameter names with their values redacted and
+/// loses its userinfo, then each JWT and authorization token becomes [`REDACTED`].
+/// Fragments and queries go first, so a JWT in either cannot end it before the parameters
+/// after it.
 fn mask_text(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if is_jwt(trimmed) || is_authorization_value(trimmed) {
         return Some(REDACTED.to_string());
     }
-    let masked = URL_QUERY
+    let masked = URL_FRAGMENT
         .replace_all(text, |caps: &regex::Captures<'_>| {
+            format!("{}#{}", &caps[1], crate::observability::loggable::query(&caps[2]))
+        })
+        .into_owned();
+    let masked = URL_QUERY
+        .replace_all(&masked, |caps: &regex::Captures<'_>| {
             format!("{}?{}", &caps[1], crate::observability::loggable::query(&caps[2]))
         })
         .into_owned();
@@ -1275,8 +1314,73 @@ mod tests {
                 .into_update(Err(error.as_str())),
         );
 
-        assert_eq!(deny["reason"], format!("caller sent Bearer {REDACTED}"));
-        assert_eq!(failed["reason"], format!("invalid token {REDACTED} at https://h.example.test/p?key={REDACTED}"));
+        let deny_reason = deny["reason"]
+            .as_str()
+            .unwrap();
+        let failed_reason = failed["reason"]
+            .as_str()
+            .unwrap();
+        assert!(deny_reason.starts_with("caller sent Bearer "), "{deny_reason}");
+        assert!(!deny_reason.contains(JWT), "{deny_reason}");
+        assert!(failed_reason.starts_with("invalid token "), "{failed_reason}");
+        assert!(!failed_reason.contains(JWT), "{failed_reason}");
+        assert!(failed_reason.ends_with(&format!(" at https://h.example.test/p?key={REDACTED}")), "{failed_reason}");
+    }
+
+    #[test]
+    fn a_url_fragment_with_parameters_has_its_values_masked_and_an_anchor_kept() {
+        let mut input = json!({
+            "a2a": { "parts": [
+                { "text": "back to https://app.example.test/cb#access_token=t-secret&state=s1 now" },
+                { "text": "see https://app.example.test/p?page=2#id_token=t-secret" },
+                { "text": "read https://docs.example.test/guide#top" },
+            ] },
+        });
+
+        mask_credentials(&mut input);
+
+        let parts = &input["a2a"]["parts"];
+        assert_eq!(
+            parts[0]["text"],
+            format!("back to https://app.example.test/cb#access_token={REDACTED}&state={REDACTED} now")
+        );
+        assert_eq!(parts[1]["text"], format!("see https://app.example.test/p?page={REDACTED}#id_token={REDACTED}"));
+        assert_eq!(parts[2]["text"], "read https://docs.example.test/guide#top");
+    }
+
+    #[test]
+    fn the_log_redaction_rules_apply_to_captured_input_and_outcome_text() {
+        let _listening = listening("input-capture-redaction-rules");
+        let input = json!({
+            "channel": { "config_id": "input-capture-redaction-rules" },
+            "http": { "path": "/a2a/agent?token=t-secret&page=2" },
+            "a2a": { "parts": [
+                { "text": "fetch https://svc:s3cr3t-pw@host.example.test/path please" },
+                { "text": "login with password=hunter2 please" },
+                { "text": "contact alice@example.test" },
+                { "text": "use agpat_abc123def" },
+            ] },
+        });
+
+        let update = update_json(
+            begin("surface", "input-capture-redaction-rules", &input, Vec::new)
+                .unwrap()
+                .into_update(Ok((false, Some("alice@example.test is not allowed")))),
+        );
+
+        let masked = update.to_string();
+        assert!(!masked.contains("hunter2"), "{masked}");
+        assert!(!masked.contains("alice@example.test"), "{masked}");
+        assert!(!masked.contains("agpat_abc123def"), "{masked}");
+        assert!(!masked.contains("s3cr3t"), "{masked}");
+        assert!(!masked.contains("t-secret"), "{masked}");
+        assert_eq!(
+            update["input"]["a2a"]["parts"][0]["text"],
+            format!("fetch https://{REDACTED}@host.example.test/path please")
+        );
+        assert_eq!(update["input"]["http"]["path"], format!("/a2a/agent?token={REDACTED}&page={REDACTED}"));
+        assert_eq!(update["reason"], "[REDACTED-EMAIL] is not allowed");
+        assert_eq!(update["input"]["channel"]["config_id"], "input-capture-redaction-rules");
     }
 
     #[test]

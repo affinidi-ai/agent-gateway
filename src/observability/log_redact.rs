@@ -73,9 +73,9 @@ pub fn built_in_rules() -> Vec<LogRedactionRule> {
 }
 
 /// Exported attribute names whose values are credentials. An attribute is one when its
-/// name, ignoring case, is one of these or ends with one after a `.`, `_` or `-`. A lowercase
-/// letter or digit followed by an uppercase letter also separates words, so `accessToken` reads
-/// as `access_token`.
+/// name, ignoring case, is one of these or ends with one after a `.`, `_`, `-` or space. A
+/// lowercase letter or digit followed by an uppercase letter also separates words, so
+/// `accessToken` reads as `access_token`.
 const CREDENTIAL_ATTRIBUTE_NAMES: &[&str] = &[
     "authorization",
     "cookie",
@@ -95,6 +95,10 @@ const CREDENTIAL_ATTRIBUTE_NAMES: &[&str] = &[
     "credentials",
 ];
 
+/// Attribute names that are credentials only as the whole name, since as a suffix they
+/// would catch names such as `primary_key` or `oauth`.
+const WHOLE_CREDENTIAL_ATTRIBUTE_NAMES: &[&str] = &["key", "auth", "pat"];
+
 pub(crate) fn is_credential_attribute(name: &str) -> bool {
     let mut normalized = String::with_capacity(name.len() + 4);
     let mut previous: Option<char> = None;
@@ -103,10 +107,13 @@ pub(crate) fn is_credential_attribute(name: &str) -> bool {
             normalized.push('_');
         }
         normalized.push(match c {
-            '.' | '-' => '_',
+            '.' | '-' | ' ' => '_',
             other => other.to_ascii_lowercase(),
         });
         previous = Some(c);
+    }
+    if WHOLE_CREDENTIAL_ATTRIBUTE_NAMES.contains(&normalized.as_str()) {
+        return true;
     }
     CREDENTIAL_ATTRIBUTE_NAMES
         .iter()
@@ -1331,6 +1338,12 @@ mod tests {
             "privateKey",
             "oauth2Token",
             "APIKey",
+            "API Key",
+            "Access Token",
+            "key",
+            "Key",
+            "auth",
+            "pat",
         ] {
             assert!(is_credential_attribute(name), "{name} must be treated as a credential");
         }
@@ -1353,6 +1366,12 @@ mod tests {
             "apiKeyId",
             "secretId",
             "inputTokens",
+            "primary_key",
+            "keys",
+            "oauth",
+            "author",
+            "path",
+            "api_key_name",
         ] {
             assert!(!is_credential_attribute(name), "{name} must not be treated as a credential");
         }

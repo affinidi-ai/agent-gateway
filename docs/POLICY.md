@@ -201,7 +201,10 @@ least 6 with a digit or one of those symbols; a `Basic` token is one that decode
 `user:password`. Message text such as `Basic authentication` or `Bearer arms` is kept. In every
 absolute URL in the input, query parameter names are kept and every query value becomes
 `<redacted>`, and the userinfo (user name and password) becomes `<redacted>`
-(`https://<redacted>@host/path`), up to the last `@` before the path, query or fragment. A deny
+(`https://<redacted>@host/path`), up to the last `@` before the path, query or fragment. A
+fragment that holds `name=value` parameters, as an OAuth redirect's does
+(`#access_token=<redacted>&state=<redacted>`), is masked like a query; a plain anchor such as
+`#top` is kept. A deny
 reason and an evaluation error get the same masking, since a policy can build its reason from
 input text and an engine error can quote it. `http.path`
 is shown as the request log line shows it: query parameter names are kept and every query value
@@ -209,11 +212,15 @@ becomes `<redacted>`, since a request received over Fabric carries the caller's 
 and capability ids in the path are shortened. Masking matches these shapes only, so a credential in
 another shape, such as an opaque key under a field name that is not a credential name, is sent as
 it is. Policies still see the full path. Headers that
-carry credentials never reach the policy input. Message bodies, tool arguments and claims are sent
-with only this masking applied. The operator's log redaction rules (`logging.redaction.rules`, such
-as the email and phone number patterns) apply to the log only, not to captures, so a value they
-remove from the log shows in full in a capture. Policy input capture is meant for writing and testing policies: the captures hold
-caller data.
+carry credentials never reach the policy input. After this masking, the operator's
+[log redaction rules](CONFIGURATION_REFERENCE.md#log-redaction) (`logging.redaction.rules`) are
+applied to every string in the input and to the deny reason and error, so a capture masks at least
+what the log masks. The built-in rules also catch credential assignments in free text
+(`password=[REDACTED]`, `api_key: [REDACTED]`), `agpat_` tokens, PEM private keys and email
+addresses, each shown with the rule's replacement. With `logging.redaction.enabled` set to `false`
+only the masking above applies. The rules are read at startup. Message bodies, tool arguments and
+claims are sent with only this masking applied. Policy input capture is meant for writing and
+testing policies: the captures hold caller data.
 
 ## Appliance-wide (global) enforcement
 

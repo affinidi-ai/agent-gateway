@@ -401,10 +401,13 @@ In OTLP exports, an attribute whose name is a credential name is replaced with
 attribute by its name. The names, ignoring case, are `authorization`, `cookie`, `token`,
 `session_id`, `sessionid`, `jsessionid`, `password`, `passwd`, `secret`, `secret_key`,
 `api_key`, `apikey`, `caller_key`, `private_key`, `credential` and `credentials`, alone or after
-a `.`, `_` or `-`, or after a camelCase word break (a lowercase letter or digit followed by an
-uppercase letter): `http.request.header.authorization`, `x-api-key`, `x-caller-key`,
-`mcp_session_id`, `accessToken` and `clientSecret` match,
-`token_count`, `secret_id`, `maxTokens` and `apiKeyId` do not. Fields named like a credential lose the
+a `.`, `_`, `-` or space, or after a camelCase word break (a lowercase letter or digit followed
+by an uppercase letter), and `key`, `auth` and `pat` as the whole name only:
+`http.request.header.authorization`, `x-api-key`, `x-caller-key`, `mcp_session_id`,
+`accessToken`, `clientSecret`, `API Key` and `key` match,
+`token_count`, `secret_id`, `maxTokens`, `apiKeyId`, `primary_key` and `oauth` do not. The same
+names mark credential-named keys in captured [policy input](POLICY.md#policy-input-capture), and
+these rules apply to captures too. Fields named like a credential lose the
 8-character prefix the gateway logs for correlation, in local logs as well as in OTLP
 exports.
 
