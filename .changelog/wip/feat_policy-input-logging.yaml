@@ -82,11 +82,5 @@ changes:
         bodies commonly use camelCase. Names such as maxTokens, apiKeyId and primary_key are still
         kept.
   removed: []
-  security:
-    - timestamp: '2026-11-17T00:00:00Z'
-      title: Update actix-http to 3.22.0 and libz-sys to 1.1.33
-      description: >-
-        actix-http 3.21.0 had advisories for chunked request body parsing and the request header
-        timeout on keep-alive connections, and the zlib that libz-sys 1.1.31 bundles had a heap
-        buffer overflow. Both are updated to releases with the fixes.
+  security: []
   breaking: []
