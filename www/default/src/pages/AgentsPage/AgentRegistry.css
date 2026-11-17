@@ -91,6 +91,14 @@ body.dark-theme .agents-name {
   --bs-table-border-color: var(--gray-200);
 }
 
+/* Inline `code` reserves no space for its vertical padding, so the "Was" chip overlaps the
+   value above it. `inline-block` gives each chip a real box; a long value wraps inside it. */
+.agent-preview-changes td code {
+  display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
 .agent-preview-change-field {
   font-weight: 600;
   color: var(--gray-800);

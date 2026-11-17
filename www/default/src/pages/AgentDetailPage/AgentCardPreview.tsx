@@ -38,7 +38,7 @@ const Value: React.FC<{ value: string | null }> = ({ value }) =>
   value === null ? (
     <span className="text-muted">-</span>
   ) : (
-    <code className="small text-break">{value}</code>
+    <code className="small text-break fw-semibold">{value}</code>
   );
 
 type ChangeKind = 'rewritten' | 'added' | 'removed';
@@ -172,7 +172,7 @@ const ChangeRowView: React.FC<{ row: ChangeRow }> = ({ row }) => {
           </div>
           {row.was !== null && (
             <div className="text-muted small text-break" data-testid={`${row.testid}-was`}>
-              Was <code className="small">{row.was}</code>
+              Was <code className="small text-muted">{row.was}</code>
             </div>
           )}
         </td>

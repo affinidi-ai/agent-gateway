@@ -1773,8 +1773,10 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
   the API's `upstream_card`, with columns **Field**, **Change** and **Value**. **Change** is a
   badge (`<row>-change`): **Rewritten** (`text-bg-warning`) when the field existed before,
   **Added** (`text-bg-primary`) when it did not, **Removed** (`text-bg-secondary`) when the
-  served card dropped it. **Value** (`<row>`) is what callers get, `-` when missing; a rewritten
-  or removed one has a muted "Was <value>" line under it (`<row>-was`), an added one none. Rows:
+  served card dropped it. **Value** (`<row>`) is what callers get, in semibold code, `-` when
+  missing; a rewritten or removed one has a muted "Was <value>" line under it, its code muted too
+  so the new value stands out (`<row>-was`), an added one none. `code` in `agent-preview-changes`
+  cells is `inline-block` so wrapped chips don't overlap. Rows:
   the URL first (`-url`), then each extension the upstream card lacks or carries differently
   (`-extension`; paired with the next upstream extension the served card dropped, which is its
   "Was"; the identity-credential extension reads **Identity credential**), each followed by a
