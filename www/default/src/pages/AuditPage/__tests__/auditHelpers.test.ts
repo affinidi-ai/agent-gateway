@@ -13,6 +13,7 @@ describe('categoryLabel', () => {
     ['identity_binding_failed', 'Identity Binding Failed'],
     ['token_refreshed', 'Token Refreshed'],
     ['consent_expired', 'Consent Expired'],
+    ['consent_limited', 'Consent Limited'],
   ])('labels %s as %s', (name, label) => {
     expect(categoryLabel(name)).toBe(label);
   });
@@ -49,9 +50,11 @@ describe('credential delegation records in the Audit Log', () => {
     expect([...DELEGATION_CATEGORIES]).toEqual([
       'consent_granted',
       'consent_expired',
+      'consent_limited',
       'token_revoked',
       'user_tokens_revoked',
     ]);
+    expect(offered).toContain('consent_limited');
   });
 
   it('still names a record of a logged event that an older gateway audited', () => {
@@ -61,6 +64,7 @@ describe('credential delegation records in the Audit Log', () => {
 
   it('marks an expired consent as a warning, not as a refusal', () => {
     expect(categoryBadgeClass('consent_expired')).toBe('badge-warning');
+    expect(categoryBadgeClass('consent_limited')).toBe('badge-warning');
     expect(categoryBadgeClass('token_revoked')).toBe('badge-danger');
     expect(categoryBadgeClass('user_tokens_revoked')).toBe('badge-danger');
   });

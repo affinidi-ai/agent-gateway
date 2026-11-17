@@ -284,6 +284,45 @@ pub fn grant_detail(
     }
 }
 
+/// Why an operator's limit on one stored consent is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitRefusal {
+    /// The consent is already older than the limit. Ending it now is a revoke.
+    AlreadyOlder,
+    /// The consent already ends at the limit's end or before. A consent is never extended.
+    NotSooner,
+}
+
+/// When the consent given at `granted_at` ends once an operator limits it to `limit_secs`
+/// after it was given. `current_end` is its end as the limits stand, `None` for one without.
+/// The limit only brings the end forward, to a time still ahead of `now`.
+pub fn limited_end(
+    granted_at: DateTime<Utc>,
+    current_end: Option<DateTime<Utc>>,
+    limit_secs: u64,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>, LimitRefusal> {
+    let end = after(granted_at, limit_secs);
+    if end <= now {
+        return Err(LimitRefusal::AlreadyOlder);
+    }
+    if current_end.is_some_and(|current| end >= current) {
+        return Err(LimitRefusal::NotSooner);
+    }
+    Ok(end)
+}
+
+/// The `detail` of a `consent_limited` audit record: when the consent was given, when it
+/// ends now, and when it ended before, for one that had an end.
+pub fn limit_detail(
+    granted_at: DateTime<Utc>,
+    end: DateTime<Utc>,
+    previous_end: Option<DateTime<Utc>>,
+) -> String {
+    let previous = previous_end.map_or_else(String::new, |time| format!(",previous_end:{}", stamp(time)));
+    format!("consent_granted_at:{},consent_expires_at:{}{previous}", stamp(granted_at), stamp(end))
+}
+
 /// `time` as an audit `detail` writes it: RFC 3339 UTC, to the second.
 fn stamp(time: DateTime<Utc>) -> String {
     time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -291,7 +330,7 @@ fn stamp(time: DateTime<Utc>) -> String {
 
 /// The earlier of two ends, or of two limits the shorter; the one there is
 /// when the other is absent.
-fn earlier<T: Ord>(
+pub(crate) fn earlier<T: Ord>(
     one: Option<T>,
     other: Option<T>,
 ) -> Option<T> {
@@ -537,6 +576,32 @@ mod tests {
             Some("grant_by_binding:external_consent")
         );
         assert_eq!(grant_detail(None, None), None);
+    }
+
+    #[test]
+    fn limiting_one_consent_brings_its_end_forward_and_never_ends_or_extends_it() {
+        let granted = at(0);
+        let now = at(3_600);
+
+        assert_eq!(limited_end(granted, None, 7_200, now), Ok(at(7_200)), "a consent without an end takes one");
+        assert_eq!(limited_end(granted, Some(at(21_600)), 7_200, now), Ok(at(7_200)));
+
+        assert_eq!(limited_end(granted, Some(at(21_600)), 21_600, now), Err(LimitRefusal::NotSooner));
+        assert_eq!(limited_end(granted, Some(at(21_600)), 86_400, now), Err(LimitRefusal::NotSooner));
+        assert_eq!(limited_end(granted, Some(at(21_600)), 3_600, now), Err(LimitRefusal::AlreadyOlder));
+        assert_eq!(limited_end(granted, None, 60, now), Err(LimitRefusal::AlreadyOlder));
+    }
+
+    #[test]
+    fn the_limit_detail_names_the_consent_time_its_new_end_and_the_end_it_had() {
+        assert_eq!(
+            limit_detail(at(0), at(7_200), Some(at(21_600))),
+            "consent_granted_at:2027-01-15T08:00:00Z,consent_expires_at:2027-01-15T10:00:00Z,previous_end:2027-01-15T14:00:00Z"
+        );
+        assert_eq!(
+            limit_detail(at(0), at(7_200), None),
+            "consent_granted_at:2027-01-15T08:00:00Z,consent_expires_at:2027-01-15T10:00:00Z"
+        );
     }
 
     #[test]

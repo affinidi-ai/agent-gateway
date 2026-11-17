@@ -83,7 +83,8 @@ export function eventTone(entry: AuditEntry): EventTone {
   if (tc) return tc.ok ? 'allow' : 'deny';
   if (requestRejected(entry)) return 'deny';
   const name = eventTypeName(entry);
-  if (name === 'consent_required' || name === 'consent_expired') return 'warn';
+  if (name === 'consent_required' || name === 'consent_expired' || name === 'consent_limited')
+    return 'warn';
   if (DENY_EVENTS.has(name)) return 'deny';
   if (ALLOW_EVENTS.has(name)) return 'allow';
   return 'neutral';
@@ -382,6 +383,15 @@ export function describeEntry(entry: AuditEntry, userName?: UserNameResolver): E
           ? `The consent for ${provider} reached its time limit, so the stored credential was removed.`
           : 'A consent reached its time limit, so the stored credential was removed.',
         detail: 'The person is asked to consent again the next time the agent needs it.',
+      };
+    case 'consent_limited':
+      return {
+        title: 'Consent limited',
+        tone,
+        summary: provider
+          ? `An operator brought the end of the consent for ${provider} forward.`
+          : 'An operator brought the end of a consent forward.',
+        detail: 'The credential is used until that end. It was not revoked.',
       };
     case 'refresh_failed':
       return {

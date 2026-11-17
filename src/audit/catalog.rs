@@ -103,6 +103,12 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         "A consent reached its time limit and the stored credential was removed; not a revocation",
         Delegation,
     ),
+    event(
+        "consent_limited",
+        "Consent Limited",
+        "An operator brought the end of one stored consent forward through the management API",
+        Delegation,
+    ),
     event("token_revoked", "Token Revoked", "A delegation token was revoked through the management API", Delegation),
     event("user_tokens_revoked", "User Tokens Revoked", "Every delegation token for a user was revoked", Delegation),
     event(
@@ -279,6 +285,7 @@ mod tests {
                 "connector_call",
                 "consent_granted",
                 "consent_expired",
+                "consent_limited",
                 "token_revoked",
                 "user_tokens_revoked",
                 "delegation_failed",
@@ -364,6 +371,7 @@ mod tests {
             "token_revoked",
             "user_tokens_revoked",
             "consent_expired",
+            "consent_limited",
             "consent_granted",
             "mcp_proxy_pin_changed",
         ] {

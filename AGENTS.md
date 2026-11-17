@@ -213,14 +213,20 @@ tab beside it that lists only active access, revokes it with a text **Revoke** w
 names the provider beside a Cancel, and opens the Audit Log as its history. Both tabs name a
 provider by its name, show an agent with a `did:web` DID by its whole host name, the full DID in
 the tooltip, and revoke one entry with the same text **Revoke**. Delegated Access shows the limit
-each consent was given under in its Ends column, and the Credential Tokens **Access Token** column
-says "Renews automatically" while the gateway refreshes the token. A new view is a new tab; an
-existing tab is never renamed or removed. See _Credential Tokens and Delegated Access tabs_ in
+that applies to each consent in its Ends column, and the Credential Tokens **Access Token** column
+says "Renews automatically" while the gateway refreshes the token. On Credential Tokens a
+**Limit duration** button beside **Revoke**, on each consent an agent can still act under, opens
+a panel in place under the row, never a modal: it sets how long after its consent that one
+delegation ends (`PUT /delegation-vault/{id}/consent-limit`) and offers Save only for a limit
+that brings the end forward. The Credential Tokens card header shows its title alone, with no
+count. A new view is a new tab, and both of these tabs stay. See
+_Credential Tokens and Delegated Access tabs_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-tokens-and-delegated-access-tabs).
 
-The credential delegation records are read in the Audit Log; the Credentials page's **Credential
-Delegation Audit** tab is a link to it, filtered to the delegation categories: the audited ones
-(consent granted or expired, a token or a user's tokens revoked). What the gateway does on each
+The credential delegation records are read in the Audit Log. The Credentials page has no audit
+tab: **History** on Delegated Access and a token's expanded row on Credential Tokens open the
+Audit Log filtered to the delegation categories, the audited ones
+(consent granted, expired or limited, a token or a user's tokens revoked). What the gateway does on each
 call, such as a token injected or refreshed, is in its log and has no category. The Audit Log
 shows a caller's Principal beside Subject when its strategy names a claim other than `sub`; see
 _Credential delegation audit_ in

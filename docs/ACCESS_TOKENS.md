@@ -232,9 +232,11 @@ token follows its provider's current tenant, so moving a provider to another ten
 tokens with it.
 
 Only an appliance-wide caller revokes agent-keyed tokens, with
-`DELETE /api/v1/delegation-vault/{id}` or `DELETE /api/v1/delegation-vault/by-user/{user_hash}`.
+`DELETE /api/v1/delegation-vault/{id}` or `DELETE /api/v1/delegation-vault/by-user/{user_hash}`,
+or brings the end of one consent forward, with
+`PUT /api/v1/delegation-vault/{id}/consent-limit`.
 A tenant PAT, and a PAT scoped by required headers alone or by a resource pattern, gets `403` and
-the tokens are kept, whichever tenant they belong to.
+the tokens are kept as they are, whichever tenant they belong to.
 
 ### Delegation audit records
 

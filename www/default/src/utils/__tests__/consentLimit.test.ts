@@ -1,5 +1,6 @@
 import {
   consentLimitLabel,
+  consentLimitSecondsOf,
   consentLimitUnitsFor,
   describeConsentLimit,
   largestWholeUnit,
@@ -16,6 +17,24 @@ describe('consent time limit', () => {
     expect(describeConsentLimit(60)).toBe('1 minute');
     expect(describeConsentLimit(61)).toBe('61 seconds');
     expect(largestWholeUnit(3_600)).toEqual({ count: 1, unit: 'hours' });
+  });
+
+  it('reads a typed limit as seconds only when the gateway takes it', () => {
+    expect(consentLimitSecondsOf('6', 'hours')).toBe(21_600);
+    expect(consentLimitSecondsOf(' 30 ', 'days')).toBe(2_592_000);
+    expect(consentLimitSecondsOf('1', 'minutes')).toBe(60);
+    expect(consentLimitSecondsOf('365', 'days')).toBe(31_536_000);
+    for (const [amount, unit] of [
+      ['', 'hours'],
+      ['0', 'minutes'],
+      ['59', 'seconds'],
+      ['366', 'days'],
+      ['1.5', 'hours'],
+      ['-2', 'hours'],
+      ['two', 'hours'],
+    ] as const) {
+      expect(consentLimitSecondsOf(amount, unit)).toBeNull();
+    }
   });
 
   it('names a limit as a span: "6-hour limit"', () => {

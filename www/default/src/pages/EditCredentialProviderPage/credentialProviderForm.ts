@@ -1,9 +1,7 @@
 import {
   ConsentLimitUnit,
-  MAX_CONSENT_LIMIT_SECS,
-  MIN_CONSENT_LIMIT_SECS,
+  consentLimitSecondsOf,
   largestWholeUnit,
-  secondsIn,
   storedConsentLimit,
 } from '../../utils/consentLimit';
 
@@ -332,9 +330,7 @@ export function consentLimitSeconds(
 ): number | null {
   const amount = form.consent_limit_amount.trim();
   if (!takesConsent(form.provider_type) || !amount) return 0;
-  if (!/^\d+$/.test(amount)) return null;
-  const secs = Number(amount) * secondsIn(form.consent_limit_unit);
-  return secs >= MIN_CONSENT_LIMIT_SECS && secs <= MAX_CONSENT_LIMIT_SECS ? secs : null;
+  return consentLimitSecondsOf(amount, form.consent_limit_unit);
 }
 
 /**

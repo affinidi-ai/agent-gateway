@@ -99,6 +99,18 @@ test.describe("Credentials page tabs", () => {
       page.getByTestId("credentials-delegated-access-tab-trigger"),
     ).toContainText("Delegated Access");
   });
+
+  test("has no audit tab, and a stored address of one opens the first tab", async ({
+    page,
+  }) => {
+    await page.goto(`${BASE_URL}/credentials?tab=credential-audit`);
+
+    await expect(
+      page.getByTestId("credentials-jwt-verification-tab-trigger"),
+    ).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByRole("tab", { name: /Audit/ })).toHaveCount(0);
+    await expect(page.getByTestId("page-audit")).toHaveCount(0);
+  });
 });
 
 test.describe("Credentials page Delegated Access tab", () => {
@@ -228,6 +240,72 @@ test.describe("Credentials page Credential Tokens tab", () => {
     ).not.toContainText("Renews automatically");
   });
 
+  test("shows its title alone in its header, with no count of tokens or of statuses", async ({
+    page,
+  }) => {
+    await openCredentialTokens(page, [
+      token("active", ALICE, fromNow(5 * HOUR)),
+      token("unlimited", BOB),
+      token("ended", BOB, fromNow(-HOUR)),
+    ]);
+
+    await expect(
+      page.getByRole("heading", { name: /Credential Delegation Tokens/ }),
+    ).toHaveText(/^\s*Credential Delegation Tokens\s*$/);
+  });
+
+  test("limits one delegation in place with Limit duration beside Revoke, with no dialog", async ({
+    page,
+  }) => {
+    let dialogs = 0;
+    page.on("dialog", async (dialog) => {
+      dialogs += 1;
+      await dialog.dismiss();
+    });
+    await openCredentialTokens(page, [
+      token("t1", ALICE, fromNow(5 * HOUR)),
+      token("ended", BOB, fromNow(-HOUR)),
+    ]);
+    const limits: unknown[] = [];
+    await page.route(
+      "**/api/v1/delegation-vault/t1/consent-limit",
+      async (route) => {
+        limits.push(route.request().postDataJSON());
+        await route.fulfill({ json: token("t1", ALICE, fromNow(HOUR)) });
+      },
+    );
+    const button = page.getByTestId("credential-token-limit-button-t1");
+    await expect(button).toHaveText("Limit duration");
+    await expect(
+      row(page, "t1").getByTestId("credential-token-revoke-button-t1"),
+    ).toBeVisible();
+    await expect(
+      page.getByTestId("credential-token-limit-button-ended"),
+    ).toHaveCount(0);
+
+    await button.click();
+    const panel = page.getByTestId("credential-token-limit-panel-t1");
+    const input = page.getByTestId("credential-token-limit-input-t1");
+    const save = page.getByTestId("credential-token-limit-save-t1");
+    await expect(panel).toContainText("Limit duration · GitHub");
+    await expect(page.locator('[role="dialog"]')).toHaveCount(0);
+    await expect(input).toHaveValue("6");
+    await expect(save).toBeDisabled();
+
+    await input.fill("2");
+    await expect(
+      page.getByTestId("credential-token-limit-preview-t1"),
+    ).toContainText("With this limit it ends");
+    await save.click();
+
+    await expect(panel).toHaveCount(0);
+    expect(limits).toEqual([{ max_consent_age_secs: 7200 }]);
+    await expect(
+      page.getByTestId("credential-token-consent-end-t1"),
+    ).toHaveText(/\(in (59 minutes|1 hour)\)$/);
+    expect(dialogs).toBe(0);
+  });
+
   test("names the agent by its host name and revokes one delegation on a second click", async ({
     page,
   }) => {
@@ -322,25 +400,6 @@ test.describe("Credentials page Credential Tokens tab", () => {
       "consent_expired",
     );
     await expect.poll(() => filters).toContain(ALICE);
-  });
-});
-
-test.describe("Credentials page Credential Delegation Audit tab", () => {
-  test("is a link to the Audit Log, filtered to credential delegation", async ({
-    page,
-  }) => {
-    await page.goto(`${BASE_URL}/credentials`);
-
-    await page.getByTestId("credentials-credential-audit-tab-trigger").click();
-
-    await expect(page.getByTestId("page-audit")).toBeVisible();
-    const categories = new URL(page.url()).searchParams.get("category") ?? "";
-    expect(categories.split(",")).toEqual([
-      "consent_granted",
-      "consent_expired",
-      "token_revoked",
-      "user_tokens_revoked",
-    ]);
   });
 });
 

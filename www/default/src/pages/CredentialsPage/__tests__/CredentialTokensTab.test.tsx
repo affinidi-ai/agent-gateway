@@ -95,10 +95,20 @@ describe('Credential Tokens tab', () => {
     expect(consentEndOf('ended')).toHaveTextContent(/^Ended /);
     expect(within(row('ended')).getByText('Consent ended')).toBeInTheDocument();
     expect(screen.getByText('Credential Delegation Tokens')).toBeInTheDocument();
-    expect(screen.getByText('3 active')).toBeInTheDocument();
-    expect(screen.getByTestId('credential-tokens-consent-ended-count')).toHaveTextContent(
-      '1 consent ended'
+  });
+
+  it('shows its title alone in its header, with no count of tokens or of statuses', async () => {
+    await renderTab([
+      token('active', ALICE),
+      token('refreshable', ALICE, { is_expired: true }),
+      token('expired', BOB, { is_expired: true, can_refresh: false }),
+      token('ended', BOB, { consent_expires_at: fromNow(-HOUR) }),
+    ]);
+
+    expect(screen.getByRole('heading', { name: /Credential Delegation Tokens/ })).toHaveTextContent(
+      /^\s*Credential Delegation Tokens\s*$/
     );
+    expect(screen.queryByTestId('credential-tokens-consent-ended-count')).toBeNull();
   });
 
   it('shows the access token expiry, and that it renews while the provider refreshes it', async () => {
@@ -236,6 +246,150 @@ describe('Credential Tokens tab', () => {
 
     expect(deletes()).toHaveLength(0);
     expect(screen.getByTestId('credential-token-row-t1')).toBeInTheDocument();
+  });
+
+  const puts = () => mockFetch.mock.calls.filter(([, options]) => options?.method === 'PUT');
+  /** Answers every later request with `answer`, as a success or as a `400`. */
+  const answerWith = (ok: boolean, answer: unknown) =>
+    mockFetch.mockImplementation(() =>
+      Promise.resolve({
+        ok,
+        status: ok ? 200 : 400,
+        statusText: ok ? 'OK' : 'Bad Request',
+        json: () => Promise.resolve(answer),
+      })
+    );
+  const limitPart = (part: string, id = 't1') =>
+    screen.getByTestId(`credential-token-limit-${part}-${id}`);
+  const sixHourConsent = (id: string, user: string) =>
+    token(id, user, { consent_expires_at: fromNow(5 * HOUR) });
+
+  it('offers Limit duration beside Revoke only for a consent an agent can still act under', async () => {
+    await renderTab(
+      [
+        sixHourConsent('active', ALICE),
+        token('unlimited', ALICE),
+        token('ended', BOB, { consent_expires_at: fromNow(-HOUR) }),
+        token('unusable', BOB, { is_expired: true, can_refresh: false }),
+        token('service', BOB, { credential_provider_id: 'cp-service' }),
+        token('unknown', BOB, { credential_provider_id: 'cp-deleted' }),
+      ],
+      {},
+      [GITHUB, { ...GITHUB, id: 'cp-service', provider_type: 'oauth2_client_credentials' }]
+    );
+
+    for (const id of ['active', 'unlimited']) {
+      const cells = within(row(id)).getAllByRole('cell');
+      const actions = within(cells[cells.length - 1]);
+      expect(actions.getByTestId(`credential-token-limit-button-${id}`)).toHaveTextContent(
+        /^Limit duration$/
+      );
+      expect(actions.getByTestId(`credential-token-revoke-button-${id}`)).toBeInTheDocument();
+    }
+    for (const id of ['ended', 'unusable', 'service', 'unknown']) {
+      expect(screen.queryByTestId(`credential-token-limit-button-${id}`)).toBeNull();
+    }
+  });
+
+  it('limits one consent in place: previews its new end, saves it and shows it in the row', async () => {
+    const confirmSpy = jest.spyOn(window, 'confirm');
+    await renderTab([sixHourConsent('t1', ALICE), token('t2', BOB)]);
+
+    fireEvent.click(screen.getByTestId('credential-token-limit-button-t1'));
+
+    expect(limitPart('panel')).toHaveTextContent('Limit duration · GitHub');
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(row('t1')).not.toHaveClass('table-active');
+    expect(limitPart('input')).toHaveValue(6);
+    expect(limitPart('unit')).toHaveValue('hours');
+    expect(limitPart('preview')).toHaveTextContent(
+      /^It already ends .+\. A limit only brings the end forward\.$/
+    );
+    expect(limitPart('save')).toBeDisabled();
+
+    fireEvent.change(limitPart('input'), { target: { value: '2' } });
+    expect(limitPart('preview')).toHaveTextContent(
+      /^Consent given .+\. With this limit it ends .+ \(in (59 minutes|1 hour)\)\.$/
+    );
+    expect(limitPart('save')).toBeEnabled();
+
+    answerWith(true, { ...token('t1', ALICE), consent_expires_at: fromNow(HOUR) });
+    fireEvent.click(limitPart('save'));
+
+    await waitFor(() => expect(screen.queryByTestId('credential-token-limit-panel-t1')).toBeNull());
+    expect(puts()).toHaveLength(1);
+    const [url, options] = puts()[0];
+    expect(url).toBe('/api/v1/delegation-vault/t1/consent-limit');
+    expect(JSON.parse(options.body)).toEqual({ max_consent_age_secs: 7200 });
+    expect(consentEndOf('t1')).toHaveTextContent(/\(in (59 minutes|1 hour)\)$/);
+    expect(consentEndOf('t2')).toHaveTextContent('No time limit');
+    expect(showToast).toHaveBeenCalledWith(
+      'success',
+      expect.stringMatching(/^Limit saved\. GitHub access ends /)
+    );
+    expect(confirmSpy).not.toHaveBeenCalled();
+    confirmSpy.mockRestore();
+  });
+
+  it('offers no Save for a limit that would end the consent now, extend it, or is no limit', async () => {
+    await renderTab([sixHourConsent('t1', ALICE)]);
+    fireEvent.click(screen.getByTestId('credential-token-limit-button-t1'));
+
+    const refused: [string, string, RegExp][] = [
+      ['12', 'hours', /A limit only brings the end forward\.$/],
+      ['30', 'minutes', /^This consent is already older than that\. Use Revoke to end it now\.$/],
+      ['', 'hours', /^Enter a whole number from 1 minute to 365 days\.$/],
+      ['1.5', 'hours', /^Enter a whole number from 1 minute to 365 days\.$/],
+      ['400', 'days', /^Enter a whole number from 1 minute to 365 days\.$/],
+    ];
+    for (const [amount, unit, preview] of refused) {
+      fireEvent.change(limitPart('input'), { target: { value: amount } });
+      fireEvent.change(limitPart('unit'), { target: { value: unit } });
+      expect(limitPart('preview')).toHaveTextContent(preview);
+      expect(limitPart('save')).toBeDisabled();
+    }
+    expect(puts()).toHaveLength(0);
+  });
+
+  it('shows what the gateway says when it refuses a limit, and keeps the panel open', async () => {
+    await renderTab([sixHourConsent('t1', ALICE)]);
+    fireEvent.click(screen.getByTestId('credential-token-limit-button-t1'));
+    fireEvent.change(limitPart('input'), { target: { value: '2' } });
+
+    answerWith(false, {
+      code: 'limit_not_sooner',
+      error: 'The consent already ends at this limit or before it. A consent is never extended',
+    });
+    fireEvent.click(limitPart('save'));
+
+    expect(await screen.findByTestId('credential-token-limit-error-t1')).toHaveTextContent(
+      'The consent already ends at this limit or before it. A consent is never extended'
+    );
+    expect(limitPart('input')).toHaveAttribute('aria-invalid', 'true');
+    expect(limitPart('panel')).toBeInTheDocument();
+    expect(consentEndOf('t1')).toHaveTextContent(/\(in 4 hours\)$/);
+    expect(showToast).not.toHaveBeenCalledWith('success', expect.anything());
+
+    fireEvent.change(limitPart('input'), { target: { value: '3' } });
+    expect(screen.queryByTestId('credential-token-limit-error-t1')).toBeNull();
+  });
+
+  it('closes the limit panel on Cancel or a second click, and sends nothing', async () => {
+    await renderTab([sixHourConsent('t1', ALICE)]);
+    const button = screen.getByTestId('credential-token-limit-button-t1');
+
+    fireEvent.click(button);
+    expect(button).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.click(limitPart('cancel'));
+    expect(screen.queryByTestId('credential-token-limit-panel-t1')).toBeNull();
+    expect(button).toHaveAttribute('aria-expanded', 'false');
+
+    fireEvent.click(button);
+    expect(limitPart('panel')).toBeInTheDocument();
+    fireEvent.click(button);
+    expect(screen.queryByTestId('credential-token-limit-panel-t1')).toBeNull();
+    expect(puts()).toHaveLength(0);
+    expect(row('t1')).toBeInTheDocument();
   });
 
   it("opens a user's delegation audit from the expanded row when the page offers it", async () => {

@@ -2298,6 +2298,7 @@ lives in [`src/delegation_vault/consent_age.rs`](../src/delegation_vault/consent
 | A binding: an entry of `outbound_credentials`, or a Transit Point's `transit_credentials` | `max_consent_age_secs` | The consents used through that binding |
 | `config.toml` | `[credential_policy] default_max_consent_age_secs` | The consents of a provider that sets no limit |
 | `config.toml` | `[credential_policy] max_consent_age_ceiling_secs` | Every consent: no limit reaches past it, and a consent nothing else limits takes it |
+| One stored consent | `PUT /api/v1/delegation-vault/{id}/consent-limit` with `max_consent_age_secs` | That consent alone, and only to bring its end forward ([Limiting one consent](#limiting-one-consent)) |
 
 Each is a number of seconds from 60 to 31,536,000, one minute to 365 days. A value outside
 that is refused with `400` when the provider or the surface is saved, and fails startup in
@@ -2381,6 +2382,42 @@ others: it refuses with the consent answer and `reason` `consent_too_old`, and t
 stays. The new consent the person gives through it replaces the token and ends at that
 binding's limit. A grant by binding has one binding, so a consent too old for it has ended.
 
+### Limiting one consent
+
+An operator can bring the end of one stored consent forward, without touching the provider's
+limit or anyone else's consent:
+
+```sh
+curl -X PUT "$GATEWAY/api/v1/delegation-vault/$TOKEN_ID/consent-limit" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"max_consent_age_secs": 7200}'
+```
+
+The consent then ends `max_consent_age_secs` after it was given, as a provider's limit counts,
+and the new end is stored with the credential as `consent_expires_at`. Until then the
+credential is used and refreshed as before; at the end it is removed and the person is asked
+again, as for any ended consent, and recorded as `consent_expired`. The answer is `200` with
+the entry's metadata, as `GET /api/v1/delegation-vault/{id}` shows it.
+
+A limit only ever shortens. Each of these is refused with `400` and a `code`, and changes
+nothing:
+
+| `code` | When |
+| --- | --- |
+| `invalid_limit` | `max_consent_age_secs` is missing, not a whole number, or outside 60 to 31,536,000 |
+| `not_a_consent` | The entry is no consent a person gave: its provider is not an `oauth2_authorization_code` provider, or is gone |
+| `limit_not_sooner` | The consent already ends at the limit's end or before it. A consent is never extended: for a longer one, the person consents again |
+| `consent_older_than_limit` | The consent is already older than the limit, so the limit would end it at once. Ending a consent now is a revoke: `DELETE /api/v1/delegation-vault/{id}` |
+
+The route needs `delegation_vault.delete`, as a revoke does, and like a revoke it is for an
+appliance-wide caller only: a tenant's access token gets `403`. An unknown id is `404`. The
+limit belongs to that consent: a new consent by the same person takes the limits in force
+then. It applies to agent-keyed tokens; a grant by binding is limited by its provider and
+its binding.
+
+The dashboard offers it as **Limit duration** beside **Revoke** on the Credentials page's
+Credential Tokens tab.
+
 ### What the person is told
 
 - The consent start page adds a **Time limit** line, and the page shown after the callback
@@ -2391,6 +2428,11 @@ binding's limit. A grant by binding has one binding, so a consent too old for it
   ([The connect API](#the-connect-api)).
 
 ### Audit
+
+A limit an operator sets on one consent is recorded as `consent_limited`, with who set it
+(`caller`), the agent, the user identity hash, the provider, the scopes and the token id. Its
+`detail` is `consent_granted_at:<time>,consent_expires_at:<time>`, the new end, followed by
+`,previous_end:<time>` when the consent had an end before.
 
 A consent given under a time limit names its end in its `consent_granted` record: `detail`
 holds `consent_expires_at:<time>`, and for a grant by binding
@@ -3211,6 +3253,7 @@ leave out all four.
 | --- | --- |
 | `GET /api/v1/delegation-vault` | List vault entries, as metadata only, without tokens; a tenant's access token lists only its own tenant's |
 | `GET`, `DELETE /api/v1/delegation-vault/{id}` | Read or revoke one entry; a tenant's access token reads only its own tenant's, and only an appliance-wide caller revokes. A revoke is audited as `token_revoked` with who revoked it and whose access it ended: the entry's agent, user identity hash, provider and scopes |
+| `PUT /api/v1/delegation-vault/{id}/consent-limit` | Bring the end of one stored consent forward ([Limiting one consent](#limiting-one-consent)); only an appliance-wide caller limits. It is audited as `consent_limited` with who limited it, whose consent it is and its new end |
 | `DELETE /api/v1/delegation-vault/by-user/{user_hash}` | Revoke every delegation one user has granted; only an appliance-wide caller revokes. It is audited as `user_tokens_revoked` with who revoked them, the user identity hash and how many were revoked |
 | `POST /api/v1/delegation-vault/connects`, `POST /api/v1/delegation-vault/connects/{connect_id}/complete` | Start and complete an external consent connect ([The connect API](#the-connect-api)) |
 | `GET /api/v1/delegation-vault/grants?surface_id=...` | Report a surface's grants by binding, as metadata only |

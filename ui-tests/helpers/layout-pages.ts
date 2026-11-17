@@ -50,7 +50,6 @@ const CREDENTIALS_TABS = tabs('credentials', [
     'credential-tokens',
     'delegated-access',
     'sts-clients',
-    'credential-audit',
 ]);
 const CREDENTIALS = ['credentials-search-input', ...CREDENTIALS_TABS];
 

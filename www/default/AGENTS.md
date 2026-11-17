@@ -1071,9 +1071,8 @@ tab key `credential-tokens`) and has a **Delegated Access** tab beside it
 `GET /api/v1/credential-providers` through `useDelegationVault.ts`, and still list the tokens
 when the providers cannot be read; the shared rules live in
 `pages/CredentialsPage/delegatedAccess.ts` (`consentState`, `timeLeft`, `isActiveDelegation`,
-`consentLimitSecs`, `renewsAutomatically`, `agentName`, `providerName`) and the page links in
-`PaginationControls.tsx`. A new view of the vault is a new tab: an existing tab is never renamed
-or removed.
+`consentLimitSecs`, `limitOutcome`, `canLimitConsent`, `renewsAutomatically`, `agentName`,
+`providerName`) and the page links in `PaginationControls.tsx`. A new view of the vault is a new tab, and both of these tabs stay.
 
 Both tabs name an agent with `agentName`: a `did:web` DID shows as its whole web address, the host
 and any path with each `:` as `/` and percent escapes decoded ("pr-reviewer.example.com"),
@@ -1096,8 +1095,25 @@ Credential Tokens lists every agent-keyed token, service tokens included.
   one that cannot be read show no such line. The expanded row keeps **Token Expires**.
 - The status badge reads "Consent ended" once the end has passed and "Ending soon" within 24 hours
   of it; otherwise it is the access token's status (Active, Expired (refreshable), Expired). The
-  header counts leave ended consents out of "active" and count them as "consent ended"
-  (`credential-tokens-consent-ended-count`).
+  card header shows the title alone: no count of tokens and no count per status.
+- **Limit duration** (`credential-token-limit-button-<id>`, `aria-expanded`) sits beside
+  **Revoke** in the Actions cell, for a user with `settings.edit`, on a consent an operator can
+  limit (`canLimitConsent`: an Authorization Code provider's token whose delegation is still
+  active). It opens `ConsentLimitPanel.tsx` in a row of its own under the token's row
+  (`credential-token-limit-panel-<id>`), never a modal or a browser dialog, and a second click
+  or **Cancel** (`credential-token-limit-cancel-<id>`) closes it. The panel is titled "Limit
+  duration · <provider name>" and reads "The agent may act for this person for at most
+  [number] [minutes | hours | days] after consent." (`credential-token-limit-input-<id>`,
+  `credential-token-limit-unit-<id>`), starting from the limit that applies now. A line under
+  it (`credential-token-limit-preview-<id>`, `aria-live`) says what the limit would do, by
+  `limitOutcome`: "Consent given <date>. With this limit it ends <date> (in 59 minutes).", "It
+  already ends <date>. A limit only brings the end forward.", "This consent is already older
+  than that. Use Revoke to end it now.", or "Enter a whole number from 1 minute to 365 days."
+  **Save limit** (`credential-token-limit-save-<id>`) is enabled only for the first, sends
+  `PUT /api/v1/delegation-vault/{id}/consent-limit` with `max_consent_age_secs`, puts the
+  answered entry in the row, closes the panel and toasts "Limit saved. <provider> access ends
+  <date>." A refusal is shown under the field (`credential-token-limit-error-<id>`, the input
+  `is-invalid` and `aria-invalid`) in the gateway's words, and the panel stays open.
 - No modal and no browser dialog confirms a revoke. The row's **Revoke**
   (`credential-token-revoke-button-<id>`) works as on Delegated Access: its first click asks with
   a danger button that names the provider, beside **Cancel**
@@ -1117,8 +1133,9 @@ has not ended and whose access token is valid or refreshable. It has no history 
 
 - Columns: User, System (the provider's name, else its `provider_id`), Agent, Access (scopes),
   Status (Active, or Ending soon within 24 hours of the end), Ends (`delegated-access-ends-<id>`:
-  the time left, then the limit the consent was given under, "6-hour limit" or "30-day limit"
-  (`consentLimitSecs`, from its consent time to its end, worded by `consentLimitLabel` in
+  the time left, then the limit that applies to the consent, "6-hour limit" or "30-day limit"
+  (`consentLimitSecs`, from its consent time to the end the vault reports, so the sooner one
+  when the limit was shortened since; worded by `consentLimitLabel` in
   `utils/consentLimit.ts`), then the date; or "No time limit"), Last Used and, with
   `settings.edit`, a text
   **Revoke** button (`delegated-access-revoke-button-<id>`, the shared `TwoStepButton` with
@@ -1136,22 +1153,24 @@ has not ended and whose access token is valid or refreshable. It has no history 
 ## Credential delegation audit
 
 The credential delegation records are read in the Audit Log (`pages/AuditPage`), not on the
-Credentials page. The **Credential Delegation Audit** tab stays in the Credentials tab row
-(`credentials-credential-audit-tab-trigger`, shown with `audit.view`) as a link: selecting it, or
-opening `/credentials?tab=credential-audit`, goes to the Audit Log with the delegation categories
-selected. Every link from the Credentials page into the audit is built by `auditLogPath` from
-`DELEGATION_CATEGORIES` or `DELEGATION_ENDED_CATEGORIES` (`pages/AuditPage/auditHelpers.ts`).
+Credentials page, and the Credentials tab row has no audit tab and no link in its place: a
+stored `/credentials?tab=credential-audit` opens the first tab, as any unknown tab does. The
+two ways from the Credentials page into the audit are **History** on Delegated Access and the
+link in a token's expanded row on Credential Tokens, both shown with `audit.view` and built by
+`auditLogPath` from `DELEGATION_ENDED_CATEGORIES` or `DELEGATION_CATEGORIES`
+(`pages/AuditPage/auditHelpers.ts`).
 
 The delegation categories are the ones the gateway audits: `consent_granted`, `consent_expired`,
-`token_revoked` and `user_tokens_revoked`. What the gateway does with a credential on each call
+`consent_limited`, `token_revoked` and `user_tokens_revoked`. What the gateway does with a credential on each call
 (`token_injected`, `token_refreshed`, `refresh_failed`, `consent_required`, `token_not_found`
 and the elicitation events) is written to its log and is no audit event, so the Audit Log
 offers no category for it and no link selects it. A record of one that an older gateway
 audited is still shown, with its label (`categoryLabel`).
 
 - The Audit Log offers each delegation category in its Category filter, labels and narrates
-  `consent_expired` ("Consent expired", a warning, apart from a revocation), and shows it with
-  the other delegation events.
+  `consent_expired` ("Consent expired", a warning, apart from a revocation) and
+  `consent_limited` ("Consent limited", a warning: an operator brought the end of one consent
+  forward, and it was not revoked), and shows them with the other delegation events.
 - Its Identity group shows **Subject**, the token's own `sub`, and a **Principal** row with the
   value the caller's grants are keyed by, `caller.principal`, only when the JWT strategy names a
   claim other than `sub`.

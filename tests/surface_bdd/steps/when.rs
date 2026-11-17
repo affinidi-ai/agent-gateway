@@ -2020,6 +2020,40 @@ async fn operator_asks_what_a_consent_time_limit_would_end(
     record_admin_response(world, response);
 }
 
+/// Limits the consent of the one delegated credential the vault holds to
+/// `seconds` after it was given, as an operator does through the admin API,
+/// and records the answer.
+pub(crate) async fn limit_the_callers_consent(
+    world: &mut SurfaceWorld,
+    seconds: u64,
+) {
+    let held = list_delegation_vault(world).await;
+    assert_eq!(held.len(), 1, "expected one delegated credential to limit, got {held:?}");
+    let id = held[0]["id"]
+        .as_str()
+        .expect("a listed delegated credential has an id");
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_recorded_json(
+            reqwest::Method::PUT,
+            &format!("/v1/delegation-vault/{id}/consent-limit"),
+            Some(&serde_json::json!({ "max_consent_age_secs": seconds })),
+        )
+        .await
+        .expect("limit a consent through the admin API");
+    record_admin_response(world, response);
+}
+
+#[when(expr = "the operator limits the caller's consent to {int} seconds")]
+async fn operator_limits_the_callers_consent(
+    world: &mut SurfaceWorld,
+    seconds: u64,
+) {
+    limit_the_callers_consent(world, seconds).await;
+}
+
 /// Deactivates credential provider `provider`, or activates it again, as an
 /// operator does through the admin API.
 pub(crate) async fn set_oauth_provider_active(

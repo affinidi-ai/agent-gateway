@@ -540,6 +540,7 @@ mod tests {
             | DelegationAuditAction::RefreshFailed
             | DelegationAuditAction::ConsentRequired
             | DelegationAuditAction::ConsentExpired
+            | DelegationAuditAction::ConsentLimited
             | DelegationAuditAction::TokenRevoked
             | DelegationAuditAction::UserTokensRevoked
             | DelegationAuditAction::TokenNotFound
@@ -585,6 +586,7 @@ mod tests {
             DelegationAuditAction::RefreshFailed,
             DelegationAuditAction::ConsentRequired,
             DelegationAuditAction::ConsentExpired,
+            DelegationAuditAction::ConsentLimited,
             DelegationAuditAction::TokenRevoked,
             DelegationAuditAction::UserTokensRevoked,
             DelegationAuditAction::TokenNotFound,

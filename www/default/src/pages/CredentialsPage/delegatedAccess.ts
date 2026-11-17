@@ -75,8 +75,9 @@ export function isActiveDelegation(
 }
 
 /**
- * The time limit a consent was given under, in seconds: from its consent time to the end the vault
- * reports. `null` for a consent without a time limit.
+ * The time limit that applies to a consent, in seconds: from its consent time to the end the vault
+ * reports, which is the sooner one when the limit was shortened since. `null` for a consent
+ * without a time limit.
  */
 export function consentLimitSecs(
   token: Pick<DelegationToken, 'consent_granted_at' | 'consent_expires_at'>
@@ -86,6 +87,48 @@ export function consentLimitSecs(
   if (!end || Number.isNaN(granted)) return null;
   const secs = Math.round((end.getTime() - granted) / 1000);
   return secs > 0 ? secs : null;
+}
+
+/** What limiting one consent to a time after it was given would do. */
+export type LimitOutcome =
+  /** No limit the gateway takes was given. */
+  | { kind: 'invalid' }
+  /** The consent is already older than the limit: ending it now is a revoke. */
+  | { kind: 'already_older' }
+  /** The consent already ends at `end`, at the limit's end or before it. */
+  | { kind: 'not_sooner'; end: Date }
+  /** The consent would end at `end`, sooner than it does now. */
+  | { kind: 'ends'; end: Date };
+
+/**
+ * What limiting the consent of `token` to `limitSecs` after it was given would do at `now`, by
+ * the rule the gateway applies: a limit only brings the end forward, to a time still ahead.
+ */
+export function limitOutcome(
+  token: Pick<DelegationToken, 'consent_granted_at' | 'consent_expires_at'>,
+  limitSecs: number | null,
+  now: Date
+): LimitOutcome {
+  const granted = new Date(token.consent_granted_at).getTime();
+  if (limitSecs === null || Number.isNaN(granted)) return { kind: 'invalid' };
+  const end = new Date(granted + limitSecs * 1000);
+  if (end.getTime() <= now.getTime()) return { kind: 'already_older' };
+  const current = consentEnd(token.consent_expires_at);
+  return current && end.getTime() >= current.getTime()
+    ? { kind: 'not_sooner', end: current }
+    : { kind: 'ends', end };
+}
+
+/**
+ * Whether an operator can limit a delegation: a consent a person gave, to an Authorization Code
+ * provider, that an agent can still act under.
+ */
+export function canLimitConsent(
+  token: Pick<DelegationToken, 'consent_expires_at' | 'is_expired' | 'can_refresh'>,
+  provider: Pick<ProviderSummary, 'provider_type'> | undefined,
+  now: Date
+): boolean {
+  return provider?.provider_type === 'oauth2_authorization_code' && isActiveDelegation(token, now);
 }
 
 /**

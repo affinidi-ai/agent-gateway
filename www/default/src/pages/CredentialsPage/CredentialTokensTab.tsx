@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { usePermissions } from '../../context/PermissionsContext';
 import { AppButton } from '../../components/shared/AppButton';
-import { Badge } from '../../components/shared/Badge';
 import { TwoStepButton } from '../../components/shared/TwoStepButton';
 import { CopyButton } from '../../components/shared/CopyButton';
 import { apiClient } from '../../api';
@@ -10,9 +9,11 @@ import { formatDateTime, topAndTail } from '../../utils/stringUtils';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { DOCS_URL } from '../../config/docs';
 import PaginationControls from './PaginationControls';
+import ConsentLimitPanel from './ConsentLimitPanel';
 import {
   DelegationToken,
   agentName,
+  canLimitConsent,
   consentEnd,
   consentState,
   providerName,
@@ -42,6 +43,7 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
   const searchTerm = externalProvided ? externalSearchTerm! : internalSearchTerm;
   const [tokensPage, setTokensPage] = useState(1);
   const [expandedTokenId, setExpandedTokenId] = useState<string | null>(null);
+  const [limitingTokenId, setLimitingTokenId] = useState<string | null>(null);
 
   const canEditTokens = hasPermission('settings.edit');
 
@@ -77,6 +79,16 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
     }
   };
 
+  const handleLimitSaved = (limited: DelegationToken) => {
+    setTokens(prev => prev.map(t => (t.id === limited.id ? { ...t, ...limited } : t)));
+    setLimitingTokenId(null);
+    const end = consentEnd(limited.consent_expires_at);
+    showToast(
+      'success',
+      `Limit saved. ${providerName(limited, providers)} access ends ${end ? formatDateTime(end, true) : 'as before'}.`
+    );
+  };
+
   const fmtDate = (d: string | null) => (d ? formatDateTime(d, true) : '—');
 
   /** The confirm of revoking every delegation of a user, with how many it ends. */
@@ -110,14 +122,6 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
     return <span className="badge text-bg-success">Active</span>;
   };
 
-  const consentEnded = (t: DelegationToken) =>
-    consentState(consentEnd(t.consent_expires_at), new Date()) === 'ended';
-  const consentEndedTokens = tokens.filter(consentEnded).length;
-  const usable = tokens.filter(t => !consentEnded(t));
-  const activeTokens = usable.filter(t => !t.is_expired).length;
-  const expiredRefreshable = usable.filter(t => t.is_expired && t.can_refresh).length;
-  const expiredNoRefresh = usable.filter(t => t.is_expired && !t.can_refresh).length;
-
   const filteredTokens = tokens.filter(t => {
     const trimmedSearch = searchTerm.trim();
     if (!trimmedSearch) return true;
@@ -143,38 +147,6 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
       <div className="card-header py-3 d-flex justify-content-between align-items-center">
         <h6 className="m-0 font-weight-bold text-primary">
           <i className="fas fa-lock"></i> Credential Delegation Tokens
-          <Badge
-            value={filteredTokens.length}
-            suffix={searchTerm ? ` of ${tokens.length}` : undefined}
-            className="ms-2"
-            ariaLabel={`${filteredTokens.length}${searchTerm ? ` of ${tokens.length}` : ''} delegation tokens`}
-          />
-          {tokens.length > 0 && (
-            <>
-              <span className="badge text-bg-success ms-2" style={{ verticalAlign: 'middle' }}>
-                {activeTokens} active
-              </span>
-              {expiredRefreshable > 0 && (
-                <span className="badge text-bg-warning ms-2" style={{ verticalAlign: 'middle' }}>
-                  {expiredRefreshable} refreshable
-                </span>
-              )}
-              {expiredNoRefresh > 0 && (
-                <span className="badge text-bg-danger ms-2" style={{ verticalAlign: 'middle' }}>
-                  {expiredNoRefresh} expired
-                </span>
-              )}
-              {consentEndedTokens > 0 && (
-                <span
-                  className="badge text-bg-secondary ms-2"
-                  style={{ verticalAlign: 'middle' }}
-                  data-testid="credential-tokens-consent-ended-count"
-                >
-                  {consentEndedTokens} consent ended
-                </span>
-              )}
-            </>
-          )}
         </h6>
       </div>
       <div className="card-body">
@@ -284,20 +256,53 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                       </td>
                       <td onClick={e => e.stopPropagation()}>
                         {canEditTokens && (
-                          <TwoStepButton
-                            label="Revoke"
-                            confirmAs="danger"
-                            confirmLabel={`Revoke ${providerName(token, providers)} access?`}
-                            title="Revoke delegation"
-                            confirmTitle="Click again to revoke this delegation"
-                            className="btn btn-outline-danger btn-sm text-nowrap"
-                            cancelTestId={`credential-token-revoke-cancel-button-${token.id}`}
-                            data-testid={`credential-token-revoke-button-${token.id}`}
-                            onConfirm={() => handleRevokeToken(token)}
-                          />
+                          <div className="d-flex flex-wrap align-items-start gap-1">
+                            {canLimitConsent(
+                              token,
+                              providers[token.credential_provider_id],
+                              new Date()
+                            ) && (
+                              <AppButton
+                                variant="outline-primary"
+                                size="sm"
+                                className="text-nowrap"
+                                title="Set how long this delegation may still be used"
+                                aria-expanded={limitingTokenId === token.id}
+                                data-testid={`credential-token-limit-button-${token.id}`}
+                                onClick={() =>
+                                  setLimitingTokenId(limitingTokenId === token.id ? null : token.id)
+                                }
+                              >
+                                Limit duration
+                              </AppButton>
+                            )}
+                            <TwoStepButton
+                              label="Revoke"
+                              confirmAs="danger"
+                              confirmLabel={`Revoke ${providerName(token, providers)} access?`}
+                              title="Revoke delegation"
+                              confirmTitle="Click again to revoke this delegation"
+                              className="btn btn-outline-danger btn-sm text-nowrap"
+                              cancelTestId={`credential-token-revoke-cancel-button-${token.id}`}
+                              data-testid={`credential-token-revoke-button-${token.id}`}
+                              onConfirm={() => handleRevokeToken(token)}
+                            />
+                          </div>
                         )}
                       </td>
                     </tr>
+                    {limitingTokenId === token.id && (
+                      <tr className="expanded-detail-row">
+                        <td colSpan={9} className="p-0">
+                          <ConsentLimitPanel
+                            token={token}
+                            providerName={providerName(token, providers)}
+                            onSaved={handleLimitSaved}
+                            onCancel={() => setLimitingTokenId(null)}
+                          />
+                        </td>
+                      </tr>
+                    )}
                     {expandedTokenId === token.id && (
                       <tr className="expanded-detail-row">
                         <td colSpan={9} className="p-0">

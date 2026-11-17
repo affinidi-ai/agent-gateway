@@ -22,6 +22,7 @@ export const CATEGORY_OPTIONS = [
   { value: 'vp_injected', label: 'VP Injected', lowFrequency: true },
   { value: 'consent_granted', label: 'Consent Granted', lowFrequency: true },
   { value: 'consent_expired', label: 'Consent Expired', lowFrequency: true },
+  { value: 'consent_limited', label: 'Consent Limited', lowFrequency: true },
   { value: 'token_revoked', label: 'Token Revoked', lowFrequency: true },
   { value: 'user_tokens_revoked', label: 'User Tokens Revoked', lowFrequency: true },
   { value: 'policy_created', label: 'Policy Created', lowFrequency: true },
@@ -41,6 +42,7 @@ export const CATEGORY_OPTIONS = [
 export const DELEGATION_CATEGORIES = [
   'consent_granted',
   'consent_expired',
+  'consent_limited',
   'token_revoked',
   'user_tokens_revoked',
 ] as const;
@@ -81,6 +83,7 @@ const CATEGORY_BADGE: Record<string, string> = {
   consent_granted: 'badge-success',
   consent_required: 'badge-warning',
   consent_expired: 'badge-warning',
+  consent_limited: 'badge-warning',
   refresh_failed: 'badge-danger',
   token_revoked: 'badge-danger',
   user_tokens_revoked: 'badge-danger',
@@ -196,6 +199,8 @@ export function categoryLabel(name: string): string {
       return 'Consent Required';
     case 'consent_expired':
       return 'Consent Expired';
+    case 'consent_limited':
+      return 'Consent Limited';
     case 'refresh_failed':
       return 'Refresh Failed';
     case 'token_revoked':

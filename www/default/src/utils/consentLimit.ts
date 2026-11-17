@@ -25,6 +25,17 @@ export function secondsIn(unit: ConsentLimitUnit): number {
   return UNIT_SECONDS.find(([name]) => name === unit)![1];
 }
 
+/**
+ * The seconds of `amount` in `unit` when that is a limit the gateway takes, a whole number from
+ * one minute to 365 days; `null` otherwise.
+ */
+export function consentLimitSecondsOf(amount: string, unit: ConsentLimitUnit): number | null {
+  const typed = amount.trim();
+  if (!/^\d+$/.test(typed)) return null;
+  const secs = Number(typed) * secondsIn(unit);
+  return secs >= MIN_CONSENT_LIMIT_SECS && secs <= MAX_CONSENT_LIMIT_SECS ? secs : null;
+}
+
 /** A stored `max_consent_age_secs` when it is a limit: a positive whole number of seconds. */
 export function storedConsentLimit(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined;

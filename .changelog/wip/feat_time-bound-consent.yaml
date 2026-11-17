@@ -76,9 +76,8 @@ changes:
         The credential delegation records are now read on the Audit page, with the rest of the
         audit, instead of in a separate list on the Credentials page. The Audit Log offers every
         delegation category as a filter, describes an expired consent apart from a revocation,
-        and shows a caller's Principal beside Subject. The Credential Delegation Audit tab stays
-        in the Credentials tab row as a link that opens the Audit Log on the delegation
-        categories, and `/credentials?tab=credential-audit` leads there too.
+        and shows a caller's Principal beside Subject. The Credentials page opens it from History
+        on Delegated Access and from a token's expanded row on Credential Tokens.
     - timestamp: '2026-11-13T17:00:00Z'
       title: Name whose access a vault revoke ended in its audit record
       description: >-

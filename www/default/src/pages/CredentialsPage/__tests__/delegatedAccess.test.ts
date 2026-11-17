@@ -1,9 +1,11 @@
 import {
   agentName,
+  canLimitConsent,
   consentEnd,
   consentLimitSecs,
   consentState,
   isActiveDelegation,
+  limitOutcome,
   renewsAutomatically,
   timeLeft,
 } from '../delegatedAccess';
@@ -92,6 +94,49 @@ describe('delegated access consent end', () => {
     expect(renewsAutomatically(delegation(true, after(-HOUR).toISOString()), refreshing, NOW)).toBe(
       false
     );
+  });
+
+  it('says what limiting one consent would do: bring its end forward, or nothing', () => {
+    const consent = {
+      consent_granted_at: after(-HOUR).toISOString(),
+      consent_expires_at: after(5 * HOUR).toISOString(),
+    };
+    const unlimited = { consent_granted_at: after(-HOUR).toISOString() };
+
+    expect(limitOutcome(consent, 7_200, NOW)).toEqual({ kind: 'ends', end: after(HOUR) });
+    expect(limitOutcome(unlimited, 7_200, NOW)).toEqual({ kind: 'ends', end: after(HOUR) });
+    expect(limitOutcome(consent, 21_600, NOW)).toEqual({
+      kind: 'not_sooner',
+      end: after(5 * HOUR),
+    });
+    expect(limitOutcome(consent, 86_400, NOW)).toEqual({
+      kind: 'not_sooner',
+      end: after(5 * HOUR),
+    });
+    expect(limitOutcome(consent, 3_600, NOW)).toEqual({ kind: 'already_older' });
+    expect(limitOutcome(consent, 1_800, NOW)).toEqual({ kind: 'already_older' });
+    expect(limitOutcome(consent, null, NOW)).toEqual({ kind: 'invalid' });
+    expect(limitOutcome({ consent_granted_at: 'not a time' }, 7_200, NOW)).toEqual({
+      kind: 'invalid',
+    });
+  });
+
+  it('lets an operator limit only a consent a person gave that an agent can still act under', () => {
+    const consented = { provider_type: 'oauth2_authorization_code' };
+    const active = { is_expired: false, can_refresh: true };
+
+    expect(canLimitConsent(active, consented, NOW)).toBe(true);
+    expect(
+      canLimitConsent({ ...active, consent_expires_at: after(HOUR).toISOString() }, consented, NOW)
+    ).toBe(true);
+    expect(
+      canLimitConsent({ ...active, consent_expires_at: after(-1).toISOString() }, consented, NOW)
+    ).toBe(false);
+    expect(canLimitConsent({ is_expired: true, can_refresh: false }, consented, NOW)).toBe(false);
+    expect(canLimitConsent(active, { provider_type: 'oauth2_client_credentials' }, NOW)).toBe(
+      false
+    );
+    expect(canLimitConsent(active, undefined, NOW)).toBe(false);
   });
 
   it('names a did:web agent by its whole web address and shortens any other DID', () => {

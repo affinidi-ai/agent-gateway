@@ -222,8 +222,19 @@ describe('eventNarrative', () => {
     expect(eventTone(at('token_injected'))).toBe('allow');
     expect(eventTone(at('consent_required'))).toBe('warn');
     expect(eventTone(at('consent_expired'))).toBe('warn');
+    expect(eventTone(at('consent_limited'))).toBe('warn');
     expect(eventTone(at('refresh_failed'))).toBe('deny');
     expect(eventTone(at('something_unknown'))).toBe('neutral');
+  });
+
+  it('says an operator brought the end of a consent forward, apart from a revocation', () => {
+    const limited = describeEntry(at('consent_limited', { provider_name: 'GitHub' }));
+    expect(limited.title).toBe('Consent limited');
+    expect(limited.summary).toBe('An operator brought the end of the consent for GitHub forward.');
+    expect(limited.detail).toBe('The credential is used until that end. It was not revoked.');
+    expect(describeEntry(at('consent_limited')).summary).toBe(
+      'An operator brought the end of a consent forward.'
+    );
   });
 
   it('says a consent reached its time limit, apart from a revocation', () => {

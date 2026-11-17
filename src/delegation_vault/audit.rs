@@ -634,6 +634,9 @@ pub enum DelegationAuditAction {
     /// A consent reached its time limit: the stored credential was removed,
     /// and the person is asked again. Never a revocation.
     ConsentExpired,
+    /// An operator brought the end of one stored consent forward. The
+    /// credential stays until that end.
+    ConsentLimited,
     /// A token was revoked via management API
     TokenRevoked,
     /// All tokens for a user were revoked
@@ -1797,6 +1800,7 @@ pub fn action_category(action: &DelegationAuditAction) -> &'static str {
         DelegationAuditAction::RefreshFailed => "refresh_failed",
         DelegationAuditAction::ConsentRequired => "consent_required",
         DelegationAuditAction::ConsentExpired => "consent_expired",
+        DelegationAuditAction::ConsentLimited => "consent_limited",
         DelegationAuditAction::TokenRevoked => "token_revoked",
         DelegationAuditAction::UserTokensRevoked => "user_tokens_revoked",
         DelegationAuditAction::TokenNotFound => "token_not_found",

@@ -20,7 +20,7 @@ use axum::{
     Extension, Form, Json,
     extract::{
         Path, Query, State,
-        rejection::{FormRejection, QueryRejection},
+        rejection::{FormRejection, JsonRejection, QueryRejection},
     },
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
@@ -364,6 +364,155 @@ pub async fn revoke_token(
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to revoke"}))).into_response()
         }
     }
+}
+
+/// The body of `PUT /api/v1/delegation-vault/{id}/consent-limit`.
+#[derive(Debug, Deserialize)]
+pub struct ConsentLimitBody {
+    max_consent_age_secs: u64,
+}
+
+/// A limit on one consent that is refused with `400`: `code` names why, for a
+/// client to act on, and `error` says it.
+fn limit_refused(
+    code: &'static str,
+    error: impl Into<String>,
+) -> Response {
+    (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "code": code, "error": error.into() }))).into_response()
+}
+
+/// PUT /api/v1/delegation-vault/{id}/consent-limit
+///
+/// Brings the end of one stored consent forward: it then ends
+/// `max_consent_age_secs` after it was given. Only a consent a person gave is
+/// limited, never to a later end than it has, and never to an end that has
+/// passed, since ending a consent now is a revoke. As a revoke, it is for an
+/// appliance-wide caller and audited with who did it.
+pub async fn limit_consent(
+    State(state): State<DelegationVaultState>,
+    caller: Option<Extension<AuthGuardOk>>,
+    delegation: Option<Extension<PatDelegationContext>>,
+    reader: VaultReader,
+    Path(id): Path<String>,
+    body: Result<Json<ConsentLimitBody>, JsonRejection>,
+) -> Response {
+    use super::consent_age::{ConsentLimits, LimitRefusal, limit_detail, limited_end};
+
+    let Some(caller_ctx) = management_caller_context(caller.as_ref(), delegation.as_ref()) else {
+        warn!(
+            target: "credential_delegation",
+            id = %loggable::untrusted(&id),
+            action = "limit",
+            "Consent limit rejected: no authenticated caller"
+        );
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "no authenticated caller"})))
+            .into_response();
+    };
+    if !reader.is_appliance_wide() {
+        warn!(
+            target: "credential_delegation",
+            id = %loggable::untrusted(&id),
+            action = "limit",
+            "Consent limit refused: only an appliance-wide caller limits a consent"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Ok(Json(ConsentLimitBody { max_consent_age_secs })) = body else {
+        return limit_refused("invalid_limit", "max_consent_age_secs is required: a whole number of seconds");
+    };
+    if let Err(refusal) =
+        crate::config::credential_policy::validate_max_consent_age("max_consent_age_secs", max_consent_age_secs)
+    {
+        return limit_refused("invalid_limit", refusal);
+    }
+
+    let failed = |error: &anyhow::Error| {
+        warn!(
+            target: "credential_delegation",
+            id = %loggable::untrusted(&id),
+            action = "limit",
+            error = %loggable::untrusted(&error.to_string()),
+            "Consent limit failed"
+        );
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to limit"}))).into_response()
+    };
+    let not_found =
+        || (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Delegation token not found"}))).into_response();
+
+    let token = match state
+        .vault_store
+        .get(&id)
+        .await
+    {
+        Ok(Some(token)) => token,
+        Ok(None) => return not_found(),
+        Err(error) => return failed(&error),
+    };
+    let provider = match state
+        .provider_store
+        .get(&token.credential_provider_id)
+        .await
+    {
+        Ok(Some(provider)) if provider.takes_consent() => provider,
+        Ok(_) => {
+            return limit_refused(
+                "not_a_consent",
+                "Only a consent a person gave to an oauth2_authorization_code provider can be limited",
+            );
+        }
+        Err(error) => return failed(&error),
+    };
+    let previous_end =
+        ConsentLimits::of_provider(Some(&provider)).ends_at(token.consent_granted_at, token.consent_expires_at);
+    let end = match limited_end(token.consent_granted_at, previous_end, max_consent_age_secs, Utc::now()) {
+        Ok(end) => end,
+        Err(LimitRefusal::AlreadyOlder) => {
+            return limit_refused(
+                "consent_older_than_limit",
+                "The consent is already older than this limit. Revoke it to end it now",
+            );
+        }
+        Err(LimitRefusal::NotSooner) => {
+            return limit_refused(
+                "limit_not_sooner",
+                "The consent already ends at this limit or before it. A consent is never extended",
+            );
+        }
+    };
+    let limited = match state
+        .vault_store
+        .limit_consent(&id, end)
+        .await
+    {
+        Ok(Some(limited)) => limited,
+        Ok(None) => return not_found(),
+        Err(error) => return failed(&error),
+    };
+
+    info!(
+        target: "credential_delegation",
+        id = %loggable::untrusted(&id),
+        actor = %caller_ctx.sub.as_deref().unwrap_or_default(),
+        action = "limit",
+        max_consent_age_secs,
+        "Consent limited via API"
+    );
+    super::audit::emit("consent_limited", || {
+        let mut event = super::audit::audit_event(
+            super::audit::DelegationAuditAction::ConsentLimited,
+            Some(&limited.agent_did),
+            Some(&limited.user_identity_hash),
+            Some(&limited.credential_provider_id),
+            None,
+        );
+        event.token_id = Some(limited.id.clone());
+        event.provider_name = Some(provider.name.clone());
+        event.scopes = Some(limited.scopes.clone());
+        event.detail = Some(limit_detail(limited.consent_granted_at, end, previous_end));
+        event.caller = Some(caller_ctx);
+        event
+    });
+    (StatusCode::OK, Json(serde_json::to_value(token_metadata(&limited, Some(&provider))).unwrap())).into_response()
 }
 
 /// DELETE /api/v1/delegation-vault/by-user/{user_hash}

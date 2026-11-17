@@ -462,8 +462,9 @@ entry with its `event` name, `label`, `description`, `group` and `group_label`, 
 `GET /v1/integrations/catalog` lists the same events as `audit.<event>` with their group.
 
 **Delegation events: audited or logged.** What a person or an operator decided about delegated
-access is audited: `consent_granted`, `consent_expired`, `token_revoked`, `user_tokens_revoked`,
-`delegation_failed`, `connector_call` and `mcp_proxy_pin_changed`. What the gateway does with a
+access is audited: `consent_granted`, `consent_expired`, `consent_limited`, `token_revoked`,
+`user_tokens_revoked`, `delegation_failed`, `connector_call` and `mcp_proxy_pin_changed`. What
+the gateway does with a
 stored credential on each call is written to the gateway log and is no audit event, so neither
 the VP Audit Log nor an integration is offered it: `token_injected`, `token_refreshed`,
 `refresh_failed`, `consent_required`, `token_not_found`, `elicitation_sent`,
@@ -902,7 +903,8 @@ Trust); see [`POLICY.md`](POLICY.md#the-authority-of-a-trust-check).
   `sts_client`). `actor` names the management caller as on policy change events. The record
   carries no record name and sets no `surface_id`.
 
-**Consent expiry events.** Raised when a consent reaches its time limit (group Delegation); see
+**Consent expiry and limit events.** Raised when a consent reaches its time limit, or an
+operator limits one (group Delegation); see
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#consent-time-limit).
 
 - `consent_expired`: the stored credential of an ended consent was removed, and the person is
@@ -915,6 +917,13 @@ Trust); see [`POLICY.md`](POLICY.md#the-authority-of-a-trust-check).
   credential, and `sweep` the hourly removal of ended consents, whose record names no surface
   for an agent-keyed token. One removal writes one record, whichever finds the consent ended
   first.
+
+- `consent_limited`: an operator brought the end of one stored consent forward through
+  `PUT /api/v1/delegation-vault/{id}/consent-limit`. The credential stays until that end, so it
+  is no revocation, and the later removal is a `consent_expired` of its own. The record names
+  who set the limit (`caller`), the agent, the user identity hash, the provider, the scopes and
+  the token id. Its `detail` is `consent_granted_at:<time>,consent_expires_at:<time>`, the new
+  end, followed by `,previous_end:<time>` when the consent had an end before.
 
 A consent given under a time limit also names its end when it is given: the `detail` of its
 `consent_granted` record holds `consent_expires_at:<time>` in RFC 3339 UTC, after

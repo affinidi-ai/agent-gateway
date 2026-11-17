@@ -34,7 +34,8 @@ jest.mock(
   )
 );
 
-const DELEGATION = 'consent_granted%2Cconsent_expired%2Ctoken_revoked%2Cuser_tokens_revoked';
+const DELEGATION =
+  'consent_granted%2Cconsent_expired%2Cconsent_limited%2Ctoken_revoked%2Cuser_tokens_revoked';
 
 const AuditLog: React.FC = () => {
   const location = useLocation();
@@ -54,7 +55,7 @@ const renderPage = (address = '/credentials?tab=credential-tokens') =>
 describe('CredentialsPage delegated access', () => {
   beforeEach(() => jest.clearAllMocks());
 
-  it('keeps the Credential Tokens tab and adds Delegated Access beside it', () => {
+  it('keeps the Credential Tokens tab, has Delegated Access beside it and no audit tab', () => {
     mockHasPermission.mockReturnValue(true);
     renderPage();
 
@@ -66,12 +67,14 @@ describe('CredentialsPage delegated access', () => {
       'Credential Tokens',
       'Delegated Access',
       'STS Clients',
-      'Credential Delegation Audit',
     ]);
     expect(screen.getByTestId('credentials-credential-tokens-tab-trigger')).toHaveAttribute(
       'aria-selected',
       'true'
     );
+    expect(
+      screen.queryByTestId('credentials-credential-audit-tab-trigger')
+    ).not.toBeInTheDocument();
   });
 
   it('opens the Audit Log on the records of ended access as the history', () => {
@@ -96,24 +99,8 @@ describe('CredentialsPage delegated access', () => {
     );
   });
 
-  it('opens the Audit Log on every delegation record from the Credential Delegation Audit tab', () => {
+  it('opens its first tab, not the Audit Log, for a stored address of the removed audit tab', () => {
     mockHasPermission.mockReturnValue(true);
-    renderPage();
-
-    fireEvent.click(screen.getByTestId('credentials-credential-audit-tab-trigger'));
-
-    expect(screen.getByTestId('audit-log')).toHaveTextContent(`/audit?category=${DELEGATION}`);
-  });
-
-  it('leads a stored address of the audit tab to the Audit Log', () => {
-    mockHasPermission.mockReturnValue(true);
-    renderPage('/credentials?tab=credential-audit');
-
-    expect(screen.getByTestId('audit-log')).toHaveTextContent(`/audit?category=${DELEGATION}`);
-  });
-
-  it('offers no way into the audit to a user who may not read it', () => {
-    mockHasPermission.mockImplementation((permission: string) => permission !== 'audit.view');
     renderPage('/credentials?tab=credential-audit');
 
     expect(screen.queryByTestId('audit-log')).not.toBeInTheDocument();
@@ -121,10 +108,14 @@ describe('CredentialsPage delegated access', () => {
       'aria-selected',
       'true'
     );
+  });
+
+  it('offers no way into the audit to a user who may not read it', () => {
+    mockHasPermission.mockImplementation((permission: string) => permission !== 'audit.view');
+    renderPage();
+
+    expect(screen.queryByTestId('audit-log')).not.toBeInTheDocument();
     expect(screen.getByTestId('stub-view-activity')).toBeDisabled();
     expect(screen.getByTestId('stub-view-history')).toBeDisabled();
-    expect(
-      screen.queryByTestId('credentials-credential-audit-tab-trigger')
-    ).not.toBeInTheDocument();
   });
 });

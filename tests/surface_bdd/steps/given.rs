@@ -4311,6 +4311,21 @@ fn oauth_provider_limits_a_consent(
         .oauth_max_consent_age_secs = Some(seconds);
 }
 
+/// An operator has limited the one stored consent to `seconds` after it was
+/// given, through the admin API.
+#[given(expr = "the operator has limited the caller's consent to {int} seconds")]
+async fn operator_has_limited_the_callers_consent(
+    world: &mut SurfaceWorld,
+    seconds: u64,
+) {
+    crate::steps::when::limit_the_callers_consent(world, seconds).await;
+    let response = world
+        .admin_response
+        .as_ref()
+        .expect("limiting a consent records the admin API's answer");
+    assert_eq!(response.status, 200, "limiting the caller's consent: {}", response.body);
+}
+
 /// Moves the consent of every delegated credential the gateway holds back by
 /// `seconds`: the time it was given, and its end when it has one. The vault is
 /// read from disk on every request, so the gateway sees the older consent
