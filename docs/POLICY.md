@@ -199,7 +199,8 @@ authorization value, also inside longer text (`Authorization: Bearer <redacted> 
 least 6 with a digit or one of those symbols; a `Basic` token is one that decodes as base64 to
 `user:password`. Message text such as `Basic authentication` or `Bearer arms` is kept. In every
 absolute URL in the input, query parameter names are kept and every query value becomes
-`<redacted>`. `http.path`
+`<redacted>`, and the userinfo (user name and password) becomes `<redacted>`
+(`https://<redacted>@host/path`), up to the last `@` before the path, query or fragment. `http.path`
 is shown as the request log line shows it: query parameter names are kept and every query value
 becomes `<redacted>`, since a request received over Fabric carries the caller's full path and query,
 and capability ids in the path are shortened. Masking matches these shapes only, so a credential in

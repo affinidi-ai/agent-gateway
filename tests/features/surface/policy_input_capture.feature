@@ -44,6 +44,13 @@ Feature: Live policy input capture
     And the Capture view shows the "target" policy of surface "alpha" deciding "allow" on an input showing "my token is <redacted> please check"
     And no captured policy input of surface "alpha" contains "eyJhbGciOiJIUzI1NiJ9"
 
+  Scenario: The Capture view masks the user name and password in a URL inside a caller's message
+    Given the operator listens to the policy input of surface "alpha"
+    When the caller sends an A2A message/send request to surface "alpha" with text "fetch https://svc:s3cr3t-pw@host.example/path please"
+    Then the response status is 200
+    And the Capture view shows the "target" policy of surface "alpha" deciding "allow" on an input showing "fetch https://<redacted>@host.example/path please"
+    And no captured policy input of surface "alpha" contains "s3cr3t-pw"
+
   Scenario: The Capture view shows a denying policy's decision and reason
     Given surface "alpha" has a request policy that denies with reason "only partners may call"
     And the operator listens to the policy input of surface "alpha"

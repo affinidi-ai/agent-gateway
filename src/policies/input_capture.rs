@@ -418,11 +418,16 @@ static URL_QUERY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)\b([a-z][a-z0-9+.\-]*://[^\s?#"'<>]+)\?([^\s#"'<>]+)"#).expect("valid URL pattern")
 });
 
+/// The scheme and userinfo of an absolute URL, anywhere in a text. The userinfo may hold
+/// `@`, so it runs to the last `@` before the host.
+static URL_USERINFO: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)\b([a-z][a-z0-9+.\-]*://)[^\s/?#"'<>]+@"#).expect("valid URL userinfo pattern"));
+
 /// `text` with its credentials masked, or `None` when it holds none. A text that is
 /// one JWT or one authorization value becomes [`REDACTED`] whole; inside longer text
-/// each URL keeps its query parameter names with their values redacted, then each JWT
-/// and authorization token becomes [`REDACTED`]. Queries go first, so a JWT in a query
-/// cannot end the query before the parameters after it.
+/// each URL keeps its query parameter names with their values redacted and loses its
+/// userinfo, then each JWT and authorization token becomes [`REDACTED`]. Queries go
+/// first, so a JWT in a query cannot end the query before the parameters after it.
 fn mask_text(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if is_jwt(trimmed) || is_authorization_value(trimmed) {
@@ -432,6 +437,9 @@ fn mask_text(text: &str) -> Option<String> {
         .replace_all(text, |caps: &regex::Captures<'_>| {
             format!("{}?{}", &caps[1], crate::observability::loggable::query(&caps[2]))
         })
+        .into_owned();
+    let masked = URL_USERINFO
+        .replace_all(&masked, |caps: &regex::Captures<'_>| format!("{}{REDACTED}@", &caps[1]))
         .into_owned();
     let masked = EMBEDDED_JWT
         .replace_all(&masked, regex::NoExpand(REDACTED))
@@ -950,6 +958,94 @@ mod tests {
         );
         assert_eq!(arguments["note"], format!("call back on https://cb.example.test/done?code={REDACTED} when ready"));
         assert_eq!(arguments["plain"], "https://api.example.test/v1/items");
+    }
+
+    #[test]
+    fn a_url_anywhere_in_the_input_loses_its_whole_userinfo() {
+        let mut input = json!({
+            "mcp": { "arguments": {
+                "endpoint": "https://user:pw@api.example.test/p",
+                "token_as_user": "https://ghp_abc123def456@git.example.test/repo.git",
+                "note": "fetch it from ftp://svc:secret@files.example.test/data now",
+                "two": "see https://a.example.test/x and https://u:p@b.example.test/y",
+            } },
+        });
+
+        mask_credentials(&mut input);
+
+        let arguments = &input["mcp"]["arguments"];
+        assert_eq!(arguments["endpoint"], format!("https://{REDACTED}@api.example.test/p"));
+        assert_eq!(arguments["token_as_user"], format!("https://{REDACTED}@git.example.test/repo.git"));
+        assert_eq!(arguments["note"], format!("fetch it from ftp://{REDACTED}@files.example.test/data now"));
+        assert_eq!(arguments["two"], format!("see https://a.example.test/x and https://{REDACTED}@b.example.test/y"));
+    }
+
+    #[test]
+    fn a_password_holding_an_at_sign_is_masked_up_to_the_last_at_sign_before_the_path() {
+        let mut input = json!({
+            "mcp": { "arguments": {
+                "path": "https://user:p@ss@host.example.test/x",
+                "query": "https://user:p@ss@host.example.test?q=1",
+                "fragment": "https://user:p@ss@host.example.test#top",
+            } },
+        });
+
+        mask_credentials(&mut input);
+
+        let arguments = &input["mcp"]["arguments"];
+        assert_eq!(arguments["path"], format!("https://{REDACTED}@host.example.test/x"));
+        assert_eq!(arguments["query"], format!("https://{REDACTED}@host.example.test?q={REDACTED}"));
+        assert_eq!(arguments["fragment"], format!("https://{REDACTED}@host.example.test#top"));
+        assert!(
+            !input
+                .to_string()
+                .contains("ss@"),
+            "{input}"
+        );
+    }
+
+    #[test]
+    fn a_url_with_userinfo_and_a_query_loses_both() {
+        let mut input = json!({
+            "mcp": { "arguments": {
+                "endpoint": "https://svc:secret@api.example.test/v1/items?api_key=k-secret&page=2",
+            } },
+        });
+
+        mask_credentials(&mut input);
+
+        assert_eq!(
+            input["mcp"]["arguments"]["endpoint"],
+            format!("https://{REDACTED}@api.example.test/v1/items?api_key={REDACTED}&page={REDACTED}")
+        );
+        assert!(
+            !input
+                .to_string()
+                .contains("secret"),
+            "{input}"
+        );
+    }
+
+    #[test]
+    fn an_at_sign_outside_url_userinfo_is_kept() {
+        let mut input = json!({
+            "a2a": { "parts": [
+                { "text": "https://host.example.test/users/@alice" },
+                { "text": "write to alice@example.test" },
+                { "text": "mailto:a@b.test" },
+                { "text": "did:web:alice.example.test" },
+                { "text": "https://host.example.test#me@x" },
+            ] },
+        });
+
+        mask_credentials(&mut input);
+
+        let parts = &input["a2a"]["parts"];
+        assert_eq!(parts[0]["text"], "https://host.example.test/users/@alice");
+        assert_eq!(parts[1]["text"], "write to alice@example.test");
+        assert_eq!(parts[2]["text"], "mailto:a@b.test");
+        assert_eq!(parts[3]["text"], "did:web:alice.example.test");
+        assert_eq!(parts[4]["text"], "https://host.example.test#me@x");
     }
 
     #[test]
