@@ -1,0 +1,24 @@
+branch: chore/update-rust-deps
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-17T00:00:00Z'
+      title: Update actix-http to 3.22.0 to fix HTTP/1.1 request parsing advisories
+      description: >-
+        Bumps actix-http from 3.21.0 to 3.22.0, which fixes RUSTSEC-2026-0552,
+        RUSTSEC-2026-0553 and RUSTSEC-2026-0554 (versions before 3.21.3 are
+        affected). A crafted HTTP/1.1 client could use bare LF in chunked
+        trailers or malformed quoted chunk extensions to consume pipelined
+        requests, stall body decoding or end a request body early. It could
+        also send partial requests on a keep-alive connection to avoid the
+        request header timeout. Restores a passing cargo audit.
+    - timestamp: '2026-11-17T00:00:00Z'
+      title: Update libz-sys to 1.1.33 to fix a heap buffer overflow advisory
+      description: >-
+        Bumps the transitive libz-sys dependency from 1.1.31 to 1.1.33, which
+        fixes RUSTSEC-2026-0544, a heap buffer overflow affecting versions
+        before 1.1.33. Restores a passing cargo audit.
+  breaking: []
