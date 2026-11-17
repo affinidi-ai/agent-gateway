@@ -43,7 +43,7 @@ import {
   useVariantSnapshots,
   BASE_VARIANT_ID,
 } from '../components/surface-builder/variants/useVariantSnapshots';
-import { DeleteButton } from '../components/shared/DeleteButton';
+import ConfirmPopover from '../components/shared/ConfirmPopover';
 import {
   hydrateSurfaceCanvas,
   nodesFromSurface,
@@ -130,6 +130,7 @@ const SurfaceDetailPage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [deleteAnchor, setDeleteAnchor] = useState<HTMLElement | null>(null);
   const [error, setError] = useState<string | null>(null);
   // `Warning` headers of the last save but the Access Point's, shown in the
   // banner and on the Transit Points they name.
@@ -1461,6 +1462,7 @@ const SurfaceDetailPage: React.FC = () => {
     } catch (err: any) {
       setError(err.message || 'Failed to delete surface');
       setDeleting(false);
+      setDeleteAnchor(null);
     }
   };
 
@@ -1830,12 +1832,40 @@ const SurfaceDetailPage: React.FC = () => {
               </button>
             )}
             {canEdit && (
-              <DeleteButton
-                onDelete={handleDelete}
+              <button
+                type="button"
+                className="btn btn-danger btn-sm"
+                onClick={e => setDeleteAnchor(e.currentTarget)}
                 disabled={deleting || saving}
-                size="sm"
                 title="Delete this surface"
-              />
+                aria-label="Delete surface"
+                data-testid="surface-delete-button"
+              >
+                {deleting ? (
+                  <i className="fas fa-spinner fa-spin" />
+                ) : (
+                  <i className="fas fa-trash" />
+                )}
+              </button>
+            )}
+            {deleteAnchor && (
+              <ConfirmPopover
+                anchor={deleteAnchor}
+                testId="surface-delete-confirm"
+                icon="fa-triangle-exclamation text-danger"
+                title="Delete Surface?"
+                confirmLabel="Delete"
+                confirmVariant="danger"
+                busy={deleting}
+                onConfirm={handleDelete}
+                onCancel={() => setDeleteAnchor(null)}
+              >
+                <p className="mb-2">
+                  You are about to permanently delete this surface and all associated configuration.
+                  This action cannot be undone.
+                </p>
+                <p className="mb-0">Are you sure you want to continue?</p>
+              </ConfirmPopover>
             )}
           </div>
         }

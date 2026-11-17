@@ -1275,6 +1275,25 @@ When the key's surface was deleted (`surface_deleted: true` on `GET /api-keys/{a
 the detail page shows the info alert "This API key is no longer in use because the associated
 surface has been deleted." (`api-key-surface-deleted-info`) at the top of Key Information.
 
+## Surface delete
+
+The surface page's delete button (`surface-delete-button`, `btn-danger` with a trash icon, shown
+only with edit rights) sends nothing: it opens `surface-delete-confirm`, the shared inline
+confirmation `components/shared/ConfirmPopover.tsx` (a speech bubble to the left of the button,
+`role="dialog"` named by its title). Its title "Delete Surface?" carries a red warning icon
+(`fa-triangle-exclamation text-danger`), and its body reads "You are about to permanently delete
+this surface and all associated configuration. This action cannot be undone." then "Are you sure
+you want to continue?". **Delete** (`surface-delete-confirm-confirm`, `btn-danger`) sends the
+`DELETE`; **Cancel** (`surface-delete-confirm-cancel`), the close button, Escape and a click
+outside send nothing. Both buttons are disabled while the delete runs. A delete succeeds with the
+toast `Surface "<name>" deleted` and returns to `/surfaces`; a failed one closes the confirmation
+and shows the gateway's message in `surface-error-alert`.
+
+`ConfirmPopover` is the shared inline confirmation: the Policies list's delete and Enforce
+globally confirmations (`policy-confirm-popover`) use it too. Each use passes its own `testId`;
+the confirm and Cancel buttons are `<testId>-confirm` and `<testId>-cancel`. Its styles are the
+`.confirm-popover*` classes in `dashboard.css`.
+
 ## Authority delete
 
 The Authorities list (`pages/AuthoritiesPage.tsx`, `authorities-delete-button-<id>`) and the

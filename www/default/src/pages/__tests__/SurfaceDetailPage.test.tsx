@@ -531,3 +531,82 @@ describe('SurfaceDetailPage serving status', () => {
     }
   );
 });
+
+describe('SurfaceDetailPage delete', () => {
+  const renderWithList = () =>
+    render(
+      <MemoryRouter initialEntries={['/surfaces/s1']}>
+        <Routes>
+          <Route path="/surfaces/:surfaceId" element={<SurfaceDetailPage />} />
+          <Route path="/surfaces" element={<output data-testid="surfaces-list" />} />
+        </Routes>
+      </MemoryRouter>
+    );
+
+  const openConfirmation = async () => {
+    fireEvent.click(await screen.findByTestId('surface-delete-button'));
+    return screen.findByTestId('surface-delete-confirm');
+  };
+
+  it('asks for confirmation and deletes nothing on the first click', async () => {
+    const deleteSurface = jest.spyOn(apiClient, 'deleteSurface').mockResolvedValue();
+    renderWithList();
+
+    const confirmation = await openConfirmation();
+
+    expect(confirmation).toHaveTextContent('Delete Surface?');
+    expect(confirmation).toHaveTextContent(
+      'You are about to permanently delete this surface and all associated configuration. This action cannot be undone.'
+    );
+    expect(confirmation).toHaveTextContent('Are you sure you want to continue?');
+    expect(screen.getByRole('dialog', { name: 'Delete Surface?' })).toBe(confirmation);
+    expect(deleteSurface).not.toHaveBeenCalled();
+  });
+
+  it('closes without deleting on Cancel', async () => {
+    const deleteSurface = jest.spyOn(apiClient, 'deleteSurface').mockResolvedValue();
+    renderWithList();
+    await openConfirmation();
+
+    fireEvent.click(screen.getByTestId('surface-delete-confirm-cancel'));
+
+    expect(screen.queryByTestId('surface-delete-confirm')).toBeNull();
+    expect(deleteSurface).not.toHaveBeenCalled();
+  });
+
+  it('closes without deleting on Escape', async () => {
+    const deleteSurface = jest.spyOn(apiClient, 'deleteSurface').mockResolvedValue();
+    renderWithList();
+    await openConfirmation();
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+
+    expect(screen.queryByTestId('surface-delete-confirm')).toBeNull();
+    expect(deleteSurface).not.toHaveBeenCalled();
+  });
+
+  it('deletes the surface and returns to the surface list on Delete', async () => {
+    const deleteSurface = jest.spyOn(apiClient, 'deleteSurface').mockResolvedValue();
+    renderWithList();
+    await openConfirmation();
+
+    fireEvent.click(screen.getByTestId('surface-delete-confirm-confirm'));
+
+    expect(await screen.findByTestId('surfaces-list')).toBeInTheDocument();
+    expect(deleteSurface).toHaveBeenCalledTimes(1);
+    expect(deleteSurface).toHaveBeenCalledWith('s1');
+    expect(showToast).toHaveBeenCalledWith('success', 'Surface "agent" deleted');
+  });
+
+  it('closes the confirmation and shows the error when the delete fails', async () => {
+    jest.spyOn(apiClient, 'deleteSurface').mockRejectedValue(new Error('Surface is in use'));
+    renderWithList();
+    await openConfirmation();
+
+    fireEvent.click(screen.getByTestId('surface-delete-confirm-confirm'));
+
+    expect(await screen.findByTestId('surface-error-alert')).toHaveTextContent('Surface is in use');
+    expect(screen.queryByTestId('surface-delete-confirm')).toBeNull();
+    expect(screen.queryByTestId('surfaces-list')).toBeNull();
+  });
+});

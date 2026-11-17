@@ -188,6 +188,10 @@ surface a new DID; it revokes only after **Revoke API key**, and a failed revoke
 toast. See _API key
 delete_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#api-key-delete).
 
+Deleting a surface on its page opens a confirmation, "Delete Surface?", built on the shared
+`ConfirmPopover`, and deletes only after **Delete**; **Cancel** deletes nothing. See _Surface
+delete_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-delete).
+
 The credential provider editor shows a **Consent confirmation** switch and its login client
 (ID and secret, both picked from the secrets store), endpoints, strategy (only the provider's
 tenant's and appliance-wide ones; appliance-wide only on a new provider), principal claim and a
