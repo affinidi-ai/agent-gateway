@@ -170,7 +170,7 @@ it one `policy_input_captured` update, once the policy has decided:
 | `slot` | The policy, in words: `inbound` (the Access Point policy), `target` (the Target's request policy), `inbound variant <alias>`, `target variant <alias>`, `outbound`, `transit <alias>`, `response` (the Target's response policy), `transit <alias> response`, `gateway` (the gateway-level policy on an inbound request), `gateway outbound` (the gateway-level policy on an outbound request, `input.gateway.direction` `outbound`) or `appliance <plane>` (an appliance-wide plane) |
 | `transit_point` | The Transit Point alias, for a Transit Point request or response policy |
 | `policies` | The policy definitions the slot evaluated, each `{"id", "name", "version"}`: one for a surface slot, every member of the set for the gateway and appliance-wide planes; a legacy inline gateway policy has neither `id` nor `name` |
-| `decided_by` | The `id` of the member that denied or failed, when a gateway or appliance-wide set denies |
+| `decided_by` | The `id` of the member that denied, when a gateway or appliance-wide set denies, or that failed to evaluate, on an appliance-wide plane |
 | `plane` | `surface`, `gateway` or `appliance` |
 | `engine` | The compiled policy key: the surface id, `inbound:`, `outbound:`, `variant:` or `transit:<surface>:<alias>` for a surface request policy, `response:<policy definition id>` or `response:transit:<surface>:<alias>` for a response policy, the gateway id, or the appliance-wide plane |
 | `input` | The policy input, credentials masked: the request input of a request policy, `response`, `caller` and `surface` (with `transit` and `source_auth` on a Transit Point leg) for a response policy |

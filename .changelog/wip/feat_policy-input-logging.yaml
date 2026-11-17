@@ -13,13 +13,16 @@ changes:
         shared dashboard broadcast, as a
         policy_input_captured update with its input,
         the id, name and version of each policy definition the slot evaluated, the member that denied
-        a gateway or appliance-wide set, and its allow, deny reason or error. The gateway policy of
+        a gateway or appliance-wide set (or failed to evaluate, on an appliance-wide plane), and its
+        allow, deny reason or error. Answers and captures are sent alongside the shared dashboard
+        updates without waiting behind them, and captures queued before a stop, or by an earlier
+        listen of the same surface, are not sent. The gateway policy of
         an outbound request shows as its own gateway outbound slot. A listen naming a surface id
         that is empty, over 256 bytes or holds a control character is refused. Credential-named values, JWTs and Bearer or Basic values
         are masked first, also inside longer text, and an SD-JWT with its disclosures (a Bearer token of at least 12 token characters,
         or 6 with a digit or symbol, and a Basic token that decodes to user:password; message text
         such as "Basic authentication" is kept), and every query value in the request path and in
-        any absolute URL is redacted, as is the user name and password in any absolute URL. Listening needs surfaces.edit and policies.edit, is checked again on each
+        any absolute URL is redacted, as are the user name and password in any absolute URL. Listening needs surfaces.edit and policies.edit, is checked again on each
         keep-alive ping before any queued capture is sent (captures still queued when access is
         lost are discarded), and ends when the connection closes. Nothing is logged or stored, and the
         surface configuration is not changed. Policy authors can see the input structure again
@@ -45,7 +48,8 @@ changes:
         A dashboard WebSocket message the client has not read within 10 seconds now closes the
         connection, and the page reconnects. A client that stopped reading used to keep its
         connection open indefinitely and hold back the keep-alive checks of its session and
-        permissions.
+        permissions. A stop answer it does not read at a keep-alive check ends the connection at
+        once, without a further wait for the ping.
   fixed:
     - timestamp: '2026-11-13T00:00:00Z'
       title: Keep surface ids whole in redacted logs so their Monitoring log shows them
@@ -59,8 +63,10 @@ changes:
       description: >-
         A dashboard WebSocket connection that fell more than websocket_broadcast_buffer updates
         behind was closed, and the page showed its reconnect dialog. It now skips the updates it
-        missed and keeps reading; only a closed update channel ends it. A burst of dashboard
-        updates no longer forces a slow connection to reconnect.
+        missed and keeps reading; only a closed update channel ends it. At its next keep-alive it
+        is sent one refresh_dashboard, however often it fell behind, so the page reloads its
+        dashboard stats. A burst of dashboard updates no longer forces a slow connection to
+        reconnect.
   removed: []
   security: []
   breaking: []
