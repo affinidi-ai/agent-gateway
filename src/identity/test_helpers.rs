@@ -25,6 +25,63 @@ pub async fn test_vc_issuer() -> (VCIssuer, tempfile::TempDir) {
     test_vc_issuer_with(Arc::new(MockIdentityStore::new())).await
 }
 
+/// A `VCIssuer` for a gateway whose DID document lists only `#key-1` under `assertionMethod`,
+/// as gateways wrote it before the signing Multikey was listed. The issuer files are written
+/// for a `did:web` gateway, so `VCIssuer::new` publishes the `did:webvh` log from that document
+/// the way an upgraded gateway does.
+#[cfg(feature = "didwebvh")]
+pub async fn test_vc_issuer_without_assertion_multikey() -> (VCIssuer, tempfile::TempDir) {
+    use crate::encryption::secret_file::write_secret_file;
+    use crate::identity::vc_issuer::{gateway_did_document, public_key_agreement_jwk};
+    use affinidi_tdk_common::secrets_resolver::secrets::Secret;
+
+    crate::gateways::did_cache::init_shared_resolver()
+        .await
+        .expect("init_shared_resolver failed");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dir = temp_dir.path();
+    let did = "did:web:example.com";
+    let signing_key = test_signing_key();
+    let x25519 = Secret::generate_x25519(Some(&format!("{did}#key-x25519-1")), None).unwrap();
+    let p256 = Secret::generate_p256(Some(&format!("{did}#key-p256-1")), None).unwrap();
+
+    let config = serde_json::json!({"proxy_did": did, "signing_key": signing_key, "is_vp_challenge_required": false});
+    write_secret_file(&dir.join("issuer_config.json"), &config.to_string())
+        .await
+        .unwrap();
+    write_secret_file(&dir.join("x25519_key.json"), &serde_json::to_string(&x25519).unwrap())
+        .await
+        .unwrap();
+    write_secret_file(&dir.join("p256_key.json"), &serde_json::to_string(&p256).unwrap())
+        .await
+        .unwrap();
+    let mut document = gateway_did_document(
+        did,
+        &signing_key,
+        &x25519.id,
+        public_key_agreement_jwk(&x25519, "X25519").unwrap(),
+        &p256.id,
+        public_key_agreement_jwk(&p256, "P-256").unwrap(),
+    )
+    .unwrap();
+    document["assertionMethod"] = serde_json::json!([format!("{did}#key-1")]);
+    crate::storage::did_artifacts::write_did_document(dir, &document.to_string())
+        .await
+        .unwrap();
+
+    let issuer = VCIssuer::new(
+        dir,
+        "example.com",
+        Arc::new(MockIdentityStore::new()),
+        Arc::new(MockVpChallengeStore::new()),
+        None,
+        None,
+    )
+    .await
+    .expect("VCIssuer::new failed");
+    (issuer, temp_dir)
+}
+
 /// [`test_vc_issuer`] over `identity_store`.
 pub async fn test_vc_issuer_with(identity_store: Arc<dyn IdentityStore>) -> (VCIssuer, tempfile::TempDir) {
     crate::gateways::did_cache::init_shared_resolver()
