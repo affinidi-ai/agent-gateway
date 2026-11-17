@@ -1,9 +1,18 @@
 version: 2
 
+# A group's `applies-to` defaults to version updates, so no group below touches
+# security updates: those keep arriving as separate PRs. An `ignore` entry
+# restricted to `update-types:` does not suppress security updates either; a
+# `versions:` range does, and a bare `dependency-name:` with no `update-types:`
+# is documented as ignoring the dependency for security updates as well, so
+# always keep the `update-types:` line.
 updates:
   # Minor and patch bumps ride in one weekly PR: one Cargo.lock, one CI run, one
-  # review. Majors stay ungrouped, since each needs its own code changes (a
-  # RustCrypto bump moves p256, hkdf, hmac and sha2 together, for instance).
+  # review. Majors stay ungrouped, but that holds only for crates past 1.0:
+  # Dependabot classifies by literal version segments, so for a 0.x crate a
+  # breaking bump counts as minor and rides in the group with everything else.
+  # The RustCrypto crates are all 0.x here (p256 0.13, hkdf 0.12, hmac 0.12,
+  # sha2 0.10), so their breaking bumps arrive inside the weekly group.
   - package-ecosystem: cargo
     directory: /
     schedule:
@@ -20,8 +29,8 @@ updates:
           - "patch"
 
   # Same grouping as cargo: one weekly PR for minor and patch, majors on their
-  # own. Security updates are never grouped by this entry and keep arriving as
-  # separate PRs, which is what the npm_and_yarn PRs are.
+  # own. The separate npm_and_yarn PRs are the security updates the header
+  # describes.
   - package-ecosystem: npm
     directory: /www/default
     schedule:
@@ -36,9 +45,12 @@ updates:
         update-types:
           - "minor"
           - "patch"
-    # Majors the dashboard is not taking: each is a migration rather than a bump,
-    # and the open PR for it has sat unmergeable for weeks. Minor and patch
-    # updates for these packages still arrive in the group above.
+    # Majors the dashboard is not taking. For typescript and the two
+    # @testing-library packages each major is a migration rather than a bump,
+    # and the open PR for it has sat unmergeable for weeks. typescript is on
+    # ^4.9.5 here, so this entry also holds the dashboard on the end-of-life 4.x
+    # line: 5, 6 and 7 are all ignored, with no PR left to prompt a move. Minor
+    # and patch updates for these packages still arrive in the group above.
     ignore:
       - dependency-name: "typescript"
         update-types:
@@ -67,8 +79,9 @@ updates:
         update-types:
           - "minor"
           - "patch"
-    # As above: the TypeScript 7 and @types/node 26 jumps are not being taken
-    # here, and Playwright pins the Node types this suite compiles against.
+    # No majors here: on ^5.6.0 and ^22.0.0 this ignores typescript 6 and up and
+    # @types/node 23 and up. The Node types track the runtime CI runs on, which
+    # is Node 22.
     ignore:
       - dependency-name: "typescript"
         update-types:

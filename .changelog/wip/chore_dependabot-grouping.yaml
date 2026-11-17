@@ -1,22 +1,7 @@
 branch: chore/dependabot-grouping
 changes:
   added: []
-  changed:
-    - timestamp: '2026-11-17T15:55:00Z'
-      title: Group weekly Dependabot updates per ecosystem and skip majors nobody is taking
-      description: >-
-        Minor and patch updates for cargo, the dashboard and the UI test suite
-        now arrive as one pull request per ecosystem each week instead of one
-        per dependency, matching the grouping the GitHub Actions pins already
-        used. Each grouped cargo pull request carries a single Cargo.lock and
-        therefore costs one CI run rather than five. Major updates stay
-        ungrouped, since each needs its own code changes and review. Major
-        updates for typescript, @testing-library/react, @testing-library/jest-dom
-        and js-yaml in the dashboard, and for typescript and @types/node in the
-        UI test suite, are now ignored: those jumps are migrations rather than
-        bumps, and their pull requests had been open for weeks. Minor and patch
-        updates for those packages continue to arrive, and security updates are
-        never grouped or suppressed.
+  changed: []
   fixed: []
   removed: []
   security: []
