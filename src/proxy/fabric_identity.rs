@@ -304,7 +304,8 @@ fn attribute_response_presentation(
 /// Remote gateway `gateway_id` and record the outcome in the VP Audit Log:
 /// `identity_binding_verified` and the received presentation (`vp_injected`)
 /// when the connection's issuers vouch for it, `identity_binding_failed`
-/// (`untrusted`) otherwise. Issuers that cannot be resolved vouch for nothing.
+/// (`untrusted`) otherwise. Issuers that cannot be resolved vouch for nothing,
+/// and the `untrusted` record then says why in its `error_detail`.
 /// The received presentation names `caller`, the request's authenticated caller.
 async fn record_response_presentation(
     presentation: &ResponsePresentation,
@@ -314,15 +315,26 @@ async fn record_response_presentation(
     facts: &crate::audit::request_events::RequestFacts<'_>,
     caller: Option<crate::delegation_vault::audit::AuditCallerContext>,
 ) -> ResponseAttribution {
-    let peer_issuers = match listener_manager {
-        Some(manager) => manager
+    let (peer_issuers, unresolved) = match listener_manager {
+        Some(manager) => match manager
             .peer_issuers_vouching_for(gateway_id, &presentation.issuer_did)
             .await
-            .unwrap_or_else(|reason| {
+        {
+            Ok(issuers) => (issuers, None),
+            Err(reason) => {
                 warn!(channel = facts.channel_name, gateway_id, %reason, "Fabric: issuers of the answering gateway unknown");
-                crate::gateways::types::PeerIssuers::default()
-            }),
-        None => crate::gateways::types::PeerIssuers::default(),
+                (
+                    crate::gateways::types::PeerIssuers::default(),
+                    Some(capped_detail(&format!(
+                        "issuers of the answering gateway could not be established: {reason}"
+                    ))),
+                )
+            }
+        },
+        None => (
+            crate::gateways::types::PeerIssuers::default(),
+            Some("issuers of the answering gateway could not be established: no Fabric listener".to_string()),
+        ),
     };
     let attribution = attribute_response_presentation(presentation, &peer_issuers, facts.channel_name);
 
@@ -356,10 +368,18 @@ async fn record_response_presentation(
             crate::audit::events::IdentityBindingFailure::Untrusted,
             Some(&presentation.agent_did),
             Some(&presentation.issuer_did),
-            None,
+            unresolved.as_deref(),
         ),
     }
     attribution
+}
+
+/// The first [`INVALID_DETAIL_MAX_CHARS`] characters of `error`.
+fn capped_detail(error: &str) -> String {
+    error
+        .chars()
+        .take(INVALID_DETAIL_MAX_CHARS)
+        .collect()
 }
 
 /// Record a response presentation that failed verification as
@@ -369,10 +389,7 @@ fn record_invalid_response_presentation(
     facts: &crate::audit::request_events::RequestFacts<'_>,
     error: &str,
 ) {
-    let detail: String = error
-        .chars()
-        .take(INVALID_DETAIL_MAX_CHARS)
-        .collect();
+    let detail = capped_detail(error);
     crate::audit::request_events::identity_binding_failed(
         facts,
         crate::audit::events::IdentityBindingFailure::Invalid,
@@ -649,11 +666,13 @@ mod tests {
                 outcome,
                 agent_did,
                 issuer_gateway,
+                error_detail,
                 ..
             } => {
                 assert_eq!(*outcome, crate::audit::events::IdentityBindingFailure::Untrusted);
                 assert_eq!(agent_did.as_deref(), Some(signed.holder_did.as_str()));
                 assert_eq!(issuer_gateway.as_deref(), Some(signed.issuer_did.as_str()));
+                assert_eq!(error_detail.as_deref(), None);
             }
             other => panic!("expected IdentityBindingFailed, got {other:?}"),
         }
@@ -880,6 +899,46 @@ mod tests {
 
         assert_eq!(result, Err(AnswerIdentityRefusal::Untrusted));
         assert_eq!(failed_outcome(&events), Some(crate::audit::events::IdentityBindingFailure::Untrusted));
+        assert_eq!(
+            failed_detail(&events).as_deref(),
+            Some("issuers of the answering gateway could not be established: no Fabric listener")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_record_says_why_the_connection_issuers_could_not_be_established() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation().await;
+        let selector = Some(&signed.issuer);
+        let presentation = presented(&credential_response(&signed.presentation), selector).await;
+        let root = tempfile::tempdir().unwrap();
+        let (manager, _gateway_id, _issuer_dir) = manager_with_peer(root.path(), &signed.issuer_did).await;
+
+        let (attribution, events) = crate::audit::producer::capture(record_response_presentation(
+            &presentation,
+            Some(manager),
+            "unknown-gateway",
+            &surface(),
+            &facts(),
+            None,
+        ))
+        .await;
+
+        assert_eq!(attribution, ResponseAttribution::Untrusted);
+        let detail = failed_detail(&events).expect("the untrusted record carries why");
+        assert!(detail.starts_with("issuers of the answering gateway could not be established: "), "{detail}");
+        assert!(detail.contains("unknown-gateway"), "{detail}");
+    }
+
+    fn failed_detail(events: &[crate::delegation_vault::audit::DelegationAuditEvent]) -> Option<String> {
+        match events {
+            [event] => match &event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::IdentityBindingFailed {
+                    error_detail, ..
+                } => error_detail.clone(),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     #[tokio::test]

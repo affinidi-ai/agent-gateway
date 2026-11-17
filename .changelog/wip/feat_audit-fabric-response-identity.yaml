@@ -34,4 +34,15 @@ changes:
         says only why the identity was refused, never the verifier's diagnostic, and the issuer
         DID the exchange records no longer overwrites a change the operator made to the Remote
         gateway record while the exchange was waiting.
-  breaking: []
+  breaking:
+    - timestamp: '2026-11-17T12:00:00Z'
+      title: Refuse Fabric answers whose identity presentation can't be trusted
+      description: >-
+        A surface with a managed identity whose Target is `fabric://` now answers `502` when the
+        answer carries an identity presentation that fails verification, comes from an issuer
+        that is not one of the connection's, or arrives while the connection's issuers cannot be
+        established, as with a legacy pairing whose peer never answers the issuer exchange or a
+        gateway with no VC issuer. This applies whatever the surface takes its identity from, so
+        surfaces with a key, certificate, JWT claim or fixed DID identity that used to accept
+        such answers now refuse them. Add the answering gateway's issuer DID to the Remote
+        gateway's trusted issuer DIDs, or configure a VC issuer, to accept them again.

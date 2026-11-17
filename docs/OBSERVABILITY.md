@@ -803,7 +803,9 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     trusts) or `untrusted` (it verified, but no trust anchor was available to vouch for its
     issuer, or, on an answer to a `fabric://` Target, its issuer is not one of the connection's
     issuers, including when they cannot be established). `error_detail` is a short diagnostic
-    (at most 256 characters on an answer) and never carries the presentation itself.
+    (at most 256 characters on an answer) and never carries the presentation itself; on an
+    `untrusted` answer it is set only when the connection's issuers could not be established,
+    and says why.
 
 **Policy change events.** Raised by management API requests that change a policy definition or
 where a policy applies (group Policies). Each record carries its body in the `event` variant, e.g.
