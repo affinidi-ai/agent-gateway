@@ -269,6 +269,9 @@ pub enum ScopedDiIssuer {
     Local,
     /// The scope has no opinion — use the appliance default.
     Inherit,
+    /// The scope maps a trust agent that cannot issue right now. Issuing under
+    /// any other issuer would change it under callers, so this is an error.
+    Unavailable(String),
 }
 
 /// What the appliance says about who signs the fabric issuer attestation,
@@ -282,6 +285,8 @@ pub enum ScopedContextSigner {
     /// No opinion — use whatever signer was installed for `[vta]`, or the
     /// gateway's own key.
     Inherit,
+    /// The chosen trust agent cannot sign right now; nothing else may attest.
+    Unavailable(String),
 }
 
 /// The agent context a scope issues credentials as.
@@ -289,6 +294,7 @@ enum IssuingContext {
     Agent { client: Arc<crate::vta::client::VtaRestClient>, context_id: String },
     Local,
     Inherit,
+    Unavailable(String),
 }
 
 /// Resolves request coordinates to a [`KeyRef`], and a `KeyRef` to a connector.
@@ -510,6 +516,7 @@ impl KeyDirectory {
             }
             IssuingContext::Local => ScopedDiIssuer::Local,
             IssuingContext::Inherit => ScopedDiIssuer::Inherit,
+            IssuingContext::Unavailable(reason) => ScopedDiIssuer::Unavailable(reason),
         }
     }
 
@@ -524,6 +531,7 @@ impl KeyDirectory {
             IssuingContext::Agent { client, context_id } => (client, context_id),
             IssuingContext::Local => return ScopedContextSigner::Local,
             IssuingContext::Inherit => return ScopedContextSigner::Inherit,
+            IssuingContext::Unavailable(reason) => return ScopedContextSigner::Unavailable(reason),
         };
         let key = (Arc::as_ptr(&client) as usize, context_id.clone());
         if let Some(signer) = self
@@ -558,23 +566,35 @@ impl KeyDirectory {
         {
             return IssuingContext::Local;
         }
+        // Someone chose this trust agent — the surface, its variant or issuer,
+        // or the gateway-wide default naming a connection. When it cannot
+        // issue, another issuer would change the credential's issuer under
+        // callers, so that is refused. With no such choice the scope inherits
+        // the appliance's issuer, which is what it always issued under.
+        let chosen = self
+            .has_explicit_mapping(KeyPurpose::Credential, scope)
+            .await
+            || self.default_names_a_connection();
+        let unusable = |reason: String| {
+            tracing::warn!(
+                target: "vta_audit",
+                surface_id = ?scope.surface_id,
+                error = %reason,
+                chosen,
+                "the trust agent that issues this scope's credential is unusable",
+            );
+            if chosen {
+                IssuingContext::Unavailable(reason)
+            } else {
+                IssuingContext::Inherit
+            }
+        };
         let key_ref = match self
             .resolve_and_provision(KeyPurpose::Credential, scope)
             .await
         {
             Ok(key_ref) => key_ref,
-            Err(e) => {
-                // The mapping was validated when the surface was written, so a
-                // failure here is transient. Signing locally beats failing the
-                // request, and the warning is what stops that being silent.
-                tracing::warn!(
-                    target: "vta_audit",
-                    surface_id = ?scope.surface_id,
-                    error = %e.log_detail(),
-                    "could not resolve a credential issuer; signing locally",
-                );
-                return IssuingContext::Inherit;
-            }
+            Err(e) => return unusable(e.log_detail().to_string()),
         };
         let KeyBackend::Vta { connection_id } = &key_ref.backend else {
             return IssuingContext::Inherit;
@@ -582,10 +602,10 @@ impl KeyDirectory {
         // A credential is issued **as** a context: its designated key signs and
         // its DID becomes the issuer. Without one there is nothing to issue as.
         let Some(context_id) = key_ref.context.as_ref() else {
-            return IssuingContext::Inherit;
+            return unusable(format!("trust agent connection `{connection_id}` names no context to issue as"));
         };
         let Some(registry) = self.connections.as_ref() else {
-            return IssuingContext::Inherit;
+            return unusable(format!("trust agent connection `{connection_id}` is not available"));
         };
         match registry
             .client(connection_id)
@@ -605,16 +625,24 @@ impl KeyDirectory {
                         .to_string(),
                 }
             }
-            Err(e) => {
-                tracing::warn!(
-                    target: "vta_audit",
-                    connection_id = %connection_id,
-                    error = %e.log_detail(),
-                    "trust agent is unusable; issuing the agent-identity credential locally",
-                );
-                IssuingContext::Inherit
-            }
+            Err(e) => unusable(format!("trust agent connection `{connection_id}`: {}", e.log_detail())),
         }
+    }
+
+    /// Whether the gateway-wide default names a stored trust agent connection,
+    /// rather than the gateway's own key or the `[vta]` bootstrap connection,
+    /// which the `[vta]` issuer serves when the registry cannot.
+    fn default_names_a_connection(&self) -> bool {
+        self.appliance_default
+            .as_ref()
+            .and_then(|source| source.signing())
+            .is_some_and(|signing| {
+                signing.backend == Some(crate::config::agent_surface::SigningBackendKind::Vta)
+                    && signing
+                        .connection_id
+                        .as_deref()
+                        .is_some_and(|id| id != DEFAULT_CONNECTION_ID)
+            })
     }
 
     /// The context creator, when `[vta]` selected one and auto-provisioning is
@@ -2612,5 +2640,73 @@ mod tests {
                 .contains("could not be resolved"),
             "{err}"
         );
+    }
+
+    /// A registry whose store holds no connection, so every named one is unusable.
+    async fn registry_without_connections(dir: &std::path::Path) -> Arc<crate::vta::registry::VtaConnectionRegistry> {
+        let store = Arc::new(
+            crate::vta::connections::FileSystemVtaConnectionStore::new(dir.join("connections"))
+                .await
+                .expect("connection store"),
+        );
+        Arc::new(crate::vta::registry::VtaConnectionRegistry::new(
+            store,
+            None,
+            None,
+            None,
+            std::time::Duration::from_secs(5),
+            4,
+        ))
+    }
+
+    /// A surface whose issuer maps a trust agent that cannot be reached does
+    /// not have its credential issued by anyone else.
+    #[tokio::test]
+    async fn a_surface_mapped_to_an_unusable_trust_agent_is_refused_its_credential_issuer() {
+        let (dir, _issuers, tmp) = directory_with_issuer(Some(issuer_agent_signing("vta-gone")), None).await;
+        let dir = dir.with_connections(registry_without_connections(tmp.path()).await);
+
+        match dir
+            .di_vc_issuer_for(&KeyScope::surface("surface-a"))
+            .await
+        {
+            ScopedDiIssuer::Unavailable(reason) => assert!(reason.contains("vta-gone"), "{reason}"),
+            ScopedDiIssuer::Agent(_) => panic!("there is no agent to issue through"),
+            ScopedDiIssuer::Local => panic!("the surface did not ask for the gateway's key"),
+            ScopedDiIssuer::Inherit => panic!("another issuer must not stand in for the chosen one"),
+        }
+    }
+
+    /// The gateway-wide default naming a connection that cannot be reached
+    /// refuses the credential and the attestation alike, rather than leaving
+    /// both to the gateway's own key.
+    #[tokio::test]
+    async fn a_default_naming_an_unusable_connection_refuses_issuance_and_attestation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = directory_with(None)
+            .with_connections(registry_without_connections(tmp.path()).await)
+            .with_appliance_default(Arc::new(StubApplianceDefault(Some(appliance_vta_signing("vta-gone")))));
+
+        assert!(matches!(
+            dir.di_vc_issuer_for(&KeyScope::default())
+                .await,
+            ScopedDiIssuer::Unavailable(_)
+        ));
+        assert!(matches!(dir.attestation_signer().await, ScopedContextSigner::Unavailable(_)));
+    }
+
+    /// A scope nobody chose a trust agent for keeps inheriting the appliance's
+    /// issuer, as it always has.
+    #[tokio::test]
+    async fn a_scope_with_no_choice_still_inherits() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = directory_with(None).with_connections(registry_without_connections(tmp.path()).await);
+
+        assert!(matches!(
+            dir.di_vc_issuer_for(&KeyScope::surface("surface-a"))
+                .await,
+            ScopedDiIssuer::Inherit
+        ));
+        assert!(matches!(dir.attestation_signer().await, ScopedContextSigner::Inherit));
     }
 }

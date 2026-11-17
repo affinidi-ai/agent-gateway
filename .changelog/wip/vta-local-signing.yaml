@@ -447,4 +447,14 @@ changes:
         key it names. Signing now fails closed in both cases, and a surface's
         trust agent block must name its key, as an issuer's already must, or
         the save is refused.
+    - timestamp: '2026-11-17T15:00:00Z'
+      title: Refuse a credential when its chosen trust agent cannot issue it
+      description: >-
+        When a surface, its variant or issuer, or the gateway-wide default
+        chose a trust agent that could not be reached or resolved, the agent-
+        identity credential in a forwarded presentation and the fabric issuer
+        attestation were issued by another issuer instead, the [vta] agent or
+        the gateway's own key. Both are now refused, so the issuer never
+        changes under callers; a scope nobody chose an agent for still issues
+        under the appliance's issuer.
   breaking: []

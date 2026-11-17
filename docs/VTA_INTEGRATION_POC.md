@@ -180,6 +180,10 @@ restart, and a choice that cannot be resolved refuses to sign rather than signin
 - A surface's signing fails closed when its mapping cannot be read (a surface or issuer store
   error) or names a block that cannot sign; a surface's trust agent block must name its
   `key_id`, as an issuer's does, or the save is refused.
+- The agent-identity credential and the issuer attestation fail closed the same way: when the
+  surface, its variant or issuer, or the gateway-wide default chose a trust agent that cannot
+  issue, the request is refused rather than issued by the `[vta]` agent or the gateway's own
+  key. A scope nobody chose an agent for still issues under the appliance's issuer.
 
 - `/oauth2/jwks.json` publishes that backend's key set (active + retiring +
   carried-over local), so a resource server verifies by selecting on `kid`.

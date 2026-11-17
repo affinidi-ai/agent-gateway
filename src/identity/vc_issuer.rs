@@ -1497,7 +1497,7 @@ impl VCIssuer {
     /// key directory resolves for the appliance's agent-identity credential,
     /// so the two cannot diverge; the signer installed for `[vta]` when the
     /// directory has no opinion; otherwise the gateway's own key (`None`).
-    async fn current_attestation_signer(&self) -> Option<Arc<dyn crate::vta::context_signer::ContextSigner>> {
+    async fn current_attestation_signer(&self) -> Result<Option<Arc<dyn crate::vta::context_signer::ContextSigner>>> {
         let directory = self
             .key_directory
             .read()
@@ -1508,15 +1508,22 @@ impl VCIssuer {
                 .attestation_signer()
                 .await
             {
-                crate::vta::key_directory::ScopedContextSigner::Agent(signer) => return Some(signer),
-                crate::vta::key_directory::ScopedContextSigner::Local => return None,
+                crate::vta::key_directory::ScopedContextSigner::Agent(signer) => return Ok(Some(signer)),
+                crate::vta::key_directory::ScopedContextSigner::Local => return Ok(None),
                 crate::vta::key_directory::ScopedContextSigner::Inherit => {}
+                crate::vta::key_directory::ScopedContextSigner::Unavailable(reason) => {
+                    anyhow::bail!(
+                        "the trust agent that issues this gateway's credentials is not available ({reason}); \
+                         the attestation is not signed by another issuer"
+                    )
+                }
             }
         }
-        self.attestation_signer
+        Ok(self
+            .attestation_signer
             .read()
             .await
-            .clone()
+            .clone())
     }
 
     /// The DID the fabric issuer attestation should claim, and which must
@@ -1524,7 +1531,7 @@ impl VCIssuer {
     pub async fn attestation_issuer_did(&self) -> Result<String> {
         match self
             .current_attestation_signer()
-            .await
+            .await?
         {
             Some(signer) => signer.issuer_did().await,
             None => self.get_issuer_did().await,
@@ -1539,7 +1546,7 @@ impl VCIssuer {
     ) -> Result<String> {
         match self
             .current_attestation_signer()
-            .await
+            .await?
         {
             Some(signer) => {
                 signer
@@ -1726,6 +1733,12 @@ impl VCIssuer {
             // An explicit `local` is honoured as written, rather than falling
             // through to whatever the appliance signs with.
             crate::vta::key_directory::ScopedDiIssuer::Local => Arc::clone(&self.vc_issuer),
+            crate::vta::key_directory::ScopedDiIssuer::Unavailable(reason) => {
+                anyhow::bail!(
+                    "the trust agent that issues this surface's credentials is not available ({reason}); \
+                     it is not replaced by another issuer"
+                )
+            }
             crate::vta::key_directory::ScopedDiIssuer::Inherit => match self
                 .di_vc_issuer
                 .read()
@@ -5253,6 +5266,37 @@ mod surface_injection_tests {
                 key_id: Some("gateway-jwt-1".to_string()),
             })
         }
+    }
+
+    /// The gateway-wide default naming a trust agent that cannot be reached
+    /// leaves the attestation unsigned rather than claiming the gateway DID,
+    /// which peers would pin while the credentials are refused.
+    #[tokio::test]
+    async fn the_attestation_is_refused_while_the_chosen_trust_agent_is_unusable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (issuer, _issuer_tmp) = crate::identity::test_helpers::test_vc_issuer().await;
+        let issuer = Arc::new(issuer);
+        let local: Arc<dyn crate::identity::authority::CredentialAuthority> =
+            Arc::new(crate::identity::authority::LocalCredentialAuthority::new(Arc::clone(&issuer)));
+        let directory =
+            crate::vta::key_directory::KeyDirectory::build(&crate::config::vta::VtaConfig::default(), local)
+                .await
+                .expect("a disabled [vta] block builds")
+                .with_connections(agent_registry(tmp.path(), "http://127.0.0.1:1").await)
+                .with_appliance_default(Arc::new(AgentIsTheDefault));
+        issuer
+            .set_key_directory(Arc::new(directory))
+            .await;
+
+        let err = issuer
+            .attestation_issuer_did()
+            .await
+            .expect_err("an unreachable chosen agent is not replaced by the gateway DID");
+        assert!(
+            err.to_string()
+                .contains("ctx-a"),
+            "refused as the chosen context: {err}"
+        );
     }
 
     /// With a trust agent connected in the dashboard and made the gateway-wide

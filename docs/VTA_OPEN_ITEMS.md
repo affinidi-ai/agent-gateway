@@ -61,6 +61,10 @@ about. The behaviour that exists is in [`VTA_INTEGRATION_POC.md`](VTA_INTEGRATIO
 
 - **No per-tenant default.** A signing key is chosen per surface, per issuer or gateway-wide;
   there is no tenant-level choice, so a tenant sets each of its surfaces or issuers.
+- **Changing the gateway-wide trust agent changes the attested issuer.** A peer pins the issuer
+  it was attested when the pair was made and refuses identity presentations from any other, so
+  after the choice moves to another agent (or back to the gateway's own key) existing peers must
+  be paired again.
 - **The token endpoint publishes one key set.** `/oauth2/jwks.json` serves the key set of the
   gateway-wide signer only, so a token a surface signs with a different trust agent key may not
   verify through it.
