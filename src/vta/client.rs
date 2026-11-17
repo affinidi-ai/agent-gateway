@@ -121,6 +121,11 @@ impl VtaRestClient {
     }
 
     /// The carrier this client is using, for metrics and diagnostics.
+    /// The trust agent's own DID, as this client was configured with it.
+    pub fn vta_did(&self) -> &str {
+        &self.vta_did
+    }
+
     pub fn carrier(&self) -> &'static str {
         self.transport.carrier()
     }

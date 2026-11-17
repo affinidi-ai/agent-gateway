@@ -1,6 +1,21 @@
 branch: vta-local-signing
 changes:
   added:
+    - timestamp: '2026-11-17T16:00:00Z'
+      title: ⭐ Let trust agent contexts sign as a did:webvh that survives key rotation
+      description: >-
+        A new [vta] context_did_method setting chooses the DID the trust agent
+        contexts the gateway creates sign as, on every connection: did_key
+        (the default, unchanged) or did_webvh. With did_webvh the trust agent
+        creates a did:webvh in each new context (the issuer context, a
+        surface's, an agent's) and keeps its keys; the gateway signs as it and
+        hosts its log at /vta-issuer/{token}/did.jsonl, or a webvh server
+        registered on the trust agent publishes it (context_did_hosting). The
+        trust agent's operator can then rotate a context's key without
+        changing its DID, so Fabric peers and verifiers keep working; the
+        gateway re-reads the log when it grows and republishes it. Existing
+        contexts and agents keep their DID. The Verifiable Trust Agent tab,
+        GET /v1/vta/status and the key inventory say which method is in use.
     - timestamp: '2026-10-23T07:00:00.000Z'
       title: ⭐ Let the gateway sign through a Verifiable Trust Agent it doesn't control
       description: >-

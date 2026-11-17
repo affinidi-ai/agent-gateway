@@ -61,6 +61,13 @@ about. The behaviour that exists is in [`VTA_INTEGRATION_POC.md`](VTA_INTEGRATIO
 
 - **No per-tenant default.** A signing key is chosen per surface, per issuer or gateway-wide;
   there is no tenant-level choice, so a tenant sets each of its surfaces or issuers.
+- **Context `did:webvh` logs hosted by the gateway are republished on the next signature.** After
+  the trust agent's operator rotates a context's key, the gateway republishes that context's log
+  the next time it signs as it; until then a verifier resolving the DID sees the previous key, which
+  is also the key every signature so far was made with. Hosting on the trust agent's webvh server
+  (`context_did_hosting = "vta_server"`) has no such window.
+- **The trust agent hosts only its own DID.** Context `did:webvh` logs are served by the gateway or
+  by a webvh server registered on the trust agent, never by the trust agent itself.
 - **Changing the gateway-wide trust agent changes the attested issuer.** A peer pins the issuer
   it was attested when the pair was made and refuses identity presentations from any other, so
   after the choice moves to another agent (or back to the gateway's own key) existing peers must

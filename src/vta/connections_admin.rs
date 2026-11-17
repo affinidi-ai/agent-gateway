@@ -1177,6 +1177,10 @@ pub async fn vta_status(
             "auto_provision_contexts": config.auto_provision_contexts,
             "control_did": control_did,
             "control_did_method": config.effective_control_did_method().as_str(),
+            // Which DID the contexts this gateway creates sign as, and where a
+            // did:webvh's log is hosted.
+            "context_did_method": config.context_did_method.as_str(),
+            "context_did_hosting": config.context_did_hosting.as_str(),
             // The control key this gateway rotates with `acl/swap-key`: absent
             // unless it holds a `did:key` control key in a file.
             "control_key": crate::vta::control_key_live::status(),

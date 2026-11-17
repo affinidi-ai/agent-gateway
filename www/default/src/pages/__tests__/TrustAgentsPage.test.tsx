@@ -112,6 +112,36 @@ describe('TrustAgentsPage', () => {
     expect(await screen.findByTestId('vta-control-key')).toBeInTheDocument();
   });
 
+  it('says new contexts sign as a did:key when the deployment does', async () => {
+    respond([], { context_did_method: 'did_key', context_did_hosting: 'gateway' });
+    mountTab();
+    expect(await screen.findByTestId('trust-agents-context-did')).toHaveTextContent(
+      'New contexts sign as a did:key'
+    );
+  });
+
+  it('says where a did:webvh is hosted when contexts sign as one', async () => {
+    respond([], { context_did_method: 'did_webvh', context_did_hosting: 'gateway' });
+    const { unmount } = mountTab();
+    const note = await screen.findByTestId('trust-agents-context-did');
+    expect(note).toHaveTextContent('did:webvh, hosted by this gateway');
+    expect(note).toHaveTextContent('without changing its DID');
+    unmount();
+
+    respond([], { context_did_method: 'did_webvh', context_did_hosting: 'vta_server' });
+    mountTab();
+    expect(await screen.findByTestId('trust-agents-context-did')).toHaveTextContent(
+      "on the trust agent's webvh server"
+    );
+  });
+
+  it('says nothing about context DIDs when the status does not', async () => {
+    respond([]);
+    mountTab();
+    await screen.findByTestId('trust-agents-intro');
+    expect(screen.queryByTestId('trust-agents-context-did')).not.toBeInTheDocument();
+  });
+
   it('shows no control key card without one', async () => {
     respond([agent]);
     mountTab();

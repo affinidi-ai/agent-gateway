@@ -201,6 +201,42 @@ DID, so moving the *issuer* DID needs re-attestation (tracked in VTA-14).
 again. Nothing is migrated or deleted by switching, so the flip is reversible in
 both directions — the local key is still published while a VTA key is active.
 
+## Context DIDs: `did:key` or `did:webvh`
+
+A context the gateway creates (its issuer context, a surface's, an agent's) signs as one DID, set
+for the whole deployment by `[vta] context_did_method`:
+
+- `did_key` (default): the `did:key` of a key the context holds. Nothing to host; rotating the key
+  changes the DID, so peers that pinned it pair again.
+- `did_webvh`: a `did:webvh` the trust agent creates in the context (`webvh/dids/create`, which the
+  grant's `key-mint` allows) and records as the context's DID. The trust agent holds its signing key
+  and its update key; the gateway never does. Its operator can rotate the key
+  (`webvh/dids/rotate-keys`, an administrator's task) without changing the DID, so peers keep
+  working.
+
+With `did_webvh` the log must be reachable by every verifier: `context_did_hosting = "gateway"`
+serves it at `/vta-issuer/{token}/did.jsonl` (the token is a digest of the trust agent and the
+context), and `"vta_server"` publishes it through a webvh server registered on the trust agent
+(`context_did_server_id`). The gateway signs as a context's `did:webvh` with the `assertionMethod`
+of its verified log whose key the context holds; before each signature it checks whether the log
+grew, and re-reads it and republishes the hosted copy when it did, so what verifiers resolve
+follows an operator's rotation. A context whose record names no DID signs as its `did:webvh` only
+when that is the only one it holds.
+
+The setting applies to contexts created after it is set: existing contexts and agents keep their
+DID, because changing an agent's DID would invalidate credentials already issued to it.
+
+**The trust agent must refuse to sign as an update key's `did:key`.** A VTA-built `did:webvh` uses
+one key as its signing key and its log's update key, so a trust agent whose `keys/sign-document`
+signs a caller's document as that key's `did:key` lets anyone holding the gateway's grant forge a
+log entry that rewrites the DID, which then survives revoking the grant. The VTA refuses this
+(`vta-service`: `keys/sign-document` and `webvh_keys::is_log_authorization_key`); use
+`did_webvh` only with a trust agent that does.
+
+The live tests in `src/vta/context_did.rs` (`live_tests`) cover it against a real trust agent with
+only the gateway's grant: create, sign, verify as a peer resolving the DID, rotate as the operator
+(admin grant for seed 44), sign again under the same DID, and an agent onboarded as a `did:webvh`.
+
 ## One control key per connection, and why
 
 A VTA **supersedes** a control DID's session when that DID authenticates again:

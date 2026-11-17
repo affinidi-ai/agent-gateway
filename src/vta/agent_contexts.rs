@@ -129,18 +129,11 @@ impl AgentKeyProvisioner for VtaAgentProvisioner {
             .as_str()
             .to_string();
 
-        let record = self
+        let did = self
             .creator
-            .get_context(&context_id)
+            .signing_did(&context_id)
             .await
-            .map_err(|e| anyhow!("reading back the agent context `{context_id}`: {e}"))?;
-        let did = record
-            .get("did")
-            .and_then(|d| d.as_str())
-            .ok_or_else(|| {
-                anyhow!("the provisioned agent context `{context_id}` carries no DID, so it cannot be an identity")
-            })?
-            .to_string();
+            .map_err(|e| anyhow!("the provisioned agent context `{context_id}` has no identity: {e}"))?;
 
         Ok(ProvisionedAgent {
             did,

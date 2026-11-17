@@ -122,6 +122,8 @@ pub struct SurfaceConfigBuilder {
     pub control_key_rotation_days: Option<u32>,
     /// `[vta] connection_key_switch_timeout_secs`, so a rotation the trust agent refuses rolls back quickly.
     pub connection_key_switch_timeout_secs: Option<u64>,
+    /// `[vta] context_did_method = "did_webvh"`, hosted on the trust agent's webvh server `host-1`.
+    pub contexts_sign_as_did_webvh: bool,
     /// The gateway serves a dashboard build from `www/` at `/`, falling back to its
     /// `index.html` for every path no other route takes, as a deployed dashboard does.
     pub serves_dashboard: bool,
@@ -297,6 +299,7 @@ impl Default for SurfaceConfigBuilder {
             writes_log_directory: false,
             control_key_trust_agent: None,
             control_key_rotation_days: None,
+            contexts_sign_as_did_webvh: false,
             connection_key_switch_timeout_secs: None,
             serves_dashboard: false,
             gateway_prefixes: Vec::new(),

@@ -83,6 +83,9 @@ pub struct KeyInventory {
     /// False for local signing. Computed here so no
     /// client can imply custody the deployment does not have.
     pub custody_claim: bool,
+    /// The DID method of the contexts this gateway creates: `did_key` or
+    /// `did_webvh`.
+    pub context_did_method: String,
     pub connections: Vec<ConnectionInventory>,
     pub mappings: Vec<SurfaceMapping>,
     /// Contexts named by no live surface or variant.
@@ -225,6 +228,10 @@ pub fn build(
     KeyInventory {
         tier: config.tier().to_string(),
         custody_claim: config.supports_custody_claim(),
+        context_did_method: config
+            .context_did_method
+            .as_str()
+            .to_string(),
         connections: connections
             .iter()
             .map(|connection| ConnectionInventory {
@@ -410,6 +417,16 @@ mod tests {
         let local = build(&VtaConfig::default(), &[], &[], &[], &[]);
         assert_eq!(local.tier, "local");
         assert!(!local.custody_claim);
+    }
+
+    #[test]
+    fn the_inventory_reports_which_did_new_contexts_sign_as() {
+        assert_eq!(build(&VtaConfig::default(), &[], &[], &[], &[]).context_did_method, "did_key");
+        let webvh = VtaConfig {
+            context_did_method: crate::config::vta::ContextDidMethod::DidWebvh,
+            ..VtaConfig::default()
+        };
+        assert_eq!(build(&webvh, &[], &[], &[], &[]).context_did_method, "did_webvh");
     }
 
     #[test]

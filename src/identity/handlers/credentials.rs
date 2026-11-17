@@ -1140,6 +1140,34 @@ async fn connection_auth_did_response(
     }
 }
 
+/// Handler for `GET /vta-issuer/{token}/did.jsonl`
+///
+/// Serves the log of a trust agent context's `did:webvh` that this gateway
+/// hosts (`[vta] context_did_hosting = "gateway"`). Unauthenticated, like every
+/// `did:webvh` log: verifiers resolve it to check what the context signed. The
+/// token becomes a path segment, so anything that is not a hosting token is a
+/// 404 rather than a lookup.
+pub async fn serve_vta_issuer_did_jsonl(
+    State(state): State<crate::identity::state::IdentityApiState>,
+    axum::extract::Path(token): axum::extract::Path<String>,
+) -> Response {
+    let storage = state
+        .vc_issuer
+        .get_storage_path()
+        .await;
+    issuer_did_response(&storage, &token).await
+}
+
+async fn issuer_did_response(
+    storage: &std::path::Path,
+    token: &str,
+) -> Response {
+    match crate::vta::context_did::hosted_log_path(storage, token) {
+        Some(path) => serve_did_jsonl_file(&path).await,
+        None => did_log_not_found(),
+    }
+}
+
 /// Handler for `GET /channel/{channel_id}/did.jsonl`
 ///
 /// Serves the per-agent verifiable DID log for the given channel UUID.
@@ -1256,7 +1284,7 @@ mod tests {
         assert!(error.contains("failed verification"), "{error}");
     }
 
-    use super::connection_auth_did_response;
+    use super::{connection_auth_did_response, issuer_did_response};
     use crate::identity::FilesystemIdentityStore;
     use crate::identity::didwebvh::types::{LogEntry, LogParameters};
     use crate::identity::{
@@ -1798,6 +1826,42 @@ mod tests {
         let (status, body) = body_of(response).await;
         assert_eq!(status, axum::http::StatusCode::OK);
         assert!(body.contains(":gw.example.com:vta-auth:conn-a"), "{body}");
+    }
+
+    /// Verifiers of what a trust agent context signs resolve its `did:webvh`
+    /// here when this gateway hosts it.
+    #[tokio::test]
+    async fn a_hosted_context_did_log_is_served_by_its_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = crate::vta::context_did::hosting_token("did:webvh:vta", "gw/ctx");
+        crate::vta::context_did::publish_log(dir.path(), &token, "{\"versionId\":\"1-Qm\"}")
+            .await
+            .unwrap();
+
+        let response = issuer_did_response(dir.path(), &token).await;
+
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .unwrap(),
+            "text/jsonl"
+        );
+        let (status, body) = body_of(response).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(body.contains("1-Qm"), "{body}");
+    }
+
+    /// The token is a path segment: one never published, or anything that is
+    /// not a token, is a 404 and never a read elsewhere.
+    #[tokio::test]
+    async fn a_context_did_token_that_is_unknown_or_malformed_is_a_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let unknown = crate::vta::context_did::hosting_token("did:webvh:vta", "gw/none");
+        for token in [unknown.as_str(), "../vta-auth", "ctx-zz"] {
+            let (status, _) = body_of(issuer_did_response(dir.path(), token).await).await;
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{token}");
+        }
     }
 
     #[tokio::test]

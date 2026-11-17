@@ -25,8 +25,10 @@ use async_trait::async_trait;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::config::vta::ContextDidMethod;
 use crate::vta::VtaError;
 use crate::vta::client::VtaRestClient;
+use crate::vta::context_did::ContextDidPolicy;
 use crate::vta::context_identity::{list_context_keys, payload_of};
 use crate::vta::key_directory::ContextId;
 use crate::vta::provisioning::ContextCreator;
@@ -87,6 +89,8 @@ pub struct GatewayContextCreator {
     /// The context the gateway was granted. Every context it creates is a child
     /// of this one — which is also the only place the capability lets it create.
     parent_context_id: String,
+    /// Which DID a context it gives an identity signs as; `None` is `did:key`.
+    did_policy: Option<ContextDidPolicy>,
 }
 
 impl GatewayContextCreator {
@@ -94,7 +98,42 @@ impl GatewayContextCreator {
         client: Arc<VtaRestClient>,
         parent_context_id: String,
     ) -> Self {
-        Self { client, parent_context_id }
+        Self {
+            client,
+            parent_context_id,
+            did_policy: crate::vta::context_did::current(),
+        }
+    }
+
+    /// The same creator, giving contexts a DID under `policy` instead of the
+    /// one installed for the process.
+    #[cfg(test)]
+    pub fn with_did_policy(
+        mut self,
+        policy: Option<ContextDidPolicy>,
+    ) -> Self {
+        self.did_policy = policy;
+        self
+    }
+
+    /// The DID `context_id` signs as: the DID its record names, or else the
+    /// `did:webvh` the trust agent holds for it.
+    pub async fn signing_did(
+        &self,
+        context_id: &str,
+    ) -> Result<String, VtaError> {
+        let record = self
+            .get_context(context_id)
+            .await?;
+        if let Some(did) = record
+            .get("did")
+            .and_then(|d| d.as_str())
+        {
+            return Ok(did.to_string());
+        }
+        crate::vta::context_did::context_webvh(&self.client, context_id)
+            .await?
+            .ok_or_else(|| VtaError::Protocol(format!("context `{context_id}` has no DID to sign as")))
     }
 
     /// The context itself, created or adopted.
@@ -143,6 +182,11 @@ impl GatewayContextCreator {
     /// verifier resolves is the key that signs, with nothing to publish and no
     /// designation to keep in step with it.
     ///
+    /// Under `context_did_method = "did_webvh"` the identity is instead a
+    /// `did:webvh` the trust agent creates in the context (see
+    /// [`crate::vta::context_did`]); the trust agent records it as the
+    /// context's DID when it creates it.
+    ///
     /// Conditional on the current record, which is what makes a retry safe. It
     /// also has to be: the provisioning path is **write-once**, so re-sending a
     /// DID the context already has is refused by design.
@@ -159,6 +203,19 @@ impl GatewayContextCreator {
             .and_then(|d| d.as_str())
             .is_some()
         {
+            return Ok(());
+        }
+        if let Some(policy) = self
+            .did_policy
+            .as_ref()
+            .filter(|p| p.method == ContextDidMethod::DidWebvh)
+        {
+            if crate::vta::context_did::context_webvh(&self.client, context_id)
+                .await?
+                .is_none()
+            {
+                crate::vta::context_did::create_context_webvh(&self.client, context_id, &policy.hosting).await?;
+            }
             return Ok(());
         }
 
@@ -1027,5 +1084,110 @@ mod live_tests {
             "refused for the wrong reason (the request was not signed): {detail}"
         );
         eprintln!("LIVE_TOP_LEVEL_REFUSED detail={detail}");
+    }
+
+    /// The DIDs the live tests authenticate as, for the operator to grant:
+    /// the gateway (seed 42) and a context admin standing in for the operator
+    /// (seed 44).
+    #[test]
+    #[ignore = "prints the live tests' control DIDs; run manually"]
+    fn print_live_control_dids() {
+        println!("LIVE_CONTROL_DID={}", ControlKey::from_seed([42u8; 32]).did());
+        println!("LIVE_ADMIN_DID={}", ControlKey::from_seed([44u8; 32]).did());
+    }
+
+    /// A trust agent context's `did:webvh` cannot be rewritten through the
+    /// gateway's grant: its update key is also its signing key, and the trust
+    /// agent must refuse to sign a forged log entry as that key's `did:key`
+    /// even though `sign-document` signs as the `did:webvh` itself.
+    #[tokio::test]
+    #[ignore = "requires a running vta-service and the provisioning grant; run manually"]
+    async fn live_a_forged_log_entry_is_not_signed_by_the_update_key() {
+        let (client, parent) = live_client();
+        let creator = GatewayContextCreator::new(Arc::clone(&client), parent.clone());
+        let context_id = creator
+            .create_context(&format!("ctx:_global/forge-{}", uuid::Uuid::new_v4()))
+            .await
+            .expect("create a context");
+        let context_id = context_id
+            .as_str()
+            .to_string();
+        let payload = |v: Value| {
+            v.get("payload")
+                .cloned()
+                .unwrap_or(v)
+        };
+        let created = payload(
+            client
+                .dispatch_signed::<Value>(
+                    "https://trusttasks.org/spec/vta/webvh/dids/create/1.2",
+                    json!({ "contextId": context_id, "url": "http://localhost:8799/forge" }),
+                )
+                .await
+                .expect("create a did:webvh with key-mint"),
+        );
+        let did = created["did"]
+            .as_str()
+            .expect("did")
+            .to_string();
+        let key_id = created["signingKeyId"]
+            .as_str()
+            .expect("signingKeyId")
+            .to_string();
+        let entry: Value = serde_json::from_str(
+            created["logEntry"]
+                .as_str()
+                .expect("the log")
+                .lines()
+                .next()
+                .expect("an entry"),
+        )
+        .expect("entry json");
+        let update_key = entry["parameters"]["updateKeys"][0]
+            .as_str()
+            .expect("an update key")
+            .to_string();
+
+        client
+            .dispatch_signed::<Value>(
+                "https://trusttasks.org/spec/keys/sign-document/0.1",
+                json!({ "keyId": key_id, "proofPurpose": "assertionMethod", "document": {
+                    "@context": ["https://www.w3.org/ns/credentials/v2"],
+                    "type": ["VerifiableCredential"],
+                    "issuer": did,
+                    "credentialSubject": { "id": "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK" },
+                }}),
+            )
+            .await
+            .expect("the key still signs as the did:webvh it serves");
+
+        let mut state = entry["state"].clone();
+        state["verificationMethod"]
+            .as_array_mut()
+            .expect("methods")
+            .push(json!({ "id": format!("{did}#attacker"), "type": "Multikey", "controller": did,
+                "publicKeyMultibase": "z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK" }));
+        let forged = json!({
+            "versionId": "2-forged",
+            "versionTime": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "parameters": {},
+            "state": state,
+            "controller": format!("did:key:{update_key}"),
+        });
+        let attack = client
+            .dispatch_signed::<Value>(
+                "https://trusttasks.org/spec/keys/sign-document/0.1",
+                json!({ "keyId": key_id, "document": forged, "proofPurpose": "assertionMethod" }),
+            )
+            .await;
+        let refusal = attack.expect_err("the update key must not sign a forged log entry");
+        assert!(
+            refusal
+                .log_detail()
+                .contains("permissionDenied"),
+            "{}",
+            refusal.log_detail()
+        );
+        eprintln!("LIVE_FORGE_REFUSED did={did}");
     }
 }

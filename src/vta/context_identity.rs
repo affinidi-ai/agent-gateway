@@ -186,6 +186,101 @@ fn identity_from_records(
     })
 }
 
+/// Work out the identity of a context that signs as `did` (a `did:webvh`) from
+/// that DID's current document and a listing of the context's keys: the first
+/// `assertionMethod` whose key is an active Ed25519 key the context holds.
+///
+/// Fails closed when none is: a DID whose methods the context does not hold
+/// is not one it can sign as.
+fn webvh_identity_from_document(
+    context_id: &str,
+    did: &str,
+    document: &Value,
+    keys: &Value,
+) -> Result<ContextIdentity> {
+    let absolute = |id: &str| match id.strip_prefix('#') {
+        Some(fragment) => format!("{did}#{fragment}"),
+        None => id.to_string(),
+    };
+    let methods: Vec<Value> = document
+        .get("verificationMethod")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let held = |public_key: &str| {
+        keys.get("keys")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|key| {
+                key.get("publicKey")
+                    .and_then(Value::as_str)
+                    == Some(public_key)
+                    && key
+                        .get("keyType")
+                        .and_then(Value::as_str)
+                        == Some("ed25519")
+                    && key
+                        .get("status")
+                        .and_then(Value::as_str)
+                        == Some("active")
+            })
+            .and_then(|key| {
+                key.get("keyId")
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_string)
+    };
+    for entry in document
+        .get("assertionMethod")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let (id, method) = match entry {
+            Value::String(reference) => {
+                let id = absolute(reference);
+                let method = methods
+                    .iter()
+                    .find(|m| {
+                        m.get("id")
+                            .and_then(Value::as_str)
+                            .map(absolute)
+                            .as_deref()
+                            == Some(id.as_str())
+                    })
+                    .cloned();
+                (id, method)
+            }
+            Value::Object(_) => match entry
+                .get("id")
+                .and_then(Value::as_str)
+            {
+                Some(id) => (absolute(id), Some(entry.clone())),
+                None => continue,
+            },
+            _ => continue,
+        };
+        let Some(public_key) = method
+            .as_ref()
+            .and_then(|m| m.get("publicKeyMultibase"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if let Some(key_id) = held(public_key) {
+            return Ok(ContextIdentity {
+                did: did.to_string(),
+                key_id,
+                verification_method: id,
+            });
+        }
+    }
+    bail!(
+        "context `{context_id}` signs as `{did}`, but no assertionMethod of it is an active Ed25519 key the context holds"
+    )
+}
+
 /// The members of a `keys/sign-document` answer the gateway consumes.
 #[derive(Debug, Deserialize)]
 struct SignDocumentResult {
@@ -274,6 +369,13 @@ pub struct ContextIdentityResolver {
     /// that stays in it, so reading them per signature would add two round
     /// trips for values that cannot change.
     cached: RwLock<Option<ContextIdentity>>,
+    /// For a `did:webvh` identity, how many log entries it was read from. The
+    /// trust agent's operator may rotate its key at any time, so a signature
+    /// first checks the log has not grown since.
+    webvh_entries: RwLock<Option<u64>>,
+    /// Where this gateway writes the logs of the `did:webvh` DIDs it hosts, so a
+    /// re-read republishes the current one. `None` when it hosts none.
+    hosted_logs: Option<std::path::PathBuf>,
 }
 
 impl ContextIdentityResolver {
@@ -285,22 +387,55 @@ impl ContextIdentityResolver {
             client,
             context_id,
             cached: RwLock::new(None),
+            webvh_entries: RwLock::new(None),
+            hosted_logs: crate::vta::context_did::current().and_then(|policy| match policy.hosting {
+                crate::vta::context_did::Hosting::Gateway { storage, .. } => Some(storage),
+                crate::vta::context_did::Hosting::VtaServer { .. } => None,
+            }),
         }
+    }
+
+    /// The same resolver, republishing hosted logs under `storage` instead of
+    /// where the installed policy says.
+    #[cfg(test)]
+    pub fn with_hosted_logs(
+        mut self,
+        storage: Option<std::path::PathBuf>,
+    ) -> Self {
+        self.hosted_logs = storage;
+        self
     }
 
     pub fn context_id(&self) -> &str {
         &self.context_id
     }
 
-    /// The context's identity, read once.
+    /// The context's identity: read once for a `did:key`, and again for a
+    /// `did:webvh` whenever its log has grown since it was read.
     pub async fn identity(&self) -> Result<ContextIdentity> {
-        if let Some(identity) = self
+        let cached = self
             .cached
             .read()
             .await
-            .as_ref()
-        {
-            return Ok(identity.clone());
+            .clone();
+        if let Some(identity) = cached {
+            if !identity
+                .did
+                .starts_with("did:webvh:")
+            {
+                return Ok(identity);
+            }
+            let entries = crate::vta::context_did::webvh_log_entries(&self.client, &identity.did)
+                .await
+                .map_err(|e| anyhow!("checking the log of `{}`: {}", identity.did, e.log_detail()))?;
+            if *self
+                .webvh_entries
+                .read()
+                .await
+                == Some(entries)
+            {
+                return Ok(identity);
+            }
         }
 
         let context = self
@@ -310,9 +445,83 @@ impl ContextIdentityResolver {
             .map_err(|e| anyhow!("reading context `{}` to sign as it: {e}", self.context_id))?;
         let keys = json!({ "keys": list_context_keys(&self.client, &self.context_id, Some("active")).await? });
 
-        let identity = identity_from_records(&self.context_id, payload_of(&context), &keys)?;
+        let record = payload_of(&context);
+        let named = record
+            .get("did")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let webvh = match named {
+            Some(did) => did
+                .starts_with("did:webvh:")
+                .then_some(did),
+            None => crate::vta::context_did::context_webvh(&self.client, &self.context_id)
+                .await
+                .map_err(|e| anyhow!("finding the did:webvh of context `{}`: {}", self.context_id, e.log_detail()))?,
+        };
+        let identity = match webvh {
+            Some(did) => {
+                self.webvh_identity(&did, &keys)
+                    .await?
+            }
+            None => identity_from_records(&self.context_id, record, &keys)?,
+        };
         *self.cached.write().await = Some(identity.clone());
         Ok(identity)
+    }
+
+    /// The identity of a context that signs as a `did:webvh` the trust agent
+    /// holds: its log, verified, names under `assertionMethod` a key the
+    /// context holds. Republishes the log when this gateway serves it, so what
+    /// verifiers resolve follows the trust agent's current key.
+    async fn webvh_identity(
+        &self,
+        did: &str,
+        keys: &Value,
+    ) -> Result<ContextIdentity> {
+        let log = crate::vta::context_did::webvh_log(&self.client, did)
+            .await
+            .map_err(|e| anyhow!("reading the log of `{did}`: {}", e.log_detail()))?;
+        let entries: Vec<String> = log
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_string)
+            .collect();
+        crate::identity::didwebvh::resolver::verify_log_with_library(did, &entries)
+            .await
+            .map_err(|e| anyhow!("the log of `{did}` does not verify: {e}"))?;
+        let current = entries
+            .last()
+            .and_then(|entry| serde_json::from_str::<Value>(entry).ok())
+            .and_then(|entry| entry.get("state").cloned())
+            .ok_or_else(|| anyhow!("the log of `{did}` has no current document"))?;
+        let identity = webvh_identity_from_document(&self.context_id, did, &current, keys)?;
+        if let Some(storage) = &self.hosted_logs {
+            crate::vta::context_did::refresh_hosted_log(storage, did, &log).await;
+        }
+        *self
+            .webvh_entries
+            .write()
+            .await = Some(entries.len() as u64);
+        Ok(identity)
+    }
+
+    /// Forget a cached `did:webvh` identity, so the next signature reads the
+    /// current key. Returns whether there was one: a `did:key` identity never
+    /// changes, so it is kept.
+    async fn forget_rotatable_identity(&self) -> bool {
+        let mut cached = self.cached.write().await;
+        if cached
+            .as_ref()
+            .is_some_and(|identity| {
+                identity
+                    .did
+                    .starts_with("did:webvh:")
+            })
+        {
+            *cached = None;
+            return true;
+        }
+        false
     }
 
     /// Attach a Data-Integrity proof to `document` as this context.
@@ -321,6 +530,31 @@ impl ContextIdentityResolver {
     /// trust agent refuses a document that names any other, or that already
     /// carries a proof, so neither can be signed through here by accident.
     pub async fn sign_document(
+        &self,
+        document: Value,
+        purpose: &str,
+        challenge: Option<&str>,
+        domain: Option<&str>,
+    ) -> Result<Value> {
+        match self
+            .sign_document_once(document.clone(), purpose, challenge, domain)
+            .await
+        {
+            // The operator may have rotated a `did:webvh`'s key since it was
+            // read; one fresh read of the identity covers that.
+            Err(_)
+                if self
+                    .forget_rotatable_identity()
+                    .await =>
+            {
+                self.sign_document_once(document, purpose, challenge, domain)
+                    .await
+            }
+            outcome => outcome,
+        }
+    }
+
+    async fn sign_document_once(
         &self,
         document: Value,
         purpose: &str,
@@ -353,6 +587,27 @@ impl ContextIdentityResolver {
     /// context: the key that backs its DID signs, and `kid` names the DID's
     /// verification method, so a verifier that resolves the DID finds the key.
     pub async fn sign_jws(
+        &self,
+        claims: &Value,
+        typ: &str,
+    ) -> Result<String> {
+        match self
+            .sign_jws_once(claims, typ)
+            .await
+        {
+            Err(_)
+                if self
+                    .forget_rotatable_identity()
+                    .await =>
+            {
+                self.sign_jws_once(claims, typ)
+                    .await
+            }
+            outcome => outcome,
+        }
+    }
+
+    async fn sign_jws_once(
         &self,
         claims: &Value,
         typ: &str,
@@ -702,6 +957,81 @@ mod tests {
         assert_eq!(identity.did, "did:key:z6MkAbc");
         assert_eq!(identity.key_id, "ctx-issuer");
         assert_eq!(identity.verification_method, "did:key:z6MkAbc#z6MkAbc");
+    }
+
+    const WEBVH: &str = "did:webvh:QmScid:gw.example.com:vta-issuer:ctx-0123456789abcdef0123";
+
+    fn context_keys() -> Value {
+        json!({ "keys": [
+            { "keyId": "old", "keyType": "ed25519", "status": "revoked", "publicKey": "z6MkOld" },
+            { "keyId": "did-key-0", "keyType": "ed25519", "status": "active", "publicKey": "z6MkCurrent" },
+        ]})
+    }
+
+    /// A context that signs as a `did:webvh` signs with the `assertionMethod`
+    /// whose key it holds, named as the document names it.
+    #[test]
+    fn a_did_webvh_identity_is_its_assertion_method_the_context_holds() {
+        for (shape, document) in [
+            (
+                "a full reference",
+                json!({
+                    "verificationMethod": [{ "id": format!("{WEBVH}#key-0"), "publicKeyMultibase": "z6MkCurrent" }],
+                    "assertionMethod": [format!("{WEBVH}#key-0")],
+                }),
+            ),
+            (
+                "a relative reference",
+                json!({
+                    "verificationMethod": [{ "id": "#key-0", "publicKeyMultibase": "z6MkCurrent" }],
+                    "assertionMethod": ["#key-0"],
+                }),
+            ),
+            (
+                "an embedded method",
+                json!({ "assertionMethod": [{ "id": format!("{WEBVH}#key-0"), "publicKeyMultibase": "z6MkCurrent" }] }),
+            ),
+        ] {
+            let identity = webvh_identity_from_document("ctx", WEBVH, &document, &context_keys())
+                .unwrap_or_else(|e| panic!("{shape}: {e}"));
+            assert_eq!(identity.did, WEBVH, "{shape}");
+            assert_eq!(identity.key_id, "did-key-0", "{shape}");
+            assert_eq!(identity.verification_method, format!("{WEBVH}#key-0"), "{shape}");
+        }
+    }
+
+    /// A `did:webvh` whose methods the context does not hold, or holds only as
+    /// a revoked key, or lists only for authentication, is not one it signs as.
+    #[test]
+    fn a_did_webvh_the_context_does_not_hold_is_refused() {
+        for (what, document) in [
+            (
+                "a key held elsewhere",
+                json!({
+                    "verificationMethod": [{ "id": "#key-0", "publicKeyMultibase": "z6MkSomeoneElse" }],
+                    "assertionMethod": ["#key-0"],
+                }),
+            ),
+            (
+                "a revoked key",
+                json!({
+                    "verificationMethod": [{ "id": "#key-0", "publicKeyMultibase": "z6MkOld" }],
+                    "assertionMethod": ["#key-0"],
+                }),
+            ),
+            (
+                "authentication only",
+                json!({
+                    "verificationMethod": [{ "id": "#key-0", "publicKeyMultibase": "z6MkCurrent" }],
+                    "authentication": ["#key-0"],
+                }),
+            ),
+        ] {
+            let err = webvh_identity_from_document("ctx", WEBVH, &document, &context_keys())
+                .expect_err(what)
+                .to_string();
+            assert!(err.contains("no assertionMethod"), "{what}: {err}");
+        }
     }
 
     #[test]

@@ -30,6 +30,7 @@ pub mod connection_key_rotation;
 pub mod connections;
 pub mod connections_admin;
 pub mod context_creator;
+pub mod context_did;
 pub mod context_identity;
 pub mod context_signer;
 pub mod control_key;

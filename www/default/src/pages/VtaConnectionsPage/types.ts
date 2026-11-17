@@ -113,6 +113,10 @@ export interface VtaDeploymentStatus {
   reserved_origins: string[];
   /** The DID method the gateway authenticates to the agent as. */
   control_did_method?: 'did_key' | 'did_webvh';
+  /** The DID method of the trust agent contexts the gateway creates (`[vta] context_did_method`). */
+  context_did_method?: 'did_key' | 'did_webvh';
+  /** Where a context's did:webvh log is hosted (`[vta] context_did_hosting`). */
+  context_did_hosting?: 'gateway' | 'vta_server';
   /** The `did:key` control key the gateway holds and can rotate. Absent or null when it holds none. */
   control_key?: VtaControlKeyStatus | null;
   /** Which backend the configuration resolves to for signing, and why (computed by the gateway). */

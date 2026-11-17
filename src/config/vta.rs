@@ -39,6 +39,50 @@ pub enum ControlDidMethod {
     DidWebvh,
 }
 
+/// The DID a trust agent context the gateway creates signs as: its issuer
+/// context, a surface's, an agent's.
+///
+/// `did_key` is the context key itself: nothing to host, but rotating the key
+/// changes the DID. `did_webvh` is a DID the trust agent creates and keeps,
+/// whose log names the current key, so the trust agent's operator can rotate the
+/// key without changing the DID, at the cost of hosting the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextDidMethod {
+    #[default]
+    DidKey,
+    DidWebvh,
+}
+
+impl ContextDidMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DidKey => "did_key",
+            Self::DidWebvh => "did_webvh",
+        }
+    }
+}
+
+impl ContextDidHosting {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gateway => "gateway",
+            Self::VtaServer => "vta_server",
+        }
+    }
+}
+
+/// Where the log of a context's `did:webvh` is hosted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextDidHosting {
+    /// This gateway serves it at `/vta-issuer/{token}/did.jsonl`.
+    #[default]
+    Gateway,
+    /// A webvh hosting server registered on the trust agent publishes it.
+    VtaServer,
+}
+
 impl ControlDidMethod {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -259,6 +303,22 @@ pub struct VtaConfig {
     #[serde(default = "default_connection_key_switch_timeout_secs")]
     pub connection_key_switch_timeout_secs: u64,
 
+    /// The DID method of the trust agent contexts the gateway creates, on every
+    /// connection. Applies to contexts created after it is set; a context that
+    /// already has a DID keeps it.
+    #[serde(default)]
+    pub context_did_method: ContextDidMethod,
+
+    /// Where a context's `did:webvh` log is hosted. Read only with
+    /// `context_did_method = "did_webvh"`.
+    #[serde(default)]
+    pub context_did_hosting: ContextDidHosting,
+
+    /// The webvh hosting server registered on the trust agent, required with
+    /// `context_did_hosting = "vta_server"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_did_server_id: Option<String>,
+
     /// Which DID the gateway authenticates to the trust agent as. Absent means
     /// "decide from the deployment": see
     /// [`effective_control_did_method`](Self::effective_control_did_method).
@@ -357,6 +417,9 @@ impl Default for VtaConfig {
             auth_did: None,
             control_key_rotation_days: default_control_key_rotation_days(),
             connection_key_switch_timeout_secs: default_connection_key_switch_timeout_secs(),
+            context_did_method: ContextDidMethod::default(),
+            context_did_hosting: ContextDidHosting::default(),
+            context_did_server_id: None,
             control_did_method: None,
             publish_auth_did: None,
             auth_verification_method: None,
@@ -385,6 +448,21 @@ impl VtaConfig {
     /// rather than a silent fallback to local signing, so an operator who meant
     /// to delegate signing is never quietly left signing locally.
     pub fn validate(&self) -> Result<(), String> {
+        // Checked whether or not the block is enabled: the setting also governs
+        // the contexts made through connections added in the dashboard.
+        if self.context_did_method == ContextDidMethod::DidWebvh
+            && self.context_did_hosting == ContextDidHosting::VtaServer
+            && self
+                .context_did_server_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+        {
+            return Err(
+                "[vta] context_did_hosting = \"vta_server\" needs context_did_server_id, the webvh hosting server \
+                 registered on the trust agent"
+                    .to_string(),
+            );
+        }
         if !self.enabled {
             return Ok(());
         }
@@ -956,5 +1034,34 @@ mod tests {
         )
         .expect("an older block with a mode still parses");
         cfg.validate().expect("valid");
+    }
+
+    #[test]
+    fn contexts_sign_as_a_did_key_unless_configured_otherwise() {
+        let config = VtaConfig::default();
+        assert_eq!(config.context_did_method, ContextDidMethod::DidKey);
+        assert_eq!(config.context_did_hosting, ContextDidHosting::Gateway);
+        let webvh: VtaConfig = toml::from_str(
+            "context_did_method = \"did_webvh\"\ncontext_did_hosting = \"vta_server\"\ncontext_did_server_id = \"host-1\"",
+        )
+        .expect("parse");
+        assert_eq!(webvh.context_did_method, ContextDidMethod::DidWebvh);
+        assert_eq!(webvh.context_did_hosting, ContextDidHosting::VtaServer);
+        webvh
+            .validate()
+            .expect("a vta_server with its id");
+    }
+
+    /// Checked whether or not the block is enabled: the setting also governs
+    /// the contexts of connections added in the dashboard.
+    #[test]
+    fn vta_server_hosting_needs_its_server_id() {
+        let config: VtaConfig =
+            toml::from_str("context_did_method = \"did_webvh\"\ncontext_did_hosting = \"vta_server\"").expect("parse");
+        assert!(!config.enabled);
+        let err = config
+            .validate()
+            .expect_err("no server to publish through");
+        assert!(err.contains("context_did_server_id"), "{err}");
     }
 }

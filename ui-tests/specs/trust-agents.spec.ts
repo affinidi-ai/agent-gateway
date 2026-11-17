@@ -98,6 +98,37 @@ test.describe("Connections: Verifiable Trust Agent tab", () => {
     await expect(page.getByText(/Signing locally/)).toHaveCount(0);
   });
 
+  test("says which DID new contexts sign as, from the deployment", async ({
+    page,
+  }) => {
+    await mockTrustAgents(
+      page,
+      [agent()],
+      status({
+        context_did_method: "did_webvh",
+        context_did_hosting: "gateway",
+      }),
+    );
+
+    await page.goto(`${BASE_URL}/connections?tab=trust-agents`);
+    await expect(page.getByTestId("trust-agents-context-did")).toHaveText(
+      "New contexts sign as a did:webvh, hosted by this gateway. The trust agent's operator can rotate a context's key without changing its DID.",
+    );
+  });
+
+  test("says new contexts sign as a did:key by default", async ({ page }) => {
+    await mockTrustAgents(
+      page,
+      [agent()],
+      status({ context_did_method: "did_key", context_did_hosting: "gateway" }),
+    );
+
+    await page.goto(`${BASE_URL}/connections?tab=trust-agents`);
+    await expect(page.getByTestId("trust-agents-context-did")).toContainText(
+      "New contexts sign as a did:key",
+    );
+  });
+
   test("has Add VTA and no filter box beside it", async ({ page }) => {
     await mockTrustAgents(page, [agent()]);
     await page.goto(`${BASE_URL}/connections?tab=trust-agents`);

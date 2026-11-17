@@ -173,6 +173,33 @@ async fn connection_did_publisher(
     Some(std::sync::Arc::new(crate::vta::auth_did::ConnectionDidPublisher::new(storage, domain)))
 }
 
+/// Install which DID the trust agent contexts this gateway creates sign as,
+/// before anything that creates one is built. A `did:webvh` setting that cannot
+/// be served stops startup rather than quietly giving contexts a `did:key`.
+async fn install_context_did_policy(
+    vta: &crate::config::vta::VtaConfig,
+    vc_issuer: &std::sync::Arc<crate::identity::VCIssuer>,
+) {
+    let domain = vc_issuer
+        .get_issuer_did()
+        .await
+        .ok()
+        .map(|did| crate::vault_identity::handlers::extract_domain_from_did(&did))
+        .filter(|domain| !domain.trim().is_empty());
+    let storage = vc_issuer
+        .get_storage_path()
+        .await;
+    let policy =
+        crate::vta::context_did::ContextDidPolicy::from_config(vta, storage, domain).unwrap_or_else(|e| panic!("{e}"));
+    info!(
+        target: "vta_audit",
+        method = ?policy.method,
+        "trust agent contexts this gateway creates sign as {:?}",
+        policy.method,
+    );
+    crate::vta::context_did::install(policy);
+}
+
 /// Give `[vta]` a stable `did:webvh` to authenticate with, creating it on
 /// first boot, when the effective control DID method calls for one.
 ///
@@ -1067,6 +1094,7 @@ pub async fn create_identity_api_router(
     // because this is the identity the operator's grant names.
     let sts_vta_config = ensure_appliance_vta_identity(sts_vta_config, &state.vc_issuer).await;
     let sts_vta_config = ensure_vta_auth_did(sts_vta_config, &state.vc_issuer).await;
+    install_context_did_policy(&sts_vta_config, &state.vc_issuer).await;
     let sts_secrets_store = secrets_store.clone();
     let sts_gateway_policy_manager = state
         .gateway_policy_manager
@@ -3045,6 +3073,9 @@ pub fn create_did_router(
         .route("/.well-known/vta-auth/did.jsonl", get(handlers::serve_vta_auth_did_jsonl))
         .route("/vta-auth/{connection_id}/did.jsonl", get(handlers::serve_vta_connection_auth_did_jsonl))
         .route("/.well-known/vta-auth/{connection_id}/did.jsonl", get(handlers::serve_vta_connection_auth_did_jsonl))
+        // Logs of trust agent context DIDs this gateway hosts; verifiers of what
+        // those contexts sign resolve them.
+        .route("/vta-issuer/{token}/did.jsonl", get(handlers::serve_vta_issuer_did_jsonl))
         // Empty witness-proofs document — the did:webvh resolver fetches this
         // alongside did.jsonl; without a route it falls through to the SPA.
         .route("/.well-known/did-witness.json", get(handlers::serve_gateway_did_witness))

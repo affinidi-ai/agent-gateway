@@ -16,6 +16,19 @@ import type { VtaConnection } from './VtaConnectionsPage/types';
 const INTRO =
   "Connect a Verifiable Trust Agent to sign audit records with a key the gateway doesn't control. Anyone can verify your records without having to trust the gateway, and even if the gateway is compromised, its records can't be forged or altered. You keep full control of the agent.";
 
+/** Which DID the contexts this gateway creates sign as, set by the deployment's configuration. */
+const contextDidNote = (method: string | undefined, hosting: string | undefined): string | null => {
+  if (method === 'did_webvh') {
+    const where =
+      hosting === 'vta_server' ? "on the trust agent's webvh server" : 'by this gateway';
+    return `New contexts sign as a did:webvh, hosted ${where}. The trust agent's operator can rotate a context's key without changing its DID.`;
+  }
+  if (method === 'did_key') {
+    return "New contexts sign as a did:key: the context's key itself, with nothing to host. Rotating that key changes the DID.";
+  }
+  return null;
+};
+
 interface TrustAgentsPageProps {
   /** The Connections page's shared filter; the tab then shows no filter of its own. */
   externalSearchTerm?: string;
@@ -53,6 +66,10 @@ const TrustAgentsPage: React.FC<TrustAgentsPageProps> = ({
   const [confirmRevoke, setConfirmRevoke] = useState<string | null>(null);
   const [strandedConfirm, setStrandedConfirm] = useState<string | null>(null);
 
+  const contextDid = contextDidNote(
+    deployment?.context_did_method,
+    deployment?.context_did_hosting
+  );
   const canEdit = hasPermission('vta_connections.edit');
   const canRotateKeys = hasPermission('key_management.edit');
   const canDelete = hasPermission('vta_connections.delete');
@@ -179,9 +196,15 @@ const TrustAgentsPage: React.FC<TrustAgentsPageProps> = ({
     <div className={isEmbedded ? '' : 'container-fluid'} data-testid="page-trust-agents">
       {actionsContainer && connectButton && createPortal(connectButton, actionsContainer)}
 
-      <p className="text-muted mb-4" data-testid="trust-agents-intro">
+      <p className="text-muted mb-2" data-testid="trust-agents-intro">
         {INTRO}
       </p>
+      {contextDid && (
+        <p className="small text-muted mb-4" data-testid="trust-agents-context-did">
+          <i className="fas fa-fingerprint me-1" aria-hidden="true" />
+          {contextDid}
+        </p>
+      )}
 
       {deployment?.control_key && (
         <ControlKeyCard

@@ -159,7 +159,9 @@ in its transaction store.
 ## Peer issuer DIDs
 
 A gateway sends fabric envelopes from a per-pairing Connection Point DID but signs the identity
-credentials it issues with its gateway DID. An issuer attestation
+credentials it issues with its gateway DID, or with the DID of the trust agent context it issues
+through: a `did:key`, or a `did:webvh` with `[vta] context_did_method = "did_webvh"`, which the
+receiver resolves from its hosted log and which keeps the same DID across a key rotation. An issuer attestation
 ([`issuer_attestation.rs`](../src/gateways/issuer_attestation.rs)) is a typed JWT
 (`gateway-issuer-attestation+jwt`) binding those two DIDs together: `sub` is the sender's Connection
 Point DID, `aud` the receiver's temporary DID, and `nonce` the handshake thread id.

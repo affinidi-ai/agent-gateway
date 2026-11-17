@@ -1581,6 +1581,13 @@ action (`trust-agents-empty-connect-button`):
 > Anyone can verify your records without having to trust the gateway, and even if the gateway is
 > compromised, its records can't be forged or altered. You keep full control of the agent.
 
+Below it, while `GET /v1/vta/status` reports `context_did_method`, one line
+(`trust-agents-context-did`) says which DID new contexts sign as: a `did:key` ("the context's key
+itself, with nothing to host. Rotating that key changes the DID.") or a `did:webvh` hosted by this
+gateway or on the trust agent's webvh server (`context_did_hosting`), whose key the trust agent's
+operator can rotate without changing its DID. It is set by the deployment's configuration and
+cannot be changed here.
+
 The tab shows no signing tier banner. Under the text, while `control_key` of `GET /v1/vta/status`
 is present (the gateway holds a rotatable `did:key` control key for a `[vta]` connection), the
 **Control key** card (`ControlKeyCard`, `data-testid="vta-control-key"`) shows the key this

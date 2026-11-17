@@ -708,6 +708,15 @@ fn write_single_surface_config_inner(
         config.push_str(&format!("\n[vta]\nconnection_key_switch_timeout_secs = {secs}\n"));
         std::fs::write(&path, config).unwrap();
     }
+    if surface_config.contexts_sign_as_did_webvh {
+        let path = base_dir.join("config.toml");
+        let mut config = std::fs::read_to_string(&path).unwrap();
+        config.push_str(
+            "\n[vta]\ncontext_did_method = \"did_webvh\"\ncontext_did_hosting = \"vta_server\"\n\
+             context_did_server_id = \"host-1\"\n",
+        );
+        std::fs::write(&path, config).unwrap();
+    }
     if surface_config.logs_audit_events {
         log_info(base_dir);
     } else if surface_config.keeps_gateway_log {
