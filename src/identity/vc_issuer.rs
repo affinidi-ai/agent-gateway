@@ -555,21 +555,19 @@ impl VCIssuer {
         }
     }
 
-    /// Lists the signing Multikey under `assertionMethod` and `authentication` in the gateway's
-    /// published DID document where it is missing, as in documents written before it was. A
-    /// `did:webvh` DID gets a new log version signed with the gateway key, so the DID does not
-    /// change; the stored `did.json` gets the same addition, also when only it still lacks the
-    /// key. No key is created or replaced, and nothing else in either document changes. Returns
-    /// whether a document changed.
-    #[cfg(feature = "didwebvh")]
+    #[cfg(all(test, feature = "didwebvh"))]
     pub async fn authorize_signing_key(&self) -> Result<bool> {
         self.authorize_signing_key_while(|| true)
             .await
     }
 
-    /// [`Self::authorize_signing_key`], appending a `did:webvh` log version only while
-    /// `still_active` holds when the version is ready, so a node that stepped down meanwhile
-    /// writes nothing.
+    /// Lists the signing Multikey under `assertionMethod` and `authentication` in the gateway's
+    /// published DID document where it is missing, as in documents written before it was. A
+    /// `did:webvh` DID gets a new log version signed with the gateway key, so the DID does not
+    /// change; the stored `did.json` gets the same addition, also when only it still lacks the
+    /// key. The version is appended only while `still_active` holds once it is ready, so a node
+    /// that stepped down meanwhile writes nothing. No key is created or replaced, and nothing
+    /// else in either document changes. Returns whether a document changed.
     #[cfg(feature = "didwebvh")]
     pub async fn authorize_signing_key_while(
         &self,
