@@ -66,6 +66,19 @@ changes:
         is sent one refresh_dashboard, however often it fell behind, so the page reloads its
         dashboard stats. A burst of dashboard updates no longer forces a slow connection to
         reconnect.
+    - timestamp: '2026-11-17T00:00:00Z'
+      title: Mask camelCase credential names such as accessToken in logs and policy input
+      description: >-
+        A credential name written in camelCase, such as accessToken, clientSecret or apiKey, is
+        now recognised like its snake_case form. Its value becomes <redacted> in exported OTLP
+        span and log attributes and in captured policy input, where MCP and A2A request bodies
+        commonly use camelCase. Names such as maxTokens and apiKeyId are still kept.
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-11-17T00:00:00Z'
+      title: Update actix-http to 3.22.0 and libz-sys to 1.1.33
+      description: >-
+        actix-http 3.21.0 had advisories for chunked request body parsing and the request header
+        timeout on keep-alive connections, and the zlib that libz-sys 1.1.31 bundles had a heap
+        buffer overflow. Both are updated to releases with the fixes.
   breaking: []

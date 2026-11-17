@@ -73,7 +73,9 @@ pub fn built_in_rules() -> Vec<LogRedactionRule> {
 }
 
 /// Exported attribute names whose values are credentials. An attribute is one when its
-/// name, ignoring case, is one of these or ends with one after a `.`, `_` or `-`.
+/// name, ignoring case, is one of these or ends with one after a `.`, `_` or `-`. A lowercase
+/// letter or digit followed by an uppercase letter also separates words, so `accessToken` reads
+/// as `access_token`.
 const CREDENTIAL_ATTRIBUTE_NAMES: &[&str] = &[
     "authorization",
     "cookie",
@@ -94,9 +96,18 @@ const CREDENTIAL_ATTRIBUTE_NAMES: &[&str] = &[
 ];
 
 pub(crate) fn is_credential_attribute(name: &str) -> bool {
-    let normalized = name
-        .to_ascii_lowercase()
-        .replace(['.', '-'], "_");
+    let mut normalized = String::with_capacity(name.len() + 4);
+    let mut previous: Option<char> = None;
+    for c in name.chars() {
+        if c.is_ascii_uppercase() && previous.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit()) {
+            normalized.push('_');
+        }
+        normalized.push(match c {
+            '.' | '-' => '_',
+            other => other.to_ascii_lowercase(),
+        });
+        previous = Some(c);
+    }
     CREDENTIAL_ATTRIBUTE_NAMES
         .iter()
         .any(|credential| {
@@ -1311,6 +1322,15 @@ mod tests {
             "http.request.header.x-caller-key",
             "private_key",
             "credentials",
+            "accessToken",
+            "refreshToken",
+            "clientSecret",
+            "apiKey",
+            "xApiKey",
+            "sessionId",
+            "privateKey",
+            "oauth2Token",
+            "APIKey",
         ] {
             assert!(is_credential_attribute(name), "{name} must be treated as a credential");
         }
@@ -1328,6 +1348,11 @@ mod tests {
             "http.uri",
             "caller.did",
             "message",
+            "maxTokens",
+            "tokenCount",
+            "apiKeyId",
+            "secretId",
+            "inputTokens",
         ] {
             assert!(!is_credential_attribute(name), "{name} must not be treated as a credential");
         }

@@ -835,6 +835,28 @@ mod tests {
     }
 
     #[test]
+    fn camel_case_credential_keys_are_masked_and_similar_keys_kept() {
+        let mut input = json!({
+            "mcp": { "params": { "arguments": {
+                "accessToken": "at-secret-value",
+                "clientSecret": "cs-secret-value",
+                "apiKey": "ak-secret-value",
+                "maxTokens": 512,
+                "apiKeyId": "key-7",
+            } } },
+        });
+
+        mask_credentials(&mut input);
+
+        let arguments = &input["mcp"]["params"]["arguments"];
+        assert_eq!(arguments["accessToken"], REDACTED);
+        assert_eq!(arguments["clientSecret"], REDACTED);
+        assert_eq!(arguments["apiKey"], REDACTED);
+        assert_eq!(arguments["maxTokens"], 512);
+        assert_eq!(arguments["apiKeyId"], "key-7");
+    }
+
+    #[test]
     fn a_credential_inside_longer_text_is_masked_and_the_text_around_it_kept() {
         let mut input = json!({
             "a2a": { "parts": [
