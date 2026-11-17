@@ -741,11 +741,14 @@ fn missing_type_fields(provider: &CredentialProvider) -> Option<Response> {
         .map(|message| (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": message }))).into_response())
 }
 
-/// Refuses a consent time limit outside one minute to 365 days, and one on a
-/// provider of a type nobody consents to.
-fn consent_limit_error(provider: &CredentialProvider) -> Option<Response> {
-    let secs = provider.max_consent_age_secs?;
-    let refusal = if provider.provider_type == CredentialProviderType::OAuth2AuthorizationCode {
+/// Refuses a consent time limit of `secs` outside one minute to 365 days, and
+/// one on a provider of a type nobody consents to (`takes_consent` false).
+fn consent_limit_error(
+    takes_consent: bool,
+    secs: Option<u64>,
+) -> Option<Response> {
+    let secs = secs?;
+    let refusal = if takes_consent {
         crate::config::credential_policy::validate_max_consent_age("max_consent_age_secs", secs).err()?
     } else {
         "max_consent_age_secs is set only on an oauth2_authorization_code provider, the type a person consents to"
@@ -937,7 +940,7 @@ pub async fn create_provider(
     if let Some(response) = missing_type_fields(&provider) {
         return response;
     }
-    if let Some(response) = consent_limit_error(&provider) {
+    if let Some(response) = consent_limit_error(provider.takes_consent(), provider.max_consent_age_secs) {
         return response;
     }
 
@@ -1318,7 +1321,7 @@ pub async fn update_provider(
     if let Some(response) = missing_type_fields(&updated) {
         return response;
     }
-    if let Some(response) = consent_limit_error(&updated) {
+    if let Some(response) = consent_limit_error(updated.takes_consent(), updated.max_consent_age_secs) {
         return response;
     }
 
@@ -1530,9 +1533,7 @@ pub async fn consent_impact(
         Err(refused) => return *refused,
     };
     let tried_secs = (query.max_consent_age_secs > 0).then_some(query.max_consent_age_secs);
-    let mut tried = provider.clone();
-    tried.max_consent_age_secs = tried_secs;
-    if let Some(refused) = consent_limit_error(&tried) {
+    if let Some(refused) = consent_limit_error(provider.takes_consent(), tried_secs) {
         return refused;
     }
     let Some(vault) = state.vault.as_deref() else {
@@ -2733,7 +2734,15 @@ mod jwt_provider_tests {
             let id = id.clone();
             async move { set_active(&state, &id, false).await }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while futures::FutureExt::now_or_never(crate::identity::handlers::surface_grants::hold_provider_bindings())
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the deactivation queues for the exclusive bindings lock");
         assert!(!deactivating.is_finished(), "the deactivation waits for the write that holds the lock");
         let mut edited = state
             .store

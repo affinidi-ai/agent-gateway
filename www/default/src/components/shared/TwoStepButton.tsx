@@ -31,7 +31,7 @@ interface TwoStepButtonProps {
   'data-testid'?: string;
 }
 
-const DANGER_CONFIRM_CLASS = 'btn btn-danger btn-sm text-wrap';
+const DANGER_CONFIRM_CLASS = 'btn app-button btn-danger btn-sm text-wrap';
 
 /**
  * A button that acts on its second click and confirms in place: the first click shows

@@ -7,13 +7,16 @@ import {
   consentLimitSecs,
   consentState,
   isActiveDelegation,
+  isPersonsDelegation,
   limitOutcome,
+  limitOutcomeText,
   matchesSearch,
   renewsAutomatically,
   revokeAllLabel,
   timeLeft,
   tokenStatus,
 } from '../delegatedAccess';
+import { formatDateTime } from '../../../utils/stringUtils';
 
 const NOW = new Date('2026-11-13T10:00:00Z');
 const after = (ms: number) => new Date(NOW.getTime() + ms);
@@ -178,6 +181,70 @@ describe('delegated access consent end', () => {
     }
     expect(matchesSearch(token, providers, 'salesforce')).toBe(false);
     expect(matchesSearch(token, {}, 'source control')).toBe(false);
+  });
+
+  it('finds a token by the name its agent is shown under', () => {
+    const token = (agent_did: string) => ({
+      id: 't1',
+      agent_did,
+      user_identity_hash: 'sha256:abcdef',
+      credential_provider_id: 'cp-scm',
+      provider_id: 'scm',
+      token_type: 'Bearer',
+      scopes: [],
+      expires_at: null,
+      consent_granted_at: NOW.toISOString(),
+      last_used_at: null,
+      created_at: NOW.toISOString(),
+      updated_at: NOW.toISOString(),
+      is_expired: false,
+      can_refresh: true,
+    });
+
+    expect(
+      matchesSearch(
+        token('did:web:Agents.example.com:tenants:sales'),
+        {},
+        'agents.example.com/tenants'
+      )
+    ).toBe(true);
+    expect(matchesSearch(token('did:web:localhost%3A8443'), {}, 'localhost:8443')).toBe(true);
+    expect(matchesSearch(token('did:web:localhost%3A8443'), {}, 'localhost/8443')).toBe(false);
+  });
+
+  it('says in words what a limit on one consent would do', () => {
+    const granted = after(-HOUR).toISOString();
+    const shown = (time: Date | string) => formatDateTime(time, true);
+
+    expect(limitOutcomeText({ kind: 'ends', end: after(HOUR) }, granted, NOW)).toBe(
+      `Consent given ${shown(granted)}. With this limit it ends ${shown(after(HOUR))} (in 1 hour).`
+    );
+    expect(limitOutcomeText({ kind: 'ends', end: after(HOUR - 1) }, granted, NOW)).toBe(
+      `Consent given ${shown(granted)}. With this limit it ends ${shown(after(HOUR - 1))} (in 59 minutes).`
+    );
+    expect(limitOutcomeText({ kind: 'not_sooner', end: after(5 * HOUR) }, granted, NOW)).toBe(
+      `It already ends ${shown(after(5 * HOUR))}. A limit only brings the end forward.`
+    );
+    expect(limitOutcomeText({ kind: 'already_older' }, granted, NOW)).toBe(
+      'This consent is already older than that. Use Revoke to end it now.'
+    );
+    expect(limitOutcomeText({ kind: 'invalid' }, granted, NOW)).toBe(
+      'Enter a whole number from 1 minute to 365 days.'
+    );
+  });
+
+  it("counts a token as a person's delegation unless its provider is one nobody consents to", () => {
+    const providers = {
+      'cp-github': { provider_type: 'oauth2_authorization_code' },
+      'cp-service': { provider_type: 'oauth2_client_credentials' },
+      'cp-untyped': {},
+    };
+    const of = (credential_provider_id: string) => ({ credential_provider_id });
+
+    expect(isPersonsDelegation(of('cp-github'), providers)).toBe(true);
+    expect(isPersonsDelegation(of('cp-service'), providers)).toBe(false);
+    expect(isPersonsDelegation(of('cp-untyped'), providers)).toBe(true);
+    expect(isPersonsDelegation(of('cp-deleted'), providers)).toBe(true);
   });
 
   it('gives a token the status of its consent first, then of its access token', () => {

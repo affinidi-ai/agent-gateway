@@ -15,8 +15,14 @@ export interface DelegationVault {
   loading: boolean;
   /** Why the vault could not be read. The tokens are then unknown, not none. */
   vaultError: string | null;
+  /** Reads the vault and the providers again behind the spinner: the Retry of a failed read. */
   reload: () => void;
-  /** Revokes one delegation and drops it from the list. Rejects with why the gateway refused. */
+  /** Reads them again while the lists stay on screen, after a change made elsewhere. */
+  refresh: () => void;
+  /**
+   * Revokes one delegation and drops it from the list. Rejects with why the gateway refused; a
+   * refusal that says the list is out of date (`404`, `409`) also reads it again.
+   */
   revoke: (id: string) => Promise<void>;
   /** Revokes every delegation of a user and drops them from the list. */
   revokeUser: (userHash: string) => Promise<void>;
@@ -77,11 +83,11 @@ export function useDelegationVault(): DelegationVault {
   const [providers, setProviders] = useState<Record<string, ProviderSummary>>({});
   const [loading, setLoading] = useState(true);
   const [vaultError, setVaultError] = useState<string | null>(null);
-  const [reads, setReads] = useState(0);
+  const [read, setRead] = useState({ count: 0, quiet: false });
 
   useEffect(() => {
     let alive = true;
-    setLoading(true);
+    if (!read.quiet) setLoading(true);
     Promise.all([readVault(), readProviders()]).then(([vault, known]) => {
       if (!alive) return;
       const refused = Array.isArray(vault) ? null : vault.refused;
@@ -93,15 +99,33 @@ export function useDelegationVault(): DelegationVault {
     return () => {
       alive = false;
     };
-  }, [reads]);
+  }, [read]);
 
-  const reload = useCallback(() => setReads(count => count + 1), []);
+  const reload = useCallback(
+    () => setRead(({ count }) => ({ count: count + 1, quiet: false })),
+    []
+  );
+  const refresh = useCallback(
+    () => setRead(({ count }) => ({ count: count + 1, quiet: true })),
+    []
+  );
 
-  const remove = useCallback(async (url: string, kept: (token: DelegationToken) => boolean) => {
-    const response = await send(url, { method: 'DELETE' });
-    if (!response.ok) throw new Error(await refusalOf(response));
-    setTokens(held => held.filter(kept));
-  }, []);
+  const refused = useCallback(
+    async (response: Response): Promise<never> => {
+      if (response.status === 404 || response.status === 409) refresh();
+      throw new Error(await refusalOf(response));
+    },
+    [refresh]
+  );
+
+  const remove = useCallback(
+    async (url: string, kept: (token: DelegationToken) => boolean) => {
+      const response = await send(url, { method: 'DELETE' });
+      if (!response.ok) await refused(response);
+      setTokens(held => held.filter(kept));
+    },
+    [refused]
+  );
 
   const revoke = useCallback(
     (id: string) =>
@@ -118,28 +142,42 @@ export function useDelegationVault(): DelegationVault {
     [remove]
   );
 
-  const limitConsent = useCallback(async (id: string, limitSecs: number) => {
-    const response = await send(
-      `/api/v1/delegation-vault/${encodeURIComponent(id)}/consent-limit`,
-      {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ max_consent_age_secs: limitSecs }),
+  const limitConsent = useCallback(
+    async (id: string, limitSecs: number) => {
+      const response = await send(
+        `/api/v1/delegation-vault/${encodeURIComponent(id)}/consent-limit`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ max_consent_age_secs: limitSecs }),
+        }
+      );
+      if (!response.ok) await refused(response);
+      const limited: { consent_expires_at?: unknown } | null = await response
+        .json()
+        .catch(() => null);
+      const end = limited?.consent_expires_at;
+      if (typeof end !== 'string') {
+        refresh();
+        throw new Error('The gateway saved the limit but did not say when the consent now ends.');
       }
-    );
-    if (!response.ok) throw new Error(await refusalOf(response));
-    const limited: { consent_expires_at?: unknown } | null = await response
-      .json()
-      .catch(() => null);
-    const end = limited?.consent_expires_at;
-    if (typeof end !== 'string') {
-      throw new Error('The gateway saved the limit but did not say when the consent now ends.');
-    }
-    setTokens(held =>
-      held.map(token => (token.id === id ? { ...token, consent_expires_at: end } : token))
-    );
-    return end;
-  }, []);
+      setTokens(held =>
+        held.map(token => (token.id === id ? { ...token, consent_expires_at: end } : token))
+      );
+      return end;
+    },
+    [refresh, refused]
+  );
 
-  return { tokens, providers, loading, vaultError, reload, revoke, revokeUser, limitConsent };
+  return {
+    tokens,
+    providers,
+    loading,
+    vaultError,
+    reload,
+    refresh,
+    revoke,
+    revokeUser,
+    limitConsent,
+  };
 }

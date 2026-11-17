@@ -7,8 +7,6 @@ import {
   takesConsent,
 } from '../../utils/consentLimit';
 
-export { takesConsent };
-
 export type CredentialProviderType =
   | 'oauth2_authorization_code'
   | 'oauth2_client_credentials'

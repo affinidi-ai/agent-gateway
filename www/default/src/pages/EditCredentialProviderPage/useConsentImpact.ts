@@ -19,26 +19,30 @@ export function useConsentImpact(
   limitSecs: number | null,
   storedSecs: number | undefined
 ): number | null {
-  const [ending, setEnding] = useState<number | null>(null);
+  const [answer, setAnswer] = useState<{
+    providerId: string;
+    limitSecs: number | null;
+    ending: number | null;
+  } | null>(null);
   const asks =
     providerId !== undefined &&
     isProviderSegment(providerId) &&
     shortensConsentLimit(limitSecs, storedSecs);
 
   useEffect(() => {
-    setEnding(null);
     if (!asks || providerId === undefined) return;
     let current = true;
     const timer = setTimeout(async () => {
+      let ending: number | null = null;
       try {
         const response = await apiClient.fetch(
           `/api/v1/credential-providers/${encodeURIComponent(providerId)}/consent-impact?max_consent_age_secs=${limitSecs}`
         );
-        const answer = response.ok ? await response.json() : null;
-        if (current) setEnding(endingConsentsOf(answer));
+        ending = endingConsentsOf(response.ok ? await response.json() : null);
       } catch {
-        if (current) setEnding(null);
+        ending = null;
       }
+      if (current) setAnswer({ providerId, limitSecs, ending });
     }, ASK_AFTER_MS);
     return () => {
       current = false;
@@ -46,5 +50,7 @@ export function useConsentImpact(
     };
   }, [asks, providerId, limitSecs]);
 
-  return ending;
+  return asks && answer?.providerId === providerId && answer.limitSecs === limitSecs
+    ? answer.ending
+    : null;
 }

@@ -5,6 +5,20 @@ import { apiClient } from '../../../api';
 import { showToast } from '../../../utils/toaster';
 import CredentialTokensTab from '../CredentialTokensTab';
 import { useDelegationVault } from '../useDelegationVault';
+import {
+  ALICE,
+  BOB,
+  DAY,
+  GITHUB,
+  HOUR,
+  MINUTE,
+  answer,
+  delegation,
+  fromNow,
+  gatewayHolds,
+  requests,
+  vaultReads as reads,
+} from '../vaultTestFixtures';
 
 jest.mock('../../../api', () => ({
   apiClient: { fetch: jest.fn() },
@@ -24,61 +38,8 @@ const Tab: React.FC<TabProps> = props => (
   <CredentialTokensTab {...props} vault={useDelegationVault()} />
 );
 
-/** An answer of the gateway, as `apiClient.fetch` resolves with it. */
-const answer = (body: unknown = {}, status = 200, statusText = 'OK') => ({
-  ok: status < 400,
-  status,
-  statusText,
-  json: () => Promise.resolve(body),
-  text: () => Promise.resolve(typeof body === 'string' ? body : JSON.stringify(body)),
-});
-
-const MINUTE = 60_000;
-const HOUR = 60 * MINUTE;
-const DAY = 24 * HOUR;
-const fromNow = (ms: number) => new Date(Date.now() + ms).toISOString();
-
-const ALICE = 'a'.repeat(64);
-const BOB = 'b'.repeat(64);
-
-const token = (id: string, user: string, extra: Record<string, unknown> = {}) => ({
-  id,
-  agent_did: 'did:web:agent.example.com',
-  user_identity_hash: user,
-  credential_provider_id: 'cp-github',
-  provider_id: 'github',
-  token_type: 'bearer',
-  scopes: ['repo'],
-  expires_at: fromNow(HOUR),
-  consent_granted_at: fromNow(-HOUR),
-  last_used_at: null,
-  created_at: fromNow(-HOUR),
-  updated_at: fromNow(-HOUR),
-  is_expired: false,
-  can_refresh: true,
-  ...extra,
-});
-
-const GITHUB = {
-  id: 'cp-github',
-  name: 'GitHub',
-  provider_type: 'oauth2_authorization_code',
-  token_refresh_enabled: true,
-};
-
-/** Answers the two lists the tab reads, and every other request with `change`. */
-const gatewayHolds = (
-  tokens: ReturnType<typeof token>[],
-  providers: unknown = [GITHUB],
-  change: () => unknown = () => answer()
-) =>
-  mockFetch.mockImplementation((url: string, options?: { method?: string }) =>
-    Promise.resolve(
-      options?.method
-        ? change()
-        : answer(url === '/api/v1/credential-providers' ? providers : tokens)
-    )
-  );
+const token = (id: string, user: string, extra: Record<string, unknown> = {}) =>
+  delegation(id, { user_identity_hash: user, ...extra });
 
 const renderTab = async (
   tokens: ReturnType<typeof token>[],
@@ -96,8 +57,7 @@ const rowIds = () =>
     .queryAllByTestId(/^credential-token-row-/)
     .map(element => element.getAttribute('data-testid')!.replace('credential-token-row-', ''));
 const consentEndOf = (id: string) => screen.getByTestId(`credential-token-consent-end-${id}`);
-const deletes = () => mockFetch.mock.calls.filter(([, options]) => options?.method === 'DELETE');
-const reads = () => mockFetch.mock.calls.filter(([url]) => url === '/api/v1/delegation-vault');
+const deletes = () => requests('DELETE');
 
 describe('Credential Tokens tab', () => {
   beforeEach(() => {
@@ -277,7 +237,7 @@ describe('Credential Tokens tab', () => {
     expect(screen.getByTestId('credential-token-row-t1')).toBeInTheDocument();
   });
 
-  const puts = () => mockFetch.mock.calls.filter(([, options]) => options?.method === 'PUT');
+  const puts = () => requests('PUT');
   /** Answers every later request with `body`, as a success or as a `400`. */
   const answerWith = (ok: boolean, body: unknown) =>
     mockFetch.mockImplementation(() =>
@@ -698,5 +658,94 @@ describe('Credential Tokens tab', () => {
       'The gateway saved the limit but did not say when the consent now ends.'
     );
     expect(showToast).not.toHaveBeenCalledWith('success', expect.anything());
+    await waitFor(() => expect(reads()).toHaveLength(2));
+  });
+
+  /** A gateway whose vault holds `held()` whenever it is read, and answers a change with `change`. */
+  const gatewayReads = (held: () => unknown[], change: () => unknown) =>
+    mockFetch.mockImplementation((url: string, options?: { method?: string }) =>
+      Promise.resolve(
+        options?.method
+          ? change()
+          : answer(url === '/api/v1/credential-providers' ? [GITHUB] : held())
+      )
+    );
+
+  it('drops a delegation the gateway no longer holds once its revoke is refused as not found', async () => {
+    let held = [token('t1', ALICE), token('t2', BOB)];
+    gatewayReads(
+      () => held,
+      () => {
+        held = held.slice(1);
+        return answer({ error: 'Delegation token not found' }, 404, 'Not Found');
+      }
+    );
+    render(<Tab />);
+    const button = await screen.findByTestId('credential-token-revoke-button-t1');
+    const kept = row('t2');
+
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    await waitFor(() => expect(rowIds()).toEqual(['t2']));
+    expect(showToast).toHaveBeenCalledWith('error', 'Not revoked: Delegation token not found');
+    expect(row('t2')).toBe(kept);
+    expect(reads()).toHaveLength(2);
+  });
+
+  it('reads the vault again when a limit is refused because the consent changed', async () => {
+    let held = [sixHourConsent('t1', ALICE)];
+    gatewayReads(
+      () => held,
+      () => {
+        held = [token('t1', ALICE, { consent_expires_at: fromNow(9 * HOUR) })];
+        return answer(
+          {
+            code: 'consent_changed',
+            error: 'The consent changed while it was being limited. Read it again',
+          },
+          409,
+          'Conflict'
+        );
+      }
+    );
+    render(<Tab />);
+    fireEvent.click(await screen.findByTestId('credential-token-limit-button-t1'));
+    fireEvent.change(limitPart('input'), { target: { value: '2' } });
+    fireEvent.click(limitPart('save'));
+
+    expect(await screen.findByTestId('credential-token-limit-error-t1')).toHaveTextContent(
+      'The consent changed while it was being limited. Read it again'
+    );
+    await waitFor(() => expect(consentEndOf('t1')).toHaveTextContent(/\(in 8 hours\)$/));
+    expect(limitPart('panel')).toBeInTheDocument();
+    expect(reads()).toHaveLength(2);
+  });
+
+  it('closes the limit panel once the search hides its row, and leaves it closed when the row is back', async () => {
+    gatewayHolds([sixHourConsent('t1', ALICE)], [GITHUB]);
+    const { rerender } = render(<Tab />);
+    fireEvent.click(await screen.findByTestId('credential-token-limit-button-t1'));
+    expect(limitPart('panel')).toBeInTheDocument();
+
+    rerender(<Tab externalSearchTerm="no such token" />);
+    expect(rowIds()).toEqual([]);
+    rerender(<Tab externalSearchTerm="" />);
+
+    expect(rowIds()).toEqual(['t1']);
+    expect(screen.queryByTestId('credential-token-limit-panel-t1')).toBeNull();
+  });
+
+  it('closes the limit panel when another page is opened', async () => {
+    const ids = Array.from({ length: 11 }, (_, index) => `t${String(index + 1).padStart(2, '0')}`);
+    await renderTab(ids.map(id => sixHourConsent(id, ALICE)));
+    fireEvent.click(screen.getByTestId('credential-token-limit-button-t01'));
+    expect(limitPart('panel', 't01')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '2' }));
+    fireEvent.click(screen.getByRole('button', { name: '1' }));
+
+    expect(rowIds()).toHaveLength(10);
+    expect(screen.queryByTestId('credential-token-limit-panel-t01')).toBeNull();
   });
 });

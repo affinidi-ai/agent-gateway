@@ -289,7 +289,10 @@ mod tests {
 
         assert_eq!(received(&["token_revoked"]), ["consent_limited", "token_revoked"]);
         assert_eq!(received(&["consent_limited"]), ["consent_limited"]);
-        assert_eq!(received(&["consent_granted", "user_tokens_revoked"]), ["consent_granted", "user_tokens_revoked"]);
+        assert_eq!(
+            received(&["consent_granted", "user_tokens_revoked"]),
+            ["consent_granted", "consent_expired", "user_tokens_revoked"]
+        );
         assert_eq!(received(&[]), [] as [&str; 0]);
         for (event, with) in RECEIVED_WITH {
             assert!(event_bit(event).is_some() && event_bit(with).is_some(), "{event} with {with}");
@@ -476,5 +479,16 @@ mod tests {
                 .recipients(bit("auth_failed"))
                 .is_empty()
         );
+    }
+
+    /// A selection made before `consent_expired` existed audits the end of a
+    /// consent wherever it audits the consent being given.
+    #[test]
+    fn a_selection_of_granted_consents_also_receives_their_expiry() {
+        let received = |selected: &[&str]| EventMask::from_categories(selected.iter().copied()).categories();
+
+        assert_eq!(received(&["consent_granted"]), ["consent_granted", "consent_expired"]);
+        assert_eq!(received(&["consent_expired"]), ["consent_expired"]);
+        assert_eq!(received(&["user_tokens_revoked"]), ["user_tokens_revoked"]);
     }
 }

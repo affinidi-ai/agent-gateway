@@ -2062,6 +2062,67 @@ async fn operator_limits_the_callers_consent(
     limit_the_callers_consent(world, seconds).await;
 }
 
+/// Sets the consent time limit of credential provider `provider` to `seconds`,
+/// as an operator does through the admin API.
+pub(crate) async fn change_provider_consent_limit(
+    world: &mut SurfaceWorld,
+    provider: &str,
+    seconds: u64,
+) {
+    ensure_admin_session(world).await;
+    let id = world
+        .surface_config
+        .provider_record_id(provider);
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_recorded_json(
+            reqwest::Method::PUT,
+            &format!("/v1/credential-providers/{id}"),
+            Some(&serde_json::json!({ "max_consent_age_secs": seconds })),
+        )
+        .await
+        .expect("change the provider's consent time limit through the admin API");
+    assert_eq!(response.status, 200, "limiting consents to OAuth provider '{provider}': {}", response.body);
+    assert_eq!(response.body["max_consent_age_secs"], serde_json::json!(seconds), "{}", response.body);
+}
+
+#[when(expr = "the operator changes the consent time limit of OAuth provider {string} to {int} seconds")]
+async fn operator_changes_the_providers_consent_limit(
+    world: &mut SurfaceWorld,
+    provider: String,
+    seconds: u64,
+) {
+    change_provider_consent_limit(world, &provider, seconds).await;
+}
+
+/// Asks the admin API to deactivate the credential provider the surface
+/// binds, whatever its type, and keeps the answer.
+#[when("the operator deactivates the credential provider the surface binds")]
+async fn operator_deactivates_the_surfaces_credential_provider(world: &mut SurfaceWorld) {
+    ensure_admin_session(world).await;
+    let id = world
+        .surface_config
+        .credential_delegation
+        .as_ref()
+        .expect("the surface binds a credential provider")
+        .record_id()
+        .to_string();
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_recorded_json::<serde_json::Value>(
+            reqwest::Method::POST,
+            &format!("/v1/credential-providers/{id}/deactivate"),
+            None,
+        )
+        .await
+        .expect("ask the admin API to deactivate the provider");
+    record_admin_response(world, response);
+}
+
 /// Deactivates credential provider `provider`, or activates it again, as an
 /// operator does through the admin API.
 pub(crate) async fn set_oauth_provider_active(
@@ -3977,6 +4038,21 @@ pub(crate) async fn post_consent_start_page(
         .send()
         .await
         .expect("confirm the consent start page")
+}
+
+/// Open the consent start page of the latest consent_required answer, as the
+/// person's browser does, whatever the gateway answers.
+#[when(expr = "the caller opens the consent start page for provider {string}")]
+async fn caller_opens_consent_start_page(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    let page = no_redirect_client()
+        .get(latest_consent_start_url(world, &provider))
+        .send()
+        .await
+        .expect("open the consent start page");
+    record_html_response(world, page).await;
 }
 
 /// The binding cookie a consent start POST set, as its `name=value` pair.

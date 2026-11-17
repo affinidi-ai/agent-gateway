@@ -4402,6 +4402,15 @@ async fn caller_has_completed_oauth_consent(
     crate::steps::when::oauth_provider_redirects_back_with_valid_code(world, provider).await;
 }
 
+#[given(expr = "caller {string} has invoked MCP tool {string} with a valid token")]
+async fn caller_has_invoked_mcp_tool_with_valid_token(
+    world: &mut SurfaceWorld,
+    caller: String,
+    tool_name: String,
+) {
+    crate::steps::when::caller_invokes_mcp_tool_with_valid_token(world, caller, tool_name).await;
+}
+
 #[given(expr = "caller {string} has invoked MCP tool {string} with a valid token and caller Agent identity {string}")]
 async fn caller_has_invoked_mcp_tool_with_valid_token_and_agent_identity(
     world: &mut SurfaceWorld,
@@ -4469,6 +4478,71 @@ fn oauth_provider_limits_a_consent(
     world
         .surface_config
         .oauth_max_consent_age_secs = Some(seconds);
+}
+
+/// `[credential_policy]` is read when the gateway starts, so a scenario sets
+/// the gateway's own consent time limits before anything starts it.
+#[given(expr = "the gateway limits a consent to {int} seconds by default")]
+fn gateway_limits_a_consent_by_default(
+    world: &mut SurfaceWorld,
+    seconds: u64,
+) {
+    assert!(!crate::steps::when::gateway_is_running(world), "the gateway reads its consent limits when it starts");
+    world
+        .surface_config
+        .default_max_consent_age_secs = Some(seconds);
+}
+
+#[given(expr = "the gateway lets no consent last longer than {int} seconds")]
+fn gateway_lets_no_consent_last_longer(
+    world: &mut SurfaceWorld,
+    seconds: u64,
+) {
+    assert!(!crate::steps::when::gateway_is_running(world), "the gateway reads its consent limits when it starts");
+    world
+        .surface_config
+        .max_consent_age_ceiling_secs = Some(seconds);
+}
+
+#[given(expr = "the operator has changed the consent time limit of OAuth provider {string} to {int} seconds")]
+async fn operator_has_changed_the_providers_consent_limit(
+    world: &mut SurfaceWorld,
+    provider: String,
+    seconds: u64,
+) {
+    crate::steps::when::change_provider_consent_limit(world, &provider, seconds).await;
+}
+
+/// An operator has set the limit of the surface's one binding, through the
+/// admin API, after the surface was stored: a consent already given through
+/// the binding keeps the end it was stored with.
+#[given(expr = "the operator has limited a consent used through the surface's binding to {int} seconds")]
+async fn operator_has_limited_the_surfaces_binding(
+    world: &mut SurfaceWorld,
+    seconds: u64,
+) {
+    use crate::bdd_support::config::single_surface_fixture::SEEDED_SURFACE_ID;
+    crate::steps::when::ensure_admin_session(world).await;
+    let client = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist");
+    let stored = client
+        .get_surface_recorded(SEEDED_SURFACE_ID)
+        .await
+        .expect("read the surface through the admin API");
+    assert_eq!(stored.status, 200, "reading the surface: {}", stored.body);
+    let mut surface = stored.body;
+    let bindings = surface["outbound_credentials"]
+        .as_array_mut()
+        .unwrap_or_else(|| panic!("the surface has no outbound_credentials"));
+    assert_eq!(bindings.len(), 1, "the surface has one binding to limit: {bindings:?}");
+    bindings[0]["max_consent_age_secs"] = serde_json::json!(seconds);
+    let saved = client
+        .update_surface_recorded(SEEDED_SURFACE_ID, &surface)
+        .await
+        .expect("save the surface through the admin API");
+    assert_eq!(saved.status, 200, "limiting the surface's binding: {}", saved.body);
 }
 
 /// An operator has limited the one stored consent to `seconds` after it was

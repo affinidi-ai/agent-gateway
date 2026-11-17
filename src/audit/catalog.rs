@@ -231,10 +231,30 @@ pub const LOGGED_EVENTS: &[&str] = &[
 ];
 
 /// Events a sink receives together: one that selects the first also receives
-/// the second. An operator's limit on a consent ends access sooner, as a
-/// revocation does, so a selection made before `consent_limited` existed that
-/// audits revocations audits limits too.
-pub const RECEIVED_WITH: &[(&str, &str)] = &[("token_revoked", "consent_limited")];
+/// the second, so a selection made before the second existed still records
+/// it. An operator's limit on a consent ends access sooner, as a revocation
+/// does, and a consent that ends at its time limit is the end of one that was
+/// granted.
+pub const RECEIVED_WITH: &[(&str, &str)] =
+    &[("token_revoked", "consent_limited"), ("consent_granted", "consent_expired")];
+
+/// Warns that `selection` names `dropped`, events the gateway no longer
+/// audits: it is used without them, and they are no longer delivered. Each
+/// is now a line of the `credential_delegation` log target. Nothing is said
+/// when none was dropped.
+pub fn warn_logged_only(
+    selection: &str,
+    dropped: &[&str],
+) {
+    if dropped.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        dropped = %dropped.join(","),
+        "{selection} names audit events the gateway now only writes to its log, under the credential_delegation \
+         log target; they are no longer recorded or delivered through it"
+    );
+}
 
 /// Whether `category` is one of the [`LOGGED_EVENTS`].
 pub fn is_logged_only(category: &str) -> bool {

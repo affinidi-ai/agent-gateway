@@ -8,7 +8,8 @@ import {
   splitByTenant,
 } from '../../../../utils/tenantScope';
 import { useSurfaceTenant } from '../../SurfaceMetaContext';
-import { describeConsentLimit, storedConsentLimit } from '../../../../utils/consentLimit';
+import { consentLimitFieldOf } from '../../../../utils/consentLimit';
+import BindingConsentLimitNote from './BindingConsentLimitNote';
 
 interface CredentialProviderOption {
   id: string;
@@ -113,9 +114,7 @@ export function transitCredentialsApiToForm(api: any): TransitCredentialsForm | 
       : {}),
     ...(api.elicit_fallback !== undefined ? { elicit_fallback: api.elicit_fallback } : {}),
     ...(api.subject === 'owner' || api.subject === 'caller' ? { subject: api.subject } : {}),
-    ...(storedConsentLimit(api.max_consent_age_secs) !== undefined
-      ? { max_consent_age_secs: api.max_consent_age_secs }
-      : {}),
+    ...consentLimitFieldOf(api),
   };
 }
 
@@ -323,16 +322,10 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
                 removing this binding revokes its grants.
               </Form.Text>
             )}
-            {value.max_consent_age_secs !== undefined && (
-              <Form.Text
-                className="text-muted d-block"
-                data-testid="transit-point-binding-consent-limit"
-                style={{ fontSize: '10px' }}
-              >
-                Consent time limit: {describeConsentLimit(value.max_consent_age_secs)}, set through
-                the API. A consent older than this is asked for again.
-              </Form.Text>
-            )}
+            <BindingConsentLimitNote
+              secs={value.max_consent_age_secs}
+              testId="transit-point-binding-consent-limit"
+            />
           </Form.Group>
 
           <Form.Group className="mb-2">

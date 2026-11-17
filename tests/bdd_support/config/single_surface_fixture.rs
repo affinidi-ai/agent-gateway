@@ -114,6 +114,11 @@ pub struct SurfaceConfigBuilder {
     /// The `[credential_policy]` rules the gateway starts with set to `enforce`.
     pub enforced_credential_rules: Vec<String>,
     pub token_request_timeout_secs: Option<u64>,
+    /// `[credential_policy] default_max_consent_age_secs`: the time limit on a consent to a
+    /// provider that sets none.
+    pub default_max_consent_age_secs: Option<u64>,
+    /// `[credential_policy] max_consent_age_ceiling_secs`: the time limit no consent reaches past.
+    pub max_consent_age_ceiling_secs: Option<u64>,
     /// The gateway logs warnings and keeps its log for the scenario to read.
     pub keeps_gateway_log: bool,
     /// The gateway writes its log files to `_storage/logs`, the directory the log routes act on.
@@ -282,6 +287,8 @@ impl Default for SurfaceConfigBuilder {
             tenant_id: None,
             enforced_credential_rules: Vec::new(),
             token_request_timeout_secs: None,
+            default_max_consent_age_secs: None,
+            max_consent_age_ceiling_secs: None,
             keeps_gateway_log: false,
             writes_log_directory: false,
             serves_dashboard: false,

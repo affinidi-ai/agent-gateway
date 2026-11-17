@@ -144,6 +144,59 @@ test.describe("Credentials page tabs", () => {
     expect(reads).toBe(1);
   });
 
+  test("marks access on Delegated Access once its provider is deactivated on Credential Providers, with no reload", async ({
+    page,
+  }) => {
+    const github = {
+      id: "cp-github",
+      name: "GitHub",
+      provider_id: "github",
+      provider_type: "oauth2_authorization_code",
+      default_scopes: [],
+      token_refresh_enabled: true,
+      created_at: "2026-10-30T00:00:00Z",
+      updated_at: "2026-10-30T00:00:00Z",
+    };
+    let deactivatedAt: string | null = null;
+    await page.route("**/api/v1/credential-providers", async (route) => {
+      await route.fulfill({
+        json: [{ ...github, deactivated_at: deactivatedAt }],
+      });
+    });
+    await page.route(
+      "**/api/v1/credential-providers/cp-github/*",
+      async (route) => {
+        deactivatedAt = route.request().url().endsWith("/deactivate")
+          ? "2026-11-13T10:00:00Z"
+          : null;
+        await route.fulfill({
+          json: { ...github, deactivated_at: deactivatedAt },
+        });
+      },
+    );
+    await serveVault(page, [token("t1", ALICE)]);
+    let loads = 0;
+    page.on("load", () => {
+      loads += 1;
+    });
+    await page.goto(`${BASE_URL}/credentials?tab=credential-providers`);
+    const deactivate = page.getByTestId(
+      "credential-provider-deactivate-button-cp-github",
+    );
+
+    await deactivate.click();
+    await deactivate.click();
+    await expect(
+      page.getByTestId("credential-provider-deactivated-badge-cp-github"),
+    ).toBeVisible();
+
+    await page.getByTestId("credentials-delegated-access-tab-trigger").click();
+    await expect(
+      page.getByTestId("delegated-access-provider-deactivated-t1"),
+    ).toHaveText("No new consent");
+    expect(loads).toBe(1);
+  });
+
   test("says the delegations could not be read, not that there are none, and lists them after Retry", async ({
     page,
   }) => {
@@ -433,13 +486,14 @@ test.describe("Credentials page Credential Tokens tab", () => {
 
     await button.click();
     await expect(button).toHaveText("Revoke this user's only delegation?");
-    // The confirmation starts listening for a click elsewhere 100 ms after it opens.
-    await page.waitForTimeout(300);
-    await page.getByTestId("credentials-search-input").click();
-
-    await expect(button).not.toContainText(
-      "Revoke this user's only delegation?",
-    );
+    // The confirmation starts listening for a click elsewhere shortly after it opens.
+    await expect(async () => {
+      await page.getByTestId("credentials-search-input").click();
+      await expect(button).not.toContainText(
+        "Revoke this user's only delegation?",
+        { timeout: 200 },
+      );
+    }).toPass();
     await expect(row(page, "t1")).toBeVisible();
     expect(revoked).toEqual([]);
   });
@@ -481,6 +535,67 @@ test.describe("Credentials page Credential Tokens tab", () => {
     expect(revoked).toEqual([]);
   });
 
+  test("offers no way to change a delegation without delegation_vault.delete", async ({
+    page,
+  }) => {
+    await page.route("**/api/v1/permissions", async (route) => {
+      const response = await route.fetch();
+      await route.fulfill({
+        response,
+        json: { ...(await response.json()), "delegation_vault.delete": false },
+      });
+    });
+    await openCredentialTokens(page, [token("t1", ALICE, fromNow(5 * HOUR))]);
+
+    await expect(
+      page.getByRole("columnheader", { name: "Actions" }),
+    ).toHaveCount(0);
+    for (const control of [
+      "limit-button",
+      "revoke-button",
+      "revoke-user-button",
+    ]) {
+      await expect(
+        page.getByTestId(`credential-token-${control}-t1`),
+      ).toHaveCount(0);
+    }
+
+    await page.getByTestId("credentials-delegated-access-tab-trigger").click();
+    await expect(accessRow(page, "t1")).toBeVisible();
+    await expect(
+      page.getByTestId("delegated-access-revoke-button-t1"),
+    ).toHaveCount(0);
+  });
+
+  test("says in the gateway's words why a revoke was refused, and drops a delegation it no longer holds", async ({
+    page,
+  }) => {
+    await serveProviders(page);
+    let held = [token("t1", ALICE), token("t2", BOB)];
+    await page.route("**/api/v1/delegation-vault**", async (route) => {
+      if (route.request().method() === "DELETE") {
+        held = held.slice(1);
+        await route.fulfill({
+          status: 404,
+          json: { error: "Delegation token not found" },
+        });
+        return;
+      }
+      await route.fulfill({ json: held });
+    });
+    await page.goto(`${BASE_URL}/credentials?tab=credential-tokens`);
+    const revoke = page.getByTestId("credential-token-revoke-button-t1");
+
+    await revoke.click();
+    await revoke.click();
+
+    await expect(
+      page.getByText("Not revoked: Delegation token not found"),
+    ).toBeVisible();
+    await expect(row(page, "t1")).toHaveCount(0);
+    await expect(row(page, "t2")).toBeVisible();
+  });
+
   test("opens a user's delegation records in the Audit Log from the expanded row", async ({
     page,
   }) => {
@@ -502,6 +617,57 @@ test.describe("Credentials page Credential Tokens tab", () => {
       "consent_expired",
     );
     await expect.poll(() => filters).toContain(ALICE);
+  });
+});
+
+test.describe("Audit Log delegation records", () => {
+  test("says when a limited consent now ends and ended before, and when a granted one ends", async ({
+    page,
+  }) => {
+    const record = (event: string, detail: string) => ({
+      id: `audit-${event}`,
+      timestamp: fromNow(-HOUR),
+      event,
+      provider_id: "github",
+      provider_name: "GitHub",
+      agent_did: AGENT_DID,
+      detail,
+    });
+    await page.route("**/api/v1/audit?**", async (route) => {
+      await route.fulfill({
+        json: {
+          events: [
+            record(
+              "consent_limited",
+              "consent_granted_at:2026-11-17T10:00:00Z,consent_expires_at:2026-11-17T12:00:00Z,previous_end:2026-11-17T16:00:00Z",
+            ),
+            record(
+              "consent_granted",
+              "consent_expires_at:2026-11-17T16:00:00Z",
+            ),
+          ],
+          total: 2,
+          page: 1,
+          limit: 50,
+          category_counts: {},
+        },
+      });
+    });
+    await page.goto(
+      `${BASE_URL}/audit?category=consent_limited,consent_granted`,
+    );
+
+    const limited = page.getByTestId("audit-item-0");
+    await expect(limited).toContainText("Consent limited");
+    await expect(limited).toContainText(
+      "An operator made the consent for GitHub end sooner.",
+    );
+    await expect(limited).toContainText(
+      /It now ends .+, not .+\. The credential is used until then\. It was not revoked\./,
+    );
+    const granted = page.getByTestId("audit-item-1");
+    await expect(granted).toContainText("The user granted consent for GitHub.");
+    await expect(granted).toContainText(/It ends .+\./);
   });
 });
 
@@ -580,6 +746,32 @@ test.describe("Credential Providers tab deactivation", () => {
 test.describe("Credential provider editor consent time limit", () => {
   const LIMIT = "credential-provider-consent-limit-input";
   const UNIT = "credential-provider-consent-limit-unit-select";
+
+  test("says a deactivated provider takes no new consent", async ({ page }) => {
+    await page.route("**/api/v1/credential-providers/p1", async (route) => {
+      await route.fulfill({
+        json: {
+          id: "p1",
+          name: "GitHub",
+          provider_id: "github",
+          provider_type: "oauth2_authorization_code",
+          authorization_endpoint: "https://github.com/login/oauth/authorize",
+          token_endpoint: "https://github.com/login/oauth/access_token",
+          client_id_secret_ref: "CLIENT_ID",
+          client_secret_secret_ref: "CLIENT_SECRET",
+          default_scopes: ["repo"],
+          token_refresh_enabled: true,
+          callback_path: "/v1/identity/oauth/callback/p1",
+          deactivated_at: "2026-11-13T10:00:00Z",
+        },
+      });
+    });
+    await page.goto(`${BASE_URL}/credential-providers/p1`);
+
+    await expect(
+      page.getByTestId("credential-provider-deactivated-notice"),
+    ).toContainText("nobody can consent to it again");
+  });
 
   test("offers the limit only on an Authorization Code provider", async ({
     page,

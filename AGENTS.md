@@ -221,14 +221,16 @@ provider by its name, show an agent with a `did:web` DID by its whole host name,
 the tooltip, and revoke one entry with the same text **Revoke**. Delegated Access shows the limit
 that applies to each consent in its Ends column, and the Credential Tokens **Access Token** column
 says "Renews automatically" while the gateway refreshes the token. On Credential Tokens a
-**Limit duration** button beside **Revoke**, on each consent an agent can still act under, opens
+**Limit duration** button above **Revoke**, on each consent an agent can still act under, opens
 a panel in place under the row, never a modal: it sets how long after its consent that one
 delegation ends (`PUT /delegation-vault/{id}/consent-limit`) and offers Save only for a limit
 that brings the end forward. The Credential Tokens card header shows its title alone, with no
 count. Both tabs show the one read of the vault the page makes, so a change on one shows on the
-other; a read that fails is shown as an error with a Retry, never as an empty list; and Revoke
-and Limit duration are shown only with `delegation_vault.delete`. A new view is a new tab, and
-both of these tabs stay. See
+other; the page reads it again, with the lists left on screen, when the gateway answers a revoke
+or a limit with `404` or `409` and when a provider is deactivated, activated or deleted on the
+Credential Providers tab; a read that fails is shown as an error with a Retry, never as an
+empty list; and Revoke and Limit duration are shown only with `delegation_vault.delete`. A new
+view is a new tab, and both of these tabs stay. See
 _Credential Tokens and Delegated Access tabs_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-tokens-and-delegated-access-tabs).
 
@@ -244,8 +246,8 @@ _Credential delegation audit_ in
 A credential provider a person consents to is deactivated, never deleted, from the dashboard:
 **Deactivate** (two clicks, in place) and **Activate** on the Credential Providers tab stop and
 restore new consent only, and the provider's row, its tokens and its audit records stay. The two
-buttons share one outline style, and the list's Status column says "Active", or "Deactivated"
-with "No new consent" under it; see
+buttons share one outline style, are shown with `credential_providers.edit`, and the list's
+Status column says "Active", or "Deactivated" with "No new consent" under it; see
 _Credential provider editor_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor) and
 [`docs/CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md#deactivating-a-provider).
@@ -257,7 +259,8 @@ provider while the gateway's own default and ceiling still apply. A refused limi
 under the field, which is marked invalid and takes the focus. A limit shorter than the stored
 one, or a stored limit removed, warns under the field how many active consents saving ends, from
 `GET /credential-providers/{id}/consent-impact`. On such a provider the token
-refresh help says refresh stops when the limit ends. The Surface Builder keeps and
+refresh help says tokens are refreshed for as long as the consent lasts and that the person
+approves again when it ends. The Surface Builder keeps and
 shows a binding's own limit, which is set through the API; see _Credential provider editor_ and
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
 

@@ -58,6 +58,15 @@ pub async fn check_definitions(
             findings.push(finding("event set", &event_set.id, &event_set.name, problem));
         } else if let Some(problem) = holds_only_logged_events(event_set) {
             findings.push(finding("event set", &event_set.id, &event_set.name, problem));
+        } else {
+            let mut logged: Vec<&str> = event_set
+                .events
+                .iter()
+                .map(String::as_str)
+                .filter(|event| is_logged_audit_event_id(event))
+                .collect();
+            logged.sort_unstable();
+            crate::audit::catalog::warn_logged_only(&format!("The integration event set {}", event_set.id), &logged);
         }
     }
     for integration in integrations {
@@ -382,5 +391,26 @@ mod tests {
                 .expect("list"),
             [orphan]
         );
+    }
+
+    /// A stored set that names an event the gateway now only logs beside
+    /// others passes the check, which warns that the event is no longer
+    /// delivered and where it is written now.
+    #[tokio::test]
+    async fn a_stored_set_that_names_an_event_the_gateway_now_only_logs_is_warned_about() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let mut mixed = gateway_events();
+        mixed
+            .events
+            .insert("audit.refresh_failed".to_string());
+
+        let report = check_definitions(&[], &[mixed, gateway_events()], &[], None).await;
+
+        assert_eq!(report.findings, []);
+        let text = logs.text();
+        assert_eq!(text.matches("WARN").count(), 1, "{text}");
+        for named in ["audit.refresh_failed", "credential_delegation"] {
+            assert!(text.contains(named), "{named}: {text}");
+        }
     }
 }

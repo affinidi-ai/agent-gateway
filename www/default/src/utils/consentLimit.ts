@@ -48,6 +48,14 @@ export function storedConsentLimit(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined;
 }
 
+/** A stored binding's `max_consent_age_secs` as the form field that keeps it; none without a limit. */
+export function consentLimitFieldOf(api: { max_consent_age_secs?: unknown }): {
+  max_consent_age_secs?: number;
+} {
+  const secs = storedConsentLimit(api.max_consent_age_secs);
+  return secs === undefined ? {} : { max_consent_age_secs: secs };
+}
+
 /** `secs` as a count of its largest whole unit: 21600 is 6 hours. */
 export function largestWholeUnit(secs: number): { count: number; unit: ConsentLimitUnit } {
   const [unit, size] = UNIT_SECONDS.find(([, size]) => secs % size === 0)!;

@@ -114,12 +114,14 @@ pub fn is_logged_audit_event_id(event: &str) -> bool {
 }
 
 /// The distinct `events`, when there is at least one and every one is in the catalog. An
-/// event the gateway now only logs is left out.
+/// event the gateway now only logs is left out, with a warning that names it.
 pub fn validate_events(events: Vec<String>) -> Result<HashSet<String>, EventSetError> {
-    // Sized by what it keeps, never by the caller's list: it grows to at most the catalog.
+    // Sized by what it keeps, never by the caller's list: each grows to at most the catalog.
     let mut unique = HashSet::new();
+    let mut logged = std::collections::BTreeSet::new();
     for event in events {
         if is_logged_audit_event_id(&event) {
+            logged.insert(event);
             continue;
         }
         if find_event(&event).is_none() {
@@ -127,6 +129,11 @@ pub fn validate_events(events: Vec<String>) -> Result<HashSet<String>, EventSetE
         }
         unique.insert(event);
     }
+    let logged: Vec<&str> = logged
+        .iter()
+        .map(String::as_str)
+        .collect();
+    crate::audit::catalog::warn_logged_only("An integration event set", &logged);
     if unique.is_empty() {
         return Err(EventSetError::Empty);
     }
@@ -338,5 +345,21 @@ mod tests {
         });
 
         assert_eq!(gateways.unknown_template_variables(&content), ["AMOUNT", "USERNAME", "_TEAM"]);
+    }
+
+    /// A save that leaves out events the gateway now only logs warns which
+    /// they were and where they are written now.
+    #[test]
+    fn leaving_out_events_the_gateway_now_only_logs_warns_which_they_were() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        validate_events(events(&["audit.refresh_failed", "gateway.created"])).unwrap();
+        validate_events(events(&["gateway.created"])).unwrap();
+
+        let text = logs.text();
+        assert_eq!(text.matches("WARN").count(), 1, "{text}");
+        for named in ["audit.refresh_failed", "credential_delegation"] {
+            assert!(text.contains(named), "{named}: {text}");
+        }
     }
 }

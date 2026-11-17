@@ -11,7 +11,7 @@ use crate::credential_providers::CredentialProvider;
 use crate::credential_providers::CredentialProviderType;
 use crate::credential_providers::storage::CredentialProviderStorage;
 use crate::delegation_vault::audit::{self, AuditCallerContext, DelegationAuditAction};
-use crate::delegation_vault::consent_age::{self, ConsentAge, ConsentLimits};
+use crate::delegation_vault::consent_age::{self, AskedAgain, ConsentLimits};
 use crate::delegation_vault::consent_confirmation::ConsentCaller;
 use crate::delegation_vault::service_token::{
     self, Freshness, IssuedToken, ServiceTokenContext, ServiceTokenError, ServiceTokenKey,
@@ -148,14 +148,13 @@ pub enum DelegationLookupResult {
     /// Token found — inject these credentials into the upstream request
     Inject(Vec<ResolvedCredentialInjection>),
     /// User has not yet consented — return consent_required to caller.
-    /// `reason` says why a caller who consented before is asked again
-    /// ([`consent_age::CONSENT_EXPIRED`] or [`consent_age::CONSENT_TOO_OLD`]),
-    /// and `max_consent_age_secs` how long the consent asked for may be used.
+    /// `reason` says why a caller who consented before is asked again, and
+    /// `max_consent_age_secs` how long the consent asked for may be used.
     ConsentRequired {
         authorization_url: String,
         provider_name: String,
         scopes: Vec<String>,
-        reason: Option<&'static str>,
+        reason: Option<AskedAgain>,
         max_consent_age_secs: Option<u64>,
     },
     /// Binding doesn't apply to this request (e.g. tool filter)
@@ -735,22 +734,19 @@ pub async fn resolve_delegation_credentials(
         let lookup_result = vault_store
             .lookup(agent_did, user_identity_hash, &binding.credential_provider_id)
             .await;
-        let consent = ConsentCheck {
-            limits: ConsentLimits::of(binding.max_consent_age_secs, provider.max_consent_age_secs),
-            vault_store,
-            binding,
-            provider_name: &provider.name,
-            channel_id,
-            via_fabric,
-            audit_ctx,
-        };
+        let limits = ConsentLimits::of(binding.max_consent_age_secs, provider.max_consent_age_secs);
         let (lookup_result, consent_reason) = match lookup_result {
             Ok(found) => {
-                let (found, reason) = consent.admit(found).await;
+                let (found, reason) = consent_age::admit(vault_store.as_ref(), limits, found, channel_id, |event| {
+                    event.via_fabric = via_fabric;
+                    enrich_audit_event(event, audit_ctx, binding, Some(&provider.name));
+                })
+                .await;
                 (Ok(found), reason)
             }
             Err(error) => (Err(error), None),
         };
+        let ask = ConsentAsk { reason: consent_reason, limits };
 
         let consented_by_other_principal = match &lookup_result {
             Ok(VaultLookupResult::Found(token)) | Ok(VaultLookupResult::ExpiredRefreshable(token)) => {
@@ -1034,7 +1030,7 @@ pub async fn resolve_delegation_credentials(
                                     secrets_store,
                                     gateway_base_url,
                                     surface_variant,
-                                    None,
+                                    ask,
                                 )
                                 .await;
                                 results.push(DelegationResolution::new(
@@ -1064,7 +1060,7 @@ pub async fn resolve_delegation_credentials(
                             secrets_store,
                             gateway_base_url,
                             surface_variant,
-                            None,
+                            ask,
                         )
                         .await;
                         results.push(DelegationResolution::new(
@@ -1127,7 +1123,7 @@ pub async fn resolve_delegation_credentials(
                         audit_ctx,
                         via_fabric,
                         surface_variant,
-                        consent_reason,
+                        ask,
                     )
                     .await
                 } else {
@@ -1147,7 +1143,7 @@ pub async fn resolve_delegation_credentials(
                         secrets_store,
                         gateway_base_url,
                         surface_variant,
-                        consent_reason,
+                        ask,
                     )
                     .await;
                     let outcome = match cr {
@@ -1158,7 +1154,7 @@ pub async fn resolve_delegation_credentials(
                         binding,
                         Some(&provider.name),
                         outcome,
-                        consent_reason.map(str::to_string),
+                        consent_reason.map(|reason| reason.as_str().to_string()),
                         cr,
                     ));
                 }
@@ -1334,69 +1330,12 @@ pub fn inject_delegated_credential_into_mcp_meta(
 /// consent: its provider was deactivated and takes no new consent.
 const PROVIDER_DEACTIVATED: &str = "provider_deactivated";
 
-/// What ends a stored consent that is past its time limit, and tells one a
-/// binding finds too old from one it may use.
-struct ConsentCheck<'a> {
+/// What a caller asked for consent is told of its time limits: why it is asked
+/// again when it consented before, and the limits the new consent comes under.
+#[derive(Clone, Copy)]
+struct ConsentAsk {
+    reason: Option<AskedAgain>,
     limits: ConsentLimits,
-    vault_store: &'a Arc<dyn DelegationVaultStorage>,
-    binding: &'a OutboundCredentialBinding,
-    provider_name: &'a str,
-    channel_id: &'a str,
-    via_fabric: bool,
-    audit_ctx: Option<&'a DelegationAuditContext>,
-}
-
-impl ConsentCheck<'_> {
-    /// `found` while its consent is within the limits. Otherwise no
-    /// credential, and why the caller is asked again: a consent past its end
-    /// is removed from the vault, whatever refresh token it holds, and one
-    /// only too old for this binding is kept for the others.
-    async fn admit(
-        &self,
-        found: VaultLookupResult,
-    ) -> (VaultLookupResult, Option<&'static str>) {
-        let token = match &found {
-            VaultLookupResult::Found(token)
-            | VaultLookupResult::ExpiredRefreshable(token)
-            | VaultLookupResult::ExpiredNoRefresh(token) => token,
-            VaultLookupResult::NotFound => return (found, None),
-        };
-        match self
-            .limits
-            .judge(token.consent_granted_at, token.consent_expires_at, Utc::now())
-        {
-            ConsentAge::Current => (found, None),
-            ConsentAge::TooOldForBinding => (VaultLookupResult::NotFound, Some(consent_age::CONSENT_TOO_OLD)),
-            ConsentAge::Ended => {
-                self.end(token).await;
-                (VaultLookupResult::NotFound, Some(consent_age::CONSENT_EXPIRED))
-            }
-        }
-    }
-
-    /// Remove `token`, whose consent ended, and audit the expiry. A removal
-    /// that fails leaves the request refused all the same: the check runs
-    /// again on the next one.
-    async fn end(
-        &self,
-        token: &DelegationToken,
-    ) {
-        let ended_at = self
-            .limits
-            .ends_at(token.consent_granted_at, token.consent_expires_at);
-        consent_age::end_consent(
-            self.vault_store.as_ref(),
-            token,
-            ended_at,
-            "release",
-            Some(self.channel_id),
-            |event| {
-                event.via_fabric = self.via_fabric;
-                enrich_audit_event(event, self.audit_ctx, self.binding, Some(self.provider_name));
-            },
-        )
-        .await;
-    }
 }
 
 /// Who a consent link is minted for, and the tenant of the surface their
@@ -1408,7 +1347,6 @@ struct ConsentLinkFor<'a> {
 }
 
 /// Build a consent_required response for a binding that has no valid token.
-/// `reason` says why a caller who consented before is asked again.
 #[allow(clippy::too_many_arguments)]
 async fn build_consent_required(
     binding: &OutboundCredentialBinding,
@@ -1420,7 +1358,7 @@ async fn build_consent_required(
     secrets_store: &Arc<dyn SecretsStore>,
     gateway_base_url: &str,
     surface_variant: Option<&str>,
-    reason: Option<&'static str>,
+    ask: ConsentAsk,
 ) -> DelegationLookupResult {
     match provider_store
         .get(&binding.credential_provider_id)
@@ -1434,8 +1372,7 @@ async fn build_consent_required(
             } else {
                 binding.scopes.clone()
             };
-            let max_consent_age_secs =
-                ConsentLimits::of(binding.max_consent_age_secs, provider.max_consent_age_secs).lifetime_secs();
+            let max_consent_age_secs = ask.limits.lifetime_secs();
 
             match oauth::mint_consent_link(
                 &provider,
@@ -1456,7 +1393,7 @@ async fn build_consent_required(
                     authorization_url: url,
                     provider_name: provider.name.clone(),
                     scopes,
-                    reason,
+                    reason: ask.reason,
                     max_consent_age_secs,
                 },
                 Err(e) => {
@@ -1511,7 +1448,7 @@ async fn try_elicit_flow(
     audit_ctx: Option<&DelegationAuditContext>,
     via_fabric: bool,
     surface_variant: Option<&str>,
-    consent_reason: Option<&'static str>,
+    ask: ConsentAsk,
 ) -> Option<(DelegationActionOutcome, Option<String>, DelegationLookupResult)> {
     let session_id = audit_ctx.and_then(|c| c.mcp_session_id.as_deref())?;
 
@@ -1550,8 +1487,7 @@ async fn try_elicit_flow(
     } else {
         binding.scopes.clone()
     };
-    let max_consent_age_secs =
-        ConsentLimits::of(binding.max_consent_age_secs, provider.max_consent_age_secs).lifetime_secs();
+    let max_consent_age_secs = ask.limits.lifetime_secs();
     let authorization_url = match oauth::mint_consent_link(
         provider,
         agent_did,
@@ -1592,7 +1528,7 @@ async fn try_elicit_flow(
         audit_ctx.and_then(|c| c.mcp_tool_name.as_deref()),
         &scopes,
         &authorization_url,
-        consent_age::notice(consent_reason, max_consent_age_secs).as_deref(),
+        consent_age::notice(ask.reason, max_consent_age_secs).as_deref(),
     );
 
     // Serialize and write onto the session's SSE stream.
@@ -1679,12 +1615,23 @@ async fn try_elicit_flow(
             let oauth_wait = tokio::time::timeout(timeout_duration, notifier_handle.notified()).await;
 
             if oauth_wait.is_ok() {
-                // Vault populated — re-lookup and inject.
-                match vault_store
+                // Vault populated — re-lookup and inject, within the consent's limits.
+                let found = match vault_store
                     .lookup(agent_did, user_identity_hash, &binding.credential_provider_id)
                     .await
                 {
-                    Ok(VaultLookupResult::Found(token)) => {
+                    Ok(found) => {
+                        consent_age::admit(vault_store.as_ref(), ask.limits, found, channel_id, |event| {
+                            event.via_fabric = via_fabric;
+                            enrich_audit_event(event, audit_ctx, binding, Some(&provider.name));
+                        })
+                        .await
+                        .0
+                    }
+                    Err(_) => VaultLookupResult::NotFound,
+                };
+                match found {
+                    VaultLookupResult::Found(token) => {
                         let headers = build_injection_headers(&binding.inject_as, &token.access_token);
                         audit::emit("token_injected", || {
                             let mut inj = audit::audit_event(
@@ -1712,7 +1659,7 @@ async fn try_elicit_flow(
                             authorization_url,
                             provider_name: provider.name.clone(),
                             scopes,
-                            reason: consent_reason,
+                            reason: ask.reason,
                             max_consent_age_secs,
                         },
                     )),
@@ -1725,7 +1672,7 @@ async fn try_elicit_flow(
                         authorization_url,
                         provider_name: provider.name.clone(),
                         scopes,
-                        reason: consent_reason,
+                        reason: ask.reason,
                         max_consent_age_secs,
                     },
                 ))
@@ -4800,7 +4747,7 @@ mod tests {
         else {
             panic!("expected a consent result, got {}", result_tag(result));
         };
-        (*reason, *max_consent_age_secs)
+        (reason.map(AskedAgain::as_str), *max_consent_age_secs)
     }
 
     #[tokio::test]
@@ -4837,7 +4784,7 @@ mod tests {
         assert_eq!(expired.provider_id.as_deref(), Some("cp-1"));
         assert_eq!(expired.surface_id.as_deref(), Some("ch-1"));
         assert_eq!(expired.scopes, Some(vec!["repo".to_string()]));
-        let stamp = |time: chrono::DateTime<Utc>| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let stamp = consent_age::stamp;
         assert_eq!(
             expired.detail.as_deref(),
             Some(
@@ -5065,7 +5012,7 @@ mod tests {
                 "scopes": ["repo"]}))
         );
         assert_eq!(
-            asked(Some("consent_expired"), Some(21_600)),
+            asked(Some(AskedAgain::ConsentExpired), Some(21_600)),
             Some(serde_json::json!({"provider_name": "GitHub", "authorization_url": "https://gw.example.com/start",
                 "scopes": ["repo"], "reason": "consent_expired", "max_consent_age_secs": 21_600}))
         );

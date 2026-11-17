@@ -23,10 +23,10 @@ import { formatDateTime } from '../../utils/stringUtils';
 export type EventTone = 'allow' | 'deny' | 'warn' | 'neutral';
 
 /**
- * The time a `consent_limited` record's `detail` gives under `key`, as it is shown; `null` when
- * the detail has no such time. The detail is `key:time` pairs joined by commas.
+ * The time a consent record's `detail` gives under `key`, as it is shown; `null` when the detail
+ * has no such time. The detail is `key:value` pairs joined by commas.
  */
-function limitedConsentTime(detail: unknown, key: string): string | null {
+function consentTime(detail: unknown, key: string): string | null {
   if (typeof detail !== 'string') return null;
   const pair = detail.split(',').find(part => part.startsWith(`${key}:`));
   const time = pair ? new Date(pair.slice(key.length + 1)) : null;
@@ -371,14 +371,17 @@ export function describeEntry(entry: AuditEntry, userName?: UserNameResolver): E
         detail: scopes.length ? `Scopes: ${scopes.join(', ')}.` : undefined,
       };
     }
-    case 'consent_granted':
+    case 'consent_granted': {
+      const end = consentTime(entry.detail, 'consent_expires_at');
       return {
         title: 'Consent granted',
         tone,
         summary: provider
           ? `The user granted consent for ${provider}.`
           : 'The user granted consent.',
+        detail: end ? `It ends ${end}.` : undefined,
       };
+    }
     case 'consent_required':
       return {
         title: 'Consent required',
@@ -397,8 +400,8 @@ export function describeEntry(entry: AuditEntry, userName?: UserNameResolver): E
         detail: 'The person is asked to consent again the next time the agent needs it.',
       };
     case 'consent_limited': {
-      const end = limitedConsentTime(entry.detail, 'consent_expires_at');
-      const previous = limitedConsentTime(entry.detail, 'previous_end');
+      const end = consentTime(entry.detail, 'consent_expires_at');
+      const previous = consentTime(entry.detail, 'previous_end');
       return {
         title: 'Consent limited',
         tone,

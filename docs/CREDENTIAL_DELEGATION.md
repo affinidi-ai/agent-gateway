@@ -2377,10 +2377,14 @@ and the connection's.
 
 ### When a consent ends
 
-The end is fixed when the person consents: the consent time plus the limit in force then. It
+The end is fixed when the person consents: the consent time plus the limit in force then. That
+is the limit they were told at the start, or the provider's own limit when it was shortened
+while the consent was under way. It
 is stored with the credential as `consent_expires_at`, beside the consent time
 (`consent_granted_at` of an agent-keyed token, `created_at` of a grant by binding). A refresh
-changes neither.
+changes neither. A release from before the consent time limit knows neither the stored end
+nor a provider's deactivation and drops them the next time it writes the record, so after a
+downgrade a limit set on one consent and a deactivation no longer hold.
 
 A consent has ended once its stored end has passed, or once it is older than the connection's
 limit as set now, whichever comes first. So:
@@ -2395,7 +2399,9 @@ Before a shorter limit is saved,
 it would end. It answers `{"active_consents": <n>, "ending_consents": <n>}`: the provider's
 consents that have not ended (its agent-keyed tokens, and its grants by binding that their
 surface still serves), and how many of them are older than the limit asked about, so that saving
-it ends them. `0` asks about a provider with no limit of its own, as a save takes it. The
+it ends them. A consent given on the `2026-07-28` MCP path is counted as ending whatever limit
+is asked about: it is bound to the provider's record, so any save of the provider ends it.
+`0` asks about a provider with no limit of its own, as a save takes it. The
 request changes nothing. It needs `credential_providers.edit` and is refused as the save would
 be: `400` for a limit outside the range, or for any limit on a provider nobody consents to, and
 `404` or `403` for a provider the caller may not change. Asked with `0`, a provider nobody
@@ -2419,19 +2425,29 @@ decision, on an Access Point, a Transit Point and Fabric receive alike.
 
 | Stored credential | At its end |
 | --- | --- |
-| Agent-keyed token (`on_demand`, `pre_authorize`, `elicit`, and a `2026-07-28` MCP binding) | The token is deleted from the vault, with its refresh token, while it still holds the access token that was read. The caller gets the consent answer of its mode: `consent_required` whose entry has `reason` `consent_expired`, or an elicitation or a `2026-07-28` input request whose message says so. No vendor is called: these providers name no revocation endpoint, so an access token already sent stays valid at the vendor until it expires there |
-| Grant by binding (`external`) | The grant is deleted and revoked at the vendor as every removed grant is ([Revoking grants at the vendor](#revoking-grants-at-the-vendor)). The caller gets `connect_required` with `cause` `consent_expired` |
+| Agent-keyed token (`on_demand`, `pre_authorize`, `elicit`, and a `2026-07-28` MCP binding) | The token is deleted from the vault, with its refresh token, while it still holds the consent that was judged: one the person gave again meanwhile is kept, and one only refreshed meanwhile is deleted. The caller gets the consent answer of its mode: `consent_required` whose entry has `reason` `consent_expired`, or an elicitation or a `2026-07-28` input request whose message says so. No vendor is called: these providers name no revocation endpoint, so an access token already sent stays valid at the vendor until it expires there |
+| Grant by binding (`external`) | The grant is deleted, while it is still the connection that was judged, and revoked at the vendor as every removed grant is ([Revoking grants at the vendor](#revoking-grants-at-the-vendor)). The caller gets `connect_required` with `cause` `consent_expired` |
 
 A removal that fails leaves the request refused all the same, and the next request tries it
 again. A request that read the credential a moment before its end finishes its call: the
-limit is checked when the credential is released, not while a response streams.
+limit is checked when the credential is released, not while a response streams. A
+`2026-07-28` `subscriptions/listen` stream is held to the limit all the same: one opened with
+a consented credential ends no later than that consent's end, the earliest of them when it
+carries several. The end is taken as it stands when the stream opens, so a limit an operator
+sets on the consent later reaches a stream that is already open only when it is opened again,
+at most the surface's `mcp_http.stream_max_lifetime_secs` (an hour by default) after the new
+end. A revoke ends open streams within about a second.
 
 A consent no request needs again is removed all the same. Once an hour, the first time ten
 minutes after startup and only while the node is active, the vault removes every ended consent
 it still holds ([`src/delegation_vault/sweep.rs`](../src/delegation_vault/sweep.rs)): an
 agent-keyed token is deleted, and a grant by binding is deleted under its surface's lock and
-revoked at the vendor. So while a node is active, a refresh token outlives its consent in the
-vault by about an hour at most.
+revoked at the vendor. The pass waits for no vendor: each removed grant is kept as a pending
+revocation and revoked in the background, and one still pending is tried again by the daily
+sweep and at the next start. So while a node is active, a refresh token outlives its consent in
+the vault by about an hour at most. The tokens of a provider whose record cannot be read are
+left for the next pass, and the pass goes on to the others; the log line of the pass counts
+them.
 A binding's own shorter limit removes no agent-keyed token here either. A token whose provider
 was deleted ends at the end stored with it, and a service token is never touched. A grant the
 surface no longer serves is left to [the daily sweep](#the-daily-sweep), and no grant is removed
@@ -2445,6 +2461,10 @@ whose own limit is shorter than the consent's remaining life does not end the co
 others: it refuses with the consent answer and `reason` `consent_too_old`, and the token
 stays. The new consent the person gives through it replaces the token and ends at that
 binding's limit. A grant by binding has one binding, so a consent too old for it has ended.
+
+A consent given on the `2026-07-28` MCP path does not say which binding asked for it. When a
+surface binds its provider more than once, the shortest of those bindings' limits is what the
+person is told and what ends the consent.
 
 ### Limiting one consent
 
@@ -2512,7 +2532,8 @@ holds `consent_expires_at:<time>`, and for a grant by binding
 no end. A consent given on the `2026-07-28` MCP path writes no `consent_granted` record.
 
 An ended consent is recorded as `consent_expired`, never as `token_revoked` or
-`user_tokens_revoked`: the agent, the caller's identity hash (or `owner`), the provider, the
+`user_tokens_revoked`, wherever `consent_granted` is selected, so a selection made before the
+event existed still receives it: the agent, the caller's identity hash (or `owner`), the provider, the
 surface, the scopes, the token or grant id, and in `detail`
 `consent_granted_at:<time>,consent_expired_at:<time>,source:<source>`, where `source` is
 `release` for a request that needed the credential and `sweep` for the hourly removal, which
@@ -3324,7 +3345,7 @@ leave out all four.
 | Route | Purpose |
 | --- | --- |
 | `GET /api/v1/delegation-vault` | List vault entries, as metadata only, without tokens; a tenant's access token lists only its own tenant's |
-| `GET`, `DELETE /api/v1/delegation-vault/{id}` | Read or revoke one entry; a tenant's access token reads only its own tenant's, and only an appliance-wide caller revokes. A revoke is audited as `token_revoked` with who revoked it and whose access it ended: the entry's agent, user identity hash, provider and scopes |
+| `GET`, `DELETE /api/v1/delegation-vault/{id}` | Read or revoke one entry; a tenant's access token reads only its own tenant's, and only an appliance-wide caller revokes. A revoke is audited as `token_revoked` with who revoked it and whose access it ended: the entry's agent, user identity hash, provider (its id, and its name while the provider can be read) and scopes |
 | `PUT /api/v1/delegation-vault/{id}/consent-limit` | Bring the end of one stored consent forward ([Limiting one consent](#limiting-one-consent)); only an appliance-wide caller limits. It is audited as `consent_limited` with who limited it, whose consent it is and its new end |
 | `DELETE /api/v1/delegation-vault/by-user/{user_hash}` | Revoke every delegation one user has granted; only an appliance-wide caller revokes. It is audited as `user_tokens_revoked` with who revoked them, the user identity hash and how many were revoked |
 | `POST /api/v1/delegation-vault/connects`, `POST /api/v1/delegation-vault/connects/{connect_id}/complete` | Start and complete an external consent connect ([The connect API](#the-connect-api)) |
@@ -3368,9 +3389,9 @@ In the dashboard these live on the Credentials page, under the **Credential Prov
 Tokens lists every agent-keyed token, service tokens included, with when each consent was given
 and when it ends, and revokes one entry or every entry of a user. Delegated Access lists only
 the access a person gave that an agent can still use, by system, with when it ends. The
-delegation records are read in the Audit Log, with the rest of the audit: the **Credential
-Delegation Audit** tab opens it on the delegation categories, and the **History** button of
-Delegated Access on the records of access that ended or was revoked.
+delegation records are read in the Audit Log, with the rest of the audit: a token's expanded
+row on Credential Tokens opens it on that user's delegation records, and the **History** button
+of Delegated Access on the records of access that ended or was revoked.
 
 ## Related
 

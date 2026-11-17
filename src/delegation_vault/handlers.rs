@@ -285,13 +285,34 @@ pub async fn revoke_token(
     };
 
     // Read for the audit record alone, which names whose access the revoke ended. A token
-    // that cannot be read is revoked all the same.
-    let revoked = state
+    // that cannot be read is revoked all the same, and its record then names nobody.
+    let revoked = match state
         .vault_store
         .get(&id)
         .await
-        .ok()
-        .flatten();
+    {
+        Ok(revoked) => revoked,
+        Err(error) => {
+            warn!(
+                target: "credential_delegation",
+                id = %loggable::untrusted(&id),
+                action = "revoke",
+                error = %loggable::untrusted(&error.to_string()),
+                "Delegation token could not be read before its revoke; the audit record names no agent, user or provider"
+            );
+            None
+        }
+    };
+    let provider_name = match &revoked {
+        Some(token) => state
+            .provider_store
+            .get(&token.credential_provider_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|provider| provider.name),
+        None => None,
+    };
     match state
         .vault_store
         .delete(&id)
@@ -324,6 +345,7 @@ pub async fn revoke_token(
                     None,
                 );
                 evt.token_id = Some(id.to_string());
+                evt.provider_name = provider_name;
                 evt.scopes = revoked
                     .as_ref()
                     .map(|token| token.scopes.clone());
@@ -1443,8 +1465,13 @@ pub async fn oauth_callback(
         .map(|domain| format!("did:web:{}", domain))
         .unwrap_or_else(|| "did:web:gateway.local".to_string());
 
+    // The lifetime the person was told, or the provider's limit as it is now when that was
+    // shortened while the consent was under way: the end named here is the end enforced.
     let now = Utc::now();
-    let consent_expires_at = super::consent_age::end_of(now, oauth_state.max_consent_age_secs);
+    let consent_expires_at = super::consent_age::earlier(
+        super::consent_age::end_of(now, oauth_state.max_consent_age_secs),
+        super::consent_age::ConsentLimits::of_provider(Some(&provider)).expires_at(now),
+    );
     let delegation_vc = oauth::build_delegation_vc(
         &gateway_did,
         &oauth_state.agent_did,

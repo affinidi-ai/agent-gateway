@@ -1086,7 +1086,7 @@ async fn outbound_proxy_handler_in_request_scope(
     // before anything is resolved or forwarded for it.
     step_check_fabric_hops(&ctx)?;
 
-    let subscription_lifetime = match ctx
+    let mut subscription_lifetime = match ctx
         .mcp_classification
         .as_ref()
     {
@@ -1192,6 +1192,9 @@ async fn outbound_proxy_handler_in_request_scope(
     // Inject delegated OAuth tokens from the credential vault, or signal consent_required.
     if let Some(response) = step_prepare_modern_credentials(&state, &mut ctx).await? {
         return Ok(response);
+    }
+    if let (Some(lifetime), Some(prepared)) = (subscription_lifetime.as_mut(), ctx.modern_delegation.as_ref()) {
+        prepared.restrict_to_consents(lifetime);
     }
     step_inject_credentials(&state, &mut ctx).await?;
 
@@ -18974,7 +18977,7 @@ mod tests {
                 Some(&GrantRefusal::ConnectRequired {
                     subject,
                     hint,
-                    cause: Some("consent_expired"),
+                    cause: Some(crate::delegation_vault::consent_age::AskedAgain::ConsentExpired),
                 }),
                 "{name}"
             );
@@ -19009,7 +19012,7 @@ mod tests {
                 "{name}"
             );
             assert_eq!(expired[0].token_id.as_deref(), Some(key.record_id().as_str()), "{name}");
-            let stamp = |time: chrono::DateTime<chrono::Utc>| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let stamp = crate::delegation_vault::consent_age::stamp;
             assert_eq!(
                 expired[0].detail,
                 Some(format!(
@@ -19086,8 +19089,7 @@ mod tests {
                 .collect();
 
             if ends {
-                let stamp =
-                    |time: chrono::DateTime<chrono::Utc>| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                let stamp = crate::delegation_vault::consent_age::stamp;
                 assert_eq!(
                     expiries,
                     vec![Some(format!(
@@ -19101,7 +19103,7 @@ mod tests {
                     matches!(
                         grant_refusal(&sent.unwrap_err()),
                         Some(GrantRefusal::ConnectRequired {
-                            cause: Some("consent_expired"),
+                            cause: Some(crate::delegation_vault::consent_age::AskedAgain::ConsentExpired),
                             ..
                         })
                     ),

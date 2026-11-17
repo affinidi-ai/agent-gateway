@@ -4,6 +4,7 @@ import '@testing-library/jest-dom';
 import { MemoryRouter } from 'react-router-dom';
 import CredentialProvidersTab, { providerDeleteError } from '../CredentialProvidersTab';
 import { apiClient } from '../../../api';
+import { showToast } from '../../../utils/toaster';
 
 jest.mock('../../../api', () => ({
   apiClient: { get: jest.fn(), put: jest.fn(), post: jest.fn(), fetch: jest.fn() },
@@ -157,24 +158,88 @@ describe('CredentialProvidersTab deactivation', () => {
 
   const renderTab = async (
     providers: Record<string, unknown>[],
-    answer?: Record<string, unknown>
+    answer?: Record<string, unknown>,
+    {
+      may = () => true,
+      onProvidersChange = undefined,
+      refused = false,
+    }: {
+      may?: (permission: string) => boolean;
+      onProvidersChange?: () => void;
+      refused?: boolean;
+    } = {}
   ) => {
-    mockHasPermission.mockReturnValue(true);
-    mockFetch.mockImplementation((_url: string, options?: { method?: string }) =>
-      Promise.resolve({
-        ok: true,
+    mockHasPermission.mockImplementation(may);
+    mockFetch.mockImplementation((_url: string, options?: { method?: string }) => {
+      const changes = options?.method === 'POST';
+      return Promise.resolve({
+        ok: !(changes && refused),
+        status: changes && refused ? 409 : 200,
         statusText: 'OK',
-        text: () => Promise.resolve(''),
-        json: () => Promise.resolve(options?.method === 'POST' ? answer : providers),
-      })
-    );
+        text: () => Promise.resolve(changes && refused ? '{"error":"Refused"}' : ''),
+        json: () => Promise.resolve(changes ? answer : providers),
+      });
+    });
     render(
       <MemoryRouter>
-        <CredentialProvidersTab />
+        <CredentialProvidersTab onProvidersChange={onProvidersChange} />
       </MemoryRouter>
     );
     await screen.findByRole('row', { name: new RegExp(`^${providers[0].name}`) });
   };
+
+  it('offers no Deactivate or Activate to a user who may edit settings but not credential providers', async () => {
+    await renderTab(
+      [consented('github'), consented('salesforce', '2026-11-13T10:00:00Z')],
+      undefined,
+      { may: permission => permission === 'settings.edit' }
+    );
+
+    expect(screen.queryByTestId('credential-provider-deactivate-button-github')).toBeNull();
+    expect(screen.queryByTestId('credential-provider-activate-button-salesforce')).toBeNull();
+    expect(mockHasPermission).toHaveBeenCalledWith('credential_providers.edit');
+  });
+
+  it('offers Deactivate and Activate to a user who may edit credential providers', async () => {
+    await renderTab(
+      [consented('github'), consented('salesforce', '2026-11-13T10:00:00Z')],
+      undefined,
+      { may: permission => permission === 'credential_providers.edit' }
+    );
+
+    expect(screen.getByTestId('credential-provider-deactivate-button-github')).toBeInTheDocument();
+    expect(
+      screen.getByTestId('credential-provider-activate-button-salesforce')
+    ).toBeInTheDocument();
+  });
+
+  it('tells the page once a provider is activated, and not when the gateway refuses', async () => {
+    const onProvidersChange = jest.fn();
+    await renderTab([consented('github', '2026-11-13T10:00:00Z')], consented('github'), {
+      onProvidersChange,
+      refused: true,
+    });
+    fireEvent.click(screen.getByTestId('credential-provider-activate-button-github'));
+    await waitFor(() => expect(posts()).toHaveLength(1));
+    await waitFor(() =>
+      expect(showToast).toHaveBeenCalledWith('error', 'Failed to activate provider: Refused (409)')
+    );
+    expect(onProvidersChange).not.toHaveBeenCalled();
+  });
+
+  it('tells the page once a provider is deactivated', async () => {
+    const onProvidersChange = jest.fn();
+    await renderTab(
+      [consented('github')],
+      { ...consented('github'), deactivated_at: '2026-11-13T10:00:00Z' },
+      { onProvidersChange }
+    );
+    const button = screen.getByTestId('credential-provider-deactivate-button-github');
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    await waitFor(() => expect(onProvidersChange).toHaveBeenCalledTimes(1));
+  });
 
   it('deactivates a provider a person consents to only on a second click, and never deletes it', async () => {
     await renderTab([consented('github')], {

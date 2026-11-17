@@ -57,8 +57,8 @@ requests_ is refused with `400`.
 request listing more events than the catalog holds is refused with `400`. An audit event the
 gateway now only writes to its log, such as `audit.token_injected` (see
 [Delegation events: audited or logged](OBSERVABILITY.md#governance-audit-forwarding)), is the exception:
-a set stored before may still name it, so a save drops it instead of refusing it, and a set left
-with no other event is refused as empty.
+a set stored before may still name it, so a save drops it instead of refusing it, with a `WARN`
+line that names it, and a set left with no other event is refused as empty.
 
 **Integrations** need an existing endpoint and event set. Their template must be a JSON object
 whose variables some event of the event set fills, and the audit delivery limits are accepted
@@ -854,7 +854,8 @@ would:
 
 - each endpoint's configuration, with its `$SECRET:` references resolved;
 - each event set's events, against the catalog (an audit event the gateway now only logs
-  passes, since a save drops it, unless the set holds nothing else);
+  passes, since a save drops it, unless the set holds nothing else; a `WARN` line names the
+  ones a set still holds, which are no longer delivered);
 - each integration's endpoint and event set, which must exist, and its template, which must
   fit the event set.
 

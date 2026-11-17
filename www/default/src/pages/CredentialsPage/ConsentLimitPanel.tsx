@@ -1,9 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { AppButton } from '../../components/shared/AppButton';
 import { getErrorMessage } from '../../utils/apiError';
-import { formatDateTime } from '../../utils/stringUtils';
 import {
-  CONSENT_LIMIT_RANGE,
   ConsentLimitUnit,
   consentLimitSecondsOf,
   consentLimitUnitsFor,
@@ -11,10 +9,9 @@ import {
 } from '../../utils/consentLimit';
 import {
   DelegationToken,
-  LimitOutcome,
   consentLimitSecs,
   limitOutcome,
-  timeLeft,
+  limitOutcomeText,
 } from './delegatedAccess';
 
 interface ConsentLimitPanelProps {
@@ -24,20 +21,6 @@ interface ConsentLimitPanelProps {
   onSave: (limitSecs: number) => Promise<void>;
   /** Asks for the panel to be closed: on Cancel, and after a save while it is still shown. */
   onClose: () => void;
-}
-
-/** What the panel says a limit would do, before anything is sent. */
-function describeOutcome(outcome: LimitOutcome, token: DelegationToken, now: Date): string {
-  switch (outcome.kind) {
-    case 'invalid':
-      return `Enter a whole number from ${CONSENT_LIMIT_RANGE}.`;
-    case 'already_older':
-      return 'This consent is already older than that. Use Revoke to end it now.';
-    case 'not_sooner':
-      return `It already ends ${formatDateTime(outcome.end, true)}. A limit only brings the end forward.`;
-    case 'ends':
-      return `Consent given ${formatDateTime(token.consent_granted_at, true)}. With this limit it ends ${formatDateTime(outcome.end, true)} (${timeLeft(outcome.end, now)}).`;
-  }
 }
 
 /**
@@ -125,8 +108,7 @@ const ConsentLimitPanel: React.FC<ConsentLimitPanelProps> = ({
           onChange={e => change({ amount: e.target.value })}
         />
         <select
-          className="form-select form-select-sm"
-          style={{ width: 'auto' }}
+          className="form-select form-select-sm w-auto"
           aria-label="Unit of the limit"
           value={fields.unit}
           data-testid={`credential-token-limit-unit-${id}`}
@@ -146,7 +128,7 @@ const ConsentLimitPanel: React.FC<ConsentLimitPanelProps> = ({
         id={previewId}
         data-testid={previewId}
       >
-        {describeOutcome(outcome, token, now)}
+        {limitOutcomeText(outcome, token.consent_granted_at, now)}
       </div>
       {refusal && (
         <div className="small text-danger mt-1" role="alert" id={errorId} data-testid={errorId}>

@@ -235,10 +235,19 @@ fn migrate_stored_settings(value: &mut serde_json::Value) {
 }
 
 /// Removes the events the gateway only logs
-/// ([`crate::audit::catalog::LOGGED_EVENTS`]): a selection made while they were
-/// audit events still names them, and they select nothing.
+/// ([`crate::audit::catalog::LOGGED_EVENTS`]), and warns which they were: a
+/// selection made while they were audit events still names them, and they
+/// select nothing.
 fn drop_logged_only(events: &mut Vec<String>) {
-    events.retain(|event| !is_logged_only(event));
+    let (kept, dropped): (Vec<String>, Vec<String>) = std::mem::take(events)
+        .into_iter()
+        .partition(|event| !is_logged_only(event));
+    *events = kept;
+    let dropped: Vec<&str> = dropped
+        .iter()
+        .map(String::as_str)
+        .collect();
+    crate::audit::catalog::warn_logged_only("The VP Audit Log selection (audit_events)", &dropped);
 }
 
 fn parse_stored_settings(content: &str) -> serde_json::Result<DashboardSettings> {
@@ -1230,5 +1239,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loaded.refresh_interval_seconds, Some(15));
+    }
+
+    /// A selection that names events the gateway now only logs is loaded and
+    /// saved without them, and each time one warning says which were dropped
+    /// and where they are written now.
+    #[test]
+    fn dropping_audit_events_the_gateway_now_only_logs_warns_which_they_were() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let (_dir, store) = store_with_file(&serde_json::json!({
+            "audit_events": ["refresh_failed", "consent_granted", "token_not_found"]
+        }));
+
+        store.load_sync().unwrap();
+
+        let loaded = logs.text();
+        assert_eq!(loaded.matches("WARN").count(), 1, "{loaded}");
+        for named in ["refresh_failed", "token_not_found", "credential_delegation"] {
+            assert!(loaded.contains(named), "{named}: {loaded}");
+        }
+        assert!(!loaded.contains("consent_granted"), "{loaded}");
+
+        store
+            .update(DashboardSettings {
+                audit_events: vec!["consent_granted".to_string(), "consent_required".to_string()],
+                ..DashboardSettings::default()
+            })
+            .unwrap();
+        let saved = logs.text();
+        assert_eq!(saved.matches("WARN").count(), 2, "{saved}");
+        assert!(saved.contains("consent_required"), "{saved}");
+
+        store
+            .update(DashboardSettings {
+                audit_events: vec!["consent_granted".to_string()],
+                ..DashboardSettings::default()
+            })
+            .unwrap();
+        assert_eq!(
+            logs.text()
+                .matches("WARN")
+                .count(),
+            2,
+            "a selection that names none warns of nothing"
+        );
     }
 }

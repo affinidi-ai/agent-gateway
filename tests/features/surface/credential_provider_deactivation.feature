@@ -31,3 +31,17 @@ Feature: Credential provider deactivation
     When caller "alice" invokes MCP tool "schedule_meeting" with a valid token
     Then the response status is 401
     And the response is a consent required error for OAuth provider "calendar"
+
+  Scenario: A consent link minted before a deactivation is refused
+    Given caller "alice" has started OAuth consent for provider "calendar"
+    And an operator has deactivated OAuth provider "calendar"
+    When the caller opens the consent start page for provider "calendar"
+    Then the consent start response status is 400
+    And the consent start response shows an authorization failure page
+    And the delegation vault holds no delegated credential
+
+  Scenario: A provider nobody consents to cannot be deactivated
+    Given the surface requires delegated credentials from a client credentials provider
+    When the operator deactivates the credential provider the surface binds
+    Then the admin API response status is 400
+    And the admin API error response mentions "provider_takes_no_consent"

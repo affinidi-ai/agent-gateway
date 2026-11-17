@@ -1259,8 +1259,9 @@ pub fn emit(
 /// caller's identity hash, how the caller authenticated and, for a request a
 /// paired gateway sent, that gateway. It carries no credential: the Target URL
 /// is written as [`loggable::url`] renders it. What a caller, a paired gateway
-/// or a vendor chooses (the tool, the sending gateway, the requesting agent's
-/// DID, the scopes, the detail) is each one [`loggable::untrusted`] token.
+/// or a vendor chooses (the agent's DID, the tool, the sending gateway, the
+/// requesting agent's DID, the scopes, the detail) is each one
+/// [`loggable::untrusted`] token.
 pub fn log_event(event: &DelegationAuditEvent) {
     fn or_dash(value: &Option<String>) -> &str {
         value
@@ -1276,7 +1277,7 @@ pub fn log_event(event: &DelegationAuditEvent) {
     info!(
         target: "credential_delegation",
         event = %action_category(&event.event),
-        agent_did = %or_dash(&event.agent_did),
+        agent_did = %rendered(event.agent_did.as_deref(), loggable::untrusted),
         user_hash = %or_dash(&event.user_identity_hash),
         provider_id = %or_dash(&event.provider_id),
         surface_id = %or_dash(&event.surface_id),
@@ -4758,7 +4759,7 @@ mod tests {
 
         for field in [
             "event=token_injected",
-            "agent_did=did:web:agent.example",
+            r#"agent_did="did:web:agent.example""#,
             "user_hash=sha256:caller",
             "provider_id=github",
             "target_endpoint=fabric://partner-gateway/partner-surface",
@@ -4775,5 +4776,16 @@ mod tests {
 
         event.target_endpoint = None;
         assert!(has_field(&logged(&event), "target_endpoint=-"));
+    }
+
+    #[test]
+    fn a_logged_delegation_event_writes_the_agent_did_as_one_token() {
+        let mut event = injected();
+        event.agent_did = Some("did:web:agent.example\nDelegation event event=token_revoked".to_string());
+
+        let line = logged(&event);
+
+        assert!(line.contains(r#"agent_did="did:web:agent.example"#), "{line}");
+        assert!(!has_field(&line, "event=token_revoked"), "{line}");
     }
 }

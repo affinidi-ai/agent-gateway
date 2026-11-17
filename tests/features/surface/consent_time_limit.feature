@@ -141,3 +141,79 @@ Feature: Consent time limit
     When caller "alice" invokes MCP tool "schedule_meeting" with a valid token
     Then the response status is 200
     And MCP server "bravo" received delegated credential for OAuth provider "calendar"
+
+  Scenario: A binding with a shorter limit asks for consent again and keeps the stored credential
+    Given OAuth provider "calendar" limits a consent to 21600 seconds
+    And caller "alice" has started OAuth consent for provider "calendar"
+    And caller "alice" has completed OAuth consent for provider "calendar"
+    And the operator has limited a consent used through the surface's binding to 3600 seconds
+    And the caller's consent was given 7200 seconds ago
+    When caller "alice" invokes MCP tool "schedule_meeting" with a valid token
+    Then the response status is 401
+    And the consent required error for OAuth provider "calendar" gives the reason "consent_too_old"
+    And the delegation vault holds 1 delegated credential
+    And MCP server "bravo" was not called
+
+  Scenario: The gateway's default limit ends a consent to a provider that sets none
+    Given the gateway limits a consent to 3600 seconds by default
+    And caller "alice" has started OAuth consent for provider "calendar"
+    And caller "alice" has completed OAuth consent for provider "calendar"
+    And the caller's consent was given 7200 seconds ago
+    When caller "alice" invokes MCP tool "schedule_meeting" with a valid token
+    Then the response status is 401
+    And the consent required error for OAuth provider "calendar" gives the reason "consent_expired"
+    And the delegation vault holds no delegated credential
+
+  Scenario: No limit of a provider reaches past the gateway's ceiling
+    Given the gateway lets no consent last longer than 3600 seconds
+    And OAuth provider "calendar" limits a consent to 21600 seconds
+    And caller "alice" has no delegated credentials for OAuth provider "calendar"
+    When caller "alice" invokes MCP tool "schedule_meeting" with a valid token
+    Then the response status is 401
+    And the consent required error says a new consent to OAuth provider "calendar" may be used for 3600 seconds
+
+  Scenario: A limit shortened after a consent was given ends that consent sooner
+    Given OAuth provider "calendar" limits a consent to 21600 seconds
+    And caller "alice" has started OAuth consent for provider "calendar"
+    And caller "alice" has completed OAuth consent for provider "calendar"
+    And the caller's consent was given 7200 seconds ago
+    And the operator has changed the consent time limit of OAuth provider "calendar" to 3600 seconds
+    When caller "alice" invokes MCP tool "schedule_meeting" with a valid token
+    Then the response status is 401
+    And the consent required error for OAuth provider "calendar" gives the reason "consent_expired"
+    And the delegation vault holds no delegated credential
+
+  Scenario: The delegation vault shows the sooner end of a consent whose limit was shortened
+    Given OAuth provider "calendar" limits a consent to 21600 seconds
+    And caller "alice" has started OAuth consent for provider "calendar"
+    And caller "alice" has completed OAuth consent for provider "calendar"
+    When the operator changes the consent time limit of OAuth provider "calendar" to 3600 seconds
+    Then the delegated credential in the delegation vault ends its consent 3600 seconds after it was given
+
+  Scenario: A lengthened limit never extends a consent already given
+    Given OAuth provider "calendar" limits a consent to 3600 seconds
+    And caller "alice" has started OAuth consent for provider "calendar"
+    And caller "alice" has completed OAuth consent for provider "calendar"
+    And the operator has changed the consent time limit of OAuth provider "calendar" to 21600 seconds
+    And the caller's consent was given 7200 seconds ago
+    When caller "alice" invokes MCP tool "schedule_meeting" with a valid token
+    Then the response status is 401
+    And the consent required error for OAuth provider "calendar" gives the reason "consent_expired"
+    And the delegation vault holds no delegated credential
+
+  Scenario: A gateway that records only granted consents also records the end of a consent
+    Given OAuth provider "calendar" limits a consent to 3600 seconds
+    And caller "alice" has started OAuth consent for provider "calendar"
+    And caller "alice" has completed OAuth consent for provider "calendar"
+    And the caller's consent was given 7200 seconds ago
+    And the VP Audit Log keeps only audit event "consent_granted"
+    When caller "alice" invokes MCP tool "schedule_meeting" with a valid token
+    Then the response status is 401
+    And the delegation audit trail contains event "consent_expired" for OAuth provider "calendar"
+
+  Scenario: A token nobody consented to takes no consent limit
+    Given the surface requires delegated credentials from a client credentials provider
+    And caller "alice" has invoked MCP tool "schedule_meeting" with a valid token
+    When the operator limits the caller's consent to 7200 seconds
+    Then the admin API response status is 400
+    And the admin API error response mentions "not_a_consent"

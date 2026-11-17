@@ -119,6 +119,7 @@ const CredentialsPage: React.FC = () => {
           <CredentialProvidersTab
             externalSearchTerm={searchTerm}
             onFilteredCountChange={setProvidersCount}
+            onProvidersChange={vault.refresh}
           />
         </Tab>
 

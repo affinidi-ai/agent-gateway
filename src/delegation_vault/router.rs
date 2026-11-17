@@ -1806,7 +1806,7 @@ mod tests {
             .expect("a consent under a limit has an end");
         assert_eq!(
             grant_details(&events),
-            [Some(format!("consent_expires_at:{}", end.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)))]
+            [Some(format!("consent_expires_at:{}", crate::delegation_vault::consent_age::stamp(end)))]
         );
 
         let (callback_state, cookie) = fixture.begin().await;
@@ -5036,6 +5036,67 @@ mod tests {
         assert_eq!(
             (status, body.as_str()),
             (StatusCode::INTERNAL_SERVER_ERROR.as_u16(), r#"{"error":"Failed to read the audit log"}"#)
+        );
+    }
+
+    /// The record of a single revoke names the provider of the access it
+    /// ended as the Credentials page does: by its name.
+    #[tokio::test]
+    async fn a_revoke_names_the_provider_of_the_access_it_ended() {
+        let (app, _vault, _dir) = admin_over(vec![consented_an_hour_ago("t1")]).await;
+
+        let (status, events) = capture(async { status_of(app, "DELETE", "/api/v1/delegation-vault/t1").await }).await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT.as_u16());
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(
+            events[0]
+                .provider_id
+                .as_deref(),
+            Some("cp-consent")
+        );
+        assert_eq!(
+            events[0]
+                .provider_name
+                .as_deref(),
+            Some("GitHub")
+        );
+    }
+
+    /// A provider's limit shortened while a consent is under way ends that
+    /// consent at the shorter limit: the stored end and the page after the
+    /// callback name the end the gateway enforces.
+    #[tokio::test]
+    async fn a_limit_shortened_while_a_consent_is_under_way_ends_it_at_the_shorter_limit() {
+        let fixture = consent::Fixture::new().await;
+        let (callback_state, cookie) = fixture
+            .begin_at(&fixture.start_url_under(Some(21_600)))
+            .await;
+        let mut shortened = fixture.provider();
+        shortened.max_consent_age_secs = Some(3_600);
+        fixture
+            .providers
+            .update(shortened)
+            .await
+            .unwrap();
+
+        let done = fixture
+            .callback("github", &format!("code=vendor-code&state={callback_state}"), Some(&cookie))
+            .await;
+
+        assert_eq!(done.status, StatusCode::OK, "{}", done.body);
+        let stored = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap();
+        let end = stored[0].consent_granted_at + chrono::Duration::seconds(3_600);
+        assert_eq!(stored[0].consent_expires_at, Some(end));
+        assert!(
+            done.body
+                .contains(&format!("on your behalf until {}.", end.format("%-d %B %Y, %H:%M UTC"))),
+            "{}",
+            done.body
         );
     }
 }

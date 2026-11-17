@@ -458,7 +458,9 @@ selection. An integration receives the audit events its event set holds, as `aud
 next to any other events. Both take event names from the audit event catalog
 (`src/audit/catalog.rs`), for example `policy_decision`, `auth_failed`, `consent_granted`; an
 unknown name is rejected (400), except the name of an event the gateway now only logs (below),
-which is dropped. `GET /v1/settings/audit-events` lists the catalog in order, each
+which is dropped: when a stored selection is loaded and when one is saved, a `WARN` line names
+the events dropped and the `credential_delegation` log target that carries them now.
+`GET /v1/settings/audit-events` lists the catalog in order, each
 entry with its `event` name, `label`, `description`, `group` and `group_label`, and
 `GET /v1/integrations/catalog` lists the same events as `audit.<event>` with their group.
 
@@ -474,7 +476,7 @@ the VP Audit Log nor an integration is offered it: `token_injected`, `token_refr
 the `credential_delegation` target:
 
 ```text
-Delegation event event=token_injected agent_did=<agent> user_hash=<identity hash> provider_id=<provider record id> surface_id=<surface> surface_variant=<variant> token_id=<token or grant id> scopes="<comma-separated>" mcp_tool_name="<tool>" via_fabric=<true|false> target_endpoint=<target> protocol=<protocol> request_id=<request> caller_method=<method> peer_gateway="<gateway>" agent_identity_did="<agent DID>" detail="<detail>"
+Delegation event event=token_injected agent_did="<agent>" user_hash=<identity hash> provider_id=<provider record id> surface_id=<surface> surface_variant=<variant> token_id=<token or grant id> scopes="<comma-separated>" mcp_tool_name="<tool>" via_fabric=<true|false> target_endpoint=<target> protocol=<protocol> request_id=<request> caller_method=<method> peer_gateway="<gateway>" agent_identity_did="<agent DID>" detail="<detail>"
 ```
 
 A field the event does not have is `-`. The line says who caused the event without naming a
@@ -485,8 +487,8 @@ its Remote gateway record id). `agent_identity_did` is the agent's own DID where
 resolved one. The line carries no credential: `target_endpoint` is the Target URL without its
 user name, password and fragment and with every query value logged as `<redacted>`, as in the
 gateway's other log lines. What a caller, a paired gateway or a vendor chooses is each one
-quoted token (`scopes`, `mcp_tool_name`, `peer_gateway`, `agent_identity_did`, and `detail`,
-which can quote what a vendor answered): quotes, backslashes, line breaks and other control
+quoted token (`agent_did`, `scopes`, `mcp_tool_name`, `peer_gateway`, `agent_identity_did`, and
+`detail`, which can quote what a vendor answered): quotes, backslashes, line breaks and other control
 characters are escaped and anything after the first 256 characters is cut, so none of them can
 start a log line or a field of its own.
 
@@ -939,7 +941,10 @@ operator limits one (group Delegation); see
   UTC and `source` what found the consent ended: `release` is a request that needed the
   credential, and `sweep` the hourly removal of ended consents, whose record names no surface
   for an agent-keyed token. One removal writes one record, whichever finds the consent ended
-  first.
+  first. It is recorded wherever `consent_granted` is selected, whether or not it is selected
+  itself (`RECEIVED_WITH` in `src/audit/catalog.rs`): a selection made before this event
+  existed names only `consent_granted`, and a gateway that records the consents given must not
+  miss their end. This holds for `audit_events` and for an integration's event set alike.
 
 - `consent_limited`: an operator made one stored consent end sooner through
   `PUT /api/v1/delegation-vault/{id}/consent-limit`. The credential stays until that end, so it

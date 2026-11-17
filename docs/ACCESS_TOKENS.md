@@ -245,8 +245,11 @@ This section covers the two routes that read the VP Audit Log as a delegation au
 credential provider it names, matched exactly as for [vault tokens](#delegation-vault-tokens), and a
 tenant PAT sees only its own tenant's records. Their `total`, `total_pages` and `category_counts`
 count only those records, and the `filter` text search looks only among them. A record that names no
-provider, such as a policy decision or a revoke through the management API, and a record of an
-appliance-wide, missing or deleted provider, are shown only to appliance-wide callers. The OAuth
+provider, such as a policy decision or the revoke of every token of a user (`user_tokens_revoked`),
+and a record of an appliance-wide, missing or deleted provider, are shown only to appliance-wide
+callers. A single revoke through the management API (`token_revoked`) and a limit on one consent
+(`consent_limited`) name the provider of the token, so that provider's tenant reads them, with who
+made the change in `caller`: the operator's user id and, for an access token, its id. The OAuth
 callback's `consent_granted` names its provider's id, so the provider's tenant reads it; one written
 by an earlier release names the provider's `provider_id` slug instead and is shown only to
 appliance-wide callers, as is the `delegation_failed` of a refused consent, which names the provider

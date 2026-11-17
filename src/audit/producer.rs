@@ -392,7 +392,7 @@ mod tests {
         assert_eq!(lines.len(), 2, "{text}");
         for field in [
             "event=token_injected",
-            "agent_did=did:web:agent.example",
+            r#"agent_did="did:web:agent.example""#,
             "user_hash=sha256:user",
             "provider_id=provider-1",
             "surface_id=surface-1",

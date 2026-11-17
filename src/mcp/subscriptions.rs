@@ -468,6 +468,15 @@ impl SubscriptionLifetime {
             .min(tokio::time::Instant::now() + remaining);
     }
 
+    /// Ends the subscription no later than `end`, the end of a consent whose
+    /// credential it carries.
+    pub fn restrict_to_end(
+        &mut self,
+        end: chrono::DateTime<chrono::Utc>,
+    ) {
+        self.restrict_to_expiry(u64::try_from(end.timestamp()).unwrap_or_default());
+    }
+
     pub fn restrict_lifetime(
         &mut self,
         lifetime: std::time::Duration,
@@ -1898,6 +1907,17 @@ mod tests {
         assert_eq!(transit.deadline, initial);
         transit.restrict_to_expiry(1);
         assert!(transit.deadline <= tokio::time::Instant::now());
+        let mut consented = SubscriptionLifetime::new(std::time::Duration::from_secs(3_600), None);
+        let initial = consented.deadline;
+        consented.restrict_to_end(chrono::Utc::now() + chrono::Duration::days(1));
+        assert_eq!(consented.deadline, initial, "a consent that outlasts the stream leaves its lifetime");
+        consented.restrict_to_end(chrono::Utc::now() + chrono::Duration::seconds(60));
+        let left = consented
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        assert!(left <= std::time::Duration::from_secs(60) && left > std::time::Duration::from_secs(50), "{left:?}");
+        consented.restrict_to_end(chrono::Utc::now() - chrono::Duration::seconds(1));
+        assert!(consented.deadline <= tokio::time::Instant::now(), "a consent that ended ends the stream");
     }
 
     async fn next_event(body: &mut axum::body::Body) -> Value {

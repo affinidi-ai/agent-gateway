@@ -2949,7 +2949,7 @@ async fn proxy_charged_request(
         Some(crate::mcp::request_validation::McpRequestClassification::Modern(request)) => Some((**request).clone()),
         _ => None,
     };
-    let subscription_lifetime = if let Some(request) = modern_request
+    let mut subscription_lifetime = if let Some(request) = modern_request
         .as_ref()
         .filter(|request| request.method == "subscriptions/listen")
     {
@@ -6474,6 +6474,9 @@ async fn proxy_charged_request(
                 body_bytes = prepared
                     .rewrite_body(&body_bytes)
                     .map_err(|error| ModernDelegationError::from(error).response(request))?;
+                if let Some(lifetime) = subscription_lifetime.as_mut() {
+                    prepared.restrict_to_consents(lifetime);
+                }
                 modern_request = Some(prepared.request.clone());
                 modern_delegation = Some(prepared);
             }

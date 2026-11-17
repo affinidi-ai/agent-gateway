@@ -86,6 +86,18 @@ pub trait DelegationVaultStorage: Send + Sync {
         anyhow::bail!("This vault does not delete a token by the value it holds")
     }
 
+    /// Delete the token with this id, and its refresh claim, only while it holds the consent
+    /// given at `granted_at`, however often it was refreshed since; `false` when no token is
+    /// stored there or the person consented again since, whose token is kept. Like
+    /// [`Self::delete_token_holding`], it is no revocation.
+    async fn delete_token_of_consent(
+        &self,
+        _id: &str,
+        _granted_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        anyhow::bail!("This vault does not delete a token by its consent")
+    }
+
     /// Store `token`, and in the same step delete the expired tokens of its agent and
     /// provider whose user hash starts with `user_hash_prefix`. Unlike a revoke, it leaves
     /// pending consents alone: it removes only records that can no longer be used. A failure
@@ -1044,6 +1056,34 @@ impl FileSystemDelegationVaultStore {
         .context("Delegation vault mutation task failed")?
     }
 
+    /// Delete the token `id`, and its refresh claim, while `meant` says the token stored
+    /// there is the one to delete. Whether it was deleted.
+    async fn delete_token_while(
+        &self,
+        id: &str,
+        meant: impl FnOnce(&DelegationToken) -> bool + Send + 'static,
+    ) -> Result<bool> {
+        let id = id.to_string();
+        self.mutate(move |store| async move {
+            let Some(current) = store.storage.get(&id).await? else {
+                return Ok(false);
+            };
+            if !meant(&current) {
+                return Ok(false);
+            }
+            store
+                .refreshes
+                .delete(&id)
+                .await?;
+            store
+                .storage
+                .delete(&id)
+                .await?;
+            Ok(true)
+        })
+        .await
+    }
+
     async fn mutation_lock(&self) -> Result<File> {
         use crate::storage::file_lock::{LockOutcome, lock_exclusive};
         match lock_exclusive(&self.mutation_lock_path, std::time::Duration::from_secs(5)).await {
@@ -1376,30 +1416,28 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
         id: &str,
         fingerprint: &[u8; 32],
     ) -> Result<bool> {
-        let id = id.to_string();
         let fingerprint = *fingerprint;
-        self.mutate(move |store| async move {
-            let Some(current) = store.storage.get(&id).await? else {
-                return Ok(false);
-            };
-            if !bool::from(subtle::ConstantTimeEq::ct_eq(
-                &access_token_fingerprint(&current.access_token)[..],
-                &fingerprint[..],
-            )) {
-                return Ok(false);
-            }
-            store
-                .refreshes
-                .delete(&id)
-                .await?;
-            store
-                .storage
-                .delete(&id)
-                .await?;
+        let deleted = self
+            .delete_token_while(id, move |current| {
+                bool::from(subtle::ConstantTimeEq::ct_eq(
+                    &access_token_fingerprint(&current.access_token)[..],
+                    &fingerprint[..],
+                ))
+            })
+            .await?;
+        if deleted {
             info!(target: "credential_delegation", id = %id, "Delegation token deleted: its Target refused it");
-            Ok(true)
-        })
-        .await
+        }
+        Ok(deleted)
+    }
+
+    async fn delete_token_of_consent(
+        &self,
+        id: &str,
+        granted_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        self.delete_token_while(id, move |current| current.consent_granted_at == granted_at)
+            .await
     }
 
     async fn update(

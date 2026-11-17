@@ -5348,7 +5348,7 @@ async fn process_charged_forward_request(
             axum::http::StatusCode::BAD_REQUEST, "Fabric request streams require an admitted modern MCP request",
         )).await;
     }
-    let subscription_lifetime = if let Some(request) = modern_request.as_ref().filter(|request| request.method == "subscriptions/listen") {
+    let mut subscription_lifetime = if let Some(request) = modern_request.as_ref().filter(|request| request.method == "subscriptions/listen") {
         let caller = crate::mcp::subscriptions::listen_caller(authenticated_identity.as_ref(), message.from_did.as_deref().unwrap_or_default());
         let Some(slot) = crate::mcp::subscriptions::ListenSlots::global().acquire(&crate::proxy::handler::listen_surface_key(&surface), &caller) else {
             return axum_response_to_forward_result(crate::mcp::subscriptions::listen_limit_error(request).into_response()).await;
@@ -5716,6 +5716,9 @@ async fn process_charged_forward_request(
                     Ok(body) => body,
                     Err(error) => return axum_response_to_forward_result(ModernDelegationError::from(error).response(request)).await,
                 };
+                if let Some(lifetime) = subscription_lifetime.as_mut() {
+                    prepared.restrict_to_consents(lifetime);
+                }
                 modern_request = Some(prepared.request.clone());
                 modern_delegation = Some(prepared);
             }

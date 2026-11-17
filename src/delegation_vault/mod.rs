@@ -356,6 +356,16 @@ pub enum VaultLookupResult {
     NotFound,
 }
 
+impl VaultLookupResult {
+    /// The token found, valid or expired; `None` when there is none.
+    pub fn token(&self) -> Option<&DelegationToken> {
+        match self {
+            Self::Found(token) | Self::ExpiredRefreshable(token) | Self::ExpiredNoRefresh(token) => Some(token),
+            Self::NotFound => None,
+        }
+    }
+}
+
 /// Metadata-only view for API listing (no tokens)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegationTokenListItem {

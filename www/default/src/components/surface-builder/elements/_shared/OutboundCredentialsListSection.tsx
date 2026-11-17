@@ -10,7 +10,8 @@ import {
   splitByTenant,
 } from '../../../../utils/tenantScope';
 import { useSurfaceTenant } from '../../SurfaceMetaContext';
-import { describeConsentLimit, storedConsentLimit } from '../../../../utils/consentLimit';
+import { consentLimitFieldOf } from '../../../../utils/consentLimit';
+import BindingConsentLimitNote from './BindingConsentLimitNote';
 
 interface CredentialProviderOption {
   id: string;
@@ -131,9 +132,7 @@ export function outboundCredentialApiToForm(api: any): OutboundCredentialFormRow
     scopes: Array.isArray(api.scopes) ? api.scopes.join(', ') : '',
     consent_mode: api.consent_mode ?? 'on_demand',
     ...(api.subject === 'owner' || api.subject === 'caller' ? { subject: api.subject } : {}),
-    ...(storedConsentLimit(api.max_consent_age_secs) !== undefined
-      ? { max_consent_age_secs: api.max_consent_age_secs }
-      : {}),
+    ...consentLimitFieldOf(api),
     elicit_timeout_secs: api.elicit_timeout_secs ?? 300,
     elicit_fallback: api.elicit_fallback ?? 'on_demand',
     required_for_mode,
@@ -376,16 +375,10 @@ const OutboundCredentialsListSection: React.FC<Props> = ({ rows, onChange }) => 
                   removing this binding revokes its grants.
                 </Form.Text>
               )}
-              {row.max_consent_age_secs !== undefined && (
-                <Form.Text
-                  className="text-muted d-block"
-                  data-testid="credential-delegation-binding-consent-limit"
-                  style={{ fontSize: '10px' }}
-                >
-                  Consent time limit: {describeConsentLimit(row.max_consent_age_secs)}, set through
-                  the API. A consent older than this is asked for again.
-                </Form.Text>
-              )}
+              <BindingConsentLimitNote
+                secs={row.max_consent_age_secs}
+                testId="credential-delegation-binding-consent-limit"
+              />
               {row.consent_mode === 'elicit' && (
                 <div className="mt-2 ps-2" style={{ borderLeft: '2px solid rgba(0,0,0,0.1)' }}>
                   <Form.Label className="small text-muted mb-0">

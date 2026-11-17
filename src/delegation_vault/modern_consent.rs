@@ -194,24 +194,34 @@ async fn authorize_ticket(
     {
         return Err(ContinuationError::BindingMismatch);
     }
-    let mut bindings = surface
+    if !surface
         .agent_keyed_outbound_credentials()
-        .filter(|binding| binding.credential_provider_id == provider_id)
-        .peekable();
-    if bindings.peek().is_none() {
+        .any(|binding| binding.credential_provider_id == provider_id)
+    {
         return Err(ContinuationError::BindingMismatch);
     }
-    // The ticket does not say which binding asked, so the shortest limit of
-    // the provider's bindings on the surface ends the consent.
-    let binding_secs = bindings
-        .filter_map(|binding| binding.max_consent_age_secs)
-        .min();
-    let consent_limits = super::consent_age::ConsentLimits::of(binding_secs, provider.max_consent_age_secs);
+    let consent_limits = consent_limits(&surface, &provider);
     Ok(AuthorizedTicket {
         provider,
         strategy,
         consent_limits,
     })
+}
+
+/// The time limits on a consent to `provider` given on `surface`: what the
+/// person is told when asked and what is stored at the callback. A consent
+/// ticket does not say which binding asked, so the shortest limit of the
+/// provider's bindings on the surface ends the consent.
+pub fn consent_limits(
+    surface: &crate::config::agent_surface::AgentSurface,
+    provider: &CredentialProvider,
+) -> super::consent_age::ConsentLimits {
+    let binding_secs = surface
+        .agent_keyed_outbound_credentials()
+        .filter(|binding| binding.credential_provider_id == provider.id)
+        .filter_map(|binding| binding.max_consent_age_secs)
+        .min();
+    super::consent_age::ConsentLimits::of(binding_secs, provider.max_consent_age_secs)
 }
 
 async fn connect(

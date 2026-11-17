@@ -1,4 +1,5 @@
 import {
+  consentLimitFieldOf,
   consentLimitLabel,
   consentLimitSecondsOf,
   consentLimitUnitsFor,
@@ -73,6 +74,16 @@ describe('consent time limit', () => {
     expect(secondsIn('minutes')).toBe(60);
     expect(secondsIn('hours')).toBe(3_600);
     expect(secondsIn('days')).toBe(86_400);
+  });
+
+  it("keeps a stored binding's limit as its form field, and nothing for a value that is no limit", () => {
+    expect(consentLimitFieldOf({ max_consent_age_secs: 21_600 })).toEqual({
+      max_consent_age_secs: 21_600,
+    });
+    for (const value of [undefined, null, 0, -60, 90.5, '3600']) {
+      expect(consentLimitFieldOf({ max_consent_age_secs: value })).toEqual({});
+    }
+    expect(consentLimitFieldOf({})).toEqual({});
   });
 
   it('takes only a positive whole number of seconds for a stored limit', () => {

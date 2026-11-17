@@ -264,6 +264,29 @@ describe('eventNarrative', () => {
     }
   );
 
+  it('says when a consent granted under a time limit ends, and nothing more without one', () => {
+    const ends = `It ends ${formatDateTime('2026-11-17T12:00:00Z', true)}.`;
+
+    expect(
+      describeEntry(
+        at('consent_granted', {
+          provider_name: 'GitHub',
+          detail: 'consent_expires_at:2026-11-17T12:00:00Z',
+        })
+      )
+    ).toMatchObject({ summary: 'The user granted consent for GitHub.', detail: ends });
+    expect(
+      describeEntry(
+        at('consent_granted', {
+          detail: 'grant_by_binding:external_consent,consent_expires_at:2026-11-17T12:00:00Z',
+        })
+      ).detail
+    ).toBe(ends);
+    for (const detail of [undefined, 'grant_by_binding:external_consent']) {
+      expect(describeEntry(at('consent_granted', { detail })).detail).toBeUndefined();
+    }
+  });
+
   it('says a consent reached its time limit, apart from a revocation', () => {
     const expired = describeEntry(at('consent_expired', { provider_name: 'GitHub' }));
     expect(expired.title).toBe('Consent expired');

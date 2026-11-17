@@ -168,5 +168,12 @@ async fn gateway_log_records_two_callers_of_one_agent(
     };
     let (found, events) = eventually_delegation_events(world, |events| named(events, "user_hash").len() == 2).await;
     assert!(found, "the gateway log does not record {event:?} for two callers: {events:?}");
-    crate::steps::then::assert_one_agent_did(&named(&events, "agent_did"), &events);
+    let agents = named(&events, "agent_did")
+        .iter()
+        .map(|did| {
+            did.trim_matches('"')
+                .to_string()
+        })
+        .collect();
+    crate::steps::then::assert_one_agent_did(&agents, &events);
 }

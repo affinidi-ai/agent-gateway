@@ -286,6 +286,7 @@ describe('EditCredentialProviderPage consent time limit', () => {
     const input = screen.getByTestId(LIMIT);
     expect(input).not.toHaveClass('is-invalid');
     expect(input).not.toHaveAttribute('aria-invalid');
+    expect(input).toHaveAccessibleDescription(/^Leave empty to set no limit on this provider\./);
     fireEvent.change(input, { target: { value: '366' } });
     fireEvent.change(screen.getByTestId(UNIT), { target: { value: 'days' } });
     fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
@@ -297,7 +298,9 @@ describe('EditCredentialProviderPage consent time limit', () => {
     expect(message).toHaveClass('invalid-feedback');
     expect(input).toHaveClass('is-invalid');
     expect(input).toHaveAttribute('aria-invalid', 'true');
-    expect(input).toHaveAttribute('aria-describedby', message.id);
+    expect(input).toHaveAccessibleDescription(
+      /^Enter a limit from 1 minute to 365 days, or leave it empty\. Leave empty to set no limit/
+    );
     expect(input).toHaveFocus();
     expect(puts()).toHaveLength(0);
   });
@@ -524,6 +527,17 @@ describe('EditCredentialProviderPage consent time limit', () => {
 
       expect(impactCalls()).toHaveLength(0);
       expect(screen.queryByTestId(IMPACT)).toBeNull();
+    });
+
+    it('asks nothing once the type is one nobody consents to, which hides the limit', async () => {
+      await renderWithImpact(authorizationCode({ max_consent_age_secs: 21_600 }));
+      fireEvent.change(screen.getByTestId('credential-provider-type-select'), {
+        target: { value: 'oauth2_client_credentials' },
+      });
+      await pause();
+
+      expect(screen.queryByTestId(LIMIT)).toBeNull();
+      expect(impactCalls()).toHaveLength(0);
     });
 
     it('takes the warning away once the limit is no longer shorter', async () => {

@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { usePermissions } from '../../context/PermissionsContext';
 import { AppButton } from '../../components/shared/AppButton';
 import { TwoStepButton } from '../../components/shared/TwoStepButton';
@@ -10,7 +10,7 @@ import { DOCS_URL } from '../../config/docs';
 import AgentName from './AgentName';
 import ConsentLimitPanel from './ConsentLimitPanel';
 import CredentialTokenDetail, { TokenStatusBadge } from './CredentialTokenDetail';
-import PaginationControls, { clampPage } from './PaginationControls';
+import PaginationControls, { clampPage } from '../../components/shared/PaginationControls';
 import VaultReadError from './VaultReadError';
 import {
   DelegationToken,
@@ -52,9 +52,15 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
   const canManage = hasPermission('delegation_vault.delete');
   const columns = canManage ? 9 : 8;
 
+  /** Shows a page of the list. An open limit panel closes with the row it belongs to. */
+  const showPage = useCallback((next: number) => {
+    setPage(next);
+    setLimitingTokenId(null);
+  }, []);
+
   useEffect(() => {
-    setPage(1);
-  }, [searchTerm]);
+    showPage(1);
+  }, [searchTerm, showPage]);
 
   const now = new Date();
   const shown = tokens.filter(token => matchesSearch(token, providers, searchTerm));
@@ -158,9 +164,8 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                   return (
                     <React.Fragment key={token.id}>
                       <tr
-                        style={{ cursor: 'pointer' }}
                         data-testid={`credential-token-row-${token.id}`}
-                        className={expanded ? 'table-active' : ''}
+                        className={`cursor-pointer${expanded ? ' table-active' : ''}`}
                         onClick={toggleExpanded}
                       >
                         <td>
@@ -211,7 +216,10 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                         </td>
                         <td>
                           {token.scopes.map(scope => (
-                            <span key={scope} className="badge text-bg-secondary me-1">
+                            <span
+                              key={scope}
+                              className="badge text-wrap text-break text-bg-secondary me-1"
+                            >
                               {scope}
                             </span>
                           ))}
@@ -261,7 +269,7 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                                 confirmLabel={`Revoke ${name} access?`}
                                 title="Revoke delegation"
                                 confirmTitle="Click again to revoke this delegation"
-                                className="btn btn-outline-danger btn-sm text-nowrap flex-grow-1"
+                                className="btn app-button btn-outline-danger btn-sm text-nowrap flex-grow-1"
                                 cancelTestId={`credential-token-revoke-cancel-button-${token.id}`}
                                 data-testid={`credential-token-revoke-button-${token.id}`}
                                 onConfirm={() => revoke(token)}
@@ -302,7 +310,7 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
               page={shownPage}
               pageSize={PAGE_SIZE}
               total={shown.length}
-              onPageChange={setPage}
+              onPageChange={showPage}
             />
           </div>
         )}

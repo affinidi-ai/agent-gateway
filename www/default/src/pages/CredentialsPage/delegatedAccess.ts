@@ -1,5 +1,5 @@
 import { formatDateTime, topAndTail } from '../../utils/stringUtils';
-import { takesConsent } from '../../utils/consentLimit';
+import { CONSENT_LIMIT_RANGE, takesConsent } from '../../utils/consentLimit';
 
 /** An agent-keyed vault token as `GET /api/v1/delegation-vault` lists it; never a secret. */
 export interface DelegationToken {
@@ -120,6 +120,37 @@ export function limitOutcome(
     : { kind: 'ends', end };
 }
 
+/** What the limit panel says a limit would do, before anything is sent. */
+export function limitOutcomeText(
+  outcome: LimitOutcome,
+  consentGrantedAt: string,
+  now: Date
+): string {
+  switch (outcome.kind) {
+    case 'invalid':
+      return `Enter a whole number from ${CONSENT_LIMIT_RANGE}.`;
+    case 'already_older':
+      return 'This consent is already older than that. Use Revoke to end it now.';
+    case 'not_sooner':
+      return `It already ends ${formatDateTime(outcome.end, true)}. A limit only brings the end forward.`;
+    case 'ends':
+      return `Consent given ${formatDateTime(consentGrantedAt, true)}. With this limit it ends ${formatDateTime(outcome.end, true)} (${timeLeft(outcome.end, now)}).`;
+  }
+}
+
+/**
+ * Whether a token is a person's delegation and not a service token, which is one of a provider
+ * nobody consents to. A token whose provider is unknown counts, since its provider may only be
+ * unreadable.
+ */
+export function isPersonsDelegation(
+  token: Pick<DelegationToken, 'credential_provider_id'>,
+  providers: Record<string, Pick<ProviderSummary, 'provider_type'>>
+): boolean {
+  const type = providers[token.credential_provider_id]?.provider_type;
+  return !type || takesConsent(type);
+}
+
 /**
  * Whether an operator can limit a delegation: a consent a person gave, to an Authorization Code
  * provider, that an agent can still act under.
@@ -186,6 +217,7 @@ export function matchesSearch(
     providerName(token, providers).toLowerCase().includes(term) ||
     token.provider_id.toLowerCase().includes(term) ||
     token.agent_did.toLowerCase().includes(term) ||
+    agentName(token.agent_did).toLowerCase().includes(term) ||
     token.user_identity_hash.toLowerCase().includes(term) ||
     token.scopes.some(scope => scope.toLowerCase().includes(term))
   );

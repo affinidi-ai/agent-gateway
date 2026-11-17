@@ -12,17 +12,12 @@ import { deepLinks } from '../utils/deepLinks';
 import { DOCS_URL } from '../config/docs';
 import ClientAuthenticationSelect from './EditCredentialProviderPage/ClientAuthenticationSelect';
 import ConsentConfirmationSection from './EditCredentialProviderPage/ConsentConfirmationSection';
+import ConsentLimitSection from './EditCredentialProviderPage/ConsentLimitSection';
 import JwtAssertionSection from './EditCredentialProviderPage/JwtAssertionSection';
 import { SecretOption as Secret, SecretOptions } from './EditCredentialProviderPage/SecretSelect';
 import { splitByTenant, type OwnerTenant } from '../utils/tenantScope';
+import { storedConsentLimit, takesConsent } from '../utils/consentLimit';
 import {
-  CONSENT_LIMIT_RANGE,
-  consentLimitUnitsFor,
-  storedConsentLimit,
-} from '../utils/consentLimit';
-import { useConsentImpact } from './EditCredentialProviderPage/useConsentImpact';
-import {
-  CONSENT_LIMIT_FIELD_MESSAGE,
   CONSENT_LIMIT_RANGE_MESSAGE,
   ClientAuthentication,
   ConsentLimitFields,
@@ -34,7 +29,6 @@ import {
   consentConfirmationField,
   consentConfirmationFieldsOf,
   consentConfirmationRedirectUri,
-  consentImpactMessage,
   missingConsentConfirmationField,
   clientAuthenticationOf,
   consentLimitOf,
@@ -47,7 +41,6 @@ import {
   missingProviderField,
   providerCredentialFields,
   providerTypeFields,
-  takesConsent,
   callbackUrlFor,
   callbackUrlToSave,
   isHttpsAddress,
@@ -423,12 +416,6 @@ const EditCredentialProviderPage: React.FC = () => {
   }, [saving, handleSubmit]);
 
   const typeFields = providerTypeFields(form.provider_type, form.client_authentication);
-  const endingConsents = useConsentImpact(
-    isNew ? undefined : id,
-    consentLimitSeconds(form),
-    storedConsentLimitSecs
-  );
-  const consentImpact = consentImpactMessage(endingConsents, form.name.trim() || form.provider_id);
 
   if (loading) {
     return (
@@ -1052,74 +1039,15 @@ const EditCredentialProviderPage: React.FC = () => {
             </div>
 
             {takesConsent(form.provider_type) && (
-              <div className="mb-3">
-                <div className="field-label-with-help">
-                  <label htmlFor="consent_limit_amount" className="mb-0">
-                    Consent time limit
-                  </label>
-                  <FieldHelp ariaLabel="About Consent time limit" testId="field-help-consent-limit">
-                    How long an agent may use a person's consent. At the end the gateway removes the
-                    stored credential and asks the person to consent again. A shorter limit also
-                    ends consents given earlier; a longer one never extends them.
-                  </FieldHelp>
-                </div>
-                <div className="input-group" style={{ maxWidth: '22rem' }}>
-                  <input
-                    ref={consentLimitRef}
-                    id="consent_limit_amount"
-                    name="consent_limit_amount"
-                    type="number"
-                    min={1}
-                    step={1}
-                    className={`form-control${consentLimitRefused ? ' is-invalid' : ''}`}
-                    placeholder="Not set"
-                    value={form.consent_limit_amount}
-                    onChange={handleChange}
-                    aria-invalid={consentLimitRefused || undefined}
-                    aria-describedby={consentLimitRefused ? 'consent_limit_error' : undefined}
-                    data-testid="credential-provider-consent-limit-input"
-                  />
-                  <select
-                    name="consent_limit_unit"
-                    aria-label="Consent time limit unit"
-                    className="form-select"
-                    value={form.consent_limit_unit}
-                    onChange={handleChange}
-                    data-testid="credential-provider-consent-limit-unit-select"
-                  >
-                    {consentLimitUnitsFor(storedConsentLimitSecs).map(unit => (
-                      <option key={unit} value={unit}>
-                        {unit}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                {consentLimitRefused && (
-                  <div
-                    id="consent_limit_error"
-                    className="invalid-feedback d-block"
-                    data-testid="credential-provider-consent-limit-error"
-                  >
-                    {CONSENT_LIMIT_FIELD_MESSAGE}
-                  </div>
-                )}
-                <small className="form-text text-muted">
-                  Leave empty to set no limit on this provider. A default or a ceiling in the
-                  gateway's configuration still applies.
-                  {!consentLimitRefused && ` From ${CONSENT_LIMIT_RANGE}.`}
-                </small>
-                <div role="status" data-testid="credential-provider-consent-limit-impact-region">
-                  {consentImpact && (
-                    <div
-                      className="alert alert-warning py-2 mt-2"
-                      data-testid="credential-provider-consent-limit-impact"
-                    >
-                      <i className="fas fa-exclamation-triangle me-2" aria-hidden="true" />
-                      {consentImpact}
-                    </div>
-                  )}
-                </div>
-              </div>
+              <ConsentLimitSection
+                form={form}
+                providerId={isNew ? undefined : id}
+                providerName={form.name.trim() || form.provider_id}
+                storedSecs={storedConsentLimitSecs}
+                refused={consentLimitRefused}
+                inputRef={consentLimitRef}
+                onChange={handleChange}
+              />
             )}
 
             {/* Additional Params */}

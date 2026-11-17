@@ -1924,7 +1924,7 @@ mod tests {
             grant_details(&events),
             [Some(format!(
                 "grant_by_binding:external_consent,consent_expires_at:{}",
-                end.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                crate::delegation_vault::consent_age::stamp(end)
             ))]
         );
     }

@@ -5,24 +5,38 @@
 use chrono::{DateTime, Duration, Utc};
 use tracing::{info, warn};
 
-use super::DelegationToken;
 use super::audit::{self, DelegationAuditAction, DelegationAuditEvent};
 use super::grants::DelegatedGrant;
-use super::storage::{DelegationVaultStorage, access_token_fingerprint};
+use super::storage::DelegationVaultStorage;
+use super::{DelegationToken, VaultLookupResult};
 use crate::config::credential_policy::{CredentialPolicyConfig, credential_policy};
-use crate::credential_providers::{CredentialProvider, CredentialProviderType};
+use crate::credential_providers::CredentialProvider;
 
 /// How far ahead of this gateway's clock a consent time may lie, as another
 /// node's clock may run, before a consent under a limit counts as ended.
 const CLOCK_SKEW_SECS: i64 = 300;
 
-/// Why a caller is asked for consent again: the consent ended at its time
-/// limit, and the stored credential was removed.
-pub const CONSENT_EXPIRED: &str = "consent_expired";
+/// Why a caller who consented before is asked for consent again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskedAgain {
+    /// The consent ended at its time limit, and the stored credential was
+    /// removed.
+    ConsentExpired,
+    /// The consent has not ended, but the binding serving the request needs
+    /// a newer one.
+    ConsentTooOld,
+}
 
-/// Why a caller is asked for consent again: the consent has not ended, but
-/// the binding serving the request needs a newer one.
-pub const CONSENT_TOO_OLD: &str = "consent_too_old";
+impl AskedAgain {
+    /// The reason as a caller reads it in an answer.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConsentExpired => "consent_expired",
+            Self::ConsentTooOld => "consent_too_old",
+        }
+    }
+}
 
 /// The time limits on the consents one binding of one credential provider uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -57,7 +71,7 @@ impl ConsentLimits {
     }
 
     /// [`Self::of`], under `policy`.
-    pub fn under(
+    fn under(
         binding_secs: Option<u64>,
         provider_secs: Option<u64>,
         policy: &CredentialPolicyConfig,
@@ -82,9 +96,7 @@ impl ConsentLimits {
     /// a consent ends it.
     pub fn of_provider(provider: Option<&CredentialProvider>) -> Self {
         match provider {
-            Some(provider) if provider.provider_type == CredentialProviderType::OAuth2AuthorizationCode => {
-                Self::of(None, provider.max_consent_age_secs)
-            }
+            Some(provider) if provider.takes_consent() => Self::of(None, provider.max_consent_age_secs),
             _ => Self::default(),
         }
     }
@@ -172,12 +184,41 @@ pub fn end_of(
     lifetime_secs.map(|secs| after(granted_at, secs))
 }
 
+/// `found` while its consent is within `limits`. Otherwise no credential, and
+/// why the caller is asked again: a consent past its end is removed from the
+/// vault, whatever refresh token it holds, and audited with what `describe`
+/// adds; one only too old for the binding is kept for the others. A removal
+/// that fails leaves the request refused all the same: the check runs again
+/// on the next one.
+pub async fn admit(
+    vault: &dyn DelegationVaultStorage,
+    limits: ConsentLimits,
+    found: VaultLookupResult,
+    surface_id: &str,
+    describe: impl FnOnce(&mut DelegationAuditEvent),
+) -> (VaultLookupResult, Option<AskedAgain>) {
+    let Some(token) = found.token() else {
+        return (found, None);
+    };
+    let asked_again = match limits.judge(token.consent_granted_at, token.consent_expires_at, Utc::now()) {
+        ConsentAge::Current => return (found, None),
+        ConsentAge::TooOldForBinding => AskedAgain::ConsentTooOld,
+        ConsentAge::Ended => {
+            let ended_at = limits.ends_at(token.consent_granted_at, token.consent_expires_at);
+            end_consent(vault, token, ended_at, "release", Some(surface_id), describe).await;
+            AskedAgain::ConsentExpired
+        }
+    };
+    (VaultLookupResult::NotFound, Some(asked_again))
+}
+
 /// Remove the agent-keyed `token`, whose consent ended at `ended_at`, while
-/// the vault still holds it with the access token read, and audit the expiry
-/// as `consent_expired`, never as a revocation: `source` says what found it
+/// the vault still holds that consent, and audit the expiry as
+/// `consent_expired`, never as a revocation: `source` says what found it
 /// ended, and `describe` adds what the caller knows of the request. Whether it
-/// was removed: a token refreshed or removed since is left to the next
-/// request, and a removal that fails is logged, so one expiry is audited once.
+/// was removed: one the person consented to again since, or removed since, is
+/// left alone, and a removal that fails is logged, so one expiry is audited
+/// once.
 pub async fn end_consent(
     vault: &dyn DelegationVaultStorage,
     token: &DelegationToken,
@@ -188,7 +229,7 @@ pub async fn end_consent(
 ) -> bool {
     let surface_variant = crate::observability::policy_audit::current_request_variant();
     match vault
-        .delete_token_holding(&token.id, &access_token_fingerprint(&token.access_token))
+        .delete_token_of_consent(&token.id, token.consent_granted_at)
         .await
     {
         Ok(true) => {}
@@ -260,7 +301,7 @@ pub fn record_grant_expiry(
 /// The `detail` of a `consent_expired` audit record: when the consent was
 /// given, when it ended, and what found it ended: `release`, a request that
 /// needed the credential, or `sweep`.
-pub fn expiry_detail(
+fn expiry_detail(
     granted_at: DateTime<Utc>,
     ended_at: Option<DateTime<Utc>>,
     source: &str,
@@ -324,7 +365,7 @@ pub fn limit_detail(
 }
 
 /// `time` as an audit `detail` writes it: RFC 3339 UTC, to the second.
-fn stamp(time: DateTime<Utc>) -> String {
+pub(crate) fn stamp(time: DateTime<Utc>) -> String {
     time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
@@ -354,17 +395,19 @@ fn after(
 }
 
 /// What a person asked for consent is told about its time limit: why they are
-/// asked again (`reason`, [`CONSENT_EXPIRED`] or [`CONSENT_TOO_OLD`]), and how
-/// long the new consent may be used. `None` when there is nothing to say.
+/// asked again, and how long the new consent may be used. `None` when there
+/// is nothing to say.
 pub fn notice(
-    reason: Option<&str>,
+    reason: Option<AskedAgain>,
     lifetime_secs: Option<u64>,
 ) -> Option<String> {
-    let asked_again = match reason {
-        Some(CONSENT_EXPIRED) => Some("Your earlier access ended at its time limit.".to_string()),
-        Some(CONSENT_TOO_OLD) => Some("Your earlier access is too old for this request.".to_string()),
-        _ => None,
-    };
+    let asked_again = reason.map(|reason| {
+        match reason {
+            AskedAgain::ConsentExpired => "Your earlier access ended at its time limit.",
+            AskedAgain::ConsentTooOld => "Your earlier access is too old for this request.",
+        }
+        .to_string()
+    });
     let lifetime = lifetime_secs.map(|secs| format!("The agent may use this access for {}.", describe(secs)));
     let sentences: Vec<String> = asked_again
         .into_iter()
@@ -545,14 +588,23 @@ mod tests {
         assert_eq!(notice(None, None), None);
         assert_eq!(notice(None, Some(21_600)).as_deref(), Some("The agent may use this access for 6 hours."));
         assert_eq!(
-            notice(Some(CONSENT_EXPIRED), Some(21_600)).as_deref(),
+            notice(Some(AskedAgain::ConsentExpired), Some(21_600)).as_deref(),
             Some("Your earlier access ended at its time limit. The agent may use this access for 6 hours.")
         );
         assert_eq!(
-            notice(Some(CONSENT_TOO_OLD), None).as_deref(),
+            notice(Some(AskedAgain::ConsentTooOld), None).as_deref(),
             Some("Your earlier access is too old for this request.")
         );
-        assert_eq!(notice(Some("another_reason"), None), None);
+    }
+
+    #[test]
+    fn a_caller_reads_why_it_is_asked_again_as_the_same_word_in_every_answer() {
+        for (reason, word) in
+            [(AskedAgain::ConsentExpired, "consent_expired"), (AskedAgain::ConsentTooOld, "consent_too_old")]
+        {
+            assert_eq!(reason.as_str(), word);
+            assert_eq!(serde_json::json!(reason), word);
+        }
     }
 
     #[test]

@@ -5,6 +5,18 @@ import { apiClient } from '../../../api';
 import { showToast } from '../../../utils/toaster';
 import DelegatedAccessTab from '../DelegatedAccessTab';
 import { useDelegationVault } from '../useDelegationVault';
+import {
+  BOB,
+  DAY,
+  HOUR,
+  PROVIDERS,
+  answer,
+  delegation as token,
+  fromNow,
+  gatewayHolds,
+  requests,
+  vaultReads as reads,
+} from '../vaultTestFixtures';
 
 jest.mock('../../../api', () => ({
   apiClient: { fetch: jest.fn() },
@@ -24,61 +36,8 @@ const Tab: React.FC<TabProps> = props => (
   <DelegatedAccessTab {...props} vault={useDelegationVault()} />
 );
 
-/** An answer of the gateway, as `apiClient.fetch` resolves with it. */
-const answer = (body: unknown = {}, status = 200, statusText = 'OK') => ({
-  ok: status < 400,
-  status,
-  statusText,
-  json: () => Promise.resolve(body),
-  text: () => Promise.resolve(typeof body === 'string' ? body : JSON.stringify(body)),
-});
-
-const HOUR = 3_600_000;
-const DAY = 24 * HOUR;
-const fromNow = (ms: number) => new Date(Date.now() + ms).toISOString();
-
-const ALICE = 'a'.repeat(64);
-const BOB = 'b'.repeat(64);
-
-const token = (id: string, extra: Record<string, unknown> = {}) => ({
-  id,
-  agent_did: 'did:web:agent.example.com',
-  user_identity_hash: ALICE,
-  credential_provider_id: 'cp-github',
-  provider_id: 'github',
-  token_type: 'bearer',
-  scopes: ['repo'],
-  expires_at: fromNow(HOUR),
-  consent_granted_at: fromNow(-HOUR),
-  last_used_at: null,
-  created_at: fromNow(-HOUR),
-  updated_at: fromNow(-HOUR),
-  is_expired: false,
-  can_refresh: true,
-  ...extra,
-});
-
 /** Generous, since the whole suite runs these beside many others. */
 const WAIT = { timeout: 5000 };
-
-const PROVIDERS = [
-  { id: 'cp-github', name: 'GitHub', provider_type: 'oauth2_authorization_code' },
-  { id: 'cp-service', name: 'Billing API', provider_type: 'oauth2_client_credentials' },
-];
-
-/** Answers the two lists the tab reads, and every other request with `change`. */
-const gatewayHolds = (
-  tokens: ReturnType<typeof token>[],
-  providers: unknown = PROVIDERS,
-  change: () => unknown = () => answer()
-) =>
-  mockFetch.mockImplementation((url: string, options?: { method?: string }) =>
-    Promise.resolve(
-      options?.method
-        ? change()
-        : answer(url === '/api/v1/credential-providers' ? providers : tokens)
-    )
-  );
 
 const renderTab = async (
   tokens: ReturnType<typeof token>[],
@@ -96,8 +55,7 @@ const rowIds = () =>
   screen
     .queryAllByTestId(/^delegated-access-row-/)
     .map(element => element.getAttribute('data-testid')!.replace('delegated-access-row-', ''));
-const deletes = () => mockFetch.mock.calls.filter(([, options]) => options?.method === 'DELETE');
-const reads = () => mockFetch.mock.calls.filter(([url]) => url === '/api/v1/delegation-vault');
+const deletes = () => requests('DELETE');
 
 describe('Delegated Access tab', () => {
   beforeEach(() => {
@@ -247,7 +205,7 @@ describe('Delegated Access tab', () => {
 
     await waitFor(() => expect(rowIds()).toEqual(['t1']), WAIT);
     expect(screen.queryByTestId('delegated-access-read-error')).toBeNull();
-    expect(screen.getByLabelText('1 active delegations')).toBeInTheDocument();
+    expect(screen.getByLabelText('1 active delegation')).toBeInTheDocument();
     expect(reads()).toHaveLength(2);
   });
 
@@ -271,15 +229,36 @@ describe('Delegated Access tab', () => {
     expect(onViewHistory).toHaveBeenCalledTimes(1);
   });
 
-  it('shows no history button when the page gives none', async () => {
-    await renderTab([token('t1')]);
+  it('shows no history button, and points at no history, when the page gives none', async () => {
+    await renderTab([token('t1'), token('t2', { user_identity_hash: BOB })]);
+
     expect(screen.queryByTestId('delegated-access-history-button')).not.toBeInTheDocument();
+    expect(screen.getByText('Active access only.')).toBeInTheDocument();
+    expect(screen.queryByText(/in the history/)).toBeNull();
+    expect(screen.getByLabelText('2 active delegations')).toBeInTheDocument();
+  });
+
+  it('points at the history beside its button', async () => {
+    await renderTab([token('t1')], { onViewHistory: jest.fn() });
+
+    expect(
+      screen.getByText('Active access only. Ended and revoked access is in the history.')
+    ).toBeInTheDocument();
   });
 
   it('says there is no active access when every entry ended', async () => {
     await renderTab([token('ended', { consent_expires_at: fromNow(-HOUR) })]);
     expect(screen.getByText('No active delegated access')).toBeInTheDocument();
+    expect(screen.queryByText(/in the history/)).toBeNull();
     expect(rowIds()).toEqual([]);
+  });
+
+  it('says where ended access is when there is none active and the history can be opened', async () => {
+    await renderTab([], { onViewHistory: jest.fn() });
+
+    expect(
+      screen.getByText(/Access that ended or was revoked is in the history\.$/)
+    ).toBeInTheDocument();
   });
 
   it('filters by the page search and reports how many it shows', async () => {

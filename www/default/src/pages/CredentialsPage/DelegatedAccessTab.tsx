@@ -7,10 +7,10 @@ import { EmptyState } from '../../components/shared/EmptyState';
 import { showToast } from '../../utils/toaster';
 import { getErrorMessage } from '../../utils/apiError';
 import { formatDateTime, topAndTail } from '../../utils/stringUtils';
-import { consentLimitLabel, takesConsent } from '../../utils/consentLimit';
+import { consentLimitLabel } from '../../utils/consentLimit';
 import { DOCS_URL } from '../../config/docs';
 import AgentName from './AgentName';
-import PaginationControls, { clampPage } from './PaginationControls';
+import PaginationControls, { clampPage } from '../../components/shared/PaginationControls';
 import VaultReadError from './VaultReadError';
 import {
   DelegationToken,
@@ -18,6 +18,7 @@ import {
   consentLimitSecs,
   consentState,
   isActiveDelegation,
+  isPersonsDelegation,
   matchesSearch,
   providerName,
   shownTime,
@@ -54,17 +55,10 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
 
   const systemOf = (token: DelegationToken) => providerName(token, providers);
 
-  /**
-   * A token of a provider nobody consents to is a service token, not a person's delegation. One
-   * whose provider is unknown is listed, since its provider may only be unreadable.
-   */
-  const consentedTo = (token: DelegationToken) => {
-    const type = providers[token.credential_provider_id]?.provider_type;
-    return !type || takesConsent(type);
-  };
-
   const now = new Date();
-  const active = tokens.filter(token => consentedTo(token) && isActiveDelegation(token, now));
+  const active = tokens.filter(
+    token => isPersonsDelegation(token, providers) && isActiveDelegation(token, now)
+  );
   const endingSoon = active.filter(
     token => consentState(consentEnd(token.consent_expires_at), now) === 'ending_soon'
   ).length;
@@ -95,13 +89,14 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
               value={shown.length}
               suffix={searchTerm ? ` of ${active.length}` : undefined}
               className="ms-2"
-              ariaLabel={`${shown.length}${searchTerm ? ` of ${active.length}` : ''} active delegations`}
+              ariaLabel={`${shown.length}${searchTerm ? ` of ${active.length}` : ''} active ${
+                (searchTerm ? active.length : shown.length) === 1 ? 'delegation' : 'delegations'
+              }`}
             />
           )}
           {endingSoon > 0 && (
             <span
-              className="badge text-bg-warning ms-2"
-              style={{ verticalAlign: 'middle' }}
+              className="badge text-bg-warning ms-2 align-middle"
               data-testid="delegated-access-ending-soon-count"
             >
               {endingSoon} ending soon
@@ -110,7 +105,8 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
         </h6>
         <div className="d-flex align-items-center gap-2">
           <small className="text-muted">
-            Active access only. Ended and revoked access is in the history.
+            Active access only.
+            {onViewHistory && ' Ended and revoked access is in the history.'}
           </small>
           {onViewHistory && (
             <AppButton
@@ -140,7 +136,9 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
           <EmptyState
             icon="fa-user-check"
             title="No active delegated access"
-            body="An entry appears here while a person's consent lets an agent act for them in another system. Access that ended or was revoked is in the history."
+            body={`An entry appears here while a person's consent lets an agent act for them in another system.${
+              onViewHistory ? ' Access that ended or was revoked is in the history.' : ''
+            }`}
             docsHref={DOCS_URL.credentialDelegation}
           />
         ) : shown.length === 0 ? (
@@ -191,7 +189,10 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
                       </td>
                       <td>
                         {token.scopes.map(scope => (
-                          <span key={scope} className="badge text-bg-secondary me-1">
+                          <span
+                            key={scope}
+                            className="badge text-wrap text-break text-bg-secondary me-1"
+                          >
                             {scope}
                           </span>
                         ))}
@@ -227,7 +228,7 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
                             confirmLabel={`Revoke ${systemOf(token)} access?`}
                             title="Revoke access"
                             confirmTitle="Click again to revoke this access"
-                            className="btn btn-outline-danger btn-sm text-nowrap"
+                            className="btn app-button btn-outline-danger btn-sm text-nowrap"
                             cancelTestId={`delegated-access-revoke-cancel-button-${token.id}`}
                             data-testid={`delegated-access-revoke-button-${token.id}`}
                             onConfirm={() => revoke(token)}

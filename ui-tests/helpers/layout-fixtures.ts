@@ -372,7 +372,11 @@ const delegationTokens: DelegationTokenFixture[] = [
         credential_provider_id: FIXTURE_ID.credentialProvider,
         provider_id: 'supplier-portal-oauth-client-for-enterprise-procurement-reconciliation-emea-production',
         token_type: 'Bearer',
-        scopes: ['purchase-orders.read', 'supplier-invoices.read', 'goods-receipts.read'],
+        scopes: [
+            'purchase-orders.read',
+            'supplier-invoices.read',
+            'https://www.googleapis.com/auth/calendar.events.readonly',
+        ],
         expires_at: iso(-60),
         consent_granted_at: iso(300),
         consent_expires_at: new Date(Date.now() + 23 * 3_600_000).toISOString(),

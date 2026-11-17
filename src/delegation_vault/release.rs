@@ -39,7 +39,7 @@ use base64::Engine as _;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
-use super::consent_age::{self, ConsentAge, ConsentLimits};
+use super::consent_age::{self, AskedAgain, ConsentAge, ConsentLimits};
 use super::grants::{DelegatedGrant, FailedRefresh, GrantKey, ObtainedTokens};
 use super::storage::{DelegationVaultStorage, RefreshError};
 use super::token_endpoint::{TokenFailure, TokenRequest};
@@ -106,10 +106,9 @@ pub enum GrantRefusal {
         subject: GrantSubject,
         /// For a caller's grant, [`connect_hint`] of the caller.
         hint: Option<String>,
-        /// Why a binding that had a grant has none:
-        /// [`consent_age::CONSENT_EXPIRED`] for a grant whose consent ended at
-        /// its time limit.
-        cause: Option<&'static str>,
+        /// Why a binding that had a grant has none: its consent ended at its
+        /// time limit.
+        cause: Option<AskedAgain>,
     },
     /// The vendor answered that the token lacks a scope, named when its
     /// challenge named a plain one.
@@ -141,7 +140,7 @@ impl GrantRefusal {
         Self::ConnectRequired {
             subject,
             hint: (subject == GrantSubject::Caller).then(|| connect_hint(&key.principal)),
-            cause: Some(consent_age::CONSENT_EXPIRED),
+            cause: Some(AskedAgain::ConsentExpired),
         }
     }
 
@@ -166,18 +165,16 @@ impl GrantRefusal {
     /// A fixed message.
     pub fn message(&self) -> &'static str {
         match self {
-            Self::ConnectRequired {
-                subject: GrantSubject::Owner,
-                cause: Some(_),
-                ..
-            } => "The owner's connection of this account ended at its time limit",
-            Self::ConnectRequired { cause: Some(_), .. } => {
-                "Your connection ended at its time limit; connect your account again"
-            }
-            Self::ConnectRequired {
-                subject: GrantSubject::Owner, ..
-            } => "The owner of this agent has not connected this account",
-            Self::ConnectRequired { .. } => "Connect your account to use this",
+            Self::ConnectRequired { subject, cause, .. } => match (subject, cause) {
+                (GrantSubject::Owner, Some(AskedAgain::ConsentExpired | AskedAgain::ConsentTooOld)) => {
+                    "The owner's connection of this account ended at its time limit"
+                }
+                (GrantSubject::Caller, Some(AskedAgain::ConsentExpired | AskedAgain::ConsentTooOld)) => {
+                    "Your connection ended at its time limit; connect your account again"
+                }
+                (GrantSubject::Owner, None) => "The owner of this agent has not connected this account",
+                (GrantSubject::Caller, None) => "Connect your account to use this",
+            },
             Self::ScopeInsufficient { .. } => "The connected account has not granted a permission this call needs",
             Self::ConnectorUnavailable => "This connection is unavailable; try again later",
         }
@@ -419,13 +416,13 @@ impl ReleaseContext<'_> {
         }
         self.end_consent(provider, key, &grant, limits.ends_for_binding_at(grant.created_at, grant.consent_expires_at))
             .await;
-        Err(refused(GrantRefusal::consent_expired(key, subject), consent_age::CONSENT_EXPIRED))
+        Err(refused(GrantRefusal::consent_expired(key, subject), AskedAgain::ConsentExpired.as_str()))
     }
 
     /// Remove the grant of `key`, whose consent ended at `ended_at`, while it
-    /// still holds the access token of `grant` as read, audit the expiry and
-    /// revoke it at the vendor in the background. A grant refreshed or
-    /// connected again since is left to the next call.
+    /// is still the connection `grant` was read as, audit the expiry and
+    /// revoke it at the vendor in the background. One connected again since
+    /// is kept: its consent is another one.
     async fn end_consent(
         &self,
         provider: &CredentialProvider,
@@ -437,7 +434,7 @@ impl ReleaseContext<'_> {
         let surface_variant = crate::observability::policy_audit::current_request_variant();
         match self
             .vault
-            .delete_grant_holding(&grant_id, &grant.access_token)
+            .delete_grant_of_connection(&grant_id, grant.created_at)
             .await
         {
             Ok(Some(removed)) => {
@@ -1314,7 +1311,7 @@ mod use_claim_tests {
     use crate::delegation_vault::storage::{DelegationVaultStorage, FileSystemDelegationVaultStore};
     use std::sync::Arc;
 
-    async fn vault(directory: &std::path::Path) -> Arc<dyn DelegationVaultStorage> {
+    pub(super) async fn vault(directory: &std::path::Path) -> Arc<dyn DelegationVaultStorage> {
         crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig {
             enabled: true,
             key_env_var: "AG_TEST_MASTER_KEY".to_string(),
@@ -1379,5 +1376,50 @@ mod use_claim_tests {
                 .is_some(),
             "the vault records its grant's use"
         );
+    }
+}
+
+#[cfg(test)]
+mod consent_end_tests {
+    use super::ReleaseContext;
+    use super::use_claim_tests::vault;
+    use crate::delegation_vault::grants::tests::{grant, key};
+
+    /// The end of a grant's consent removes only the connection that was
+    /// judged. One made again since is kept, though the vendor handed back
+    /// the same access token, and no expiry is recorded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_end_of_a_grants_consent_keeps_a_connection_made_again_since() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = vault(directory.path()).await;
+        let key = key();
+        let mut judged = grant(&key, "access");
+        judged.created_at = chrono::Utc::now() - chrono::Duration::hours(2);
+        for connection in [judged.clone(), grant(&key, "access")] {
+            vault
+                .store_grant(connection)
+                .await
+                .unwrap();
+        }
+        let provider = crate::delegation_vault::revocation::tests::provider(None, "none", None);
+        let context = ReleaseContext {
+            vault: &vault,
+            secrets: None,
+            exact_allowlist: None,
+            refusal_limit: 3,
+            max_consent_age_secs: None,
+        };
+
+        let ((), events) = crate::audit::producer::capture(context.end_consent(&provider, &key, &judged, None)).await;
+
+        assert!(
+            vault
+                .grant(&key)
+                .await
+                .unwrap()
+                .is_some(),
+            "the connection made again is kept"
+        );
+        assert!(events.is_empty(), "{events:?}");
     }
 }

@@ -4,7 +4,7 @@ use super::{ResolvedCredentialInjection, build_injection_headers};
 use crate::config::agent_surface::AgentSurface;
 use crate::config::types::{CredentialInjection, CredentialRequirement, OutboundCredentialBinding};
 use crate::credential_providers::{CredentialProvider, CredentialProviderType, storage::CredentialProviderStorage};
-use crate::delegation_vault::consent_age::{self, ConsentAge, ConsentLimits};
+use crate::delegation_vault::consent_age::{self, AskedAgain, ConsentLimits};
 use crate::delegation_vault::{DelegationToken, VaultLookupResult, storage::DelegationVaultStorage};
 use crate::jwt_bearer::{JwtVerificationStrategyStorage, models::JwtVerificationStrategy};
 use crate::mcp::continuations::{
@@ -51,6 +51,9 @@ pub struct PreparedDelegation {
     response_binding: Option<ContinuationBinding>,
     claimed: Option<ClaimedContinuation>,
     payment: Option<ContinuationPayment>,
+    /// The earliest end of the consents whose credentials the call carries;
+    /// `None` when it carries none under a time limit.
+    consent_ends_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[cfg(test)]
@@ -67,6 +70,7 @@ impl PreparedDelegation {
             response_binding: None,
             claimed: None,
             payment: None,
+            consent_ends_at: None,
         }
     }
 }
@@ -552,6 +556,7 @@ impl ModernDelegationContext<'_> {
                 .map(|provider| provider.binding.clone()),
             claimed: None,
             payment: None,
+            consent_ends_at: None,
         };
         if selected.is_empty() {
             return Ok(ModernDelegationResult::Prepared(Box::new(prepared)));
@@ -654,14 +659,11 @@ impl ModernDelegationContext<'_> {
                 prepared.add_credential(&provider.config.inject_as, &token)?;
                 continue;
             }
-            let mut asked_again = None;
-            let credential = if resumed_credential
-                .as_ref()
-                .is_some_and(|credential| credential.credential_provider_id == provider.provider.id)
+            let found = match resumed_credential
+                .take_if(|credential| credential.credential_provider_id == provider.provider.id)
             {
-                resumed_credential.take()
-            } else {
-                let found = self
+                Some(resumed) => VaultLookupResult::Found(resumed),
+                None => self
                     .vault
                     .lookup(
                         self.agent_did,
@@ -671,23 +673,26 @@ impl ModernDelegationContext<'_> {
                         &provider.provider.id,
                     )
                     .await
-                    .map_err(|_| ContinuationError::Unavailable)?;
-                let found = self
-                    .within_consent_limits(found, &provider, &mut asked_again)
-                    .await;
-                match found {
-                    VaultLookupResult::Found(credential) => Some(credential),
-                    VaultLookupResult::ExpiredRefreshable(credential)
-                        if provider
-                            .provider
-                            .token_refresh_enabled
-                            && verified_credential_identity(&credential, &provider) =>
-                    {
-                        self.refresh_credential(&provider, credential, now)
-                            .await?
-                    }
-                    _ => None,
+                    .map_err(|_| ContinuationError::Unavailable)?,
+            };
+            let (found, mut asked_again) = self
+                .admit(found, &provider)
+                .await;
+            let credential = match found {
+                VaultLookupResult::Found(credential) => Some(credential),
+                VaultLookupResult::ExpiredRefreshable(credential)
+                    if provider
+                        .provider
+                        .token_refresh_enabled
+                        && verified_credential_identity(&credential, &provider) =>
+                {
+                    let (refreshed, reason) = self
+                        .refresh_credential(&provider, credential, now)
+                        .await?;
+                    asked_again = asked_again.or(reason);
+                    refreshed
                 }
+                _ => None,
             };
             let credential = credential.filter(|credential| verified_credential(credential, &provider, now));
             let Some(credential) = credential else {
@@ -704,7 +709,9 @@ impl ModernDelegationContext<'_> {
                     return Err(ContinuationError::Denied.into());
                 }
                 require_client_capability(request, RequiredClientCapability::ElicitationUrl)?;
-                let lifetime_secs = consent_limits(&provider).lifetime_secs();
+                let lifetime_secs =
+                    crate::delegation_vault::modern_consent::consent_limits(self.surface, &provider.provider)
+                        .lifetime_secs();
                 let origin = url::Url::parse(&self.profile.issuer)
                     .map_err(|_| ContinuationError::InvalidRecord)?
                     .origin()
@@ -754,48 +761,29 @@ impl ModernDelegationContext<'_> {
                 }
                 return Ok(ModernDelegationResult::InputRequired(response));
             };
+            prepared.consent_ends_at = consent_age::earlier(
+                prepared.consent_ends_at,
+                consent_limits(&provider)
+                    .ends_for_binding_at(credential.consent_granted_at, credential.consent_expires_at),
+            );
             prepared.add_credential(&provider.config.inject_as, &credential.access_token)?;
         }
         Ok(ModernDelegationResult::Prepared(Box::new(prepared)))
     }
 
-    /// `found` while its consent is within the time limits of `selected`.
-    /// Otherwise no credential, with why the caller is asked again in
-    /// `asked_again`: a consent past its end is removed from the vault and
-    /// audited, and one only too old for this binding is kept for the others.
-    async fn within_consent_limits(
+    /// [`consent_age::admit`] under the time limits of `selected`: every
+    /// credential this path injects goes through it, whether it was read from
+    /// the vault or resumed from a consent just completed.
+    async fn admit(
         &self,
         found: VaultLookupResult,
         selected: &SelectedProvider<'_>,
-        asked_again: &mut Option<&'static str>,
-    ) -> VaultLookupResult {
-        let credential = match &found {
-            VaultLookupResult::Found(credential)
-            | VaultLookupResult::ExpiredRefreshable(credential)
-            | VaultLookupResult::ExpiredNoRefresh(credential) => credential,
-            VaultLookupResult::NotFound => return found,
-        };
-        let limits = consent_limits(selected);
-        match limits.judge(credential.consent_granted_at, credential.consent_expires_at, chrono::Utc::now()) {
-            ConsentAge::Current => return found,
-            ConsentAge::TooOldForBinding => *asked_again = Some(consent_age::CONSENT_TOO_OLD),
-            ConsentAge::Ended => {
-                *asked_again = Some(consent_age::CONSENT_EXPIRED);
-                consent_age::end_consent(
-                    self.vault,
-                    credential,
-                    limits.ends_at(credential.consent_granted_at, credential.consent_expires_at),
-                    "release",
-                    Some(&self.surface.surface_id),
-                    |event| {
-                        event.provider_name = Some(selected.provider.name.clone());
-                        event.channel_name = Some(self.surface.name.clone());
-                    },
-                )
-                .await;
-            }
-        }
-        VaultLookupResult::NotFound
+    ) -> (VaultLookupResult, Option<AskedAgain>) {
+        consent_age::admit(self.vault, consent_limits(selected), found, &self.surface.surface_id, |event| {
+            event.provider_name = Some(selected.provider.name.clone());
+            event.channel_name = Some(self.surface.name.clone());
+        })
+        .await
     }
 
     async fn service_credential(
@@ -839,12 +827,15 @@ impl ModernDelegationContext<'_> {
             })
     }
 
+    /// `credential` refreshed, or the token another call stored meanwhile,
+    /// which is judged like any other read; with it, why the caller is asked
+    /// again when that token's consent no longer serves.
     async fn refresh_credential(
         &self,
         provider: &SelectedProvider<'_>,
         credential: DelegationToken,
         now: u64,
-    ) -> Result<Option<DelegationToken>, ContinuationError> {
+    ) -> Result<(Option<DelegationToken>, Option<AskedAgain>), ContinuationError> {
         use crate::delegation_vault::storage::RefreshError;
         let claim = match self
             .vault
@@ -853,19 +844,24 @@ impl ModernDelegationContext<'_> {
         {
             Ok(claim) => claim,
             Err(RefreshError::Changed) => {
-                return match self
+                let current = self
                     .vault
                     .lookup(&credential.agent_did, &credential.user_identity_hash, &credential.credential_provider_id)
                     .await
-                    .map_err(|_| ContinuationError::Unavailable)?
-                {
-                    VaultLookupResult::Found(current) if verified_credential(&current, provider, now) => {
-                        Ok(Some(current))
-                    }
-                    _ => Ok(None),
-                };
+                    .map_err(|_| ContinuationError::Unavailable)?;
+                return Ok(
+                    match self
+                        .admit(current, provider)
+                        .await
+                    {
+                        (VaultLookupResult::Found(current), _) if verified_credential(&current, provider, now) => {
+                            (Some(current), None)
+                        }
+                        (_, reason) => (None, reason),
+                    },
+                );
             }
-            Err(RefreshError::Uncertain | RefreshError::NotRefreshable) => return Ok(None),
+            Err(RefreshError::Uncertain | RefreshError::NotRefreshable) => return Ok((None, None)),
             Err(_) => return Err(ContinuationError::Unavailable),
         };
         let egress = self
@@ -887,7 +883,7 @@ impl ModernDelegationContext<'_> {
         .await
         .map_err(|_| ContinuationError::Unavailable)?
         else {
-            return Ok(None);
+            return Ok((None, None));
         };
         let current_provider = self
             .providers
@@ -913,7 +909,7 @@ impl ModernDelegationContext<'_> {
         self.vault
             .complete_refresh(claim, response, now_secs()?)
             .await
-            .map(Some)
+            .map(|refreshed| (Some(refreshed), None))
             .map_err(|_| ContinuationError::Unavailable)
     }
 }
@@ -1035,6 +1031,17 @@ impl PreparedDelegation {
         self.injections
             .extend(injections);
         Ok(())
+    }
+
+    /// Ends `lifetime`, a stream this call opens, no later than the earliest
+    /// end of the consents whose credentials the call carries.
+    pub fn restrict_to_consents(
+        &self,
+        lifetime: &mut crate::mcp::subscriptions::SubscriptionLifetime,
+    ) {
+        if let Some(end) = self.consent_ends_at {
+            lifetime.restrict_to_end(end);
+        }
     }
 
     pub fn credential_headers(&self) -> Result<axum::http::HeaderMap, ContinuationError> {
@@ -1193,6 +1200,7 @@ mod tests {
             response_binding: None,
             claimed: None,
             payment: None,
+            consent_ends_at: None,
         };
         let custom = CredentialInjection::CustomHeader {
             name: "X-Provider-Key".into(),
@@ -2846,13 +2854,13 @@ mod tests {
             }
         }
 
-        /// Store a credential the caller consented to `age` ago, whose
-        /// consent ends `ends_in` from now when it has a stored end.
-        async fn store_consent(
+        /// A credential the caller consented to `age` ago, whose consent
+        /// ends `ends_in` from now when it has an end.
+        async fn credential(
             &self,
             age: chrono::Duration,
             ends_in: Option<chrono::Duration>,
-        ) {
+        ) -> DelegationToken {
             let context = self.context();
             let selected = context
                 .select(&Self::tool_call())
@@ -2873,8 +2881,83 @@ mod tests {
             }))
             .unwrap();
             token.consent_expires_at = ends_in.map(|ends_in| now + ends_in);
+            token
+        }
+
+        /// Store [`Self::credential`] in the vault.
+        async fn store_consent(
+            &self,
+            age: chrono::Duration,
+            ends_in: Option<chrono::Duration>,
+        ) {
             self.vault
-                .store(token)
+                .store(
+                    self.credential(age, ends_in)
+                        .await,
+                )
+                .await
+                .unwrap();
+        }
+
+        /// The consent a tool call without a credential is asked for: its
+        /// input request, and the state the call is resumed with.
+        async fn asked(&self) -> (String, Value, Value) {
+            let ModernDelegationResult::InputRequired(asked) = self
+                .context()
+                .prepare(&Self::tool_call(), 10)
+                .await
+                .ok()
+                .expect("the preparation succeeds")
+            else {
+                panic!("a caller without a consent is asked for one");
+            };
+            let (key, input) = asked["result"]["inputRequests"]
+                .as_object()
+                .and_then(|requests| requests.iter().next())
+                .expect("a consent input request");
+            (key.clone(), input.clone(), asked["result"]["requestState"].clone())
+        }
+
+        /// Complete, with `credential`, the consent the input request `input`
+        /// asks for, as the vendor callback does.
+        async fn complete_consent(
+            &self,
+            input: &Value,
+            credential: DelegationToken,
+        ) {
+            let connect = url::Url::parse(
+                input["params"]["url"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap()
+            .query_pairs()
+            .find(|(name, _)| name == "state")
+            .expect("a connect ticket")
+            .1
+            .into_owned();
+            let ticket = self
+                .service
+                .read_consent_ticket(&connect, false, 10)
+                .await
+                .unwrap();
+            let callback = self
+                .service
+                .begin_consent_callback(ticket, "v".repeat(43), &self.vault, 10)
+                .await
+                .unwrap();
+            let ticket = self
+                .service
+                .read_consent_ticket(&callback, true, 10)
+                .await
+                .unwrap();
+            let claimed = self
+                .service
+                .claim_consent_callback(ticket, 10)
+                .await
+                .unwrap();
+            self.service
+                .complete_consent_callback(claimed, &self.vault, credential, 10)
                 .await
                 .unwrap();
         }
@@ -3026,5 +3109,152 @@ mod tests {
             .store_consent(chrono::Duration::days(400), None)
             .await;
         assert_eq!(unlimited.prepare().await, (None, vec![], true));
+    }
+
+    /// A consent resumed from its staged record is judged like one read from
+    /// the vault: past its time limit it is removed and never injected, and
+    /// the caller is asked again and told why.
+    #[tokio::test]
+    async fn a_resumed_modern_consent_past_its_time_limit_is_not_injected() {
+        let seconds = chrono::Duration::seconds;
+        let fixture = ConsentFixture::new(Some(60)).await;
+        let (key, input, state) = fixture.asked().await;
+        fixture
+            .complete_consent(
+                &input,
+                fixture
+                    .credential(seconds(120), Some(-seconds(60)))
+                    .await,
+            )
+            .await;
+        let mut resumed = ConsentFixture::tool_call();
+        resumed.id = Some(json!(2));
+        let params = resumed
+            .params
+            .as_mut()
+            .unwrap();
+        params["requestState"] = state;
+        params["inputResponses"] = json!({key: {"action": "accept"}});
+
+        let context = fixture.context();
+        let (prepared, events) = crate::audit::producer::capture(context.prepare(&resumed, 11)).await;
+
+        let ModernDelegationResult::InputRequired(again) = prepared
+            .ok()
+            .expect("the preparation succeeds")
+        else {
+            panic!("a consent past its end is never injected");
+        };
+        let message = again["result"]["inputRequests"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()["params"]["message"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            message,
+            "Authorize access to the provider. Your earlier access ended at its time limit. The agent may use this \
+             access for 1 minute."
+        );
+        let expired: Vec<_> = events
+            .iter()
+            .map(|event| crate::delegation_vault::audit::action_category(&event.event))
+            .collect();
+        assert_eq!(expired, ["consent_expired"]);
+        assert!(
+            fixture
+                .vault
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty(),
+            "the ended consent is removed"
+        );
+    }
+
+    /// A surface may bind one provider more than once, each binding with a
+    /// limit of its own. The consent ticket does not say which binding asked,
+    /// so the shortest of them is what the person is told and what is stored.
+    #[tokio::test]
+    async fn a_modern_consent_is_told_the_lifetime_it_is_stored_with() {
+        let mut fixture = ConsentFixture::new(Some(21_600)).await;
+        let mut surface = serde_json::to_value(&fixture.surface).unwrap();
+        surface["outbound_credentials"] = json!([
+            {"credential_provider_id": "provider", "scopes": ["read"], "max_consent_age_secs": 21_600,
+             "required_for": {"tools": ["read"]}},
+            {"credential_provider_id": "provider", "scopes": ["read"], "max_consent_age_secs": 3_600,
+             "required_for": {"tools": ["write"]},
+             "inject_as": {"type": "custom_header", "name": "x-provider-token", "format": "{value}"}}
+        ]);
+        fixture.surface = serde_json::from_value(surface).unwrap();
+
+        let (_, input, _) = fixture.asked().await;
+
+        let limits = crate::delegation_vault::modern_consent::consent_limits(
+            &fixture.surface,
+            &fixture
+                .providers
+                .get("provider")
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(limits.lifetime_secs(), Some(3_600), "the end the callback stores");
+        assert_eq!(
+            input["params"]["message"],
+            "Authorize access to the provider. The agent may use this access for 1 hour."
+        );
+    }
+
+    /// A refresh that finds the token changed by another call uses the token
+    /// stored now only within its consent's limits: past its end it is
+    /// removed, like any other credential this path reads.
+    #[tokio::test]
+    async fn a_token_another_call_stored_during_a_refresh_is_judged_before_it_is_used() {
+        let hours = chrono::Duration::hours;
+        let fixture = ConsentFixture::new(None).await;
+        let read = fixture
+            .vault
+            .store(
+                fixture
+                    .credential(hours(2), Some(-hours(1)))
+                    .await,
+            )
+            .await
+            .unwrap();
+        let mut stored_since = read.clone();
+        stored_since.access_token = "stored-since".into();
+        fixture
+            .vault
+            .update(stored_since)
+            .await
+            .unwrap();
+        let context = fixture.context();
+        let selected = context
+            .select(&ConsentFixture::tool_call())
+            .await
+            .unwrap();
+
+        let (refreshed, events) =
+            crate::audit::producer::capture(context.refresh_credential(&selected[0], read, 10)).await;
+
+        let (credential, asked_again) = refreshed.expect("the refresh is answered");
+        assert!(credential.is_none(), "a consent past its end is never used");
+        assert_eq!(asked_again, Some(AskedAgain::ConsentExpired));
+        let recorded: Vec<_> = events
+            .iter()
+            .map(|event| crate::delegation_vault::audit::action_category(&event.event))
+            .collect();
+        assert_eq!(recorded, ["consent_expired"]);
+        assert!(
+            fixture
+                .vault
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }
