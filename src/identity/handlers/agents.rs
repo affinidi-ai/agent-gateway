@@ -1232,12 +1232,7 @@ fn served_card_response(
     match served.and_then(agent_card_fields) {
         Some(card) => {
             remember_served_card_name(surface, &card);
-            Ok(AgentCardResponse::available(
-                card,
-                source,
-                &surface.surface_id,
-                upstream.and_then(agent_card_fields),
-            ))
+            Ok(AgentCardResponse::available(card, source, &surface.surface_id, upstream.and_then(agent_card_fields)))
         }
         None => {
             warn!(agent_id = %agent_id, surface_id = %surface.surface_id, "Agent Card preview returned no Agent Card");
