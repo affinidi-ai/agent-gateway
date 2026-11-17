@@ -158,6 +158,10 @@ const MAX_SURFACE_ID_LEN: usize = 256;
 /// queue full are dropped for that connection only.
 const MAX_PENDING_CAPTURES: usize = 64;
 
+/// How long one message may wait for a client to read it before the connection is closed.
+/// A client that stops reading would otherwise hold back the keep-alive access recheck.
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl WsSubscription {
     fn new(captures: crate::policies::input_capture::CaptureSender) -> Self {
         Self {
@@ -449,6 +453,39 @@ async fn recheck_policy_input(
         .map(|surface_id| policy_input_listen_answer(surface_id, false, Some(refusal)))
         .collect();
     (false, answers)
+}
+
+/// The keep-alive recheck of policy input listening: when `caller` may no longer listen,
+/// every listen stops and the captures already queued in `captures` are discarded, so
+/// none reaches the client. Returns the answers telling the client which listens stopped.
+async fn recheck_at_keep_alive(
+    subscription: &RwLock<WsSubscription>,
+    caller: Option<&WsCaller>,
+    captures: &mut tokio::sync::mpsc::Receiver<Arc<str>>,
+) -> Vec<String> {
+    let (allowed, stopped) = recheck_policy_input(subscription, caller).await;
+    if !allowed {
+        while captures.try_recv().is_ok() {}
+    }
+    stopped
+}
+
+/// Send `message` to the client. Returns false when the connection should end: the
+/// client is gone, or it has not read the message within [`SEND_TIMEOUT`].
+async fn deliver<S>(
+    sender: &mut S,
+    message: Message,
+) -> bool
+where
+    S: futures::Sink<Message> + Unpin,
+{
+    match tokio::time::timeout(SEND_TIMEOUT, sender.send(message)).await {
+        Ok(sent) => sent.is_ok(),
+        Err(_) => {
+            debug!("WebSocket client stopped reading; closing the connection");
+            false
+        }
+    }
 }
 
 /// Message sent by a client to configure its subscription.
@@ -744,6 +781,22 @@ async fn handle_socket(
 
         loop {
             tokio::select! {
+                // The keep-alive recheck goes first, so a due recheck always runs before
+                // any queued capture is sent.
+                biased;
+                _ = ping_interval.tick() => {
+                    logs_allowed = WsCaller::logs_allowed(caller).await;
+                    let stopped = recheck_at_keep_alive(&send_sub, caller, &mut capture_rx).await;
+                    for answer in stopped {
+                        if !deliver(&mut sender, Message::Text(answer.into())).await {
+                            break;
+                        }
+                    }
+                    if !deliver(&mut sender, Message::Ping("ping".into())).await {
+                        break;
+                    }
+                    debug!("Sent WebSocket ping");
+                }
                 // Handle broadcast updates
                 update_result = rx.recv() => {
                     match update_result {
@@ -770,7 +823,7 @@ async fn handle_socket(
                                 },
                             };
 
-                            if sender.send(msg).await.is_err() {
+                            if !deliver(&mut sender, msg).await {
                                 break;
                             }
                         }
@@ -780,32 +833,15 @@ async fn handle_socket(
                         Err(_) => break,
                     }
                 }
-                // Send periodic pings to keep connection alive
                 Some(answer) = answer_rx.recv() => {
-                    if sender.send(Message::Text(answer.into())).await.is_err() {
+                    if !deliver(&mut sender, Message::Text(answer.into())).await {
                         break;
                     }
                 }
                 Some(capture) = capture_rx.recv() => {
-                    if sender.send(Message::Text(capture.as_ref().into())).await.is_err() {
+                    if !deliver(&mut sender, Message::Text(capture.as_ref().into())).await {
                         break;
                     }
-                }
-                _ = ping_interval.tick() => {
-                    logs_allowed = WsCaller::logs_allowed(caller).await;
-                    let (allowed, stopped) = recheck_policy_input(&send_sub, caller).await;
-                    if !allowed {
-                        while capture_rx.try_recv().is_ok() {}
-                    }
-                    for answer in stopped {
-                        if sender.send(Message::Text(answer.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    if sender.send(Message::Ping("ping".into())).await.is_err() {
-                        break;
-                    }
-                    debug!("Sent WebSocket ping");
                 }
             }
         }
@@ -1445,6 +1481,55 @@ mod tests {
         assert_eq!(answers.len(), 1);
         assert_eq!(answer(answers[0].clone())["error"], super::SESSION_ENDED);
         assert!(!is_captured("ws-session-ended"));
+    }
+
+    #[tokio::test]
+    async fn captures_queued_before_access_is_lost_are_discarded_at_the_keep_alive_recheck() {
+        use crate::policies::input_capture::begin;
+
+        let dir = TempDir::new().unwrap();
+        let caller =
+            caller_for(guard_with_user(&dir, crate::auth::types::UserRole::Administrator).await, "user-1").await;
+        let (captures_tx, mut captures) = tokio::sync::mpsc::channel(8);
+        let subscription = tokio::sync::RwLock::new(super::WsSubscription::new(captures_tx));
+        super::listen_to_policy_input(&subscription, Some(&caller), listen_message("ws-drained"), true).await;
+        let capture = || {
+            begin("surface", "ws-drained", &serde_json::json!({ "channel": { "config_id": "ws-drained" } }), Vec::new)
+                .unwrap()
+                .finish(Ok((true, None)));
+        };
+
+        capture();
+        let stopped = super::recheck_at_keep_alive(&subscription, Some(&caller), &mut captures).await;
+        assert!(stopped.is_empty());
+        assert!(captures.try_recv().is_ok(), "a capture queued while the caller may listen is kept");
+
+        capture();
+        capture();
+        caller
+            .sessions
+            .remove_sessions_for_user("user-1")
+            .await;
+        let stopped = super::recheck_at_keep_alive(&subscription, Some(&caller), &mut captures).await;
+
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(answer(stopped[0].clone())["error"], super::SESSION_ENDED);
+        assert!(captures.try_recv().is_err(), "no queued capture is left to send");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_stops_reading_is_given_up_on_after_the_send_timeout() {
+        use axum::extract::ws::Message;
+
+        let (mut reading, mut read) = futures::channel::mpsc::channel::<Message>(1);
+        assert!(super::deliver(&mut reading, Message::Ping("one".into())).await);
+        read.try_recv().unwrap();
+        assert!(super::deliver(&mut reading, Message::Ping("two".into())).await);
+
+        let (mut stalled, _never_read) = futures::channel::mpsc::channel::<Message>(0);
+        let started = tokio::time::Instant::now();
+        assert!(!super::deliver(&mut stalled, Message::Ping("stuck".into())).await);
+        assert_eq!(started.elapsed(), super::SEND_TIMEOUT);
     }
 
     #[tokio::test]

@@ -145,7 +145,9 @@ request on the dashboard WebSocket, with no admin API route and nothing stored o
 - Starting needs a dashboard session whose user holds `surfaces.edit` and `policies.edit`
   ([`RBAC.md`](RBAC.md#policy-input-capture)). The session and permissions are checked again on each
   keep-alive ping; once the session ends or either permission is gone, the connection stops
-  listening to every surface and is told why.
+  listening to every surface and is told why. A due check runs before any queued capture is
+  sent, and the captures still queued when access is lost are discarded. A client that has not
+  read a message within 10 seconds is disconnected, so it cannot delay the check.
 - Listening ends when the connection closes, so reloading or leaving the page ends it. The
   dashboard sends its listens again after a reconnect.
 

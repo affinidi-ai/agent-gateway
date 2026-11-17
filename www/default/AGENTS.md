@@ -655,8 +655,9 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   answers this page's own stop and changes nothing, so a stop answered after the user listened
   again doesn't turn the button off.
 - The card follows the Capture view's existing cards, Payload History in particular: a
-  `card shadow mb-4` whose `text-primary` `h6` header holds the icon, the title, a `count/max`
-  `text-bg-primary` badge and a muted hint, with the listen control on the right; a
+  `card shadow mb-4` whose `text-primary` `h6` header holds the icon, the title and a `count/max`
+  `text-bg-primary` badge, with the warning and muted hint lines beneath it (see below) and the
+  listen control on the right; a
   `table table-hover table-sm` with a **Timestamp** column rendered by `formatDateTime(…, true)`
   (`timestamp-cell`) and the policy slot as a `text-bg-secondary` badge, like a payload's Channel;
   the no-policy note as an `alert alert-info` with an icon, like the route and Target lines. The
@@ -695,7 +696,8 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
 | ----------------------------------------------- | ---------------------------------------------------------------------- |
 | Control, button, listening, missing permission  | `policy-input-capture`, `policy-input-capture-listen`, `policy-input-capture-listening`, `policy-input-capture-not-allowed` |
 | Waiting for the connection                      | `policy-input-capture-waiting`                                         |
-| Kept count, slot filter                         | `policy-input-capture-kept`, `policy-input-capture-slot-filter`        |
+| Hint line (kept count), slot filter             | `policy-input-capture-kept`, `policy-input-capture-slot-filter`        |
+| Warning line, skipped notice                    | `policy-input-capture-warning`, `policy-input-capture-skipped`         |
 | Help and error                                  | `field-help-policy-input-capture`, `policy-input-capture-error`        |
 | Card, empty state, no-policy note, row          | `policy-input-capture-card`, `policy-input-capture-empty`, `policy-input-capture-no-policy`, `policy-input-capture-row` |
 | Reason, input toggle, input, copy               | `policy-input-capture-reason`, `policy-input-capture-toggle`, `policy-input-capture-input`, `policy-input-capture-copy` |

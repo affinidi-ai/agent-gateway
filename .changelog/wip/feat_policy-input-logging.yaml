@@ -20,7 +20,8 @@ changes:
         or 6 with a digit or symbol, and a Basic token that decodes to user:password; message text
         such as "Basic authentication" is kept), and every query value in the request path and in
         any absolute URL is redacted. Listening needs surfaces.edit and policies.edit, is checked again on each
-        keep-alive ping, and ends when the connection closes. Nothing is logged or stored, and the
+        keep-alive ping before any queued capture is sent (captures still queued when access is
+        lost are discarded), and ends when the connection closes. Nothing is logged or stored, and the
         surface configuration is not changed. Policy authors can see the input structure again
         without the gateway logging it. See docs/POLICY.md.
     - timestamp: '2026-11-12T00:00:00Z'
@@ -37,7 +38,14 @@ changes:
         faster than the dashboard could receive them. On a surface with no policy yet, it says a
         request policy must be added before there is anything to capture. It is for developing and
         testing policies only.
-  changed: []
+  changed:
+    - timestamp: '2026-11-17T00:00:00Z'
+      title: Close a dashboard connection whose client stops reading for 10 seconds
+      description: >-
+        A dashboard WebSocket message the client has not read within 10 seconds now closes the
+        connection, and the page reconnects. A client that stopped reading used to keep its
+        connection open indefinitely and hold back the keep-alive checks of its session and
+        permissions.
   fixed:
     - timestamp: '2026-11-13T00:00:00Z'
       title: Keep surface ids whole in redacted logs so their Monitoring log shows them

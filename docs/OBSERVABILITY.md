@@ -9,7 +9,9 @@ for the checked-out source revision.
 
 [`WsState`](../src/server/websocket.rs) wraps a Tokio broadcast sender. Each connected dashboard
 WebSocket subscribes independently after any configured authentication check; a slow receiver that
-lags skips the updates it missed and keeps reading rather than blocking producers.
+lags skips the updates it missed and keeps reading rather than blocking producers. A connection
+whose client has not read a message within 10 seconds is closed, so a client that stops reading
+cannot hold back the keep-alive access checks.
 `websocket_broadcast_buffer` controls the channel capacity and defaults to `500`.
 
 `WsUpdate` currently defines these event shapes:

@@ -31,7 +31,8 @@ struct Listener {
 
 impl Listener {
     /// Queue `capture`, first telling the listener how many captures it missed. A capture
-    /// that finds the queue full is counted as missed instead.
+    /// that finds the queue full is counted as missed instead. The missed count is claimed
+    /// whole before it is reported, so concurrent sends never report the same captures twice.
     fn send(
         &self,
         surface_id: &str,
@@ -39,7 +40,7 @@ impl Listener {
     ) {
         let skipped = self
             .skipped
-            .load(Ordering::Relaxed);
+            .swap(0, Ordering::AcqRel);
         if skipped > 0 {
             let notice = serde_json::json!({
                 "type": "policy_input_skipped",
@@ -53,11 +54,9 @@ impl Listener {
                 .is_err()
             {
                 self.skipped
-                    .fetch_add(1, Ordering::Relaxed);
+                    .fetch_add(skipped + 1, Ordering::AcqRel);
                 return;
             }
-            self.skipped
-                .fetch_sub(skipped, Ordering::Relaxed);
         }
         if self
             .captures
@@ -600,11 +599,92 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_captures_report_each_missed_capture_exactly_once() {
+        const SENDERS: usize = 8;
+        const SENDS: usize = 2_000;
+        let (queue, mut received) = mpsc::channel(4);
+        let listener = Arc::new(Listener {
+            id: 0,
+            captures: queue,
+            skipped: AtomicU64::new(0),
+        });
+        let capture: Arc<str> = Arc::from("{\"type\":\"policy_input_captured\"}");
+        let sending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let reader = {
+            let sending = Arc::clone(&sending);
+            std::thread::spawn(move || {
+                let (mut delivered, mut reported) = (0u64, 0u64);
+                loop {
+                    match received.try_recv() {
+                        Ok(update) => {
+                            let update: Value = serde_json::from_str(&update).unwrap();
+                            match update["skipped"].as_u64() {
+                                Some(skipped) => reported += skipped,
+                                None => delivered += 1,
+                            }
+                        }
+                        Err(_) if !sending.load(Ordering::Acquire) => return (delivered, reported),
+                        Err(_) => std::thread::yield_now(),
+                    }
+                }
+            })
+        };
+        let senders: Vec<_> = (0..SENDERS)
+            .map(|_| {
+                let listener = Arc::clone(&listener);
+                let capture = Arc::clone(&capture);
+                std::thread::spawn(move || {
+                    for _ in 0..SENDS {
+                        listener.send("input-capture-concurrent", &capture);
+                    }
+                })
+            })
+            .collect();
+        for sender in senders {
+            sender.join().unwrap();
+        }
+        sending.store(false, Ordering::Release);
+        let (delivered, reported) = reader.join().unwrap();
+
+        let still_missed = listener
+            .skipped
+            .load(Ordering::Acquire);
+        assert_eq!(delivered + reported + still_missed, (SENDERS * SENDS) as u64);
+    }
+
+    #[test]
     fn the_surface_comes_from_the_channel_config_id() {
         let input = json!({ "channel": { "config_id": "alpha", "name": "Alpha" } });
 
         assert_eq!(surface_of(&input), Some("alpha"));
         assert_eq!(surface_of(&json!({ "http": {} })), None);
+    }
+
+    #[test]
+    fn a_request_received_over_fabric_is_captured_for_its_surface() {
+        let _listening = listening("input-capture-fabric");
+        let input = crate::surface_context::PolicyInput::new(
+            "POST",
+            "/example",
+            std::collections::HashMap::new(),
+            "inbound",
+            Some("did:web:peer.example".to_string()),
+            None,
+            Some("input-capture-fabric".to_string()),
+            "Fabric surface",
+        );
+        let input = serde_json::to_value(&input).unwrap();
+
+        for (plane, engine, slot) in [
+            ("appliance", "gateway", "appliance gateway"),
+            ("gateway", "gw-1", "gateway"),
+            ("surface", "inbound:input-capture-fabric", "inbound"),
+        ] {
+            let capture = begin(plane, engine, &input, Vec::new).unwrap_or_else(|| panic!("{plane} is captured"));
+            assert_eq!(capture.surface_id, "input-capture-fabric");
+            assert_eq!(capture.slot, slot);
+        }
     }
 
     #[test]

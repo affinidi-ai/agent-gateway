@@ -14,6 +14,8 @@ use crate::world::{DashboardSocket, SurfaceWorld};
 const CAPTURED: &str = "policy_input_captured";
 const LISTEN_ANSWER: &str = "policy_input_capture";
 const THE_OPERATOR: &str = "";
+/// Longer than the dashboard WebSocket's 30 s keep-alive interval.
+const KEEP_ALIVE_WAIT: Duration = Duration::from_secs(40);
 
 fn text_of(message: Message) -> Option<Value> {
     match message {
@@ -334,6 +336,49 @@ async fn named_operator_may_not_listen(
         .unwrap_or_else(|| panic!("operator '{operator}' must have asked to listen to policy input"));
     assert_eq!(answer["listening"], false, "{answer}");
     assert_eq!(answer["error"], "needs surfaces.edit and policies.edit", "{answer}");
+}
+
+#[when(expr = "the dashboard session of operator {string} ends")]
+async fn operator_session_ends(
+    world: &mut SurfaceWorld,
+    operator: String,
+) {
+    let ended = client(world, Some(&operator))
+        .await
+        .send_recorded_json(reqwest::Method::POST, "/auth/logout", None::<&Value>)
+        .await
+        .expect("sign the operator out");
+    assert!(ended.status < 300, "signing operator '{operator}' out: {}", ended.body);
+}
+
+#[then(
+    expr = "operator {string} is told by the next keep-alive check that listening to surface {string} stopped because the session ended"
+)]
+async fn operator_told_listening_stopped(
+    world: &mut SurfaceWorld,
+    operator: String,
+    surface_name: String,
+) {
+    let surface_id = tracked_surface_id(world, &surface_name);
+    let stopped = |answer: &Value| {
+        answer["surface_id"] == surface_id.as_str()
+            && answer["listening"] == false
+            && answer["error"] == "your dashboard session has ended; sign in again"
+    };
+    let deadline = tokio::time::Instant::now() + KEEP_ALIVE_WAIT;
+    while tokio::time::Instant::now() < deadline {
+        if received_of(world, &operator, LISTEN_ANSWER)
+            .iter()
+            .any(stopped)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!(
+        "operator '{operator}' was not told that listening to surface '{surface_name}' stopped: {:#?}",
+        received_of(world, &operator, LISTEN_ANSWER)
+    );
 }
 
 /// Wait until `operator`'s Capture view has received a capture `matches` accepts,

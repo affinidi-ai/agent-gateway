@@ -1,7 +1,7 @@
 Feature: Listening to policy input needs both surfaces.edit and policies.edit
   Listening to a surface's policy input in the dashboard's Capture view needs
   surfaces.edit and policies.edit. An operator whose role holds only one of them
-  may not listen and receives nothing.
+  may not listen and receives nothing, and one whose session ends stops listening.
 
   Scenario: An operator who may edit surfaces and policies receives the policy input they listen to
     Given the "poweruser" role is granted "surfaces.edit"
@@ -40,6 +40,15 @@ Feature: Listening to policy input needs both surfaces.edit and policies.edit
     Then operator "pete" may not listen to policy input
     And the Capture view shows the "target" policy of surface "alpha" deciding "allow" on an input showing "hello policy"
     And the Capture view of operator "pete" shows no policy input
+
+  Scenario: An operator whose dashboard session ends stops listening at the next keep-alive check
+    Given the "poweruser" role is granted "surfaces.edit"
+    And the "poweruser" role is granted "policies.edit"
+    And A2A surface "alpha" exists for route "/example" with managed agent "bravo" as its target
+    And operator "pete" has the "poweruser" role
+    And operator "pete" listens to the policy input of surface "alpha"
+    When the dashboard session of operator "pete" ends
+    Then operator "pete" is told by the next keep-alive check that listening to surface "alpha" stopped because the session ended
 
   Scenario: An operator whose role holds neither surfaces.edit nor policies.edit may not listen to policy input
     Given A2A surface "alpha" exists for route "/example" with managed agent "bravo" as its target
