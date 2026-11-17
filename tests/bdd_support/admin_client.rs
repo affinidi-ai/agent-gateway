@@ -675,6 +675,17 @@ impl GatewayAdminClient {
             .await
     }
 
+    /// The dashboard WebSocket URL of this gateway.
+    pub fn dashboard_socket_url(&self) -> String {
+        self.client
+            .dashboard_socket_url()
+    }
+
+    /// The session token from [`Self::bootstrap_test_session`], if any.
+    pub fn session_token(&self) -> Option<String> {
+        self.client.session_token()
+    }
+
     /// PATCH a surface with `application/merge-patch+json`. Delegates to the
     /// inner `AdminApiClient` (which already has the session token from
     /// [`Self::bootstrap_test_session`]).

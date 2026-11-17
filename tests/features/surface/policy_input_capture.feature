@@ -86,7 +86,7 @@ Feature: Live policy input capture
     When the caller sends an A2A message/send request to surface "alpha" with text "hello policy"
     Then the response status is 403
     And the Capture view shows the "appliance agent_surface" policy of surface "alpha" denying with reason "Blocked by appliance-wide policy"
-    And the Capture view shows the "appliance agent_surface" policy of surface "alpha" running policy "BDD appliance-wide policy"
+    And the Capture view shows the "appliance agent_surface" policy of surface "alpha" decided by policy "BDD appliance-wide policy"
 
   Scenario: The Capture view shows an appliance-wide policy that fails to evaluate as an error
     Given an appliance-wide surface policy "BDD failing appliance-wide policy" fails to evaluate

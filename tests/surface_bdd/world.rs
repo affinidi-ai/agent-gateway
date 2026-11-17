@@ -9,6 +9,7 @@ use crate::bdd_support::actors::{
     ActorRegistry, PRIMARY_COLLABORATOR_KEY, RuntimeRegistry, SECONDARY_COLLABORATOR_KEY, TargetActorKind,
 };
 use crate::bdd_support::config::api_keys::UnreadableKeyFolders;
+use crate::bdd_support::dashboard_socket::DashboardSocket;
 use crate::bdd_support::gateway_process::GatewayProcess;
 use crate::bdd_support::jwt::JwksServer;
 use crate::bdd_support::mock_server::{MockResponse, MockServer, ReceivedRequest};
@@ -99,55 +100,6 @@ pub fn get_default_temp_dir() -> TempDir {
         builder
             .tempdir()
             .expect("Temporary directory should be created")
-    }
-}
-
-/// An operator's open dashboard WebSocket: the messages it received and a way to send.
-/// Dropping it closes the connection.
-#[derive(Debug)]
-pub struct DashboardSocket {
-    received: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
-    outgoing: tokio::sync::mpsc::UnboundedSender<String>,
-    reader: tokio::task::JoinHandle<()>,
-    writer: tokio::task::JoinHandle<()>,
-}
-
-impl DashboardSocket {
-    pub fn new(
-        received: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
-        outgoing: tokio::sync::mpsc::UnboundedSender<String>,
-        reader: tokio::task::JoinHandle<()>,
-        writer: tokio::task::JoinHandle<()>,
-    ) -> Self {
-        Self {
-            received,
-            outgoing,
-            reader,
-            writer,
-        }
-    }
-
-    pub fn received(&self) -> Vec<serde_json::Value> {
-        self.received
-            .lock()
-            .expect("dashboard messages lock")
-            .clone()
-    }
-
-    pub fn send(
-        &self,
-        text: String,
-    ) {
-        self.outgoing
-            .send(text)
-            .expect("the dashboard WebSocket is open");
-    }
-}
-
-impl Drop for DashboardSocket {
-    fn drop(&mut self) {
-        self.reader.abort();
-        self.writer.abort();
     }
 }
 

@@ -520,6 +520,25 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     });
 }
 
+/// The port of the scenario's one gateway declared with `Given gateway "<name>"`.
+fn only_gateway_instance_port(world: &SurfaceWorld) -> u16 {
+    let mut ports = world
+        .actors
+        .gateway_instances()
+        .values()
+        .filter_map(|gateway| {
+            gateway
+                .fixture
+                .as_ref()
+                .map(|fixture| fixture.gateway_port)
+        });
+    let port = ports
+        .next()
+        .expect("the scenario must start a gateway");
+    assert!(ports.next().is_none(), "the operator's session needs a scenario with one gateway");
+    port
+}
+
 pub async fn ensure_admin_session(world: &mut SurfaceWorld) {
     if world.admin_client.is_some() {
         return;
@@ -527,11 +546,10 @@ pub async fn ensure_admin_session(world: &mut SurfaceWorld) {
 
     ensure_gateway_running(world).await;
 
-    let gateway_port = world
-        .infra
-        .as_ref()
-        .expect("scenario infra must exist")
-        .gateway_port;
+    let gateway_port = match world.infra.as_ref() {
+        Some(infra) => infra.gateway_port,
+        None => only_gateway_instance_port(world),
+    };
     let client = AdminApiClient::new(gateway_port, TEST_AUTH_TOKEN, "surface-bdd-admin");
     client
         .bootstrap_test_session()

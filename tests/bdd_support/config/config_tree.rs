@@ -160,6 +160,8 @@ pub struct GatewayBootstrapFixture {
     pub root_dir: Option<PathBuf>,
     pub log_level: Option<Level>,
     pub policy_opa_entry: Option<String>,
+    /// The policy definition the gateway-level policy references instead of its inline Rego.
+    pub policy_definition_id: Option<String>,
     pub terms_enabled: bool,
     pub affinidi_terms_url: Option<String>,
     /// Dashboard settings the gateway starts with; defaults when absent.
@@ -190,6 +192,7 @@ impl GatewayBootstrapFixture {
             root_dir: None,
             log_level: None,
             policy_opa_entry: None,
+            policy_definition_id: None,
             terms_enabled: false,
             affinidi_terms_url: None,
             settings: None,
@@ -239,6 +242,7 @@ impl GatewayBootstrapFixture {
                 json!({
                     "enabled": true,
                     "policy": policy_opa_entry,
+                    "policy_definition_id": &self.policy_definition_id,
                 })
             } else {
                 serde_json::Value::Null
