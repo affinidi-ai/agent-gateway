@@ -148,7 +148,18 @@ install-python-deps: ## Install the Python packages the changelog tooling needs,
 
 install-git-hooks: ## Install git hooks via pre-commit framework
 	@echo "$(BLUE)🔗 Installing git hooks...$(NC)"
-	@pre-commit install
+	@# pre-commit writes to .git/hooks and refuses to install while core.hooksPath
+	@# is set, since git would ignore .git/hooks entirely. Tools like did-git-sign
+	@# set it globally to a dispatcher that chains back to .git/hooks, so the two
+	@# compose at runtime — only the install needs the setting out of the way.
+	@set -e; \
+	hooks_path=$$(git config --global --get core.hooksPath || true); \
+	if [ -n "$$hooks_path" ]; then \
+		echo "$(BLUE)   core.hooksPath is set globally ($$hooks_path) — restoring it after install$(NC)"; \
+		git config --global --unset-all core.hooksPath; \
+		trap 'git config --global core.hooksPath "$$hooks_path"' EXIT INT TERM; \
+	fi; \
+	pre-commit install
 	@echo "$(GREEN)✅ Git hooks installed!$(NC)"
 
 install-deps: install-rust-deps install-python-deps ## Install all local development dependencies (macOS)
