@@ -116,6 +116,24 @@ test.describe("Connections: Verifiable Trust Agent tab", () => {
     );
   });
 
+  test("says a did:webvh is hosted on the trust agent's webvh server", async ({
+    page,
+  }) => {
+    await mockTrustAgents(
+      page,
+      [agent()],
+      status({
+        context_did_method: "did_webvh",
+        context_did_hosting: "vta_server",
+      }),
+    );
+
+    await page.goto(`${BASE_URL}/connections?tab=trust-agents`);
+    await expect(page.getByTestId("trust-agents-context-did")).toContainText(
+      "on the trust agent's webvh server",
+    );
+  });
+
   test("says new contexts sign as a did:key by default", async ({ page }) => {
     await mockTrustAgents(
       page,
