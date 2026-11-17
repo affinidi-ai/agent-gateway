@@ -10,12 +10,16 @@ changes:
         shortens: one that would extend the consent, or that the consent is already older than,
         is refused with 400 and a code (limit_not_sooner, consent_older_than_limit), as is a
         value outside one minute to 365 days (invalid_limit) and an entry nobody consented to
-        (not_a_consent). The credential is used and refreshed until the new end and then
+        (not_a_consent). A consent that changed while it was being limited, because the person
+        consented again or another limit got there first, is left as it is and answered with
+        409 consent_changed. The credential is used and refreshed until the new end and then
         removed as any ended consent. The route needs delegation_vault.delete and an
         appliance-wide caller, as a revoke does, and is audited as the new consent_limited
         event, which names who set the limit, whose consent it is, its new end and the end it
         had. consent_limited is listed by GET /v1/settings/audit-events and the integration
-        event catalog.
+        event catalog, and is also recorded wherever token_revoked is selected, so an audit
+        selection or an integration event set made before this release receives it without
+        being changed.
     - timestamp: '2026-11-17T14:40:00Z'
       title: Add Limit duration beside Revoke on the Credential Tokens tab
       description: >-
@@ -23,8 +27,11 @@ changes:
         the Credentials page's Credential Tokens tab. It opens a panel in place under the row,
         with no dialog, to set how long after its consent that one delegation may be used. The
         panel says when the consent would end before anything is saved, and offers Save only
-        for a limit that brings the end forward. The Audit Log offers the new Consent Limited
-        category and describes its records.
+        for a limit that brings the end forward. It takes the keyboard focus when it opens and
+        gives it back to the button when it closes, and a refusal is shown under the field in
+        the gateway's words. The button is shown to users with delegation_vault.delete. The
+        Audit Log offers the new Consent Limited category and says in each record when the
+        consent now ends and when it ended before.
     - timestamp: '2026-11-16T15:30:00Z'
       title: Warn how many active consents a shorter consent time limit ends
       description: >-
@@ -80,9 +87,12 @@ changes:
       description: >-
         Delegated Access and Credential Tokens cut an agent's DID in the middle, which hid the
         agent's name. A did:web agent now shows its whole web address, such as
-        "pr-reviewer.example.com", without "did:web:" and wrapping when long; other DID methods
-        stay shortened, and the full DID is in the tooltip. Credential Tokens also revokes one
-        delegation with the same "Revoke" text button and named confirm as Delegated Access.
+        "pr-reviewer.example.com", without "did:web:", wrapping after a dot or a slash when
+        long; other DID methods stay shortened, and the full DID is in the tooltip. A did:web
+        DID with a percent escape other than its port's, or with an invisible character, stays
+        shortened too, so a DID cannot show a name it does not spell. Credential Tokens also
+        revokes one delegation with the same "Revoke" text button and named confirm as
+        Delegated Access.
     - timestamp: '2026-11-16T16:00:00Z'
       title: Show each consent's limit, and when an access token renews by itself
       description: >-
@@ -124,8 +134,9 @@ changes:
       description: >-
         The help under "Enable automatic token refresh" on an Authorization Code provider said the
         connection keeps working without reauthorizing, which a consent time limit contradicts.
-        It now says tokens are refreshed until the consent time limit ends, and that the person
-        then approves again. Other provider types keep the old help.
+        It now says tokens are refreshed for as long as the consent lasts, points at the
+        Consent time limit field, and says the person approves again when the consent ends.
+        Other provider types keep the old help.
     - timestamp: '2026-11-16T15:20:00Z'
       title: Show a refused consent time limit under its field and move focus there
       description: >-
@@ -134,6 +145,47 @@ changes:
         now marked invalid for assistive technology too, says "Enter a limit from 1 minute to 365
         days, or leave it empty." under itself and takes the focus; the banner stays as a
         summary.
+    - timestamp: '2026-11-17T18:00:00Z'
+      title: Show a failed read of the delegation vault as an error, not an empty list
+      description: >-
+        When the gateway refused the list of delegations, or could not be reached, Credential
+        Tokens said "No delegation tokens yet" and Delegated Access said there was no active
+        access, as if nobody had delegated anything. Both tabs now show why the read failed,
+        with a Retry, and say there are none only when the gateway lists none.
+    - timestamp: '2026-11-17T18:05:00Z'
+      title: Keep Credential Tokens and Delegated Access in step after a change
+      description: >-
+        The two tabs each read the vault on their own, so a delegation revoked or limited on one
+        still showed its old state on the other until the page was reloaded. The Credentials
+        page now reads the vault once for both, which also halves its requests.
+    - timestamp: '2026-11-17T18:10:00Z'
+      title: Show the page before when the last delegation of a page is revoked
+      description: >-
+        Revoking the only delegation on the last page of Credential Tokens or Delegated Access,
+        or all of a user's there, left a table with headers, no rows and no page links. The tab
+        now shows the last page that still has entries.
+    - timestamp: '2026-11-17T18:15:00Z'
+      title: Offer Revoke on the credential tabs by the permission the gateway checks
+      description: >-
+        Credential Tokens and Delegated Access showed Revoke to users with settings.edit, while
+        the gateway asks for delegation_vault.delete, so a role with one and not the other saw
+        a button that was refused or no button for something it may do. The tabs now show
+        Revoke, Revoke all and Limit duration with delegation_vault.delete, and no Actions
+        column without it.
+    - timestamp: '2026-11-17T18:20:00Z'
+      title: Say why a revoke on the credential tabs was refused
+      description: >-
+        A refused revoke toasted "Failed to revoke: Revoke failed:" and the HTTP status text,
+        which is empty on some connections, and dropped what the gateway answered. The toast
+        now reads "Not revoked:" with the gateway's own words, its status where it gave none,
+        or that the gateway could not be reached.
+    - timestamp: '2026-11-17T18:25:00Z'
+      title: Open a token's details and cancel a confirm from the keyboard
+      description: >-
+        A row of Credential Tokens opened its details only on a mouse click, so the keyboard
+        could not reach a token's consent end or the link to its user's audit records; the row
+        now has a button for it. Escape now cancels a two-step confirm, such as Revoke, Revoke
+        all, Deactivate or a delete, which only a click elsewhere did before.
   removed:
     - timestamp: '2026-11-17T13:20:00Z'
       title: Remove the Credential Delegation Audit tab from the Credentials page
@@ -143,7 +195,16 @@ changes:
         records are still read in the Audit Log: open it from the menu, from History on
         Delegated Access, or from a token's expanded row on Credential Tokens. A stored
         /credentials?tab=credential-audit address now opens the page's first tab.
-  security: []
+  security:
+    - timestamp: '2026-11-17T18:30:00Z'
+      title: Show gateway log lines on the dashboard to appliance-wide callers only
+      description: >-
+        GET /v1/dashboard/delta and GET /v1/dashboard/stats returned the gateway's log lines to
+        any caller with logs.view, including an access token scoped to one tenant, to a
+        resource pattern or by required headers alone. The log holds every tenant's lines, and
+        now the per-call delegation events too, so such a token is answered without log lines,
+        as GET /v1/logs/download already refused it. Sessions and appliance-wide access tokens
+        are unaffected.
   breaking:
     - timestamp: '2026-11-16T17:00:00Z'
       title: ⭐ Write per-call delegation events to the gateway log, not the audit
@@ -154,10 +215,13 @@ changes:
         and integrations are offered none of them, and GET /v1/settings/audit-events and the
         integration event catalog no longer list them. Each is now one INFO line of the gateway
         log, "Delegation event event=<name> ...", naming the agent, the caller's identity hash,
+        how the caller authenticated, the paired gateway that sent the request when one did,
         the provider, the surface, the token or grant, its scopes and the MCP tool, and no
-        credential: the Target URL is logged without its user name and password and with every
-        query value redacted, and the tool name, which the caller chooses, as a quoted token that
-        cannot start a log line of its own. What was decided about delegated access stays
+        credential or personal detail: the Target URL is logged without its user name and
+        password and with every query value redacted, and what a caller, a paired gateway or a
+        vendor chooses (the tool name, the scopes, the sending gateway, the agent's DID, the
+        detail) as quoted tokens that cannot start a log line of their own. What was decided
+        about delegated access stays
         audited: consent_granted, consent_expired, token_revoked, user_tokens_revoked,
         delegation_failed, connector_call and mcp_proxy_pin_changed. Upgrade note: the lines are
         written at the default log level, INFO, to stderr and, when a log directory is set, to

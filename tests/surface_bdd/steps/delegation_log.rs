@@ -21,60 +21,20 @@ fn gateway_keeps_its_log_of_delegation_events(world: &mut SurfaceWorld) {
 
 type LoggedEvent = HashMap<String, String>;
 
-/// The `key=value` fields of every `Delegation event` line in the gateway log.
+/// The `key=value` fields of every `Delegation event` line in the gateway log. A value a
+/// caller or a vendor chose is logged as a quoted token: it is kept as logged, quotes included.
 fn delegation_events(world: &SurfaceWorld) -> Vec<LoggedEvent> {
     gateway_log(world)
         .lines()
         .filter_map(|line| line.split_once("Delegation event "))
-        .map(|(_, fields)| logged_fields(fields))
+        .map(|(_, fields)| {
+            fields
+                .split_whitespace()
+                .filter_map(|field| field.split_once('='))
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        })
         .collect()
-}
-
-/// The fields of one line. A value a caller or a vendor chose is logged as a
-/// quoted token, so a space inside it starts no field; a field named twice
-/// keeps its first value.
-fn logged_fields(mut rest: &str) -> LoggedEvent {
-    let mut fields = LoggedEvent::new();
-    while let Some((key, after)) = rest
-        .trim_start()
-        .split_once('=')
-    {
-        let (value, remainder) = match after.strip_prefix('"') {
-            Some(quoted) => quoted_value(quoted),
-            None => {
-                let (value, remainder) = after
-                    .split_once(char::is_whitespace)
-                    .unwrap_or((after, ""));
-                (value.to_string(), remainder)
-            }
-        };
-        fields
-            .entry(key.to_string())
-            .or_insert(value);
-        rest = remainder;
-    }
-    fields
-}
-
-/// The text of a quoted token, read from just after its opening quote, and what
-/// follows its closing quote.
-fn quoted_value(quoted: &str) -> (String, &str) {
-    let mut value = String::new();
-    let mut characters = quoted.char_indices();
-    while let Some((position, character)) = characters.next() {
-        match character {
-            '"' => return (value, &quoted[position + 1..]),
-            '\\' => match characters.next() {
-                Some((_, 'n')) => value.push('\n'),
-                Some((_, 'r')) => value.push('\r'),
-                Some((_, 't')) => value.push('\t'),
-                Some((_, escaped)) => value.push(escaped),
-                None => {}
-            },
-            other => value.push(other),
-        }
-    }
-    (value, "")
 }
 
 /// A request is answered before the log line of its last step is flushed, so
@@ -174,7 +134,7 @@ async fn gateway_log_records_delegation_event_naming_tool(
             .any(|logged| {
                 logged
                     .get("mcp_tool_name")
-                    .is_some_and(|name| name == &tool)
+                    .is_some_and(|name| *name == format!("{tool:?}"))
             })
     })
     .await;
@@ -208,12 +168,5 @@ async fn gateway_log_records_two_callers_of_one_agent(
     };
     let (found, events) = eventually_delegation_events(world, |events| named(events, "user_hash").len() == 2).await;
     assert!(found, "the gateway log does not record {event:?} for two callers: {events:?}");
-    let agents = named(&events, "agent_did");
-    assert_eq!(agents.len(), 1, "the callers use one Agent DID: {events:?}");
-    assert!(
-        agents
-            .iter()
-            .all(|did| did.starts_with("did:")),
-        "{agents:?}"
-    );
+    crate::steps::then::assert_one_agent_did(&named(&events, "agent_did"), &events);
 }

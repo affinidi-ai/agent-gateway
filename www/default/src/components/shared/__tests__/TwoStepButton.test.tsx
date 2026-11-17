@@ -1,5 +1,5 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { TwoStepButton } from '../TwoStepButton';
 
@@ -52,6 +52,24 @@ describe('TwoStepButton', () => {
     await waitFor(() => expect(button()).toHaveClass('text-warning'));
   });
 
+  it('asks no more after Escape, and acts on nothing', () => {
+    const { onConfirm, button } = renderButton({
+      confirmAs: 'danger',
+      confirmLabel: 'Revoke all 2 for this user?',
+    });
+    fireEvent.click(button());
+    expect(button()).toHaveTextContent(/^Revoke all 2 for this user\?$/);
+
+    fireEvent.keyDown(document, { key: 'Enter' });
+    expect(button()).toHaveClass('btn-danger');
+    fireEvent.keyDown(document, { key: 'Escape' });
+
+    expect(button()).toHaveClass('text-warning');
+    expect(button()).not.toHaveClass('btn-danger');
+    expect(button()).toHaveAccessibleName('Revoke all');
+    expect(onConfirm).not.toHaveBeenCalled();
+  });
+
   it('names a danger confirm by what it reads', () => {
     const { button } = renderButton({ confirmAs: 'danger', confirmLabel: 'Revoke GitHub access?' });
 
@@ -87,5 +105,46 @@ describe('TwoStepButton', () => {
     expect(button()).toHaveTextContent(/^Revoke$/);
     expect(button()).toHaveFocus();
     expect(onConfirm).not.toHaveBeenCalled();
+  });
+
+  describe('once it listens for a click elsewhere', () => {
+    beforeEach(() => jest.useFakeTimers());
+    afterEach(() => jest.useRealTimers());
+
+    const asking = () => {
+      const view = renderButton({
+        icon: undefined,
+        label: 'Revoke',
+        confirmAs: 'danger',
+        confirmLabel: 'Revoke GitHub access?',
+        cancelTestId: 'two-step-cancel',
+      });
+      fireEvent.click(view.button());
+      act(() => {
+        jest.advanceTimersByTime(100);
+      });
+      return view;
+    };
+
+    it('asks no more after a press elsewhere', () => {
+      const { onConfirm, button } = asking();
+
+      fireEvent.mouseDown(document.body);
+
+      expect(button()).toHaveTextContent(/^Revoke$/);
+      expect(onConfirm).not.toHaveBeenCalled();
+    });
+
+    it('keeps asking while Cancel is pressed, so that Cancel returns the focus', () => {
+      const { button } = asking();
+      const cancel = screen.getByTestId('two-step-cancel');
+
+      fireEvent.mouseDown(cancel);
+      expect(screen.getByTestId('two-step-cancel')).toBeInTheDocument();
+      fireEvent.click(cancel);
+
+      expect(button()).toHaveTextContent(/^Revoke$/);
+      expect(button()).toHaveFocus();
+    });
   });
 });

@@ -15,7 +15,11 @@ import ConsentConfirmationSection from './EditCredentialProviderPage/ConsentConf
 import JwtAssertionSection from './EditCredentialProviderPage/JwtAssertionSection';
 import { SecretOption as Secret, SecretOptions } from './EditCredentialProviderPage/SecretSelect';
 import { splitByTenant, type OwnerTenant } from '../utils/tenantScope';
-import { consentLimitUnitsFor, storedConsentLimit } from '../utils/consentLimit';
+import {
+  CONSENT_LIMIT_RANGE,
+  consentLimitUnitsFor,
+  storedConsentLimit,
+} from '../utils/consentLimit';
 import { useConsentImpact } from './EditCredentialProviderPage/useConsentImpact';
 import {
   CONSENT_LIMIT_FIELD_MESSAGE,
@@ -1039,7 +1043,7 @@ const EditCredentialProviderPage: React.FC = () => {
               <div>
                 <small className="form-text text-muted">
                   {takesConsent(form.provider_type)
-                    ? 'Access tokens are refreshed automatically using the stored refresh token, until the consent time limit below ends. After that, the person approves again.'
+                    ? 'Access tokens are refreshed automatically using the stored refresh token for as long as the consent lasts (see Consent time limit below). When the consent ends, the person approves again.'
                     : 'Access tokens are refreshed automatically using the stored refresh token whenever one is available, so this connection keeps working without needing to reauthorize.'}
                 </small>
               </div>
@@ -1099,18 +1103,20 @@ const EditCredentialProviderPage: React.FC = () => {
                 )}
                 <small className="form-text text-muted">
                   Leave empty to set no limit on this provider. A default or a ceiling in the
-                  gateway's configuration still applies. From 1 minute to 365 days.
+                  gateway's configuration still applies.
+                  {!consentLimitRefused && ` From ${CONSENT_LIMIT_RANGE}.`}
                 </small>
-                {consentImpact && (
-                  <div
-                    className="form-text text-warning-emphasis"
-                    role="status"
-                    data-testid="credential-provider-consent-limit-impact"
-                  >
-                    <i className="fas fa-exclamation-triangle me-1" aria-hidden="true" />
-                    {consentImpact}
-                  </div>
-                )}
+                <div role="status" data-testid="credential-provider-consent-limit-impact-region">
+                  {consentImpact && (
+                    <div
+                      className="alert alert-warning py-2 mt-2"
+                      data-testid="credential-provider-consent-limit-impact"
+                    >
+                      <i className="fas fa-exclamation-triangle me-2" aria-hidden="true" />
+                      {consentImpact}
+                    </div>
+                  )}
+                </div>
               </div>
             )}
 

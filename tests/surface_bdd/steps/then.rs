@@ -4017,8 +4017,16 @@ async fn delegation_audit_trail_records_consents_of_two_callers(
     let (found, events) =
         eventually_delegation_audit_events(world, |events| named(events, "user_identity_hash").len() == 2).await;
     assert!(found, "expected a consent to provider '{provider}' ({record_id}) by two callers, got {events:?}");
-    let agents = named(&events, "agent_did");
-    assert_eq!(agents.len(), 1, "the callers use one Agent DID: {events:?}");
+    assert_one_agent_did(&named(&events, "agent_did"), &events);
+}
+
+/// The callers named by `records` act through one agent: `agents`, the Agent DIDs
+/// the records name, is one DID.
+pub(crate) fn assert_one_agent_did(
+    agents: &std::collections::BTreeSet<String>,
+    records: &impl std::fmt::Debug,
+) {
+    assert_eq!(agents.len(), 1, "the callers use one Agent DID: {records:?}");
     assert!(
         agents
             .iter()

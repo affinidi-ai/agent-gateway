@@ -4,25 +4,30 @@ import { AppButton } from '../../components/shared/AppButton';
 import { Badge } from '../../components/shared/Badge';
 import { TwoStepButton } from '../../components/shared/TwoStepButton';
 import { EmptyState } from '../../components/shared/EmptyState';
-import { apiClient } from '../../api';
 import { showToast } from '../../utils/toaster';
+import { getErrorMessage } from '../../utils/apiError';
 import { formatDateTime, topAndTail } from '../../utils/stringUtils';
-import { consentLimitLabel } from '../../utils/consentLimit';
+import { consentLimitLabel, takesConsent } from '../../utils/consentLimit';
 import { DOCS_URL } from '../../config/docs';
-import PaginationControls from './PaginationControls';
+import AgentName from './AgentName';
+import PaginationControls, { clampPage } from './PaginationControls';
+import VaultReadError from './VaultReadError';
 import {
   DelegationToken,
-  agentName,
   consentEnd,
   consentLimitSecs,
   consentState,
   isActiveDelegation,
+  matchesSearch,
   providerName,
+  shownTime,
   timeLeft,
 } from './delegatedAccess';
-import { useDelegationVault } from './useDelegationVault';
+import { DelegationVault } from './useDelegationVault';
 
 interface DelegatedAccessTabProps {
+  /** The vault the Credentials page loaded, the same one the Credential Tokens tab shows. */
+  vault: DelegationVault;
   externalSearchTerm?: string;
   onFilteredCountChange?: (n: number) => void;
   /** Opens the delegation audit, where ended and revoked access is recorded; no button without it. */
@@ -32,15 +37,16 @@ interface DelegatedAccessTabProps {
 const PAGE_SIZE = 10;
 
 const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
+  vault,
   externalSearchTerm,
   onFilteredCountChange,
   onViewHistory,
 }) => {
   const { hasPermission } = usePermissions();
-  const { tokens, setTokens, providers, loading } = useDelegationVault();
+  const { tokens, providers, loading, vaultError } = vault;
   const [page, setPage] = useState(1);
   const searchTerm = (externalSearchTerm ?? '').trim().toLowerCase();
-  const canRevoke = hasPermission('settings.edit');
+  const canRevoke = hasPermission('delegation_vault.delete');
 
   useEffect(() => {
     setPage(1);
@@ -48,10 +54,13 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
 
   const systemOf = (token: DelegationToken) => providerName(token, providers);
 
-  /** A token of a provider nobody consents to is a service token, not a person's delegation. */
+  /**
+   * A token of a provider nobody consents to is a service token, not a person's delegation. One
+   * whose provider is unknown is listed, since its provider may only be unreadable.
+   */
   const consentedTo = (token: DelegationToken) => {
     const type = providers[token.credential_provider_id]?.provider_type;
-    return !type || type === 'oauth2_authorization_code';
+    return !type || takesConsent(type);
   };
 
   const now = new Date();
@@ -59,16 +68,9 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
   const endingSoon = active.filter(
     token => consentState(consentEnd(token.consent_expires_at), now) === 'ending_soon'
   ).length;
-  const shown = active.filter(
-    token =>
-      !searchTerm ||
-      systemOf(token).toLowerCase().includes(searchTerm) ||
-      token.provider_id.toLowerCase().includes(searchTerm) ||
-      token.agent_did.toLowerCase().includes(searchTerm) ||
-      token.user_identity_hash.toLowerCase().includes(searchTerm) ||
-      token.scopes.some(scope => scope.toLowerCase().includes(searchTerm))
-  );
-  const paged = shown.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+  const shown = active.filter(token => matchesSearch(token, providers, searchTerm));
+  const shownPage = clampPage(page, PAGE_SIZE, shown.length);
+  const paged = shown.slice((shownPage - 1) * PAGE_SIZE, shownPage * PAGE_SIZE);
 
   useEffect(() => {
     onFilteredCountChange?.(shown.length);
@@ -76,15 +78,10 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
 
   const revoke = async (token: DelegationToken) => {
     try {
-      const response = await apiClient.fetch(
-        `/api/v1/delegation-vault/${encodeURIComponent(token.id)}`,
-        { method: 'DELETE' }
-      );
-      if (!response.ok) throw new Error(`Revoke failed: ${response.statusText}`);
-      setTokens(prev => prev.filter(t => t.id !== token.id));
+      await vault.revoke(token.id);
       showToast('success', 'Access revoked');
-    } catch (e: any) {
-      showToast('error', `Failed to revoke: ${e.message}`);
+    } catch (error) {
+      showToast('error', `Not revoked: ${getErrorMessage(error)}`);
     }
   };
 
@@ -93,12 +90,14 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
       <div className="card-header py-3 d-flex justify-content-between align-items-center flex-wrap gap-2">
         <h6 className="m-0 font-weight-bold text-primary">
           <i className="fas fa-user-check"></i> Delegated Access
-          <Badge
-            value={shown.length}
-            suffix={searchTerm ? ` of ${active.length}` : undefined}
-            className="ms-2"
-            ariaLabel={`${shown.length}${searchTerm ? ` of ${active.length}` : ''} active delegations`}
-          />
+          {!vaultError && (
+            <Badge
+              value={shown.length}
+              suffix={searchTerm ? ` of ${active.length}` : undefined}
+              className="ms-2"
+              ariaLabel={`${shown.length}${searchTerm ? ` of ${active.length}` : ''} active delegations`}
+            />
+          )}
           {endingSoon > 0 && (
             <span
               className="badge text-bg-warning ms-2"
@@ -131,6 +130,12 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
           <div className="text-center py-5">
             <div className="spinner-border text-primary" role="status"></div>
           </div>
+        ) : vaultError ? (
+          <VaultReadError
+            error={vaultError}
+            onRetry={vault.reload}
+            testId="delegated-access-read-error"
+          />
         ) : active.length === 0 ? (
           <EmptyState
             icon="fa-user-check"
@@ -182,9 +187,7 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
                         )}
                       </td>
                       <td>
-                        <code className="text-muted text-break" title={token.agent_did}>
-                          {agentName(token.agent_did)}
-                        </code>
+                        <AgentName did={token.agent_did} />
                       </td>
                       <td>
                         {token.scopes.map(scope => (
@@ -214,9 +217,7 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
                         )}
                       </td>
                       <td>
-                        <small>
-                          {token.last_used_at ? formatDateTime(token.last_used_at, true) : '—'}
-                        </small>
+                        <small>{shownTime(token.last_used_at)}</small>
                       </td>
                       {canRevoke && (
                         <td>
@@ -239,7 +240,7 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
               </tbody>
             </table>
             <PaginationControls
-              page={page}
+              page={shownPage}
               pageSize={PAGE_SIZE}
               total={shown.length}
               onPageChange={setPage}

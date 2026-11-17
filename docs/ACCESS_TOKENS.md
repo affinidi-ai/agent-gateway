@@ -328,7 +328,10 @@ provider
 The server logs are unpartitioned as well and hold every tenant's request and credential
 delegation detail, so `GET /v1/logs/download` serves them only to an appliance-wide caller: a
 session, or a PAT with neither a resource pattern nor required headers. A tenant PAT, and a PAT
-scoped by a resource pattern or by required headers alone, gets `403`, `audit.view` or not.
+scoped by a resource pattern or by required headers alone, gets `403`, `audit.view` or not. The
+log lines the dashboard shows follow the same rule: `GET /v1/dashboard/delta` and
+`GET /v1/dashboard/stats` answer such a PAT without any, `logs.view` or not
+([`RBAC.md`](RBAC.md#dashboard-log-lines)).
 
 A feature-gated management route checks both the bound user's role and the PAT's feature
 scopes. The role-only routes listed in [`RBAC.md`](RBAC.md#permissions-endpoint) check only the

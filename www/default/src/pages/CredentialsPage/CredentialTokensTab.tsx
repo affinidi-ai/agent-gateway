@@ -1,28 +1,33 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { usePermissions } from '../../context/PermissionsContext';
 import { AppButton } from '../../components/shared/AppButton';
 import { TwoStepButton } from '../../components/shared/TwoStepButton';
-import { CopyButton } from '../../components/shared/CopyButton';
-import { apiClient } from '../../api';
-import { showToast } from '../../utils/toaster';
-import { formatDateTime, topAndTail } from '../../utils/stringUtils';
 import { EmptyState } from '../../components/shared/EmptyState';
+import { showToast } from '../../utils/toaster';
+import { getErrorMessage } from '../../utils/apiError';
+import { formatDateTime, topAndTail } from '../../utils/stringUtils';
 import { DOCS_URL } from '../../config/docs';
-import PaginationControls from './PaginationControls';
+import AgentName from './AgentName';
 import ConsentLimitPanel from './ConsentLimitPanel';
+import CredentialTokenDetail, { TokenStatusBadge } from './CredentialTokenDetail';
+import PaginationControls, { clampPage } from './PaginationControls';
+import VaultReadError from './VaultReadError';
 import {
   DelegationToken,
-  agentName,
   canLimitConsent,
-  consentEnd,
-  consentState,
+  consentEndSentence,
+  matchesSearch,
   providerName,
   renewsAutomatically,
-  timeLeft,
+  revokeAllLabel,
+  shownTime,
+  tokenStatus,
 } from './delegatedAccess';
-import { useDelegationVault } from './useDelegationVault';
+import { DelegationVault } from './useDelegationVault';
 
 interface CredentialTokensTabProps {
+  /** The vault the Credentials page loaded, the same one the Delegated Access tab shows. */
+  vault: DelegationVault;
   externalSearchTerm?: string;
   onFilteredCountChange?: (n: number) => void;
   /** Opens the delegation audit of one user identity hash; no link is shown without it. */
@@ -32,115 +37,68 @@ interface CredentialTokensTabProps {
 const PAGE_SIZE = 10;
 
 const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
+  vault,
   externalSearchTerm,
   onFilteredCountChange,
   onViewActivity,
 }) => {
   const { hasPermission } = usePermissions();
-  const { tokens, setTokens, providers, loading } = useDelegationVault();
-  const [internalSearchTerm, setInternalSearchTerm] = useState('');
-  const externalProvided = externalSearchTerm !== undefined;
-  const searchTerm = externalProvided ? externalSearchTerm! : internalSearchTerm;
-  const [tokensPage, setTokensPage] = useState(1);
+  const { tokens, providers, loading, vaultError } = vault;
+  const [page, setPage] = useState(1);
   const [expandedTokenId, setExpandedTokenId] = useState<string | null>(null);
   const [limitingTokenId, setLimitingTokenId] = useState<string | null>(null);
-
-  const canEditTokens = hasPermission('settings.edit');
+  const limitButtonRef = useRef<HTMLButtonElement>(null);
+  const searchTerm = (externalSearchTerm ?? '').trim().toLowerCase();
+  const canManage = hasPermission('delegation_vault.delete');
+  const columns = canManage ? 9 : 8;
 
   useEffect(() => {
-    setTokensPage(1);
+    setPage(1);
   }, [searchTerm]);
 
-  const handleRevokeToken = async (token: DelegationToken) => {
-    try {
-      const response = await apiClient.fetch(
-        `/api/v1/delegation-vault/${encodeURIComponent(token.id)}`,
-        { method: 'DELETE' }
-      );
-      if (!response.ok) throw new Error(`Revoke failed: ${response.statusText}`);
-      setTokens(prev => prev.filter(t => t.id !== token.id));
-      showToast('success', 'Delegation revoked');
-    } catch (e: any) {
-      showToast('error', `Failed to revoke: ${e.message}`);
-    }
-  };
-
-  const handleRevokeByUser = async (userHash: string) => {
-    try {
-      const response = await apiClient.fetch(
-        `/api/v1/delegation-vault/by-user/${encodeURIComponent(userHash)}`,
-        { method: 'DELETE' }
-      );
-      if (!response.ok) throw new Error(`Bulk revoke failed: ${response.statusText}`);
-      setTokens(prev => prev.filter(t => t.user_identity_hash !== userHash));
-      showToast('success', 'All delegations for user revoked');
-    } catch (e: any) {
-      showToast('error', `Failed to revoke: ${e.message}`);
-    }
-  };
-
-  const handleLimitSaved = (limited: DelegationToken) => {
-    setTokens(prev => prev.map(t => (t.id === limited.id ? { ...t, ...limited } : t)));
-    setLimitingTokenId(null);
-    const end = consentEnd(limited.consent_expires_at);
-    showToast(
-      'success',
-      `Limit saved. ${providerName(limited, providers)} access ends ${end ? formatDateTime(end, true) : 'as before'}.`
-    );
-  };
-
-  const fmtDate = (d: string | null) => (d ? formatDateTime(d, true) : '—');
-
-  /** The confirm of revoking every delegation of a user, with how many it ends. */
-  const revokeAllLabel = (userHash: string) => {
-    const count = tokens.filter(t => t.user_identity_hash === userHash).length;
-    return count === 1
-      ? "Revoke this user's only delegation?"
-      : `Revoke all ${count} for this user?`;
-  };
-
-  /** The end of a token's consent: as a sentence for the list, or as a value for the detail. */
-  const consentEndText = (token: DelegationToken, form: 'sentence' | 'value') => {
-    const end = consentEnd(token.consent_expires_at);
-    if (!end) return 'No time limit';
-    const date = formatDateTime(end, true);
-    if (consentState(end, new Date()) === 'ended') {
-      return form === 'sentence' ? `Ended ${date}` : `${date} (ended)`;
-    }
-    const left = timeLeft(end, new Date());
-    return form === 'sentence' ? `Ends ${date} (${left})` : `${date} (${left})`;
-  };
-
-  const getStatusBadge = (token: DelegationToken) => {
-    const consent = consentState(consentEnd(token.consent_expires_at), new Date());
-    if (consent === 'ended') return <span className="badge text-bg-secondary">Consent ended</span>;
-    if (consent === 'ending_soon')
-      return <span className="badge text-bg-warning">Ending soon</span>;
-    if (token.is_expired && token.can_refresh)
-      return <span className="badge text-bg-warning">Expired (refreshable)</span>;
-    if (token.is_expired) return <span className="badge text-bg-danger">Expired</span>;
-    return <span className="badge text-bg-success">Active</span>;
-  };
-
-  const filteredTokens = tokens.filter(t => {
-    const trimmedSearch = searchTerm.trim();
-    if (!trimmedSearch) return true;
-
-    const searchLower = trimmedSearch.toLowerCase();
-    return (
-      providerName(t, providers).toLowerCase().includes(searchLower) ||
-      t.provider_id.toLowerCase().includes(searchLower) ||
-      t.agent_did.toLowerCase().includes(searchLower) ||
-      t.user_identity_hash.toLowerCase().includes(searchLower) ||
-      t.scopes.some(scope => scope.toLowerCase().includes(searchLower))
-    );
-  });
+  const now = new Date();
+  const shown = tokens.filter(token => matchesSearch(token, providers, searchTerm));
+  const shownPage = clampPage(page, PAGE_SIZE, shown.length);
+  const paged = shown.slice((shownPage - 1) * PAGE_SIZE, shownPage * PAGE_SIZE);
 
   useEffect(() => {
-    onFilteredCountChange?.(filteredTokens.length);
-  }, [filteredTokens.length, onFilteredCountChange]);
+    onFilteredCountChange?.(shown.length);
+  }, [shown.length, onFilteredCountChange]);
 
-  const pagedTokens = filteredTokens.slice((tokensPage - 1) * PAGE_SIZE, tokensPage * PAGE_SIZE);
+  const revoke = async (token: DelegationToken) => {
+    try {
+      await vault.revoke(token.id);
+      showToast('success', 'Delegation revoked');
+    } catch (error) {
+      showToast('error', `Not revoked: ${getErrorMessage(error)}`);
+    }
+  };
+
+  const revokeUser = async (userHash: string) => {
+    try {
+      await vault.revokeUser(userHash);
+      showToast('success', 'All delegations for user revoked');
+    } catch (error) {
+      showToast('error', `Not revoked: ${getErrorMessage(error)}`);
+    }
+  };
+
+  const limit = async (token: DelegationToken, limitSecs: number) => {
+    const end = await vault.limitConsent(token.id, limitSecs);
+    showToast(
+      'success',
+      `Limit saved. ${providerName(token, providers)} access ends ${formatDateTime(end, true)}.`
+    );
+  };
+
+  /** Closes the open limit panel and returns the focus to the button that opened it. */
+  const closeLimit = () => {
+    limitButtonRef.current?.focus();
+    setLimitingTokenId(null);
+  };
+
+  const delegationsOf = (userHash: string) =>
+    tokens.filter(held => held.user_identity_hash === userHash).length;
 
   return (
     <div className="card shadow mb-4">
@@ -154,6 +112,12 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
           <div className="text-center py-5">
             <div className="spinner-border text-primary" role="status"></div>
           </div>
+        ) : vaultError ? (
+          <VaultReadError
+            error={vaultError}
+            onRetry={vault.reload}
+            testId="credential-tokens-read-error"
+          />
         ) : tokens.length === 0 ? (
           <EmptyState
             icon="fa-lock"
@@ -161,7 +125,7 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
             body="Delegation tokens let a caller act on behalf of a credential holder. They appear here once per-caller credential delegation is configured."
             docsHref={DOCS_URL.credentialDelegation}
           />
-        ) : filteredTokens.length === 0 ? (
+        ) : shown.length === 0 ? (
           <div className="text-center text-muted py-5">
             <i className="fas fa-search fa-3x mb-3" aria-hidden="true" />
             <p className="mb-0">No tokens match your search.</p>
@@ -179,359 +143,166 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                   <th>Consented</th>
                   <th>Last Used</th>
                   <th>Access Token</th>
-                  <th>Actions</th>
+                  {canManage && <th>Actions</th>}
                 </tr>
               </thead>
               <tbody>
-                {pagedTokens.map(token => (
-                  <React.Fragment key={token.id}>
-                    <tr
-                      style={{ cursor: 'pointer' }}
-                      data-testid={`credential-token-row-${token.id}`}
-                      className={expandedTokenId === token.id ? 'table-active' : ''}
-                      onClick={() =>
-                        setExpandedTokenId(expandedTokenId === token.id ? null : token.id)
-                      }
-                    >
-                      <td>
-                        <i
-                          className={`fas fa-chevron-${expandedTokenId === token.id ? 'down' : 'right'} me-2 text-muted`}
-                          style={{ fontSize: '0.7rem' }}
-                        ></i>
-                        <strong>{providerName(token, providers)}</strong>
-                      </td>
-                      <td>
-                        <code className="text-muted text-break" title={token.agent_did}>
-                          {agentName(token.agent_did)}
-                        </code>
-                      </td>
-                      <td>
-                        <div className="d-flex flex-wrap align-items-center gap-1">
-                          <code className="text-muted" title={token.user_identity_hash}>
-                            {topAndTail(token.user_identity_hash, 8, 8)}
-                          </code>
-                          {canEditTokens && (
-                            <TwoStepButton
-                              icon="fa-ban"
-                              confirmAs="danger"
-                              confirmLabel={revokeAllLabel(token.user_identity_hash)}
-                              title="Revoke all for this user"
-                              confirmTitle="Click again to revoke every delegation of this user"
-                              ariaLabel={`Revoke all delegations for user ${topAndTail(token.user_identity_hash, 8, 8)}`}
-                              confirmAriaLabel={`${revokeAllLabel(token.user_identity_hash)} User ${topAndTail(token.user_identity_hash, 8, 8)}`}
-                              className="btn btn-link btn-sm p-0 border-0 text-warning text-decoration-none"
-                              data-testid={`credential-token-revoke-user-button-${token.id}`}
-                              onConfirm={() => handleRevokeByUser(token.user_identity_hash)}
+                {paged.map(token => {
+                  const provider = providers[token.credential_provider_id];
+                  const name = providerName(token, providers);
+                  const user = topAndTail(token.user_identity_hash, 8, 8);
+                  const revokeAll = revokeAllLabel(delegationsOf(token.user_identity_hash));
+                  const expanded = expandedTokenId === token.id;
+                  const limiting = limitingTokenId === token.id;
+                  const toggleExpanded = () => setExpandedTokenId(expanded ? null : token.id);
+                  return (
+                    <React.Fragment key={token.id}>
+                      <tr
+                        style={{ cursor: 'pointer' }}
+                        data-testid={`credential-token-row-${token.id}`}
+                        className={expanded ? 'table-active' : ''}
+                        onClick={toggleExpanded}
+                      >
+                        <td>
+                          <AppButton
+                            variant="link"
+                            size="sm"
+                            className="p-0 me-2 text-muted"
+                            aria-expanded={expanded}
+                            aria-controls={`credential-token-detail-${token.id}`}
+                            aria-label={`Details of ${name} access for user ${user}`}
+                            data-testid={`credential-token-expand-button-${token.id}`}
+                            onClick={event => {
+                              event.stopPropagation();
+                              toggleExpanded();
+                            }}
+                          >
+                            <i
+                              className={`fas fa-chevron-${expanded ? 'down' : 'right'}`}
+                              style={{ fontSize: '0.7rem' }}
+                              aria-hidden="true"
                             />
-                          )}
-                        </div>
-                      </td>
-                      <td>
-                        {token.scopes.map(scope => (
-                          <span key={scope} className="badge text-bg-secondary me-1">
-                            {scope}
-                          </span>
-                        ))}
-                      </td>
-                      <td>{getStatusBadge(token)}</td>
-                      <td>
-                        <small>{fmtDate(token.consent_granted_at)}</small>
-                        <div
-                          className="small text-muted"
-                          data-testid={`credential-token-consent-end-${token.id}`}
-                        >
-                          {consentEndText(token, 'sentence')}
-                        </div>
-                      </td>
-                      <td>
-                        <small>{fmtDate(token.last_used_at)}</small>
-                      </td>
-                      <td data-testid={`credential-token-access-token-${token.id}`}>
-                        <small>{fmtDate(token.expires_at)}</small>
-                        {renewsAutomatically(
-                          token,
-                          providers[token.credential_provider_id],
-                          new Date()
-                        ) && <div className="small text-muted">Renews automatically</div>}
-                      </td>
-                      <td onClick={e => e.stopPropagation()}>
-                        {canEditTokens && (
-                          <div className="d-flex flex-wrap align-items-start gap-1">
-                            {canLimitConsent(
-                              token,
-                              providers[token.credential_provider_id],
-                              new Date()
-                            ) && (
-                              <AppButton
-                                variant="outline-primary"
-                                size="sm"
-                                className="text-nowrap"
-                                title="Set how long this delegation may still be used"
-                                aria-expanded={limitingTokenId === token.id}
-                                data-testid={`credential-token-limit-button-${token.id}`}
-                                onClick={() =>
-                                  setLimitingTokenId(limitingTokenId === token.id ? null : token.id)
-                                }
-                              >
-                                Limit duration
-                              </AppButton>
+                          </AppButton>
+                          <strong>{name}</strong>
+                        </td>
+                        <td>
+                          <AgentName did={token.agent_did} />
+                        </td>
+                        <td>
+                          <div className="d-flex flex-wrap align-items-center gap-1">
+                            <code className="text-muted" title={token.user_identity_hash}>
+                              {user}
+                            </code>
+                            {canManage && (
+                              <TwoStepButton
+                                icon="fa-ban"
+                                confirmAs="danger"
+                                confirmLabel={revokeAll}
+                                title="Revoke all for this user"
+                                confirmTitle="Click again to revoke every delegation of this user"
+                                ariaLabel={`Revoke all delegations for user ${user}`}
+                                confirmAriaLabel={`${revokeAll} User ${user}`}
+                                className="btn btn-link btn-sm p-0 border-0 text-warning text-decoration-none"
+                                data-testid={`credential-token-revoke-user-button-${token.id}`}
+                                onConfirm={() => revokeUser(token.user_identity_hash)}
+                              />
                             )}
-                            <TwoStepButton
-                              label="Revoke"
-                              confirmAs="danger"
-                              confirmLabel={`Revoke ${providerName(token, providers)} access?`}
-                              title="Revoke delegation"
-                              confirmTitle="Click again to revoke this delegation"
-                              className="btn btn-outline-danger btn-sm text-nowrap"
-                              cancelTestId={`credential-token-revoke-cancel-button-${token.id}`}
-                              data-testid={`credential-token-revoke-button-${token.id}`}
-                              onConfirm={() => handleRevokeToken(token)}
-                            />
                           </div>
-                        )}
-                      </td>
-                    </tr>
-                    {limitingTokenId === token.id && (
-                      <tr className="expanded-detail-row">
-                        <td colSpan={9} className="p-0">
-                          <ConsentLimitPanel
-                            token={token}
-                            providerName={providerName(token, providers)}
-                            onSaved={handleLimitSaved}
-                            onCancel={() => setLimitingTokenId(null)}
-                          />
                         </td>
-                      </tr>
-                    )}
-                    {expandedTokenId === token.id && (
-                      <tr className="expanded-detail-row">
-                        <td colSpan={9} className="p-0">
-                          <div className="px-4 py-3" style={{ borderTop: 'none' }}>
-                            <div className="row g-3">
-                              <div className="col-md-6">
-                                <table
-                                  className="table table-sm table-borderless mb-0"
-                                  style={{ fontSize: '0.85rem' }}
+                        <td>
+                          {token.scopes.map(scope => (
+                            <span key={scope} className="badge text-bg-secondary me-1">
+                              {scope}
+                            </span>
+                          ))}
+                        </td>
+                        <td>
+                          <TokenStatusBadge status={tokenStatus(token, now)} />
+                        </td>
+                        <td>
+                          <small>{shownTime(token.consent_granted_at)}</small>
+                          <div
+                            className="small text-muted"
+                            data-testid={`credential-token-consent-end-${token.id}`}
+                          >
+                            {consentEndSentence(token, now)}
+                          </div>
+                        </td>
+                        <td>
+                          <small>{shownTime(token.last_used_at)}</small>
+                        </td>
+                        <td data-testid={`credential-token-access-token-${token.id}`}>
+                          <small>{shownTime(token.expires_at)}</small>
+                          {renewsAutomatically(token, provider, now) && (
+                            <div className="small text-muted">Renews automatically</div>
+                          )}
+                        </td>
+                        {canManage && (
+                          <td onClick={event => event.stopPropagation()}>
+                            <div className="d-grid gap-1">
+                              {canLimitConsent(token, provider, now) && (
+                                <AppButton
+                                  ref={limiting ? limitButtonRef : undefined}
+                                  variant="outline-primary"
+                                  size="sm"
+                                  className="text-nowrap"
+                                  title="Set how long after its consent this delegation ends"
+                                  aria-expanded={limiting}
+                                  aria-controls={`credential-token-limit-panel-${token.id}`}
+                                  data-testid={`credential-token-limit-button-${token.id}`}
+                                  onClick={() => setLimitingTokenId(limiting ? null : token.id)}
                                 >
-                                  <tbody>
-                                    <tr>
-                                      <td
-                                        className="text-muted fw-semibold"
-                                        style={{ width: '140px', whiteSpace: 'nowrap' }}
-                                      >
-                                        Token ID
-                                      </td>
-                                      <td>
-                                        <code>{token.id}</code>
-                                        <CopyButton text={token.id} title="Copy Token ID" />
-                                      </td>
-                                    </tr>
-                                    <tr>
-                                      <td
-                                        className="text-muted fw-semibold"
-                                        style={{ whiteSpace: 'nowrap' }}
-                                      >
-                                        Provider ID
-                                      </td>
-                                      <td>
-                                        <strong>{token.provider_id}</strong>
-                                      </td>
-                                    </tr>
-                                    <tr>
-                                      <td
-                                        className="text-muted fw-semibold"
-                                        style={{ whiteSpace: 'nowrap' }}
-                                      >
-                                        Credential Provider
-                                      </td>
-                                      <td>
-                                        <code>{token.credential_provider_id}</code>
-                                        <CopyButton
-                                          text={token.credential_provider_id}
-                                          title="Copy Credential Provider"
-                                        />
-                                      </td>
-                                    </tr>
-                                    <tr>
-                                      <td
-                                        className="text-muted fw-semibold"
-                                        style={{ whiteSpace: 'nowrap' }}
-                                      >
-                                        Token Type
-                                      </td>
-                                      <td>
-                                        <span className="badge text-bg-info">
-                                          {token.token_type}
-                                        </span>
-                                      </td>
-                                    </tr>
-                                    <tr>
-                                      <td
-                                        className="text-muted fw-semibold"
-                                        style={{ whiteSpace: 'nowrap' }}
-                                      >
-                                        Agent DID
-                                      </td>
-                                      <td>
-                                        <code style={{ wordBreak: 'break-all' }}>
-                                          {token.agent_did}
-                                        </code>
-                                        <CopyButton text={token.agent_did} title="Copy Agent DID" />
-                                      </td>
-                                    </tr>
-                                    <tr>
-                                      <td
-                                        className="text-muted fw-semibold"
-                                        style={{ whiteSpace: 'nowrap' }}
-                                      >
-                                        User Identity
-                                      </td>
-                                      <td>
-                                        <code style={{ wordBreak: 'break-all' }}>
-                                          {token.user_identity_hash}
-                                        </code>
-                                        <CopyButton
-                                          text={token.user_identity_hash}
-                                          title="Copy User Identity"
-                                        />
-                                      </td>
-                                    </tr>
-                                    <tr>
-                                      <td
-                                        className="text-muted fw-semibold"
-                                        style={{ whiteSpace: 'nowrap' }}
-                                      >
-                                        Scopes
-                                      </td>
-                                      <td>
-                                        {token.scopes.map(scope => (
-                                          <span
-                                            key={scope}
-                                            className="badge text-bg-secondary me-1"
-                                          >
-                                            {scope}
-                                          </span>
-                                        ))}
-                                      </td>
-                                    </tr>
-                                  </tbody>
-                                </table>
-                              </div>
-                              <div className="col-md-6">
-                                <table
-                                  className="table table-sm table-borderless mb-0"
-                                  style={{ fontSize: '0.85rem' }}
-                                >
-                                  <tbody>
-                                    <tr>
-                                      <td
-                                        className="text-muted fw-semibold"
-                                        style={{ width: '140px', whiteSpace: 'nowrap' }}
-                                      >
-                                        Status
-                                      </td>
-                                      <td>{getStatusBadge(token)}</td>
-                                    </tr>
-                                    <tr>
-                                      <td
-                                        className="text-muted fw-semibold"
-                                        style={{ whiteSpace: 'nowrap' }}
-                                      >
-                                        Can Refresh
-                                      </td>
-                                      <td>
-                                        {token.can_refresh ? (
-                                          <span className="badge text-bg-success">Yes</span>
-                                        ) : (
-                                          <span className="badge text-bg-secondary">No</span>
-                                        )}
-                                      </td>
-                                    </tr>
-                                    <tr>
-                                      <td
-                                        className="text-muted fw-semibold"
-                                        style={{ whiteSpace: 'nowrap' }}
-                                      >
-                                        Consented
-                                      </td>
-                                      <td>{fmtDate(token.consent_granted_at)}</td>
-                                    </tr>
-                                    <tr>
-                                      <td
-                                        className="text-muted fw-semibold"
-                                        style={{ whiteSpace: 'nowrap' }}
-                                      >
-                                        Consent Ends
-                                      </td>
-                                      <td>{consentEndText(token, 'value')}</td>
-                                    </tr>
-                                    <tr>
-                                      <td
-                                        className="text-muted fw-semibold"
-                                        style={{ whiteSpace: 'nowrap' }}
-                                      >
-                                        Token Expires
-                                      </td>
-                                      <td>{fmtDate(token.expires_at)}</td>
-                                    </tr>
-                                    <tr>
-                                      <td
-                                        className="text-muted fw-semibold"
-                                        style={{ whiteSpace: 'nowrap' }}
-                                      >
-                                        Last Used
-                                      </td>
-                                      <td>{fmtDate(token.last_used_at)}</td>
-                                    </tr>
-                                    <tr>
-                                      <td
-                                        className="text-muted fw-semibold"
-                                        style={{ whiteSpace: 'nowrap' }}
-                                      >
-                                        Created
-                                      </td>
-                                      <td>{fmtDate(token.created_at)}</td>
-                                    </tr>
-                                    <tr>
-                                      <td
-                                        className="text-muted fw-semibold"
-                                        style={{ whiteSpace: 'nowrap' }}
-                                      >
-                                        Updated
-                                      </td>
-                                      <td>{fmtDate(token.updated_at)}</td>
-                                    </tr>
-                                  </tbody>
-                                </table>
-                                {onViewActivity && (
-                                  <AppButton
-                                    variant="link"
-                                    size="sm"
-                                    className="p-0 mt-2"
-                                    data-testid={`credential-token-view-activity-button-${token.id}`}
-                                    onClick={() => onViewActivity(token.user_identity_hash)}
-                                    iconStart={
-                                      <i className="fas fa-clipboard-list" aria-hidden="true" />
-                                    }
-                                  >
-                                    View this user's delegation audit
-                                  </AppButton>
-                                )}
-                              </div>
+                                  Limit duration
+                                </AppButton>
+                              )}
+                              <TwoStepButton
+                                label="Revoke"
+                                confirmAs="danger"
+                                confirmLabel={`Revoke ${name} access?`}
+                                title="Revoke delegation"
+                                confirmTitle="Click again to revoke this delegation"
+                                className="btn btn-outline-danger btn-sm text-nowrap flex-grow-1"
+                                cancelTestId={`credential-token-revoke-cancel-button-${token.id}`}
+                                data-testid={`credential-token-revoke-button-${token.id}`}
+                                onConfirm={() => revoke(token)}
+                              />
                             </div>
-                          </div>
-                        </td>
+                          </td>
+                        )}
                       </tr>
-                    )}
-                  </React.Fragment>
-                ))}
+                      {limiting && (
+                        <tr className="expanded-detail-row">
+                          <td colSpan={columns} className="p-0">
+                            <ConsentLimitPanel
+                              token={token}
+                              providerName={name}
+                              onSave={limitSecs => limit(token, limitSecs)}
+                              onClose={closeLimit}
+                            />
+                          </td>
+                        </tr>
+                      )}
+                      {expanded && (
+                        <tr className="expanded-detail-row">
+                          <td colSpan={columns} className="p-0">
+                            <CredentialTokenDetail
+                              token={token}
+                              now={now}
+                              onViewActivity={onViewActivity}
+                            />
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  );
+                })}
               </tbody>
             </table>
             <PaginationControls
-              page={tokensPage}
+              page={shownPage}
               pageSize={PAGE_SIZE}
-              total={filteredTokens.length}
-              onPageChange={setTokensPage}
+              total={shown.length}
+              onPageChange={setPage}
             />
           </div>
         )}

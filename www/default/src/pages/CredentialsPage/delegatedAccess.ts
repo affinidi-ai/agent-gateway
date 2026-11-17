@@ -1,4 +1,5 @@
-import { topAndTail } from '../../utils/stringUtils';
+import { formatDateTime, topAndTail } from '../../utils/stringUtils';
+import { takesConsent } from '../../utils/consentLimit';
 
 /** An agent-keyed vault token as `GET /api/v1/delegation-vault` lists it; never a secret. */
 export interface DelegationToken {
@@ -128,7 +129,7 @@ export function canLimitConsent(
   provider: Pick<ProviderSummary, 'provider_type'> | undefined,
   now: Date
 ): boolean {
-  return provider?.provider_type === 'oauth2_authorization_code' && isActiveDelegation(token, now);
+  return takesConsent(provider?.provider_type) && isActiveDelegation(token, now);
 }
 
 /**
@@ -146,24 +147,107 @@ export function renewsAutomatically(
 
 const DID_WEB = 'did:web:';
 
-function decodeDidWebPart(part: string): string {
-  try {
-    return decodeURIComponent(part);
-  } catch {
-    return part;
-  }
+/** Control and invisible formatting characters, which can reorder or hide what a name shows. */
+const UNPRINTABLE = /[\p{Cc}\p{Cf}]/u;
+
+/**
+ * A `did:web` part as it is shown: its port's `%3A` as `:`. `null` for a part that holds any
+ * other escape or an unprintable character, since decoding it could show a name the DID does
+ * not spell.
+ */
+function shownDidWebPart(part: string): string | null {
+  const shown = part.replace(/%3A/gi, ':');
+  return !shown || shown.includes('%') || UNPRINTABLE.test(shown) ? null : shown;
 }
 
 /**
  * An agent's DID as both tabs show it: a `did:web` DID as its whole web address, the host and
  * any path ("pr-reviewer.example.com", "agents.example.com/tenants/sales"), never cut; any other
- * DID shortened in the middle. The full DID belongs in the tooltip.
+ * DID, and a `did:web` one with an escape other than its port's, shortened in the middle. The
+ * full DID belongs in the tooltip.
  */
 export function agentName(did: string): string {
-  const parts = did.startsWith(DID_WEB) ? did.slice(DID_WEB.length).split(':') : [];
-  return parts.length > 0 && parts.every(Boolean)
-    ? parts.map(decodeDidWebPart).join('/')
+  const parts = did.startsWith(DID_WEB)
+    ? did.slice(DID_WEB.length).split(':').map(shownDidWebPart)
+    : [];
+  return parts.length > 0 && parts.every(part => part !== null)
+    ? parts.join('/')
     : topAndTail(did, 12, 12);
+}
+
+/** Whether `token` matches `term`, a trimmed lower-case search over what the tabs show of it. */
+export function matchesSearch(
+  token: DelegationToken,
+  providers: Record<string, Pick<ProviderSummary, 'name'>>,
+  term: string
+): boolean {
+  return (
+    !term ||
+    providerName(token, providers).toLowerCase().includes(term) ||
+    token.provider_id.toLowerCase().includes(term) ||
+    token.agent_did.toLowerCase().includes(term) ||
+    token.user_identity_hash.toLowerCase().includes(term) ||
+    token.scopes.some(scope => scope.toLowerCase().includes(term))
+  );
+}
+
+/** A token's status on the Credential Tokens tab, and the tone of the badge that shows it. */
+export interface TokenStatus {
+  label: string;
+  tone: 'success' | 'warning' | 'danger' | 'secondary';
+}
+
+/**
+ * The consent's state while it is ending or has ended; otherwise the access token's own:
+ * active, expired but refreshable, or expired.
+ */
+export function tokenStatus(
+  token: Pick<DelegationToken, 'consent_expires_at' | 'is_expired' | 'can_refresh'>,
+  now: Date
+): TokenStatus {
+  const consent = consentState(consentEnd(token.consent_expires_at), now);
+  if (consent === 'ended') return { label: 'Consent ended', tone: 'secondary' };
+  if (consent === 'ending_soon') return { label: 'Ending soon', tone: 'warning' };
+  if (token.is_expired) {
+    return token.can_refresh
+      ? { label: 'Expired (refreshable)', tone: 'warning' }
+      : { label: 'Expired', tone: 'danger' };
+  }
+  return { label: 'Active', tone: 'success' };
+}
+
+/** The end of a token's consent as the list says it: "Ends <date> (in 3 hours)". */
+export function consentEndSentence(
+  token: Pick<DelegationToken, 'consent_expires_at'>,
+  now: Date
+): string {
+  const end = consentEnd(token.consent_expires_at);
+  if (!end) return 'No time limit';
+  const date = formatDateTime(end, true);
+  return consentState(end, now) === 'ended'
+    ? `Ended ${date}`
+    : `Ends ${date} (${timeLeft(end, now)})`;
+}
+
+/** The end of a token's consent as a value, the date first: "<date> (in 3 hours)". */
+export function consentEndValue(
+  token: Pick<DelegationToken, 'consent_expires_at'>,
+  now: Date
+): string {
+  const end = consentEnd(token.consent_expires_at);
+  if (!end) return 'No time limit';
+  const date = formatDateTime(end, true);
+  return consentState(end, now) === 'ended' ? `${date} (ended)` : `${date} (${timeLeft(end, now)})`;
+}
+
+/** A time the vault reports as the tabs show it, or a dash for one it does not have. */
+export function shownTime(value: string | null | undefined): string {
+  return value ? formatDateTime(value, true) : '—';
+}
+
+/** The confirm of revoking every delegation of a user, which says how many (`count`) it ends. */
+export function revokeAllLabel(count: number): string {
+  return count === 1 ? "Revoke this user's only delegation?" : `Revoke all ${count} for this user?`;
 }
 
 /** How long until `end`, in the largest unit that has passed whole: "in 3 hours", "in 12 days". */

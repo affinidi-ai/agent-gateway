@@ -1,5 +1,6 @@
 import { describeEntry, eventTone } from '../eventNarrative';
 import type { AuditEntry } from '../types';
+import { formatDateTime } from '../../../utils/stringUtils';
 
 const at = (event: AuditEntry['event'], extra: Partial<AuditEntry> = {}): AuditEntry => ({
   timestamp: '2026-02-01T10:00:00Z',
@@ -227,15 +228,41 @@ describe('eventNarrative', () => {
     expect(eventTone(at('something_unknown'))).toBe('neutral');
   });
 
-  it('says an operator brought the end of a consent forward, apart from a revocation', () => {
-    const limited = describeEntry(at('consent_limited', { provider_name: 'GitHub' }));
+  it('says an operator made a consent end sooner, and when, apart from a revocation', () => {
+    const limited = describeEntry(
+      at('consent_limited', {
+        provider_name: 'GitHub',
+        detail:
+          'consent_granted_at:2026-11-17T10:00:00Z,consent_expires_at:2026-11-17T12:00:00Z,previous_end:2026-11-17T16:00:00Z',
+      })
+    );
     expect(limited.title).toBe('Consent limited');
-    expect(limited.summary).toBe('An operator brought the end of the consent for GitHub forward.');
-    expect(limited.detail).toBe('The credential is used until that end. It was not revoked.');
-    expect(describeEntry(at('consent_limited')).summary).toBe(
-      'An operator brought the end of a consent forward.'
+    expect(limited.summary).toBe('An operator made the consent for GitHub end sooner.');
+    expect(limited.detail).toBe(
+      `It now ends ${formatDateTime('2026-11-17T12:00:00Z', true)}, not ${formatDateTime('2026-11-17T16:00:00Z', true)}. The credential is used until then. It was not revoked.`
     );
   });
+
+  it('names only the new end of a limited consent that had no end before', () => {
+    const limited = describeEntry(
+      at('consent_limited', {
+        detail: 'consent_granted_at:2026-11-17T10:00:00Z,consent_expires_at:2026-11-17T12:00:00Z',
+      })
+    );
+    expect(limited.summary).toBe('An operator made a consent end sooner.');
+    expect(limited.detail).toBe(
+      `It now ends ${formatDateTime('2026-11-17T12:00:00Z', true)}. The credential is used until then. It was not revoked.`
+    );
+  });
+
+  it.each([undefined, '', 'consent_expires_at:not-a-time', 'previous_end:2026-11-17T16:00:00Z'])(
+    'names no end of a limited consent whose record gives none it can read (%p)',
+    detail => {
+      expect(describeEntry(at('consent_limited', { detail })).detail).toBe(
+        'The credential is used until its new end. It was not revoked.'
+      );
+    }
+  );
 
   it('says a consent reached its time limit, apart from a revocation', () => {
     const expired = describeEntry(at('consent_expired', { provider_name: 'GitHub' }));

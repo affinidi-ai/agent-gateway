@@ -396,7 +396,7 @@ mod tests {
             "user_hash=sha256:user",
             "provider_id=provider-1",
             "surface_id=surface-1",
-            "scopes=repo,read:org",
+            r#"scopes="repo,read:org""#,
             r#"detail="grant_by_binding:owner:target""#,
         ] {
             assert!(lines[0].contains(field), "{field}: {}", lines[0]);

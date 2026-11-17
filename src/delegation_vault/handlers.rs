@@ -2,6 +2,7 @@
 
 use super::{
     DelegationToken, DelegationTokenListItem,
+    consent_age::{ConsentLimits, LimitRefusal, limit_detail, limited_end},
     notifier::SharedVaultPopulationNotifier,
     oauth,
     read_scope::{VaultReadScope, VaultReader},
@@ -142,8 +143,8 @@ fn token_metadata(
     provider: Option<&crate::credential_providers::CredentialProvider>,
 ) -> DelegationTokenListItem {
     let mut item = DelegationTokenListItem::from(token);
-    item.consent_expires_at = super::consent_age::ConsentLimits::of_provider(provider)
-        .ends_at(token.consent_granted_at, token.consent_expires_at);
+    item.consent_expires_at =
+        ConsentLimits::of_provider(provider).ends_at(token.consent_granted_at, token.consent_expires_at);
     item
 }
 
@@ -278,29 +279,10 @@ pub async fn revoke_token(
     reader: VaultReader,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    // Fail closed: a revoke must be attributable to an authenticated actor.
-    let caller_ctx = match management_caller_context(caller.as_ref(), delegation.as_ref()) {
-        Some(ctx) => ctx,
-        None => {
-            warn!(
-                target: "credential_delegation",
-                id = %id,
-                action = "revoke",
-                "Delegation token revoke rejected — no authenticated caller"
-            );
-            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "no authenticated caller"})))
-                .into_response();
-        }
+    let caller_ctx = match appliance_wide_caller(caller.as_ref(), delegation.as_ref(), &reader, "revoke", &id) {
+        Ok(caller_ctx) => caller_ctx,
+        Err(refused) => return *refused,
     };
-    if !reader.is_appliance_wide() {
-        warn!(
-            target: "credential_delegation",
-            id = %loggable::untrusted(&id),
-            action = "revoke",
-            "Delegation token revoke refused: only an appliance-wide caller revokes"
-        );
-        return StatusCode::FORBIDDEN.into_response();
-    }
 
     // Read for the audit record alone, which names whose access the revoke ended. A token
     // that cannot be read is revoked all the same.
@@ -372,15 +354,6 @@ pub struct ConsentLimitBody {
     max_consent_age_secs: u64,
 }
 
-/// A limit on one consent that is refused with `400`: `code` names why, for a
-/// client to act on, and `error` says it.
-fn limit_refused(
-    code: &'static str,
-    error: impl Into<String>,
-) -> Response {
-    (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "code": code, "error": error.into() }))).into_response()
-}
-
 /// PUT /api/v1/delegation-vault/{id}/consent-limit
 ///
 /// Brings the end of one stored consent forward: it then ends
@@ -396,34 +369,19 @@ pub async fn limit_consent(
     Path(id): Path<String>,
     body: Result<Json<ConsentLimitBody>, JsonRejection>,
 ) -> Response {
-    use super::consent_age::{ConsentLimits, LimitRefusal, limit_detail, limited_end};
+    let bad_request = |code, error: &str| super::connect_api::error(StatusCode::BAD_REQUEST, code, error);
 
-    let Some(caller_ctx) = management_caller_context(caller.as_ref(), delegation.as_ref()) else {
-        warn!(
-            target: "credential_delegation",
-            id = %loggable::untrusted(&id),
-            action = "limit",
-            "Consent limit rejected: no authenticated caller"
-        );
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "no authenticated caller"})))
-            .into_response();
+    let caller_ctx = match appliance_wide_caller(caller.as_ref(), delegation.as_ref(), &reader, "limit", &id) {
+        Ok(caller_ctx) => caller_ctx,
+        Err(refused) => return *refused,
     };
-    if !reader.is_appliance_wide() {
-        warn!(
-            target: "credential_delegation",
-            id = %loggable::untrusted(&id),
-            action = "limit",
-            "Consent limit refused: only an appliance-wide caller limits a consent"
-        );
-        return StatusCode::FORBIDDEN.into_response();
-    }
     let Ok(Json(ConsentLimitBody { max_consent_age_secs })) = body else {
-        return limit_refused("invalid_limit", "max_consent_age_secs is required: a whole number of seconds");
+        return bad_request("invalid_limit", "max_consent_age_secs is required: a whole number of seconds");
     };
     if let Err(refusal) =
         crate::config::credential_policy::validate_max_consent_age("max_consent_age_secs", max_consent_age_secs)
     {
-        return limit_refused("invalid_limit", refusal);
+        return bad_request("invalid_limit", &refusal);
     }
 
     let failed = |error: &anyhow::Error| {
@@ -436,8 +394,6 @@ pub async fn limit_consent(
         );
         (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to limit"}))).into_response()
     };
-    let not_found =
-        || (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Delegation token not found"}))).into_response();
 
     let token = match state
         .vault_store
@@ -445,7 +401,10 @@ pub async fn limit_consent(
         .await
     {
         Ok(Some(token)) => token,
-        Ok(None) => return not_found(),
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Delegation token not found"})))
+                .into_response();
+        }
         Err(error) => return failed(&error),
     };
     let provider = match state
@@ -455,7 +414,7 @@ pub async fn limit_consent(
     {
         Ok(Some(provider)) if provider.takes_consent() => provider,
         Ok(_) => {
-            return limit_refused(
+            return bad_request(
                 "not_a_consent",
                 "Only a consent a person gave to an oauth2_authorization_code provider can be limited",
             );
@@ -467,13 +426,13 @@ pub async fn limit_consent(
     let end = match limited_end(token.consent_granted_at, previous_end, max_consent_age_secs, Utc::now()) {
         Ok(end) => end,
         Err(LimitRefusal::AlreadyOlder) => {
-            return limit_refused(
+            return bad_request(
                 "consent_older_than_limit",
                 "The consent is already older than this limit. Revoke it to end it now",
             );
         }
         Err(LimitRefusal::NotSooner) => {
-            return limit_refused(
+            return bad_request(
                 "limit_not_sooner",
                 "The consent already ends at this limit or before it. A consent is never extended",
             );
@@ -481,11 +440,17 @@ pub async fn limit_consent(
     };
     let limited = match state
         .vault_store
-        .limit_consent(&id, end)
+        .limit_consent(&id, token.consent_granted_at, end)
         .await
     {
         Ok(Some(limited)) => limited,
-        Ok(None) => return not_found(),
+        Ok(None) => {
+            return super::connect_api::error(
+                StatusCode::CONFLICT,
+                "consent_changed",
+                "The consent changed while it was being limited. Read it again",
+            );
+        }
         Err(error) => return failed(&error),
     };
 
@@ -512,7 +477,7 @@ pub async fn limit_consent(
         event.caller = Some(caller_ctx);
         event
     });
-    (StatusCode::OK, Json(serde_json::to_value(token_metadata(&limited, Some(&provider))).unwrap())).into_response()
+    Json(token_metadata(&limited, Some(&provider))).into_response()
 }
 
 /// DELETE /api/v1/delegation-vault/by-user/{user_hash}
@@ -523,29 +488,11 @@ pub async fn revoke_user_tokens(
     reader: VaultReader,
     Path(user_hash): Path<String>,
 ) -> impl IntoResponse {
-    // Fail closed: a mass-revoke must be attributable to an authenticated actor.
-    let caller_ctx = match management_caller_context(caller.as_ref(), delegation.as_ref()) {
-        Some(ctx) => ctx,
-        None => {
-            warn!(
-                target: "credential_delegation",
-                user_hash = %user_hash,
-                action = "revoke_all",
-                "Delegation mass-revoke rejected — no authenticated caller"
-            );
-            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "no authenticated caller"})))
-                .into_response();
-        }
-    };
-    if !reader.is_appliance_wide() {
-        warn!(
-            target: "credential_delegation",
-            user_hash = %loggable::untrusted(&user_hash),
-            action = "revoke_all",
-            "Delegation mass-revoke refused: only an appliance-wide caller revokes"
-        );
-        return StatusCode::FORBIDDEN.into_response();
-    }
+    let caller_ctx =
+        match appliance_wide_caller(caller.as_ref(), delegation.as_ref(), &reader, "revoke_all", &user_hash) {
+            Ok(caller_ctx) => caller_ctx,
+            Err(refused) => return *refused,
+        };
 
     match state
         .vault_store
@@ -555,7 +502,7 @@ pub async fn revoke_user_tokens(
         Ok(count) => {
             info!(
                 target: "credential_delegation",
-                user_hash = %user_hash,
+                user_hash = %loggable::untrusted(&user_hash),
                 count = %count,
                 actor = %caller_ctx.sub.as_deref().unwrap_or_default(),
                 action = "revoke_all",
@@ -1725,6 +1672,39 @@ setTimeout(function() {{ window.close(); }}, 3000);
         attach_binding_cookie(&mut response, cleared);
     }
     response
+}
+
+/// The caller of a change to the vault: authenticated, so the change can be
+/// attributed, and appliance-wide. Any other caller is refused, with `401` or a
+/// bare `403`, and the refusal is logged with the `action` and what it was on.
+fn appliance_wide_caller(
+    caller: Option<&Extension<AuthGuardOk>>,
+    delegation: Option<&Extension<PatDelegationContext>>,
+    reader: &VaultReader,
+    action: &'static str,
+    subject: &str,
+) -> Result<super::audit::AuditCallerContext, Box<Response>> {
+    let Some(caller_ctx) = management_caller_context(caller, delegation) else {
+        warn!(
+            target: "credential_delegation",
+            subject = %loggable::untrusted(subject),
+            action,
+            "Delegation vault change rejected: no authenticated caller"
+        );
+        return Err(Box::new(
+            (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "no authenticated caller"}))).into_response(),
+        ));
+    };
+    if !reader.is_appliance_wide() {
+        warn!(
+            target: "credential_delegation",
+            subject = %loggable::untrusted(subject),
+            action,
+            "Delegation vault change refused: only an appliance-wide caller makes it"
+        );
+        return Err(Box::new(StatusCode::FORBIDDEN.into_response()));
+    }
+    Ok(caller_ctx)
 }
 
 /// Resolve the authenticated management-API actor from the request extensions

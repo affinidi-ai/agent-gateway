@@ -1789,16 +1789,6 @@ async fn the_retry_is_logged_under_its_caller_and_the_grants_use_recorded() {
         })
         .await;
         assert_eq!(status, axum::http::StatusCode::OK, "{subject}: {body}");
-        assert!(
-            !recorded
-                .audited
-                .iter()
-                .any(|event| matches!(
-                    event.event,
-                    crate::delegation_vault::audit::DelegationAuditAction::TokenInjected
-                )),
-            "{subject}: an injection is offered to no audit sink"
-        );
         let injected: Vec<_> = recorded
             .logged
             .iter()

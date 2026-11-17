@@ -111,13 +111,14 @@ pub trait DelegationVaultStorage: Send + Sync {
         id: &str,
     ) -> Result<()>;
 
-    /// Bring the end of the consent of the agent-keyed token `id` forward to `end`, and return
-    /// the token as it is stored then; `None` when no token has this id. The stored end only
-    /// moves sooner: a token whose consent already ends at `end` or before is returned
-    /// unchanged. The access and refresh tokens are left as they are.
+    /// Bring the end of the consent of the agent-keyed token `id`, given at `granted_at`,
+    /// forward to `end`, and return the token as it is stored then. `None` when nothing was
+    /// changed: no token has this id, its consent is another one, given at another time, or
+    /// it already ends at `end` or before. The access and refresh tokens are left as they are.
     async fn limit_consent(
         &self,
         _id: &str,
+        _granted_at: DateTime<Utc>,
         _end: DateTime<Utc>,
     ) -> Result<Option<DelegationToken>> {
         anyhow::bail!("This vault does not limit a stored consent")
@@ -1474,24 +1475,30 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
     async fn limit_consent(
         &self,
         id: &str,
+        granted_at: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Option<DelegationToken>> {
         let id = id.to_string();
         self.mutate(move |store| async move {
-            let Some(mut token) = store.storage.get(&id).await? else {
+            let Some(mut token) = store
+                .storage
+                .get(&id)
+                .await?
+                .filter(|token| {
+                    token.consent_granted_at == granted_at
+                        && token
+                            .consent_expires_at
+                            .is_none_or(|stored| end < stored)
+                })
+            else {
                 return Ok(None);
             };
-            if token
-                .consent_expires_at
-                .is_none_or(|stored| end < stored)
-            {
-                token.consent_expires_at = Some(end);
-                store
-                    .storage
-                    .save_atomic(&token)
-                    .await
-                    .context("Failed to limit the consent of a delegation token")?;
-            }
+            token.consent_expires_at = Some(end);
+            store
+                .storage
+                .save_atomic(&token)
+                .await
+                .context("Failed to limit the consent of a delegation token")?;
             Ok(Some(token))
         })
         .await
@@ -2337,57 +2344,104 @@ mod tests {
             .await
             .unwrap();
         let granted = token.consent_granted_at;
-        let read = || async {
+        let stored_end = || async {
             store
                 .get(&token.id)
                 .await
                 .unwrap()
                 .unwrap()
+                .consent_expires_at
+        };
+        let limit = |id: &'static str, granted_at, hours| {
+            let store = store.clone();
+            let id = if id.is_empty() {
+                token.id.clone()
+            } else {
+                id.to_string()
+            };
+            async move {
+                store
+                    .limit_consent(&id, granted_at, granted + Duration::hours(hours))
+                    .await
+                    .unwrap()
+            }
         };
 
-        let limited = store
-            .limit_consent(&token.id, granted + Duration::hours(6))
+        let limited = limit("", granted, 6)
             .await
-            .unwrap()
-            .expect("the token is stored");
-        assert_eq!(
-            limited.consent_expires_at,
-            Some(granted + Duration::hours(6)),
-            "a consent without an end takes one"
-        );
-        assert_eq!(
-            read()
-                .await
-                .consent_expires_at,
-            Some(granted + Duration::hours(6))
-        );
+            .expect("a consent without an end takes one");
+        assert_eq!(limited.consent_expires_at, Some(granted + Duration::hours(6)));
+        assert_eq!(stored_end().await, Some(granted + Duration::hours(6)));
 
-        let sooner = store
-            .limit_consent(&token.id, granted + Duration::hours(2))
+        let sooner = limit("", granted, 2)
             .await
-            .unwrap()
-            .unwrap();
+            .expect("a sooner end is stored");
         assert_eq!(sooner.consent_expires_at, Some(granted + Duration::hours(2)));
-
-        let later = store
-            .limit_consent(&token.id, granted + Duration::hours(9))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(later.consent_expires_at, Some(granted + Duration::hours(2)), "an end is never moved later");
-        let stored = read().await;
-        assert_eq!(stored.consent_expires_at, Some(granted + Duration::hours(2)));
-        assert_eq!(stored.access_token, token.access_token);
-        assert_eq!(stored.refresh_token, token.refresh_token);
-        assert_eq!(stored.updated_at, token.updated_at, "a refresh under way still finds the token it read");
+        assert_eq!(sooner.access_token, token.access_token);
+        assert_eq!(sooner.refresh_token, token.refresh_token);
+        assert_eq!(sooner.updated_at, token.updated_at, "a refresh under way still finds the token it read");
 
         assert!(
-            store
-                .limit_consent("no-such-token", granted + Duration::hours(1))
+            limit("", granted, 9)
                 .await
-                .unwrap()
+                .is_none(),
+            "an end is never moved later"
+        );
+        assert!(
+            limit("", granted, 2)
+                .await
+                .is_none(),
+            "the same end changes nothing"
+        );
+        assert!(
+            limit("", granted + Duration::seconds(1), 1)
+                .await
+                .is_none(),
+            "a limit worked out for another consent time is not applied"
+        );
+        assert!(
+            limit("no-such-token", granted, 1)
+                .await
                 .is_none()
         );
+        assert_eq!(stored_end().await, Some(granted + Duration::hours(2)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_limit_worked_out_before_a_new_consent_does_not_cut_the_new_consent_short() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileSystemDelegationVaultStore::new(directory.path().into())
+            .await
+            .unwrap();
+        let mut first = super::super::tests::make_token(Some(3600), true);
+        first.consent_granted_at = Utc::now() - Duration::hours(3);
+        first.consent_expires_at = Some(first.consent_granted_at + Duration::hours(6));
+        let first = store
+            .store(first)
+            .await
+            .unwrap();
+
+        let mut again = super::super::tests::make_token(Some(3600), true);
+        again.consent_expires_at = Some(again.consent_granted_at + Duration::hours(6));
+        let again = store
+            .store(again)
+            .await
+            .unwrap();
+        assert_eq!(again.id, first.id, "a new consent by the same person replaces the token under its id");
+
+        let limited = store
+            .limit_consent(&first.id, first.consent_granted_at, first.consent_granted_at + Duration::hours(4))
+            .await
+            .unwrap();
+
+        assert!(limited.is_none(), "the consent the limit was worked out for is gone");
+        let stored = store
+            .get(&first.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.consent_granted_at, again.consent_granted_at);
+        assert_eq!(stored.consent_expires_at, again.consent_expires_at);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2404,7 +2458,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .limit_consent(&read_before_the_limit.id, granted + Duration::hours(2))
+            .limit_consent(&read_before_the_limit.id, granted, granted + Duration::hours(2))
             .await
             .unwrap()
             .unwrap();

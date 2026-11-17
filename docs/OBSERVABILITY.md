@@ -60,7 +60,8 @@ outbound updates with periodic ping frames. An incoming JSON `subscribe` command
 of dashboard sections included in subsequent `DashboardDelta` events. A connection whose session
 has ended, or whose user lacks `logs.view` or is not Approved, also loses the `logs` section and
 every `LogEntry` update; it checks the session and the user's role and status on connect and on
-each keep-alive ping, and an unauthenticated connection never gets log lines (see [`RBAC.md`](RBAC.md#dashboard-log-lines)). Any broadcast
+each keep-alive ping, and an unauthenticated connection never gets log lines. The two dashboard
+routes that return log lines give them only to an appliance-wide caller (see [`RBAC.md`](RBAC.md#dashboard-log-lines)). Any broadcast
 receive error, including lag, ends the connection; socket closure does likewise.
 
 `DashboardDelta` is already serialized before broadcast and held in `Arc<String>`, reducing clone
@@ -473,16 +474,21 @@ the VP Audit Log nor an integration is offered it: `token_injected`, `token_refr
 the `credential_delegation` target:
 
 ```text
-Delegation event event=token_injected agent_did=<agent> user_hash=<identity hash> provider_id=<provider record id> surface_id=<surface> surface_variant=<variant> token_id=<token or grant id> scopes=<comma-separated> mcp_tool_name="<tool>" via_fabric=<true|false> target_endpoint=<target> protocol=<protocol> request_id=<request> detail="<detail>"
+Delegation event event=token_injected agent_did=<agent> user_hash=<identity hash> provider_id=<provider record id> surface_id=<surface> surface_variant=<variant> token_id=<token or grant id> scopes="<comma-separated>" mcp_tool_name="<tool>" via_fabric=<true|false> target_endpoint=<target> protocol=<protocol> request_id=<request> caller_method=<method> peer_gateway="<gateway>" agent_identity_did="<agent DID>" detail="<detail>"
 ```
 
-A field the event does not have is `-`. The line names the caller by identity hash only and
-carries no credential: `target_endpoint` is the Target URL without its user name, password and
-fragment and with every query value logged as `<redacted>`, as in the gateway's other log lines.
-`mcp_tool_name`, which the caller chooses, and `detail`, which can quote what a vendor answered,
-are each one quoted token: quotes, backslashes, line breaks and other control characters are
-escaped and anything after the first 256 characters is cut, so neither can start a log line or a
-field of its own.
+A field the event does not have is `-`. The line says who caused the event without naming a
+person: the caller by identity hash only (`user_hash`), how that caller authenticated
+(`caller_method`, the source authentication method, such as `jwt_bearer` or `api_key`) and, for
+a request a paired gateway sent over Fabric, that gateway (`peer_gateway`: its issuer DID, else
+its Remote gateway record id). `agent_identity_did` is the agent's own DID where the gateway
+resolved one. The line carries no credential: `target_endpoint` is the Target URL without its
+user name, password and fragment and with every query value logged as `<redacted>`, as in the
+gateway's other log lines. What a caller, a paired gateway or a vendor chooses is each one
+quoted token (`scopes`, `mcp_tool_name`, `peer_gateway`, `agent_identity_did`, and `detail`,
+which can quote what a vendor answered): quotes, backslashes, line breaks and other control
+characters are escaped and anything after the first 256 characters is cut, so none of them can
+start a log line or a field of its own.
 
 The line is written at `INFO`, the default of `[logging] level`; a gateway set to log less
 writes none of these events anywhere. It goes where the rest of the gateway's log goes: stderr,
@@ -918,12 +924,16 @@ operator limits one (group Delegation); see
   for an agent-keyed token. One removal writes one record, whichever finds the consent ended
   first.
 
-- `consent_limited`: an operator brought the end of one stored consent forward through
+- `consent_limited`: an operator made one stored consent end sooner through
   `PUT /api/v1/delegation-vault/{id}/consent-limit`. The credential stays until that end, so it
   is no revocation, and the later removal is a `consent_expired` of its own. The record names
   who set the limit (`caller`), the agent, the user identity hash, the provider, the scopes and
   the token id. Its `detail` is `consent_granted_at:<time>,consent_expires_at:<time>`, the new
-  end, followed by `,previous_end:<time>` when the consent had an end before.
+  end, followed by `,previous_end:<time>` when the consent had an end before. It is recorded
+  wherever `token_revoked` is selected, whether or not it is selected itself (`RECEIVED_WITH` in
+  `src/audit/catalog.rs`): a selection made before this event existed names only
+  `token_revoked`, and a gateway that records revocations must not miss an operator cutting a
+  consent short. This holds for `audit_events` and for an integration's event set alike.
 
 A consent given under a time limit also names its end when it is given: the `detail` of its
 `consent_granted` record holds `consent_expires_at:<time>` in RFC 3339 UTC, after

@@ -219,7 +219,10 @@ says "Renews automatically" while the gateway refreshes the token. On Credential
 a panel in place under the row, never a modal: it sets how long after its consent that one
 delegation ends (`PUT /delegation-vault/{id}/consent-limit`) and offers Save only for a limit
 that brings the end forward. The Credential Tokens card header shows its title alone, with no
-count. A new view is a new tab, and both of these tabs stay. See
+count. Both tabs show the one read of the vault the page makes, so a change on one shows on the
+other; a read that fails is shown as an error with a Retry, never as an empty list; and Revoke
+and Limit duration are shown only with `delegation_vault.delete`. A new view is a new tab, and
+both of these tabs stay. See
 _Credential Tokens and Delegated Access tabs_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-tokens-and-delegated-access-tabs).
 

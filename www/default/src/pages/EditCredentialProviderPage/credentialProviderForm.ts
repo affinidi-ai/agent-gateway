@@ -1,9 +1,13 @@
 import {
+  CONSENT_LIMIT_RANGE,
   ConsentLimitUnit,
   consentLimitSecondsOf,
-  largestWholeUnit,
+  limitFieldsOf,
   storedConsentLimit,
+  takesConsent,
 } from '../../utils/consentLimit';
+
+export { takesConsent };
 
 export type CredentialProviderType =
   | 'oauth2_authorization_code'
@@ -287,12 +291,10 @@ export function jwtFieldsOf(data: Record<string, unknown>): JwtFormFields {
   };
 }
 
-export const CONSENT_LIMIT_RANGE_MESSAGE =
-  'Consent time limit must be a whole number from 1 minute to 365 days, or empty to set none.';
+export const CONSENT_LIMIT_RANGE_MESSAGE = `Consent time limit must be a whole number from ${CONSENT_LIMIT_RANGE}, or empty to set none.`;
 
 /** What the consent time limit field says under itself while it holds a limit the gateway refuses. */
-export const CONSENT_LIMIT_FIELD_MESSAGE =
-  'Enter a limit from 1 minute to 365 days, or leave it empty.';
+export const CONSENT_LIMIT_FIELD_MESSAGE = `Enter a limit from ${CONSENT_LIMIT_RANGE}, or leave it empty.`;
 
 export interface ConsentLimitFields {
   /** The number as typed; empty when the provider sets no limit. */
@@ -305,20 +307,10 @@ export const NO_CONSENT_LIMIT: ConsentLimitFields = {
   consent_limit_unit: 'hours',
 };
 
-/**
- * Whether a person consents to a provider of this type. Only such a provider takes a consent
- * time limit, and only such a provider can be deactivated.
- */
-export function takesConsent(type: CredentialProviderType): boolean {
-  return type === 'oauth2_authorization_code';
-}
-
 /** The consent time limit of a loaded provider record, in its largest whole unit. */
 export function consentLimitOf(data: Record<string, unknown>): ConsentLimitFields {
-  const secs = storedConsentLimit(data.max_consent_age_secs);
-  if (secs === undefined) return NO_CONSENT_LIMIT;
-  const { count, unit } = largestWholeUnit(secs);
-  return { consent_limit_amount: String(count), consent_limit_unit: unit };
+  const { amount, unit } = limitFieldsOf(storedConsentLimit(data.max_consent_age_secs));
+  return { consent_limit_amount: amount, consent_limit_unit: unit };
 }
 
 /**

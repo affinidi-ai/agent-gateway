@@ -2,12 +2,17 @@ import {
   agentName,
   canLimitConsent,
   consentEnd,
+  consentEndSentence,
+  consentEndValue,
   consentLimitSecs,
   consentState,
   isActiveDelegation,
   limitOutcome,
+  matchesSearch,
   renewsAutomatically,
+  revokeAllLabel,
   timeLeft,
+  tokenStatus,
 } from '../delegatedAccess';
 
 const NOW = new Date('2026-11-13T10:00:00Z');
@@ -139,13 +144,93 @@ describe('delegated access consent end', () => {
     expect(canLimitConsent(active, undefined, NOW)).toBe(false);
   });
 
+  it('shows the raw DID, shortened, when decoding it could show another name', () => {
+    const spoofed = 'did:web:evil.example:%E2%80%AEmoc.knab-doog';
+    expect(agentName(spoofed)).toBe('did:web:evil...oc.knab-doog');
+    expect(agentName('did:web:host.example:a%2Fb')).toBe('did:web:host.example:a%2Fb');
+    expect(agentName('did:web:odd%zz.example.com')).toBe('did:web:odd%zz.example.com');
+    expect(agentName('did:web:host.example:pa\u202Eth-of-a-longer-name')).toBe(
+      'did:web:host...-longer-name'
+    );
+  });
+
+  it('finds a token by its provider, agent, user or scope', () => {
+    const token = {
+      id: 't1',
+      agent_did: 'did:web:PR-Reviewer.example.com',
+      user_identity_hash: 'sha256:ABCDEF',
+      credential_provider_id: 'cp-scm',
+      provider_id: 'scm',
+      token_type: 'Bearer',
+      scopes: ['repo', 'read:org'],
+      expires_at: null,
+      consent_granted_at: NOW.toISOString(),
+      last_used_at: null,
+      created_at: NOW.toISOString(),
+      updated_at: NOW.toISOString(),
+      is_expired: false,
+      can_refresh: true,
+    };
+    const providers = { 'cp-scm': { name: 'Source Control' } };
+
+    for (const term of ['', 'source control', 'scm', 'pr-reviewer', 'abcdef', 'read:org']) {
+      expect(matchesSearch(token, providers, term)).toBe(true);
+    }
+    expect(matchesSearch(token, providers, 'salesforce')).toBe(false);
+    expect(matchesSearch(token, {}, 'source control')).toBe(false);
+  });
+
+  it('gives a token the status of its consent first, then of its access token', () => {
+    const live = { is_expired: false, can_refresh: true };
+    const ends = (ms: number) => ({ consent_expires_at: after(ms).toISOString() });
+
+    expect(tokenStatus(live, NOW)).toEqual({ label: 'Active', tone: 'success' });
+    expect(tokenStatus({ ...live, ...ends(2 * DAY) }, NOW)).toEqual({
+      label: 'Active',
+      tone: 'success',
+    });
+    expect(tokenStatus({ ...live, ...ends(HOUR) }, NOW)).toEqual({
+      label: 'Ending soon',
+      tone: 'warning',
+    });
+    expect(tokenStatus({ ...live, ...ends(-1) }, NOW)).toEqual({
+      label: 'Consent ended',
+      tone: 'secondary',
+    });
+    expect(tokenStatus({ is_expired: true, can_refresh: true }, NOW)).toEqual({
+      label: 'Expired (refreshable)',
+      tone: 'warning',
+    });
+    expect(tokenStatus({ is_expired: true, can_refresh: false }, NOW)).toEqual({
+      label: 'Expired',
+      tone: 'danger',
+    });
+  });
+
+  it('says when a consent ends, as a sentence for the list and as a value for the detail', () => {
+    const soon = { consent_expires_at: after(3 * HOUR + 5 * MINUTE).toISOString() };
+    const over = { consent_expires_at: after(-HOUR).toISOString() };
+
+    expect(consentEndSentence(soon, NOW)).toMatch(/^Ends .+ \(in 3 hours\)$/);
+    expect(consentEndValue(soon, NOW)).toMatch(/^(?!Ends).+ \(in 3 hours\)$/);
+    expect(consentEndSentence(over, NOW)).toMatch(/^Ended \S/);
+    expect(consentEndValue(over, NOW)).toMatch(/ \(ended\)$/);
+    expect(consentEndSentence({}, NOW)).toBe('No time limit');
+    expect(consentEndValue({}, NOW)).toBe('No time limit');
+  });
+
+  it('says how many delegations a revoke-all ends', () => {
+    expect(revokeAllLabel(1)).toBe("Revoke this user's only delegation?");
+    expect(revokeAllLabel(2)).toBe('Revoke all 2 for this user?');
+  });
+
   it('names a did:web agent by its whole web address and shortens any other DID', () => {
     expect(agentName('did:web:pr-reviewer.example.com')).toBe('pr-reviewer.example.com');
     expect(agentName('did:web:agents.example.com:tenants:sales:crm-assistant')).toBe(
       'agents.example.com/tenants/sales/crm-assistant'
     );
     expect(agentName('did:web:localhost%3A8443')).toBe('localhost:8443');
-    expect(agentName('did:web:odd%zz.example.com')).toBe('odd%zz.example.com');
+    expect(agentName('did:web:localhost%3a8443:agents')).toBe('localhost:8443/agents');
     expect(agentName('did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK')).toBe(
       'did:key:z6Mk...pbnnEGta2doK'
     );

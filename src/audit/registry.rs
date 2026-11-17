@@ -8,20 +8,26 @@ use std::time::Duration;
 use parking_lot::RwLock;
 use tokio::sync::watch;
 
-use crate::audit::catalog::{AUDIT_EVENTS, event_bit};
+use crate::audit::catalog::{AUDIT_EVENTS, RECEIVED_WITH, event_bit};
 
 /// A set of catalog events, one bit per event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EventMask(u64);
 
 impl EventMask {
-    /// Names that are not in the catalog are ignored.
+    /// Names that are not in the catalog are ignored. A selection that holds an event also
+    /// holds the events received with it ([`RECEIVED_WITH`]).
     pub fn from_categories<'a>(categories: impl IntoIterator<Item = &'a str>) -> Self {
+        let selected = categories
+            .into_iter()
+            .filter_map(event_bit)
+            .fold(0, |mask, bit| mask | (1 << bit));
         Self(
-            categories
-                .into_iter()
-                .filter_map(event_bit)
-                .fold(0, |mask, bit| mask | (1 << bit)),
+            RECEIVED_WITH
+                .iter()
+                .filter_map(|(event, with)| Some((event_bit(event)?, event_bit(with)?)))
+                .filter(|(event, _)| selected & (1 << event) != 0)
+                .fold(selected, |mask, (_, with)| mask | (1 << with)),
         )
     }
 
@@ -273,6 +279,21 @@ mod tests {
         categories: &[&str],
     ) -> Sink {
         Sink::new(id, EventMask::from_categories(categories.iter().copied()))
+    }
+
+    /// A selection made before `consent_limited` existed audits an operator's
+    /// limit wherever it audits a revocation, and nothing else changes.
+    #[test]
+    fn a_selection_of_revocations_also_receives_limits_on_a_consent() {
+        let received = |selected: &[&str]| EventMask::from_categories(selected.iter().copied()).categories();
+
+        assert_eq!(received(&["token_revoked"]), ["consent_limited", "token_revoked"]);
+        assert_eq!(received(&["consent_limited"]), ["consent_limited"]);
+        assert_eq!(received(&["consent_granted", "user_tokens_revoked"]), ["consent_granted", "user_tokens_revoked"]);
+        assert_eq!(received(&[]), [] as [&str; 0]);
+        for (event, with) in RECEIVED_WITH {
+            assert!(event_bit(event).is_some() && event_bit(with).is_some(), "{event} with {with}");
+        }
     }
 
     #[test]

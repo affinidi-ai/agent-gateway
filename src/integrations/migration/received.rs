@@ -361,7 +361,8 @@ mod tests {
         for event in delivered.chain(audit) {
             assert_eq!(
                 known.contains(&event.as_str()),
-                event != REMOVED_AUDIT_EVENT && !crate::integrations::definitions::event_set::is_only_logged(&event),
+                event != REMOVED_AUDIT_EVENT
+                    && !crate::integrations::definitions::event_set::is_logged_audit_event_id(&event),
                 "{event}"
             );
         }

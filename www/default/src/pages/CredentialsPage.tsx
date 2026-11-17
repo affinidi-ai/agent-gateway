@@ -7,6 +7,7 @@ import CredentialProvidersTab from './SettingsPage/CredentialProvidersTab';
 import CredentialTokensTab from './CredentialsPage/CredentialTokensTab';
 import DelegatedAccessTab from './CredentialsPage/DelegatedAccessTab';
 import StsClientsTab from './CredentialsPage/StsClientsTab';
+import { useDelegationVault } from './CredentialsPage/useDelegationVault';
 import { usePermissions } from '../context/PermissionsContext';
 import {
   DELEGATION_CATEGORIES,
@@ -39,6 +40,7 @@ const CredentialsPage: React.FC = () => {
   const { hasPermission, loading: permissionsLoading } = usePermissions();
   const canViewAudit = !permissionsLoading && hasPermission('audit.view');
   const canViewSts = !permissionsLoading && hasPermission('sts_clients.view');
+  const vault = useDelegationVault();
 
   const [strategiesCount, setStrategiesCount] = useState(0);
   const [providersCount, setProvidersCount] = useState(0);
@@ -130,6 +132,7 @@ const CredentialsPage: React.FC = () => {
           }
         >
           <CredentialTokensTab
+            vault={vault}
             externalSearchTerm={searchTerm}
             onFilteredCountChange={setTokensCount}
             onViewActivity={canViewAudit ? viewActivity : undefined}
@@ -146,6 +149,7 @@ const CredentialsPage: React.FC = () => {
           }
         >
           <DelegatedAccessTab
+            vault={vault}
             externalSearchTerm={searchTerm}
             onFilteredCountChange={setDelegationsCount}
             onViewHistory={canViewAudit ? viewHistory : undefined}

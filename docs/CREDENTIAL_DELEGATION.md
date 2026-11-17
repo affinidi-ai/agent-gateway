@@ -2415,8 +2415,14 @@ limit belongs to that consent: a new consent by the same person takes the limits
 then. It applies to agent-keyed tokens; a grant by binding is limited by its provider and
 its binding.
 
+The limit is stored only for the consent it was worked out for. When the entry changed between
+the request reading it and writing it (the person consented again, or another limit brought the
+end to this one or before it), nothing is written or recorded and the answer is `409` with
+`code` `consent_changed`: read the entry again and decide again. A token refresh that was under
+way keeps the limit.
+
 The dashboard offers it as **Limit duration** beside **Revoke** on the Credentials page's
-Credential Tokens tab.
+Credential Tokens tab, to a user with `delegation_vault.delete`.
 
 ### What the person is told
 
@@ -2432,7 +2438,9 @@ Credential Tokens tab.
 A limit an operator sets on one consent is recorded as `consent_limited`, with who set it
 (`caller`), the agent, the user identity hash, the provider, the scopes and the token id. Its
 `detail` is `consent_granted_at:<time>,consent_expires_at:<time>`, the new end, followed by
-`,previous_end:<time>` when the consent had an end before.
+`,previous_end:<time>` when the consent had an end before. It is recorded wherever
+`token_revoked` is selected, so a selection made before the event existed still receives it
+([`OBSERVABILITY.md`](OBSERVABILITY.md)).
 
 A consent given under a time limit names its end in its `consent_granted` record: `detail`
 holds `consent_expires_at:<time>`, and for a grant by binding

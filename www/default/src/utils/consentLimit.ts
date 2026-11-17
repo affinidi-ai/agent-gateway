@@ -20,6 +20,13 @@ export function consentLimitUnitsFor(storedSecs: number | undefined): ConsentLim
 /** The gateway's bounds on `max_consent_age_secs`: one minute to 365 days. */
 export const MIN_CONSENT_LIMIT_SECS = 60;
 export const MAX_CONSENT_LIMIT_SECS = 31_536_000;
+/** Those bounds as a person reads them. */
+export const CONSENT_LIMIT_RANGE = '1 minute to 365 days';
+
+/** Whether a person consents to a provider of this type: only an Authorization Code provider. */
+export function takesConsent(providerType: string | undefined): boolean {
+  return providerType === 'oauth2_authorization_code';
+}
 
 export function secondsIn(unit: ConsentLimitUnit): number {
   return UNIT_SECONDS.find(([name]) => name === unit)![1];
@@ -45,6 +52,19 @@ export function storedConsentLimit(value: unknown): number | undefined {
 export function largestWholeUnit(secs: number): { count: number; unit: ConsentLimitUnit } {
   const [unit, size] = UNIT_SECONDS.find(([, size]) => secs % size === 0)!;
   return { count: secs / size, unit };
+}
+
+/**
+ * A limit as the amount and unit a field starts from: its largest whole unit, or an empty amount
+ * in hours when there is none.
+ */
+export function limitFieldsOf(secs: number | null | undefined): {
+  amount: string;
+  unit: ConsentLimitUnit;
+} {
+  if (!secs) return { amount: '', unit: 'hours' };
+  const { count, unit } = largestWholeUnit(secs);
+  return { amount: String(count), unit };
 }
 
 /** A consent time limit as a person reads it: "6 hours", "1 day". */

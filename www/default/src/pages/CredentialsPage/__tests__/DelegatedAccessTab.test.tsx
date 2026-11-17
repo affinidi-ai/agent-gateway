@@ -4,6 +4,7 @@ import '@testing-library/jest-dom';
 import { apiClient } from '../../../api';
 import { showToast } from '../../../utils/toaster';
 import DelegatedAccessTab from '../DelegatedAccessTab';
+import { useDelegationVault } from '../useDelegationVault';
 
 jest.mock('../../../api', () => ({
   apiClient: { fetch: jest.fn() },
@@ -15,6 +16,22 @@ jest.mock('../../../context/PermissionsContext', () => ({
 jest.mock('../../../utils/toaster', () => ({ showToast: jest.fn() }));
 
 const mockFetch = apiClient.fetch as jest.Mock;
+
+type TabProps = Omit<React.ComponentProps<typeof DelegatedAccessTab>, 'vault'>;
+
+/** The tab on the vault the Credentials page would hand it. */
+const Tab: React.FC<TabProps> = props => (
+  <DelegatedAccessTab {...props} vault={useDelegationVault()} />
+);
+
+/** An answer of the gateway, as `apiClient.fetch` resolves with it. */
+const answer = (body: unknown = {}, status = 200, statusText = 'OK') => ({
+  ok: status < 400,
+  status,
+  statusText,
+  json: () => Promise.resolve(body),
+  text: () => Promise.resolve(typeof body === 'string' ? body : JSON.stringify(body)),
+});
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
@@ -49,26 +66,28 @@ const PROVIDERS = [
   { id: 'cp-service', name: 'Billing API', provider_type: 'oauth2_client_credentials' },
 ];
 
+/** Answers the two lists the tab reads, and every other request with `change`. */
+const gatewayHolds = (
+  tokens: ReturnType<typeof token>[],
+  providers: unknown = PROVIDERS,
+  change: () => unknown = () => answer()
+) =>
+  mockFetch.mockImplementation((url: string, options?: { method?: string }) =>
+    Promise.resolve(
+      options?.method
+        ? change()
+        : answer(url === '/api/v1/credential-providers' ? providers : tokens)
+    )
+  );
+
 const renderTab = async (
   tokens: ReturnType<typeof token>[],
-  props: React.ComponentProps<typeof DelegatedAccessTab> = {},
-  providers: unknown = PROVIDERS
+  props: TabProps = {},
+  providers: unknown = PROVIDERS,
+  change?: () => unknown
 ) => {
-  mockFetch.mockImplementation((url: string, options?: { method?: string }) =>
-    Promise.resolve({
-      ok: true,
-      statusText: 'OK',
-      json: () =>
-        Promise.resolve(
-          options?.method === 'DELETE'
-            ? {}
-            : url === '/api/v1/credential-providers'
-              ? providers
-              : tokens
-        ),
-    })
-  );
-  render(<DelegatedAccessTab {...props} />);
+  gatewayHolds(tokens, providers, change);
+  render(<Tab {...props} />);
   await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument(), WAIT);
 };
 
@@ -78,11 +97,14 @@ const rowIds = () =>
     .queryAllByTestId(/^delegated-access-row-/)
     .map(element => element.getAttribute('data-testid')!.replace('delegated-access-row-', ''));
 const deletes = () => mockFetch.mock.calls.filter(([, options]) => options?.method === 'DELETE');
+const reads = () => mockFetch.mock.calls.filter(([url]) => url === '/api/v1/delegation-vault');
 
 describe('Delegated Access tab', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockHasPermission.mockReturnValue(true);
+    mockHasPermission.mockImplementation(
+      (permission: string) => permission === 'delegation_vault.delete'
+    );
   });
 
   it('lists only the access an agent can still use, and no service token', async () => {
@@ -119,9 +141,7 @@ describe('Delegated Access tab', () => {
     expect(screen.getByTestId('delegated-access-ends-later')).toHaveTextContent(
       /^in 12 days30-day limit\S/
     );
-    expect(screen.getByTestId('delegated-access-ends-soon')).toHaveTextContent(/^in 3 hours/);
     expect(within(row('soon')).getByText('Ending soon')).toBeInTheDocument();
-    expect(screen.getByTestId('delegated-access-ends-later')).toHaveTextContent(/^in 12 days/);
     expect(within(row('later')).getByText('Active')).toBeInTheDocument();
     expect(screen.getByTestId('delegated-access-ends-unlimited')).toHaveTextContent(
       'No time limit'
@@ -176,12 +196,72 @@ describe('Delegated Access tab', () => {
     );
   });
 
-  it('offers no revoke to a user who may not edit', async () => {
-    mockHasPermission.mockReturnValue(false);
+  it('offers no revoke to a user who may not delete from the vault', async () => {
+    mockHasPermission.mockImplementation((permission: string) => permission === 'settings.edit');
     await renderTab([token('t1')]);
 
     expect(row('t1')).toBeInTheDocument();
     expect(screen.queryByTestId('delegated-access-revoke-button-t1')).not.toBeInTheDocument();
+    expect(screen.queryByRole('columnheader', { name: 'Actions' })).toBeNull();
+    expect(mockHasPermission).toHaveBeenCalledWith('delegation_vault.delete');
+  });
+
+  it('says why a revoke was refused, in the words of the gateway, and keeps the access', async () => {
+    await renderTab([token('t1')], {}, PROVIDERS, () =>
+      answer({ error: 'Failed to revoke' }, 500, 'Internal Server Error')
+    );
+    const button = screen.getByTestId('delegated-access-revoke-button-t1');
+
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    await waitFor(
+      () => expect(showToast).toHaveBeenCalledWith('error', 'Not revoked: Failed to revoke'),
+      WAIT
+    );
+    expect(rowIds()).toEqual(['t1']);
+    expect(showToast).not.toHaveBeenCalledWith('success', expect.anything());
+  });
+
+  it('says the access could not be read, not that there is none, and reads again on Retry', async () => {
+    let refuse = true;
+    mockFetch.mockImplementation((url: string) =>
+      Promise.resolve(
+        url === '/api/v1/credential-providers'
+          ? answer(PROVIDERS)
+          : refuse
+            ? answer('', 403, 'Forbidden')
+            : answer([token('t1')])
+      )
+    );
+    render(<Tab />);
+
+    expect(await screen.findByTestId('delegated-access-read-error')).toHaveTextContent(
+      'Failed to load delegations: Forbidden (403)'
+    );
+    expect(screen.queryByText('No active delegated access')).toBeNull();
+    expect(screen.queryByLabelText(/active delegations/)).toBeNull();
+
+    refuse = false;
+    fireEvent.click(screen.getByTestId('delegated-access-read-error-retry'));
+
+    await waitFor(() => expect(rowIds()).toEqual(['t1']), WAIT);
+    expect(screen.queryByTestId('delegated-access-read-error')).toBeNull();
+    expect(screen.getByLabelText('1 active delegations')).toBeInTheDocument();
+    expect(reads()).toHaveLength(2);
+  });
+
+  it('shows the last page left once the only access of a later page is revoked', async () => {
+    const ids = Array.from({ length: 11 }, (_, index) => `t${String(index + 1).padStart(2, '0')}`);
+    await renderTab(ids.map(id => token(id)));
+    fireEvent.click(screen.getByRole('button', { name: '2' }));
+    expect(rowIds()).toEqual(['t11']);
+
+    const revoke = screen.getByTestId('delegated-access-revoke-button-t11');
+    fireEvent.click(revoke);
+    fireEvent.click(revoke);
+
+    await waitFor(() => expect(rowIds()).toEqual(ids.slice(0, 10)), WAIT);
   });
 
   it('opens the history when the page offers it, and shows no button otherwise', async () => {
@@ -196,7 +276,7 @@ describe('Delegated Access tab', () => {
     expect(screen.queryByTestId('delegated-access-history-button')).not.toBeInTheDocument();
   });
 
-  it('says there is no active access when every entry ended, and still lists by system name', async () => {
+  it('says there is no active access when every entry ended', async () => {
     await renderTab([token('ended', { consent_expires_at: fromNow(-HOUR) })]);
     expect(screen.getByText('No active delegated access')).toBeInTheDocument();
     expect(rowIds()).toEqual([]);

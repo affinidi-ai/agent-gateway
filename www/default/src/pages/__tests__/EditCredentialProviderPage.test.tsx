@@ -326,11 +326,26 @@ describe('EditCredentialProviderPage consent time limit', () => {
     ).toBeInTheDocument();
   });
 
-  it('says token refresh stops when the consent time limit ends', async () => {
+  it('states the range of a limit once while the field is refused', async () => {
     await renderProvider(authorizationCode());
+    fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '0' } });
+    fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
+    await screen.findByTestId('credential-provider-consent-limit-error');
+
     expect(
       screen.getByText(
-        'Access tokens are refreshed automatically using the stored refresh token, until the consent time limit below ends. After that, the person approves again.'
+        "Leave empty to set no limit on this provider. A default or a ceiling in the gateway's configuration still applies."
+      )
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/From 1 minute to 365 days\.$/)).toBeNull();
+  });
+
+  it('says token refresh lasts as long as the consent, with or without a limit set', async () => {
+    await renderProvider(authorizationCode());
+    expect(screen.getByTestId(LIMIT)).toHaveValue(null);
+    expect(
+      screen.getByText(
+        'Access tokens are refreshed automatically using the stored refresh token for as long as the consent lasts (see Consent time limit below). When the consent ends, the person approves again.'
       )
     ).toBeInTheDocument();
     expect(screen.queryByText(/without needing to reauthorize/)).not.toBeInTheDocument();
@@ -339,7 +354,7 @@ describe('EditCredentialProviderPage consent time limit', () => {
   it('keeps the refresh help free of a consent limit on a provider nobody consents to', async () => {
     await renderProvider(provider(null));
     expect(screen.getByText(/without needing to reauthorize/)).toBeInTheDocument();
-    expect(screen.queryByText(/consent time limit below/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/consent time limit below/i)).not.toBeInTheDocument();
   });
 
   it('says a deactivated provider takes no new consent, and never sends that state on save', async () => {
@@ -405,6 +420,17 @@ describe('EditCredentialProviderPage consent time limit', () => {
       expect(impactCalls().map(([url]) => url)).toEqual([
         '/api/v1/credential-providers/p1/consent-impact?max_consent_age_secs=3600',
       ]);
+    });
+
+    it('announces the warning in a status region that is there before the warning is', async () => {
+      await renderWithImpact(authorizationCode({ max_consent_age_secs: 21_600 }));
+      const region = screen.getByTestId('credential-provider-consent-limit-impact-region');
+      expect(region).toHaveAttribute('role', 'status');
+      expect(region).toBeEmptyDOMElement();
+
+      fireEvent.change(screen.getByTestId(LIMIT), { target: { value: '1' } });
+
+      expect(await within(region).findByTestId(IMPACT)).toHaveClass('alert', 'alert-warning');
     });
 
     it('speaks of one person when saving ends one consent', async () => {

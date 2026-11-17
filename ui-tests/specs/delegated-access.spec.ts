@@ -111,6 +111,69 @@ test.describe("Credentials page tabs", () => {
     await expect(page.getByRole("tab", { name: /Audit/ })).toHaveCount(0);
     await expect(page.getByTestId("page-audit")).toHaveCount(0);
   });
+
+  test("drops a delegation revoked on Delegated Access from Credential Tokens too, from one read", async ({
+    page,
+  }) => {
+    let reads = 0;
+    page.on("request", (request) => {
+      if (
+        request.method() === "GET" &&
+        new URL(request.url()).pathname === "/api/v1/delegation-vault"
+      ) {
+        reads += 1;
+      }
+    });
+    await serveProviders(page);
+    const revoked = await serveVault(page, [
+      token("t1", ALICE, fromNow(5 * HOUR)),
+      token("t2", BOB),
+    ]);
+    await page.goto(`${BASE_URL}/credentials?tab=delegated-access`);
+    await expect(accessRow(page, "t1")).toBeVisible();
+
+    const revoke = page.getByTestId("delegated-access-revoke-button-t1");
+    await revoke.click();
+    await revoke.click();
+    await expect(accessRow(page, "t1")).toHaveCount(0);
+
+    await page.getByTestId("credentials-credential-tokens-tab-trigger").click();
+    await expect(row(page, "t2")).toBeVisible();
+    await expect(row(page, "t1")).toHaveCount(0);
+    expect(revoked).toEqual(["/api/v1/delegation-vault/t1"]);
+    expect(reads).toBe(1);
+  });
+
+  test("says the delegations could not be read, not that there are none, and lists them after Retry", async ({
+    page,
+  }) => {
+    await serveProviders(page);
+    let refuse = true;
+    await page.route("**/api/v1/delegation-vault**", async (route) => {
+      if (refuse) {
+        await route.fulfill({
+          status: 500,
+          json: { error: "Failed to list tokens" },
+        });
+        return;
+      }
+      await route.fulfill({ json: [token("t1", ALICE)] });
+    });
+    await page.goto(`${BASE_URL}/credentials?tab=credential-tokens`);
+
+    await expect(
+      page.getByTestId("credential-tokens-read-error"),
+    ).toContainText("Failed to load delegations: Failed to list tokens");
+    await expect(page.getByText("No delegation tokens yet")).toHaveCount(0);
+
+    refuse = false;
+    await page.getByTestId("credential-tokens-read-error-retry").click();
+
+    await expect(row(page, "t1")).toBeVisible();
+    await expect(page.getByTestId("credential-tokens-read-error")).toHaveCount(
+      0,
+    );
+  });
 });
 
 test.describe("Credentials page Delegated Access tab", () => {
@@ -374,8 +437,47 @@ test.describe("Credentials page Credential Tokens tab", () => {
     await page.waitForTimeout(300);
     await page.getByTestId("credentials-search-input").click();
 
-    await expect(button).not.toContainText("Revoke this user's only delegation?");
+    await expect(button).not.toContainText(
+      "Revoke this user's only delegation?",
+    );
     await expect(row(page, "t1")).toBeVisible();
+    expect(revoked).toEqual([]);
+  });
+
+  test("opens the details and the limit panel, and cancels a confirm, from the keyboard", async ({
+    page,
+  }) => {
+    const revoked = await openCredentialTokens(page, [
+      token("t1", ALICE, fromNow(5 * HOUR)),
+    ]);
+
+    const expand = page.getByTestId("credential-token-expand-button-t1");
+    await expand.focus();
+    await page.keyboard.press("Enter");
+    await expect(expand).toHaveAttribute("aria-expanded", "true");
+    await expect(page.locator("#credential-token-detail-t1")).toContainText(
+      "Consent Ends",
+    );
+
+    const limit = page.getByTestId("credential-token-limit-button-t1");
+    await limit.focus();
+    await page.keyboard.press("Enter");
+    await expect(
+      page.getByTestId("credential-token-limit-input-t1"),
+    ).toBeFocused();
+    await page.getByTestId("credential-token-limit-cancel-t1").focus();
+    await page.keyboard.press("Enter");
+    await expect(
+      page.getByTestId("credential-token-limit-panel-t1"),
+    ).toHaveCount(0);
+    await expect(limit).toBeFocused();
+
+    const revoke = page.getByTestId("credential-token-revoke-button-t1");
+    await revoke.focus();
+    await page.keyboard.press("Enter");
+    await expect(revoke).toHaveText("Revoke GitHub access?");
+    await page.keyboard.press("Escape");
+    await expect(revoke).toHaveText("Revoke");
     expect(revoked).toEqual([]);
   });
 

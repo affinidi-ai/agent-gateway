@@ -50,7 +50,7 @@ const MAX_SCOPES: usize = 128;
 /// The longest authorization code accepted.
 const MAX_CODE_CHARS: usize = 4096;
 
-fn error(
+pub(super) fn error(
     status: StatusCode,
     code: &'static str,
     message: &str,

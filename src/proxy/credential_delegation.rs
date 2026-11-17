@@ -4894,7 +4894,7 @@ mod tests {
         assert_eq!(result_tag(&results[0].result), "Inject");
         assert_eq!(results[0].action.outcome, DelegationActionOutcome::TokenInjected);
         assert!(kept.is_some());
-        assert!(events.audited.is_empty(), "an injection is logged, not audited: {:?}", categories(&events.audited));
+        assert!(events.audited.is_empty(), "an injection writes no audit record: {:?}", categories(&events.audited));
         assert_eq!(categories(&events.logged), vec!["token_injected"]);
     }
 
@@ -4914,7 +4914,7 @@ mod tests {
         assert_eq!(result_tag(&results[0].result), "Inject");
         assert_eq!(results[0].action.outcome, DelegationActionOutcome::TokenInjected);
         assert!(kept.is_some());
-        assert!(events.audited.is_empty(), "an injection is logged, not audited: {:?}", categories(&events.audited));
+        assert!(events.audited.is_empty(), "an injection writes no audit record: {:?}", categories(&events.audited));
         assert_eq!(categories(&events.logged), vec!["token_injected"]);
     }
 
@@ -4976,7 +4976,7 @@ mod tests {
 
         assert_eq!(result_tag(&results[0].result), "Inject");
         assert!(kept.is_some());
-        assert!(events.audited.is_empty(), "an injection is logged, not audited: {:?}", categories(&events.audited));
+        assert!(events.audited.is_empty(), "an injection writes no audit record: {:?}", categories(&events.audited));
         assert_eq!(categories(&events.logged), vec!["token_injected"]);
     }
 

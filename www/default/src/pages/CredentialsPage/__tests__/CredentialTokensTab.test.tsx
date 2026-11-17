@@ -1,19 +1,37 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { apiClient } from '../../../api';
 import { showToast } from '../../../utils/toaster';
 import CredentialTokensTab from '../CredentialTokensTab';
+import { useDelegationVault } from '../useDelegationVault';
 
 jest.mock('../../../api', () => ({
   apiClient: { fetch: jest.fn() },
 }));
+const mockHasPermission = jest.fn();
 jest.mock('../../../context/PermissionsContext', () => ({
-  usePermissions: () => ({ hasPermission: () => true, loading: false }),
+  usePermissions: () => ({ hasPermission: mockHasPermission, loading: false }),
 }));
 jest.mock('../../../utils/toaster', () => ({ showToast: jest.fn() }));
 
 const mockFetch = apiClient.fetch as jest.Mock;
+
+type TabProps = Omit<React.ComponentProps<typeof CredentialTokensTab>, 'vault'>;
+
+/** The tab on the vault the Credentials page would hand it. */
+const Tab: React.FC<TabProps> = props => (
+  <CredentialTokensTab {...props} vault={useDelegationVault()} />
+);
+
+/** An answer of the gateway, as `apiClient.fetch` resolves with it. */
+const answer = (body: unknown = {}, status = 200, statusText = 'OK') => ({
+  ok: status < 400,
+  status,
+  statusText,
+  json: () => Promise.resolve(body),
+  text: () => Promise.resolve(typeof body === 'string' ? body : JSON.stringify(body)),
+});
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -48,35 +66,46 @@ const GITHUB = {
   token_refresh_enabled: true,
 };
 
+/** Answers the two lists the tab reads, and every other request with `change`. */
+const gatewayHolds = (
+  tokens: ReturnType<typeof token>[],
+  providers: unknown = [GITHUB],
+  change: () => unknown = () => answer()
+) =>
+  mockFetch.mockImplementation((url: string, options?: { method?: string }) =>
+    Promise.resolve(
+      options?.method
+        ? change()
+        : answer(url === '/api/v1/credential-providers' ? providers : tokens)
+    )
+  );
+
 const renderTab = async (
   tokens: ReturnType<typeof token>[],
-  props: React.ComponentProps<typeof CredentialTokensTab> = {},
+  props: TabProps = {},
   providers: unknown = [GITHUB]
 ) => {
-  mockFetch.mockImplementation((url: string, options?: { method?: string }) =>
-    Promise.resolve({
-      ok: true,
-      statusText: 'OK',
-      json: () =>
-        Promise.resolve(
-          options?.method === 'DELETE'
-            ? {}
-            : url === '/api/v1/credential-providers'
-              ? providers
-              : tokens
-        ),
-    })
-  );
-  render(<CredentialTokensTab {...props} />);
+  gatewayHolds(tokens, providers);
+  render(<Tab {...props} />);
   await screen.findByTestId(`credential-token-row-${tokens[0].id}`);
 };
 
 const row = (id: string) => screen.getByTestId(`credential-token-row-${id}`);
+const rowIds = () =>
+  screen
+    .queryAllByTestId(/^credential-token-row-/)
+    .map(element => element.getAttribute('data-testid')!.replace('credential-token-row-', ''));
 const consentEndOf = (id: string) => screen.getByTestId(`credential-token-consent-end-${id}`);
 const deletes = () => mockFetch.mock.calls.filter(([, options]) => options?.method === 'DELETE');
+const reads = () => mockFetch.mock.calls.filter(([url]) => url === '/api/v1/delegation-vault');
 
 describe('Credential Tokens tab', () => {
-  beforeEach(() => jest.clearAllMocks());
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockHasPermission.mockImplementation(
+      (permission: string) => permission === 'delegation_vault.delete'
+    );
+  });
 
   it('shows when each consent ends and marks one ending within a day or already ended', async () => {
     await renderTab([
@@ -249,15 +278,10 @@ describe('Credential Tokens tab', () => {
   });
 
   const puts = () => mockFetch.mock.calls.filter(([, options]) => options?.method === 'PUT');
-  /** Answers every later request with `answer`, as a success or as a `400`. */
-  const answerWith = (ok: boolean, answer: unknown) =>
+  /** Answers every later request with `body`, as a success or as a `400`. */
+  const answerWith = (ok: boolean, body: unknown) =>
     mockFetch.mockImplementation(() =>
-      Promise.resolve({
-        ok,
-        status: ok ? 200 : 400,
-        statusText: ok ? 'OK' : 'Bad Request',
-        json: () => Promise.resolve(answer),
-      })
+      Promise.resolve(ok ? answer(body) : answer(body, 400, 'Bad Request'))
     );
   const limitPart = (part: string, id = 't1') =>
     screen.getByTestId(`credential-token-limit-${part}-${id}`);
@@ -413,5 +437,266 @@ describe('Credential Tokens tab', () => {
     expect(
       screen.queryByTestId('credential-token-view-activity-button-t1')
     ).not.toBeInTheDocument();
+  });
+
+  it('opens the detail of a token from a button a keyboard reaches', async () => {
+    await renderTab([token('t1', ALICE)]);
+    const expand = screen.getByTestId('credential-token-expand-button-t1');
+    expect(expand).toHaveAttribute('aria-expanded', 'false');
+    expect(expand).toHaveAccessibleName(/^Details of GitHub access for user a{8}.+a{8}$/);
+
+    fireEvent.click(expand);
+    expect(expand).toHaveAttribute('aria-expanded', 'true');
+    const detail = screen.getByTestId('credential-token-detail-t1');
+    expect(expand).toHaveAttribute('aria-controls', detail.id);
+    expect(detail).toHaveTextContent('Consent Ends');
+
+    fireEvent.click(expand);
+    expect(expand).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText('Consent Ends')).toBeNull();
+  });
+
+  it('offers no way to change a delegation to a user who may not delete from the vault', async () => {
+    mockHasPermission.mockImplementation((permission: string) => permission === 'settings.edit');
+    await renderTab([sixHourConsent('t1', ALICE)]);
+
+    expect(row('t1')).toBeInTheDocument();
+    expect(screen.queryByRole('columnheader', { name: 'Actions' })).toBeNull();
+    for (const control of ['limit-button', 'revoke-button', 'revoke-user-button']) {
+      expect(screen.queryByTestId(`credential-token-${control}-t1`)).toBeNull();
+    }
+    expect(mockHasPermission).toHaveBeenCalledWith('delegation_vault.delete');
+  });
+
+  it('says why a revoke was refused, in the words of the gateway, and keeps the delegation', async () => {
+    gatewayHolds([token('t1', ALICE)], [GITHUB], () =>
+      answer({ error: 'Failed to revoke' }, 500, 'Internal Server Error')
+    );
+    render(<Tab />);
+    const button = await screen.findByTestId('credential-token-revoke-button-t1');
+
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    await waitFor(() =>
+      expect(showToast).toHaveBeenCalledWith('error', 'Not revoked: Failed to revoke')
+    );
+    expect(rowIds()).toEqual(['t1']);
+    expect(showToast).not.toHaveBeenCalledWith('success', expect.anything());
+  });
+
+  it("names the status of a refused revoke of a user's delegations when the gateway gave no words", async () => {
+    gatewayHolds([token('t1', ALICE), token('t2', ALICE)], [GITHUB], () =>
+      answer('', 403, 'Forbidden')
+    );
+    render(<Tab />);
+    const button = () => screen.getByTestId('credential-token-revoke-user-button-t1');
+    await screen.findByTestId('credential-token-row-t1');
+
+    fireEvent.click(button());
+    fireEvent.click(button());
+
+    await waitFor(() =>
+      expect(showToast).toHaveBeenCalledWith('error', 'Not revoked: Forbidden (403)')
+    );
+    expect(rowIds()).toEqual(['t1', 't2']);
+  });
+
+  it('says a revoke did not reach the gateway and keeps the delegation', async () => {
+    gatewayHolds([token('t1', ALICE)], [GITHUB], () =>
+      Promise.reject(new TypeError('Failed to fetch'))
+    );
+    render(<Tab />);
+    const button = await screen.findByTestId('credential-token-revoke-button-t1');
+
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    await waitFor(() =>
+      expect(showToast).toHaveBeenCalledWith(
+        'error',
+        'Not revoked: The gateway could not be reached.'
+      )
+    );
+    expect(rowIds()).toEqual(['t1']);
+  });
+
+  it('says the delegations could not be read, not that there are none, and reads again on Retry', async () => {
+    let refuse = true;
+    mockFetch.mockImplementation((url: string) =>
+      Promise.resolve(
+        url === '/api/v1/credential-providers'
+          ? answer([GITHUB])
+          : refuse
+            ? answer({ error: 'Failed to list tokens' }, 500, 'Internal Server Error')
+            : answer([token('t1', ALICE)])
+      )
+    );
+    render(<Tab />);
+
+    expect(await screen.findByTestId('credential-tokens-read-error')).toHaveTextContent(
+      'Failed to load delegations: Failed to list tokens'
+    );
+    expect(screen.queryByText('No delegation tokens yet')).toBeNull();
+    expect(rowIds()).toEqual([]);
+
+    refuse = false;
+    fireEvent.click(screen.getByTestId('credential-tokens-read-error-retry'));
+
+    expect(await screen.findByTestId('credential-token-row-t1')).toBeInTheDocument();
+    expect(screen.queryByTestId('credential-tokens-read-error')).toBeNull();
+    expect(reads()).toHaveLength(2);
+  });
+
+  it('says the gateway could not be reached when the read gets no answer', async () => {
+    mockFetch.mockRejectedValue(new TypeError('Failed to fetch'));
+    render(<Tab />);
+
+    expect(await screen.findByTestId('credential-tokens-read-error')).toHaveTextContent(
+      'Failed to load delegations: The gateway could not be reached.'
+    );
+    expect(screen.queryByText('No delegation tokens yet')).toBeNull();
+  });
+
+  it('says there are no tokens only when the gateway lists none', async () => {
+    gatewayHolds([]);
+    render(<Tab />);
+
+    expect(await screen.findByText('No delegation tokens yet')).toBeInTheDocument();
+    expect(screen.queryByTestId('credential-tokens-read-error')).toBeNull();
+  });
+
+  it('shows the last page left once the only delegation of a later page is revoked', async () => {
+    const ids = Array.from({ length: 11 }, (_, index) => `t${String(index + 1).padStart(2, '0')}`);
+    await renderTab(ids.map(id => token(id, id === 't11' ? BOB : ALICE)));
+    fireEvent.click(screen.getByRole('button', { name: '2' }));
+    expect(rowIds()).toEqual(['t11']);
+
+    const revoke = screen.getByTestId('credential-token-revoke-button-t11');
+    fireEvent.click(revoke);
+    fireEvent.click(revoke);
+
+    await waitFor(() => expect(rowIds()).toEqual(ids.slice(0, 10)));
+  });
+
+  it('opens the limit panel of a consent with no time limit empty, in hours, with no Save', async () => {
+    await renderTab([token('t1', ALICE)]);
+    fireEvent.click(screen.getByTestId('credential-token-limit-button-t1'));
+
+    expect(limitPart('input')).toHaveValue(null);
+    expect(limitPart('unit')).toHaveValue('hours');
+    expect(limitPart('preview')).toHaveTextContent(
+      /^Enter a whole number from 1 minute to 365 days\.$/
+    );
+    expect(limitPart('save')).toBeDisabled();
+  });
+
+  it('moves the focus into the limit panel when it opens, and back to its button when it closes', async () => {
+    await renderTab([sixHourConsent('t1', ALICE)]);
+    const button = screen.getByTestId('credential-token-limit-button-t1');
+
+    fireEvent.click(button);
+    expect(limitPart('input')).toHaveFocus();
+    expect(button).toHaveAttribute('aria-controls', 'credential-token-limit-panel-t1');
+    expect(limitPart('panel')).toHaveAccessibleName('Limit duration · GitHub');
+    fireEvent.click(limitPart('cancel'));
+    expect(button).toHaveFocus();
+
+    fireEvent.click(button);
+    expect(limitPart('input')).toHaveFocus();
+    fireEvent.change(limitPart('input'), { target: { value: '2' } });
+    answerWith(true, { consent_expires_at: fromNow(HOUR) });
+    fireEvent.click(limitPart('save'));
+
+    await waitFor(() => expect(screen.queryByTestId('credential-token-limit-panel-t1')).toBeNull());
+    expect(button).toHaveFocus();
+  });
+
+  it('says a limit did not reach the gateway, ties that to the field and lets it be saved again', async () => {
+    await renderTab([sixHourConsent('t1', ALICE)]);
+    fireEvent.click(screen.getByTestId('credential-token-limit-button-t1'));
+    fireEvent.change(limitPart('input'), { target: { value: '2' } });
+
+    mockFetch.mockRejectedValue(new TypeError('Failed to fetch'));
+    fireEvent.click(limitPart('save'));
+
+    expect(await screen.findByTestId('credential-token-limit-error-t1')).toHaveTextContent(
+      /^The gateway could not be reached\.$/
+    );
+    expect(limitPart('input')).toHaveAttribute(
+      'aria-describedby',
+      'credential-token-limit-preview-t1 credential-token-limit-error-t1'
+    );
+    expect(limitPart('save')).toBeEnabled();
+    expect(consentEndOf('t1')).toHaveTextContent(/\(in 4 hours\)$/);
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  /** Holds every later request until the function it returns is called with the answer. */
+  const holdRequests = () => {
+    let finish: (value: unknown) => void = () => undefined;
+    mockFetch.mockImplementation(
+      () =>
+        new Promise(resolve => {
+          finish = resolve;
+        })
+    );
+    return (value: unknown) => act(async () => finish(value));
+  };
+
+  it('sends a limit once, however often Save is clicked while it is being saved', async () => {
+    await renderTab([sixHourConsent('t1', ALICE)]);
+    fireEvent.click(screen.getByTestId('credential-token-limit-button-t1'));
+    fireEvent.change(limitPart('input'), { target: { value: '2' } });
+
+    const finish = holdRequests();
+    fireEvent.click(limitPart('save'));
+    expect(limitPart('save')).toBeDisabled();
+    expect(limitPart('save')).toHaveAttribute('aria-busy', 'true');
+    expect(limitPart('cancel')).toBeDisabled();
+    fireEvent.click(limitPart('save'));
+    expect(puts()).toHaveLength(1);
+
+    await finish(answer({ consent_expires_at: fromNow(HOUR) }));
+    await waitFor(() => expect(screen.queryByTestId('credential-token-limit-panel-t1')).toBeNull());
+    expect(puts()).toHaveLength(1);
+  });
+
+  it("keeps another delegation's limit panel open when an earlier save finishes", async () => {
+    await renderTab([sixHourConsent('t1', ALICE), sixHourConsent('t2', BOB)]);
+    fireEvent.click(screen.getByTestId('credential-token-limit-button-t1'));
+    fireEvent.change(limitPart('input'), { target: { value: '2' } });
+    const finish = holdRequests();
+    fireEvent.click(limitPart('save'));
+
+    fireEvent.click(screen.getByTestId('credential-token-limit-button-t2'));
+    expect(screen.queryByTestId('credential-token-limit-panel-t1')).toBeNull();
+    expect(limitPart('input', 't2')).toHaveFocus();
+    await finish(answer({ consent_expires_at: fromNow(HOUR) }));
+
+    await waitFor(() =>
+      expect(consentEndOf('t1')).toHaveTextContent(/\(in (59 minutes|1 hour)\)$/)
+    );
+    expect(limitPart('panel', 't2')).toBeInTheDocument();
+    expect(limitPart('input', 't2')).toHaveFocus();
+    expect(consentEndOf('t2')).toHaveTextContent(/\(in 4 hours\)$/);
+    expect(showToast).toHaveBeenCalledWith(
+      'success',
+      expect.stringMatching(/^Limit saved\. GitHub access ends /)
+    );
+  });
+
+  it('says so when the gateway saves a limit without saying when the consent now ends', async () => {
+    await renderTab([sixHourConsent('t1', ALICE)]);
+    fireEvent.click(screen.getByTestId('credential-token-limit-button-t1'));
+    fireEvent.change(limitPart('input'), { target: { value: '2' } });
+
+    answerWith(true, { id: 't1' });
+    fireEvent.click(limitPart('save'));
+
+    expect(await screen.findByTestId('credential-token-limit-error-t1')).toHaveTextContent(
+      'The gateway saved the limit but did not say when the consent now ends.'
+    );
+    expect(showToast).not.toHaveBeenCalledWith('success', expect.anything());
   });
 });

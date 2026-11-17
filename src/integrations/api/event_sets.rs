@@ -11,7 +11,7 @@ use super::{
     refuse_while_used, require_known_id, validate_text,
 };
 use crate::auth_manager::middleware::AuthGuardOk;
-use crate::integrations::definitions::event_set::{is_only_logged, validate_events};
+use crate::integrations::definitions::event_set::{is_logged_audit_event_id, validate_events};
 use crate::integrations::definitions::{EventSet, EventSetError};
 use crate::integrations::events::catalog;
 
@@ -128,7 +128,7 @@ fn within_catalog(events: &[String]) -> Result<(), ApiError> {
     let most = catalog().len();
     let offered = events
         .iter()
-        .filter(|event| !is_only_logged(event))
+        .filter(|event| !is_logged_audit_event_id(event))
         .count();
     if offered > most {
         return Err((StatusCode::BAD_REQUEST, format!("An event set holds at most {most} events")));

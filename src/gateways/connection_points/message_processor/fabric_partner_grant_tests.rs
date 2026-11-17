@@ -782,13 +782,6 @@ async fn a_grant_released_to_a_partner_is_logged_with_the_peer_and_the_target() 
             .await
     })
     .await;
-    assert!(
-        !recorded
-            .audited
-            .iter()
-            .any(|event| matches!(event.event, DelegationAuditAction::TokenInjected)),
-        "a release is offered to no audit sink"
-    );
     let injected: Vec<_> = recorded
         .logged
         .into_iter()

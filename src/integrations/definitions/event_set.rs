@@ -55,7 +55,7 @@ impl EventSet {
     pub fn has_audit_events(&self) -> bool {
         self.events
             .iter()
-            .any(|event| event.starts_with(AUDIT_EVENT_PREFIX) && !is_only_logged(event))
+            .any(|event| event.starts_with(AUDIT_EVENT_PREFIX) && !is_logged_audit_event_id(event))
     }
 
     /// Template variables in `content` that no event of the set fills, sorted.
@@ -107,7 +107,7 @@ fn collect_template_variables(
 
 /// Whether `event` is an audit event the gateway used to offer and now only writes to its
 /// log ([`crate::audit::catalog::LOGGED_EVENTS`]). A set stored before may still name it.
-pub fn is_only_logged(event: &str) -> bool {
+pub fn is_logged_audit_event_id(event: &str) -> bool {
     event
         .strip_prefix(AUDIT_EVENT_PREFIX)
         .is_some_and(crate::audit::catalog::is_logged_only)
@@ -119,7 +119,7 @@ pub fn validate_events(events: Vec<String>) -> Result<HashSet<String>, EventSetE
     // Sized by what it keeps, never by the caller's list: it grows to at most the catalog.
     let mut unique = HashSet::new();
     for event in events {
-        if is_only_logged(&event) {
+        if is_logged_audit_event_id(&event) {
             continue;
         }
         if find_event(&event).is_none() {
@@ -268,9 +268,9 @@ mod tests {
             Ok(unique(&["audit.consent_granted", "gateway.created"]))
         );
         for logged in crate::audit::catalog::LOGGED_EVENTS {
-            assert!(is_only_logged(&format!("audit.{logged}")), "{logged}");
+            assert!(is_logged_audit_event_id(&format!("audit.{logged}")), "{logged}");
         }
-        assert!(!is_only_logged("audit.consent_granted"));
+        assert!(!is_logged_audit_event_id("audit.consent_granted"));
     }
 
     #[test]
@@ -284,7 +284,7 @@ mod tests {
     #[test]
     fn only_an_audit_event_is_one_the_gateway_now_only_logs() {
         for id in ["token_injected", "gateway.token_injected"] {
-            assert!(!is_only_logged(id), "{id}");
+            assert!(!is_logged_audit_event_id(id), "{id}");
             assert_eq!(validate_events(events(&[id])), Err(EventSetError::UnknownEvent(id.to_string())));
         }
     }

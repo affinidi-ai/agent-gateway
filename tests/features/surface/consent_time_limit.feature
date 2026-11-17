@@ -98,6 +98,16 @@ Feature: Consent time limit
     And the delegated credential in the delegation vault ends its consent 7200 seconds after it was given
     And the delegation audit trail contains event "consent_limited" for OAuth provider "calendar"
 
+  Scenario: A gateway that records only revoked tokens also records a limit on a consent
+    Given OAuth provider "calendar" limits a consent to 21600 seconds
+    And caller "alice" has started OAuth consent for provider "calendar"
+    And caller "alice" has completed OAuth consent for provider "calendar"
+    And the caller's consent was given 3600 seconds ago
+    And the VP Audit Log keeps only audit event "token_revoked"
+    When the operator limits the caller's consent to 7200 seconds
+    Then the admin API response status is 200
+    And the delegation audit trail contains event "consent_limited" for OAuth provider "calendar"
+
   Scenario: A consent an operator limited is removed at its new end
     Given OAuth provider "calendar" limits a consent to 21600 seconds
     And caller "alice" has started OAuth consent for provider "calendar"

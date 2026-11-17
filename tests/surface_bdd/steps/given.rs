@@ -3251,6 +3251,21 @@ async fn vp_audit_log_keeps_every_audit_event(world: &mut SurfaceWorld) {
     }
 }
 
+#[given(expr = "the VP Audit Log keeps only audit event {string}")]
+async fn vp_audit_log_keeps_only_audit_event(
+    world: &mut SurfaceWorld,
+    event: String,
+) {
+    crate::steps::when::ensure_admin_session(world).await;
+    world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .keep_only_audit_events(&[event.as_str()])
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log must keep only {event}: {error:#}"));
+}
+
 /// The live VP Audit Log of the running gateway: beside its logs when the
 /// scenario configured a log directory, and under `_storage/audit` otherwise,
 /// which the gateway resolves against the base folder it runs in. The rotated

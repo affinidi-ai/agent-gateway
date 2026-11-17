@@ -106,7 +106,7 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
     event(
         "consent_limited",
         "Consent Limited",
-        "An operator brought the end of one stored consent forward through the management API",
+        "An operator brought the end of one stored consent forward through the management API; also recorded wherever Token Revoked is selected",
         Delegation,
     ),
     event("token_revoked", "Token Revoked", "A delegation token was revoked through the management API", Delegation),
@@ -229,6 +229,12 @@ pub const LOGGED_EVENTS: &[&str] = &[
     "elicitation_cancelled",
     "elicitation_timed_out",
 ];
+
+/// Events a sink receives together: one that selects the first also receives
+/// the second. An operator's limit on a consent ends access sooner, as a
+/// revocation does, so a selection made before `consent_limited` existed that
+/// audits revocations audits limits too.
+pub const RECEIVED_WITH: &[(&str, &str)] = &[("token_revoked", "consent_limited")];
 
 /// Whether `category` is one of the [`LOGGED_EVENTS`].
 pub fn is_logged_only(category: &str) -> bool {

@@ -18,8 +18,20 @@ import {
 } from './auditHelpers';
 import type { AuditEntry, PolicyChangeActor, PolicyChangeData, PolicyChangeEvent } from './types';
 import { isBaseSurfaceVariant, surfaceVariantPhrase } from '../../utils/surfaceVariant';
+import { formatDateTime } from '../../utils/stringUtils';
 
 export type EventTone = 'allow' | 'deny' | 'warn' | 'neutral';
+
+/**
+ * The time a `consent_limited` record's `detail` gives under `key`, as it is shown; `null` when
+ * the detail has no such time. The detail is `key:time` pairs joined by commas.
+ */
+function limitedConsentTime(detail: unknown, key: string): string | null {
+  if (typeof detail !== 'string') return null;
+  const pair = detail.split(',').find(part => part.startsWith(`${key}:`));
+  const time = pair ? new Date(pair.slice(key.length + 1)) : null;
+  return time && !Number.isNaN(time.getTime()) ? formatDateTime(time, true) : null;
+}
 
 /** A user's name for their id, when it is known. */
 export type UserNameResolver = (userId: string) => string | undefined;
@@ -384,15 +396,20 @@ export function describeEntry(entry: AuditEntry, userName?: UserNameResolver): E
           : 'A consent reached its time limit, so the stored credential was removed.',
         detail: 'The person is asked to consent again the next time the agent needs it.',
       };
-    case 'consent_limited':
+    case 'consent_limited': {
+      const end = limitedConsentTime(entry.detail, 'consent_expires_at');
+      const previous = limitedConsentTime(entry.detail, 'previous_end');
       return {
         title: 'Consent limited',
         tone,
         summary: provider
-          ? `An operator brought the end of the consent for ${provider} forward.`
-          : 'An operator brought the end of a consent forward.',
-        detail: 'The credential is used until that end. It was not revoked.',
+          ? `An operator made the consent for ${provider} end sooner.`
+          : 'An operator made a consent end sooner.',
+        detail: end
+          ? `It now ends ${end}${previous ? `, not ${previous}` : ''}. The credential is used until then. It was not revoked.`
+          : 'The credential is used until its new end. It was not revoked.',
       };
+    }
     case 'refresh_failed':
       return {
         title: 'Token refresh failed',

@@ -8,30 +8,41 @@ const mockHasPermission = jest.fn();
 jest.mock('../../context/PermissionsContext', () => ({
   usePermissions: () => ({ hasPermission: mockHasPermission, loading: false }),
 }));
+const mockVault = { tokens: [], providers: {}, loading: false, vaultError: null };
+const mockVaultsGiven: Record<string, unknown> = {};
+jest.mock('../CredentialsPage/useDelegationVault', () => ({
+  useDelegationVault: () => mockVault,
+}));
 jest.mock('../SettingsPage/StrategiesTab', () => () => null);
 jest.mock('../SettingsPage/CredentialProvidersTab', () => () => null);
 jest.mock('../CredentialsPage/StsClientsTab', () => () => null);
 jest.mock(
   '../CredentialsPage/CredentialTokensTab',
-  () => (props: { onViewActivity?: (userHash: string) => void }) => (
-    <button
-      type="button"
-      data-testid="stub-view-activity"
-      disabled={!props.onViewActivity}
-      onClick={() => props.onViewActivity?.('sha256:user-1')}
-    />
-  )
+  () => (props: { vault: unknown; onViewActivity?: (userHash: string) => void }) => {
+    mockVaultsGiven.credentialTokens = props.vault;
+    return (
+      <button
+        type="button"
+        data-testid="stub-view-activity"
+        disabled={!props.onViewActivity}
+        onClick={() => props.onViewActivity?.('sha256:user-1')}
+      />
+    );
+  }
 );
 jest.mock(
   '../CredentialsPage/DelegatedAccessTab',
-  () => (props: { onViewHistory?: () => void }) => (
-    <button
-      type="button"
-      data-testid="stub-view-history"
-      disabled={!props.onViewHistory}
-      onClick={() => props.onViewHistory?.()}
-    />
-  )
+  () => (props: { vault: unknown; onViewHistory?: () => void }) => {
+    mockVaultsGiven.delegatedAccess = props.vault;
+    return (
+      <button
+        type="button"
+        data-testid="stub-view-history"
+        disabled={!props.onViewHistory}
+        onClick={() => props.onViewHistory?.()}
+      />
+    );
+  }
 );
 
 const DELEGATION =
@@ -75,6 +86,14 @@ describe('CredentialsPage delegated access', () => {
     expect(
       screen.queryByTestId('credentials-credential-audit-tab-trigger')
     ).not.toBeInTheDocument();
+  });
+
+  it('hands both delegation tabs the one vault it loaded', () => {
+    mockHasPermission.mockReturnValue(true);
+    renderPage();
+
+    expect(mockVaultsGiven.credentialTokens).toBe(mockVault);
+    expect(mockVaultsGiven.delegatedAccess).toBe(mockVault);
   });
 
   it('opens the Audit Log on the records of ended access as the history', () => {

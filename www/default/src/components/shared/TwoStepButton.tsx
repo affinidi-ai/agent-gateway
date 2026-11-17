@@ -35,8 +35,8 @@ const DANGER_CONFIRM_CLASS = 'btn btn-danger btn-sm text-wrap';
 
 /**
  * A button that acts on its second click and confirms in place: the first click shows
- * `confirmLabel`, the second runs `onConfirm`, and a click elsewhere, or Cancel when offered,
- * cancels. For an action that is not a delete; a delete uses `DeleteButton`.
+ * `confirmLabel`, the second runs `onConfirm`, and a click elsewhere, Escape, or Cancel when
+ * offered, cancels. For an action that is not a delete; a delete uses `DeleteButton`.
  */
 export const TwoStepButton: React.FC<TwoStepButtonProps> = ({
   onConfirm,

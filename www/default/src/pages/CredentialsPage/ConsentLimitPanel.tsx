@@ -1,11 +1,13 @@
-import React, { useState } from 'react';
-import { apiClient } from '../../api';
+import React, { useEffect, useRef, useState } from 'react';
+import { AppButton } from '../../components/shared/AppButton';
+import { getErrorMessage } from '../../utils/apiError';
 import { formatDateTime } from '../../utils/stringUtils';
 import {
+  CONSENT_LIMIT_RANGE,
   ConsentLimitUnit,
   consentLimitSecondsOf,
   consentLimitUnitsFor,
-  largestWholeUnit,
+  limitFieldsOf,
 } from '../../utils/consentLimit';
 import {
   DelegationToken,
@@ -18,16 +20,17 @@ import {
 interface ConsentLimitPanelProps {
   token: DelegationToken;
   providerName: string;
-  /** Called with the token as the gateway stores it once its limit is saved. */
-  onSaved: (limited: DelegationToken) => void;
-  onCancel: () => void;
+  /** Saves the limit, in seconds after the consent was given. Rejects with why it was refused. */
+  onSave: (limitSecs: number) => Promise<void>;
+  /** Asks for the panel to be closed: on Cancel, and after a save while it is still shown. */
+  onClose: () => void;
 }
 
 /** What the panel says a limit would do, before anything is sent. */
 function describeOutcome(outcome: LimitOutcome, token: DelegationToken, now: Date): string {
   switch (outcome.kind) {
     case 'invalid':
-      return 'Enter a whole number from 1 minute to 365 days.';
+      return `Enter a whole number from ${CONSENT_LIMIT_RANGE}.`;
     case 'already_older':
       return 'This consent is already older than that. Use Revoke to end it now.';
     case 'not_sooner':
@@ -39,91 +42,95 @@ function describeOutcome(outcome: LimitOutcome, token: DelegationToken, now: Dat
 
 /**
  * Sets a time limit on one delegation: it then ends that long after its consent was given. It
- * opens in place under the delegation's row, never as a modal or a browser dialog, and offers
- * Save only for a limit that brings the end forward.
+ * opens in place under the delegation's row, never as a modal or a browser dialog, takes the
+ * focus, and offers Save only for a limit that brings the end forward.
  */
 const ConsentLimitPanel: React.FC<ConsentLimitPanelProps> = ({
   token,
   providerName,
-  onSaved,
-  onCancel,
+  onSave,
+  onClose,
 }) => {
   const currentSecs = consentLimitSecs(token);
-  const current = currentSecs === null ? null : largestWholeUnit(currentSecs);
-  const [amount, setAmount] = useState(current ? String(current.count) : '');
-  const [unit, setUnit] = useState<ConsentLimitUnit>(current?.unit ?? 'hours');
+  const [fields, setFields] = useState(() => limitFieldsOf(currentSecs));
   const [refusal, setRefusal] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const shown = useRef(true);
+
+  useEffect(() => {
+    shown.current = true;
+    inputRef.current?.focus();
+    return () => {
+      shown.current = false;
+    };
+  }, []);
 
   const now = new Date();
-  const limitSecs = consentLimitSecondsOf(amount, unit);
+  const limitSecs = consentLimitSecondsOf(fields.amount, fields.unit);
   const outcome = limitOutcome(token, limitSecs, now);
   const id = token.id;
+  const previewId = `credential-token-limit-preview-${id}`;
+  const errorId = `credential-token-limit-error-${id}`;
+  const titleId = `credential-token-limit-title-${id}`;
+
+  const change = (changed: Partial<typeof fields>) => {
+    setFields(held => ({ ...held, ...changed }));
+    setRefusal(null);
+  };
 
   const save = async () => {
     if (outcome.kind !== 'ends' || limitSecs === null) return;
     setSaving(true);
     setRefusal(null);
-    let answer: unknown = null;
-    let saved = false;
     try {
-      const response = await apiClient.fetch(
-        `/api/v1/delegation-vault/${encodeURIComponent(id)}/consent-limit`,
-        {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ max_consent_age_secs: limitSecs }),
-        }
-      );
-      answer = await response.json().catch(() => null);
-      saved = response.ok && !!answer && typeof answer === 'object';
-      if (!saved) {
-        const said = (answer as { error?: unknown } | null)?.error;
-        setRefusal(typeof said === 'string' ? said : 'The gateway did not save the limit.');
+      await onSave(limitSecs);
+    } catch (error) {
+      if (shown.current) {
+        setRefusal(getErrorMessage(error, 'The gateway did not save the limit.'));
+        setSaving(false);
       }
-    } catch {
-      setRefusal('The gateway could not be reached, so the limit was not saved.');
+      return;
     }
-    if (saved) {
-      onSaved(answer as DelegationToken);
-    } else {
-      setSaving(false);
-    }
+    if (shown.current) onClose();
   };
 
   return (
-    <div className="px-4 py-3" data-testid={`credential-token-limit-panel-${id}`}>
-      <div className="fw-semibold mb-2">Limit duration · {providerName}</div>
+    <div
+      className="px-4 py-3"
+      id={`credential-token-limit-panel-${id}`}
+      role="group"
+      aria-labelledby={titleId}
+      data-testid={`credential-token-limit-panel-${id}`}
+    >
+      <div className="fw-semibold mb-2" id={titleId}>
+        Limit duration · {providerName}
+      </div>
       <div className="d-flex flex-wrap align-items-center gap-2">
         <label className="mb-0" htmlFor={`credential-token-limit-input-${id}`}>
           The agent may act for this person for at most
         </label>
         <input
+          ref={inputRef}
           id={`credential-token-limit-input-${id}`}
           type="number"
           min={1}
           step={1}
           className={`form-control form-control-sm${refusal ? ' is-invalid' : ''}`}
           style={{ width: '6rem' }}
-          value={amount}
+          value={fields.amount}
           aria-invalid={refusal ? true : undefined}
-          aria-describedby={`credential-token-limit-preview-${id}`}
+          aria-describedby={refusal ? `${previewId} ${errorId}` : previewId}
           data-testid={`credential-token-limit-input-${id}`}
-          onChange={e => {
-            setAmount(e.target.value);
-            setRefusal(null);
-          }}
+          onChange={e => change({ amount: e.target.value })}
         />
         <select
           className="form-select form-select-sm"
           style={{ width: 'auto' }}
           aria-label="Unit of the limit"
-          value={unit}
+          value={fields.unit}
           data-testid={`credential-token-limit-unit-${id}`}
-          onChange={e => {
-            setUnit(e.target.value as ConsentLimitUnit);
-            setRefusal(null);
-          }}
+          onChange={e => change({ unit: e.target.value as ConsentLimitUnit })}
         >
           {consentLimitUnitsFor(currentSecs ?? undefined).map(name => (
             <option key={name} value={name}>
@@ -136,39 +143,36 @@ const ConsentLimitPanel: React.FC<ConsentLimitPanelProps> = ({
       <div
         className="small text-muted mt-2"
         aria-live="polite"
-        id={`credential-token-limit-preview-${id}`}
-        data-testid={`credential-token-limit-preview-${id}`}
+        id={previewId}
+        data-testid={previewId}
       >
         {describeOutcome(outcome, token, now)}
       </div>
       {refusal && (
-        <div
-          className="small text-danger mt-1"
-          role="alert"
-          data-testid={`credential-token-limit-error-${id}`}
-        >
+        <div className="small text-danger mt-1" role="alert" id={errorId} data-testid={errorId}>
           {refusal}
         </div>
       )}
       <div className="d-flex gap-2 mt-3">
-        <button
-          type="button"
-          className="btn btn-primary btn-sm"
-          disabled={saving || outcome.kind !== 'ends'}
+        <AppButton
+          variant="primary"
+          size="sm"
+          loading={saving}
+          disabled={outcome.kind !== 'ends'}
           data-testid={`credential-token-limit-save-${id}`}
           onClick={save}
         >
           Save limit
-        </button>
-        <button
-          type="button"
-          className="btn btn-outline-secondary btn-sm"
+        </AppButton>
+        <AppButton
+          variant="outline-secondary"
+          size="sm"
           disabled={saving}
           data-testid={`credential-token-limit-cancel-${id}`}
-          onClick={onCancel}
+          onClick={onClose}
         >
           Cancel
-        </button>
+        </AppButton>
       </div>
     </div>
   );

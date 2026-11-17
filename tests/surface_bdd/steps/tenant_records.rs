@@ -448,6 +448,62 @@ async fn header_scoped_token_downloads_server_logs(world: &mut SurfaceWorld) {
     send_with_token(world, TokenScope::RequiredHeadersAlone(HEADER_TENANT), Method::GET, "/v1/logs/download").await;
 }
 
+/// The newest log lines of the gateway, as the dashboard asks for them.
+const DASHBOARD_LOG_LINES_PATH: &str = "/v1/dashboard/delta";
+
+#[when("an appliance-wide access token reads the dashboard's log lines")]
+async fn appliance_wide_token_reads_dashboard_log_lines(world: &mut SurfaceWorld) {
+    send_with_token(world, TokenScope::ApplianceWide, Method::GET, DASHBOARD_LOG_LINES_PATH).await;
+}
+
+#[when(expr = "a token of tenant {string} reads the dashboard's log lines")]
+async fn tenant_reads_dashboard_log_lines(
+    world: &mut SurfaceWorld,
+    tenant: String,
+) {
+    send_with_token(world, TokenScope::Tenant(&tenant), Method::GET, DASHBOARD_LOG_LINES_PATH).await;
+}
+
+#[when("an access token scoped by required headers alone reads the dashboard's log lines")]
+async fn header_scoped_token_reads_dashboard_log_lines(world: &mut SurfaceWorld) {
+    send_with_token(world, TokenScope::RequiredHeadersAlone(HEADER_TENANT), Method::GET, DASHBOARD_LOG_LINES_PATH)
+        .await;
+}
+
+/// The log lines of the recorded dashboard answer; none when it leaves the
+/// log section out.
+fn dashboard_log_lines(world: &SurfaceWorld) -> Vec<Value> {
+    let body = &world
+        .admin_response
+        .as_ref()
+        .expect("the dashboard must have answered")
+        .body;
+    body["changes"]["logs"]["new_entries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[then(expr = "the answer holds the log line {string}")]
+fn answer_holds_log_line(
+    world: &mut SurfaceWorld,
+    message: String,
+) {
+    let lines = dashboard_log_lines(world);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["message"] == message.as_str()),
+        "the dashboard answer should hold the log line {message:?}: {lines:?}"
+    );
+}
+
+#[then("the answer holds no log lines")]
+fn answer_holds_no_log_lines(world: &mut SurfaceWorld) {
+    let lines = dashboard_log_lines(world);
+    assert!(lines.is_empty(), "the dashboard answer should hold no log lines: {lines:?}");
+}
+
 #[when("an appliance-wide access token lists the delegation vault")]
 async fn appliance_wide_token_lists_delegation_vault(world: &mut SurfaceWorld) {
     send_with_token(world, TokenScope::ApplianceWide, Method::GET, "/v1/delegation-vault").await;

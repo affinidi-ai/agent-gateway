@@ -4,7 +4,7 @@
 use anyhow::Result;
 use tracing::{info, warn};
 
-use super::event_set::is_only_logged;
+use super::event_set::is_logged_audit_event_id;
 use super::{DefinitionStores, Endpoint, EventSet, Integration};
 use crate::integrations::events::find_event;
 use crate::secrets::SecretsStore;
@@ -51,7 +51,7 @@ pub async fn check_definitions(
             .events
             .iter()
             .map(String::as_str)
-            .filter(|event| find_event(event).is_none() && !is_only_logged(event))
+            .filter(|event| find_event(event).is_none() && !is_logged_audit_event_id(event))
             .collect();
         if !unknown.is_empty() {
             let problem = format!("Unknown events: {}", unknown.join(", "));
@@ -84,7 +84,7 @@ fn holds_only_logged_events(event_set: &EventSet) -> Option<String> {
     if events.is_empty()
         || !events
             .iter()
-            .all(|event| is_only_logged(event))
+            .all(|event| is_logged_audit_event_id(event))
     {
         return None;
     }

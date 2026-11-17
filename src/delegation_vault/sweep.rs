@@ -110,9 +110,8 @@ pub async fn consent_impact(
     if !provider.takes_consent() {
         return Ok(impact);
     }
-    let mut tried = provider.clone();
-    tried.max_consent_age_secs = tried_secs;
-    let (as_stored, as_tried) = (ConsentLimits::of_provider(Some(provider)), ConsentLimits::of_provider(Some(&tried)));
+    let (as_stored, as_tried) =
+        (ConsentLimits::of(None, provider.max_consent_age_secs), ConsentLimits::of(None, tried_secs));
     for token in vault
         .list_all()
         .await?
