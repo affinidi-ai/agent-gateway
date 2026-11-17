@@ -162,6 +162,9 @@ const MAX_PENDING_CAPTURES: usize = 64;
 /// A client that stops reading would otherwise hold back the keep-alive access recheck.
 const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How often a connection rechecks its access and pings the client.
+const KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl WsSubscription {
     fn new(captures: crate::policies::input_capture::CaptureSender) -> Self {
         Self {
@@ -729,6 +732,90 @@ fn keeps_reading(error: &broadcast::error::RecvError) -> bool {
     matches!(error, broadcast::error::RecvError::Lagged(_))
 }
 
+/// Send the connection's broadcast updates, answers and policy input captures to the
+/// client, and at each `ping_interval` tick recheck its access and ping it. Returns when
+/// the client is gone or stops reading, or the update channel closes.
+async fn send_loop<S>(
+    mut sender: S,
+    mut rx: broadcast::Receiver<WsUpdate>,
+    mut answer_rx: tokio::sync::mpsc::Receiver<String>,
+    mut capture_rx: tokio::sync::mpsc::Receiver<Arc<str>>,
+    send_sub: &RwLock<WsSubscription>,
+    caller: Option<&WsCaller>,
+    mut ping_interval: tokio::time::Interval,
+) where
+    S: futures::Sink<Message> + Unpin,
+{
+    let mut logs_allowed = WsCaller::logs_allowed(caller).await;
+
+    'send: loop {
+        tokio::select! {
+            // The keep-alive recheck goes first, so a due recheck always runs before
+            // any queued capture is sent.
+            biased;
+            _ = ping_interval.tick() => {
+                logs_allowed = WsCaller::logs_allowed(caller).await;
+                let stopped = recheck_at_keep_alive(send_sub, caller, &mut capture_rx).await;
+                for answer in stopped {
+                    if !deliver(&mut sender, Message::Text(answer.into())).await {
+                        break 'send;
+                    }
+                }
+                if !deliver(&mut sender, Message::Ping("ping".into())).await {
+                    break;
+                }
+                debug!("Sent WebSocket ping");
+            }
+            // Handle broadcast updates
+            update_result = rx.recv() => {
+                match update_result {
+                    Ok(update) => {
+                        if !admits(&update, logs_allowed) {
+                            continue;
+                        }
+                        // DashboardDelta is already serialized; apply per-client
+                        // section filtering before forwarding.
+                        let msg = match &update {
+                            WsUpdate::DashboardDelta { json } => {
+                                let sub = send_sub.read().await;
+                                match delta_for_connection(json, &sub, logs_allowed) {
+                                    Some(delta) => Message::Text(delta.into()),
+                                    None => continue, // Nothing left after filtering
+                                }
+                            }
+                            other => match serde_json::to_string(other) {
+                                Ok(json) => Message::Text(json.into()),
+                                Err(e) => {
+                                    error!("Failed to serialize update: {}", e);
+                                    continue;
+                                }
+                            },
+                        };
+
+                        if !deliver(&mut sender, msg).await {
+                            break;
+                        }
+                    }
+                    Err(error) if keeps_reading(&error) => {
+                        debug!("WebSocket client fell behind the update channel: {}", error);
+                    }
+                    Err(_) => break,
+                }
+            }
+            Some(answer) = answer_rx.recv() => {
+                if !deliver(&mut sender, Message::Text(answer.into())).await {
+                    break;
+                }
+            }
+            Some(capture) = capture_rx.recv() => {
+                if !deliver(&mut sender, Message::Text(capture.as_ref().into())).await {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Handle a WebSocket connection
 async fn handle_socket(
     socket: WebSocket,
@@ -737,16 +824,16 @@ async fn handle_socket(
     caller: Option<WsCaller>,
 ) {
     let (mut sender, mut receiver) = socket.split();
-    let mut rx = state.subscribe();
+    let rx = state.subscribe();
 
     // Per-connection subscription – shared between send & recv tasks.
     // Captured policy input of the surfaces this connection listens to, sent by the send task.
-    let (capture_tx, mut capture_rx) = tokio::sync::mpsc::channel::<Arc<str>>(MAX_PENDING_CAPTURES);
+    let (capture_tx, capture_rx) =tokio::sync::mpsc::channel::<Arc<str>>(MAX_PENDING_CAPTURES);
     let subscription = Arc::new(RwLock::new(WsSubscription::new(capture_tx)));
     let caller = Arc::new(caller);
     // Answers to the client's own requests, sent by the send task.
     // Bounded, so a client that stops reading its socket is no longer read from either.
-    let (answer_tx, mut answer_rx) = tokio::sync::mpsc::channel::<String>(MAX_PENDING_ANSWERS);
+    let (answer_tx, answer_rx) =tokio::sync::mpsc::channel::<String>(MAX_PENDING_ANSWERS);
 
     // Send initial connection confirmation
     if let Err(e) = sender
@@ -774,77 +861,9 @@ async fn handle_socket(
     let send_sub = Arc::clone(&subscription);
     let send_caller = Arc::clone(&caller);
     let mut send_task = tokio::spawn(async move {
-        let caller = (*send_caller).as_ref();
-        let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        let mut ping_interval = tokio::time::interval(KEEP_ALIVE_INTERVAL);
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut logs_allowed = WsCaller::logs_allowed(caller).await;
-
-        loop {
-            tokio::select! {
-                // The keep-alive recheck goes first, so a due recheck always runs before
-                // any queued capture is sent.
-                biased;
-                _ = ping_interval.tick() => {
-                    logs_allowed = WsCaller::logs_allowed(caller).await;
-                    let stopped = recheck_at_keep_alive(&send_sub, caller, &mut capture_rx).await;
-                    for answer in stopped {
-                        if !deliver(&mut sender, Message::Text(answer.into())).await {
-                            break;
-                        }
-                    }
-                    if !deliver(&mut sender, Message::Ping("ping".into())).await {
-                        break;
-                    }
-                    debug!("Sent WebSocket ping");
-                }
-                // Handle broadcast updates
-                update_result = rx.recv() => {
-                    match update_result {
-                        Ok(update) => {
-                            if !admits(&update, logs_allowed) {
-                                continue;
-                            }
-                            // DashboardDelta is already serialized; apply per-client
-                            // section filtering before forwarding.
-                            let msg = match &update {
-                                WsUpdate::DashboardDelta { json } => {
-                                    let sub = send_sub.read().await;
-                                    match delta_for_connection(json, &sub, logs_allowed) {
-                                        Some(delta) => Message::Text(delta.into()),
-                                        None => continue, // Nothing left after filtering
-                                    }
-                                }
-                                other => match serde_json::to_string(other) {
-                                    Ok(json) => Message::Text(json.into()),
-                                    Err(e) => {
-                                        error!("Failed to serialize update: {}", e);
-                                        continue;
-                                    }
-                                },
-                            };
-
-                            if !deliver(&mut sender, msg).await {
-                                break;
-                            }
-                        }
-                        Err(error) if keeps_reading(&error) => {
-                            debug!("WebSocket client fell behind the update channel: {}", error);
-                        }
-                        Err(_) => break,
-                    }
-                }
-                Some(answer) = answer_rx.recv() => {
-                    if !deliver(&mut sender, Message::Text(answer.into())).await {
-                        break;
-                    }
-                }
-                Some(capture) = capture_rx.recv() => {
-                    if !deliver(&mut sender, Message::Text(capture.as_ref().into())).await {
-                        break;
-                    }
-                }
-            }
-        }
+        send_loop(sender, rx, answer_rx, capture_rx, &send_sub, (*send_caller).as_ref(), ping_interval).await;
     });
 
     // Handle incoming messages from client (ping/pong, close, and subscribe)
@@ -1530,6 +1549,37 @@ mod tests {
         let started = tokio::time::Instant::now();
         assert!(!super::deliver(&mut stalled, Message::Ping("stuck".into())).await);
         assert_eq!(started.elapsed(), super::SEND_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_answer_the_client_does_not_read_at_a_keep_alive_check_ends_the_connection_without_a_ping() {
+        use axum::extract::ws::Message;
+
+        let dir = TempDir::new().unwrap();
+        let caller =
+            caller_for(guard_with_user(&dir, crate::auth::types::UserRole::Administrator).await, "user-1").await;
+        let (captures_tx, captures) = tokio::sync::mpsc::channel(8);
+        let subscription = tokio::sync::RwLock::new(super::WsSubscription::new(captures_tx));
+        super::listen_to_policy_input(&subscription, Some(&caller), listen_message("ws-stalled-stop"), true).await;
+        caller
+            .sessions
+            .remove_sessions_for_user("user-1")
+            .await;
+        let (updates_tx, updates) = tokio::sync::broadcast::channel(8);
+        let (answers_tx, answers) = tokio::sync::mpsc::channel(8);
+        let (stalled, mut never_read) = futures::channel::mpsc::channel::<Message>(0);
+
+        let started = tokio::time::Instant::now();
+        let ping_interval = tokio::time::interval(super::KEEP_ALIVE_INTERVAL);
+        super::send_loop(stalled, updates, answers, captures, &subscription, Some(&caller), ping_interval).await;
+
+        assert_eq!(started.elapsed(), super::SEND_TIMEOUT);
+        let Ok(Message::Text(stop)) = never_read.try_recv() else {
+            panic!("the stop answer is the one message sent");
+        };
+        assert_eq!(answer(stop.to_string())["error"], super::SESSION_ENDED);
+        assert!(never_read.try_recv().is_err(), "no ping follows the stop answer");
+        drop((updates_tx, answers_tx));
     }
 
     #[tokio::test]
