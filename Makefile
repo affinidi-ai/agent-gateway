@@ -146,27 +146,52 @@ install-python-deps: ## Install the Python packages the changelog tooling needs,
 	@$(VENV)/bin/python3 -m pip install --quiet $(PYTHON_DEPS)
 	@echo "$(GREEN)✅ Python dependencies installed!$(NC)"
 
-install-git-hooks: ## Install git hooks via pre-commit framework
+install-git-hooks: ## Install git hooks via pre-commit framework (SKIP_GIT_HOOKS=1 if you manage hooks yourself)
 	@echo "$(BLUE)🔗 Installing git hooks...$(NC)"
 	@# pre-commit writes to .git/hooks and refuses to install while core.hooksPath
-	@# is set, since git would ignore .git/hooks entirely. Tools like did-git-sign
-	@# set it globally to a dispatcher that chains back to .git/hooks, so the two
-	@# compose at runtime — only the install needs the setting out of the way.
+	@# is set, since git reads hooks from that directory instead. This target does
+	@# not move that setting aside for you: it lives in your config rather than this
+	@# repo's, and a dependency target that clears it loses it for every repository
+	@# on the machine if it is killed before restoring it. So it refuses, says what
+	@# to run, and never reports hooks git would ignore as installed.
 	@set -e; \
-	hooks_path=$$(git config --global --get core.hooksPath || true); \
-	if [ -n "$$hooks_path" ]; then \
-		echo "$(BLUE)   core.hooksPath is set globally ($$hooks_path) — restoring it after install$(NC)"; \
-		git config --global --unset-all core.hooksPath; \
-		trap 'git config --global core.hooksPath "$$hooks_path"' EXIT INT TERM; \
+	if [ -n "$(SKIP_GIT_HOOKS)" ]; then \
+		echo "$(YELLOW)⏭️  SKIP_GIT_HOOKS set: hooks were NOT installed. This repo's pre-commit checks, gitleaks included, will not run locally.$(NC)"; \
+		exit 0; \
 	fi; \
-	pre-commit install
-	@echo "$(GREEN)✅ Git hooks installed!$(NC)"
+	hooks_path=$$(git config --get core.hooksPath || true); \
+	if [ -n "$$hooks_path" ]; then \
+		echo "$(RED)❌ core.hooksPath is set to '$$hooks_path'.$(NC)"; \
+		echo "$(RED)   git reads hooks from there, so pre-commit refuses to install into .git/hooks and$(NC)"; \
+		echo "$(RED)   this repo's checks, gitleaks included, will not run locally until you resolve it.$(NC)"; \
+		echo "$(RED)   Either stop using it:$(NC)"; \
+		echo "$(RED)     git config --global --unset-all core.hooksPath   # or --local, wherever it is set$(NC)"; \
+		echo "$(RED)   or, if '$$hooks_path' chains to .git/hooks, install by hand once per clone:$(NC)"; \
+		echo "$(RED)     git config --global --unset-all core.hooksPath$(NC)"; \
+		echo "$(RED)     pre-commit install$(NC)"; \
+		echo "$(RED)     git config --global core.hooksPath '$$hooks_path'$(NC)"; \
+		echo "$(RED)   or acknowledge that you manage this repo's hooks yourself:$(NC)"; \
+		echo "$(RED)     make install-git-hooks SKIP_GIT_HOOKS=1$(NC)"; \
+		exit 1; \
+	fi; \
+	pre-commit install; \
+	echo "$(GREEN)✅ Git hooks installed!$(NC)"
 
 install-deps: install-rust-deps install-python-deps ## Install all local development dependencies (macOS)
 	@echo "$(BLUE)📦 Installing dependencies...$(NC)"
 	@brew install $(DEPS) 2>/dev/null || true
-	@$(MAKE) install-git-hooks
-	@echo "$(GREEN)✅ Dependencies installed!$(NC)"
+	@# install-git-hooks exits non-zero when git would ignore the hooks it installs.
+	@# That is worth stopping for on its own, but not worth failing a full dependency
+	@# install over, so it is caught here and reprinted last, where it is still read.
+	@hooks_ok=1; \
+	$(MAKE) install-git-hooks || hooks_ok=0; \
+	echo "$(GREEN)✅ Dependencies installed!$(NC)"; \
+	if [ "$$hooks_ok" = 0 ]; then \
+		echo ""; \
+		echo "$(YELLOW)⚠️  Git hooks were NOT installed; see the error above.$(NC)"; \
+		echo "$(YELLOW)   This repo's pre-commit checks, gitleaks included, will not run locally.$(NC)"; \
+		echo "$(YELLOW)   Fix core.hooksPath and re-run 'make install-git-hooks', or acknowledge with SKIP_GIT_HOOKS=1.$(NC)"; \
+	fi
 
 # ==============================================================================
 # Build Commands

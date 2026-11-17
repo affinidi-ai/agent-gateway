@@ -1,11 +1,11 @@
 version: 2
 
 # A group's `applies-to` defaults to version updates, so no group below touches
-# security updates: those keep arriving as separate PRs. An `ignore` entry
-# restricted to `update-types:` does not suppress security updates either; a
-# `versions:` range does, and a bare `dependency-name:` with no `update-types:`
-# is documented as ignoring the dependency for security updates as well, so
-# always keep the `update-types:` line.
+# security updates: those keep arriving as separate PRs. Majors are not grouped
+# anywhere here, so each arrives as its own PR. There are deliberately no
+# `ignore` entries; if one is ever added, keep an `update-types:` line on it,
+# because a bare `dependency-name:` is documented as ignoring the dependency for
+# security updates as well.
 updates:
   # Minor and patch bumps ride in one weekly PR: one Cargo.lock, one CI run, one
   # review. Majors stay ungrouped, but that holds only for crates past 1.0:
@@ -45,25 +45,6 @@ updates:
         update-types:
           - "minor"
           - "patch"
-    # Majors the dashboard is not taking. For typescript and the two
-    # @testing-library packages each major is a migration rather than a bump,
-    # and the open PR for it has sat unmergeable for weeks. typescript is on
-    # ^4.9.5 here, so this entry also holds the dashboard on the end-of-life 4.x
-    # line: 5, 6 and 7 are all ignored, with no PR left to prompt a move. Minor
-    # and patch updates for these packages still arrive in the group above.
-    ignore:
-      - dependency-name: "typescript"
-        update-types:
-          - "version-update:semver-major"
-      - dependency-name: "@testing-library/react"
-        update-types:
-          - "version-update:semver-major"
-      - dependency-name: "@testing-library/jest-dom"
-        update-types:
-          - "version-update:semver-major"
-      - dependency-name: "js-yaml"
-        update-types:
-          - "version-update:semver-major"
 
   - package-ecosystem: npm
     directory: /ui-tests
@@ -79,16 +60,6 @@ updates:
         update-types:
           - "minor"
           - "patch"
-    # No majors here: on ^5.6.0 and ^22.0.0 this ignores typescript 6 and up and
-    # @types/node 23 and up. The Node types track the runtime CI runs on, which
-    # is Node 22.
-    ignore:
-      - dependency-name: "typescript"
-        update-types:
-          - "version-update:semver-major"
-      - dependency-name: "@types/node"
-        update-types:
-          - "version-update:semver-major"
 
   # Keep the digest-pinned runtime base image in the Dockerfile current.
   - package-ecosystem: docker
