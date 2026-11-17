@@ -435,11 +435,16 @@ pub fn mask_credentials(value: &mut Value) {
 }
 
 /// A JWT candidate anywhere in a text, with the `~`-separated disclosures and key binding
-/// JWT that follow it in an SD-JWT. A header starting with `{` encodes to `ey` or `ew`;
+/// JWT that follow it in an SD-JWT. A header starting with `{` encodes to `ey` or `ew`, and
+/// one starting with JSON whitespace (space, tab, newline or carriage return) before the `{`
+/// to `IA`, `IC`, `IH`, `CQ`, `CS`, `CX`, `Cg`, `Ci`, `Cn`, `DQ`, `DS` or `DX`. The header
+/// takes `=` only as trailing padding, so `CSRF=` in front of a JWT is not part of it;
 /// [`is_jwt_header`] decides whether the candidate is one.
 static EMBEDDED_JWT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(e[wy][A-Za-z0-9_=-]+)\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]*(?:~[A-Za-z0-9_=.-]*)*")
-        .expect("valid JWT pattern")
+    Regex::new(
+        r"\b((?:e[wy]|I[ACH]|C[QSXgin]|D[QSX])[A-Za-z0-9_-]+={0,2})\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]*(?:~[A-Za-z0-9_=.-]*)*",
+    )
+    .expect("valid JWT pattern")
 });
 
 /// `Bearer` or `Basic`, whitespace and the token after it, anywhere in a text.
@@ -487,15 +492,7 @@ fn mask_text(text: &str) -> Option<String> {
     let masked = URL_USERINFO
         .replace_all(&masked, |caps: &regex::Captures<'_>| format!("{}{REDACTED}@", &caps[1]))
         .into_owned();
-    let masked = EMBEDDED_JWT
-        .replace_all(&masked, |caps: &regex::Captures<'_>| {
-            if is_jwt_header(&caps[1]) {
-                REDACTED.to_string()
-            } else {
-                caps[0].to_string()
-            }
-        })
-        .into_owned();
+    let masked = mask_embedded_jwts(&masked);
     let masked = AUTHORIZATION
         .replace_all(&masked, |caps: &regex::Captures<'_>| {
             if is_authorization_token(&caps[1], &caps[3]) {
@@ -506,6 +503,33 @@ fn mask_text(text: &str) -> Option<String> {
         })
         .into_owned();
     (masked != text).then_some(masked)
+}
+
+/// `text` with each embedded JWT replaced by [`REDACTED`]. A candidate whose header does
+/// not decode is searched again from just after the first `-` in its header, or else from
+/// its first dot, so a word such as `Cisco-` or `Cisco.` in front of a JWT does not hide it.
+fn mask_embedded_jwts(text: &str) -> String {
+    let mut masked = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut from = 0;
+    while let Some(caps) = EMBEDDED_JWT.captures_at(text, from) {
+        let (Some(whole), Some(header)) = (caps.get(0), caps.get(1)) else {
+            break;
+        };
+        if is_jwt_header(header.as_str()) {
+            masked.push_str(&text[copied..whole.start()]);
+            masked.push_str(REDACTED);
+            copied = whole.end();
+            from = whole.end();
+        } else {
+            from = header
+                .as_str()
+                .find('-')
+                .map_or(header.end(), |dash| header.start() + dash + 1);
+        }
+    }
+    masked.push_str(&text[copied..]);
+    masked
 }
 
 /// The shortest `Bearer` token taken as a credential when it is only letters. Shorter
@@ -1426,6 +1450,67 @@ mod tests {
         assert_eq!(parts[0]["text"], REDACTED);
         assert_eq!(parts[1]["text"], format!("the token is {REDACTED} ok"));
         assert_eq!(parts[2]["text"], "see ewe.com.au or eyes.on.it");
+    }
+
+    #[test]
+    fn a_jwt_whose_header_json_starts_with_whitespace_is_masked_inside_text() {
+        use base64::Engine;
+        let encode = |json: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+        let payload = encode(r#"{"sub":"x"}"#);
+        for lead in [" ", "\t", "\n", "\r", "  ", " \t", "\t ", "\n ", "\r\n", "\t\t", "\n\n", "\r "] {
+            let jwt = format!("{}.{payload}.c2ln", encode(&format!(r#"{lead}{{"alg":"HS256"}}"#)));
+            let mut input = json!({ "a2a": { "parts": [{ "text": format!("presented {jwt} here") }] } });
+
+            mask_credentials(&mut input);
+
+            assert_eq!(
+                input["a2a"]["parts"][0]["text"],
+                format!("presented {REDACTED} here"),
+                "lead {lead:?}, jwt {jwt}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_word_that_looks_like_a_header_does_not_hide_the_jwt_after_it() {
+        let mut input = json!({ "a2a": { "parts": [
+            { "text": format!("Cisco.{JWT} and eyes.{JWT}") },
+            { "text": "Cisco.com.au and ICE.v2.bak" },
+        ] } });
+
+        mask_credentials(&mut input);
+
+        let parts = &input["a2a"]["parts"];
+        assert_eq!(parts[0]["text"], format!("Cisco.{REDACTED} and eyes.{REDACTED}"));
+        assert_eq!(parts[1]["text"], "Cisco.com.au and ICE.v2.bak");
+    }
+
+    #[test]
+    fn a_jwt_joined_to_a_word_by_a_dash_or_equals_sign_is_masked() {
+        use base64::Engine;
+        let encode = |json: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+        let spaced = format!("{}.{}.c2ln", encode(r#" {"alg":"HS256"}"#), encode(r#"{"sub":"x"}"#));
+        assert!(spaced.starts_with("IHsi"), "{spaced}");
+        let mut input = json!({ "a2a": { "parts": [
+            { "text": format!("CSRF={JWT}") },
+            { "text": format!("X-CSRF-Token={JWT}") },
+            { "text": format!("Cisco-{JWT}") },
+            { "text": format!("DSID={JWT}") },
+            { "text": format!("eyes-{JWT} ewe={JWT}") },
+            { "text": format!("DSID={spaced} Cisco-{spaced}") },
+            { "text": "Cisco.com.au CQRS.handler.ts ICE.v2.bak" },
+        ] } });
+
+        mask_credentials(&mut input);
+
+        let parts = &input["a2a"]["parts"];
+        assert_eq!(parts[0]["text"], format!("CSRF={REDACTED}"));
+        assert_eq!(parts[1]["text"], format!("X-CSRF-Token={REDACTED}"));
+        assert_eq!(parts[2]["text"], format!("Cisco-{REDACTED}"));
+        assert_eq!(parts[3]["text"], format!("DSID={REDACTED}"));
+        assert_eq!(parts[4]["text"], format!("eyes-{REDACTED} ewe={REDACTED}"));
+        assert_eq!(parts[5]["text"], format!("DSID={REDACTED} Cisco-{REDACTED}"));
+        assert_eq!(parts[6]["text"], "Cisco.com.au CQRS.handler.ts ICE.v2.bak");
     }
 
     #[test]
