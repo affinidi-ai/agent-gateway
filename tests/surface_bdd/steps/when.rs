@@ -2995,6 +2995,59 @@ pub(crate) async fn send_mcp_request_through_transit_point_path_with_headers(
     body: serde_json::Value,
     headers: Vec<(String, String)>,
 ) {
+    send_through_transit_point_path(world, agent_name, reqwest::Method::POST, path, Some(body), headers).await;
+}
+
+#[when(
+    expr = "managed agent {string} reads {string} with {word} through Transit Point {string} with its transit token"
+)]
+async fn managed_agent_reads_through_transit_point_with_its_token(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    document: String,
+    method: String,
+    transit_point: String,
+) {
+    let headers = with_transit_token(world, Vec::new());
+    read_through_transit_point(world, &agent_name, &method, &transit_point, &document, headers).await;
+}
+
+#[when(expr = "managed agent {string} reads {string} with {word} through Transit Point {string}")]
+async fn managed_agent_reads_through_transit_point(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    document: String,
+    method: String,
+    transit_point: String,
+) {
+    read_through_transit_point(world, &agent_name, &method, &transit_point, &document, Vec::new()).await;
+}
+
+async fn read_through_transit_point(
+    world: &mut SurfaceWorld,
+    agent_name: &str,
+    method: &str,
+    transit_point: &str,
+    document: &str,
+    headers: Vec<(String, String)>,
+) {
+    let method = match method {
+        "GET" => reqwest::Method::GET,
+        "HEAD" => reqwest::Method::HEAD,
+        other => panic!("a discovery read is a GET or HEAD, not {other}"),
+    };
+    let path = format!("/transit/{transit_point}/{}", document.trim_start_matches('/'));
+    send_through_transit_point_path(world, agent_name, method, &path, None, headers).await;
+}
+
+async fn send_through_transit_point_path(
+    world: &mut SurfaceWorld,
+    agent_name: &str,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+    headers: Vec<(String, String)>,
+) {
     world
         .actors
         .expect_target_kind(agent_name, TargetActorKind::ManagedAgent);
@@ -3012,18 +3065,18 @@ pub(crate) async fn send_mcp_request_through_transit_point_path_with_headers(
         .unwrap_or_else(|error| panic!("outbound listener did not become ready on port {outbound_port}: {error}"));
     let url = format!("http://127.0.0.1:{}{}", outbound_port, path);
 
-    world.sent_body = Some(body.clone());
-    let mut request = reqwest::Client::new()
-        .post(&url)
-        .header("content-type", "application/json");
+    let mut request = reqwest::Client::new().request(method, &url);
+    if let Some(body) = body {
+        world.sent_body = Some(body.clone());
+        request = request.json(&body);
+    }
     for (name, value) in headers {
         request = request.header(name, value);
     }
     let response = request
-        .json(&body)
         .send()
         .await
-        .expect("send MCP request through Transit Point");
+        .expect("send request through Transit Point");
 
     let status = response.status().as_u16();
     let headers = collect_headers(response.headers());

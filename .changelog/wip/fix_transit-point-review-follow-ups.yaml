@@ -1,0 +1,21 @@
+branch: fix/transit-point-review-follow-ups
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking:
+    - timestamp: '2026-11-10T16:31:39+02:00'
+      title: ⭐ Require a transit token on Transit Point discovery reads
+      description: >-
+        A GET or HEAD of a discovery document (such as /.well-known/agent-card.json,
+        agent.json or discovery) through a Transit Point that requires a transit token is
+        refused with 401 without a valid X-Transit-Token, so a target on a trusted network no
+        longer serves its metadata to anyone who reaches the Transit Point. Discovery reads
+        also pass Trust Check and the gateway, surface and Transit Point policies, which must
+        allow them, and still reach the target without a caller credential. Send the transit
+        token on discovery reads, set require_transit_token to false on a Transit Point that
+        must serve them without one (an invalid token is then ignored, not refused), or allow
+        them in policy. An Access Point's discovery
+        documents stay public.

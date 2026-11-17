@@ -157,7 +157,7 @@ logic.
 | Extension inspection | Parsing and validating declared extensions (`inspect_message_extensions`) | [`src/protocols/extensions.rs`](src/protocols/extensions.rs) |
 | Caller identity | The configured caller identity (`from_mtls`, `from_api_key`, `static`, `from_jwt_claim`) and any inbound identity presentation, which Trust Check depends on. On a direct request, an inbound `from_api_key` identifies each caller by the API key it presents and replaces any body identity; Fabric receive does not read it ([`docs/FABRIC.md`](docs/FABRIC.md)) | [`src/proxy/caller_identity.rs`](src/proxy/caller_identity.rs), [`src/identity/`](src/identity/) |
 | Metadata injection | Operator-defined request metadata (`resolve_metadata_references`) | [`src/protocols/extensions.rs`](src/protocols/extensions.rs) |
-| Trust Check, caller leg | TRQP queries feeding policy input. Never denies; OPA decides. Discovery `GET` and `HEAD` requests skip it; any other method on a discovery-like path, such as a `POST` to `{route}/agent.json`, runs it. | [`src/trust_registry_verification/`](src/trust_registry_verification/) |
+| Trust Check, caller leg | TRQP queries feeding policy input. Never denies; OPA decides. On the inbound (Access Point) path, discovery `GET` and `HEAD` requests skip it; any other method on a discovery-like path, such as a `POST` to `{route}/agent.json`, runs it. On the outbound (Transit Point) path, all requests including discovery reads run it. | [`src/trust_registry_verification/`](src/trust_registry_verification/) |
 | Access Point OPA | `access_point.inbound_policy`, its own deny gate, independent of the surface policy | [`src/policies/surface_manager.rs`](src/policies/surface_manager.rs) |
 | Appliance-wide surface policy | The global surface-plane set, deny-overrides, ahead of the surface's own policy | [`src/policies/global_policy.rs`](src/policies/global_policy.rs) |
 | Surface OPA | The per-surface policy gate | [`src/policies/surface_manager.rs`](src/policies/surface_manager.rs) |
@@ -198,20 +198,22 @@ flowchart TB
         D0[Credential injection] --> D1[Forward] --> D2["Response and<br/>agent-card rewrite"] --> D3[Metrics]
     end
     E --> I --> P --> F
-    I -. discovery read .-> F
 ```
 
 Every Transit Point authenticates its caller in the first stage, with its `source_auth` or
-Resource Server token, or in the second, with the transit token, unless it is marked
+Resource Server token, or in the second, with the transit token (when required), unless it is marked
 `allow_unauthenticated_callers`; one that cannot be enforced refuses every request there,
 before anything is forwarded or any credential resolved (see
-[`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#transit-point-callers)). A discovery read, a `GET`
-or `HEAD` of a discovery document such as an agent card directly below the Transit Point,
-skips transit token validation and the trust and policy group, and is forwarded without
-credentials. It still meets a Transit Point's `source_auth` or Resource Server token, but on a
-Transit Point that authenticates its callers with the transit token alone, a discovery read is
-forwarded with no caller authentication at all. The outbound path does not evaluate the
-appliance-wide policies.
+[`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#transit-point-callers)). All Transit Point
+requests, including discovery reads (a `GET` or `HEAD` of a discovery document such as an agent
+card directly below the Transit Point), require transit token validation when configured to require it and must pass through all
+trust and policy checks. However, the caller is reported to the target as unauthenticated
+(`CallerAssertion::Unauthenticated`) because discovery is metadata-only and should not identify
+the requester to the upstream. The request still meets a Transit Point's `source_auth` or
+Resource Server token requirements, but on a Transit Point that authenticates its callers with
+the transit token alone, a discovery read is forwarded with no caller identity to the target,
+though the transit token must be present and valid. The outbound path evaluates all three
+OPA scopes (gateway, surface, and Transit Point) for every request, including discovery reads.
 
 ## Full order
 
@@ -249,8 +251,9 @@ Transit Point header mapping
 identity → custom metadata → trust context → Trust Check (the Transit Point's own list) → gateway OPA →
 surface OPA → Transit Point OPA → MCP tool gating (`tools/call`) → credential injection →
 forward (a `proxy://` Transit Point is answered by its MCP Proxy, whose backend gets only a
-`consent_mode: external` grant) → response and agent-card rewrite → metrics. The stages from trust context to MCP
-tool gating are skipped for discovery reads.
+`consent_mode: external` grant) → response and agent-card rewrite → metrics. A discovery read (a `GET` or `HEAD` of a discovery document on the Transit Point) runs
+the same stages, transit token validation included, except identity resolution: it has no body
+to resolve an identity from, so it reaches Trust Check and policy without a resolved identity.
 
 This page is the authority on pipeline ordering. When it disagrees with a summary
 elsewhere, the source is the arbiter and this page is corrected.
@@ -346,7 +349,7 @@ Breaking one of these is a correctness bug, not a style question.
 | Identity attribution fails closed. A presentation that does not verify never becomes the caller identity. | An unverified DID would reach policy as if it were proven. |
 | Every event of a forwarded A2A event stream gets the response checks a non-streaming reply gets before it is sent, and one that fails them ends the stream. | Streaming would bypass the response policy and the agent identity credential. |
 | A caller whose source authentication failed is never forwarded with the surface's stored target credential, or the A2A proxy's Direct Line secret, on the inbound and Fabric forwarding paths (direct, `proxy://` MCP, `a2a-proxy://`, Fabric send, Fabric receive). The gateway's own agent card fetch is not a forward: on Fabric receive a `GET` of the card path is answered by a new bodiless `GET` the gateway builds, which carries the target credential and none of the caller's headers, body or credentials. | An unauthenticated caller would reach the Target with the operator's credential. |
-| A Transit Point authenticates its caller, with a transit token, a Resource Server token or its `source_auth`, before anything is forwarded or any credential resolved, unless it is marked `allow_unauthenticated_callers`; one whose caller authentication cannot be enforced refuses every request. The one exception: a Transit Point that relies on the transit token alone forwards a discovery read, a `GET` or `HEAD` of a discovery document directly below the Transit Point, without it, and without any credential. | Anyone who reaches a Transit Point would call its target as this gateway, with its target credentials. |
+| A Transit Point authenticates its caller with a transit token, a Resource Server token, or its `source_auth`, before anything is forwarded or any credential resolved, unless it is marked `allow_unauthenticated_callers`; one whose caller authentication cannot be enforced refuses every request. Discovery reads (`GET`/`HEAD` of discovery documents) on a Transit Point configured with `require_transit_token: true` must carry a valid transit token and undergo the same trust context collection, Trust Check evaluation, and all three levels of OPA policy evaluation as other requests. A Transit Point with `require_transit_token: false` allows discovery reads without a token, but still checks one the agent sends: a valid one names the caller to policy, an invalid one is ignored. | Anyone who reaches a Transit Point would call its target as this gateway, with its target credentials, and discovery reads would leak the target's metadata to unauthenticated callers. |
 | A managed agent receives the caller-info and `did:webvh` identity headers (`CallerHeaders::NAMES`) only as this gateway sets them: the inbound path and Fabric receive drop every copy a caller or a peer gateway sent, and a Transit Point sends its target none of them. | The agent, or a Transit Point's target, could not rely on these headers. |
 | A transit token issued for a request that arrived over Fabric names the peer gateway, never carries a `sub`, and its only principal (`fabric.principal_hash`) is the caller the receiving surface's own source authentication verified, set only when that authentication tells a partner's users apart; nothing the peer says about its caller becomes one. It opens the Transit Points of the surface that served the request, as an Access Point's token does, keys a delegated credential only on one that sets `delegated_credentials_for_fabric_callers`, and the agent gets only the token this gateway issued. | A partner gateway's word about a user could unlock that user's grants, or a token a peer sent could reach the agent. |
 | Fabric receive releases its Target's per-user delegated credentials only on a view whose HTTP or HTTPS Target sets `delegated_credentials_for_fabric_callers` beside caller authentication that tells a partner's users apart, checked on every request, and then only the grant kept under the receiving surface for the caller that surface verified, never one a partner names; it never starts consent for a legacy Fabric request. The check treats any `jwt_bearer` method with a verification strategy and an audience as telling users apart, so a static `target_auth` JWT the partner presents for every user keys one grant for all of them. A Transit Point's `delegated_credentials_for_fabric_callers` releases a grant only beside caller authentication that tells a partner's users apart, checked when the token is issued and again on the call, and a Transit Point never starts consent, legacy or `2026-07-28`, for a caller a Fabric-issued token names: it releases only a grant that already exists. | One partner credential would key one grant for all of the partner's users, a partner could pick whose grant it is sent, or an authorization URL relayed through a partner would let it bind its own account. |

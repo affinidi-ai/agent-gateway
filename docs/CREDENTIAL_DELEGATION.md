@@ -1839,10 +1839,10 @@ stores are not available. An MCP Transit Point answers with a JSON-RPC error (`-
 `application/problem+json` body. A missing token still gets the consent answer above.
 
 A Transit Point discovery read, a `GET` or `HEAD` of a discovery document directly below the
-Transit Point (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)), is forwarded without a
-transit token check, so it carries no caller, and without a delegated credential or the
-`target_auth` one. Any other path, a discovery document below another segment included,
-needs a transit token and carries the credentials.
+Transit Point (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#discovery-reads-on-a-transit-point)), needs a
+transit token and passes Trust Check and policy like any other Transit Point request, but is
+forwarded without a delegated credential or the `target_auth` one. Any other path, a discovery
+document below another segment included, carries the credentials.
 
 Outside these checks a request is still forwarded without the credential: on an Access Point
 or Fabric receive whose delegation stores

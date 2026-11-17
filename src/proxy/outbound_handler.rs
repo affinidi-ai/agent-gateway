@@ -1168,29 +1168,25 @@ async fn outbound_proxy_handler_in_request_scope(
     // [7] Custom Metadata Injection
     step_inject_custom_metadata(&state, &mut ctx).await?;
 
-    // Public discovery reads (agent card, UCP well-known) are metadata-only
-    // reads — skip trust context, trust check, and OPA evaluation.
-    if !is_transit_discovery_read(&ctx) {
-        // [8] Trust Context Collection
-        step_collect_trust_context(&state, &mut ctx).await?;
+    // [8] Trust Context Collection
+    step_collect_trust_context(&state, &mut ctx).await?;
 
-        // [8b] Trust Check stage (target leg) — runs before any OPA so all
-        // three outbound OPA scopes see the same `input.trust_check_results`.
-        step_trust_check(&state, &mut ctx).await?;
+    // [8b] Trust Check stage (target leg) — runs before any OPA so all
+    // three outbound OPA scopes see the same `input.trust_check_results`.
+    step_trust_check(&state, &mut ctx).await?;
 
-        // [9] Gateway-Level OPA Policy
-        step_gateway_opa_policy(&state, &mut ctx).await?;
+    // [9] Gateway-Level OPA Policy
+    step_gateway_opa_policy(&state, &mut ctx).await?;
 
-        // [10] Surface-Level OPA Policy
-        step_surface_opa_policy(&state, &mut ctx).await?;
+    // [10] Surface-Level OPA Policy
+    step_surface_opa_policy(&state, &mut ctx).await?;
 
-        // [9.5] Per-Transit-Point OPA Policy (§6.2 step 10)
-        step_transit_point_opa_policy(&state, &mut ctx).await?;
+    // [9.5] Per-Transit-Point OPA Policy (§6.2 step 10)
+    step_transit_point_opa_policy(&state, &mut ctx).await?;
 
-        // [10.6] Per-Transit-Point MCP Tool Gating (tools/call leg) — blocks an
-        // outbound tools/call whose tool this TP's gating firewall hides.
-        step_transit_mcp_tool_gating(&state, &mut ctx).await?;
-    }
+    // [10.6] Per-Transit-Point MCP Tool Gating (tools/call leg) — blocks an
+    // outbound tools/call whose tool this TP's gating firewall hides.
+    step_transit_mcp_tool_gating(&state, &mut ctx).await?;
 
     // [11] Credential Injection (§5.3 / §6.2 step 12)
     // Inject delegated OAuth tokens from the credential vault, or signal consent_required.
@@ -1305,23 +1301,6 @@ async fn validate_transit_token(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
-    // Public discovery reads (a GET or HEAD of an agent card or other discovery
-    // document at the Transit Point's root) are unauthenticated metadata reads.
-    // The transit token is a transit-point *authorization* control, so it
-    // doesn't apply to them — mirroring the discovery bypass the later
-    // identity/trust-context/trust-check/OPA stages already use. Without this an
-    // agent-card fetch through a transit point is rejected for a missing
-    // `X-Transit-Token` before it can reach those bypasses. The trace id stays the
-    // one `OutboundContext::new` derived (no token to adopt one from), which is
-    // fine for a standalone metadata read.
-    if is_transit_discovery_read(ctx) {
-        debug!(
-            request_id = %ctx.request_id,
-            "Transit token validation skipped for public discovery path"
-        );
-        return Ok(());
-    }
-
     let modern = matches!(
         ctx.mcp_classification
             .as_ref(),
@@ -5325,8 +5304,8 @@ fn refuse_partner_consent(ctx: &OutboundPipelineContext) -> OutboundPipelineErro
 /// The caller is the one [`delegation_caller_hash`] names. The channel's `outbound_credentials`
 /// bindings determine which credential providers to look up. A binding that applies
 /// but cannot be resolved refuses the request; it is never forwarded without the
-/// credential. A public discovery read carries no caller, so, as with target
-/// authentication, no caller's credential is released for it.
+/// credential. A discovery read is forwarded without a caller credential, so, as with
+/// target authentication, no caller's credential is released for it.
 async fn step_inject_credentials(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
@@ -7112,9 +7091,8 @@ fn compute_outbound_remainder_path(
         .to_string()
 }
 
-/// Whether the request is a public discovery read of the Transit Point's target:
-/// a `GET` or `HEAD` of a discovery document at the target's root. It is
-/// forwarded without a transit token check, the request gates, or any credential.
+/// Whether the request is a discovery read of the Transit Point's target:
+/// a `GET` or `HEAD` of a discovery document at the target's root.
 fn is_transit_discovery_read(ctx: &OutboundPipelineContext) -> bool {
     crate::proxy::paths::is_transit_discovery_request(
         ctx.original_method.as_str(),
@@ -7129,8 +7107,8 @@ fn is_transit_discovery_read(ctx: &OutboundPipelineContext) -> bool {
     )
 }
 
-/// A public discovery read was not authenticated, so the gateway vouches for no
-/// caller on it; any other Transit Point request was.
+/// A discovery read is forwarded without a caller credential; any other Transit
+/// Point request carries one.
 fn transit_caller_assertion(ctx: &OutboundPipelineContext) -> crate::proxy::handler::CallerAssertion {
     if is_transit_discovery_read(ctx) {
         crate::proxy::handler::CallerAssertion::Unauthenticated
@@ -15903,42 +15881,124 @@ mod tests {
         );
     }
 
-    /// Only a `GET` or `HEAD` of a discovery document at the Transit Point's
-    /// root, as its target receives the path, skips the transit token, and
-    /// exactly those requests carry no caller credential.
-    #[tokio::test]
-    async fn only_a_discovery_read_at_the_transit_point_root_skips_the_transit_token() {
+    const TRANSIT_TEST_BASE: &str = "/outbound/surfaces/order/partner-a";
+    const TRANSIT_TEST_SURFACE: &str = "test-surf-001";
+
+    const TRANSIT_DISCOVERY_READS: [(Method, &str); 5] = [
+        (Method::GET, ".well-known/agent-card.json"),
+        (Method::HEAD, ".well-known/agent-card.json"),
+        (Method::GET, "agent.json"),
+        (Method::GET, "discovery"),
+        (Method::HEAD, "discovery/"),
+    ];
+
+    fn transit_token_test_state() -> (OutboundProxyState, crate::proxy::transit_token::TransitTokenIssuer) {
         let mut state = test_outbound_state();
-        state.transit_token_issuer = Some(Arc::new(crate::proxy::transit_token::TransitTokenIssuer::new(
+        let issuer = crate::proxy::transit_token::TransitTokenIssuer::new(
             crate::proxy::transit_token::TransitTokenKey::generate().unwrap(),
             "gw-test".to_string(),
-        )));
-        let base = "/outbound/surfaces/order/partner-a";
-        for (method, path, discovery) in [
-            (Method::GET, ".well-known/agent-card.json", true),
-            (Method::HEAD, ".well-known/agent-card.json", true),
-            (Method::GET, "agent.json", true),
-            (Method::GET, "discovery", true),
-            (Method::HEAD, "discovery/", true),
-            (Method::GET, "message/send", false),
-            (Method::POST, "agent.json", false),
-            (Method::GET, "x/admin/discovery", false),
-            (Method::HEAD, "x/admin/discovery", false),
-            (Method::GET, "admin/.well-known/agent-card.json", false),
-            (Method::GET, "admin%2Fdiscovery", false),
-            (Method::GET, "admin/%2e%2e/discovery", false),
-            (Method::GET, "admin/../discovery", false),
-            (Method::GET, "admin;/discovery", false),
-            (Method::GET, "discovery;x=1", false),
-        ] {
-            let mut ctx = test_pipeline_context();
-            ctx.original_method = method.clone();
-            ctx.request_path = format!("{base}/{path}");
+        );
+        state.transit_token_issuer = Some(Arc::new(issuer.clone()));
+        (state, issuer)
+    }
+
+    /// A Transit Point request for `path`, carrying a token `issuer` issued for
+    /// `token_surface_id` when one is given.
+    fn transit_request(
+        issuer: &crate::proxy::transit_token::TransitTokenIssuer,
+        method: &Method,
+        path: &str,
+        token_surface_id: Option<&str>,
+    ) -> OutboundPipelineContext {
+        let mut ctx = test_pipeline_context();
+        ctx.original_method = method.clone();
+        ctx.request_path = format!("{TRANSIT_TEST_BASE}/{path}");
+        Arc::make_mut(&mut ctx.surface).surface_id = TRANSIT_TEST_SURFACE.into();
+        if let Some(surface_id) = token_surface_id {
+            let token = issuer
+                .issue(
+                    surface_id,
+                    Some("did:web:gateway.example"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    vec!["partner-a".to_string()],
+                )
+                .unwrap();
+            ctx.original_headers
+                .insert("X-Transit-Token", token.parse().unwrap());
+        }
+        ctx
+    }
+
+    async fn transit_token_refusal(
+        state: &OutboundProxyState,
+        ctx: &mut OutboundPipelineContext,
+    ) -> String {
+        match step_validate_transit_token(state, ctx).await {
+            Err(OutboundPipelineError::TransitTokenInvalid(reason)) => reason,
+            other => panic!("expected a transit token refusal, got {other:?}"),
+        }
+    }
+
+    /// Only a `GET` or `HEAD` of a discovery document at the Transit Point's
+    /// root, as its target receives the path, carries no caller credential;
+    /// every request with a valid transit token passes the token check.
+    #[tokio::test]
+    async fn only_a_discovery_read_at_the_transit_point_root_carries_no_credential() {
+        let (state, issuer) = transit_token_test_state();
+        let other_requests = [
+            (Method::GET, "message/send"),
+            (Method::POST, "agent.json"),
+            (Method::GET, "x/admin/discovery"),
+            (Method::HEAD, "x/admin/discovery"),
+            (Method::GET, "admin/.well-known/agent-card.json"),
+            (Method::GET, "admin%2Fdiscovery"),
+            (Method::GET, "admin/%2e%2e/discovery"),
+            (Method::GET, "admin/../discovery"),
+            (Method::GET, "admin;/discovery"),
+            (Method::GET, "discovery;x=1"),
+        ];
+        for (method, path, discovery) in TRANSIT_DISCOVERY_READS
+            .iter()
+            .map(|(method, path)| (method, *path, true))
+            .chain(
+                other_requests
+                    .iter()
+                    .map(|(method, path)| (method, *path, false)),
+            )
+        {
+            let mut ctx = transit_request(&issuer, method, path, Some(TRANSIT_TEST_SURFACE));
 
             let result = step_validate_transit_token(&state, &mut ctx).await;
 
-            assert_eq!(result.is_ok(), discovery, "{method} {path}: {result:?}");
+            assert!(result.is_ok(), "{method} {path}: {result:?}");
             assert_eq!(transit_caller_assertion(&ctx).permits_target_credential(), !discovery, "{method} {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_discovery_read_without_a_transit_token_is_refused() {
+        let (state, issuer) = transit_token_test_state();
+        for (method, path) in &TRANSIT_DISCOVERY_READS {
+            let mut ctx = transit_request(&issuer, method, path, None);
+
+            let reason = transit_token_refusal(&state, &mut ctx).await;
+
+            assert_eq!(reason, "missing X-Transit-Token header", "{method} {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_discovery_read_with_a_transit_token_for_another_surface_is_refused() {
+        let (state, issuer) = transit_token_test_state();
+        for (method, path) in &TRANSIT_DISCOVERY_READS {
+            let mut ctx = transit_request(&issuer, method, path, Some("another-surface"));
+
+            let reason = transit_token_refusal(&state, &mut ctx).await;
+
+            assert_eq!(reason, "transit token was issued for another surface", "{method} {path}");
         }
     }
 
@@ -24124,22 +24184,30 @@ mod tests {
         );
     }
 
-    /// A public discovery read needs no transit token and names no caller, so
-    /// it reaches the target without a delegated credential, as it does without
-    /// a target authentication one, rather than being refused.
+    /// A discovery read needs a transit token but carries no caller credential
+    /// to the target.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_public_discovery_read_through_a_credentialed_transit_point_carries_no_credential() {
+    async fn a_discovery_read_through_a_credentialed_transit_point_requires_token_but_carries_no_credential() {
         let directory = tempfile::tempdir().unwrap();
         let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
-        let (state, _) = delegation_pipeline(
+        let (mut state, issuer) = delegation_pipeline(
             directory.path(),
             &target.url,
             &[("granted", "mcp", binding("provider", json!({"type": "bearer_header"})))],
         )
         .await;
+
+        // Issue a valid transit token
+        let token = issuer
+            .issue("transit-fabric", Some("did:web:agent.example"), None, None, None, None, vec![])
+            .unwrap();
+
+        state.transit_token_issuer = Some(Arc::new(issuer));
+
         let request = Request::builder()
             .method("GET")
             .uri("/outbound/mcp/granted/.well-known/agent-card.json")
+            .header("X-Transit-Token", &token)
             .body(axum::body::Body::empty())
             .unwrap();
 

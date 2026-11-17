@@ -1101,19 +1101,30 @@ A `2026-07-28` MCP request must also carry exactly one token, and allows no cloc
 The refusal says only that the transit token is missing or invalid; which check it failed is
 logged.
 
-A discovery read is forwarded without a transit token check, and so without any credential
-(see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#when-a-credential-cannot-be-resolved)).
-It is a `GET` or `HEAD` whose path below the Transit Point, which is the path the target
-receives below its endpoint, is exactly one of `.well-known/agent-card.json`,
-`.well-known/agent.json`, `.well-known/agent-card`, `.well-known/ucp`, `agent-card.json`,
-`agent.json` or `discovery`, with at most one trailing slash. A document below another
-segment, such as `admin/discovery`, and a spelling with percent-escapes, `;` parameters, `\`
-or `.` and `..` segments are not discovery reads, whatever the target resolves them to, so
-they need a transit token.
+#### Discovery reads on a Transit Point
 
-Transit Point policies see the caller the token carries in `input.transit.caller`, and a
-client the Transit Point verified itself apart from it, in `input.transit.client`; see
-[`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input).
+A discovery read is a `GET` or `HEAD` whose path below the Transit Point, which is the path the
+target receives below its endpoint, is exactly one of `.well-known/agent-card.json`,
+`.well-known/agent.json`, `.well-known/agent-card`, `.well-known/ucp`, `agent-card.json`,
+`agent.json` or `discovery`, with at most one trailing slash. A document below another segment,
+such as `admin/discovery`, and a spelling with percent-escapes, `;` parameters, `\` or `.` and
+`..` segments are not discovery reads, whatever the target resolves them to.
+
+A discovery read needs a transit token like any other Transit Point request: without a valid one
+it is refused with `401` on a Transit Point that requires one, and a Transit Point with
+`require_transit_token: false` forwards it without one and still checks one the agent sends: a
+valid token names the caller to policy, and an invalid one is ignored, leaving the caller
+anonymous. It then runs the rest of the
+outbound pipeline, Trust Check and the gateway, surface and Transit Point policies included,
+except identity resolution, since it has no body to resolve an identity from. It is forwarded
+without any caller credential, delegated or `target_auth`, and without caller identity headers
+(see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#when-a-credential-cannot-be-resolved)).
+
+Transit Point policies see the caller the token carries in `input.transit.caller`, a discovery
+read's included, and a client the Transit Point verified itself apart from it, in
+`input.transit.client`; see [`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input).
+
+An Access Point's discovery documents stay public; only the Transit Point needs the token.
 
 The signing key is 32 random bytes the gateway creates on its first start, in
 `transit_token_key.json` under `[storage_paths] vc_keys`, readable by the owner only and
