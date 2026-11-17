@@ -285,6 +285,10 @@ surface was deleted, with a red "Revoked" badge, shows a deleted surface as plai
 _Identities page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page).
 
+The Identities table hides Attestation, UAI and Created below 2000px and Trust Score and Last
+Used below 1600px, and the expanded row shows the Trust Score, Created, Last Used and UAI; see
+_Laptop layouts_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#laptop-layouts).
+
 The Agent Cards view of an A2A or AP2 surface shows the managed agent's card beside the served card,
 and the Managed Agent panel shows its fetch status, including a card served without a managed
 identity, in the warning tone; a card refused for its identity names the identity error; see

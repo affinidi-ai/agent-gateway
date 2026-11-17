@@ -999,33 +999,6 @@ const IdentitiesPage: React.FC = () => {
                                                             </div>
                                                           </div>
                                                         )}
-                                                      {!identity.metadata?.agentDNA &&
-                                                        (identity.has_tee ||
-                                                          identity.has_cloud ||
-                                                          identity.attestation_count !==
-                                                            undefined) && (
-                                                          <div
-                                                            className="mb-2"
-                                                            data-testid="identities-detail-attestation"
-                                                          >
-                                                            <small className="font-weight-bold text-muted">
-                                                              Attestation:
-                                                            </small>
-                                                            <div>
-                                                              <small>
-                                                                {[
-                                                                  identity.has_tee && 'TEE',
-                                                                  identity.has_cloud && 'Cloud',
-                                                                  identity.attestation_count !==
-                                                                    undefined &&
-                                                                    `${identity.attestation_count} attestations`,
-                                                                ]
-                                                                  .filter(Boolean)
-                                                                  .join(' · ')}
-                                                              </small>
-                                                            </div>
-                                                          </div>
-                                                        )}
                                                     </div>
                                                   </div>
                                                 </div>

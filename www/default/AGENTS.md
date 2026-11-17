@@ -2016,9 +2016,10 @@ room for its text.
   above. Below 1600px, Trust Score and Last Used (`.identities-col-mid-up`) hide too, and the
   DID cell (`IdentityNameCell` with `compactDid`) shows a shorter DID. The expanded details always
   show Created, Last Used and the Trust Score (`identities-detail-trust-score`), and for an
-  identity without Agent DNA they show its UAI (`identities-detail-uai`) and attestation flags
-  and count (`identities-detail-attestation`) when set. The table fits its box at a 1512px
-  laptop viewport with every row action inside it; the DID keeps its title and copy button.
+  identity without Agent DNA its UAI (`identities-detail-uai`); with Agent DNA the Agent DNA
+  card shows the UAI. The table fits its box from the 1280px viewport that
+  `laptop-layout.spec.ts` checks up to the 1512px and 1728px laptop viewports, with every row
+  action inside it; the DID keeps its title and copy button.
 - **Connection Points actions**: the row actions sit in a 6rem wide wrapping block (two
   buttons per line) with no left margins, so the Actions column stays near 120px and the
   Name and Mediator columns keep their room. Add a new row action inside that block.
