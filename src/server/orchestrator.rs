@@ -633,7 +633,7 @@ async fn repair_and_sync_gateway_did_within(
         }
     }
     if let Err(e) = issuer
-        .authorize_signing_key()
+        .authorize_signing_key_while(|| !crate::server::mode::is_standby())
         .await
     {
         warn!(
@@ -649,7 +649,7 @@ async fn repair_and_sync_gateway_did_within(
             return;
         }
     };
-    if gateway_did.starts_with("did:webvh:") {
+    if gateway_did.starts_with("did:webvh:") && !crate::server::mode::is_standby() {
         let log_src = issuer
             .get_storage_path()
             .await

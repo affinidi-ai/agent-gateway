@@ -563,6 +563,18 @@ impl VCIssuer {
     /// whether a document changed.
     #[cfg(feature = "didwebvh")]
     pub async fn authorize_signing_key(&self) -> Result<bool> {
+        self.authorize_signing_key_while(|| true)
+            .await
+    }
+
+    /// [`Self::authorize_signing_key`], appending a `did:webvh` log version only while
+    /// `still_active` holds when the version is ready, so a node that stepped down meanwhile
+    /// writes nothing.
+    #[cfg(feature = "didwebvh")]
+    pub async fn authorize_signing_key_while(
+        &self,
+        still_active: impl Fn() -> bool + Sync,
+    ) -> Result<bool> {
         let config = self
             .config
             .read()
@@ -574,7 +586,7 @@ impl VCIssuer {
             .starts_with("did:webvh:")
         {
             let multikey_id = format!("{}#{}", config.proxy_did, DEFAULT_SIGNING_KEY_ID);
-            return Self::append_signing_key_version(&config, &multikey_id).await;
+            return Self::append_signing_key_version(&config, &multikey_id, &still_active).await;
         }
 
         let changed = Self::authorize_signing_key_in_did_document(&config, None).await?;
@@ -651,6 +663,7 @@ impl VCIssuer {
     async fn append_signing_key_version(
         config: &VCIssuerConfig,
         multikey_id: &str,
+        still_active: &(dyn Fn() -> bool + Sync),
     ) -> Result<bool> {
         use crate::identity::didwebvh::handlers::{build_signing_secret, build_webvh_state};
         use crate::storage::did_artifacts::{append_did_log_raw, read_did_log_raw};
@@ -705,6 +718,10 @@ impl VCIssuer {
         )
         .await?;
         let entry_json = serde_json::to_string(update.log_entry())?;
+        if !still_active() {
+            info!("Gateway DID repair left to the Active node: this node stepped down to Standby");
+            return Ok(false);
+        }
         append_did_log_raw(&config.storage_path, &log, &entry_json).await?;
         let entry: serde_json::Value = serde_json::from_str(&entry_json)?;
         if let Err(e) = Self::authorize_signing_key_in_did_document(config, Some(&entry["state"])).await {
@@ -3330,6 +3347,26 @@ mod tests {
                 .signing_key_is_listed()
                 .await
         );
+    }
+
+    /// A node no longer Active when the repair would append, as one stepped down during the
+    /// repair is, appends nothing and leaves did.json as it is.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn repair_by_a_node_that_stepped_down_appends_nothing() {
+        let (issuer, temp_dir) = crate::identity::test_helpers::test_vc_issuer_without_assertion_multikey().await;
+        let dir = temp_dir.path();
+        let log_before = std::fs::read_to_string(dir.join("did.jsonl")).unwrap();
+        let doc_before = std::fs::read_to_string(dir.join("did.json")).unwrap();
+
+        let changed = issuer
+            .authorize_signing_key_while(|| false)
+            .await
+            .unwrap();
+
+        assert!(!changed);
+        assert_eq!(std::fs::read_to_string(dir.join("did.jsonl")).unwrap(), log_before);
+        assert_eq!(std::fs::read_to_string(dir.join("did.json")).unwrap(), doc_before);
     }
 
     /// A `did:webvh` gateway whose did.jsonl is gone still gets its did.json repaired, and no
