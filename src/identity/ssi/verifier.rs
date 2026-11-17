@@ -309,6 +309,10 @@ fn without_proof(document: &Value) -> Value {
 /// parse the JCS suite and would reject the document for the wrong reason. The
 /// signature has already been checked here, and the bindings for every proof
 /// on the document were checked above regardless.
+///
+/// A document that mixes `eddsa-jcs-2022` with any other suite is refused:
+/// skipping the `ssi` pass would leave its other proofs with only their binding
+/// checked, so an unsigned proof could carry a forged `challenge` or `domain`.
 async fn check_bindings_and_jcs_proofs(
     document: &Value,
     expected_controller: &str,
@@ -318,6 +322,19 @@ async fn check_bindings_and_jcs_proofs(
 ) -> Result<bool> {
     let proofs = proofs_of(document, what)?;
     let unsigned = without_proof(document);
+    let is_jcs = |proof: &Value| {
+        proof
+            .get("cryptosuite")
+            .and_then(|c| c.as_str())
+            == Some(JCS_CRYPTOSUITE)
+    };
+    let jcs_proofs = proofs
+        .iter()
+        .filter(|proof| is_jcs(proof))
+        .count();
+    if jcs_proofs > 0 && jcs_proofs != proofs.len() {
+        anyhow::bail!("{what} mixes {JCS_CRYPTOSUITE} proofs with other cryptosuites");
+    }
     let mut any_jcs = false;
 
     for proof in &proofs {
@@ -335,11 +352,7 @@ async fn check_bindings_and_jcs_proofs(
             );
         }
 
-        if proof
-            .get("cryptosuite")
-            .and_then(|c| c.as_str())
-            == Some(JCS_CRYPTOSUITE)
-        {
+        if is_jcs(proof) {
             any_jcs = true;
             super::di_jcs::verify_jcs_proof(&unsigned, proof, did_cache.clone())
                 .await
@@ -512,7 +525,8 @@ impl Verifier for LocalVerifier {
         }
 
         // Replay bindings come from the holder's proof. `proofs_of` guarantees
-        // at least one, and the first is the holder proof in every shape the
+        // at least one, every proof's signature was verified above (one suite
+        // per document), and the first is the holder proof in every shape the
         // gateway produces or accepts; the caller compares these against what
         // it challenged with, so a presentation whose binding does not match is
         // refused there.
@@ -1423,5 +1437,92 @@ mod tests {
             .err()
             .expect("an unsigned presentation must be rejected");
         assert!(err.contains("has no proof"), "{err}");
+    }
+
+    /// A captured trust-agent presentation replayed with an unsigned proof of
+    /// another suite placed first, naming the holder and carrying a fresh
+    /// challenge, is refused: that proof's signature would go unchecked, and its
+    /// challenge is the one the caller compares.
+    #[tokio::test]
+    async fn rejects_a_jcs_presentation_with_an_unsigned_proof_of_another_suite() {
+        let f = fixture().await;
+        let (mut vp, _) = bound_presentation(Some("nonce-1"), None).await;
+        let real = vp["proof"].clone();
+        let forged = json!({
+            "type": "DataIntegrityProof",
+            "cryptosuite": "eddsa-rdfc-2022",
+            "created": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "verificationMethod": real["verificationMethod"],
+            "proofPurpose": "authentication",
+            "challenge": "fresh-challenge",
+            "proofValue": "z1111111111111111111111111111111111111111111111111111111111111111",
+        });
+        vp["proof"] = json!([forged, real]);
+
+        let err = verify(&f, &vp)
+            .await
+            .err()
+            .expect("an unverifiable proof must not ride along with a verified one");
+        assert!(err.contains("mixes eddsa-jcs-2022"), "refused for the wrong reason: {err}");
+    }
+
+    /// Every proof on a JCS document is verified, so a second JCS proof whose
+    /// signature does not hold is refused even when the first one verifies.
+    #[tokio::test]
+    async fn rejects_a_jcs_presentation_whose_second_proof_does_not_verify() {
+        let f = fixture().await;
+        let (mut vp, _) = bound_presentation(Some("nonce-1"), None).await;
+        let real = vp["proof"].clone();
+        let mut forged = real.clone();
+        forged["challenge"] = json!("fresh-challenge");
+        vp["proof"] = json!([forged, real]);
+
+        let err = verify(&f, &vp)
+            .await
+            .err()
+            .expect("a proof whose challenge was changed must not verify");
+        assert!(err.contains("verification failed"), "refused for the wrong reason: {err}");
+    }
+
+    /// A JCS proof is checked against the verification relationship it names,
+    /// as `ssi` does for the other suites: a purpose no proof can use, or none
+    /// at all, is refused.
+    #[tokio::test]
+    async fn rejects_a_jcs_proof_whose_purpose_is_not_a_proof_relationship() {
+        let f = fixture().await;
+        let (issuer_key, issuer_did, issuer_vm) = did_key_identity();
+        let (holder_key, holder_did, holder_vm) = did_key_identity();
+        let vc = sign_jcs(
+            unsigned_agent_vc(&holder_did, &issuer_did),
+            &issuer_key,
+            &issuer_did,
+            &issuer_vm,
+            "assertionMethod",
+        )
+        .await;
+        let unsigned_vp = json!({
+            "@context": ["https://www.w3.org/ns/credentials/v2"],
+            "type": ["VerifiablePresentation"],
+            "holder": holder_did,
+            "verifiableCredential": [vc],
+            "id": "urn:uuid:7a7a0000-0000-4000-8000-000000000009",
+        });
+        let vp = sign_jcs(unsigned_vp.clone(), &holder_key, &holder_did, &holder_vm, "keyAgreement").await;
+        let err = verify(&f, &vp)
+            .await
+            .err()
+            .expect("keyAgreement is not a relationship a proof can use");
+        assert!(err.contains("keyAgreement"), "refused for the wrong reason: {err}");
+
+        let mut vp = sign_jcs(unsigned_vp, &holder_key, &holder_did, &holder_vm, "authentication").await;
+        vp["proof"]
+            .as_object_mut()
+            .unwrap()
+            .remove("proofPurpose");
+        let err = verify(&f, &vp)
+            .await
+            .err()
+            .expect("a proof with no purpose must be refused");
+        assert!(err.contains("proofPurpose"), "refused for the wrong reason: {err}");
     }
 }

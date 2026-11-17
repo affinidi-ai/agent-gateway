@@ -25,7 +25,6 @@ use affinidi_data_integrity::did_vm::{DidKeyResolver, ResolvedKey, VerificationM
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_secrets_resolver::secrets::KeyType;
 use anyhow::{Context as AnyhowContext, Result};
-use async_trait::async_trait;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -48,41 +47,73 @@ impl GatewayVmResolver {
     pub fn new(did_cache: Arc<DIDCacheClient>) -> Self {
         Self { did_cache }
     }
-}
 
-#[async_trait]
-impl VerificationMethodResolver for GatewayVmResolver {
-    async fn resolve_vm(
+    /// Resolve `vm`'s key, requiring the DID document to list `vm` under the
+    /// verification relationship `purpose` (the proof's `proofPurpose`).
+    ///
+    /// A `did:key` document lists its one key under every proof relationship,
+    /// so only the purpose itself is checked there.
+    async fn resolve_for_purpose(
         &self,
         vm: &str,
-    ) -> std::result::Result<ResolvedKey, DataIntegrityError> {
+        purpose: &str,
+    ) -> Result<ResolvedKey> {
+        if !PROOF_RELATIONSHIPS.contains(&purpose) {
+            anyhow::bail!("proofPurpose `{purpose}` is not a verification relationship a proof can use");
+        }
         if vm.starts_with("did:key:") {
             return DidKeyResolver
                 .resolve_vm(vm)
-                .await;
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"));
         }
 
         let did = vm
             .split('#')
             .next()
             .filter(|d| !d.is_empty())
-            .ok_or_else(|| DataIntegrityError::Resolver(format!("verification method has no DID: {vm}")))?;
-
+            .ok_or_else(|| anyhow::anyhow!("verification method has no DID: {vm}"))?;
         let resolved = self
             .did_cache
             .resolve(did)
             .await
-            .map_err(|e| DataIntegrityError::Resolver(format!("resolve {did}: {e}")))?;
-
-        let doc = serde_json::to_value(&resolved.doc)
-            .map_err(|e| DataIntegrityError::Resolver(format!("serialize DID document for {did}: {e}")))?;
-
-        let method = find_verification_method(&doc, vm).ok_or_else(|| {
-            DataIntegrityError::Resolver(format!("DID document for {did} declares no verification method {vm}"))
-        })?;
-
-        public_key_from_method(&method, vm)
+            .map_err(|e| anyhow::anyhow!("resolve {did}: {e}"))?;
+        let doc = serde_json::to_value(&resolved.doc).context("serialize DID document")?;
+        if !relationship_lists(&doc, purpose, vm) {
+            anyhow::bail!("DID document for {did} does not list {vm} under {purpose}");
+        }
+        let method = find_verification_method(&doc, vm)
+            .ok_or_else(|| anyhow::anyhow!("DID document for {did} declares no verification method {vm}"))?;
+        public_key_from_method(&method, vm).map_err(|e| anyhow::anyhow!("{e}"))
     }
+}
+
+/// The verification relationships a Data Integrity proof's `proofPurpose` can name.
+const PROOF_RELATIONSHIPS: &[&str] =
+    &["authentication", "assertionMethod", "capabilityInvocation", "capabilityDelegation"];
+
+/// Whether `doc` lists `vm` under the relationship `purpose`, by reference
+/// (full URI or `#fragment`) or as an embedded method.
+fn relationship_lists(
+    doc: &Value,
+    purpose: &str,
+    vm: &str,
+) -> bool {
+    let fragment = vm
+        .split_once('#')
+        .map(|(_, f)| f);
+    doc.get(purpose)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            entry.as_str().or_else(|| {
+                entry
+                    .get("id")
+                    .and_then(Value::as_str)
+            })
+        })
+        .any(|id| id == vm || fragment.is_some_and(|f| id.strip_prefix('#') == Some(f)))
 }
 
 /// Find the verification method `vm` in a DID document.
@@ -224,6 +255,7 @@ pub async fn verify_jcs_proof(
     }
     let verification_method =
         text("verificationMethod").ok_or_else(|| anyhow::anyhow!("proof names no verification method"))?;
+    let purpose = text("proofPurpose").ok_or_else(|| anyhow::anyhow!("proof names no proofPurpose"))?;
     let proof_value = text("proofValue").ok_or_else(|| anyhow::anyhow!("proof carries no proofValue"))?;
 
     let (_, signature) = multibase::decode(proof_value).context("proofValue is not multibase")?;
@@ -241,7 +273,7 @@ pub async fn verify_jcs_proof(
     hash_data.extend_from_slice(&Sha256::digest(canonical(document)?.as_bytes()));
 
     let key = GatewayVmResolver::new(did_cache)
-        .resolve_vm(verification_method)
+        .resolve_for_purpose(verification_method, purpose)
         .await
         .map_err(|e| anyhow::anyhow!("eddsa-jcs-2022 proof verification failed: {e}"))?;
     if key.key_type != KeyType::Ed25519 {
@@ -343,5 +375,27 @@ mod tests {
     fn a_string_reference_is_not_mistaken_for_a_method() {
         let doc = json!({ "authentication": ["did:web:x#k1"] });
         assert!(find_verification_method(&doc, "did:web:x#k1").is_none());
+    }
+
+    #[test]
+    fn a_relationship_lists_a_method_by_reference_or_embedded() {
+        let doc = json!({
+            "authentication": ["did:web:x#k1", { "id": "#k2", "publicKeyMultibase": "z2" }],
+            "assertionMethod": ["#k3"],
+        });
+        assert!(relationship_lists(&doc, "authentication", "did:web:x#k1"));
+        assert!(relationship_lists(&doc, "authentication", "did:web:x#k2"), "an embedded method by fragment");
+        assert!(relationship_lists(&doc, "assertionMethod", "did:web:x#k3"), "a bare fragment reference");
+    }
+
+    #[test]
+    fn a_method_under_another_relationship_is_not_listed() {
+        let doc = json!({
+            "verificationMethod": [{ "id": "did:web:x#k1", "publicKeyMultibase": "z1" }],
+            "keyAgreement": ["did:web:x#k1"],
+            "authentication": ["did:web:x#k2"],
+        });
+        assert!(!relationship_lists(&doc, "authentication", "did:web:x#k1"));
+        assert!(!relationship_lists(&doc, "assertionMethod", "did:web:x#k1"));
     }
 }
