@@ -948,10 +948,7 @@ impl VCIssuer {
     /// DID are all in place, read without creating anything; `None` when any is missing. A key
     /// file that does not parse is an error, as it is when the keys are created.
     async fn load_published_config(storage_path: &Path) -> Result<Option<VCIssuerConfig>> {
-        if !storage_path
-            .join("did.json")
-            .exists()
-        {
+        if !tokio::fs::try_exists(storage_path.join("did.json")).await? {
             return Ok(None);
         }
         for file in ["x25519_key.json", "p256_key.json"] {

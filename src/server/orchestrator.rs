@@ -416,8 +416,8 @@ enum IndexComparison {
     Current,
     /// Holds every version of the log and more, as a stale read of shared storage leaves it.
     Ahead,
-    /// Holds the first versions of the log; the rest start at this index.
-    Behind(usize),
+    /// Holds the first versions of the log only.
+    Behind,
     /// Does not follow the log, or holds a version twice.
     Rebuild,
 }
@@ -449,7 +449,7 @@ fn compare_index_with_log(
     {
         std::cmp::Ordering::Greater => IndexComparison::Ahead,
         std::cmp::Ordering::Equal => IndexComparison::Current,
-        std::cmp::Ordering::Less => IndexComparison::Behind(indexed.len()),
+        std::cmp::Ordering::Less => IndexComparison::Behind,
     }
 }
 
@@ -512,20 +512,17 @@ async fn gateway_did_is_current(
 }
 
 /// Brings the resolver index up to the gateway DID log, so `/v1/resolve` answers with the
-/// latest gateway DID document: versions the index does not hold yet are added, and an index
-/// that is not the start of the log, by version id, is rebuilt from the log.
+/// latest gateway DID document: an index that lacks versions of the log, or is not the start of
+/// it by version id, is replaced with the log by an atomic rename.
 #[cfg(feature = "didwebvh")]
 async fn sync_gateway_did_log(
     storage: &Arc<dyn crate::storage::DidLogStorage>,
     gateway_did: &str,
     log_src: &std::path::Path,
 ) {
-    if !log_src.exists() {
-        return;
-    }
-
     let content = match tokio::fs::read_to_string(log_src).await {
         Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
             warn!("Could not read gateway DID log for sync: {}", e);
             return;
@@ -546,7 +543,7 @@ async fn sync_gateway_did_log(
             return;
         }
     };
-    let missing_from = match compare_index_with_log(&indexed, &lines) {
+    match compare_index_with_log(&indexed, &lines) {
         IndexComparison::Current => {
             debug!("Gateway DID already present in log storage");
             return;
@@ -567,18 +564,15 @@ async fn sync_gateway_did_log(
             }
             return;
         }
-        IndexComparison::Behind(missing_from) => missing_from,
-    };
-    for line in &lines[missing_from..] {
-        if let Err(e) = storage
-            .append_raw(gateway_did, line)
-            .await
-        {
-            warn!("Failed to register gateway DID log entry: {}", e);
-            return;
-        }
+        IndexComparison::Behind => {}
     }
-    debug!("Gateway DID registered for resolution via /v1/resolve");
+    match storage
+        .replace_raw(gateway_did, &lines)
+        .await
+    {
+        Ok(()) => debug!("Gateway DID registered for resolution via /v1/resolve"),
+        Err(e) => warn!("Failed to register gateway DID log entries: {}", e),
+    }
 }
 
 /// Longest wait for the gateway DID lock before a repair is left to the next start or
@@ -5540,8 +5534,8 @@ mod tests {
         let cases = [
             (versions(&["1-a", "2-b"]), IndexComparison::Current),
             (versions(&["1-a", "2-b", "3-c"]), IndexComparison::Ahead),
-            (versions(&["1-a"]), IndexComparison::Behind(1)),
-            (Vec::new(), IndexComparison::Behind(0)),
+            (versions(&["1-a"]), IndexComparison::Behind),
+            (Vec::new(), IndexComparison::Behind),
             (versions(&["1-a", "2-b", "2-b"]), IndexComparison::Rebuild),
             (versions(&["1-a", "2-x"]), IndexComparison::Rebuild),
             (vec!["not json".to_string()], IndexComparison::Rebuild),
