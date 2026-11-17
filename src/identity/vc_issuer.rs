@@ -130,6 +130,18 @@ fn add_signing_key_to_relationships(
     Ok(changed)
 }
 
+/// The parallel `did:web` document of a `did:webvh` log state, encoded as the gateway serves it
+/// at `/.well-known/did.json`, which reads the state as a typed DID document.
+#[cfg(feature = "didwebvh")]
+fn parallel_did_document(
+    state: &serde_json::Value,
+    proxy_did: &str,
+    scid: &str,
+) -> Result<serde_json::Value> {
+    let typed: crate::identity::didwebvh::types::DidDocument = serde_json::from_value(state.clone())?;
+    Ok(crate::identity::didwebvh::generate_parallel_did_web(&serde_json::to_value(&typed)?, proxy_did, scid))
+}
+
 /// The gateway's DID document. The Ed25519 signing key is published twice: as `#key-1`
 /// (JsonWebKey2020) and as the Multikey the `eddsa-rdfc-2022` signer references. Both are
 /// listed under `assertionMethod` and `authentication`, so verifiers accept the credentials and
@@ -774,7 +786,7 @@ impl VCIssuer {
                 let scid = crate::identity::didwebvh::identifier::parse_did_webvh(&config.proxy_did)?
                     .scid
                     .context("Gateway DID has no SCID")?;
-                let parallel = crate::identity::didwebvh::generate_parallel_did_web(state, &config.proxy_did, &scid);
+                let parallel = parallel_did_document(state, &config.proxy_did, &scid)?;
                 write_did_document(&config.storage_path, &serde_json::to_string_pretty(&parallel)?).await?;
                 return Ok(true);
             }
@@ -828,7 +840,7 @@ impl VCIssuer {
         let scid = crate::identity::didwebvh::identifier::parse_did_webvh(proxy_did)?
             .scid
             .context("Gateway DID has no SCID")?;
-        let parallel = crate::identity::didwebvh::generate_parallel_did_web(state, proxy_did, &scid);
+        let parallel = parallel_did_document(state, proxy_did, &scid)?;
         write_did_document(storage_path, &serde_json::to_string_pretty(&parallel)?).await?;
         info!("Gateway did.json was missing; written again from the gateway DID log");
         Ok(true)
@@ -3227,7 +3239,7 @@ mod tests {
             .unwrap()
             .scid
             .unwrap();
-        crate::identity::didwebvh::generate_parallel_did_web(state, did, &scid)
+        super::parallel_did_document(state, did, &scid).unwrap()
     }
 
     /// A did.json that does not parse holds nothing to keep, so the repair rebuilds it from the
