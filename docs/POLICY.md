@@ -189,7 +189,11 @@ allows everything is enough). The Capture view says so while the surface has non
 
 Only a dashboard WebSocket opened with a session (`websocket_require_auth`, on by default) can
 listen; a socket without a session never receives captures. Nothing is written to the log or
-stored, so a capture is gone once it has been sent.
+stored, so a capture is gone once it has been sent. A listen is checked against the user's
+permissions, not against the surface: dashboard sessions are appliance-wide, so a user with both
+permissions can listen to any surface, and a listen naming a surface that does not exist receives
+nothing. Scoping dashboard sessions to tenants or surfaces would need the listen check to apply the
+same scope.
 
 Before a capture is sent, every credential in the input becomes `<redacted>`: the value of a key
 named like a credential (the [credential names](CONFIGURATION_REFERENCE.md#log-redaction) of log
