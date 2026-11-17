@@ -49,6 +49,7 @@ mod upstream_response_bounds_e2e;
 
 #[cfg(test)]
 mod freeze {
+    use crate::component_test_freeze::refusal;
     use std::path::{Path, PathBuf};
 
     const FROZEN_FILES: &[(&str, usize)] = &[
@@ -83,7 +84,7 @@ mod freeze {
         ("mcp_record_compat.rs", 9),
         ("mcp_sandbox_e2e.rs", 2),
         ("mcp_subscription_scope.rs", 2),
-        ("mod.rs", 4),
+        ("mod.rs", 3),
         ("mtls.rs", 6),
         ("multi_method_source_auth_e2e.rs", 7),
         ("provider_key_gate_e2e.rs", 6),
@@ -105,18 +106,6 @@ mod freeze {
         ("trust_recorder_status_e2e.rs", 1),
         ("upstream_response_bounds_e2e.rs", 12),
     ];
-
-    const GUIDANCE: &str = "src/component_tests is frozen: put new tests outside it, a Gherkin scenario under tests/features or a unit test beside the code (see docs/development/TESTING.md)";
-
-    const MATCH_MAIN: &str = "only if main already has these tests, after a FROZEN_FILES merge conflict or because main itself fails this guard, set the entry in src/component_tests/mod.rs to main's count (a new file gets an entry with main's count) and state why in the pull request";
-
-    fn added_files_message(added: &[&String]) -> String {
-        format!("{GUIDANCE}; new files: {added:?}; {MATCH_MAIN}")
-    }
-
-    fn grown_files_message(grown: &[String]) -> String {
-        format!("{GUIDANCE}; grown files: {grown:?}; {MATCH_MAIN}")
-    }
 
     const LOWER_THE_PIN: &str = "lower or remove its entry in FROZEN_FILES in src/component_tests/mod.rs in the same change, so deleted tests cannot come back";
 
@@ -193,7 +182,7 @@ mod freeze {
             })
             .collect();
         added.sort();
-        assert!(added.is_empty(), "{}", added_files_message(&added));
+        assert!(added.is_empty(), "{}", refusal("new files", &added));
 
         let missing: Vec<_> = FROZEN_FILES
             .iter()
@@ -230,7 +219,7 @@ mod freeze {
             }
         }
         assert!(inspected > 0, "no component test files were inspected; the guard would pass vacuously");
-        assert!(grown.is_empty(), "{}", grown_files_message(&grown));
+        assert!(grown.is_empty(), "{}", refusal("grown files", &grown));
         assert!(shrunk.is_empty(), "fewer tests than pinned: {shrunk:?}; {LOWER_THE_PIN}");
     }
 
@@ -246,24 +235,5 @@ mod freeze {
         for line in ignored {
             assert!(!is_test_attribute(line), "{line} must not count as a test");
         }
-    }
-
-    #[test]
-    fn a_refusal_sends_new_tests_outside_the_folder_and_names_the_files() {
-        let file = "new_flow_e2e.rs".to_string();
-        let added = added_files_message(&[&file]);
-        let grown = grown_files_message(&["a2a_flow_e2e.rs has 52 tests, pinned at 51".to_string()]);
-
-        for message in [&added, &grown] {
-            assert!(message.contains("put new tests outside it"), "{message}");
-            assert!(message.contains("docs/development/TESTING.md"), "{message}");
-            assert!(message.contains("only if main already has these tests"), "{message}");
-            assert!(message.contains("merge conflict"), "{message}");
-            assert!(!message.contains("if a rebase brought this in"), "{message}");
-        }
-        assert!(added.contains("new files: [\"new_flow_e2e.rs\"]"), "{added}");
-        assert!(grown.contains("grown files: [\"a2a_flow_e2e.rs has 52 tests, pinned at 51\"]"), "{grown}");
-        assert!(!added.contains("grown files"), "{added}");
-        assert!(!grown.contains("new files"), "{grown}");
     }
 }

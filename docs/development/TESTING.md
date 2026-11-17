@@ -122,9 +122,11 @@ file is deleted without lowering or removing its pin. New helpers are caught in 
 by the tests.
 
 Pins only go down. A change that deletes tests lowers the pin in the same change. Raising a
-pin needs a stated reason in the pull request; the usual one is matching tests main already
-has, after a merge conflict in `FROZEN_FILES` or when main itself fails the guard. A test a
-branch writes belongs outside the folder, never behind a raised pin.
+pin needs a reason stated in the pull request; the usual one is matching main's count after
+a `FROZEN_FILES` merge conflict or when main itself fails the guard. A test a branch writes
+belongs outside the folder, never behind a raised pin. The guard's failure message is built
+in [`src/component_test_freeze.rs`](../../src/component_test_freeze.rs), outside the folder,
+so its own tests need no pin.
 
 They compile into the binary's test target, so they still run with the unit tests:
 
