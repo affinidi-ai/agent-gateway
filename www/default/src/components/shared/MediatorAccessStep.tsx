@@ -27,6 +27,9 @@ interface MediatorAccessStepProps {
   onLater: () => void;
 }
 
+/** Whether the name already ends in "Mediator", so the word isn't said twice. */
+const namedMediator = (name: string): boolean => /\bmediator$/i.test(name.trim());
+
 /**
  * The pause of a pairing on a DIDComm Mediator that admits only the DIDs it
  * allows. Shown when the mediator refused the gateway's new DIDs, or when the
@@ -51,7 +54,8 @@ const MediatorAccessStep: React.FC<MediatorAccessStepProps> = ({
     </div>
     <div className="card-body">
       <p data-testid="mediator-access-explanation">
-        DIDComm Mediator <strong>{mediatorName}</strong> most probably uses{' '}
+        This <strong>{mediatorName}</strong>
+        {namedMediator(mediatorName) ? '' : ' Mediator'} most probably uses{' '}
         <strong>Explicit Allow</strong>, so it only accepts connections from DIDs on its ACL. This
         gateway was blocked because the DIDs below aren&apos;t on it yet. Add them to let it
         connect.

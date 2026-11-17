@@ -86,7 +86,7 @@ test('a refused first try shows the DIDs to allow, without a "still refuses" ale
   fireEvent.click(await screen.findByText('refuse'));
 
   expect(await screen.findByTestId('mediator-access-explanation')).toHaveTextContent(
-    'DIDComm Mediator Test mediator most probably uses Explicit Allow'
+    'This Test mediator most probably uses Explicit Allow'
   );
   expect(screen.queryByTestId('mediator-access-refused')).not.toBeInTheDocument();
   expect(screen.getByText('Mediator Access')).toBeInTheDocument();
