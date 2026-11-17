@@ -375,9 +375,11 @@ and a peer's messages are refused with `e.p.delivery.refused`.
 A mediator in `explicit_allow` mode refuses every DID its administrator has not added, and the
 gateway cannot tell from any record whether a mediator works that way. So creating a Connection
 Point and adding a gateway can each stop after minting their DIDs and before their first mediator
-call, show the DIDs, and continue when the operator says they are allowed. The dashboard always
-asks for the pause; the API pauses only when the request sets `await_mediator_access: true`, and
-otherwise behaves as without it ([`mediator_access.rs`](../src/gateways/mediator_access.rs)).
+call, show the DIDs, and continue when the operator says they are allowed. The API pauses only
+when the request sets `await_mediator_access: true`, and otherwise behaves as without it
+([`mediator_access.rs`](../src/gateways/mediator_access.rs)). The dashboard always asks for the
+pause, then continues at once, and shows the DIDs only when the mediator refuses one; on a
+mediator that admits them, pairing looks as it did before.
 
 | Step | Mints | Continued by |
 | --- | --- | --- |

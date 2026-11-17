@@ -2739,8 +2739,10 @@ to it over `fabric://`) shows the gateway's message.
 
 A mediator in `explicit_allow` mode refuses DIDs its administrator has not added, so both peer
 pairing wizards stop after the gateway mints its DIDs, on one shared step
-(`components/shared/MediatorAccessStep.tsx`, helpers in `utils/mediatorAccess.ts`). The step
-always shows: the gateway cannot tell the mediator's mode, so the user decides.
+(`components/shared/MediatorAccessStep.tsx`, helpers in `utils/mediatorAccess.ts`). The gateway
+cannot tell the mediator's mode, so each wizard tries to continue at once and shows the step only
+when the mediator refuses a DID. On a mediator that admits them, **mediator-access** is left out
+of the step bar too.
 
 | Wizard | Steps | DIDs shown |
 | --- | --- | --- |
@@ -2748,18 +2750,26 @@ always shows: the gateway cannot tell the mediator's mode, so the user decides.
 | Add Gateway (`/gateways/connect`) | enter-details, enter-link, **mediator-access**, connect, complete | Temporary DID for the handshake, Permanent DID for this pairing |
 
 - Leaving enter-details (Create Connection Point) or enter-link (Add Gateway) posts with
-  `await_mediator_access: true`; the response's `mediator_access` fills the step.
-- The card header is "Allow these DIDs on the mediator" (`fa-user-shield`). One row per DID:
-  its label, `topAndTail(did, 16, 16)` and a `CopyButton`; **Copy all DIDs** copies them one
-  per line. Both wizards show the step the same way, with no warning banner: the dashboard
-  cannot tell whose mediator it is, since both gateways may use the same one.
-- **Continue later** returns to Connections and changes nothing. **Continue** calls
-  `POST /connection-points/{id}/continue` (then the existing complete step with the link and
-  secret) or moves to the connect step, which calls `POST /gateways/{id}/continue`.
-- A `409 mediator_access_refused` keeps the step and shows "Mediator {name} still refuses the
-  {label} ({short DID}). Ask its administrator to add it, then continue."
+  `await_mediator_access: true`; the response's `mediator_access` fills the step. Create
+  Connection Point then calls `POST /connection-points/{id}/continue` behind its saving
+  spinner; Add Gateway moves to the connect step, which calls `POST /gateways/{id}/continue`.
+  Success goes on as before; a `409 mediator_access_refused` opens the step without a
+  refusal message.
+- The card header is "Add These DIDs to the DIDComm Mediator's Allow List" (`fa-user-shield`).
+  The text opens with "This {name} Mediator most probably uses Explicit Allow, …" ("Mediator"
+  is left out when the name already ends in it), then says what to do when the mediator is
+  hosted by Affinidi or self-hosted. **Copy All DIDs as a Bundle** copies every DID, one per
+  line; below it, one row per DID with its label, `topAndTail(did, 16, 16)` and a
+  `CopyButton`, and a note to use one or the other. Both wizards show the step the same way,
+  with no warning banner: the dashboard cannot tell whose mediator it is, since both gateways
+  may use the same one.
+- **Continue Later** (left) returns to Connections and changes nothing. **Test Connection**
+  (right) calls the same Continue again. A `409 mediator_access_refused` then keeps the step
+  and shows "DIDComm Mediator {name} still refuses the {label} ({short DID}). Make sure it is
+  allowed, then select Test Connection again."
 - `?resume=<id>` opens either wizard at the step with the same DIDs, from
-  `GET /connection-points/{id}/mediator-access` or `GET /gateways/{id}/mediator-access`.
+  `GET /connection-points/{id}/mediator-access` or `GET /gateways/{id}/mediator-access`,
+  without calling Continue first.
 - On Connections, a gateway with status `awaiting-mediator-access` and a Connection Point with
   `awaiting_mediator_access` show the warning badge "Waiting for mediator access" and a
   **Continue** button that opens its wizard with `?resume=`. Both **Continue** buttons are
