@@ -18,6 +18,13 @@ const RUNTIME_ICONS: Record<AgentRuntime, string> = {
   gateway: 'fa-network-wired',
 };
 
+/** What each route means, for the route badge's tooltip and screen readers. */
+const ROUTE_DESCRIPTIONS: Record<AgentRuntime, string> = {
+  url: 'The gateway calls the agent URL directly.',
+  'a2a-proxy': 'The gateway forwards to an A2A proxy, which generates the Agent Card.',
+  gateway: 'The gateway forwards over the trust fabric to a remote gateway.',
+};
+
 const PROTOCOL_LABELS: Record<string, string> = {
   a2a: 'A2A',
   ap2: 'AP2',
@@ -25,12 +32,11 @@ const PROTOCOL_LABELS: Record<string, string> = {
   didcomm: 'DIDComm',
 };
 
-export type BadgeTone = 'primary' | 'secondary' | 'success' | 'warning' | 'info';
-
-const PROTOCOL_TONES: Record<string, BadgeTone> = {
-  a2a: 'primary',
-  ap2: 'warning',
-  mcp: 'info',
+/** The protocol badge colours of the Surfaces page. */
+const PROTOCOL_BADGE_CLASSES: Record<string, string> = {
+  a2a: 'text-bg-primary',
+  ap2: 'text-bg-warning',
+  mcp: 'text-bg-info',
 };
 
 export const UNNAMED_AGENT = 'Unnamed agent';
@@ -48,12 +54,18 @@ export function runtimeIcon(runtime: string): string {
   return RUNTIME_ICONS[runtime as AgentRuntime] ?? 'fa-robot';
 }
 
+export function routeDescription(runtime: string): string {
+  return (
+    ROUTE_DESCRIPTIONS[runtime as AgentRuntime] ?? 'How the gateway reaches this agent is unknown.'
+  );
+}
+
 export function protocolLabel(protocol: string): string {
   return PROTOCOL_LABELS[protocol] ?? 'Other protocol';
 }
 
-export function protocolTone(protocol: string): BadgeTone {
-  return PROTOCOL_TONES[protocol] ?? 'secondary';
+export function protocolBadgeClass(protocol: string): string {
+  return PROTOCOL_BADGE_CLASSES[protocol] ?? 'text-bg-secondary';
 }
 
 export function trustRegistryLabel(trust: AgentTrustRegistry): string {
@@ -99,6 +111,34 @@ export function connectionTarget(endpoint: string): AgentConnectionTarget {
   } catch {
     return { kind: 'unknown' };
   }
+}
+
+/**
+ * The short target shown under the agent name, so rows with the same name can
+ * be told apart: the URL origin (scheme and host), the A2A proxy, or the remote gateway (and
+ * channel). A proxy or gateway shows its name, or its id when the API returns none. `null` for
+ * an endpoint that can't be shown.
+ */
+export function endpointHost(agent: Pick<AgentRecord, 'endpoint' | 'target_name'>): string | null {
+  const target = connectionTarget(agent.endpoint);
+  const name = agent.target_name?.trim() || null;
+  switch (target.kind) {
+    case 'url':
+      return new URL(target.display).origin;
+    case 'a2a-proxy':
+      return name ?? target.proxyId;
+    case 'gateway': {
+      const gateway = name ?? target.gatewayId;
+      return target.channelId ? `${gateway}/${target.channelId}` : gateway;
+    }
+    default:
+      return null;
+  }
+}
+
+/** "1 identity" or "N identities". */
+export function identitiesLabel(count: number): string {
+  return `${count} ${count === 1 ? 'identity' : 'identities'}`;
 }
 
 /** `360` → `6h`, `90` → `90m`, `2880` → `2d`. */

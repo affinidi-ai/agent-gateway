@@ -10,12 +10,12 @@ use std::sync::{Arc, OnceLock};
 
 use axum::{
     Extension, Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tracing::{debug, error, warn};
@@ -30,7 +30,7 @@ use crate::identity::state::IdentityApiState;
 use crate::identity::target_card_names::{CardLocation, TARGET_CARD_NAME_TTL, TargetCardNameService};
 use crate::metrics::{InboundTraffic, SurfaceStats};
 use crate::observability::refresh_cache::RefreshCache;
-use crate::proxy::card_preview::{AgentCardPreview, CardFetchStatus, PreviewRequest, RateLimited};
+use crate::proxy::card_preview::{AgentCardPreview, CardFetchStatus, PreviewRequest, RateLimited, access_point_url};
 use crate::surfaces::AgentSurfaceStore;
 use crate::tenancy::{PatTenantContext, ResourceKind, can_access, can_mutate, scope_allows_resource};
 use crate::trust_registry_verification::recorder_status::{RecorderState, TrustRecorderStatusStore, global_store};
@@ -104,6 +104,9 @@ pub struct AgentSurfaceSummary {
     pub name: String,
     pub protocol: SurfaceProtocol,
     pub route: String,
+    /// The URL callers reach the surface at: its listener's first external URL and its route.
+    /// `null` when no listener with an external URL matches the Access Point.
+    pub public_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -118,6 +121,9 @@ pub struct AgentRecord<S> {
     pub identities: Vec<AgentIdentity>,
     pub trust_registry: AgentTrustRegistry,
     pub last_activity_at: Option<DateTime<Utc>>,
+    /// The name of the A2A proxy or remote gateway the endpoint names, when the caller
+    /// may see that record. Unverified display text.
+    pub target_name: Option<String>,
 }
 
 /// Access Point (inbound) request totals and p95 latency over the metrics retention
@@ -135,9 +141,6 @@ pub struct AgentTraffic {
 pub struct AgentDetails {
     #[serde(flatten)]
     pub agent: AgentRecord<AgentSurfaceSummary>,
-    /// The name of the A2A proxy or remote gateway the endpoint names, when the caller
-    /// may see that record. Unverified display text.
-    pub target_name: Option<String>,
     pub traffic: AgentTraffic,
 }
 
@@ -189,8 +192,24 @@ pub struct AgentCardResponse {
     pub card: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<AgentCardSource>,
+    /// The surface the card was read through.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub surface_id: Option<String>,
+    /// The card as the agent or remote gateway published it, before this gateway rewrote it:
+    /// its Agent Card fields only. Absent for a card the A2A proxy generates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_card: Option<Value>,
+    /// The surfaces the card may be read through, for `surface_id` in the query.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub card_surface_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<AgentCardUnavailable>,
+}
+
+/// `GET /v1/agents/{id}/agent-card` query: the surface to read the card through.
+#[derive(Debug, Default, Deserialize)]
+pub struct AgentCardQuery {
+    pub surface_id: Option<String>,
 }
 
 /// The top-level Agent Card fields of A2A 0.3 and 1.0 that the response passes on.
@@ -236,11 +255,16 @@ impl AgentCardResponse {
     fn available(
         card: Value,
         source: AgentCardSource,
+        surface_id: &str,
+        upstream_card: Option<Value>,
     ) -> Self {
         Self {
             available: true,
             card: Some(card),
             source: Some(source),
+            surface_id: Some(surface_id.to_string()),
+            upstream_card,
+            card_surface_ids: Vec::new(),
             reason: None,
         }
     }
@@ -250,6 +274,9 @@ impl AgentCardResponse {
             available: false,
             card: None,
             source: None,
+            surface_id: None,
+            upstream_card: None,
+            card_surface_ids: Vec::new(),
             reason: Some(reason),
         }
     }
@@ -656,8 +683,36 @@ impl RegistryData<'_> {
 /// Looks up a surface's Agent Card name.
 type CardName<'a> = dyn Fn(&AgentSurface) -> Option<String> + Sync + 'a;
 
+/// Lowercase, with `_` and `-` read as spaces and runs of whitespace collapsed.
+fn normalized_name(name: &str) -> String {
+    name.to_lowercase()
+        .replace(['_', '-'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A canvas target name that names a surface, not the agent: one of the group's surface
+/// names, or a generated `<kind> surface <n>` such as `proxy_surface_1`.
+fn is_surface_placeholder(
+    name: &str,
+    surfaces: &[&AgentSurface],
+) -> bool {
+    let name = normalized_name(name);
+    if surfaces
+        .iter()
+        .any(|surface| normalized_name(&surface.name) == name)
+    {
+        return true;
+    }
+    matches!(
+        name.split(' ').collect::<Vec<_>>().as_slice(),
+        [_, "surface", n] if n.parse::<u32>().is_ok()
+    )
+}
+
 /// The Agent Card name of the most recently active surface that has one, else that
-/// surface's canvas target name, else none.
+/// surface's canvas target name unless it only names a surface, else none.
 fn display_name(
     by_activity: &[&AgentSurface],
     card_name: &CardName<'_>,
@@ -668,7 +723,8 @@ fn display_name(
         .or_else(|| {
             by_activity
                 .iter()
-                .find_map(|surface| canvas_target_name(surface.canvas.as_ref()))
+                .filter_map(|surface| canvas_target_name(surface.canvas.as_ref()))
+                .find(|name| !is_surface_placeholder(name, by_activity))
         })
 }
 
@@ -736,6 +792,22 @@ fn surface_summary(surface: &AgentSurface) -> AgentSurfaceSummary {
             .access_point
             .route
             .clone(),
+        public_url: None,
+    }
+}
+
+/// Fills each summary's `public_url` from its surface in `group`.
+fn with_public_urls(
+    summaries: &mut [AgentSurfaceSummary],
+    group: &AgentGroup<'_>,
+    network: &crate::config::NetworkConfig,
+) {
+    for summary in summaries {
+        summary.public_url = group
+            .surfaces
+            .iter()
+            .find(|surface| surface.surface_id == summary.surface_id)
+            .and_then(|surface| access_point_url(surface, network));
     }
 }
 
@@ -775,6 +847,7 @@ async fn agent_record<S>(
             .iter()
             .filter_map(|surface| data.last_activity(surface))
             .max(),
+        target_name: None,
     }
 }
 
@@ -1007,7 +1080,9 @@ pub async fn list_agents(
 
     let mut agents = Vec::with_capacity(groups.len());
     for group in &groups {
-        agents.push(agent_record(group, &data, recorder.as_deref(), &card_name, surface_ref).await);
+        let mut agent = agent_record(group, &data, recorder.as_deref(), &card_name, surface_ref).await;
+        agent.target_name = target_name(&state, &group.endpoint, tenant_context(&context)).await;
+        agents.push(agent);
     }
     sort_agents(&mut agents);
 
@@ -1094,7 +1169,9 @@ pub async fn get_agent(
         stats: &stats,
     };
     let card_name = |surface: &AgentSurface| surface_card_name(&state, surface);
-    let agent = agent_record(&group, &data, recorder_store().as_deref(), &card_name, surface_summary).await;
+    let mut agent = agent_record(&group, &data, recorder_store().as_deref(), &card_name, surface_summary).await;
+    agent.target_name = target_name(&state, &group.endpoint, tenant_context(&context)).await;
+    with_public_urls(&mut agent.surfaces, &group, &state.network_config);
 
     let surface_ids: Vec<&str> = group
         .surfaces
@@ -1105,11 +1182,9 @@ pub async fn get_agent(
         .metrics_store
         .inbound_traffic(&surface_ids)
         .await;
-    let target_name = target_name(&state, &group.endpoint, tenant_context(&context)).await;
 
     Ok(Json(AgentDetails {
         agent,
-        target_name,
         traffic: traffic(
             inbound,
             state
@@ -1145,18 +1220,24 @@ fn card_surfaces<'a>(
 }
 
 /// The response for the card the gateway served through `surface`: only its Agent Card
-/// fields, with how the gateway obtains it. `502` when there is no card, or it is too large
-/// to show or not an Agent Card.
+/// fields, with how the gateway obtains it and the card it started from. `502` when there
+/// is no card, or it is too large to show or not an Agent Card.
 fn served_card_response(
     agent_id: &str,
     surface: &AgentSurface,
     served: Option<Value>,
+    upstream: Option<Value>,
 ) -> Result<AgentCardResponse, AgentApiError> {
     let source = AgentCardSource::from(AgentRuntime::from_endpoint(&surface.target.endpoint));
     match served.and_then(agent_card_fields) {
         Some(card) => {
             remember_served_card_name(surface, &card);
-            Ok(AgentCardResponse::available(card, source))
+            Ok(AgentCardResponse::available(
+                card,
+                source,
+                &surface.surface_id,
+                upstream.and_then(agent_card_fields),
+            ))
         }
         None => {
             warn!(agent_id = %agent_id, surface_id = %surface.surface_id, "Agent Card preview returned no Agent Card");
@@ -1178,35 +1259,64 @@ fn currently_served(preview: AgentCardPreview) -> Option<Value> {
     }
 }
 
+/// The surfaces to read the card through: `requested` alone, or every one of `surfaces` in
+/// order when none is requested. `404` for a requested surface that is not one of them.
+fn chosen_card_surfaces<'a>(
+    surfaces: &[&'a AgentSurface],
+    requested: Option<&str>,
+) -> Result<Vec<&'a AgentSurface>, AgentApiError> {
+    match requested {
+        None => Ok(surfaces.to_vec()),
+        Some(id) => surfaces
+            .iter()
+            .find(|surface| surface.surface_id == id)
+            .map(|surface| vec![*surface])
+            .ok_or(AgentApiError::NotFound),
+    }
+}
+
 /// The card the gateway serves for the agent, read through the agent card preview of the
-/// first of its [`card_surfaces`] that runs here, so a direct URL, A2A proxy and Fabric
-/// target each give the card callers get. Fetches are limited and audited as previews.
+/// requested surface, or else the first of its [`card_surfaces`] that runs here, so a direct
+/// URL, A2A proxy and Fabric target each give the card callers get. Fetches are limited and
+/// audited as previews.
 async fn agent_card_response(
     state: &IdentityApiState,
     group: &AgentGroup<'_>,
     context: Option<&PatTenantContext>,
     user_id: &str,
+    requested: Option<&str>,
 ) -> Result<AgentCardResponse, AgentApiError> {
     let surfaces = match card_surfaces(group, context) {
         Ok(surfaces) => surfaces,
         Err(reason) => return Ok(AgentCardResponse::unavailable(reason)),
     };
-    for surface in surfaces {
+    let card_surface_ids: Vec<String> = surfaces
+        .iter()
+        .map(|surface| surface.surface_id.clone())
+        .collect();
+    for surface in chosen_card_surfaces(&surfaces, requested)? {
         let preview = surface_card_preview(state, surface, context, user_id, PreviewRequest::Read)
             .await
             .map_err(|RateLimited { retry_after_secs }| AgentApiError::RateLimited(retry_after_secs))?;
         if preview.supported {
-            return served_card_response(&group.id, surface, currently_served(preview));
+            let upstream = preview.before.clone();
+            let mut response = served_card_response(&group.id, surface, currently_served(preview), upstream)?;
+            response.card_surface_ids = card_surface_ids;
+            return Ok(response);
         }
     }
-    Ok(AgentCardResponse::unavailable(AgentCardUnavailable::NotRunning))
+    let mut response = AgentCardResponse::unavailable(AgentCardUnavailable::NotRunning);
+    response.card_surface_ids = card_surface_ids;
+    Ok(response)
 }
 
 /// The Agent Card the gateway serves for the managed agent, or why it isn't available.
-/// `502` when the gateway has no card to show, with no upstream detail, and `429` past
-/// the agent card preview's fetch limit.
+/// `502` when the gateway has no card to show, with no upstream detail, `404` for a
+/// `surface_id` the card can't be read through, and `429` past the agent card preview's
+/// fetch limit.
 pub async fn get_agent_card(
     Path(id): Path<String>,
+    Query(query): Query<AgentCardQuery>,
     State(state): State<IdentityApiState>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
@@ -1214,7 +1324,7 @@ pub async fn get_agent_card(
 ) -> Result<Json<AgentCardResponse>, AgentApiError> {
     let live_surfaces = all_surfaces(&state).await?;
     let group = listed_group(&live_surfaces, &id, tenant_context(&context), resource_scope(&scope))?;
-    agent_card_response(&state, &group, tenant_context(&context), &user_id)
+    agent_card_response(&state, &group, tenant_context(&context), &user_id, query.surface_id.as_deref())
         .await
         .map(Json)
 }
@@ -1686,6 +1796,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_display_name_skips_canvas_names_that_only_name_a_surface() {
+        let mut generated = with_canvas_name(surface("s1"), "PROXY SURFACE 1");
+        generated.name = "orders".to_string();
+        let mut own = with_canvas_name(surface("s2"), "Payments-Gateway");
+        own.name = "payments_gateway".to_string();
+        let agent = Fixture::new()
+            .only(&[generated.clone(), own], None)
+            .await;
+        assert_eq!(agent.name, None, "a generated or own surface name is not the agent's");
+
+        let named = with_canvas_name(surface("s3"), "Billing Bot");
+        let agent = Fixture::new()
+            .only(&[generated, named], None)
+            .await;
+        assert_eq!(agent.name.as_deref(), Some("Billing Bot"), "the next canvas name is used");
+    }
+
+    #[test]
+    fn test_surface_placeholder_names() {
+        let mut orders = surface("s1");
+        orders.name = "orders".to_string();
+        let surfaces = [&orders];
+        for name in ["proxy_surface_1", "A2A Surface 12", "a2a-surface-3", "Orders", " orders "] {
+            assert!(is_surface_placeholder(name, &surfaces), "{name}");
+        }
+        for name in ["Orders Bot", "surface 1", "proxy surface one", "my proxy surface 1"] {
+            assert!(!is_surface_placeholder(name, &surfaces), "{name}");
+        }
+    }
+
+    #[tokio::test]
     async fn test_display_name_is_none_without_card_or_canvas_name() {
         let missing_name = with_target_node(
             surface("s1"),
@@ -2046,7 +2187,6 @@ mod tests {
         let group = &group_surfaces(&live)[0];
         let details = AgentDetails {
             agent: agent_record(group, &data, None, &no_card, surface_summary).await,
-            target_name: None,
             traffic: traffic(InboundTraffic::default(), 360),
         };
 
@@ -2290,13 +2430,53 @@ mod tests {
         ] {
             let card = serde_json::json!({ "name": "TimeAsker", "skills": [] });
             let response =
-                served_card_response("a1", &targeting("s1", endpoint), Some(card.clone())).expect("response");
+                served_card_response("a1", &targeting("s1", endpoint), Some(card.clone()), None).expect("response");
             assert_eq!(
                 serde_json::to_value(&response).expect("serialize"),
-                serde_json::json!({ "available": true, "card": card, "source": source }),
+                serde_json::json!({ "available": true, "card": card, "source": source, "surface_id": "s1" }),
                 "{endpoint}"
             );
         }
+    }
+
+    #[test]
+    fn test_served_card_response_passes_on_the_upstream_card_fields_only() {
+        let served = serde_json::json!({ "name": "TimeAsker", "url": "https://gateway.example/time" });
+        let upstream = serde_json::json!({
+            "name": "TimeAsker",
+            "url": "http://10.0.0.5:9002",
+            "internal_config": { "db_password": "secret" },
+        });
+        let response = served_card_response("a1", &surface("s1"), Some(served), Some(upstream)).expect("response");
+        assert_eq!(
+            response.upstream_card,
+            Some(serde_json::json!({ "name": "TimeAsker", "url": "http://10.0.0.5:9002" }))
+        );
+
+        let not_a_card = served_card_response(
+            "a1",
+            &surface("s1"),
+            Some(serde_json::json!({ "name": "TimeAsker" })),
+            Some(serde_json::json!({ "status": "ok" })),
+        )
+        .expect("response");
+        assert_eq!(not_a_card.upstream_card, None, "an upstream body that is not an Agent Card is dropped");
+    }
+
+    #[test]
+    fn test_chosen_card_surfaces_are_the_requested_one_or_all() {
+        let live = [targeting("s1", "https://agent.example/a2a"), targeting("s2", "https://agent.example/a2a")];
+        let surfaces: Vec<&AgentSurface> = live.iter().collect();
+        let ids = |chosen: Vec<&AgentSurface>| -> Vec<String> {
+            chosen
+                .iter()
+                .map(|surface| surface.surface_id.clone())
+                .collect()
+        };
+
+        assert_eq!(ids(chosen_card_surfaces(&surfaces, None).expect("all")), ["s1", "s2"]);
+        assert_eq!(ids(chosen_card_surfaces(&surfaces, Some("s2")).expect("one")), ["s2"]);
+        assert!(matches!(chosen_card_surfaces(&surfaces, Some("s3")), Err(AgentApiError::NotFound)));
     }
 
     #[test]
@@ -2321,7 +2501,7 @@ mod tests {
             "capabilities": { "extensions": [] },
             "internal_config": { "db_password": "secret" },
         });
-        let response = served_card_response("a1", &surface("s1"), Some(card)).expect("response");
+        let response = served_card_response("a1", &surface("s1"), Some(card), None).expect("response");
         assert_eq!(
             response.card,
             Some(serde_json::json!({
@@ -2340,7 +2520,8 @@ mod tests {
             serde_json::json!([{ "name": "TimeAsker" }]),
             serde_json::json!("TimeAsker"),
         ] {
-            let error = served_card_response("a1", &surface("s1"), Some(body.clone())).expect_err("not an Agent Card");
+            let error =
+                served_card_response("a1", &surface("s1"), Some(body.clone()), None).expect_err("not an Agent Card");
             assert_eq!(error.into_response().status(), StatusCode::BAD_GATEWAY, "{body}");
         }
     }
@@ -2375,7 +2556,7 @@ mod tests {
         for status in [CardFetchStatus::Failed, CardFetchStatus::NotServed] {
             let card = currently_served(preview_after_fetch(status));
             assert_eq!(card, None, "{status:?}");
-            let error = served_card_response("a1", &surface("s1"), card).expect_err("no current card");
+            let error = served_card_response("a1", &surface("s1"), card, None).expect_err("no current card");
             assert_eq!(error.into_response().status(), StatusCode::BAD_GATEWAY, "{status:?}");
         }
         let mut no_fetch = preview_after_fetch(CardFetchStatus::Ok);
@@ -2385,7 +2566,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_served_card_response_without_a_card_is_generic_502() {
-        let error = served_card_response("a1", &surface("s1"), None).expect_err("no card");
+        let error = served_card_response("a1", &surface("s1"), None, None).expect_err("no card");
         let response = error.into_response();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)

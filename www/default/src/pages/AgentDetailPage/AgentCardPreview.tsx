@@ -1,5 +1,7 @@
 import React from 'react';
+import { VpJwtRow } from '../../components/shared/VpViewer';
 import { UNNAMED_AGENT } from '../AgentsPage/agentLabels';
+import { GatewayChanges, IDENTITY_CREDENTIAL_EXTENSION, gatewayChanges } from './gatewayChanges';
 
 type CardFields = Record<string, unknown>;
 
@@ -31,11 +33,81 @@ const skillsOf = (card: CardFields): Skill[] =>
       }))
     : [];
 
+/** What the gateway changed in the card, the rewritten URL first. Every value is plain text. */
+const GatewayChangesSection: React.FC<{ changes: GatewayChanges }> = ({ changes }) => (
+  <section className="agent-preview-gateway" data-testid="agent-card-gateway-changes">
+    <h6 className="agent-preview-section-title">Added by the gateway</h6>
+    <dl className="agent-preview-rows">
+      {changes.url && (
+        <>
+          <dt>URL</dt>
+          <dd data-testid="agent-card-gateway-url">
+            <code className="small">{changes.url.served}</code>
+            {changes.url.upstream && (
+              <div className="small text-muted">
+                Rewritten from <code className="small">{changes.url.upstream}</code>
+              </div>
+            )}
+          </dd>
+        </>
+      )}
+      {changes.added.map((extension, index) => (
+        <React.Fragment key={`${extension.uri}-${index}`}>
+          <dt>
+            {extension.uri === IDENTITY_CREDENTIAL_EXTENSION ? 'Identity credential' : 'Extension'}
+          </dt>
+          <dd data-testid="agent-card-gateway-extension">
+            <code className="small">{extension.uri}</code>
+            {extension.did && (
+              <div className="small" data-testid="agent-card-gateway-did">
+                <span className="text-muted me-1">DID</span>
+                <code className="small">{extension.did}</code>
+              </div>
+            )}
+            {extension.presentation && (
+              <table className="table table-sm table-borderless mb-0 mt-1">
+                <tbody>
+                  <VpJwtRow vpJwt={extension.presentation} />
+                </tbody>
+              </table>
+            )}
+          </dd>
+        </React.Fragment>
+      ))}
+      {changes.replaced.length > 0 && (
+        <>
+          <dt>Replaces</dt>
+          <dd data-testid="agent-card-gateway-replaced">
+            {changes.replaced.map(uri => (
+              <div key={uri}>
+                <code className="small">{uri}</code>
+              </div>
+            ))}
+          </dd>
+        </>
+      )}
+      {changes.otherFields.length > 0 && (
+        <>
+          <dt>Also changed</dt>
+          <dd data-testid="agent-card-gateway-other">{changes.otherFields.join(', ')}</dd>
+        </>
+      )}
+    </dl>
+  </section>
+);
+
+interface AgentCardPreviewProps {
+  card: unknown;
+  /** The card before the gateway rewrote it, when the API returns one. */
+  upstreamCard?: unknown;
+}
+
 /**
- * A visual summary of the agent's published card. The card is untrusted, so every
- * value renders as plain text: no HTML, Markdown or links, and the URL is not clickable.
+ * A visual summary of the card the gateway serves, then what the gateway changed in it. The
+ * card is untrusted, so every value renders as plain text: no HTML, Markdown or links, and the
+ * URL is not clickable.
  */
-const AgentCardPreview: React.FC<{ card: unknown }> = ({ card }) => {
+const AgentCardPreview: React.FC<AgentCardPreviewProps> = ({ card, upstreamCard }) => {
   if (!isObject(card)) {
     return (
       <p className="text-muted mb-0" data-testid="agent-card-preview-empty">
@@ -53,6 +125,7 @@ const AgentCardPreview: React.FC<{ card: unknown }> = ({ card }) => {
   const inputModes = textList(card.defaultInputModes);
   const outputModes = textList(card.defaultOutputModes);
   const skills = skillsOf(card);
+  const changes = gatewayChanges(card, upstreamCard);
 
   const rows: { label: string; value: React.ReactNode }[] = [
     { label: 'Version', value: text(card.version) ?? <NotSet /> },
@@ -69,7 +142,6 @@ const AgentCardPreview: React.FC<{ card: unknown }> = ({ card }) => {
 
   return (
     <div className="agent-preview" data-testid="agent-card-preview">
-      <div className="agent-preview-eyebrow">Agent Card</div>
       <div className="agent-preview-head">
         <span className="agent-preview-avatar">
           <i className="fas fa-robot" aria-hidden="true" />
@@ -91,21 +163,24 @@ const AgentCardPreview: React.FC<{ card: unknown }> = ({ card }) => {
           </React.Fragment>
         ))}
       </dl>
-      <div className="agent-preview-footer" data-testid="agent-card-preview-skills">
-        <div className="fw-semibold mb-1">Skills ({skills.length})</div>
+      {changes && <GatewayChangesSection changes={changes} />}
+      <section className="agent-preview-skills" data-testid="agent-card-preview-skills">
+        <h6 className="agent-preview-skills-title">Skills ({skills.length})</h6>
         {skills.length === 0 ? (
-          <span>No skills listed</span>
+          <span className="text-muted">No skills listed</span>
         ) : (
-          <ul className="list-unstyled mb-0">
+          <ul className="agent-preview-skill-list">
             {skills.map(skill => (
-              <li key={skill.key} className="mb-1">
-                <strong>{skill.name}</strong>
-                {skill.description && <span className="ms-2">{skill.description}</span>}
+              <li key={skill.key}>
+                <div className="fw-semibold">{skill.name}</div>
+                {skill.description && (
+                  <div className="agent-preview-skill-description">{skill.description}</div>
+                )}
               </li>
             ))}
           </ul>
         )}
-      </div>
+      </section>
     </div>
   );
 };

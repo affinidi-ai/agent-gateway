@@ -2,21 +2,28 @@
   cursor: pointer;
 }
 
-.agent-preview {
-  padding: 18px;
-  background: var(--gray-0);
-  border: 1px solid var(--gray-200);
-  border-radius: var(--radius-xl);
-  box-shadow: var(--shadow-md);
+.agents-row-chevron {
+  width: 1%;
+  color: var(--gray-400);
 }
 
-.agent-preview-eyebrow {
-  margin-bottom: 12px;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--gray-500);
+.agents-row:hover .agents-row-chevron,
+.agents-row:focus-visible .agents-row-chevron {
+  color: var(--accent-blue);
+}
+
+body.dark-theme .agents-row-chevron {
+  color: var(--dark-text-muted);
+}
+
+.agents-name {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--gray-800);
+}
+
+body.dark-theme .agents-name {
+  color: var(--dark-text-heading);
 }
 
 .agent-preview-head {
@@ -73,17 +80,43 @@
   overflow-wrap: anywhere;
 }
 
-.agent-preview-footer {
-  margin-top: 14px;
-  padding-top: 10px;
-  font-size: 12px;
-  color: var(--gray-500);
+.agent-preview-skills,
+.agent-preview-gateway {
+  margin-top: 16px;
+  padding-top: 14px;
   border-top: 1px solid var(--gray-200);
+}
+
+.agent-card-json {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.agent-preview-skills-title,
+.agent-preview-section-title {
+  margin-bottom: 10px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--gray-800);
+}
+
+.agent-preview-skill-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-preview-skill-description {
+  font-size: 13px;
+  color: var(--gray-600);
+  overflow-wrap: anywhere;
 }
 
 .agent-connection-path {
   display: grid;
-  grid-template-columns: 1fr auto 1fr auto 1fr auto 1fr;
+  grid-template-columns: 1fr auto 1fr;
   gap: 8px;
   align-items: stretch;
 }
@@ -227,22 +260,19 @@ body.dark-theme .agent-connection-details dt {
   color: var(--dark-text-muted);
 }
 
-body.dark-theme .agent-preview {
-  background: var(--dark-card);
-  border-color: var(--dark-border);
-}
-
-body.dark-theme .agent-preview-name {
+body.dark-theme .agent-preview-name,
+body.dark-theme .agent-preview-skills-title,
+body.dark-theme .agent-preview-section-title {
   color: var(--dark-text-heading);
 }
 
 body.dark-theme .agent-preview-description,
-body.dark-theme .agent-preview-eyebrow,
-body.dark-theme .agent-preview-footer,
+body.dark-theme .agent-preview-skill-description,
 body.dark-theme .agent-preview-rows dt {
   color: var(--dark-text-muted);
 }
 
-body.dark-theme .agent-preview-footer {
+body.dark-theme .agent-preview-skills,
+body.dark-theme .agent-preview-gateway {
   border-top-color: var(--dark-border);
 }

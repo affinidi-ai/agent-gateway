@@ -1,24 +1,32 @@
 import React from 'react';
-import { Link } from 'react-router-dom';
-import type { AgentSurfaceSummary, AgentTraffic } from '../../api';
+import type { AgentTraffic } from '../../api';
 import StatCard from '../../components/StatCard';
+import { EmptyState } from '../../components/shared/EmptyState';
 import { formatWindow } from '../AgentsPage/agentLabels';
 
 interface TrafficTabProps {
   traffic: AgentTraffic;
-  surfaces: AgentSurfaceSummary[];
 }
 
 /**
  * Totals cover only the metrics retention window, so every card names that
- * window. The gateway keeps no 7-day history. The API returns agent totals
- * only, so the per-surface breakdown shows only for a single-surface agent.
+ * window. The API returns agent totals only, so there is no per-surface breakdown.
  */
-const TrafficTab: React.FC<TrafficTabProps> = ({ traffic, surfaces }) => {
+const TrafficTab: React.FC<TrafficTabProps> = ({ traffic }) => {
   const windowLabel = formatWindow(traffic.window_minutes);
   const failed = traffic.failed + traffic.gateway_faults;
-  const perSurface =
-    surfaces.length === 1 ? [{ ...surfaces[0], count: traffic.total_requests }] : [];
+
+  if (traffic.total_requests === 0) {
+    return (
+      <div data-testid="agent-traffic-empty">
+        <EmptyState
+          icon="fa-chart-bar"
+          title={`No requests in the last ${windowLabel}`}
+          body="Requests to this agent's surfaces show here."
+        />
+      </div>
+    );
+  }
 
   return (
     <div data-testid="agent-traffic-tab">
@@ -29,14 +37,6 @@ const TrafficTab: React.FC<TrafficTabProps> = ({ traffic, surfaces }) => {
           icon="fa-exchange-alt"
           color="primary"
           testId="agent-traffic-requests"
-        />
-        <StatCard
-          title="Requests (7 days)"
-          value="—"
-          subtitle="Needs longer metrics history"
-          icon="fa-calendar-week"
-          color="info"
-          testId="agent-traffic-requests-7d"
         />
         <StatCard
           title={`Failed requests (last ${windowLabel})`}
@@ -53,39 +53,6 @@ const TrafficTab: React.FC<TrafficTabProps> = ({ traffic, surfaces }) => {
           testId="agent-traffic-p95"
         />
       </div>
-
-      {perSurface.length > 0 && (
-        <div data-testid="agent-traffic-by-surface">
-          <h6 className="font-weight-bold">Requests by surface (last {windowLabel})</h6>
-          {perSurface.map(surface => {
-            const percent = traffic.total_requests > 0 ? 100 : 0;
-            return (
-              <div key={surface.surface_id} className="mb-2">
-                <div className="d-flex justify-content-between small">
-                  <Link
-                    to={`/surfaces/${encodeURIComponent(surface.surface_id)}`}
-                    data-testid="agent-traffic-surface-link"
-                  >
-                    {surface.name}
-                  </Link>
-                  <span>{surface.count}</span>
-                </div>
-                <div className="progress" style={{ height: '0.5rem' }}>
-                  <div
-                    className="progress-bar"
-                    role="progressbar"
-                    style={{ width: `${percent}%` }}
-                    aria-valuenow={percent}
-                    aria-valuemin={0}
-                    aria-valuemax={100}
-                    aria-label={`${surface.name} requests`}
-                  />
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
     </div>
   );
 };

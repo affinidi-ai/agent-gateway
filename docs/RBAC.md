@@ -94,12 +94,18 @@ gets `operator_only` instead of a fetch on an appliance-wide surface. See
 `GET /v1/agents`, `GET /v1/agents/{id}` and `GET /v1/agents/{id}/agent-card` are read-only and
 need `surfaces.view`. They group only the surfaces in the caller's tenant and PAT resource scope,
 return `404` for an agent id outside it, and are not served when no auth backend is configured.
-`GET /v1/agents/{id}` also returns `target_name`, the name of the A2A proxy or remote gateway the
+`GET /v1/agents` and `GET /v1/agents/{id}` return `target_name` on each agent, the name of the A2A proxy or remote gateway the
 agent's endpoint names, and `null` for a URL endpoint, a missing record or another tenant's record.
+`GET /v1/agents/{id}` returns each surface's `public_url`, the first external URL of the listener
+its Access Point runs on plus its route, or `null` when no listener with an external URL matches.
 `GET /v1/agents/{id}/agent-card` returns the card the gateway serves for the agent, read through
-the agent card preview of its first running A2A or AP2 surface, with `source` naming how the
+the agent card preview of its first running A2A or AP2 surface, or of the one `?surface_id=` names
+(`404` when the card can't be read through that surface), with `source` naming how the
 gateway obtains it: `fetched` (a URL Target's card, rewritten), `generated` (by an A2A proxy) or
-`remote_gateway` (served over Fabric). The read is audited and rate limited as a preview read, and
+`remote_gateway` (served over Fabric). It also returns `surface_id` (the surface read through),
+`card_surface_ids` (the surfaces the caller may read the card through, also on `not_running`) and
+`upstream_card`, the card before this gateway rewrote it, reduced to the same Agent Card fields
+(absent for a generated card, or when that card is not an Agent Card). The read is audited and rate limited as a preview read, and
 answers `429` past the limits without an earlier preview. Only the card's A2A Agent Card fields are
 returned, and no card or a body that is not an Agent Card is a `502`. A read whose fetch failed or
 whose card the gateway refuses to serve is also a `502`, never the preview's last good card; a

@@ -1,26 +1,31 @@
 import React from 'react';
 import type { AgentRecord } from '../../api';
-import { AgentProtocolBadge } from '../AgentsPage/AgentBadges';
-import { UNNAMED_AGENT, runtimeIcon, runtimeLabel } from '../AgentsPage/agentLabels';
+import { AgentProtocolBadge, AgentRouteBadge } from '../AgentsPage/AgentBadges';
+import { UNNAMED_AGENT, endpointHost } from '../AgentsPage/agentLabels';
 
-/** Name and protocol, with the runtime on the right. Read-only: no actions. */
-const AgentDetailHeader: React.FC<{ agent: AgentRecord }> = ({ agent }) => (
-  <div
-    className="card-header py-3 d-flex flex-wrap gap-2 justify-content-between align-items-center"
-    data-testid="agent-details-header"
-  >
-    <h6 className="m-0 font-weight-bold text-primary d-flex flex-wrap align-items-center gap-2">
-      <i className="fas fa-robot" aria-hidden="true" />
-      <span data-testid="agent-details-name">
-        {agent.name ?? <span className="text-muted fst-italic">{UNNAMED_AGENT}</span>}
-      </span>
-      <AgentProtocolBadge protocol={agent.protocol} />
-    </h6>
-    <span className="small text-muted" data-testid="agent-details-runtime">
-      <i className={`fas ${runtimeIcon(agent.runtime)} me-1`} aria-hidden="true" />
-      {runtimeLabel(agent.runtime)}
-    </span>
-  </div>
-);
+/**
+ * Name with its protocol and route beside it; an unnamed agent also shows its endpoint host,
+ * so it can be told apart. Read-only: no actions.
+ */
+const AgentDetailHeader: React.FC<{ agent: AgentRecord }> = ({ agent }) => {
+  const host = agent.name ? null : endpointHost(agent);
+  return (
+    <div className="card-header py-3" data-testid="agent-details-header">
+      <h6 className="m-0 font-weight-bold text-primary d-flex flex-wrap align-items-center gap-2">
+        <i className="fas fa-robot" aria-hidden="true" />
+        <span data-testid="agent-details-name">
+          {agent.name ?? <span className="text-muted fst-italic">{UNNAMED_AGENT}</span>}
+        </span>
+        {host && (
+          <span className="small text-muted fw-normal" data-testid="agent-details-endpoint-host">
+            {host}
+          </span>
+        )}
+        <AgentProtocolBadge protocol={agent.protocol} />
+        <AgentRouteBadge runtime={agent.runtime} data-testid="agent-details-runtime" />
+      </h6>
+    </div>
+  );
+};
 
 export default AgentDetailHeader;

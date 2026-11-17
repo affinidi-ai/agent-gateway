@@ -121,6 +121,8 @@ export interface AgentRecord {
   identities: AgentIdentity[];
   trust_registry: AgentTrustRegistry;
   last_activity_at: string | null;
+  /** The name of the A2A proxy or remote gateway the endpoint names; `null` when unknown. */
+  target_name?: string | null;
 }
 
 /** GET /v1/agents. `window_minutes` is the metrics retention window of `last_activity_at`. */
@@ -132,6 +134,8 @@ export interface AgentListResponse {
 export interface AgentSurfaceSummary extends AgentSurfaceRef {
   protocol: SurfaceProtocol;
   route: string;
+  /** The URL callers reach the surface at; `null` when no listener has an external URL. */
+  public_url?: string | null;
 }
 
 /** Request totals over the metrics retention window (`window_minutes`). */
@@ -145,18 +149,31 @@ export interface AgentTraffic {
 
 export interface AgentDetails extends AgentRecord {
   surfaces: AgentSurfaceSummary[];
-  /** The name of the A2A proxy or remote gateway the endpoint names; `null` when unknown. */
-  target_name?: string | null;
   traffic: AgentTraffic;
 }
 
 /** How the gateway obtains the card it serves for an agent, from the agent's runtime. */
 export type AgentCardSource = 'fetched' | 'generated' | 'remote_gateway';
 
-/** The card the gateway serves for the agent, as callers get it. Untrusted and not verified. */
+/**
+ * The card the gateway serves for the agent, as callers get it, read through `surface_id`.
+ * `upstream_card` is the card before this gateway rewrote it (absent for a generated card).
+ * `card_surface_ids` lists the surfaces the card can be read through. Untrusted and not verified.
+ */
 export type AgentCardResponse =
-  | { available: true; card: unknown; source: AgentCardSource }
-  | { available: false; reason: 'no_agent_card' | 'not_running' | 'operator_only' };
+  | {
+      available: true;
+      card: unknown;
+      source: AgentCardSource;
+      surface_id?: string;
+      upstream_card?: unknown;
+      card_surface_ids?: string[];
+    }
+  | {
+      available: false;
+      reason: 'no_agent_card' | 'not_running' | 'operator_only';
+      card_surface_ids?: string[];
+    };
 
 class SessionManager {
   private static readonly YES_VALUE = '1';
@@ -637,8 +654,9 @@ class APIClient {
     return this.request<AgentDetails>(`/agents/${encodeURIComponent(id)}`);
   }
 
-  async getAgentCard(id: string): Promise<AgentCardResponse> {
-    return this.request<AgentCardResponse>(`/agents/${encodeURIComponent(id)}/agent-card`);
+  async getAgentCard(id: string, surfaceId?: string): Promise<AgentCardResponse> {
+    const query = surfaceId ? `?surface_id=${encodeURIComponent(surfaceId)}` : '';
+    return this.request<AgentCardResponse>(`/agents/${encodeURIComponent(id)}/agent-card${query}`);
   }
 
   // Agent Surfaces

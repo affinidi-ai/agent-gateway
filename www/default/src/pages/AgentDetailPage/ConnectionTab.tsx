@@ -1,14 +1,16 @@
 import React from 'react';
-import { Link } from 'react-router-dom';
-import type { AgentDetails } from '../../api';
+import { Link, useNavigate } from 'react-router-dom';
+import type { AgentDetails, AgentSurfaceSummary } from '../../api';
 import { CopyButton } from '../../components/shared/CopyButton';
 import { usePermissions } from '../../context/PermissionsContext';
+import { SurfaceLinkButton } from '../IdentitiesPage/IdentitySurfaceCell';
+import { AgentRouteBadge } from '../AgentsPage/AgentBadges';
 import type { AgentConnectionTarget } from '../AgentsPage/agentLabels';
 import {
   connectionTarget,
-  protocolLabel,
+  routeDescription,
   runtimeIcon,
-  runtimeLabel,
+  surfacesUsedLabel,
 } from '../AgentsPage/agentLabels';
 
 /** The A2A proxy or remote gateway by name, as plain text, or by id when it has none. */
@@ -16,9 +18,9 @@ const TargetLabel: React.FC<{ name?: string | null; id: string }> = ({ name, id 
   name ? <span title={id}>{name}</span> : <code>{id}</code>;
 
 const ROUTE_DESCRIPTIONS: Record<AgentConnectionTarget['kind'], string> = {
-  url: 'The gateway calls the agent URL directly.',
-  'a2a-proxy': 'The gateway forwards to an A2A proxy.',
-  gateway: 'The gateway forwards over the trust fabric to a remote gateway.',
+  url: routeDescription('url'),
+  'a2a-proxy': routeDescription('a2a-proxy'),
+  gateway: routeDescription('gateway'),
   unknown: "The endpoint can't be shown, so the target is hidden.",
 };
 
@@ -57,17 +59,59 @@ const Hop: React.FC<HopProps> = ({ label, value, icon, tone, testId }) => (
   </div>
 );
 
+/** One surface: its name linking to the surface page, and the URL callers use. */
+const SurfaceRow: React.FC<{ surface: AgentSurfaceSummary; onOpen: (id: string) => void }> = ({
+  surface,
+  onOpen,
+}) => (
+  <div data-testid={`agent-connection-surface-${surface.surface_id}`}>
+    <dt>
+      <SurfaceLinkButton
+        surface={{ id: surface.surface_id, name: surface.name, deleted: false }}
+        onOpen={onOpen}
+        data-testid="agent-connection-surface-link"
+      />
+    </dt>
+    <dd data-testid="agent-connection-surface-url">
+      {surface.public_url ? (
+        <>
+          <code className="text-break">{surface.public_url}</code>
+          <CopyButton
+            text={surface.public_url}
+            title="Copy URL"
+            data-testid="agent-connection-copy-surface-url"
+          />
+        </>
+      ) : (
+        <>
+          <code className="text-break">{surface.route}</code>
+          <span className="small text-muted ms-2">No external URL configured</span>
+        </>
+      )}
+    </dd>
+  </div>
+);
+
 /**
- * How the gateway reaches the agent: the surface's `target.endpoint`, as a
- * path and a detail list. Read-only; the endpoint is changed in the surface editor.
+ * How callers reach the agent and how the gateway reaches it: each surface with the URL
+ * callers use, then the surfaces' `target.endpoint`. Read-only; both are changed in the
+ * surface editor.
  */
 const ConnectionTab: React.FC<{ agent: AgentDetails }> = ({ agent }) => {
   const { hasPermission } = usePermissions();
+  const navigate = useNavigate();
+  const openSurface = (id: string) => navigate(`/surfaces/${encodeURIComponent(id)}`);
   const target = connectionTarget(agent.endpoint);
   const hops: HopProps[] = [
-    { label: 'Caller', value: `${protocolLabel(agent.protocol)} client`, icon: 'fa-user' },
-    { label: 'Surface', value: 'Access Point', icon: 'fa-sign-in-alt' },
-    { label: 'Gateway', value: 'This gateway', icon: 'fa-server' },
+    {
+      label: agent.surfaces.length === 1 ? 'Surface' : 'Surfaces',
+      value:
+        agent.surfaces.length === 1
+          ? agent.surfaces[0].name
+          : surfacesUsedLabel(agent.surfaces.length),
+      icon: 'fa-sign-in-alt',
+      testId: 'agent-connection-surfaces-hop',
+    },
     { ...targetHop(target, agent.target_name), testId: 'agent-connection-target' },
   ];
 
@@ -144,8 +188,27 @@ const ConnectionTab: React.FC<{ agent: AgentDetails }> = ({ agent }) => {
 
   return (
     <div data-testid="agent-connection-tab">
+      <div className="mb-2">
+        <h6 className="m-0 fw-bold">Surfaces</h6>
+        <div className="small text-muted">The URLs callers use to reach this agent.</div>
+      </div>
+      {agent.surfaces.length === 0 ? (
+        <p className="small text-muted mb-4" data-testid="agent-connection-no-surfaces">
+          No surface uses this agent.
+        </p>
+      ) : (
+        <dl className="agent-connection-details mb-4" data-testid="agent-connection-surfaces">
+          {agent.surfaces.map(surface => (
+            <SurfaceRow key={surface.surface_id} surface={surface} onOpen={openSurface} />
+          ))}
+        </dl>
+      )}
+
       <div className="mb-3">
-        <h6 className="m-0 fw-bold">Upstream</h6>
+        <h6 className="m-0 fw-bold d-flex align-items-center gap-2">
+          Route
+          <AgentRouteBadge runtime={agent.runtime} data-testid="agent-connection-runtime" />
+        </h6>
         <div className="small text-muted" data-testid="agent-connection-description">
           {ROUTE_DESCRIPTIONS[target.kind]}
         </div>
@@ -154,7 +217,7 @@ const ConnectionTab: React.FC<{ agent: AgentDetails }> = ({ agent }) => {
       <div
         className="agent-connection-path mb-3"
         role="group"
-        aria-label="Upstream path"
+        aria-label="Route path"
         data-testid="agent-connection-path"
       >
         {hops.map((hop, index) => (
@@ -170,15 +233,6 @@ const ConnectionTab: React.FC<{ agent: AgentDetails }> = ({ agent }) => {
       </div>
 
       <dl className="agent-connection-details">
-        <div>
-          <dt>Route</dt>
-          <dd data-testid="agent-connection-runtime">
-            <span className="badge bg-info">
-              <i className={`fas ${runtimeIcon(agent.runtime)} me-1`} aria-hidden="true" />
-              {runtimeLabel(agent.runtime)}
-            </span>
-          </dd>
-        </div>
         {rows.map(({ label, value, testId }) => (
           <div key={label}>
             <dt>{label}</dt>

@@ -410,9 +410,9 @@ pub fn displayable_card_url(card_url: &str) -> (Option<String>, bool) {
     (Some(url.to_string()), hidden)
 }
 
-/// The public URL callers fetch the base route's card from: the first external
-/// URL of the listener the Access Point runs on, its route and the well-known path.
-pub fn served_card_url(
+/// The public URL callers reach the Access Point at: the first external URL of
+/// the listener it runs on, and its route. `None` when no listener matches.
+pub fn access_point_url(
     surface: &AgentSurface,
     network: &crate::config::NetworkConfig,
 ) -> Option<String> {
@@ -425,7 +425,16 @@ pub fn served_card_url(
         .and_then(|port| network.get_listener_by_port(port))?
         .external_urls
         .first()?;
-    let access_point = format!("{}{}", origin.trim_end_matches('/'), surface.access_point.route);
+    Some(format!("{}{}", origin.trim_end_matches('/'), surface.access_point.route))
+}
+
+/// The public URL callers fetch the base route's card from: the
+/// [`access_point_url`] and the well-known path.
+pub fn served_card_url(
+    surface: &AgentSurface,
+    network: &crate::config::NetworkConfig,
+) -> Option<String> {
+    let access_point = access_point_url(surface, network)?;
     Some(crate::proxy::protocol_router::join_endpoint_path(&access_point, "/.well-known/agent-card.json"))
 }
 
@@ -1177,11 +1186,13 @@ mod tests {
             served_card_url(&surface, &network).as_deref(),
             Some("https://gateway.example/a2a/.well-known/agent-card.json")
         );
+        assert_eq!(access_point_url(&surface, &network).as_deref(), Some("https://gateway.example/a2a"));
         let mut elsewhere = surface;
         elsewhere
             .access_point
             .listen_address = "https://unknown.example".into();
         assert_eq!(served_card_url(&elsewhere, &network), None);
+        assert_eq!(access_point_url(&elsewhere, &network), None);
     }
 
     #[test]

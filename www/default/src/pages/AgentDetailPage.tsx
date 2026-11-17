@@ -3,6 +3,8 @@ import { Tab, Tabs } from 'react-bootstrap';
 import { useNavigate, useParams } from 'react-router-dom';
 import { AgentDetails, ApiError, apiClient } from '../api';
 import { AppButton } from '../components/shared/AppButton';
+import { usePageTitle } from '../context/PageTitleContext';
+import { UNNAMED_AGENT } from './AgentsPage/agentLabels';
 import AgentCardTab from './AgentDetailPage/AgentCardTab';
 import AgentDetailHeader from './AgentDetailPage/AgentDetailHeader';
 import ConnectionTab from './AgentDetailPage/ConnectionTab';
@@ -22,6 +24,8 @@ const AgentDetailPage: React.FC = () => {
   const [notFound, setNotFound] = useState(false);
 
   const latestRequest = useRef(0);
+
+  usePageTitle(agent ? (agent.name ?? UNNAMED_AGENT) : null);
 
   const loadAgent = useCallback(async () => {
     const request = ++latestRequest.current;
@@ -56,7 +60,7 @@ const AgentDetailPage: React.FC = () => {
     <div className="mb-3">
       <button
         type="button"
-        className="btn btn-sm btn-secondary"
+        className="btn btn-sm btn-outline-secondary"
         onClick={() => navigate('/agent-registry')}
         data-testid="agent-back-button"
       >
@@ -125,7 +129,7 @@ const AgentDetailPage: React.FC = () => {
                 </>
               }
             >
-              <AgentCardTab agentId={agent.id} />
+              <AgentCardTab agentId={agent.id} surfaces={agent.surfaces} />
             </Tab>
             <Tab
               eventKey="connection"
@@ -147,7 +151,7 @@ const AgentDetailPage: React.FC = () => {
                 </>
               }
             >
-              <TrafficTab traffic={agent.traffic} surfaces={agent.surfaces} />
+              <TrafficTab traffic={agent.traffic} />
             </Tab>
           </Tabs>
         </div>
