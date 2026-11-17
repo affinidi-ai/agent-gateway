@@ -204,6 +204,50 @@ continues with no caller identity, only the audit record for the unverified DID 
 written, and no weaker identity source is consulted for that request, neither the identity
 binding VP nor a raw identity extension.
 
+The calling gateway checks the presentation on a `2xx` answer the same way, when the calling
+surface's Target is `fabric://` and the surface has a managed identity. The presentation must
+verify, which includes its holder being its credential's subject, and its issuer must be one of
+the issuers of the connection to the Remote gateway the Target names. The calling gateway
+establishes that gateway's issuer DID through the issuer exchange when its record does not hold
+one yet, and skips the exchange when the issuers its record holds already include the
+presentation's issuer. An answer waits at most 3 seconds for the exchange, where a request waits
+the exchange's full 10 seconds. Answers and requests that need the same gateway's issuer DID at
+once share one exchange, which keeps running after an answer stops waiting and records the issuer
+DID when it completes, so the next answer finds it. When the surface takes the agent's identity from the payload, a verified
+presentation from one of those issuers is that identity, in place of the raw `agent-identity/v1`
+extension the paired gateway replaced with it; the surface's identity schema and rules apply to
+that raw payload, which the calling gateway never receives, so the issuer check stands in for
+them. A surface that takes the identity from a key, a token claim, a certificate or a fixed DID
+keeps it: the presentation is still checked and recorded, but the answering agent's DID is not
+stored as an identity of the surface. A presentation the calling gateway has no VC issuer to verify
+counts as one that fails verification. A presentation
+that fails verification refuses the answer with `502` and records `identity_binding_failed` with
+outcome `invalid`. One whose issuer is not one of the connection's issuers, including when they
+cannot be established, also refuses the answer with `502`: the answering agent's DID is not
+stored, and the VP Audit Log records `identity_binding_failed` with outcome `untrusted`. A verified
+one records `identity_binding_verified` and the received presentation (`vp_injected`, detail
+`response_path_fabric_received`), both with `via_fabric: true` and the request's trace id. Answers
+to a Transit Point over Fabric, to MCP requests over Fabric, and agent cards fetched over Fabric
+are not checked.
+
+Accepted risk: an answer that carries no presentation is not checked. A paired gateway signs one
+only when its surface has a managed identity and it has a VC issuer, so an answer from any other
+paired surface carries the agent's raw `agent-identity/v1` extension instead, and a surface that
+takes the identity from the payload derives it from that extension under its own schema and
+rules, with no issuer check and no audit record. A paired gateway can therefore drop the
+presentation and send `x-identity` fields copied from another agent to be given that agent's
+identity. Only a gateway this one is paired with can do this; the mediator and the answering
+agent cannot remove a presentation the paired gateway adds.
+
+Accepted risk: the calling surface's identity schema and rules do not run on an answer that
+carries a verified presentation, and response extension inspection skips that presentation's
+credential extension while still checking every other watched extension. They are written for the raw `agent-identity/v1` extension,
+which the paired gateway checked against its own schema and rules and replaced, and the
+presentation's fields follow the paired gateway's schema, so checking them against the calling
+surface's could refuse legitimate agents. A paired gateway whose rules are looser than the
+calling surface's can therefore pass an agent the calling surface's rules would refuse; the issuer
+check is the only check the calling gateway applies.
+
 The presentation the receiving gateway signs for its agent's response, when the Target has a
 Workload Binding, names the caller as the user the agent acted for (`userIdentity`, with
 `delegated: true`) only when a presentation from one of the connection's issuers proved the

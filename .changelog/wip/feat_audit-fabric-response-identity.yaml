@@ -1,0 +1,53 @@
+branch: feat/audit-fabric-response-identity
+changes:
+  added:
+    - timestamp: '2026-11-16T12:00:00Z'
+      title: Audit the answering agent's verified identity on the calling gateway
+      description: >-
+        A surface with a managed identity whose Target is `fabric://` records the identity
+        presentation on the answer in its own VP Audit Log: `identity_binding_verified` with the
+        answering agent's DID and the issuing gateway, and the received presentation as
+        `vp_injected` with detail `response_path_fabric_received` and the request's caller, both
+        with `via_fabric: true` and the request's trace id. An untrusted issuer records `identity_binding_failed` (`untrusted`)
+        and a presentation that fails verification records `identity_binding_failed` (`invalid`),
+        so the calling gateway's audit trail names the agent that answered without the peer's logs.
+  changed: []
+  fixed:
+    - timestamp: '2026-11-16T12:00:00Z'
+      title: Accept a paired gateway's identity presentation on a Fabric answer
+      description: >-
+        A surface with a managed identity whose Target is a surface with a managed identity on a
+        paired gateway refused every answer with `422 identity_extension_missing`, because the
+        paired gateway replaces the agent's raw identity extension with its signed presentation.
+        When the surface takes the agent's identity from the payload, a verified presentation on a
+        2xx answer from one of the connection's issuers is now the answering agent's identity, and
+        response extension inspection no longer checks that presentation against the surface's
+        raw-payload rules.
+  removed: []
+  security:
+    - timestamp: '2026-11-16T12:00:00Z'
+      title: Check the issuer of the identity presentation on a Fabric answer
+      description: >-
+        The calling gateway accepts the identity presentation on an answer from a `fabric://`
+        Target only from an issuer of the connection to that Remote gateway, establishing its
+        issuer DID through the issuer exchange when the record does not hold one. An answer whose
+        presentation comes from another issuer, or from a gateway whose issuers cannot be
+        established, is refused with 502 and its agent DID is not stored as verified. The 502
+        says only why the identity was refused, never the verifier's diagnostic, and the issuer
+        DID the exchange records no longer overwrites a change the operator made to the Remote
+        gateway record while the exchange was waiting. An answer waits at most 3 seconds for the
+        issuer exchange, and answers and requests that need the same gateway's issuer at once
+        share one exchange, so a peer that never answers it cannot hold one connection slot and
+        one issuer request per answer for 10 seconds.
+  breaking:
+    - timestamp: '2026-11-17T12:00:00Z'
+      title: Refuse Fabric answers whose identity presentation can't be trusted
+      description: >-
+        A surface with a managed identity whose Target is `fabric://` now answers `502` when the
+        answer carries an identity presentation that fails verification, comes from an issuer
+        that is not one of the connection's, or arrives while the connection's issuers cannot be
+        established, as with a legacy pairing whose peer never answers the issuer exchange or a
+        gateway with no VC issuer. This applies whatever the surface takes its identity from, so
+        surfaces with a key, certificate, JWT claim or fixed DID identity that used to accept
+        such answers now refuse them. Add the answering gateway's issuer DID to the Remote
+        gateway's trusted issuer DIDs, or configure a VC issuer, to accept them again.

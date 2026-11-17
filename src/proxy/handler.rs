@@ -9141,6 +9141,7 @@ async fn proxy_charged_request(
                     surface: &state.surface,
                     response_rules_engine: &state.identity_rules_engine,
                     metrics_store: &state.metrics_store,
+                    verified_presentation: false,
                 };
                 crate::protocols::extensions::inspect_response_extensions(&response_body, &response_ctx).await
             };
@@ -13541,6 +13542,65 @@ async fn handle_fabric_request_inner(
                 let is_well_known_card_response =
                     crate::proxy::paths::is_well_known_agent_card_path(uri.path()) && status < 400;
 
+                // ── Verify the answering agent's identity presentation ─────────
+                let mut answer_presentation_verified = false;
+                let presented_identity = if state
+                    .surface
+                    .managed_identity()
+                    .is_some()
+                    && (200..300).contains(&status)
+                    && !response_body.is_empty()
+                {
+                    let response_audit_facts = crate::audit::request_events::RequestFacts {
+                        surface_id: config_id,
+                        channel_name,
+                        trace_id: Some(trace_id.as_str()),
+                        via_fabric: true,
+                    };
+                    let listener_manager = state
+                        .listener_manager
+                        .read()
+                        .await
+                        .clone();
+                    match crate::proxy::fabric_identity::check_answer_identity(
+                        crate::proxy::fabric_identity::AnswerIdentityCheck {
+                            response_body: &response_body,
+                            surface: &state.surface,
+                            vc_issuer: state.vc_issuer.as_ref(),
+                            listener_manager,
+                            gateway_id,
+                            facts: &response_audit_facts,
+                            caller: authenticated_identity
+                                .as_ref()
+                                .map(crate::delegation_vault::audit::build_caller_context),
+                        },
+                    )
+                    .await
+                    {
+                        Ok(presentation) => presentation
+                            .inspect(|_| answer_presentation_verified = true)
+                            .filter(|_| {
+                                crate::proxy::backend_identity::slot_reads_response_body(
+                                    &state.surface,
+                                    crate::proxy::backend_identity::IdentitySlot::Protected,
+                                )
+                            })
+                            .map(|presentation| ProtectedAgentIdentity::Managed {
+                                did: presentation.agent_did,
+                                identity_fields: presentation.identity_fields,
+                            }),
+                        Err(refusal) => {
+                            error!(channel = channel_name, ?refusal, "Fabric: answer identity presentation refused");
+                            connection_guard
+                                .decrement()
+                                .await;
+                            return Err(create_error_response(StatusCode::BAD_GATEWAY, refusal.detail()));
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 // ── Step 12: Resolve Protected Agent Identity (fabric path) ─────
                 let is_agent_card_request = is_well_known_card_response || is_extended_card_response;
                 let identity_response_kind = crate::proxy::backend_identity::IdentityResponseKind::for_response(
@@ -13559,7 +13619,9 @@ async fn handle_fabric_request_inner(
                     .or(state
                         .identity_rules_engine
                         .as_ref());
-                let resolved_identity = if (200..300).contains(&status) && !response_body.is_empty() {
+                let resolved_identity = if let Some(identity) = presented_identity {
+                    identity
+                } else if (200..300).contains(&status) && !response_body.is_empty() {
                     match crate::proxy::backend_identity::resolve_protected_agent_identity(
                         response_body.as_bytes(),
                         &state.surface,
@@ -14190,52 +14252,6 @@ async fn handle_fabric_request_inner(
                     );
                 }
 
-                // Extract and verify backend agent identity from fabric response (multi-gateway only)
-                // This verifies VPs sent by GW2 instead of computing raw identity
-                let _agent_identity = if state
-                    .surface
-                    .managed_identity()
-                    .is_some()
-                {
-                    match crate::proxy::fabric_identity::extract_fabric_backend_agent_identity(
-                        &response_body,
-                        &state.surface,
-                        &state.identity_selector,
-                        channel_name,
-                    )
-                    .await
-                    {
-                        Ok(identity_opt) => {
-                            if let Some(ref agent_did) = identity_opt {
-                                info!(
-                                    channel = channel_name,
-                                    did = agent_did,
-                                    "Fabric: Verified backend agent identity from GW2"
-                                );
-                            }
-                            identity_opt
-                        }
-                        Err(e) => {
-                            // VP verification failed - reject the response (Policy: Option C)
-                            error!(channel = channel_name, error = %e, "Fabric: Backend agent VP verification failed");
-                            connection_guard
-                                .decrement()
-                                .await;
-                            return Err(create_error_response(
-                                StatusCode::BAD_GATEWAY,
-                                &format!("Backend agent identity verification failed: {}", e),
-                            ));
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                if let Some(ref agent_did) = _agent_identity {
-                    // Log for metrics/audit purposes
-                    debug!(channel = channel_name, did = agent_did, "Fabric: Backend agent DID extracted and verified");
-                }
-
                 // Inspect response extensions if enabled (same as direct path)
                 // Skip validation for agent card requests (they're JSON config, not A2A messages)
                 let _inspect_span =
@@ -14286,6 +14302,7 @@ async fn handle_fabric_request_inner(
                                 surface: &state.surface,
                                 response_rules_engine: &state.identity_rules_engine,
                                 metrics_store: &state.metrics_store,
+                                verified_presentation: answer_presentation_verified,
                             };
                             crate::protocols::extensions::inspect_response_extensions(
                                 _response_body_bytes,

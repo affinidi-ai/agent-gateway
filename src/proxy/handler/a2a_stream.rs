@@ -365,6 +365,7 @@ impl AccessPointEvents {
             surface: &state.surface,
             response_rules_engine: &state.identity_rules_engine,
             metrics_store: &state.metrics_store,
+            verified_presentation: false,
         };
         crate::protocols::extensions::inspect_response_extensions(body, &context)
             .await

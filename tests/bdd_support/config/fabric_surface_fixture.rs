@@ -35,6 +35,9 @@ pub struct SurfaceSpec {
     /// Surface-level managed identity derived from the managed agent's
     /// `agent-identity/v1` payload; Transit Points inherit it and mint a VP.
     pub managed_identity: bool,
+    /// Managed identity fixed to this DID, in the surface's protected
+    /// identity slot.
+    pub fixed_managed_identity: Option<String>,
     pub mcp_tool_policy: Option<McpToolPolicySpec>,
     pub mcp_proxy: Option<McpProxySpec>,
     /// The target is a real upstream serving one path, not a harness mock.
@@ -123,6 +126,7 @@ impl SurfaceSpec {
             target_policy_rego: None,
             transit_policy_rego: None,
             managed_identity: false,
+            fixed_managed_identity: None,
             mcp_tool_policy: None,
             mcp_proxy: None,
             external_target: false,

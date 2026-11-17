@@ -569,6 +569,118 @@ async fn vp_audit_log_of_gateway_records_verified_identity_binding(
     );
 }
 
+/// The record of the identity presentation a calling gateway received on a
+/// Fabric answer.
+fn is_presentation_received_on_answer(event: &Value) -> bool {
+    event["event"] == "vp_injected" && event["detail"] == "response_path_fabric_received"
+}
+
+/// An identity binding the calling gateway recorded for a Fabric answer; its
+/// own request-side bindings are not marked as received over Fabric.
+fn is_identity_binding_for_answer(event: &Value) -> bool {
+    event["via_fabric"] == true
+        && (event["event"]
+            .get("identity_binding_verified")
+            .is_some()
+            || event["event"]
+                .get("identity_binding_failed")
+                .is_some())
+}
+
+#[then(expr = "the VP Audit Log of gateway {int} records the identity presentation received on the answer")]
+async fn vp_audit_log_records_presentation_received_on_answer(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let (found, events) = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .wait_for_audit_event(is_presentation_received_on_answer)
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must be readable: {error:#}"));
+    assert!(
+        found,
+        "expected gateway {gateway} to record the identity presentation received on the answer, got {events:?}"
+    );
+}
+
+#[then(expr = "the VP Audit Log of gateway {int} records no identity presentation received on the answer")]
+async fn vp_audit_log_records_no_presentation_received_on_answer(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let (found, events) = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .wait_for_audit_event(is_presentation_received_on_answer)
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must be readable: {error:#}"));
+    assert!(
+        !found,
+        "expected gateway {gateway} to record no identity presentation received on the answer, got {events:?}"
+    );
+}
+
+#[then(expr = "the VP Audit Log of gateway {int} records no identity binding for the answer")]
+async fn vp_audit_log_records_no_identity_binding_for_answer(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let (found, events) = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .wait_for_audit_event(is_identity_binding_for_answer)
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must be readable: {error:#}"));
+    assert!(!found, "expected gateway {gateway} to record no identity binding for the answer, got {events:?}");
+}
+
+#[then(expr = "the VP Audit Log of gateway {int} records the answer's identity under the trace id of the request")]
+async fn vp_audit_log_records_answer_identity_under_request_trace_id(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let admin = &world
+        .harness()
+        .gw(gateway)
+        .admin;
+    let (found, events) = admin
+        .wait_for_audit_event(|event| {
+            event["via_fabric"] == true
+                && event["event"]
+                    .get("identity_binding_verified")
+                    .is_some()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must be readable: {error:#}"));
+    assert!(found, "expected gateway {gateway} to record a verified identity binding for the answer, got {events:?}");
+    let trace_of = |matches: &dyn Fn(&Value) -> bool| {
+        events
+            .iter()
+            .find(|event| matches(event))
+            .and_then(|event| event["trace_id"].as_str())
+            .map(str::to_string)
+    };
+    let binding_trace = trace_of(&|event| is_identity_binding_for_answer(event))
+        .unwrap_or_else(|| panic!("the answer's identity binding on gateway {gateway} has no trace id: {events:?}"));
+    assert_eq!(
+        trace_of(&is_presentation_received_on_answer).as_deref(),
+        Some(binding_trace.as_str()),
+        "the presentation received on the answer should carry the trace id of the answer's identity binding, got {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["trace_id"] == binding_trace.as_str()
+                && !is_identity_binding_for_answer(event)
+                && !is_presentation_received_on_answer(event)
+        }),
+        "gateway {gateway} should have another record of the request under trace id {binding_trace}, got {events:?}"
+    );
+}
+
 /// The audit outcome for a failed identity binding, as the step names it.
 fn audited_identity_binding_failure(reason: &str) -> &'static str {
     match reason {
