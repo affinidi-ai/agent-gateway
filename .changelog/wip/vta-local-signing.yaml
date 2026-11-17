@@ -327,6 +327,14 @@ changes:
         the agent's own trust agent context, as its holder proofs do, and a
         gateway-held key is still used for agents onboarded before a trust
         agent was connected.
+    - timestamp: '2026-11-17T20:00:00Z'
+      title: Keep creating trust agent contexts with VTA releases that retired old tasks
+      description: >-
+        A VTA release retired contexts/update-did 1.1 and webvh/dids/list 1.0,
+        so the gateway could no longer give a new context its DID or find its
+        did:webvh. The gateway now asks for update-did 1.2 and vta/dids/list
+        0.1 first and falls back to the older task only when the trust agent
+        says it does not serve the newer one, so it works with both releases.
   removed: []
   security:
     - timestamp: '2026-11-09T00:00:00Z'

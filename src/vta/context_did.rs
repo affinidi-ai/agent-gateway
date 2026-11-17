@@ -26,8 +26,11 @@ use crate::vta::context_identity::payload_of;
 
 /// `vta/webvh/dids/create/1.2`.
 const TASK_WEBVH_DIDS_CREATE: &str = "https://trusttasks.org/spec/vta/webvh/dids/create/1.2";
-/// `vta/webvh/dids/list/1.0`.
-const TASK_WEBVH_DIDS_LIST: &str = "https://trusttasks.org/spec/vta/webvh/dids/list/1.0";
+/// The DIDs a trust agent holds, newest first: `vta/dids/list/0.1`, and
+/// `vta/webvh/dids/list/1.0` for a trust agent released before it. Both answer
+/// `dids`, each with its `did` and `contextId`.
+const TASK_DIDS_LIST: [&str; 2] =
+    ["https://trusttasks.org/spec/vta/dids/list/0.1", "https://trusttasks.org/spec/vta/webvh/dids/list/1.0"];
 /// `vta/webvh/dids/get/1.0`.
 const TASK_WEBVH_DIDS_GET: &str = "https://trusttasks.org/spec/vta/webvh/dids/get/1.0";
 
@@ -191,7 +194,7 @@ pub async fn context_webvh(
     context_id: &str,
 ) -> Result<Option<String>, VtaError> {
     let listed = client
-        .dispatch_signed::<Value>(TASK_WEBVH_DIDS_LIST, json!({ "contextId": context_id }))
+        .dispatch_signed_newest::<Value>(&TASK_DIDS_LIST, json!({ "contextId": context_id }))
         .await?;
     let dids = webvh_dids_in(payload_of(&listed), context_id);
     match dids.as_slice() {
@@ -204,7 +207,7 @@ pub async fn context_webvh(
     }
 }
 
-/// The `did:webvh` DIDs a `webvh/dids/list` answer places in `context_id`.
+/// The `did:webvh` DIDs a DID listing places in `context_id`.
 fn webvh_dids_in(
     listed: &Value,
     context_id: &str,

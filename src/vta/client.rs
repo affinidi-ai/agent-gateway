@@ -407,6 +407,27 @@ impl VtaRestClient {
         }
     }
 
+    /// [`dispatch_signed`](Self::dispatch_signed) for a task the trust agent's
+    /// releases serve under different types: `type_uris` lists them newest
+    /// first, and one this trust agent does not serve gives way to the next.
+    pub async fn dispatch_signed_newest<T: DeserializeOwned>(
+        &self,
+        type_uris: &[&str],
+        payload: Value,
+    ) -> Result<T, VtaError> {
+        let mut unserved = None;
+        for type_uri in type_uris {
+            match self
+                .dispatch_signed(type_uri, payload.clone())
+                .await
+            {
+                Err(e) if e.is_unserved_task() => unserved = Some(e),
+                other => return other,
+            }
+        }
+        Err(unserved.unwrap_or_else(|| VtaError::Config("no trust task type to dispatch".to_string())))
+    }
+
     async fn dispatch_signed_once<T: DeserializeOwned>(
         &self,
         type_uri: &str,
@@ -752,6 +773,150 @@ mod tests {
         cell.set(Arc::clone(&client))
             .ok();
         (client, calls)
+    }
+
+    const NEW_TASK: &str = "https://trusttasks.org/spec/test/listing/0.2";
+    const OLD_TASK: &str = "https://trusttasks.org/spec/test/listing/0.1";
+
+    /// A trust agent that serves only `served` of the listing tasks, refuses
+    /// one of them outright when `refused`, and records every type asked for.
+    #[derive(Clone)]
+    struct ReleaseState {
+        auth: MockState,
+        served: Vec<&'static str>,
+        refused: Option<&'static str>,
+        asked: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    async fn release(
+        State(state): State<ReleaseState>,
+        Json(body): Json<Value>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let type_uri = body["type"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if type_uri.contains("/auth/") {
+            return trust_tasks(State(state.auth), Json(body))
+                .await
+                .into_response();
+        }
+        state
+            .asked
+            .lock()
+            .unwrap()
+            .push(type_uri.clone());
+        if state.refused == Some(type_uri.as_str()) {
+            return (axum::http::StatusCode::FORBIDDEN, Json(json!({ "payload": { "code": "permissionDenied" } })))
+                .into_response();
+        }
+        if state
+            .served
+            .contains(&type_uri.as_str())
+        {
+            return Json(json!({ "payload": { "servedAs": type_uri } })).into_response();
+        }
+        let code = if type_uri.ends_with("/0.1") {
+            "unsupportedType"
+        } else {
+            "unsupportedVersion"
+        };
+        (
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "payload": { "code": code, "details": { "requestedType": type_uri } } })),
+        )
+            .into_response()
+    }
+
+    async fn release_client(
+        served: Vec<&'static str>,
+        refused: Option<&'static str>,
+    ) -> (VtaRestClient, Arc<std::sync::Mutex<Vec<String>>>) {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = ReleaseState {
+            auth: MockState {
+                auth_count: Arc::new(AtomicUsize::new(0)),
+                token_expires_in: 3600,
+                issuers: Arc::new(std::sync::Mutex::new(Vec::new())),
+            },
+            served,
+            refused,
+            asked: Arc::clone(&asked),
+        };
+        let app = Router::new()
+            .route(TRUST_TASKS_PATH, post(release))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        (test_client(&format!("http://{addr}"), Arc::new(ControlKey::from_seed([31u8; 32]))), asked)
+    }
+
+    fn asked(log: &Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> {
+        log.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn the_newest_task_a_trust_agent_serves_is_used() {
+        let (client, log) = release_client(vec![NEW_TASK, OLD_TASK], None).await;
+
+        let reply: Value = client
+            .dispatch_signed_newest(&[NEW_TASK, OLD_TASK], json!({}))
+            .await
+            .expect("served");
+
+        assert_eq!(reply["payload"]["servedAs"], NEW_TASK);
+        assert_eq!(asked(&log), vec![NEW_TASK.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_trust_agent_released_before_the_newest_task_is_asked_the_older_one() {
+        let (client, log) = release_client(vec![OLD_TASK], None).await;
+
+        let reply: Value = client
+            .dispatch_signed_newest(&[NEW_TASK, OLD_TASK], json!({}))
+            .await
+            .expect("served by the older task");
+
+        assert_eq!(reply["payload"]["servedAs"], OLD_TASK);
+        assert_eq!(asked(&log), vec![NEW_TASK.to_string(), OLD_TASK.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_is_final_and_never_retried_as_an_older_task() {
+        let (client, log) = release_client(vec![NEW_TASK, OLD_TASK], Some(NEW_TASK)).await;
+
+        let err = client
+            .dispatch_signed_newest::<Value>(&[NEW_TASK, OLD_TASK], json!({}))
+            .await
+            .expect_err("refused");
+
+        assert_eq!(
+            err.trust_task_code()
+                .as_deref(),
+            Some("permissionDenied")
+        );
+        assert_eq!(asked(&log), vec![NEW_TASK.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_trust_agent_serving_none_of_the_tasks_says_so() {
+        let (client, log) = release_client(vec![], None).await;
+
+        let err = client
+            .dispatch_signed_newest::<Value>(&[NEW_TASK, OLD_TASK], json!({}))
+            .await
+            .expect_err("served by neither");
+
+        assert!(err.is_unserved_task(), "{err:?}");
+        assert_eq!(asked(&log).len(), 2);
     }
 
     #[tokio::test]

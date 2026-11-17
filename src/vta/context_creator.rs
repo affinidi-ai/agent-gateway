@@ -39,11 +39,15 @@ const TASK_CONTEXTS_CREATE: &str = "https://trusttasks.org/spec/vta/contexts/cre
 /// `vta/contexts/get/1.0`.
 const TASK_CONTEXTS_GET: &str = "https://trusttasks.org/spec/vta/contexts/get/1.0";
 
-/// `vta/contexts/update-did/1.1`.
+/// `vta/contexts/update-did`, newest first: `1.2`, and `1.1` for a trust agent
+/// released before it.
 ///
 /// Not `contexts/update/1.0`: that one edits the whole record and is
 /// super-admin, which the gateway deliberately is not.
-const TASK_CONTEXTS_UPDATE_DID: &str = "https://trusttasks.org/spec/vta/contexts/update-did/1.1";
+const TASK_CONTEXTS_UPDATE_DID: [&str; 2] = [
+    "https://trusttasks.org/spec/vta/contexts/update-did/1.2",
+    "https://trusttasks.org/spec/vta/contexts/update-did/1.1",
+];
 
 /// `keys/create/0.1`.
 const TASK_KEYS_CREATE: &str = "https://trusttasks.org/spec/keys/create/0.1";
@@ -223,7 +227,7 @@ impl GatewayContextCreator {
         let public_key = self
             .ensure_issuer_key(context_id, &key_id)
             .await?;
-        self.configure(TASK_CONTEXTS_UPDATE_DID, json!({ "id": context_id, "did": format!("did:key:{public_key}") }))
+        self.configure(&TASK_CONTEXTS_UPDATE_DID, json!({ "id": context_id, "did": format!("did:key:{public_key}") }))
             .await
     }
 
@@ -236,12 +240,12 @@ impl GatewayContextCreator {
     /// Anything else surfaces.
     async fn configure(
         &self,
-        task: &str,
+        tasks: &[&str],
         request: serde_json::Value,
     ) -> Result<(), VtaError> {
         match self
             .client
-            .dispatch_signed::<serde_json::Value>(task, request)
+            .dispatch_signed_newest::<serde_json::Value>(tasks, request)
             .await
         {
             Ok(_) => Ok(()),
@@ -954,7 +958,7 @@ mod live_tests {
 
         for did in ["did:web:example.com", "did:key:z6MkNobodyInThisContextHoldsThis"] {
             let outcome: Result<Value, VtaError> = client
-                .dispatch_signed(TASK_CONTEXTS_UPDATE_DID, json!({ "id": context_id, "did": did }))
+                .dispatch_signed_newest(&TASK_CONTEXTS_UPDATE_DID, json!({ "id": context_id, "did": did }))
                 .await;
             assert!(outcome.is_err(), "`{did}` is not a DID this context controls, so naming it must be refused");
         }
@@ -1182,9 +1186,12 @@ mod live_tests {
             .await;
         let refusal = attack.expect_err("the update key must not sign a forged log entry");
         assert!(
-            refusal
-                .log_detail()
-                .contains("permissionDenied"),
+            matches!(
+                refusal
+                    .trust_task_code()
+                    .as_deref(),
+                Some("keys/sign-document:failedPrecondition" | "permissionDenied")
+            ),
             "{}",
             refusal.log_detail()
         );

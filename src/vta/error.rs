@@ -88,6 +88,16 @@ impl VtaError {
             .map(str::to_owned)
     }
 
+    /// The trust agent does not serve the task, or not the version asked for:
+    /// a different release of it, which may serve another version.
+    pub fn is_unserved_task(&self) -> bool {
+        matches!(
+            self.trust_task_code()
+                .as_deref(),
+            Some("unsupportedVersion" | "unsupportedType")
+        )
+    }
+
     /// The trust agent ended this session because the same DID signed in again:
     /// `401` with `{"error":"unauthorized: token superseded"}`.
     pub fn is_superseded(&self) -> bool {

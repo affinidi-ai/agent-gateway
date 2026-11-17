@@ -230,8 +230,13 @@ DID, because changing an agent's DID would invalidate credentials already issued
 one key as its signing key and its log's update key, so a trust agent whose `keys/sign-document`
 signs a caller's document as that key's `did:key` lets anyone holding the gateway's grant forge a
 log entry that rewrites the DID, which then survives revoking the grant. The VTA refuses this
-(`vta-service`: `keys/sign-document` and `webvh_keys::is_log_authorization_key`); use
-`did_webvh` only with a trust agent that does.
+(`keys/sign-document` answers `failedPrecondition` for a key any held `did:webvh` log names as an
+update or pre-rotation key); use `did_webvh` only with a trust agent that does.
+
+**Trust agent releases.** The gateway asks for the newest version of a task first and falls back
+to the older one only when the trust agent answers `unsupportedVersion` or `unsupportedType`:
+`contexts/update-did` 1.2 then 1.1, and `vta/dids/list` 0.1 then `webvh/dids/list` 1.0. Any other
+refusal is final.
 
 The live tests in `src/vta/context_did.rs` (`live_tests`) cover it against a real trust agent with
 only the gateway's grant: create, sign, verify as a peer resolving the DID, rotate as the operator
