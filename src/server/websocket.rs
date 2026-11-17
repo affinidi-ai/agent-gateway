@@ -728,7 +728,8 @@ fn normalize_origin(origin: &str) -> Option<String> {
 }
 
 /// Whether a connection keeps reading the update channel after `error`: one that fell
-/// behind skips the updates it missed, and only a closed channel ends it.
+/// behind skips the updates it missed and is told to refresh its dashboard at the next
+/// keep-alive, and only a closed channel ends it.
 fn keeps_reading(error: &broadcast::error::RecvError) -> bool {
     matches!(error, broadcast::error::RecvError::Lagged(_))
 }
@@ -742,8 +743,9 @@ enum Outgoing {
 }
 
 /// Send the connection's broadcast updates, answers and policy input captures to the
-/// client, and at each `ping_interval` tick recheck its access and ping it. Returns when
-/// the client is gone or stops reading, or the update channel closes.
+/// client, and at each `ping_interval` tick recheck its access, send one
+/// `refresh_dashboard` if it fell behind the update channel since the last tick, and
+/// ping it. Returns when the client is gone or stops reading, or the update channel closes.
 async fn send_loop<S>(
     mut sender: S,
     mut rx: broadcast::Receiver<WsUpdate>,
@@ -756,6 +758,7 @@ async fn send_loop<S>(
     S: futures::Sink<Message> + Unpin,
 {
     let mut logs_allowed = WsCaller::logs_allowed(caller).await;
+    let mut refresh_pending = false;
 
     'send: loop {
         let outgoing = tokio::select! {
@@ -768,6 +771,17 @@ async fn send_loop<S>(
                 for answer in stopped {
                     if !deliver(&mut sender, Message::Text(answer.into())).await {
                         break 'send;
+                    }
+                }
+                if refresh_pending {
+                    refresh_pending = false;
+                    match serde_json::to_string(&WsUpdate::RefreshDashboard) {
+                        Ok(refresh) => {
+                            if !deliver(&mut sender, Message::Text(refresh.into())).await {
+                                break;
+                            }
+                        }
+                        Err(e) => error!("Failed to serialize update: {}", e),
                     }
                 }
                 if !deliver(&mut sender, Message::Ping("ping".into())).await {
@@ -814,6 +828,7 @@ async fn send_loop<S>(
             }
             Outgoing::Missed(error) if keeps_reading(&error) => {
                 debug!("WebSocket client fell behind the update channel: {}", error);
+                refresh_pending = true;
                 continue;
             }
             Outgoing::Missed(_) => break,
@@ -1786,6 +1801,102 @@ mod tests {
         assert_eq!(sent[0], "ping");
         assert_eq!(sent[1]["type"], "policy_input_captured");
         assert_eq!(sent[1]["config_id"], "ws-kept-t");
+    }
+
+    fn channel_expired() -> super::WsUpdate {
+        super::WsUpdate::ChannelExpired {
+            config_id: "ws-lag".to_string(),
+            channel_name: "lag".to_string(),
+        }
+    }
+
+    /// Run the send loop of a connection without a caller over `updates` while `producing`
+    /// runs, for at most `run_for`. Returns whether the loop ended by itself, and the type
+    /// of each message it sent, with a ping as `"ping"`.
+    async fn kinds_sent_over(
+        updates: tokio::sync::broadcast::Receiver<super::WsUpdate>,
+        producing: impl std::future::Future<Output = ()>,
+        run_for: std::time::Duration,
+    ) -> (bool, Vec<String>) {
+        let (captures_tx, captures) = tokio::sync::mpsc::channel(1);
+        let subscription = tokio::sync::RwLock::new(super::WsSubscription::new(captures_tx));
+        let (_answers_tx, answers) = tokio::sync::mpsc::channel(1);
+        let (sink, sent) = futures::channel::mpsc::channel(64);
+        let ping_interval = tokio::time::interval(super::KEEP_ALIVE_INTERVAL);
+        let looping = super::send_loop(sink, updates, answers, captures, &subscription, None, ping_interval);
+        let (_, ran) = tokio::join!(producing, tokio::time::timeout(run_for, looping));
+        let kinds = sent_messages(sent)
+            .into_iter()
+            .map(|message| match message.as_str() {
+                Some(ping) => ping.to_string(),
+                None => message["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            })
+            .collect();
+        (ran.is_ok(), kinds)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_falls_behind_several_times_is_told_once_to_refresh_at_its_next_keep_alive() {
+        let (updates_tx, updates) = tokio::sync::broadcast::channel(1);
+        let producing = async {
+            for _ in 0..3 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                for _ in 0..3 {
+                    updates_tx
+                        .send(channel_expired())
+                        .unwrap();
+                }
+            }
+        };
+
+        let (ended, sent) =
+            kinds_sent_over(updates, producing, super::KEEP_ALIVE_INTERVAL * 2 + std::time::Duration::from_secs(1))
+                .await;
+
+        assert!(!ended, "falling behind does not end the connection");
+        assert_eq!(
+            sent,
+            ["ping", "channel_expired", "channel_expired", "channel_expired", "refresh_dashboard", "ping", "ping"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_keeps_up_is_not_told_to_refresh() {
+        let (updates_tx, updates) = tokio::sync::broadcast::channel(8);
+        let producing = async {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            for _ in 0..3 {
+                updates_tx
+                    .send(channel_expired())
+                    .unwrap();
+            }
+        };
+
+        let (ended, sent) =
+            kinds_sent_over(updates, producing, super::KEEP_ALIVE_INTERVAL + std::time::Duration::from_secs(1)).await;
+
+        assert!(!ended);
+        assert_eq!(sent, ["ping", "channel_expired", "channel_expired", "channel_expired", "ping"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_update_channel_ends_a_connection_that_fell_behind() {
+        let (updates_tx, updates) = tokio::sync::broadcast::channel(1);
+        for _ in 0..3 {
+            updates_tx
+                .send(channel_expired())
+                .unwrap();
+        }
+        drop(updates_tx);
+
+        let (ended, sent) =
+            kinds_sent_over(updates, async {}, super::KEEP_ALIVE_INTERVAL + std::time::Duration::from_secs(1)).await;
+
+        assert!(ended, "a closed update channel ends the loop");
+        assert_eq!(sent, ["ping", "channel_expired"]);
     }
 
     #[tokio::test]

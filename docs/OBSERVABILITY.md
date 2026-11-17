@@ -9,7 +9,10 @@ for the checked-out source revision.
 
 [`WsState`](../src/server/websocket.rs) wraps a Tokio broadcast sender. Each connected dashboard
 WebSocket subscribes independently after any configured authentication check; a slow receiver that
-lags skips the updates it missed and keeps reading rather than blocking producers. A connection
+lags skips the updates it missed and keeps reading rather than blocking producers. At its next
+keep-alive it is sent one `{"type": "refresh_dashboard"}`, however often it lagged since the last
+one, so the page reloads its dashboard stats; missed log lines and payload captures are not
+recovered. A connection
 whose client has not read a message within 10 seconds is closed, so a client that stops reading
 cannot hold back the keep-alive access checks.
 `websocket_broadcast_buffer` controls the channel capacity and defaults to `500`.
@@ -78,8 +81,8 @@ broadcast or another connection. The connection is told how many it missed with 
 `{"type": "policy_input_skipped", "config_id", "skipped"}` message queued before its next capture. At most 32 answers wait to be sent before the connection stops
 reading the client's commands, and closing the connection ends its listening (see
 [`POLICY.md`](POLICY.md#policy-input-capture)). A connection that falls more than
-`websocket_broadcast_buffer` broadcast updates behind skips the ones it missed and keeps reading;
-only a closed broadcast channel or socket ends it.
+`websocket_broadcast_buffer` broadcast updates behind skips the ones it missed, keeps reading and
+is sent `refresh_dashboard` at its next keep-alive; only a closed broadcast channel or socket ends it.
 
 `DashboardDelta` is already serialized before broadcast and held in `Arc<String>`, reducing clone
 cost across subscribers. Other variants are serialized per connection.
