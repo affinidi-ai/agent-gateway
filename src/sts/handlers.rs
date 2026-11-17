@@ -146,6 +146,10 @@ pub trait StsSigner: Send + Sync {
 pub struct VerifiedAssertion {
     pub claims: Value,
     pub principal_claim: String,
+    /// Verified against a key this gateway signs with or publishes, retired
+    /// keys included. The one answer to "did this gateway issue it", shared by
+    /// verification and by the exchange's refusal of self-issued tokens.
+    pub issued_here: bool,
 }
 
 impl VerifiedAssertion {
@@ -153,6 +157,15 @@ impl VerifiedAssertion {
         Self {
             claims,
             principal_claim: crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM.to_string(),
+            issued_here: false,
+        }
+    }
+
+    /// A token verified against this gateway's own keys.
+    pub fn issued_by_this_gateway(claims: Value) -> Self {
+        Self {
+            issued_here: true,
+            ..Self::named_by_sub(claims)
         }
     }
 }
@@ -343,7 +356,7 @@ impl StsSubjectVerifier for JwtBearerSubjectVerifier {
             return self
                 .verify_local_jwt(token, &self_did)
                 .await
-                .map(VerifiedAssertion::named_by_sub);
+                .map(VerifiedAssertion::issued_by_this_gateway);
         }
 
         // A VTA-signed token claims the `did:key` of the key that signed it, so
@@ -360,7 +373,7 @@ impl StsSubjectVerifier for JwtBearerSubjectVerifier {
             return self
                 .verify_local_jwt(token, &iss)
                 .await
-                .map(VerifiedAssertion::named_by_sub);
+                .map(VerifiedAssertion::issued_by_this_gateway);
         }
 
         let strategies = self
@@ -460,7 +473,13 @@ async fn verify_with_client_strategies(
             .validate(token, &strategy, &[], crate::jwt_bearer::models::AudienceClaim::Aud)
             .await
         {
-            Ok(claims) => return Ok(VerifiedAssertion { claims, principal_claim }),
+            Ok(claims) => {
+                return Ok(VerifiedAssertion {
+                    claims,
+                    principal_claim,
+                    issued_here: false,
+                });
+            }
             Err(error) => failure = Some(error),
         }
     }
@@ -1089,6 +1108,7 @@ async fn handle_token_exchange(
     let VerifiedAssertion {
         claims: subject_claims,
         principal_claim: subject_claim,
+        issued_here: subject_issued_here,
     } = verify_assertion(state, req.subject_token_type, &req.subject_token, profile, record.tenant_id.as_deref())
         .await?;
     let mut assertion_expiry = None;
@@ -1096,7 +1116,15 @@ async fn handle_token_exchange(
         .subject_token_type
         .is_jwt_shaped()
     {
-        reject_self_issued(state, &gateway_did, profile, "subject", &req.subject_token, &subject_claims)?;
+        reject_self_issued(
+            state,
+            &gateway_did,
+            profile,
+            "subject",
+            &req.subject_token,
+            &subject_claims,
+            subject_issued_here,
+        )?;
         if let Some(profile) = profile {
             if record
                 .allowed_subject_audiences
@@ -1132,9 +1160,18 @@ async fn handle_token_exchange(
             let VerifiedAssertion {
                 claims: actor_claims,
                 principal_claim: actor_claim,
+                issued_here: actor_issued_here,
             } = verify_assertion(state, actor_type, actor_token, profile, record.tenant_id.as_deref()).await?;
             if actor_type.is_jwt_shaped() {
-                reject_self_issued(state, &gateway_did, profile, "actor", actor_token, &actor_claims)?;
+                reject_self_issued(
+                    state,
+                    &gateway_did,
+                    profile,
+                    "actor",
+                    actor_token,
+                    &actor_claims,
+                    actor_issued_here,
+                )?;
                 let actor_expiry = match profile {
                     Some(profile) => {
                         let expiry = profile.validate_subject(&actor_claims, &actor_claim, now_secs())?;
@@ -1356,7 +1393,7 @@ async fn handle_jwt_bearer(
         .await?;
 
     let tenant_id = record.tenant_id.as_deref();
-    let VerifiedAssertion { claims, principal_claim } = match profile {
+    let VerifiedAssertion { claims, principal_claim, .. } = match profile {
         Some(profile) => {
             state
                 .verifier
@@ -1838,10 +1875,11 @@ fn claimed_expiry(claims: &Value) -> Option<u64> {
 }
 
 /// Refuse a verified exchange subject or actor that this gateway signed, under
-/// its DID or its MCP issuer, unless the legacy endpoint receives one of its own
-/// access tokens (`typ: JWT`). Its ID-JAGs are consumed only through single-use
-/// jwt-bearer redemption, its peer issuer attestations never become subjects,
-/// and the MCP profile exchanges only external assertions.
+/// its DID, any key it publishes (`issued_here`, decided by the verifier) or its
+/// MCP issuer, unless the legacy endpoint receives one of its own access tokens
+/// (`typ: JWT`). Its ID-JAGs are consumed only through single-use jwt-bearer
+/// redemption, its peer issuer attestations never become subjects, and the MCP
+/// profile exchanges only external assertions.
 fn reject_self_issued(
     state: &StsState,
     gateway_did: &str,
@@ -1849,6 +1887,7 @@ fn reject_self_issued(
     role: &str,
     token: &str,
     claims: &Value,
+    issued_here: bool,
 ) -> Result<(), StsError> {
     let Some(issuer) = claims
         .get("iss")
@@ -1859,7 +1898,8 @@ fn reject_self_issued(
     let is_mcp_issuer = |profile: Option<&crate::sts::mcp_profile::McpIssuerProfile>| {
         profile.is_some_and(|profile| profile.issuer == issuer)
     };
-    let self_issued = issuer == gateway_did
+    let gateway_signed = issued_here || issuer == gateway_did;
+    let self_issued = gateway_signed
         || is_mcp_issuer(profile)
         || is_mcp_issuer(
             state
@@ -1867,9 +1907,8 @@ fn reject_self_issued(
                 .mcp_issuer
                 .as_ref(),
         );
-    let legacy_access_token = profile.is_none()
-        && issuer == gateway_did
-        && parse_jose_typ(token).is_some_and(|typ| typ.eq_ignore_ascii_case("JWT"));
+    let legacy_access_token =
+        profile.is_none() && gateway_signed && parse_jose_typ(token).is_some_and(|typ| typ.eq_ignore_ascii_case("JWT"));
     if !self_issued || legacy_access_token {
         return Ok(());
     }
@@ -4075,6 +4114,7 @@ mod tests {
                 .map(|claims| VerifiedAssertion {
                     claims,
                     principal_claim: "oid".to_string(),
+                    issued_here: false,
                 })
                 .ok_or_else(|| StsError::InvalidGrant("unknown test token".to_string()))
         }
@@ -4404,7 +4444,7 @@ mod tests {
         let claims = json!({ "iss": GATEWAY_DID });
         let token = typed_assertion(ID_JAG_JWT_TYP, &claims);
         let state = self_issued_state();
-        let err = reject_self_issued(&state, GATEWAY_DID, None, "subject", &token, &claims)
+        let err = reject_self_issued(&state, GATEWAY_DID, None, "subject", &token, &claims, false)
             .expect_err("an ID-JAG must be refused");
         assert!(matches!(err, StsError::UnsupportedTokenType(_)), "got {err:?}");
     }
@@ -4417,7 +4457,7 @@ mod tests {
         let token = typed_assertion("at+jwt", &claims);
         let state = self_issued_state();
         assert!(
-            reject_self_issued(&state, GATEWAY_DID, None, "subject", &token, &claims).is_err(),
+            reject_self_issued(&state, GATEWAY_DID, None, "subject", &token, &claims, false).is_err(),
             "an access token is a resource credential, not an identity assertion"
         );
     }
@@ -4431,7 +4471,7 @@ mod tests {
         let state = self_issued_state();
         for typ in ["JWT", ID_JAG_JWT_TYP, "at+jwt"] {
             let token = typed_assertion(typ, &claims);
-            reject_self_issued(&state, GATEWAY_DID, None, "subject", &token, &claims)
+            reject_self_issued(&state, GATEWAY_DID, None, "subject", &token, &claims, false)
                 .unwrap_or_else(|e| panic!("an external {typ} should pass: {e:?}"));
         }
     }
@@ -4442,7 +4482,7 @@ mod tests {
         let claims = json!({ "iss": GATEWAY_DID });
         let token = typed_assertion("JWT", &claims);
         let state = self_issued_state();
-        reject_self_issued(&state, GATEWAY_DID, None, "subject", &token, &claims)
+        reject_self_issued(&state, GATEWAY_DID, None, "subject", &token, &claims, false)
             .expect("the legacy exchange accepts one of its own `typ: JWT` access tokens");
     }
 
@@ -4581,5 +4621,97 @@ mod tests {
                 .contains("no verification strategy"),
             "an unknown issuer is not self-trusted: {err}"
         );
+    }
+
+    /// The active signing authority after a rotation: it signs as a VTA DID and
+    /// still publishes the key the rotation retired.
+    struct RotatedAuthority {
+        retired_x: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::identity::authority::CredentialAuthority for RotatedAuthority {
+        async fn issuer_did(&self) -> anyhow::Result<String> {
+            Ok(ROTATED_ISSUER.to_string())
+        }
+
+        async fn issuer_jwks(&self) -> anyhow::Result<Value> {
+            Ok(json!({ "keys": [
+                { "kty": "OKP", "crv": "Ed25519", "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo", "kid": "active" },
+                { "kty": "OKP", "crv": "Ed25519", "x": self.retired_x, "kid": "retired" },
+            ]}))
+        }
+
+        async fn sign_token(
+            &self,
+            _claims: &Value,
+        ) -> anyhow::Result<String> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn sign_token_typ(
+            &self,
+            _claims: &Value,
+            _typ: &str,
+        ) -> anyhow::Result<String> {
+            unimplemented!("not exercised by this test")
+        }
+    }
+
+    const ROTATED_ISSUER: &str = "did:webvh:vta.example:gateway";
+
+    /// An ID-JAG signed by a key the gateway retired is still one the gateway
+    /// issued: the verifier accepts it as the gateway's own, so the exchange
+    /// must refuse it as a subject token exactly as it refuses one signed by the
+    /// active key, rather than letting it skip single-use jwt-bearer redemption.
+    #[tokio::test]
+    async fn an_id_jag_signed_by_a_retired_key_cannot_be_exchanged() {
+        let retired = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
+        let public = retired.verifying_key();
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let mut multicodec = vec![0xed, 0x01];
+        multicodec.extend_from_slice(public.as_bytes());
+        let retired_did = format!("did:key:{}", multibase::encode(multibase::Base::Base58Btc, &multicodec));
+        let now = now_secs();
+        let claims = json!({
+            "iss": retired_did, "sub": "user-1", "aud": ROTATED_ISSUER,
+            "iat": now, "exp": now + 300, "jti": "retired-id-jag",
+        });
+        let signing_input = format!(
+            "{}.{}",
+            b64(json!({ "alg": "EdDSA", "typ": ID_JAG_JWT_TYP, "kid": "retired" })
+                .to_string()
+                .as_bytes()),
+            b64(claims.to_string().as_bytes()),
+        );
+        let signature = ed25519_dalek::Signer::sign(&retired, signing_input.as_bytes());
+        let token = format!("{signing_input}.{}", b64(&signature.to_bytes()));
+
+        let jwt_verifier =
+            Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(Arc::new(crate::jwt_bearer::JwksClient::new())));
+        let mut state = self_issued_state();
+        state.signer = Arc::new(MockSigner {
+            issuer: ROTATED_ISSUER.to_string(),
+        });
+        state.verifier = Arc::new(JwtBearerSubjectVerifier::new(
+            jwt_verifier,
+            Arc::new(EmptyStrategies),
+            Arc::new(RotatedAuthority {
+                retired_x: b64(public.as_bytes()),
+            }),
+        ));
+        let verified = state
+            .verifier
+            .verify_jwt(&token, None)
+            .await
+            .expect("a token signed by a published retired key verifies as the gateway's own");
+        assert!(verified.issued_here);
+
+        let mut form = exchange_form();
+        form.subject_token = Some(token);
+        let err = dispatch_with_profile(&state, &HeaderMap::new(), form, None)
+            .await
+            .expect_err("a gateway-issued ID-JAG is redeemed through jwt-bearer, never exchanged");
+        assert!(matches!(err, StsError::UnsupportedTokenType(_)), "got {err:?}");
     }
 }
