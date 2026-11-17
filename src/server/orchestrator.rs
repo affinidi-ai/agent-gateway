@@ -397,6 +397,77 @@ async fn sync_raw_did_log_if_missing(
     }
 }
 
+#[cfg(feature = "didwebvh")]
+fn log_version_id(line: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|entry| {
+            entry["versionId"]
+                .as_str()
+                .map(str::to_string)
+        })
+}
+
+/// Whether the resolver index holds exactly the versions of the gateway DID log, in order.
+#[cfg(feature = "didwebvh")]
+async fn gateway_did_index_is_current(
+    storage: &Arc<dyn crate::storage::DidLogStorage>,
+    gateway_did: &str,
+    log_src: &std::path::Path,
+) -> bool {
+    let Ok(content) = tokio::fs::read_to_string(log_src).await else {
+        return false;
+    };
+    let log_ids: Vec<Option<String>> = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(log_version_id)
+        .collect();
+    let Ok(indexed) = storage
+        .load_all_raw(gateway_did)
+        .await
+    else {
+        return false;
+    };
+    let indexed_ids: Vec<Option<String>> = indexed
+        .iter()
+        .map(|entry| log_version_id(entry))
+        .collect();
+    !log_ids.is_empty()
+        && log_ids
+            .iter()
+            .all(Option::is_some)
+        && indexed_ids == log_ids
+}
+
+/// Whether the gateway DID document already lists the signing key and the resolver index holds
+/// the whole gateway DID log, read without the gateway DID lock.
+#[cfg(feature = "didwebvh")]
+async fn gateway_did_is_current(
+    issuer: &crate::identity::VCIssuer,
+    storage: &Arc<dyn crate::storage::DidLogStorage>,
+) -> bool {
+    if !issuer
+        .signing_key_is_listed()
+        .await
+    {
+        return false;
+    }
+    let gateway_did = issuer
+        .get_issuer_did()
+        .await
+        .unwrap_or_default();
+    if !gateway_did.starts_with("did:webvh:") {
+        return true;
+    }
+    let log_src = issuer
+        .get_storage_path()
+        .await
+        .join("did.jsonl");
+    gateway_did_index_is_current(storage, &gateway_did, &log_src).await
+}
+
 /// Brings the resolver index up to the gateway DID log, so `/v1/resolve` answers with the
 /// latest gateway DID document: versions the index does not hold yet are added, and an index
 /// that is not the start of the log, by version id, is rebuilt from the log.
@@ -436,23 +507,14 @@ async fn sync_gateway_did_log(
             return;
         }
     };
-    let version_id = |line: &str| {
-        serde_json::from_str::<serde_json::Value>(line)
-            .ok()
-            .and_then(|entry| {
-                entry["versionId"]
-                    .as_str()
-                    .map(str::to_string)
-            })
-    };
     let indexed_ids: Vec<Option<String>> = indexed
         .iter()
-        .map(|entry| version_id(entry))
+        .map(|entry| log_version_id(entry))
         .collect();
     let matches_log = indexed_ids
         .iter()
         .zip(&lines)
-        .all(|(id, line)| id.is_some() && *id == version_id(line));
+        .all(|(id, line)| id.is_some() && *id == log_version_id(line));
     let distinct_versions = indexed_ids
         .iter()
         .collect::<std::collections::HashSet<_>>()
@@ -507,8 +569,10 @@ async fn repair_and_sync_gateway_did(
     repair_and_sync_gateway_did_within(issuer, storage, GATEWAY_DID_REPAIR_LOCK_TIMEOUT).await;
 }
 
-/// Runs under the gateway DID lock, so two nodes Active at once repair the gateway DID and
-/// sync the index one after the other, and the second finds nothing left to do. A volume
+/// A gateway DID document that already lists the signing key, with an index that holds its
+/// whole log, is left as it is without taking the lock. Anything else runs under the gateway
+/// DID lock, so two nodes Active at once repair the gateway DID and sync the index one after
+/// the other, and the second finds nothing left to do. A volume
 /// without the lock runs both unlocked, as before the lock; a lock held past `lock_timeout`
 /// leaves both to the holder and to the next start or promotion.
 #[cfg(feature = "didwebvh")]
@@ -520,6 +584,10 @@ async fn repair_and_sync_gateway_did_within(
     use crate::storage::file_lock::LockOutcome;
 
     if crate::server::mode::is_standby() {
+        return;
+    }
+    if gateway_did_is_current(issuer, storage).await {
+        debug!("Gateway DID document and resolver index are up to date; nothing to repair");
         return;
     }
     let lock = issuer
@@ -5369,6 +5437,54 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "the resolver index is left to the lock holder"
+        );
+    }
+
+    /// A gateway whose DID document already lists the signing key, with an index that holds its
+    /// whole log, neither waits for the gateway DID lock nor writes anything.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn repaired_gateway_with_a_current_index_does_not_wait_for_the_lock() {
+        let (issuer, keys) = crate::identity::test_helpers::test_vc_issuer_without_assertion_multikey().await;
+        let index_dir = tempfile::tempdir().unwrap();
+        let storage = index(index_dir.path());
+        crate::server::mode::in_test_mode(
+            crate::server::mode::ServerMode::Active,
+            super::repair_and_sync_gateway_did_within(&issuer, &storage, std::time::Duration::from_secs(5)),
+        )
+        .await;
+        let log_before = std::fs::read_to_string(keys.path().join("did.jsonl")).unwrap();
+        let did = issuer
+            .get_issuer_did()
+            .await
+            .unwrap();
+        let index_before = storage
+            .load_all_raw(&did)
+            .await
+            .unwrap();
+        assert_eq!(index_before.len(), 2);
+        let crate::storage::file_lock::LockOutcome::Acquired(_held) = issuer
+            .lock_gateway_did(std::time::Duration::ZERO)
+            .await
+        else {
+            panic!("the lock must be free");
+        };
+
+        let started = std::time::Instant::now();
+        crate::server::mode::in_test_mode(
+            crate::server::mode::ServerMode::Active,
+            super::repair_and_sync_gateway_did_within(&issuer, &storage, std::time::Duration::from_secs(5)),
+        )
+        .await;
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "took {:?}", started.elapsed());
+        assert_eq!(std::fs::read_to_string(keys.path().join("did.jsonl")).unwrap(), log_before);
+        assert_eq!(
+            storage
+                .load_all_raw(&did)
+                .await
+                .unwrap(),
+            index_before
         );
     }
 

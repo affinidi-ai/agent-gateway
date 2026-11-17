@@ -25,34 +25,51 @@ pub(crate) async fn open_lock_file(path: &Path) -> anyhow::Result<File> {
     use anyhow::Context;
 
     let path: PathBuf = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let mut options = OpenOptions::new();
-        options
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        options
-            .open(&path)
-            .with_context(|| format!("Failed to open lock file {}", path.display()))
-    })
-    .await
-    .context("Lock file open task failed")?
+    tokio::task::spawn_blocking(move || open_lock_file_blocking(&path))
+        .await
+        .context("Lock file open task failed")?
+}
+
+fn open_lock_file_blocking(path: &Path) -> anyhow::Result<File> {
+    use anyhow::Context;
+
+    let mut options = OpenOptions::new();
+    options
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
+        .open(path)
+        .with_context(|| format!("Failed to open lock file {}", path.display()))
 }
 
 /// Takes the exclusive lock on the file at `path`, retrying while another holder has it, for
 /// up to `timeout`. The lock is tried at least once, so a zero timeout takes a free lock.
+/// Opening and every attempt run on a blocking thread, since each can be a round trip to a
+/// network file server.
 pub(crate) async fn lock_exclusive(
     path: &Path,
     timeout: Duration,
 ) -> LockOutcome {
-    let file = match open_lock_file(path).await {
+    let path: PathBuf = path.to_path_buf();
+    match tokio::task::spawn_blocking(move || lock_exclusive_blocking(&path, timeout)).await {
+        Ok(outcome) => outcome,
+        Err(error) => LockOutcome::Unavailable(anyhow::Error::new(error).context("Lock task failed")),
+    }
+}
+
+fn lock_exclusive_blocking(
+    path: &Path,
+    timeout: Duration,
+) -> LockOutcome {
+    let file = match open_lock_file_blocking(path) {
         Ok(file) => file,
         Err(error) => return LockOutcome::Unavailable(error),
     };
-    let give_up_at = tokio::time::Instant::now() + timeout;
+    let give_up_at = std::time::Instant::now() + timeout;
     loop {
         match file.try_lock() {
             Ok(()) => return LockOutcome::Acquired(file),
@@ -63,10 +80,10 @@ pub(crate) async fn lock_exclusive(
                 );
             }
         }
-        if tokio::time::Instant::now() >= give_up_at {
+        if std::time::Instant::now() >= give_up_at {
             return LockOutcome::TimedOut;
         }
-        tokio::time::sleep(LOCK_RETRY_INTERVAL).await;
+        std::thread::sleep(LOCK_RETRY_INTERVAL);
     }
 }
 

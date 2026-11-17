@@ -587,6 +587,55 @@ impl VCIssuer {
         Ok(changed)
     }
 
+    /// Whether the latest gateway DID log version, for a `did:webvh` DID, and the stored
+    /// `did.json` both list the signing key under `assertionMethod` and `authentication`. Only
+    /// reads, without the gateway DID lock; anything missing or unreadable counts as not listed.
+    #[cfg(feature = "didwebvh")]
+    pub async fn signing_key_is_listed(&self) -> bool {
+        let config = self
+            .config
+            .read()
+            .await
+            .clone();
+        Self::signing_key_is_listed_in(&config)
+            .await
+            .unwrap_or(false)
+    }
+
+    #[cfg(feature = "didwebvh")]
+    async fn signing_key_is_listed_in(config: &VCIssuerConfig) -> Result<bool> {
+        use crate::storage::did_artifacts::{read_did_document, read_did_log_raw};
+
+        let lists = |document: &serde_json::Value, document_id: &str| -> Result<bool> {
+            let mut document = document.clone();
+            let multikey_id = format!("{document_id}#{DEFAULT_SIGNING_KEY_ID}");
+            Ok(!add_signing_key_to_relationships(&mut document, &multikey_id, &config.signing_key)?)
+        };
+        if config
+            .proxy_did
+            .starts_with("did:webvh:")
+        {
+            let Some(log) = read_did_log_raw(&config.storage_path).await? else {
+                return Ok(false);
+            };
+            let latest: serde_json::Value = serde_json::from_str(
+                log.lines()
+                    .map(str::trim)
+                    .rfind(|line| !line.is_empty())
+                    .context("Gateway DID log has no entries")?,
+            )?;
+            if !lists(&latest["state"], &config.proxy_did)? {
+                return Ok(false);
+            }
+        }
+        let Some(content) = read_did_document(&config.storage_path).await? else {
+            return Ok(false);
+        };
+        let document: serde_json::Value = serde_json::from_str(&content)?;
+        let document_id = Self::did_document_id(config)?;
+        Ok(document["id"] == document_id.as_str() && lists(&document, &document_id)?)
+    }
+
     /// Takes the lock that serializes creating, upgrading and repairing the gateway DID between
     /// gateways sharing its storage, waiting up to `timeout` for another holder.
     #[cfg(feature = "didwebvh")]
@@ -3230,6 +3279,32 @@ mod tests {
         );
 
         assert_eq!(read_json(&dir.join("did.json")), foreign_json);
+    }
+
+    /// The signing key reads as listed only once the latest log version and did.json both list
+    /// it under assertionMethod and authentication.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn signing_key_is_listed_only_after_the_repair() {
+        let (issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer_without_assertion_multikey().await;
+        assert!(
+            !issuer
+                .signing_key_is_listed()
+                .await
+        );
+
+        assert!(
+            issuer
+                .authorize_signing_key()
+                .await
+                .unwrap()
+        );
+
+        assert!(
+            issuer
+                .signing_key_is_listed()
+                .await
+        );
     }
 
     /// A `did:webvh` gateway whose did.jsonl is gone still gets its did.json repaired, and no

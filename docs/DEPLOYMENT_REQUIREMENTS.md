@@ -101,8 +101,8 @@ and a `did:web` gateway is moved to `did:webvh`, under an exclusive lock on the
 `.gateway_did.lock` file in that folder, so instances starting together publish one DID with
 the one signing key they all hold: the first creates them and the others wait, then load what
 it wrote. A gateway whose keys and `did:webvh` DID are already in place loads them without
-the lock and creates nothing; an Active node takes the lock briefly to repair the DID document
-(see [Server mode](CONFIGURATION_RELOAD.md#server-mode)). Several instances need file locks
+the lock and creates nothing; an Active node takes the lock briefly only when its DID document
+or resolver index still needs repairing (see [Server mode](CONFIGURATION_RELOAD.md#server-mode)). Several instances need file locks
 that hold across hosts (see [Shared storage for several instances](#shared-storage-for-several-instances)).
 Where the lock cannot be taken at all the gateway logs a warning and goes on without it, as a
 single instance can, except that a node started in Standby, as every node of a multi-node
