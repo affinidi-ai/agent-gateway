@@ -19,6 +19,7 @@ export interface MediatorAccessRefusal {
 interface MediatorAccessStepProps {
   dids: MediatorAccessDid[];
   mediatorName: string;
+  /** The mediator refused a DID again after the user tested the connection. */
   refusal?: MediatorAccessRefusal | null;
   error?: string;
   continuing: boolean;
@@ -27,9 +28,10 @@ interface MediatorAccessStepProps {
 }
 
 /**
- * The pause of a pairing on a mediator that only admits known DIDs: shows the
- * DIDs the gateway minted for the mediator's administrator to add, and
- * continues when the user says they are allowed.
+ * The pause of a pairing on a DIDComm Mediator that admits only the DIDs it
+ * allows. Shown when the mediator refused the gateway's new DIDs, or when the
+ * user continues a paused pairing from Connections: the DIDs to add to its
+ * allow list, once as one bundle and once each on its own.
  */
 const MediatorAccessStep: React.FC<MediatorAccessStepProps> = ({
   dids,
@@ -44,26 +46,42 @@ const MediatorAccessStep: React.FC<MediatorAccessStepProps> = ({
     <div className="card-header py-3">
       <h6 className="m-0 font-weight-bold text-primary">
         <i className="fas fa-user-shield me-2" aria-hidden="true"></i>
-        Allow these DIDs on the mediator
+        Add These DIDs to the DIDComm Mediator&apos;s Allow List
       </h6>
     </div>
     <div className="card-body">
-      <p>
-        These DIDs are for you to know. Make sure they are allowed on mediator{' '}
-        <strong>{mediatorName}</strong> before you continue.
+      <p data-testid="mediator-access-explanation">
+        DIDComm Mediator <strong>{mediatorName}</strong> most probably uses{' '}
+        <strong>Explicit Allow</strong>, so it only accepts connections from DIDs on its ACL. This
+        gateway was blocked because the DIDs below aren&apos;t on it yet. Add them to let it
+        connect.
       </p>
       <ul>
         <li>
-          If it is an <code>explicit_deny</code> mediator or a public mediator, you can continue
-          right away.
+          <strong>Hosted by Affinidi:</strong> in the Affinidi Portal, go to DIDComm Mediator,
+          select <strong>Edit</strong> under <strong>Access Controls</strong>, add the DIDs below,
+          and save.
         </li>
         <li>
-          Otherwise, contact the mediator&apos;s administrator to add these DIDs, each with the
-          right to manage its own access list. You can leave this page and continue later from
-          Connections.
+          <strong>Self-hosted:</strong> ask its administrator to add each DID below to the allow
+          list.
         </li>
       </ul>
 
+      <div className="mb-3">
+        <CopyButton
+          text={dids.map(item => item.did).join('\n')}
+          variant="outline-primary"
+          label="Copy All DIDs as a Bundle"
+          title="Copy all the DIDs at once, one per line"
+          data-testid="mediator-access-copy-all"
+        />
+        <div className="small text-muted mt-1">
+          All {dids.length} DIDs in one copy, for the Affinidi Portal.
+        </div>
+      </div>
+
+      <div className="small text-muted mb-1">Or copy each DID on its own:</div>
       <ul className="list-group mb-2">
         {dids.map(item => (
           <li
@@ -83,19 +101,21 @@ const MediatorAccessStep: React.FC<MediatorAccessStepProps> = ({
           </li>
         ))}
       </ul>
-      <CopyButton
-        text={dids.map(item => item.did).join('\n')}
-        variant="outline-primary"
-        label="Copy all DIDs"
-        title="Copy all DIDs, one per line"
-        data-testid="mediator-access-copy-all"
-      />
+      <div className="small text-muted" data-testid="mediator-access-one-way">
+        Use one or the other: all the DIDs as a bundle, or each DID on its own. Not both.
+      </div>
+
+      <p className="mt-3 mb-0">
+        Once the DIDs are allowed, select <strong>Test Connection</strong>. Or select{' '}
+        <strong>Continue Later</strong> and continue from Connections.
+      </p>
 
       {refusal && (
         <div className="alert alert-danger mt-3" role="alert" data-testid="mediator-access-refused">
           <i className="fas fa-exclamation-circle me-2" aria-hidden="true"></i>
-          Mediator {mediatorName} still refuses the {refusal.label} (
-          {topAndTail(refusal.did, 16, 16)}). Ask its administrator to add it, then continue.
+          DIDComm Mediator {mediatorName} still refuses the {refusal.label} (
+          {topAndTail(refusal.did, 16, 16)}). Make sure it is allowed, then select Test Connection
+          again.
         </div>
       )}
       {error && (
@@ -104,7 +124,7 @@ const MediatorAccessStep: React.FC<MediatorAccessStepProps> = ({
         </div>
       )}
 
-      <div className="d-flex justify-content-between mt-4">
+      <div className="d-flex justify-content-end gap-2 mt-4">
         <AppButton
           type="button"
           variant="secondary"
@@ -113,7 +133,7 @@ const MediatorAccessStep: React.FC<MediatorAccessStepProps> = ({
           iconStart={<i className="fas fa-clock" aria-hidden="true"></i>}
           data-testid="mediator-access-later-button"
         >
-          Continue later
+          Continue Later
         </AppButton>
         <AppButton
           type="button"
@@ -121,10 +141,10 @@ const MediatorAccessStep: React.FC<MediatorAccessStepProps> = ({
           size="md"
           onClick={onContinue}
           loading={continuing}
-          iconEnd={<i className="fas fa-arrow-right" aria-hidden="true"></i>}
+          iconStart={<i className="fas fa-plug" aria-hidden="true"></i>}
           data-testid="mediator-access-continue-button"
         >
-          Continue
+          Test Connection
         </AppButton>
       </div>
     </div>

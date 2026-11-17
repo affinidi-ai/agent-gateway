@@ -487,14 +487,13 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                             )}
                         </td>
                         <td className="align-middle">
-                          <div className="d-flex flex-column flex-lg-row gap-2 align-items-start align-items-lg-center">
+                          <div className="d-flex flex-nowrap gap-2 align-items-center">
                             {hasPermission('gateways.edit') && (
                               <>
                                 {gateway.status === 'awaiting-approval' && (
                                   <AppButton
                                     variant="warning"
                                     size="sm"
-                                    className="me-1"
                                     title="Approve Gateway Connection"
                                     data-testid={`gateways-approve-button-${gateway.id}`}
                                     aria-label={`Approve gateway ${gateway.name}`}
@@ -510,7 +509,6 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                   <AppButton
                                     variant="outline-primary"
                                     size="sm"
-                                    className="me-1"
                                     title="Continue adding this gateway"
                                     data-testid={`gateways-continue-button-${gateway.id}`}
                                     aria-label={`Continue adding gateway ${gateway.name}`}
@@ -524,7 +522,6 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                 )}
                                 {gateway.gateway_type !== 'self' && !isGatewayPending(gateway) && (
                                   <AppButton
-                                    style={{ marginLeft: '10px' }}
                                     title="Ping Gateway - Test connectivity"
                                     variant={
                                       pingStatus[gateway.id] === 'pinging'
@@ -560,9 +557,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                   <AppButton
                                     variant="outline-primary"
                                     size="sm"
-                                    style={{ marginLeft: '10px' }}
                                     title="Edit Gateway"
-                                    className="me-1"
                                     data-testid={`gateways-edit-button-${gateway.id}`}
                                     aria-label={`Edit gateway ${gateway.name}`}
                                     onClick={() => navigate(`/gateways/${gateway.id}`)}
@@ -577,7 +572,6 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                               onError={setError}
                               testId={`gateways-use-as-payment-button-${gateway.id}`}
                               iconOnly
-                              className="me-1"
                             />
                             {hasPermission('gateways.delete') &&
                               gateway.gateway_type !== 'self' && (
@@ -586,7 +580,6 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                   onDelete={() => handleDeleteGateway(gateway.id)}
                                   className="btn-sm"
                                   title="Delete Gateway"
-                                  style={{ marginLeft: '10px' }}
                                 />
                               )}
                           </div>
@@ -757,10 +750,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                             )}
                           </td>
                           <td className="align-middle">
-                            <div
-                              className="d-flex flex-wrap gap-2 align-items-center"
-                              style={{ width: '6rem' }}
-                            >
+                            <div className="d-flex flex-nowrap gap-2 align-items-center">
                               {hasPermission('gateways.edit') && (
                                 <AppButton
                                   variant="outline-primary"
