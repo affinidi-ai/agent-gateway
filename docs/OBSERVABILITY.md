@@ -510,7 +510,10 @@ surface's id (see
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)), and the
 event names the Target (`target_endpoint`), `protocol` and `mcp_tool_name`. A
 `vp_injected` record of a Fabric request also carries `via_fabric: true`, with the DID of the
-agent its presentation is for as `agent_did`.
+agent its presentation is for as `agent_did`. `vp_injected` also records a presentation a gateway
+received over Fabric and verified: on the request, detail `request_path_fabric_received`, and on
+the answer to a `fabric://` Target, detail `response_path_fabric_received` (see
+[`FABRIC.md`](FABRIC.md#peer-issuer-dids)).
 
 **File size.** The VP Audit Log is rotated: once the live file reaches
 `[audit] vp_audit_log_max_bytes` (8 MiB by default) it is renamed to the next free position,
@@ -805,8 +808,14 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     own card fetch with no triggering request (the preview), where `trace_id` is absent; a card
     fetch that serves a caller's `/.well-known/agent-card.json` request carries that request's
     trace id. The record carries `provider_id` for a credential provider and a
-    `target_auth` object: `outcome` is `rejected` (the request was refused, `http_status` `502`
-    on HTTP) or `passthrough` (forwarded without the credential, no `http_status`),
+    `target_auth` object: `outcome` is `rejected` (the request was refused, `http_status` on
+    HTTP is the status answered: `500` or `503` for a credential that could not be obtained or
+    sent, `400` for a caller's path or MCP proxy tool URL outside the Target base path),
+    `passthrough` (forwarded without the credential, no `http_status`) or
+    `refused_by_target` (the credential was sent and the peer gateway refused it as its caller
+    credential; `upstream_status` is the peer's status, `401`, and `http_status` `500`; see
+    [Target credential refused by the peer
+    gateway](CREDENTIAL_DELEGATION.md#target-credential-refused-by-the-peer-gateway)),
     `transit_point` names the Transit Point by alias when the credential was a Transit Point's
     `target_auth` (absent for the Target), and
     `oauth_error` is present when the token endpoint answered with an OAuth `error` code: the
@@ -821,15 +830,23 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
   gateway faults (a failed egress check task) are not recorded.
 - `identity_binding_verified` and `identity_binding_failed`: the outcome of checking the identity
   presentation (identity binding VP) a request carries, recorded wherever the gateway checks one:
-  A2A requests on the direct path, MCP requests at admission, Transit Point MCP requests, and, on
-  the fabric receive path, when a surface policy relies on the presentation. These record that a
-  received presentation was checked; `vp_injected` records the gateway creating one.
+  A2A requests on the direct path, MCP requests at admission, Transit Point MCP requests, on
+  the fabric receive path when a surface policy relies on the presentation, and on the answer to a
+  `fabric://` Target. These record that a received presentation was checked; `vp_injected` records
+  the gateway creating one, or the presentation itself once a received one verified.
   - `identity_binding_verified`: the presentation verified and a trust anchor vouches for its
-    issuer. Carries `agent_did`, `issuer_gateway` and the caller-context `assurance`.
+    issuer. Carries `agent_did`, `issuer_gateway` and the caller-context `assurance`; the record
+    for a presentation on an answer to a `fabric://` Target carries no `assurance`, and its
+    `agent_did` names the agent that presented, which is the surface's identity only when the
+    surface takes that identity from the payload.
   - `identity_binding_failed`: `outcome` is `absent` (no presentation was sent), `invalid` (it
-    failed verification, including an issuer the receiving connection does not trust) or
-    `untrusted` (it verified, but no trust anchor was available to vouch for its issuer).
-    `error_detail` is a short diagnostic and never carries the presentation itself.
+    failed verification, or, on a request, its issuer is not one the receiving connection
+    trusts) or `untrusted` (it verified, but no trust anchor was available to vouch for its
+    issuer, or, on an answer to a `fabric://` Target, its issuer is not one of the connection's
+    issuers, including when they cannot be established). `error_detail` is a short diagnostic
+    (at most 256 characters on an answer) and never carries the presentation itself; on an
+    `untrusted` answer it is set only when the connection's issuers could not be established,
+    and says why.
 
 **Policy change events.** Raised by management API requests that change a policy definition or
 where a policy applies (group Policies). Each record carries its body in the `event` variant, e.g.

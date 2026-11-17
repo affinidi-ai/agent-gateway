@@ -107,16 +107,6 @@
 }
 
 /* Validation indicators */
-.text-bg-danger {
-  background-color: var(--danger);
-  color: white;
-}
-
-.text-bg-success {
-  background-color: var(--success);
-  color: white;
-}
-
 .border-danger {
   border-color: var(--danger) !important;
   border-width: 2px !important;
@@ -141,7 +131,7 @@
   display: block;
   margin-top: 0.25rem;
   font-size: 0.875rem;
-  color: var(--danger);
+  color: var(--danger-text);
   padding: 0.5rem;
   background-color: rgba(239, 68, 68, 0.1);
   border-radius: 0.25rem;

@@ -404,6 +404,14 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         );
     }
 
+    if world.gateway_did_without_assertion_multikey {
+        crate::steps::gateway_did::seed_gateway_did_without_assertion_multikey(
+            &temp_dir
+                .path()
+                .join("_storage/vc_keys"),
+        );
+    }
+
     if world.affinidi_cache_seeded {
         let cache_dir = temp_dir
             .path()
@@ -995,7 +1003,7 @@ async fn caller_sends_a2a_message_send_with_mapped_identity_headers(
 }
 
 #[when(
-    regex = r#"^the caller sends an A2A message/send request to surface "([^"]+)" with header "([^"]+)" set to "([^"]+)"$"#
+    regex = r#"^the caller sends an A2A message/send request to surface "([^"]+)" with header "([^"]+)" set to "([^"]*)"$"#
 )]
 async fn caller_sends_a2a_message_send_with_header(
     world: &mut SurfaceWorld,
@@ -2622,12 +2630,36 @@ async fn get_path_and_record(
     path: &str,
     headers: Vec<(String, String)>,
 ) {
+    request_path_and_record(world, reqwest::Method::GET, path, headers).await;
+}
+
+#[when(expr = "the caller sends a {word} request to the surface route path {string}")]
+async fn caller_sends_method_request_to_route_path(
+    world: &mut SurfaceWorld,
+    method: String,
+    path: String,
+) {
+    let full_path = format!("{}{}", world.surface_config.route, path);
+    if method.eq_ignore_ascii_case("POST") {
+        send_request_to_path_and_record(world, &full_path, vec![]).await;
+        return;
+    }
+    let method = reqwest::Method::from_bytes(method.as_bytes()).expect("step method must be a valid HTTP method");
+    request_path_and_record(world, method, &full_path, vec![]).await;
+}
+
+async fn request_path_and_record(
+    world: &mut SurfaceWorld,
+    method: reqwest::Method,
+    path: &str,
+    headers: Vec<(String, String)>,
+) {
     ensure_gateway_running(world).await;
 
     let infra = world.infra.as_ref().unwrap();
     let url = format!("http://127.0.0.1:{}{}", infra.gateway_port, path);
 
-    let mut req = reqwest::Client::new().get(&url);
+    let mut req = reqwest::Client::new().request(method, &url);
     for (name, value) in &headers {
         req = req.header(name.as_str(), value.as_str());
     }
@@ -3086,6 +3118,59 @@ pub(crate) async fn send_mcp_request_through_transit_point_path_with_headers(
     body: serde_json::Value,
     headers: Vec<(String, String)>,
 ) {
+    send_through_transit_point_path(world, agent_name, reqwest::Method::POST, path, Some(body), headers).await;
+}
+
+#[when(
+    expr = "managed agent {string} reads {string} with {word} through Transit Point {string} with its transit token"
+)]
+async fn managed_agent_reads_through_transit_point_with_its_token(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    document: String,
+    method: String,
+    transit_point: String,
+) {
+    let headers = with_transit_token(world, Vec::new());
+    read_through_transit_point(world, &agent_name, &method, &transit_point, &document, headers).await;
+}
+
+#[when(expr = "managed agent {string} reads {string} with {word} through Transit Point {string}")]
+async fn managed_agent_reads_through_transit_point(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    document: String,
+    method: String,
+    transit_point: String,
+) {
+    read_through_transit_point(world, &agent_name, &method, &transit_point, &document, Vec::new()).await;
+}
+
+async fn read_through_transit_point(
+    world: &mut SurfaceWorld,
+    agent_name: &str,
+    method: &str,
+    transit_point: &str,
+    document: &str,
+    headers: Vec<(String, String)>,
+) {
+    let method = match method {
+        "GET" => reqwest::Method::GET,
+        "HEAD" => reqwest::Method::HEAD,
+        other => panic!("a discovery read is a GET or HEAD, not {other}"),
+    };
+    let path = format!("/transit/{transit_point}/{}", document.trim_start_matches('/'));
+    send_through_transit_point_path(world, agent_name, method, &path, None, headers).await;
+}
+
+async fn send_through_transit_point_path(
+    world: &mut SurfaceWorld,
+    agent_name: &str,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+    headers: Vec<(String, String)>,
+) {
     world
         .actors
         .expect_target_kind(agent_name, TargetActorKind::ManagedAgent);
@@ -3103,18 +3188,18 @@ pub(crate) async fn send_mcp_request_through_transit_point_path_with_headers(
         .unwrap_or_else(|error| panic!("outbound listener did not become ready on port {outbound_port}: {error}"));
     let url = format!("http://127.0.0.1:{}{}", outbound_port, path);
 
-    world.sent_body = Some(body.clone());
-    let mut request = reqwest::Client::new()
-        .post(&url)
-        .header("content-type", "application/json");
+    let mut request = reqwest::Client::new().request(method, &url);
+    if let Some(body) = body {
+        world.sent_body = Some(body.clone());
+        request = request.json(&body);
+    }
     for (name, value) in headers {
         request = request.header(name, value);
     }
     let response = request
-        .json(&body)
         .send()
         .await
-        .expect("send MCP request through Transit Point");
+        .expect("send request through Transit Point");
 
     let status = response.status().as_u16();
     let headers = collect_headers(response.headers());

@@ -13,7 +13,12 @@ jest.mock('../../../../utils/issuersCache', () => ({
 }));
 jest.mock('../../../../utils/authoritiesCache', () => ({
   getAuthorities: () =>
-    Promise.resolve([{ id: 'a-1', name: 'Payments Authority', did: 'did:web:auth.example' }]),
+    Promise.resolve([
+      { id: 'a-1', name: 'Payments Authority', did: 'did:web:auth.example' },
+      { id: 'a-a', name: 'authority-A', did: 'did:web:authority-a' },
+      { id: 'a-b', name: 'authority-B', did: 'did:web:authority-b' },
+      { id: 'a-c', name: 'authority-C', did: 'did:web:authority-c' },
+    ]),
 }));
 
 const AP_SLOT = 'request:trust-check-access_point_trust_check_list';
@@ -105,7 +110,7 @@ describe('TrustCheckPanel — sidebar context block', () => {
     expect(within(ctx).getByText(/destination entity before sending/i)).toBeInTheDocument();
   });
 
-  it('preserves a JSON-API-authored query name in the preview list (no editor, but still visible)', () => {
+  it('lists a JSON-API-authored query without its name', () => {
     const props = baseProps(AP_SLOT, {
       queries: [
         {
@@ -119,7 +124,11 @@ describe('TrustCheckPanel — sidebar context block', () => {
     });
     render(<TrustCheckPanel {...(props as any)} />);
 
-    expect(screen.getByText(/issuer-accreditation/)).toBeInTheDocument();
+    // The side panel shows the query number and record type only; the name still round-trips.
+    expect(screen.getByTestId('trust-check-panel-query-0')).toHaveTextContent(
+      /^Query 1Authorization$/
+    );
+    expect(screen.queryByText(/issuer-accreditation/)).toBeNull();
     // With at least one query the empty-state block must not render.
     expect(screen.queryByTestId('trust-check-panel-empty-state')).toBeNull();
   });
@@ -183,6 +192,28 @@ describe('TrustCheckPanel — sidebar context block', () => {
 
     // Title row stays visible.
     expect(screen.getByText(/sender of an incoming request/i)).toBeInTheDocument();
+  });
+});
+
+describe('TrustCheckPanel — query list', () => {
+  it('shows only the query number and record type, not its Authorities or name', () => {
+    const config = {
+      queries: [
+        {
+          id: 'q-1',
+          name: 'partner check',
+          trust_registry_id: 'tr-1',
+          query_type: 'recognition',
+          query: {
+            authority_ids: ['did:web:authority-a', '{{ input.agent.identity_issuer_did }}'],
+          },
+        },
+      ],
+    };
+    render(<TrustCheckPanel {...(baseProps(AP_SLOT, config) as any)} />);
+    expect(screen.getByTestId('trust-check-panel-query-0')).toHaveTextContent(
+      /^Query 1Recognition$/
+    );
   });
 });
 
@@ -259,9 +290,17 @@ describe('TrustCheckFullscreenPanel — Authority source', () => {
     return props;
   }
 
-  async function pickAuthority(label: string) {
+  const toggleAuthority = (did: string) =>
+    fireEvent.click(screen.getByTestId(`trust-check-query-0-authority-option-${did}`));
+
+  /** Open the Authority multi-select and check or uncheck each DID in turn. */
+  function toggleAuthorities(...dids: string[]) {
     fireEvent.click(screen.getByTestId('trust-check-query-0-authority'));
-    fireEvent.click(screen.getByText(label));
+    dids.forEach(toggleAuthority);
+  }
+
+  async function swapAuthority(from: string, to: string) {
+    toggleAuthorities(from, to);
     fireEvent.click(screen.getByTestId('trust-check-save'));
   }
 
@@ -275,7 +314,7 @@ describe('TrustCheckFullscreenPanel — Authority source', () => {
 
   it('saves authority_source "authority" beside a picked Authority', async () => {
     const { updateFields } = await openEditor([stored('did:web:issuer.example', 'issuer')]);
-    await pickAuthority('Payments Authority');
+    await swapAuthority('did:web:issuer.example', 'did:web:auth.example');
     const [query] = updateFields.mock.calls[0][0].queries;
     expect(query.authority_source).toBe('authority');
     expect(query.query.authority_id).toBe('did:web:auth.example');
@@ -283,10 +322,83 @@ describe('TrustCheckFullscreenPanel — Authority source', () => {
 
   it('saves authority_source "issuer" beside a picked Issuer', async () => {
     const { updateFields } = await openEditor([stored('did:web:auth.example', 'authority')]);
-    await pickAuthority('Acme Issuer');
+    await swapAuthority('did:web:auth.example', 'did:web:issuer.example');
     const [query] = updateFields.mock.calls[0][0].queries;
     expect(query.authority_source).toBe('issuer');
     expect(query.query.authority_id).toBe('did:web:issuer.example');
+  });
+
+  it('saves several Authorities and an Issuer checked in turn, each with its register', async () => {
+    const { updateFields } = await openEditor([stored('did:web:authority-a', 'authority')]);
+    toggleAuthorities('did:web:authority-b', 'did:web:authority-c', 'did:web:issuer.example');
+    fireEvent.click(screen.getByTestId('trust-check-save'));
+    const [query] = updateFields.mock.calls[0][0].queries;
+    expect(query.query.authority_ids).toEqual([
+      'did:web:authority-a',
+      'did:web:authority-b',
+      'did:web:authority-c',
+      'did:web:issuer.example',
+    ]);
+    expect(query.query).not.toHaveProperty('authority_id');
+    expect(query.authority_sources).toEqual({
+      'did:web:authority-a': 'authority',
+      'did:web:authority-b': 'authority',
+      'did:web:authority-c': 'authority',
+      'did:web:issuer.example': 'issuer',
+    });
+    expect(query).not.toHaveProperty('authority_source');
+  });
+
+  it('does not save once every Authority is unchecked', async () => {
+    const { updateFields } = await openEditor([stored('did:web:authority-a', 'authority')]);
+    toggleAuthorities('did:web:authority-a');
+    fireEvent.click(screen.getByTestId('trust-check-save'));
+    expect(updateFields).not.toHaveBeenCalled();
+    expect(screen.getByTestId('trust-check-query-0-authority')).toHaveClass('is-invalid');
+  });
+
+  it('saves a single authority_id again once the others are unchecked', async () => {
+    const { updateFields } = await openEditor([stored('did:web:authority-a', 'authority')]);
+    toggleAuthorities('did:web:authority-b', 'did:web:authority-a');
+    fireEvent.click(screen.getByTestId('trust-check-save'));
+    const [query] = updateFields.mock.calls[0][0].queries;
+    expect(query.query).toEqual({ authority_id: 'did:web:authority-b' });
+    expect(query.authority_source).toBe('authority');
+    expect(query).not.toHaveProperty('authority_sources');
+  });
+
+  it('opens a stored list of Authorities checked in order, with nothing to save', async () => {
+    const listed = {
+      id: 'q-1',
+      trust_registry_id: 'tr-1',
+      query_type: 'recognition',
+      authority_sources: { 'did:web:authority-b': 'authority', 'did:web:issuer.example': 'issuer' },
+      query: { authority_ids: ['did:web:authority-b', 'did:web:issuer.example'] },
+    };
+    const { updateFields } = await openEditor([listed]);
+    expect(screen.getByTestId('trust-check-query-0-authority')).toHaveTextContent(
+      'authority-B, Acme Issuer'
+    );
+    expect(screen.getByTestId('trust-check-save')).toBeDisabled();
+    expect(updateFields).not.toHaveBeenCalled();
+  });
+
+  it('saves queries naming any number of Authorities in total', async () => {
+    const listOf = (id: string, count: number) => ({
+      id,
+      trust_registry_id: 'tr-1',
+      query_type: 'recognition',
+      query: { authority_ids: Array.from({ length: count }, (_, i) => `did:web:${id}-${i}`) },
+    });
+    const { updateFields } = await openEditor([
+      listOf('first', 20),
+      listOf('second', 6),
+      stored('did:web:authority-a', 'authority'),
+    ]);
+    fireEvent.click(screen.getByTestId('trust-check-query-2-remove'));
+    expect(screen.getByTestId('trust-check-add-query')).toBeEnabled();
+    fireEvent.click(screen.getByTestId('trust-check-save'));
+    expect(updateFields).toHaveBeenCalled();
   });
 
   it('flags a deleted Authority once the register has loaded', async () => {

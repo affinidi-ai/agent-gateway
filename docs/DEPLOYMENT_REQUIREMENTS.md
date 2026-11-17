@@ -83,9 +83,10 @@ storage next to `_storage`, never inside it: a restore empties `_storage`. A ful
 covers `_storage` except `logs/` and `system_metrics/`. Back up `config.toml`,
 `gateway.json`, the other configuration files and the TLS certificates separately. See
 [Locating the files](CONFIGURATION_REFERENCE.md#locating-the-files). Where
-`[storage_paths] vc_keys` points, the gateway creates its transit token key on its first
-start by linking a complete copy into place, so that instances starting together create one
-key between them. Local disks, EFS and NFS support hard links. Where the link fails, as it
+`[storage_paths] vc_keys` points, the gateway creates its transit token key and its login
+decoy credential key on its first start (the decoy key on its first start in passkey sign-in
+mode), each by linking a complete copy into place, so that
+instances starting together create one key between them. Local disks, EFS and NFS support hard links. Where the link fails, as it
 does on a volume without them such as an Azure Files SMB share, the gateway logs a warning
 and creates the key file exclusively instead, filling it in place; instances still share one
 key, and one reading the file while another fills it waits up to 5 seconds for it to be
@@ -95,12 +96,47 @@ restart; a key file that holds no content, which a first start killed while fill
 leaves behind, is removed and created again instead, but only by an instance that found it
 unchanged across those 5 seconds, so a file another instance is filling is left alone. See
 [Transit token](SOURCE_AUTH.md#transit-token) for the whole
-rule and the error. No configuration beyond the mount
+rule and the error. The gateway's own DID and its signing and key agreement keys are created,
+and a `did:web` gateway is moved to `did:webvh`, under an exclusive lock on the
+`.gateway_did.lock` file in that folder, so instances starting together publish one DID with
+the one signing key they all hold: the first creates them and the others wait, then load what
+it wrote. A gateway whose keys and `did:webvh` DID are already in place loads them without
+the lock and creates nothing; an Active node takes the lock briefly only when its DID document
+or resolver index still needs repairing (see [Server mode](CONFIGURATION_RELOAD.md#server-mode)). Several instances need file locks
+that hold across hosts (see [Shared storage for several instances](#shared-storage-for-several-instances)).
+Where the lock cannot be taken at all the gateway logs a warning and goes on without it, as a
+single instance can, except that a node started in Standby, as every node of a multi-node
+gateway is, stops with an error rather than create a gateway DID that does not exist yet. A start still waiting after 30 seconds for an
+instance that holds the lock loads the DID if that instance has finished publishing it, and
+otherwise stops with an error and is restarted. No configuration beyond the mount
 is needed: the gateway reacts to what the volume does. Mount an SMB share with options that
 keep the key file readable by its owner only (`file_mode=0600`, `dir_mode=0700`, and `uid`
 and `gid` matching the user the gateway runs as, or your platform's equivalent for the
 share). A mount that applies its own mode instead leaves the key readable by others on the
 host; the gateway warns about it and starts.
+
+### Shared storage for several instances
+
+Instances that share one `_storage` volume, such as an Active node and its Standby nodes, take
+turns through advisory file locks on that volume: the gateway DID lock (`.gateway_did.lock` in
+`vc_keys`) and the delegation vault's mutation lock (see
+[Credential delegation](CREDENTIAL_DELEGATION.md)). The file server must grant each lock to one
+host at a time:
+
+| Volume | Locks hold across hosts |
+| --- | --- |
+| Local disk (one host) | Yes |
+| Amazon EFS, NFSv4 | Yes |
+| NFS mounted with `nolock`, `local_lock=flock` or `local_lock=all` | No: each host grants its own locks |
+| Azure Files (SMB) | Not verified |
+
+The gateway cannot tell when a mount grants locks only on its own host: the lock is taken
+without an error, so nodes on different hosts may each create their own gateway DID or write
+the vault at the same time. Mount NFS without those options. On a volume that refuses locks
+outright, a node started in Standby refuses to create a new gateway DID; creating it on an
+Active node, upgrading an existing one or repairing it logs a warning and goes on without the
+lock; and a vault change fails. A lock held by a host that stopped is released when the file server's
+lease for that host expires.
 
 Back up with full `.agbak` archives from the dashboard or the management API; see
 [Storage export and backup](development/DEVELOPMENT.md#storage-export-and-backup). Treat
@@ -148,7 +184,8 @@ you open any listener:
   is listed, the gateway sees every caller as the balancer's address, so the STS token
   endpoint throttle, which is on by default, counts them all as one source: a burst of
   failed client logins through the balancer locks every STS client out for
-  `lockout_secs`. The SAML and CLI login limits, when enabled, share one budget the same way. The
+  `lockout_secs`. The passkey, SAML and CLI login limits, when enabled, share one budget the
+  same way. The
   balancer must append the caller's address to `X-Forwarded-For` or overwrite it, and set
   or strip `X-Forwarded-Host` and `X-Forwarded-Proto` rather than pass a caller's through.
 - **Register the first administrator before anyone else can reach the gateway.** The

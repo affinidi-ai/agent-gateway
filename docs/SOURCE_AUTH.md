@@ -485,6 +485,15 @@ and limit requests per client upstream of the gateway if credential guessing is 
 `Caller credential missing or invalid`; the reason is logged. Public discovery reads, the DID Auth ceremony and
 onboarding surfaces are unaffected.
 
+On Fabric receive, when the gateway verified exactly one credential, read from a header the
+request carries, and refuses it with `401` (plainly or with the protected resource discovery
+challenge), its `ForwardResponse` also names that header in the envelope field `caller_refusal`
+(`{"credential_header": "x-api-key"}`, lowercase), never in the body. A missing credential,
+credentials for more than one method, a credential read from the body or a client certificate,
+and a public Access Point get no `caller_refusal`. The sending gateway uses it to tell its own
+Target credential being refused from any other `401` (see [Target credential refused by the
+peer gateway](CREDENTIAL_DELEGATION.md#target-credential-refused-by-the-peer-gateway)).
+
 Create and update responses are the saved surface plus `access_point_status` and, when it
 names a key id, `api_key_references`. A save warns
 in `Warning` headers (code 299), before the Transit Point warnings described below, when the
@@ -1013,7 +1022,7 @@ Which requests carry one:
 | Pipeline | Issues a transit token |
 | --- | --- |
 | Access Point (direct HTTP: MCP, A2A, HTTP) | For every request it forwards to the managed agent of a surface with Transit Points, an anonymous caller's included, but not for an agent card fetch |
-| Fabric receive, buffered and framed stream | For every request a paired gateway sends that it forwards to an HTTP or HTTPS Target of a surface with Transit Points, but not for a public discovery `GET` such as an agent card fetch. The token lists every Transit Point of the surface, as the Access Point's does; which partners reach a surface is set by peer exposure (see [`FABRIC.md`](FABRIC.md#which-transit-points-a-partner-can-drive)). When one should be issued and cannot be, the request is refused with `503` |
+| Fabric receive, buffered and framed stream | For every request a paired gateway sends that it forwards to an HTTP or HTTPS Target of a surface with Transit Points, but not for a public discovery `GET` such as an agent card fetch, or the gateway's own agent card fetch at a configured card location. The token lists every Transit Point of the surface, as the Access Point's does; which partners reach a surface is set by peer exposure (see [`FABRIC.md`](FABRIC.md#which-transit-points-a-partner-can-drive)). When one should be issued and cannot be, the request is refused with `503` |
 | `proxy://` and `a2a-proxy://` Targets, on either path | Never: the gateway runs the MCP Proxy and there is no agent, and an A2A Proxy's backend, such as Direct Line, must never see one |
 | Fabric send, the STS, the management API | Never |
 
@@ -1092,19 +1101,30 @@ A `2026-07-28` MCP request must also carry exactly one token, and allows no cloc
 The refusal says only that the transit token is missing or invalid; which check it failed is
 logged.
 
-A discovery read is forwarded without a transit token check, and so without any credential
-(see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#when-a-credential-cannot-be-resolved)).
-It is a `GET` or `HEAD` whose path below the Transit Point, which is the path the target
-receives below its endpoint, is exactly one of `.well-known/agent-card.json`,
-`.well-known/agent.json`, `.well-known/agent-card`, `.well-known/ucp`, `agent-card.json`,
-`agent.json` or `discovery`, with at most one trailing slash. A document below another
-segment, such as `admin/discovery`, and a spelling with percent-escapes, `;` parameters, `\`
-or `.` and `..` segments are not discovery reads, whatever the target resolves them to, so
-they need a transit token.
+#### Discovery reads on a Transit Point
 
-Transit Point policies see the caller the token carries in `input.transit.caller`, and a
-client the Transit Point verified itself apart from it, in `input.transit.client`; see
-[`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input).
+A discovery read is a `GET` or `HEAD` whose path below the Transit Point, which is the path the
+target receives below its endpoint, is exactly one of `.well-known/agent-card.json`,
+`.well-known/agent.json`, `.well-known/agent-card`, `.well-known/ucp`, `agent-card.json`,
+`agent.json` or `discovery`, with at most one trailing slash. A document below another segment,
+such as `admin/discovery`, and a spelling with percent-escapes, `;` parameters, `\` or `.` and
+`..` segments are not discovery reads, whatever the target resolves them to.
+
+A discovery read needs a transit token like any other Transit Point request: without a valid one
+it is refused with `401` on a Transit Point that requires one, and a Transit Point with
+`require_transit_token: false` forwards it without one and still checks one the agent sends: a
+valid token names the caller to policy, and an invalid one is ignored, leaving the caller
+anonymous. It then runs the rest of the
+outbound pipeline, Trust Check and the gateway, surface and Transit Point policies included,
+except identity resolution, since it has no body to resolve an identity from. It is forwarded
+without any caller credential, delegated or `target_auth`, and without caller identity headers
+(see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#when-a-credential-cannot-be-resolved)).
+
+Transit Point policies see the caller the token carries in `input.transit.caller`, a discovery
+read's included, and a client the Transit Point verified itself apart from it, in
+`input.transit.client`; see [`POLICY.md`](POLICY.md#caller-in-transit-point-policy-input).
+
+An Access Point's discovery documents stay public; only the Transit Point needs the token.
 
 The signing key is 32 random bytes the gateway creates on its first start, in
 `transit_token_key.json` under `[storage_paths] vc_keys`, readable by the owner only and
@@ -1331,7 +1351,12 @@ on a direct request to an inbound `from_api_key` surface, where the key's DID re
 On the protected slot, `payload_extraction` refuses a response that carries no identity with
 `422 identity_extension_missing`, and one whose identity is present but invalid with `422
 identity_validation_failed`, except on a public card this gateway serves to a peer over Fabric,
-which is served without an identity credential on any identity error. The public agent card of
+which is served without an identity credential on any identity error, and on a `2xx` answer from
+a `fabric://` Target that carries a verified identity presentation from one of the connection's
+issuers, which is the identity instead (see [`FABRIC.md`](FABRIC.md#peer-issuer-dids)).
+Accepted risk: the surface's identity schema and rules do not run on such an answer; the paired
+gateway applied its own to the raw extension it replaced, and the issuer check stands in for
+them. The public agent card of
 an A2A or AP2 surface is the exception for a missing identity: a named card with neither
 `agent-identity/v1` nor `agent-identity-credential/v1` is served as anonymous, with no identity
 credential and no Trust Recorder write. The gateway logs a `WARN` once per surface, and again

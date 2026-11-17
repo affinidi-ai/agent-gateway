@@ -6,7 +6,7 @@
 //! Trust Recorder entry stops writing, instead of both carrying on under a DID nothing vouches
 //! for.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -123,9 +123,12 @@ pub struct AuthorityReference {
     pub did: String,
     pub source: Option<AuthoritySource>,
     pub used_by: AuthorityUse,
+    /// The field that records `source`: `authority_source`, or `authority_sources` for a DID
+    /// of `query.authority_ids`.
+    pub source_field: &'static str,
 }
 
-type Visit<'v> = dyn FnMut(&str, &mut Option<AuthoritySource>, AuthorityUse) + 'v;
+type Visit<'v> = dyn FnMut(&str, &mut Option<AuthoritySource>, AuthorityUse, &'static str) + 'v;
 
 /// Calls `visit` with every authority DID of `surface`, on its base and in each variant's
 /// overrides, its source, and where it is set.
@@ -204,7 +207,7 @@ fn visit_legs(
     for (placement, elements) in legs {
         for element in elements.unwrap_or_default() {
             let used_by = AuthorityUse::trust_check(element, Some(placement), None, variant);
-            visit(&element.query.authority_id, &mut element.authority_source, used_by);
+            visit_trust_check(element, used_by, visit);
         }
     }
     for point in transit_points.unwrap_or_default() {
@@ -215,7 +218,7 @@ fn visit_legs(
                 Some(&point.alias),
                 variant,
             );
-            visit(&element.query.authority_id, &mut element.authority_source, used_by);
+            visit_trust_check(element, used_by, visit);
         }
     }
     for entry in trust_recorder
@@ -227,19 +230,50 @@ fn visit_legs(
         .unwrap_or_default()
     {
         let used_by = AuthorityUse::trust_recorder(entry, variant);
-        visit(&entry.authority_did, &mut entry.authority_source, used_by);
+        visit(&entry.authority_did, &mut entry.authority_source, used_by, "authority_source");
     }
+}
+
+/// Calls `visit` with the authority DID of `element` and its `authority_source`, or with each
+/// DID of `query.authority_ids` and its entry in `authority_sources`, in list order. Validation
+/// refuses `authority_sources` keys the element does not list; this drops any that reach it
+/// anyway.
+fn visit_trust_check(
+    element: &mut TrustCheckElement,
+    used_by: AuthorityUse,
+    visit: &mut Visit<'_>,
+) {
+    let Some(authorities) = &element.query.authority_ids else {
+        element
+            .authority_sources
+            .clear();
+        visit(&element.query.authority_id, &mut element.authority_source, used_by, "authority_source");
+        return;
+    };
+    let mut sources = BTreeMap::new();
+    for did in authorities {
+        let mut source = element
+            .authority_sources
+            .get(did)
+            .copied();
+        visit(did, &mut source, used_by.clone(), "authority_sources");
+        if let Some(source) = source {
+            sources.insert(did.clone(), source);
+        }
+    }
+    element.authority_sources = sources;
 }
 
 /// Every authority DID a surface sets, on its base and in each variant's overrides.
 pub fn surface_references(surface: &AgentSurface) -> Vec<AuthorityReference> {
     let mut surface = surface.clone();
     let mut references = Vec::new();
-    visit_surface(&mut surface, &mut |did, source, used_by| {
+    visit_surface(&mut surface, &mut |did, source, used_by, source_field| {
         references.push(AuthorityReference {
             did: did.to_string(),
             source: *source,
             used_by,
+            source_field,
         });
     });
     references
@@ -247,17 +281,19 @@ pub fn surface_references(surface: &AgentSurface) -> Vec<AuthorityReference> {
 
 /// Every authority DID an STS client's Trust Checks set.
 pub fn trust_check_references(elements: &[TrustCheckElement]) -> Vec<AuthorityReference> {
-    elements
-        .iter()
-        .map(|element| AuthorityReference {
-            did: element
-                .query
-                .authority_id
-                .clone(),
-            source: element.authority_source,
-            used_by: AuthorityUse::trust_check(element, None, None, None),
-        })
-        .collect()
+    let mut references = Vec::new();
+    for element in elements {
+        let used_by = AuthorityUse::trust_check(element, None, None, None);
+        visit_trust_check(&mut element.clone(), used_by, &mut |did, source, used_by, source_field| {
+            references.push(AuthorityReference {
+                did: did.to_string(),
+                source: *source,
+                used_by,
+                source_field,
+            });
+        });
+    }
+    references
 }
 
 /// The Authorities and Issuers an authority DID is classified against.
@@ -341,7 +377,7 @@ impl AuthorityRegisters {
             .unwrap_or_default();
         let tenant_id = surface.tenant_id.clone();
         let mut changed = false;
-        visit_surface(surface, &mut |did, source, _| {
+        visit_surface(surface, &mut |did, source, _, _| {
             changed |= self.classify(did, source, tenant_id.as_deref(), &kept);
         });
         changed
@@ -359,7 +395,10 @@ impl AuthorityRegisters {
             .unwrap_or_default();
         let mut changed = false;
         for element in elements {
-            changed |= self.classify(&element.query.authority_id, &mut element.authority_source, tenant_id, &kept);
+            let used_by = AuthorityUse::trust_check(element, None, None, None);
+            visit_trust_check(element, used_by, &mut |did, source, _, _| {
+                changed |= self.classify(did, source, tenant_id, &kept);
+            });
         }
         changed
     }
@@ -375,8 +414,9 @@ impl AuthorityRegisters {
         for reference in references {
             if reference.source.is_some() && is_template(&reference.did) {
                 return Err(format!(
-                    "{}: authority_source cannot be set on a template; remove it or use a DID",
-                    reference.used_by.label()
+                    "{}: {} cannot be set on a template; remove it or use a DID",
+                    reference.used_by.label(),
+                    reference.source_field
                 ));
             }
             if requires_authority(&reference.did, reference.source)
@@ -944,6 +984,142 @@ mod tests {
             .map(|entry| missing.fails_entry(entry))
             .collect();
         assert_eq!(failing, [false, true, false]);
+    }
+
+    fn listed(
+        id: &str,
+        dids: &[&str],
+        sources: serde_json::Value,
+    ) -> serde_json::Value {
+        json!({
+            "id": id, "trust_registry_id": "tr-1", "query_type": "recognition",
+            "query": {"authority_ids": dids, "entity_id": "{{ input.agent.did }}"},
+            "authority_sources": sources
+        })
+    }
+
+    fn listed_sources(surface: &AgentSurface) -> serde_json::Value {
+        serde_json::to_value(
+            &surface
+                .access_point
+                .trust_check_list[0]
+                .authority_sources,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn references_list_each_authority_of_a_list_with_its_own_source() {
+        let element = element(listed("authority-recognised", &[ACME, TYPED], json!({ ACME: "authority" })));
+
+        let references: Vec<(String, Option<AuthoritySource>, serde_json::Value)> = trust_check_references(&[element])
+            .into_iter()
+            .map(|reference| (reference.did, reference.source, serde_json::to_value(&reference.used_by).unwrap()))
+            .collect();
+
+        let used_by = json!({"element": "trust_check", "id": "authority-recognised"});
+        assert_eq!(
+            references,
+            [(ACME.to_string(), Some(AuthoritySource::Authority), used_by.clone()), (TYPED.to_string(), None, used_by)]
+        );
+    }
+
+    #[test]
+    fn classify_sets_the_source_of_each_listed_did_and_drops_unlisted_ones() {
+        let template = "{{ input.agent.authority_did }}";
+        let unlisted = json!({ "did:web:unlisted.example": "authority" });
+        let mut surface =
+            surface(vec![listed("authority-recognised", &[ACME, BILLING, TYPED, template], unlisted)], BILLING);
+
+        assert!(registers(vec![authority(ACME, None)]).classify_surface(&mut surface, None));
+
+        assert_eq!(listed_sources(&surface), json!({ ACME: "authority", BILLING: "issuer" }));
+    }
+
+    #[test]
+    fn classify_never_drops_a_link_of_a_listed_did() {
+        let registers = registers(Vec::new());
+        let stored = surface(vec![listed("authority-recognised", &[TYPED], json!({ TYPED: "authority" }))], BILLING);
+
+        let mut dropped = surface(vec![listed("authority-recognised", &[TYPED], json!({}))], BILLING);
+        registers.classify_surface(&mut dropped, Some(&stored));
+
+        assert_eq!(listed_sources(&dropped), json!({ TYPED: "authority" }));
+    }
+
+    #[test]
+    fn classify_trust_checks_sets_the_source_of_each_listed_did() {
+        let mut elements = [element(listed("authority-recognised", &[ACME, TYPED], json!({ TYPED: "issuer" })))];
+
+        assert!(registers(vec![authority(ACME, None)]).classify_trust_checks(&mut elements, None, None));
+
+        assert_eq!(serde_json::to_value(&elements[0].authority_sources).unwrap(), json!({ ACME: "authority" }));
+    }
+
+    #[test]
+    fn check_refuses_a_listed_authority_that_is_gone() {
+        let surface =
+            surface(vec![listed("authority-recognised", &[ACME, TYPED], json!({ TYPED: "authority" }))], BILLING);
+
+        assert_eq!(
+            registers(vec![authority(ACME, None)]).check(&surface_references(&surface), None),
+            Err(format!(
+                "Trust Check 'authority-recognised' uses Authority {TYPED}, which does not exist or belongs to another tenant. Pick \
+                 another Authority or remove the Trust Check"
+            ))
+        );
+    }
+
+    #[test]
+    fn check_refuses_a_listed_authority_another_tenant_owns_as_it_refuses_a_missing_one() {
+        let references = trust_check_references(&[element(listed(
+            "authority-recognised",
+            &[TYPED, ACME],
+            json!({ ACME: "authority" }),
+        ))]);
+        let other_tenants = registers(vec![authority(ACME, Some("tenant-b"))]);
+
+        let refusal = other_tenants
+            .check(&references, Some("tenant-a"))
+            .unwrap_err();
+        assert_eq!(
+            Err(refusal),
+            registers(Vec::new()).check(&references, Some("tenant-a")),
+            "another tenant's listed Authority is refused exactly as a missing one"
+        );
+        assert_eq!(other_tenants.check(&references, Some("tenant-b")), Ok(()));
+    }
+
+    #[test]
+    fn check_refuses_a_source_on_a_listed_template() {
+        let template = "{{ input.agent.authority_did }}";
+        let surface =
+            surface(vec![listed("authority-recognised", &[ACME, template], json!({ template: "issuer" }))], BILLING);
+
+        assert_eq!(
+            registers(Vec::new()).check(&surface_references(&surface), None),
+            Err("Trust Check 'authority-recognised': authority_sources cannot be set on a template; remove it or use a DID"
+                .to_string())
+        );
+    }
+
+    #[test]
+    fn check_refuses_a_kept_listed_authority_that_is_gone() {
+        let registers = registers(vec![authority(ACME, None)]);
+        let stored = surface(
+            vec![listed("authority-recognised", &[ACME, TYPED], json!({ ACME: "authority", TYPED: "authority" }))],
+            BILLING,
+        );
+        let mut saved = surface(vec![listed("authority-recognised", &[ACME, TYPED], json!({}))], BILLING);
+        registers.classify_surface(&mut saved, Some(&stored));
+
+        assert_eq!(
+            registers.check(&surface_references(&saved), None),
+            Err(format!(
+                "Trust Check 'authority-recognised' uses Authority {TYPED}, which does not exist or belongs to another tenant. Pick \
+                 another Authority or remove the Trust Check"
+            ))
+        );
     }
 
     #[test]

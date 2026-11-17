@@ -239,7 +239,8 @@ pub enum ServiceTokenError {
     SecretUnavailable,
     #[error("credential provider token request failed")]
     TokenRequestFailed,
-    /// The token endpoint answered with an OAuth error, whose `error` code this keeps.
+    /// The token endpoint refused the request as a client error with an OAuth error, whose
+    /// `error` code this keeps.
     #[error("credential provider token request rejected: {0}")]
     TokenRequestRejected(oauth::OAuthErrorCode),
     #[error("credential provider token endpoint refused by egress policy")]
@@ -368,7 +369,7 @@ pub async fn acquire(
         CachedToken::RenewalDue(token) => Some(token),
         CachedToken::None if backoff.holds_back(locked_at) => {
             debug!(target: "credential_delegation", provider_id = %provider.provider_id, "Service token request held back by the retry backoff");
-            return Err(ServiceTokenError::TokenRequestFailed);
+            return Err(backoff.held_back_error());
         }
         CachedToken::None => None,
     };
@@ -568,13 +569,20 @@ fn release_idle_slots(
 /// The token requests to one key that failed in a row, and the time before which the next
 /// one is not sent: 1 s after the first failed request ends, doubling up to 60 s. A success
 /// clears it, and the failures are forgotten [`BACKOFF_MEMORY_SECS`] after the retry time.
+/// A request held back fails with the error of the last failed request.
 #[derive(Debug, Default)]
 struct Backoff {
     failures: u32,
     retry_at: Option<DateTime<Utc>>,
+    last_failure: Option<ServiceTokenError>,
 }
 
 impl Backoff {
+    fn held_back_error(&self) -> ServiceTokenError {
+        self.last_failure
+            .unwrap_or(ServiceTokenError::TokenRequestFailed)
+    }
+
     fn holds_back(
         &self,
         now: DateTime<Utc>,
@@ -606,6 +614,7 @@ impl Backoff {
                     .failures
                     .saturating_add(1);
                 self.retry_at = Some(now + backoff_delay(self.failures));
+                self.last_failure = Some(*error);
             }
             Err(_) => {}
         }
@@ -3035,8 +3044,8 @@ mod tests {
                         .acquire(&provider, &["read"], held_back)
                         .await
                         .err(),
-                    Some(ServiceTokenError::TokenRequestFailed),
-                    "{error}"
+                    Some(error),
+                    "a held back request fails as the request that started the backoff: {error}"
                 );
             }
             assert_eq!(fixture.requests().len(), 1, "{error}");
@@ -3204,6 +3213,7 @@ mod tests {
         let mut remembered = Backoff {
             failures: 2,
             retry_at: Some(seconds(start, 4)),
+            ..Backoff::default()
         };
         let _ = remembered.record(failed, seconds(start, 4 + 599));
         assert_eq!((remembered.failures, remembered.retry_at), (3, Some(seconds(start, 4 + 599 + 4))));
@@ -3252,12 +3262,14 @@ mod tests {
         let remembered = Backoff {
             failures: 1,
             retry_at: Some(seconds(now, -599)),
+            ..Backoff::default()
         };
         drop(insert_slot(&slots, "remembered", remembered));
         drop(insert_slot(&slots, "idle", Backoff::default()));
         let forgotten = Backoff {
             failures: 3,
             retry_at: Some(seconds(now, -600)),
+            ..Backoff::default()
         };
         drop(insert_slot(&slots, "forgotten", forgotten));
         release_idle_slots(&slots, now);

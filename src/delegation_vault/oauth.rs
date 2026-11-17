@@ -1172,8 +1172,9 @@ impl std::fmt::Display for OAuthErrorCode {
     }
 }
 
-/// A service token request the token endpoint answered with an OAuth error. Only its `error`
-/// code is kept.
+/// A service token request the token endpoint refused as a client error (a `4xx` other than
+/// `429`) with an OAuth error. Only its `error` code is kept. A `5xx` or `429` answer is a
+/// failed request whatever its body says.
 #[derive(Debug, thiserror::Error)]
 #[error("Provider token request rejected")]
 pub struct TokenRequestRejected {
@@ -1557,10 +1558,12 @@ fn read_token_answer(
         return Ok(None);
     }
     if !status.is_success() {
+        let refused_as_client_error = status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS;
         return Err(
             match value
                 .get("error")
                 .and_then(serde_json::Value::as_str)
+                .filter(|_| refused_as_client_error)
             {
                 Some(error) => anyhow::Error::new(TokenRequestRejected {
                     code: OAuthErrorCode::new(error),
@@ -3592,6 +3595,29 @@ mod tests {
             assert!(!egress.insecure_endpoint(Some("http://idp.internal/token")));
             assert!(!egress.insecure_endpoint(Some("http://idp.test/token")));
             assert!(egress.insecure_endpoint(Some("http://idp.example/token")));
+        }
+
+        #[tokio::test]
+        async fn only_a_client_error_with_an_oauth_error_is_a_rejected_token_request() {
+            let fixture = fixture().await;
+            for (status, rejected) in [(400, true), (401, true), (429, false), (500, false), (503, false)] {
+                let endpoint = token_endpoint(status, json!({"error": "invalid_client"})).await;
+                let provider = provider(
+                    &endpoint.url,
+                    json!({"provider_type": "oauth2_client_credentials",
+                           "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"}),
+                );
+                let error = fetch_scoped_client_credentials_token(&provider, &[], &fixture.secrets, &endpoint.egress)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error
+                        .downcast_ref::<TokenRequestRejected>()
+                        .map(|rejected| rejected.code.as_str()),
+                    rejected.then_some("invalid_client"),
+                    "HTTP {status}"
+                );
+            }
         }
 
         #[tokio::test]

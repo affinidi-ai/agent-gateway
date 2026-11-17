@@ -23,6 +23,18 @@ There are exactly two policy planes — **Gateway** (appliance-to-appliance) and
 `surface.policy` at boot. Deny reason: `data.surface.policy.deny_reason` /
 `data.gateway.policy.deny_reason`.
 
+A surface's own policy is skipped only for a public discovery read: a `GET` or `HEAD` of a path
+ending in `/agent-card.json`, `/agent.json`, `/.well-known/agent-card`, `/.well-known/ucp` or
+`/discovery` (`paths::is_public_request`). This holds on the direct path, Fabric receive, and the
+sending gateway of a `fabric://` Target, so a `POST` to a path that merely ends in
+`/agent-card.json` or `/agent.json` is evaluated like any other call, and the sending gateway
+skips its policy for a `GET` of `/discovery` or `/.well-known/ucp` as the direct path does.
+
+On the direct path and the sending gateway, a request of any method whose path ends in
+`/.well-known/agent-card.json` or `/.well-known/agent.json` is answered by the gateway's own agent
+card fetch, a `GET` to the Target, before policy runs (`handle_agent_card`), so that request never
+reaches the Target as sent.
+
 ### MCP request context (`input.mcp`)
 
 On an MCP surface, gateway and surface policies get `input.mcp` on the direct
@@ -156,8 +168,10 @@ for trust, no identity verification, no TRQP query. A request through a Transit 
 only that Transit Point's results, at `input.trust_check_results.target`, in all three
 outbound OPA scopes (gateway, surface, Transit Point).
 
-A list holds at most `TRUST_CHECK_LIST_MAX` (10) elements
-([`src/config/agent_surface.rs`](../src/config/agent_surface.rs)). A surface variant
+A list has no limit on its elements or on the authorities they query
+([`src/config/agent_surface.rs`](../src/config/agent_surface.rs)). The gateway queries every
+listed authority of a leg at once, so each authority adds one TRQP message per request (see
+the accepted risk under [_Several authorities in one query_](#several-authorities-in-one-query)). A surface variant
 override replaces the whole list verbatim, never element by element; a variant gives its
 Transit Points their own lists through its `transit.points` override.
 
@@ -260,6 +274,8 @@ Element validation is in
 | `id` | Required, unique within the leg, at most `TRUST_CHECK_ID_MAX_CODE_POINTS` (64) code points. Rego-addressable and audit-visible. |
 | `name` | Optional display label, at most `TRUST_CHECK_NAME_MAX_CODE_POINTS` (64) code points. |
 | `id` and `name` | Control, DEL, C1, and bidi-override codepoints are rejected. |
+| `query.authority_id` / `query.authority_ids` | Exactly one is set. `authority_ids` holds one or more distinct, non-blank DIDs or templates. `authority_sources` is refused without `authority_ids` or with a key `authority_ids` does not list, and `authority_source` is refused with `authority_ids`. |
+| `timeout_secs` | Optional on a single-authority element; without it the element waits for the trust registry transport's own timeout. Refused on a multi-authority element, where each authority always waits `TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS` (5). |
 
 The two caps are separate constants that happen to share a value today, because `id` is
 addressable from policy while `name` is only a label. Counts are code points, not bytes.
@@ -268,6 +284,79 @@ When an audit sink selects `trust_check`, each element's outcome is recorded wit
 surface id, the request's trace id and the authenticated caller (on the Access Point, Fabric
 and MCP-proxy paths), so a trust check can be tied to the request and principal that
 triggered it. On the outbound path the record also names the Transit Point.
+
+### Several authorities in one query
+
+A query that must accept an entity any of several organisations recognises lists them in
+`query.authority_ids` instead of `query.authority_id`:
+
+```json
+{
+  "id": "authority-recognised",
+  "trust_registry_id": "tr-main",
+  "query_type": "recognition",
+  "query": {
+    "authority_ids": ["did:web:authority-a", "did:web:authority-b", "did:web:authority-c"],
+    "entity_id": "{{ input.agent.did }}"
+  }
+}
+```
+
+The gateway sends one TRQP query per listed authority, all at once, and waits until each one
+answers or reaches its built-in 5-second timeout (`TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS`),
+which fails that authority's result with `QUERY_TIMEOUT`; it never stops early and never
+combines the answers. Such an element cannot set `timeout_secs`. Each
+authority gets its own result, in list order, all carrying the element's `id` and each its own
+`authority_id`, and its own audit record and `agent_gateway_trust_check_total` sample. A result
+failed with `AGENT_CARD_UNAVAILABLE`, `TRUST_REGISTRY_METADATA_UNAVAILABLE`,
+`IDENTITY_VP_VERIFICATION_FAILED` or `TARGET_AGENT_IDENTITY_UNAVAILABLE` omits `authority_id`
+and `entity_id`, so the authorities of one element tell such results apart only by order. A
+template that fails to resolve, a missing metadata field or an unreachable registry fails only
+that authority's result. An authority that resolves to a blank value, in a list or in
+`query.authority_id`, fails with `TEMPLATE_RESOLUTION_FAILED` without querying its registry.
+When the target cannot be checked at all (for example its agent card
+is unavailable), every listed authority gets a result with that error code.
+
+Because several results share an `id`, an any-of rule iterates them:
+
+```rego
+allow if {
+    some r in input.trust_check_results.caller
+    r.id == "authority-recognised"
+    r.ok
+}
+```
+
+A rule that addresses one result by `id` alone matches every authority of the element.
+`authority_sources` maps each listed literal DID to the register it was picked from, as
+`authority_source` does for `authority_id` (see
+[_The authority of a Trust Check_](#the-authority-of-a-trust-check)); a template or a DID in
+neither register has no entry. A listed Authority that no longer exists fails only its own
+result with `AUTHORITY_NOT_FOUND`, and the other authorities are queried as usual. The Surface
+Builder's fullscreen editor picks that list in one multi-select of the Issuers and Authorities
+registers; see _Authority lists_ in
+[`www/default/AGENTS.md`](../www/default/AGENTS.md).
+
+Accepted risk: nothing bounds how many authorities a leg queries. Every request sends one TRQP
+message per listed authority, all at once, through the trust registry's connection and its
+mediator, and writes one audit record and one `agent_gateway_trust_check_total` sample per
+authority, so the lists an operator configures set the load each request puts on the registry,
+the mediator and the audit sinks. Keep lists to the authorities a policy needs. A query that
+times out never marks the registry connection `Failed`: every request the gateway sends to a
+registry has a thread id starting with `ag-req-` (`REQUEST_THREAD_PREFIX` in
+[`src/trust_registries/communication.rs`](../src/trust_registries/communication.rs)), and a
+problem report on such a thread that no query still awaits is logged and ignored, however late
+it arrives. Only a problem report on any other thread is taken as the registry rejecting the
+gateway.
+
+Gateway 1.0.9 and earlier cannot read `query.authority_ids`, even a list of one. It skips any
+stored surface or managed connection with a Trust Check that sets `query.authority_ids`, and
+logs a parse error. Requests to that surface fail as unknown, and that client cannot
+authenticate. Before rolling back to 1.0.9 or earlier, or before a standby on such a version
+takes over, change each such query to a single `authority_id`. Surfaces and managed
+connections whose queries set only `authority_id` load as before. Such a gateway also caps a leg's list at 10 Trust Checks, but only when saving: it loads
+and runs a longer list, and refuses to save that surface or managed connection (`400`) until
+the list is trimmed to 10.
 
 ### The authority of a Trust Check
 
@@ -280,6 +369,9 @@ triggered it. On the outbound path the record also names the Transit Point.
 | `authority` | Linked to the Authority with that DID. The Authority must still exist. |
 | `issuer` | An Issuer has that DID. |
 | absent | A template, or a DID in neither register. |
+
+For a query that lists authorities, `authority_sources` holds the same value per listed DID, and
+everything below applies to each listed DID on its own.
 
 Every save of a surface or STS client sets it for each literal DID: `authority` when the write
 sends `authority`, when the stored record already had the DID as `authority`, or when an
@@ -454,7 +546,7 @@ keep the rule in the Transit Point's own `response_policy`.
 | `input.transit.caller.verification` | `transit_token` | The call carries a valid transit token whose `user_identity_hash` came from source authentication on the Access Point. |
 | | `unverified` | A valid transit token names a caller DID but carries no verified principal: the DID was asserted or derived from request fields on the Access Point. |
 | | `fabric_peer` | The call carries a valid transit token this gateway issued for a request a paired gateway sent over Fabric (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). The peer gateway is verified, and named in `fabric`. The caller it sent the request for is verified only when the receiving surface's own `source_auth` or resource token verified a credential on that request with caller authentication that tells a partner's users apart (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)): then `verified` is `true` and `user_identity_hash` names that caller. An API key or other shared credential leaves it unverified. Whatever the peer says about its caller never verifies it. A rule on `verification == "transit_token"` never matches it. |
-| | `anonymous` | The call carries no valid transit token: none on a Transit Point that does not require one, one there that does not verify, or a discovery read (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A Transit Point that does not require a token still verifies one the agent sends, so a valid token is reported as above. There it names the caller to policy and to the Transit Point's [per-caller rate limit](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point) only: delegated credentials, Workload Binding and stream expiry still treat the call as carrying no token. A client the Transit Point authenticated does not change this. |
+| | `anonymous` | The call carries no valid transit token: none on a Transit Point that does not require one, or one there that does not verify (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A Transit Point that does not require a token still verifies one the agent sends, so a valid token is reported as above. There it names the caller to policy and to the Transit Point's [per-caller rate limit](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point) only: delegated credentials, Workload Binding and stream expiry still treat the call as carrying no token. A discovery read with a valid transit token is not anonymous; policy sees the named caller and can enforce rules on it. A client the Transit Point authenticated does not change this. |
 | `input.transit.caller.identity_source` | `gateway-computed`, `self-presented`, `verified-presentation` | How the Access Point established the caller DID. Absent when the token has none. |
 | | `fabric-presentation`, `fabric-asserted` | For a `fabric_peer` caller: the DID came from a presentation one of the connection's issuers signed, or from anything else the peer sent (or the request names no DID). |
 | `input.transit.caller.user_identity_hash` | lowercase hex SHA-256 | The caller's [identity hash](CREDENTIAL_DELEGATION.md#the-callers-identity-hash) the Access Point computed: the source-auth method, its issuer, the surface's tenant and the principal (for a JWT the value of its strategy's [`principal_claim`](SOURCE_AUTH.md#which-claim-names-a-jwt-caller), `sub` by default, with the claim's name when it is not `sub`; the API key name, DID or mTLS principal). The same subject verified by another method, issuer or tenant has another hash. For a `fabric_peer` caller it is the caller the receiving surface verified on the Fabric request, the same value for the same credential as on its Access Point. Present only when `verified`, and absent for a JWT without a non-empty string in its strategy's principal claim. |
@@ -714,7 +806,20 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
 - Fabric receive's **agent-card hop** to the local Target, made for the GW2
   policy context, uses the forward's `forward_client_for`
   (`egress::pinned_forward_client` for an `http(s)` Target), so it is pinned
-  and does not follow redirects. A blocked target or a redirect yields no card.
+  and does not follow redirects, and reads the card within `a2a.max_body_size`.
+  It presents the surface's `target.auth` as the gateway's own request, so the
+  policy input sees the card of a protected Target, and drops a provider token
+  the Target refuses as `invalid_token`, as the forward does. A blocked target, a
+  redirect, a non-success answer or a `target.auth` credential that cannot be
+  resolved yields no card in the policy input; the failure is logged as a
+  warning without the credential. Under `target.auth.fallback: passthrough` a
+  credential that cannot be resolved reads the card without it. A Target that is
+  not an `http(s)` URL, such as a `proxy://` MCP proxy, has no card to read, so
+  no credential is resolved for it. The outcome is
+  cached per surface and `target.auth` for 60 seconds (10 seconds for no card),
+  is not cleared when a secret or credential provider changes, and is cleared on
+  configuration reload or a surface save, so the policy input may see a card up
+  to a minute old.
 - The Transit Point's **agent-card fetch** for target-leg Trust Check and
   agent context (`src/proxy/outbound_handler.rs::fetch_agent_card`) pins each
   well-known URL with `egress::pinned_forward_client`, the forward step's

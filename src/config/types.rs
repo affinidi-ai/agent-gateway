@@ -825,7 +825,7 @@ fn default_provider_header_format() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetAuthFallback {
-    /// Reject the request with 502 Bad Gateway
+    /// Reject the request: `500 target_auth_misconfigured` or `503 target_auth_unavailable`
     #[default]
     Reject,
     /// Pass through the request without injecting credentials
@@ -1379,7 +1379,8 @@ pub struct StsRuntimeConfig {
     pub mcp_replay: crate::sts::replay::McpReplayConfig,
 }
 
-/// Per-client-IP throttle for a sign-in endpoint (SAML login, CLI login). Off unless enabled. The
+/// Per-client-IP throttle for a sign-in endpoint (SAML login, CLI login, passkey sign-in and
+/// registration starts). Off unless enabled. The
 /// IP is resolved by [`crate::source_auth::client_ip`] from the proxies in [`ClientIpConfig`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoginThrottleConfig {

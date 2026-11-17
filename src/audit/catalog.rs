@@ -126,13 +126,13 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
     event(
         "identity_binding_failed",
         "Identity Binding Failed",
-        "A request's identity binding Verifiable Presentation was missing or could not be verified",
+        "A request's or a Fabric answer's identity binding Verifiable Presentation was missing or could not be verified",
         Identity,
     ),
     event(
         "identity_binding_verified",
         "Identity Binding Verified",
-        "A request's identity binding Verifiable Presentation was verified",
+        "A request's or a Fabric answer's identity binding Verifiable Presentation was verified",
         Identity,
     ),
     event(

@@ -104,8 +104,18 @@ issuers, trust registries, and Connection Points each at their own path. Each do
 carries the verification methods and service endpoints another system needs to check a
 signature. The gateway's DID and newly created managed agent DIDs list the Multikey that signs
 their credentials and presentations (`#key-2`) under `assertionMethod`, so strict Data
-Integrity verifiers accept them. The gateway writes its DID log when it first starts, so a gateway that
-already has one keeps publishing the document it was created with.
+Integrity verifiers accept them; the gateway's DID also lists it under `authentication`, the
+proof purpose presentations conventionally claim. A gateway whose published DID document leaves
+the Multikey out of either adds it when it starts Active, or when a Standby node is promoted (see
+[Server mode](CONFIGURATION_RELOAD.md#server-mode)): a `did:webvh` DID gets a new log
+version signed with the gateway key, so the DID and its earlier versions stay as they are, and a
+`did:web` DID gets its document rewritten. No key is created or replaced: the new version and
+the stored `did.json` differ from what they held only by the Multikey added to
+`assertionMethod` and `authentication`. A document that lacks either relationship, publishes
+another key as its own `#key-2` or publishes `#key-2` more than once is left as it is; a stored `did.json` that is missing or does not parse
+is written again from the latest log version. A log that does not verify, or whose latest version
+is dated more than a second ahead of the node's clock, is left as it is and the gateway
+logs a warning; the repair runs again on the next start.
 
 ## Federation across organisations
 
@@ -556,7 +566,9 @@ A gateway starts in **active** or **standby** mode. A standby instance holds no
 listeners and reports itself unready, so a load balancer sends it no traffic. `SIGUSR1`
 promotes it and `SIGUSR2` steps it down. Two instances sharing storage can keep their
 caches in step with a periodic refresh. See
-[`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md#server-mode).
+[`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md#server-mode). Instances sharing storage
+need a volume whose file locks hold across hosts, so they create and repair one gateway DID; see
+[`DEPLOYMENT_REQUIREMENTS.md`](DEPLOYMENT_REQUIREMENTS.md#shared-storage-for-several-instances).
 
 Instances sharing storage also share the key that signs transit tokens, kept beside the
 gateway's own keys, so a managed agent's Transit Point calls are accepted by whichever

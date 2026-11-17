@@ -204,6 +204,50 @@ continues with no caller identity, only the audit record for the unverified DID 
 written, and no weaker identity source is consulted for that request, neither the identity
 binding VP nor a raw identity extension.
 
+The calling gateway checks the presentation on a `2xx` answer the same way, when the calling
+surface's Target is `fabric://` and the surface has a managed identity. The presentation must
+verify, which includes its holder being its credential's subject, and its issuer must be one of
+the issuers of the connection to the Remote gateway the Target names. The calling gateway
+establishes that gateway's issuer DID through the issuer exchange when its record does not hold
+one yet, and skips the exchange when the issuers its record holds already include the
+presentation's issuer. An answer waits at most 3 seconds for the exchange, where a request waits
+the exchange's full 10 seconds. Answers and requests that need the same gateway's issuer DID at
+once share one exchange, which keeps running after an answer stops waiting and records the issuer
+DID when it completes, so the next answer finds it. When the surface takes the agent's identity from the payload, a verified
+presentation from one of those issuers is that identity, in place of the raw `agent-identity/v1`
+extension the paired gateway replaced with it; the surface's identity schema and rules apply to
+that raw payload, which the calling gateway never receives, so the issuer check stands in for
+them. A surface that takes the identity from a key, a token claim, a certificate or a fixed DID
+keeps it: the presentation is still checked and recorded, but the answering agent's DID is not
+stored as an identity of the surface. A presentation the calling gateway has no VC issuer to verify
+counts as one that fails verification. A presentation
+that fails verification refuses the answer with `502` and records `identity_binding_failed` with
+outcome `invalid`. One whose issuer is not one of the connection's issuers, including when they
+cannot be established, also refuses the answer with `502`: the answering agent's DID is not
+stored, and the VP Audit Log records `identity_binding_failed` with outcome `untrusted`. A verified
+one records `identity_binding_verified` and the received presentation (`vp_injected`, detail
+`response_path_fabric_received`), both with `via_fabric: true` and the request's trace id. Answers
+to a Transit Point over Fabric, to MCP requests over Fabric, and agent cards fetched over Fabric
+are not checked.
+
+Accepted risk: an answer that carries no presentation is not checked. A paired gateway signs one
+only when its surface has a managed identity and it has a VC issuer, so an answer from any other
+paired surface carries the agent's raw `agent-identity/v1` extension instead, and a surface that
+takes the identity from the payload derives it from that extension under its own schema and
+rules, with no issuer check and no audit record. A paired gateway can therefore drop the
+presentation and send `x-identity` fields copied from another agent to be given that agent's
+identity. Only a gateway this one is paired with can do this; the mediator and the answering
+agent cannot remove a presentation the paired gateway adds.
+
+Accepted risk: the calling surface's identity schema and rules do not run on an answer that
+carries a verified presentation, and response extension inspection skips that presentation's
+credential extension while still checking every other watched extension. They are written for the raw `agent-identity/v1` extension,
+which the paired gateway checked against its own schema and rules and replaced, and the
+presentation's fields follow the paired gateway's schema, so checking them against the calling
+surface's could refuse legitimate agents. A paired gateway whose rules are looser than the
+calling surface's can therefore pass an agent the calling surface's rules would refuse; the issuer
+check is the only check the calling gateway applies.
+
 The presentation the receiving gateway signs for its agent's response, when the Target has a
 Workload Binding, names the caller as the user the agent acted for (`userIdentity`, with
 `delegated: true`) only when a presentation from one of the connection's issuers proved the
@@ -421,7 +465,13 @@ request received by the destination gateway:
    is answered here with a `401` before policy, without `resource_metadata`, and a failed
    credential of another method with a plain `401`: the sending Gateway strips the caller's
    own `Authorization` header, so only a credential it injects, issued for this surface's
-   resource, can pass. There is no A2A counterpart:
+   resource, can pass. A buffered `ForwardResponse` refusing one credential read from a header
+   names that header in the envelope field `caller_refusal`, beside `status`, `headers`, `body`
+   and `error`, never in the body; a framed stream carries no such field. The sending gateway
+   answers its caller `500 target_auth_rejected` when that header is the one its own Target
+   credential went in, and drops the field either way (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md)). A
+   receiving gateway that relays another peer's answer builds its own `ForwardResponse`, so a
+   `caller_refusal` never crosses more than one hop. There is no A2A counterpart:
    `A2A-Version` is negotiated and A2A requests are validated on the sending gateway, not here
    (see below).
 6. Build policy input containing the authenticated sending Gateway and any source-auth result. An
@@ -434,12 +484,14 @@ request received by the destination gateway:
    has Transit Points and the Target is an HTTP or HTTPS URL, the request carries a transit token
    this gateway issued for it, naming the peer, the hop count and, when step 5 verified one, the
    caller the surface's own source authentication verified, so the agent can call its own Transit
-   Points (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A public discovery `GET`, such as
-   an agent card fetch, carries none, nor does a request relayed to an MCP Target over the legacy
-   HTTP+SSE transport. The surface's `target.auth` goes only with a request whose caller was
-   vetted, and with a `GET` of exactly `/.well-known/agent-card.json` or the surface's configured
-   card location, the sending gateway's own card fetch; any other discovery read, the
-   `/.well-known/agent.json` fallback included, gets none (see
+   Points (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A public discovery `GET` of the
+   surface, such as an agent card fetch, carries none, nor does a request relayed to an MCP Target
+   over the legacy HTTP+SSE transport. That is the token handed to this surface's Target; a
+   discovery read the agent sends through one of its own Transit Points still needs its own
+   token (see [Chains across gateways](#chains-across-gateways)). The surface's `target.auth` goes
+   only with a request whose caller was vetted, and with the gateway's own agent card fetch, which
+   follows the [direct path's rules](#agent-card-fetch-over-fabric); any other discovery read gets
+   none (see
    [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#target-authentication-from-a-credential-provider)).
    The Target's answer travels back as text, so the request, a framed stream's included, asks
    for an uncompressed one (`Accept-Encoding: identity`) in place of whatever the sender accepts;
@@ -458,6 +510,89 @@ only over Fabric, or used only for its Transit Points, still needs a route a sur
 the admin API refuses to save a new or changed route that none serves (see `channels` in
 [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md)). Moving the route changes nothing a peer
 calls, but it moves the default paths of the surface's Transit Points, which follow the route.
+
+### Agent card fetch over Fabric
+
+On a surface with `target.auth`, the receiving gateway fetches the local Target's agent card with
+the [direct path](PROTOCOLS.md#agent-card-fetch)'s header, body and failure rules. Only a `GET` whose
+path is exactly `/.well-known/agent-card.json` or the surface's configured card location, the paths
+a sending gateway's card fetch asks for, is a card fetch
+([`is_fabric_card_fetch`](../src/proxy/handler.rs)). That fetch is the gateway's own request: a `GET` with no body, sent to the card path under the Target endpoint (or
+the configured location on the Target's origin), carrying `target.auth`, the gateway's own
+`Accept-Encoding: identity` and, from the peer, only `Accept`, `Accept-Language` and `User-Agent`.
+The peer's `Authorization`, `Cookie`, other headers
+and body are dropped, and the fetch carries no caller's material: no delegated credential from
+`outbound_credentials` (so it never answers `consent_required`), no
+[caller key](CREDENTIAL_DELEGATION.md#caller-keys), even for a caller whose JWT the surface verified
+at a configured card location, no transit token, even at a configured card location, and no
+`X-Gateway-Trace-Id`.
+
+The Target's answer to that fetch reaches the peer with only `Content-Type`, `Content-Language`,
+`Cache-Control`, `ETag`, `Last-Modified` and `Vary`, so a session cookie or authentication header
+the Target sets for the credential stays on the receiving gateway, and a card is processed as an
+agent card response. The client does not follow redirects: a 3xx answers the peer `502` "Upstream
+redirected", as on the direct path, without the Target's `Location`. Any other non-2xx answer
+reaches the peer as its status with the body "Upstream error: <status>", so nothing the Target says
+about the credential reaches the peer.
+
+Without `target.auth` none of these rules apply: the card fetch is forwarded as the peer sent it,
+body included, with the header rules of any other forwarded request, and the Target's answer is
+relayed as for any other request. A Target redirect is relayed with its status, so the sending
+gateway's caller gets that 3xx status with the body "Upstream error: <status>" and no `Location`.
+
+Every other public read skips caller authentication and is forwarded without the credential:
+another discovery path such as `/discovery` or `/.well-known/ucp`, a `HEAD` of the card path, the
+legacy `/.well-known/agent.json`, and a card path with a query, dot segments or percent-escapes.
+Without a configured card location it is forwarded as the peer sent it. On a surface with a
+configured card location, every `GET` or `HEAD` of a discovery path is sent to that location on the
+Target's origin, still without the credential. A card path in another case, such as
+`/.well-known/Agent-Card.json`, is not a public read, because the discovery path match is
+case-sensitive: it is a caller's request, source authentication runs on it, and it carries the
+credential when the caller authenticated. A credential that cannot be resolved under
+`target.auth.fallback: reject` answers `500 target_auth_misconfigured` or `503
+target_auth_unavailable` with the detail "Target authentication failed", as the direct path and
+the MCP proxy path do (see [When a Target credential cannot be
+obtained](CREDENTIAL_DELEGATION.md#when-a-target-credential-cannot-be-obtained)).
+
+The sending gateway's agent card route gives its caller the same answer: a peer's Target
+authentication refusal, whose `reason` is one of the gateway's own and matches its status, is
+answered with that status, the detail "Target authentication failed" and that `reason`; a peer's
+`502` whose detail is exactly "Target authentication failed" (from a gateway that sends no
+`reason`) or "Upstream redirected" is answered with that text; and any other refusal with its
+status and "Upstream error: <status>", never the peer's words. The sending gateway asks for `/.well-known/agent-card.json`, or
+the configured card location of its own surface, so give both surfaces the same `agent_card_path`:
+a location only the sending gateway configures is not a card fetch at the receiving gateway and
+gets no `target.auth`.
+
+Two things differ from the direct path:
+
+- The direct path answers a request of any method to `/.well-known/agent-card.json` or the legacy
+  `/.well-known/agent.json` with its card fetch. Over Fabric only a `GET` of
+  `/.well-known/agent-card.json` or the configured card location is the card fetch; any other read
+  of a card path is a public read without `target.auth`, or a caller's request as described above.
+- Over Fabric a `GET` at the configured card location is the card fetch: the gateway sends it as
+  its own request with `target.auth` and returns the card. When that location is not a public
+  discovery path, such as `/cards/me`, source authentication still runs on it first. A caller who
+  failed source authentication gets the card on a public Access Point (`access_point.public: true`),
+  which hands failed callers to policy. Every other Access Point answers `401`: a closed one, a
+  legacy one stored without `public`, and a public one whose inbound identity is `from_jwt_claim`
+  or whose `caller_authentication.on_failure` is `reject`. The sending gateway's own card fetch
+  carries no caller credential, so on such a surface it gets `401` at the configured location.
+
+The card read for the receiving gateway's policy input also presents `target.auth` as the gateway,
+resolving it from the gateway's secrets store rather than opening one per request, and drops a
+provider token the Target refuses as `invalid_token`, as the forward does. Under
+`target.auth.fallback: passthrough` a credential that cannot be resolved reads the card without it.
+A Target that is not an `http(s)` URL, such as a `proxy://` MCP proxy, has no card to read, so no
+credential is resolved for it. On a surface with `target.auth` the card is read only from a URL
+the forward would send that credential to
+([`is_target_credential_destination`](../src/proxy/paths.rs)): a path under the Target endpoint,
+or the configured card location on the Target's origin; any other URL yields no card and is not
+asked.
+The outcome, card or none, is cached per surface and `target.auth` (so a variant with its own
+`target.auth` reads its own card) for 60 seconds (10 seconds for none) and cleared on
+configuration reload or a surface save; see
+[`POLICY.md`](POLICY.md#other-pinned-egress-sinks).
 
 ### Modern MCP activation
 
@@ -673,11 +808,14 @@ request back and forth without end. A hop count bounds them.
 Hops are counted only across Fabric. A chain through an `http` Transit Point into another
 gateway's Access Point, or an agent calling an Access Point directly, its own gateway's
 included, starts again at 1, and so does a call without a transit token through a Transit Point
-that does not require one (it reads the count from a token the agent sends), a call
-through a Transit Point of a gateway with no transit token issuer, which reads no token, and a
-discovery read (a `GET` or `HEAD` of an agent card or other discovery document directly below
-the Transit Point) through any Transit Point, which reads no token either. So does a chain through a gateway that predates the hop count,
+that does not require one (it reads the count from a token the agent sends), and a call
+through a Transit Point of a gateway with no transit token issuer, which reads no token. So does a chain through a gateway that predates the hop count,
 which neither reads nor sends it. A peer that does not follow these rules can reset the count.
+
+Discovery reads (a `GET` or `HEAD` of an agent card or other discovery document directly below
+the Transit Point) require a transit token when the Transit Point is configured to require it and read hop count and trace id from the token, just like
+other Transit Point requests.
+
 The gateway's own read of a `fabric://` Transit Point target's agent card, for its Trust Checks
 or a policy with `require_agent_context`, is a discovery read too: it goes straight over Fabric,
 not through the Transit Point, with a count of 1 and a trace id of its own. It reads

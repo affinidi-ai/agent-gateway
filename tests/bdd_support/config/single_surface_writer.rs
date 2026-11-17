@@ -689,6 +689,15 @@ fn write_single_surface_config_inner(
         base_dir,
         &surface_config.enforced_credential_rules,
         surface_config.token_request_timeout_secs,
+        surface_config
+            .target_auth_provider
+            .as_ref()
+            .filter(|provider| provider.token_endpoint_listed_as_insecure)
+            .and_then(|provider| {
+                provider
+                    .token_endpoint
+                    .as_deref()
+            }),
     );
     if surface_config.logs_at_info {
         log_info(base_dir);
@@ -861,13 +870,15 @@ fn set_log_directory(base_dir: &Path) {
 }
 
 /// Appends a `[credential_policy]` table setting each of `rules` to `enforce` and, when
-/// given, the token request timeout.
+/// given, the token request timeout and the one token endpoint `insecure_token_endpoints`
+/// names.
 fn write_credential_policy(
     base_dir: &Path,
     rules: &[String],
     token_request_timeout_secs: Option<u64>,
+    insecure_token_endpoint: Option<&str>,
 ) {
-    if rules.is_empty() && token_request_timeout_secs.is_none() {
+    if rules.is_empty() && token_request_timeout_secs.is_none() && insecure_token_endpoint.is_none() {
         return;
     }
     let path = base_dir.join("config.toml");
@@ -878,6 +889,9 @@ fn write_credential_policy(
     }
     if let Some(secs) = token_request_timeout_secs {
         config.push_str(&format!("token_request_timeout_secs = {secs}\n"));
+    }
+    if let Some(endpoint) = insecure_token_endpoint {
+        config.push_str(&format!("insecure_token_endpoints = [\"{endpoint}\"]\n"));
     }
     std::fs::write(&path, config).unwrap();
 }
@@ -975,22 +989,7 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
         secrets.push(SecretFixture::new(&caller_key.secret_id, secret_value));
     }
     if let Some(provider) = &surface_config.target_auth_provider {
-        if provider.grant == TargetAuthProviderGrant::JwtBearer {
-            let signing_key = if provider.signing_key_is_service_account_file {
-                target_auth_service_account_key_file()
-            } else {
-                target_auth_signing_key()
-                    .private_pem
-                    .clone()
-            };
-            secrets.push(SecretFixture::new(TARGET_AUTH_SIGNING_KEY_SECRET, &signing_key));
-        }
-        if provider.stores_client_id() {
-            secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_ID_SECRET, TARGET_AUTH_CLIENT_ID_VALUE));
-        }
-        if provider.stores_client_secret() {
-            secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_CLIENT_SECRET_VALUE));
-        }
+        secrets.extend(target_auth_provider_secrets(provider));
     }
     if let Some(delegation) = &surface_config.credential_delegation {
         match &delegation.provider_kind {
@@ -1049,18 +1048,40 @@ fn credential_provider_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<Cr
     providers
 }
 
-fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) -> CredentialProviderFixture {
+/// The secrets the Target credential provider reads: a JWT bearer provider's signing key, and
+/// the client id and client secret a provider stores.
+pub fn target_auth_provider_secrets(provider: &SurfaceTargetAuthProviderConfig) -> Vec<SecretFixture> {
+    let mut secrets = Vec::new();
+    if provider.grant == TargetAuthProviderGrant::JwtBearer {
+        let signing_key = if provider.signing_key_is_service_account_file {
+            target_auth_service_account_key_file()
+        } else {
+            target_auth_signing_key()
+                .private_pem
+                .clone()
+        };
+        secrets.push(SecretFixture::new(TARGET_AUTH_SIGNING_KEY_SECRET, &signing_key));
+    }
+    if provider.stores_client_id() {
+        secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_ID_SECRET, TARGET_AUTH_CLIENT_ID_VALUE));
+    }
+    if provider.seeds_client_secret() {
+        secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_CLIENT_SECRET_VALUE));
+    }
+    secrets
+}
+
+pub fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) -> CredentialProviderFixture {
     let now = chrono::Utc::now();
-    let client_credentials = provider.grant == TargetAuthProviderGrant::ClientCredentials;
     CredentialProviderFixture {
         id: TARGET_AUTH_PROVIDER_ID.to_string(),
         tenant_id: None,
         name: TARGET_AUTH_PROVIDER_ID.to_string(),
         provider_id: TARGET_AUTH_PROVIDER_ID.to_string(),
-        provider_type: if client_credentials {
-            "oauth2_client_credentials"
-        } else {
-            "oauth2_jwt_bearer"
+        provider_type: match provider.grant {
+            TargetAuthProviderGrant::ClientCredentials => "oauth2_client_credentials",
+            TargetAuthProviderGrant::AuthorizationCode => "oauth2_authorization_code",
+            TargetAuthProviderGrant::JwtBearer => "oauth2_jwt_bearer",
         }
         .to_string(),
         authorization_endpoint: None,
@@ -1077,13 +1098,17 @@ fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) -> C
             .stores_client_secret()
             .then(|| TARGET_AUTH_CLIENT_SECRET_SECRET.to_string()),
         default_scopes: vec![TARGET_AUTH_PROVIDER_SCOPE.to_string()],
-        callback_path: String::new(),
+        callback_path: if provider.grant == TargetAuthProviderGrant::AuthorizationCode {
+            format!("/v1/identity/oauth/callback/{TARGET_AUTH_PROVIDER_ID}")
+        } else {
+            String::new()
+        },
         callback_url: None,
         token_refresh_enabled: false,
         api_key_secret_ref: None,
         authorization_response_issuer: None,
         max_consent_age_secs: None,
-        jwt_settings: (!client_credentials).then(|| {
+        jwt_settings: (provider.grant == TargetAuthProviderGrant::JwtBearer).then(|| {
             serde_json::json!({
                 "jwt_issuer": TARGET_AUTH_JWT_ISSUER,
                 "jwt_signing_key_secret_ref": TARGET_AUTH_SIGNING_KEY_SECRET,

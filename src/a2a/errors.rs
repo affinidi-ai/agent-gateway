@@ -7,12 +7,33 @@ pub fn create_error_response(
     status: StatusCode,
     message: &str,
 ) -> Response {
-    let error_body = serde_json::json!({
+    proxy_error_response(status, message, None)
+}
+
+/// The generic problem JSON of [`create_error_response`] with a fixed `reason` a
+/// caller can branch on.
+pub fn create_error_response_with_reason(
+    status: StatusCode,
+    message: &str,
+    reason: &str,
+) -> Response {
+    proxy_error_response(status, message, Some(reason))
+}
+
+fn proxy_error_response(
+    status: StatusCode,
+    message: &str,
+    reason: Option<&str>,
+) -> Response {
+    let mut error_body = serde_json::json!({
         "type": "https://a2a-protocol.org/errors/proxy-error",
         "title": status.canonical_reason().unwrap_or("Error"),
         "status": status.as_u16(),
         "detail": message,
     });
+    if let Some(reason) = reason {
+        error_body["reason"] = serde_json::Value::from(reason);
+    }
 
     Response::builder()
         .status(status)

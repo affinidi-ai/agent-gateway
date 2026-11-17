@@ -133,6 +133,7 @@ pub struct SurfaceWorld {
     pub human_clients: HashMap<String, Vec<AdminApiClient>>,
     pub terms_enabled: bool,
     pub affinidi_cache_seeded: bool,
+    pub gateway_did_without_assertion_multikey: bool,
     pub affinidi_well_available: bool,
     pub affinidi_terms_manifest: serde_json::Value,
     pub caller_did: Option<String>,
@@ -183,6 +184,12 @@ pub struct SurfaceWorld {
     pub passkeys: HashMap<String, SoftPasskey>,
     /// The passkey sign-in started last and not yet finished.
     pub started_sign_in: Option<StartedSignIn>,
+    /// The `allowCredentials` of each passkey sign-in challenge the scenario started, in order.
+    pub sign_in_challenge_credentials: Vec<Vec<serde_json::Value>>,
+    /// A passkey the scenario registered for a username that already had an account.
+    pub other_passkey: Option<SoftPasskey>,
+    /// How long the last passkey registration finish took to be answered.
+    pub registration_answer_time: Option<std::time::Duration>,
     /// The event payload a sign-in step last found on the Redis stream.
     pub sign_in_event: Option<serde_json::Value>,
     /// The payload with Agent Watch's record content a sign-in step last found on the stream.
@@ -229,6 +236,7 @@ impl SurfaceWorld {
             human_clients: HashMap::new(),
             terms_enabled: false,
             affinidi_cache_seeded: false,
+            gateway_did_without_assertion_multikey: false,
             affinidi_well_available: true,
             affinidi_terms_manifest: serde_json::json!({
                 "schema_version": 1,
@@ -268,6 +276,9 @@ impl SurfaceWorld {
             sign_in_stream: None,
             passkeys: HashMap::new(),
             started_sign_in: None,
+            sign_in_challenge_credentials: Vec::new(),
+            other_passkey: None,
+            registration_answer_time: None,
             sign_in_event: None,
             sign_in_record: None,
             client_certificates: HashMap::new(),

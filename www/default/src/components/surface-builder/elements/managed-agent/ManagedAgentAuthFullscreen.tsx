@@ -226,7 +226,7 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
             value={config.target_auth_fallback || 'reject'}
             onChange={e => updateField('target_auth_fallback', e.target.value)}
           >
-            <option value="reject">Reject request (502 Bad Gateway)</option>
+            <option value="reject">Reject request</option>
             <option value="passthrough">Pass through without credentials</option>
           </select>
           <small className="form-text text-muted">

@@ -3233,6 +3233,7 @@ pub async fn create_surface(
         resource_scope(&scope),
     )
     .await?;
+    validate_trust_checks(&surface)?;
     super::surface_tenancy::validate_authority_sources(&state, &mut surface, None).await?;
     super::surface_tenancy::validate_external_consent_bindings(&state, &mut surface, None).await?;
 
@@ -3256,9 +3257,6 @@ pub async fn create_surface(
     validate_resolved_variants(&surface)?;
     super::surface_caller_key::validate_caller_key(&surface)?;
 
-    surface
-        .validate()
-        .map_err(|e| SurfaceApiError::BadRequest(e.to_string()))?;
     reject_target_trust_checks_unless_target_runs_them(&surface)?;
 
     // Check for duplicate surface_id
@@ -4254,6 +4252,7 @@ async fn validate_and_save_surface(
         existing,
     )?;
     super::surface_tenancy::validate_surface_references(state, &surface, existing, context, scope).await?;
+    validate_trust_checks(&surface)?;
     super::surface_tenancy::validate_authority_sources(state, &mut surface, existing).await?;
     super::surface_tenancy::validate_external_consent_bindings(state, &mut surface, existing).await?;
     validate_listen_path_collisions(&surface, store, &state.network_config).await?;
@@ -4262,7 +4261,6 @@ async fn validate_and_save_surface(
     validate_delegation_source_auth(&surface)?;
     validate_surface_mcp_tool_gating(&surface)?;
     validate_resolved_variants(&surface)?;
-    validate_trust_checks(&surface)?;
     reject_target_trust_checks_unless_target_runs_them(&surface)?;
     validate_workload_binding_config(&surface)?;
     validate_source_auth(&surface, existing)?;
@@ -9505,9 +9503,11 @@ mod validation_tests {
             id: "tc-1".to_string(),
             trust_registry_id: "tr-1".to_string(),
             authority_source: None,
+            authority_sources: Default::default(),
             query_type: crate::trust_registry_verification::trust_check_element::TrqpQueryType::Recognition,
             query: crate::trust_registry_verification::trust_check_element::TrqpQueryParams {
                 authority_id: "did:web:authority.example".to_string(),
+                authority_ids: None,
                 entity_id: "{{ caller.did }}".to_string(),
                 action: None,
                 resource: None,

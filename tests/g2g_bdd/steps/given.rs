@@ -12,6 +12,7 @@ use crate::bdd_support::config::fabric_surface_fixture::{
     TransitPointHeaderMetadataMappingRowSpec, TransitPointSpec,
 };
 use crate::bdd_support::config::modern_consent::ModernConsentFixture;
+use crate::bdd_support::config::single_surface_fixture::{SurfaceTargetAuthProviderConfig, TargetAuthProviderGrant};
 use crate::bdd_support::json_rpc::{
     IdentityBindingProof, McpVersion, build_mcp_echo_response_body, build_target_agent_card_naming_did,
     build_target_ok_response,
@@ -688,6 +689,15 @@ fn surface_is_stored_as_a_legacy_surface(
     surface_spec_mut(world, &surface_name).legacy_access_point = true;
 }
 
+#[given(expr = "surface {string} fetches its agent card from path {string}")]
+pub async fn surface_fetches_its_agent_card_from_path(
+    world: &mut G2gWorld,
+    surface_name: String,
+    path: String,
+) {
+    surface_spec_mut(world, &surface_name).agent_card_path = Some(path);
+}
+
 /// Saves the surface through its gateway's admin API with
 /// `access_point.public: false`, the state a surface created through the
 /// admin API has: its Access Point refuses a caller whose credential is
@@ -780,6 +790,37 @@ pub async fn surface_injects_missing_target_credential(
     });
 }
 
+#[given(expr = "surface {string} authenticates to its managed agent with a client credentials provider")]
+pub async fn surface_authenticates_target_with_client_credentials(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    surface_spec_mut(world, &surface_name).target_auth_provider =
+        Some(SurfaceTargetAuthProviderConfig::new(TargetAuthProviderGrant::ClientCredentials));
+}
+
+#[given(expr = "the credential provider of surface {string} is refusing token requests")]
+pub async fn surface_credential_provider_refuses_tokens(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    surface_spec_mut(world, &surface_name)
+        .target_auth_provider
+        .as_mut()
+        .expect("the surface must authenticate to its managed agent with a credential provider first")
+        .token_status = 401;
+}
+
+#[given(expr = "managed agent {string} publishes an agent card with url {string}")]
+pub async fn managed_agent_publishes_card_with_url(
+    world: &mut G2gWorld,
+    agent_name: String,
+    url: String,
+) {
+    let card = serde_json::json!({ "name": agent_name, "url": url, "skills": [] });
+    set_target_response(world, &agent_name, card);
+}
+
 #[given(expr = "MCP server {string} publishes a tool catalog")]
 pub async fn mcp_server_publishes_tool_catalog(
     world: &mut G2gWorld,
@@ -790,6 +831,24 @@ pub async fn mcp_server_publishes_tool_catalog(
         .actors
         .expect_target_kind(&server_name, TargetActorKind::McpServer);
     set_target_response(world, &server_name, build_mcp_tool_catalog_response());
+}
+
+#[given(expr = "MCP server {string} refuses every request with status {int}")]
+pub async fn mcp_server_refuses_every_request(
+    world: &mut G2gWorld,
+    server_name: String,
+    status: u16,
+) {
+    world
+        .topology
+        .actors
+        .expect_target_kind(&server_name, TargetActorKind::McpServer);
+    let (gw_index, surface_id) = world.target(&server_name);
+    world
+        .topology
+        .plan_mut(gw_index)
+        .mock_statuses
+        .insert(surface_id, status);
 }
 
 #[given(expr = "MCP server {string} supports initialization")]
@@ -892,6 +951,137 @@ pub async fn gateway_trusts_issuer_on_connection(
             .contains(&issuer_did),
         "gateway {gw_index}'s record for gateway {connection_gw} should list {issuer_did} as a trusted issuer, got {:?}",
         updated.trusted_issuer_dids
+    );
+}
+
+/// The issuer DID a gateway holds for a peer can only come from a pairing or
+/// an issuer exchange, never from the admin API, so the record is edited where
+/// the gateway stores it while it is stopped.
+#[given(expr = "gateway {int} has recorded {string} as the issuer DID of gateway {int}")]
+pub async fn gateway_has_recorded_issuer_did_for_peer(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    issuer_did: String,
+    peer_gw: usize,
+) {
+    world.start().await;
+    let remote_id = remote_record_id(world, gw_index, peer_gw);
+    world
+        .harness_mut()
+        .restart_gateway_after_storage_edit(gw_index, |base_dir| {
+            record_remote_gateway_issuer_did(base_dir, &remote_id, &issuer_did)
+        })
+        .await
+        .unwrap_or_else(|error| panic!("{error:#}"));
+    wait_until_gateway_reaches_peer(world, gw_index, peer_gw).await;
+    let record = world
+        .harness()
+        .gw(gw_index)
+        .admin
+        .get_gateway(&remote_id)
+        .await
+        .unwrap_or_else(|error| panic!("read gateway {gw_index}'s record for gateway {peer_gw}: {error:#}"));
+    assert_eq!(
+        record.issuer_did.as_deref(),
+        Some(issuer_did.as_str()),
+        "gateway {gw_index}'s record for gateway {peer_gw} should carry the recorded issuer DID"
+    );
+}
+
+/// A restarted gateway reconnects to its mediator before it reaches its peer
+/// again; its answers may be refused, so a fabric ping is the readiness signal.
+async fn wait_until_gateway_reaches_peer(
+    world: &G2gWorld,
+    gw_index: usize,
+    peer_gw: usize,
+) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if world
+            .harness()
+            .ping(gw_index, peer_gw)
+            .await
+            .unwrap_or(false)
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "gateway {gw_index} did not reach gateway {peer_gw} within 60s of restarting"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+/// Sets `issuer_did` on the stored Remote gateway record `remote_id`, found
+/// as `{remote_id}.json` in a `gateways` directory under `base_dir`.
+fn record_remote_gateway_issuer_did(
+    base_dir: &std::path::Path,
+    remote_id: &str,
+    issuer_did: &str,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let path = find_stored_gateway_record(base_dir, &format!("{remote_id}.json"))
+        .with_context(|| format!("search {} for the stored record {remote_id}.json", base_dir.display()))?
+        .with_context(|| format!("no stored record {remote_id}.json under {}", base_dir.display()))?;
+    let mut record: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    record["issuer_did"] = Value::String(issuer_did.to_string());
+    std::fs::write(&path, serde_json::to_string_pretty(&record)?)?;
+    Ok(())
+}
+
+fn find_stored_gateway_record(
+    dir: &std::path::Path,
+    file_name: &str,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            if let Some(found) = find_stored_gateway_record(&path, file_name)? {
+                return Ok(Some(found));
+            }
+        } else if path.file_name() == Some(std::ffi::OsStr::new(file_name))
+            && path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                == Some(std::ffi::OsStr::new("gateways"))
+        {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+#[given(expr = "managed agent {string} response contains the agent-identity extension")]
+pub fn managed_agent_response_contains_agent_identity_extension(
+    world: &mut G2gWorld,
+    agent_name: String,
+) {
+    use crate::bdd_support::json_rpc::AGENT_IDENTITY_EXTENSION_URI as AGENT_IDENTITY_URI;
+    world
+        .topology
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    set_target_response(
+        world,
+        &agent_name,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "kind": "message",
+                "messageId": "msg-001",
+                "role": "agent",
+                "parts": [{ "kind": "text", "text": "response" }],
+                "extensions": [AGENT_IDENTITY_URI],
+                "metadata": {
+                    AGENT_IDENTITY_URI: {
+                        "softwareInfo": { "name": "managed-agent", "version": "2.0" },
+                        "cloudProvider": "local"
+                    }
+                }
+            }
+        }),
     );
 }
 
@@ -1034,6 +1224,136 @@ pub async fn surface_requires_caller_identity_issued_by_gateway(
         .unwrap_or_else(|error| panic!("attach identity issuer policy to surface '{surface_id}': {error:#}"));
 }
 
+#[given(expr = "surface {string} has a request policy that denies all requests")]
+async fn surface_has_deny_all_request_policy(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    attach_request_policy(world, &surface_name, "deny-all", "default allow := false").await;
+}
+
+async fn attach_request_policy(
+    world: &mut G2gWorld,
+    surface_name: &str,
+    label: &str,
+    rule: &str,
+) {
+    world.start().await;
+    let (gw_index, surface_id) = world.surface(surface_name);
+    let policy_definition_id = format!("{surface_id}-{label}-policy");
+    let admin = &world
+        .harness()
+        .gw(gw_index)
+        .admin;
+    admin
+        .create_surface_policy_definition(
+            &policy_definition_id,
+            &format!("g2g BDD {label} policy for {surface_id}"),
+            &format!("package surface.policy\n\n{rule}\n"),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error:#}"));
+    admin
+        .patch_surface(
+            &surface_id,
+            &serde_json::json!({ "target": { "policy": { "policy_definition_id": policy_definition_id } } }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("attach {label} policy to surface '{surface_id}': {error:#}"));
+}
+
+/// The admin API refuses to save a surface whose Target authentication secret is
+/// missing, so on such a surface the policy is written into the gateway's
+/// configuration before it boots; on any other it is attached once the Fabric
+/// route is up.
+#[given(
+    expr = "surface {string} has a request policy that allows only requests whose Target agent card names DID {string}"
+)]
+async fn surface_has_card_did_request_policy(
+    world: &mut G2gWorld,
+    surface_name: String,
+    did: String,
+) {
+    let rule = card_did_policy_rule(&did);
+    let surface = surface_spec_mut(world, &surface_name);
+    if surface
+        .target_auth
+        .as_ref()
+        .is_some_and(|auth| auth.secret_value.is_none())
+    {
+        surface.target_policy_rego = Some(format!("package surface.policy\n\n{rule}\n"));
+        assert!(
+            world.harness.is_none(),
+            "a policy on a surface whose Target secret is missing must be given before the fabric starts"
+        );
+    } else {
+        attach_request_policy(world, &surface_name, "card-did", &rule).await;
+    }
+}
+
+fn card_did_policy_rule(did: &str) -> String {
+    format!("default allow := false\n\nallow if input.agent.did == {}", serde_json::json!(did))
+}
+
+/// The managed agent answers every request with its usual result plus an agent
+/// card's identity extension, so a card read and a forwarded call get the same body.
+#[given(expr = "managed agent {string} publishes an agent card naming DID {string}")]
+pub async fn managed_agent_publishes_card_naming_did(
+    world: &mut G2gWorld,
+    agent_name: String,
+    did: String,
+) {
+    let mut response = build_target_ok_response();
+    response["capabilities"] = serde_json::json!({
+        "extensions": [{
+            "uri": "https://fabric.affinidi.io/extensions/agent-identity-credential/v1",
+            "did": did,
+        }],
+    });
+    set_target_response(world, &agent_name, response);
+}
+
+async fn started_mock<'a>(
+    world: &'a mut G2gWorld,
+    agent_name: &str,
+) -> &'a crate::bdd_support::mock_server::MockServer {
+    world.start().await;
+    let (gw_index, surface_id) = world.target(agent_name);
+    world
+        .harness()
+        .gw(gw_index)
+        .mock(&surface_id)
+        .unwrap_or_else(|| panic!("no managed agent backing surface '{surface_id}' on gateway {gw_index}"))
+}
+
+/// Starts the fabric first, so the route probe is answered as usual.
+#[given(expr = "managed agent {string} answers with header {string} set to {string}")]
+pub async fn managed_agent_answers_with_header(
+    world: &mut G2gWorld,
+    agent_name: String,
+    header: String,
+    value: String,
+) {
+    started_mock(world, &agent_name)
+        .await
+        .set_response_header(&header, &value)
+        .await;
+}
+
+/// Starts the fabric first, so the route probe is answered as usual.
+#[given(expr = "managed agent {string} refuses with status {int} saying {string}")]
+pub async fn managed_agent_refuses_with_status(
+    world: &mut G2gWorld,
+    agent_name: String,
+    status: u16,
+    text: String,
+) {
+    let mock = started_mock(world, &agent_name).await;
+    mock.set_response(serde_json::json!({ "error": text }))
+        .await;
+    mock.set_status(status).await;
+}
+
 #[given(expr = "the VP Audit Log of gateway {int} keeps every audit event")]
 async fn vp_audit_log_of_gateway_keeps_every_audit_event(
     world: &mut G2gWorld,
@@ -1047,6 +1367,16 @@ async fn vp_audit_log_of_gateway_keeps_every_audit_event(
         .enable_every_audit_event()
         .await
         .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must keep every audit event: {error:#}"));
+}
+
+#[given(expr = "gateway {int} surface {string} takes its managed identity from the fixed DID {string}")]
+pub fn surface_takes_managed_identity_from_fixed_did(
+    world: &mut G2gWorld,
+    _gw: usize,
+    surface_name: String,
+    did: String,
+) {
+    surface_spec_mut(world, &surface_name).fixed_managed_identity = Some(did);
 }
 
 #[given(expr = "gateway {int} surface {string} has managed identity enabled")]

@@ -663,18 +663,16 @@ impl CallerAssertion {
         }
     }
 
-    /// A request received over Fabric. Only a `GET` of exactly the default card location or the
-    /// surface's own one is the sending gateway's card fetch; any other request, a `HEAD` or
-    /// another discovery read included, is a caller's, as [`Self::for_forwarded_request`] decides.
+    /// A request received over Fabric. The sending gateway's card fetch
+    /// ([`is_fabric_card_fetch`]) is the gateway's own; any other request, a `HEAD` or another
+    /// discovery read included, is a caller's, as [`Self::for_forwarded_request`] decides.
     pub(crate) fn for_fabric_received_request(
         surface: &crate::config::agent_surface::AgentSurface,
         method: &str,
         path: &str,
         source_auth_failed: bool,
     ) -> Self {
-        if method.eq_ignore_ascii_case("GET")
-            && (path == DEFAULT_AGENT_CARD_PATH || path == agent_card_fabric_forward_path(surface))
-        {
+        if is_fabric_card_fetch(surface, method, path) {
             Self::GatewayOriginated
         } else {
             Self::for_forwarded_request(method, path, source_auth_failed)
@@ -895,6 +893,10 @@ pub(crate) fn a2a_proxy_target_caller(
 
 pub(crate) const TARGET_AUTH_FAILED: &str = "Target authentication failed";
 
+/// The detail of the `502` the gateway answers when the Target redirects the gateway's own agent
+/// card fetch, which never follows a redirect.
+pub(crate) const UPSTREAM_REDIRECTED: &str = "Upstream redirected";
+
 /// Why a target credential could not be resolved. Rendered to the caller only as a
 /// generic failure; the variant is logged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -923,6 +925,85 @@ impl TargetAuthError {
             _ => None,
         }
     }
+
+    /// How a request refused over this error is reported to its caller: a failure a later
+    /// request may get past is `Unavailable`, one only an operator can fix is `Misconfigured`.
+    pub(crate) fn failure(&self) -> TargetAuthFailure {
+        use crate::delegation_vault::service_token::ServiceTokenError as Token;
+        match self {
+            Self::StoreUnavailable
+            | Self::ServiceToken(Token::TokenRequestFailed | Token::ProviderChanged | Token::StoreUnavailable) => {
+                TargetAuthFailure::Unavailable
+            }
+            Self::SecretNotFound
+            | Self::ProviderNotFound
+            | Self::ProviderNeedsConsent
+            | Self::Withheld(_)
+            | Self::InvalidHeader
+            | Self::ServiceToken(
+                Token::Unsupported
+                | Token::SecretUnavailable
+                | Token::TokenRequestRejected(_)
+                | Token::TokenEndpointRefused
+                | Token::TokenEndpointNotHttps
+                | Token::ScopeMismatch
+                | Token::ProviderMisconfigured,
+            ) => TargetAuthFailure::Misconfigured,
+        }
+    }
+}
+
+/// Why a request was refused because its Target credential could not be sent, as the
+/// caller is told: a status and a fixed `reason`, never the cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetAuthFailure {
+    /// `500 target_auth_misconfigured`: the credential's configuration is wrong.
+    Misconfigured,
+    /// `503 target_auth_unavailable`: the credential cannot be obtained for now.
+    Unavailable,
+    /// `400 target_path_refused`: the caller's path leaves the Target's base path, so the
+    /// credential would reach another resource.
+    PathRefused,
+    /// `500 target_auth_rejected`: the peer gateway refused the credential this gateway sent
+    /// as its caller credential.
+    Rejected,
+}
+
+impl TargetAuthFailure {
+    pub(crate) fn status(self) -> StatusCode {
+        match self {
+            Self::Misconfigured | Self::Rejected => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::PathRefused => StatusCode::BAD_REQUEST,
+        }
+    }
+
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::Misconfigured => "target_auth_misconfigured",
+            Self::Unavailable => "target_auth_unavailable",
+            Self::PathRefused => "target_path_refused",
+            Self::Rejected => "target_auth_rejected",
+        }
+    }
+
+    /// The problem JSON with the generic [`TARGET_AUTH_FAILED`] detail and this `reason`.
+    pub(crate) fn response(self) -> Response {
+        crate::a2a::create_error_response_with_reason(self.status(), TARGET_AUTH_FAILED, self.reason())
+    }
+
+    /// The failure a peer gateway refused with over Fabric: its problem JSON `body` names one
+    /// of these reasons with the matching `status`. Any other answer is `None`.
+    pub(crate) fn relayed(
+        status: u16,
+        body: &str,
+    ) -> Option<Self> {
+        let body: serde_json::Value = serde_json::from_str(body).ok()?;
+        let reason = body.get("reason")?.as_str()?;
+        [Self::Misconfigured, Self::Unavailable, Self::PathRefused, Self::Rejected]
+            .into_iter()
+            .find(|failure| failure.reason() == reason && failure.status().as_u16() == status)
+    }
 }
 
 /// Records in the VP Audit Log that the Target credential of `target_auth` was not sent
@@ -939,24 +1020,59 @@ pub(crate) fn record_target_auth_failure(
         crate::config::TargetAuthFallback::Reject => TargetAuthOutcome::Rejected,
         crate::config::TargetAuthFallback::Passthrough => TargetAuthOutcome::Passthrough,
     };
-    record_target_auth_outcome(facts, transit_point, target_auth, outcome, error.oauth_error());
+    record_target_auth_outcome(
+        facts,
+        transit_point,
+        target_auth,
+        outcome,
+        error.failure().status(),
+        error.oauth_error(),
+    );
 }
 
-/// Records in the VP Audit Log that a request was refused over the Target credential of
-/// `target_auth` whatever its `fallback`: it would have carried the credential outside the
-/// Target's base path, or the credential cannot be sent as a header. Nothing is forwarded.
+/// Records in the VP Audit Log that a request was refused with `status` over the Target
+/// credential of `target_auth` whatever its `fallback`: it would have carried the credential
+/// outside the Target's base path, or the credential cannot be sent as a header. Nothing is
+/// forwarded.
 pub(crate) fn record_target_auth_refusal(
     facts: &crate::audit::request_events::RequestFacts<'_>,
     transit_point: Option<&str>,
     target_auth: &crate::config::TargetAuthConfig,
+    status: StatusCode,
 ) {
     record_target_auth_outcome(
         facts,
         transit_point,
         target_auth,
         crate::audit::request_events::TargetAuthOutcome::Rejected,
+        status,
         None,
     );
+}
+
+/// Records in the VP Audit Log that the peer gateway refused the Target credential of
+/// `target_auth` with `401`, so the request was answered with `500 target_auth_rejected`.
+pub(crate) fn record_target_credential_refused_by_target(
+    facts: &crate::audit::request_events::RequestFacts<'_>,
+    transit_point: Option<&str>,
+    target_auth: &crate::config::TargetAuthConfig,
+) {
+    crate::audit::request_events::target_credential_refused_by_target(
+        facts,
+        transit_point,
+        target_auth_provider_id(target_auth),
+        TargetAuthFailure::Rejected
+            .status()
+            .as_u16(),
+        StatusCode::UNAUTHORIZED.as_u16(),
+    );
+}
+
+fn target_auth_provider_id(target_auth: &crate::config::TargetAuthConfig) -> Option<&str> {
+    match &target_auth.method {
+        crate::config::TargetAuthMethod::CredentialProvider { provider_id, .. } => Some(provider_id.as_str()),
+        _ => None,
+    }
 }
 
 fn record_target_auth_outcome(
@@ -964,13 +1080,17 @@ fn record_target_auth_outcome(
     transit_point: Option<&str>,
     target_auth: &crate::config::TargetAuthConfig,
     outcome: crate::audit::request_events::TargetAuthOutcome,
+    status: StatusCode,
     oauth_error: Option<crate::delegation_vault::oauth::OAuthErrorCode>,
 ) {
-    let provider_id = match &target_auth.method {
-        crate::config::TargetAuthMethod::CredentialProvider { provider_id, .. } => Some(provider_id.as_str()),
-        _ => None,
-    };
-    crate::audit::request_events::target_auth_failed(facts, transit_point, provider_id, outcome, oauth_error);
+    crate::audit::request_events::target_auth_failed(
+        facts,
+        transit_point,
+        target_auth_provider_id(target_auth),
+        outcome,
+        status.as_u16(),
+        oauth_error,
+    );
 }
 
 /// A Target credential header the gateway attaches, and the issued service token behind it,
@@ -6697,8 +6817,9 @@ async fn proxy_charged_request(
                 channel = channel_name,
                 "Refusing a request outside the Target base path: it would carry the Target credential"
             );
-            record_target_auth_refusal(&audit_facts, None, target_auth);
-            return Ok(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED));
+            let refusal = TargetAuthFailure::PathRefused;
+            record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
+            return Ok(refusal.response());
         }
         let caller_assertion = CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed);
         let mcp_proxy_base_url = match state.mcp_proxy_store.as_ref() {
@@ -6731,10 +6852,9 @@ async fn proxy_charged_request(
             Err(e) => {
                 error!(channel = channel_name, error = %e, "Failed to resolve target authentication");
                 record_target_auth_failure(&audit_facts, None, target_auth, &e);
-                // Check fallback behavior
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
-                        return Ok(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED));
+                        return Ok(e.failure().response());
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(
@@ -9017,6 +9137,7 @@ async fn proxy_charged_request(
                     surface: &state.surface,
                     response_rules_engine: &state.identity_rules_engine,
                     metrics_store: &state.metrics_store,
+                    verified_presentation: false,
                 };
                 crate::protocols::extensions::inspect_response_extensions(&response_body, &response_ctx).await
             };
@@ -11584,7 +11705,7 @@ async fn handle_fabric_request_inner(
 
     // Surface-Level OPA Policy check (fabric:// path)
     if state.surface.opa_enabled()
-        && !(fabric_target_url.ends_with("/agent.json") || fabric_target_url.ends_with("/agent-card.json"))
+        && !crate::proxy::paths::is_public_request(method.as_str(), &fabric_target_url)
         && state
             .policy_manager
             .as_ref()
@@ -12562,17 +12683,19 @@ async fn handle_fabric_request_inner(
     };
     // Inject target authentication credentials into the forwarded headers so
     // GW2 delivers them to the upstream service.
+    let mut injected_target_header: Option<String> = None;
     if let Some(target_auth) = state.surface.target_auth() {
         if !crate::proxy::paths::appended_path_stays_below_base(uri.path()) {
             warn!(
                 channel = channel_name,
                 "Refusing a Fabric request that climbs out of its path: it would carry the Target credential"
             );
-            record_target_auth_refusal(&fabric_send_facts, None, target_auth);
+            let refusal = TargetAuthFailure::PathRefused;
+            record_target_auth_refusal(&fabric_send_facts, None, target_auth, refusal.status());
             connection_guard
                 .decrement()
                 .await;
-            return Err(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED));
+            return Err(refusal.response());
         }
         match inject_target_auth_header(
             target_auth,
@@ -12593,6 +12716,7 @@ async fn handle_fabric_request_inner(
                     stream_headers.insert(name, value);
                 }
                 headers_map.insert(header_name.to_uppercase(), header_value);
+                injected_target_header = Some(header_name);
                 channel_info!(config_id, "Injected target auth header into fabric ForwardRequest");
             }
             Ok(None) => {}
@@ -12604,7 +12728,7 @@ async fn handle_fabric_request_inner(
                         connection_guard
                             .decrement()
                             .await;
-                        return Err(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED));
+                        return Err(e.failure().response());
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(
@@ -13112,6 +13236,12 @@ async fn handle_fabric_request_inner(
         .then(|| crate::a2a::url_rewriter::extended_agent_card_request_id(&original_body_bytes))
         .flatten();
     let is_extended_card_rpc_request = extended_card_rpc_id.is_some();
+    let sent_target_credential = state
+        .surface
+        .target_auth()
+        .cloned()
+        .zip(injected_target_header);
+    let refusal_trace_id = trace_id.clone();
     let mut process_response = async move |forward_result: Result<
         Option<crate::gateways::connection_points::messages::ReceivedMessage>,
         String,
@@ -13164,6 +13294,27 @@ async fn handle_fabric_request_inner(
                     .get("status")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(500) as u16;
+
+                if let Some((target_auth, injected)) = &sent_target_credential
+                    && crate::proxy::fabric_forward::refused_injected_credential(
+                        status,
+                        crate::proxy::fabric_forward::refused_credential_header(&response_msg.message_body),
+                        injected,
+                    )
+                {
+                    channel_warn!(config_id, "The peer gateway refused the Target credential sent in {}", injected);
+                    let facts = crate::audit::request_events::RequestFacts {
+                        surface_id: config_id,
+                        channel_name,
+                        trace_id: Some(&refusal_trace_id),
+                        via_fabric: false,
+                    };
+                    record_target_credential_refused_by_target(&facts, None, target_auth);
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Err(TargetAuthFailure::Rejected.response());
+                }
 
                 let response_headers = response_msg
                     .message_body
@@ -13222,6 +13373,7 @@ async fn handle_fabric_request_inner(
                     }
 
                     channel_error!(config_id, "❌ Gateway forwarding error: {}", error);
+                    let relayed_failure = TargetAuthFailure::relayed(status, &response_body);
 
                     // For MCP requests, return the error as a properly formatted JSON-RPC error response
                     // instead of converting it to an HTTP error (which causes a 500)
@@ -13238,6 +13390,18 @@ async fn handle_fabric_request_inner(
                         } else {
                             -32603
                         };
+                        let jsonrpc_error = || {
+                            let mut jsonrpc_error = serde_json::json!({
+                                "code": jsonrpc_error_code,
+                                "message": error
+                                    .as_str()
+                                    .unwrap_or("Gateway forwarding failed")
+                            });
+                            if let Some(failure) = relayed_failure {
+                                jsonrpc_error["data"] = serde_json::json!({ "reason": failure.reason() });
+                            }
+                            serde_json::json!({ "jsonrpc": "2.0", "id": null, "error": jsonrpc_error }).to_string()
+                        };
 
                         // Try to parse the response_body as JSON to see if it's already a JSON-RPC error
                         let error_response =
@@ -13249,34 +13413,10 @@ async fn handle_fabric_request_inner(
                                 {
                                     response_body
                                 } else {
-                                    // Create a JSON-RPC error response
-                                    let error_msg = error
-                                        .as_str()
-                                        .unwrap_or("Gateway forwarding failed");
-                                    serde_json::json!({
-                                        "jsonrpc": "2.0",
-                                        "id": null,
-                                        "error": {
-                                            "code": jsonrpc_error_code,
-                                            "message": error_msg
-                                        }
-                                    })
-                                    .to_string()
+                                    jsonrpc_error()
                                 }
                             } else {
-                                // Create a JSON-RPC error response
-                                let error_msg = error
-                                    .as_str()
-                                    .unwrap_or("Gateway forwarding failed");
-                                serde_json::json!({
-                                    "jsonrpc": "2.0",
-                                    "id": null,
-                                    "error": {
-                                        "code": jsonrpc_error_code,
-                                        "message": error_msg
-                                    }
-                                })
-                                .to_string()
+                                jsonrpc_error()
                             };
 
                         // Build response with headers from the forward response.
@@ -13318,6 +13458,9 @@ async fn handle_fabric_request_inner(
                     connection_guard
                         .decrement()
                         .await;
+                    if let Some(failure) = relayed_failure {
+                        return Err(failure.response());
+                    }
                     return Err(create_error_response(
                         error_status,
                         error
@@ -13395,6 +13538,65 @@ async fn handle_fabric_request_inner(
                 let is_well_known_card_response =
                     crate::proxy::paths::is_well_known_agent_card_path(uri.path()) && status < 400;
 
+                // ── Verify the answering agent's identity presentation ─────────
+                let mut answer_presentation_verified = false;
+                let presented_identity = if state
+                    .surface
+                    .managed_identity()
+                    .is_some()
+                    && (200..300).contains(&status)
+                    && !response_body.is_empty()
+                {
+                    let response_audit_facts = crate::audit::request_events::RequestFacts {
+                        surface_id: config_id,
+                        channel_name,
+                        trace_id: Some(trace_id.as_str()),
+                        via_fabric: true,
+                    };
+                    let listener_manager = state
+                        .listener_manager
+                        .read()
+                        .await
+                        .clone();
+                    match crate::proxy::fabric_identity::check_answer_identity(
+                        crate::proxy::fabric_identity::AnswerIdentityCheck {
+                            response_body: &response_body,
+                            surface: &state.surface,
+                            vc_issuer: state.vc_issuer.as_ref(),
+                            listener_manager,
+                            gateway_id,
+                            facts: &response_audit_facts,
+                            caller: authenticated_identity
+                                .as_ref()
+                                .map(crate::delegation_vault::audit::build_caller_context),
+                        },
+                    )
+                    .await
+                    {
+                        Ok(presentation) => presentation
+                            .inspect(|_| answer_presentation_verified = true)
+                            .filter(|_| {
+                                crate::proxy::backend_identity::slot_reads_response_body(
+                                    &state.surface,
+                                    crate::proxy::backend_identity::IdentitySlot::Protected,
+                                )
+                            })
+                            .map(|presentation| ProtectedAgentIdentity::Managed {
+                                did: presentation.agent_did,
+                                identity_fields: presentation.identity_fields,
+                            }),
+                        Err(refusal) => {
+                            error!(channel = channel_name, ?refusal, "Fabric: answer identity presentation refused");
+                            connection_guard
+                                .decrement()
+                                .await;
+                            return Err(create_error_response(StatusCode::BAD_GATEWAY, refusal.detail()));
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 // ── Step 12: Resolve Protected Agent Identity (fabric path) ─────
                 let is_agent_card_request = is_well_known_card_response || is_extended_card_response;
                 let identity_response_kind = crate::proxy::backend_identity::IdentityResponseKind::for_response(
@@ -13413,7 +13615,9 @@ async fn handle_fabric_request_inner(
                     .or(state
                         .identity_rules_engine
                         .as_ref());
-                let resolved_identity = if (200..300).contains(&status) && !response_body.is_empty() {
+                let resolved_identity = if let Some(identity) = presented_identity {
+                    identity
+                } else if (200..300).contains(&status) && !response_body.is_empty() {
                     match crate::proxy::backend_identity::resolve_protected_agent_identity(
                         response_body.as_bytes(),
                         &state.surface,
@@ -14044,52 +14248,6 @@ async fn handle_fabric_request_inner(
                     );
                 }
 
-                // Extract and verify backend agent identity from fabric response (multi-gateway only)
-                // This verifies VPs sent by GW2 instead of computing raw identity
-                let _agent_identity = if state
-                    .surface
-                    .managed_identity()
-                    .is_some()
-                {
-                    match crate::proxy::fabric_identity::extract_fabric_backend_agent_identity(
-                        &response_body,
-                        &state.surface,
-                        &state.identity_selector,
-                        channel_name,
-                    )
-                    .await
-                    {
-                        Ok(identity_opt) => {
-                            if let Some(ref agent_did) = identity_opt {
-                                info!(
-                                    channel = channel_name,
-                                    did = agent_did,
-                                    "Fabric: Verified backend agent identity from GW2"
-                                );
-                            }
-                            identity_opt
-                        }
-                        Err(e) => {
-                            // VP verification failed - reject the response (Policy: Option C)
-                            error!(channel = channel_name, error = %e, "Fabric: Backend agent VP verification failed");
-                            connection_guard
-                                .decrement()
-                                .await;
-                            return Err(create_error_response(
-                                StatusCode::BAD_GATEWAY,
-                                &format!("Backend agent identity verification failed: {}", e),
-                            ));
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                if let Some(ref agent_did) = _agent_identity {
-                    // Log for metrics/audit purposes
-                    debug!(channel = channel_name, did = agent_did, "Fabric: Backend agent DID extracted and verified");
-                }
-
                 // Inspect response extensions if enabled (same as direct path)
                 // Skip validation for agent card requests (they're JSON config, not A2A messages)
                 let _inspect_span =
@@ -14140,6 +14298,7 @@ async fn handle_fabric_request_inner(
                                 surface: &state.surface,
                                 response_rules_engine: &state.identity_rules_engine,
                                 metrics_store: &state.metrics_store,
+                                verified_presentation: answer_presentation_verified,
                             };
                             crate::protocols::extensions::inspect_response_extensions(
                                 _response_body_bytes,
@@ -14779,6 +14938,19 @@ async fn evaluate_mcp_tool_policies(
 
 const DEFAULT_AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
 
+/// Whether a request received over Fabric is the sending gateway's own agent card fetch: a `GET`
+/// whose path is exactly `/.well-known/agent-card.json` or the surface's configured card
+/// location, the paths a sending gateway's card fetch asks for. Another method, a query, another
+/// spelling of the path, or the legacy `/.well-known/agent.json` is not.
+pub(crate) fn is_fabric_card_fetch(
+    surface: &crate::config::agent_surface::AgentSurface,
+    method: &str,
+    path: &str,
+) -> bool {
+    method.eq_ignore_ascii_case("GET")
+        && (path == DEFAULT_AGENT_CARD_PATH || path == agent_card_fabric_forward_path(surface))
+}
+
 fn agent_card_fabric_forward_path(surface: &crate::config::agent_surface::AgentSurface) -> String {
     if surface.override_agent_card_location()
         && let Some(custom_path) = surface.agent_card_location_path()
@@ -14869,7 +15041,7 @@ async fn pinned_target_client(
 /// credential. The caller is anonymous, so only content negotiation passes;
 /// nothing the caller sends can override the credential or ride along on a
 /// request the gateway has authenticated.
-fn is_forwarded_on_credentialed_card_fetch(name: &str) -> bool {
+pub(crate) fn is_forwarded_on_credentialed_card_fetch(name: &str) -> bool {
     ["accept", "accept-language", "user-agent"]
         .iter()
         .any(|allowed| name.eq_ignore_ascii_case(allowed))
@@ -15622,10 +15794,7 @@ async fn handle_mcp_proxy_request_inner(
                 record_target_auth_failure(&audit_facts, None, target_auth, &e);
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
-                        return Err(create_error_response(
-                            StatusCode::BAD_GATEWAY,
-                            "Target authentication configuration error",
-                        ));
+                        return Err(e.failure().response());
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(
@@ -15966,10 +16135,11 @@ async fn handle_mcp_proxy_request_inner(
             Ok(axum::response::Json(response_json).into_response())
         }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::OutsideTargetBase) => {
+            let refusal = TargetAuthFailure::PathRefused;
             if let Some(target_auth) = state.surface.target_auth() {
-                record_target_auth_refusal(&audit_facts, None, target_auth);
+                record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
             }
-            Err(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED))
+            Err(refusal.response())
         }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::Failed(e)) => {
             error!(
@@ -16608,6 +16778,8 @@ pub(crate) fn compute_transit_token_caller_context(
 }
 
 #[cfg(test)]
+mod fabric_send_policy_tests;
+#[cfg(test)]
 mod target_auth_audit_tests;
 #[cfg(test)]
 pub(crate) mod variant_routing_tests;
@@ -16706,6 +16878,71 @@ mod caller_assertion_tests {
         ] {
             assert_eq!(CallerAssertion::for_forwarded_request(method, path, false), expected, "{method} {path}");
         }
+    }
+
+    fn surface_with_card_location(card_location: Option<&str>) -> crate::config::agent_surface::AgentSurface {
+        let mut value = serde_json::json!({
+            "surface_id": "card", "name": "card",
+            "access_point": {"listen_address": "127.0.0.1:8080", "route": "/card", "protocol": "a2a"},
+            "target": {"endpoint": "https://agent.example/base"}
+        });
+        if let Some(location) = card_location {
+            value["access_point"]["agent_card_path"] = serde_json::json!(location);
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn only_an_exact_card_get_over_fabric_is_the_sending_gateways_card_fetch() {
+        let default = surface_with_card_location(None);
+        let configured = surface_with_card_location(Some("cards/me"));
+        for (surface, method, path) in [
+            (&default, "GET", "/.well-known/agent-card.json"),
+            (&default, "get", "/.well-known/agent-card.json"),
+            (&configured, "GET", "/cards/me"),
+            (&configured, "GET", "/.well-known/agent-card.json"),
+        ] {
+            assert!(super::is_fabric_card_fetch(surface, method, path), "{method} {path}");
+            assert_eq!(
+                CallerAssertion::for_fabric_received_request(surface, method, path, true),
+                CallerAssertion::GatewayOriginated,
+                "{method} {path}: the fetch is the gateway's own, whatever the caller"
+            );
+        }
+        for (surface, method, path) in [
+            (&default, "HEAD", "/.well-known/agent-card.json"),
+            (&default, "POST", "/.well-known/agent-card.json"),
+            (&default, "GET", "/.well-known/agent.json"),
+            (&default, "GET", "/.well-known/agent-card.json?view=full"),
+            (&default, "GET", "/x/../.well-known/agent-card.json"),
+            (&default, "GET", "/x/%2e%2e/.well-known/agent-card.json"),
+            (&default, "GET", "/%2Ewell-known/agent-card.json"),
+            (&default, "GET", "/.well-known/Agent-Card.json"),
+            (&default, "GET", "/.well-known/agent-card.json/"),
+            (&default, "GET", "/discovery"),
+            (&default, "GET", "/.well-known/ucp"),
+            (&default, "GET", "/cards/me"),
+            (&configured, "HEAD", "/cards/me"),
+            (&configured, "GET", "/cards/me/"),
+            (&configured, "GET", "/cards/ME"),
+        ] {
+            assert!(!super::is_fabric_card_fetch(surface, method, path), "{method} {path}");
+            assert_ne!(
+                CallerAssertion::for_fabric_received_request(surface, method, path, false),
+                CallerAssertion::GatewayOriginated,
+                "{method} {path}"
+            );
+        }
+        assert_eq!(
+            CallerAssertion::for_fabric_received_request(&default, "HEAD", "/.well-known/agent-card.json", false),
+            CallerAssertion::Unauthenticated,
+            "a HEAD of the card path is a caller's discovery read"
+        );
+        assert_eq!(
+            CallerAssertion::for_fabric_received_request(&default, "GET", "/cards/me", true),
+            CallerAssertion::Unauthenticated,
+            "a path that is no card location keeps the failed caller's rule"
+        );
     }
 }
 
@@ -17020,6 +17257,84 @@ pub(crate) mod target_auth_tests {
             .collect();
         stored.sort();
         assert_eq!(stored, vec![vec!["read".to_string()], vec!["write".to_string()]]);
+    }
+
+    #[test]
+    fn each_target_auth_error_is_reported_as_misconfigured_or_unavailable() {
+        use crate::config::target_auth_rules::TargetCredentialRule;
+        use crate::delegation_vault::oauth::OAuthErrorCode;
+        use crate::proxy::handler::TargetAuthFailure;
+        let unavailable = [
+            TargetAuthError::StoreUnavailable,
+            TargetAuthError::ServiceToken(ServiceTokenError::TokenRequestFailed),
+            TargetAuthError::ServiceToken(ServiceTokenError::ProviderChanged),
+            TargetAuthError::ServiceToken(ServiceTokenError::StoreUnavailable),
+        ];
+        let misconfigured = [
+            TargetAuthError::SecretNotFound,
+            TargetAuthError::ProviderNotFound,
+            TargetAuthError::ProviderNeedsConsent,
+            TargetAuthError::Withheld(TargetCredentialRule::Https),
+            TargetAuthError::Withheld(TargetCredentialRule::SourceAuth),
+            TargetAuthError::InvalidHeader,
+            TargetAuthError::ServiceToken(ServiceTokenError::Unsupported),
+            TargetAuthError::ServiceToken(ServiceTokenError::SecretUnavailable),
+            TargetAuthError::ServiceToken(ServiceTokenError::TokenRequestRejected(OAuthErrorCode::new(
+                "invalid_client",
+            ))),
+            TargetAuthError::ServiceToken(ServiceTokenError::TokenEndpointRefused),
+            TargetAuthError::ServiceToken(ServiceTokenError::TokenEndpointNotHttps),
+            TargetAuthError::ServiceToken(ServiceTokenError::ScopeMismatch),
+            TargetAuthError::ServiceToken(ServiceTokenError::ProviderMisconfigured),
+        ];
+        for error in unavailable {
+            assert_eq!(error.failure(), TargetAuthFailure::Unavailable, "{error:?}");
+        }
+        for error in misconfigured {
+            assert_eq!(error.failure(), TargetAuthFailure::Misconfigured, "{error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_target_auth_failure_answers_its_status_and_reason_with_the_generic_detail() {
+        use crate::proxy::handler::{TARGET_AUTH_FAILED, TargetAuthFailure};
+        use axum::http::StatusCode;
+        for (failure, status, reason) in [
+            (TargetAuthFailure::Misconfigured, StatusCode::INTERNAL_SERVER_ERROR, "target_auth_misconfigured"),
+            (TargetAuthFailure::Unavailable, StatusCode::SERVICE_UNAVAILABLE, "target_auth_unavailable"),
+            (TargetAuthFailure::PathRefused, StatusCode::BAD_REQUEST, "target_path_refused"),
+            (TargetAuthFailure::Rejected, StatusCode::INTERNAL_SERVER_ERROR, "target_auth_rejected"),
+        ] {
+            let response = failure.response();
+            assert_eq!(response.status(), status, "{failure:?}");
+            assert_eq!(response.headers()["content-type"], "application/problem+json", "{failure:?}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["status"], status.as_u16(), "{failure:?}");
+            assert_eq!(body["detail"], TARGET_AUTH_FAILED, "{failure:?}");
+            assert_eq!(body["reason"], reason, "{failure:?}");
+        }
+    }
+
+    #[test]
+    fn a_peer_gateways_target_auth_refusal_is_read_only_from_a_known_reason_with_its_status() {
+        use crate::proxy::handler::TargetAuthFailure;
+        let problem =
+            |reason: &str| serde_json::json!({"detail": "Target authentication failed", "reason": reason}).to_string();
+        for (status, body, expected) in [
+            (500, problem("target_auth_misconfigured"), Some(TargetAuthFailure::Misconfigured)),
+            (503, problem("target_auth_unavailable"), Some(TargetAuthFailure::Unavailable)),
+            (400, problem("target_path_refused"), Some(TargetAuthFailure::PathRefused)),
+            (500, problem("target_auth_rejected"), Some(TargetAuthFailure::Rejected)),
+            (503, problem("target_auth_misconfigured"), None),
+            (500, problem("anything_else"), None),
+            (500, serde_json::json!({"detail": "Target authentication failed"}).to_string(), None),
+            (500, "not json".to_string(), None),
+        ] {
+            assert_eq!(TargetAuthFailure::relayed(status, &body), expected, "{status} {body}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -23949,7 +24264,7 @@ mod fabric_send_tests {
 
     const TARGET_URL: &str = "https://backend.internal/a2a";
 
-    fn run_on_large_stack<F>(test: F)
+    pub(super) fn run_on_large_stack<F>(test: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -24395,7 +24710,7 @@ mod fabric_send_tests {
         for path in ["/%2e%2e/admin", "/x/../../admin", "/..;/admin", "/%2E%2E/%2e%2e/admin"] {
             assert_eq!(
                 fabric_send_status_with_passthrough_target_auth(path).await,
-                axum::http::StatusCode::BAD_GATEWAY,
+                axum::http::StatusCode::BAD_REQUEST,
                 "{path}"
             );
         }

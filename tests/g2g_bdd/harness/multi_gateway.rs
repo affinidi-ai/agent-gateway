@@ -23,9 +23,11 @@ use crate::bdd_support::config::fabric_surface_fixture::SurfaceSpec;
 use crate::bdd_support::config::modern_consent::{
     ModernConsentFixture, oauth_endpoint_allowlist, write_modern_consent_config,
 };
+use crate::bdd_support::config::single_surface_fixture::SurfaceTargetAuthProviderConfig;
+use crate::bdd_support::config::target_auth::{TARGET_AUTH_CLIENT_SECRET_VALUE, TARGET_AUTH_PROVIDER_TOKEN};
 use crate::bdd_support::gateway_process::GatewayProcess;
 use crate::bdd_support::json_rpc::McpVersion;
-use crate::bdd_support::mock_server::MockServer;
+use crate::bdd_support::mock_server::{MockResponse, MockServer};
 use crate::bdd_support::temp::{TempDirGuard, create_project_temp_dir};
 
 use crate::bdd_support::mediator::{Mediator, MediatorCrossBridge, ScenarioDockerMediator, bridge_mediator_pairs};
@@ -55,6 +57,9 @@ pub struct GatewayNode {
     /// gateway is on its own mediator.
     pub mediator_index: usize,
     extra_env: HashMap<String, String>,
+    /// The token endpoints of the credential providers this gateway's surfaces authenticate to
+    /// their Targets with, kept serving for the gateway's lifetime.
+    _token_endpoints: Vec<MockServer>,
     _temp_dir: TempDirGuard,
     gateway: GatewayProcess,
 }
@@ -105,6 +110,17 @@ impl GatewayNode {
             .await
             .with_context(|| format!("bootstrap test session on restarted gateway port {}", self.port))
     }
+
+    /// Stop the gateway, let `edit` change what it stored under its base
+    /// directory, then start it again, so the new process reads the edit.
+    pub async fn restart_after_storage_edit(
+        &mut self,
+        edit: impl FnOnce(&std::path::Path) -> Result<()>,
+    ) -> Result<()> {
+        self.gateway.stop();
+        edit(&self.base_dir)?;
+        self.restart().await
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -112,6 +128,8 @@ pub struct GatewayPlan {
     pub surfaces: Vec<SurfaceSpec>,
     pub mock_responses: HashMap<String, serde_json::Value>,
     pub mock_response_delays: HashMap<String, (u64, u64)>,
+    /// Surfaces whose mock answers with this status instead of 200.
+    pub mock_statuses: HashMap<String, u16>,
     /// Surfaces whose mock gzip-compresses its replies, always or only when the
     /// request accepts gzip.
     pub mock_gzip: HashMap<String, crate::bdd_support::mock_server::MockStream>,
@@ -290,16 +308,35 @@ impl MultiGatewayHarness {
         &mut self,
         one_based_index: usize,
     ) -> Result<()> {
+        self.node_mut(one_based_index)?
+            .restart()
+            .await
+            .with_context(|| format!("restart gateway {one_based_index}"))
+    }
+
+    /// Restart one gateway after `edit` changed its stored records; see
+    /// [`GatewayNode::restart_after_storage_edit`].
+    pub async fn restart_gateway_after_storage_edit(
+        &mut self,
+        one_based_index: usize,
+        edit: impl FnOnce(&std::path::Path) -> Result<()>,
+    ) -> Result<()> {
+        self.node_mut(one_based_index)?
+            .restart_after_storage_edit(edit)
+            .await
+            .with_context(|| format!("restart gateway {one_based_index} after editing its storage"))
+    }
+
+    fn node_mut(
+        &mut self,
+        one_based_index: usize,
+    ) -> Result<&mut GatewayNode> {
         let i = one_based_index
             .checked_sub(1)
             .expect("gateway index must be 1-based");
-        let node = self
-            .nodes
+        self.nodes
             .get_mut(i)
-            .with_context(|| format!("no gateway at index {one_based_index}"))?;
-        node.restart()
-            .await
-            .with_context(|| format!("restart gateway {one_based_index}"))
+            .with_context(|| format!("no gateway at index {one_based_index}"))
     }
 
     /// The DID gateway `index` signs identity credentials with, read from its
@@ -1014,6 +1051,12 @@ async fn spawn_node(
             {
                 response.stream = *stream;
             }
+            if let Some(status) = plan
+                .mock_statuses
+                .get(&surface.surface_id)
+            {
+                response.status = *status;
+            }
             let mock = MockServer::start(response).await;
             if let Some((min_ms, max_ms)) = plan
                 .mock_response_delays
@@ -1035,6 +1078,20 @@ async fn spawn_node(
             }
             mocks.insert(surface.surface_id.clone(), mock);
         }
+    }
+    let mut oauth_endpoints = Vec::new();
+    let mut token_endpoints = Vec::new();
+    for provider in surfaces
+        .iter_mut()
+        .filter_map(|surface| {
+            surface
+                .target_auth_provider
+                .as_mut()
+        })
+    {
+        let token_endpoint = start_target_auth_token_endpoint(provider).await;
+        oauth_endpoints.push(format!("{}/token", token_endpoint.url()));
+        token_endpoints.push(token_endpoint);
     }
 
     let (gateway_port, mut port_reservation) = config::reserve_free_port("");
@@ -1079,7 +1136,10 @@ async fn spawn_node(
         }
     }
     if let Some(consent) = &plan.modern_consent {
-        extra_env.insert("AG_BDD_OAUTH_ENDPOINT_ALLOWLIST".to_string(), oauth_endpoint_allowlist(consent));
+        oauth_endpoints.push(oauth_endpoint_allowlist(consent));
+    }
+    if !oauth_endpoints.is_empty() {
+        extra_env.insert("AG_BDD_OAUTH_ENDPOINT_ALLOWLIST".to_string(), oauth_endpoints.join(","));
     }
     let mut gateway = GatewayProcess::start_g2g_with_env(&config_path, temp_dir.path(), &extra_env);
     gateway = gateway
@@ -1136,9 +1196,33 @@ async fn spawn_node(
         mediator_id: mediator_record.id,
         mediator_index,
         extra_env,
+        _token_endpoints: token_endpoints,
         _temp_dir: TempDirGuard::new(temp_dir, name),
         gateway,
     })
+}
+
+/// Serves `provider`'s token endpoint and records its URL on `provider`. It issues
+/// [`TARGET_AUTH_PROVIDER_TOKEN`] or, when `provider` refuses token requests, answers an OAuth
+/// `invalid_client` error whose description and the client secret must never leave the gateway.
+async fn start_target_auth_token_endpoint(provider: &mut SurfaceTargetAuthProviderConfig) -> MockServer {
+    let body = if provider.token_status == 200 {
+        serde_json::json!({
+            "access_token": TARGET_AUTH_PROVIDER_TOKEN,
+            "token_type": "Bearer",
+            "expires_in": provider.expires_in,
+        })
+    } else {
+        serde_json::json!({
+            "error": "invalid_client",
+            "error_description": format!("client secret {TARGET_AUTH_CLIENT_SECRET_VALUE} rejected"),
+        })
+    };
+    let mut response = MockResponse::json(body);
+    response.status = provider.token_status;
+    let token_endpoint = MockServer::start(response).await;
+    provider.token_endpoint = Some(format!("{}/token", token_endpoint.url()));
+    token_endpoint
 }
 
 /// Union of `mediator_egress_allowlist` across every mediator instance in the
