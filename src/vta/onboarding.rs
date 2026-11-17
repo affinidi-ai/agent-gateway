@@ -17,7 +17,6 @@
 //! The distinct identities (VTA service DID, gateway **control** DID, **issuer**
 //! DID) are kept separate throughout.
 
-use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
@@ -225,19 +224,6 @@ impl OnboardingRecord {
     }
 }
 
-/// Audit trail entry for a control-key rotation.
-// The guarded-rotation primitive below (`rotate` + this record) is exercised by
-// tests and is the entry point the operator rotation flow calls; wiring that
-// admin trigger is a follow-up (VTA-13 moves the control DID to did:webvh), so
-// the primitive ships ahead of its runtime caller.
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RotationAudit {
-    pub old_control_did: String,
-    pub new_control_did: String,
-    pub rotated_at: DateTime<Utc>,
-}
-
 /// Guards control-key rotation: **rate-limited**, **prove-new-before-revoke-old**,
 /// and **audited**. A stolen control key must not be able to silently self-rotate
 /// and lock the real gateway out, so an off-schedule rotation is rejected and
@@ -273,42 +259,6 @@ impl RotationGuard {
             }
         }
         Ok(())
-    }
-
-    /// Guarded rotation: run `prove_new` (authenticate with the new key) and only
-    /// on success authorize revoking the old key (**new-before-delete**), then
-    /// emit an audit record. If the new key cannot be proven the old key is
-    /// retained.
-    #[allow(dead_code)] // rotation primitive; the admin trigger is a follow-up (see RotationAudit note)
-    pub async fn rotate<F, Fut>(
-        &self,
-        old_control_did: &str,
-        new_control_did: &str,
-        now: DateTime<Utc>,
-        last_rotation: Option<DateTime<Utc>>,
-        prove_new: F,
-    ) -> Result<RotationAudit, VtaError>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<(), VtaError>>,
-    {
-        self.check_schedule(now, last_rotation)?;
-        prove_new().await.map_err(|e| {
-            tracing::warn!(target: "vta_audit", event = "control_key_rotation_proof_failed", "new control key failed proof; old key retained");
-            VtaError::Config(format!("new control key failed proof; old key retained: {}", e.log_detail()))
-        })?;
-        tracing::info!(
-            target: "vta_audit",
-            event = "control_key_rotated",
-            %old_control_did,
-            %new_control_did,
-            "control-key rotation: new key proven; old key may now be revoked (one-ACL-delete)"
-        );
-        Ok(RotationAudit {
-            old_control_did: old_control_did.to_string(),
-            new_control_did: new_control_did.to_string(),
-            rotated_at: now,
-        })
     }
 }
 
@@ -537,28 +487,6 @@ mod tests {
             .unwrap()
             .expect("present after save");
         assert_eq!(loaded, record, "idempotent round-trip");
-    }
-
-    #[tokio::test]
-    async fn rotation_proves_new_key_before_authorizing_old_revocation() {
-        let guard = RotationGuard::new(Duration::from_secs(3600));
-        let now = Utc::now();
-
-        // New key proves out → rotation authorized + audited.
-        let audit = guard
-            .rotate("did:key:zOld", "did:key:zNew", now, None, || async { Ok(()) })
-            .await
-            .expect("proven new key rotates");
-        assert_eq!(audit.old_control_did, "did:key:zOld");
-        assert_eq!(audit.new_control_did, "did:key:zNew");
-
-        // New key fails proof → old key retained (rotation refused).
-        let refused = guard
-            .rotate("did:key:zOld", "did:key:zBad", now, None, || async {
-                Err(VtaError::Transport("cannot auth".to_string()))
-            })
-            .await;
-        assert!(refused.is_err(), "unproven key must not trigger old-key revocation");
     }
 
     #[test]

@@ -2492,11 +2492,16 @@ pub async fn create_identity_api_router(
         }
     }
 
+    // What `[vta]` resolves to at boot: checked here so a configured agent
+    // that cannot sign stops startup, and handed to the connection registry as
+    // the bootstrap connection's connector. Signing itself resolves per call
+    // through `ApplianceAuthority` below, once the dashboard's connections and
+    // default are attached.
     let appliance_key = key_directory
         .resolve_and_provision(crate::config::vta::KeyPurpose::Jwt, &crate::vta::key_directory::KeyScope::default())
         .await
         .unwrap_or_else(|e| panic!("VTA signing key could not be resolved: {}", e.log_detail()));
-    let sts_signing_authority = key_directory
+    let bootstrap_authority = key_directory
         .authority_for(&appliance_key, crate::config::vta::KeyPurpose::Jwt)
         .await
         .unwrap_or_else(|e| panic!("VTA signing key could not be resolved: {}", e.log_detail()));
@@ -2514,7 +2519,7 @@ pub async fn create_identity_api_router(
                 sts_secrets_store.clone(),
                 sts_vta_config
                     .enabled
-                    .then(|| std::sync::Arc::clone(&sts_signing_authority)),
+                    .then(|| std::sync::Arc::clone(&bootstrap_authority)),
                 // The same client `[vta]` already dialled. Re-dialling would
                 // open a second session for the same control DID, which the
                 // VTA supersedes — cutting off the first.
@@ -2578,6 +2583,8 @@ pub async fn create_identity_api_router(
         }
     }
     let key_directory = std::sync::Arc::new(key_directory);
+    let sts_signing_authority: std::sync::Arc<dyn crate::identity::authority::CredentialAuthority> =
+        std::sync::Arc::new(crate::vta::key_directory::ApplianceAuthority::new(std::sync::Arc::clone(&key_directory)));
 
     // What this appliance signs with when nobody has said.
     let default_resolution = std::sync::Arc::new(crate::vta::onboarding_default::resolve(&sts_vta_config));
@@ -2659,9 +2666,8 @@ pub async fn create_identity_api_router(
 
     // Payment-receipt VCs are VC-JWTs, so they sign through the same connector
     // as STS tokens. Upgrade the payment issuer from the local default the
-    // orchestrator registered at boot to whichever backend `[vta]` selected
-    // (VTA-10) — otherwise receipts would keep being signed by the local key
-    // while STS signed via the VTA.
+    // orchestrator registered at boot to the appliance authority, so receipts
+    // follow the same choice as STS (VTA-10).
     crate::payment_credentials::set_global_payment_credential_authority(std::sync::Arc::clone(&sts_signing_authority));
 
     // The JWT-shaped agent-identity credential signs through the same connector
@@ -2753,6 +2759,9 @@ pub async fn create_identity_api_router(
             ))),
         ));
         sts_vc_issuer
+            .set_agent_jwt_signer(holder_issuer.clone())
+            .await;
+        sts_vc_issuer
             .set_di_vp_issuer(holder_issuer)
             .await;
         sts_vc_issuer
@@ -2780,6 +2789,9 @@ pub async fn create_identity_api_router(
                 crate::identity::ssi::vp_issuer::LocalVpSigner::new(),
             ))),
         ));
+        sts_vc_issuer
+            .set_agent_jwt_signer(holder_issuer.clone())
+            .await;
         sts_vc_issuer
             .set_di_vp_issuer(holder_issuer)
             .await;

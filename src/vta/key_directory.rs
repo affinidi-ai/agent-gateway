@@ -30,7 +30,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use serde_json::Value;
 use tokio::sync::RwLock;
 
 use crate::config::vta::{KeyPurpose, VtaConfig};
@@ -44,7 +43,6 @@ pub struct KeyId(pub String);
 impl KeyId {
     /// Read the id back out. Used by callers that render a `KeyRef` (the Key
     /// Management dashboard, VTA-20) and by this module's tests.
-    #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -62,7 +60,6 @@ pub struct ContextId(pub String);
 
 impl ContextId {
     /// See [`KeyId::as_str`].
-    #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -83,10 +80,6 @@ pub enum KeyBackend {
     /// connection exists today; VTA-23 makes connections managed records, at
     /// which point `connection_id` selects between several.
     Vta { connection_id: String },
-    /// An external HSM/KMS signer. The arm and its capability profile exist so
-    /// the directory's shape is final; the implementation is VTA-22.
-    #[allow(dead_code)]
-    Hsm { provider: String },
 }
 
 impl KeyBackend {
@@ -96,7 +89,6 @@ impl KeyBackend {
         match self {
             Self::Local => "local",
             Self::Vta { .. } => "vta",
-            Self::Hsm { .. } => "hsm",
         }
     }
 }
@@ -184,9 +176,6 @@ pub fn supports(
         // Data Integrity proofs via the local suite.
         KeyBackend::Local => true,
         KeyBackend::Vta { .. } => matches!(purpose, KeyPurpose::Jwt | KeyPurpose::Credential),
-        // An HSM signs raw JWS. Credential/proof assembly is not an HSM
-        // operation, so those stay with whichever backend owns the issuer DID.
-        KeyBackend::Hsm { .. } => matches!(purpose, KeyPurpose::Jwt),
     }
 }
 
@@ -209,7 +198,7 @@ impl KeyScope {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn variant(
         surface_id: impl Into<String>,
         variant_id: impl Into<String>,
@@ -220,23 +209,10 @@ impl KeyScope {
             ..Self::default()
         }
     }
-
-    #[allow(dead_code)]
-    pub fn tenant(tenant_id: impl Into<String>) -> Self {
-        Self {
-            tenant_id: Some(tenant_id.into()),
-            ..Self::default()
-        }
-    }
 }
 
 /// What a mapping is scoped to. Ordered most-specific first — the discriminant
 /// order *is* the resolution order.
-///
-/// No mapping is installed until VTA-19 provides per-surface/variant config; the
-/// resolution order it defines is unit-tested here so that ticket only has to
-/// supply the data.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum MappingScope {
     /// A specific variant of a specific surface.
@@ -246,9 +222,6 @@ enum MappingScope {
     },
     Surface {
         surface_id: String,
-    },
-    Tenant {
-        tenant_id: String,
     },
 }
 
@@ -284,7 +257,6 @@ struct KeyMapping {
     key_ref: KeyRef,
 }
 
-/// Resolves request coordinates to a [`KeyRef`], and a `KeyRef` to a connector.
 /// What a scope says about which issuer signs its agent-identity credential.
 ///
 /// Three-state on purpose: an `Option` conflated "this surface asks for the
@@ -299,6 +271,27 @@ pub enum ScopedDiIssuer {
     Inherit,
 }
 
+/// What the appliance says about who signs the fabric issuer attestation,
+/// decided by the same resolution as the agent-identity credential's issuer so
+/// the DID it attests is the one peers receive credentials from.
+pub enum ScopedContextSigner {
+    /// Sign as the agent context that issues the appliance's credentials.
+    Agent(Arc<dyn crate::vta::context_signer::ContextSigner>),
+    /// The appliance explicitly asks for the gateway's own key.
+    Local,
+    /// No opinion — use whatever signer was installed for `[vta]`, or the
+    /// gateway's own key.
+    Inherit,
+}
+
+/// The agent context a scope issues credentials as.
+enum IssuingContext {
+    Agent { client: Arc<crate::vta::client::VtaRestClient>, context_id: String },
+    Local,
+    Inherit,
+}
+
+/// Resolves request coordinates to a [`KeyRef`], and a `KeyRef` to a connector.
 pub struct KeyDirectory {
     /// Appliance-wide default per purpose. Populated from `[vta]` by
     /// [`KeyDirectory::build`]; falls back to the local key for any purpose the
@@ -311,6 +304,9 @@ pub struct KeyDirectory {
     /// Contexts already given a signing identity, so the bootstrap costs one
     /// round trip per context rather than one per request.
     identified: tokio::sync::RwLock<std::collections::HashSet<String>>,
+    /// Attestation signers by client and context, so a context's identity is
+    /// read once per connection client rather than on every attestation.
+    context_signers: RwLock<HashMap<(usize, String), Arc<dyn crate::vta::context_signer::ContextSigner>>>,
     /// The bootstrap-configured VTA connector, if `[vta]` is enabled. Used for
     /// [`DEFAULT_CONNECTION_ID`] so a gateway with no connection records — and
     /// no secrets store — still resolves exactly what `[vta]` always built.
@@ -429,6 +425,7 @@ impl KeyDirectory {
 
         Ok(Self {
             identified: tokio::sync::RwLock::new(std::collections::HashSet::new()),
+            context_signers: RwLock::new(HashMap::new()),
             defaults,
             mappings: Vec::new(),
             local,
@@ -463,19 +460,6 @@ impl KeyDirectory {
         self.di_vc_issuer.clone()
     }
 
-    /// The Data-Integrity credential issuer for one request's coordinates, or
-    /// `None` to sign locally.
-    ///
-    /// Resolves through the ordinary order — variant, surface, tenant,
-    /// dashboard default, `[vta]`, local — so a surface's own `signing` block
-    /// governs the credential inside an injected presentation exactly as it
-    /// governs a token. A scope that resolves to the local key returns `None`,
-    /// which is what keeps a gateway that never adopted an agent on precisely
-    /// the path it was always on.
-    ///
-    /// Provisioning is deliberate, not incidental: a surface mapped to an
-    /// agent with no context named gets one derived from its stable id and
-    /// created on first use, the same context its tokens already use.
     /// Give a context reached through this directory an identity so it can
     /// issue, remembering the ones already done.
     async fn ensure_can_issue(
@@ -499,20 +483,80 @@ impl KeyDirectory {
         }
     }
 
+    /// The Data-Integrity credential issuer for one request's coordinates, or
+    /// `None` to sign locally.
+    ///
+    /// Resolves through the ordinary order — variant, surface, issuer,
+    /// dashboard default, `[vta]`, local — so a surface's own `signing` block
+    /// governs the credential inside an injected presentation exactly as it
+    /// governs a token. A scope that resolves to the local key returns `None`,
+    /// which is what keeps a gateway that never adopted an agent on precisely
+    /// the path it was always on.
+    ///
+    /// Provisioning is deliberate, not incidental: a surface mapped to an
+    /// agent with no context named gets one derived from its stable id and
+    /// created on first use, the same context its tokens already use.
     pub async fn di_vc_issuer_for(
         &self,
         scope: &KeyScope,
     ) -> ScopedDiIssuer {
+        match self
+            .issuing_context_for(scope)
+            .await
+        {
+            IssuingContext::Agent { client, context_id } => {
+                ScopedDiIssuer::Agent(Arc::new(crate::vta::vc_issuer::VtaVcIssuer::new(client, context_id))
+                    as Arc<dyn crate::identity::ssi::vc_issuer::VcIssuer>)
+            }
+            IssuingContext::Local => ScopedDiIssuer::Local,
+            IssuingContext::Inherit => ScopedDiIssuer::Inherit,
+        }
+    }
+
+    /// Who signs the fabric issuer attestation: the context that issues the
+    /// appliance-wide agent-identity credential, resolved the same way and at
+    /// the same moment, so the attested DID and the credential issuer agree.
+    pub async fn attestation_signer(&self) -> ScopedContextSigner {
+        let (client, context_id) = match self
+            .issuing_context_for(&KeyScope::default())
+            .await
+        {
+            IssuingContext::Agent { client, context_id } => (client, context_id),
+            IssuingContext::Local => return ScopedContextSigner::Local,
+            IssuingContext::Inherit => return ScopedContextSigner::Inherit,
+        };
+        let key = (Arc::as_ptr(&client) as usize, context_id.clone());
+        if let Some(signer) = self
+            .context_signers
+            .read()
+            .await
+            .get(&key)
+        {
+            return ScopedContextSigner::Agent(Arc::clone(signer));
+        }
+        let signer: Arc<dyn crate::vta::context_signer::ContextSigner> =
+            Arc::new(crate::vta::context_signer::VtaContextSigner::new(client, context_id));
+        self.context_signers
+            .write()
+            .await
+            .insert(key, Arc::clone(&signer));
+        ScopedContextSigner::Agent(signer)
+    }
+
+    async fn issuing_context_for(
+        &self,
+        scope: &KeyScope,
+    ) -> IssuingContext {
         // An explicit `local` on the surface is an **answer**, not an absence.
         // Reading it as "no opinion" let it fall through to the appliance
         // default, so a surface switched back to the gateway's own key carried
         // on issuing through the agent and the setting looked inert.
-        if let Some(declared) = self
+        if let Ok(Some(declared)) = self
             .live_surface_ref(KeyPurpose::Credential, scope)
             .await
             && matches!(declared.backend, KeyBackend::Local)
         {
-            return ScopedDiIssuer::Local;
+            return IssuingContext::Local;
         }
         let key_ref = match self
             .resolve_and_provision(KeyPurpose::Credential, scope)
@@ -529,19 +573,19 @@ impl KeyDirectory {
                     error = %e.log_detail(),
                     "could not resolve a credential issuer; signing locally",
                 );
-                return ScopedDiIssuer::Inherit;
+                return IssuingContext::Inherit;
             }
         };
         let KeyBackend::Vta { connection_id } = &key_ref.backend else {
-            return ScopedDiIssuer::Inherit;
+            return IssuingContext::Inherit;
         };
         // A credential is issued **as** a context: its designated key signs and
         // its DID becomes the issuer. Without one there is nothing to issue as.
         let Some(context_id) = key_ref.context.as_ref() else {
-            return ScopedDiIssuer::Inherit;
+            return IssuingContext::Inherit;
         };
         let Some(registry) = self.connections.as_ref() else {
-            return ScopedDiIssuer::Inherit;
+            return IssuingContext::Inherit;
         };
         match registry
             .client(connection_id)
@@ -554,12 +598,12 @@ impl KeyDirectory {
                 // the walkthrough — refuses the first issuance outright.
                 self.ensure_can_issue(&client, context_id.as_str())
                     .await;
-                ScopedDiIssuer::Agent(Arc::new(crate::vta::vc_issuer::VtaVcIssuer::new(
+                IssuingContext::Agent {
                     client,
-                    context_id
+                    context_id: context_id
                         .as_str()
                         .to_string(),
-                )) as Arc<dyn crate::identity::ssi::vc_issuer::VcIssuer>)
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -568,7 +612,7 @@ impl KeyDirectory {
                     error = %e.log_detail(),
                     "trust agent is unusable; issuing the agent-identity credential locally",
                 );
-                ScopedDiIssuer::Inherit
+                IssuingContext::Inherit
             }
         }
     }
@@ -635,38 +679,47 @@ impl KeyDirectory {
     }
 
     /// The `signing` of the issuer that owns `surface`, when it has one.
+    ///
+    /// An issuer that no longer exists sets nothing; one that cannot be read is
+    /// an error, because its `signing` may be the mapping that decides the key.
     async fn issuer_signing(
         &self,
         surface: &crate::config::agent_surface::AgentSurface,
-    ) -> Option<crate::config::agent_surface::SurfaceSigningConfig> {
-        let store = self.issuers.as_ref()?;
-        let issuer_id = surface.issuer_id.as_deref()?;
-        store
+    ) -> Result<Option<crate::config::agent_surface::SurfaceSigningConfig>, VtaError> {
+        let (Some(store), Some(issuer_id)) = (self.issuers.as_ref(), surface.issuer_id.as_deref()) else {
+            return Ok(None);
+        };
+        let issuer = store
             .get(issuer_id)
             .await
-            .ok()
-            .flatten()?
-            .signing
-            .filter(|signing| !signing.is_empty())
+            .map_err(|e| VtaError::Config(format!("issuer `{issuer_id}` could not be read for its signing: {e}")))?;
+        Ok(issuer
+            .and_then(|issuer| issuer.signing)
+            .filter(|signing| !signing.is_empty()))
     }
 
     /// The mapping a surface declares **right now**, if it declares one.
     ///
-    /// A miss — no store, no such surface, nothing declared, or a block this
-    /// backend cannot serve for `purpose` — falls through to the snapshot and
-    /// then the appliance default, which is what an unmapped surface has
-    /// always resolved.
+    /// `Ok(None)` — no store, no such surface, or nothing declared — falls
+    /// through to the snapshot and then the appliance default, which is what an
+    /// unmapped surface has always resolved. A store that cannot be read, or a
+    /// declared block this backend cannot serve for `purpose`, is an error: the
+    /// surface may map a trust agent key, and reading either as "no mapping"
+    /// would sign with the appliance key instead.
     async fn live_surface_ref(
         &self,
         purpose: KeyPurpose,
         scope: &KeyScope,
-    ) -> Option<KeyRef> {
-        let store = self.surfaces.as_ref()?;
-        let surface_id = scope.surface_id.as_deref()?;
-        let surface = crate::surfaces::AgentSurfaceStore::get(store.as_ref(), surface_id)
+    ) -> Result<Option<KeyRef>, VtaError> {
+        let (Some(store), Some(surface_id)) = (self.surfaces.as_ref(), scope.surface_id.as_deref()) else {
+            return Ok(None);
+        };
+        let Some(surface) = crate::surfaces::AgentSurfaceStore::get_checked(store.as_ref(), surface_id)
             .await
-            .ok()
-            .flatten()?;
+            .map_err(|e| VtaError::Config(format!("surface `{surface_id}` could not be read for its signing: {e}")))?
+        else {
+            return Ok(None);
+        };
 
         // A variant override wins over its surface, matching `resolve`.
         let variant_signing = scope
@@ -688,15 +741,26 @@ impl KeyDirectory {
             .filter(|s| !s.is_empty()))
         {
             Some(own) => own,
-            None => {
-                issuer_signing = self
-                    .issuer_signing(&surface)
-                    .await?;
-                &issuer_signing
-            }
+            None => match self
+                .issuer_signing(&surface)
+                .await?
+            {
+                Some(signing) => {
+                    issuer_signing = signing;
+                    &issuer_signing
+                }
+                None => return Ok(None),
+            },
         };
 
-        signing_key_ref(signing, purpose).ok()
+        signing_key_ref(signing, purpose)
+            .map(Some)
+            .map_err(|e| {
+                VtaError::Config(format!(
+                    "surface `{surface_id}` declares a signing key it cannot use: {}",
+                    e.log_detail()
+                ))
+            })
     }
 
     /// Attach the lazy context provisioner (VTA-19), so a surface that asks
@@ -749,25 +813,6 @@ impl KeyDirectory {
                 key_ref,
             });
         Ok(())
-    }
-
-    /// Install a tenant-scoped override. Fed by per-tenant selection (VTA-15);
-    /// the resolution order it participates in is tested here so that ticket
-    /// only has to supply the data.
-    #[allow(dead_code)]
-    pub fn with_tenant_mapping(
-        mut self,
-        tenant_id: impl Into<String>,
-        key_ref: KeyRef,
-    ) -> Result<Self, VtaError> {
-        key_ref.validate()?;
-        self.mappings
-            .push(KeyMapping {
-                scope: MappingScope::Tenant { tenant_id: tenant_id.into() },
-                purpose: key_ref.purpose,
-                key_ref,
-            });
-        Ok(self)
     }
 
     /// Install the mappings a surface and its variants declare (VTA-19).
@@ -871,12 +916,6 @@ impl KeyDirectory {
         {
             return m;
         }
-        if let Some(tenant_id) = scope.tenant_id.as_deref()
-            && let Some(m) =
-                self.find(purpose, |s| matches!(s, MappingScope::Tenant { tenant_id: tid } if tid == tenant_id))
-        {
-            return m;
-        }
         // The dashboard override outranks the `[vta]` block: an operator who
         // points the appliance at a paired connection in the UI expects that
         // to win over a file they may not be able to edit. A malformed
@@ -897,24 +936,27 @@ impl KeyDirectory {
             .unwrap_or_else(|| KeyRef::local(purpose))
     }
 
-    /// Whether `scope` has a mapping of its own: a variant, surface or tenant
-    /// mapping, or a `signing` block on the surface itself. The appliance default
+    /// Whether `scope` has a mapping of its own: a variant or surface
+    /// mapping, or a `signing` block on the surface or its issuer. The appliance default
     /// and the local key are what *everything* resolves to, so they do not count.
     ///
     /// An explicit mapping is a decision somebody made about whose key signs
     /// here. When that key cannot be reached, signing with a different one is
     /// not a graceful degradation: it changes the issuer under callers' feet and
     /// can hand a tenant's tokens to the operator's key.
+    ///
+    /// A surface whose mapping cannot be read counts as mapped, so its signing
+    /// fails closed rather than falling back to the appliance key.
     pub async fn has_explicit_mapping(
         &self,
         purpose: KeyPurpose,
         scope: &KeyScope,
     ) -> bool {
-        if self
-            .live_surface_ref(purpose, scope)
-            .await
-            .is_some()
-        {
+        if !matches!(
+            self.live_surface_ref(purpose, scope)
+                .await,
+            Ok(None)
+        ) {
             return true;
         }
         self.mappings
@@ -925,7 +967,6 @@ impl KeyDirectory {
                     scope.surface_id.as_deref() == Some(surface_id) && scope.variant_id.as_deref() == Some(variant_id)
                 }
                 MappingScope::Surface { surface_id } => scope.surface_id.as_deref() == Some(surface_id),
-                MappingScope::Tenant { tenant_id } => scope.tenant_id.as_deref() == Some(tenant_id),
             })
     }
 
@@ -947,7 +988,7 @@ impl KeyDirectory {
     ) -> Result<KeyRef, VtaError> {
         let mut key_ref = match self
             .live_surface_ref(purpose, scope)
-            .await
+            .await?
         {
             Some(live) => live,
             None => self.resolve(purpose, scope),
@@ -1066,9 +1107,6 @@ impl KeyDirectory {
                         .await;
                 }
             },
-            KeyBackend::Hsm { provider } => {
-                return Err(VtaError::Config(format!("[vta] HSM backend `{provider}` is not implemented yet")));
-            }
         };
 
         self.cache
@@ -1077,69 +1115,81 @@ impl KeyDirectory {
             .insert(key_ref.clone(), Arc::clone(&authority));
         Ok(authority)
     }
-
-    /// Every key the gateway publishes, aggregated across the backends the
-    /// directory can reach and deduplicated by `kid`.
-    ///
-    /// A verifier picks between an active and a retiring key by `kid`, so a key
-    /// missing here breaks tokens that are still in flight. A backend that
-    /// cannot be reached is therefore **warned and skipped** rather than
-    /// failing the whole set: publishing most of the keys beats publishing
-    /// none.
-    ///
-    /// Not yet served at `/oauth2/jwks.json`: with a single backend, VTA-17's
-    /// carried-over JWKS already publishes the local key alongside the VTA's.
-    /// This becomes the endpoint's source once several connections or an HSM
-    /// can hold keys at once (VTA-22, VTA-23).
-    #[allow(dead_code)]
-    pub async fn jwks(&self) -> Value {
-        let mut keys: Vec<Value> = Vec::new();
-        let mut seen: Vec<String> = Vec::new();
-
-        let mut sources: Vec<Arc<dyn CredentialAuthority>> = vec![Arc::clone(&self.local)];
-        if let Some(vta) = &self.vta {
-            sources.push(Arc::clone(vta));
-        }
-
-        for source in sources {
-            match source.issuer_jwks().await {
-                Ok(jwks) => {
-                    let Some(entries) = jwks
-                        .get("keys")
-                        .and_then(Value::as_array)
-                    else {
-                        continue;
-                    };
-                    for key in entries {
-                        // A `kid`-less key cannot be selected by a verifier and
-                        // cannot be deduplicated, so keep it rather than drop
-                        // it, but do not let it suppress a later named key.
-                        match key
-                            .get("kid")
-                            .and_then(Value::as_str)
-                        {
-                            Some(kid) if seen.iter().any(|s| s == kid) => continue,
-                            Some(kid) => seen.push(kid.to_string()),
-                            None => {}
-                        }
-                        keys.push(key.clone());
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    target: "vta_audit",
-                    error = %e,
-                    "a signing backend's JWKS is unavailable; its keys are omitted from the published set",
-                ),
-            }
-        }
-
-        serde_json::json!({ "keys": keys })
-    }
 }
 
 /// Connection id of the single bootstrap-configured VTA. VTA-23 replaces this
 /// with real stored connection records.
 pub const DEFAULT_CONNECTION_ID: &str = "default";
+
+/// The appliance-wide token signer, resolved through the directory on every
+/// call: the dashboard's gateway-wide default, then `[vta]`, then the local key.
+///
+/// Resolving per call is what lets a trust agent connected and chosen in the
+/// dashboard sign STS tokens, ID-JAGs, MCP access tokens and payment receipts
+/// without a restart, and keeps the JWKS those are verified against the one of
+/// the key that signs them. A key that cannot be resolved is an error, never a
+/// fallback to the local key.
+pub struct ApplianceAuthority {
+    directory: Arc<KeyDirectory>,
+}
+
+impl ApplianceAuthority {
+    pub fn new(directory: Arc<KeyDirectory>) -> Self {
+        Self { directory }
+    }
+
+    async fn current(&self) -> anyhow::Result<Arc<dyn CredentialAuthority>> {
+        let failed =
+            |e: VtaError| anyhow::anyhow!("the appliance signing key could not be resolved: {}", e.log_detail());
+        let key_ref = self
+            .directory
+            .resolve_and_provision(KeyPurpose::Jwt, &KeyScope::default())
+            .await
+            .map_err(failed)?;
+        self.directory
+            .authority_for(&key_ref, KeyPurpose::Jwt)
+            .await
+            .map_err(failed)
+    }
+}
+
+#[async_trait::async_trait]
+impl CredentialAuthority for ApplianceAuthority {
+    async fn issuer_did(&self) -> anyhow::Result<String> {
+        self.current()
+            .await?
+            .issuer_did()
+            .await
+    }
+
+    async fn issuer_jwks(&self) -> anyhow::Result<serde_json::Value> {
+        self.current()
+            .await?
+            .issuer_jwks()
+            .await
+    }
+
+    async fn sign_token(
+        &self,
+        claims: &serde_json::Value,
+    ) -> anyhow::Result<String> {
+        self.current()
+            .await?
+            .sign_token(claims)
+            .await
+    }
+
+    async fn sign_token_typ(
+        &self,
+        claims: &serde_json::Value,
+        typ: &str,
+    ) -> anyhow::Result<String> {
+        self.current()
+            .await?
+            .sign_token_typ(claims, typ)
+            .await
+    }
+}
 
 /// Translate a surface/variant `signing` block into a [`KeyRef`].
 ///
@@ -1163,12 +1213,6 @@ pub fn signing_key_ref(
                 .connection_id
                 .clone()
                 .unwrap_or_else(|| DEFAULT_CONNECTION_ID.to_string()),
-        },
-        Some(SigningBackendKind::Hsm) => KeyBackend::Hsm {
-            provider: signing
-                .connection_id
-                .clone()
-                .unwrap_or_else(|| "default".to_string()),
         },
     };
     let key_ref = KeyRef {
@@ -1196,6 +1240,7 @@ pub fn signing_key_ref(
 mod tests {
     use super::*;
     use crate::identity::authority::LocalCredentialAuthority;
+    use serde_json::Value;
 
     struct StubAuthority {
         did: &'static str,
@@ -1243,34 +1288,6 @@ mod tests {
         }
     }
 
-    struct UnreachableAuthority;
-
-    #[async_trait::async_trait]
-    impl CredentialAuthority for UnreachableAuthority {
-        async fn issuer_did(&self) -> anyhow::Result<String> {
-            anyhow::bail!("unreachable")
-        }
-
-        async fn issuer_jwks(&self) -> anyhow::Result<Value> {
-            anyhow::bail!("unreachable")
-        }
-
-        async fn sign_token(
-            &self,
-            _claims: &Value,
-        ) -> anyhow::Result<String> {
-            anyhow::bail!("unreachable")
-        }
-
-        async fn sign_token_typ(
-            &self,
-            _claims: &Value,
-            _typ: &str,
-        ) -> anyhow::Result<String> {
-            anyhow::bail!("unreachable")
-        }
-    }
-
     fn vta_jwt_ref(key_id: &str) -> KeyRef {
         KeyRef {
             backend: KeyBackend::Vta {
@@ -1285,6 +1302,7 @@ mod tests {
     fn directory_with(vta: Option<Arc<dyn CredentialAuthority>>) -> KeyDirectory {
         KeyDirectory {
             identified: tokio::sync::RwLock::new(std::collections::HashSet::new()),
+            context_signers: RwLock::new(HashMap::new()),
             di_vc_issuer: None,
             context_creator: None,
             agent_provisioner: None,
@@ -1343,59 +1361,8 @@ mod tests {
     }
 
     #[test]
-    fn a_tenant_mapping_beats_the_appliance_default() {
-        let mut dir = directory_with(None)
-            .with_tenant_mapping("tenant-a", vta_jwt_ref("tenant-key"))
-            .unwrap();
-        dir.defaults
-            .insert(KeyPurpose::Jwt, vta_jwt_ref("appliance-key"));
-
-        let resolved = dir.resolve(KeyPurpose::Jwt, &KeyScope::tenant("tenant-a"));
-        assert_eq!(
-            resolved
-                .key_id
-                .as_ref()
-                .map(KeyId::as_str),
-            Some("tenant-key")
-        );
-        // A different tenant still falls through to the default.
-        let other = dir.resolve(KeyPurpose::Jwt, &KeyScope::tenant("tenant-b"));
-        assert_eq!(
-            other
-                .key_id
-                .as_ref()
-                .map(KeyId::as_str),
-            Some("appliance-key")
-        );
-    }
-
-    #[test]
-    fn a_surface_mapping_beats_a_tenant_mapping() {
-        let mut dir = directory_with(None)
-            .with_tenant_mapping("tenant-a", vta_jwt_ref("tenant-key"))
-            .unwrap();
-        dir.push_surface_mapping("surface-a", vta_jwt_ref("surface-key"))
-            .unwrap();
-
-        let scope = KeyScope {
-            tenant_id: Some("tenant-a".to_string()),
-            surface_id: Some("surface-a".to_string()),
-            variant_id: None,
-        };
-        assert_eq!(
-            dir.resolve(KeyPurpose::Jwt, &scope)
-                .key_id
-                .as_ref()
-                .map(KeyId::as_str),
-            Some("surface-key")
-        );
-    }
-
-    #[test]
     fn a_variant_mapping_beats_a_surface_mapping() {
-        let mut dir = directory_with(None)
-            .with_tenant_mapping("tenant-a", vta_jwt_ref("tenant-key"))
-            .unwrap();
+        let mut dir = directory_with(None);
         dir.push_surface_mapping("surface-a", vta_jwt_ref("surface-key"))
             .unwrap();
         dir.push_variant_mapping("surface-a", "variant-a", vta_jwt_ref("variant-key"))
@@ -1989,47 +1956,6 @@ mod tests {
         assert!(supports(&KeyBackend::Local, KeyPurpose::Proof));
     }
 
-    #[tokio::test]
-    async fn the_hsm_backend_signs_jws_only_and_is_not_implemented_yet() {
-        let hsm = KeyBackend::Hsm {
-            provider: "cloudhsm".to_string(),
-        };
-        assert!(supports(&hsm, KeyPurpose::Jwt));
-        // Credential/proof assembly is not an HSM operation, so a config that
-        // asks for it is rejected before anything is built.
-        assert!(!supports(&hsm, KeyPurpose::Credential));
-
-        let msg = error_detail(
-            KeyRef {
-                backend: hsm.clone(),
-                context: None,
-                key_id: None,
-                purpose: KeyPurpose::Proof,
-            }
-            .validate(),
-            "the hsm backend cannot build proofs",
-        );
-        assert!(msg.contains("hsm") && msg.contains("proof"), "unexpected error: {msg}");
-
-        // The arm exists so the directory's shape is final; the signer itself
-        // is VTA-22, and until then it must fail rather than silently fall back.
-        let dir = directory_with(None);
-        let msg = error_detail(
-            dir.authority_for(
-                &KeyRef {
-                    backend: hsm,
-                    context: None,
-                    key_id: Some(KeyId::from("hsm-key")),
-                    purpose: KeyPurpose::Jwt,
-                },
-                KeyPurpose::Jwt,
-            )
-            .await,
-            "the hsm signer is not implemented",
-        );
-        assert!(msg.contains("cloudhsm"), "the error must name the provider: {msg}");
-    }
-
     #[test]
     fn a_key_ref_the_backend_cannot_serve_is_rejected_naming_both() {
         let key_ref = KeyRef {
@@ -2069,39 +1995,6 @@ mod tests {
         };
         let msg = error_detail(key_ref.validate(), "the local backend has no nameable key id");
         assert!(msg.contains("key id"), "unexpected error: {msg}");
-    }
-
-    // ---- jwks aggregation -------------------------------------------------
-
-    #[tokio::test]
-    async fn jwks_aggregates_every_backend_and_dedupes_by_kid() {
-        let vta = StubAuthority::new("did:webvh:vta", vec!["vta-active", "vta-retiring", "local-1"]);
-        let dir = directory_with(Some(vta));
-
-        let jwks = dir.jwks().await;
-        let kids: Vec<&str> = jwks["keys"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|k| k["kid"].as_str().unwrap())
-            .collect();
-
-        assert_eq!(kids, vec!["local-1", "vta-active", "vta-retiring"], "got {kids:?}");
-    }
-
-    #[tokio::test]
-    async fn an_unreachable_backend_does_not_empty_the_published_set() {
-        let dir = directory_with(Some(Arc::new(UnreachableAuthority)));
-
-        let jwks = dir.jwks().await;
-        let kids: Vec<&str> = jwks["keys"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|k| k["kid"].as_str().unwrap())
-            .collect();
-        // The local key is still published, so tokens it signed keep verifying.
-        assert_eq!(kids, vec!["local-1"]);
     }
 
     // ---- appliance-wide override (dashboard setting) ---------------------
@@ -2532,21 +2425,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_surface_tenant_or_variant_mapping_is_explicit_only_for_its_own_scope() {
-        let mut dir = directory_with(None)
-            .with_tenant_mapping("tenant-a", vta_jwt_ref("tenant-key"))
-            .unwrap();
+    async fn a_surface_or_variant_mapping_is_explicit_only_for_its_own_scope() {
+        let mut dir = directory_with(None);
         dir.push_surface_mapping("surface-1", vta_jwt_ref("surface-key"))
             .unwrap();
 
-        assert!(
-            dir.has_explicit_mapping(KeyPurpose::Jwt, &KeyScope::tenant("tenant-a"))
-                .await
-        );
-        assert!(
-            !dir.has_explicit_mapping(KeyPurpose::Jwt, &KeyScope::tenant("tenant-b"))
-                .await
-        );
         assert!(
             dir.has_explicit_mapping(KeyPurpose::Jwt, &KeyScope::surface("surface-1"))
                 .await
@@ -2559,6 +2442,175 @@ mod tests {
             !dir.has_explicit_mapping(KeyPurpose::Credential, &KeyScope::surface("surface-1"))
                 .await,
             "a mapping for one purpose says nothing about another"
+        );
+    }
+
+    /// A surface store that holds the surface but cannot read it.
+    struct UnreadableSurfaces;
+
+    #[async_trait::async_trait]
+    impl crate::surfaces::AgentSurfaceStore for UnreadableSurfaces {
+        async fn save(
+            &self,
+            _surface: &crate::config::agent_surface::AgentSurface,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn get(
+            &self,
+            _surface_id: &str,
+        ) -> anyhow::Result<Option<crate::config::agent_surface::AgentSurface>> {
+            Ok(None)
+        }
+
+        async fn get_checked(
+            &self,
+            surface_id: &str,
+        ) -> anyhow::Result<Option<crate::config::agent_surface::AgentSurface>> {
+            anyhow::bail!("surface `{surface_id}` is stored but unreadable")
+        }
+
+        async fn list_all(&self) -> anyhow::Result<Vec<crate::config::agent_surface::AgentSurface>> {
+            Ok(Vec::new())
+        }
+
+        async fn delete(
+            &self,
+            _surface_id: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A surface whose mapping cannot be read may map a trust agent key, so
+    /// its signing fails closed rather than resolving the appliance default.
+    #[tokio::test]
+    async fn a_surface_whose_mapping_cannot_be_read_fails_closed() {
+        let dir = KeyDirectory::build(&VtaConfig::default(), StubAuthority::new("did:key:local", vec!["local-1"]))
+            .await
+            .expect("a disabled [vta] block builds")
+            .with_surface_store(Arc::new(UnreadableSurfaces) as Arc<dyn crate::surfaces::AgentSurfaceStore>);
+        let scope = KeyScope::surface("surface-a");
+
+        let err = dir
+            .resolve_and_provision(KeyPurpose::Jwt, &scope)
+            .await
+            .expect_err("an unreadable mapping is not \"no mapping\"");
+        assert!(
+            err.log_detail()
+                .contains("could not be read"),
+            "{}",
+            err.log_detail()
+        );
+        assert!(
+            dir.has_explicit_mapping(KeyPurpose::Jwt, &scope)
+                .await,
+            "an unreadable mapping counts as one, so the signer refuses rather than falls back"
+        );
+    }
+
+    /// A declared block the backend cannot serve is an error, not an absence:
+    /// a VTA block without a key id cannot sign a token, and reading it as
+    /// unmapped signed that surface's tokens with the appliance key.
+    #[tokio::test]
+    async fn a_declared_block_that_cannot_sign_a_token_fails_closed() {
+        let unusable = crate::config::agent_surface::SurfaceSigningConfig {
+            key_id: None,
+            ..issuer_agent_signing("vta-a")
+        };
+        let (dir, _issuers, _tmp) = directory_with_issuer(None, Some(unusable)).await;
+        let scope = KeyScope::surface("surface-a");
+
+        let err = dir
+            .resolve_and_provision(KeyPurpose::Jwt, &scope)
+            .await
+            .expect_err("a block that cannot sign a token must not resolve the appliance key");
+        assert!(
+            err.log_detail()
+                .contains("cannot use"),
+            "{}",
+            err.log_detail()
+        );
+        assert!(
+            dir.has_explicit_mapping(KeyPurpose::Jwt, &scope)
+                .await
+        );
+        let credential = dir
+            .resolve_and_provision(KeyPurpose::Credential, &scope)
+            .await
+            .expect("the same block still names the context a credential issues as");
+        assert!(matches!(&credential.backend, KeyBackend::Vta { connection_id } if connection_id == "vta-a"));
+    }
+
+    /// The gateway-wide default as the dashboard holds it: changed while the
+    /// gateway runs.
+    struct SwitchableDefault(std::sync::Mutex<Option<crate::config::agent_surface::SurfaceSigningConfig>>);
+
+    impl ApplianceSigningDefault for SwitchableDefault {
+        fn signing(&self) -> Option<crate::config::agent_surface::SurfaceSigningConfig> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// Tokens and their JWKS follow the gateway-wide default as it changes,
+    /// with no restart: the authority resolves the key on every call.
+    #[tokio::test]
+    async fn the_appliance_authority_follows_the_gateway_wide_default_as_it_changes() {
+        let default = Arc::new(SwitchableDefault(std::sync::Mutex::new(None)));
+        let mut dir = directory_with(Some(StubAuthority::new("did:webvh:vta", vec!["vta-1"])));
+        dir.defaults
+            .insert(KeyPurpose::Jwt, vta_jwt_ref("appliance-key"));
+        let authority = ApplianceAuthority::new(Arc::new(
+            dir.with_appliance_default(Arc::clone(&default) as Arc<dyn ApplianceSigningDefault>),
+        ));
+        assert_eq!(
+            authority
+                .issuer_did()
+                .await
+                .unwrap(),
+            "did:webvh:vta",
+            "[vta] signs while nothing is chosen"
+        );
+
+        *default.0.lock().unwrap() = Some(crate::config::agent_surface::SurfaceSigningConfig {
+            backend: Some(crate::config::agent_surface::SigningBackendKind::Local),
+            ..Default::default()
+        });
+        assert_eq!(
+            authority
+                .issuer_did()
+                .await
+                .unwrap(),
+            "did:key:local"
+        );
+        assert_eq!(
+            authority
+                .issuer_jwks()
+                .await
+                .unwrap()["keys"][0]["kid"],
+            "local-1",
+            "the published keys follow the signer"
+        );
+    }
+
+    /// A default naming a trust agent that cannot be reached refuses to sign
+    /// rather than signing with the gateway's own key.
+    #[tokio::test]
+    async fn the_appliance_authority_fails_closed_when_its_key_cannot_be_resolved() {
+        let authority = ApplianceAuthority::new(Arc::new(
+            directory_with(None)
+                .with_appliance_default(Arc::new(StubApplianceDefault(Some(appliance_vta_signing("vta-gone"))))),
+        ));
+
+        let err = authority
+            .sign_token(&serde_json::json!({ "sub": "u" }))
+            .await
+            .expect_err("an unreachable agent is not replaced by the local key");
+        assert!(
+            err.to_string()
+                .contains("could not be resolved"),
+            "{err}"
         );
     }
 }

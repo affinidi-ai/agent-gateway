@@ -1572,12 +1572,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_signing_block_that_names_no_usable_backend_is_refused() {
+    async fn a_signing_block_that_cannot_sign_a_token_is_refused() {
         let (store, issuer, _dir) = stored_issuer(None).await;
         let (connections, _connections_dir) = connection_store_with(&[]).await;
-        let hsm = crate::config::agent_surface::SurfaceSigningConfig {
-            backend: Some(crate::config::agent_surface::SigningBackendKind::Hsm),
-            ..Default::default()
+        let keyless = crate::config::agent_surface::SurfaceSigningConfig {
+            backend: Some(crate::config::agent_surface::SigningBackendKind::Vta),
+            connection_id: Some("vta-a".into()),
+            context_id: Some("ctx-a".into()),
+            key_id: None,
         };
 
         let refused = update_issuer(
@@ -1588,7 +1590,7 @@ mod tests {
             Path(issuer.id.clone()),
             None,
             None,
-            with_signing(hsm),
+            with_signing(keyless),
         )
         .await;
 

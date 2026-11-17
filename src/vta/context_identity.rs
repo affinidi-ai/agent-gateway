@@ -36,6 +36,24 @@ const TASK_KEYS_LIST: &str = "https://trusttasks.org/spec/keys/list/0.2";
 /// `keys/sign-document/0.1`.
 const TASK_KEYS_SIGN_DOCUMENT: &str = "https://trusttasks.org/spec/keys/sign-document/0.1";
 
+/// `keys/sign-jws/0.1`.
+const TASK_KEYS_SIGN_JWS: &str = "https://trusttasks.org/spec/keys/sign-jws/0.1";
+
+/// The JOSE algorithm a context's `did:key` signs with. The VTA echoes the
+/// algorithm it chose; the gateway checks it so a JWS it attributes to the
+/// context DID cannot have been made under a different one.
+const SIGNING_ALGORITHM: &str = "EdDSA";
+
+/// The `keys/sign-jws` result. `alg` and `keyId` are echoed by the VTA and
+/// verified before the signature is attributed to the context DID.
+#[derive(Debug, Deserialize)]
+struct SignJwsResult {
+    jws: String,
+    alg: String,
+    #[serde(rename = "keyId")]
+    key_id: String,
+}
+
 /// The verification relationship a credential's issuer signs under.
 pub const PURPOSE_ASSERTION_METHOD: &str = "assertionMethod";
 
@@ -329,6 +347,46 @@ impl ContextIdentityResolver {
         verify_signed_document(&identity, &document, purpose, challenge, domain, &result)
             .map_err(|e| anyhow!("signing a document as context `{}`: {e}", self.context_id))?;
         Ok(result.document)
+    }
+
+    /// Sign `claims` into a compact JWS with an explicit JOSE `typ`, as this
+    /// context: the key that backs its DID signs, and `kid` names the DID's
+    /// verification method, so a verifier that resolves the DID finds the key.
+    pub async fn sign_jws(
+        &self,
+        claims: &Value,
+        typ: &str,
+    ) -> Result<String> {
+        let identity = self.identity().await?;
+        let request = json!({
+            "keyId": identity.key_id,
+            "header": { "typ": typ, "kid": identity.verification_method },
+            "payload": claims,
+        });
+        let response: SignJwsResult = self
+            .client
+            .dispatch_signed(TASK_KEYS_SIGN_JWS, request)
+            .await
+            .map_err(|e| anyhow!("signing as context `{}`: {e}", self.context_id))?;
+        // Fail closed on attribution: a verifier resolves the claimed DID and
+        // demands the signing key be declared there, so the VTA must have used
+        // exactly the key this context designates, under its algorithm.
+        if response.key_id != identity.key_id {
+            bail!(
+                "signing as context `{}`: VTA echoed key `{}` but `{}` was requested",
+                self.context_id,
+                response.key_id,
+                identity.key_id
+            );
+        }
+        if response.alg != SIGNING_ALGORITHM {
+            bail!(
+                "signing as context `{}`: VTA signed with `{}`; the context key uses `{SIGNING_ALGORITHM}`",
+                self.context_id,
+                response.alg
+            );
+        }
+        Ok(response.jws)
     }
 }
 

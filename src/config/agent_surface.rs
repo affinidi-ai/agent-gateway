@@ -164,8 +164,6 @@ pub enum SigningBackendKind {
     Local,
     /// A Verifiable Trust Agent, addressed by stored connection.
     Vta,
-    /// An external HSM/KMS signer (VTA-22).
-    Hsm,
 }
 
 /// Per-surface (and per-variant) signing configuration.

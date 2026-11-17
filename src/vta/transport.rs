@@ -170,10 +170,9 @@ impl DidCommTransport {
     /// rather than stored: keeping them would be an unbounded buffer fed by a
     /// remote party.
     ///
-    /// Called by the mediator adapter that receives inbound DIDComm messages;
-    /// the correlation, deadline and bounding rules live here so they are
-    /// testable without a live mediator.
-    #[allow(dead_code)]
+    /// No mediator adapter delivers inbound replies yet, so only tests call
+    /// this and a DIDComm connection cannot complete a Trust Task.
+    #[cfg(test)]
     pub async fn deliver_reply(
         &self,
         correlation_id: &str,
@@ -191,7 +190,7 @@ impl DidCommTransport {
     }
 
     /// How many replies are outstanding, for diagnostics and tests.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub async fn in_flight(&self) -> usize {
         self.pending
             .lock()

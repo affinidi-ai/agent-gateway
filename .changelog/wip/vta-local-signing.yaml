@@ -279,6 +279,39 @@ changes:
         left behind by a merge. The Key Management tab additionally no longer
         takes the rest of the Secrets screen down with it when the key
         inventory cannot be read; it reports the problem in its own tab.
+    - timestamp: '2026-11-17T12:04:00Z'
+      title: Sign tokens with the trust agent chosen in the dashboard without a restart
+      description: >-
+        STS tokens, ID-JAGs, MCP access tokens and payment receipts were
+        signed by the key chosen when the gateway started, so a trust agent
+        connected and made the gateway-wide default in the dashboard did not
+        sign them until a restart, while Settings already named it. The signer
+        is now resolved on every call, and one that cannot be resolved refuses
+        to sign.
+    - timestamp: '2026-11-17T12:05:00Z'
+      title: Accept MCP access tokens the gateway issued through a trust agent
+      description: >-
+        The gateway's own MCP Resource Server verified MCP access tokens
+        against the local key only, so it refused every token the gateway had
+        signed through a trust agent. It now verifies them against the key set
+        of the authority that signs them.
+    - timestamp: '2026-11-17T12:06:00Z'
+      title: Attest the issuer that issues the gateway credentials peers receive
+      description: >-
+        With a trust agent connected only in the dashboard, the fabric issuer
+        attestation claimed the gateway DID while the credentials were issued
+        by the agent's context, so peers refused every identity presentation.
+        The attestation now follows the same choice as the credential issuer,
+        at the same moment, from the dashboard or from [vta].
+    - timestamp: '2026-11-17T12:07:00Z'
+      title: Sign a trust-agent-held agent's JWTs in its own context
+      description: >-
+        The agents API's sign-jwt and the AP2 presentation signed with the
+        agent's key on the gateway, which an agent minted in a trust agent
+        does not have, so they failed for every such agent. They now sign in
+        the agent's own trust agent context, as its holder proofs do, and a
+        gateway-held key is still used for agents onboarded before a trust
+        agent was connected.
   removed: []
   security:
     - timestamp: '2026-11-09T00:00:00Z'
@@ -382,4 +415,36 @@ changes:
         connected before it existed must be granted it again. That shortfall
         is otherwise invisible: pairing succeeds and only the first signature
         fails.
+    - timestamp: '2026-11-17T12:00:00Z'
+      title: Refuse a presentation that mixes eddsa-jcs-2022 with other proof suites
+      description: >-
+        A presentation or credential carrying an eddsa-jcs-2022 proof skipped
+        the verification of its other proofs, so an unsigned proof placed
+        first could carry a forged challenge or domain that was then compared
+        as the verified one. A document that mixes the JCS suite with any
+        other is now refused, so every proof on it is verified.
+    - timestamp: '2026-11-17T12:01:00Z'
+      title: Check a JCS proof's purpose against the signer's DID document
+      description: >-
+        An eddsa-jcs-2022 proof is now refused unless its proofPurpose names a
+        verification relationship that lists its verification method in the
+        signer's DID document, as the other suites already were.
+    - timestamp: '2026-11-17T12:02:00Z'
+      title: Refuse to exchange a token the gateway signed with a retired key
+      description: >-
+        Token exchange refused a subject or actor token the gateway issued
+        only when it named the current issuer, while verification accepted
+        tokens signed by any key the gateway publishes, retired keys included.
+        An ID-JAG or access token signed by a retired trust agent key could be
+        exchanged instead of redeemed once through jwt-bearer. Both now share
+        one answer to whether the gateway issued a token.
+    - timestamp: '2026-11-17T12:03:00Z'
+      title: Refuse to sign when a surface's signing choice cannot be read
+      description: >-
+        A surface or issuer store read that failed, or a surface signing block
+        that cannot sign a token, was taken as no choice at all, so the
+        surface signed with the gateway-wide key instead of the trust agent
+        key it names. Signing now fails closed in both cases, and a surface's
+        trust agent block must name its key, as an issuer's already must, or
+        the save is refused.
   breaking: []

@@ -15,31 +15,12 @@
 
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use async_trait::async_trait;
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::vta::client::VtaRestClient;
 use crate::vta::context_identity::ContextIdentityResolver;
-
-/// `keys/sign-jws/0.1`.
-const TASK_KEYS_SIGN_JWS: &str = "https://trusttasks.org/spec/keys/sign-jws/0.1";
-
-/// The JOSE algorithm the context's `did:key` signs with. The VTA echoes the
-/// algorithm it chose; the gateway checks it so an attestation it attributes to
-/// the context DID cannot have been made under a different one.
-const SIGNING_ALGORITHM: &str = "EdDSA";
-
-/// The `keys/sign-jws` result. `alg` and `keyId` are echoed by the VTA and
-/// verified before the signature is attributed to the context DID.
-#[derive(Debug, Deserialize)]
-struct SignJwsResult {
-    jws: String,
-    alg: String,
-    #[serde(rename = "keyId")]
-    key_id: String,
-}
 
 /// Signs artifacts that must be attributable to a DID a verifier can resolve.
 #[async_trait]
@@ -57,7 +38,6 @@ pub trait ContextSigner: Send + Sync {
 
 /// Signs as a VTA context, using the key that backs the context's DID.
 pub struct VtaContextSigner {
-    client: Arc<VtaRestClient>,
     context: ContextIdentityResolver,
 }
 
@@ -67,8 +47,7 @@ impl VtaContextSigner {
         context_id: String,
     ) -> Self {
         Self {
-            context: ContextIdentityResolver::new(Arc::clone(&client), context_id),
-            client,
+            context: ContextIdentityResolver::new(client, context_id),
         }
     }
 }
@@ -88,43 +67,9 @@ impl ContextSigner for VtaContextSigner {
         claims: &Value,
         typ: &str,
     ) -> Result<String> {
-        let identity = self
-            .context
-            .identity()
-            .await?;
-        // `kid` is the context DID's own verification method. A `did:key`
-        // document declares exactly one, whose id is the DID plus its own
-        // multibase fragment — so naming it keeps a verifier from having to
-        // guess, and a verifier that ignores `kid` still lands on the same key.
-        let request = json!({
-            "keyId": identity.key_id,
-            "header": { "typ": typ, "kid": identity.verification_method },
-            "payload": claims,
-        });
-        let response: SignJwsResult = self
-            .client
-            .dispatch_signed(TASK_KEYS_SIGN_JWS, request)
+        self.context
+            .sign_jws(claims, typ)
             .await
-            .map_err(|e| anyhow!("signing as context `{}`: {e}", self.context.context_id()))?;
-        // Fail closed on attribution: a peer resolves the claimed DID and
-        // demands the signing key be declared there, so the VTA must have used
-        // exactly the key this context designates, under its algorithm.
-        if response.key_id != identity.key_id {
-            return Err(anyhow!(
-                "signing as context `{}`: VTA echoed key `{}` but `{}` was requested",
-                self.context.context_id(),
-                response.key_id,
-                identity.key_id
-            ));
-        }
-        if response.alg != SIGNING_ALGORITHM {
-            return Err(anyhow!(
-                "signing as context `{}`: VTA signed with `{}`; the context key uses `{SIGNING_ALGORITHM}`",
-                self.context.context_id(),
-                response.alg
-            ));
-        }
-        Ok(response.jws)
     }
 }
 
@@ -132,6 +77,7 @@ impl ContextSigner for VtaContextSigner {
 mod tests {
     use super::*;
     use crate::vta::control_key::ControlKey;
+    use serde_json::json;
     use std::time::Duration;
 
     fn signer(context_id: &str) -> VtaContextSigner {

@@ -241,6 +241,9 @@ pub struct VCIssuer {
     /// own context). Collapsing them would mean one key signing as both, which
     /// is the custody problem rather than its fix.
     di_vp_issuer: Arc<RwLock<Option<Arc<dyn VpIssuer>>>>,
+    /// Signs JWTs for agents whose key is in a trust agent, set beside
+    /// `di_vp_issuer` because both find the agent's context the same way.
+    agent_jwt_signer: Arc<RwLock<Option<Arc<dyn crate::vta::vp_issuer::AgentJwtSigner>>>>,
 
     /// Provisions an agent identity whose private key lives in a Verifiable
     /// Trust Agent (VTA-12). When set, a newly onboarded agent gets a
@@ -322,6 +325,7 @@ impl VCIssuer {
             signing_authority: Arc::new(RwLock::new(None)),
             di_vc_issuer: Arc::new(RwLock::new(None)),
             di_vp_issuer: Arc::new(RwLock::new(None)),
+            agent_jwt_signer: Arc::new(RwLock::new(None)),
             agent_provisioner: Arc::new(RwLock::new(None)),
             attestation_signer: Arc::new(RwLock::new(None)),
             key_directory: Arc::new(RwLock::new(None)),
@@ -384,7 +388,7 @@ impl VCIssuer {
     /// A resolution **failure** falls back only for a surface that **maps
     /// nothing of its own**: it signs with the appliance key either way, so the
     /// fallback is the same key it always used. A surface with an explicit
-    /// mapping (its own `signing` block, a variant's, or its tenant's) fails
+    /// mapping (its own `signing` block, a variant's, or its issuer's) fails
     /// closed instead. Someone chose whose key signs there, and when that key
     /// cannot be reached, signing with another would change the issuer under
     /// callers' feet, or hand a tenant's tokens to the operator's key.
@@ -504,6 +508,17 @@ impl VCIssuer {
         *slot = Some(issuer);
     }
 
+    /// Sign agents' JWTs in their own trust agent context when they have one.
+    pub async fn set_agent_jwt_signer(
+        &self,
+        signer: Arc<dyn crate::vta::vp_issuer::AgentJwtSigner>,
+    ) {
+        *self
+            .agent_jwt_signer
+            .write()
+            .await = Some(signer);
+    }
+
     /// Onboard new agents with a key held in their own VTA context (VTA-12)
     /// rather than one generated here.
     ///
@@ -597,6 +612,25 @@ impl VCIssuer {
     /// The gateway's public JWKS (Ed25519 signing key, private `d` component
     /// stripped). Lets a standard OAuth resource server verify STS-issued tokens
     /// via a `jwks_uri` without resolving the gateway DID document.
+    /// The public JWKS of the authority that signs this gateway's tokens (STS
+    /// tokens, ID-JAGs, MCP access tokens), so a verifier inside the gateway
+    /// checks them against the key that signed them: the local key's until a
+    /// signing authority is installed.
+    pub async fn token_signing_jwks(&self) -> Result<serde_json::Value> {
+        let authority = self
+            .signing_authority
+            .read()
+            .await
+            .clone();
+        match authority {
+            Some(authority) => authority.issuer_jwks().await,
+            None => {
+                self.signing_public_jwks()
+                    .await
+            }
+        }
+    }
+
     pub async fn signing_public_jwks(&self) -> Result<serde_json::Value> {
         let config = self.config.read().await;
         let mut jwk = serde_json::to_value(&config.signing_key)?;
@@ -1407,19 +1441,33 @@ impl VCIssuer {
 
         let key_json = record
             .private_key
-            .ok_or_else(|| anyhow::anyhow!("No private key found for agent: {}", did))?;
+            .ok_or_else(|| anyhow::anyhow!("agent {did} has no key on this gateway and no trust agent signs for it"))?;
 
         let key: JWK = serde_json::from_value(key_json).context("Failed to deserialize agent private key")?;
 
         Ok(key)
     }
 
-    /// Sign a JWT payload with an agent's private key
+    /// Sign a JWT payload as an agent: in the agent's own trust agent context
+    /// when its key lives there, otherwise with the key the gateway holds.
     pub async fn sign_jwt_with_agent_key(
         &self,
         did: &str,
         payload: &serde_json::Value,
     ) -> Result<String> {
+        let signer = self
+            .agent_jwt_signer
+            .read()
+            .await
+            .clone();
+        if let Some(signer) = signer
+            && let Some(jwt) = signer
+                .sign_agent_jwt(did, payload)
+                .await?
+        {
+            info!(did = did, "✍️ Signed JWT in the agent's trust agent context");
+            return Ok(jwt);
+        }
         let key = self
             .get_agent_key_by_did(did)
             .await?;
@@ -1445,14 +1493,38 @@ impl VCIssuer {
         *slot = Some(signer);
     }
 
+    /// Who signs the fabric issuer attestation right now: the context the
+    /// key directory resolves for the appliance's agent-identity credential,
+    /// so the two cannot diverge; the signer installed for `[vta]` when the
+    /// directory has no opinion; otherwise the gateway's own key (`None`).
+    async fn current_attestation_signer(&self) -> Option<Arc<dyn crate::vta::context_signer::ContextSigner>> {
+        let directory = self
+            .key_directory
+            .read()
+            .await
+            .clone();
+        if let Some(directory) = directory {
+            match directory
+                .attestation_signer()
+                .await
+            {
+                crate::vta::key_directory::ScopedContextSigner::Agent(signer) => return Some(signer),
+                crate::vta::key_directory::ScopedContextSigner::Local => return None,
+                crate::vta::key_directory::ScopedContextSigner::Inherit => {}
+            }
+        }
+        self.attestation_signer
+            .read()
+            .await
+            .clone()
+    }
+
     /// The DID the fabric issuer attestation should claim, and which must
     /// therefore also be the issuer of the credentials peers will receive.
     pub async fn attestation_issuer_did(&self) -> Result<String> {
         match self
-            .attestation_signer
-            .read()
+            .current_attestation_signer()
             .await
-            .as_ref()
         {
             Some(signer) => signer.issuer_did().await,
             None => self.get_issuer_did().await,
@@ -1466,10 +1538,8 @@ impl VCIssuer {
         typ: &str,
     ) -> Result<String> {
         match self
-            .attestation_signer
-            .read()
+            .current_attestation_signer()
             .await
-            .as_ref()
         {
             Some(signer) => {
                 signer
@@ -4842,19 +4912,16 @@ mod surface_injection_tests {
         (url, vta)
     }
 
-    /// The whole chain, as the proxy drives it: a surface that names an agent
-    /// must have that agent issue the credential embedded in the presentation
-    /// it forwards.
-    #[tokio::test]
-    async fn a_surface_mapped_to_an_agent_has_it_issue_the_embedded_credential() {
-        let (agent_url, recorder) = spawn_agent().await;
-        let tmp = tempfile::tempdir().expect("tempdir");
-
+    /// A connection `vta-a` to the trust agent at `agent_url`, connected and
+    /// holding its control key, behind a registry.
+    async fn agent_registry(
+        dir: &std::path::Path,
+        agent_url: &str,
+    ) -> Arc<crate::vta::registry::VtaConnectionRegistry> {
         // The control key the connection authenticates with.
         let secrets: Arc<dyn crate::secrets::SecretsStore> = Arc::new(
             crate::secrets::FilesystemSecretsStore::new_async(
-                tmp.path()
-                    .join("secrets")
+                dir.join("secrets")
                     .to_str()
                     .unwrap(),
             )
@@ -4878,7 +4945,7 @@ mod surface_injection_tests {
             .expect("store the control key");
 
         let connections = Arc::new(
-            crate::vta::connections::FileSystemVtaConnectionStore::new(tmp.path().join("conns"))
+            crate::vta::connections::FileSystemVtaConnectionStore::new(dir.join("conns"))
                 .await
                 .expect("connection store"),
         );
@@ -4892,7 +4959,7 @@ mod surface_injection_tests {
                 description: None,
                 enabled: true,
                 transport: crate::vta::connections::VtaConnectionTransport::Https,
-                endpoint: agent_url.clone(),
+                endpoint: agent_url.to_string(),
                 vta_did: "did:webvh:agent.example".to_string(),
                 default_context_id: Some("ctx-a".to_string()),
                 control_key_ref: Some("ctl".to_string()),
@@ -4912,6 +4979,23 @@ mod surface_injection_tests {
         .await
         .expect("store the connection");
 
+        Arc::new(crate::vta::registry::VtaConnectionRegistry::new(
+            connections,
+            Some(secrets),
+            None,
+            None,
+            std::time::Duration::from_secs(5),
+            4,
+        ))
+    }
+
+    /// The whole chain, as the proxy drives it: a surface that names an agent
+    /// must have that agent issue the credential embedded in the presentation
+    /// it forwards.
+    #[tokio::test]
+    async fn a_surface_mapped_to_an_agent_has_it_issue_the_embedded_credential() {
+        let (agent_url, recorder) = spawn_agent().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
         // The surface, saved **after** the directory is built — the shape an
         // operator creates one in.
         let surfaces = Arc::new(
@@ -4924,14 +5008,7 @@ mod surface_injection_tests {
         let issuer = Arc::new(issuer);
         let local: Arc<dyn crate::identity::authority::CredentialAuthority> =
             Arc::new(crate::identity::authority::LocalCredentialAuthority::new(Arc::clone(&issuer)));
-        let registry = Arc::new(crate::vta::registry::VtaConnectionRegistry::new(
-            connections,
-            Some(Arc::clone(&secrets)),
-            None,
-            None,
-            std::time::Duration::from_secs(5),
-            4,
-        ));
+        let registry = agent_registry(tmp.path(), &agent_url).await;
         let directory =
             crate::vta::key_directory::KeyDirectory::build(&crate::config::vta::VtaConfig::default(), local)
                 .await
@@ -5163,5 +5240,81 @@ mod surface_injection_tests {
             }
             assert_eq!(birth_logs(f.store_dir.path()), ROUNDS, "a discarded DID leaves no birth log");
         }
+    }
+
+    struct AgentIsTheDefault;
+
+    impl crate::vta::key_directory::ApplianceSigningDefault for AgentIsTheDefault {
+        fn signing(&self) -> Option<crate::config::agent_surface::SurfaceSigningConfig> {
+            Some(crate::config::agent_surface::SurfaceSigningConfig {
+                backend: Some(crate::config::agent_surface::SigningBackendKind::Vta),
+                connection_id: Some("vta-a".to_string()),
+                context_id: Some("ctx-a".to_string()),
+                key_id: Some("gateway-jwt-1".to_string()),
+            })
+        }
+    }
+
+    /// With a trust agent connected in the dashboard and made the gateway-wide
+    /// default, and no `[vta]` block, the fabric issuer attestation claims the
+    /// agent context's DID — the DID that issues the credentials peers receive —
+    /// and is signed by that context's key, so a peer that pins the attested
+    /// issuer accepts those credentials.
+    #[tokio::test]
+    async fn the_attestation_claims_the_context_that_issues_the_appliances_credentials() {
+        let (agent_url, agent) = spawn_agent().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (issuer, _issuer_tmp) = crate::identity::test_helpers::test_vc_issuer().await;
+        let issuer = Arc::new(issuer);
+        let gateway_did = issuer
+            .get_issuer_did()
+            .await
+            .expect("gateway did");
+        let local: Arc<dyn crate::identity::authority::CredentialAuthority> =
+            Arc::new(crate::identity::authority::LocalCredentialAuthority::new(Arc::clone(&issuer)));
+        let directory = Arc::new(
+            crate::vta::key_directory::KeyDirectory::build(&crate::config::vta::VtaConfig::default(), local)
+                .await
+                .expect("a disabled [vta] block builds")
+                .with_connections(agent_registry(tmp.path(), &agent_url).await)
+                .with_appliance_default(Arc::new(AgentIsTheDefault)),
+        );
+        assert_eq!(
+            issuer
+                .attestation_issuer_did()
+                .await
+                .unwrap(),
+            gateway_did,
+            "no directory, no agent"
+        );
+        issuer
+            .set_key_directory(Arc::clone(&directory))
+            .await;
+
+        let attested = issuer
+            .attestation_issuer_did()
+            .await
+            .expect("the attested issuer");
+        assert_eq!(attested, agent.did(), "the attestation claims the issuing context, not the gateway DID");
+        assert!(
+            matches!(
+                directory
+                    .di_vc_issuer_for(&crate::vta::key_directory::KeyScope::default())
+                    .await,
+                crate::vta::key_directory::ScopedDiIssuer::Agent(_)
+            ),
+            "the same context issues the appliance's credentials"
+        );
+
+        let jws = issuer
+            .sign_attestation_typ(&json!({ "iss": attested }), "issuer-attestation+jwt")
+            .await
+            .expect("signed as the context");
+        let header: serde_json::Value = serde_json::from_slice(
+            &base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, jws.split('.').next().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(header["kid"], json!(agent.verification_method()), "signed by the key the attested DID declares");
     }
 }

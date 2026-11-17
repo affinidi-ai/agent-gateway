@@ -3091,6 +3091,12 @@ fn validate_surface_signing(
             errors.push(format!("Surface '{label}': {message}"));
             return;
         }
+        // A surface's tokens sign with this block and fail closed when it is
+        // unusable, so a block that cannot sign a token is refused here.
+        if let Err(e) = crate::vta::key_directory::signing_key_ref(signing, crate::config::vta::KeyPurpose::Jwt) {
+            errors.push(format!("Surface '{label}': {}", e.log_detail()));
+            return;
+        }
         if signing.backend == Some(SigningBackendKind::Vta)
             && signing.context_id.is_none()
             && !vta_config.auto_provision_contexts
@@ -11807,5 +11813,32 @@ mod tests {
         let mut after = surface_recording(&["tr-1"]);
         after.name = "renamed".into();
         assert!(!trust_recorder_changed(&before, &after));
+    }
+
+    fn surface_signing_with(key_id: Option<&str>) -> AgentSurface {
+        AgentSurface {
+            name: "signed".into(),
+            signing: Some(crate::config::agent_surface::SurfaceSigningConfig {
+                backend: Some(crate::config::agent_surface::SigningBackendKind::Vta),
+                connection_id: Some("vta-a".into()),
+                context_id: Some("ctx-a".into()),
+                key_id: key_id.map(str::to_string),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A surface's tokens sign with its block and fail closed when it cannot,
+    /// so a trust agent block that names no key to sign tokens with is refused
+    /// on save rather than at the first token.
+    #[test]
+    fn a_trust_agent_signing_block_without_a_key_is_refused_on_save() {
+        let config = crate::config::vta::VtaConfig::default();
+        let err = validate_surface_signing(&surface_signing_with(None), &config)
+            .expect_err("a block that cannot sign a token must not be saved");
+        assert!(format!("{err:?}").contains("key_id"), "{err:?}");
+
+        validate_surface_signing(&surface_signing_with(Some("gateway-jwt-1")), &config)
+            .expect("a block naming its key is saved");
     }
 }

@@ -155,7 +155,6 @@ fn mapping_for(
                 match b {
                     crate::config::agent_surface::SigningBackendKind::Local => "local",
                     crate::config::agent_surface::SigningBackendKind::Vta => "vta",
-                    crate::config::agent_surface::SigningBackendKind::Hsm => "hsm",
                 }
                 .to_string()
             })

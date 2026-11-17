@@ -59,11 +59,11 @@ about. The behaviour that exists is in [`VTA_INTEGRATION_POC.md`](VTA_INTEGRATIO
 
 ## Tenancy and publication
 
-- **No per-tenant default.** `KeyDirectory::with_tenant_mapping` exists but nothing calls it, and
-  signing scopes carry no `tenant_id`, so a tenant maps each surface by hand.
-- **The token endpoint publishes one key set.** `/oauth2/jwks.json` serves the appliance's
-  signer; `KeyDirectory::jwks()`, which would publish every connection's keys, is not served,
-  so a token a surface signs with a tenant's own trust agent key may not verify through it.
+- **No per-tenant default.** A signing key is chosen per surface, per issuer or gateway-wide;
+  there is no tenant-level choice, so a tenant sets each of its surfaces or issuers.
+- **The token endpoint publishes one key set.** `/oauth2/jwks.json` serves the key set of the
+  gateway-wide signer only, so a token a surface signs with a different trust agent key may not
+  verify through it.
 - **Issuer records keep their private keys on the gateway's disk** and are not part of the
   key inventory.
 

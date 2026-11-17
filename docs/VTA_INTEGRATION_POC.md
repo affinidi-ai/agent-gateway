@@ -159,7 +159,27 @@ per-surface key keep verifying. A verifier that wants this protection resolves
 record id, not a verification-method id.
 
 Both the **`iss` value** and the **verification keys** come from the *same*
-`CredentialAuthority`, so they can never disagree:
+`CredentialAuthority`, so they can never disagree. That authority
+(`ApplianceAuthority`) resolves the gateway-wide signer on every call: the dashboard's
+**Audit signing** choice, then `[vta]`, then the gateway's own key. Choosing a trust agent in
+the dashboard moves STS tokens, ID-JAGs, MCP access tokens and payment receipts to it with no
+restart, and a choice that cannot be resolved refuses to sign rather than signing locally.
+
+- The gateway's own MCP Resource Server verifies MCP access tokens against that authority's
+  key set, so tokens it issued through a trust agent are accepted.
+- A token the gateway issued, under its DID or the `did:key` of any key it publishes (retired
+  keys included), is the gateway's own both when it is verified and when token exchange
+  refuses self-issued subject and actor tokens; an ID-JAG signed by a retired key is redeemed
+  through jwt-bearer, never exchanged.
+- The fabric issuer attestation claims the agent context that issues the gateway-wide
+  agent-identity credential, resolved the same way at the same moment, so a peer that pins
+  the attested issuer accepts those credentials, whether the agent came from `[vta]` or the
+  dashboard.
+- An agent whose key was minted in a trust agent signs its JWTs there too: the agents API's
+  `sign-jwt` and the AP2 presentation sign in the agent's own context, as its holder proofs do.
+- A surface's signing fails closed when its mapping cannot be read (a surface or issuer store
+  error) or names a block that cannot sign; a surface's trust agent block must name its
+  `key_id`, as an issuer's does, or the save is refused.
 
 - `/oauth2/jwks.json` publishes that backend's key set (active + retiring +
   carried-over local), so a resource server verifies by selecting on `kid`.
@@ -300,7 +320,7 @@ In the Surface Builder this is the **Signing key source** field: **Gateway secre
 An **Issuer** can set the same `signing` block, which then applies to every surface it owns
 that sets none of its own (`PUT /v1/issuers/{id}`, `signing`; an empty block clears it). A
 signing key resolves in this order, first match wins: a variant's block, the surface's block,
-the owning issuer's block, a tenant mapping, the gateway-wide default (Settings → Security →
+the owning issuer's block, the gateway-wide default (Settings → Security →
 Audit signing), then the gateway's own key. An issuer's `connection_id` must name a connection its
 tenant may use, the same rule as a surface's.
 

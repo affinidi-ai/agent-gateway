@@ -19,7 +19,7 @@
 //! credentials they signed are still in the wild. [`ContextProvisioner::orphaned`]
 //! lists them for explicit operator cleanup instead.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -191,33 +191,8 @@ impl ContextProvisioner {
         names
     }
 
-    /// Context names this gateway created that no live surface or variant
-    /// claims any more.
-    ///
-    /// Deleting a surface deliberately does **not** delete its keys — artifacts
-    /// they signed must stay verifiable — so these are reported for explicit
-    /// operator cleanup rather than reclaimed. Surfaced by the Key Management
-    /// dashboard (VTA-20).
-    #[allow(dead_code)]
-    pub async fn orphaned(
-        &self,
-        live: &HashSet<String>,
-    ) -> Vec<String> {
-        let mut orphans: Vec<String> = self
-            .known
-            .read()
-            .await
-            .keys()
-            .filter(|name| !live.contains(*name))
-            .cloned()
-            .collect();
-        orphans.sort();
-        orphans
-    }
-
-    /// How many contexts are currently accounted for. Rendered against
-    /// `max_contexts` by the Key Management dashboard (VTA-20).
-    #[allow(dead_code)]
+    /// How many contexts are currently accounted for.
+    #[cfg(test)]
     pub async fn in_use(&self) -> usize {
         self.known.read().await.len()
     }
@@ -316,12 +291,6 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(creator.calls(), 1, "a rename must not provision a second context");
-        assert!(
-            provisioner
-                .orphaned(&HashSet::from([after]))
-                .await
-                .is_empty()
-        );
     }
 
     // ---- lazy + idempotent ------------------------------------------------
@@ -452,32 +421,5 @@ mod tests {
                 .unwrap(),
             ContextId("ctx-operator".to_string())
         );
-    }
-
-    // ---- orphans ----------------------------------------------------------
-
-    #[tokio::test]
-    async fn deleting_a_surface_reports_an_orphan_rather_than_reclaiming_it() {
-        let creator = CountingCreator::new(0);
-        let provisioner = ContextProvisioner::new(Arc::clone(&creator) as Arc<dyn ContextCreator>, 10);
-        provisioner
-            .ensure_context("ctx:_global/kept")
-            .await
-            .unwrap();
-        provisioner
-            .ensure_context("ctx:_global/deleted")
-            .await
-            .unwrap();
-
-        let live = HashSet::from(["ctx:_global/kept".to_string()]);
-        assert_eq!(
-            provisioner
-                .orphaned(&live)
-                .await,
-            vec!["ctx:_global/deleted".to_string()]
-        );
-        // Reported, not reclaimed: still resolvable, so anything it signed
-        // stays verifiable.
-        assert_eq!(provisioner.in_use().await, 2);
     }
 }

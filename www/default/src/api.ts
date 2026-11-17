@@ -1389,7 +1389,7 @@ export interface AgentSurface {
   issuer_id?: string;
   /** Which key signs for this surface. Absent means inherit the appliance default. */
   signing?: {
-    backend?: 'local' | 'vta' | 'hsm';
+    backend?: 'local' | 'vta';
     connection_id?: string;
     context_id?: string;
     key_id?: string;

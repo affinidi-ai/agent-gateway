@@ -237,6 +237,53 @@ impl VpIssuer for VtaVpIssuer {
     }
 }
 
+/// Signs a JWT as an agent whose key lives in a trust agent.
+#[async_trait]
+pub trait AgentJwtSigner: Send + Sync {
+    /// The JWT signed by `agent_did`'s own context, or `None` when the agent
+    /// has no trust agent context and its key is held by the gateway.
+    async fn sign_agent_jwt(
+        &self,
+        agent_did: &str,
+        claims: &Value,
+    ) -> Result<Option<String>>;
+}
+
+#[async_trait]
+impl AgentJwtSigner for VtaVpIssuer {
+    async fn sign_agent_jwt(
+        &self,
+        agent_did: &str,
+        claims: &Value,
+    ) -> Result<Option<String>> {
+        let Some(binding) = self
+            .contexts
+            .binding_for(agent_did)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let resolver = self
+            .resolver_for(&binding)
+            .await?;
+        let identity = resolver.identity().await?;
+        // The JWT is the agent's own statement, so only the context whose DID
+        // is the agent may sign it; a mismatch means the record and the context
+        // have come apart.
+        if identity.did != agent_did {
+            bail!(
+                "agent `{agent_did}` is bound to context `{}`, whose DID is `{}`; refusing to sign as a different identity",
+                binding.context_id,
+                identity.did
+            );
+        }
+        resolver
+            .sign_jws(claims, "JWT")
+            .await
+            .map(Some)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,5 +521,124 @@ mod tests {
         };
         assert!(err.contains("raspberry-pi"), "the error must name the trust agent that could not be reached: {err}");
         assert_eq!(local.0.load(Ordering::SeqCst), 0, "and it must not quietly sign locally either");
+    }
+
+    /// Verify a compact EdDSA JWS against a `did:key` multibase public key.
+    fn verifies_under(
+        jws: &str,
+        public_key_multibase: &str,
+    ) -> bool {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let (signing_input, signature) = jws
+            .rsplit_once('.')
+            .expect("compact JWS");
+        let (_, key) = multibase::decode(public_key_multibase).expect("multibase key");
+        let key = ed25519_dalek::VerifyingKey::from_bytes(
+            key[2..]
+                .try_into()
+                .expect("32 bytes"),
+        )
+        .expect("key");
+        let signature = ed25519_dalek::Signature::from_slice(
+            &b64.decode(signature)
+                .expect("signature"),
+        )
+        .expect("signature bytes");
+        key.verify_strict(signing_input.as_bytes(), &signature)
+            .is_ok()
+    }
+
+    /// An agent whose key lives in a trust agent gets its JWT signed there,
+    /// by its own context's key, which is what its DID declares.
+    #[tokio::test]
+    async fn a_bound_agent_signs_its_jwt_through_its_own_context() {
+        let vta = MockContextVta::new("gw/agent-1", "agent-1-issuer");
+        let url = vta.spawn().await;
+        let local = Arc::new(CountingLocal::default());
+        let issuer = issuer(vta.client(&url), Arc::new(FixedContext("gw/agent-1")), &local);
+
+        let jwt = issuer
+            .sign_agent_jwt(&vta.did(), &json!({ "iss": vta.did(), "sub": "task" }))
+            .await
+            .expect("signs")
+            .expect("a bound agent is signed in its context");
+
+        assert!(verifies_under(&jwt, &vta.public_key), "signed by the context's key");
+        let sent = vta
+            .last_sign_request
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a sign-jws request");
+        assert_eq!(sent["header"]["kid"], json!(vta.verification_method()));
+        assert_eq!(sent["header"]["typ"], json!("JWT"));
+    }
+
+    /// An agent onboarded before its gateway connected a trust agent keeps its
+    /// gateway-held key, so the signer leaves it to the local path.
+    #[tokio::test]
+    async fn an_agent_with_no_context_is_left_to_its_gateway_held_key() {
+        let local = Arc::new(CountingLocal::default());
+        let issuer = issuer(unreachable_client(), Arc::new(NoContexts), &local);
+
+        assert_eq!(
+            issuer
+                .sign_agent_jwt("did:key:zAgent", &json!({}))
+                .await
+                .expect("no error"),
+            None
+        );
+    }
+
+    /// A context whose DID is not the agent must not sign as it.
+    #[tokio::test]
+    async fn an_agent_jwt_is_refused_when_the_context_is_another_identity() {
+        let vta = MockContextVta::new("gw/agent-1", "agent-1-issuer");
+        let url = vta.spawn().await;
+        let local = Arc::new(CountingLocal::default());
+        let issuer = issuer(vta.client(&url), Arc::new(FixedContext("gw/agent-1")), &local);
+
+        let err = issuer
+            .sign_agent_jwt("did:key:zSomeoneElse", &json!({}))
+            .await
+            .expect_err("the context is not this agent")
+            .to_string();
+        assert!(err.contains("different identity"), "{err}");
+        assert_eq!(vta.sign_calls(), 0);
+    }
+
+    /// The agents API's sign-jwt and the AP2 presentation sign through
+    /// `sign_jwt_with_agent_key`. For an agent whose key is held in a trust
+    /// agent — stored with no private key — that signs in the agent's context
+    /// instead of failing for want of a key the gateway never had.
+    #[tokio::test]
+    async fn the_gateway_signs_a_trust_agent_held_agents_jwt_in_its_context() {
+        let vta = MockContextVta::new("gw/agent-1", "agent-1-issuer");
+        let url = vta.spawn().await;
+        let local = Arc::new(CountingLocal::default());
+        let (gateway, _dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let agent_did = vta.did();
+        let claims = json!({ "iss": agent_did, "sub": "task" });
+
+        let err = gateway
+            .sign_jwt_with_agent_key(&agent_did, &claims)
+            .await
+            .expect_err("without a trust agent signer there is no key for this agent");
+        assert!(
+            err.to_string()
+                .contains(&agent_did),
+            "{err}"
+        );
+
+        gateway
+            .set_agent_jwt_signer(Arc::new(issuer(vta.client(&url), Arc::new(FixedContext("gw/agent-1")), &local)))
+            .await;
+        let jwt = gateway
+            .sign_jwt_with_agent_key(&agent_did, &claims)
+            .await
+            .expect("signed in the agent's context");
+        assert!(verifies_under(&jwt, &vta.public_key));
+        assert_eq!(local.0.load(Ordering::SeqCst), 0, "no gateway-held key is involved");
     }
 }

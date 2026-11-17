@@ -96,7 +96,7 @@ impl VtaConnectionRegistry {
 
     /// Attach the mediator channel that carries Trust Tasks over DIDComm
     /// (VTA-27), enabling connections whose VTA has no reachable address.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn with_didcomm(
         mut self,
         channel: Arc<dyn crate::vta::transport::DidCommChannel>,

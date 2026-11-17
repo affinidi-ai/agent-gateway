@@ -117,7 +117,7 @@ export interface SurfaceContext {
  * than an empty one.
  */
 export interface SurfaceSigning {
-  backend?: 'local' | 'vta' | 'hsm';
+  backend?: 'local' | 'vta';
   connection_id?: string;
   context_id?: string;
   key_id?: string;
