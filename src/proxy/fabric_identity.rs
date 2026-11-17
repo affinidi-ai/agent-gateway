@@ -233,8 +233,9 @@ async fn extract_a2a_fabric_identity(
 
 /// Verify the VP carried by GW2's credential extension. Rejects a credential
 /// that carries no `verifiablePresentation`, whose VP fails verification
-/// (including a holder that is not its credential's subject), or whose VP
-/// carries no credential to name an issuer.
+/// (including a holder that is not its credential's subject), whose VP
+/// carries no credential to name an issuer, or that this gateway has no VC
+/// issuer to verify.
 async fn verify_fabric_credential(
     credential_ext: &JsonValue,
     vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
@@ -256,8 +257,8 @@ async fn verify_fabric_credential(
     };
 
     let Some(vc_issuer) = vc_issuer else {
-        warn!(channel = channel_name, "Fabric: No VC issuer available for VP verification");
-        return Ok(None);
+        warn!(channel = channel_name, "✗ Fabric: no VC issuer to verify the response VP");
+        return Err("VP verification failed for server agent identity: no VC issuer to verify the presentation".into());
     };
     let verified = vc_issuer
         .verify_agent_presentation_full(vp_jwt)
@@ -840,6 +841,21 @@ mod tests {
 
         assert_eq!(result, Err(AnswerIdentityRefusal::Untrusted));
         assert_eq!(failed_outcome(&events), Some(crate::audit::events::IdentityBindingFailure::Untrusted));
+    }
+
+    #[tokio::test]
+    async fn a_presentation_this_gateway_has_no_vc_issuer_to_verify_is_refused_as_invalid_and_recorded() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation().await;
+
+        let (result, events) = checked(&credential_response(&signed.presentation), None).await;
+
+        match result {
+            Err(AnswerIdentityRefusal::Invalid(error)) => {
+                assert!(error.contains("no VC issuer to verify the presentation"), "{error}")
+            }
+            other => panic!("expected an invalid refusal, got {other:?}"),
+        }
+        assert_eq!(failed_outcome(&events), Some(crate::audit::events::IdentityBindingFailure::Invalid));
     }
 
     #[tokio::test]

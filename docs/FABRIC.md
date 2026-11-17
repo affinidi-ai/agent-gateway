@@ -216,7 +216,8 @@ extension the paired gateway replaced with it; the surface's identity schema and
 that raw payload, which the calling gateway never receives, so the issuer check stands in for
 them. A surface that takes the identity from a key, a token claim, a certificate or a fixed DID
 keeps it: the presentation is still checked and recorded, but the answering agent's DID is not
-stored as an identity of the surface. A presentation
+stored as an identity of the surface. A presentation the calling gateway has no VC issuer to verify
+counts as one that fails verification. A presentation
 that fails verification refuses the answer with `502` and records `identity_binding_failed` with
 outcome `invalid`. One whose issuer is not one of the connection's issuers, including when they
 cannot be established, also refuses the answer with `502`: the answering agent's DID is not
