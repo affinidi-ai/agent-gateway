@@ -419,9 +419,9 @@ static URL_QUERY: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// The scheme and userinfo of an absolute URL, anywhere in a text. The userinfo may hold
-/// `@`, so it runs to the last `@` before the host.
+/// `@` and `'`, so it runs to the last `@` before the host.
 static URL_USERINFO: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(?i)\b([a-z][a-z0-9+.\-]*://)[^\s/?#"'<>]+@"#).expect("valid URL userinfo pattern"));
+    LazyLock::new(|| Regex::new(r#"(?i)\b([a-z][a-z0-9+.\-]*://)[^\s/?#"<>]+@"#).expect("valid URL userinfo pattern"));
 
 /// `text` with its credentials masked, or `None` when it holds none. A text that is
 /// one JWT or one authorization value becomes [`REDACTED`] whole; inside longer text
@@ -968,12 +968,14 @@ mod tests {
                 "token_as_user": "https://ghp_abc123def456@git.example.test/repo.git",
                 "note": "fetch it from ftp://svc:secret@files.example.test/data now",
                 "two": "see https://a.example.test/x and https://u:p@b.example.test/y",
+                "apostrophe": "https://svc:pa'ss@host.example.test/x",
             } },
         });
 
         mask_credentials(&mut input);
 
         let arguments = &input["mcp"]["arguments"];
+        assert_eq!(arguments["apostrophe"], format!("https://{REDACTED}@host.example.test/x"));
         assert_eq!(arguments["endpoint"], format!("https://{REDACTED}@api.example.test/p"));
         assert_eq!(arguments["token_as_user"], format!("https://{REDACTED}@git.example.test/repo.git"));
         assert_eq!(arguments["note"], format!("fetch it from ftp://{REDACTED}@files.example.test/data now"));
@@ -1001,6 +1003,23 @@ mod tests {
                 .to_string()
                 .contains("ss@"),
             "{input}"
+        );
+    }
+
+    #[test]
+    fn a_url_with_a_jwt_as_its_user_name_in_its_path_and_in_its_query_loses_all_three() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln";
+        let mut input = json!({
+            "mcp": { "arguments": {
+                "endpoint": format!("https://{jwt}:x@host.example.test/{jwt}?access_token={jwt}&page=2"),
+            } },
+        });
+
+        mask_credentials(&mut input);
+
+        assert_eq!(
+            input["mcp"]["arguments"]["endpoint"],
+            format!("https://{REDACTED}@host.example.test/{REDACTED}?access_token={REDACTED}&page={REDACTED}")
         );
     }
 
