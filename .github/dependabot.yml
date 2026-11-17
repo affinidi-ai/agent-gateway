@@ -1,6 +1,9 @@
 version: 2
 
 updates:
+  # Minor and patch bumps ride in one weekly PR: one Cargo.lock, one CI run, one
+  # review. Majors stay ungrouped, since each needs its own code changes (a
+  # RustCrypto bump moves p256, hkdf, hmac and sha2 together, for instance).
   - package-ecosystem: cargo
     directory: /
     schedule:
@@ -8,7 +11,17 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
 
+  # Same grouping as cargo: one weekly PR for minor and patch, majors on their
+  # own. Security updates are never grouped by this entry and keep arriving as
+  # separate PRs, which is what the npm_and_yarn PRs are.
   - package-ecosystem: npm
     directory: /www/default
     schedule:
@@ -16,6 +29,29 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    groups:
+      npm-default-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    # Majors the dashboard is not taking: each is a migration rather than a bump,
+    # and the open PR for it has sat unmergeable for weeks. Minor and patch
+    # updates for these packages still arrive in the group above.
+    ignore:
+      - dependency-name: "typescript"
+        update-types:
+          - "version-update:semver-major"
+      - dependency-name: "@testing-library/react"
+        update-types:
+          - "version-update:semver-major"
+      - dependency-name: "@testing-library/jest-dom"
+        update-types:
+          - "version-update:semver-major"
+      - dependency-name: "js-yaml"
+        update-types:
+          - "version-update:semver-major"
 
   - package-ecosystem: npm
     directory: /ui-tests
@@ -24,6 +60,22 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    groups:
+      npm-ui-tests-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    # As above: the TypeScript 7 and @types/node 26 jumps are not being taken
+    # here, and Playwright pins the Node types this suite compiles against.
+    ignore:
+      - dependency-name: "typescript"
+        update-types:
+          - "version-update:semver-major"
+      - dependency-name: "@types/node"
+        update-types:
+          - "version-update:semver-major"
 
   # Keep the digest-pinned runtime base image in the Dockerfile current.
   - package-ecosystem: docker
