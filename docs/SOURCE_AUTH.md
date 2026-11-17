@@ -1351,7 +1351,12 @@ on a direct request to an inbound `from_api_key` surface, where the key's DID re
 On the protected slot, `payload_extraction` refuses a response that carries no identity with
 `422 identity_extension_missing`, and one whose identity is present but invalid with `422
 identity_validation_failed`, except on a public card this gateway serves to a peer over Fabric,
-which is served without an identity credential on any identity error. The public agent card of
+which is served without an identity credential on any identity error, and on a `2xx` answer from
+a `fabric://` Target that carries a verified identity presentation from one of the connection's
+issuers, which is the identity instead (see [`FABRIC.md`](FABRIC.md#peer-issuer-dids)).
+Accepted risk: the surface's identity schema and rules do not run on such an answer; the paired
+gateway applied its own to the raw extension it replaced, and the issuer check stands in for
+them. The public agent card of
 an A2A or AP2 surface is the exception for a missing identity: a named card with neither
 `agent-identity/v1` nor `agent-identity-credential/v1` is served as anonymous, with no identity
 credential and no Trust Recorder write. The gateway logs a `WARN` once per surface, and again

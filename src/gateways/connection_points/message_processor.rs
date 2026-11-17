@@ -1629,17 +1629,10 @@ async fn process_get_surfaces_response(message: &ReceivedMessage) -> ProcessingR
     ProcessingResult::ProcessedNoResponse
 }
 
-/// Extract caller identity from inbound fabric request (VP, extensions, MCP _meta).
-/// Extracted from `process_forward_request` to reduce async state-machine size.
-/// The verified gateway DID of the peer that sent a fabric envelope from
-/// `from_did`, running the issuer exchange when its Remote gateway record does
-/// not hold it yet. Fails closed: an unknown Connection Point, or a peer that
-/// cannot prove its issuer DID, is rejected.
-/// The issuers a forward-request's sender may present identities from: the
-/// paired gateway's attested issuer DID (fetched on demand when missing) plus
-/// the issuer DIDs an operator trusts for that connection. A peer with
-/// neither is rejected; a peer with operator-trusted issuers is admitted even
-/// when the attestation exchange fails, so a legacy peer can be trusted by hand.
+/// The issuers the paired gateway that sent a forward-request from `from_did`
+/// may present identities from; see
+/// [`ConnectionPointListenerManager::peer_issuers`]. Fails closed: a request
+/// with no sender, or from an unknown Connection Point, is rejected.
 async fn resolve_peer_issuers(from_did: Option<&str>) -> Result<crate::gateways::types::PeerIssuers, String> {
     let from_did = from_did.ok_or_else(|| "forward-request has no sender DID".to_string())?;
     let manager = GLOBAL_LISTENER_MANAGER

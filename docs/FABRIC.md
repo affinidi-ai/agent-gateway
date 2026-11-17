@@ -226,6 +226,23 @@ one records `identity_binding_verified` and the received presentation (`vp_injec
 `response_path_fabric_received`), both with `via_fabric: true` and the request's trace id. Answers
 to a Transit Point over Fabric and to MCP requests over Fabric are not checked.
 
+Accepted risk: an answer that carries no presentation is not checked. A paired gateway signs one
+only when its surface has a managed identity and it has a VC issuer, so an answer from any other
+paired surface carries the agent's raw `agent-identity/v1` extension instead, and a surface that
+takes the identity from the payload derives it from that extension under its own schema and
+rules, with no issuer check and no audit record. A paired gateway can therefore drop the
+presentation and send `x-identity` fields copied from another agent to be given that agent's
+identity. Only a gateway this one is paired with can do this; the mediator and the answering
+agent cannot remove a presentation the paired gateway adds.
+
+Accepted risk: the calling surface's identity schema and rules do not run on an answer that
+carries a verified presentation. They are written for the raw `agent-identity/v1` extension,
+which the paired gateway checked against its own schema and rules and replaced, and the
+presentation's fields follow the paired gateway's schema, so checking them against the calling
+surface's could refuse legitimate agents. A paired gateway whose rules are looser than the
+calling surface's can therefore pass an agent the calling surface's rules would refuse; the issuer
+check is the only check the calling gateway applies.
+
 The presentation the receiving gateway signs for its agent's response, when the Target has a
 Workload Binding, names the caller as the user the agent acted for (`userIdentity`, with
 `delegated: true`) only when a presentation from one of the connection's issuers proved the

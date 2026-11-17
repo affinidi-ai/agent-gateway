@@ -25,7 +25,7 @@ pub struct ResponsePresentation {
 
 /// Whether the connection's issuers vouch for a response presentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResponseAttribution {
+enum ResponseAttribution {
     /// The issuer is one of the connection's issuers.
     Verified,
     /// The issuer is not one of them; the answer is refused.
@@ -36,30 +36,34 @@ pub enum ResponseAttribution {
 /// The refusal is already recorded in the VP Audit Log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnswerIdentityRefusal {
-    /// The presentation failed verification, with the diagnostic.
+    /// The presentation failed verification, with the verifier's diagnostic,
+    /// which is logged and never sent to the caller.
     Invalid(String),
     /// No issuer of the connection vouches for the presentation.
     Untrusted,
 }
 
 impl AnswerIdentityRefusal {
-    /// The detail of the `502` the caller receives.
-    pub fn detail(&self) -> String {
+    /// The detail of the `502` the caller receives: a fixed sentence per
+    /// refusal, never the verifier's diagnostic.
+    pub fn detail(&self) -> &'static str {
         match self {
-            Self::Invalid(error) => format!("Backend agent identity verification failed: {error}"),
-            Self::Untrusted => {
-                "Managed agent identity verification failed: issuer is not trusted on this connection".to_string()
-            }
+            Self::Invalid(_) => "Managed agent identity verification failed",
+            Self::Untrusted => "Managed agent identity verification failed: issuer is not trusted on this connection",
         }
     }
 }
+
+/// The longest `error_detail` an `invalid` record keeps of the verifier's
+/// diagnostic, which a peer's presentation can make arbitrarily long.
+const INVALID_DETAIL_MAX_CHARS: usize = 256;
 
 /// A fabric answer whose identity presentation the calling gateway checks.
 pub struct AnswerIdentityCheck<'a> {
     pub response_body: &'a str,
     pub surface: &'a crate::config::agent_surface::AgentSurface,
     /// The gateway's VC issuer, which verifies the presentation; without one
-    /// no presentation is checked.
+    /// a presentation is refused as invalid.
     pub vc_issuer: Option<&'a Arc<crate::identity::VCIssuer>>,
     pub listener_manager: Option<Arc<crate::gateways::ConnectionPointListenerManager>>,
     /// The Remote gateway record the `fabric://` Target names.
@@ -71,10 +75,11 @@ pub struct AnswerIdentityCheck<'a> {
 
 /// Verify the identity presentation on a fabric answer, check its issuer
 /// against the connection's issuers and record the outcome in the VP Audit
-/// Log. A verified presentation that sets the surface's identity (see
-/// [`presentation_sets_identity`]) also stores the answering agent's DID as
-/// verified. `Ok(None)` when the answer carries no presentation; a refusal is
-/// recorded before it is returned.
+/// Log. When the surface takes its protected identity from the answer (see
+/// [`crate::proxy::backend_identity::slot_reads_response_body`]), a verified
+/// presentation also stores the answering agent's DID as verified. `Ok(None)`
+/// when the answer carries no presentation; a refusal is recorded before it is
+/// returned.
 pub async fn check_answer_identity(
     check: AnswerIdentityCheck<'_>
 ) -> Result<Option<ResponsePresentation>, AnswerIdentityRefusal> {
@@ -105,11 +110,9 @@ pub async fn check_answer_identity(
     {
         ResponseAttribution::Verified => {
             if let Some(vc_issuer) = check.vc_issuer
-                && presentation_sets_identity(
-                    check
-                        .surface
-                        .managed_identity()
-                        .as_ref(),
+                && crate::proxy::backend_identity::slot_reads_response_body(
+                    check.surface,
+                    crate::proxy::backend_identity::IdentitySlot::Protected,
                 )
             {
                 store_answering_agent(&presentation, vc_issuer, check.surface, check.facts.channel_name).await;
@@ -144,14 +147,6 @@ async fn store_answering_agent(
     }
 }
 
-/// Whether a verified answer presentation is the answering agent's protected
-/// identity: only when that identity is taken from the agent's payload, which
-/// the paired gateway replaced with its presentation. A slot that derives the
-/// identity from a key, a token claim or a fixed value keeps it.
-pub fn presentation_sets_identity(managed_identity: Option<&crate::source_auth::ManagedIdentityConfig>) -> bool {
-    matches!(managed_identity, Some(crate::source_auth::ManagedIdentityConfig::PayloadExtraction(_)))
-}
-
 /// Extract and verify the identity presentation a paired gateway attached to
 /// a fabric answer.
 ///
@@ -160,7 +155,7 @@ pub fn presentation_sets_identity(managed_identity: Option<&crate::source_auth::
 ///   caller refuses the response.
 /// - `Ok(None)` when the answer carries no presentation; a raw identity
 ///   extension is left to protected identity resolution.
-pub async fn extract_fabric_backend_agent_identity(
+async fn extract_fabric_backend_agent_identity(
     response_body: &str,
     surface: &crate::config::agent_surface::AgentSurface,
     vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
@@ -232,28 +227,27 @@ async fn extract_a2a_fabric_identity(
 }
 
 /// Verify the VP carried by GW2's credential extension. Rejects a credential
-/// that carries no `verifiablePresentation`, whose VP fails verification
-/// (including a holder that is not its credential's subject), whose VP
-/// carries no credential to name an issuer, or that this gateway has no VC
-/// issuer to verify.
+/// whose `verifiablePresentation` is missing or is not a non-empty string,
+/// whose VP fails verification (including a holder that is not its
+/// credential's subject), whose VP carries no credential to name an issuer,
+/// or that this gateway has no VC issuer to verify.
 async fn verify_fabric_credential(
     credential_ext: &JsonValue,
     vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
     channel_name: &str,
 ) -> Result<Option<ResponsePresentation>, String> {
-    let Some(vp_jwt) = credential_ext
-        .get("verifiablePresentation")
-        .and_then(|v| v.as_str())
-    else {
-        if credential_ext
-            .get("verifiablePresentation")
-            .is_none()
-        {
-            let error_msg = "VP credential extension present but missing verifiablePresentation field".to_string();
+    let vp_jwt = match credential_ext.get("verifiablePresentation") {
+        Some(JsonValue::String(vp_jwt)) if !vp_jwt.is_empty() => vp_jwt.as_str(),
+        Some(_) => {
+            let error_msg = "VP credential extension carries a verifiablePresentation that is not a presentation";
             warn!(channel = channel_name, "{}", error_msg);
-            return Err(error_msg);
+            return Err(error_msg.to_string());
         }
-        return Ok(None);
+        None => {
+            let error_msg = "VP credential extension present but missing verifiablePresentation field";
+            warn!(channel = channel_name, "{}", error_msg);
+            return Err(error_msg.to_string());
+        }
     };
 
     let Some(vc_issuer) = vc_issuer else {
@@ -287,7 +281,7 @@ async fn verify_fabric_credential(
 
 /// Check `presentation`'s issuer against `peer_issuers`, the issuers of the
 /// connection the answer came over.
-pub fn attribute_response_presentation(
+fn attribute_response_presentation(
     presentation: &ResponsePresentation,
     peer_issuers: &crate::gateways::types::PeerIssuers,
     channel_name: &str,
@@ -312,7 +306,7 @@ pub fn attribute_response_presentation(
 /// when the connection's issuers vouch for it, `identity_binding_failed`
 /// (`untrusted`) otherwise. Issuers that cannot be resolved vouch for nothing.
 /// The received presentation names `caller`, the request's authenticated caller.
-pub async fn record_response_presentation(
+async fn record_response_presentation(
     presentation: &ResponsePresentation,
     listener_manager: Option<Arc<crate::gateways::ConnectionPointListenerManager>>,
     gateway_id: &str,
@@ -369,22 +363,27 @@ pub async fn record_response_presentation(
 }
 
 /// Record a response presentation that failed verification as
-/// `identity_binding_failed` (`invalid`), with `error` as its diagnostic.
-pub fn record_invalid_response_presentation(
+/// `identity_binding_failed` (`invalid`), with the first
+/// [`INVALID_DETAIL_MAX_CHARS`] characters of `error` as its diagnostic.
+fn record_invalid_response_presentation(
     facts: &crate::audit::request_events::RequestFacts<'_>,
     error: &str,
 ) {
+    let detail: String = error
+        .chars()
+        .take(INVALID_DETAIL_MAX_CHARS)
+        .collect();
     crate::audit::request_events::identity_binding_failed(
         facts,
         crate::audit::events::IdentityBindingFailure::Invalid,
         None,
         None,
-        Some(error),
+        Some(&detail),
     );
 }
 
 /// The `vp_injected` detail of a presentation received on a fabric answer.
-pub const RESPONSE_PRESENTATION_DETAIL: &str = "response_path_fabric_received";
+const RESPONSE_PRESENTATION_DETAIL: &str = "response_path_fabric_received";
 
 #[cfg(test)]
 mod tests {
@@ -714,8 +713,18 @@ mod tests {
         Result<Option<ResponsePresentation>, AnswerIdentityRefusal>,
         Vec<crate::delegation_vault::audit::DelegationAuditEvent>,
     ) {
+        checked_on(surface(), response, vc_issuer).await
+    }
+
+    async fn checked_on(
+        surface: crate::config::agent_surface::AgentSurface,
+        response: &JsonValue,
+        vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
+    ) -> (
+        Result<Option<ResponsePresentation>, AnswerIdentityRefusal>,
+        Vec<crate::delegation_vault::audit::DelegationAuditEvent>,
+    ) {
         let body = response.to_string();
-        let surface = surface();
         let facts = facts();
         crate::audit::producer::capture(check_answer_identity(AnswerIdentityCheck {
             response_body: &body,
@@ -791,8 +800,8 @@ mod tests {
         assert!(stored_after_a_trusted_answer(surface).await);
     }
 
-    #[tokio::test]
-    async fn a_trusted_answer_on_a_fixed_identity_surface_is_recorded_but_not_stored() {
+    /// `surface()` with a managed identity fixed to one DID.
+    fn fixed_identity_surface() -> crate::config::agent_surface::AgentSurface {
         let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
             "name": "a-party",
             "access_point": { "listen_address": "http://localhost:8700", "route": "/agents/a", "protocol": "a2a" },
@@ -801,8 +810,38 @@ mod tests {
         }))
         .expect("surface JSON");
         assert!(matches!(surface.managed_identity(), Some(crate::source_auth::ManagedIdentityConfig::Static { .. })));
+        surface
+    }
 
-        assert!(!stored_after_a_trusted_answer(surface).await);
+    #[tokio::test]
+    async fn a_trusted_answer_on_a_fixed_identity_surface_is_recorded_but_not_stored() {
+        assert!(!stored_after_a_trusted_answer(fixed_identity_surface()).await);
+    }
+
+    #[tokio::test]
+    async fn a_presentation_that_is_not_a_presentation_string_is_rejected() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation().await;
+        for presentation in [json!(null), json!({ "holder": "did:web:agent" }), json!(7), json!("")] {
+            let response = v1_task(agent_message(CREDENTIAL_URI, json!({ "verifiablePresentation": presentation })));
+
+            assert!(
+                extract(&response, Some(&signed.issuer))
+                    .await
+                    .is_err(),
+                "{presentation} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_answer_on_a_fixed_identity_surface_whose_presentation_is_not_a_string_is_refused_as_invalid() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation().await;
+        let response = v1_task(agent_message(CREDENTIAL_URI, json!({ "verifiablePresentation": null })));
+
+        let (result, events) = checked_on(fixed_identity_surface(), &response, Some(&signed.issuer)).await;
+
+        assert!(matches!(result, Err(AnswerIdentityRefusal::Invalid(_))), "{result:?}");
+        assert_eq!(failed_outcome(&events), Some(crate::audit::events::IdentityBindingFailure::Invalid));
     }
 
     fn failed_outcome(
@@ -869,31 +908,53 @@ mod tests {
     }
 
     #[test]
-    fn only_a_payload_identity_is_taken_from_the_answer_presentation() {
-        let payload: crate::source_auth::ManagedIdentityConfig = serde_json::from_value(json!({
-            "type": "from_payload",
-            "meta_field": "agentIdentity",
-            "fields": ["agentIdentity.name"]
-        }))
-        .expect("payload identity");
-        let from_api_key: crate::source_auth::ManagedIdentityConfig =
-            serde_json::from_value(json!({ "type": "from_api_key", "api_key_id": "key-1" })).expect("API key identity");
-
-        assert!(presentation_sets_identity(Some(&payload)));
-        assert!(!presentation_sets_identity(Some(&from_api_key)));
-        assert!(!presentation_sets_identity(None));
-    }
-
-    #[test]
-    fn a_refused_answer_tells_the_caller_why() {
+    fn a_refused_answer_tells_the_caller_why_without_the_verifier_diagnostic() {
         assert_eq!(
             AnswerIdentityRefusal::Untrusted.detail(),
             "Managed agent identity verification failed: issuer is not trusted on this connection"
         );
         assert_eq!(
-            AnswerIdentityRefusal::Invalid("bad signature".into()).detail(),
-            "Backend agent identity verification failed: bad signature"
+            AnswerIdentityRefusal::Invalid("VP holder (did:web:a) does not match VC subject (did:web:b)".into())
+                .detail(),
+            "Managed agent identity verification failed"
         );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_record_keeps_at_most_the_first_256_characters_of_the_diagnostic() {
+        use crate::delegation_vault::audit::DelegationAuditAction;
+        let diagnostic = "x".repeat(INVALID_DETAIL_MAX_CHARS + 100);
+
+        let ((), events) = crate::audit::producer::capture(async {
+            record_invalid_response_presentation(&facts(), &diagnostic);
+        })
+        .await;
+
+        match &events[..] {
+            [event] => match &event.event {
+                DelegationAuditAction::IdentityBindingFailed { error_detail, .. } => {
+                    assert_eq!(error_detail.as_deref(), Some(&diagnostic[..INVALID_DETAIL_MAX_CHARS]));
+                }
+                other => panic!("expected IdentityBindingFailed, got {other:?}"),
+            },
+            other => panic!("expected one record, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_mcp_answer_carries_no_checked_presentation() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation().await;
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "name": "a-party",
+            "access_point": { "listen_address": "http://localhost:8700", "route": "/agents/a", "protocol": "mcp" },
+            "target": { "endpoint": "fabric://gw-2/b-party" }
+        }))
+        .expect("surface JSON");
+        let body = credential_response(&signed.presentation).to_string();
+
+        let presented = extract_fabric_backend_agent_identity(&body, &surface, Some(&signed.issuer), "a-party").await;
+
+        assert_eq!(presented, Ok(None));
     }
 
     #[tokio::test]

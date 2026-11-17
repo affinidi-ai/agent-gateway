@@ -795,11 +795,15 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
   the gateway creating one, or the presentation itself once a received one verified.
   - `identity_binding_verified`: the presentation verified and a trust anchor vouches for its
     issuer. Carries `agent_did`, `issuer_gateway` and the caller-context `assurance`; the record
-    for a presentation on an answer to a `fabric://` Target carries no `assurance`.
+    for a presentation on an answer to a `fabric://` Target carries no `assurance`, and its
+    `agent_did` names the agent that presented, which is the surface's identity only when the
+    surface takes that identity from the payload.
   - `identity_binding_failed`: `outcome` is `absent` (no presentation was sent), `invalid` (it
-    failed verification, including an issuer the receiving connection does not trust) or
-    `untrusted` (it verified, but no trust anchor was available to vouch for its issuer).
-    `error_detail` is a short diagnostic and never carries the presentation itself.
+    failed verification, or, on a request, its issuer is not one the receiving connection
+    trusts) or `untrusted` (it verified, but no trust anchor was available to vouch for its
+    issuer, or, on an answer to a `fabric://` Target, its issuer is not one of the connection's
+    issuers, including when they cannot be established). `error_detail` is a short diagnostic
+    (at most 256 characters on an answer) and never carries the presentation itself.
 
 **Policy change events.** Raised by management API requests that change a policy definition or
 where a policy applies (group Policies). Each record carries its body in the `event` variant, e.g.

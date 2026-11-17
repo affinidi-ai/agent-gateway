@@ -30,5 +30,8 @@ changes:
         Target only from an issuer of the connection to that Remote gateway, establishing its
         issuer DID through the issuer exchange when the record does not hold one. An answer whose
         presentation comes from another issuer, or from a gateway whose issuers cannot be
-        established, is refused with 502 and its agent DID is not stored as verified.
+        established, is refused with 502 and its agent DID is not stored as verified. The 502
+        says only why the identity was refused, never the verifier's diagnostic, and the issuer
+        DID the exchange records no longer overwrites a change the operator made to the Remote
+        gateway record while the exchange was waiting.
   breaking: []

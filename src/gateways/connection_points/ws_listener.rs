@@ -1371,8 +1371,9 @@ impl ConnectionPointListenerManager {
 
     /// The issuers the Remote gateway `gateway_id` may present identities
     /// from, to check `issuer_did` against. The issuers its record already
-    /// holds answer without the issuer exchange when they accept `issuer_did`;
-    /// otherwise see [`Self::peer_issuers`].
+    /// holds answer without the issuer exchange when they accept `issuer_did`
+    /// or include an established issuer DID, which is never re-fetched here;
+    /// only a record without one runs [`Self::peer_issuers`].
     pub async fn peer_issuers_vouching_for(
         &self,
         gateway_id: &str,
@@ -1393,7 +1394,7 @@ impl ConnectionPointListenerManager {
                 .trusted_issuer_dids
                 .clone(),
         };
-        if recorded.accepts(issuer_did) {
+        if recorded.accepts(issuer_did) || recorded.attested.is_some() {
             return Ok(recorded);
         }
         self.peer_issuers(gateway)
@@ -1449,7 +1450,7 @@ impl ConnectionPointListenerManager {
             .gateway_store
             .as_ref()
             .ok_or_else(|| PeerIssuerError::Store("gateway store not available".to_string()))?;
-        let mut gateway = store
+        let gateway = store
             .get(gateway_id)
             .await
             .map_err(|e| PeerIssuerError::Store(e.to_string()))?
@@ -1510,13 +1511,7 @@ impl ConnectionPointListenerManager {
         )
         .await?;
 
-        gateway.issuer_did = Some(issuer_did.clone());
-        gateway.issuer_did_source = Some(crate::gateways::types::IssuerDidSource::Exchange);
-        gateway.updated_at = chrono::Utc::now();
-        store
-            .update(&gateway)
-            .await
-            .map_err(|e| PeerIssuerError::Store(e.to_string()))?;
+        record_exchanged_issuer_did(store.as_ref(), gateway_id, &issuer_did).await?;
         info!(gateway_id, issuer_did = %issuer_did, "✓ Peer issuer DID verified and stored");
         Ok(issuer_did)
     }
@@ -6021,6 +6016,32 @@ mod restart_listener_tests {
     }
 }
 
+/// Store the issuer DID an exchange established on the Remote gateway
+/// `gateway_id`. The record is read again here rather than reused from before
+/// the exchange, so an operator's change made while it waited for the peer is
+/// kept.
+async fn record_exchanged_issuer_did(
+    store: &crate::gateways::FileSystemGatewayStore,
+    gateway_id: &str,
+    issuer_did: &str,
+) -> Result<(), crate::gateways::issuer_exchange::PeerIssuerError> {
+    use crate::gateways::GatewayStore;
+    use crate::gateways::issuer_exchange::PeerIssuerError;
+
+    let mut gateway = store
+        .get(gateway_id)
+        .await
+        .map_err(|e| PeerIssuerError::Store(e.to_string()))?
+        .ok_or_else(|| PeerIssuerError::GatewayNotFound(gateway_id.to_string()))?;
+    gateway.issuer_did = Some(issuer_did.to_string());
+    gateway.issuer_did_source = Some(crate::gateways::types::IssuerDidSource::Exchange);
+    gateway.updated_at = chrono::Utc::now();
+    store
+        .update(&gateway)
+        .await
+        .map_err(|e| PeerIssuerError::Store(e.to_string()))
+}
+
 #[cfg(test)]
 mod peer_issuer_tests {
     use std::sync::Arc;
@@ -6152,6 +6173,68 @@ mod peer_issuer_tests {
             .unwrap_err();
 
         assert!(err.starts_with(&format!("peer issuer DID not established for gateway {}", gateway.id)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_exchanged_issuer_keeps_an_operator_change_made_during_the_exchange() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileSystemGatewayStore::new(root.path().join("gateways"), Some("did:web:gateway.example".into()))
+            .await
+            .unwrap();
+        let before_exchange = peer(None, &["did:web:relay"]);
+        store
+            .create(&before_exchange)
+            .await
+            .unwrap();
+        // The operator stops trusting the relay while the exchange waits.
+        let mut edited = before_exchange.clone();
+        edited
+            .trusted_issuer_dids
+            .clear();
+        store
+            .update(&edited)
+            .await
+            .unwrap();
+
+        super::record_exchanged_issuer_did(&store, &before_exchange.id, "did:web:peer-issuer")
+            .await
+            .unwrap();
+
+        let stored = store
+            .get(&before_exchange.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.issuer_did.as_deref(), Some("did:web:peer-issuer"));
+        assert_eq!(stored.issuer_did_source, Some(crate::gateways::types::IssuerDidSource::Exchange));
+        assert!(
+            stored
+                .trusted_issuer_dids
+                .is_empty(),
+            "the operator's removal is kept: {:?}",
+            stored.trusted_issuer_dids
+        );
+    }
+
+    #[tokio::test]
+    async fn an_established_issuer_answers_without_the_issuer_exchange() {
+        let root = tempfile::tempdir().unwrap();
+        let gateway = peer(Some("did:web:peer-issuer"), &[]);
+        let (manager, _issuer_dir) = manager_with(root.path(), &gateway).await;
+
+        let issuers = manager
+            .peer_issuers_vouching_for(&gateway.id, "did:web:another-issuer")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            issuers,
+            PeerIssuers {
+                attested: Some("did:web:peer-issuer".to_string()),
+                trusted: Vec::new(),
+            }
+        );
+        assert!(!issuers.accepts("did:web:another-issuer"));
     }
 
     #[tokio::test]

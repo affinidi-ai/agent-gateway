@@ -13541,11 +13541,11 @@ async fn handle_fabric_request_inner(
                 let is_well_known_card_response =
                     crate::proxy::paths::is_well_known_agent_card_path(uri.path()) && status < 400;
 
-                // ── Step 11: Verify the answering agent's identity presentation ─
-                let managed_identity = state
+                // ── Verify the answering agent's identity presentation ─────────
+                let presented_identity = if state
                     .surface
-                    .managed_identity();
-                let presented_identity = if managed_identity.is_some()
+                    .managed_identity()
+                    .is_some()
                     && (200..300).contains(&status)
                     && !response_body.is_empty()
                 {
@@ -13577,7 +13577,10 @@ async fn handle_fabric_request_inner(
                     {
                         Ok(presentation) => presentation
                             .filter(|_| {
-                                crate::proxy::fabric_identity::presentation_sets_identity(managed_identity.as_ref())
+                                crate::proxy::backend_identity::slot_reads_response_body(
+                                    &state.surface,
+                                    crate::proxy::backend_identity::IdentitySlot::Protected,
+                                )
                             })
                             .map(|presentation| ProtectedAgentIdentity::Managed {
                                 did: presentation.agent_did,
@@ -13588,7 +13591,7 @@ async fn handle_fabric_request_inner(
                             connection_guard
                                 .decrement()
                                 .await;
-                            return Err(create_error_response(StatusCode::BAD_GATEWAY, &refusal.detail()));
+                            return Err(create_error_response(StatusCode::BAD_GATEWAY, refusal.detail()));
                         }
                     }
                 } else {
