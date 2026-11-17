@@ -141,10 +141,24 @@ verify-rust-deps: ## Verify Rust build toolchain dependencies (sccache, lld, etc
 
 install-python-deps: ## Install the Python packages the changelog tooling needs, into .venv
 	@echo "$(BLUE)🐍 Installing Python dependencies...$(NC)"
-	@python3 -m venv $(VENV)
-	@$(VENV)/bin/python3 -m pip install --quiet --upgrade pip
-	@$(VENV)/bin/python3 -m pip install --quiet $(PYTHON_DEPS)
-	@echo "$(GREEN)✅ Python dependencies installed!$(NC)"
+	@# A missing python3 warns rather than fails: it costs only 'make lint-changelog',
+	@# which guards itself and says so at the point of use. Stopping a whole
+	@# 'make install-deps' over one optional check would be out of proportion.
+	@set -e; \
+	if ! command -v python3 >/dev/null 2>&1; then \
+		echo "$(YELLOW)⚠️  python3 not found, skipping. 'make lint-changelog' will not work.$(NC)"; \
+		echo "$(YELLOW)   Install it (brew install python3), then re-run 'make install-python-deps'.$(NC)"; \
+		exit 0; \
+	fi; \
+	if ! python3 -c 'import venv' >/dev/null 2>&1; then \
+		echo "$(YELLOW)⚠️  python3 has no venv module, skipping. 'make lint-changelog' will not work.$(NC)"; \
+		echo "$(YELLOW)   Debian and Ubuntu ship it separately: apt install python3-venv, then re-run 'make install-python-deps'.$(NC)"; \
+		exit 0; \
+	fi; \
+	python3 -m venv $(VENV); \
+	$(VENV)/bin/python3 -m pip install --quiet --upgrade pip; \
+	$(VENV)/bin/python3 -m pip install --quiet $(PYTHON_DEPS); \
+	echo "$(GREEN)✅ Python dependencies installed!$(NC)"
 
 install-git-hooks: ## Install git hooks via pre-commit framework (SKIP_GIT_HOOKS=1 if you manage hooks yourself)
 	@echo "$(BLUE)🔗 Installing git hooks...$(NC)"
@@ -191,6 +205,11 @@ install-deps: install-rust-deps install-python-deps ## Install all local develop
 		echo "$(YELLOW)⚠️  Git hooks were NOT installed; see the error above.$(NC)"; \
 		echo "$(YELLOW)   This repo's pre-commit checks, gitleaks included, will not run locally.$(NC)"; \
 		echo "$(YELLOW)   Fix core.hooksPath and re-run 'make install-git-hooks', or acknowledge with SKIP_GIT_HOOKS=1.$(NC)"; \
+	fi; \
+	if [ ! -x "$(VENV)/bin/python3" ]; then \
+		echo ""; \
+		echo "$(YELLOW)⚠️  Python dependencies were NOT installed; see the warning above.$(NC)"; \
+		echo "$(YELLOW)   'make lint-changelog' will not work until 'make install-python-deps' succeeds.$(NC)"; \
 	fi
 
 # ==============================================================================
@@ -521,6 +540,10 @@ shellcheck: ## Lint all Bash scripts with ShellCheck (fails on warnings)
 lint-changelog: ## Validate changelog fragments like CI, requiring the current branch's fragment (needs PyYAML: run 'make install-python-deps')
 	@echo "$(BLUE)📝 Validating changelog fragments...$(NC)"
 	@if [ -x "$(VENV)/bin/python3" ]; then py="$(VENV)/bin/python3"; else py="python3"; fi; \
+	command -v "$$py" >/dev/null 2>&1 || { \
+		echo "$(RED)❌ python3 not found. Install it (brew install python3), then run 'make install-python-deps'$(NC)"; \
+		exit 1; \
+	}; \
 	"$$py" -c 'import yaml' 2>/dev/null || { \
 		echo "$(RED)❌ PyYAML not found. Run 'make install-python-deps'$(NC)"; \
 		exit 1; \
