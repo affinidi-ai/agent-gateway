@@ -408,7 +408,63 @@ fn log_version_id(line: &str) -> Option<String> {
         })
 }
 
-/// Whether the resolver index holds exactly the versions of the gateway DID log, in order.
+/// How the resolver index stands against a read of the gateway DID log, by version id.
+#[cfg(feature = "didwebvh")]
+#[derive(Debug, PartialEq)]
+enum IndexComparison {
+    /// Holds every version of the log, each once.
+    Current,
+    /// Holds every version of the log and more, as a stale read of shared storage leaves it.
+    Ahead,
+    /// Holds the first versions of the log; the rest start at this index.
+    Behind(usize),
+    /// Does not follow the log, or holds a version twice.
+    Rebuild,
+}
+
+#[cfg(feature = "didwebvh")]
+fn compare_index_with_log(
+    indexed: &[String],
+    lines: &[&str],
+) -> IndexComparison {
+    let indexed_ids: Vec<Option<String>> = indexed
+        .iter()
+        .map(|entry| log_version_id(entry))
+        .collect();
+    let matches_log = indexed_ids
+        .iter()
+        .zip(lines)
+        .all(|(id, line)| id.is_some() && *id == log_version_id(line));
+    let distinct_versions = indexed_ids
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        == indexed_ids.len();
+    if !matches_log || !distinct_versions {
+        return IndexComparison::Rebuild;
+    }
+    match indexed
+        .len()
+        .cmp(&lines.len())
+    {
+        std::cmp::Ordering::Greater => IndexComparison::Ahead,
+        std::cmp::Ordering::Equal => IndexComparison::Current,
+        std::cmp::Ordering::Less => IndexComparison::Behind(indexed.len()),
+    }
+}
+
+/// The non-empty lines of the gateway DID log content.
+#[cfg(feature = "didwebvh")]
+fn log_lines(content: &str) -> Vec<&str> {
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// Whether the resolver index needs nothing from the gateway DID log: it holds every version,
+/// or is ahead of a stale read of the log, which the sync also leaves as it is.
 #[cfg(feature = "didwebvh")]
 async fn gateway_did_index_is_current(
     storage: &Arc<dyn crate::storage::DidLogStorage>,
@@ -418,27 +474,15 @@ async fn gateway_did_index_is_current(
     let Ok(content) = tokio::fs::read_to_string(log_src).await else {
         return false;
     };
-    let log_ids: Vec<Option<String>> = content
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(log_version_id)
-        .collect();
+    let lines = log_lines(&content);
     let Ok(indexed) = storage
         .load_all_raw(gateway_did)
         .await
     else {
         return false;
     };
-    let indexed_ids: Vec<Option<String>> = indexed
-        .iter()
-        .map(|entry| log_version_id(entry))
-        .collect();
-    !log_ids.is_empty()
-        && log_ids
-            .iter()
-            .all(Option::is_some)
-        && indexed_ids == log_ids
+    !lines.is_empty()
+        && matches!(compare_index_with_log(&indexed, &lines), IndexComparison::Current | IndexComparison::Ahead)
 }
 
 /// Whether the gateway DID document already lists the signing key and the resolver index holds
@@ -454,10 +498,9 @@ async fn gateway_did_is_current(
     {
         return false;
     }
-    let gateway_did = issuer
-        .get_issuer_did()
-        .await
-        .unwrap_or_default();
+    let Ok(gateway_did) = issuer.get_issuer_did().await else {
+        return false;
+    };
     if !gateway_did.starts_with("did:webvh:") {
         return true;
     }
@@ -488,11 +531,7 @@ async fn sync_gateway_did_log(
             return;
         }
     };
-    let lines: Vec<&str> = content
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
+    let lines = log_lines(&content);
     if lines.is_empty() {
         warn!("Gateway DID log is empty; leaving the gateway DID log storage unchanged");
         return;
@@ -507,40 +546,30 @@ async fn sync_gateway_did_log(
             return;
         }
     };
-    let indexed_ids: Vec<Option<String>> = indexed
-        .iter()
-        .map(|entry| log_version_id(entry))
-        .collect();
-    let matches_log = indexed_ids
-        .iter()
-        .zip(&lines)
-        .all(|(id, line)| id.is_some() && *id == log_version_id(line));
-    let distinct_versions = indexed_ids
-        .iter()
-        .collect::<std::collections::HashSet<_>>()
-        .len()
-        == indexed_ids.len();
-    if indexed.len() > lines.len() && matches_log && distinct_versions {
-        debug!("Gateway DID log storage is ahead of the gateway DID log read; leaving it as it is");
-        return;
-    }
-    if !matches_log || !distinct_versions {
-        match storage
-            .replace_raw(gateway_did, &lines)
-            .await
-        {
-            Ok(()) => warn!("Gateway DID log storage did not match the gateway DID log; rebuilt it from the log"),
-            Err(e) => {
-                warn!("Gateway DID log storage does not match the gateway DID log and could not be rebuilt: {}", e)
-            }
+    let missing_from = match compare_index_with_log(&indexed, &lines) {
+        IndexComparison::Current => {
+            debug!("Gateway DID already present in log storage");
+            return;
         }
-        return;
-    }
-    if indexed.len() == lines.len() {
-        debug!("Gateway DID already present in log storage");
-        return;
-    }
-    for line in &lines[indexed.len()..] {
+        IndexComparison::Ahead => {
+            debug!("Gateway DID log storage is ahead of the gateway DID log read; leaving it as it is");
+            return;
+        }
+        IndexComparison::Rebuild => {
+            match storage
+                .replace_raw(gateway_did, &lines)
+                .await
+            {
+                Ok(()) => warn!("Gateway DID log storage did not match the gateway DID log; rebuilt it from the log"),
+                Err(e) => {
+                    warn!("Gateway DID log storage does not match the gateway DID log and could not be rebuilt: {}", e)
+                }
+            }
+            return;
+        }
+        IndexComparison::Behind(missing_from) => missing_from,
+    };
+    for line in &lines[missing_from..] {
         if let Err(e) = storage
             .append_raw(gateway_did, line)
             .await
@@ -619,10 +648,13 @@ async fn repair_and_sync_gateway_did_within(
         );
     }
 
-    let gateway_did = issuer
-        .get_issuer_did()
-        .await
-        .unwrap_or_default();
+    let gateway_did = match issuer.get_issuer_did().await {
+        Ok(did) => did,
+        Err(e) => {
+            warn!("Could not read the gateway DID; the resolver index is left as it is: {e:#}");
+            return;
+        }
+    };
     if gateway_did.starts_with("did:webvh:") {
         let log_src = issuer
             .get_storage_path()
@@ -5486,6 +5518,89 @@ mod tests {
                 .unwrap(),
             index_before
         );
+    }
+
+    #[cfg(feature = "didwebvh")]
+    fn versions(ids: &[&str]) -> Vec<String> {
+        ids.iter()
+            .map(|id| serde_json::json!({ "versionId": id }).to_string())
+            .collect()
+    }
+
+    #[cfg(feature = "didwebvh")]
+    #[test]
+    fn index_comparison_with_the_gateway_did_log() {
+        use super::{IndexComparison, compare_index_with_log};
+
+        let log = versions(&["1-a", "2-b"]);
+        let lines: Vec<&str> = log
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let cases = [
+            (versions(&["1-a", "2-b"]), IndexComparison::Current),
+            (versions(&["1-a", "2-b", "3-c"]), IndexComparison::Ahead),
+            (versions(&["1-a"]), IndexComparison::Behind(1)),
+            (Vec::new(), IndexComparison::Behind(0)),
+            (versions(&["1-a", "2-b", "2-b"]), IndexComparison::Rebuild),
+            (versions(&["1-a", "2-x"]), IndexComparison::Rebuild),
+            (vec!["not json".to_string()], IndexComparison::Rebuild),
+        ];
+        for (indexed, expected) in cases {
+            assert_eq!(compare_index_with_log(&indexed, &lines), expected, "index {indexed:?}");
+        }
+    }
+
+    /// A repaired gateway whose index is ahead of its log read, as a stale read leaves it, does
+    /// not wait for the lock either; one whose index holds a version twice does.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn index_ahead_counts_as_current_and_a_duplicated_version_does_not() {
+        let (issuer, _keys) = crate::identity::test_helpers::test_vc_issuer_without_assertion_multikey().await;
+        assert!(
+            issuer
+                .authorize_signing_key()
+                .await
+                .unwrap()
+        );
+        let did = issuer
+            .get_issuer_did()
+            .await
+            .unwrap();
+        let log_src = issuer
+            .get_storage_path()
+            .await
+            .join("did.jsonl");
+        let log = std::fs::read_to_string(&log_src).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        let extra = serde_json::json!({ "versionId": "3-later" }).to_string();
+
+        let ahead_dir = tempfile::tempdir().unwrap();
+        let ahead = index(ahead_dir.path());
+        for line in lines
+            .iter()
+            .copied()
+            .chain([extra.as_str()])
+        {
+            ahead
+                .append_raw(&did, line)
+                .await
+                .unwrap();
+        }
+        let duplicated_dir = tempfile::tempdir().unwrap();
+        let duplicated = index(duplicated_dir.path());
+        for line in lines
+            .iter()
+            .chain(lines.last())
+        {
+            duplicated
+                .append_raw(&did, line)
+                .await
+                .unwrap();
+        }
+
+        assert!(super::gateway_did_is_current(&issuer, &ahead).await);
+        assert!(!super::gateway_did_is_current(&issuer, &duplicated).await);
     }
 
     /// A node demoted to Standby while it waited for the gateway DID lock writes neither the

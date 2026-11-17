@@ -25,18 +25,19 @@ changes:
     - timestamp: '2026-11-16T13:11:38Z'
       title: Give gateways that start together on shared storage one DID and signing key
       description: >-
-        Gateway instances that start together on one shared volume no longer each create
-        their own signing keys and did:webvh DID, which could publish a DID document whose
-        keys are not the ones the gateway signs with. The gateway DID and its keys are now
-        created, and a did:web gateway moved to did:webvh, under an exclusive file lock in the
-        vc_keys folder, so the first instance creates them and the others load what it wrote.
-        A gateway whose keys and DID are already in place loads them without the lock, creates
-        nothing and keeps every existing key. The DID document repair runs under the same
-        lock, so two nodes Active at once add one version between them; a promoted node makes
-        it after it admits traffic. On a volume that refuses the lock, a node started in Standby
-        stops with an error rather than create a new gateway DID alone; an Active node, or one
-        whose DID exists, starts without the lock as before. The DID log and did.json are now
-        replaced atomically, so a reader never sees a partly written file.
+        Gateway instances that start together on one shared volume no longer each create their
+        own signing keys and did:webvh DID, which could publish a DID document whose keys are
+        not the ones the gateway signs with. The gateway DID and its keys are now created, and a
+        did:web gateway moved to did:webvh, under an exclusive file lock in the vc_keys folder,
+        so the first instance creates them and the others load what it wrote. A gateway whose
+        keys and DID are already in place loads them without the lock, creates nothing and keeps
+        every existing key. The DID document repair runs under the same lock, so two nodes
+        Active at once add one version between them; a promoted node makes it after it admits
+        traffic, and a node whose DID document and resolver index are already up to date takes
+        no lock. On a volume that refuses the lock, a node started in Standby stops with an
+        error rather than create a new gateway DID alone; an Active node, or one whose DID
+        exists, starts without the lock as before. The DID log and did.json are now replaced
+        atomically, so a reader never sees a partly written file.
   removed: []
   security: []
   breaking: []

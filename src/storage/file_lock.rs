@@ -48,30 +48,29 @@ fn open_lock_file_blocking(path: &Path) -> anyhow::Result<File> {
 
 /// Takes the exclusive lock on the file at `path`, retrying while another holder has it, for
 /// up to `timeout`. The lock is tried at least once, so a zero timeout takes a free lock.
-/// Opening and every attempt run on a blocking thread, since each can be a round trip to a
-/// network file server.
+/// Opening and each attempt run on a blocking thread, since each can be a round trip to a
+/// network file server; the wait between attempts does not hold one.
 pub(crate) async fn lock_exclusive(
     path: &Path,
     timeout: Duration,
 ) -> LockOutcome {
-    let path: PathBuf = path.to_path_buf();
-    match tokio::task::spawn_blocking(move || lock_exclusive_blocking(&path, timeout)).await {
-        Ok(outcome) => outcome,
-        Err(error) => LockOutcome::Unavailable(anyhow::Error::new(error).context("Lock task failed")),
-    }
-}
-
-fn lock_exclusive_blocking(
-    path: &Path,
-    timeout: Duration,
-) -> LockOutcome {
-    let file = match open_lock_file_blocking(path) {
+    let mut file = match open_lock_file(path).await {
         Ok(file) => file,
         Err(error) => return LockOutcome::Unavailable(error),
     };
-    let give_up_at = std::time::Instant::now() + timeout;
+    let give_up_at = tokio::time::Instant::now() + timeout;
     loop {
-        match file.try_lock() {
+        let attempt = tokio::task::spawn_blocking(move || {
+            let result = file.try_lock();
+            (file, result)
+        })
+        .await;
+        let result;
+        (file, result) = match attempt {
+            Ok(attempted) => attempted,
+            Err(error) => return LockOutcome::Unavailable(anyhow::Error::new(error).context("Lock task failed")),
+        };
+        match result {
             Ok(()) => return LockOutcome::Acquired(file),
             Err(std::fs::TryLockError::WouldBlock) => {}
             Err(std::fs::TryLockError::Error(error)) => {
@@ -80,10 +79,10 @@ fn lock_exclusive_blocking(
                 );
             }
         }
-        if std::time::Instant::now() >= give_up_at {
+        if tokio::time::Instant::now() >= give_up_at {
             return LockOutcome::TimedOut;
         }
-        std::thread::sleep(LOCK_RETRY_INTERVAL);
+        tokio::time::sleep(LOCK_RETRY_INTERVAL).await;
     }
 }
 
