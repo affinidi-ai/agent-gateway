@@ -21,7 +21,7 @@ interface PolicyInputCaptureCardProps {
 /**
  * Whether `surface` has a policy the gateway captures: on the Access Point, Target or its
  * response, the shared Transit Point policy, a Transit Point or its response, or a
- * variant's Access Point or Target.
+ * variant's Access Point, Target or Target response.
  */
 export const surfaceHasPolicy = (surface: AgentSurface): boolean =>
   Boolean(
@@ -32,7 +32,9 @@ export const surfaceHasPolicy = (surface: AgentSurface): boolean =>
     surface.transit?.points?.some(point => point.policy || point.response_policy) ||
     surface.variants?.some(
       variant =>
-        variant.overrides?.access_point?.inbound_policy || variant.overrides?.target?.policy
+        variant.overrides?.access_point?.inbound_policy ||
+        variant.overrides?.target?.policy ||
+        variant.overrides?.target?.response_policy
     )
   );
 

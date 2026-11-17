@@ -78,6 +78,13 @@ describe('PolicyInputCaptureCard', () => {
         surface({ variants: [{ alias: 'beta', overrides: { target: { policy } } }] })
       )
     ).toBe(true);
+    expect(
+      surfaceHasPolicy(
+        surface({
+          variants: [{ alias: 'beta', overrides: { target: { response_policy: policy } } }],
+        })
+      )
+    ).toBe(true);
     expect(surfaceHasPolicy(surface({ variants: [{ alias: 'beta', overrides: {} }] }))).toBe(false);
   });
 
