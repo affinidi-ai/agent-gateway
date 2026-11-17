@@ -57,7 +57,11 @@ const details = (overrides: Partial<AgentDetails> = {}): AgentDetails => ({
 const OpenAgentB: React.FC = () => {
   const navigate = useNavigate();
   return (
-    <button type="button" data-testid="open-agent-b1" onClick={() => navigate('/agent-registry/b1')} />
+    <button
+      type="button"
+      data-testid="open-agent-b1"
+      onClick={() => navigate('/agent-registry/b1')}
+    />
   );
 };
 
