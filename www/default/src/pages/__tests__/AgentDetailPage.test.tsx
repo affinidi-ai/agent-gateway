@@ -1,5 +1,5 @@
 import React from 'react';
-import { act, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import AgentDetailPage from '../AgentDetailPage';
@@ -314,7 +314,9 @@ describe('AgentDetailPage', () => {
     mockedGetAgent.mockResolvedValue(details({ name: null }));
     renderPage();
     expect(await screen.findByTestId('agent-details-name')).toHaveTextContent('Unnamed agent');
-    expect(screen.getByTestId('topbar-title')).toHaveTextContent(/^Unnamed agent$/);
+    await waitFor(() =>
+      expect(screen.getByTestId('topbar-title')).toHaveTextContent(/^Unnamed agent$/)
+    );
   });
 
   it('names the agent in the top bar and uses an outline back button', async () => {
@@ -322,7 +324,9 @@ describe('AgentDetailPage', () => {
     renderPage();
     await screen.findByTestId('agent-details-name');
 
-    expect(screen.getByTestId('topbar-title')).toHaveTextContent(/^TimeAsker$/);
+    await waitFor(() =>
+      expect(screen.getByTestId('topbar-title')).toHaveTextContent(/^TimeAsker$/)
+    );
     expect(screen.getByTestId('agent-back-button')).toHaveClass('btn-outline-secondary');
   });
 
