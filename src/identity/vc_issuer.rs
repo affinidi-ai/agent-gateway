@@ -926,19 +926,22 @@ impl VCIssuer {
         Self::create_or_complete_config(storage_path, proxy_domain).await
     }
 
-    /// Whether a gateway identity is already in place: its config, both key agreement keys and
-    /// its DID document. A gateway creating its identity writes the DID document after the
-    /// others, so a partly created identity is not one.
+    /// Whether a gateway identity is already in place: its config, both key agreement keys,
+    /// stored plain or encrypted at rest, and its DID document. A gateway creating its identity
+    /// writes the DID document after the others, so a partly created identity is not one.
     async fn has_existing_identity(storage_path: &Path) -> bool {
-        for file in ["issuer_config.json", "x25519_key.json", "p256_key.json", "did.json"] {
-            if !tokio::fs::try_exists(storage_path.join(file))
+        let exists = |path: PathBuf| async move {
+            tokio::fs::try_exists(&path)
                 .await
                 .unwrap_or(false)
-            {
+        };
+        for file in ["issuer_config.json", "x25519_key.json", "p256_key.json"] {
+            let path = storage_path.join(file);
+            if !exists(path.clone()).await && !exists(crate::encryption::secret_file::secret_enc_path(&path)).await {
                 return false;
             }
         }
-        true
+        exists(storage_path.join("did.json")).await
     }
 
     /// The saved config of a gateway whose keys, DID document and, with `didwebvh`, `did:webvh`
@@ -3044,6 +3047,31 @@ mod tests {
             .collect();
         written.sort();
         assert_eq!(written, vec![GATEWAY_DID_LOCK_FILE.to_string()]);
+    }
+
+    /// A Standby gateway whose identity is encrypted at rest counts it as existing, so it still
+    /// upgrades it without the lock rather than refusing to start.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn standby_gateway_with_an_encrypted_identity_starts_unlocked_when_the_lock_file_cannot_be_opened() {
+        enable_test_encryption();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+        let signing_key = crate::identity::test_helpers::seed_did_web_gateway(dir, |_, _| {}).await;
+        assert!(
+            !dir.join("issuer_config.json")
+                .exists()
+        );
+        std::fs::create_dir(dir.join(GATEWAY_DID_LOCK_FILE)).unwrap();
+
+        let config = crate::server::mode::in_test_mode(
+            crate::server::mode::ServerMode::Standby,
+            VCIssuer::load_or_create_config(dir.to_path_buf(), "example.com".to_string()),
+        )
+        .await
+        .expect("a Standby gateway with an encrypted identity must start without the lock");
+
+        assert_eq!(config.signing_key, signing_key);
     }
 
     /// A Standby gateway that finds a partly created identity, as another node creating it

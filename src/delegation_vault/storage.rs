@@ -1014,16 +1014,12 @@ impl FileSystemDelegationVaultStore {
         Operation: FnOnce(Self) -> Pending + Send + 'static,
         Pending: std::future::Future<Output = Result<Output>> + Send,
     {
-        let file = self
-            .open_mutation_lock()
-            .await?;
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::fs::TryLockError::Error(error)) => {
-                return Err(error).context("Failed to lock delegation vault mutations");
-            }
-        }
+        use crate::storage::file_lock::{LockOutcome, lock_exclusive};
+        let file = match lock_exclusive(&self.mutation_lock_path, std::time::Duration::ZERO).await {
+            LockOutcome::Acquired(file) => file,
+            LockOutcome::TimedOut => return Ok(None),
+            LockOutcome::Unavailable(error) => return Err(error.context("Failed to lock delegation vault mutations")),
+        };
         let store = self.clone();
         tokio::spawn(async move {
             let _guard = file;
@@ -1033,12 +1029,6 @@ impl FileSystemDelegationVaultStore {
         })
         .await
         .context("Delegation vault mutation task failed")?
-    }
-
-    async fn open_mutation_lock(&self) -> Result<File> {
-        crate::storage::file_lock::open_lock_file(&self.mutation_lock_path)
-            .await
-            .context("Failed to open delegation vault mutation lock")
     }
 
     async fn mutation_lock(&self) -> Result<File> {

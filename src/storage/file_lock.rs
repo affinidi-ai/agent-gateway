@@ -21,7 +21,7 @@ pub(crate) enum LockOutcome {
 
 /// Opens the lock file at `path`, creating it owner-only when it is missing. The file holds
 /// nothing and is never truncated or removed, so every holder locks the same file.
-pub(crate) async fn open_lock_file(path: &Path) -> anyhow::Result<File> {
+async fn open_lock_file(path: &Path) -> anyhow::Result<File> {
     use anyhow::Context;
 
     let path: PathBuf = path.to_path_buf();
