@@ -17,7 +17,8 @@ changes:
         version and the stored did.json differ from the earlier ones only by #key-2 added to
         those two relationships. Only the Active node writes, the repair runs once, and a log
         that does not verify, a document missing either relationship or publishing another key
-        as #key-2, or a log dated ahead of the node's clock is left as it is, and a stored
+        as #key-2 or publishing #key-2 twice, or a log dated ahead of the node's clock is left
+        as it is, and a stored
         did.json that is missing or does not parse is written again from the log. The /v1/resolve
         index now picks up new versions of the gateway DID log and is rebuilt from it when it
         does not match.
@@ -31,8 +32,11 @@ changes:
         vc_keys folder, so the first instance creates them and the others load what it wrote.
         A gateway whose keys and DID are already in place loads them without the lock, creates
         nothing and keeps every existing key. The DID document repair runs under the same
-        lock, so two nodes Active at once add one version between them. The DID log and
-        did.json are now replaced atomically, so a reader never sees a partly written file.
+        lock, so two nodes Active at once add one version between them; a promoted node makes
+        it after it admits traffic. On a volume that refuses the lock, a node started in Standby
+        stops with an error rather than create a new gateway DID alone; an Active node, or one
+        whose DID exists, starts without the lock as before. The DID log and did.json are now
+        replaced atomically, so a reader never sees a partly written file.
   removed: []
   security: []
   breaking: []

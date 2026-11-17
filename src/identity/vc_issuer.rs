@@ -96,12 +96,15 @@ fn add_signing_key_to_relationships(
     signing_key: &JWK,
 ) -> Result<bool> {
     let expected_key = crate::identity::ssi::did_utils::jwk_to_multibase_ed25519(signing_key)?;
-    let published = document["verificationMethod"]
+    let mut matching = document["verificationMethod"]
         .as_array()
         .into_iter()
         .flatten()
-        .find(|method| method["id"] == multikey_id)
+        .filter(|method| method["id"] == multikey_id);
+    let published = matching
+        .next()
         .with_context(|| format!("DID document does not publish {multikey_id}"))?;
+    anyhow::ensure!(matching.next().is_none(), "DID document publishes {multikey_id} more than once");
     anyhow::ensure!(
         published["type"] == "Multikey" && published["publicKeyMultibase"] == expected_key.as_str(),
         "DID document publishes a key other than the gateway signing key as {multikey_id}"
@@ -604,7 +607,8 @@ impl VCIssuer {
         use crate::storage::did_artifacts::{append_did_log_raw, read_did_log_raw};
 
         let Some(log) = read_did_log_raw(&config.storage_path).await? else {
-            return Ok(false);
+            warn!("Gateway DID {} has no did.jsonl; repairing its did.json only", config.proxy_did);
+            return Self::authorize_signing_key_in_did_document(config, None).await;
         };
         let entries: Vec<String> = log
             .lines()
@@ -662,6 +666,26 @@ impl VCIssuer {
         Ok(true)
     }
 
+    /// The DID the stored `did.json` describes: the gateway DID, or for a `did:webvh` DID its
+    /// parallel `did:web` DID.
+    #[cfg(feature = "didwebvh")]
+    fn did_document_id(config: &VCIssuerConfig) -> Result<String> {
+        if !config
+            .proxy_did
+            .starts_with("did:webvh:")
+        {
+            return Ok(config.proxy_did.clone());
+        }
+        let scid = crate::identity::didwebvh::identifier::parse_did_webvh(&config.proxy_did)?
+            .scid
+            .context("Gateway DID has no SCID")?;
+        config
+            .proxy_did
+            .strip_prefix(&format!("did:webvh:{scid}:"))
+            .map(|rest| format!("did:web:{rest}"))
+            .context("Gateway DID does not start with its SCID")
+    }
+
     /// Adds the signing Multikey the stored `did.json` publishes to its `assertionMethod` and
     /// `authentication`, and changes nothing else in it, so a `did.json` that differs from the DID
     /// log keeps its other content. Refuses a `did.json` that publishes another key as the
@@ -691,15 +715,13 @@ impl VCIssuer {
                 return Ok(true);
             }
         };
-        let signing_key_suffix = format!("#{DEFAULT_SIGNING_KEY_ID}");
-        let multikey_id = document["verificationMethod"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|method| method["id"].as_str())
-            .find(|id| id.ends_with(&signing_key_suffix))
-            .map(str::to_string)
-            .context("Gateway did.json does not publish the signing Multikey")?;
+        let document_id = Self::did_document_id(config)?;
+        anyhow::ensure!(
+            document["id"] == document_id.as_str(),
+            "Gateway did.json describes {} rather than {document_id}",
+            document["id"]
+        );
+        let multikey_id = format!("{document_id}#{DEFAULT_SIGNING_KEY_ID}");
         if !add_signing_key_to_relationships(&mut document, &multikey_id, &config.signing_key)? {
             return Ok(false);
         }
@@ -814,10 +836,11 @@ impl VCIssuer {
 
     /// A gateway whose keys and DID are all in place only reads them. Any other start creates
     /// or upgrades them under the gateway DID lock, so gateways sharing the directory end up
-    /// with the one set the first of them wrote. A volume without the lock gets today's
-    /// unlocked start. A start that waited out `lock_timeout` loads what another gateway
-    /// finished publishing meanwhile, and otherwise fails, so it is restarted rather than
-    /// creating a second identity.
+    /// with the one set the first of them wrote. A volume without the lock starts unlocked,
+    /// except that a node booting Standby, as every node of a multi-node gateway does, refuses
+    /// to create a gateway DID that does not exist yet. A start that waited out `lock_timeout`
+    /// loads what another gateway finished publishing meanwhile, and otherwise fails, so it is
+    /// restarted rather than creating a second identity.
     async fn load_or_create_config_within(
         storage_path: PathBuf,
         proxy_domain: String,
@@ -831,6 +854,12 @@ impl VCIssuer {
         let _lock = match lock_gateway_did(&storage_path, lock_timeout).await {
             LockOutcome::Acquired(file) => Some(file),
             LockOutcome::Unavailable(error) => {
+                if crate::server::mode::is_standby() && !Self::has_existing_identity(&storage_path).await {
+                    return Err(error.context(
+                        "Gateway DID lock unavailable; a Standby node does not create the gateway DID without it, \
+                         as other nodes sharing this volume may create their own",
+                    ));
+                }
                 warn!(
                     "Gateway DID lock unavailable ({error:#}); creating the gateway DID without it, so gateways \
                      starting together on this volume may not share one DID"
@@ -846,6 +875,21 @@ impl VCIssuer {
             }
         };
         Self::create_or_complete_config(storage_path, proxy_domain).await
+    }
+
+    /// Whether a gateway identity is already in place: its config, both key agreement keys and
+    /// its DID document. A gateway creating its identity writes the DID document after the
+    /// others, so a partly created identity is not one.
+    async fn has_existing_identity(storage_path: &Path) -> bool {
+        for file in ["issuer_config.json", "x25519_key.json", "p256_key.json", "did.json"] {
+            if !tokio::fs::try_exists(storage_path.join(file))
+                .await
+                .unwrap_or(false)
+            {
+                return false;
+            }
+        }
+        true
     }
 
     /// The saved config of a gateway whose keys, DID document and, with `didwebvh`, `did:webvh`
@@ -2898,17 +2942,21 @@ mod tests {
         assert!(format!("{err:#}").contains("x25519_key.json"), "unexpected error: {err:#}");
     }
 
-    /// A volume where the lock file cannot be opened does not stop a gateway from starting.
+    /// A gateway booting Active, as a single instance does, creates its DID without the lock on
+    /// a volume where the lock file cannot be opened.
     #[cfg(feature = "didwebvh")]
     #[tokio::test]
-    async fn gateway_starts_unlocked_when_the_lock_file_cannot_be_opened() {
+    async fn active_gateway_creates_its_did_unlocked_when_the_lock_file_cannot_be_opened() {
         let temp_dir = tempfile::tempdir().unwrap();
         let dir = temp_dir.path();
         std::fs::create_dir(dir.join(GATEWAY_DID_LOCK_FILE)).unwrap();
 
-        let config = VCIssuer::load_or_create_config(dir.to_path_buf(), "example.com".to_string())
-            .await
-            .expect("the gateway must start without the lock");
+        let config = crate::server::mode::in_test_mode(
+            crate::server::mode::ServerMode::Active,
+            VCIssuer::load_or_create_config(dir.to_path_buf(), "example.com".to_string()),
+        )
+        .await
+        .expect("an Active gateway must start without the lock");
 
         assert!(
             config
@@ -2916,6 +2964,80 @@ mod tests {
                 .starts_with("did:webvh:")
         );
         assert!(dir.join("did.jsonl").exists());
+    }
+
+    /// A gateway booting Standby, as every node of a multi-node gateway does, refuses to create
+    /// a new DID without the lock and writes nothing.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn standby_gateway_refuses_to_create_its_did_when_the_lock_file_cannot_be_opened() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+        std::fs::create_dir(dir.join(GATEWAY_DID_LOCK_FILE)).unwrap();
+
+        let err = crate::server::mode::in_test_mode(
+            crate::server::mode::ServerMode::Standby,
+            VCIssuer::load_or_create_config(dir.to_path_buf(), "example.com".to_string()),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("Gateway DID lock unavailable"), "unexpected error: {err:#}");
+        let mut written: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        written.sort();
+        assert_eq!(written, vec![GATEWAY_DID_LOCK_FILE.to_string()]);
+    }
+
+    /// A Standby gateway that finds a partly created identity, as another node creating it
+    /// without the lock leaves it, refuses to complete it without the lock.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn standby_gateway_refuses_to_complete_a_partly_created_did_when_the_lock_file_cannot_be_opened() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+        crate::identity::test_helpers::seed_did_web_gateway(dir, |_, _| {}).await;
+        std::fs::remove_file(dir.join("did.json")).unwrap();
+        std::fs::create_dir(dir.join(GATEWAY_DID_LOCK_FILE)).unwrap();
+
+        let err = crate::server::mode::in_test_mode(
+            crate::server::mode::ServerMode::Standby,
+            VCIssuer::load_or_create_config(dir.to_path_buf(), "example.com".to_string()),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("Gateway DID lock unavailable"), "unexpected error: {err:#}");
+        assert!(!dir.join("did.json").exists());
+        assert!(!dir.join("did.jsonl").exists());
+    }
+
+    /// A Standby gateway whose DID already exists still starts without the lock, upgrading it
+    /// where it has to, so an existing gateway never stops starting because of the lock.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn standby_gateway_with_an_existing_did_starts_unlocked_when_the_lock_file_cannot_be_opened() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+        let signing_key = crate::identity::test_helpers::seed_did_web_gateway(dir, |_, _| {}).await;
+        std::fs::create_dir(dir.join(GATEWAY_DID_LOCK_FILE)).unwrap();
+
+        let config = crate::server::mode::in_test_mode(
+            crate::server::mode::ServerMode::Standby,
+            VCIssuer::load_or_create_config(dir.to_path_buf(), "example.com".to_string()),
+        )
+        .await
+        .expect("a Standby gateway with an existing DID must start without the lock");
+
+        assert_eq!(config.signing_key, signing_key);
     }
 
     /// The repair adds the signing key to `assertionMethod` and `authentication` in the stored
@@ -3038,6 +3160,111 @@ mod tests {
             2
         );
         assert_eq!(read_json(&dir.join("did.json")), did_json);
+    }
+
+    /// A repaired log stands when did.json publishes the signing key under another DID's
+    /// `#key-2`: that id is never listed in the gateway's relationships.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn repair_does_not_list_another_dids_key_2_in_the_did_document() {
+        let (issuer, temp_dir) = crate::identity::test_helpers::test_vc_issuer_without_assertion_multikey().await;
+        let dir = temp_dir.path();
+        let foreign_id = "did:web:attacker.example#key-2";
+        let mut did_json = read_json(&dir.join("did.json"));
+        for method in did_json["verificationMethod"]
+            .as_array_mut()
+            .unwrap()
+        {
+            if method["type"] == "Multikey" {
+                method["id"] = json!(foreign_id);
+            }
+        }
+        crate::storage::did_artifacts::write_did_document(dir, &did_json.to_string())
+            .await
+            .unwrap();
+
+        assert!(
+            issuer
+                .authorize_signing_key()
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            did_log_entries(&issuer)
+                .await
+                .len(),
+            2
+        );
+        assert_eq!(read_json(&dir.join("did.json")), did_json);
+    }
+
+    /// A did.json that describes another DID is left as it is, even when it publishes the
+    /// gateway signing key as that DID's `#key-2`.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn repair_leaves_a_did_document_of_another_did_unchanged() {
+        let (issuer, temp_dir) = crate::identity::test_helpers::test_vc_issuer_without_assertion_multikey().await;
+        let dir = temp_dir.path();
+        let foreign = "did:web:attacker.example";
+        let did_json = read_json(&dir.join("did.json"));
+        let own = did_json["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let foreign_json: serde_json::Value = serde_json::from_str(
+            &did_json
+                .to_string()
+                .replace(&own, foreign),
+        )
+        .unwrap();
+        crate::storage::did_artifacts::write_did_document(dir, &foreign_json.to_string())
+            .await
+            .unwrap();
+
+        assert!(
+            issuer
+                .authorize_signing_key()
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(read_json(&dir.join("did.json")), foreign_json);
+    }
+
+    /// A `did:webvh` gateway whose did.jsonl is gone still gets its did.json repaired, and no
+    /// log is created for it.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn repair_without_a_did_log_repairs_the_did_document() {
+        let (issuer, temp_dir) = crate::identity::test_helpers::test_vc_issuer_without_assertion_multikey().await;
+        let dir = temp_dir.path();
+        std::fs::remove_file(dir.join("did.jsonl")).unwrap();
+
+        assert!(
+            issuer
+                .authorize_signing_key()
+                .await
+                .unwrap()
+        );
+
+        assert!(!dir.join("did.jsonl").exists());
+        let did_json = read_json(&dir.join("did.json"));
+        let multikey_id = format!(
+            "{}#{DEFAULT_SIGNING_KEY_ID}",
+            did_json["id"]
+                .as_str()
+                .unwrap()
+        );
+        for relationship in SIGNING_KEY_RELATIONSHIPS {
+            assert!(
+                did_json[relationship]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(multikey_id)),
+                "{relationship} must list {multikey_id}: {did_json}"
+            );
+        }
     }
 
     /// A log whose update key is not the gateway signing key is refused and left as it is: no
@@ -3431,6 +3658,39 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("a key other than the gateway signing key"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(document, before);
+    }
+
+    #[cfg(feature = "didwebvh")]
+    #[test]
+    fn signing_key_is_not_authorized_when_the_document_publishes_key_2_twice() {
+        let key = crate::identity::test_helpers::test_signing_key();
+        let did = "did:web:example.com";
+        let multikey_id = format!("{did}#{DEFAULT_SIGNING_KEY_ID}");
+        let mut document = gateway_did_document(did, &key, "x", json!({}), "p", json!({})).unwrap();
+        document["assertionMethod"] = json!([format!("{did}#key-1")]);
+        let other_key = crate::identity::ssi::did_utils::jwk_to_multibase_ed25519(
+            &crate::identity::test_helpers::test_signing_key(),
+        )
+        .unwrap();
+        document["verificationMethod"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "id": multikey_id,
+                "type": "Multikey",
+                "controller": did,
+                "publicKeyMultibase": other_key
+            }));
+        let before = document.clone();
+
+        let err = add_signing_key_to_relationships(&mut document, &multikey_id, &key).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("more than once"),
             "unexpected error: {err}"
         );
         assert_eq!(document, before);

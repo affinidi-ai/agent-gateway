@@ -105,7 +105,8 @@ the lock and creates nothing; an Active node takes the lock briefly to repair th
 (see [Server mode](CONFIGURATION_RELOAD.md#server-mode)). Several instances need file locks
 that hold across hosts (see [Shared storage for several instances](#shared-storage-for-several-instances)).
 Where the lock cannot be taken at all the gateway logs a warning and goes on without it, as a
-single instance can. A start still waiting after 30 seconds for an
+single instance can, except that a node started in Standby, as every node of a multi-node
+gateway is, stops with an error rather than create a gateway DID that does not exist yet. A start still waiting after 30 seconds for an
 instance that holds the lock loads the DID if that instance has finished publishing it, and
 otherwise stops with an error and is restarted. No configuration beyond the mount
 is needed: the gateway reacts to what the volume does. Mount an SMB share with options that
@@ -132,8 +133,9 @@ host at a time:
 The gateway cannot tell when a mount grants locks only on its own host: the lock is taken
 without an error, so nodes on different hosts may each create their own gateway DID or write
 the vault at the same time. Mount NFS without those options. On a volume that refuses locks
-outright, creating or repairing the gateway DID logs a warning and goes on without the lock, and
-a vault change fails. A lock held by a host that stopped is released when the file server's
+outright, a node started in Standby refuses to create a new gateway DID; creating it on an
+Active node, upgrading an existing one or repairing it logs a warning and goes on without the
+lock; and a vault change fails. A lock held by a host that stopped is released when the file server's
 lease for that host expires.
 
 Back up with full `.agbak` archives from the dashboard or the management API; see

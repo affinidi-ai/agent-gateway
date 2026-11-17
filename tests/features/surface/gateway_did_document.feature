@@ -23,3 +23,9 @@ Feature: Gateway DID document
     And the first version of the gateway DID log does not list the gateway signing key under assertionMethod
     And the latest version of the gateway DID log lists the gateway signing key under assertionMethod and authentication
     And the gateway DID log verifies as a did:webvh log
+
+  Scenario: The gateway resolves its repaired DID to the document that lists the signing key
+    Given the gateway published its DID document without its signing key under assertionMethod
+    When the caller resolves the gateway DID through the gateway resolver
+    Then the response status is 200
+    And the DID document lists the gateway signing key under assertionMethod and authentication

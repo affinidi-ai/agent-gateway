@@ -19,18 +19,22 @@ pub(crate) enum LockOutcome {
     TimedOut,
 }
 
-/// Opens the lock file at `path`, creating it when it is missing. The file holds nothing and
-/// is never truncated or removed, so every holder locks the same file.
+/// Opens the lock file at `path`, creating it owner-only when it is missing. The file holds
+/// nothing and is never truncated or removed, so every holder locks the same file.
 pub(crate) async fn open_lock_file(path: &Path) -> anyhow::Result<File> {
     use anyhow::Context;
 
     let path: PathBuf = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        OpenOptions::new()
+        let mut options = OpenOptions::new();
+        options
             .create(true)
             .truncate(false)
             .read(true)
-            .write(true)
+            .write(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        options
             .open(&path)
             .with_context(|| format!("Failed to open lock file {}", path.display()))
     })
@@ -113,5 +117,23 @@ mod tests {
         let outcome = lock_exclusive(&path, Duration::from_secs(5)).await;
 
         assert!(matches!(outcome, LockOutcome::Unavailable(_)), "a directory is not a lock file: {outcome:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lock_file_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".test.lock");
+
+        let outcome = lock_exclusive(&path, Duration::ZERO).await;
+
+        assert!(matches!(outcome, LockOutcome::Acquired(_)), "a free lock must be taken: {outcome:?}");
+        let mode = std::fs::metadata(&path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

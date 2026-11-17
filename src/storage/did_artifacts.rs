@@ -176,17 +176,7 @@ mod tests {
 
         let on_disk = std::fs::read_to_string(dir.path().join("did.jsonl")).unwrap();
         assert_eq!(on_disk, "first\nsecond\n");
-        let files: Vec<String> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|entry| {
-                entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
-        assert_eq!(files, vec!["did.jsonl"], "the temporary log must be renamed into place");
+        assert_eq!(files_in(dir.path()), vec!["did.jsonl"], "the temporary log must be renamed into place");
     }
 
     #[cfg(feature = "didwebvh")]

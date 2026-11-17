@@ -121,6 +121,50 @@ async fn gateway_did_log_fetched(world: &mut SurfaceWorld) {
     world.caller_response = Some(RecordedResponse { status, headers, body });
 }
 
+#[when("the caller resolves the gateway DID through the gateway resolver")]
+async fn gateway_did_resolved(world: &mut SurfaceWorld) {
+    ensure_gateway_running(world).await;
+
+    let infra = world
+        .infra
+        .as_ref()
+        .expect("scenario infra must exist");
+    let client = reqwest::Client::new();
+    let log = client
+        .get(format!("http://127.0.0.1:{}/.well-known/did.jsonl", infra.gateway_port))
+        .send()
+        .await
+        .expect("fetch gateway DID log")
+        .text()
+        .await
+        .expect("read gateway DID log");
+    let first: Value = serde_json::from_str(
+        log.lines()
+            .next()
+            .expect("the gateway DID log has a version"),
+    )
+    .expect("the gateway DID log version is JSON");
+    let did = first["state"]["id"]
+        .as_str()
+        .expect("the gateway DID log names its DID")
+        .to_string();
+    let response = client
+        .get(format!("http://127.0.0.1:{}/api/v1/resolve", infra.gateway_port))
+        .query(&[("did", did.as_str())])
+        .send()
+        .await
+        .expect("resolve the gateway DID");
+
+    world.sent_body = None;
+    let status = response.status().as_u16();
+    let headers = collect_headers(response.headers());
+    let body = response
+        .json::<Value>()
+        .await
+        .expect("the resolved DID document is JSON");
+    world.caller_response = Some(RecordedResponse { status, headers, body });
+}
+
 fn response_body(world: &SurfaceWorld) -> &Value {
     &world
         .caller_response

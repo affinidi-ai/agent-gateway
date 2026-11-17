@@ -207,6 +207,29 @@ pub fn spawn_signal_handlers() {}
 #[cfg(test)]
 pub(crate) static TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Runs `run` with the server mode set to `mode` under [`TEST_GUARD`], and restores the
+/// previous mode afterwards, also when `run` panics.
+#[cfg(test)]
+pub(crate) async fn in_test_mode<T>(
+    mode: ServerMode,
+    run: impl std::future::Future<Output = T>,
+) -> T {
+    struct Restore(ServerMode);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_server_mode(self.0);
+            if self.0 == ServerMode::Active {
+                mark_activation_ready(current_activation_generation());
+            }
+        }
+    }
+
+    let _guard = TEST_GUARD.lock().await;
+    let _restore = Restore(current_mode());
+    set_server_mode(mode);
+    run.await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

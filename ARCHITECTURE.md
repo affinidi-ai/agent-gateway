@@ -75,7 +75,10 @@ so a fabric peer can be reachable while the dashboard is still being assembled.
 reports 503 on health. `SIGUSR1` promotes, `SIGUSR2` steps down. See
 [`src/server/mode.rs`](src/server/mode.rs). A node booting Active, or promoted, revokes the
 API keys of surfaces that no longer exist before its surfaces go live; see
-[`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live).
+[`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live). Only an Active
+node repairs the gateway DID document and brings the `/v1/resolve` index up to the gateway DID
+log, at startup or, once promoted, in the background; see
+[`CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md#server-mode).
 
 `SIGTERM` or Ctrl-C stops the process: `main.rs` writes the system metrics history to disk,
 shuts down OpenTelemetry, and exits, allowing each step 10 seconds. In-flight requests are not
@@ -450,7 +453,7 @@ from.
 | Module | Owns | Document |
 | --- | --- | --- |
 | [`config/`](src/config/) | Bootstrap parsing, `AgentSurface`, variants, limits, loaders; `target_auth_rules.rs` holds the rules Target authentication must meet (header, value format, https Target, a leg that checks its callers); `caller_key.rs` the surface's `caller_key` setting and its rules; `route_claims.rs` the prefixes `gateway.json` serves, no two of which may serve the same path, and whether a surface prefix serves a surface route | [`CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md) |
-| [`storage/`](src/storage/) | Store traits, filesystem JSON, config cache, DID artifacts | [`DESIGN_PATTERNS.md`](docs/DESIGN_PATTERNS.md) |
+| [`storage/`](src/storage/) | Store traits, filesystem JSON, config cache, DID artifacts, advisory file locks shared across nodes | [`DESIGN_PATTERNS.md`](docs/DESIGN_PATTERNS.md) |
 | [`encryption/`](src/encryption/) | Encryption at rest and key sources | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#configtoml) |
 | [`backup_restore/`](src/backup_restore/) | `.agbak` backup and restore | [`DEVELOPMENT.md`](docs/development/DEVELOPMENT.md) |
 | [`export/`](src/export/) | Redacted `.atgx` storage export | [`DEVELOPMENT.md`](docs/development/DEVELOPMENT.md) |

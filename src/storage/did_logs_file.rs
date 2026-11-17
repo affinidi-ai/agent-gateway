@@ -64,9 +64,8 @@ impl DidLogStorage for FileDidLogStorage {
             .await
             .with_context(|| format!("open {:?} for append", path))?;
 
-        file.write_all(raw_json.as_bytes())
+        file.write_all(format!("{raw_json}\n").as_bytes())
             .await?;
-        file.write_all(b"\n").await?;
         file.flush().await?;
         Ok(())
     }
