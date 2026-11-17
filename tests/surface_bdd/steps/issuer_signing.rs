@@ -10,20 +10,31 @@ async fn create_issuer(
     name: &str,
     tenant: Option<&str>,
 ) {
+    request_issuer(world, name, tenant).await;
+    let response = world
+        .admin_response
+        .as_ref()
+        .expect("the create response");
+    assert_eq!(response.status, 201, "creating issuer {name}: {}", response.body);
+}
+
+async fn request_issuer(
+    world: &mut SurfaceWorld,
+    name: &str,
+    tenant: Option<&str>,
+) {
     let body = json!({
         "name": name,
         "description": format!("{name} team"),
         "tenant_id": tenant,
     });
     let response = send(world, Method::POST, "/v1/issuers", Some(&body)).await;
-    assert_eq!(response.status, 201, "creating issuer {name}: {}", response.body);
-    let id = response.body["id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("the new issuer has an id: {}", response.body))
-        .to_string();
-    world
-        .issuers
-        .insert(name.to_string(), id);
+    if let Some(id) = response.body["id"].as_str() {
+        world
+            .issuers
+            .insert(name.to_string(), id.to_string());
+    }
+    world.admin_response = Some(response);
 }
 
 fn issuer_id(
@@ -86,6 +97,14 @@ async fn operator_created_issuer(
     create_issuer(world, &name, None).await;
 }
 
+#[when(expr = "the operator creates the issuer {string}")]
+async fn operator_creates_issuer(
+    world: &mut SurfaceWorld,
+    name: String,
+) {
+    request_issuer(world, &name, None).await;
+}
+
 #[given(expr = "the operator has created the issuer {string} owned by tenant {string}")]
 async fn operator_created_tenant_issuer(
     world: &mut SurfaceWorld,
@@ -120,12 +139,21 @@ async fn operator_saves_issuer_signing(
     save_issuer_signing(world, &issuer, through_connection(&id)).await;
 }
 
-#[when(expr = "the operator saves the issuer {string} signing through a hardware module")]
-async fn operator_saves_issuer_signing_through_hsm(
+#[when(
+    expr = "the operator saves the issuer {string} signing through the trust agent connection {string} without naming a key"
+)]
+async fn operator_saves_issuer_signing_without_a_key(
     world: &mut SurfaceWorld,
     issuer: String,
+    connection: String,
 ) {
-    save_issuer_signing(world, &issuer, json!({ "backend": "hsm" })).await;
+    let id = connection_id(world, &connection);
+    let mut signing = through_connection(&id);
+    signing
+        .as_object_mut()
+        .expect("a signing block")
+        .remove("key_id");
+    save_issuer_signing(world, &issuer, signing).await;
 }
 
 #[when(expr = "the operator clears the signing of the issuer {string}")]

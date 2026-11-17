@@ -1,8 +1,8 @@
 Feature: An issuer chooses which backend signs for the surfaces it owns
   An issuer can name a trust agent connection to sign through. A surface it owns that sets no
   signing of its own follows it, ahead of the appliance default. The issuer may only name a
-  connection its own tenant owns or one that belongs to the whole appliance, and a backend the
-  gateway cannot sign with is refused. An empty choice hands the issuer back to the appliance
+  connection its own tenant owns or one that belongs to the whole appliance, and a choice the
+  gateway cannot sign tokens with is refused. An empty choice hands the issuer back to the appliance
   default.
 
   Background:
@@ -24,8 +24,9 @@ Feature: An issuer chooses which backend signs for the surfaces it owns
     And the issuer "Research" follows the appliance default
 
   Scenario: An issuer that sets no signing follows the appliance default
-    Given the operator has created the issuer "Research"
-    Then the issuer "Research" follows the appliance default
+    When the operator creates the issuer "Research"
+    Then the admin API response status is 201
+    And the issuer "Research" follows the appliance default
 
   Scenario: A tenant's issuer cannot sign through another tenant's connection
     Given tenant "tenant-a" holds the trust agent connection "agent-a"
@@ -40,9 +41,10 @@ Feature: An issuer chooses which backend signs for the surfaces it owns
     When the operator saves the issuer "Orders" signing through the trust agent connection "agent-b"
     Then the admin API response status is 200
 
-  Scenario: A backend the gateway cannot sign with is refused
-    Given the operator has created the issuer "Research"
-    When the operator saves the issuer "Research" signing through a hardware module
+  Scenario: A trust agent choice that names no key to sign tokens with is refused
+    Given the appliance holds the trust agent connection "shared-agent"
+    And the operator has created the issuer "Research"
+    When the operator saves the issuer "Research" signing through the trust agent connection "shared-agent" without naming a key
     Then the admin API response status is 400
     And the issuer "Research" follows the appliance default
 

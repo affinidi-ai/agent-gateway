@@ -59,6 +59,27 @@ async fn operator_saves_surface_signing_through_connection(
     save_signing_through(world, &connection_id).await;
 }
 
+#[when(
+    expr = "the operator saves the surface signing through the trust agent connection {string} without naming a key"
+)]
+async fn operator_saves_surface_signing_without_a_key(
+    world: &mut SurfaceWorld,
+    name: String,
+) {
+    let connection_id = world
+        .trust_agent_connections
+        .get(&name)
+        .cloned()
+        .unwrap_or_else(|| panic!("no trust agent connection named {name} was created"));
+    let mut surface = stored_surface(world).await;
+    surface["signing"] = json!({
+        "backend": "vta",
+        "connection_id": connection_id,
+        "context_id": "ctx-orders",
+    });
+    save_surface(world, &surface).await;
+}
+
 #[when("the operator saves the surface signing through a trust agent connection that does not exist")]
 async fn operator_saves_surface_signing_through_missing_connection(world: &mut SurfaceWorld) {
     save_signing_through(world, "00000000-0000-0000-0000-000000000000").await;
@@ -73,6 +94,7 @@ async fn save_signing_through(
         "backend": "vta",
         "connection_id": connection_id,
         "context_id": "ctx-orders",
+        "key_id": "key-orders",
     });
     save_surface(world, &surface).await;
 }

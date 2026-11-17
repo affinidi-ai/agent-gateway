@@ -3,7 +3,8 @@ Feature: A surface signs only through a trust agent connection its tenant may us
   a connection in its signing settings only if its own tenant owns that connection or the
   connection belongs to the whole appliance; any other save is refused with 400. A
   connection that does not exist is refused the same way, so the answer never reveals
-  which connection ids another tenant has.
+  which connection ids another tenant has. A surface's tokens sign with the connection's key
+  and are refused when it cannot, so a choice that names no key is refused on save.
 
   Background:
     Given the operator can use the admin API and no surface is configured for route "/example"
@@ -44,3 +45,11 @@ Feature: A surface signs only through a trust agent connection its tenant may us
     When the operator saves the surface signing through the trust agent connection "agent-a"
     Then the admin API response status is 400
     And the admin API error response mentions "does not reference a trust agent connection this surface may sign through"
+
+  Scenario: A surface's trust agent choice that names no key to sign tokens with is refused
+    Given the appliance holds the trust agent connection "shared-agent"
+    And the appliance holds the secret "orders-key"
+    And the operator has created the appliance-wide surface for route "/orders" authenticating its target with secret "orders-key"
+    When the operator saves the surface signing through the trust agent connection "shared-agent" without naming a key
+    Then the admin API response status is 400
+    And the admin API error response mentions "key_id"
