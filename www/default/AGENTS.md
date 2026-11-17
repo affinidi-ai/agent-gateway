@@ -1475,7 +1475,8 @@ parts `IdentityNameCell`, `IdentitySurfaceCell`, `IdentityOriginBadge`,
   surface name show no badge. Without a display name, it shows `metadata.agent_name` when that
   is a non-empty string, else a muted, italic "Unnamed Agent".
 - The **DID** column (`IdentityNameCell` with `showName={false}`) shows the shortened DID in
-  monospace with a copy button for the full DID, then the version badge and SCID when set.
+  monospace with a copy button for the full DID, then the version badge and SCID when set,
+  on a second line.
 - The table has no Usage Count column; the usage count is still in the expanded details and
   the API.
 - A **shared managed DID** is the managed agent on more than one live surface: its
@@ -2007,10 +2008,17 @@ room for its text.
   or target label longer than that is cut to 22 characters plus `...` by `cutLabel` in
   `MetricsFlowVisualization.tsx`, so a long DID cannot run across its neighbours or past the
   chart edge; `Anonymous` is unchanged and the hover tooltip shows the full value.
-- **Identities table**: ten columns, so `.identities-table` (`dashboard.css`) keeps
+- **Identities table**: up to eleven columns, so `.identities-table` (`dashboard.css`) keeps
   Bootstrap's `table-sm` horizontal cell padding (0.25rem) instead of the 0.75rem of the
-  shared `.table-sm` rules. The table fits its box at 1280px wide with every row action
-  inside it; the DID keeps its title and copy button.
+  shared `.table-sm` rules. The Name (`.identities-name`, 14rem) and Agent Surface
+  (`.identities-surface`, 12rem) cells wrap long values inside a capped width; the Origin badges
+  wrap. Attestation, UAI and Created (`.identities-col-wide-only`) show only at 2000px wide and
+  above. Below 1600px, Trust Score and Last Used (`.identities-col-mid-up`) hide too, and the
+  DID cell (`IdentityNameCell` with `compactDid`) shows a shorter DID. The expanded details always
+  show Created, Last Used and the Trust Score (`identities-detail-trust-score`), and for an
+  identity without Agent DNA they show its UAI (`identities-detail-uai`) and attestation flags
+  and count (`identities-detail-attestation`) when set. The table fits its box at a 1512px
+  laptop viewport with every row action inside it; the DID keeps its title and copy button.
 - **Connection Points actions**: the row actions sit in a 6rem wide wrapping block (two
   buttons per line) with no left margins, so the Actions column stays near 120px and the
   Name and Mediator columns keep their room. Add a new row action inside that block.
