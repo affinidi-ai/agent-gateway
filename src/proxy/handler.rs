@@ -9141,6 +9141,7 @@ async fn proxy_charged_request(
                     surface: &state.surface,
                     response_rules_engine: &state.identity_rules_engine,
                     metrics_store: &state.metrics_store,
+                    verified_presentation: false,
                 };
                 crate::protocols::extensions::inspect_response_extensions(&response_body, &response_ctx).await
             };
@@ -13542,6 +13543,7 @@ async fn handle_fabric_request_inner(
                     crate::proxy::paths::is_well_known_agent_card_path(uri.path()) && status < 400;
 
                 // ── Verify the answering agent's identity presentation ─────────
+                let mut answer_presentation_verified = false;
                 let presented_identity = if state
                     .surface
                     .managed_identity()
@@ -13576,6 +13578,7 @@ async fn handle_fabric_request_inner(
                     .await
                     {
                         Ok(presentation) => presentation
+                            .inspect(|_| answer_presentation_verified = true)
                             .filter(|_| {
                                 crate::proxy::backend_identity::slot_reads_response_body(
                                     &state.surface,
@@ -14299,6 +14302,7 @@ async fn handle_fabric_request_inner(
                                 surface: &state.surface,
                                 response_rules_engine: &state.identity_rules_engine,
                                 metrics_store: &state.metrics_store,
+                                verified_presentation: answer_presentation_verified,
                             };
                             crate::protocols::extensions::inspect_response_extensions(
                                 _response_body_bytes,

@@ -227,7 +227,8 @@ cannot be established, also refuses the answer with `502`: the answering agent's
 stored, and the VP Audit Log records `identity_binding_failed` with outcome `untrusted`. A verified
 one records `identity_binding_verified` and the received presentation (`vp_injected`, detail
 `response_path_fabric_received`), both with `via_fabric: true` and the request's trace id. Answers
-to a Transit Point over Fabric and to MCP requests over Fabric are not checked.
+to a Transit Point over Fabric, to MCP requests over Fabric, and agent cards fetched over Fabric
+are not checked.
 
 Accepted risk: an answer that carries no presentation is not checked. A paired gateway signs one
 only when its surface has a managed identity and it has a VC issuer, so an answer from any other
@@ -239,7 +240,8 @@ identity. Only a gateway this one is paired with can do this; the mediator and t
 agent cannot remove a presentation the paired gateway adds.
 
 Accepted risk: the calling surface's identity schema and rules do not run on an answer that
-carries a verified presentation. They are written for the raw `agent-identity/v1` extension,
+carries a verified presentation, and response extension inspection skips that presentation's
+credential extension while still checking every other watched extension. They are written for the raw `agent-identity/v1` extension,
 which the paired gateway checked against its own schema and rules and replaced, and the
 presentation's fields follow the paired gateway's schema, so checking them against the calling
 surface's could refuse legitimate agents. A paired gateway whose rules are looser than the

@@ -20,7 +20,9 @@ changes:
         paired gateway refused every answer with `422 identity_extension_missing`, because the
         paired gateway replaces the agent's raw identity extension with its signed presentation.
         When the surface takes the agent's identity from the payload, a verified presentation on a
-        2xx answer from one of the connection's issuers is now the answering agent's identity.
+        2xx answer from one of the connection's issuers is now the answering agent's identity, and
+        response extension inspection no longer checks that presentation against the surface's
+        raw-payload rules.
   removed: []
   security:
     - timestamp: '2026-11-16T12:00:00Z'
