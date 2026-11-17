@@ -6,6 +6,7 @@ Feature: Agent registry card
   Scenario: The card of an agent behind a URL Target is fetched and rewritten
     Given an A2A surface targeting managed agent "bravo"
     And managed agent "bravo" serves an Agent Card that names its own address
+    And the operator has looked up the surface's agent
     When the operator reads the agent card of the surface's agent
     Then the admin API response status is 200
     And the agent card is available with source "fetched"
@@ -15,6 +16,7 @@ Feature: Agent registry card
     Given non-A2A managed agent "bravo" is available
     And A2A proxy "worker" targets non-A2A managed agent "bravo"
     And A2A surface "alpha" exists for route "/example" targeting A2A proxy "worker"
+    And the operator has looked up the surface's agent
     When the operator reads the agent card of the surface's agent
     Then the admin API response status is 200
     And the agent card is available with source "generated"

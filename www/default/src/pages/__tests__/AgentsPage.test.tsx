@@ -129,7 +129,7 @@ describe('AgentsPage', () => {
     renderPage();
     const row = await screen.findByTestId('agents-row-a1');
 
-    expect(screen.getByRole('columnheader', { name: 'Route' })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: 'Runtime' })).toBeInTheDocument();
     expect(screen.getByRole('columnheader', { name: 'Protocol' })).toBeInTheDocument();
     expect(screen.getByRole('columnheader', { name: 'Identities' })).toBeInTheDocument();
     const dids = within(row).getAllByTestId('agents-did');

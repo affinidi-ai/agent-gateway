@@ -187,13 +187,12 @@ async fn send_welcome_notification(
     record(world, caller, Method::POST, "/v1/notifications/send-welcome", Some(&request)).await;
 }
 
-/// Sends `GET path` with a personal access token of `tenant`, limited to the tenant's
-/// surfaces that `surfaces` matches, and records the answer.
-async fn get_as_tenant(
+/// Mints a personal access token of `tenant`, limited to the tenant's surfaces that
+/// `surfaces` matches, for the scenario's personal access token steps.
+async fn hold_tenant_token(
     world: &mut SurfaceWorld,
     tenant: &str,
     surfaces: &str,
-    path: &str,
 ) {
     ensure_admin_session(world).await;
     let request = json!({
@@ -210,21 +209,19 @@ async fn get_as_tenant(
         .expect("the operator session must exist")
         .personal_access_token_client(&request, headers)
         .await;
-    let port = world
-        .infra
-        .as_ref()
-        .expect("the gateway must be running")
-        .gateway_port;
-    let response = client
-        .get(format!("http://127.0.0.1:{port}/api{path}"))
-        .send()
-        .await
-        .unwrap_or_else(|error| panic!("{path} with a token of tenant {tenant}: {error}"));
-    world.admin_response = Some(
-        recorded_response(response)
-            .await
-            .unwrap_or_else(|error| panic!("reading the {path} response: {error}")),
-    );
+    world.personal_access_token_client = Some(client);
+}
+
+/// `/v1/agents/{id}` of the surface's agent, followed by `suffix`.
+fn surface_agent_path(
+    world: &SurfaceWorld,
+    suffix: &str,
+) -> String {
+    let id = world
+        .surface_agent_id
+        .as_deref()
+        .expect("the operator must have looked up the surface's agent");
+    format!("{AGENTS_PATH}/{id}{suffix}")
 }
 
 /// The id of the agent in an agents list that the surface under test uses.
@@ -304,6 +301,28 @@ async fn operator_holds_personal_access_token(
         .personal_access_token_client(&request, header::HeaderMap::new())
         .await;
     world.personal_access_token_client = Some(client);
+}
+
+#[given(expr = "a personal access token of tenant {string}")]
+async fn tenant_personal_access_token(
+    world: &mut SurfaceWorld,
+    tenant: String,
+) {
+    hold_tenant_token(world, &tenant, ALL_SURFACES).await;
+}
+
+#[given(expr = "a personal access token of tenant {string} limited to surface {string}")]
+async fn surface_limited_tenant_personal_access_token(
+    world: &mut SurfaceWorld,
+    tenant: String,
+    surface: String,
+) {
+    hold_tenant_token(world, &tenant, &regex::escape(&surface)).await;
+}
+
+#[given("the operator has looked up the surface's agent")]
+async fn operator_looked_up_surface_agent(world: &mut SurfaceWorld) {
+    world.surface_agent_id = Some(agent_id_of_surface(world).await);
 }
 
 #[when(expr = "operator {string} removes old log files")]
@@ -409,50 +428,26 @@ async fn personal_access_token_lists_agents(world: &mut SurfaceWorld) {
     record(world, Caller::PersonalAccessToken, Method::GET, AGENTS_PATH, None).await;
 }
 
-#[when(expr = "a token of tenant {string} lists the agents")]
-async fn tenant_token_lists_agents(
-    world: &mut SurfaceWorld,
-    tenant: String,
-) {
-    get_as_tenant(world, &tenant, ALL_SURFACES, AGENTS_PATH).await;
+#[when("the personal access token reads the surface's agent")]
+async fn personal_access_token_reads_surface_agent(world: &mut SurfaceWorld) {
+    let path = surface_agent_path(world, "");
+    record(world, Caller::PersonalAccessToken, Method::GET, &path, None).await;
 }
 
-#[when(expr = "a token of tenant {string} reads the agent of the surface")]
-async fn tenant_token_reads_agent_of_surface(
-    world: &mut SurfaceWorld,
-    tenant: String,
-) {
-    let id = agent_id_of_surface(world).await;
-    get_as_tenant(world, &tenant, ALL_SURFACES, &format!("{AGENTS_PATH}/{id}")).await;
-}
-
-#[when(expr = "a token of tenant {string} limited to surface {string} reads the agent of the surface")]
-async fn surface_limited_tenant_token_reads_agent_of_surface(
-    world: &mut SurfaceWorld,
-    tenant: String,
-    surface: String,
-) {
-    let id = agent_id_of_surface(world).await;
-    get_as_tenant(world, &tenant, &regex::escape(&surface), &format!("{AGENTS_PATH}/{id}")).await;
-}
-
-#[when(expr = "a token of tenant {string} reads the agent card of the surface's agent")]
-async fn tenant_token_reads_agent_card_of_surface(
-    world: &mut SurfaceWorld,
-    tenant: String,
-) {
-    let id = agent_id_of_surface(world).await;
-    get_as_tenant(world, &tenant, ALL_SURFACES, &format!("{AGENTS_PATH}/{id}/agent-card")).await;
+#[when("the personal access token reads the agent card of the surface's agent")]
+async fn personal_access_token_reads_agent_card_of_surface(world: &mut SurfaceWorld) {
+    let path = surface_agent_path(world, "/agent-card");
+    record(world, Caller::PersonalAccessToken, Method::GET, &path, None).await;
 }
 
 #[when("the operator reads the agent card of the surface's agent")]
 async fn operator_reads_agent_card_of_surface(world: &mut SurfaceWorld) {
-    let id = agent_id_of_surface(world).await;
+    let path = surface_agent_path(world, "/agent-card");
     let response = world
         .admin_client
         .as_ref()
         .expect("the operator session must exist")
-        .send_recorded_json::<Value>(Method::GET, &format!("{AGENTS_PATH}/{id}/agent-card"), None)
+        .send_recorded_json::<Value>(Method::GET, &path, None)
         .await
         .expect("reading the agent card as the operator");
     world.admin_response = Some(response);

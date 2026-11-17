@@ -101,7 +101,9 @@ the agent card preview of its first running A2A or AP2 surface, with `source` na
 gateway obtains it: `fetched` (a URL Target's card, rewritten), `generated` (by an A2A proxy) or
 `remote_gateway` (served over Fabric). The read is audited and rate limited as a preview read, and
 answers `429` past the limits without an earlier preview. Only the card's A2A Agent Card fields are
-returned, and no card or a body that is not an Agent Card is a `502`. When none of the agent's
+returned, and no card or a body that is not an Agent Card is a `502`. A read whose fetch failed or
+whose card the gateway refuses to serve is also a `502`, never the preview's last good card; a
+card served without an identity credential is returned. When none of the agent's
 surfaces runs on this gateway, the answer is `available: false` with `not_running`. A tenant's
 token sees the agents of appliance-wide surfaces, but the card is read only through a surface of
 its own tenant: when only an appliance-wide surface could reach it, the answer is

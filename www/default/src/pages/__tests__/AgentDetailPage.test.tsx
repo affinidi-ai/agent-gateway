@@ -1,7 +1,7 @@
 import React from 'react';
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import AgentDetailPage from '../AgentDetailPage';
 import { AgentDetails, apiClient } from '../../api';
 import { usePermissions } from '../../context/PermissionsContext';
@@ -54,9 +54,33 @@ const details = (overrides: Partial<AgentDetails> = {}): AgentDetails => ({
   ...overrides,
 });
 
+const OpenAgentB: React.FC = () => {
+  const navigate = useNavigate();
+  return (
+    <button type="button" data-testid="open-agent-b1" onClick={() => navigate('/agent-registry/b1')} />
+  );
+};
+
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason: unknown) => void;
+};
+
+const deferred = <T,>(): Deferred<T> => {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+};
+
 const renderPage = () =>
   render(
     <MemoryRouter initialEntries={['/agent-registry/a1']}>
+      <OpenAgentB />
       <Routes>
         <Route path="/agent-registry/:agentId" element={<AgentDetailPage />} />
         <Route path="/agent-registry" element={<div data-testid="list-route" />} />
@@ -208,6 +232,41 @@ describe('AgentDetailPage', () => {
     expect(screen.getByTestId('list-route')).toBeInTheDocument();
   });
 
+  it('shows not found, not the previous agent, after opening a missing agent', async () => {
+    const { ApiError } = jest.requireMock('../../api');
+    mockedGetAgent.mockImplementation((id: string) =>
+      id === 'a1' ? Promise.resolve(details()) : Promise.reject(new ApiError('Not Found', 404))
+    );
+    renderPage();
+    expect(await screen.findByTestId('agent-details-name')).toHaveTextContent('TimeAsker');
+
+    fireEvent.click(screen.getByTestId('open-agent-b1'));
+
+    expect(await screen.findByTestId('agent-not-found')).toBeInTheDocument();
+    expect(screen.queryByTestId('agent-details-name')).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['response', (late: Deferred<AgentDetails>) => late.resolve(details())],
+    ['failure', (late: Deferred<AgentDetails>) => late.reject(new Error('Boom'))],
+  ])('ignores a late %s for the previously opened agent', async (_, settle) => {
+    const late = deferred<AgentDetails>();
+    mockedGetAgent.mockImplementation((id: string) =>
+      id === 'a1' ? late.promise : Promise.resolve(details({ id: 'b1', name: 'Oxygen' }))
+    );
+    renderPage();
+    fireEvent.click(screen.getByTestId('open-agent-b1'));
+    expect(await screen.findByTestId('agent-details-name')).toHaveTextContent('Oxygen');
+
+    await act(async () => {
+      settle(late);
+      await late.promise.catch(() => undefined);
+    });
+
+    expect(screen.getByTestId('agent-details-name')).toHaveTextContent('Oxygen');
+    expect(screen.queryByTestId('agent-load-error')).not.toBeInTheDocument();
+  });
+
   it('previews the card as plain text', async () => {
     mockedGetAgent.mockResolvedValue(details());
     mockedGetAgentCard.mockResolvedValue({
@@ -283,14 +342,19 @@ describe('AgentDetailPage', () => {
     await screen.findByTestId('agent-details-name');
     openTab(/Agent Card/);
 
-    fireEvent.click(await screen.findByTestId('agent-card-view-json'));
+    expect(await screen.findByTestId('agent-card-preview')).toBeInTheDocument();
+    expect(screen.queryByTestId('agent-card-copy-button')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('agent-card-view-json'));
     expect(screen.getByTestId('agent-card-view-json')).toHaveAttribute('aria-pressed', 'true');
     expect(screen.queryByTestId('agent-card-preview')).not.toBeInTheDocument();
     const json = screen.getByTestId('agent-card-json');
     expect(json).toHaveTextContent('<img src=x onerror=alert(1)>');
     expect(within(json).queryByRole('img')).not.toBeInTheDocument();
     expect(within(json).queryByRole('link')).not.toBeInTheDocument();
-    expect(screen.getByTestId('agent-card-copy-button')).toHaveTextContent('Copy JSON');
+    expect(screen.getByRole('button', { name: 'Copy JSON' })).toBe(
+      screen.getByTestId('agent-card-copy-button')
+    );
   });
 
   it.each([

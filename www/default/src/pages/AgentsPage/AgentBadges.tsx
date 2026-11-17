@@ -4,7 +4,7 @@ import { Badge } from '../../components/shared/Badge';
 import { CopyButton } from '../../components/shared/CopyButton';
 import { NO_DID, protocolLabel, protocolTone, shortenDid, trustRegistryLabel } from './agentLabels';
 
-/** The protocol only; how the agent is reached is the Route. */
+/** The protocol only; how the agent is reached is the Runtime. */
 export const AgentProtocolBadge: React.FC<{ protocol: string }> = ({ protocol }) => (
   <Badge
     value={protocolLabel(protocol)}

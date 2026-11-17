@@ -95,35 +95,26 @@ const AgentCardTab: React.FC<{ agentId: string }> = ({ agentId }) => {
     <div className="card" data-testid="agent-card-tab">
       <div className="card-header py-2 d-flex flex-wrap gap-2 align-items-center justify-content-between">
         {sourceText ? (
-          <span className="small" data-testid="agent-card-source" data-source={response.source}>
+          <span data-testid="agent-card-source" data-source={response.source}>
             <span className="text-muted me-1">Card source</span>
             {sourceText}
           </span>
         ) : (
           <span />
         )}
-        <span className="d-flex align-items-center gap-2">
-          <span className="btn-group btn-group-sm" role="group" aria-label="Agent Card view">
-            {CARD_VIEWS.map(v => (
-              <button
-                key={v.key}
-                type="button"
-                className={`btn ${view === v.key ? 'btn-primary' : 'btn-outline-secondary'}`}
-                aria-pressed={view === v.key}
-                onClick={() => setView(v.key)}
-                data-testid={`agent-card-view-${v.key}`}
-              >
-                {v.label}
-              </button>
-            ))}
-          </span>
-          <CopyButton
-            text={json}
-            variant="outline-primary"
-            label="Copy JSON"
-            title="Copy JSON"
-            data-testid="agent-card-copy-button"
-          />
+        <span className="btn-group btn-group-sm" role="group" aria-label="Agent Card view">
+          {CARD_VIEWS.map(v => (
+            <button
+              key={v.key}
+              type="button"
+              className={`btn ${view === v.key ? 'btn-primary' : 'btn-outline-secondary'}`}
+              aria-pressed={view === v.key}
+              onClick={() => setView(v.key)}
+              data-testid={`agent-card-view-${v.key}`}
+            >
+              {v.label}
+            </button>
+          ))}
         </span>
       </div>
       {view === 'preview' ? (
@@ -131,13 +122,28 @@ const AgentCardTab: React.FC<{ agentId: string }> = ({ agentId }) => {
           <AgentCardPreview card={response.card} />
         </div>
       ) : (
-        <pre
-          className="card-body mb-0 small"
-          style={{ maxHeight: '60vh', overflow: 'auto', whiteSpace: 'pre-wrap' }}
-          data-testid="agent-card-json"
-        >
-          {json}
-        </pre>
+        <div className="position-relative">
+          <CopyButton
+            text={json}
+            variant="outline-primary"
+            title="Copy JSON"
+            aria-label="Copy JSON"
+            className="position-absolute top-0 end-0 mt-2 me-4 bg-body"
+            data-testid="agent-card-copy-button"
+          />
+          <pre
+            className="card-body mb-0 small"
+            style={{
+              maxHeight: '60vh',
+              overflow: 'auto',
+              whiteSpace: 'pre-wrap',
+              paddingRight: '4.5rem',
+            }}
+            data-testid="agent-card-json"
+          >
+            {json}
+          </pre>
+        </div>
       )}
     </div>
   );

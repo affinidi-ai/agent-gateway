@@ -39,7 +39,7 @@ describe('agentLabels', () => {
   });
 
   it('never shows raw enum values', () => {
-    expect(runtimeLabel('ftp')).toBe('Unknown route');
+    expect(runtimeLabel('ftp')).toBe('Unknown runtime');
     expect(protocolLabel('a2a')).toBe('A2A');
     expect(protocolLabel('mcp')).toBe('MCP');
     expect(protocolLabel('carrier-pigeon')).toBe('Other protocol');
@@ -112,7 +112,7 @@ describe('agentLabels', () => {
     expect(agentMatchesFilter(agent(), 'time')).toBe(true);
     expect(agentMatchesFilter(agent(), 'rick')).toBe(true);
     expect(agentMatchesFilter(agent(), 'morty')).toBe(true);
-    expect(agentMatchesFilter(agent(), 'direct url')).toBe(true);
+    expect(agentMatchesFilter(agent(), 'direct')).toBe(true);
     expect(agentMatchesFilter(agent(), 'a2a-proxy')).toBe(false);
     expect(agentMatchesFilter(agent(), 'summer')).toBe(false);
     expect(agentMatchesFilter(agent({ name: null }), 'time')).toBe(false);

@@ -1689,6 +1689,9 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
   details header badge.
 - The details page has three tabs, **Agent Card** (opened first), **Connection** and **Traffic**.
   Identities and surfaces are shown only in the list, never repeated on the details page.
+- Opening another agent's details clears the shown record and loads again; only the answer for
+  the current `agentId` (and its latest load) updates the page, so a late answer for the previous
+  agent never replaces it.
 - The list filters client-side by text only: the display name (**Unnamed agent** included), every
   surface name in the record, and the route label (`agentMatchesFilter`).
 - Columns: Agent, Route, Protocol, Identities, Used by surfaces, Trust registry, Last activity.

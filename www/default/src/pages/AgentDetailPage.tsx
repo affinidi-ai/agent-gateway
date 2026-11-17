@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Tab, Tabs } from 'react-bootstrap';
 import { useNavigate, useParams } from 'react-router-dom';
 import { AgentDetails, ApiError, apiClient } from '../api';
@@ -21,25 +21,35 @@ const AgentDetailPage: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [notFound, setNotFound] = useState(false);
 
+  const latestRequest = useRef(0);
+
   const loadAgent = useCallback(async () => {
+    const request = ++latestRequest.current;
+    const isCurrent = () => request === latestRequest.current;
+    setLoading(true);
+    setError(null);
+    setNotFound(false);
+    setAgent(null);
     try {
-      setLoading(true);
-      setError(null);
-      setNotFound(false);
-      setAgent(await apiClient.getAgent(agentId));
+      const loaded = await apiClient.getAgent(agentId);
+      if (isCurrent()) setAgent(loaded);
     } catch (err) {
+      if (!isCurrent()) return;
       if (err instanceof ApiError && err.status === 404) {
         setNotFound(true);
       } else {
         setError(err instanceof Error && err.message ? err.message : 'Failed to load agent');
       }
     } finally {
-      setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }, [agentId]);
 
   useEffect(() => {
     loadAgent();
+    return () => {
+      latestRequest.current += 1;
+    };
   }, [loadAgent]);
 
   const backButton = (

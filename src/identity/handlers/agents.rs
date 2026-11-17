@@ -30,7 +30,7 @@ use crate::identity::state::IdentityApiState;
 use crate::identity::target_card_names::{CardLocation, TARGET_CARD_NAME_TTL, TargetCardNameService};
 use crate::metrics::{InboundTraffic, SurfaceStats};
 use crate::observability::refresh_cache::RefreshCache;
-use crate::proxy::card_preview::{PreviewRequest, RateLimited};
+use crate::proxy::card_preview::{AgentCardPreview, CardFetchStatus, PreviewRequest, RateLimited};
 use crate::surfaces::AgentSurfaceStore;
 use crate::tenancy::{PatTenantContext, ResourceKind, can_access, can_mutate, scope_allows_resource};
 use crate::trust_registry_verification::recorder_status::{RecorderState, TrustRecorderStatusStore, global_store};
@@ -1165,6 +1165,19 @@ fn served_card_response(
     }
 }
 
+/// The card the preview's own fetch obtained and the gateway serves. `None` when that fetch
+/// failed or the gateway refuses the card, although the preview still shows the last good one.
+fn currently_served(preview: AgentCardPreview) -> Option<Value> {
+    match preview
+        .fetch
+        .as_ref()
+        .map(|fetch| fetch.status)
+    {
+        Some(CardFetchStatus::Ok | CardFetchStatus::ServedWithoutIdentity) => preview.after,
+        Some(CardFetchStatus::Failed | CardFetchStatus::NotServed) | None => None,
+    }
+}
+
 /// The card the gateway serves for the agent, read through the agent card preview of the
 /// first of its [`card_surfaces`] that runs here, so a direct URL, A2A proxy and Fabric
 /// target each give the card callers get. Fetches are limited and audited as previews.
@@ -1183,7 +1196,7 @@ async fn agent_card_response(
             .await
             .map_err(|RateLimited { retry_after_secs }| AgentApiError::RateLimited(retry_after_secs))?;
         if preview.supported {
-            return served_card_response(&group.id, surface, preview.after);
+            return served_card_response(&group.id, surface, currently_served(preview));
         }
     }
     Ok(AgentCardResponse::unavailable(AgentCardUnavailable::NotRunning))
@@ -2330,6 +2343,44 @@ mod tests {
             let error = served_card_response("a1", &surface("s1"), Some(body.clone())).expect_err("not an Agent Card");
             assert_eq!(error.into_response().status(), StatusCode::BAD_GATEWAY, "{body}");
         }
+    }
+
+    fn preview_after_fetch(status: CardFetchStatus) -> AgentCardPreview {
+        use crate::proxy::card_preview::{CardFetchReport, UnsupportedReason};
+        let mut preview = AgentCardPreview::unsupported("s1", UnsupportedReason::NotRunning);
+        preview.supported = true;
+        preview.unsupported_reason = None;
+        preview.fetch = Some(CardFetchReport {
+            status,
+            cause: None,
+            http_status: None,
+            duration_ms: 0,
+            identity_error: None,
+            identity_slot: None,
+        });
+        preview.after = Some(serde_json::json!({ "name": "TimeAsker", "skills": [] }));
+        preview
+    }
+
+    #[test]
+    fn test_a_served_card_is_the_card_of_a_fetch_the_gateway_serves() {
+        for status in [CardFetchStatus::Ok, CardFetchStatus::ServedWithoutIdentity] {
+            let card = currently_served(preview_after_fetch(status));
+            assert_eq!(card, Some(serde_json::json!({ "name": "TimeAsker", "skills": [] })), "{status:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_fetch_after_a_good_one_is_generic_502_not_the_last_good_card() {
+        for status in [CardFetchStatus::Failed, CardFetchStatus::NotServed] {
+            let card = currently_served(preview_after_fetch(status));
+            assert_eq!(card, None, "{status:?}");
+            let error = served_card_response("a1", &surface("s1"), card).expect_err("no current card");
+            assert_eq!(error.into_response().status(), StatusCode::BAD_GATEWAY, "{status:?}");
+        }
+        let mut no_fetch = preview_after_fetch(CardFetchStatus::Ok);
+        no_fetch.fetch = None;
+        assert_eq!(currently_served(no_fetch), None);
     }
 
     #[tokio::test]

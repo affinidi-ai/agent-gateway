@@ -22,7 +22,7 @@ const AgentsTable: React.FC<AgentsTableProps> = ({ agents, retentionMinutes, onO
       <thead>
         <tr>
           <th style={{ width: '18%' }}>Agent</th>
-          <th style={{ width: '10%' }}>Route</th>
+          <th style={{ width: '10%' }}>Runtime</th>
           <th style={{ width: '10%' }}>Protocol</th>
           <th style={{ width: '19%' }}>Identities</th>
           <th style={{ width: '16%' }}>Used by surfaces</th>

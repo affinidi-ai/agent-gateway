@@ -176,6 +176,8 @@ pub struct SurfaceWorld {
     pub surface_draft: Option<serde_json::Value>,
     /// A client presenting the personal access token an operator minted in the scenario.
     pub personal_access_token_client: Option<reqwest::Client>,
+    /// The id of the surface's agent, as the operator's agents list names it.
+    pub surface_agent_id: Option<String>,
     /// API keys the scenario created, by scenario name: the owning surface id and the key id.
     pub api_keys: HashMap<String, (String, String)>,
     /// The Redis stream an integration delivers sign-in events to.
@@ -272,6 +274,7 @@ impl SurfaceWorld {
             credential_provider_ids: HashMap::new(),
             surface_draft: None,
             personal_access_token_client: None,
+            surface_agent_id: None,
             api_keys: HashMap::new(),
             sign_in_stream: None,
             passkeys: HashMap::new(),

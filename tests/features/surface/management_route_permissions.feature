@@ -146,45 +146,57 @@ Feature: Management route permissions
   Scenario: A token of the surface's tenant lists its agent
     Given an A2A surface targeting managed agent "bravo"
     And the surface belongs to tenant "tenant-a"
-    When a token of tenant "tenant-a" lists the agents
+    And a personal access token of tenant "tenant-a"
+    When the personal access token lists the agents
     Then the admin API response status is 200
     And the agents list names the surface
 
   Scenario: A token of the surface's tenant reads its agent
     Given an A2A surface targeting managed agent "bravo"
     And the surface belongs to tenant "tenant-a"
-    When a token of tenant "tenant-a" reads the agent of the surface
+    And the operator has looked up the surface's agent
+    And a personal access token of tenant "tenant-a"
+    When the personal access token reads the surface's agent
     Then the admin API response status is 200
     And the agent answer names the surface
 
   Scenario: A token of another tenant does not list the surface's agent
     Given an A2A surface targeting managed agent "bravo"
     And the surface belongs to tenant "tenant-a"
-    When a token of tenant "tenant-b" lists the agents
+    And a personal access token of tenant "tenant-b"
+    When the personal access token lists the agents
     Then the admin API response status is 200
     And the agents list is empty
 
   Scenario: A token of another tenant cannot read the surface's agent
     Given an A2A surface targeting managed agent "bravo"
     And the surface belongs to tenant "tenant-a"
-    When a token of tenant "tenant-b" reads the agent of the surface
+    And the operator has looked up the surface's agent
+    And a personal access token of tenant "tenant-b"
+    When the personal access token reads the surface's agent
     Then the admin API response status is 404
 
   Scenario: A token limited to another surface of its tenant cannot read the surface's agent
     Given an A2A surface targeting managed agent "bravo"
     And the surface belongs to tenant "tenant-a"
-    When a token of tenant "tenant-a" limited to surface "other-surface" reads the agent of the surface
+    And the operator has looked up the surface's agent
+    And a personal access token of tenant "tenant-a" limited to surface "other-surface"
+    When the personal access token reads the surface's agent
     Then the admin API response status is 404
 
   Scenario: A token of another tenant cannot read the agent card of the surface's agent
     Given an A2A surface targeting managed agent "bravo"
     And the surface belongs to tenant "tenant-a"
-    When a token of tenant "tenant-b" reads the agent card of the surface's agent
+    And the operator has looked up the surface's agent
+    And a personal access token of tenant "tenant-b"
+    When the personal access token reads the agent card of the surface's agent
     Then the admin API response status is 404
 
   Scenario: A tenant token reads no agent card through an appliance-wide surface
     Given an A2A surface targeting managed agent "bravo"
-    When a token of tenant "tenant-a" reads the agent card of the surface's agent
+    And the operator has looked up the surface's agent
+    And a personal access token of tenant "tenant-a"
+    When the personal access token reads the agent card of the surface's agent
     Then the admin API response status is 200
     And the agent card is unavailable because only an operator may read it
 

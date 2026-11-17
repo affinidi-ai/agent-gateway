@@ -41,7 +41,7 @@ export function displayName(agent: Pick<AgentRecord, 'name'>): string {
 }
 
 export function runtimeLabel(runtime: string): string {
-  return RUNTIME_LABELS[runtime as AgentRuntime] ?? 'Unknown route';
+  return RUNTIME_LABELS[runtime as AgentRuntime] ?? 'Unknown runtime';
 }
 
 export function runtimeIcon(runtime: string): string {
