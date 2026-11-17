@@ -177,10 +177,19 @@ async function grantClipboard(page: Page) {
 }
 
 test.describe("Mediator access step", () => {
-  test("Create Connection Point pauses on the step, copies the DIDs and leaves for later", async ({
+  test("Create Connection Point shows the step when the mediator refuses, copies the DIDs and leaves for later", async ({
     page,
   }) => {
     const { posts } = await mockConnections(page);
+    await page.route(
+      "**/api/v1/connection-points/cp-paused/continue",
+      (route) =>
+        json(
+          route,
+          { ...REFUSED_TEMP, role: "connection_point", did: CP_DID },
+          409,
+        ),
+    );
     await grantClipboard(page);
     await page.goto(`${BASE_URL}/gateways/publish`);
 
@@ -191,8 +200,13 @@ test.describe("Mediator access step", () => {
     await page.getByTestId("wizard-next").click();
 
     const step = page.getByTestId("wizard-step-mediator-access");
-    await expect(step).toContainText("Allow these DIDs on the mediator");
-    await expect(step).toContainText("Mediator X");
+    await expect(step).toContainText(
+      "Add These DIDs to the DIDComm Mediator's Allow List",
+    );
+    await expect(step).toContainText(
+      "This Mediator X Mediator most probably uses Explicit Allow",
+    );
+    await expect(page.getByTestId("mediator-access-refused")).toHaveCount(0);
     await expect(step.locator(".surface-info-panel")).toHaveCount(0);
     await expect(
       page.getByTestId("mediator-access-did-connection_point"),
@@ -215,10 +229,13 @@ test.describe("Mediator access step", () => {
     await expect(page).toHaveURL(/\/connections\?tab=gateways$/);
   });
 
-  test("Add Gateway pauses on the same step as Create Connection Point and copies the DIDs", async ({
+  test("Add Gateway shows the same step when the mediator refuses and copies the DIDs", async ({
     page,
   }) => {
     const { posts } = await mockConnections(page);
+    await page.route("**/api/v1/gateways/gw-paused/continue", (route) =>
+      json(route, REFUSED_TEMP, 409),
+    );
     await grantClipboard(page);
     await page.goto(`${BASE_URL}/gateways/connect`);
 
@@ -231,8 +248,11 @@ test.describe("Mediator access step", () => {
     await page.getByTestId("wizard-next").click();
 
     const step = page.getByTestId("wizard-step-mediator-access");
-    await expect(step).toContainText("Allow these DIDs on the mediator");
+    await expect(step).toContainText(
+      "Add These DIDs to the DIDComm Mediator's Allow List",
+    );
     await expect(step).toContainText("Mediator X");
+    await expect(page.getByTestId("mediator-access-refused")).toHaveCount(0);
     await expect(step.locator(".surface-info-panel")).toHaveCount(0);
     await expect(step).not.toContainText("sent the invitation");
     await expect(step).not.toContainText("The invitation expires on");
@@ -254,6 +274,33 @@ test.describe("Mediator access step", () => {
 
     await page.getByTestId("mediator-access-later-button").click();
     await expect(page).toHaveURL(/\/connections\?tab=gateways$/);
+  });
+
+  test("a mediator that admits the DIDs at once never shows the step", async ({
+    page,
+  }) => {
+    await mockConnections(page);
+    await page.route(
+      "**/api/v1/connection-points/cp-paused/continue",
+      (route) => json(route, { connection_point: OPENED_CP }),
+    );
+    await page.goto(`${BASE_URL}/gateways/publish`);
+
+    await page.getByTestId("wizard-next").click();
+    await page
+      .getByPlaceholder("e.g., Public Gateway Invitation")
+      .fill("Partner invitation");
+    await page.getByTestId("wizard-next").click();
+
+    await expect(
+      page.locator(`input[value="${OPENED_CP.oob_url}"]`),
+    ).toBeVisible();
+    await expect(page.getByTestId("wizard-step-mediator-access")).toHaveCount(
+      0,
+    );
+    await expect(
+      page.getByTestId("wizard-progress-step-mediator-access"),
+    ).toHaveCount(0);
   });
 
   test("Connections shows both pauses with Continue, and each resumes with the same DIDs", async ({
@@ -365,7 +412,9 @@ test.describe("Mediator access step", () => {
     await expect(
       page.getByTestId("gateway-editor-remote-pending"),
     ).toContainText("once it accepts the connection");
-    await expect(page.getByTestId("gateway-editor-delete-button")).toBeEnabled();
+    await expect(
+      page.getByTestId("gateway-editor-delete-button"),
+    ).toBeEnabled();
   });
 
   test("the Add Gateway wizard's View Connection opens the pending gateway's details", async ({
@@ -414,7 +463,7 @@ test.describe("Mediator access step", () => {
 
     await page.getByTestId("mediator-access-continue-button").click();
     await expect(page.getByTestId("mediator-access-refused")).toContainText(
-      "Mediator Mediator X still refuses the Permanent DID for the paired gateway",
+      "DIDComm Mediator Mediator X still refuses the Permanent DID for the paired gateway",
     );
     await expect(page.getByTestId("wizard-step-mediator-access")).toBeVisible();
 
