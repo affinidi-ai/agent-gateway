@@ -1,8 +1,22 @@
 import React from 'react';
 import { fireEvent, render, screen } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
 import '@testing-library/jest-dom';
 import SystemSettingsTab from '../SystemSettingsTab';
 import { Settings } from '../../../types';
+
+// The tab renders the key-management disclosure, which reads permissions. The
+// section is collapsed by default and fetches nothing until it is opened, so a
+// static grant is all these appliance-id assertions need.
+jest.mock('../../../context/PermissionsContext', () => ({
+  usePermissions: () => ({
+    permissions: {},
+    loading: false,
+    error: null,
+    refetchPermissions: jest.fn(),
+    hasPermission: () => true,
+  }),
+}));
 
 const SETTINGS: Settings = {
   badge_threshold: 5,
@@ -19,13 +33,15 @@ const SETTINGS: Settings = {
 
 function applianceIdInput(formData: Settings, onInputChange = jest.fn()) {
   render(
-    <SystemSettingsTab
-      formData={formData}
-      isSubmitting={false}
-      onInputChange={onInputChange}
-      onSave={jest.fn()}
-      onReset={jest.fn()}
-    />
+    <MemoryRouter>
+      <SystemSettingsTab
+        formData={formData}
+        isSubmitting={false}
+        onInputChange={onInputChange}
+        onSave={jest.fn()}
+        onReset={jest.fn()}
+      />
+    </MemoryRouter>
   );
   return screen.getByTestId('settings-appliance-id-input') as HTMLInputElement;
 }

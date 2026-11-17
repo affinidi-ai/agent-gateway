@@ -45,6 +45,45 @@ pub async fn write_did_log_raw(
         .with_context(|| format!("writing DID log {}", path.display()))
 }
 
+/// Append one entry to `{dir}/did.jsonl` so that a reader never sees a half
+/// written log: the whole new log is written beside it, flushed to disk and
+/// renamed over the old one.
+#[cfg(feature = "didwebvh")]
+pub async fn append_did_log_raw(
+    dir: &Path,
+    raw_entry: &str,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let path = dir.join(DID_LOG_FILE);
+    let existing = read_did_log_raw(dir)
+        .await?
+        .unwrap_or_default();
+    let mut text = existing
+        .trim_end()
+        .to_string();
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(raw_entry.trim_end());
+    text.push('\n');
+
+    let temporary = dir.join(format!("{DID_LOG_FILE}.tmp"));
+    let mut file = tokio::fs::File::create(&temporary)
+        .await
+        .with_context(|| format!("creating {}", temporary.display()))?;
+    file.write_all(text.as_bytes())
+        .await
+        .with_context(|| format!("writing {}", temporary.display()))?;
+    file.sync_all()
+        .await
+        .with_context(|| format!("flushing {}", temporary.display()))?;
+    drop(file);
+    tokio::fs::rename(&temporary, &path)
+        .await
+        .with_context(|| format!("replacing DID log {}", path.display()))
+}
+
 /// Write the `did:web` current document to `{dir}/did.json`, replacing any
 /// existing content.
 pub async fn write_did_document(
@@ -102,6 +141,61 @@ mod tests {
 
         let on_disk = std::fs::read_to_string(dir.path().join("did.jsonl")).unwrap();
         assert_eq!(on_disk, format!("{}\n", raw));
+    }
+
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn appending_keeps_the_existing_entries_and_adds_one() {
+        let dir = tempdir().unwrap();
+        write_did_log_raw(dir.path(), "first")
+            .await
+            .unwrap();
+
+        append_did_log_raw(dir.path(), "second")
+            .await
+            .unwrap();
+        append_did_log_raw(dir.path(), "third\n")
+            .await
+            .unwrap();
+
+        let on_disk = std::fs::read_to_string(dir.path().join("did.jsonl")).unwrap();
+        assert_eq!(on_disk, "first\nsecond\nthird\n");
+        assert!(
+            !dir.path()
+                .join("did.jsonl.tmp")
+                .exists(),
+            "no temporary file is left"
+        );
+    }
+
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn appending_to_a_missing_log_starts_it() {
+        let dir = tempdir().unwrap();
+        append_did_log_raw(dir.path(), "only")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("did.jsonl")).unwrap(), "only\n");
+    }
+
+    #[cfg(all(feature = "didwebvh", unix))]
+    #[tokio::test]
+    async fn a_failed_append_leaves_the_published_log_as_it_was() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        write_did_log_raw(dir.path(), "first")
+            .await
+            .unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = append_did_log_raw(dir.path(), "second").await;
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        if std::fs::File::create(dir.path().join("probe")).is_ok() && result.is_ok() {
+            return;
+        }
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(dir.path().join("did.jsonl")).unwrap(), "first\n");
     }
 
     #[cfg(feature = "didwebvh")]

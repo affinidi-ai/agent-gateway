@@ -152,6 +152,11 @@ class SessionManager {
     sessionStorage.removeItem('session_token');
   }
 
+  /** Drop a token the server no longer recognises, without telling the server. */
+  forgetSessionToken(): void {
+    sessionStorage.removeItem('session_token');
+  }
+
   expireSession(): void {
     this.setSessionExpiredError();
     this.logout().finally(() => window.location.reload());
@@ -1382,6 +1387,13 @@ export interface AgentSurface {
   status: SurfaceStatus;
   agent_did?: string;
   issuer_id?: string;
+  /** Which key signs for this surface. Absent means inherit the appliance default. */
+  signing?: {
+    backend?: 'local' | 'vta';
+    connection_id?: string;
+    context_id?: string;
+    key_id?: string;
+  };
   mcp_legacy_metadata_output?: 'compatibility' | 'canonical';
   mcp_http?: McpHttpConfig;
   browser_origins?: string[];

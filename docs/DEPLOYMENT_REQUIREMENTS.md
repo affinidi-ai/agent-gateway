@@ -5,8 +5,8 @@ source revision. If Affinidi hosts the appliance for you, use the hosted
 [Agent Gateway documentation](https://docs.affinidi.com/products/affinidi-trust-fabric/agent-gateway/)
 instead.
 
-Agent Gateway is a single process, `agent-gateway`. It needs no database and no sidecar:
-it keeps its state in memory and saves it as JSON files on disk. The web dashboard is a
+Agent Gateway is a single process, `agent-gateway`. It needs no database and no sidecar: it keeps its state in
+memory and saves it as JSON files on disk. The web dashboard is a
 folder of static files that the process serves.
 
 ## At a glance

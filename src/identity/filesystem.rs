@@ -172,6 +172,30 @@ pub struct AgentIdentityRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub private_key: Option<JsonValue>,
 
+    /// The VTA context whose key is this agent's, when the agent's private key
+    /// lives in a Verifiable Trust Agent rather than here (VTA-12).
+    ///
+    /// Mutually exclusive with [`private_key`](Self::private_key) in practice:
+    /// a VTA-backed agent has no local key, and an agent onboarded before the
+    /// migration has no context. Recorded explicitly rather than inferred from
+    /// the absence of a key, because "which agents still have a key on this
+    /// disk" is the question a migration has to be able to answer directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vta_context_id: Option<String>,
+
+    /// Which trust agent that context lives in.
+    ///
+    /// Recorded even while only one is configured, because the alternative is
+    /// inferring it later — and the day a second agent is connected, every
+    /// record written before then would have to be migrated on the assumption
+    /// that it meant the first one. Writing it down now costs a field and
+    /// makes that migration unnecessary.
+    ///
+    /// `None` means an agent onboarded before this was recorded; it resolves
+    /// to the bootstrap connection, which is the only one it could have used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vta_connection_id: Option<String>,
+
     /// The channel config ID where this identity was last used
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel_config_id: Option<String>,
@@ -231,6 +255,20 @@ impl StorableEntity for RotationHistory {
 }
 
 impl AgentIdentityRecord {
+    /// The record as a dashboard WebSocket frame carries it: everything but the
+    /// agent's private key.
+    ///
+    /// Every dashboard session receives these frames whatever its role, and the
+    /// key is the one field that lets a holder impersonate the agent. The
+    /// storage export redacts it for the same reason.
+    pub(crate) fn to_broadcast_json(&self) -> Option<JsonValue> {
+        let mut value = serde_json::to_value(self).ok()?;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("private_key");
+        }
+        Some(value)
+    }
+
     /// Stored origin, or `ExternalCaller` for legacy remote records; legacy local records stay unknown.
     pub fn effective_origin(&self) -> Option<IdentityOrigin> {
         match self.origin {
@@ -528,7 +566,7 @@ impl FilesystemIdentityStore {
 
         if is_new
             && let Some(ws) = &self.ws_state
-            && let Ok(identity_json) = serde_json::to_value(&record)
+            && let Some(identity_json) = record.to_broadcast_json()
         {
             info!(
                 did = %record.did,
@@ -661,7 +699,7 @@ impl IdentityStore for FilesystemIdentityStore {
 
             // Broadcast identity update via WebSocket
             if let Some(ws) = &self.ws_state {
-                if let Ok(identity_json) = serde_json::to_value(&record) {
+                if let Some(identity_json) = record.to_broadcast_json() {
                     info!(
                         did = %record.did,
                         usage_count = record.usage_count,
@@ -770,6 +808,8 @@ impl IdentityStore for FilesystemIdentityStore {
             is_local: false,   // External DID is remote
             verified,          // Track whether VP/VC signature was verified
             origin: Some(IdentityOrigin::ExternalCaller),
+            vta_context_id: None,
+            vta_connection_id: None,
             slot: None,
             credential_updated_at: None,
             rotations: Vec::new(),
@@ -828,7 +868,7 @@ impl IdentityStore for FilesystemIdentityStore {
         self.persist(&mut record)
             .await?;
         if let Some(ws) = &self.ws_state
-            && let Ok(identity_json) = serde_json::to_value(&record)
+            && let Some(identity_json) = record.to_broadcast_json()
         {
             ws.broadcast(crate::server::WsUpdate::IdentityUpdated { identity: identity_json });
         }
@@ -884,6 +924,8 @@ mod tests {
             last_used_at: None,
             channel_usage: vec![],
             private_key: None,
+            vta_context_id: None,
+            vta_connection_id: None,
             channel_config_id: None,
             is_local,
             verified: false,
@@ -929,6 +971,8 @@ mod tests {
             last_used_at: None,
             channel_usage: vec![],
             private_key: None,
+            vta_context_id: None,
+            vta_connection_id: None,
             channel_config_id: None,
             is_local: true,
             verified: true,
@@ -1015,6 +1059,8 @@ mod tests {
             last_used_at: None,
             channel_usage: vec![],
             private_key: None,
+            vta_context_id: None,
+            vta_connection_id: None,
             channel_config_id: None,
             is_local: true,
             verified: true,
@@ -1412,6 +1458,66 @@ mod tests {
         );
     }
 
+    /// An identity record written before VTA-12 has no `vta_context_id`, and
+    /// must keep loading. A deployment that upgrades and cannot read its own
+    /// agents has lost every managed identity it had.
+    #[test]
+    fn a_record_written_before_vta_backed_agents_still_loads() {
+        let pre_migration = serde_json::json!({
+            "did": "did:webvh:QmSomeScid:example.com:surface:abc",
+            "identity_hash": "hash-1",
+            "created_at": "2026-01-01T00:00:00Z",
+            "identity_fields": { "region": "eu" },
+            "usage_count": 7,
+            "private_key": { "kty": "OKP", "crv": "Ed25519", "x": "pub", "d": "priv" },
+            "is_local": true,
+            "verified": true
+        });
+
+        let record: AgentIdentityRecord =
+            serde_json::from_value(pre_migration).expect("a pre-migration record must still load");
+        assert_eq!(record.vta_context_id, None, "an old record is not VTA-backed");
+        assert!(
+            record.private_key.is_some(),
+            "its gateway-held key must survive the upgrade, or the agent stops being able to present"
+        );
+        assert_eq!(record.usage_count, 7);
+    }
+
+    /// Writing a record that is not VTA-backed must not change the file shape,
+    /// so an upgrade followed by a rollback leaves nothing a prior version
+    /// cannot read.
+    #[test]
+    fn a_non_vta_record_serialises_without_the_new_field() {
+        let record = AgentIdentityRecord {
+            did: "did:webvh:QmSomeScid:example.com:surface:abc".to_string(),
+            identity_hash: "hash-1".to_string(),
+            created_at: chrono::Utc::now(),
+            identity_fields: std::collections::HashMap::new(),
+            usage_count: 0,
+            last_used_at: None,
+            channel_usage: vec![],
+            private_key: None,
+            vta_context_id: None,
+            vta_connection_id: None,
+            channel_config_id: None,
+            is_local: true,
+            verified: true,
+            origin: None,
+            slot: None,
+            credential_updated_at: None,
+            rotations: Vec::new(),
+            rotation_count: 0,
+        };
+
+        let written = serde_json::to_value(&record).expect("serialise");
+        assert!(
+            written
+                .get("vta_context_id")
+                .is_none(),
+            "an absent context must be absent from the file, not written as null: {written}"
+        );
+    }
     fn at(seconds: i64) -> chrono::DateTime<chrono::Utc> {
         chrono::DateTime::from_timestamp(1_767_225_600 + seconds, 0).unwrap()
     }
@@ -1677,6 +1783,59 @@ mod tests {
                 .unwrap()
                 .total_rotations(),
             3
+        );
+    }
+
+    /// A legacy agent's key stays on disk, where it signs, and never reaches a
+    /// dashboard WebSocket frame: every session receives those, whatever its role.
+    #[tokio::test]
+    async fn no_identity_frame_carries_the_agents_private_key() {
+        const SECRET_SCALAR: &str = "c2VjcmV0LXNjYWxhci1vZi10aGUtYWdlbnQta2V5";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ws = Arc::new(crate::server::WsState::new(16));
+        let store = FilesystemIdentityStore::new_with_ws(temp_dir.path(), Some(Arc::clone(&ws)))
+            .await
+            .unwrap();
+        let mut updates = ws.subscribe();
+        let mut record = credential_record(mtls_fields("aa"), Some(at(0)));
+        record.private_key = Some(serde_json::json!({
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "cHVibGljLWhhbGY",
+            "d": SECRET_SCALAR,
+        }));
+
+        store
+            .create(record)
+            .await
+            .unwrap();
+        store
+            .update_usage("h", None, None)
+            .await
+            .unwrap();
+        store
+            .apply_managed_source("h", &observed(60), &mtls_fields("bb"))
+            .await
+            .unwrap();
+
+        let mut frames = Vec::new();
+        while let Ok(update) = updates.try_recv() {
+            frames.push(serde_json::to_string(&update).unwrap());
+        }
+        assert_eq!(frames.len(), 3, "a create and two updates: {frames:?}");
+        for frame in &frames {
+            assert!(!frame.contains(SECRET_SCALAR), "{frame}");
+            assert!(!frame.contains("private_key"), "{frame}");
+        }
+        assert!(
+            store
+                .find_by_hash("h")
+                .await
+                .unwrap()
+                .unwrap()
+                .private_key
+                .is_some(),
+            "the key the agent signs with is still stored"
         );
     }
 

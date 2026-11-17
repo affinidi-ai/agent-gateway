@@ -17,6 +17,7 @@ jest.mock('../../api', () => ({
     createDidWebVhIdentity: jest.fn(),
     listDidWebVhIdentities: jest.fn().mockResolvedValue({ identities: [] }),
     getIdentityRotations: jest.fn(),
+    fetch: jest.fn(),
   },
 }));
 
@@ -172,6 +173,11 @@ const mockAppContext: any = {
 describe('IdentitiesPage', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // The Issuers tab lists the trust agents its issuers sign through; resetMocks: true clears this.
+    require('../../api').apiClient.fetch.mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve([]),
+    });
     // Re-apply stringUtils mock implementations reset by resetMocks: true
     const stringUtils = require('../../utils/stringUtils');
     stringUtils.formatDateTime.mockImplementation((date: string) => `Formatted: ${date}`);

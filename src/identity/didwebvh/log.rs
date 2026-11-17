@@ -238,7 +238,7 @@ pub fn compute_entry_hash(
     let mut e = entry.clone();
     e.proof.clear();
     e.version_id = prev_version_id.to_string();
-    let canonical = serde_jcs::to_string(&e)?;
+    let canonical = serde_json_canonicalizer::to_string(&e)?;
     let digest = Sha256::digest(canonical.as_bytes());
     let multihash = build_sha256_multihash(&digest);
     Ok(bs58::encode(&multihash).into_string())
@@ -252,7 +252,7 @@ pub fn sign_entry(
     let mut to_sign = entry.clone();
     to_sign.proof.clear();
 
-    let doc_jcs = serde_jcs::to_string(&to_sign)?;
+    let doc_jcs = serde_json_canonicalizer::to_string(&to_sign)?;
 
     let proof_config = serde_json::json!({
         "type": "DataIntegrityProof",
@@ -260,7 +260,7 @@ pub fn sign_entry(
         "verificationMethod": verification_method,
         "proofPurpose": "assertionMethod"
     });
-    let proof_config_jcs = serde_jcs::to_string(&proof_config)?;
+    let proof_config_jcs = serde_json_canonicalizer::to_string(&proof_config)?;
 
     let hash_data: Vec<u8> =
         [Sha256::digest(proof_config_jcs.as_bytes()).as_slice(), Sha256::digest(doc_jcs.as_bytes()).as_slice()]

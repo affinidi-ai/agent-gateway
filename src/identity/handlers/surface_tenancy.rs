@@ -69,10 +69,119 @@ pub async fn validate_surface_references(
     authorizer
         .provider_keys(&provider_key_ids(surface)?)
         .await?;
+    validate_signing_connections(state, surface).await?;
     validate_target_auth_methods(state, surface).await?;
     super::surface_caller_key::validate_caller_key_secret(state, surface).await?;
     let https_proxies = super::surface_target_auth::https_mcp_proxies(state).await;
     super::surface_target_auth::validate_target_auth_rules(surface, stored, &https_proxies)
+}
+
+const SIGNING_CONNECTION_NOT_ACCESSIBLE: &str =
+    "signing.connection_id does not reference a trust agent connection this surface may sign through";
+
+/// Whether a surface owned by `owner_tenant_id` may sign through `connection`.
+///
+/// A trust agent connection holds the authority to sign as its owner, so a
+/// surface may reference only its own tenant's connection or an appliance-wide
+/// one, the same rule as a secret. A connection that does not exist counts as
+/// not accessible to a tenant surface, so the answer never reveals whether
+/// another tenant's connection id exists.
+fn may_sign_through(
+    owner_tenant_id: Option<&str>,
+    connection: Option<&crate::vta::connections::VtaConnection>,
+) -> bool {
+    match connection {
+        Some(connection) => can_reference(
+            owner_tenant_id,
+            connection
+                .tenant_id
+                .as_deref(),
+        ),
+        None => owner_tenant_id.is_none(),
+    }
+}
+
+/// Why a `signing.connection_id` was refused.
+#[derive(Debug)]
+pub(crate) enum SigningConnectionError {
+    /// The connection does not exist or belongs to another tenant.
+    NotAccessible,
+    /// The connection store could not be read.
+    Store(String),
+}
+
+impl SigningConnectionError {
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::NotAccessible => SIGNING_CONNECTION_NOT_ACCESSIBLE.to_string(),
+            Self::Store(error) => format!("could not read the trust agent connection: {error}"),
+        }
+    }
+}
+
+/// Every `signing.connection_id` in `blocks` must name a trust agent connection a resource owned
+/// by `owner_tenant_id` may sign through.
+///
+/// The appliance's own connections, the bootstrap one and the default, belong to no tenant and are
+/// always usable. Without this check a tenant could point a surface, or an issuer, at another
+/// tenant's connection and have its tokens signed by that tenant's key.
+pub(crate) async fn check_signing_connections<'a>(
+    store: &dyn crate::vta::connections::VtaConnectionStorage,
+    owner_tenant_id: Option<&str>,
+    blocks: impl Iterator<Item = &'a crate::config::agent_surface::SurfaceSigningConfig>,
+) -> Result<(), SigningConnectionError> {
+    for connection_id in blocks.filter_map(|signing| {
+        signing
+            .connection_id
+            .as_deref()
+    }) {
+        if connection_id == crate::vta::connections::BOOTSTRAP_CONNECTION_ID
+            || connection_id == crate::vta::key_directory::DEFAULT_CONNECTION_ID
+        {
+            continue;
+        }
+        let connection = store
+            .get(connection_id)
+            .await
+            .map_err(|e| SigningConnectionError::Store(e.to_string()))?;
+        if !may_sign_through(owner_tenant_id, connection.as_ref()) {
+            return Err(SigningConnectionError::NotAccessible);
+        }
+    }
+    Ok(())
+}
+
+/// A surface's (and each variant's) `signing.connection_id` must name a trust
+/// agent connection its tenant may use.
+async fn validate_signing_connections(
+    state: &IdentityApiState,
+    surface: &AgentSurface,
+) -> Result<(), SurfaceApiError> {
+    let Some(store) = state
+        .vta_connection_store
+        .as_ref()
+    else {
+        return Ok(());
+    };
+    let blocks = surface.signing.iter().chain(
+        surface
+            .variants
+            .iter()
+            .filter_map(|variant| {
+                variant
+                    .overrides
+                    .signing
+                    .as_ref()
+            }),
+    );
+    check_signing_connections(store.as_ref(), surface.tenant_id.as_deref(), blocks)
+        .await
+        .map_err(|error| match error {
+            SigningConnectionError::NotAccessible => {
+                SurfaceApiError::BadRequest(SIGNING_CONNECTION_NOT_ACCESSIBLE.to_string())
+            }
+            SigningConnectionError::Store(_) => SurfaceApiError::InternalError(error.message()),
+        })
 }
 
 /// Classifies each literal authority DID of `surface` by the register it is in, then refuses a
@@ -6382,5 +6491,58 @@ mod tests {
         .await
         .expect_err("a complete variant that clears the Target policy");
         assert!(message.starts_with("variant 'candidate' overrides.target.policy: "), "{message}");
+    }
+
+    fn connection_owned_by(tenant: Option<&str>) -> crate::vta::connections::VtaConnection {
+        let now = chrono::Utc::now();
+        crate::vta::connections::VtaConnection {
+            id: "c1".to_string(),
+            tenant_id: tenant.map(str::to_string),
+            name: "Agent".to_string(),
+            description: None,
+            enabled: true,
+            transport: crate::vta::connections::VtaConnectionTransport::Https,
+            endpoint: "https://vta.example".to_string(),
+            vta_did: "did:webvh:vta.example".to_string(),
+            default_context_id: None,
+            control_key_ref: None,
+            control_did: None,
+            control_key_state: Default::default(),
+            status: crate::vta::connections::VtaConnectionStatus::Unpaired,
+            keys: Default::default(),
+            pairing: Default::default(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn a_tenant_surface_may_sign_through_its_own_tenants_connection() {
+        assert!(may_sign_through(Some("tenant-a"), Some(&connection_owned_by(Some("tenant-a")))));
+    }
+
+    #[test]
+    fn a_tenant_surface_may_sign_through_an_appliance_wide_connection() {
+        assert!(may_sign_through(Some("tenant-a"), Some(&connection_owned_by(None))));
+    }
+
+    #[test]
+    fn a_tenant_surface_may_not_sign_through_another_tenants_connection() {
+        assert!(
+            !may_sign_through(Some("tenant-b"), Some(&connection_owned_by(Some("tenant-a")))),
+            "tenant B's tokens must not be signed by tenant A's key"
+        );
+    }
+
+    #[test]
+    fn an_appliance_wide_surface_may_not_sign_through_a_tenants_connection() {
+        assert!(!may_sign_through(None, Some(&connection_owned_by(Some("tenant-a")))));
+        assert!(may_sign_through(None, Some(&connection_owned_by(None))));
+    }
+
+    #[test]
+    fn a_missing_connection_is_not_accessible_to_a_tenant_so_existence_is_not_revealed() {
+        assert!(!may_sign_through(Some("tenant-b"), None));
+        assert!(may_sign_through(None, None), "an appliance-wide surface keeps its old behaviour");
     }
 }

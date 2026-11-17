@@ -125,9 +125,16 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
         try {
           const authCheck = await apiClient.fetch('/api/auth/check');
           if (authCheck.ok) {
-            await authCheck.json();
-            window.location.href = loginNextTarget(window.location) ?? ROUTES.DASHBOARD;
-            return;
+            // A 200 does not mean signed in: a token the server no longer knows (a
+            // wiped or restarted gateway) is answered with `authenticated: false`.
+            // The app shows this page for that answer, so redirecting here as well
+            // sent the browser round in circles. Forget the token and sign in.
+            const check = (await authCheck.json()) as { authenticated?: boolean };
+            if (check.authenticated) {
+              window.location.href = loginNextTarget(window.location) ?? ROUTES.DASHBOARD;
+              return;
+            }
+            sessionManager.forgetSessionToken();
           }
         } catch {
           // Not authenticated, continue to login

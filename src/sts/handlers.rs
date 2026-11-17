@@ -146,6 +146,10 @@ pub trait StsSigner: Send + Sync {
 pub struct VerifiedAssertion {
     pub claims: Value,
     pub principal_claim: String,
+    /// Verified against a key this gateway signs with or publishes, retired
+    /// keys included. The one answer to "did this gateway issue it", shared by
+    /// verification and by the exchange's refusal of self-issued tokens.
+    pub issued_here: bool,
 }
 
 impl VerifiedAssertion {
@@ -153,6 +157,15 @@ impl VerifiedAssertion {
         Self {
             claims,
             principal_claim: crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM.to_string(),
+            issued_here: false,
+        }
+    }
+
+    /// A token verified against this gateway's own keys.
+    pub fn issued_by_this_gateway(claims: Value) -> Self {
+        Self {
+            issued_here: true,
+            ..Self::named_by_sub(claims)
         }
     }
 }
@@ -200,16 +213,19 @@ pub trait StsClientRegistry: Send + Sync {
 
 // ── Production adapters ───────────────────────────────────────────────────────
 
-/// [`StsSigner`] backed by the gateway [`VCIssuer`] (EdDSA / gateway key).
+/// [`StsSigner`] backed by the gateway [`CredentialAuthority`] port (EdDSA /
+/// gateway key today; a VTA-backed authority later). Routing through the port
+/// rather than `VCIssuer` directly is what lets the signing move to a VTA
+/// without touching this call site (epic VTA integration, VTA-01).
 pub struct VcIssuerSigner {
-    pub vc_issuer: Arc<VCIssuer>,
+    pub authority: Arc<dyn crate::identity::authority::CredentialAuthority>,
 }
 
 #[async_trait::async_trait]
 impl StsSigner for VcIssuerSigner {
     async fn issuer(&self) -> Result<String, StsError> {
-        self.vc_issuer
-            .get_issuer_did()
+        self.authority
+            .issuer_did()
             .await
             .map_err(|e| StsError::ServerError(format!("issuer lookup failed: {e}")))
     }
@@ -218,8 +234,8 @@ impl StsSigner for VcIssuerSigner {
         &self,
         claims: &Value,
     ) -> Result<String, StsError> {
-        self.vc_issuer
-            .sign_jwt_with_gateway_key(claims)
+        self.authority
+            .sign_token(claims)
             .await
             .map_err(|e| StsError::ServerError(format!("token signing failed: {e}")))
     }
@@ -228,8 +244,8 @@ impl StsSigner for VcIssuerSigner {
         &self,
         claims: &Value,
     ) -> Result<String, StsError> {
-        self.vc_issuer
-            .sign_jwt_with_gateway_key_typ(claims, ID_JAG_JWT_TYP)
+        self.authority
+            .sign_token_typ(claims, ID_JAG_JWT_TYP)
             .await
             .map_err(|e| StsError::ServerError(format!("token signing failed: {e}")))
     }
@@ -238,15 +254,15 @@ impl StsSigner for VcIssuerSigner {
         &self,
         claims: &Value,
     ) -> Result<String, StsError> {
-        self.vc_issuer
-            .sign_jwt_with_gateway_key_typ(claims, "at+jwt")
+        self.authority
+            .sign_token_typ(claims, "at+jwt")
             .await
             .map_err(|error| StsError::ServerError(format!("token signing failed: {error}")))
     }
 
     async fn public_jwks(&self) -> Result<Value, StsError> {
-        self.vc_issuer
-            .signing_public_jwks()
+        self.authority
+            .issuer_jwks()
             .await
             .map_err(|e| StsError::ServerError(format!("jwks projection failed: {e}")))
     }
@@ -262,19 +278,26 @@ pub struct JwtBearerSubjectVerifier {
     /// gateway was signed with the gateway key, so it is verified against our own
     /// published JWKS — a gateway-issued ID-JAG can be redeemed on the loopback
     /// (issuer == resource AS) without an operator-configured self-trust strategy.
-    self_issuer: Arc<VCIssuer>,
+    ///
+    /// This is the **same `CredentialAuthority` that mints tokens** (VTA-09), not
+    /// the local issuer. The two must agree: minting takes `iss` from
+    /// `authority.issuer_did()`, so resolving self-trust from anywhere else would
+    /// make the gateway fail to recognise its own tokens the moment signing moved
+    /// to a VTA — loopback ID-JAG redemption would break with "no verification
+    /// strategy for issuer …".
+    self_authority: Arc<dyn crate::identity::authority::CredentialAuthority>,
 }
 
 impl JwtBearerSubjectVerifier {
     pub fn new(
         verifier: Arc<crate::jwt_bearer::JwtBearerVerifier>,
         strategies: Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>,
-        self_issuer: Arc<VCIssuer>,
+        self_authority: Arc<dyn crate::identity::authority::CredentialAuthority>,
     ) -> Self {
         Self {
             verifier,
             strategies,
-            self_issuer,
+            self_authority,
         }
     }
 
@@ -284,8 +307,8 @@ impl JwtBearerSubjectVerifier {
         issuer: &str,
     ) -> Result<Value, StsError> {
         let jwks = self
-            .self_issuer
-            .signing_public_jwks()
+            .self_authority
+            .issuer_jwks()
             .await
             .map_err(|error| StsError::ServerError(format!("gateway jwks projection failed: {error}")))?;
         let strategy = gateway_self_trust_strategy(issuer, &jwks)?;
@@ -311,16 +334,46 @@ impl StsSubjectVerifier for JwtBearerSubjectVerifier {
         // ID-JAG can be redeemed on the loopback (issuer == resource AS) without
         // an operator-configured verification strategy for our own DID. Genuinely
         // external issuers continue through the strategy store below.
+        //
+        // Resolved from the **signing authority**, so this keeps working when
+        // signing moves to a VTA: `iss` and the verification keys then both come
+        // from the VTA rather than from the local issuer (VTA-09).
         if let Ok(self_did) = self
-            .self_issuer
-            .get_issuer_did()
+            .self_authority
+            .issuer_did()
             .await
             && iss == self_did
         {
+            // NOTE: `enforce_self_issued_subject_claims` is deliberately *not*
+            // applied here. It demands `aud == self_did`, which holds for a
+            // loopback ID-JAG redemption but not for the legacy exchange of a
+            // gateway-issued access token, whose audience is the resource —
+            // see `sts_token_exchange.feature`, "An agent exchanges a token the
+            // gateway issued without outliving the identity assertion". The
+            // role-confusion case that rule targets is already refused by
+            // `reject_self_issued` on the exchange path, which knows the role
+            // the token is being presented in; this verifier does not.
             return self
                 .verify_local_jwt(token, &self_did)
                 .await
-                .map(VerifiedAssertion::named_by_sub);
+                .map(VerifiedAssertion::issued_by_this_gateway);
+        }
+
+        // A VTA-signed token claims the `did:key` of the key that signed it, so
+        // a surface mapped to its own key, or a key retired by a rotation,
+        // claims a different issuer than the appliance's current one. It is
+        // still ours when that key is one this gateway publishes.
+        if iss.starts_with("did:key:")
+            && let Ok(jwks) = self
+                .self_authority
+                .issuer_jwks()
+                .await
+            && jwks_publishes_did_key(&jwks, &iss)
+        {
+            return self
+                .verify_local_jwt(token, &iss)
+                .await
+                .map(VerifiedAssertion::issued_by_this_gateway);
         }
 
         let strategies = self
@@ -420,7 +473,13 @@ async fn verify_with_client_strategies(
             .validate(token, &strategy, &[], crate::jwt_bearer::models::AudienceClaim::Aud)
             .await
         {
-            Ok(claims) => return Ok(VerifiedAssertion { claims, principal_claim }),
+            Ok(claims) => {
+                return Ok(VerifiedAssertion {
+                    claims,
+                    principal_claim,
+                    issued_here: false,
+                });
+            }
             Err(error) => failure = Some(error),
         }
     }
@@ -911,6 +970,7 @@ pub async fn jwks_endpoint(State(state): State<StsState>) -> Response {
 /// otherwise issuance proceeds under the static managed-connection allowlists.
 pub fn build_sts_router(
     vc_issuer: Arc<VCIssuer>,
+    signing_authority: Arc<dyn crate::identity::authority::CredentialAuthority>,
     jwks_client: Option<Arc<crate::jwt_bearer::JwksClient>>,
     strategy_store: Option<Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>>,
     client_store: Option<Arc<dyn crate::sts::store::StsClientStorage>>,
@@ -923,10 +983,14 @@ pub fn build_sts_router(
     let verifier: Arc<dyn StsSubjectVerifier> = match (jwks_client, strategy_store) {
         (Some(jwks), Some(store)) => {
             let jwt_verifier = Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(jwks));
-            Arc::new(JwtBearerSubjectVerifier::new(jwt_verifier, store, vc_issuer.clone()))
+            // Self-trust resolves from the **signing** authority, so the gateway
+            // recognises its own tokens whichever backend minted them (VTA-09).
+            Arc::new(JwtBearerSubjectVerifier::new(jwt_verifier, store, Arc::clone(&signing_authority)))
         }
         _ => Arc::new(DisabledSubjectVerifier),
     };
+    // VP verification stays on the local issuer by design: it is a public-key
+    // operation with no secret, so it needs no VTA hop (VTA-08).
     let vp_verifier: Arc<dyn StsVpVerifier> = Arc::new(VcIssuerVpVerifier { vc_issuer: vc_issuer.clone() });
     let clients: Arc<dyn StsClientRegistry> = match (client_store, secrets_store) {
         (Some(store), Some(secrets)) => Arc::new(crate::sts::store::StoreBackedClientRegistry::new(store, secrets)),
@@ -943,7 +1007,7 @@ pub fn build_sts_router(
     let replay = crate::sts::replay::build_replay_backend(&config.replay_backend);
     let throttle = Arc::new(crate::sts::throttle::TokenEndpointThrottle::from_config(&config.throttle));
     let state = StsState {
-        signer: Arc::new(VcIssuerSigner { vc_issuer }),
+        signer: Arc::new(VcIssuerSigner { authority: signing_authority }),
         verifier,
         vp_verifier,
         clients,
@@ -1044,6 +1108,7 @@ async fn handle_token_exchange(
     let VerifiedAssertion {
         claims: subject_claims,
         principal_claim: subject_claim,
+        issued_here: subject_issued_here,
     } = verify_assertion(state, req.subject_token_type, &req.subject_token, profile, record.tenant_id.as_deref())
         .await?;
     let mut assertion_expiry = None;
@@ -1051,7 +1116,15 @@ async fn handle_token_exchange(
         .subject_token_type
         .is_jwt_shaped()
     {
-        reject_self_issued(state, &gateway_did, profile, "subject", &req.subject_token, &subject_claims)?;
+        reject_self_issued(
+            state,
+            &gateway_did,
+            profile,
+            "subject",
+            &req.subject_token,
+            &subject_claims,
+            subject_issued_here,
+        )?;
         if let Some(profile) = profile {
             if record
                 .allowed_subject_audiences
@@ -1087,9 +1160,18 @@ async fn handle_token_exchange(
             let VerifiedAssertion {
                 claims: actor_claims,
                 principal_claim: actor_claim,
+                issued_here: actor_issued_here,
             } = verify_assertion(state, actor_type, actor_token, profile, record.tenant_id.as_deref()).await?;
             if actor_type.is_jwt_shaped() {
-                reject_self_issued(state, &gateway_did, profile, "actor", actor_token, &actor_claims)?;
+                reject_self_issued(
+                    state,
+                    &gateway_did,
+                    profile,
+                    "actor",
+                    actor_token,
+                    &actor_claims,
+                    actor_issued_here,
+                )?;
                 let actor_expiry = match profile {
                     Some(profile) => {
                         let expiry = profile.validate_subject(&actor_claims, &actor_claim, now_secs())?;
@@ -1311,7 +1393,7 @@ async fn handle_jwt_bearer(
         .await?;
 
     let tenant_id = record.tenant_id.as_deref();
-    let VerifiedAssertion { claims, principal_claim } = match profile {
+    let VerifiedAssertion { claims, principal_claim, .. } = match profile {
         Some(profile) => {
             state
                 .verifier
@@ -1698,6 +1780,33 @@ pub(crate) fn gateway_self_trust_strategy(
     })
 }
 
+/// Whether `jwks` publishes the Ed25519 key that `did` (a `did:key`) is.
+fn jwks_publishes_did_key(
+    jwks: &Value,
+    did: &str,
+) -> bool {
+    use base64::Engine;
+    let Some(multibase_key) = did.strip_prefix("did:key:") else {
+        return false;
+    };
+    let Ok((_base, bytes)) = multibase::decode(multibase_key) else {
+        return false;
+    };
+    if bytes.len() != 34 || bytes[..2] != [0xed, 0x01] {
+        return false;
+    }
+    let x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes[2..]);
+    jwks.get("keys")
+        .and_then(Value::as_array)
+        .is_some_and(|keys| {
+            keys.iter().any(|k| {
+                k.get("x")
+                    .and_then(Value::as_str)
+                    == Some(x.as_str())
+            })
+        })
+}
+
 /// Read the (unverified) `iss` from a JWT for strategy selection. The signature
 /// is verified afterwards against the resolved strategy — this only routes.
 fn decode_unverified_issuer(token: &str) -> Option<String> {
@@ -1766,10 +1875,11 @@ fn claimed_expiry(claims: &Value) -> Option<u64> {
 }
 
 /// Refuse a verified exchange subject or actor that this gateway signed, under
-/// its DID or its MCP issuer, unless the legacy endpoint receives one of its own
-/// access tokens (`typ: JWT`). Its ID-JAGs are consumed only through single-use
-/// jwt-bearer redemption, its peer issuer attestations never become subjects,
-/// and the MCP profile exchanges only external assertions.
+/// its DID, any key it publishes (`issued_here`, decided by the verifier) or its
+/// MCP issuer, unless the legacy endpoint receives one of its own access tokens
+/// (`typ: JWT`). Its ID-JAGs are consumed only through single-use jwt-bearer
+/// redemption, its peer issuer attestations never become subjects, and the MCP
+/// profile exchanges only external assertions.
 fn reject_self_issued(
     state: &StsState,
     gateway_did: &str,
@@ -1777,6 +1887,7 @@ fn reject_self_issued(
     role: &str,
     token: &str,
     claims: &Value,
+    issued_here: bool,
 ) -> Result<(), StsError> {
     let Some(issuer) = claims
         .get("iss")
@@ -1787,7 +1898,8 @@ fn reject_self_issued(
     let is_mcp_issuer = |profile: Option<&crate::sts::mcp_profile::McpIssuerProfile>| {
         profile.is_some_and(|profile| profile.issuer == issuer)
     };
-    let self_issued = issuer == gateway_did
+    let gateway_signed = issued_here || issuer == gateway_did;
+    let self_issued = gateway_signed
         || is_mcp_issuer(profile)
         || is_mcp_issuer(
             state
@@ -1795,9 +1907,8 @@ fn reject_self_issued(
                 .mcp_issuer
                 .as_ref(),
         );
-    let legacy_access_token = profile.is_none()
-        && issuer == gateway_did
-        && parse_jose_typ(token).is_some_and(|typ| typ.eq_ignore_ascii_case("JWT"));
+    let legacy_access_token =
+        profile.is_none() && gateway_signed && parse_jose_typ(token).is_some_and(|typ| typ.eq_ignore_ascii_case("JWT"));
     if !self_issued || legacy_access_token {
         return Ok(());
     }
@@ -4003,6 +4114,7 @@ mod tests {
                 .map(|claims| VerifiedAssertion {
                     claims,
                     principal_claim: "oid".to_string(),
+                    issued_here: false,
                 })
                 .ok_or_else(|| StsError::InvalidGrant("unknown test token".to_string()))
         }
@@ -4198,10 +4310,56 @@ mod tests {
     }
 
     #[test]
+    fn a_did_key_issuer_is_ours_only_when_its_key_is_published() {
+        let x_bytes = [7u8; 32];
+        let mut prefixed = vec![0xed, 0x01];
+        prefixed.extend_from_slice(&x_bytes);
+        let did = format!("did:key:{}", multibase::encode(multibase::Base::Base58Btc, &prefixed));
+        let x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(x_bytes);
+
+        let published = json!({ "keys": [{ "kty": "OKP", "crv": "Ed25519", "x": x, "kid": "k" }] });
+        assert!(jwks_publishes_did_key(&published, &did));
+
+        let other = json!({ "keys": [{ "kty": "OKP", "crv": "Ed25519", "x": "AAAA", "kid": "k" }] });
+        assert!(!jwks_publishes_did_key(&other, &did), "a key we do not publish is not ours");
+        assert!(!jwks_publishes_did_key(&published, "did:web:example.com"), "only a did:key can be matched");
+        assert!(!jwks_publishes_did_key(&published, "did:key:not-multibase!"));
+    }
+
+    #[test]
     fn gateway_self_trust_strategy_rejects_jwks_without_keys() {
         let err = gateway_self_trust_strategy("did:webvh:example:gw", &json!({}))
             .expect_err("jwks without a keys array must error");
         assert!(matches!(err, StsError::ServerError(_)));
+    }
+
+    /// Self-trust has to survive a rotation. Since VTA-17 the published JWKS
+    /// carries the active key **and** any retiring/carried-over keys, so a
+    /// token minted just before a rotation must still be recognisable on the
+    /// loopback afterwards — which means every key has to reach the strategy.
+    #[test]
+    fn gateway_self_trust_strategy_carries_every_published_key() {
+        let jwks = json!({
+            "keys": [
+                { "kty": "OKP", "crv": "Ed25519", "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+                  "use": "sig", "alg": "EdDSA", "kid": "vta-active" },
+                { "kty": "OKP", "crv": "Ed25519", "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+                  "use": "sig", "alg": "EdDSA", "kid": "vta-retiring" },
+                { "kty": "OKP", "crv": "Ed25519", "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+                  "use": "sig", "alg": "EdDSA", "kid": "key-1" }
+            ]
+        });
+        let strategy = gateway_self_trust_strategy("did:webvh:example:gw", &jwks).expect("a multi-key jwks projects");
+        match strategy.jwks_source {
+            crate::jwt_bearer::models::JwksSource::Static { jwks } => {
+                let kids: Vec<&str> = jwks
+                    .iter()
+                    .filter_map(|k| k.kid.as_deref())
+                    .collect();
+                assert_eq!(kids, vec!["vta-active", "vta-retiring", "key-1"], "every key is carried: {kids:?}");
+            }
+            other => panic!("expected a Static jwks source, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4257,5 +4415,303 @@ mod tests {
     #[test]
     fn decode_unverified_issuer_rejects_non_jwt() {
         assert_eq!(decode_unverified_issuer("not-a-jwt"), None);
+    }
+
+    // ── VTA-17 / SEC0-6115 condition 6: subject-path hardening ───────────────
+
+    /// The DID `state_with` reports as this gateway's issuer.
+    const GATEWAY_DID: &str = "did:webvh:example:gw";
+
+    /// A state with no client and no verifier claims: `reject_self_issued`
+    /// reads only `config.mcp_issuer`, so nothing else has to be stood up.
+    fn self_issued_state() -> StsState {
+        state_with(HashMap::new(), client(base_record(), Some("s3cret")))
+    }
+
+    fn jwt_with(
+        header: &str,
+        payload: &str,
+    ) -> String {
+        let b64 = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s);
+        format!("{}.{}.sig", b64(header), b64(payload))
+    }
+
+    #[test]
+    fn an_id_jag_cannot_be_presented_as_a_subject_token() {
+        // An ID-JAG has its own redemption grant (`jwt-bearer`). Accepting one
+        // as a subject assertion would let a caller exchange it for a token
+        // with a different audience.
+        let claims = json!({ "iss": GATEWAY_DID });
+        let token = typed_assertion(ID_JAG_JWT_TYP, &claims);
+        let state = self_issued_state();
+        let err = reject_self_issued(&state, GATEWAY_DID, None, "subject", &token, &claims, false)
+            .expect_err("an ID-JAG must be refused");
+        assert!(matches!(err, StsError::UnsupportedTokenType(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn an_access_token_cannot_be_presented_as_a_subject_token() {
+        // `at+jwt` is a resource credential, not a statement about who someone
+        // is, so the legacy `typ: JWT` exemption must not extend to it.
+        let claims = json!({ "iss": GATEWAY_DID });
+        let token = typed_assertion("at+jwt", &claims);
+        let state = self_issued_state();
+        assert!(
+            reject_self_issued(&state, GATEWAY_DID, None, "subject", &token, &claims, false).is_err(),
+            "an access token is a resource credential, not an identity assertion"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_assertion_is_accepted_as_a_subject_token() {
+        // A third-party assertion must keep working whatever `typ` it carries —
+        // the refusal is scoped to what *this gateway* issued, so an external
+        // IdP's ID-JAG is none of its business.
+        let claims = json!({ "iss": "https://idp.example" });
+        let state = self_issued_state();
+        for typ in ["JWT", ID_JAG_JWT_TYP, "at+jwt"] {
+            let token = typed_assertion(typ, &claims);
+            reject_self_issued(&state, GATEWAY_DID, None, "subject", &token, &claims, false)
+                .unwrap_or_else(|e| panic!("an external {typ} should pass: {e:?}"));
+        }
+    }
+
+    /// The one gateway-issued artifact the legacy endpoint still accepts.
+    #[test]
+    fn the_legacy_endpoint_still_accepts_its_own_access_token() {
+        let claims = json!({ "iss": GATEWAY_DID });
+        let token = typed_assertion("JWT", &claims);
+        let state = self_issued_state();
+        reject_self_issued(&state, GATEWAY_DID, None, "subject", &token, &claims, false)
+            .expect("the legacy exchange accepts one of its own `typ: JWT` access tokens");
+    }
+
+    // ── VTA-09: self-trust follows the signing authority ─────────────────────
+
+    /// A `CredentialAuthority` standing in for a VTA-backed signer: its issuer
+    /// DID is **not** the local gateway's.
+    struct BackendAuthority {
+        issuer_did: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::identity::authority::CredentialAuthority for BackendAuthority {
+        async fn issuer_did(&self) -> anyhow::Result<String> {
+            Ok(self.issuer_did.clone())
+        }
+
+        async fn issuer_jwks(&self) -> anyhow::Result<Value> {
+            Ok(json!({
+                "keys": [{
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+                    "use": "sig",
+                    "alg": "EdDSA",
+                    "kid": "vta-key"
+                }]
+            }))
+        }
+
+        async fn sign_token(
+            &self,
+            _claims: &Value,
+        ) -> anyhow::Result<String> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn sign_token_typ(
+            &self,
+            _claims: &Value,
+            _typ: &str,
+        ) -> anyhow::Result<String> {
+            unimplemented!("not exercised by this test")
+        }
+    }
+
+    /// A strategy store that knows about nobody, so the only way a token can be
+    /// recognised is via the self-trust path.
+    struct EmptyStrategies;
+
+    #[async_trait::async_trait]
+    impl crate::jwt_bearer::JwtVerificationStrategyStorage for EmptyStrategies {
+        async fn create(
+            &self,
+            strategy: crate::jwt_bearer::models::JwtVerificationStrategy,
+        ) -> anyhow::Result<crate::jwt_bearer::models::JwtVerificationStrategy> {
+            Ok(strategy)
+        }
+
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<Option<crate::jwt_bearer::models::JwtVerificationStrategy>> {
+            Ok(None)
+        }
+
+        async fn list(&self) -> anyhow::Result<Vec<crate::jwt_bearer::models::JwtVerificationStrategy>> {
+            Ok(Vec::new())
+        }
+
+        async fn update(
+            &self,
+            strategy: crate::jwt_bearer::models::JwtVerificationStrategy,
+        ) -> anyhow::Result<crate::jwt_bearer::models::JwtVerificationStrategy> {
+            Ok(strategy)
+        }
+
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn subject_verifier_for(issuer_did: &str) -> JwtBearerSubjectVerifier {
+        let jwks_client = Arc::new(crate::jwt_bearer::JwksClient::new());
+        let jwt_verifier = Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(jwks_client));
+        JwtBearerSubjectVerifier::new(
+            jwt_verifier,
+            Arc::new(EmptyStrategies),
+            Arc::new(BackendAuthority {
+                issuer_did: issuer_did.to_string(),
+            }),
+        )
+    }
+
+    /// The regression this ticket exists to prevent: when signing moves to a
+    /// VTA, minted tokens carry the **VTA's** issuer DID. If self-trust were
+    /// still resolved from the local issuer, the gateway would stop recognising
+    /// its own tokens and loopback ID-JAG redemption would fail with "no
+    /// verification strategy for issuer …".
+    ///
+    /// The token here is unsigned, so verification must still fail — but it has
+    /// to fail *having taken the self-trust path*, which the error distinguishes.
+    #[tokio::test]
+    async fn self_trust_recognises_the_signing_authoritys_issuer() {
+        let vta_did = "did:webvh:vta.example:gateway";
+        let verifier = subject_verifier_for(vta_did);
+        let token = jwt_with(r#"{"alg":"EdDSA","typ":"JWT"}"#, &format!(r#"{{"iss":"{vta_did}","sub":"u"}}"#));
+
+        let err = verifier
+            .verify_jwt(&token, None)
+            .await
+            .expect_err("an unsigned token never verifies");
+        let text = err.to_string();
+        assert!(
+            !text.contains("no verification strategy"),
+            "the token must be recognised as self-issued, not fall through to the strategy store: {text}"
+        );
+        assert!(text.contains("verification failed"), "it fails at signature verification: {text}");
+    }
+
+    /// A genuinely foreign issuer still falls through to the strategy store.
+    #[tokio::test]
+    async fn an_unknown_issuer_still_falls_through_to_the_strategy_store() {
+        let verifier = subject_verifier_for("did:webvh:vta.example:gateway");
+        let token = jwt_with(r#"{"alg":"RS256","typ":"JWT"}"#, r#"{"iss":"https://idp.example","sub":"u"}"#);
+
+        let err = verifier
+            .verify_jwt(&token, None)
+            .await
+            .expect_err("no strategy is registered");
+        assert!(
+            err.to_string()
+                .contains("no verification strategy"),
+            "an unknown issuer is not self-trusted: {err}"
+        );
+    }
+
+    /// The active signing authority after a rotation: it signs as a VTA DID and
+    /// still publishes the key the rotation retired.
+    struct RotatedAuthority {
+        retired_x: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::identity::authority::CredentialAuthority for RotatedAuthority {
+        async fn issuer_did(&self) -> anyhow::Result<String> {
+            Ok(ROTATED_ISSUER.to_string())
+        }
+
+        async fn issuer_jwks(&self) -> anyhow::Result<Value> {
+            Ok(json!({ "keys": [
+                { "kty": "OKP", "crv": "Ed25519", "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo", "kid": "active" },
+                { "kty": "OKP", "crv": "Ed25519", "x": self.retired_x, "kid": "retired" },
+            ]}))
+        }
+
+        async fn sign_token(
+            &self,
+            _claims: &Value,
+        ) -> anyhow::Result<String> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn sign_token_typ(
+            &self,
+            _claims: &Value,
+            _typ: &str,
+        ) -> anyhow::Result<String> {
+            unimplemented!("not exercised by this test")
+        }
+    }
+
+    const ROTATED_ISSUER: &str = "did:webvh:vta.example:gateway";
+
+    /// An ID-JAG signed by a key the gateway retired is still one the gateway
+    /// issued: the verifier accepts it as the gateway's own, so the exchange
+    /// must refuse it as a subject token exactly as it refuses one signed by the
+    /// active key, rather than letting it skip single-use jwt-bearer redemption.
+    #[tokio::test]
+    async fn an_id_jag_signed_by_a_retired_key_cannot_be_exchanged() {
+        let retired = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
+        let public = retired.verifying_key();
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let mut multicodec = vec![0xed, 0x01];
+        multicodec.extend_from_slice(public.as_bytes());
+        let retired_did = format!("did:key:{}", multibase::encode(multibase::Base::Base58Btc, &multicodec));
+        let now = now_secs();
+        let claims = json!({
+            "iss": retired_did, "sub": "user-1", "aud": ROTATED_ISSUER,
+            "iat": now, "exp": now + 300, "jti": "retired-id-jag",
+        });
+        let signing_input = format!(
+            "{}.{}",
+            b64(json!({ "alg": "EdDSA", "typ": ID_JAG_JWT_TYP, "kid": "retired" })
+                .to_string()
+                .as_bytes()),
+            b64(claims.to_string().as_bytes()),
+        );
+        let signature = ed25519_dalek::Signer::sign(&retired, signing_input.as_bytes());
+        let token = format!("{signing_input}.{}", b64(&signature.to_bytes()));
+
+        let jwt_verifier =
+            Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(Arc::new(crate::jwt_bearer::JwksClient::new())));
+        let mut state = self_issued_state();
+        state.signer = Arc::new(MockSigner {
+            issuer: ROTATED_ISSUER.to_string(),
+        });
+        state.verifier = Arc::new(JwtBearerSubjectVerifier::new(
+            jwt_verifier,
+            Arc::new(EmptyStrategies),
+            Arc::new(RotatedAuthority {
+                retired_x: b64(public.as_bytes()),
+            }),
+        ));
+        let verified = state
+            .verifier
+            .verify_jwt(&token, None)
+            .await
+            .expect("a token signed by a published retired key verifies as the gateway's own");
+        assert!(verified.issued_here);
+
+        let mut form = exchange_form();
+        form.subject_token = Some(token);
+        let err = dispatch_with_profile(&state, &HeaderMap::new(), form, None)
+            .await
+            .expect_err("a gateway-issued ID-JAG is redeemed through jwt-bearer, never exchanged");
+        assert!(matches!(err, StsError::UnsupportedTokenType(_)), "got {err:?}");
     }
 }

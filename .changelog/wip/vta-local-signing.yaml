@@ -1,0 +1,460 @@
+branch: vta-local-signing
+changes:
+  added:
+    - timestamp: '2026-10-23T07:00:00.000Z'
+      title: ⭐ Let the gateway sign through a Verifiable Trust Agent it doesn't control
+      description: >-
+        The gateway can be connected to a Verifiable Trust Agent (VTA) and sign
+        through it, so the private keys it signs with no longer need to sit on
+        its own disk. Once connected, the key the gateway signs its own tokens and
+        credentials with, the keys of agents onboarded from then on (created
+        inside the agent, never held by the gateway), the issuer attestation a
+        peer gateway receives and the credential carried inside a forwarded
+        request are all signed by the agent. The gateway is granted the initiator
+        role in one context and may create only sub-contexts under it, never
+        administer the agent. Connecting is optional and forward-only: an
+        installation that connects nothing signs exactly as before, with the same
+        keys in the same places, and agents onboarded before connecting keep their
+        keys, since moving them would change their DIDs. Everything is set up from
+        the dashboard, and the key management inventory lists which keys still
+        live on the gateway and why.
+    - timestamp: '2026-11-10T16:00:00Z'
+      title: Rotate a custom connection's control key from its row in Connections
+      description: >-
+        A connection added by hand with a did:webvh identity shows which key it
+        signs in with and when it was last rotated, and has a Rotate control key
+        action (for users who can manage keys) that asks first. While a rotation
+        is under way the row says so, shows the last error and offers Cancel
+        rotation, and the page refreshes itself every ten seconds. Connections
+        that authenticate as a did:key show none of this.
+    - timestamp: '2026-11-10T15:30:00Z'
+      title: Rotate a connection's control key from the API, with cancel
+      description: >-
+        POST /v1/vta/connections/{id}/control-key/rotate replaces the control key
+        of a connection added by hand, keeping its DID: 200 when it finished, 202
+        while it carries on, 502 when the trust agent refused the new key and the
+        old one was put back. POST .../rotate/cancel stops a rotation that has not
+        switched. The connection list shows when the key was last rotated and a
+        rotation under way, without naming the secrets. Editing a connection no
+        longer resets which of its DID's keys the gateway signs in with, and is
+        refused while a rotation is under way.
+    - timestamp: '2026-11-10T15:00:00Z'
+      title: ⭐ Rotate a custom trust agent connection's control key, keeping its DID
+      description: >-
+        The gateway can now replace the control key of a connection you added
+        yourself without a new grant on the trust agent: the connection's
+        did:webvh stays the same, the new key joins its published document beside
+        the old one, the gateway signs in with it, and the old key is removed. A
+        new key the trust agent refuses is retried and then rolled back, leaving
+        the old key in use, and a rotation a restart interrupted is resumed. A new
+        setting, `[vta] connection_key_switch_timeout_secs`, sets how long it
+        retries.
+    - timestamp: '2026-11-10T11:00:00Z'
+      title: Show when the control key was rotated, with a Rotate button
+      description: >-
+        The Verifiable Trust Agent tab in Connections has a card for the key the gateway authenticates to
+        its trust agent with: the control DID, when it was last rotated, when it
+        is next due, and a Rotate control key button for users who can edit key
+        management. The button asks for confirmation, rotates through the API,
+        and says how long to wait when a rotation was just done. It shows only
+        while the gateway holds a did:key control key it can rotate.
+    - timestamp: '2026-11-10T10:30:00Z'
+      title: Rotate the gateway's trust agent control key from the API
+      description: >-
+        POST /v1/vta/control-key/rotate moves the gateway's access entry on its
+        trust agent to a new control did:key now, with acl/swap-key. It needs key
+        management edit rights, is refused with 429 and a Retry-After for ten
+        minutes after the last rotation, with 404 when the gateway holds no
+        did:key control key it can rotate, and answers 502 when the agent
+        refuses, leaving the current key in use. The new --vta-print-control-did
+        command prints the stored key's DID for granting it again after a backup
+        restore.
+    - timestamp: '2026-11-10T10:00:00Z'
+      title: Rotate the gateway's trust agent control key on a schedule
+      description: >-
+        Setting `[vta] control_key_rotation_days` makes the gateway rotate the
+        control did:key it authenticates to its trust agent with at that
+        interval while it runs. The active gateway does it, with a random delay
+        of up to six hours; a failure keeps the current key, retries with a
+        growing wait and logs an error after three in a row. It is off by
+        default. The status API reports the days, when the key last rotated and
+        when it is next due. An interrupted rotation is finished at the next
+        start.
+    - timestamp: '2026-11-10T09:00:00Z'
+      title: Rotate the gateway's trust agent control key without a restart
+      description: >-
+        The gateway's did:key control key for its trust agent can be moved to a
+        new key while the gateway runs, through the connection it already has,
+        so requests in flight keep working. The signing keys and issuer do not
+        change.
+    - timestamp: '2026-11-09T16:00:00Z'
+      title: Let a surface sign through the trust agent configured in [vta] by name
+      description: >-
+        A surface could not name the trust agent configured in the [vta] block:
+        its record was treated as having no control key, so the surface fell
+        back to local signing, and the Surface Builder greyed it out as "not
+        ready". The record now validates without a secrets-store control key and
+        shows its signing key once connected, so a surface can be pinned to it
+        while the appliance default is another trust agent.
+    - timestamp: '2026-11-16T12:00:00Z'
+      title: Choose a trust agent to sign for an issuer's surfaces
+      description: >-
+        An issuer can set which backend signs for the surfaces it owns, local or
+        one of the connected trust agents, in the issuer editor, and the Issuers
+        list shows the choice. A surface or variant that sets its own signing
+        keeps it; a surface that sets none follows its issuer, then the appliance
+        default. An issuer can only name a trust agent connection its tenant may
+        use.
+  changed:
+    - timestamp: '2026-11-11T18:00:00Z'
+      title: ⭐ Sign with the gateway's own keys through the VTA library
+      description: >-
+        With no trust agent connected, the gateway now signs its tokens, agent
+        credentials, presentations and did:webvh log entries through
+        the VTA's signing library, `vta-signing`, instead of with its own
+        signing code. Keys, DIDs, key ids and the published JWKS are unchanged,
+        credential proofs stay eddsa-rdfc-2022 so peers that verify them keep
+        accepting them, and a signing fix now lands in one place for local and
+        remote signing. The gateway keeps no key store and links no VTA server code.
+    - timestamp: '2026-11-08T21:30:00Z'
+      title: Stop granting raw sign to the gateway on a trust agent
+      description: >-
+        The grant command the gateway prints for a trust agent no longer names
+        the raw sign capability, because no gateway code path calls keys/sign;
+        it signs through sign-jws and sign-document. Existing grants that
+        still carry sign keep working.
+    - timestamp: '2026-11-08T21:00:00Z'
+      title: Let the gateway authenticate to a trust agent as a did:key
+      description: >-
+        A new [vta] control_did_method setting (did_key or did_webvh) chooses the
+        DID the gateway authenticates as. A did:key needs no hosting and no
+        resolution by the trust agent. publish_auth_did is still read, and must
+        agree with control_did_method when both are set.
+    - timestamp: '2026-11-08T18:30:00Z'
+      title: Authenticate to a trust agent as a did:webvh by default
+      description: >-
+        New trust-agent connections and the [vta] block now authenticate as a
+        did:webvh the gateway publishes (at /vta-auth/{connection_id}/did.jsonl
+        for a connection), so the DID an operator grants stays the same when
+        the control key is replaced. The agent resolves the document on every
+        authentication, so the gateway must be reachable from it; set
+        publish_auth_did = false, or create the connection with
+        control_identity "did_key", to keep authenticating as a did:key.
+        Connections that already exist keep their did:key.
+    - timestamp: '2026-11-08T12:00:00Z'
+      title: Issue trust-agent-signed tokens under the DID of the signing key
+      description: >-
+        Tokens and ID-JAGs signed through a trust agent now claim the did:key
+        of the key that signed them as their issuer, instead of the trust
+        agent's service DID. That DID's document never listed the key, so the
+        tokens only verified through the gateway's JWKS, and two gateways
+        sharing one trust agent claimed the same issuer. A did:key is the key
+        itself, so it cannot be repointed by anyone who controls the gateway.
+        Rotating the signing key now changes the issuer; the gateway still
+        accepts its own tokens from a retired or per-surface key. Verifiers
+        that pin the old issuer must be updated.
+    - timestamp: '2026-11-08T12:10:00Z'
+      title: Ask before disconnecting a trust agent that holds agent keys
+      description: >-
+        Revoking, deleting or disabling a trust-agent connection now fails with
+        a conflict while agents keep their key in it, naming how many, unless
+        the request acknowledges they will be stranded. Those agents cannot be
+        moved and would need re-onboarding with a new DID. The dashboard shows
+        the message and asks for a second click on Revoke. The setup guide
+        explains that there is no migration for existing agents.
+    - timestamp: '2026-11-08T10:00:00Z'
+      title: Sign agent credentials through a trust agent with its specified signing task
+      description: >-
+        An agent-identity credential issued through a connected trust agent is
+        now built by the gateway, exactly as it builds one it signs itself, and
+        signed by the trust agent's standard document-signing task instead of a
+        task made only for this integration. The credential names the agent's
+        own context as its issuer, and the trust agent signs it only with the
+        key behind that context, so it can no longer be made to sign as the
+        trust agent itself. The gateway checks the answer against what it asked
+        for, and refuses it if the key, the signer, the proof or the document
+        differ. Gateways that were connected before this must be granted again:
+        the permission to sign documents is separate from the general signing
+        permission, so a connection paired earlier still verifies and then
+        fails the first credential it signs. The setup guide has the new
+        command and the failure to look for.
+    - timestamp: '2026-11-08T10:05:00Z'
+      title: Sign an agent's presentation in its trust agent without holding its key
+      description: >-
+        An agent whose key lives in a trust agent now has its presentation
+        signed there too, by the same document-signing task as its credential,
+        so the gateway never has the private half. The trust agent finds the
+        signer in a controller member, which a presentation does not normally
+        carry, so the presentation sent for signing names the agent as both its
+        holder and its controller. The holder is still named, and the gateway's
+        own check, which reads the holder, is unchanged and still refuses a
+        proof made by anyone else. The one visible difference is that extra
+        member; a verifier elsewhere that rejects members it does not know would
+        refuse it. A challenge and a domain are now bound into the signed proof
+        rather than refused. The gateway will not sign if the agent's own
+        context is not the holder the presentation names.
+    - timestamp: '2026-11-16T12:05:00Z'
+      title: Add Verifiable Trust Agents in Connections and set audit signing in Settings
+      description: >-
+        Verifiable Trust Agents are now a tab of Connections, beside Gateways,
+        Mediators and Registries, opening with what connecting one gives, with
+        Add VTA and no filter box; the separate Trust Agent page and its signing
+        banner are gone. Add VTA opens a full-page wizard with a step bar instead
+        of a pop-up. The gateway-wide default moves to Settings, Security, Audit
+        signing, which holds only the signing key source and Connect my own VTA.
+        The Mediators and Registries tabs now show only to users who may view
+        them.
+    - timestamp: '2026-11-16T12:10:00Z'
+      title: Choose a surface's signing key source, Gateway secret or Verifiable Trust Agent
+      description: >-
+        The Surface Builder's signing choice is now a Signing key source with two
+        options, Gateway secret and Verifiable Trust Agent, which lists the
+        connected agents with a link to add another. A surface that sets nothing
+        shows what it follows, its issuer's source or the gateway-wide default,
+        and can be handed back to it.
+  fixed:
+    - timestamp: '2026-11-10T14:00:00Z'
+      title: Retry a trust agent call whose session a key change ended
+      description: >-
+        When the gateway moves to a new control key, the trust agent ends the
+        old session of the same DID, and a call that took the old token a moment
+        earlier came back as "token superseded". The client now retries such a
+        call once with a fresh session, and only when its own key changed in the
+        meantime; any other refusal still fails at once.
+    - timestamp: '2026-11-10T09:30:00Z'
+      title: Keep signing after the control key was rotated by another process
+      description: >-
+        When the trust agent refuses the gateway's control key, the
+        gateway now looks for the key stored for it, finishing an interrupted
+        rotation first, and signs in once more if that is a different key. It
+        never retries with the same key and never falls back to local signing.
+    - timestamp: '2026-11-09T15:15:00Z'
+      title: Stop the dashboard reloading forever on a session the gateway forgot
+      description: >-
+        A browser holding a session token the gateway no longer knows (after the
+        gateway's storage was wiped or replaced) made the dashboard reload without
+        end. The sign-in page redirected to the dashboard whenever the session
+        check answered 200, though the answer said "authenticated: false", and the
+        app sent the browser straight back. The page now redirects only for a real
+        session, and otherwise forgets the stale token and shows the sign-in form.
+    - timestamp: '2026-11-09T13:45:00Z'
+      title: Say what the appliance signs with in Settings, and why
+      description: >-
+        The Key management card in Settings preselected "This gateway's own key
+        (local)" while the appliance signed through a trust agent, kept saying
+        the old default after one was chosen, and lost its confirmation message
+        after a save. Its first option now names what the configuration resolves
+        to, the card shows the chosen default, and the confirmation stays. The
+        reason line also no longer cuts off or prints an internal state name.
+    - timestamp: '2026-11-08T10:20:00Z'
+      title: Verify a trust-agent presentation bound to a challenge or domain
+      description: >-
+        A presentation signed by a trust agent can be bound to a challenge and a
+        domain, which become part of what is signed. The check the gateway used
+        for that kind of signature did not know about them: it dropped them and
+        then rebuilt bytes nobody had signed, so every such presentation failed,
+        however genuine. The gateway now checks the signature itself, including
+        both members, so a presentation bound to a challenge verifies and one
+        whose challenge or domain was changed afterwards, which is what replaying
+        it elsewhere would need, does not. Presentations that are not bound to
+        either verify exactly as before.
+    - timestamp: '2026-10-27T05:00:00Z'
+      title: Sign through a trust agent again by proving who is asking
+      description: >-
+        The trust agent requires every signing request to prove it came from
+        the gateway, not merely that a session exists. The gateway was sending
+        the request without that proof, so the agent refused all of them and
+        nothing could be signed through a connected agent at all. The proof is
+        now attached, and an external identity provider's grant is no longer
+        turned away when it is offered as proof of who someone is.
+    - timestamp: '2026-10-27T07:00:00Z'
+      title: Repair the System Settings screen and the new surface name default
+      description: >-
+        The System Settings screen had a duplicated block of Save and Reset
+        buttons and a missing closing tag, which stopped the dashboard being
+        built at all. Creating a surface also stopped treating a typed name
+        that matches the suggested one as still being the suggestion, so the
+        page claimed unsaved changes when nothing had been changed and the
+        name no longer followed a protocol switch. Both were a stray duplicate
+        left behind by a merge. The Key Management tab additionally no longer
+        takes the rest of the Secrets screen down with it when the key
+        inventory cannot be read; it reports the problem in its own tab.
+    - timestamp: '2026-11-17T12:04:00Z'
+      title: Sign tokens with the trust agent chosen in the dashboard without a restart
+      description: >-
+        STS tokens, ID-JAGs, MCP access tokens and payment receipts were
+        signed by the key chosen when the gateway started, so a trust agent
+        connected and made the gateway-wide default in the dashboard did not
+        sign them until a restart, while Settings already named it. The signer
+        is now resolved on every call, and one that cannot be resolved refuses
+        to sign.
+    - timestamp: '2026-11-17T12:05:00Z'
+      title: Accept MCP access tokens the gateway issued through a trust agent
+      description: >-
+        The gateway's own MCP Resource Server verified MCP access tokens
+        against the local key only, so it refused every token the gateway had
+        signed through a trust agent. It now verifies them against the key set
+        of the authority that signs them.
+    - timestamp: '2026-11-17T12:06:00Z'
+      title: Attest the issuer that issues the gateway credentials peers receive
+      description: >-
+        With a trust agent connected only in the dashboard, the fabric issuer
+        attestation claimed the gateway DID while the credentials were issued
+        by the agent's context, so peers refused every identity presentation.
+        The attestation now follows the same choice as the credential issuer,
+        at the same moment, from the dashboard or from [vta].
+    - timestamp: '2026-11-17T12:07:00Z'
+      title: Sign a trust-agent-held agent's JWTs in its own context
+      description: >-
+        The agents API's sign-jwt and the AP2 presentation signed with the
+        agent's key on the gateway, which an agent minted in a trust agent
+        does not have, so they failed for every such agent. They now sign in
+        the agent's own trust agent context, as its holder proofs do, and a
+        gateway-held key is still used for agents onboarded before a trust
+        agent was connected.
+  removed: []
+  security:
+    - timestamp: '2026-11-09T00:00:00Z'
+      title: Refuse a surface that signs through another tenant's trust agent
+      description: >-
+        A surface's signing.connection_id (and each variant's) must now name a
+        trust agent connection its own tenant owns, or an appliance-wide one.
+        Before, only the connection record was tenant-checked, so a tenant
+        could point its surface at another tenant's connection and have its
+        tokens signed with that tenant's key. A connection that does not exist
+        is refused the same way, so the answer does not reveal which ids exist.
+    - timestamp: '2026-11-09T00:05:00Z'
+      title: Fail closed when a surface's mapped trust agent key is unavailable
+      description: >-
+        When the trust agent key a surface (or its variant or tenant) maps could
+        not be resolved, credential issuance used to log a warning and sign
+        with the appliance key, changing the issuer under callers and handing a
+        tenant's tokens to the operator's key. It now refuses. A surface that
+        maps nothing of its own still signs with the appliance key as before.
+    - timestamp: '2026-11-08T10:10:00Z'
+      title: Name a trust-agent context's identity only from a key it holds
+      description: >-
+        A gateway that provisions its own contexts could name any DID for a
+        context it had been granted access to. It may now name only the DID of
+        an active signing key that lives in that context, and only once, so a
+        context cannot be given an identity it does not control. The same
+        change removes the separate step that told the trust agent which key a
+        context signs credentials with: the context's identity is the key
+        itself, so there is nothing left to point at the wrong key.
+    - timestamp: '2026-10-27T02:00:00Z'
+      title: Remove an unreachable check from the self-issued token path
+      description: >-
+        A rule about which tokens the gateway will accept back from itself sat
+        behind an early exit, so it never ran while still appearing to be in
+        place. Reading it as live would mislead anyone reviewing how self-issued
+        tokens are handled. The unreachable code is gone and the rule is kept
+        alongside a note explaining why it is not applied: as written it would
+        refuse an exchange the gateway has supported since its first release.
+        Nothing changes for callers.
+    - timestamp: '2026-10-27T03:00:00Z'
+      title: Stop a signed document containing a number from aborting the gateway
+      description: >-
+        Preparing a document for signing used a canonicaliser that, in the way
+        this product is built, stops the whole process the moment the document
+        contains a number rather than reporting a problem. Numbers are present
+        in almost everything that gets signed, including the issue and expiry
+        times on every token, and in places the content comes from the caller.
+        The gateway now uses the same canonicaliser as the rest of the product,
+        which handles them, and a test covers it.
+    - timestamp: '2026-10-27T06:00:00Z'
+      title: Stop a published identity log or payment request from aborting the gateway
+      description: >-
+        The same canonicaliser fault reached three more places: reading an
+        identity log published by somebody else, creating and updating this
+        gateway's own identity logs, and preparing a payment request. The first
+        is the one that mattered most, because the document comes from outside
+        and a single number anywhere in it was enough to stop the gateway
+        rather than fail the check. All of them now use the canonicaliser the
+        rest of the product uses, and the old one is gone from the build.
+        Identities are unaffected: the canonical form both produce was
+        confirmed identical, and a test now pins the identifier a fixed log
+        entry produces so this cannot drift unnoticed.
+    - timestamp: '2026-10-27T04:00:00Z'
+      title: Reject an unsigned presentation whose proof list is empty
+      description: >-
+        A presentation that carried an empty list of signatures, rather than
+        none at all, passed the check meant to stop unsigned documents from
+        reaching a verification decision. It is now refused like any other
+        unsigned presentation, and a presentation carrying several signatures
+        has each of them checked for expiry instead of only the first.
+    - timestamp: '2026-11-17T09:00:00Z'
+      title: Keep agent private keys out of the dashboard's live identity updates
+      description: >-
+        An agent onboarded before trust agents held its key keeps that key on
+        the gateway, and every identity create or update sent the whole record,
+        key included, to every open dashboard session whatever its role. The
+        updates now carry the record without the key, and the WebSocket drops a
+        private key from any identity update before sending it. The stored key
+        is unchanged.
+    - timestamp: '2026-11-17T09:05:00Z'
+      title: Refuse to resolve a did:webvh log that fails verification
+      description: >-
+        The DID resolution endpoint's deactivation-aware path checked a stored
+        did:webvh log but ignored the result, so a tampered or corrupt log
+        resolved as the current document. It now verifies the log with the same
+        library as every other resolution path and answers invalidDid when
+        verification fails.
+    - timestamp: '2026-10-27T01:00:00Z'
+      title: Refuse a trust-agent signature that was not made by the key we asked for
+      description: >-
+        The trust agent reports which key it signed with and which algorithm it
+        used. The gateway now checks both against what it asked for and refuses
+        the result when they disagree, rather than publishing a token or an
+        attestation under its own identity on the strength of a signature it
+        cannot account for. When the agent rejects a signing request, the
+        reason it gives is now included in the failure, so a refused call says
+        which part of the contract failed instead of only that something
+        returned an error; the agent's full reply still stays in the logs.
+        The setup guide records that permission to sign this way is a separate
+        one which the general signing permission does not cover, so an agent
+        connected before it existed must be granted it again. That shortfall
+        is otherwise invisible: pairing succeeds and only the first signature
+        fails.
+    - timestamp: '2026-11-17T12:00:00Z'
+      title: Refuse a presentation that mixes eddsa-jcs-2022 with other proof suites
+      description: >-
+        A presentation or credential carrying an eddsa-jcs-2022 proof skipped
+        the verification of its other proofs, so an unsigned proof placed
+        first could carry a forged challenge or domain that was then compared
+        as the verified one. A document that mixes the JCS suite with any
+        other is now refused, so every proof on it is verified.
+    - timestamp: '2026-11-17T12:01:00Z'
+      title: Check a JCS proof's purpose against the signer's DID document
+      description: >-
+        An eddsa-jcs-2022 proof is now refused unless its proofPurpose names a
+        verification relationship that lists its verification method in the
+        signer's DID document, as the other suites already were.
+    - timestamp: '2026-11-17T12:02:00Z'
+      title: Refuse to exchange a token the gateway signed with a retired key
+      description: >-
+        Token exchange refused a subject or actor token the gateway issued
+        only when it named the current issuer, while verification accepted
+        tokens signed by any key the gateway publishes, retired keys included.
+        An ID-JAG or access token signed by a retired trust agent key could be
+        exchanged instead of redeemed once through jwt-bearer. Both now share
+        one answer to whether the gateway issued a token.
+    - timestamp: '2026-11-17T12:03:00Z'
+      title: Refuse to sign when a surface's signing choice cannot be read
+      description: >-
+        A surface or issuer store read that failed, or a surface signing block
+        that cannot sign a token, was taken as no choice at all, so the
+        surface signed with the gateway-wide key instead of the trust agent
+        key it names. Signing now fails closed in both cases, and a surface's
+        trust agent block must name its key, as an issuer's already must, or
+        the save is refused.
+    - timestamp: '2026-11-17T15:00:00Z'
+      title: Refuse a credential when its chosen trust agent cannot issue it
+      description: >-
+        When a surface, its variant or issuer, or the gateway-wide default
+        chose a trust agent that could not be reached or resolved, the agent-
+        identity credential in a forwarded presentation and the fabric issuer
+        attestation were issued by another issuer instead, the [vta] agent or
+        the gateway's own key. Both are now refused, so the issuer never
+        changes under callers; a scope nobody chose an agent for still issues
+        under the appliance's issuer.
+  breaking: []

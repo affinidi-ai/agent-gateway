@@ -1,6 +1,6 @@
 import { createContext, useContext } from 'react';
 import type { AgentSurface } from '../../api';
-import type { Protocol } from './elements/types';
+import type { Protocol, SurfaceSigning } from './elements/types';
 import type { AccessPointNotice } from './elements/access-point/readiness';
 import type { ApiKeyStatuses } from './elements/identity/apiKeyStatus';
 
@@ -36,6 +36,12 @@ export interface SurfaceMetaValue {
   issuerId: string;
   /** Gateway-managed did:webvh identity injected on every outbound request. */
   didwebvh: DidwebvhConfig;
+  /**
+   * Which backend signs for this surface. `undefined` or an all-empty block
+   * means inherit the appliance default — never a resolved value, so the panel
+   * can show "inherit" rather than implying a choice nobody made.
+   */
+  signing?: SurfaceSigning;
   /** True when fields shown to the user must be read-only. */
   readOnly: boolean;
   /** Whether the protocol field can still be changed. */
@@ -81,6 +87,7 @@ export interface SurfaceMetaValue {
   setTerminateTraceId: (v: boolean) => void;
   setIssuerId: (v: string) => void;
   setDidwebvh: (v: DidwebvhConfig) => void;
+  setSigning: (v: SurfaceSigning | undefined) => void;
   /** Optional callback to snapshot the current surface as a reusable template. */
   onSaveAsTemplate?: () => void;
   /** Opens the Agent Cards view. Set only while that view is offered for the surface's protocol. */

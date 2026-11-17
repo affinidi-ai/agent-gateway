@@ -162,6 +162,23 @@ key of a deleted surface is no longer in use. See _Surface Builder_ and
 [_API key delete_](www/default/AGENTS.md#api-key-delete) in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
+Verifiable Trust Agents are connections: they live on the Connections page's **Verifiable Trust
+Agent** tab, which opens with what connecting one gives, has **Add VTA** and no filter box, and
+opens a full-page wizard (`/connections/trust-agents/connect`), never a pop-up. There is no Trust
+Agent page and no signing tier banner. The tab's Control key card, shown while `GET /v1/vta/status`
+reports a `control_key`, shows the key the gateway signs in to its trust agent with, when it was
+last rotated and when it is next due, and a Rotate control key button for key management editors.
+A connection added by hand with a `did:webvh` identity has a Rotate control key action on its
+row, with a rotation-under-way state and Cancel. The gateway-wide default is **Settings →
+Security → Audit signing**. See _Verifiable Trust Agent tab and Audit signing_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#verifiable-trust-agent-tab-and-audit-signing).
+
+Wherever a signing key is chosen (a surface, an issuer, Audit signing) the field is **Signing key
+source**, with **Gateway secret** and **Verifiable Trust Agent**, which picks a connected agent.
+An Issuer's choice applies to every surface it owns that sets none of its own, before the
+gateway-wide default. See _Signing key source_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#signing-key-source).
+
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
 
 The endpoint editor picks a Kafka endpoint's security protocol (`plaintext`, `ssl`,
@@ -438,6 +455,8 @@ Do not summarise these here. Update the owning document in the same change as th
 | Credential providers, delegation vault, consent modes                          | [`docs/CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md)     |
 | Terms, acceptance, consent-pending sessions                                    | [`docs/TERMS_AND_CONSENT.md`](docs/TERMS_AND_CONSENT.md)             |
 | Integrations, events, notifications, the event hook                            | [`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md)                       |
+| Trust agent (VTA) signing, key custody, per-surface keys                        | [`docs/VTA_INTEGRATION_POC.md`](docs/VTA_INTEGRATION_POC.md)         |
+| Trust agent open items and limitations                                         | [`docs/VTA_OPEN_ITEMS.md`](docs/VTA_OPEN_ITEMS.md)                   |
 
 # Ways of working
 

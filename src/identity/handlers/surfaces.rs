@@ -3071,6 +3071,62 @@ fn validate_surface_mcp_tool_gating(surface: &AgentSurface) -> Result<(), Surfac
     Ok(())
 }
 
+/// Validate the per-surface and per-variant `signing` blocks (VTA-19).
+///
+/// Two classes of failure are caught here rather than at the first signing
+/// call: a block whose fields contradict each other, and a block that asks for
+/// a VTA context on an appliance that cannot create one. The second is a
+/// **tier** property — auto-provisioning needs super-admin on the target VTA,
+/// which a customer-owned VTA does not grant — so the message says exactly how
+/// to fix it.
+fn validate_surface_signing(
+    surface: &AgentSurface,
+    vta_config: &crate::config::vta::VtaConfig,
+) -> Result<(), SurfaceApiError> {
+    use crate::config::agent_surface::SigningBackendKind;
+
+    let mut errors = Vec::new();
+    let mut check = |signing: &crate::config::agent_surface::SurfaceSigningConfig, label: &str| {
+        if let Err(message) = signing.validate() {
+            errors.push(format!("Surface '{label}': {message}"));
+            return;
+        }
+        // A surface's tokens sign with this block and fail closed when it is
+        // unusable, so a block that cannot sign a token is refused here.
+        if let Err(e) = crate::vta::key_directory::signing_key_ref(signing, crate::config::vta::KeyPurpose::Jwt) {
+            errors.push(format!("Surface '{label}': {}", e.log_detail()));
+            return;
+        }
+        if signing.backend == Some(SigningBackendKind::Vta)
+            && signing.context_id.is_none()
+            && !vta_config.auto_provision_contexts
+        {
+            errors.push(format!(
+                "Surface '{label}': signing.context_id is required because this gateway cannot create VTA \
+                 contexts; set `[vta] auto_provision_contexts` (the agent grant must carry \
+                 `context-create`) or name an existing context"
+            ));
+        }
+    };
+
+    if let Some(signing) = surface.signing.as_ref() {
+        check(signing, &surface.name);
+    }
+    for variant in &surface.variants {
+        if let Some(signing) = variant
+            .overrides
+            .signing
+            .as_ref()
+        {
+            check(signing, &format!("{} (variant '{}')", surface.name, variant.alias));
+        }
+    }
+    if !errors.is_empty() {
+        return Err(SurfaceApiError::BadRequest(errors.join("; ")));
+    }
+    Ok(())
+}
+
 /// A variant's Transit Point is enforced with the MCP tool gating, policy,
 /// response policy and per-caller rate limit of the surface's Transit Point of
 /// the same alias, so one that sets any of them to something else is refused
@@ -3251,6 +3307,9 @@ pub async fn create_surface(
 
     // Validate MCP Tool Gating regex patterns (base + every variant).
     validate_surface_mcp_tool_gating(&surface)?;
+
+    // Validate per-surface / per-variant signing config (base + every variant).
+    validate_surface_signing(&surface, &state.bootstrap_config.vta)?;
 
     // Re-run the shape check against every resolved variant so a
     // variant override can't blank out a required field unnoticed.
@@ -4260,6 +4319,7 @@ async fn validate_and_save_surface(
     let warnings = validate_surface_payment_policies(state.gateway_store.as_ref(), &mut surface, existing).await?;
     validate_delegation_source_auth(&surface)?;
     validate_surface_mcp_tool_gating(&surface)?;
+    validate_surface_signing(&surface, &state.bootstrap_config.vta)?;
     validate_resolved_variants(&surface)?;
     reject_target_trust_checks_unless_target_runs_them(&surface)?;
     validate_workload_binding_config(&surface)?;
@@ -8564,6 +8624,7 @@ mod validation_tests {
             mcp_legacy_metadata_output: None,
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
+            signing: None,
             caller_key: None,
             trust_check_split: false,
             transit_point_source_auth: false,
@@ -11752,5 +11813,32 @@ mod tests {
         let mut after = surface_recording(&["tr-1"]);
         after.name = "renamed".into();
         assert!(!trust_recorder_changed(&before, &after));
+    }
+
+    fn surface_signing_with(key_id: Option<&str>) -> AgentSurface {
+        AgentSurface {
+            name: "signed".into(),
+            signing: Some(crate::config::agent_surface::SurfaceSigningConfig {
+                backend: Some(crate::config::agent_surface::SigningBackendKind::Vta),
+                connection_id: Some("vta-a".into()),
+                context_id: Some("ctx-a".into()),
+                key_id: key_id.map(str::to_string),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A surface's tokens sign with its block and fail closed when it cannot,
+    /// so a trust agent block that names no key to sign tokens with is refused
+    /// on save rather than at the first token.
+    #[test]
+    fn a_trust_agent_signing_block_without_a_key_is_refused_on_save() {
+        let config = crate::config::vta::VtaConfig::default();
+        let err = validate_surface_signing(&surface_signing_with(None), &config)
+            .expect_err("a block that cannot sign a token must not be saved");
+        assert!(format!("{err:?}").contains("key_id"), "{err:?}");
+
+        validate_surface_signing(&surface_signing_with(Some("gateway-jwt-1")), &config)
+            .expect("a block naming its key is saved");
     }
 }

@@ -1481,6 +1481,7 @@ pub async fn run_axum_proxy(
             credential_provider_store: None,
             delegation_vault_store: None,
             sts_client_store: None,
+            vta_connection_store: None,
             api_key_store: api_key_store
                 .clone()
                 .map(|store| store as Arc<dyn crate::api_keys::store::ApiKeyStore>),
@@ -1876,6 +1877,55 @@ pub async fn run_axum_proxy(
                 Err(e) => warn!("Failed to read the Authorities; STS client authority DIDs stay unclassified: {}", e),
             }
         }
+
+        // VTA connection store (which Verifiable Trust Agent signs for this
+        // appliance). A bootstrap `[vta]` block is migrated into it once, under
+        // a fixed id, so the migration is idempotent across restarts.
+        let vta_connection_store: Option<Arc<dyn crate::vta::connections::VtaConnectionStorage>> = {
+            let path = PathBuf::from(
+                &bootstrap_config
+                    .storage_paths
+                    .authorities,
+            )
+            .parent()
+            .map(|p| p.join("vta_connections"))
+            .unwrap_or_else(|| PathBuf::from("_storage/vta_connections"));
+            match crate::vta::connections::FileSystemVtaConnectionStore::new(path).await {
+                Ok(store) => {
+                    let store: Arc<dyn crate::vta::connections::VtaConnectionStorage> = Arc::new(store);
+                    // Migration failure must not stop the gateway: the
+                    // bootstrap block still drives the connector directly, so
+                    // the only loss is the record's visibility in the API.
+                    match crate::vta::connections::migrate_bootstrap_connection(&bootstrap_config.vta, store.as_ref())
+                        .await
+                    {
+                        Ok(Some(connection)) => {
+                            info!(id = %connection.id, "VTA bootstrap connection recorded");
+                        }
+                        Ok(None) => {}
+                        Err(e) => error!("Failed to migrate the [vta] block into a connection record: {}", e),
+                    }
+                    // Take every known VTA address off the data plane before
+                    // any listener accepts a request (VTA-21). Reserving at
+                    // first *use* would be too late: a surface could be
+                    // configured and exercised before the connection it
+                    // shadows has ever signed anything.
+                    match store.list().await {
+                        Ok(connections) => {
+                            for connection in &connections {
+                                crate::vta::isolation::reserve(&connection.endpoint);
+                            }
+                        }
+                        Err(e) => error!("Failed to reserve VTA connection endpoints: {}", e),
+                    }
+                    Some(store)
+                }
+                Err(e) => {
+                    error!("Failed to initialize VTA connection store: {}", e);
+                    None
+                }
+            }
+        };
 
         // ── Credential Delegation stores ──────────────────────────────────
         let credential_provider_store: Option<
@@ -2465,6 +2515,7 @@ pub async fn run_axum_proxy(
             .clone()
             .map(|store| store as Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>);
         identity_state.sts_client_store = sts_client_store.clone();
+        identity_state.vta_connection_store = vta_connection_store.clone();
 
         // Initialize gateway-level OPA policy manager
         let gateway_policy_manager = Arc::new(crate::policies::GatewayPolicyManager::new());
@@ -3626,9 +3677,11 @@ pub async fn run_axum_proxy(
             metrics_store.clone(),
             sts_client_store,
             mcp_replay,
+            vta_connection_store,
             terms_manager.clone(),
             pat_authenticator.clone(),
-        );
+        )
+        .await;
 
         let reference_stores = crate::credential_providers::references::ReferenceStores {
             surfaces: identity_state

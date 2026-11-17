@@ -7137,6 +7137,7 @@ async fn proxy_charged_request(
                             wb,
                             None,
                             None,
+                            state.surface.config_id(),
                         )
                         .await
                     {
@@ -7387,7 +7388,14 @@ async fn proxy_charged_request(
             authenticated_identity.as_ref(),
         );
         match vc_issuer
-            .create_agent_identity_presentation_with_binding(&result.did, &result.identity_fields, wb, None, None)
+            .create_agent_identity_presentation_with_binding(
+                &result.did,
+                &result.identity_fields,
+                wb,
+                None,
+                None,
+                state.surface.config_id(),
+            )
             .await
         {
             Ok(final_vp_jwt) => {
@@ -12457,6 +12465,7 @@ async fn handle_fabric_request_inner(
                     None,
                     None,
                     chained_credentials,
+                    None,
                 )
                 .await
             {
