@@ -133,7 +133,7 @@ test('a mediator that refuses the first try shows the DIDs to allow, without a "
   fireEvent.click(screen.getByText('create'));
 
   expect(await screen.findByTestId('mediator-access-explanation')).toHaveTextContent(
-    'DIDComm Mediator Test mediator most probably uses Explicit Allow'
+    'This Test mediator most probably uses Explicit Allow'
   );
   expect(screen.getByTestId('mediator-access-did-connection_point')).toBeInTheDocument();
   expect(screen.queryByTestId('mediator-access-refused')).not.toBeInTheDocument();
