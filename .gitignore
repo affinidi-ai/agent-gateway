@@ -103,3 +103,6 @@ config/certs/openssl.cnf
 *.py[cod]
 
 __pycache__/
+
+# python virtualenv for the changelog tooling (make install-python-deps)
+.venv/

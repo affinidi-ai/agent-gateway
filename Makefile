@@ -16,7 +16,7 @@ SHELL := /bin/bash
 # ==============================================================================
 
 .PHONY: help cargo-release cargo-build run-debug run-watch run-release \
-        config-certs config-debug config-debug-dev config-debug-x config-test config-release install-deps install-rust-deps verify-rust-deps install-git-hooks setup-vscode \
+        config-certs config-debug config-debug-dev config-debug-x config-test config-release install-deps install-rust-deps verify-rust-deps install-python-deps install-git-hooks setup-vscode \
         docker-build-local docker-build-local-dev docker-rebuild-local docker-rebuild-local-dev docker-run docker-run-dev docker-shell docker-network \
         config-docker \
 	test test-unit test-bins test-policies test-coverage test-junit test-rust-ci npm-test npm-test-ci npm-build npm-build-ci npm-install npm-install-ci clippy clippy-ci fmt fmt-www-all fmt-check lint lint-changelog npm-lint shellcheck npm-lint-www-all npm-lint-ci check cargo-build-ci node-ci rust-ci node-local rust-local local audit-www-all audit-fix-www-all browserslist-update license-check \
@@ -75,6 +75,13 @@ endif
 endif
 CARGO_TOOLS := cargo-llvm-cov cargo-nextest cargo-audit cargo-deny cargo-watch
 DEPS := jq mdbook plantuml pre-commit gitleaks
+# Python packages the changelog tooling imports. Homebrew's python3 is
+# externally managed (PEP 668), so a plain `pip install` into it fails; these go
+# into a repo-local venv instead. CI has its own interpreter from setup-python
+# and installs them with pip there, so lint-changelog falls back to whatever
+# python3 is on PATH when the venv is absent.
+VENV := .venv
+PYTHON_DEPS := PyYAML
 COVERAGE_THRESHOLD ?= 37
 WWW_DIR ?= www/default
 WWW_DIRS := www/default
@@ -132,12 +139,19 @@ verify-rust-deps: ## Verify Rust build toolchain dependencies (sccache, lld, etc
 	@rustup component list --installed 2>/dev/null | grep -q llvm-tools || (echo "$(RED)❌ llvm-tools-preview not installed. Please run 'make install-rust-deps'.$(NC)" && exit 1)
 	@echo "$(GREEN)✅ Rust dependencies verified!$(NC)"
 
+install-python-deps: ## Install the Python packages the changelog tooling needs, into .venv
+	@echo "$(BLUE)🐍 Installing Python dependencies...$(NC)"
+	@python3 -m venv $(VENV)
+	@$(VENV)/bin/python3 -m pip install --quiet --upgrade pip
+	@$(VENV)/bin/python3 -m pip install --quiet $(PYTHON_DEPS)
+	@echo "$(GREEN)✅ Python dependencies installed!$(NC)"
+
 install-git-hooks: ## Install git hooks via pre-commit framework
 	@echo "$(BLUE)🔗 Installing git hooks...$(NC)"
 	@pre-commit install
 	@echo "$(GREEN)✅ Git hooks installed!$(NC)"
 
-install-deps: install-rust-deps ## Install all local development dependencies (macOS)
+install-deps: install-rust-deps install-python-deps ## Install all local development dependencies (macOS)
 	@echo "$(BLUE)📦 Installing dependencies...$(NC)"
 	@brew install $(DEPS) 2>/dev/null || true
 	@$(MAKE) install-git-hooks
@@ -468,17 +482,18 @@ shellcheck: ## Lint all Bash scripts with ShellCheck (fails on warnings)
 	@shellcheck --severity=warning $$(git ls-files -- '*.sh')
 	@echo "$(GREEN)✅ ShellCheck passed!$(NC)"
 
-lint-changelog: ## Validate changelog fragments like CI, requiring the current branch's fragment (needs python3 + PyYAML)
+lint-changelog: ## Validate changelog fragments like CI, requiring the current branch's fragment (needs PyYAML: run 'make install-python-deps')
 	@echo "$(BLUE)📝 Validating changelog fragments...$(NC)"
-	@python3 -c 'import yaml' 2>/dev/null || { \
-		echo "$(RED)❌ PyYAML not found — install it (python3 -m pip install PyYAML)$(NC)"; \
+	@if [ -x "$(VENV)/bin/python3" ]; then py="$(VENV)/bin/python3"; else py="python3"; fi; \
+	"$$py" -c 'import yaml' 2>/dev/null || { \
+		echo "$(RED)❌ PyYAML not found. Run 'make install-python-deps'$(NC)"; \
 		exit 1; \
-	}
-	@branch="$$(git rev-parse --abbrev-ref HEAD)"; \
+	}; \
+	branch="$$(git rev-parse --abbrev-ref HEAD)"; \
 	if [ "$$branch" = "main" ] || [ "$$branch" = "HEAD" ]; then \
-		python3 .github/scripts/changelog.py check; \
+		"$$py" .github/scripts/changelog.py check; \
 	else \
-		python3 .github/scripts/changelog.py check --require "$$branch"; \
+		"$$py" .github/scripts/changelog.py check --require "$$branch"; \
 	fi
 	@echo "$(GREEN)✅ Changelog fragments are valid!$(NC)"
 
