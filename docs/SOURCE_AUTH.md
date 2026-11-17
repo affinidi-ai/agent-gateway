@@ -2044,7 +2044,10 @@ shows it in place of the surface name. The card is read from
 `<target endpoint>/.well-known/agent-card.json`, then `/.well-known/agent.json`, or from
 the target origin plus the access point's `agent_card_path` when that is set. Surfaces of
 other protocols, such as MCP, and targets with another scheme, such as `fabric://`, are
-never looked up.
+never looked up here. The Agents API names an agent behind an `a2a-proxy://` or `fabric://`
+target from the card the gateway serves for the surface instead (the A2A proxy's generated
+card, or the remote gateway's card), cached the same way per surface and running
+configuration, and also updated when the agent's card is read through the Agents API.
 
 Lookups are cached per surface for 300 seconds and are re-read when the target endpoint
 or card path changes, with a 5-second timeout for each card URL tried. The dashboard

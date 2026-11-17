@@ -445,6 +445,43 @@ async fn tenant_token_reads_agent_card_of_surface(
     get_as_tenant(world, &tenant, ALL_SURFACES, &format!("{AGENTS_PATH}/{id}/agent-card")).await;
 }
 
+#[when("the operator reads the agent card of the surface's agent")]
+async fn operator_reads_agent_card_of_surface(world: &mut SurfaceWorld) {
+    let id = agent_id_of_surface(world).await;
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("the operator session must exist")
+        .send_recorded_json::<Value>(Method::GET, &format!("{AGENTS_PATH}/{id}/agent-card"), None)
+        .await
+        .expect("reading the agent card as the operator");
+    world.admin_response = Some(response);
+}
+
+#[then(expr = "the agent card is available with source {string}")]
+fn agent_card_is_available_with_source(
+    world: &mut SurfaceWorld,
+    source: String,
+) {
+    let body = &management_response(world).body;
+    assert_eq!((&body["available"], &body["source"]), (&json!(true), &json!(source)), "the agent card answer: {body}");
+    assert!(body["card"]["name"].is_string(), "the agent card names the agent: {body}");
+}
+
+#[then("the agent card points at the gateway")]
+fn agent_card_points_at_gateway(world: &mut SurfaceWorld) {
+    let port = world
+        .infra
+        .as_ref()
+        .expect("the gateway must be running")
+        .gateway_port;
+    let body = &management_response(world).body;
+    let url = body["card"]["url"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the agent card names a url: {body}"));
+    assert!(url.contains(&format!("localhost:{port}")), "{url} does not point at the gateway");
+}
+
 #[then("the agents list names the surface")]
 fn agents_list_names_surface(world: &mut SurfaceWorld) {
     let body = &management_response(world).body;

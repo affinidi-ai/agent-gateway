@@ -14,7 +14,7 @@ const AgentDetailHeader: React.FC<{ agent: AgentRecord }> = ({ agent }) => (
       <span data-testid="agent-details-name">
         {agent.name ?? <span className="text-muted fst-italic">{UNNAMED_AGENT}</span>}
       </span>
-      <AgentProtocolBadge protocol={agent.protocol} runtime={agent.runtime} />
+      <AgentProtocolBadge protocol={agent.protocol} />
     </h6>
     <span className="small text-muted" data-testid="agent-details-runtime">
       <i className={`fas ${runtimeIcon(agent.runtime)} me-1`} aria-hidden="true" />

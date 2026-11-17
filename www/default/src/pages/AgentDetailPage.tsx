@@ -6,14 +6,12 @@ import { AppButton } from '../components/shared/AppButton';
 import AgentCardTab from './AgentDetailPage/AgentCardTab';
 import AgentDetailHeader from './AgentDetailPage/AgentDetailHeader';
 import ConnectionTab from './AgentDetailPage/ConnectionTab';
-import OverviewTab from './AgentDetailPage/OverviewTab';
-import SurfacesTab from './AgentDetailPage/SurfacesTab';
 import TrafficTab from './AgentDetailPage/TrafficTab';
 import './AgentsPage/AgentRegistry.css';
 
 const tabAttrs = (key: string) => ({ 'data-testid': `agent-tab-${key}` });
 
-/** Read-only details of one agent: Overview, Agent Card, Connection, Surfaces and Traffic. */
+/** Read-only details of one agent: Agent Card, Connection and Traffic. */
 const AgentDetailPage: React.FC = () => {
   const { agentId = '' } = useParams<{ agentId: string }>();
   const navigate = useNavigate();
@@ -103,22 +101,11 @@ const AgentDetailPage: React.FC = () => {
         <AgentDetailHeader agent={agent} />
         <div className="card-body">
           <Tabs
-            defaultActiveKey="overview"
+            defaultActiveKey="agent-card"
             className="mb-3 custom-channel-tabs"
             mountOnEnter
             data-testid="agent-details-tabs"
           >
-            <Tab
-              eventKey="overview"
-              tabAttrs={tabAttrs('overview')}
-              title={
-                <>
-                  <i className="fas fa-info-circle" /> Overview
-                </>
-              }
-            >
-              <OverviewTab agent={agent} />
-            </Tab>
             <Tab
               eventKey="agent-card"
               tabAttrs={tabAttrs('agent-card')}
@@ -140,17 +127,6 @@ const AgentDetailPage: React.FC = () => {
               }
             >
               <ConnectionTab agent={agent} />
-            </Tab>
-            <Tab
-              eventKey="surfaces"
-              tabAttrs={tabAttrs('surfaces')}
-              title={
-                <>
-                  <i className="fas fa-layer-group" /> Surfaces ({agent.surfaces.length})
-                </>
-              }
-            >
-              <SurfacesTab surfaces={agent.surfaces} />
             </Tab>
             <Tab
               eventKey="traffic"

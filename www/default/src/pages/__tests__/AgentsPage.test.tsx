@@ -66,7 +66,7 @@ describe('AgentsPage', () => {
     const first = await screen.findByTestId('agents-row-a1');
     expect(screen.getByTestId('agents-count')).toHaveTextContent('2');
     expect(within(first).getByText('TimeAsker')).toBeInTheDocument();
-    expect(within(first).getByText('Direct URL')).toBeInTheDocument();
+    expect(within(first).getByText('Direct')).toBeInTheDocument();
     expect(within(first).getByTestId('agents-protocol-badge')).toHaveTextContent('A2A');
     expect(within(first).getByTestId('agents-trust-recorded')).toHaveTextContent('Recorded');
     expect(within(first).queryByTestId('agents-trust-not-recorded')).not.toBeInTheDocument();
@@ -83,8 +83,8 @@ describe('AgentsPage', () => {
     expect(within(second).queryByTestId('agents-name')).not.toBeInTheDocument();
     expect(within(second).getByText('No DID')).toBeInTheDocument();
     expect(within(second).queryByTestId('agents-copy-did-button')).not.toBeInTheDocument();
-    expect(within(second).getByText('A2A proxy')).toBeInTheDocument();
-    expect(within(second).getByTestId('agents-protocol-badge')).toHaveTextContent('A2A via proxy');
+    expect(within(second).getByText('Proxied')).toBeInTheDocument();
+    expect(within(second).getByTestId('agents-protocol-badge')).toHaveTextContent(/^A2A$/);
     expect(within(second).getByTestId('agents-trust-not-recorded')).toHaveTextContent(
       'Not recorded'
     );
@@ -129,6 +129,8 @@ describe('AgentsPage', () => {
     renderPage();
     const row = await screen.findByTestId('agents-row-a1');
 
+    expect(screen.getByRole('columnheader', { name: 'Route' })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: 'Protocol' })).toBeInTheDocument();
     expect(screen.getByRole('columnheader', { name: 'Identities' })).toBeInTheDocument();
     const dids = within(row).getAllByTestId('agents-did');
     expect(dids.map(d => d.textContent)).toEqual(['did:web:a.example', 'did:web:b.example']);
@@ -203,7 +205,7 @@ describe('AgentsPage', () => {
     expect(screen.getByTestId('agents-row-a2')).toBeInTheDocument();
   });
 
-  it('filters by runtime label', async () => {
+  it('filters by route label', async () => {
     mockedListAgents.mockResolvedValue(
       list(
         agent(),
@@ -218,7 +220,7 @@ describe('AgentsPage', () => {
     renderPage();
     await screen.findByTestId('agents-row-a1');
 
-    fireEvent.change(screen.getByTestId('agents-filter-input'), { target: { value: 'remote' } });
+    fireEvent.change(screen.getByTestId('agents-filter-input'), { target: { value: 'fabric' } });
     expect(screen.queryByTestId('agents-row-a1')).not.toBeInTheDocument();
     expect(screen.getByTestId('agents-row-a2')).toBeInTheDocument();
   });

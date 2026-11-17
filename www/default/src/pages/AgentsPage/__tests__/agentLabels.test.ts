@@ -4,10 +4,8 @@ import {
   connectionTarget,
   displayName,
   formatWindow,
-  identitySourceLabel,
   lastActivityLabel,
-  protocolBadgeLabel,
-  protocolBadgeTitle,
+  protocolLabel,
   runtimeIcon,
   runtimeLabel,
   shortenDid,
@@ -33,18 +31,18 @@ const agent = (overrides: Partial<AgentRecord> = {}): AgentRecord => ({
 
 describe('agentLabels', () => {
   it.each([
-    ['url', 'Direct URL', 'A2A'],
-    ['a2a-proxy', 'A2A proxy', 'A2A via proxy'],
-    ['gateway', 'Remote gateway', 'A2A via gateway'],
-  ])('maps runtime %s to display labels', (runtime, label, badge) => {
+    ['url', 'Direct'],
+    ['a2a-proxy', 'Proxied'],
+    ['gateway', 'Fabric'],
+  ])('maps runtime %s to its route label', (runtime, label) => {
     expect(runtimeLabel(runtime)).toBe(label);
-    expect(protocolBadgeLabel('a2a', runtime)).toBe(badge);
   });
 
   it('never shows raw enum values', () => {
-    expect(runtimeLabel('ftp')).toBe('Unknown runtime');
-    expect(protocolBadgeLabel('mcp', 'gateway')).toBe('MCP via gateway');
-    expect(protocolBadgeLabel('carrier-pigeon', 'url')).toBe('Other protocol');
+    expect(runtimeLabel('ftp')).toBe('Unknown route');
+    expect(protocolLabel('a2a')).toBe('A2A');
+    expect(protocolLabel('mcp')).toBe('MCP');
+    expect(protocolLabel('carrier-pigeon')).toBe('Other protocol');
   });
 
   it('labels the trust registry Recorded or Not recorded', () => {
@@ -72,11 +70,6 @@ describe('agentLabels', () => {
     expect(short.endsWith('abcdef12')).toBe(true);
     expect(short).toContain('…');
     expect(shortenDid('did:web:a.com')).toBe('did:web:a.com');
-  });
-
-  it('describes where an identity comes from', () => {
-    expect(identitySourceLabel('managed')).toBe('Managed identity, issued by this gateway');
-    expect(identitySourceLabel('surface')).toBe('Set on the surface');
   });
 
   it('parses the connection target and hides URL secrets', () => {
@@ -127,10 +120,7 @@ describe('agentLabels', () => {
     expect(agentMatchesFilter(agent(), '  ')).toBe(true);
   });
 
-  it('names the indirect runtimes for the protocol badge', () => {
-    expect(protocolBadgeTitle('url')).toBeUndefined();
-    expect(protocolBadgeTitle('a2a-proxy')).toContain('A2A proxy');
-    expect(protocolBadgeTitle('gateway')).toContain('remote gateway');
+  it('picks a route icon', () => {
     expect(runtimeIcon('a2a-proxy')).toBe('fa-exchange-alt');
     expect(runtimeIcon('ftp')).toBe('fa-robot');
   });

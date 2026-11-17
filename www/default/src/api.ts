@@ -145,13 +145,18 @@ export interface AgentTraffic {
 
 export interface AgentDetails extends AgentRecord {
   surfaces: AgentSurfaceSummary[];
+  /** The name of the A2A proxy or remote gateway the endpoint names; `null` when unknown. */
+  target_name?: string | null;
   traffic: AgentTraffic;
 }
 
-/** The agent's own card, as published by the agent. Untrusted and not verified. */
+/** How the gateway obtains the card it serves for an agent, from the agent's runtime. */
+export type AgentCardSource = 'fetched' | 'generated' | 'remote_gateway';
+
+/** The card the gateway serves for the agent, as callers get it. Untrusted and not verified. */
 export type AgentCardResponse =
-  | { available: true; card: unknown }
-  | { available: false; reason: 'no_agent_card' | 'unsupported_runtime' | 'operator_only' };
+  | { available: true; card: unknown; source: AgentCardSource }
+  | { available: false; reason: 'no_agent_card' | 'not_running' | 'operator_only' };
 
 class SessionManager {
   private static readonly YES_VALUE = '1';

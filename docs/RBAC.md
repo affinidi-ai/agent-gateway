@@ -94,14 +94,19 @@ gets `operator_only` instead of a fetch on an appliance-wide surface. See
 `GET /v1/agents`, `GET /v1/agents/{id}` and `GET /v1/agents/{id}/agent-card` are read-only and
 need `surfaces.view`. They group only the surfaces in the caller's tenant and PAT resource scope,
 return `404` for an agent id outside it, and are not served when no auth backend is configured.
-`GET /v1/agents/{id}/agent-card` makes the gateway fetch the agent's own card from its target
-endpoint on request, without the surface's Target Authentication and without any userinfo the
-endpoint holds. Unlike the agent card preview, that fetch is not audited and not rate limited: a
-card is cached per agent for 5 minutes and a failed fetch for 30 seconds. A tenant's token sees the
-agents of appliance-wide surfaces, but the card is fetched only through a surface of its own
-tenant: when only an appliance-wide surface could reach it, the answer is `available: false` with
-`operator_only` and nothing is fetched, as in the preview. See [`POLICY.md`](POLICY.md) for the
-egress rules it follows.
+`GET /v1/agents/{id}` also returns `target_name`, the name of the A2A proxy or remote gateway the
+agent's endpoint names, and `null` for a URL endpoint, a missing record or another tenant's record.
+`GET /v1/agents/{id}/agent-card` returns the card the gateway serves for the agent, read through
+the agent card preview of its first running A2A or AP2 surface, with `source` naming how the
+gateway obtains it: `fetched` (a URL Target's card, rewritten), `generated` (by an A2A proxy) or
+`remote_gateway` (served over Fabric). The read is audited and rate limited as a preview read, and
+answers `429` past the limits without an earlier preview. Only the card's A2A Agent Card fields are
+returned, and no card or a body that is not an Agent Card is a `502`. When none of the agent's
+surfaces runs on this gateway, the answer is `available: false` with `not_running`. A tenant's
+token sees the agents of appliance-wide surfaces, but the card is read only through a surface of
+its own tenant: when only an appliance-wide surface could reach it, the answer is
+`available: false` with `operator_only` and nothing is fetched, as in the preview. See
+[`POLICY.md`](POLICY.md) for the egress rules it follows.
 
 ## Payments admin API
 

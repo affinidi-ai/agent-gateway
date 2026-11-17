@@ -4,33 +4,21 @@ import { Badge } from '../../components/shared/Badge';
 import { CopyButton } from '../../components/shared/CopyButton';
 import {
   NO_DID,
-  protocolBadgeLabel,
-  protocolBadgeTitle,
+  protocolLabel,
   protocolTone,
-  runtimeIcon,
   shortenDid,
   trustRegistryLabel,
 } from './agentLabels';
 
-/** Proxied and remote-gateway agents get the runtime icon and a tooltip saying so. */
-export const AgentProtocolBadge: React.FC<{ protocol: string; runtime: string }> = ({
-  protocol,
-  runtime,
-}) => {
-  const title = protocolBadgeTitle(runtime);
-  return (
-    <Badge
-      value={protocolBadgeLabel(protocol, runtime)}
-      tone={protocolTone(protocol)}
-      size="sm"
-      prefix={
-        title ? <i className={`fas ${runtimeIcon(runtime)} me-1`} aria-hidden="true" /> : undefined
-      }
-      title={title}
-      data-testid="agents-protocol-badge"
-    />
-  );
-};
+/** The protocol only; how the agent is reached is the Route. */
+export const AgentProtocolBadge: React.FC<{ protocol: string }> = ({ protocol }) => (
+  <Badge
+    value={protocolLabel(protocol)}
+    tone={protocolTone(protocol)}
+    size="sm"
+    data-testid="agents-protocol-badge"
+  />
+);
 
 /** `Recorded` when any of the agent's identities was recorded to a trust registry. */
 export const AgentTrustRegistryBadge: React.FC<{ trust: AgentTrustRegistry }> = ({ trust }) => {

@@ -21,12 +21,13 @@ const AgentsTable: React.FC<AgentsTableProps> = ({ agents, retentionMinutes, onO
     <table className="table table-hover table-sm">
       <thead>
         <tr>
-          <th style={{ width: '20%' }}>Agent</th>
-          <th style={{ width: '15%' }}>Runtime &amp; protocol</th>
-          <th style={{ width: '20%' }}>Identities</th>
-          <th style={{ width: '17%' }}>Used by surfaces</th>
+          <th style={{ width: '18%' }}>Agent</th>
+          <th style={{ width: '10%' }}>Route</th>
+          <th style={{ width: '10%' }}>Protocol</th>
+          <th style={{ width: '19%' }}>Identities</th>
+          <th style={{ width: '16%' }}>Used by surfaces</th>
           <th style={{ width: '13%' }}>Trust registry</th>
-          <th style={{ width: '15%' }}>Last activity</th>
+          <th style={{ width: '14%' }}>Last activity</th>
         </tr>
       </thead>
       <tbody>
@@ -54,11 +55,13 @@ const AgentsTable: React.FC<AgentsTableProps> = ({ agents, retentionMinutes, onO
               )}
             </td>
             <td>
-              <div className="small mb-1" data-testid="agents-runtime">
+              <div className="small" data-testid="agents-runtime">
                 <i className={`fas ${runtimeIcon(agent.runtime)} me-1`} aria-hidden="true" />
                 {runtimeLabel(agent.runtime)}
               </div>
-              <AgentProtocolBadge protocol={agent.protocol} runtime={agent.runtime} />
+            </td>
+            <td>
+              <AgentProtocolBadge protocol={agent.protocol} />
             </td>
             <td>
               <AgentIdentities identities={agent.identities} />

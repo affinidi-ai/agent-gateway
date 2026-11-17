@@ -1,4 +1,4 @@
-import type { AgentIdentity, AgentRecord, AgentRuntime, AgentTrustRegistry } from '../../api';
+import type { AgentRecord, AgentRuntime, AgentTrustRegistry } from '../../api';
 import { timeAgo } from '../../utils/stringUtils';
 
 /**
@@ -7,9 +7,9 @@ import { timeAgo } from '../../utils/stringUtils';
  */
 
 const RUNTIME_LABELS: Record<AgentRuntime, string> = {
-  url: 'Direct URL',
-  'a2a-proxy': 'A2A proxy',
-  gateway: 'Remote gateway',
+  url: 'Direct',
+  'a2a-proxy': 'Proxied',
+  gateway: 'Fabric',
 };
 
 const RUNTIME_ICONS: Record<AgentRuntime, string> = {
@@ -41,7 +41,7 @@ export function displayName(agent: Pick<AgentRecord, 'name'>): string {
 }
 
 export function runtimeLabel(runtime: string): string {
-  return RUNTIME_LABELS[runtime as AgentRuntime] ?? 'Unknown runtime';
+  return RUNTIME_LABELS[runtime as AgentRuntime] ?? 'Unknown route';
 }
 
 export function runtimeIcon(runtime: string): string {
@@ -54,21 +54,6 @@ export function protocolLabel(protocol: string): string {
 
 export function protocolTone(protocol: string): BadgeTone {
   return PROTOCOL_TONES[protocol] ?? 'secondary';
-}
-
-/** The protocol badge, which also says how the agent is reached: `A2A via proxy`. */
-export function protocolBadgeLabel(protocol: string, runtime: string): string {
-  const label = protocolLabel(protocol);
-  if (runtime === 'a2a-proxy') return `${label} via proxy`;
-  if (runtime === 'gateway') return `${label} via gateway`;
-  return label;
-}
-
-/** Tooltip for the protocol badge when the gateway doesn't call the agent directly. */
-export function protocolBadgeTitle(runtime: string): string | undefined {
-  if (runtime === 'a2a-proxy') return 'The gateway reaches this agent through an A2A proxy';
-  if (runtime === 'gateway') return 'The gateway reaches this agent through a remote gateway';
-  return undefined;
 }
 
 export function trustRegistryLabel(trust: AgentTrustRegistry): string {
@@ -136,10 +121,6 @@ export function lastActivityLabel(at: string | null, windowMinutes?: number): st
 export function shortenDid(did: string, head = 20, tail = 8): string {
   if (did.length <= head + tail + 1) return did;
   return `${did.slice(0, head)}…${did.slice(-tail)}`;
-}
-
-export function identitySourceLabel(source: AgentIdentity['source']): string {
-  return source === 'managed' ? 'Managed identity, issued by this gateway' : 'Set on the surface';
 }
 
 /** "Not used", "1 surface" or "N surfaces". */

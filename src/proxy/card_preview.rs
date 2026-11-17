@@ -36,6 +36,7 @@ const PREVIEW_MEMORY_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_SURFACES: u64 = 512;
 const MAX_PREVIEW_SECS: u64 = 60;
 const PREVIEW_SOURCE: &str = "agent-card-preview";
+const NAME_SOURCE: &str = "agent-registry-name";
 
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -647,6 +648,33 @@ fn surface_cache<V: Clone + Send + Sync + 'static>() -> moka::future::Cache<Stri
         .max_capacity(MAX_SURFACES)
         .time_to_live(PREVIEW_MEMORY_TTL)
         .build()
+}
+
+/// The base route's card as callers get it, built as a preview is, for the Agents API's
+/// background name lookup. It runs at most once per surface per lookup period, so it is
+/// neither rate limited nor audited. `None` when the build fails or times out, or the
+/// surface derives a DID from an API key it may not use.
+pub(crate) async fn served_card(state: &ProxyState) -> Option<serde_json::Value> {
+    if crate::identity::provider_key_gate::gate()
+        .refuses(&state.surface)
+        .await
+        .is_some()
+    {
+        return None;
+    }
+    let deadline = preview_deadline(
+        state
+            .config
+            .a2a
+            .timeout_seconds,
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+    tokio::time::timeout(deadline, build_public_card(state, &headers, NAME_SOURCE, CardMode::Preview, None))
+        .await
+        .ok()?
+        .ok()
+        .map(|card| card.served)
 }
 
 /// The preview memory every surface on this replica shares.

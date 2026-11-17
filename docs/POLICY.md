@@ -859,26 +859,32 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   lists, so a tenant's list can start it for an appliance-wide surface's agent
   and see that card's `name`, though the tenant's own card read answers
   `operator_only`. See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#agent-card-names).
+- The **Agents API served card name lookup** (`src/identity/handlers/agents.rs`,
+  `card_preview.rs::served_card`) names agents behind an `a2a-proxy://` or
+  `fabric://` target. It builds the card the surface serves, as the
+  [Agent card preview](RBAC.md#agent-card-preview) does, so it follows the
+  same rules: the A2A proxy generates the card, and a `fabric://` card is read
+  from the remote gateway. It runs in the background on a cache miss, once per
+  surface per 5 minutes and at most 4 at once, is not rate limited or audited,
+  and issues no DID, writes no Trust Registry record and records no request.
+  As with the target card name, a tenant's list can start it for an
+  appliance-wide surface's agent and see that card's `name`.
 - The **Agents API Agent Card fetch** (`GET /v1/agents/{id}/agent-card`,
-  `src/identity/handlers/agents.rs`) reads the managed agent's own card on
-  request, through the same `outbound_handler.rs::fetch_agent_card` with the
-  purpose `agent-registry-card`, so it shares the forward step's policy:
-  loopback and private targets are allowed, cloud metadata is blocked, and
-  redirects are not followed. It reads the operator-configured HTTP(S) target
-  of the agent's first A2A or AP2 surface without the surface's Target
-  Authentication, never through the surface's public card route. A tenant's
-  token reads it only through a surface of its own tenant, and gets
-  `available: false` with `operator_only` and no fetch when only an
-  appliance-wide surface could reach the card, as the surface's card preview
-  does. Userinfo in the endpoint (`https://user:pass@host`) is dropped before
-  this fetch and the target card name fetch, so neither sends it; an endpoint
-  that does not parse as a URL is not fetched. The fetch has
-  a 5-second timeout and a 64 KiB limit; a card is cached per agent for 5
-  minutes and a failed fetch for 30 seconds, and a failure returns a generic
-  `502`. Concurrent views of one agent share one fetch, and at most 4 fetches
-  run at once. Unlike the surface's [Agent card preview](RBAC.md#agent-card-preview),
-  it is not audited and not rate limited; the failure cache bounds how often one
-  agent's target is read. See [`RBAC.md`](RBAC.md#agents-api).
+  `src/identity/handlers/agents.rs`) is the surface's
+  [Agent card preview](RBAC.md#agent-card-preview) of the agent's first A2A or
+  AP2 surface that runs on this gateway, so it follows the same rules as the
+  preview and the surface's own card route: a URL Target's card is fetched
+  with the surface's Target Authentication and rewritten, an `a2a-proxy://`
+  Target's card is generated, and a `fabric://` Target's card is read from the
+  remote gateway. Serving it issues no DID, writes no Trust Registry record and
+  records no request. A tenant's token reads it only through a surface of its
+  own tenant, and gets `available: false` with `operator_only` and no fetch
+  when only an appliance-wide surface could, as the preview does. Each fetch
+  counts against the preview's per-user and per-surface limits and is audited;
+  past them the last preview of the surface answers, or `429` without one. The
+  response carries only the top-level A2A 0.3 and 1.0 Agent Card fields of the
+  card the gateway serves, and `502` when there is no card or it is not a JSON
+  object with a string `name`. See [`RBAC.md`](RBAC.md#agents-api).
 - The dashboard's **caller Agent Card fetch**
   (`src/observability/caller_names.rs`) reads a URL taken from the caller's own
   DID document, so the caller chooses it. It goes through
