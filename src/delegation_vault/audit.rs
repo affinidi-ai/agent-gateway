@@ -27,6 +27,7 @@ use super::read_scope::VaultReadScope;
 use crate::audit::log_files;
 use crate::audit::pipeline::PipelineControl;
 use crate::metrics::backends::prometheus::set_audit_pipeline_started;
+use crate::observability::loggable;
 use crate::server::mode::ServerMode;
 
 /// Global audit file path — for reading the log
@@ -1251,12 +1252,20 @@ pub fn emit(
 
 /// Writes `event` to the gateway log. The delegation events in
 /// [`crate::audit::catalog::LOGGED_EVENTS`] are kept there and in no audit
-/// sink. The line names the caller by identity hash only, and no credential.
+/// sink. The line names the caller by identity hash only, and no credential:
+/// the Target URL is written as [`loggable::url`] renders it. The tool name,
+/// which the caller chooses, and the detail, which can quote a vendor, are
+/// each one [`loggable::untrusted`] token.
 pub fn log_event(event: &DelegationAuditEvent) {
     let text = |value: &Option<String>| -> String {
         value
             .clone()
             .unwrap_or_else(|| "-".to_string())
+    };
+    let rendered = |value: &Option<String>, render: fn(&str) -> String| -> String {
+        value
+            .as_deref()
+            .map_or_else(|| "-".to_string(), render)
     };
     info!(
         target: "credential_delegation",
@@ -1268,12 +1277,12 @@ pub fn log_event(event: &DelegationAuditEvent) {
         surface_variant = %text(&event.surface_variant),
         token_id = %text(&event.token_id),
         scopes = %event.scopes.as_ref().map_or_else(|| "-".to_string(), |scopes| scopes.join(",")),
-        mcp_tool_name = %text(&event.mcp_tool_name),
+        mcp_tool_name = %rendered(&event.mcp_tool_name, loggable::untrusted),
         via_fabric = event.via_fabric,
-        target_endpoint = %text(&event.target_endpoint),
+        target_endpoint = %rendered(&event.target_endpoint, loggable::url),
         protocol = %text(&event.protocol),
         request_id = %text(&event.request_id),
-        detail = %text(&event.detail),
+        detail = %rendered(&event.detail, loggable::untrusted),
         "Delegation event"
     );
 }
@@ -4634,5 +4643,124 @@ mod tests {
     fn emitting_before_the_pipeline_starts_does_not_panic() {
         emit("token_injected", || audit_event(DelegationAuditAction::TokenInjected, None, None, None, None));
         submit(audit_event(DelegationAuditAction::TokenInjected, None, None, None, None));
+    }
+
+    type LoggedFields = std::collections::HashMap<String, String>;
+
+    /// The fields of the one line [`log_event`] writes for `event`, by name.
+    fn logged(event: &DelegationAuditEvent) -> LoggedFields {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+
+        #[derive(Default)]
+        struct Fields(LoggedFields);
+
+        impl Visit for Fields {
+            fn record_debug(
+                &mut self,
+                field: &Field,
+                value: &dyn std::fmt::Debug,
+            ) {
+                self.0
+                    .insert(field.name().to_string(), format!("{value:?}"));
+            }
+        }
+
+        struct Capture(Arc<Mutex<Vec<LoggedFields>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: Context<'_, S>,
+            ) {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                self.0
+                    .lock()
+                    .expect("captured lines")
+                    .push(fields.0);
+            }
+        }
+
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(lines.clone()));
+        tracing::subscriber::with_default(subscriber, || log_event(event));
+        let mut lines = lines
+            .lock()
+            .expect("captured lines")
+            .clone();
+        assert_eq!(lines.len(), 1, "one event is one line: {lines:?}");
+        lines.remove(0)
+    }
+
+    fn injected() -> DelegationAuditEvent {
+        audit_event(
+            DelegationAuditAction::TokenInjected,
+            Some("did:web:agent.example"),
+            Some("sha256:caller"),
+            Some("github"),
+            Some("surface-a"),
+        )
+    }
+
+    #[test]
+    fn a_logged_delegation_event_names_its_target_without_the_credentials_in_its_url() {
+        let mut event = injected();
+        event.target_endpoint =
+            Some("https://operator:hunter2@vendor.example/mcp?key=opaque-credential&region=eu#section".to_string());
+
+        let line = logged(&event);
+
+        assert_eq!(line["target_endpoint"], "https://vendor.example/mcp?key=<redacted>&region=<redacted>");
+        for secret in ["opaque-credential", "hunter2", "operator"] {
+            assert!(
+                line.values()
+                    .all(|value| !value.contains(secret)),
+                "{secret} is logged: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_caller_cannot_forge_a_log_line_or_a_field_through_the_tool_it_names() {
+        let mut event = injected();
+        event.mcp_tool_name =
+            Some("read\nINFO Delegation event event=consent_granted user_hash=sha256:other".to_string());
+        event.detail = Some("refused\r\nWARN forged".to_string());
+
+        let line = logged(&event);
+
+        assert_eq!(
+            line["mcp_tool_name"],
+            r#""read\nINFO Delegation event event=consent_granted user_hash=sha256:other""#
+        );
+        assert_eq!(line["detail"], r#""refused\r\nWARN forged""#);
+        assert!(
+            line.values()
+                .all(|value| !value.contains(['\n', '\r'])),
+            "{line:?}"
+        );
+    }
+
+    #[test]
+    fn a_logged_delegation_event_keeps_a_fabric_target_and_marks_the_fields_it_does_not_have() {
+        let mut event = injected();
+        event.target_endpoint = Some("fabric://partner-gateway/partner-surface".to_string());
+
+        let line = logged(&event);
+
+        assert_eq!(line["event"], "token_injected");
+        assert_eq!(line["agent_did"], "did:web:agent.example");
+        assert_eq!(line["user_hash"], "sha256:caller");
+        assert_eq!(line["provider_id"], "github");
+        assert_eq!(line["target_endpoint"], "fabric://partner-gateway/partner-surface");
+        for absent in ["mcp_tool_name", "detail", "token_id", "scopes"] {
+            assert_eq!(line[absent], "-", "{absent}: {line:?}");
+        }
+
+        event.target_endpoint = None;
+        assert_eq!(logged(&event)["target_endpoint"], "-");
     }
 }

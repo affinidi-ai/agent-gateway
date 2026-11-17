@@ -397,7 +397,7 @@ mod tests {
             "provider_id=provider-1",
             "surface_id=surface-1",
             "scopes=repo,read:org",
-            "detail=grant_by_binding:owner:target",
+            r#"detail="grant_by_binding:owner:target""#,
         ] {
             assert!(lines[0].contains(field), "{field}: {}", lines[0]);
         }

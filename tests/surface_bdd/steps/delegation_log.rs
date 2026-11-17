@@ -26,14 +26,55 @@ fn delegation_events(world: &SurfaceWorld) -> Vec<LoggedEvent> {
     gateway_log(world)
         .lines()
         .filter_map(|line| line.split_once("Delegation event "))
-        .map(|(_, fields)| {
-            fields
-                .split_whitespace()
-                .filter_map(|field| field.split_once('='))
-                .map(|(key, value)| (key.to_string(), value.to_string()))
-                .collect()
-        })
+        .map(|(_, fields)| logged_fields(fields))
         .collect()
+}
+
+/// The fields of one line. A value a caller or a vendor chose is logged as a
+/// quoted token, so a space inside it starts no field; a field named twice
+/// keeps its first value.
+fn logged_fields(mut rest: &str) -> LoggedEvent {
+    let mut fields = LoggedEvent::new();
+    while let Some((key, after)) = rest
+        .trim_start()
+        .split_once('=')
+    {
+        let (value, remainder) = match after.strip_prefix('"') {
+            Some(quoted) => quoted_value(quoted),
+            None => {
+                let (value, remainder) = after
+                    .split_once(char::is_whitespace)
+                    .unwrap_or((after, ""));
+                (value.to_string(), remainder)
+            }
+        };
+        fields
+            .entry(key.to_string())
+            .or_insert(value);
+        rest = remainder;
+    }
+    fields
+}
+
+/// The text of a quoted token, read from just after its opening quote, and what
+/// follows its closing quote.
+fn quoted_value(quoted: &str) -> (String, &str) {
+    let mut value = String::new();
+    let mut characters = quoted.char_indices();
+    while let Some((position, character)) = characters.next() {
+        match character {
+            '"' => return (value, &quoted[position + 1..]),
+            '\\' => match characters.next() {
+                Some((_, 'n')) => value.push('\n'),
+                Some((_, 'r')) => value.push('\r'),
+                Some((_, 't')) => value.push('\t'),
+                Some((_, escaped)) => value.push(escaped),
+                None => {}
+            },
+            other => value.push(other),
+        }
+    }
+    (value, "")
 }
 
 /// A request is answered before the log line of its last step is flushed, so

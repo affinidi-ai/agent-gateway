@@ -114,11 +114,15 @@ changes:
         integration event catalog no longer list them. Each is now one INFO line of the gateway
         log, "Delegation event event=<name> ...", naming the agent, the caller's identity hash,
         the provider, the surface, the token or grant, its scopes and the MCP tool, and no
-        credential. What was decided about delegated access stays audited: consent_granted,
-        consent_expired, token_revoked, user_tokens_revoked, delegation_failed, connector_call and
-        mcp_proxy_pin_changed. Upgrade note: the gateway log is kept for
-        retention.local_logs_hours, 24 hours by default, so after that nothing on the gateway
-        records which calls used a person's credential. An integration or SIEM that received
-        these events receives them no longer; forward the gateway log, or raise the retention, to
-        keep them. Records of these events written before stay in the VP Audit Log and stay
-        readable.
+        credential: the Target URL is logged without its user name and password and with every
+        query value redacted, and the tool name, which the caller chooses, as a quoted token that
+        cannot start a log line of its own. What was decided about delegated access stays
+        audited: consent_granted, consent_expired, token_revoked, user_tokens_revoked,
+        delegation_failed, connector_call and mcp_proxy_pin_changed. Upgrade note: the lines are
+        written at the default log level, INFO, to stderr and, when a log directory is set, to
+        agent-gateway.log, which the gateway neither rotates nor removes by age. How long they
+        are kept is therefore the deployment's log retention, and a gateway set to log less
+        than INFO writes none. An integration or SIEM that received these events receives them
+        no longer; ship the gateway log, or export the credential_delegation log target over
+        OTLP, to keep them. Records of these events written before stay in the VP Audit Log
+        and stay readable.

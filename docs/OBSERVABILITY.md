@@ -472,13 +472,26 @@ the VP Audit Log nor an integration is offered it: `token_injected`, `token_refr
 the `credential_delegation` target:
 
 ```text
-Delegation event event=token_injected agent_did=<agent> user_hash=<identity hash> provider_id=<provider record id> surface_id=<surface> surface_variant=<variant> token_id=<token or grant id> scopes=<comma-separated> mcp_tool_name=<tool> via_fabric=<true|false> target_endpoint=<target> protocol=<protocol> request_id=<request> detail=<detail>
+Delegation event event=token_injected agent_did=<agent> user_hash=<identity hash> provider_id=<provider record id> surface_id=<surface> surface_variant=<variant> token_id=<token or grant id> scopes=<comma-separated> mcp_tool_name="<tool>" via_fabric=<true|false> target_endpoint=<target> protocol=<protocol> request_id=<request> detail="<detail>"
 ```
 
 A field the event does not have is `-`. The line names the caller by identity hash only and
-carries no credential; it is kept as long as the gateway's logs are (`retention.local_logs_hours`,
-24 hours by default). A selection made before may still name one of these events, and the name
-selects nothing: the gateway drops it from the stored `audit_events` when it loads its settings
+carries no credential: `target_endpoint` is the Target URL without its user name, password and
+fragment and with every query value logged as `<redacted>`, as in the gateway's other log lines.
+`mcp_tool_name`, which the caller chooses, and `detail`, which can quote what a vendor answered,
+are each one quoted token: quotes, backslashes, line breaks and other control characters are
+escaped and anything after the first 256 characters is cut, so neither can start a log line or a
+field of its own.
+
+The line is written at `INFO`, the default of `[logging] level`; a gateway set to log less
+writes none of these events anywhere. It goes where the rest of the gateway's log goes: stderr,
+and `agent-gateway.log` in the log directory when one is set, a file the gateway neither rotates
+nor removes by age. So how long these events are kept is the deployment's log retention, not the
+gateway's: ship the log, or export the `credential_delegation` target over OTLP
+([`opentelemetry.logs.targets`](CONFIGURATION_REFERENCE.md#metricsjson)), where they are
+needed for longer.
+
+A selection made before may still name one of these events, and the name selects nothing: the gateway drops it from the stored `audit_events` when it loads its settings
 and from any `audit_events` or event set it is asked to save, where any other unknown name is
 refused. An event set left with no other event is refused as empty, and reported by the startup
 check of stored definitions until it is changed or deleted. Records of these events written to

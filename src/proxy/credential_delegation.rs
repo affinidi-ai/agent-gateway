@@ -2996,7 +2996,7 @@ mod tests {
             .lines()
             .find(|line| line.contains("Delegation event") && line.contains("event=refresh_failed"))
             .unwrap_or_else(|| panic!("the refused refresh is logged as a delegation event: {text}"));
-        assert!(event_line.contains(&format!("detail={expected}")), "{event_line}");
+        assert!(event_line.contains(&format!("detail={expected:?}")), "{event_line}");
         for marker in ["description-marker", "uri-marker"] {
             assert!(!text.contains(marker), "{marker} reached the log: {text}");
         }
