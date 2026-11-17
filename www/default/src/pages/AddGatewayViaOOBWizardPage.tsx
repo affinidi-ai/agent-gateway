@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import './OnboardWizard.css';
 import { apiClient } from '../api';
@@ -47,9 +47,27 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
   const [error, setError] = useState('');
   const [pausing, setPausing] = useState(false);
   const [refusal, setRefusal] = useState<MediatorAccessRefusal | null>(null);
+  /**
+   * Whether the running continue is the wizard's own first try. A paused gateway
+   * goes straight to Connect; a refusal of that first try only shows the
+   * Mediator Access step, without a "still refuses" alert.
+   */
+  const autoTrying = useRef(false);
+  const autoTried = useRef<string | null>(null);
+
+  /** Tries a paused gateway's DIDs once, before asking the user for anything. */
+  const autoTry = (gatewayId: string) => {
+    if (autoTried.current === gatewayId) return false;
+    autoTried.current = gatewayId;
+    autoTrying.current = true;
+    return true;
+  };
+
+  const resumed = useRef<string | null>(null);
 
   useEffect(() => {
-    if (!resumeId) return;
+    if (!resumeId || resumed.current === resumeId) return;
+    resumed.current = resumeId;
     const resume = async () => {
       try {
         setPausing(true);
@@ -63,6 +81,7 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
           description: gateway.data.description,
           gateway: gateway.data,
           mediatorAccess: access.data,
+          // Continuing from Connections shows the DIDs at once; the user tests the connection.
           currentStep: 'mediator-access',
         }));
       } catch (err: any) {
@@ -74,10 +93,19 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
     resume();
   }, [resumeId]);
 
+  // Mediator Access is listed only once the mediator has refused the DIDs, so a
+  // mediator that admits them looks the same as before the pause existed.
+  const [accessStepShown, setAccessStepShown] = useState(false);
+  useEffect(() => {
+    if (wizardState.currentStep === 'mediator-access') setAccessStepShown(true);
+  }, [wizardState.currentStep]);
+
   const steps: { key: WizardStep; label: string }[] = [
     { key: 'enter-details', label: 'Enter Details' },
     { key: 'enter-link', label: 'Enter Connection Point Link' },
-    { key: 'mediator-access', label: 'Mediator Access' },
+    ...(accessStepShown || wizardState.currentStep === 'mediator-access'
+      ? [{ key: 'mediator-access' as WizardStep, label: 'Mediator Access' }]
+      : []),
     { key: 'connect', label: 'Connect' },
     { key: 'complete', label: 'Complete' },
   ];
@@ -128,11 +156,12 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
         await_mediator_access: true,
       });
       const access: MediatorAccess | undefined = response.data.mediator_access;
+      const tryNow = access ? autoTry(response.data.gateway.id) : false;
       setWizardState(prev => ({
         ...prev,
         gateway: response.data.gateway,
         mediatorAccess: access ?? null,
-        currentStep: access ? 'mediator-access' : 'complete',
+        currentStep: access ? (tryNow ? 'connect' : 'mediator-access') : 'complete',
       }));
     } catch (err: any) {
       setError(err.message || 'Failed to accept the connection point link.');
@@ -142,12 +171,14 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
   };
 
   const handleMediatorAccessConfirmed = () => {
+    autoTrying.current = false;
     setRefusal(null);
     goToStep('connect');
   };
 
   const handleRefused = (refused: MediatorAccessRefusal) => {
-    setRefusal(refused);
+    setRefusal(autoTrying.current ? null : refused);
+    autoTrying.current = false;
     goToStep('mediator-access');
   };
 

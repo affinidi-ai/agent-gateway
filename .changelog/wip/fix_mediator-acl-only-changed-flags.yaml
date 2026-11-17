@@ -34,6 +34,21 @@ changes:
       description: >-
         The Continue button of a gateway and of a Connection Point waiting for mediator access had
         different styles. Both now use the outlined small style of the list's Edit button.
+    - timestamp: '2026-11-17T09:00:00Z'
+      title: Show the mediator access step only when the mediator refuses the new DIDs
+      description: >-
+        Right after creating a Connection Point or accepting an invitation, the dashboard now tries
+        to continue at once. On a mediator that admits the DIDs, such as one in explicit_deny mode,
+        the pairing goes straight on as before and the step is never shown. Only when the mediator
+        refuses them does the step appear, asking to add the DIDs to the DIDComm Mediator's allow
+        list, with every DID in one copy (Copy All DIDs as a Bundle) or each on its own, and Test
+        Connection to try again. Continue on Connections opens the step at once, without testing first.
+    - timestamp: '2026-11-17T09:05:00Z'
+      title: Keep the action buttons on one line on Connections
+      description: >-
+        The action buttons of a gateway or a Connection Point no longer stack on narrow windows or in
+        the Connection Points list; the table scrolls sideways instead, and buttons never wrap their
+        labels.
   fixed:
     - timestamp: '2026-11-12T16:00:00Z'
       title: ⭐ Pair gateways on an explicit_allow mediator without admin-only ACL rights
