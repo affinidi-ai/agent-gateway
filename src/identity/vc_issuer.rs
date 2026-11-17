@@ -793,6 +793,47 @@ impl VCIssuer {
         Ok(true)
     }
 
+    /// Writes `did.json` of a published `did:webvh` gateway again from the latest version of its
+    /// verified DID log, as the parallel `did:web` document the log describes. Returns whether
+    /// there was a log to write it from.
+    #[cfg(feature = "didwebvh")]
+    async fn restore_did_document_from_log(
+        storage_path: &Path,
+        proxy_did: &str,
+    ) -> Result<bool> {
+        use crate::identity::didwebvh::handlers::build_webvh_state;
+        use crate::storage::did_artifacts::{read_did_log_raw, write_did_document};
+
+        let Some(log) = read_did_log_raw(storage_path).await? else {
+            return Ok(false);
+        };
+        let entries: Vec<String> = log
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect();
+        build_webvh_state(proxy_did, &entries)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let latest: serde_json::Value = serde_json::from_str(
+            entries
+                .last()
+                .context("Gateway DID log has no entries")?,
+        )?;
+        let state = latest
+            .get("state")
+            .filter(|state| state.is_object())
+            .context("Gateway DID log entry has no state")?;
+        let scid = crate::identity::didwebvh::identifier::parse_did_webvh(proxy_did)?
+            .scid
+            .context("Gateway DID has no SCID")?;
+        let parallel = crate::identity::didwebvh::generate_parallel_did_web(state, proxy_did, &scid);
+        write_did_document(storage_path, &serde_json::to_string_pretty(&parallel)?).await?;
+        info!("Gateway did.json was missing; written again from the gateway DID log");
+        Ok(true)
+    }
+
     /// Migrate the gateway `proxy_did` from `did:web:` to `did:webvh:` on first boot after upgrade.
     ///
     /// Delegates to `create_webvh_did` (the same spec-compliant helper used by
@@ -1070,9 +1111,26 @@ impl VCIssuer {
         let did_doc_path = storage_path.join("did.json");
 
         // Only regenerate DID document if it doesn't exist or if we created new keys
-        let should_update_did_doc = !did_doc_path.exists() || is_new_config || !x25519_existed || !p256_existed;
+        let did_doc_missing = !tokio::fs::try_exists(&did_doc_path).await?;
+        let should_update_did_doc = did_doc_missing || is_new_config || !x25519_existed || !p256_existed;
 
-        if should_update_did_doc {
+        #[cfg(feature = "didwebvh")]
+        let restored = did_doc_missing
+            && !is_new_config
+            && x25519_existed
+            && p256_existed
+            && proxy_did.starts_with("did:webvh:")
+            && match Self::restore_did_document_from_log(&storage_path, &proxy_did).await {
+                Ok(restored) => restored,
+                Err(e) => {
+                    warn!("Gateway did.json could not be written again from the gateway DID log: {e:#}");
+                    false
+                }
+            };
+        #[cfg(not(feature = "didwebvh"))]
+        let restored = false;
+
+        if should_update_did_doc && !restored {
             let did_doc = gateway_did_document(
                 &proxy_did,
                 &key,
@@ -3365,6 +3423,65 @@ mod tests {
         assert!(!changed);
         assert_eq!(std::fs::read_to_string(dir.join("did.jsonl")).unwrap(), log_before);
         assert_eq!(std::fs::read_to_string(dir.join("did.json")).unwrap(), doc_before);
+    }
+
+    /// A published gateway whose did.json is gone gets it back at start as the parallel did:web
+    /// document of its DID log, which the repair then completes rather than refuses.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn missing_did_document_is_restored_from_the_log_at_start() {
+        let (issuer, temp_dir) = crate::identity::test_helpers::test_vc_issuer_without_assertion_multikey().await;
+        let dir = temp_dir.path();
+        std::fs::remove_file(dir.join("did.json")).unwrap();
+
+        let config = VCIssuer::load_or_create_config(dir.to_path_buf(), "example.com".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            config.proxy_did,
+            issuer
+                .get_issuer_did()
+                .await
+                .unwrap()
+        );
+        let latest = &did_log_entries(&issuer).await[0]["state"];
+        assert_eq!(read_json(&dir.join("did.json")), parallel_did_web(latest));
+        assert!(
+            issuer
+                .authorize_signing_key()
+                .await
+                .unwrap()
+        );
+        assert!(
+            issuer
+                .signing_key_is_listed()
+                .await
+        );
+    }
+
+    /// A published gateway whose did.json and log are both unusable still starts: the restore
+    /// is skipped with a warning and did.json is generated as before.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn gateway_starts_when_its_did_document_cannot_be_restored_from_the_log() {
+        let (issuer, temp_dir) = crate::identity::test_helpers::test_vc_issuer_without_assertion_multikey().await;
+        let dir = temp_dir.path();
+        std::fs::remove_file(dir.join("did.json")).unwrap();
+        std::fs::write(dir.join("did.jsonl"), "{\"not\": \"a log entry\"}\n").unwrap();
+
+        let config = VCIssuer::load_or_create_config(dir.to_path_buf(), "example.com".to_string())
+            .await
+            .expect("a log that does not verify must not stop the gateway from starting");
+
+        assert_eq!(
+            config.proxy_did,
+            issuer
+                .get_issuer_did()
+                .await
+                .unwrap()
+        );
+        assert!(dir.join("did.json").exists());
     }
 
     /// A `did:webvh` gateway whose did.jsonl is gone still gets its did.json repaired, and no
