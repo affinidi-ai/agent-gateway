@@ -28,9 +28,7 @@ updates:
           - "minor"
           - "patch"
 
-  # Same grouping as cargo: one weekly PR for minor and patch, majors on their
-  # own. The separate npm_and_yarn PRs are the security updates the header
-  # describes.
+  # Same grouping as cargo: one weekly PR for minor and patch, majors on their own.
   - package-ecosystem: npm
     directory: /www/default
     schedule:
