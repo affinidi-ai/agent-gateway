@@ -150,6 +150,8 @@ request on the dashboard WebSocket, with no admin API route and nothing stored o
   read a message within 10 seconds is disconnected, so it cannot delay the check.
 - Listening ends when the connection closes, so reloading or leaving the page ends it. The
   dashboard sends its listens again after a reconnect.
+- Captures and `policy_input_skipped` notices queued before a stop, or by an earlier listen to
+  the same surface, are not sent; those of the connection's other surfaces still are.
 
 A surface's policy input is captured while at least one connection listens to it, and only the
 listening connections receive the captures, each through its own queue of at most 64; a capture

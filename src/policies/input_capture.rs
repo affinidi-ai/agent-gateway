@@ -16,10 +16,18 @@ use tokio::sync::mpsc;
 use crate::observability::loggable::REDACTED;
 use crate::server::WsUpdate;
 
-/// Where a dashboard connection receives its captures: each one a serialized
-/// `policy_input_captured` update, or a `policy_input_skipped` update counting the
-/// captures dropped because it was full.
-pub type CaptureSender = mpsc::Sender<Arc<str>>;
+/// A serialized `policy_input_captured` update, or a `policy_input_skipped` update
+/// counting the captures dropped because the queue was full, queued for one listen:
+/// the surface it belongs to and the id of that listen's [`Listening`].
+#[derive(Debug, Clone)]
+pub struct QueuedCapture {
+    pub surface_id: String,
+    pub listen: u64,
+    pub update: Arc<str>,
+}
+
+/// Where a dashboard connection receives its captures.
+pub type CaptureSender = mpsc::Sender<QueuedCapture>;
 
 /// One listen: the id of its [`Listening`], where its captures go, and how many it has
 /// missed since it was last told.
@@ -38,6 +46,11 @@ impl Listener {
         surface_id: &str,
         capture: &Arc<str>,
     ) {
+        let queued = |update: Arc<str>| QueuedCapture {
+            surface_id: surface_id.to_string(),
+            listen: self.id,
+            update,
+        };
         let skipped = self
             .skipped
             .swap(0, Ordering::AcqRel);
@@ -50,7 +63,7 @@ impl Listener {
             .to_string();
             if self
                 .captures
-                .try_send(notice.into())
+                .try_send(queued(notice.into()))
                 .is_err()
             {
                 self.skipped
@@ -60,7 +73,7 @@ impl Listener {
         }
         if self
             .captures
-            .try_send(Arc::clone(capture))
+            .try_send(queued(Arc::clone(capture)))
             .is_err()
         {
             self.skipped
@@ -103,6 +116,13 @@ pub fn listen(
     }
 }
 
+impl Listening {
+    /// The id the captures queued for this listen carry.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
 impl Drop for Listening {
     fn drop(&mut self) {
         if let Some(mut listeners) = LISTENERS.get_mut(&self.surface_id) {
@@ -137,17 +157,17 @@ impl CapturedPolicy {
 
 /// A listen to `surface_id` for tests, with the receiver of its captures.
 #[cfg(test)]
-pub(crate) fn listening(surface_id: &str) -> (Listening, mpsc::Receiver<Arc<str>>) {
+pub(crate) fn listening(surface_id: &str) -> (Listening, mpsc::Receiver<QueuedCapture>) {
     let (captures, received) = mpsc::channel(64);
     (listen(surface_id, captures), received)
 }
 
-/// The captures `received` has been sent so far, as JSON.
+/// The updates `received` has been sent so far, as JSON.
 #[cfg(test)]
-pub(crate) fn received_captures(received: &mut mpsc::Receiver<Arc<str>>) -> Vec<Value> {
+pub(crate) fn received_captures(received: &mut mpsc::Receiver<QueuedCapture>) -> Vec<Value> {
     let mut captures = Vec::new();
     while let Ok(capture) = received.try_recv() {
-        captures.push(serde_json::from_str(&capture).expect("a capture is JSON"));
+        captures.push(serde_json::from_str(&capture.update).expect("a capture is JSON"));
     }
     captures
 }
@@ -599,6 +619,33 @@ mod tests {
     }
 
     #[test]
+    fn captures_and_skipped_notices_are_queued_with_their_surface_and_the_id_of_their_listen() {
+        let (queue, mut received) = mpsc::channel(1);
+        let tagged = listen("input-capture-tagged", queue);
+        let (other, _other_received) = listening("input-capture-tagged");
+        let input = json!({ "channel": { "config_id": "input-capture-tagged" } });
+        let capture = || {
+            begin("surface", "input-capture-tagged", &input, Vec::new)
+                .unwrap()
+                .finish(Ok((true, None)))
+        };
+
+        capture();
+        capture();
+        let first = received.try_recv().unwrap();
+        capture();
+        let notice = received.try_recv().unwrap();
+
+        for (queued, kind) in [(&first, "policy_input_captured"), (&notice, "policy_input_skipped")] {
+            assert_eq!(queued.surface_id, "input-capture-tagged");
+            assert_eq!(queued.listen, tagged.id());
+            let update: Value = serde_json::from_str(&queued.update).unwrap();
+            assert_eq!(update["type"], kind);
+        }
+        assert_ne!(other.id(), tagged.id());
+    }
+
+    #[test]
     fn concurrent_captures_report_each_missed_capture_exactly_once() {
         const SENDERS: usize = 8;
         const SENDS: usize = 2_000;
@@ -618,7 +665,7 @@ mod tests {
                 loop {
                     match received.try_recv() {
                         Ok(update) => {
-                            let update: Value = serde_json::from_str(&update).unwrap();
+                            let update: Value = serde_json::from_str(&update.update).unwrap();
                             match update["skipped"].as_u64() {
                                 Some(skipped) => reported += skipped,
                                 None => delivered += 1,

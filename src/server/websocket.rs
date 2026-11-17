@@ -20,6 +20,7 @@ use tokio::sync::{RwLock, broadcast};
 use tracing::{debug, error, info, warn};
 
 use crate::observability::loggable;
+use crate::policies::input_capture::QueuedCapture;
 
 /// WebSocket update message types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -464,7 +465,7 @@ async fn recheck_policy_input(
 async fn recheck_at_keep_alive(
     subscription: &RwLock<WsSubscription>,
     caller: Option<&WsCaller>,
-    captures: &mut tokio::sync::mpsc::Receiver<Arc<str>>,
+    captures: &mut tokio::sync::mpsc::Receiver<QueuedCapture>,
 ) -> Vec<String> {
     let (allowed, stopped) = recheck_policy_input(subscription, caller).await;
     if !allowed {
@@ -732,6 +733,14 @@ fn keeps_reading(error: &broadcast::error::RecvError) -> bool {
     matches!(error, broadcast::error::RecvError::Lagged(_))
 }
 
+/// What the send loop picked to send next, apart from the keep-alive tick.
+enum Outgoing {
+    Update(Box<WsUpdate>),
+    Missed(broadcast::error::RecvError),
+    Answer(String),
+    Capture(QueuedCapture),
+}
+
 /// Send the connection's broadcast updates, answers and policy input captures to the
 /// client, and at each `ping_interval` tick recheck its access and ping it. Returns when
 /// the client is gone or stops reading, or the update channel closes.
@@ -739,7 +748,7 @@ async fn send_loop<S>(
     mut sender: S,
     mut rx: broadcast::Receiver<WsUpdate>,
     mut answer_rx: tokio::sync::mpsc::Receiver<String>,
-    mut capture_rx: tokio::sync::mpsc::Receiver<Arc<str>>,
+    mut capture_rx: tokio::sync::mpsc::Receiver<QueuedCapture>,
     send_sub: &RwLock<WsSubscription>,
     caller: Option<&WsCaller>,
     mut ping_interval: tokio::time::Interval,
@@ -749,9 +758,9 @@ async fn send_loop<S>(
     let mut logs_allowed = WsCaller::logs_allowed(caller).await;
 
     'send: loop {
-        tokio::select! {
-            // The keep-alive recheck goes first, so a due recheck always runs before
-            // any queued capture is sent.
+        let outgoing = tokio::select! {
+            // A due keep-alive recheck runs before any queued capture is sent; the
+            // other queues share the rest fairly, so a busy broadcast starves none.
             biased;
             _ = ping_interval.tick() => {
                 logs_allowed = WsCaller::logs_allowed(caller).await;
@@ -765,53 +774,65 @@ async fn send_loop<S>(
                     break;
                 }
                 debug!("Sent WebSocket ping");
+                continue;
             }
-            // Handle broadcast updates
-            update_result = rx.recv() => {
-                match update_result {
-                    Ok(update) => {
-                        if !admits(&update, logs_allowed) {
+            outgoing = async {
+                tokio::select! {
+                    update = rx.recv() => match update {
+                        Ok(update) => Outgoing::Update(Box::new(update)),
+                        Err(error) => Outgoing::Missed(error),
+                    },
+                    Some(answer) = answer_rx.recv() => Outgoing::Answer(answer),
+                    Some(capture) = capture_rx.recv() => Outgoing::Capture(capture),
+                }
+            } => outgoing,
+        };
+
+        let msg = match outgoing {
+            Outgoing::Update(update) => {
+                if !admits(&update, logs_allowed) {
+                    continue;
+                }
+                // DashboardDelta is already serialized; apply per-client
+                // section filtering before forwarding.
+                match update.as_ref() {
+                    WsUpdate::DashboardDelta { json } => {
+                        let sub = send_sub.read().await;
+                        match delta_for_connection(json, &sub, logs_allowed) {
+                            Some(delta) => Message::Text(delta.into()),
+                            None => continue, // Nothing left after filtering
+                        }
+                    }
+                    other => match serde_json::to_string(other) {
+                        Ok(json) => Message::Text(json.into()),
+                        Err(e) => {
+                            error!("Failed to serialize update: {}", e);
                             continue;
                         }
-                        // DashboardDelta is already serialized; apply per-client
-                        // section filtering before forwarding.
-                        let msg = match &update {
-                            WsUpdate::DashboardDelta { json } => {
-                                let sub = send_sub.read().await;
-                                match delta_for_connection(json, &sub, logs_allowed) {
-                                    Some(delta) => Message::Text(delta.into()),
-                                    None => continue, // Nothing left after filtering
-                                }
-                            }
-                            other => match serde_json::to_string(other) {
-                                Ok(json) => Message::Text(json.into()),
-                                Err(e) => {
-                                    error!("Failed to serialize update: {}", e);
-                                    continue;
-                                }
-                            },
-                        };
-
-                        if !deliver(&mut sender, msg).await {
-                            break;
-                        }
-                    }
-                    Err(error) if keeps_reading(&error) => {
-                        debug!("WebSocket client fell behind the update channel: {}", error);
-                    }
-                    Err(_) => break,
+                    },
                 }
             }
-            Some(answer) = answer_rx.recv() => {
-                if !deliver(&mut sender, Message::Text(answer.into())).await {
-                    break;
-                }
+            Outgoing::Missed(error) if keeps_reading(&error) => {
+                debug!("WebSocket client fell behind the update channel: {}", error);
+                continue;
             }
-            Some(capture) = capture_rx.recv() => {
-                if !deliver(&mut sender, Message::Text(capture.as_ref().into())).await {
-                    break;
+            Outgoing::Missed(_) => break,
+            Outgoing::Answer(answer) => Message::Text(answer.into()),
+            Outgoing::Capture(capture) => {
+                let held = send_sub
+                    .read()
+                    .await
+                    .policy_input
+                    .get(&capture.surface_id)
+                    .is_some_and(|listening| listening.id() == capture.listen);
+                if !held {
+                    continue;
                 }
+                Message::Text(capture.update.as_ref().into())
             }
+        };
+        if !deliver(&mut sender, msg).await {
+            break;
         }
     }
 }
@@ -828,12 +849,12 @@ async fn handle_socket(
 
     // Per-connection subscription – shared between send & recv tasks.
     // Captured policy input of the surfaces this connection listens to, sent by the send task.
-    let (capture_tx, capture_rx) =tokio::sync::mpsc::channel::<Arc<str>>(MAX_PENDING_CAPTURES);
+    let (capture_tx, capture_rx) = tokio::sync::mpsc::channel::<QueuedCapture>(MAX_PENDING_CAPTURES);
     let subscription = Arc::new(RwLock::new(WsSubscription::new(capture_tx)));
     let caller = Arc::new(caller);
     // Answers to the client's own requests, sent by the send task.
     // Bounded, so a client that stops reading its socket is no longer read from either.
-    let (answer_tx, answer_rx) =tokio::sync::mpsc::channel::<String>(MAX_PENDING_ANSWERS);
+    let (answer_tx, answer_rx) = tokio::sync::mpsc::channel::<String>(MAX_PENDING_ANSWERS);
 
     // Send initial connection confirmation
     if let Err(e) = sender
@@ -1580,6 +1601,191 @@ mod tests {
         assert_eq!(answer(stop.to_string())["error"], super::SESSION_ENDED);
         assert!(never_read.try_recv().is_err(), "no ping follows the stop answer");
         drop((updates_tx, answers_tx));
+    }
+
+    /// What `sent` received, in order: each text message as JSON, and each ping as `"ping"`.
+    fn sent_messages(mut sent: futures::channel::mpsc::Receiver<axum::extract::ws::Message>) -> Vec<serde_json::Value> {
+        use axum::extract::ws::Message;
+
+        let mut messages = Vec::new();
+        while let Ok(message) = sent.try_recv() {
+            messages.push(match message {
+                Message::Text(text) => serde_json::from_str(text.as_str()).unwrap(),
+                Message::Ping(_) => serde_json::json!("ping"),
+                other => panic!("unexpected message {other:?}"),
+            });
+        }
+        messages
+    }
+
+    /// Run the send loop over `captures` until it has nothing left to send, with no
+    /// broadcast updates or answers, and return what it sent.
+    async fn sent_until_idle(
+        captures: tokio::sync::mpsc::Receiver<crate::policies::input_capture::QueuedCapture>,
+        subscription: &tokio::sync::RwLock<super::WsSubscription>,
+        caller: &super::WsCaller,
+    ) -> Vec<serde_json::Value> {
+        let (_updates_tx, updates) = tokio::sync::broadcast::channel(1);
+        let (_answers_tx, answers) = tokio::sync::mpsc::channel(1);
+        let (sink, sent) = futures::channel::mpsc::channel(64);
+        let ping_interval = tokio::time::interval(super::KEEP_ALIVE_INTERVAL);
+        let looping = super::send_loop(sink, updates, answers, captures, subscription, Some(caller), ping_interval);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), looping)
+                .await
+                .is_err()
+        );
+        sent_messages(sent)
+    }
+
+    fn capture_on(
+        surface_id: &str,
+        allow: bool,
+    ) {
+        crate::policies::input_capture::begin(
+            "surface",
+            surface_id,
+            &serde_json::json!({ "channel": { "config_id": surface_id } }),
+            Vec::new,
+        )
+        .unwrap()
+        .finish(Ok((allow, None)));
+    }
+
+    #[tokio::test]
+    async fn queued_answers_and_a_queued_capture_are_sent_before_a_busy_broadcast_drains() {
+        const UPDATES: usize = 500;
+        let dir = TempDir::new().unwrap();
+        let caller =
+            caller_for(guard_with_user(&dir, crate::auth::types::UserRole::Administrator).await, "user-1").await;
+        let (captures_tx, captures) = tokio::sync::mpsc::channel(8);
+        let subscription = tokio::sync::RwLock::new(super::WsSubscription::new(captures_tx));
+        super::listen_to_policy_input(&subscription, Some(&caller), listen_message("ws-busy"), true).await;
+        capture_on("ws-busy", true);
+        let (updates_tx, updates) = tokio::sync::broadcast::channel(UPDATES);
+        for _ in 0..UPDATES {
+            updates_tx
+                .send(super::WsUpdate::RefreshDashboard)
+                .unwrap();
+        }
+        drop(updates_tx);
+        let (answers_tx, answers) = tokio::sync::mpsc::channel(super::MAX_PENDING_ANSWERS);
+        for n in 0..super::MAX_PENDING_ANSWERS {
+            answers_tx
+                .try_send(serde_json::json!({ "type": "answer", "n": n }).to_string())
+                .unwrap();
+        }
+        let (sink, sent) = futures::channel::mpsc::channel(UPDATES + super::MAX_PENDING_ANSWERS + 8);
+        let ping_interval = tokio::time::interval(super::KEEP_ALIVE_INTERVAL);
+
+        super::send_loop(sink, updates, answers, captures, &subscription, Some(&caller), ping_interval).await;
+
+        let sent = sent_messages(sent);
+        let of_type = |messages: &[serde_json::Value], kind: &str| {
+            messages
+                .iter()
+                .filter(|message| message["type"] == kind)
+                .count()
+        };
+        assert_eq!(of_type(&sent, "refresh_dashboard"), UPDATES);
+        let last_update = sent
+            .iter()
+            .rposition(|message| message["type"] == "refresh_dashboard")
+            .unwrap();
+        let before_drained = &sent[..last_update];
+        assert_eq!(of_type(before_drained, "answer"), super::MAX_PENDING_ANSWERS);
+        assert_eq!(of_type(before_drained, "policy_input_captured"), 1);
+        drop(answers_tx);
+    }
+
+    #[tokio::test]
+    async fn a_due_recheck_that_revokes_access_runs_before_a_queued_capture_is_sent() {
+        let dir = TempDir::new().unwrap();
+        let caller =
+            caller_for(guard_with_user(&dir, crate::auth::types::UserRole::Administrator).await, "user-1").await;
+        let (captures_tx, captures) = tokio::sync::mpsc::channel(8);
+        let subscription = tokio::sync::RwLock::new(super::WsSubscription::new(captures_tx));
+        super::listen_to_policy_input(&subscription, Some(&caller), listen_message("ws-recheck-first"), true).await;
+        capture_on("ws-recheck-first", true);
+        caller
+            .sessions
+            .remove_sessions_for_user("user-1")
+            .await;
+        let (_, updates) = tokio::sync::broadcast::channel::<super::WsUpdate>(1);
+        let (_, answers) = tokio::sync::mpsc::channel(1);
+        let (sink, sent) = futures::channel::mpsc::channel(8);
+        let ping_interval = tokio::time::interval(super::KEEP_ALIVE_INTERVAL);
+
+        super::send_loop(sink, updates, answers, captures, &subscription, Some(&caller), ping_interval).await;
+
+        let sent = sent_messages(sent);
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[0]["surface_id"], "ws-recheck-first");
+        assert_eq!(sent[0]["error"], super::SESSION_ENDED);
+        assert_eq!(sent[1], "ping");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn captures_and_a_skipped_notice_queued_before_a_stop_are_not_sent() {
+        let dir = TempDir::new().unwrap();
+        let caller =
+            caller_for(guard_with_user(&dir, crate::auth::types::UserRole::Administrator).await, "user-1").await;
+        let (captures_tx, mut captures) = tokio::sync::mpsc::channel(2);
+        let subscription = tokio::sync::RwLock::new(super::WsSubscription::new(captures_tx));
+        super::listen_to_policy_input(&subscription, Some(&caller), listen_message("ws-stopped-queue"), true).await;
+        for _ in 0..3 {
+            capture_on("ws-stopped-queue", true);
+        }
+        captures.try_recv().unwrap();
+        capture_on("ws-stopped-queue", true);
+        assert_eq!(captures.len(), 2, "a capture and a skipped notice are queued before the stop");
+        super::listen_to_policy_input(&subscription, Some(&caller), listen_message("ws-stopped-queue"), false).await;
+
+        let sent = sent_until_idle(captures, &subscription, &caller).await;
+
+        assert_eq!(sent, vec![serde_json::json!("ping")]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn after_a_stop_and_a_new_listen_only_the_new_listens_captures_are_sent() {
+        let dir = TempDir::new().unwrap();
+        let caller =
+            caller_for(guard_with_user(&dir, crate::auth::types::UserRole::Administrator).await, "user-1").await;
+        let (captures_tx, captures) = tokio::sync::mpsc::channel(8);
+        let subscription = tokio::sync::RwLock::new(super::WsSubscription::new(captures_tx));
+        super::listen_to_policy_input(&subscription, Some(&caller), listen_message("ws-restarted"), true).await;
+        capture_on("ws-restarted", true);
+        super::listen_to_policy_input(&subscription, Some(&caller), listen_message("ws-restarted"), false).await;
+        super::listen_to_policy_input(&subscription, Some(&caller), listen_message("ws-restarted"), true).await;
+        capture_on("ws-restarted", false);
+
+        let sent = sent_until_idle(captures, &subscription, &caller).await;
+
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[0], "ping");
+        assert_eq!(sent[1]["config_id"], "ws-restarted");
+        assert_eq!(sent[1]["decision"], "deny");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopping_one_surface_still_sends_the_queued_captures_of_another() {
+        let dir = TempDir::new().unwrap();
+        let caller =
+            caller_for(guard_with_user(&dir, crate::auth::types::UserRole::Administrator).await, "user-1").await;
+        let (captures_tx, captures) = tokio::sync::mpsc::channel(8);
+        let subscription = tokio::sync::RwLock::new(super::WsSubscription::new(captures_tx));
+        super::listen_to_policy_input(&subscription, Some(&caller), listen_message("ws-stopped-s"), true).await;
+        super::listen_to_policy_input(&subscription, Some(&caller), listen_message("ws-kept-t"), true).await;
+        capture_on("ws-stopped-s", true);
+        capture_on("ws-kept-t", true);
+        super::listen_to_policy_input(&subscription, Some(&caller), listen_message("ws-stopped-s"), false).await;
+
+        let sent = sent_until_idle(captures, &subscription, &caller).await;
+
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[0], "ping");
+        assert_eq!(sent[1]["type"], "policy_input_captured");
+        assert_eq!(sent[1]["config_id"], "ws-kept-t");
     }
 
     #[tokio::test]
