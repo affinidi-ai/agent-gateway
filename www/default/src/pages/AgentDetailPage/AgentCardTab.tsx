@@ -1,8 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { AgentCardResponse, AgentCardSource, AgentSurfaceRef, apiClient } from '../../api';
 import { AppButton } from '../../components/shared/AppButton';
 import FormSelect from '../../components/shared/FormSelect';
 import { tokenizeJson } from '../../components/shared/jsonHighlight';
+import { SurfaceLinkButton } from '../IdentitiesPage/IdentitySurfaceCell';
 import AgentCardPreview from './AgentCardPreview';
 
 type CardView = 'preview' | 'json';
@@ -34,24 +36,45 @@ interface SurfacePickerProps {
   onChange: (surfaceId: string) => void;
 }
 
-/** The surface the card is read through: a select when there are several, else its name. */
+/**
+ * The surface the card is read through: a link to it, or a select with an Open surface link when
+ * there are several.
+ */
 const SurfacePicker: React.FC<SurfacePickerProps> = ({ ids, value, names, onChange }) => {
+  const navigate = useNavigate();
+  const openSurface = (surfaceId: string) => navigate(`/surfaces/${surfaceId}`);
   const options = useMemo(
     () => ids.map(id => ({ value: id, label: names.get(id) ?? id })),
     [ids, names]
   );
   if (ids.length < 2) {
-    return <strong data-testid="agent-card-surface">{names.get(value) ?? value}</strong>;
+    return (
+      <SurfaceLinkButton
+        surface={{ id: value, name: names.get(value) ?? value, deleted: false }}
+        onOpen={openSurface}
+        data-testid="agent-card-surface"
+      />
+    );
   }
   return (
-    <FormSelect
-      value={value}
-      options={options}
-      onChange={onChange}
-      ariaLabel="Surface serving the Agent Card"
-      className="d-inline-block"
-      testid="agent-card-surface-select"
-    />
+    <>
+      <FormSelect
+        value={value}
+        options={options}
+        onChange={onChange}
+        ariaLabel="Surface serving the Agent Card"
+        className="d-inline-block"
+        testid="agent-card-surface-select"
+      />
+      <button
+        type="button"
+        className="btn btn-link btn-sm p-0 ms-1"
+        onClick={() => openSurface(value)}
+        data-testid="agent-card-open-surface-button"
+      >
+        Open surface
+      </button>
+    </>
   );
 };
 

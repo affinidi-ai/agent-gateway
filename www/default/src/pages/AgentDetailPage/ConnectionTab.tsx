@@ -1,17 +1,13 @@
 import React from 'react';
-import { Link, useNavigate } from 'react-router-dom';
-import type { AgentDetails, AgentSurfaceSummary } from '../../api';
+import { Link } from 'react-router-dom';
+import type { AgentDetails, AgentRegistryOutcome } from '../../api';
 import { CopyButton } from '../../components/shared/CopyButton';
+import { TrustRecorderStateBadge } from '../../components/trust-recorder/TrustRecorderStateBadge';
 import { usePermissions } from '../../context/PermissionsContext';
-import { SurfaceLinkButton } from '../IdentitiesPage/IdentitySurfaceCell';
-import { AgentRouteBadge } from '../AgentsPage/AgentBadges';
+import { trustRecorderReasonText } from '../../utils/trustRecorderStatus';
+import { AgentDid } from '../AgentsPage/AgentBadges';
 import type { AgentConnectionTarget } from '../AgentsPage/agentLabels';
-import {
-  connectionTarget,
-  routeDescription,
-  runtimeIcon,
-  surfacesUsedLabel,
-} from '../AgentsPage/agentLabels';
+import { connectionTarget, routeDescription } from '../AgentsPage/agentLabels';
 
 /** The A2A proxy or remote gateway by name, as plain text, or by id when it has none. */
 const TargetLabel: React.FC<{ name?: string | null; id: string }> = ({ name, id }) =>
@@ -24,96 +20,77 @@ const ROUTE_DESCRIPTIONS: Record<AgentConnectionTarget['kind'], string> = {
   unknown: "The endpoint can't be shown, so the target is hidden.",
 };
 
-interface HopProps {
-  label: string;
-  value: string;
-  icon: string;
-  tone?: 'target' | 'hidden';
-  testId?: string;
-}
-
-/** The last hop of the path: what `target.endpoint` names, as plain text. */
-function targetHop(target: AgentConnectionTarget, targetName?: string | null): HopProps {
-  const hop = { icon: runtimeIcon(target.kind), tone: 'target' as const };
-  switch (target.kind) {
-    case 'url':
-      return { ...hop, label: 'Agent URL', value: new URL(target.display).host };
-    case 'a2a-proxy':
-      return { ...hop, label: 'A2A proxy', value: targetName || target.proxyId };
-    case 'gateway':
-      return { ...hop, label: 'Remote gateway', value: targetName || target.gatewayId };
-    default:
-      return { label: 'Target', value: 'Hidden', icon: 'fa-eye-slash', tone: 'hidden' };
-  }
-}
-
-const Hop: React.FC<HopProps> = ({ label, value, icon, tone, testId }) => (
-  <div className={`agent-connection-hop${tone ? ` is-${tone}` : ''}`} data-testid={testId}>
-    <span className="agent-connection-hop-icon" aria-hidden="true">
-      <i className={`fas ${icon}`} />
-    </span>
-    <div className="agent-connection-hop-text">
-      <div className="agent-connection-hop-label">{label}</div>
-      <div className="agent-connection-hop-value">{value}</div>
-    </div>
-  </div>
-);
-
-/** One surface: its name linking to the surface page, and the URL callers use. */
-const SurfaceRow: React.FC<{ surface: AgentSurfaceSummary; onOpen: (id: string) => void }> = ({
-  surface,
-  onOpen,
-}) => (
-  <div data-testid={`agent-connection-surface-${surface.surface_id}`}>
-    <dt>
-      <SurfaceLinkButton
-        surface={{ id: surface.surface_id, name: surface.name, deleted: false }}
-        onOpen={onOpen}
-        data-testid="agent-connection-surface-link"
-      />
-    </dt>
-    <dd data-testid="agent-connection-surface-url">
-      {surface.public_url ? (
-        <>
-          <code className="text-break">{surface.public_url}</code>
-          <CopyButton
-            text={surface.public_url}
-            title="Copy URL"
-            data-testid="agent-connection-copy-surface-url"
-          />
-        </>
+/**
+ * Which Trust Registry each of the agent's identities was written to, with the last Trust
+ * Recorder outcome. The registry links to its page only with `trust_registries.edit`.
+ */
+const TrustRegistrySection: React.FC<{ outcomes: AgentRegistryOutcome[] }> = ({ outcomes }) => {
+  const { hasPermission } = usePermissions();
+  return (
+    <section className="mt-4" data-testid="agent-connection-trust-registry">
+      <h6 className="m-0 fw-bold">Trust registry</h6>
+      <div className="small text-muted mb-3">
+        Where the agent&apos;s identities were recorded. Recording is not a trust decision.
+      </div>
+      {outcomes.length === 0 ? (
+        <p className="text-muted small mb-0" data-testid="agent-connection-trust-registry-empty">
+          No identity of this agent was sent to a trust registry.
+        </p>
       ) : (
-        <>
-          <code className="text-break">{surface.route}</code>
-          <span className="small text-muted ms-2">No external URL configured</span>
-        </>
+        <table className="table table-sm align-middle mb-0 agent-preview-changes">
+          <thead>
+            <tr>
+              <th scope="col">Trust registry</th>
+              <th scope="col">Identity</th>
+              <th scope="col">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {outcomes.map(outcome => {
+              const label = (
+                <TargetLabel name={outcome.trust_registry_name} id={outcome.trust_registry_id} />
+              );
+              const reason = trustRecorderReasonText(outcome.reason);
+              return (
+                <tr
+                  key={`${outcome.trust_registry_id}-${outcome.did}`}
+                  data-testid={`agent-connection-registry-${outcome.trust_registry_id}`}
+                >
+                  <td className="agent-preview-change-field text-break">
+                    {hasPermission('trust_registries.edit') ? (
+                      <Link
+                        to={`/trust-registries/${encodeURIComponent(outcome.trust_registry_id)}`}
+                      >
+                        {label}
+                      </Link>
+                    ) : (
+                      label
+                    )}
+                  </td>
+                  <td>
+                    <AgentDid did={outcome.did} />
+                  </td>
+                  <td>
+                    <TrustRecorderStateBadge state={outcome.state} />
+                    {reason && <div className="text-muted small text-break">{reason}</div>}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
       )}
-    </dd>
-  </div>
-);
+    </section>
+  );
+};
 
 /**
- * How callers reach the agent and how the gateway reaches it: each surface with the URL
- * callers use, then the surfaces' `target.endpoint`. Read-only; both are changed in the
- * surface editor.
+ * Where the surfaces' `target.endpoint` sends callers.
+ * Read-only; the route is changed in the surface editor.
  */
 const ConnectionTab: React.FC<{ agent: AgentDetails }> = ({ agent }) => {
   const { hasPermission } = usePermissions();
-  const navigate = useNavigate();
-  const openSurface = (id: string) => navigate(`/surfaces/${encodeURIComponent(id)}`);
   const target = connectionTarget(agent.endpoint);
-  const hops: HopProps[] = [
-    {
-      label: agent.surfaces.length === 1 ? 'Surface' : 'Surfaces',
-      value:
-        agent.surfaces.length === 1
-          ? agent.surfaces[0].name
-          : surfacesUsedLabel(agent.surfaces.length),
-      icon: 'fa-sign-in-alt',
-      testId: 'agent-connection-surfaces-hop',
-    },
-    { ...targetHop(target, agent.target_name), testId: 'agent-connection-target' },
-  ];
 
   let rows: { label: string; value: React.ReactNode; testId: string }[];
   switch (target.kind) {
@@ -188,58 +165,33 @@ const ConnectionTab: React.FC<{ agent: AgentDetails }> = ({ agent }) => {
 
   return (
     <div data-testid="agent-connection-tab">
-      <div className="mb-2">
-        <h6 className="m-0 fw-bold">Surfaces</h6>
-        <div className="small text-muted">The URLs callers use to reach this agent.</div>
-      </div>
-      {agent.surfaces.length === 0 ? (
-        <p className="small text-muted mb-4" data-testid="agent-connection-no-surfaces">
-          No surface uses this agent.
-        </p>
-      ) : (
-        <dl className="agent-connection-details mb-4" data-testid="agent-connection-surfaces">
-          {agent.surfaces.map(surface => (
-            <SurfaceRow key={surface.surface_id} surface={surface} onOpen={openSurface} />
-          ))}
-        </dl>
-      )}
-
       <div className="mb-3">
-        <h6 className="m-0 fw-bold d-flex align-items-center gap-2">
-          Route
-          <AgentRouteBadge runtime={agent.runtime} data-testid="agent-connection-runtime" />
-        </h6>
+        <h6 className="m-0 fw-bold">Route</h6>
         <div className="small text-muted" data-testid="agent-connection-description">
           {ROUTE_DESCRIPTIONS[target.kind]}
         </div>
       </div>
 
-      <div
-        className="agent-connection-path mb-3"
-        role="group"
-        aria-label="Route path"
-        data-testid="agent-connection-path"
-      >
-        {hops.map((hop, index) => (
-          <React.Fragment key={hop.label}>
-            {index > 0 && (
-              <span className="agent-connection-arrow" aria-hidden="true">
-                <i className="fas fa-chevron-right" />
-              </span>
-            )}
-            <Hop {...hop} />
-          </React.Fragment>
-        ))}
-      </div>
+      <table className="table table-sm align-middle mb-0 agent-preview-changes">
+        <thead>
+          <tr>
+            <th scope="col">Field</th>
+            <th scope="col">Value</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(({ label, value, testId }) => (
+            <tr key={label}>
+              <td className="agent-preview-change-field">{label}</td>
+              <td className="text-break" data-testid={testId}>
+                {value}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
 
-      <dl className="agent-connection-details">
-        {rows.map(({ label, value, testId }) => (
-          <div key={label}>
-            <dt>{label}</dt>
-            <dd data-testid={testId}>{value}</dd>
-          </div>
-        ))}
-      </dl>
+      <TrustRegistrySection outcomes={agent.trust_registry.registries ?? []} />
     </div>
   );
 };

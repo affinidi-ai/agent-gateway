@@ -1,10 +1,10 @@
 import React from 'react';
 import type { AgentRecord } from '../../api';
-import { AgentProtocolBadge, AgentRouteBadge } from '../AgentsPage/AgentBadges';
+import { AgentProtocolBadge } from '../AgentsPage/AgentBadges';
 import { UNNAMED_AGENT, endpointHost } from '../AgentsPage/agentLabels';
 
 /**
- * Name with its protocol and route beside it; an unnamed agent also shows its endpoint host,
+ * Name with its protocol beside it; an unnamed agent also shows its endpoint host,
  * so it can be told apart. Read-only: no actions.
  */
 const AgentDetailHeader: React.FC<{ agent: AgentRecord }> = ({ agent }) => {
@@ -22,7 +22,6 @@ const AgentDetailHeader: React.FC<{ agent: AgentRecord }> = ({ agent }) => {
           </span>
         )}
         <AgentProtocolBadge protocol={agent.protocol} />
-        <AgentRouteBadge runtime={agent.runtime} data-testid="agent-details-runtime" />
       </h6>
     </div>
   );

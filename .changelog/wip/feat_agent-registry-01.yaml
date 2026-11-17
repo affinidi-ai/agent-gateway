@@ -61,9 +61,11 @@ changes:
         query string and fragment removed, and "Can't be shown" for an endpoint the API redacted.
         The Agent Card opens as a visual preview with a JSON view, and every value is shown as plain
         text, under "Served by <surface> · <source>" (Fetched & rewritten by the gateway, Generated
-        by the A2A proxy or Relayed from the remote gateway), with a surface select when several
-        serve it, an **Added by the gateway** section (the rewritten URL, the identity credential
-        and other changes against the card the agent published) and highlighted JSON.
+        by the A2A proxy or Relayed from the remote gateway), the surface as a link, or a surface
+        select with an **Open surface** link when several serve it, a **Changes by the gateway**
+        table (each changed field marked Rewritten, Added or Removed with what callers get and, for
+        a rewritten one, what it was; the Verifiable Presentation expands in place with Readable
+        and Raw JSON views; a surface without a DID says so) and highlighted JSON.
         `GET /v1/agents/{id}/agent-card` takes `?surface_id=` and returns `surface_id`,
         `card_surface_ids` and `upstream_card`. The list's **Identities** column shows the number of current identities as
         a badge with the first DID (all on hover), and flags **No DID** when surfaces use an agent

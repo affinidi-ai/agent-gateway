@@ -1,5 +1,6 @@
-import React from 'react';
-import { VpJwtRow } from '../../components/shared/VpViewer';
+import React, { useState } from 'react';
+import { AppButton } from '../../components/shared/AppButton';
+import { VpView } from '../../components/shared/VpViewer';
 import { UNNAMED_AGENT } from '../AgentsPage/agentLabels';
 import { GatewayChanges, IDENTITY_CREDENTIAL_EXTENSION, gatewayChanges } from './gatewayChanges';
 
@@ -33,66 +34,194 @@ const skillsOf = (card: CardFields): Skill[] =>
       }))
     : [];
 
-/** What the gateway changed in the card, the rewritten URL first. Every value is plain text. */
-const GatewayChangesSection: React.FC<{ changes: GatewayChanges }> = ({ changes }) => (
+const Value: React.FC<{ value: string | null }> = ({ value }) =>
+  value === null ? (
+    <span className="text-muted">-</span>
+  ) : (
+    <code className="small text-break">{value}</code>
+  );
+
+type ChangeKind = 'rewritten' | 'added' | 'removed';
+
+const CHANGE_BADGES: Record<ChangeKind, { label: string; className: string }> = {
+  rewritten: { label: 'Rewritten', className: 'text-bg-warning' },
+  added: { label: 'Added', className: 'text-bg-primary' },
+  removed: { label: 'Removed', className: 'text-bg-secondary' },
+};
+
+interface ChangeRow {
+  key: string;
+  field: string;
+  kind: ChangeKind;
+  testid: string;
+  value: React.ReactNode;
+  /** The value before the gateway changed it; `null` when there is nothing worth showing. */
+  was: string | null;
+  /** The presentation the row's Show button expands across the table. */
+  vp?: string;
+}
+
+const kindOf = (before: unknown, after: unknown): ChangeKind => {
+  if (before === null || before === false) return 'added';
+  return after === null ? 'removed' : 'rewritten';
+};
+
+const changeRows = (changes: GatewayChanges): ChangeRow[] => {
+  const rows: ChangeRow[] = [];
+  if (changes.url) {
+    rows.push({
+      key: 'url',
+      field: 'URL',
+      kind: kindOf(changes.url.upstream, changes.url.served),
+      testid: 'agent-card-gateway-url',
+      value: <Value value={changes.url.served} />,
+      was: changes.url.upstream,
+    });
+  }
+  changes.added.forEach((extension, index) => {
+    const key = `${extension.uri}-${index}`;
+    rows.push({
+      key,
+      field: extension.uri === IDENTITY_CREDENTIAL_EXTENSION ? 'Identity credential' : 'Extension',
+      kind: kindOf(extension.original, extension.uri),
+      testid: 'agent-card-gateway-extension',
+      value: <Value value={extension.uri} />,
+      was: extension.original === extension.uri ? null : extension.original,
+    });
+    if ((extension.did || extension.originalDid) && extension.did !== extension.originalDid) {
+      rows.push({
+        key: `${key}-did`,
+        field: 'DID',
+        kind: kindOf(extension.originalDid, extension.did),
+        testid: 'agent-card-gateway-did',
+        value: <Value value={extension.did} />,
+        was: extension.originalDid,
+      });
+    }
+    if (extension.vp) {
+      rows.push({
+        key: `${key}-vp`,
+        field: 'Verifiable Presentation',
+        kind: kindOf(extension.originalHasVp, extension.vp),
+        testid: 'agent-card-gateway-vp',
+        value: null,
+        was: null,
+        vp: extension.vp,
+      });
+    }
+  });
+  changes.removed.forEach(uri =>
+    rows.push({
+      key: `removed-${uri}`,
+      field: 'Extension',
+      kind: 'removed',
+      testid: 'agent-card-gateway-removed',
+      value: <Value value={null} />,
+      was: uri,
+    })
+  );
+  changes.otherFields.forEach(change =>
+    rows.push({
+      key: `field-${change.field}`,
+      field: change.field,
+      kind: kindOf(change.original, change.rewritten),
+      testid: `agent-card-gateway-other-${change.field}`,
+      value: <Value value={change.rewritten} />,
+      was: change.original,
+    })
+  );
+  return rows;
+};
+
+/** One change. A presentation's Show button expands it in a full-width row under its own. */
+const ChangeRowView: React.FC<{ row: ChangeRow }> = ({ row }) => {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <tr>
+        <td className="agent-preview-change-field">{row.field}</td>
+        <td>
+          <span
+            className={`badge ${CHANGE_BADGES[row.kind].className}`}
+            data-testid={`${row.testid}-change`}
+          >
+            {CHANGE_BADGES[row.kind].label}
+          </span>
+        </td>
+        <td>
+          <div data-testid={row.testid}>
+            {row.vp !== undefined ? (
+              <AppButton
+                variant="outline-secondary"
+                size="sm"
+                onClick={() => setOpen(o => !o)}
+                aria-expanded={open}
+                iconStart={
+                  <i
+                    className={`fas ${open ? 'fa-eye-slash' : 'fa-eye'} me-1`}
+                    aria-hidden="true"
+                  />
+                }
+                data-testid="agent-card-gateway-vp-toggle-button"
+              >
+                {open ? 'Hide' : 'Show'}
+              </AppButton>
+            ) : (
+              row.value
+            )}
+          </div>
+          {row.was !== null && (
+            <div className="text-muted small text-break" data-testid={`${row.testid}-was`}>
+              Was <code className="small">{row.was}</code>
+            </div>
+          )}
+        </td>
+      </tr>
+      {open && row.vp !== undefined && (
+        <tr>
+          <td colSpan={3} data-testid="agent-card-gateway-vp-view">
+            <VpView vpJwt={row.vp} />
+          </td>
+        </tr>
+      )}
+    </>
+  );
+};
+
+interface GatewayChangesSectionProps {
+  changes: GatewayChanges;
+  hasIdentityCredential: boolean;
+}
+
+/**
+ * What the gateway changed in the card, the URL first: the value callers get, with what it was
+ * under a rewritten one. Every value is plain text.
+ */
+const GatewayChangesSection: React.FC<GatewayChangesSectionProps> = ({
+  changes,
+  hasIdentityCredential,
+}) => (
   <section className="agent-preview-gateway" data-testid="agent-card-gateway-changes">
-    <h6 className="agent-preview-section-title">Added by the gateway</h6>
-    <dl className="agent-preview-rows">
-      {changes.url && (
-        <>
-          <dt>URL</dt>
-          <dd data-testid="agent-card-gateway-url">
-            <code className="small">{changes.url.served}</code>
-            {changes.url.upstream && (
-              <div className="small text-muted">
-                Rewritten from <code className="small">{changes.url.upstream}</code>
-              </div>
-            )}
-          </dd>
-        </>
-      )}
-      {changes.added.map((extension, index) => (
-        <React.Fragment key={`${extension.uri}-${index}`}>
-          <dt>
-            {extension.uri === IDENTITY_CREDENTIAL_EXTENSION ? 'Identity credential' : 'Extension'}
-          </dt>
-          <dd data-testid="agent-card-gateway-extension">
-            <code className="small">{extension.uri}</code>
-            {extension.did && (
-              <div className="small" data-testid="agent-card-gateway-did">
-                <span className="text-muted me-1">DID</span>
-                <code className="small">{extension.did}</code>
-              </div>
-            )}
-            {extension.presentation && (
-              <table className="table table-sm table-borderless mb-0 mt-1">
-                <tbody>
-                  <VpJwtRow vpJwt={extension.presentation} />
-                </tbody>
-              </table>
-            )}
-          </dd>
-        </React.Fragment>
-      ))}
-      {changes.replaced.length > 0 && (
-        <>
-          <dt>Replaces</dt>
-          <dd data-testid="agent-card-gateway-replaced">
-            {changes.replaced.map(uri => (
-              <div key={uri}>
-                <code className="small">{uri}</code>
-              </div>
-            ))}
-          </dd>
-        </>
-      )}
-      {changes.otherFields.length > 0 && (
-        <>
-          <dt>Also changed</dt>
-          <dd data-testid="agent-card-gateway-other">{changes.otherFields.join(', ')}</dd>
-        </>
-      )}
-    </dl>
+    <h6 className="agent-preview-section-title">Changes by the gateway</h6>
+    <table className="table table-sm align-middle mb-0 agent-preview-changes">
+      <thead>
+        <tr>
+          <th scope="col">Field</th>
+          <th scope="col">Change</th>
+          <th scope="col">Value</th>
+        </tr>
+      </thead>
+      <tbody>
+        {changeRows(changes).map(row => (
+          <ChangeRowView key={row.key} row={row} />
+        ))}
+      </tbody>
+    </table>
+    {!hasIdentityCredential && (
+      <p className="text-muted small mt-2 mb-0" data-testid="agent-card-gateway-no-did">
+        This surface has no DID, so the card carries no identity credential.
+      </p>
+    )}
   </section>
 );
 
@@ -103,7 +232,7 @@ interface AgentCardPreviewProps {
 }
 
 /**
- * A visual summary of the card the gateway serves, then what the gateway changed in it. The
+ * A visual summary of the card the gateway serves, its skills, then what the gateway changed. The
  * card is untrusted, so every value renders as plain text: no HTML, Markdown or links, and the
  * URL is not clickable.
  */
@@ -126,11 +255,19 @@ const AgentCardPreview: React.FC<AgentCardPreviewProps> = ({ card, upstreamCard 
   const outputModes = textList(card.defaultOutputModes);
   const skills = skillsOf(card);
   const changes = gatewayChanges(card, upstreamCard);
+  const hasIdentityCredential =
+    isObject(card.capabilities) &&
+    Array.isArray(card.capabilities.extensions) &&
+    card.capabilities.extensions.some(
+      extension => isObject(extension) && extension.uri === IDENTITY_CREDENTIAL_EXTENSION
+    );
 
   const rows: { label: string; value: React.ReactNode }[] = [
     { label: 'Version', value: text(card.version) ?? <NotSet /> },
     { label: 'Provider', value: provider ?? <NotSet /> },
-    { label: 'URL', value: url ? <code className="small">{url}</code> : <NotSet /> },
+    ...(changes?.url
+      ? []
+      : [{ label: 'URL', value: url ? <code className="small">{url}</code> : <NotSet /> }]),
     { label: 'Protocol version', value: text(card.protocolVersion) ?? <NotSet /> },
     {
       label: 'Streaming',
@@ -155,7 +292,7 @@ const AgentCardPreview: React.FC<AgentCardPreviewProps> = ({ card, upstreamCard 
           </div>
         </div>
       </div>
-      <dl className="agent-preview-rows">
+      <dl className="agent-preview-rows" data-testid="agent-card-preview-details">
         {rows.map(row => (
           <React.Fragment key={row.label}>
             <dt>{row.label}</dt>
@@ -163,7 +300,6 @@ const AgentCardPreview: React.FC<AgentCardPreviewProps> = ({ card, upstreamCard 
           </React.Fragment>
         ))}
       </dl>
-      {changes && <GatewayChangesSection changes={changes} />}
       <section className="agent-preview-skills" data-testid="agent-card-preview-skills">
         <h6 className="agent-preview-skills-title">Skills ({skills.length})</h6>
         {skills.length === 0 ? (
@@ -181,6 +317,9 @@ const AgentCardPreview: React.FC<AgentCardPreviewProps> = ({ card, upstreamCard 
           </ul>
         )}
       </section>
+      {changes && (
+        <GatewayChangesSection changes={changes} hasIdentityCredential={hasIdentityCredential} />
+      )}
     </div>
   );
 };

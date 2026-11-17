@@ -33,7 +33,9 @@ use crate::observability::refresh_cache::RefreshCache;
 use crate::proxy::card_preview::{AgentCardPreview, CardFetchStatus, PreviewRequest, RateLimited, access_point_url};
 use crate::surfaces::AgentSurfaceStore;
 use crate::tenancy::{PatTenantContext, ResourceKind, can_access, can_mutate, scope_allows_resource};
-use crate::trust_registry_verification::recorder_status::{RecorderState, TrustRecorderStatusStore, global_store};
+use crate::trust_registry_verification::recorder_status::{
+    RecorderReason, RecorderState, TrustRecorderStatusStore, global_store,
+};
 
 const JWT_CLAIM_CREDENTIAL_TYPE: &str = "jwt_claim";
 const MAX_CONCURRENT_SERVED_NAME_FETCHES: usize = 4;
@@ -71,10 +73,25 @@ impl AgentRuntime {
     }
 }
 
-/// Whether any of the agent's current identities was written to a Trust Registry.
-#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+/// Whether any of the agent's current identities was written to a Trust Registry, and the
+/// last Trust Recorder outcome per Trust Registry and identity.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct AgentTrustRegistry {
     pub recorded: bool,
+    /// Filled on the agent details only; the list leaves it out.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub registries: Vec<AgentRegistryOutcome>,
+}
+
+/// The best Trust Recorder outcome of one identity in one Trust Registry across the agent's
+/// surfaces. `trust_registry_name` is `null` when the caller may not see that registry.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AgentRegistryOutcome {
+    pub trust_registry_id: String,
+    pub trust_registry_name: Option<String>,
+    pub did: String,
+    pub state: RecorderState,
+    pub reason: Option<RecorderReason>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -749,28 +766,68 @@ fn primary_protocol(group: &AgentGroup<'_>) -> SurfaceProtocol {
         .unwrap_or_default()
 }
 
-/// Recorded when a (surface, DID) pair of the group is Recorded or Partly recorded and the
-/// DID is still one of the agent's identities. Without a store nothing is recorded.
-async fn is_recorded(
+/// Lower is better: the outcome kept when one identity has several in one registry.
+fn recorder_state_rank(state: RecorderState) -> u8 {
+    match state {
+        RecorderState::Recorded => 0,
+        RecorderState::Partial => 1,
+        RecorderState::Failed => 2,
+        RecorderState::Skipped => 3,
+        RecorderState::NotAttempted => 4,
+    }
+}
+
+/// The Trust Recorder outcomes of the group's (surface, DID) pairs whose DID is still one of
+/// the agent's identities, best per (registry, DID). Recorded when any is Recorded or Partly
+/// recorded. Without a store nothing is recorded.
+async fn trust_registry_outcomes(
     recorder: Option<&TrustRecorderStatusStore>,
     group: &AgentGroup<'_>,
     identities: &[AgentIdentity],
-) -> bool {
+) -> AgentTrustRegistry {
     let Some(recorder) = recorder else {
-        return false;
+        return AgentTrustRegistry::default();
     };
+    let mut recorded = false;
+    let mut best: BTreeMap<(String, String), AgentRegistryOutcome> = BTreeMap::new();
     for surface in &group.surfaces {
         for identity in identities {
-            let state = recorder
+            let Some(status) = recorder
                 .status_for(&surface.surface_id, &identity.did)
                 .await
-                .map(|status| status.state);
-            if matches!(state, Some(RecorderState::Recorded | RecorderState::Partial)) {
-                return true;
+            else {
+                continue;
+            };
+            recorded |= matches!(status.state, RecorderState::Recorded | RecorderState::Partial);
+            for entry in status.entries {
+                let key = (
+                    entry
+                        .trust_registry_id
+                        .clone(),
+                    identity.did.clone(),
+                );
+                let better = best
+                    .get(&key)
+                    .is_none_or(|kept| recorder_state_rank(entry.state) < recorder_state_rank(kept.state));
+                if better {
+                    best.insert(
+                        key,
+                        AgentRegistryOutcome {
+                            trust_registry_id: entry.trust_registry_id,
+                            trust_registry_name: None,
+                            did: identity.did.clone(),
+                            state: entry.state,
+                            reason: entry.reason,
+                        },
+                    );
+                }
             }
         }
     }
-    false
+    AgentTrustRegistry {
+        recorded,
+        registries: best.into_values().collect(),
+    }
 }
 
 fn surface_ref(surface: &AgentSurface) -> AgentSurfaceRef {
@@ -819,7 +876,7 @@ async fn agent_record<S>(
     summarise: fn(&AgentSurface) -> S,
 ) -> AgentRecord<S> {
     let identities = data.identities(group);
-    let recorded = is_recorded(recorder, group, &identities).await;
+    let trust_registry = trust_registry_outcomes(recorder, group, &identities).await;
     let tags: BTreeSet<&String> = group
         .surfaces
         .iter()
@@ -841,7 +898,7 @@ async fn agent_record<S>(
             .map(|surface| summarise(surface))
             .collect(),
         identities,
-        trust_registry: AgentTrustRegistry { recorded },
+        trust_registry,
         last_activity_at: group
             .surfaces
             .iter()
@@ -1082,6 +1139,10 @@ pub async fn list_agents(
     for group in &groups {
         let mut agent = agent_record(group, &data, recorder.as_deref(), &card_name, surface_ref).await;
         agent.target_name = target_name(&state, &group.endpoint, tenant_context(&context)).await;
+        agent
+            .trust_registry
+            .registries
+            .clear();
         agents.push(agent);
     }
     sort_agents(&mut agents);
@@ -1150,6 +1211,42 @@ async fn target_name(
     visible_name(tenant_id.as_deref(), name, context)
 }
 
+/// Fills each outcome's Trust Registry name the caller may see. Store errors are logged and
+/// give no name.
+async fn with_registry_names(
+    state: &IdentityApiState,
+    outcomes: &mut [AgentRegistryOutcome],
+    context: Option<&PatTenantContext>,
+) {
+    use crate::trust_registries::TrustRegistryStore;
+
+    let Some(store) = state
+        .trust_registry_store
+        .as_ref()
+    else {
+        return;
+    };
+    let mut names: HashMap<String, Option<String>> = HashMap::new();
+    for outcome in outcomes {
+        if !names.contains_key(&outcome.trust_registry_id) {
+            let name = store
+                .get(&outcome.trust_registry_id)
+                .await
+                .inspect_err(|error| warn!(error = %error, "Agents API could not read the Trust Registry"))
+                .ok()
+                .flatten()
+                .and_then(|registry| visible_name(registry.tenant_id.as_deref(), registry.name, context));
+            names.insert(
+                outcome
+                    .trust_registry_id
+                    .clone(),
+                name,
+            );
+        }
+        outcome.trust_registry_name = names[&outcome.trust_registry_id].clone();
+    }
+}
+
 /// One agent record with every surface and the Access Point traffic across them.
 pub async fn get_agent(
     Path(id): Path<String>,
@@ -1171,6 +1268,14 @@ pub async fn get_agent(
     let card_name = |surface: &AgentSurface| surface_card_name(&state, surface);
     let mut agent = agent_record(&group, &data, recorder_store().as_deref(), &card_name, surface_summary).await;
     agent.target_name = target_name(&state, &group.endpoint, tenant_context(&context)).await;
+    with_registry_names(
+        &state,
+        &mut agent
+            .trust_registry
+            .registries,
+        tenant_context(&context),
+    )
+    .await;
     with_public_urls(&mut agent.surfaces, &group, &state.network_config);
 
     let surface_ids: Vec<&str> = group
@@ -2043,7 +2148,41 @@ mod tests {
         let agent = recorder_fixture()
             .only(&[surface("s-oxygen"), surface("s-helium")], None)
             .await;
-        assert_eq!(agent.trust_registry, AgentTrustRegistry { recorded: false });
+        assert_eq!(agent.trust_registry, AgentTrustRegistry::default());
+    }
+
+    #[tokio::test]
+    async fn test_trust_registry_lists_the_best_outcome_per_registry_and_identity() {
+        let store = TrustRecorderStatusStore::in_memory();
+        record_outcome(&store, "s-oxygen", "did:a", EntryStatus::from_counts("tr-1", 0, 0, 1, None)).await;
+        record_outcome(&store, "s-helium", "did:a", EntryStatus::from_counts("tr-1", 1, 0, 0, None)).await;
+        record_outcome(&store, "s-helium", "did:b", EntryStatus::skipped("tr-2", RecorderReason::NoSurfaceIssuer))
+            .await;
+        let mut fixture = recorder_fixture();
+        fixture.records =
+            vec![managed("did:a", "s-oxygen"), managed("did:a", "s-helium"), managed("did:b", "s-helium")];
+        let agent = fixture
+            .only(&[surface("s-oxygen"), surface("s-helium")], Some(&store))
+            .await;
+        let outcomes: Vec<(&str, &str, RecorderState)> = agent
+            .trust_registry
+            .registries
+            .iter()
+            .map(|outcome| {
+                (
+                    outcome
+                        .trust_registry_id
+                        .as_str(),
+                    outcome.did.as_str(),
+                    outcome.state,
+                )
+            })
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec![("tr-1", "did:a", RecorderState::Recorded), ("tr-2", "did:b", RecorderState::Skipped)]
+        );
+        assert!(agent.trust_registry.recorded);
     }
 
     #[tokio::test]

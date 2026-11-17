@@ -116,7 +116,6 @@ describe('AgentDetailPage', () => {
     await screen.findByTestId('agent-details-name');
     openTab(/Connection/);
 
-    expect(screen.getByTestId('agent-connection-runtime')).toHaveTextContent('Fabric');
     expect(screen.getByTestId('agent-connection-gateway-link')).toHaveAttribute(
       'href',
       '/gateways/g1'
@@ -170,24 +169,70 @@ describe('AgentDetailPage', () => {
     expect(screen.getByTestId('agent-connection-endpoint')).toHaveTextContent(
       'https://agent.example.com/a2a'
     );
-    expect(screen.getByTestId('agent-connection-target')).toHaveTextContent('agent.example.com');
     expect(screen.getByTestId('agent-connection-copy-endpoint')).toBeInTheDocument();
     expect(screen.queryByText(/s3cret|pw@/)).not.toBeInTheDocument();
   });
 
-  it('shows the upstream path ending at the remote gateway', async () => {
+  it('shows each trust registry an identity was recorded in, with its status', async () => {
+    mockedGetAgent.mockResolvedValue(
+      details({
+        trust_registry: {
+          recorded: true,
+          registries: [
+            {
+              trust_registry_id: 'tr-1',
+              trust_registry_name: 'Acme Registry',
+              did: 'did:web:agent.example.com',
+              state: 'recorded',
+              reason: null,
+            },
+            {
+              trust_registry_id: 'tr-2',
+              trust_registry_name: null,
+              did: 'did:web:agent.example.com',
+              state: 'failed',
+              reason: 'rejected',
+            },
+          ],
+        },
+      })
+    );
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Connection/);
+
+    const recorded = screen.getByTestId('agent-connection-registry-tr-1');
+    expect(recorded).toHaveTextContent('Acme Registry');
+    expect(within(recorded).getByRole('link')).toHaveAttribute('href', '/trust-registries/tr-1');
+    expect(within(recorded).getByTestId('agents-did')).toHaveAttribute(
+      'title',
+      'did:web:agent.example.com'
+    );
+    expect(recorded).toHaveTextContent('Recorded');
+    expect(screen.getByTestId('agent-connection-registry-tr-2')).toHaveTextContent('tr-2');
+    expect(screen.getByTestId('agent-connection-registry-tr-2')).toHaveTextContent('Failed');
+  });
+
+  it('says no identity was sent to a trust registry when there is no outcome', async () => {
+    mockedGetAgent.mockResolvedValue(details({ trust_registry: { recorded: false } }));
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Connection/);
+
+    expect(screen.getByTestId('agent-connection-trust-registry-empty')).toBeInTheDocument();
+  });
+
+  it('shows the remote gateway by name', async () => {
     mockedGetAgent.mockResolvedValue(details({ target_name: 'Acme Gateway' }));
     renderPage();
     await screen.findByTestId('agent-details-name');
     openTab(/Connection/);
 
-    expect(screen.getByTestId('agent-connection-target')).toHaveTextContent(
-      /Remote gateway\s*Acme Gateway/
-    );
+    expect(screen.getByTestId('agent-connection-gateway')).toHaveTextContent('Acme Gateway');
     expect(screen.getByTestId('agent-connection-description')).toHaveTextContent('remote gateway');
   });
 
-  it('lists every surface with the URL callers use, linking to the surface', async () => {
+  it('shows no route path and no surfaces section', async () => {
     mockedGetAgent.mockResolvedValue(
       details({
         surfaces: [
@@ -206,39 +251,13 @@ describe('AgentDetailPage', () => {
     await screen.findByTestId('agent-details-name');
     openTab(/Connection/);
 
-    const helium = screen.getByTestId('agent-connection-surface-s1');
-    expect(within(helium).getByTestId('agent-connection-surface-url')).toHaveTextContent(
-      'https://gateway.example/helium'
-    );
-    expect(within(helium).getByTestId('agent-connection-copy-surface-url')).toBeInTheDocument();
-    const oxygen = screen.getByTestId('agent-connection-surface-s2');
-    expect(within(oxygen).getByTestId('agent-connection-surface-url')).toHaveTextContent(
-      '/oxygenNo external URL configured'
-    );
-    expect(screen.getByTestId('agent-connection-surfaces-hop')).toHaveTextContent('2 surfaces');
+    expect(screen.queryByTestId('agent-connection-path')).not.toBeInTheDocument();
+    expect(screen.queryByText('A2A Client')).not.toBeInTheDocument();
+    expect(screen.queryByText('2 surfaces')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('agent-connection-surfaces')).not.toBeInTheDocument();
+    expect(screen.queryByText('https://gateway.example/helium')).not.toBeInTheDocument();
     expect(screen.queryByText('This gateway')).not.toBeInTheDocument();
     expect(screen.queryByText('Access Point')).not.toBeInTheDocument();
-
-    fireEvent.click(within(oxygen).getByTestId('agent-connection-surface-link'));
-    expect(await screen.findByTestId('surface-route')).toBeInTheDocument();
-  });
-
-  it('names the single surface in the path', async () => {
-    mockedGetAgent.mockResolvedValue(details());
-    renderPage();
-    await screen.findByTestId('agent-details-name');
-    openTab(/Connection/);
-    expect(screen.getByTestId('agent-connection-surfaces-hop')).toHaveTextContent('RICK');
-  });
-
-  it('says when no surface uses the agent', async () => {
-    mockedGetAgent.mockResolvedValue(details({ surfaces: [] }));
-    renderPage();
-    await screen.findByTestId('agent-details-name');
-    openTab(/Connection/);
-    expect(screen.getByTestId('agent-connection-no-surfaces')).toHaveTextContent(
-      'No surface uses this agent.'
-    );
   });
 
   it("shows Can't be shown for a redacted endpoint", async () => {
@@ -250,7 +269,6 @@ describe('AgentDetailPage', () => {
     openTab(/Connection/);
 
     expect(screen.getByTestId('agent-connection-endpoint')).toHaveTextContent("Can't be shown");
-    expect(screen.getByTestId('agent-connection-target')).toHaveTextContent('Hidden');
     expect(screen.queryByText(/redacted\.invalid/)).not.toBeInTheDocument();
   });
 
@@ -281,8 +299,7 @@ describe('AgentDetailPage', () => {
     expect(within(header).queryByText(/Active|Disabled/)).not.toBeInTheDocument();
     expect(within(header).getByTestId('agents-protocol-badge')).toHaveTextContent(/^A2A$/);
     expect(within(header).getByTestId('agents-protocol-badge')).not.toHaveAttribute('title');
-    expect(within(header).getByTestId('agent-details-runtime')).toHaveTextContent('Fabric');
-    expect(within(header).getByTestId('agent-details-runtime')).toHaveClass('agent-route-badge');
+    expect(within(header).queryByTestId('agent-details-runtime')).not.toBeInTheDocument();
     expect(within(header).queryByTestId('agent-details-endpoint-host')).not.toBeInTheDocument();
     expect(within(header).queryByRole('button')).not.toBeInTheDocument();
   });
@@ -306,8 +323,7 @@ describe('AgentDetailPage', () => {
 
     expect(screen.getByRole('heading', { name: /^Route/ })).toBeInTheDocument();
     expect(screen.queryByText('Upstream')).not.toBeInTheDocument();
-    expect(screen.getByTestId('agent-connection-runtime')).toHaveClass('agent-route-badge');
-    expect(screen.getByTestId('agent-connection-path')).toHaveAttribute('aria-label', 'Route path');
+    expect(screen.queryByTestId('agent-connection-runtime')).not.toBeInTheDocument();
   });
 
   it('shows Unnamed agent for an agent without a name', async () => {
@@ -552,7 +568,127 @@ describe('AgentDetailPage', () => {
     expect(screen.getByTestId('agent-card-surface-select')).toHaveTextContent('oxygen');
   });
 
-  it('groups what the gateway changed under Added by the gateway', async () => {
+  it('opens the surface serving the card from its link', async () => {
+    mockedGetAgent.mockResolvedValue(details());
+    mockedGetAgentCard.mockResolvedValue({
+      available: true,
+      card: { name: 'TimeAsker' },
+      source: 'fetched',
+      surface_id: 's1',
+      card_surface_ids: ['s1'],
+    });
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Agent Card/);
+
+    const link = await screen.findByTestId('agent-card-surface');
+    expect(screen.queryByTestId('agent-card-open-surface-button')).not.toBeInTheDocument();
+    fireEvent.click(link);
+    expect(await screen.findByTestId('surface-route')).toBeInTheDocument();
+  });
+
+  it('opens the selected surface when several serve the card', async () => {
+    mockedGetAgent.mockResolvedValue(
+      details({
+        surfaces: [
+          { surface_id: 's1', name: 'helium', protocol: 'a2a', route: '/helium' },
+          { surface_id: 's2', name: 'oxygen', protocol: 'a2a', route: '/oxygen' },
+        ],
+      })
+    );
+    mockedGetAgentCard.mockResolvedValue({
+      available: true,
+      card: { name: 'TimeAsker' },
+      source: 'fetched',
+      surface_id: 's2',
+      card_surface_ids: ['s1', 's2'],
+    });
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Agent Card/);
+
+    const open = await screen.findByTestId('agent-card-open-surface-button');
+    expect(open).toHaveTextContent('Open surface');
+    fireEvent.click(open);
+    expect(await screen.findByTestId('surface-route')).toBeInTheDocument();
+  });
+
+  it('marks each change Rewritten or Added, with what a rewritten value was', async () => {
+    mockedGetAgent.mockResolvedValue(details());
+    mockedGetAgentCard.mockResolvedValue({
+      available: true,
+      source: 'fetched',
+      surface_id: 's1',
+      card: { name: 'TimeAsker', url: 'https://gateway.example/agents/rick', provider: 'x' },
+      upstream_card: { name: 'TimeAsker', url: 'http://10.0.0.5:9002' },
+    });
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Agent Card/);
+
+    const changes = await screen.findByTestId('agent-card-gateway-changes');
+    expect(within(changes).getByRole('columnheader', { name: 'Field' })).toBeInTheDocument();
+    expect(within(changes).getByRole('columnheader', { name: 'Change' })).toBeInTheDocument();
+    expect(within(changes).getByRole('columnheader', { name: 'Value' })).toBeInTheDocument();
+    expect(within(changes).getByTestId('agent-card-gateway-url-change')).toHaveTextContent(
+      'Rewritten'
+    );
+    expect(within(changes).getByTestId('agent-card-gateway-url-was')).toHaveTextContent(
+      /^Was http:\/\/10\.0\.0\.5:9002$/
+    );
+    expect(
+      within(changes).getByTestId('agent-card-gateway-other-provider-change')
+    ).toHaveTextContent('Added');
+    expect(
+      within(changes).queryByTestId('agent-card-gateway-other-provider-was')
+    ).not.toBeInTheDocument();
+    expect(within(changes).getByTestId('agent-card-gateway-no-did')).toHaveTextContent(
+      'This surface has no DID'
+    );
+    expect(screen.getByTestId('agent-card-preview-details')).not.toHaveTextContent('URL');
+  });
+
+  it('shows the Verifiable Presentation in place', async () => {
+    const credential = 'https://fabric.affinidi.io/extensions/agent-identity-credential/v1';
+    mockedGetAgent.mockResolvedValue(details());
+    mockedGetAgentCard.mockResolvedValue({
+      available: true,
+      source: 'generated',
+      surface_id: 's1',
+      card: {
+        name: 'TimeAsker',
+        capabilities: {
+          extensions: [
+            {
+              uri: credential,
+              params: { did: 'did:web:rick.example', verifiablePresentation: '{"holder":"rick"}' },
+            },
+          ],
+        },
+      },
+    });
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Agent Card/);
+
+    const changes = await screen.findByTestId('agent-card-gateway-changes');
+    expect(within(changes).getByTestId('agent-card-gateway-vp-change')).toHaveTextContent('Added');
+    expect(within(changes).queryByTestId('agent-card-gateway-vp-view')).not.toBeInTheDocument();
+    expect(within(changes).queryByTestId('agent-card-gateway-no-did')).not.toBeInTheDocument();
+
+    const toggle = within(changes).getByTestId('agent-card-gateway-vp-toggle-button');
+    expect(toggle).toHaveTextContent('Show');
+    fireEvent.click(toggle);
+    expect(toggle).toHaveTextContent('Hide');
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    const view = within(changes).getByTestId('agent-card-gateway-vp-view');
+    expect(view).toHaveAttribute('colspan', '3');
+    expect(within(view).getByRole('button', { name: /Readable/ })).toBeInTheDocument();
+    expect(within(view).getByRole('button', { name: /Raw JSON/ })).toBeInTheDocument();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  it('groups what the gateway changed under Changes by the gateway', async () => {
     const credential = 'https://fabric.affinidi.io/extensions/agent-identity-credential/v1';
     mockedGetAgent.mockResolvedValue(details());
     mockedGetAgentCard.mockResolvedValue({
@@ -561,6 +697,7 @@ describe('AgentDetailPage', () => {
       surface_id: 's1',
       card: {
         name: 'TimeAsker',
+        version: '2',
         url: 'https://gateway.example/agents/rick',
         capabilities: {
           extensions: [
@@ -573,6 +710,7 @@ describe('AgentDetailPage', () => {
       },
       upstream_card: {
         name: 'TimeAsker',
+        version: '1',
         url: 'http://10.0.0.5:9002',
         capabilities: {
           extensions: [{ uri: 'https://fabric.affinidi.io/extensions/agent-identity/v1' }],
@@ -585,20 +723,35 @@ describe('AgentDetailPage', () => {
 
     const changes = await screen.findByTestId('agent-card-gateway-changes');
     expect(
-      within(changes).getByRole('heading', { name: 'Added by the gateway' })
+      within(changes).getByRole('heading', { name: 'Changes by the gateway' })
     ).toBeInTheDocument();
+    expect(
+      screen.getByTestId('agent-card-preview-skills').compareDocumentPosition(changes) &
+        Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy();
     expect(within(changes).getByTestId('agent-card-gateway-url')).toHaveTextContent(
-      'https://gateway.example/agents/rickRewritten from http://10.0.0.5:9002'
+      /^https:\/\/gateway\.example\/agents\/rick$/
     );
     expect(within(changes).getByText('Identity credential')).toBeInTheDocument();
-    expect(within(changes).getByTestId('agent-card-gateway-did')).toHaveTextContent(
-      'did:web:rick.example'
+    expect(within(changes).getByTestId('agent-card-gateway-extension')).toHaveTextContent(
+      credential
     );
+    expect(within(changes).getByTestId('agent-card-gateway-did')).toHaveTextContent(
+      /^did:web:rick\.example$/
+    );
+    expect(within(changes).getByTestId('agent-card-gateway-did-change')).toHaveTextContent('Added');
     expect(within(changes).getByText('Verifiable Presentation')).toBeInTheDocument();
-    expect(within(changes).getByTestId('agent-card-gateway-replaced')).toHaveTextContent(
+    expect(within(changes).getByTestId('agent-card-gateway-extension-change')).toHaveTextContent(
+      'Rewritten'
+    );
+    expect(within(changes).getByTestId('agent-card-gateway-extension-was')).toHaveTextContent(
       'https://fabric.affinidi.io/extensions/agent-identity/v1'
     );
-    expect(within(changes).queryByTestId('agent-card-gateway-other')).not.toBeInTheDocument();
+    expect(within(changes).queryByTestId('agent-card-gateway-removed')).not.toBeInTheDocument();
+    expect(within(changes).getByTestId('agent-card-gateway-other-version')).toHaveTextContent(
+      /^2$/
+    );
+    expect(changes).not.toHaveTextContent('→');
   });
 
   it('shows no gateway changes for a card the gateway passed on unchanged', async () => {

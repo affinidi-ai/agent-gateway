@@ -19,6 +19,8 @@ import {
   Task,
   TruncateLogsResult,
   TruncateMetricsResult,
+  TrustRecorderReason,
+  TrustRecorderState,
   TrustRecorderStatus,
   TrustRegistry,
   SurfacePaymentPolicy,
@@ -93,8 +95,22 @@ export interface LimitItem {
 export type AgentRuntime = 'url' | 'a2a-proxy' | 'gateway';
 
 /** `recorded`: at least one of the agent's identities was recorded to a trust registry. */
+/**
+ * The best Trust Recorder outcome of one identity in one Trust Registry. `trust_registry_name`
+ * is `null` when the viewer may not see that registry.
+ */
+export interface AgentRegistryOutcome {
+  trust_registry_id: string;
+  trust_registry_name: string | null;
+  did: string;
+  state: TrustRecorderState;
+  reason: TrustRecorderReason | null;
+}
+
 export interface AgentTrustRegistry {
   recorded: boolean;
+  /** On the agent details only; absent in the list and when there is no outcome. */
+  registries?: AgentRegistryOutcome[];
 }
 
 export interface AgentSurfaceRef {
