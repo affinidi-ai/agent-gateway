@@ -33,7 +33,10 @@ changes:
         established, is refused with 502 and its agent DID is not stored as verified. The 502
         says only why the identity was refused, never the verifier's diagnostic, and the issuer
         DID the exchange records no longer overwrites a change the operator made to the Remote
-        gateway record while the exchange was waiting.
+        gateway record while the exchange was waiting. An answer waits at most 3 seconds for the
+        issuer exchange, and answers and requests that need the same gateway's issuer at once
+        share one exchange, so a peer that never answers it cannot hold one connection slot and
+        one issuer request per answer for 10 seconds.
   breaking:
     - timestamp: '2026-11-17T12:00:00Z'
       title: Refuse Fabric answers whose identity presentation can't be trusted

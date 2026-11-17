@@ -1643,7 +1643,7 @@ async fn resolve_peer_issuers(from_did: Option<&str>) -> Result<crate::gateways:
         .await
         .ok_or_else(|| format!("unknown peer gateway {from_did}"))?;
     manager
-        .peer_issuers(gateway)
+        .peer_issuers(gateway, crate::gateways::issuer_exchange::ISSUER_REQUEST_TIMEOUT)
         .await
 }
 

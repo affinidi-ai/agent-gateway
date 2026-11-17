@@ -222,7 +222,14 @@ pub struct ConnectionPointListenerManager {
     /// Notifies concurrent startup callers when an in-flight startup completes.
     starting_listeners_notify: Arc<Notify>,
     event_hook: Option<Arc<crate::event_hook::EventHook>>,
+    /// The issuer exchange in flight per Remote gateway id, shared by every
+    /// caller that needs that gateway's issuer DID until it completes.
+    issuer_exchanges: Arc<std::sync::Mutex<HashMap<String, SharedIssuerExchange>>>,
 }
+
+type SharedIssuerExchange = futures::future::Shared<
+    futures::future::BoxFuture<'static, Result<String, crate::gateways::issuer_exchange::PeerIssuerError>>,
+>;
 
 /// Command to start a new listener
 pub struct ListenerStartCommand {
@@ -263,6 +270,7 @@ impl ConnectionPointListenerManager {
             starting_listeners: Arc::new(Mutex::new(HashSet::new())),
             starting_listeners_notify: Arc::new(Notify::new()),
             event_hook: None,
+            issuer_exchanges: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -1373,7 +1381,8 @@ impl ConnectionPointListenerManager {
     /// from, to check `issuer_did` against. The issuers its record already
     /// holds answer without the issuer exchange when they accept `issuer_did`
     /// or include an established issuer DID, which is never re-fetched here;
-    /// only a record without one runs [`Self::peer_issuers`].
+    /// only a record without one runs [`Self::peer_issuers`], waiting at most
+    /// [`ANSWER_ISSUER_EXCHANGE_DEADLINE`](crate::gateways::issuer_exchange::ANSWER_ISSUER_EXCHANGE_DEADLINE).
     pub async fn peer_issuers_vouching_for(
         &self,
         gateway_id: &str,
@@ -1397,24 +1406,25 @@ impl ConnectionPointListenerManager {
         if recorded.accepts(issuer_did) || recorded.attested.is_some() {
             return Ok(recorded);
         }
-        self.peer_issuers(gateway)
+        self.peer_issuers(gateway, crate::gateways::issuer_exchange::ANSWER_ISSUER_EXCHANGE_DEADLINE)
             .await
     }
 
     /// The issuers a paired gateway may present identities from: its attested
-    /// issuer DID (fetched on demand when missing) plus the issuer DIDs an
-    /// operator trusts for that connection. A peer with neither is refused; a
-    /// peer with operator-trusted issuers is accepted even when the attestation
-    /// exchange fails, so a legacy peer can be trusted by hand.
+    /// issuer DID (fetched on demand when missing, waiting at most `deadline`)
+    /// plus the issuer DIDs an operator trusts for that connection. A peer with
+    /// neither is refused; a peer with operator-trusted issuers is accepted even
+    /// when the attestation exchange fails, so a legacy peer can be trusted by hand.
     pub async fn peer_issuers(
         &self,
         gateway: crate::gateways::types::Gateway,
+        deadline: std::time::Duration,
     ) -> Result<crate::gateways::types::PeerIssuers, String> {
         let trusted = gateway.trusted_issuer_dids;
         let attested = match gateway.issuer_did {
             Some(issuer_did) => Some(issuer_did),
             None => match self
-                .ensure_peer_issuer_did(&gateway.id)
+                .ensure_peer_issuer_did_within(&gateway.id, deadline)
                 .await
             {
                 Ok(issuer_did) => Some(issuer_did),
@@ -1434,7 +1444,71 @@ impl ConnectionPointListenerManager {
     /// Return the peer's verified issuer DID for a Remote gateway, running the
     /// `gateway-issuer-request` exchange over the pairing's Connection Point
     /// when the record does not hold it yet, and persisting the result.
+    /// Concurrent callers for the same gateway share one exchange.
     pub async fn ensure_peer_issuer_did(
+        &self,
+        gateway_id: &str,
+    ) -> Result<String, crate::gateways::issuer_exchange::PeerIssuerError> {
+        self.shared_issuer_exchange(gateway_id)
+            .await
+    }
+
+    /// [`Self::ensure_peer_issuer_did`], giving up after `deadline` with
+    /// `Pending`; the exchange keeps running and records the issuer DID when
+    /// it completes.
+    pub async fn ensure_peer_issuer_did_within(
+        &self,
+        gateway_id: &str,
+        deadline: std::time::Duration,
+    ) -> Result<String, crate::gateways::issuer_exchange::PeerIssuerError> {
+        tokio::time::timeout(deadline, self.shared_issuer_exchange(gateway_id))
+            .await
+            .unwrap_or(Err(crate::gateways::issuer_exchange::PeerIssuerError::Pending(deadline)))
+    }
+
+    /// The issuer exchange in flight for `gateway_id`, or a new one run on
+    /// its own task so it completes even when every caller stops waiting.
+    fn shared_issuer_exchange(
+        &self,
+        gateway_id: &str,
+    ) -> SharedIssuerExchange {
+        use futures::FutureExt;
+
+        let mut exchanges = self
+            .issuer_exchanges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(exchange) = exchanges.get(gateway_id) {
+            return exchange.clone();
+        }
+        let manager = self.clone();
+        let id = gateway_id.to_string();
+        let task = tokio::spawn(async move {
+            let result = manager
+                .exchange_peer_issuer_did(&id)
+                .await;
+            manager
+                .issuer_exchanges
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+            result
+        });
+        let exchange = async move {
+            task.await
+                .unwrap_or_else(|e| {
+                    Err(crate::gateways::issuer_exchange::PeerIssuerError::Send(format!(
+                        "issuer exchange task failed: {e}"
+                    )))
+                })
+        }
+        .boxed()
+        .shared();
+        exchanges.insert(gateway_id.to_string(), exchange.clone());
+        exchange
+    }
+
+    async fn exchange_peer_issuer_did(
         &self,
         gateway_id: &str,
     ) -> Result<String, crate::gateways::issuer_exchange::PeerIssuerError> {
@@ -6173,6 +6247,80 @@ mod peer_issuer_tests {
             .unwrap_err();
 
         assert!(err.starts_with(&format!("peer issuer DID not established for gateway {}", gateway.id)), "{err}");
+    }
+
+    /// A manager whose peer `peer_did` has no issuer DID and a registered
+    /// listener, so an issuer exchange sends its request and waits for an
+    /// answer that never comes; returns the count of issuer requests sent.
+    async fn manager_with_silent_peer(
+        root: &std::path::Path,
+        peer_did: &str,
+    ) -> (ConnectionPointListenerManager, Gateway, Arc<std::sync::atomic::AtomicUsize>, tempfile::TempDir) {
+        let mut gateway = peer(None, &[]);
+        gateway.did = peer_did.to_string();
+        let (manager, issuer_dir) = manager_with(root, &gateway).await;
+        let mut listener = crate::gateways::test_helpers::test_listener(peer_did).await;
+        listener.gateway_id = gateway.id.clone();
+        manager
+            .register_test_listener(listener)
+            .await;
+        let issuer_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&issuer_requests);
+        crate::comm::didcomm::client::test_send_hook::install(peer_did, move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        (manager, gateway, issuer_requests, issuer_dir)
+    }
+
+    #[tokio::test]
+    async fn concurrent_callers_share_one_issuer_exchange() {
+        use crate::gateways::issuer_exchange::PeerIssuerError;
+        let root = tempfile::tempdir().unwrap();
+        let (manager, gateway, issuer_requests, _issuer_dir) =
+            manager_with_silent_peer(root.path(), "did:example:peer-asked-at-once").await;
+        let deadline = std::time::Duration::from_millis(300);
+
+        let (first, second) = tokio::join!(
+            manager.ensure_peer_issuer_did_within(&gateway.id, deadline),
+            manager.ensure_peer_issuer_did_within(&gateway.id, deadline),
+        );
+        crate::comm::didcomm::client::test_send_hook::uninstall(&gateway.did);
+
+        assert_eq!(first, Err(PeerIssuerError::Pending(deadline)));
+        assert_eq!(second, Err(PeerIssuerError::Pending(deadline)));
+        assert_eq!(
+            issuer_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "both callers wait on one issuer request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_stops_at_its_deadline_and_the_next_one_joins_the_running_exchange() {
+        use crate::gateways::issuer_exchange::PeerIssuerError;
+        let root = tempfile::tempdir().unwrap();
+        let (manager, gateway, issuer_requests, _issuer_dir) =
+            manager_with_silent_peer(root.path(), "did:example:peer-slow-to-answer").await;
+        let deadline = std::time::Duration::from_millis(200);
+
+        let started = std::time::Instant::now();
+        let first = manager
+            .ensure_peer_issuer_did_within(&gateway.id, deadline)
+            .await;
+        let waited = started.elapsed();
+        let second = manager
+            .ensure_peer_issuer_did_within(&gateway.id, deadline)
+            .await;
+        crate::comm::didcomm::client::test_send_hook::uninstall(&gateway.did);
+
+        assert_eq!(first, Err(PeerIssuerError::Pending(deadline)));
+        assert!(waited < std::time::Duration::from_secs(2), "the caller waited {waited:?}");
+        assert_eq!(second, Err(PeerIssuerError::Pending(deadline)));
+        assert_eq!(
+            issuer_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the exchange keeps running after the first caller stops waiting, and is not started again"
+        );
     }
 
     #[tokio::test]

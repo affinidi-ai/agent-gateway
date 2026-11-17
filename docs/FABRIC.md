@@ -210,7 +210,10 @@ verify, which includes its holder being its credential's subject, and its issuer
 the issuers of the connection to the Remote gateway the Target names. The calling gateway
 establishes that gateway's issuer DID through the issuer exchange when its record does not hold
 one yet, and skips the exchange when the issuers its record holds already include the
-presentation's issuer. When the surface takes the agent's identity from the payload, a verified
+presentation's issuer. An answer waits at most 3 seconds for the exchange, where a request waits
+the exchange's full 10 seconds. Answers and requests that need the same gateway's issuer DID at
+once share one exchange, which keeps running after an answer stops waiting and records the issuer
+DID when it completes, so the next answer finds it. When the surface takes the agent's identity from the payload, a verified
 presentation from one of those issuers is that identity, in place of the raw `agent-identity/v1`
 extension the paired gateway replaced with it; the surface's identity schema and rules apply to
 that raw payload, which the calling gateway never receives, so the issuer check stands in for

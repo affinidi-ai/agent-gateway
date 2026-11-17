@@ -3404,7 +3404,9 @@ pub async fn request_gateway_issuer<S: GatewayStore>(
             let status = match &e {
                 PeerIssuerError::GatewayNotFound(_) => StatusCode::NOT_FOUND,
                 PeerIssuerError::NoListener(_) => StatusCode::SERVICE_UNAVAILABLE,
-                PeerIssuerError::Send(_) | PeerIssuerError::Timeout => StatusCode::GATEWAY_TIMEOUT,
+                PeerIssuerError::Send(_) | PeerIssuerError::Timeout | PeerIssuerError::Pending(_) => {
+                    StatusCode::GATEWAY_TIMEOUT
+                }
                 PeerIssuerError::UnexpectedResponder { .. }
                 | PeerIssuerError::UnexpectedMessageType(_)
                 | PeerIssuerError::Attestation(_) => StatusCode::BAD_GATEWAY,
