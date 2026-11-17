@@ -930,9 +930,7 @@ fn served_card_name(
     };
     if !fresh {
         let state = state.clone();
-        let surface_id = surface
-            .surface_id
-            .clone();
+        let surface_id = surface.surface_id.clone();
         let last = cached.clone();
         names.spawn_refresh(&surface.surface_id, move || async move {
             let card = match state
@@ -1452,11 +1450,7 @@ mod tests {
     #[tokio::test]
     async fn test_each_surface_with_a_scheme_less_redacted_endpoint_is_an_agent_of_its_own() {
         let agents = Fixture::new()
-            .agents(
-                &[targeting("s-oxygen", "user:pw@host://x"), targeting("s-helium", "key@host/a2a")],
-                None,
-                &no_card,
-            )
+            .agents(&[targeting("s-oxygen", "user:pw@host://x"), targeting("s-helium", "key@host/a2a")], None, &no_card)
             .await;
         assert_eq!(agents.len(), 2);
         assert_ne!(agents[0].id, agents[1].id);
@@ -2163,7 +2157,12 @@ mod tests {
 
         let url = targeting("names-url-surface", "https://agent.example/a2a");
         remember_served_card_name(&url, &card);
-        assert!(served_card_names().get("names-url-surface").is_none(), "a URL target's name is fetched from it");
+        assert!(
+            served_card_names()
+                .get("names-url-surface")
+                .is_none(),
+            "a URL target's name is fetched from it"
+        );
     }
 
     #[tokio::test]

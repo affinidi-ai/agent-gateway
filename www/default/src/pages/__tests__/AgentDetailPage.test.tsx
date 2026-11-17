@@ -146,9 +146,7 @@ describe('AgentDetailPage', () => {
     expect(screen.getByTestId('agent-connection-target')).toHaveTextContent(
       /Remote gateway\s*Acme Gateway/
     );
-    expect(screen.getByTestId('agent-connection-description')).toHaveTextContent(
-      'remote gateway'
-    );
+    expect(screen.getByTestId('agent-connection-description')).toHaveTextContent('remote gateway');
   });
 
   it("shows Can't be shown for a redacted endpoint", async () => {
