@@ -39,5 +39,12 @@ changes:
         exists, starts without the lock as before. The DID log and did.json are now replaced
         atomically, so a reader never sees a partly written file.
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-11-17T12:00:00Z'
+      title: Update actix-http and libz-sys to fix published security advisories
+      description: >-
+        actix-http moves from 3.21.0 to 3.22.0, which fixes HTTP/1.1 request parsing flaws (bare
+        LF in chunked trailers, malformed quoted chunk extensions, and partial keep-alive
+        requests bypassing the header timeout), and libz-sys moves from 1.1.31 to 1.1.33 for a
+        zlib heap buffer overflow. Only the lock file changes.
   breaking: []
