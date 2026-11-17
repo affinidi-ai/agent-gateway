@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import '@testing-library/jest-dom';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
@@ -209,9 +209,11 @@ describe('ConnectTrustAgentWizardPage', () => {
   it('goes back to the Trust Agents tab when cancelled', async () => {
     mountWizard();
 
-    await userEvent.click(screen.getByTestId('wizard-cancel'));
+    await userEvent.click(await screen.findByTestId('wizard-cancel'));
 
-    expect(screen.getByTestId('where')).toHaveTextContent('/connections?tab=trust-agents');
+    await waitFor(() =>
+      expect(screen.getByTestId('where')).toHaveTextContent('/connections?tab=trust-agents')
+    );
   });
 });
 
