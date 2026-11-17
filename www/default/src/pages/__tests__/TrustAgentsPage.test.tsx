@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import '@testing-library/jest-dom';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
@@ -88,7 +88,9 @@ describe('TrustAgentsPage', () => {
     await userEvent.click(await screen.findByTestId('trust-agents-connect-button'));
 
     expect(screen.getByTestId('trust-agents-connect-button')).toHaveTextContent('Add VTA');
-    expect(screen.getByTestId('where')).toHaveTextContent('/connections/trust-agents/connect');
+    await waitFor(() =>
+      expect(screen.getByTestId('where')).toHaveTextContent('/connections/trust-agents/connect')
+    );
   });
 
   it('offers Add VTA when there is no agent yet', async () => {
