@@ -121,7 +121,7 @@ hmac = "0.12"
 hex = "0.4"
 zeroize = { version = "1.8", features = ["derive"] }
 # Not on crates.io yet: pinned to the exact commit of the fork branch that adds the crate.
-vta-signing = { git = "https://github.com/DenisPopov15/verifiable-trust-infrastructure", rev = "a1b5ac775ee7d6c55b38b0a6414226ac6e4148b7" }
+vta-signing = { git = "https://github.com/OpenVTC/verifiable-trust-infrastructure", rev = "672428d9729d46b118128311f8baa024b1fc5ed5" }
 affinidi-did-resolver-cache-sdk = { version = "0.8.39", features = [
     "agent-names",
 ] }
