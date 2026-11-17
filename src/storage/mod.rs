@@ -14,6 +14,7 @@ pub mod did_logs;
 pub mod did_logs_file;
 pub mod dynamodb_generic_repository;
 pub mod dynamodb_store;
+pub(crate) mod file_lock;
 pub mod filesystem;
 pub mod id_locks;
 pub mod settings_store;
