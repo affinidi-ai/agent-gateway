@@ -48,8 +48,7 @@ changes:
         A dashboard WebSocket message the client has not read within 10 seconds now closes the
         connection, and the page reconnects. A client that stopped reading used to keep its
         connection open indefinitely and hold back the keep-alive checks of its session and
-        permissions. A stop answer it does not read at a keep-alive check ends the connection at
-        once, without a further wait for the ping.
+        permissions.
   fixed:
     - timestamp: '2026-11-13T00:00:00Z'
       title: Keep surface ids whole in redacted logs so their Monitoring log shows them

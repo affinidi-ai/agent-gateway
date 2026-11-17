@@ -1713,7 +1713,7 @@ mod tests {
         drop(answers_tx);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_due_recheck_that_revokes_access_runs_before_a_queued_capture_is_sent() {
         let dir = TempDir::new().unwrap();
         let caller =
@@ -1729,7 +1729,9 @@ mod tests {
         let (_, updates) = tokio::sync::broadcast::channel::<super::WsUpdate>(1);
         let (_, answers) = tokio::sync::mpsc::channel(1);
         let (sink, sent) = futures::channel::mpsc::channel(8);
-        let ping_interval = tokio::time::interval(super::KEEP_ALIVE_INTERVAL);
+        let mut ping_interval = tokio::time::interval(super::KEEP_ALIVE_INTERVAL);
+        ping_interval.tick().await;
+        tokio::time::advance(super::KEEP_ALIVE_INTERVAL).await;
 
         super::send_loop(sink, updates, answers, captures, &subscription, Some(&caller), ping_interval).await;
 
