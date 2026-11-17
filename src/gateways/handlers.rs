@@ -1379,6 +1379,14 @@ mod tests {
         assert_eq!(disabled.status, GatewayStatus::Disabled);
     }
 
+    #[test]
+    fn the_payment_route_refuses_to_pause_for_mediator_access() {
+        let refused = pause_allowed_for(GatewayRole::Payment, true).expect_err("payment cannot pause");
+        assert_eq!(refused.0, StatusCode::BAD_REQUEST);
+        assert!(pause_allowed_for(GatewayRole::Payment, false).is_ok());
+        assert!(pause_allowed_for(GatewayRole::Peer, true).is_ok());
+    }
+
     #[tokio::test]
     async fn a_route_family_lists_only_gateways_of_its_role() {
         let mut payment = remote_gateway();
@@ -3005,6 +3013,17 @@ async fn mediator_document_of<M: crate::mediators::MediatorStore>(
         .and_then(|mediator| mediator.did_document)
 }
 
+/// Only a peer pairing can pause for mediator access; the payment route refuses it.
+fn pause_allowed_for(
+    role: GatewayRole,
+    await_mediator_access: bool,
+) -> Result<(), (StatusCode, String)> {
+    if await_mediator_access && role == GatewayRole::Payment {
+        return Err((StatusCode::BAD_REQUEST, "await_mediator_access is available for peer gateways only".to_string()));
+    }
+    Ok(())
+}
+
 /// Connect to a remote gateway using an OOB (Out-of-Band) invitation link
 pub async fn connect_via_oob<
     S: GatewayStore + 'static,
@@ -3033,9 +3052,7 @@ pub async fn connect_via_oob<
     Json(mut req): Json<ConnectViaOOBRequest>,
 ) -> Result<Json<ConnectViaOOBResponse>, (StatusCode, String)> {
     let role = scoped_role(&role_scope);
-    if req.await_mediator_access && role == GatewayRole::Payment {
-        return Err((StatusCode::BAD_REQUEST, "await_mediator_access is available for peer gateways only".to_string()));
-    }
+    pause_allowed_for(role, req.await_mediator_access)?;
     req.tenant_id = tenant_for_create(req.tenant_id.take(), pat.is_some(), tenant_context(&context))
         .map_err(|message| (StatusCode::FORBIDDEN, message.to_string()))?;
     let pending_gateway_id = uuid::Uuid::new_v4().to_string();
@@ -3484,14 +3501,17 @@ pub async fn connect_via_oob<
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create gateway: {}", e)))?;
 
-            if let Some(hook) = event_hook.as_ref()
-                && let Some(reserved) = &point.reserved_permanent
-            {
-                hook.emit(
-                    crate::event_hook::EventKind::CreationStarted,
-                    crate::event_hook::ConnectionPointPayload::reserved(&point, reserved),
-                );
-            }
+            // The reserved DID's announcement fails until the temporary point that
+            // reserves it is stored.
+            let reservation = point
+                .reserved_permanent
+                .as_ref()
+                .map(|reserved| {
+                    crate::event_hook::CreationGuard::start(
+                        event_hook.clone(),
+                        crate::event_hook::ConnectionPointPayload::reserved(&point, reserved),
+                    )
+                });
             let record = point.clone();
             let point_store = cp_store.clone();
             temp_announcement
@@ -3507,6 +3527,9 @@ pub async fn connect_via_oob<
                 .map_err(|e| {
                     (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create temporary connection point: {}", e))
                 })?;
+            if let Some(reservation) = reservation {
+                reservation.hand_over();
+            }
 
             info!("⏸  Gateway {} waits for the mediator to admit its DIDs", paused_gateway.id);
             let name =
@@ -3778,6 +3801,12 @@ pub async fn continue_gateway<
     }
     info!("✓ The mediator admits the handshake and permanent DIDs of gateway {}", id);
 
+    // Everything the pairing needs after the connection-setup is checked before it is
+    // sent: sending spends the invitation on the inviter.
+    let listener_manager = listener_manager.ok_or_else(|| {
+        (StatusCode::SERVICE_UNAVAILABLE, "Listener manager not available - cannot start listener".to_string())
+    })?;
+
     let mut didcomm_client = crate::comm::didcomm::client::DIDCommClient::new_with_mediator_document(
         point
             .connection_point_did
@@ -3801,7 +3830,7 @@ pub async fn continue_gateway<
             their_mediator_did: &their_mediator_did,
         },
         &vc_issuer,
-        listener_manager.as_ref(),
+        Some(&listener_manager),
         mediator_directory.as_ref(),
     )
     .await;
@@ -3823,9 +3852,6 @@ pub async fn continue_gateway<
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update connection point: {}", e)))?;
 
-    let listener_manager = listener_manager.ok_or_else(|| {
-        (StatusCode::SERVICE_UNAVAILABLE, "Listener manager not available - cannot start listener".to_string())
-    })?;
     listener_manager
         .request_start_listener(point, their_mediator_did, their_mediator_endpoint)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start temporary listener: {}", e)))?;

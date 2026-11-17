@@ -3513,10 +3513,11 @@ pub async fn run_axum_proxy(
                 }
             });
 
-            // Clean up pending OOB gateways from previous sessions. A handshake that had
-            // started is not resumed after a restart, so its gateway is removed. A gateway
-            // paused for mediator access keeps its keys and state on disk and is kept
-            // until its invitation expires.
+            // Clean up pending OOB gateways from previous sessions. An acceptance whose
+            // temporary connection point is still unexpired keeps waiting for approval (its
+            // listener is restarted with the other connection points); one without is removed.
+            // A gateway paused for mediator access keeps its keys and state on disk and is
+            // kept until its invitation expires.
             if let Some(ref gw_store) = gateway_store {
                 let gw_store_clone = gw_store.clone();
                 let pending_store_clone = pending_connection_store.clone();
@@ -3529,56 +3530,17 @@ pub async fn run_axum_proxy(
                     // Small delay after startup
                     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
-                    remove_lapsed_pauses(gw_store_clone.as_ref(), paused_cp_store.as_ref(), &pending_store_clone).await;
-
-                    match gw_store_clone
-                        .list_all()
-                        .await
-                    {
-                        Ok(gateways) => {
-                            let pending_gateways: Vec<_> = gateways
-                                .into_iter()
-                                .filter(|gw| gw.is_left_pending_by_an_earlier_run(started_at))
-                                .collect();
-
-                            if pending_gateways.is_empty() {
-                                info!("No pending gateways from previous sessions");
-                            } else {
-                                warn!("Found {} pending gateway(s) from previous session(s)", pending_gateways.len());
-                                warn!("These are from incomplete OOB handshakes that cannot be resumed");
-
-                                for gateway in pending_gateways {
-                                    warn!("  - Cleaning up pending gateway: {} (ID: {})", gateway.name, gateway.id);
-
-                                    // Delete the gateway
-                                    if let Err(e) = gw_store_clone
-                                        .delete(&gateway.id)
-                                        .await
-                                    {
-                                        error!("Failed to delete pending gateway '{}': {}", gateway.name, e);
-                                    } else {
-                                        info!("  ✓ Deleted pending gateway '{}'", gateway.name);
-                                    }
-
-                                    // Also clean up the pending connection if it exists
-                                    if let Some(pending_conn) = pending_store_clone
-                                        .get_by_temporary_did(&gateway.did)
-                                        .await
-                                    {
-                                        pending_store_clone
-                                            .remove(&pending_conn.id)
-                                            .await;
-                                        info!("  ✓ Cleaned up pending connection state");
-                                    }
-                                }
-
-                                info!("✓ Pending gateway cleanup complete");
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to list gateways for pending cleanup: {}", e);
-                        }
-                    }
+                    let now = chrono::Utc::now();
+                    remove_lapsed_pauses(gw_store_clone.as_ref(), paused_cp_store.as_ref(), &pending_store_clone, now)
+                        .await;
+                    remove_abandoned_pending_gateways(
+                        gw_store_clone.as_ref(),
+                        paused_cp_store.as_ref(),
+                        &pending_store_clone,
+                        started_at,
+                        now,
+                    )
+                    .await;
                 });
             }
 
@@ -5202,6 +5164,7 @@ async fn remove_lapsed_pauses(
     gateway_store: &crate::gateways::FileSystemGatewayStore,
     cp_store: &crate::gateways::FileSystemConnectionPointStore,
     pending_store: &crate::gateways::PendingConnectionStore,
+    now: chrono::DateTime<chrono::Utc>,
 ) {
     use crate::gateways::GatewayStore;
     use crate::gateways::connection_points::ConnectionPointStore;
@@ -5209,15 +5172,24 @@ async fn remove_lapsed_pauses(
     let Ok(gateways) = gateway_store.list_all().await else {
         return;
     };
-    let now = chrono::Utc::now();
     for gateway in gateways {
         if gateway.status != crate::gateways::types::GatewayStatus::AwaitingMediatorAccess {
             continue;
         }
-        let points = cp_store
+        // A pause counts as lapsed only after a successful read shows it.
+        let points = match cp_store
             .list_by_gateway(&gateway.id)
             .await
-            .unwrap_or_default();
+        {
+            Ok(points) => points,
+            Err(e) => {
+                warn!(
+                    "Keeping gateway '{}' ({}) paused for mediator access: could not read its connection points: {}",
+                    gateway.name, gateway.id, e
+                );
+                continue;
+            }
+        };
         let expires_at = points
             .iter()
             .find(|point| point.awaiting_mediator_access)
@@ -5246,6 +5218,75 @@ async fn remove_lapsed_pauses(
             .await
         {
             error!("Failed to delete gateway '{}' of an expired pause: {}", gateway.id, e);
+        }
+    }
+}
+
+/// Removes the `pending` gateways an earlier run left whose acceptance can no longer
+/// complete: none of their connection points records an unexpired invitation. An
+/// acceptance still inside its invitation's lifetime keeps waiting for approval. A
+/// gateway whose connection points cannot be read is kept.
+async fn remove_abandoned_pending_gateways(
+    gateway_store: &crate::gateways::FileSystemGatewayStore,
+    cp_store: &crate::gateways::FileSystemConnectionPointStore,
+    pending_store: &crate::gateways::PendingConnectionStore,
+    started_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    use crate::gateways::GatewayStore;
+    use crate::gateways::connection_points::ConnectionPointStore;
+
+    let gateways = match gateway_store.list_all().await {
+        Ok(gateways) => gateways,
+        Err(e) => {
+            error!("Failed to list gateways for pending cleanup: {}", e);
+            return;
+        }
+    };
+    for gateway in gateways
+        .into_iter()
+        .filter(|gw| gw.is_left_pending_by_an_earlier_run(started_at))
+    {
+        let points = match cp_store
+            .list_by_gateway(&gateway.id)
+            .await
+        {
+            Ok(points) => points,
+            Err(e) => {
+                warn!(
+                    "Keeping pending gateway '{}' ({}): could not read its connection points: {}",
+                    gateway.name, gateway.id, e
+                );
+                continue;
+            }
+        };
+        let still_waiting = points.iter().any(|point| {
+            point
+                .recorded_expires_at()
+                .is_some_and(|expires_at| expires_at > now)
+        });
+        if still_waiting {
+            info!(
+                "Pending gateway '{}' ({}) keeps waiting for approval until its invitation expires",
+                gateway.name, gateway.id
+            );
+            continue;
+        }
+        warn!("Cleaning up pending gateway '{}' ({}): its handshake cannot complete", gateway.name, gateway.id);
+        if let Err(e) = gateway_store
+            .delete(&gateway.id)
+            .await
+        {
+            error!("Failed to delete pending gateway '{}': {}", gateway.name, e);
+            continue;
+        }
+        if let Some(pending_conn) = pending_store
+            .get_by_temporary_did(&gateway.did)
+            .await
+        {
+            pending_store
+                .remove(&pending_conn.id)
+                .await;
         }
     }
 }
@@ -6372,6 +6413,235 @@ mod tests {
                 .unwrap()
                 .count(),
             1
+        );
+    }
+}
+
+#[cfg(test)]
+mod startup_sweep_tests {
+    use super::{remove_abandoned_pending_gateways, remove_lapsed_pauses};
+    use crate::gateways::connection_points::ConnectionPointStore;
+    use crate::gateways::connection_points::types::{ConnectionPointType, GatewayConnectionPoint};
+    use crate::gateways::types::{Gateway, GatewayStatus, GatewayType};
+    use crate::gateways::{
+        ConnectionRole, ConnectionState, FileSystemConnectionPointStore, FileSystemGatewayStore, GatewayStore,
+        PendingConnectionStore, PendingOOBConnection,
+    };
+    use chrono::{DateTime, Duration, Utc};
+    use tempfile::TempDir;
+
+    struct Stores {
+        _dir: TempDir,
+        gateways: FileSystemGatewayStore,
+        points: FileSystemConnectionPointStore,
+        pending: PendingConnectionStore,
+    }
+
+    async fn stores() -> Stores {
+        let dir = TempDir::new().unwrap();
+        Stores {
+            gateways: FileSystemGatewayStore::new(dir.path().join("gateways"), None)
+                .await
+                .unwrap(),
+            points: FileSystemConnectionPointStore::new(
+                dir.path()
+                    .join("connection_points"),
+            )
+            .await
+            .unwrap(),
+            pending: PendingConnectionStore::new(dir.path().join("pending"))
+                .await
+                .unwrap(),
+            _dir: dir,
+        }
+    }
+
+    fn gateway(
+        id: &str,
+        status: GatewayStatus,
+        created_at: DateTime<Utc>,
+    ) -> Gateway {
+        let mut gateway = Gateway::new(
+            id.to_string(),
+            "Partner".to_string(),
+            format!("did:peer:2.temporary-{id}"),
+            GatewayType::Remote,
+        );
+        gateway.id = id.to_string();
+        gateway.status = status;
+        gateway.created_at = created_at;
+        gateway
+    }
+
+    fn temporary_point(
+        gateway_id: &str,
+        expires_at: DateTime<Utc>,
+        awaiting: bool,
+    ) -> GatewayConnectionPoint {
+        let mut point = GatewayConnectionPoint::new(
+            gateway_id.to_string(),
+            "med-1".to_string(),
+            format!("did:peer:2.temporary-{gateway_id}"),
+            "temporary".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            serde_json::json!({}),
+            None,
+            ConnectionPointType::OobAcceptor,
+            String::new(),
+        );
+        point.id = format!("tmp-{gateway_id}");
+        point.expires_at = Some(expires_at);
+        point.awaiting_mediator_access = awaiting;
+        point
+    }
+
+    fn pending_for(gateway: &Gateway) -> PendingOOBConnection {
+        let now = Utc::now();
+        PendingOOBConnection {
+            id: format!("tmp-{}", gateway.id),
+            invitation_id: "invitation".to_string(),
+            our_temporary_did: gateway.did.clone(),
+            our_secure_did: "did:peer:2.permanent".to_string(),
+            their_temporary_did: "did:peer:2.inviter".to_string(),
+            their_secure_did: None,
+            their_issuer_did: None,
+            mediator_did: "did:web:mediator.example".to_string(),
+            connection_point_id: String::new(),
+            role: ConnectionRole::Acceptor,
+            state: ConnectionState::WaitingForResponse,
+            created_at: now,
+            expires_at: now + Duration::days(7),
+            secure_cp_id: Some("permanent".to_string()),
+            temporary_cp_id: Some(format!("tmp-{}", gateway.id)),
+            mediator_record_id: None,
+        }
+    }
+
+    async fn seed(
+        stores: &Stores,
+        gateway: &Gateway,
+        point: &GatewayConnectionPoint,
+    ) {
+        stores
+            .gateways
+            .create(gateway)
+            .await
+            .unwrap();
+        stores
+            .points
+            .create(point)
+            .await
+            .unwrap();
+        stores
+            .pending
+            .store(pending_for(gateway))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn the_lapsed_pause_sweep_keeps_an_unexpired_pause_and_removes_an_expired_one_with_its_state() {
+        let stores = stores().await;
+        let now = Utc::now();
+        let waiting = gateway("waiting", GatewayStatus::AwaitingMediatorAccess, now - Duration::days(1));
+        let lapsed = gateway("lapsed", GatewayStatus::AwaitingMediatorAccess, now - Duration::days(9));
+        seed(&stores, &waiting, &temporary_point("waiting", now + Duration::days(2), true)).await;
+        seed(&stores, &lapsed, &temporary_point("lapsed", now - Duration::hours(1), true)).await;
+
+        remove_lapsed_pauses(&stores.gateways, &stores.points, &stores.pending, now).await;
+
+        assert!(
+            stores
+                .gateways
+                .get("waiting")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            stores
+                .points
+                .get("tmp-waiting")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            stores
+                .pending
+                .get("tmp-waiting")
+                .await
+                .is_some()
+        );
+        assert!(
+            stores
+                .gateways
+                .get("lapsed")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            stores
+                .points
+                .get("tmp-lapsed")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            stores
+                .pending
+                .get("tmp-lapsed")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_acceptance_inside_its_invitation_lifetime_survives_a_restart() {
+        let stores = stores().await;
+        let started_at = Utc::now();
+        let before = started_at - Duration::hours(3);
+        let waiting = gateway("waiting", GatewayStatus::Pending, before);
+        let abandoned = gateway("abandoned", GatewayStatus::Pending, before);
+        seed(&stores, &waiting, &temporary_point("waiting", started_at + Duration::days(3), false)).await;
+        seed(&stores, &abandoned, &temporary_point("abandoned", started_at - Duration::minutes(5), false)).await;
+
+        remove_abandoned_pending_gateways(&stores.gateways, &stores.points, &stores.pending, started_at, started_at)
+            .await;
+
+        assert!(
+            stores
+                .gateways
+                .get("waiting")
+                .await
+                .unwrap()
+                .is_some(),
+            "an unexpired acceptance keeps waiting"
+        );
+        assert!(
+            stores
+                .pending
+                .get("tmp-waiting")
+                .await
+                .is_some()
+        );
+        assert!(
+            stores
+                .gateways
+                .get("abandoned")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            stores
+                .pending
+                .get("tmp-abandoned")
+                .await
+                .is_none()
         );
     }
 }

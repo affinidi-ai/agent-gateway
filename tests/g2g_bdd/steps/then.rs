@@ -1503,8 +1503,8 @@ pub async fn accepted_gateway_failed_with(
     assert_eq!(gateway.description, description);
 }
 
-#[then(regex = r"^gateway (\d+) can delete the gateway it accepted last$")]
-pub async fn accepted_gateway_can_be_deleted(
+#[then(regex = r"^gateway (\d+) no longer lists the gateway it accepted last$")]
+pub async fn accepted_gateway_is_no_longer_listed(
     world: &mut G2gWorld,
     gw_index: usize,
 ) {
@@ -1512,17 +1512,14 @@ pub async fn accepted_gateway_can_be_deleted(
         .accepted_gateway_id
         .clone()
         .expect("a When must accept an invitation before this Then");
-    let admin = world
+    let status = world
+        .response_status
+        .expect("a When must delete the gateway before this Then");
+    assert!((200..300).contains(&status), "delete refused: {status} {:?}", world.response_body);
+    let remaining = world
         .harness()
         .gw(gw_index)
         .admin
-        .clone();
-    let deleted = admin
-        .delete_gateway_recorded(&gateway_id)
-        .await
-        .expect("delete request completes at the transport layer");
-    assert!((200..300).contains(&deleted.status), "delete refused: {} {}", deleted.status, deleted.body);
-    let remaining = admin
         .list_gateways()
         .await
         .expect("list gateways");

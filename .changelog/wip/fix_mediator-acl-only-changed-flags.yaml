@@ -8,41 +8,24 @@ changes:
         Creating a Connection Point and adding a gateway can now stop after minting their DIDs
         (the Connection Point DID and the permanent DID it reserves for the paired gateway, or
         the handshake and permanent DIDs of an acceptance), show them, and continue when they are
-        allowed, now or days later from Connections, until the invitation expires. Continue
-        checks each DID on the mediator and answers 409 mediator_access_refused naming the one
-        still refused. The dashboard always pauses; the API pauses when a request sets
-        await_mediator_access. Approval uses the reserved permanent DID, so pings work as soon as
-        the pairing completes. The event hook announces every DID at the pause.
+        allowed, now or days later from Connections, until the invitation expires. A pause, its
+        keys and its reserved permanent DID survive a restart. Continue checks each DID on the
+        mediator and answers 409 mediator_access_refused naming the one still refused. The API
+        pauses when a request sets await_mediator_access. The dashboard asks for the pause and
+        continues at once: on a mediator that admits the DIDs, such as one in explicit_deny mode,
+        pairing looks as before, and only a refusal shows a step that asks to add the DIDs to the
+        DIDComm Mediator's allow list (all of them in one copy, or each on its own). Approval uses
+        the reserved permanent DID, so pings work as soon as the pairing completes. The event hook
+        announces every DID at the pause.
   changed:
     - timestamp: '2026-11-12T20:05:00Z'
       title: Let an accepted invitation wait for approval until the invitation expires
       description: >-
         A gateway that accepted an invitation now waits for the inviting gateway's approval until
-        the invitation expires (its expires_time, else seven days) instead of one hour
-        (oob_connection.pending_expiry_hours), since the inviting administrator may approve days
-        later. pending_expiry_hours now applies only to acceptances stored before the expiry was
-        recorded.
-    - timestamp: '2026-11-13T15:00:00Z'
-      title: Drop the inviter's-mediator warning from Add Gateway's mediator access step
-      description: >-
-        The Add Gateway wizard's mediator access step showed a warning that the mediator belongs
-        to the gateway that sent the invitation, and when the invitation expires. The dashboard
-        cannot know whose mediator it is, since both gateways may use the same one, so the step
-        now looks exactly like the Create Connection Point step, with no warning.
-    - timestamp: '2026-11-13T15:05:00Z'
-      title: Style both Continue buttons on Connections like the per-row Edit button
-      description: >-
-        The Continue button of a gateway and of a Connection Point waiting for mediator access had
-        different styles. Both now use the outlined small style of the list's Edit button.
-    - timestamp: '2026-11-17T09:00:00Z'
-      title: Show the mediator access step only when the mediator refuses the new DIDs
-      description: >-
-        Right after creating a Connection Point or accepting an invitation, the dashboard now tries
-        to continue at once. On a mediator that admits the DIDs, such as one in explicit_deny mode,
-        the pairing goes straight on as before and the step is never shown. Only when the mediator
-        refuses them does the step appear, asking to add the DIDs to the DIDComm Mediator's allow
-        list, with every DID in one copy (Copy All DIDs as a Bundle) or each on its own, and Test
-        Connection to try again. Continue on Connections opens the step at once, without testing first.
+        the invitation expires (its expires_time, capped at seven days, or seven days without one)
+        instead of one hour (oob_connection.pending_expiry_hours), since the inviting administrator may approve
+        days later. Such a pending acceptance now survives a restart until then. pending_expiry_hours
+        now applies only to acceptances stored before the expiry was recorded.
     - timestamp: '2026-11-17T09:05:00Z'
       title: Keep the action buttons on one line on Connections
       description: >-
@@ -75,8 +58,8 @@ changes:
         stayed pending for ever, because the inviting gateway only logged the refusal. The
         inviting gateway now answers with connection-rejected and the reason "This invitation
         can't be used any more. Ask for a new one.", without saying which, as it already did for
-        a wrong secret. The acceptor marks its gateway failed with that reason in its description,
-        and it can be deleted. A rejection is taken only from the inviter the setup went to, and
+        a wrong secret. The acceptor marks its gateway failed with that reason in front of the
+        description its operator gave, and it can be deleted. A rejection is taken only from the inviter the setup went to, and
         sending it is best effort.
     - timestamp: '2026-11-13T15:15:00Z'
       title: Open a pending gateway from the Gateways list, as the Add Gateway wizard does

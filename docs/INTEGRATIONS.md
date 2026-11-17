@@ -610,7 +610,7 @@ of its own and never hides the entry. A stored provided record cannot be changed
 offered by the directory or used by a connection point or a pending pairing, until the directory
 has answered successfully without its DID (or no directory is configured) and nothing uses it: no stored Connection Point names it
 (a pending pairing's temporary Connection Point, until its recorded expiry, names its acceptor mediator in
-`oob_message.secure_mediator_id`), and no unexpired pending pairing names it as its acceptor mediator record (a pairing expires with its invitation: its `expires_time`, else seven days, and one that has expired can no longer be finalized). Then `DELETE` removes it, and
+`oob_message.secure_mediator_id`), and no unexpired pending pairing names it as its acceptor mediator record (a pairing expires with its invitation: its `expires_time`, capped at seven days, or seven days without one, and one that has expired can no longer be finalized). Then `DELETE` removes it, and
 the list marks such a record `"deletable": true` (a directory answer that omits its DID sets it, and so does having no directory
 configured, since nothing then offers the record; a directory that has not answered yet, or still
 lists the DID, does not. The dashboard offers Delete only for such records, and the in-use check still
@@ -632,10 +632,12 @@ mediator.** These are current behaviour, not guarantees:
   provided one. A missing one refuses the finalization and writes nothing, where earlier versions
   recreated it with no tenant, which could attach a gateway with no tenant to a tenant's mediator
   or pick up another acceptance's gateway by the shared DID.
-- An invitation accepted just before the gateway restarts does not complete. At start the gateway
-  removes the pending gateways, and their pairings, that an earlier run left behind; one created
-  since the process started belongs to a pairing in flight and is kept. The interrupted invitation
-  has to be accepted again.
+- A pending acceptance survives a restart while its temporary Connection Point is unexpired (the
+  invitation's `expires_time`, capped at seven days): its listener is started again and it keeps
+  waiting for approval. At start the gateway removes the pending gateways, and their pairings, that
+  an earlier run left behind with no unexpired temporary Connection Point; one created since the
+  process started belongs to a pairing in flight and is kept. Such an invitation has to be accepted
+  again.
 - A rejected acceptance, or one whose finalization fails, leaves its pairing, temporary Connection
   Point, listener and pending gateway until the pairing expires or the gateway restarts. They hold the
   provided mediator (`409` on `DELETE`) until then. A failure while the invitation is being

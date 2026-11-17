@@ -200,6 +200,7 @@ pub async fn approve_gateway<
         // The gateway connection point (for receiving from acceptor) is the one the
         // connection point reserved, else a new one
         let (gateway_cp_id, reserved_did) = permanent_connection_point(&connection_point);
+        let announced_at_pause = reserved_did.is_some();
         if !scope_allows_resource(resource_scope, tenant_context, ResourceKind::ConnectionPoints, &gateway_cp_id) {
             return Err((
                 StatusCode::FORBIDDEN,
@@ -268,12 +269,16 @@ pub async fn approve_gateway<
             .clone();
         gateway_connection_point.mediator_did = Some(gw_mediator_did.clone());
 
-        let announcement = crate::event_hook::CreationGuard::start(
-            listener_manager
-                .as_ref()
-                .and_then(|manager| manager.event_hook().cloned()),
-            crate::event_hook::ConnectionPointPayload::from_record(&gateway_connection_point, None),
-        );
+        let hook = listener_manager
+            .as_ref()
+            .and_then(|manager| manager.event_hook().cloned());
+        let minted = crate::event_hook::ConnectionPointPayload::from_record(&gateway_connection_point, None);
+        // A reserved DID was announced when the connection point paused.
+        let announcement = if announced_at_pause {
+            crate::event_hook::CreationGuard::resume(hook, minted)
+        } else {
+            crate::event_hook::CreationGuard::start(hook, minted)
+        };
         let record = gateway_connection_point.clone();
         let point_store = cp_store.clone();
         announcement

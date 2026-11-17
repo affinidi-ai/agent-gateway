@@ -168,28 +168,59 @@ pub async fn require_admitted(
     }
 }
 
+static CONTINUE_LOCKS: std::sync::LazyLock<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
+
+/// Keeps a pairing's lock entry in the map while it is in use and removes it when
+/// the last user is gone, also when a request is cancelled mid-wait.
+struct LockEntry {
+    key: String,
+    lock: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl Drop for LockEntry {
+    fn drop(&mut self) {
+        self.lock.take();
+        CONTINUE_LOCKS.remove_if(&self.key, |_, lock| Arc::strong_count(lock) == 1);
+    }
+}
+
+/// The pairing's lock held, with its map entry kept until the guard is dropped.
+pub struct ContinueGuard {
+    _held: tokio::sync::OwnedMutexGuard<()>,
+    _entry: LockEntry,
+}
+
 /// Serialises the continuation of one paused pairing, so two requests cannot both
 /// open its invitation or send its connection-setup.
-pub async fn lock(key: &str) -> tokio::sync::OwnedMutexGuard<()> {
-    static LOCKS: std::sync::LazyLock<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>> =
-        std::sync::LazyLock::new(dashmap::DashMap::new);
-    let lock = LOCKS
+pub async fn lock(key: &str) -> ContinueGuard {
+    let lock = CONTINUE_LOCKS
         .entry(key.to_string())
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .or_default()
         .clone();
-    lock.lock_owned().await
+    let entry = LockEntry {
+        key: key.to_string(),
+        lock: Some(lock.clone()),
+    };
+    ContinueGuard {
+        _held: lock.lock_owned().await,
+        _entry: entry,
+    }
 }
 
 /// When an accepted invitation stops being usable: its `expires_time`, else
-/// [`DEFAULT_INVITATION_LIFETIME`] from `now`.
+/// [`DEFAULT_INVITATION_LIFETIME`] from `now`. The invitation comes from the inviter,
+/// so its `expires_time` is capped at the same lifetime: an acceptance never keeps
+/// its keys, secret and listener for longer.
 pub fn invitation_expiry(
     expires_time: Option<u64>,
     now: DateTime<Utc>,
 ) -> DateTime<Utc> {
+    let longest = now + DEFAULT_INVITATION_LIFETIME;
     expires_time
         .and_then(|secs| i64::try_from(secs).ok())
         .and_then(|secs| DateTime::from_timestamp(secs, 0))
-        .unwrap_or(now + DEFAULT_INVITATION_LIFETIME)
+        .map_or(longest, |expires_at| expires_at.min(longest))
 }
 
 /// The name the dashboard shows for a mediator: its stored record's, else its DID.
@@ -279,6 +310,22 @@ mod tests {
     fn an_invitation_expires_at_its_expires_time() {
         let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
         assert_eq!(invitation_expiry(Some(1_800_086_400), now), DateTime::from_timestamp(1_800_086_400, 0).unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_continue_lock_leaves_no_entry_behind_once_released() {
+        let key = "lock-entry-test";
+        {
+            let _first = lock(key).await;
+            assert!(CONTINUE_LOCKS.contains_key(key));
+        }
+        assert!(!CONTINUE_LOCKS.contains_key(key), "the entry is removed with its last guard");
+    }
+
+    #[test]
+    fn an_invitation_that_expires_later_than_seven_days_is_capped_at_seven_days() {
+        let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        assert_eq!(invitation_expiry(Some(4_000_000_000), now), now + chrono::Duration::days(7));
     }
 
     #[test]
