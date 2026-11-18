@@ -425,17 +425,21 @@ titles share one style; see _Policy input capture_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#policy-input-capture).
 
 The policy editor's create and edit pages share Start from (create only), Details and Policy
-sections. It offers policy templates without a gateway API, following the Apply Policies
-guides and linking each to its docs section: a **Start from** gallery of template cards on the
-create form (a new policy starts from Deny by default; Allow all (blank), then built-in and
-organisation templates of either Type, each shown in place with its settings and example inputs
-before **Use this template** fills the form and sets the Type), a **Rules | Rego** view of the policy whose Rules view groups the
-rules by the template they came from and removes a template's rules or a single rule, **Add rules from a template** there
-(`policies.edit`) to combine several templates in a new or saved policy, **Save as template** on
-a saved policy (`policies.edit`), and a Template examples card that runs an added template's
-examples through the existing simulate endpoint. Built-in templates ship
-in the dashboard and organisation templates last for the browser tab; see _Policy
-templates_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#policy-templates).
+sections built from the shared dashboard components, and are read-only without
+`policies.edit`; see _Policy definition editor_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#policy-definition-editor). Templates need no
+gateway API and link to their Apply Policies docs section. A new policy starts as Deny by
+default, preselected in the **Start from** gallery, and opens on the Rules view. A gallery card
+(**Allow all (blank)**, then built-in and organisation templates of either Type) shows its
+settings, How it decides, its Rego and docs link in place, and **Use this template** fills the
+form and sets the Type. The Policy section's **Rules | Rego** toggle lists the rules grouped by
+template, with Remove per group and per rule, disabled with its reason while `allow` reads the
+rule. **Add rules from a template** only adds rules, so several templates combine in a new or
+saved policy; it refuses a standalone template, one meant to be the whole policy because it only
+sets the default decision or allows requests outside what it restricts. A saved policy offers
+**Save as template**, and once rules are added a Template examples card runs their examples
+through the existing simulate endpoint. Organisation templates last for the browser tab; see
+_Policy templates_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#policy-templates).
 
 The Dashboard shows the metrics **Delete** button only to users with `settings.edit`; see
 _Maintenance actions_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#maintenance-actions).

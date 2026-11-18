@@ -16,8 +16,10 @@ changes:
         template fills Name, Description, Type and Rego with settings that are checked first.
         Add rules from a template appends a template's rules to a new or saved policy, so
         several can be combined, and on a saved policy checks the template's examples with the
-        existing dry-run. A Rules view lists the policy's rules grouped by the template they
-        came from, labelling only deny_reason as a Deny reason, removes a template's rules or a
+        existing dry-run; a template meant to be the whole policy is used from Start from only.
+        A Rules | Rego toggle shows the policy, opening on Rules. The Rules view lists the
+        policy's rules grouped by the template they came from, with an empty state that offers
+        templates or Rego, labelling only deny_reason as a Deny reason, removes a template's rules or a
         single rule, and switches an allow-all policy to deny by default. Remove is refused, with
         the reason shown under the rule or template, while the allow rule still reads that rule,
         directly or through other rules; a read from deny_reason alone doesn't count, and an
@@ -36,17 +38,15 @@ changes:
       title: Start new policies as deny by default
       description: >-
         A new policy definition starts as default allow := false, the deny-by-default practice
-        the policy docs recommend, instead of allowing all traffic. Allow all (blank) stays a
-        starting point in the Start from gallery.
+        the policy docs recommend, instead of allowing all traffic. Deny by default is
+        preselected in the Start from gallery, and Allow all (blank) is a card there.
     - timestamp: '2026-11-18T18:00:00Z'
       title: Redesign the policy editor into Details and Policy sections
       description: >-
         The policy create and edit pages group Name, Description, Type and an Enabled switch
         into one Details section, keep the templates in a column beside the editor so opening
         one never resizes the form, show a saved policy's ID and SHA on one line with copy
-        buttons, and show the policy as a Rules view or the Rego, with line numbers in the
-        editor, an empty state that offers templates or Rego, and a banner when the Rego
-        doesn't compile.
+        buttons, and show the Rego with line numbers and a banner when it doesn't compile.
   fixed:
     - timestamp: '2026-11-18T18:00:00Z'
       title: Describe the policy input the gateway sends in the policy editor

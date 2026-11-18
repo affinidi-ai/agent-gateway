@@ -1792,7 +1792,7 @@ font-weight-bold text-primary`) and their description in the body. A policy Type
 from the one `POLICY_TYPE_NAMES` map in `policyTemplates/types.ts`, and the editor sets no
 inline `style`. The exceptions are the selectable `.policy-template-row` cards and rows, `nav-link`
 tabs, the Rego reference heading toggle, `btn-close`, Back, the Rego view's package-mismatch
-alert with **Fix it** (main's Bootstrap `alert-danger`, kept as it was), and the Rules view's
+alert with **Fix it** (Bootstrap `alert-danger`), and the Rules view's
 rule-kind badges (`.policy-rules__kind`, a neutral `--muted-text` outline for every kind, so a
 rule's kind never reads as an allow or deny decision).
 
@@ -1826,7 +1826,7 @@ Policy templates live in `pages/SettingsPage/policyTemplates/`. The editor never
 template API: built-in templates ship with the dashboard in `builtinPolicyTemplates.json`,
 and organisation templates saved from a policy are kept by `policyTemplateStore.ts` in the
 tab's `sessionStorage` (`policy-templates:organization`), so they last in that browser tab
-until it is closed; the panel, the save toast and the changelog say so. On read the store
+until it is closed; the panel and the save toast say so. On read the store
 keeps only entries whose fields check out (category an own key of `CATEGORY_LABELS`, each
 example with a text `name`, an object `input` and `expected` allow or deny) and rebuilds
 each from those fields; when a write fails it keeps the templates in memory until reload.
@@ -1852,9 +1852,11 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   string's `format: "time_zone"` accepts IANA names only (written in their canonical spelling),
   and a list's `allowed` names the only values accepted, matched without regard to case and
   written in the listed spelling; Allow during business hours uses all three. A template that reads the clock (`time.now_ns()`) has no examples.
-  An entry is `standalone` when its rules allow requests outside what it restricts (such as
-  Restrict MCP tools by role and Allowlist outbound destinations), so inserting them would widen
-  another policy; Add to policy refuses it (`policy-templates-standalone-note`). Allow listed
+  An entry is `standalone` when it is meant to be the whole policy: its rules only set the
+  default decision (Deny by default, Monitor-only baseline) or allow requests outside what they
+  restrict (Restrict MCP tools by role, Allowlist outbound destinations). It is used from Start
+  from, and Add to policy refuses it (`policy-templates-default-only-note`,
+  `policy-templates-standalone-note`). Allow listed
   paths denies a path that contains `..`, `%2e`, a backslash or `%5c`.
   `builtinPolicyTemplates.test.ts` checks every entry renders under its package. The catalogue
   holds the starter templates of the template library except rate controls, which are set on
@@ -1920,7 +1922,7 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   and moves focus to the selected card, or to the search when no shown card is selected. Use
   there replaces the Rego. After a discard and Undo the page keeps only the form, so no
   card is selected over Rego other than `DEFAULT_POLICY`. Changing Type keeps the Rego, whose
-  package the Type select rewrites as before, keeps a template that serves both Types used,
+  package line the Type select rewrites, keeps a template that serves both Types used,
   with its settings, and shows a warning toast naming any built-in template in it, used or
   added, that has no variant for the new Type.
 - **Templates column** (`PolicyTemplatesPanel`, `policy-templates-panel`): for users with
