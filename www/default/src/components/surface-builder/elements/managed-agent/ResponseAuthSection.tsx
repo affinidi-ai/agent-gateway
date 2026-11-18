@@ -1,12 +1,11 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Form } from 'react-bootstrap';
-import { apiClient } from '../../../../api';
 import FieldHelp from '../../../shared/FieldHelp';
 import AddResourceLink from '../../../shared/AddResourceLink';
 import { deepLinks } from '../../../../utils/deepLinks';
 import type { CertificateKind, MtlsTrust } from '../../../../types';
 import { useOptionalSurfaceMeta } from '../../SurfaceMetaContext';
-import { useApiKeySecrets } from '../caller-auth/useCallerAuthOptions';
+import { useApiKeySecrets, useCertificates } from '../caller-auth/useCallerAuthOptions';
 import {
   DEFAULT_RESPONSE_AUTH_HEADER,
   isHttpsTarget,
@@ -23,13 +22,6 @@ import {
   type ResponseAuthMethod,
 } from './responseAuth';
 
-interface CertificateOption {
-  id: string;
-  name: string;
-  kind?: CertificateKind;
-  active: boolean;
-}
-
 interface Props {
   endpoint: string;
   value: unknown;
@@ -37,38 +29,6 @@ interface Props {
 }
 
 const T = 'managed-agent-response-auth';
-
-function useCertificates(enabled: boolean): {
-  certificates: CertificateOption[];
-  loaded: boolean;
-  failed: boolean;
-} {
-  const [certificates, setCertificates] = useState<CertificateOption[]>([]);
-  const [loaded, setLoaded] = useState(false);
-  const [failed, setFailed] = useState(false);
-  useEffect(() => {
-    if (!enabled) return;
-    let current = true;
-    apiClient
-      .get<CertificateOption[]>('/certificates')
-      .then(res => {
-        if (!current) return;
-        setCertificates((Array.isArray(res.data) ? res.data : []).filter(c => c.active));
-        setFailed(false);
-        setLoaded(true);
-      })
-      .catch(() => {
-        if (!current) return;
-        setCertificates([]);
-        setFailed(true);
-        setLoaded(true);
-      });
-    return () => {
-      current = false;
-    };
-  }, [enabled]);
-  return { certificates, loaded, failed };
-}
 
 /**
  * Response authentication (`target.response_auth`): how the managed agent's

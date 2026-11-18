@@ -1334,6 +1334,12 @@ Target URL, resolves the managed agent's identity from that answer and records i
 and enforced only: a surface without the setting behaves as before, and there is no
 report-only mode.
 
+It covers the response leg only: the answers the Managed Agent sends back to the gateway. A
+call the managed agent makes through one of the surface's Transit Points is authenticated by
+that Transit Point's own `source_auth` (see
+[Transit Point source authentication](#transit-point-source-authentication)), not by
+`response_auth`.
+
 ```json
 "target": {
   "endpoint": "https://bravo.example/a2a",
@@ -1348,6 +1354,11 @@ header holds exactly one value equal to one of the keys, compared in constant ti
 ([`src/proxy/response_auth.rs`](../src/proxy/response_auth.rs)). The header is removed whatever
 the outcome, so the caller never receives the key. A variant may set its own `response_auth`,
 or clear it as a complete variant, as with `target.auth`.
+
+An `api_key` check runs on the answer, so it runs after the request was sent: a server that
+answers at the Target URL without being the managed agent has already received the request,
+the transit token, the Target credential and the caller headers the gateway forwards, even
+though its answer is refused. Only `mtls` stops such a server before anything is sent.
 
 ```json
 "target": {
@@ -1364,16 +1375,19 @@ With `mtls`, the gateway connects to the Target with TLS settings that trust onl
 public CAs are never consulted ([`src/proxy/response_auth/tls.rs`](../src/proxy/response_auth/tls.rs)):
 
 - `pinned` accepts a server certificate whose SHA-256 leaf fingerprint is that of one of
-  `certificate_ids`, stored `client_leaf` certificates. No chain, name or expiry is checked;
-  the handshake signature is still verified with that certificate's key.
+  `certificate_ids`, stored `client_leaf` certificates. It matches the fingerprint only: no
+  chain, host name or expiry is checked, so a pinned certificate stays trusted after it
+  expires, and removing it from `certificate_ids` is the only way to stop trusting it. The
+  handshake signature is still verified with that certificate's key.
 - `ca` accepts a server certificate that chains to one of `ca_certificate_ids`, stored `ca`
   certificates, and is valid for the Target's host. `require_client_auth_eku` does not apply to
   a server certificate, and `check_crl` and `require_ocsp` must be `false`.
 
 `client_certificate_id`, optional, is a stored `client_leaf` certificate with its private key,
 which the gateway presents to the managed agent so that both ends of the link are proven by
-keys. The TLS settings are built once per surface and built again when the setting or any
-certificate it names changes. The check is the TLS handshake itself: a server certificate that
+keys. The TLS settings are built once per surface and setting, so each variant with a setting
+of its own keeps its own, built again when a certificate the setting names changes, and dropped
+when the surface is saved or deleted. The check is the TLS handshake itself: a server certificate that
 fails the trust ends the connection before any response exists, and the request is refused as
 below. Any other connection failure, such as a Target that cannot be reached, is answered as
 before. The gateway tells the two apart by the TLS error it receives
@@ -1381,7 +1395,9 @@ before. The gateway tells the two apart by the TLS error it receives
 
 The check runs right after the Target answers, success or error, before the response is read
 by anything else: before managed identity is resolved, a credential is issued for it, the Trust
-Recorder writes, response policy runs or a held payment is captured. A streamed answer is
+Recorder writes, response policy runs or a held payment is captured. On a Target bound by
+external consent it runs before a refusal of the token refreshes the grant, so an answer that
+fails never refreshes or retries, and the retry's answer is checked again. A streamed answer is
 checked on its response headers before the first event. Every hop to the Target runs it:
 
 - the Access Point's direct forward, with its A2A event streams, MCP Streamable HTTP streams
@@ -1438,6 +1454,10 @@ resolves:
   Target by Target authentication, a credential binding, a forwarded caller token, header
   metadata mapping or `caller_key` (the
   [Target authentication header rules](CREDENTIAL_DELEGATION.md#target-authentication-rules));
+- names as `api_key.secret_id` a secret the gateway sends to the Target or accepts from
+  callers: the `secret_id` of a `static_secret` Target authentication, of `caller_key`, or of
+  an Access Point `api_key` caller authentication method, so neither the managed agent nor a
+  caller already holds the key its responses are checked against;
 - names a secret or certificate that does not exist or belongs to another tenant (an
   appliance-wide one is accepted, as for a Transit Point's `source_auth`; see
   [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md));

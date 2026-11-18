@@ -204,6 +204,65 @@ async fn a_legacy_sse_fallback_whose_stream_lacks_the_key_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn funds_held_for_a_target_response_without_the_key_are_voided_not_captured() {
+    use crate::payments_ledger::SettleAction;
+    use crate::payments_ledger::settlement::SettlementStatus;
+    use crate::payments_ledger::settlement::tests::{Scripted, answer};
+    use crate::proxy::handler::agent_pay_gate::{install_test_transport, tests::MockGate};
+
+    let gateway = format!("response-auth-gate-{}", uuid::Uuid::new_v4());
+    install_test_transport(
+        &gateway,
+        MockGate::answering(
+            200,
+            &[
+                ("Payment-Receipt", "authorization-receipt"),
+                ("payment-authorization", "auth-response-key"),
+                ("payment-capture-deadline", "2099-01-01T00:00:00Z"),
+            ],
+            json!({}),
+        ),
+    );
+    let settlement = Scripted::settling(vec![answer(SettlementStatus::Voided)]);
+    crate::payments_ledger::settlement::install_test_client(&gateway, settlement.clone());
+    let target = target(Post::EventStream).await;
+    let mut paid = surface("mcp", &target.url, api_key_bravo());
+    paid.target.payment_policy = Some(
+        serde_json::from_value(json!({"type": "agent_pay", "payment_gateway_id": gateway,
+            "payment_surface_id": "pay-1", "mcp_payment_triggers": {"mode": "all"}}))
+        .unwrap(),
+    );
+    let (path, headers, body) = mcp_call();
+    let credential = format!("proof-{}", uuid::Uuid::new_v4());
+    let mut headers: Vec<(&str, &str)> = headers;
+    headers.push(("payment-signature", &credential));
+
+    assert_refused("a paid call", &send(paid, (path, headers, body)).await);
+
+    let mut settled = Vec::new();
+    for _ in 0..200 {
+        settled = settlement
+            .settled
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, action, _)| *action)
+            .collect();
+        if !settled.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(settled, vec![SettleAction::Void]);
+    assert_eq!(
+        target
+            .requests
+            .load(Ordering::SeqCst),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_request_whose_target_cannot_be_checked_is_refused_before_it_is_sent() {
     let target = target(Post::EventStream).await;
     let https = target

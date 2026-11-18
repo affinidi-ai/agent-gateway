@@ -8048,24 +8048,7 @@ async fn proxy_charged_request(
     } else {
         send_response.await?
     };
-    // The vendor's answer to the Target's grant: a refusal of the token gets
-    // one refresh and one retry, and its cookies and authentication challenges
-    // never reach the caller.
-    let mut upstream_response = match (target_grant.as_ref(), released_target_grant) {
-        (Some(route), Some(released)) => match route
-            .answer(&state, released, upstream_response, target_grant_retry)
-            .await
-        {
-            Ok(response) => response,
-            Err(refused) => {
-                connection_guard
-                    .decrement()
-                    .await;
-                return Ok(refused.response(&state.surface, &body_bytes));
-            }
-        },
-        _ => upstream_response,
-    };
+    let mut upstream_response = upstream_response;
     if let Err(failure) = crate::proxy::response_auth::authenticate_response(
         &state.surface,
         upstream_response.headers_mut(),
@@ -8078,6 +8061,48 @@ async fn proxy_charged_request(
             .await;
         return Ok(crate::proxy::response_auth::refuse(failure, &audit_facts, &body_bytes));
     }
+    // The vendor's answer to the Target's grant: a refusal of the token gets
+    // one refresh and one retry, and its cookies and authentication challenges
+    // never reach the caller.
+    let mut upstream_response = match (target_grant.as_ref(), released_target_grant) {
+        (Some(route), Some(released)) => {
+            let retried = matches!(
+                crate::delegation_vault::release::vendor_answer(
+                    upstream_response.status(),
+                    upstream_response.headers()
+                ),
+                crate::delegation_vault::release::VendorAnswer::TokenRejected
+            );
+            match route
+                .answer(&state, released, upstream_response, target_grant_retry)
+                .await
+            {
+                Ok(mut response) => {
+                    if retried
+                        && let Err(failure) = crate::proxy::response_auth::authenticate_response(
+                            &state.surface,
+                            response.headers_mut(),
+                            state.secrets_store.as_ref(),
+                        )
+                        .await
+                    {
+                        connection_guard
+                            .decrement()
+                            .await;
+                        return Ok(crate::proxy::response_auth::refuse(failure, &audit_facts, &body_bytes));
+                    }
+                    response
+                }
+                Err(refused) => {
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Ok(refused.response(&state.surface, &body_bytes));
+                }
+            }
+        }
+        _ => upstream_response,
+    };
     if bound_target {
         crate::proxy::target_grant::withhold_vendor_headers(&mut upstream_response);
         if let Some(refused) = crate::proxy::target_grant::refuse_a_compressed_answer(

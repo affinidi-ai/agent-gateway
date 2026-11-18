@@ -1,6 +1,7 @@
 //! Save-time rules for Response authentication (`target.response_auth`), on the surface and
 //! each variant as it resolves: only an http or https Target, which a managed agent answers,
-//! may set it; its header is held to the Target authentication header rules; and an API key
+//! may set it; its header is held to the Target authentication header rules; its API key secret
+//! is none the surface sends to the Target or accepts from callers; and an API key
 //! read from an `http://` Target follows `credential_policy.target_https`: saved with a
 //! warning in `warn`, refused in `enforce` unless the stored surface already had the same
 //! setting on the same Target. mTLS needs an `https://` Target not bound by external consent
@@ -10,11 +11,13 @@
 use tracing::warn;
 
 use crate::certificates::{Certificate, CertificateKind, CertificateStore};
+use crate::config::TargetAuthMethod;
 use crate::config::agent_surface::AgentSurface;
 use crate::config::agent_surface_variants::SurfaceOverrides;
 use crate::config::credential_policy::credential_policy;
 use crate::config::response_auth::{MtlsResponseAuth, ResponseAuthConfig};
 use crate::config::target_auth_rules::{TargetCredentialRule, is_header_name, reserved_header, same_header_name};
+use crate::source_auth::SourceAuthConfig;
 use crate::source_auth::models::MtlsTrust;
 
 use super::surfaces::SurfaceApiError;
@@ -37,7 +40,8 @@ struct Placed {
 
 /// Refuses the first `target.response_auth` of `surface` that breaks a rule: a Target that is
 /// not an http or https URL, mTLS on a Target that is not https ([`mtls_rule`]), a header that
-/// is not an HTTP field name, is reserved or is already sent to the Target, and an API key on
+/// is not an HTTP field name, is reserved or is already sent to the Target, a key secret the
+/// surface also sends to the Target or accepts from callers ([`shares_a_secret`]), and an API key on
 /// an `http://` Target while `credential_policy.target_https` is `enforce`, unless `stored` had
 /// the same setting on the same Target. An `http://` Target in `warn` is logged and saved.
 pub(super) fn validate_response_auth_rules(
@@ -70,6 +74,12 @@ pub(super) fn validate_response_auth_rules(
         };
         if let Some(rule) = header_rule(&view, &config.header_name) {
             return Err(SurfaceApiError::BadRequest(format!("{field}.api_key.header_name {rule}")));
+        }
+        if shares_a_secret(&view, &config.secret_id) {
+            return Err(SurfaceApiError::BadRequest(format!(
+                "{field}.api_key.secret_id must not be a secret the gateway sends to the Target or accepts from \
+                 callers"
+            )));
         }
         if is_http_url(&setting.endpoint) {
             let message = in_clear(&field);
@@ -362,6 +372,39 @@ fn header_rule(
         .map(|(_, used_by)| format!("{header_name} is already sent to the Target by {used_by}"))
 }
 
+/// Whether `secret_id` is a secret `view` also sends to its Target, by Target authentication or
+/// `caller_key`, or accepts from its callers by an API key method, so the managed agent, or a
+/// caller, would already hold the key its responses are checked against.
+fn shares_a_secret(
+    view: &AgentSurface,
+    secret_id: &str,
+) -> bool {
+    let target_auth = view
+        .target
+        .auth
+        .as_ref()
+        .and_then(|auth| match &auth.method {
+            TargetAuthMethod::StaticSecret { secret_id, .. } => Some(secret_id.as_str()),
+            _ => None,
+        });
+    let caller_key = view
+        .caller_key
+        .as_ref()
+        .map(|caller_key| caller_key.secret_id.as_str());
+    let caller_api_keys = view
+        .source_auth_methods()
+        .iter()
+        .filter_map(|method| match method {
+            SourceAuthConfig::ApiKey(config) => Some(config.secret_id.as_str()),
+            _ => None,
+        });
+    target_auth
+        .into_iter()
+        .chain(caller_key)
+        .chain(caller_api_keys)
+        .any(|used| used == secret_id)
+}
+
 fn is_http_url(endpoint: &str) -> bool {
     has_scheme(endpoint, "http")
 }
@@ -550,6 +593,53 @@ mod tests {
         ] {
             assert_eq!(check(&body), Err(format!("target.response_auth.api_key.header_name {refusal}")), "{case}");
         }
+    }
+
+    const SHARED_SECRET: &str = "target.response_auth.api_key.secret_id must not be a secret the gateway sends to \
+                                 the Target or accepts from callers";
+
+    fn target_auth_with(secret_id: &str) -> Value {
+        json!({"method": {"static_secret": {
+            "secret_id": secret_id, "header_name": "X-Api-Key", "header_format": "{value}"
+        }}})
+    }
+
+    fn caller_api_key_with(secret_id: &str) -> Value {
+        json!({"methods": [{"type": "api_key",
+            "extraction": {"source": "http_header", "field": "X-Caller-Api-Key"}, "secret_id": secret_id}]})
+    }
+
+    #[test]
+    fn test_a_key_secret_the_gateway_sends_or_accepts_is_refused() {
+        let mut target_auth = surface("https://bravo.example", api_key("X-Agent-Key"));
+        target_auth["target"]["auth"] = target_auth_with("bravo-key");
+        let mut keyed = surface("https://bravo.example", api_key("X-Agent-Key"));
+        keyed["caller_key"] = json!({"secret_id": "bravo-key"});
+        let mut caller_api_key = surface("https://bravo.example", api_key("X-Agent-Key"));
+        caller_api_key["access_point"]["caller_authentication"] = caller_api_key_with("bravo-key");
+
+        for (case, body) in
+            [("Target authentication", target_auth), ("caller_key", keyed), ("a caller API key", caller_api_key)]
+        {
+            assert_eq!(check(&body), Err(SHARED_SECRET.to_string()), "{case}");
+        }
+    }
+
+    #[test]
+    fn test_a_key_secret_of_its_own_saves_beside_the_others() {
+        let mut distinct = surface("https://bravo.example", api_key("X-Agent-Key"));
+        distinct["target"]["auth"] = target_auth_with("target-key");
+        distinct["caller_key"] = json!({"secret_id": "caller-keys"});
+        distinct["access_point"]["caller_authentication"] = caller_api_key_with("caller-api-key");
+        assert_eq!(check(&distinct), Ok(()));
+    }
+
+    #[test]
+    fn test_a_variant_whose_key_secret_the_gateway_sends_is_refused_by_its_alias() {
+        let mut body = surface("https://bravo.example", api_key("X-Agent-Key"));
+        body["variants"] = json!([{"id": "beta-id", "alias": "beta", "name": "Beta",
+            "overrides": {"target": {"auth": target_auth_with("bravo-key")}}}]);
+        assert_eq!(check(&body), Err(format!("variants['beta'].{SHARED_SECRET}")));
     }
 
     #[test]

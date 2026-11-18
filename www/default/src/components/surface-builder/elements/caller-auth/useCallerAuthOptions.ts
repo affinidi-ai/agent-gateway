@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { apiClient } from '../../../../api';
+import type { CertificateKind } from '../../../../types';
 
 export interface JwtVerificationStrategyOption {
   id: string;
@@ -13,6 +14,14 @@ export interface ApiKeySecretOption {
   name: string;
   secret_id?: string;
   secret_type?: string;
+}
+
+export interface CertificateOption {
+  id: string;
+  name: string;
+  kind?: CertificateKind;
+  active: boolean;
+  expires_at?: string;
 }
 
 export type JwtStrategiesStatus = 'idle' | 'loading' | 'loaded' | 'failed';
@@ -83,4 +92,45 @@ export function useApiKeySecrets(enabled: boolean): {
       .finally(() => setLoading(false));
   }, [enabled]);
   return { secrets, loading };
+}
+
+/**
+ * The active certificates in the certificate store, loaded while `enabled`. `loaded` and `failed`
+ * stay set once a read answered, so a stored id can be shown as missing only after a read.
+ */
+export function useCertificates(enabled: boolean): {
+  certificates: CertificateOption[];
+  loading: boolean;
+  loaded: boolean;
+  failed: boolean;
+} {
+  const [certificates, setCertificates] = useState<CertificateOption[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    if (!enabled) return;
+    let current = true;
+    setLoading(true);
+    apiClient
+      .get<CertificateOption[]>('/certificates')
+      .then(res => {
+        if (!current) return;
+        setCertificates((Array.isArray(res.data) ? res.data : []).filter(c => c.active));
+        setFailed(false);
+        setLoaded(true);
+        setLoading(false);
+      })
+      .catch(() => {
+        if (!current) return;
+        setCertificates([]);
+        setFailed(true);
+        setLoaded(true);
+        setLoading(false);
+      });
+    return () => {
+      current = false;
+    };
+  }, [enabled]);
+  return { certificates, loading, loaded, failed };
 }

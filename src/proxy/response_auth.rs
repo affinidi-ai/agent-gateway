@@ -18,6 +18,7 @@ mod tls;
 
 #[cfg(test)]
 pub(crate) use tests::{BRAVO_KEY, BRAVO_KEY_HEADER, api_key_bravo, bravo_key_store};
+pub(crate) use tls::forget_tls_settings;
 #[cfg(test)]
 pub(crate) use tls::tests::{pinned_bravo, untrusted_target};
 pub use tls::{handshake_failure, target_tls, tls_stamp};

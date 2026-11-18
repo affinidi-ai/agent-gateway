@@ -6,7 +6,8 @@
 //! certificate, with no chain, name or expiry check, and still verifies the handshake signature
 //! with that certificate's key. `ca` trust verifies the chain to one of the configured CAs and
 //! the Target's host against the certificate's names. The settings are built once per surface
-//! and built again when the setting or any certificate it names changes.
+//! and setting, built again when a certificate the setting names changes, and dropped when the
+//! surface changes or is deleted.
 
 use std::sync::{Arc, LazyLock};
 
@@ -39,14 +40,17 @@ pub async fn target_tls(
         .await
 }
 
-/// What the mTLS settings [`target_tls`] last built for `surface` were built from: the setting
-/// and every certificate it names, so it changes when a certificate is renewed. `None` before
-/// any were built.
+/// What the mTLS settings [`target_tls`] last built for `surface` and its setting were built
+/// from: the setting and every certificate it names, so it changes when a certificate is
+/// renewed. `None` before any were built.
 pub fn tls_stamp(surface: &AgentSurface) -> Option<[u8; 32]> {
-    SETTINGS
-        .built
-        .get(&surface.surface_id)
-        .map(|built| built.0)
+    SETTINGS.stamp(surface)
+}
+
+/// Drops every mTLS setting built for the surface `surface_id`, so a changed or deleted surface
+/// keeps no client configuration, and no client private key, in memory.
+pub(crate) fn forget_tls_settings(surface_id: &str) {
+    SETTINGS.forget(surface_id);
 }
 
 /// [`ResponseAuthFailure::ServerUntrusted`] when `error`, from sending a request to the Target of
@@ -80,13 +84,50 @@ fn rustls_error<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a 
     }
 }
 
-/// The TLS settings built for each surface, with the stamp of what they were built from.
+/// A surface's id and the hash of its mTLS setting, so each variant setting of a surface keeps
+/// settings of its own.
+type SettingKey = (String, [u8; 32]);
+
+fn setting_key(
+    surface: &AgentSurface,
+    config: &MtlsResponseAuth,
+) -> SettingKey {
+    let setting = Sha256::digest(serde_json::to_vec(config).unwrap_or_default()).into();
+    (surface.surface_id.clone(), setting)
+}
+
+/// The TLS settings built for each surface and setting, with the stamp of what they were built
+/// from.
 #[derive(Default)]
 struct TlsSettingsCache {
-    built: DashMap<String, ([u8; 32], Arc<ClientConfig>)>,
+    built: DashMap<SettingKey, ([u8; 32], Arc<ClientConfig>)>,
 }
 
 impl TlsSettingsCache {
+    fn stamp(
+        &self,
+        surface: &AgentSurface,
+    ) -> Option<[u8; 32]> {
+        let Some(ResponseAuthConfig::Mtls(config)) = surface
+            .target
+            .response_auth
+            .as_ref()
+        else {
+            return None;
+        };
+        self.built
+            .get(&setting_key(surface, config))
+            .map(|built| built.0)
+    }
+
+    fn forget(
+        &self,
+        surface_id: &str,
+    ) {
+        self.built
+            .retain(|(id, _), _| id != surface_id);
+    }
+
     async fn settings(
         &self,
         surface: &AgentSurface,
@@ -101,16 +142,17 @@ impl TlsSettingsCache {
         };
         let material = Material::load(surface, config, certificates).await?;
         let stamp = material.stamp(config);
+        let key = setting_key(surface, config);
         if let Some(built) = self
             .built
-            .get(&surface.surface_id)
+            .get(&key)
             .filter(|built| built.0 == stamp)
         {
             return Ok(Some(Arc::clone(&built.1)));
         }
         let built = Arc::new(material.client_config(config)?);
         self.built
-            .insert(surface.surface_id.clone(), (stamp, Arc::clone(&built)));
+            .insert(key, (stamp, Arc::clone(&built)));
         Ok(Some(built))
     }
 }
@@ -823,6 +865,55 @@ pub(super) mod tests {
                 .is_err(),
             "the old certificate is no longer trusted"
         );
+    }
+
+    #[tokio::test]
+    async fn test_each_setting_of_a_surface_keeps_its_own_settings_and_stamp() {
+        let (_dir, store) = store().await;
+        put(&store, "bravo", CertificateKind::ClientLeaf, &self_signed(&["127.0.0.1"]), false, None).await;
+        put(&store, "bravo-ca", CertificateKind::Ca, &ca_and_leaf(&["127.0.0.1"]).0, false, None).await;
+        let cache = TlsSettingsCache::default();
+        let pinned_variant = surface(None, pinned(&["bravo"]));
+        let ca_variant = surface(None, ca(&["bravo-ca"]));
+        assert_eq!(cache.stamp(&pinned_variant), None, "nothing built yet");
+
+        let first_pinned = settings(&cache, &pinned_variant, &store).await;
+        let first_ca = settings(&cache, &ca_variant, &store).await;
+        let pinned_stamp = cache.stamp(&pinned_variant);
+        let ca_stamp = cache.stamp(&ca_variant);
+
+        assert_eq!(cache.built.len(), 2);
+        assert!(Arc::ptr_eq(&first_pinned, &settings(&cache, &pinned_variant, &store).await), "pinned kept");
+        assert!(Arc::ptr_eq(&first_ca, &settings(&cache, &ca_variant, &store).await), "CA kept");
+        assert!(pinned_stamp.is_some() && ca_stamp.is_some());
+        assert_ne!(pinned_stamp, ca_stamp);
+        assert_eq!(cache.stamp(&pinned_variant), pinned_stamp, "alternating keeps each stamp");
+    }
+
+    #[tokio::test]
+    async fn test_forgetting_a_surface_drops_only_its_settings() {
+        let (_dir, store) = store().await;
+        put(&store, "bravo", CertificateKind::ClientLeaf, &self_signed(&["127.0.0.1"]), false, None).await;
+        put(&store, "bravo-ca", CertificateKind::Ca, &ca_and_leaf(&["127.0.0.1"]).0, false, None).await;
+        let cache = TlsSettingsCache::default();
+        let mut other = surface(None, pinned(&["bravo"]));
+        other.surface_id = "surface-2".to_string();
+        settings(&cache, &surface(None, pinned(&["bravo"])), &store).await;
+        settings(&cache, &surface(None, ca(&["bravo-ca"])), &store).await;
+        let kept = settings(&cache, &other, &store).await;
+
+        cache.forget("surface-1");
+
+        assert_eq!(
+            cache
+                .built
+                .iter()
+                .map(|entry| entry.key().0.clone())
+                .collect::<Vec<_>>(),
+            vec!["surface-2".to_string()]
+        );
+        assert_eq!(cache.stamp(&surface(None, pinned(&["bravo"]))), None);
+        assert!(Arc::ptr_eq(&kept, &settings(&cache, &other, &store).await), "another surface's settings kept");
     }
 
     #[tokio::test]
