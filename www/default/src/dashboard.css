@@ -1352,6 +1352,40 @@ select.dropdown-styling option {
   padding-left: 0.25rem;
 }
 
+/* Long names and surface names wrap inside a capped width instead of widening the table */
+.identities-table .identities-name {
+  max-width: 14rem;
+  overflow-wrap: anywhere;
+}
+
+.identities-table .identities-surface {
+  max-width: 12rem;
+  overflow-wrap: anywhere;
+}
+
+/* Attestation, UAI and Created show only on wide screens; the expanded row keeps the details */
+@media (max-width: 1999.98px) {
+  .identities-table .identities-col-wide-only {
+    display: none;
+  }
+}
+
+/* Below 1600px (a 14-inch laptop at 1512px), Trust Score and Last Used hide too and the DID shortens */
+.identities-table .identities-did-compact {
+  display: none;
+}
+
+@media (max-width: 1599.98px) {
+  .identities-table .identities-col-mid-up,
+  .identities-table .identities-did-full {
+    display: none;
+  }
+
+  .identities-table .identities-did-compact {
+    display: inline;
+  }
+}
+
 /* Modern Buttons */
 .btn {
   font-weight: 600;

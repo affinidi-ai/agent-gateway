@@ -1,0 +1,21 @@
+branch: fix/identities-page-view
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-17T00:00:00Z'
+      title: Show trust score and UAI in the expanded Identities row
+      description: >-
+        The expanded row on the Identities page now shows the trust score and, for an identity
+        without Agent DNA, its UAI. These details stay available on screens where their columns
+        are hidden.
+  fixed:
+    - timestamp: '2026-11-17T00:00:00Z'
+      title: Fit the Identities table on laptop screens without sideways scrolling
+      description: >-
+        Long names, surface names and origin badges now wrap, and the DID version and SCID sit on
+        a second line. Attestation, UAI and Created show only on screens 2000px wide or more, and
+        below 1600px Trust Score and Last Used hide and the DID shortens, so the table and its
+        row actions fit on 14-inch and 16-inch laptop screens.
+  removed: []
+  security: []
+  breaking: []

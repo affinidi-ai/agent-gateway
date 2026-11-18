@@ -577,11 +577,16 @@ const IdentitiesPage: React.FC = () => {
                               <th>Name</th>
                               <th>DID</th>
                               <th>Agent Surface</th>
-                              <th>Trust Score</th>
-                              <th>Attestation</th>
-                              <th title="Universal Agent Identifier">UAI</th>
-                              <th>Created</th>
-                              <th>Last Used</th>
+                              <th className="identities-col-mid-up">Trust Score</th>
+                              <th className="identities-col-wide-only">Attestation</th>
+                              <th
+                                className="identities-col-wide-only"
+                                title="Universal Agent Identifier"
+                              >
+                                UAI
+                              </th>
+                              <th className="identities-col-wide-only">Created</th>
+                              <th className="identities-col-mid-up">Last Used</th>
                               <th>Origin</th>
                               {hasRecorderStatus && <th>Recorder</th>}
                               <th>Actions</th>
@@ -605,7 +610,7 @@ const IdentitiesPage: React.FC = () => {
                                     data-testid={`identities-row-${identity.did}`}
                                   >
                                     <td>
-                                      <div className="d-inline-flex align-items-center flex-nowrap">
+                                      <div className="d-inline-flex align-items-center identities-name">
                                         <i
                                           className={`fas fa-chevron-${isExpanded ? 'down' : 'right'} me-2`}
                                         ></i>
@@ -626,27 +631,39 @@ const IdentitiesPage: React.FC = () => {
                                       </div>
                                     </td>
                                     <td>
-                                      <IdentityNameCell identity={identity} showName={false} />
-                                      {identity.version !== undefined &&
-                                        identity.version !== null && (
-                                          <span className="badge badge-primary ml-2">
-                                            v{identity.version}
-                                          </span>
-                                        )}
-                                      {identity.scid && (
-                                        <small className="text-muted ml-2" title={identity.scid}>
-                                          SCID {identity.scid.slice(0, 10)}...
-                                        </small>
+                                      <IdentityNameCell
+                                        identity={identity}
+                                        showName={false}
+                                        compactDid
+                                      />
+                                      {((identity.version !== undefined &&
+                                        identity.version !== null) ||
+                                        identity.scid) && (
+                                        <div className="d-flex flex-wrap align-items-center gap-1">
+                                          {identity.version !== undefined &&
+                                            identity.version !== null && (
+                                              <span className="badge badge-primary">
+                                                v{identity.version}
+                                              </span>
+                                            )}
+                                          {identity.scid && (
+                                            <small className="text-muted" title={identity.scid}>
+                                              SCID {identity.scid.slice(0, 10)}...
+                                            </small>
+                                          )}
+                                        </div>
                                       )}
                                     </td>
                                     <td>
-                                      <IdentitySurfaceCell
-                                        links={surfaceLinksFor(identity)}
-                                        principal={identity.credential_principal}
-                                        onOpenSurface={openSurface}
-                                      />
+                                      <div className="identities-surface">
+                                        <IdentitySurfaceCell
+                                          links={surfaceLinksFor(identity)}
+                                          principal={identity.credential_principal}
+                                          onOpenSurface={openSurface}
+                                        />
+                                      </div>
                                     </td>
-                                    <td>
+                                    <td className="identities-col-mid-up">
                                       {identity.trust_score !== undefined ? (
                                         <div style={{ minWidth: '120px' }}>
                                           <div
@@ -684,7 +701,7 @@ const IdentitiesPage: React.FC = () => {
                                         <span className="text-muted">-</span>
                                       )}
                                     </td>
-                                    <td>
+                                    <td className="identities-col-wide-only">
                                       {identity.has_tee && (
                                         <i
                                           className="fas fa-bolt text-warning me-1"
@@ -705,7 +722,7 @@ const IdentitiesPage: React.FC = () => {
                                         <span className="text-muted">-</span>
                                       ) : null}
                                     </td>
-                                    <td>
+                                    <td className="identities-col-wide-only">
                                       {(() => {
                                         const uai =
                                           identity.metadata?.agentDNA?.uai || identity.uai;
@@ -727,14 +744,14 @@ const IdentitiesPage: React.FC = () => {
                                         );
                                       })()}
                                     </td>
-                                    <td>
+                                    <td className="identities-col-wide-only">
                                       <small>
                                         {identity.created_at
                                           ? formatDateTime(identity.created_at, true)
                                           : 'Never'}
                                       </small>
                                     </td>
-                                    <td>
+                                    <td className="identities-col-mid-up">
                                       <small>
                                         {identity.last_used_at || identity.last_used
                                           ? timeAgo((identity.last_used_at || identity.last_used)!)
@@ -743,31 +760,26 @@ const IdentitiesPage: React.FC = () => {
                                     </td>
                                     <td>
                                       {identity.origin ? (
-                                        <>
+                                        <div className="d-flex flex-wrap align-items-center gap-1">
                                           <IdentityOriginBadge origin={identity.origin} />
                                           {identity.origin === 'external_caller' &&
                                             identity.verified && (
-                                              <span className="badge text-bg-success ms-1">
+                                              <span className="badge text-bg-success">
                                                 VERIFIED
                                               </span>
                                             )}
-                                        </>
+                                        </div>
                                       ) : identity.is_local !== undefined ? (
-                                        <>
+                                        <div className="d-flex flex-wrap align-items-center gap-1">
                                           <span
                                             className={`badge ${identity.is_local ? 'text-bg-info' : 'text-bg-warning'}`}
                                           >
                                             {identity.is_local ? 'LOCAL' : 'REMOTE'}
                                           </span>
                                           {!identity.is_local && identity.verified && (
-                                            <span
-                                              className="badge text-bg-success ms-1"
-                                              style={{ marginLeft: '0.75rem' }}
-                                            >
-                                              VERIFIED
-                                            </span>
+                                            <span className="badge text-bg-success">VERIFIED</span>
                                           )}
-                                        </>
+                                        </div>
                                       ) : identity.badge ? (
                                         <>
                                           <span
@@ -948,6 +960,45 @@ const IdentitiesPage: React.FC = () => {
                                                           </small>
                                                         </div>
                                                       </div>
+                                                      {identity.trust_score !== undefined && (
+                                                        <div
+                                                          className="mb-2"
+                                                          data-testid="identities-detail-trust-score"
+                                                        >
+                                                          <small className="font-weight-bold text-muted">
+                                                            Trust Score:
+                                                          </small>
+                                                          <div>
+                                                            <small>
+                                                              {(identity.trust_score * 100).toFixed(
+                                                                0
+                                                              )}
+                                                              %
+                                                            </small>
+                                                          </div>
+                                                        </div>
+                                                      )}
+                                                      {!identity.metadata?.agentDNA &&
+                                                        identity.uai && (
+                                                          <div
+                                                            className="mb-2"
+                                                            data-testid="identities-detail-uai"
+                                                          >
+                                                            <small className="font-weight-bold text-muted">
+                                                              UAI:
+                                                            </small>
+                                                            <div>
+                                                              <code
+                                                                style={{
+                                                                  fontSize: '0.75rem',
+                                                                  wordBreak: 'break-all',
+                                                                }}
+                                                              >
+                                                                {identity.uai}
+                                                              </code>
+                                                            </div>
+                                                          </div>
+                                                        )}
                                                     </div>
                                                   </div>
                                                 </div>
