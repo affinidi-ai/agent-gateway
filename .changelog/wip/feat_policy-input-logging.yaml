@@ -6,9 +6,9 @@ changes:
       description: >-
         A dashboard WebSocket connection can listen to one surface's policy input with a
         capture_policy_input message and stop with stop_capturing_policy_input. While at least one
-        connection listens, each request and response policy evaluation on that surface (gateway,
-        surface, Transit Point and appliance-wide planes, on the direct, Fabric and MCP proxy paths)
-        is serialized once and queued for the listening connections only (up to 64 per connection,
+        connection listens, each request and response policy evaluation on that surface (on the
+        gateway, surface and appliance-wide planes, Transit Point slots included, on the direct,
+        Fabric and MCP proxy paths) is serialized once and queued for the listening connections only (up to 64 per connection,
         then dropped for that connection, which is told how many it missed), never through the
         shared dashboard broadcast, as a
         policy_input_captured update with its input,
@@ -17,19 +17,22 @@ changes:
         allow, deny reason or error. Answers and captures are sent alongside the shared dashboard
         updates without waiting behind them, and captures queued before a stop, or by an earlier
         listen of the same surface, are not sent. The gateway policy of
-        an outbound request shows as its own gateway outbound slot. A listen naming a surface id
-        that is empty, over 256 bytes or holds a control character is refused. Credential-named values, JWTs and Bearer or Basic values
+        an outbound request shows as its own gateway outbound slot. MCP tool policies, the
+        tools/list filtering of a surface policy and the fail-closed deny of a slot whose policy did
+        not compile are not captured. A listen naming a surface id that is empty, over 256 bytes or
+        holds a control character is refused. Credential-named values (in snake_case, camelCase or
+        with spaces, such as accessToken or "API Key"), JWTs and Bearer or Basic values
         are masked first, also inside longer text, and an SD-JWT with its disclosures (a Bearer token of at least 12 token characters,
         or 6 with a digit or symbol, and a Basic token that decodes to user:password; message text
         such as "Basic authentication" is kept), and every query value in the request path and in
         any absolute URL is redacted, as are the user name and password in any absolute URL. A JWT
         is recognised by its header decoding to a JSON object, whatever whitespace that JSON holds,
-        including before its opening brace, also when a word is joined to it by a dash or equals
-        sign (CSRF=..., Cisco-...), and the deny reason and evaluation error are masked the same way as the input. A URL
-        fragment holding name=value parameters, as an OAuth redirect's does, is masked like a
+        including before its opening brace. A JWT after a word and an equals sign, as in CSRF=...,
+        is masked too. The deny reason and evaluation error are masked the same way as the input.
+        A URL fragment holding name=value parameters, as an OAuth redirect's does, is masked like a
         query. The operator's log redaction rules are then applied to every captured string and to
-        the reason and error, so a capture masks at least what the log masks, including credential
-        assignments in free text such as password=..., agpat_ tokens and email addresses. Listening needs surfaces.edit and policies.edit, is checked again on each
+        the reason and error, so their rules that match a value, such as credential assignments
+        in free text like password=..., agpat_ tokens and email addresses, mask captures too. Listening needs surfaces.edit and policies.edit, is checked again on each
         keep-alive ping before any queued capture is sent (captures still queued when access is
         lost are discarded), and ends when the connection closes. Nothing is logged or stored, and the
         surface configuration is not changed. Policy authors can see the input structure again
@@ -39,7 +42,7 @@ changes:
       description: >-
         The Surface Builder's Capture view has a Policy Input card with a Listen to policy input
         button for users with both surfaces.edit and policies.edit. While listening, the card lists
-        each policy evaluation with its slot, the name and version of the policy it ran, its
+        each captured policy evaluation with its slot, the name and version of the policy it ran, its
         decision and reason, and shows or copies its input to
         try in the policy Test panel. Stopping, leaving the view or reloading the page ends
         listening. It keeps the last 50 evaluations with a filter by policy slot, says when it is
@@ -74,13 +77,12 @@ changes:
         dashboard stats. A burst of dashboard updates no longer forces a slow connection to
         reconnect.
     - timestamp: '2026-11-17T00:00:00Z'
-      title: Mask camelCase and spaced credential names in logs and policy input
+      title: Mask camelCase and spaced credential names in exported OTLP attributes
       description: >-
         A credential name written in camelCase or with spaces, such as accessToken, clientSecret,
         apiKey or "API Key", is now recognised like its snake_case form, and key, auth and pat are
         credential names when they are the whole name. Its value becomes <redacted> in exported
-        OTLP span and log attributes and in captured policy input, where MCP and A2A request
-        bodies commonly use camelCase. Names such as maxTokens, apiKeyId and primary_key are still
+        OTLP span and log attributes. Names such as maxTokens, apiKeyId and primary_key are still
         kept.
   removed: []
   security: []

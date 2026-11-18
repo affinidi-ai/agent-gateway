@@ -30,7 +30,7 @@ cannot hold back the keep-alive access checks.
 | `OnboardingAttempt` | Defined for wire compatibility but not emitted; onboarding uses `PayloadCaptured`. |
 | `RefreshDashboard` | Requests a complete dashboard refetch after settings updates, policy-definition create/update/delete, or Trust Registry connection-state changes. |
 | `DashboardDelta` | Carries a pre-serialized periodic dashboard delta in `Arc<String>`. |
-| `PolicyInputCaptured` | Emitted after each policy evaluation on a surface that a dashboard connection listens to. It never goes through the broadcast: it is serialized once and queued only for the listening connections. Carries the input with credentials masked, the policies the slot ran and the decision (see [`POLICY.md`](POLICY.md#policy-input-capture)). |
+| `PolicyInputCaptured` | Emitted after each request and response policy evaluation on a surface that a dashboard connection listens to; MCP tool policies are not captured. It never goes through the broadcast: it is serialized once and queued only for the listening connections. Carries the input with credentials masked, the policies the slot ran and the decision (see [`POLICY.md`](POLICY.md#policy-input-capture)). |
 
 Configuration reload does **not** emit `RefreshDashboard`. A dashboard observes reloaded state
 through periodic `DashboardDelta` broadcasts or an explicit refetch.

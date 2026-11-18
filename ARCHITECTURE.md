@@ -164,6 +164,7 @@ logic.
 | Access Point OPA | `access_point.inbound_policy`, its own deny gate, independent of the surface policy | [`src/policies/surface_manager.rs`](src/policies/surface_manager.rs) |
 | Appliance-wide surface policy | The global surface-plane set, deny-overrides, ahead of the surface's own policy | [`src/policies/global_policy.rs`](src/policies/global_policy.rs) |
 | Surface OPA | The per-surface policy gate | [`src/policies/surface_manager.rs`](src/policies/surface_manager.rs) |
+| Policy input capture | Sends each request and response policy evaluation's masked input and decision to dashboard connections listening to the surface | [`src/policies/input_capture.rs`](src/policies/input_capture.rs), [`POLICY.md`](docs/POLICY.md#policy-input-capture) |
 | MCP tool gating | The allow/deny firewall over tool names | [`src/policies/mcp_tool_gating.rs`](src/policies/mcp_tool_gating.rs) |
 | Delegated payment | Deciding whether an `agent_pay` request is chargeable and asking agent-pay to take the payment, last, just before the request is forwarded; receipts, audit, metrics and the payments ledger. Manifest discovery in [`src/gateways/payment_manifest.rs`](src/gateways/payment_manifest.rs) and the held-payment status query in [`src/gateways/payment_case.rs`](src/gateways/payment_case.rs) | [`src/proxy/handler/agent_pay_gate.rs`](src/proxy/handler/agent_pay_gate.rs), [`src/x402/delegate.rs`](src/x402/delegate.rs) |
 | Headers | Trace ID, `did:webvh` identity headers (`x-did-identity`, `x-did-signed-identity`), caller-info headers (`x-caller-did`, `x-caller-identity-source`, `x-caller-dna-uai`, `x-gateway-did`), and, after target authentication, the caller key of a surface with `caller_key` for a caller whose JWT was verified on the request; the caller's own copies of these headers are dropped | [`src/proxy/handler.rs`](src/proxy/handler.rs), [`src/proxy/caller_identity.rs`](src/proxy/caller_identity.rs), [`src/proxy/caller_key.rs`](src/proxy/caller_key.rs) |
@@ -415,7 +416,7 @@ from.
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`policies/`](src/policies/) | Regorus OPA evaluation, both planes, tool gating, rate limits, circuit breaker | [`POLICY.md`](docs/POLICY.md), [`MCP_TOOL_GATING.md`](docs/MCP_TOOL_GATING.md) |
+| [`policies/`](src/policies/) | Regorus OPA evaluation, both planes, tool gating, rate limits, circuit breaker, policy input capture | [`POLICY.md`](docs/POLICY.md), [`MCP_TOOL_GATING.md`](docs/MCP_TOOL_GATING.md) |
 
 ### Payments
 

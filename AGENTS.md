@@ -392,7 +392,7 @@ with a **Configure Authentication** action; see
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 A surface's Capture view has a **Policy Input** card listing, live, the input and decision of each
-policy evaluation while the user listens with its **Listen to policy input** button (users with
+request and response policy evaluation (not MCP tool policies) while the user listens with its **Listen to policy input** button (users with
 both `surfaces.edit` and `policies.edit`; leaving the view or reloading stops it), and says a
 request policy must be added first while the surface has none; see _Policy input capture_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#policy-input-capture).
