@@ -76,8 +76,9 @@ changes:
         returns. Opening another agent's
         details clears the previous one, and a late answer for it is ignored. When the card can't
         be read through the chosen surface, the surface select stays above the message with a
-        **Retry**. With no agents, the empty list offers users who can edit surfaces an **Add
-        Agent Surface** action that opens `/surfaces/new`. Needs surface view permission.
+        **Retry**. With no agents, the empty list offers users who can edit surfaces a **Create a
+        surface** link that opens `/surfaces/new`, followed by a **What's a surface?** docs link
+        shown to everyone. Needs surface view permission.
   changed: []
   fixed: []
   removed: []
