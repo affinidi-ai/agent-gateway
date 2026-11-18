@@ -42,3 +42,14 @@ Feature: Credentials an A2A Transit Point sends to its external agent
     Then the response status is 401
     And the response is a consent required error for OAuth provider "calendar"
     And external agent "charlie" was not called
+
+  Scenario: An A2A Transit Point tells a caller how long a new consent may be used
+    Given Transit Point "tr1" injects delegated credentials from OAuth provider "calendar"
+    And Transit Point "tr1" authenticates its callers with API key "caller-key-1"
+    And Transit Point "tr1" has a managed identity of its own
+    And the operator has changed the consent time limit of OAuth provider "calendar" to 3600 seconds
+    When managed agent "bravo" sends an A2A message/send request with the agent-identity extension through Transit Point "tr1" with header "x-api-key" set to "caller-key-1"
+    Then the response status is 401
+    And the response is a consent required error for OAuth provider "calendar"
+    And the consent required error says a new consent to OAuth provider "calendar" may be used for 3600 seconds
+    And external agent "charlie" was not called

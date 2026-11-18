@@ -499,6 +499,12 @@ struct GrantStorage {
     stable_ids: bool,
 }
 
+/// Refuses a binding's consent time limit outside one minute to 365 days.
+fn check_max_consent_age(max_consent_age_secs: Option<u64>) -> Result<(), String> {
+    max_consent_age_secs
+        .map_or(Ok(()), |secs| crate::config::credential_policy::validate_max_consent_age("max_consent_age_secs", secs))
+}
+
 async fn check_external_consent_bindings(
     providers: Option<&std::sync::Arc<dyn CredentialProviderStorage>>,
     surface: &AgentSurface,
@@ -533,6 +539,7 @@ async fn check_external_consent_bindings(
         {
             let refuse =
                 |reason: &str| SurfaceApiError::BadRequest(format!("{prefix}outbound_credentials[{index}]: {reason}"));
+            check_max_consent_age(binding.max_consent_age_secs).map_err(|reason| refuse(&reason))?;
             if !binding.is_external() {
                 if binding.subject.is_some() {
                     return Err(refuse("subject is set only with consent_mode external"));
@@ -567,6 +574,7 @@ async fn check_external_consent_bindings(
             let refuse = |reason: &str| {
                 SurfaceApiError::BadRequest(format!("{prefix}transit.points[{index}].transit_credentials: {reason}"))
             };
+            check_max_consent_age(binding.max_consent_age_secs).map_err(|reason| refuse(&reason))?;
             if !binding.is_external() {
                 if binding.subject.is_some() {
                     return Err(refuse("subject is set only with consent_mode external"));
@@ -5274,6 +5282,56 @@ mod tests {
         let legacy =
             surface_binding(serde_json::json!({"credential_provider_id": "legacy-a"}), serde_json::json!([]), None);
         assert_eq!(checked(&providers, legacy, false).await, Ok(()), "other bindings are unchanged");
+    }
+
+    #[tokio::test]
+    async fn a_binding_takes_a_consent_time_limit_from_a_minute_to_a_year() {
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        let none = serde_json::json!([]);
+        let transit = |secs: u64| {
+            surface_binding(
+                serde_json::json!({"credential_provider_id": "legacy-a", "max_consent_age_secs": secs}),
+                none.clone(),
+                None,
+            )
+        };
+        let target = |secs: u64| {
+            surface_with_points(
+                none.clone(),
+                serde_json::json!([{"credential_provider_id": "legacy-a", "max_consent_age_secs": secs}]),
+                None,
+            )
+        };
+        for accepted in [60, 21_600, 31_536_000] {
+            assert_eq!(checked(&providers, transit(accepted), false).await, Ok(()), "{accepted}");
+            assert_eq!(checked(&providers, target(accepted), false).await, Ok(()), "{accepted}");
+        }
+        for refused in [0, 59, 31_536_001] {
+            assert_eq!(
+                checked(&providers, transit(refused), false).await,
+                Err(format!(
+                    "transit.points[0].transit_credentials: max_consent_age_secs must be from 60 to 31536000, got \
+                     {refused}"
+                ))
+            );
+            assert_eq!(
+                checked(&providers, target(refused), false).await,
+                Err(format!(
+                    "outbound_credentials[0]: max_consent_age_secs must be from 60 to 31536000, got {refused}"
+                ))
+            );
+        }
+        let external_with_a_limit = {
+            let mut binding = external("external-a", Some("caller"));
+            binding["max_consent_age_secs"] = serde_json::json!(30);
+            surface_binding(binding, none.clone(), None)
+        };
+        assert_eq!(
+            checked(&providers, external_with_a_limit, true).await,
+            Err("transit.points[0].transit_credentials: max_consent_age_secs must be from 60 to 31536000, got 30"
+                .to_string())
+        );
     }
 
     #[tokio::test]

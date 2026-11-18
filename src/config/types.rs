@@ -1248,6 +1248,11 @@ pub struct OutboundCredentialBinding {
     /// Required with `external`, refused with every other mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<crate::config::agent_surface::GrantSubject>,
+
+    /// Seconds a person's consent may be used through this binding, from one
+    /// minute to 365 days; the provider's limit, else the gateway's, when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_consent_age_secs: Option<u64>,
 }
 
 impl OutboundCredentialBinding {

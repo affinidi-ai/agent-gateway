@@ -189,7 +189,12 @@ notifications and need only a session (see
 ## Dashboard log lines
 
 Log lines from the gateway log file need `logs.view`, checked against the caller's role and, for a
-personal access token, its feature scopes ([`dashboard.rs`](../src/observability/dashboard.rs)):
+personal access token, its feature scopes ([`dashboard.rs`](../src/observability/dashboard.rs)).
+The log holds every tenant's lines, the per-call credential delegation events among them, so the
+two routes below also give them only to an appliance-wide caller: a session, or a PAT with
+neither a resource pattern nor required headers. A tenant's PAT, and one scoped by a resource
+pattern or by required headers alone, is answered as a caller without `logs.view` is, `logs.view`
+or not (see [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#what-tenancy-does-not-partition)):
 
 - `GET /v1/dashboard/delta` leaves out `changes.logs`, and `GET /v1/dashboard/stats` returns an
   empty `proxy_info.log_entries`, without reading the log file.

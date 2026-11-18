@@ -1549,6 +1549,7 @@ mod tests {
     fn delegation_token(binding: &ContinuationBinding) -> DelegationToken {
         let created_at = chrono::DateTime::from_timestamp(10, 0).unwrap();
         DelegationToken {
+            consent_expires_at: None,
             id: Uuid::new_v4().to_string(),
             agent_did: binding.agent_did.clone(),
             user_identity_hash: binding

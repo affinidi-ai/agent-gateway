@@ -1767,12 +1767,12 @@ async fn no_payment_is_taken_for_the_targets_grant() {
     );
 }
 
-/// The injection of a refreshed grant into the one retry is audited as the
-/// first one is: under the caller's identity hash, whose grant it is or who
-/// acts as the owner, with the binding's subject in the detail; and the
-/// grant's use is recorded, on a task of its own.
+/// The injection of a refreshed grant into the one retry is logged as the
+/// first one is, and audited by neither: under the caller's identity hash,
+/// whose grant it is or who acts as the owner, with the binding's subject in
+/// the detail; and the grant's use is recorded, on a task of its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_retry_is_audited_under_its_caller_and_the_grants_use_recorded() {
+async fn the_retry_is_logged_under_its_caller_and_the_grants_use_recorded() {
     for (subject, key) in [("owner", owner_key()), ("caller", caller_key(&caller_principal()))] {
         let fixture = Fixture::new(vec![refresh_answer("second")], vec![rejected_token(), vendor_result()]).await;
         let target = format!("{}/mcp", fixture.vendor.origin());
@@ -1782,14 +1782,15 @@ async fn the_retry_is_audited_under_its_caller_and_the_grants_use_recorded() {
         fixture
             .store(&key, "first")
             .await;
-        let ((status, _, body), events) = crate::audit::producer::capture(async {
+        let ((status, _, body), recorded) = crate::audit::producer::capture_apart(async {
             fixture
                 .send(mcp_call(Some(KEY)))
                 .await
         })
         .await;
         assert_eq!(status, axum::http::StatusCode::OK, "{subject}: {body}");
-        let injected: Vec<_> = events
+        let injected: Vec<_> = recorded
+            .logged
             .iter()
             .filter(|event| matches!(event.event, crate::delegation_vault::audit::DelegationAuditAction::TokenInjected))
             .map(|event| {

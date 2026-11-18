@@ -232,9 +232,11 @@ token follows its provider's current tenant, so moving a provider to another ten
 tokens with it.
 
 Only an appliance-wide caller revokes agent-keyed tokens, with
-`DELETE /api/v1/delegation-vault/{id}` or `DELETE /api/v1/delegation-vault/by-user/{user_hash}`.
+`DELETE /api/v1/delegation-vault/{id}` or `DELETE /api/v1/delegation-vault/by-user/{user_hash}`,
+or brings the end of one consent forward, with
+`PUT /api/v1/delegation-vault/{id}/consent-limit`.
 A tenant PAT, and a PAT scoped by required headers alone or by a resource pattern, gets `403` and
-the tokens are kept, whichever tenant they belong to.
+the tokens are kept as they are, whichever tenant they belong to.
 
 ### Delegation audit records
 
@@ -243,8 +245,11 @@ This section covers the two routes that read the VP Audit Log as a delegation au
 credential provider it names, matched exactly as for [vault tokens](#delegation-vault-tokens), and a
 tenant PAT sees only its own tenant's records. Their `total`, `total_pages` and `category_counts`
 count only those records, and the `filter` text search looks only among them. A record that names no
-provider, such as a policy decision or a revoke through the management API, and a record of an
-appliance-wide, missing or deleted provider, are shown only to appliance-wide callers. The OAuth
+provider, such as a policy decision or the revoke of every token of a user (`user_tokens_revoked`),
+and a record of an appliance-wide, missing or deleted provider, are shown only to appliance-wide
+callers. A single revoke through the management API (`token_revoked`) and a limit on one consent
+(`consent_limited`) name the provider of the token, so that provider's tenant reads them, with who
+made the change in `caller`: the operator's user id and, for an access token, its id. The OAuth
 callback's `consent_granted` names its provider's id, so the provider's tenant reads it; one written
 by an earlier release names the provider's `provider_id` slug instead and is shown only to
 appliance-wide callers, as is the `delegation_failed` of a refused consent, which names the provider
@@ -326,7 +331,10 @@ provider
 The server logs are unpartitioned as well and hold every tenant's request and credential
 delegation detail, so `GET /v1/logs/download` serves them only to an appliance-wide caller: a
 session, or a PAT with neither a resource pattern nor required headers. A tenant PAT, and a PAT
-scoped by a resource pattern or by required headers alone, gets `403`, `audit.view` or not.
+scoped by a resource pattern or by required headers alone, gets `403`, `audit.view` or not. The
+log lines the dashboard shows follow the same rule: `GET /v1/dashboard/delta` and
+`GET /v1/dashboard/stats` answer such a PAT without any, `logs.view` or not
+([`RBAC.md`](RBAC.md#dashboard-log-lines)).
 
 A feature-gated management route checks both the bound user's role and the PAT's feature
 scopes. The role-only routes listed in [`RBAC.md`](RBAC.md#permissions-endpoint) check only the

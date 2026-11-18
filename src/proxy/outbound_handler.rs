@@ -1086,7 +1086,7 @@ async fn outbound_proxy_handler_in_request_scope(
     // before anything is resolved or forwarded for it.
     step_check_fabric_hops(&ctx)?;
 
-    let subscription_lifetime = match ctx
+    let mut subscription_lifetime = match ctx
         .mcp_classification
         .as_ref()
     {
@@ -1192,6 +1192,9 @@ async fn outbound_proxy_handler_in_request_scope(
     // Inject delegated OAuth tokens from the credential vault, or signal consent_required.
     if let Some(response) = step_prepare_modern_credentials(&state, &mut ctx).await? {
         return Ok(response);
+    }
+    if let (Some(lifetime), Some(prepared)) = (subscription_lifetime.as_mut(), ctx.modern_delegation.as_ref()) {
+        prepared.restrict_to_consents(lifetime);
     }
     step_inject_credentials(&state, &mut ctx).await?;
 
@@ -5508,17 +5511,11 @@ async fn step_inject_credentials(
     // Check for consent_required — if any binding needs consent, return the signal
     let mut consent_entries = Vec::new();
     for resolution in &results {
-        if let crate::proxy::credential_delegation::DelegationLookupResult::ConsentRequired {
-            authorization_url,
-            provider_name,
-            scopes,
-        } = &resolution.result
+        if let Some(entry) = resolution
+            .result
+            .consent_entry()
         {
-            consent_entries.push(serde_json::json!({
-                "provider_name": provider_name,
-                "authorization_url": authorization_url,
-                "scopes": scopes,
-            }));
+            consent_entries.push(entry);
         }
     }
 
@@ -5764,6 +5761,8 @@ pub struct ReleasedGrant {
     key: crate::delegation_vault::grants::GrantKey,
     subject: crate::config::agent_surface::GrantSubject,
     injection: crate::config::types::CredentialInjection,
+    /// The binding's time limit on the consent of its grants.
+    max_consent_age_secs: Option<u64>,
 }
 
 /// [11a] A Transit Point's `consent_mode = external` binding: release the
@@ -5923,6 +5922,7 @@ async fn step_inject_external_grant(
         },
         None => return Err(refuse_external_grant(ctx, "no_subject")),
     };
+    let max_consent_age_secs = binding.max_consent_age_secs;
     let release = crate::delegation_vault::release::ReleaseContext {
         vault,
         secrets: state.secrets_store.as_ref(),
@@ -5934,6 +5934,7 @@ async fn step_inject_external_grant(
                 .network_config
                 .external_consent_refresh_refusals,
         ),
+        max_consent_age_secs,
     };
     let grant = match release
         .release(&provider, &key, subject)
@@ -5969,7 +5970,7 @@ async fn step_inject_external_grant(
     // that carries it is sent ([`record_mcp_proxy_grant_sent`]).
     if !through_proxy {
         crate::delegation_vault::release::record_use_in_background(vault, &grant, Some(ctx.request_id.clone()));
-        audit_grant_injected(ctx, &caller, &provider, &grant, subject);
+        log_grant_injected(ctx, &caller, &provider, &grant, subject);
     }
     ctx.released_grant = Some(Box::new(ReleasedGrant {
         grant,
@@ -5977,6 +5978,7 @@ async fn step_inject_external_grant(
         key,
         subject,
         injection,
+        max_consent_age_secs,
     }));
     Ok(())
 }
@@ -6006,11 +6008,11 @@ fn record_mcp_proxy_grant_sent(
         );
     }
     let caller = delegation_caller_hash(ctx).unwrap_or_default();
-    audit_grant_injected(ctx, &caller, &released.provider, &released.grant, released.subject);
+    log_grant_injected(ctx, &caller, &released.provider, &released.grant, released.subject);
 }
 
-/// Audit that a grant by binding was injected into a request.
-fn audit_grant_injected(
+/// Log that a grant by binding was injected into a request.
+fn log_grant_injected(
     ctx: &OutboundPipelineContext,
     caller: &str,
     provider: &crate::credential_providers::CredentialProvider,
@@ -7237,6 +7239,7 @@ async fn step_answer_a_refused_grant(
         key,
         subject,
         injection,
+        max_consent_age_secs,
     } = *released;
     let Some(vault) = state
         .delegation_vault_store
@@ -7255,6 +7258,7 @@ async fn step_answer_a_refused_grant(
                 .network_config
                 .external_consent_refresh_refusals,
         ),
+        max_consent_age_secs,
     };
     let may_resend = ctx
         .body_bytes
@@ -7274,7 +7278,7 @@ async fn step_answer_a_refused_grant(
     // sent ([`record_mcp_proxy_grant_sent`]).
     if !is_mcp_proxy_transit_point(ctx) {
         let caller = delegation_caller_hash(ctx).unwrap_or_default();
-        audit_grant_injected(ctx, &caller, &provider, &fresh, subject);
+        log_grant_injected(ctx, &caller, &provider, &fresh, subject);
     }
     ctx.released_grant = Some(Box::new(ReleasedGrant {
         grant: fresh,
@@ -7282,6 +7286,7 @@ async fn step_answer_a_refused_grant(
         key,
         subject,
         injection,
+        max_consent_age_secs,
     }));
     let retried = forward_once(state, ctx).await?;
     if let Err(refused) = vendor_answer_to_a_retry(retried.status(), retried.headers()) {
@@ -18864,6 +18869,7 @@ mod tests {
         assert_eq!(
             grant_refusal(&refused),
             Some(&GrantRefusal::ConnectRequired {
+                cause: None,
                 subject: crate::config::agent_surface::GrantSubject::Caller,
                 hint: Some(crate::delegation_vault::release::connect_hint(&caller)),
             })
@@ -18902,6 +18908,228 @@ mod tests {
             .unwrap();
         assert_eq!(kept.state(), "refresh_failed");
         assert!(vendor.requests().is_empty());
+    }
+
+    /// The fixture surface, its Transit Point's binding limiting a consent to
+    /// `max_consent_age_secs`.
+    fn fixture_surface_with_limit(
+        vendor: &crate::delegation_vault::revocation::tests::RecordingServer,
+        subject: &str,
+        max_consent_age_secs: u64,
+    ) -> crate::config::agent_surface::AgentSurface {
+        let mut point = vendor_transit_point(VENDOR_HOP, "fixture-vendor", subject);
+        point["target_endpoint"] = json!(format!("{}/mcp", vendor.origin()));
+        point["protocol"] = json!("http");
+        point["transit_credentials"]["max_consent_age_secs"] = json!(max_consent_age_secs);
+        transit_surface(json!([point]), json!([]))
+    }
+
+    /// A grant whose consent ended at its time limit is never sent and never
+    /// refreshed, though its refresh token would still work: it is removed,
+    /// revoked at the vendor and audited as an expiry, and the caller is told
+    /// to connect again and why. An owner's grant ends the same way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_whose_consent_ended_is_removed_revoked_and_asked_for_again() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::release::GrantRefusal;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let caller = "c".repeat(64);
+        for (subject, key, hint) in [
+            (
+                crate::config::agent_surface::GrantSubject::Caller,
+                GrantKey::caller(None, "transit-fabric", VENDOR_HOP, "fixture-vendor", &caller).unwrap(),
+                Some(crate::delegation_vault::release::connect_hint(&caller)),
+            ),
+            (
+                crate::config::agent_surface::GrantSubject::Owner,
+                GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor"),
+                None,
+            ),
+        ] {
+            let authorization_server =
+                RecordingServer::start_answering(vec![Answer::status(200), Answer::status(200)]).await;
+            let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+            let directory = tempfile::tempdir().unwrap();
+            let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+            let vault = state
+                .delegation_vault_store
+                .clone()
+                .unwrap();
+            let mut ended = crate::delegation_vault::grants::tests::grant(&key, "ended");
+            ended.expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
+            ended.created_at = chrono::Utc::now() - chrono::Duration::hours(2);
+            ended.consent_expires_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+            vault
+                .store_grant(ended.clone())
+                .await
+                .unwrap();
+            let name = match subject {
+                crate::config::agent_surface::GrantSubject::Owner => "owner",
+                crate::config::agent_surface::GrantSubject::Caller => "caller",
+            };
+            let surface = fixture_surface(&vendor, name, "http");
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+
+            let (refused, events) = crate::audit::producer::capture(send_with_grant(&state, &mut ctx)).await;
+
+            assert_eq!(
+                grant_refusal(&refused.unwrap_err()),
+                Some(&GrantRefusal::ConnectRequired {
+                    subject,
+                    hint,
+                    cause: Some(crate::delegation_vault::consent_age::AskedAgain::ConsentExpired),
+                }),
+                "{name}"
+            );
+            assert!(
+                vault
+                    .grant(&key)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{name}: the grant is removed"
+            );
+            assert!(vendor.requests().is_empty(), "{name}: the grant is never sent");
+            let expired: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    matches!(event.event, crate::delegation_vault::audit::DelegationAuditAction::ConsentExpired)
+                })
+                .collect();
+            assert_eq!(expired.len(), 1, "{name}");
+            assert_eq!(
+                expired[0]
+                    .user_identity_hash
+                    .as_deref(),
+                Some(key.principal.as_str()),
+                "{name}"
+            );
+            assert_eq!(
+                expired[0]
+                    .provider_id
+                    .as_deref(),
+                Some("fixture-vendor"),
+                "{name}"
+            );
+            assert_eq!(expired[0].token_id.as_deref(), Some(key.record_id().as_str()), "{name}");
+            let stamp = crate::delegation_vault::consent_age::stamp;
+            assert_eq!(
+                expired[0].detail,
+                Some(format!(
+                    "consent_granted_at:{},consent_expired_at:{},source:release",
+                    stamp(ended.created_at),
+                    stamp(
+                        ended
+                            .consent_expires_at
+                            .unwrap()
+                    )
+                )),
+                "{name}"
+            );
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while authorization_server
+                    .requests()
+                    .len()
+                    < 2
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            assert!(
+                authorization_server
+                    .requests()
+                    .iter()
+                    .all(|(head, _)| head.starts_with("POST /revoke ")),
+                "{name}: the authorization server is asked to revoke, never to refresh"
+            );
+            assert_eq!(
+                authorization_server.revoked_tokens(),
+                vec!["ended".to_string(), "ended-refresh".to_string()],
+                "{name}"
+            );
+        }
+    }
+
+    /// The binding's own limit ends a grant connected before it was set, and
+    /// one within every limit is sent as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bindings_time_limit_ends_an_older_grant_and_leaves_a_newer_one() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::release::GrantRefusal;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let caller = "c".repeat(64);
+        let key = GrantKey::caller(None, "transit-fabric", VENDOR_HOP, "fixture-vendor", &caller).unwrap();
+        for (age_minutes, ends) in [(30, false), (90, true)] {
+            let authorization_server = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+            let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+            let directory = tempfile::tempdir().unwrap();
+            let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+            let vault = state
+                .delegation_vault_store
+                .clone()
+                .unwrap();
+            let mut grant = crate::delegation_vault::grants::tests::grant(&key, "access");
+            let created_at = chrono::Utc::now() - chrono::Duration::minutes(age_minutes);
+            grant.created_at = created_at;
+            vault
+                .store_grant(grant)
+                .await
+                .unwrap();
+            let surface = fixture_surface_with_limit(&vendor, "caller", 3_600);
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+
+            let (sent, events) = crate::audit::producer::capture(send_with_grant(&state, &mut ctx)).await;
+            let expiries: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    matches!(event.event, crate::delegation_vault::audit::DelegationAuditAction::ConsentExpired)
+                })
+                .map(|event| event.detail.clone())
+                .collect();
+
+            if ends {
+                let stamp = crate::delegation_vault::consent_age::stamp;
+                assert_eq!(
+                    expiries,
+                    vec![Some(format!(
+                        "consent_granted_at:{},consent_expired_at:{},source:release",
+                        stamp(created_at),
+                        stamp(created_at + chrono::Duration::hours(1))
+                    ))],
+                    "the end is the one the binding's limit sets"
+                );
+                assert!(
+                    matches!(
+                        grant_refusal(&sent.unwrap_err()),
+                        Some(GrantRefusal::ConnectRequired {
+                            cause: Some(crate::delegation_vault::consent_age::AskedAgain::ConsentExpired),
+                            ..
+                        })
+                    ),
+                    "{age_minutes} minutes"
+                );
+                assert!(
+                    vault
+                        .grant(&key)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(vendor.requests().is_empty());
+            } else {
+                assert_eq!(sent.unwrap(), reqwest::StatusCode::OK, "{age_minutes} minutes");
+                assert!(expiries.is_empty(), "no expiry is recorded for a grant within its limit");
+                assert_eq!(vendor_bearers(&vendor), vec!["Bearer access".to_string()]);
+                assert!(
+                    vault
+                        .grant(&key)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+            }
+        }
     }
 
     /// A vendor's `401` to a grant that cannot be refreshed asks for a new
@@ -20056,6 +20284,7 @@ mod tests {
         assert_eq!(
             grant_refusal(&refused),
             Some(&GrantRefusal::ConnectRequired {
+                cause: None,
                 subject: crate::config::agent_surface::GrantSubject::Owner,
                 hint: None,
             })
@@ -20417,6 +20646,7 @@ mod tests {
                 assert_eq!(
                     grant_refusal(&outcome.unwrap_err()),
                     Some(&GrantRefusal::ConnectRequired {
+                        cause: None,
                         subject: crate::config::agent_surface::GrantSubject::Owner,
                         hint: None,
                     }),
@@ -21075,6 +21305,7 @@ mod tests {
         store_grant(&state, key.clone(), "expired", -60).await;
         let surface = fixture_surface(&vendor, "caller", "mcp");
         let connect = Some(GrantRefusal::ConnectRequired {
+            cause: None,
             subject: crate::config::agent_surface::GrantSubject::Caller,
             hint: Some(crate::delegation_vault::release::connect_hint(&caller)),
         });
@@ -21160,6 +21391,7 @@ mod tests {
                     assert_eq!(
                         grant_refusal(&outcome.unwrap_err()),
                         Some(&GrantRefusal::ConnectRequired {
+                            cause: None,
                             subject: crate::config::agent_surface::GrantSubject::Owner,
                             hint: None,
                         }),
@@ -21664,6 +21896,7 @@ mod tests {
         assert_eq!(
             grant_refusal(&refused),
             Some(&crate::delegation_vault::release::GrantRefusal::ConnectRequired {
+                cause: None,
                 subject: crate::config::agent_surface::GrantSubject::Owner,
                 hint: None,
             }),

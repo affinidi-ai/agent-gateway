@@ -165,11 +165,28 @@ impl AdminApiClient {
 
     /// Turn the VP Audit Log on and keep every audit event on a running gateway.
     pub async fn enable_every_audit_event(&self) -> Result<()> {
+        self.keep_audit_events(&audit_log_keeping_every_event())
+            .await
+    }
+
+    /// Turn the VP Audit Log on and select only `events` on a running gateway.
+    pub async fn keep_only_audit_events(
+        &self,
+        events: &[&str],
+    ) -> Result<()> {
+        self.keep_audit_events(&serde_json::json!({"audit_enabled": true, "audit_events": events}))
+            .await
+    }
+
+    async fn keep_audit_events(
+        &self,
+        settings: &Value,
+    ) -> Result<()> {
         let response = self
-            .send_recorded_json(Method::POST, "/v1/settings", Some(&audit_log_keeping_every_event()))
+            .send_recorded_json(Method::POST, "/v1/settings", Some(settings))
             .await?;
         if !(200..300).contains(&response.status) {
-            bail!("keeping every audit event failed with status {}: {}", response.status, response.body);
+            bail!("selecting the audit events failed with status {}: {}", response.status, response.body);
         }
         Ok(())
     }

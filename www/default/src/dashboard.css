@@ -2717,7 +2717,7 @@ body.dark-theme .btn-info:hover {
   color: #ffffff !important;
 }
 
-/* Expanded detail row inside .table-hover (e.g. Credential Audit Log).
+/* Expanded detail row inside .table-hover (e.g. Credential Tokens).
    Subtle tint in light mode; glassmorphism panel in dark mode.
    Hover must not change the background. */
 .expanded-detail-row > td,

@@ -286,6 +286,20 @@ async fn log_file(
         .unwrap_or_else(|error| panic!("writing log file {file_name}: {error}"));
 }
 
+/// Appends a line the dashboard reads as one log entry to the gateway's log file.
+#[given(expr = "the gateway log holds the line {string}")]
+fn gateway_log_holds_line(
+    world: &mut SurfaceWorld,
+    message: String,
+) {
+    let line = json!({"timestamp": "2026-01-01T00:00:00Z", "level": "INFO", "message": message});
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(log_directory(world).join("agent-gateway.log"))
+        .and_then(|mut file| file.write_all(format!("{line}\n").as_bytes()))
+        .unwrap_or_else(|error| panic!("writing the gateway log line: {error}"));
+}
+
 #[given(expr = "operator {string} holds a personal access token with scopes {string}")]
 async fn operator_holds_personal_access_token(
     world: &mut SurfaceWorld,

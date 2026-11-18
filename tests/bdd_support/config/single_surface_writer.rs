@@ -692,7 +692,11 @@ fn write_single_surface_config_inner(
     write_credential_policy(
         base_dir,
         &surface_config.enforced_credential_rules,
-        surface_config.token_request_timeout_secs,
+        [
+            ("token_request_timeout_secs", surface_config.token_request_timeout_secs),
+            ("default_max_consent_age_secs", surface_config.default_max_consent_age_secs),
+            ("max_consent_age_ceiling_secs", surface_config.max_consent_age_ceiling_secs),
+        ],
         surface_config
             .target_auth_provider
             .as_ref()
@@ -703,7 +707,7 @@ fn write_single_surface_config_inner(
                     .as_deref()
             }),
     );
-    if surface_config.logs_audit_events {
+    if surface_config.logs_at_info {
         log_info(base_dir);
     } else if surface_config.keeps_gateway_log {
         log_warnings(base_dir);
@@ -874,15 +878,19 @@ fn set_log_directory(base_dir: &Path) {
 }
 
 /// Appends a `[credential_policy]` table setting each of `rules` to `enforce` and, when
-/// given, the token request timeout and the one token endpoint `insecure_token_endpoints`
-/// names.
+/// given, each of `seconds` (a key and its number of seconds) and the one token endpoint
+/// `insecure_token_endpoints` names.
 fn write_credential_policy(
     base_dir: &Path,
     rules: &[String],
-    token_request_timeout_secs: Option<u64>,
+    seconds: [(&str, Option<u64>); 3],
     insecure_token_endpoint: Option<&str>,
 ) {
-    if rules.is_empty() && token_request_timeout_secs.is_none() && insecure_token_endpoint.is_none() {
+    let seconds: Vec<(&str, u64)> = seconds
+        .into_iter()
+        .filter_map(|(key, secs)| Some((key, secs?)))
+        .collect();
+    if rules.is_empty() && seconds.is_empty() && insecure_token_endpoint.is_none() {
         return;
     }
     let path = base_dir.join("config.toml");
@@ -891,8 +899,8 @@ fn write_credential_policy(
     for rule in rules {
         config.push_str(&format!("{rule} = \"enforce\"\n"));
     }
-    if let Some(secs) = token_request_timeout_secs {
-        config.push_str(&format!("token_request_timeout_secs = {secs}\n"));
+    for (key, secs) in seconds {
+        config.push_str(&format!("{key} = {secs}\n"));
     }
     if let Some(endpoint) = insecure_token_endpoint {
         config.push_str(&format!("insecure_token_endpoints = [\"{endpoint}\"]\n"));
@@ -1111,6 +1119,7 @@ pub fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) 
         token_refresh_enabled: false,
         api_key_secret_ref: None,
         authorization_response_issuer: None,
+        max_consent_age_secs: None,
         jwt_settings: (provider.grant == TargetAuthProviderGrant::JwtBearer).then(|| {
             serde_json::json!({
                 "jwt_issuer": TARGET_AUTH_JWT_ISSUER,
@@ -1144,12 +1153,13 @@ fn delegation_provider_fixture(surface_config: &SurfaceConfigBuilder) -> Vec<Cre
                 surface_config
                     .oauth_authorization_response_issuer
                     .clone(),
+                surface_config.oauth_max_consent_age_secs,
             )];
             providers.extend(
                 surface_config
                     .additional_oauth_providers
                     .iter()
-                    .map(|provider_id| oauth_provider_fixture(surface_config, provider_id, Vec::new(), None)),
+                    .map(|provider_id| oauth_provider_fixture(surface_config, provider_id, Vec::new(), None, None)),
             );
             providers
         }
@@ -1169,6 +1179,7 @@ fn delegation_provider_fixture(surface_config: &SurfaceConfigBuilder) -> Vec<Cre
             token_refresh_enabled: false,
             api_key_secret_ref: Some(secret_id.clone()),
             authorization_response_issuer: None,
+            max_consent_age_secs: None,
             jwt_settings: None,
             consent_confirmation: None,
             created_at: now,
@@ -1182,6 +1193,7 @@ fn oauth_provider_fixture(
     provider_id: &str,
     default_scopes: Vec<String>,
     authorization_response_issuer: Option<String>,
+    max_consent_age_secs: Option<u64>,
 ) -> CredentialProviderFixture {
     let now = chrono::Utc::now();
     let base_url = surface_config
@@ -1217,6 +1229,7 @@ fn oauth_provider_fixture(
         token_refresh_enabled: true,
         api_key_secret_ref: None,
         authorization_response_issuer,
+        max_consent_age_secs,
         jwt_settings: None,
         consent_confirmation: (own && surface_config.consent_confirmation)
             .then(|| consent_confirmation_json(surface_config)),

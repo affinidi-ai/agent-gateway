@@ -761,11 +761,12 @@ async fn a_grant_a_person_connects_directly_reaches_their_partner_requests_once_
     assert_eq!(injected, [(Some(SURFACE_ID), Some(receiver.principal("alice", None)), true)]);
 }
 
-/// The audit record of a grant released to a partner's request names it as a
+/// The event logged for a grant released to a partner's request names it as a
 /// Fabric request, the Target, the surface by its name, the caller the surface
 /// verified and the paired gateway that sent it, and carries no presentation.
+/// It is offered to no audit sink.
 #[tokio::test]
-async fn a_grant_released_to_a_partner_is_audited_with_the_peer_and_the_target() {
+async fn a_grant_released_to_a_partner_is_logged_with_the_peer_and_the_target() {
     if ran_in_child("ATG_FABRIC_PARTNER_GRANT_AUDIT_CHILD").await {
         return;
     }
@@ -775,13 +776,14 @@ async fn a_grant_released_to_a_partner_is_audited_with_the_peer_and_the_target()
         .connected("alice")
         .await;
 
-    let (_, events) = crate::audit::producer::capture(async {
+    let (_, recorded) = crate::audit::producer::capture_apart(async {
         receiver
             .assert_released(&receiver.partner_request(receiver.as_user("alice")), "Bearer alice-access")
             .await
     })
     .await;
-    let injected: Vec<_> = events
+    let injected: Vec<_> = recorded
+        .logged
         .into_iter()
         .filter(|event| matches!(event.event, DelegationAuditAction::TokenInjected))
         .map(|event| {

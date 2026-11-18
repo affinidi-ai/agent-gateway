@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use tokio::fs;
 use tracing::{info, warn};
 
-use crate::audit::catalog::event_bit;
+use crate::audit::catalog::{event_bit, is_logged_only};
 
 /// File name of the dashboard settings inside the settings storage directory.
 pub const SETTINGS_FILE_NAME: &str = "settings.json";
@@ -234,10 +234,28 @@ fn migrate_stored_settings(value: &mut serde_json::Value) {
     object.insert("audit_events".to_string(), events.into());
 }
 
+/// Removes the events the gateway only logs
+/// ([`crate::audit::catalog::LOGGED_EVENTS`]), and warns which they were: a
+/// selection made while they were audit events still names them, and they
+/// select nothing.
+fn drop_logged_only(events: &mut Vec<String>) {
+    let (kept, dropped): (Vec<String>, Vec<String>) = std::mem::take(events)
+        .into_iter()
+        .partition(|event| !is_logged_only(event));
+    *events = kept;
+    let dropped: Vec<&str> = dropped
+        .iter()
+        .map(String::as_str)
+        .collect();
+    crate::audit::catalog::warn_logged_only("The VP Audit Log selection (audit_events)", &dropped);
+}
+
 fn parse_stored_settings(content: &str) -> serde_json::Result<DashboardSettings> {
     let mut value: serde_json::Value = serde_json::from_str(content)?;
     migrate_stored_settings(&mut value);
-    serde_json::from_value(value)
+    let mut settings: DashboardSettings = serde_json::from_value(value)?;
+    drop_logged_only(&mut settings.audit_events);
+    Ok(settings)
 }
 
 /// Settings store that manages persistent dashboard settings
@@ -413,11 +431,14 @@ impl SettingsStore {
             .clone()
     }
 
-    /// Update settings
+    /// Update settings. An audit event the gateway only logs is dropped from
+    /// `audit_events`; any other name outside the audit event catalog is refused.
     pub fn update(
         &self,
-        new_settings: DashboardSettings,
+        mut new_settings: DashboardSettings,
     ) -> Result<()> {
+        drop_logged_only(&mut new_settings.audit_events);
+
         // Validate settings
         if new_settings.badge_threshold_minutes < 1 {
             anyhow::bail!("Badge threshold must be at least 1 minute");
@@ -937,6 +958,43 @@ mod tests {
         );
     }
 
+    /// A selection stored before the per-call delegation events left the audit
+    /// still names them.
+    #[test]
+    fn stored_audit_events_the_gateway_now_only_logs_are_dropped_on_load() {
+        let (_dir, store) = store_with_file(&serde_json::json!({
+            "audit_events": ["consent_granted", "token_injected", "consent_required", "policy_decision"]
+        }));
+        store.load_sync().unwrap();
+        assert_eq!(store.get().audit_events, vec!["consent_granted".to_string(), "policy_decision".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn stored_audit_events_the_gateway_now_only_logs_are_dropped_on_async_load() {
+        let (_dir, store) = store_with_file(&serde_json::json!({
+            "audit_events": ["elicitation_sent", "token_revoked"]
+        }));
+        store.load().await.unwrap();
+        assert_eq!(store.get().audit_events, vec!["token_revoked".to_string()]);
+    }
+
+    #[test]
+    fn update_drops_an_audit_event_the_gateway_now_only_logs() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = SettingsStore::new(temp_dir.path());
+        store
+            .update(DashboardSettings {
+                audit_events: vec![
+                    "token_injected".to_string(),
+                    "consent_granted".to_string(),
+                    "refresh_failed".to_string(),
+                ],
+                ..DashboardSettings::default()
+            })
+            .expect("a name the gateway now only logs is dropped, not refused");
+        assert_eq!(store.get().audit_events, vec!["consent_granted".to_string()]);
+    }
+
     #[test]
     fn update_rejects_an_unknown_audit_event() {
         let temp_dir = TempDir::new().unwrap();
@@ -1181,5 +1239,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loaded.refresh_interval_seconds, Some(15));
+    }
+
+    /// A selection that names events the gateway now only logs is loaded and
+    /// saved without them, and each time one warning says which were dropped
+    /// and where they are written now.
+    #[test]
+    fn dropping_audit_events_the_gateway_now_only_logs_warns_which_they_were() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let (_dir, store) = store_with_file(&serde_json::json!({
+            "audit_events": ["refresh_failed", "consent_granted", "token_not_found"]
+        }));
+
+        store.load_sync().unwrap();
+
+        let loaded = logs.text();
+        assert_eq!(loaded.matches("WARN").count(), 1, "{loaded}");
+        for named in ["refresh_failed", "token_not_found", "credential_delegation"] {
+            assert!(loaded.contains(named), "{named}: {loaded}");
+        }
+        assert!(!loaded.contains("consent_granted"), "{loaded}");
+
+        store
+            .update(DashboardSettings {
+                audit_events: vec!["consent_granted".to_string(), "consent_required".to_string()],
+                ..DashboardSettings::default()
+            })
+            .unwrap();
+        let saved = logs.text();
+        assert_eq!(saved.matches("WARN").count(), 2, "{saved}");
+        assert!(saved.contains("consent_required"), "{saved}");
+
+        store
+            .update(DashboardSettings {
+                audit_events: vec!["consent_granted".to_string()],
+                ..DashboardSettings::default()
+            })
+            .unwrap();
+        assert_eq!(
+            logs.text()
+                .matches("WARN")
+                .count(),
+            2,
+            "a selection that names none warns of nothing"
+        );
     }
 }

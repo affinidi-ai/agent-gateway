@@ -10,6 +10,7 @@ use tracing::error;
 
 use crate::auth_manager::middleware::{AuthGuardOk, RbacGuard, caller_allows};
 use crate::auth_manager::pat::PatContext;
+use crate::delegation_vault::read_scope::VaultReader;
 use crate::identity::IdentityStore;
 use crate::identity::display_name::{ManagedDisplayName, managed_surfaces_by_did, resolve_managed_display_name};
 use crate::identity::filesystem::{CredentialRotation, IdentityOrigin, ManagedSlot};
@@ -1271,40 +1272,45 @@ async fn stats_log_entries(
     log_entries
 }
 
-/// Whether the caller of a dashboard request may read log lines
-/// (`logs.view`). A request without an RBAC guard or an authenticated user
-/// may not.
+/// Whether the caller of a dashboard request may read log lines: it holds
+/// `logs.view` and reads appliance-wide, since the log holds every tenant's
+/// lines. A request without an RBAC guard or an authenticated user may not,
+/// and neither may an access token scoped to a tenant, a resource pattern or
+/// required headers.
 async fn request_allows_logs(
     guard: &Option<Extension<RbacGuard>>,
     caller: &Option<Extension<AuthGuardOk>>,
     pat: &Option<Extension<PatContext>>,
+    reader: &VaultReader,
 ) -> bool {
-    caller_allows(
-        guard
-            .as_ref()
-            .map(|Extension(guard)| guard),
-        caller
-            .as_ref()
-            .map(|Extension(AuthGuardOk(user_id))| user_id.as_str()),
-        pat.as_ref()
-            .map(|Extension(pat)| pat),
-        &crate::rbac::Feature::LogsView,
-    )
-    .await
+    reader.is_appliance_wide()
+        && caller_allows(
+            guard
+                .as_ref()
+                .map(|Extension(guard)| guard),
+            caller
+                .as_ref()
+                .map(|Extension(AuthGuardOk(user_id))| user_id.as_str()),
+            pat.as_ref()
+                .map(|Extension(pat)| pat),
+            &crate::rbac::Feature::LogsView,
+        )
+        .await
 }
 
 /// API endpoint to get incremental dashboard updates (delta/changes only).
 /// Deprecated: deltas are now pushed via WebSocket. This endpoint remains
 /// for backward compatibility. Log lines are left out unless the caller
-/// holds `logs.view`.
+/// holds `logs.view` and reads appliance-wide.
 pub async fn get_dashboard_delta(
     State(state): State<DashboardState>,
     guard: Option<Extension<RbacGuard>>,
     caller: Option<Extension<AuthGuardOk>>,
     pat: Option<Extension<PatContext>>,
+    reader: VaultReader,
     Query(query): Query<DashboardQuery>,
 ) -> Result<Json<DashboardDelta>, (axum::http::StatusCode, String)> {
-    let include_logs = request_allows_logs(&guard, &caller, &pat).await;
+    let include_logs = request_allows_logs(&guard, &caller, &pat, &reader).await;
     compute_dashboard_delta(&state, &query, include_logs)
         .await
         .map(Json)
@@ -1408,6 +1414,7 @@ pub async fn get_dashboard_stats(
     guard: Option<Extension<RbacGuard>>,
     caller: Option<Extension<AuthGuardOk>>,
     pat: Option<Extension<PatContext>>,
+    reader: VaultReader,
     Query(query): Query<DashboardQuery>,
 ) -> Result<Json<DashboardStats>, (axum::http::StatusCode, String)> {
     // Get all identities with full agent identity data
@@ -1864,7 +1871,7 @@ pub async fn get_dashboard_stats(
             .log_directory
             .clone(),
         &query,
-        request_allows_logs(&guard, &caller, &pat).await,
+        request_allows_logs(&guard, &caller, &pat, &reader).await,
     )
     .await;
 
@@ -4094,6 +4101,7 @@ mod tests {
         use crate::auth::types::{UserRole, UserStatus};
         use crate::auth_manager::middleware::{AuthGuardOk, RbacGuard};
         use crate::auth_manager::pat::PatContext;
+        use crate::delegation_vault::test_support::{delegation, pattern, reader, tenant};
 
         async fn guard_with(
             role: UserRole,
@@ -4144,6 +4152,15 @@ mod tests {
             user_id: Option<&str>,
             scopes: Option<&[&str]>,
         ) -> bool {
+            allows_logs_as(guard, user_id, scopes, &reader(None, None, None)).await
+        }
+
+        async fn allows_logs_as(
+            guard: Option<&RbacGuard>,
+            user_id: Option<&str>,
+            scopes: Option<&[&str]>,
+            reader: &crate::delegation_vault::read_scope::VaultReader,
+        ) -> bool {
             request_allows_logs(
                 &guard.map(|guard| Extension(guard.clone())),
                 &user_id.map(|user_id| Extension(AuthGuardOk(user_id.to_string()))),
@@ -4155,6 +4172,7 @@ mod tests {
                             .collect(),
                     )))
                 }),
+                reader,
             )
             .await
         }
@@ -4214,6 +4232,32 @@ mod tests {
 
             assert!(!allows_logs(Some(&admin), Some("user-1"), Some(&["dashboard.view"])).await);
             assert!(allows_logs(Some(&admin), Some("user-1"), Some(&["dashboard.view", "logs.view"])).await);
+        }
+
+        /// The log holds every tenant's lines, so an access token scoped to a
+        /// tenant, a resource pattern or required headers reads none of them,
+        /// whatever its scopes say.
+        #[tokio::test]
+        async fn only_an_appliance_wide_caller_reads_logs() {
+            let dir = tempfile::tempdir().unwrap();
+            let admin = guard_with(UserRole::Administrator, &dir).await;
+            let logs_view = Some(&["dashboard.view", "logs.view"][..]);
+
+            for (caller, scoped) in [
+                (
+                    "a tenant's token",
+                    reader(Some(tenant("tenant-a")), Some(pattern("tenant-a")), Some(delegation(true))),
+                ),
+                (
+                    "a token scoped by a resource pattern",
+                    reader(None, Some(pattern("tenant-a")), Some(delegation(true))),
+                ),
+                ("a token scoped by required headers alone", reader(None, None, Some(delegation(true)))),
+            ] {
+                assert!(!allows_logs_as(Some(&admin), Some("user-1"), logs_view, &scoped).await, "{caller}");
+            }
+            let unscoped = reader(None, None, Some(delegation(false)));
+            assert!(allows_logs_as(Some(&admin), Some("user-1"), logs_view, &unscoped).await);
         }
 
         #[tokio::test]

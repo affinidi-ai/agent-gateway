@@ -6,6 +6,7 @@ pub mod consent_confirmation;
 pub mod credential_references;
 pub mod credential_save;
 pub mod dashboard_routes;
+pub mod delegation_log;
 pub mod gateway_did;
 pub mod given;
 pub mod identities;

@@ -4,9 +4,10 @@ Feature: Management route permissions
   Both permissions belong to administrators by default. A personal access token with feature
   scopes also needs the permission among its scopes. Downloading the server logs needs
   audit.view, and since the logs hold every tenant's request and delegation detail, a tenant's
-  access token or one scoped by required headers alone cannot download them. Listing and reading
-  agents needs surfaces.view, and a tenant's token sees only the agents of its own surfaces.
-  A tenant's token reads an agent card only through a surface of its own tenant.
+  access token or one scoped by required headers alone cannot download them and is shown none
+  of their lines on the dashboard. Listing and reading agents needs surfaces.view, and a tenant's
+  token sees only the agents of its own surfaces. A tenant's token reads an agent card only
+  through a surface of its own tenant.
 
   Scenario: An administrator downloads the server logs
     Given a log file "agent-gateway.log"
@@ -24,6 +25,27 @@ Feature: Management route permissions
     Given a log file "agent-gateway.log"
     When an access token scoped by required headers alone downloads the server logs
     Then the admin API response status is 403
+
+  Scenario: An appliance-wide access token reads the gateway's log lines on the dashboard
+    Given a log file "agent-gateway.log"
+    And the gateway log holds the line "request served for tenant-b"
+    When an appliance-wide access token reads the dashboard's log lines
+    Then the admin API response status is 200
+    And the answer holds the log line "request served for tenant-b"
+
+  Scenario: A tenant token is shown none of the gateway's log lines on the dashboard
+    Given a log file "agent-gateway.log"
+    And the gateway log holds the line "request served for tenant-b"
+    When a token of tenant "tenant-a" reads the dashboard's log lines
+    Then the admin API response status is 200
+    And the answer holds no log lines
+
+  Scenario: An access token scoped by required headers alone is shown none of the gateway's log lines
+    Given a log file "agent-gateway.log"
+    And the gateway log holds the line "request served for tenant-b"
+    When an access token scoped by required headers alone reads the dashboard's log lines
+    Then the admin API response status is 200
+    And the answer holds no log lines
 
   Scenario: A base user cannot remove rotated log files
     Given a log file "agent-gateway.log.1"

@@ -2975,7 +2975,7 @@ async fn proxy_charged_request(
         Some(crate::mcp::request_validation::McpRequestClassification::Modern(request)) => Some((**request).clone()),
         _ => None,
     };
-    let subscription_lifetime = if let Some(request) = modern_request
+    let mut subscription_lifetime = if let Some(request) = modern_request
         .as_ref()
         .filter(|request| request.method == "subscriptions/listen")
     {
@@ -5518,15 +5518,17 @@ async fn proxy_charged_request(
     // "deferred request VP injection" site below, after the resolver has
     // produced the per-binding `delegationAction` summary.
 
-    // ── Capture buffer for delegation audit events ─────────────────────
+    // ── Capture buffer for delegation audit records ────────────────────
     //
-    // The per-binding audit events (TokenInjected/Refreshed/ConsentRequired/
-    // elicitation_*) are emitted by `resolve_delegation_credentials` *before*
-    // we know the final `delegationAction` summary. We buffer them via a
-    // tokio task-local queue, then re-stamp each with the canonical identity
-    // VP after the deferred mint below. When workload-binding attestation is
-    // explicitly configured, that VP carries `workloadBinding.delegationAction`;
-    // otherwise it stays in the legacy `identityFields` shape.
+    // The audit records `resolve_delegation_credentials` submits, such as
+    // `consent_expired`, are submitted *before* we know the final
+    // `delegationAction` summary. We buffer them via a tokio task-local
+    // queue, then re-stamp each with the canonical identity VP after the
+    // deferred mint below. When workload-binding attestation is explicitly
+    // configured, that VP carries `workloadBinding.delegationAction`;
+    // otherwise it stays in the legacy `identityFields` shape. The events it
+    // only logs (`token_injected`, `consent_required` and the like) are
+    // written to the gateway log at once, without the VP.
     let deferred_audit = crate::audit::producer::DeferredAudit::new(crate::audit::producer::producer());
 
     // Note: outbound request body VP injection is deferred to after credential
@@ -6498,6 +6500,9 @@ async fn proxy_charged_request(
                 body_bytes = prepared
                     .rewrite_body(&body_bytes)
                     .map_err(|error| ModernDelegationError::from(error).response(request))?;
+                if let Some(lifetime) = subscription_lifetime.as_mut() {
+                    prepared.restrict_to_consents(lifetime);
+                }
                 modern_request = Some(prepared.request.clone());
                 modern_delegation = Some(prepared);
             }
@@ -7114,17 +7119,11 @@ async fn proxy_charged_request(
             // Check for consent_required — if any binding needs consent, return immediately
             let mut consent_entries = Vec::new();
             for resolution in &delegation_results {
-                if let crate::proxy::credential_delegation::DelegationLookupResult::ConsentRequired {
-                    authorization_url,
-                    provider_name,
-                    scopes,
-                } = &resolution.result
+                if let Some(entry) = resolution
+                    .result
+                    .consent_entry()
                 {
-                    consent_entries.push(serde_json::json!({
-                        "provider_name": provider_name,
-                        "authorization_url": authorization_url,
-                        "scopes": scopes,
-                    }));
+                    consent_entries.push(entry);
                 }
             }
 

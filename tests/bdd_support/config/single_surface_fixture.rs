@@ -55,6 +55,8 @@ pub struct SurfaceConfigBuilder {
     pub oauth_callback_base_url: Option<String>,
     /// The RFC 9207 `iss` the surface's OAuth provider records as its authorization server's.
     pub oauth_authorization_response_issuer: Option<String>,
+    /// The seconds the surface's OAuth provider lets a consent be used.
+    pub oauth_max_consent_age_secs: Option<u64>,
     /// OAuth providers the gateway has besides the surface's own, by provider id.
     pub additional_oauth_providers: Vec<String>,
     /// The surface's OAuth provider is stored as the admin API now creates one: with a
@@ -106,14 +108,19 @@ pub struct SurfaceConfigBuilder {
     pub rate_limit_per_minute: Option<u32>,
     /// The gateway starts with the VP Audit Log keeping every audit event.
     pub audit_log_keeps_every_event: bool,
-    /// The gateway logs its `audit` target events at info level and keeps its log for the
-    /// scenario to read.
-    pub logs_audit_events: bool,
+    /// The gateway logs at info level, which shows its `audit` target events and its
+    /// delegation events.
+    pub logs_at_info: bool,
     /// The tenant that owns the surface; appliance-wide when absent.
     pub tenant_id: Option<String>,
     /// The `[credential_policy]` rules the gateway starts with set to `enforce`.
     pub enforced_credential_rules: Vec<String>,
     pub token_request_timeout_secs: Option<u64>,
+    /// `[credential_policy] default_max_consent_age_secs`: the time limit on a consent to a
+    /// provider that sets none.
+    pub default_max_consent_age_secs: Option<u64>,
+    /// `[credential_policy] max_consent_age_ceiling_secs`: the time limit no consent reaches past.
+    pub max_consent_age_ceiling_secs: Option<u64>,
     /// The gateway logs warnings and keeps its log for the scenario to read.
     pub keeps_gateway_log: bool,
     /// The gateway writes its log files to `_storage/logs`, the directory the log routes act on.
@@ -250,6 +257,7 @@ impl Default for SurfaceConfigBuilder {
             oauth_provider_base_url: None,
             oauth_callback_base_url: None,
             oauth_authorization_response_issuer: None,
+            oauth_max_consent_age_secs: None,
             additional_oauth_providers: Vec::new(),
             oauth_callback_path_ends_in_record_id: false,
             identity_provider: false,
@@ -278,10 +286,12 @@ impl Default for SurfaceConfigBuilder {
             a2a_settings: None,
             rate_limit_per_minute: None,
             audit_log_keeps_every_event: false,
-            logs_audit_events: false,
+            logs_at_info: false,
             tenant_id: None,
             enforced_credential_rules: Vec::new(),
             token_request_timeout_secs: None,
+            default_max_consent_age_secs: None,
+            max_consent_age_ceiling_secs: None,
             keeps_gateway_log: false,
             writes_log_directory: false,
             serves_dashboard: false,

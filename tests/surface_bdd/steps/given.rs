@@ -3396,6 +3396,21 @@ async fn vp_audit_log_keeps_every_audit_event(world: &mut SurfaceWorld) {
     }
 }
 
+#[given(expr = "the VP Audit Log keeps only audit event {string}")]
+async fn vp_audit_log_keeps_only_audit_event(
+    world: &mut SurfaceWorld,
+    event: String,
+) {
+    crate::steps::when::ensure_admin_session(world).await;
+    world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .keep_only_audit_events(&[event.as_str()])
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log must keep only {event}: {error:#}"));
+}
+
 /// The live VP Audit Log of the running gateway: beside its logs when the
 /// scenario configured a log directory, and under `_storage/audit` otherwise,
 /// which the gateway resolves against the base folder it runs in. The rotated
@@ -3485,9 +3500,9 @@ fn vp_audit_log_holds_a_line_that_is_not_a_record(world: &mut SurfaceWorld) {
 }
 
 #[given(
-    expr = "the Credential Delegation Audit Log contains a token injection for caller {string} with email {string} and name {string}"
+    expr = "caller {string} with email {string} and name {string} has consented to and used a delegated credential"
 )]
-async fn credential_delegation_audit_log_contains_token_injection_for_caller(
+async fn caller_has_consented_to_and_used_a_delegated_credential(
     world: &mut SurfaceWorld,
     caller: String,
     email: String,
@@ -3511,7 +3526,7 @@ async fn credential_delegation_audit_log_contains_token_injection_for_caller(
     oauth_provider_ready_to_exchange_code(world, "calendar".to_string()).await;
     caller_has_completed_oauth_consent(world, caller.clone(), "calendar".to_string()).await;
     caller_has_invoked_mcp_tool_with_valid_token_and_identity(world, caller, "schedule_meeting".to_string()).await;
-    wait_for_audit_events(world, "/v1/delegation-audit?page_size=100").await;
+    wait_for_audit_record_of_tool(world, "schedule_meeting").await;
 }
 
 #[given(expr = "an API-key delegated credential was injected for caller {string}")]
@@ -3533,12 +3548,15 @@ async fn api_key_delegated_credential_was_injected(
 
     enable_every_audit_event(world).await;
     caller_has_invoked_mcp_tool_with_valid_token_and_identity(world, caller, "lookup_place".to_string()).await;
-    wait_for_audit_events(world, "/v1/delegation-audit?page_size=100").await;
+    wait_for_audit_record_of_tool(world, "lookup_place").await;
 }
 
-async fn wait_for_audit_events(
+/// Audit records reach the log shortly after the request that produced them,
+/// so this reads the Credential Delegation Audit Log again until it holds a
+/// record of a call to MCP tool `tool`, for up to five seconds.
+async fn wait_for_audit_record_of_tool(
     world: &mut SurfaceWorld,
-    path: &str,
+    tool: &str,
 ) {
     crate::steps::when::ensure_admin_session(world).await;
     let client = world
@@ -3546,23 +3564,25 @@ async fn wait_for_audit_events(
         .as_ref()
         .expect("admin client must exist");
     let mut last_body = None;
-    for _ in 0..10 {
+    for _ in 0..50 {
         let response = client
-            .send_recorded_json::<serde_json::Value>(reqwest::Method::GET, path, None)
+            .send_recorded_json::<serde_json::Value>(reqwest::Method::GET, "/v1/delegation-audit?page_size=100", None)
             .await
             .expect("audit setup read should return an HTTP response");
-        let has_events = response
-            .body
-            .get("events")
-            .and_then(|events| events.as_array())
-            .is_some_and(|events| !events.is_empty());
-        if has_events {
+        let recorded = response.body["events"]
+            .as_array()
+            .is_some_and(|events| {
+                events
+                    .iter()
+                    .any(|event| event["mcp_tool_name"] == tool)
+            });
+        if recorded {
             return;
         }
         last_body = Some(response.body);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    panic!("audit setup did not produce events at {path}; last response body: {last_body:?}");
+    panic!("the audit log holds no record of MCP tool {tool:?}; last response body: {last_body:?}");
 }
 
 #[given(expr = "MCP surface {string} targets MCP server {string}")]
@@ -4252,6 +4272,22 @@ fn caller_has_no_delegated_credentials(
 ) {
 }
 
+#[given(expr = "an operator has deactivated OAuth provider {string}")]
+async fn operator_has_deactivated_oauth_provider(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    crate::steps::when::set_oauth_provider_active(world, &provider, false).await;
+}
+
+#[given(expr = "an operator has activated OAuth provider {string} again")]
+async fn operator_has_activated_oauth_provider_again(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    crate::steps::when::set_oauth_provider_active(world, &provider, true).await;
+}
+
 #[given(expr = "OAuth provider {string} is ready to exchange an authorization code for delegated credentials")]
 async fn oauth_provider_ready_to_exchange_code(
     world: &mut SurfaceWorld,
@@ -4366,6 +4402,15 @@ async fn caller_has_completed_oauth_consent(
     crate::steps::when::oauth_provider_redirects_back_with_valid_code(world, provider).await;
 }
 
+#[given(expr = "caller {string} has invoked MCP tool {string} with a valid token")]
+async fn caller_has_invoked_mcp_tool_with_valid_token(
+    world: &mut SurfaceWorld,
+    caller: String,
+    tool_name: String,
+) {
+    crate::steps::when::caller_invokes_mcp_tool_with_valid_token(world, caller, tool_name).await;
+}
+
 #[given(expr = "caller {string} has invoked MCP tool {string} with a valid token and caller Agent identity {string}")]
 async fn caller_has_invoked_mcp_tool_with_valid_token_and_agent_identity(
     world: &mut SurfaceWorld,
@@ -4417,6 +4462,151 @@ async fn caller_has_started_oauth_consent(
 #[given("the caller's delegated credentials have expired")]
 fn caller_delegated_credentials_have_expired(world: &mut SurfaceWorld) {
     expire_delegation_tokens(world);
+}
+
+#[given(expr = "OAuth provider {string} limits a consent to {int} seconds")]
+fn oauth_provider_limits_a_consent(
+    world: &mut SurfaceWorld,
+    provider: String,
+    seconds: u64,
+) {
+    assert_eq!(
+        delegation_config_mut(world).provider_id,
+        provider,
+        "a consent time limit is set only on the surface's own OAuth provider"
+    );
+    world
+        .surface_config
+        .oauth_max_consent_age_secs = Some(seconds);
+}
+
+/// `[credential_policy]` is read when the gateway starts, so a scenario sets
+/// the gateway's own consent time limits before anything starts it.
+#[given(expr = "the gateway limits a consent to {int} seconds by default")]
+fn gateway_limits_a_consent_by_default(
+    world: &mut SurfaceWorld,
+    seconds: u64,
+) {
+    assert!(!crate::steps::when::gateway_is_running(world), "the gateway reads its consent limits when it starts");
+    world
+        .surface_config
+        .default_max_consent_age_secs = Some(seconds);
+}
+
+#[given(expr = "the gateway lets no consent last longer than {int} seconds")]
+fn gateway_lets_no_consent_last_longer(
+    world: &mut SurfaceWorld,
+    seconds: u64,
+) {
+    assert!(!crate::steps::when::gateway_is_running(world), "the gateway reads its consent limits when it starts");
+    world
+        .surface_config
+        .max_consent_age_ceiling_secs = Some(seconds);
+}
+
+#[given(expr = "the operator has changed the consent time limit of OAuth provider {string} to {int} seconds")]
+async fn operator_has_changed_the_providers_consent_limit(
+    world: &mut SurfaceWorld,
+    provider: String,
+    seconds: u64,
+) {
+    crate::steps::when::change_provider_consent_limit(world, &provider, seconds).await;
+}
+
+/// An operator has set the limit of the surface's one binding, through the
+/// admin API, after the surface was stored: a consent already given through
+/// the binding keeps the end it was stored with.
+#[given(expr = "the operator has limited a consent used through the surface's binding to {int} seconds")]
+async fn operator_has_limited_the_surfaces_binding(
+    world: &mut SurfaceWorld,
+    seconds: u64,
+) {
+    use crate::bdd_support::config::single_surface_fixture::SEEDED_SURFACE_ID;
+    crate::steps::when::ensure_admin_session(world).await;
+    let client = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist");
+    let stored = client
+        .get_surface_recorded(SEEDED_SURFACE_ID)
+        .await
+        .expect("read the surface through the admin API");
+    assert_eq!(stored.status, 200, "reading the surface: {}", stored.body);
+    let mut surface = stored.body;
+    let bindings = surface["outbound_credentials"]
+        .as_array_mut()
+        .unwrap_or_else(|| panic!("the surface has no outbound_credentials"));
+    assert_eq!(bindings.len(), 1, "the surface has one binding to limit: {bindings:?}");
+    bindings[0]["max_consent_age_secs"] = serde_json::json!(seconds);
+    let saved = client
+        .update_surface_recorded(SEEDED_SURFACE_ID, &surface)
+        .await
+        .expect("save the surface through the admin API");
+    assert_eq!(saved.status, 200, "limiting the surface's binding: {}", saved.body);
+}
+
+/// An operator has limited the one stored consent to `seconds` after it was
+/// given, through the admin API.
+#[given(expr = "the operator has limited the caller's consent to {int} seconds")]
+async fn operator_has_limited_the_callers_consent(
+    world: &mut SurfaceWorld,
+    seconds: u64,
+) {
+    crate::steps::when::limit_the_callers_consent(world, seconds).await;
+    let response = world
+        .admin_response
+        .as_ref()
+        .expect("limiting a consent records the admin API's answer");
+    assert_eq!(response.status, 200, "limiting the caller's consent: {}", response.body);
+}
+
+/// Moves the consent of every delegated credential the gateway holds back by
+/// `seconds`: the time it was given, and its end when it has one. The vault is
+/// read from disk on every request, so the gateway sees the older consent
+/// without a restart.
+#[given(expr = "the caller's consent was given {int} seconds ago")]
+fn callers_consent_was_given_seconds_ago(
+    world: &mut SurfaceWorld,
+    seconds: i64,
+) {
+    let vault_dir = world
+        .infra
+        .as_ref()
+        .expect("the gateway must hold a delegated credential before its consent can age")
+        ._temp_dir
+        .path()
+        .join("_storage/delegation_vault");
+    let earlier = |token: &serde_json::Value, field: &str| {
+        token[field]
+            .as_str()
+            .map(|time| {
+                let time = chrono::DateTime::parse_from_rfc3339(time).expect("a stored time is RFC 3339");
+                serde_json::json!((time - chrono::Duration::seconds(seconds)).to_rfc3339())
+            })
+    };
+    let mut aged = 0;
+    for entry in std::fs::read_dir(&vault_dir).expect("read the delegation vault directory") {
+        let path = entry
+            .expect("delegation vault entry")
+            .path();
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("json")
+        {
+            continue;
+        }
+        let mut token: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read a stored delegated credential"))
+                .expect("a stored delegated credential is JSON");
+        token["consent_granted_at"] = earlier(&token, "consent_granted_at").expect("a stored consent time");
+        if let Some(end) = earlier(&token, "consent_expires_at") {
+            token["consent_expires_at"] = end;
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(&token).unwrap()).expect("write the aged consent");
+        aged += 1;
+    }
+    assert_eq!(aged, 1, "the gateway must hold exactly one delegated credential");
 }
 
 #[given(expr = "OAuth provider {string} is ready to refresh delegated credentials")]

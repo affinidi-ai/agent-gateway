@@ -1050,9 +1050,20 @@ fn credential_delegation_audit_log_includes_caller_name(
     assert_audit_response_contains_text(world, &name, "Credential Delegation Audit Log caller name");
 }
 
-#[then("the Credential Delegation Audit Log includes a token injection")]
-fn credential_delegation_audit_log_includes_token_injection(world: &mut SurfaceWorld) {
-    assert_audit_response_contains_text(world, "token_injected", "Credential Delegation Audit Log token injection");
+#[then(expr = "the Credential Delegation Audit Log includes a record of MCP tool {string}")]
+fn credential_delegation_audit_log_includes_record_of_tool(
+    world: &mut SurfaceWorld,
+    tool: String,
+) {
+    let body = &get_admin_response(world).body;
+    let recorded = body["events"]
+        .as_array()
+        .is_some_and(|events| {
+            events
+                .iter()
+                .any(|event| event["mcp_tool_name"] == tool.as_str())
+        });
+    assert!(recorded, "the Credential Delegation Audit Log has no record of MCP tool {tool:?}: {body}");
 }
 
 #[then("the Credential Delegation Audit Log does not include OAuth access tokens")]
@@ -2558,6 +2569,97 @@ fn response_is_consent_required_error(
     );
 }
 
+#[then(expr = "the consent required error for OAuth provider {string} gives the reason {string}")]
+fn consent_required_error_gives_the_reason(
+    world: &mut SurfaceWorld,
+    provider: String,
+    reason: String,
+) {
+    let body = get_response_body_value(world);
+    let entry =
+        consent_entry(body, &provider).unwrap_or_else(|| panic!("missing consent entry for '{provider}', got {body}"));
+    assert_eq!(entry["reason"], serde_json::json!(reason), "{entry}");
+}
+
+#[then(expr = "the consent required error for OAuth provider {string} gives no reason")]
+fn consent_required_error_gives_no_reason(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    let body = get_response_body_value(world);
+    let entry =
+        consent_entry(body, &provider).unwrap_or_else(|| panic!("missing consent entry for '{provider}', got {body}"));
+    assert!(entry.get("reason").is_none(), "{entry}");
+}
+
+#[then(expr = "the consent required error says a new consent to OAuth provider {string} may be used for {int} seconds")]
+fn consent_required_error_says_how_long_a_new_consent_lasts(
+    world: &mut SurfaceWorld,
+    provider: String,
+    seconds: u64,
+) {
+    let body = get_response_body_value(world);
+    let entry =
+        consent_entry(body, &provider).unwrap_or_else(|| panic!("missing consent entry for '{provider}', got {body}"));
+    assert_eq!(entry["max_consent_age_secs"], serde_json::json!(seconds), "{entry}");
+}
+
+#[then(expr = "the delegation vault holds {int} delegated credential(s)")]
+async fn delegation_vault_holds_delegated_credentials(
+    world: &mut SurfaceWorld,
+    count: usize,
+) {
+    let held = crate::steps::when::list_delegation_vault(world).await;
+    assert_eq!(held.len(), count, "{held:?}");
+}
+
+#[then("the delegation vault holds no delegated credential")]
+async fn delegation_vault_holds_no_delegated_credential(world: &mut SurfaceWorld) {
+    let held = crate::steps::when::list_delegation_vault(world).await;
+    assert!(held.is_empty(), "expected an empty delegation vault, got {held:?}");
+}
+
+#[then(expr = "the delegated credential in the delegation vault ends its consent {int} seconds after it was given")]
+async fn delegated_credential_ends_its_consent_after(
+    world: &mut SurfaceWorld,
+    seconds: i64,
+) {
+    let held = crate::steps::when::list_delegation_vault(world).await;
+    assert_eq!(held.len(), 1, "expected one delegated credential, got {held:?}");
+    let time = |field: &str| {
+        chrono::DateTime::parse_from_rfc3339(
+            held[0][field]
+                .as_str()
+                .unwrap_or_else(|| panic!("the delegated credential has no {field}: {}", held[0])),
+        )
+        .expect("a listed time is RFC 3339")
+    };
+    assert_eq!(
+        time("consent_expires_at") - time("consent_granted_at"),
+        chrono::Duration::seconds(seconds),
+        "{}",
+        held[0]
+    );
+}
+
+#[then(expr = "OAuth provider {string} was not asked to refresh delegated credentials")]
+fn oauth_provider_was_not_asked_to_refresh(
+    world: &mut SurfaceWorld,
+    _provider: String,
+) {
+    let refreshes: Vec<_> = oauth_provider_requests(world)
+        .into_iter()
+        .filter(|request| {
+            request
+                .path_and_query
+                .starts_with("/token")
+                && url::form_urlencoded::parse(request.raw_body.as_bytes())
+                    .any(|(name, value)| name == "grant_type" && value == "refresh_token")
+        })
+        .collect();
+    assert!(refreshes.is_empty(), "expected no token refresh request, got {refreshes:?}");
+}
+
 #[then("the consent required error names neither the caller's identity hash nor the managed agent's DID")]
 fn consent_required_error_names_no_caller_or_agent(world: &mut SurfaceWorld) {
     let body = get_response_body_value(world);
@@ -3840,6 +3942,62 @@ async fn delegation_audit_trail_contains_event(
     assert!(found, "expected delegation audit event '{event}' for provider '{provider}' ({record_id}), got {events:?}");
 }
 
+#[then(expr = "the gateway counts {int} active consent(s), of which the limit would end {int}")]
+fn gateway_counts_active_and_ending_consents(
+    world: &mut SurfaceWorld,
+    active: u64,
+    ending: u64,
+) {
+    assert_eq!(
+        get_admin_response(world).body,
+        serde_json::json!({"active_consents": active, "ending_consents": ending})
+    );
+}
+
+/// The `consent_granted` record of a consent given under a time limit names
+/// in `detail` the end the delegation vault lists for it, to the second.
+#[then(expr = "the delegation audit trail records when the consent to OAuth provider {string} ends")]
+async fn delegation_audit_trail_records_the_consent_end(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    let held = crate::steps::when::list_delegation_vault(world).await;
+    assert_eq!(held.len(), 1, "expected one delegated credential, got {held:?}");
+    let end = chrono::DateTime::parse_from_rfc3339(
+        held[0]["consent_expires_at"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the delegated credential has no consent_expires_at: {}", held[0])),
+    )
+    .expect("a listed time is RFC 3339")
+    .with_timezone(&chrono::Utc)
+    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let detail = format!("consent_expires_at:{end}");
+    let record_id = world
+        .surface_config
+        .provider_record_id(&provider);
+    let (found, events) = eventually_delegation_audit_events(world, |events| {
+        events.iter().any(|entry| {
+            entry
+                .get("event")
+                .and_then(|value| value.as_str())
+                == Some("consent_granted")
+                && entry
+                    .get("provider_id")
+                    .and_then(|value| value.as_str())
+                    == Some(record_id.as_str())
+                && entry
+                    .get("detail")
+                    .and_then(|value| value.as_str())
+                    == Some(detail.as_str())
+        })
+    })
+    .await;
+    assert!(
+        found,
+        "expected a consent_granted record with detail '{detail}' for provider '{provider}' ({record_id}), got {events:?}"
+    );
+}
+
 #[then(expr = "the delegation audit trail has no event {string} for OAuth provider {string}")]
 async fn delegation_audit_trail_has_no_event(
     world: &mut SurfaceWorld,
@@ -3904,15 +4062,61 @@ async fn eventually_delegation_audit_events(
     (false, events)
 }
 
-#[then(
-    expr = "the delegation audit trail contains event {string} for OAuth provider {string} on the later MCP tool call"
-)]
-async fn delegation_audit_trail_contains_later_event(
+/// The trail is read once it has settled, so a record written a moment after
+/// the gateway answered is seen.
+#[then(expr = "the delegation audit trail holds no record of event {string}")]
+async fn delegation_audit_trail_holds_no_record_of_event(
     world: &mut SurfaceWorld,
     event: String,
+) {
+    let events = read_delegation_audit_events(world).await;
+    assert!(!events.is_empty(), "the delegation audit trail is empty, so it shows nothing about {event:?}");
+    let found: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|entry| entry["event"] == event.as_str())
+        .collect();
+    assert!(found.is_empty(), "expected no delegation audit record of event '{event}', got {found:?}");
+}
+
+/// A consent names its caller by identity hash, so two callers behind one
+/// Agent DID are two hashes under one DID.
+#[then(
+    expr = "the delegation audit trail records a consent to OAuth provider {string} by two callers of one Agent DID"
+)]
+async fn delegation_audit_trail_records_consents_of_two_callers(
+    world: &mut SurfaceWorld,
     provider: String,
 ) {
-    delegation_audit_trail_contains_event(world, event, provider).await;
+    let record_id = world
+        .surface_config
+        .provider_record_id(&provider);
+    let named = |events: &[serde_json::Value], field: &str| -> std::collections::BTreeSet<String> {
+        events
+            .iter()
+            .filter(|entry| entry["event"] == "consent_granted" && entry["provider_id"] == record_id.as_str())
+            .filter_map(|entry| entry[field].as_str())
+            .map(str::to_string)
+            .collect()
+    };
+    let (found, events) =
+        eventually_delegation_audit_events(world, |events| named(events, "user_identity_hash").len() == 2).await;
+    assert!(found, "expected a consent to provider '{provider}' ({record_id}) by two callers, got {events:?}");
+    assert_one_agent_did(&named(&events, "agent_did"), &events);
+}
+
+/// The callers named by `records` act through one agent: `agents`, the Agent DIDs
+/// the records name, is one DID.
+pub(crate) fn assert_one_agent_did(
+    agents: &std::collections::BTreeSet<String>,
+    records: &impl std::fmt::Debug,
+) {
+    assert_eq!(agents.len(), 1, "the callers use one Agent DID: {records:?}");
+    assert!(
+        agents
+            .iter()
+            .all(|did| did.starts_with("did:")),
+        "{agents:?}"
+    );
 }
 
 #[then("the delegation audit trail does not expose delegated credential secrets")]
@@ -3976,54 +4180,6 @@ async fn delegation_audit_trail_identifies_mcp_tool(
     })
     .await;
     assert!(found, "expected delegation audit trail to identify MCP tool '{tool}', got {events:?}");
-}
-
-#[then(expr = "the delegation audit trail contains distinct authenticated caller records for {string} and {string}")]
-async fn delegation_audit_trail_contains_distinct_callers(
-    world: &mut SurfaceWorld,
-    first: String,
-    second: String,
-) {
-    delegation_audit_trail_identifies_caller(world, first).await;
-    delegation_audit_trail_identifies_caller(world, second).await;
-}
-
-#[then(expr = "both audit records are bound to caller Agent identity {string}")]
-async fn both_audit_records_are_bound_to_agent_identity(
-    world: &mut SurfaceWorld,
-    identity: String,
-) {
-    let (found, events) = eventually_delegation_audit_events(world, |events| {
-        events
-            .iter()
-            .filter(|event| event_contains_text(event, &identity))
-            .count()
-            >= 2
-    })
-    .await;
-    assert!(found, "expected at least two audit records bound to caller Agent identity '{identity}', got {events:?}");
-}
-
-#[then("both audit records identify the same caller Agent DID")]
-async fn both_audit_records_identify_same_caller_agent_did(world: &mut SurfaceWorld) {
-    let (found, events) = eventually_delegation_audit_events(world, |events| {
-        events
-            .iter()
-            .filter_map(extract_holder_did_from_audit_event)
-            .count()
-            >= 2
-    })
-    .await;
-    assert!(found, "expected at least two audit records with caller Agent DIDs, got {events:?}");
-    let dids = events
-        .iter()
-        .filter_map(extract_holder_did_from_audit_event)
-        .collect::<Vec<_>>();
-    assert!(
-        dids.iter()
-            .all(|did| did == &dids[0]),
-        "expected audit records to identify the same caller Agent DID, got {dids:?}"
-    );
 }
 
 #[then(expr = "the VP received by MCP server {string} includes selected caller identity field {string}")]
@@ -4135,16 +4291,6 @@ fn event_contains_text(
     expanded_audit_event_material(event).contains(needle)
 }
 
-fn extract_holder_did_from_audit_event(event: &serde_json::Value) -> Option<String> {
-    let vp = event
-        .get("vp_jwt")
-        .or_else(|| event.get("workload_binding_vp"))?;
-    let decoded = expand_encoded_value(vp);
-    find_string_field(&decoded, "holder")
-        .or_else(|| find_string_field(&decoded, "did"))
-        .filter(|value| value.starts_with("did:"))
-}
-
 fn expanded_audit_event_material(event: &serde_json::Value) -> String {
     expand_encoded_value(event).to_string()
 }
@@ -4181,28 +4327,6 @@ fn decode_jwt_payload(text: &str) -> Option<serde_json::Value> {
         .decode(parts[1])
         .ok()?;
     serde_json::from_slice::<serde_json::Value>(&payload).ok()
-}
-
-fn find_string_field(
-    value: &serde_json::Value,
-    field: &str,
-) -> Option<String> {
-    match value {
-        serde_json::Value::Object(map) => {
-            if let Some(found) = map
-                .get(field)
-                .and_then(|value| value.as_str())
-            {
-                return Some(found.to_string());
-            }
-            map.values()
-                .find_map(|value| find_string_field(value, field))
-        }
-        serde_json::Value::Array(items) => items
-            .iter()
-            .find_map(|value| find_string_field(value, field)),
-        _ => None,
-    }
 }
 
 #[then(expr = "agent {string} received the forwarded request")]

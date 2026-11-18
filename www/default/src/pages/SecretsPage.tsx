@@ -11,6 +11,7 @@ import { DOCS_URL } from '../config/docs';
 import AddResourceLink from '../components/shared/AddResourceLink';
 import { apiClient, ApiKeyMeta, ApiKeyCreated } from '../api';
 import { formatApiError, getErrorMessage } from '../utils/apiError';
+import PaginationControls from '../components/shared/PaginationControls';
 import SearchInput from '../components/shared/SearchInput';
 import { formatDateTime } from '../utils/stringUtils';
 import { deepLinks } from '../utils/deepLinks';
@@ -281,59 +282,8 @@ const SecretsPage: React.FC = () => {
     return items.slice(start, start + PAGE_SIZE);
   };
 
-  const totalPages = (count: number) => Math.max(1, Math.ceil(count / PAGE_SIZE));
-
   const pagedSecrets = paginate(filteredSecrets, secretsPage);
   const pagedCertificates = paginate(filteredCertificates, certsPage);
-  const PaginationControls: React.FC<{
-    currentPage: number;
-    total: number;
-    onPageChange: (p: number) => void;
-  }> = ({ currentPage, total, onPageChange }) => {
-    const pages = totalPages(total);
-    if (pages <= 1) return null;
-    return (
-      <div className="d-flex justify-content-between align-items-center mt-2 px-1">
-        <small className="text-muted">
-          {(currentPage - 1) * PAGE_SIZE + 1}–{Math.min(currentPage * PAGE_SIZE, total)} of {total}
-        </small>
-        <nav>
-          <ul className="pagination pagination-sm mb-0">
-            <li className={`page-item ${currentPage <= 1 ? 'disabled' : ''}`}>
-              <button className="page-link" onClick={() => onPageChange(currentPage - 1)}>
-                &lsaquo;
-              </button>
-            </li>
-            {Array.from({ length: pages }, (_, i) => i + 1)
-              .filter(p => p === 1 || p === pages || Math.abs(p - currentPage) <= 1)
-              .reduce<(number | '...')[]>((acc, p, idx, arr) => {
-                if (idx > 0 && p - (arr[idx - 1] as number) > 1) acc.push('...');
-                acc.push(p);
-                return acc;
-              }, [])
-              .map((p, idx) =>
-                p === '...' ? (
-                  <li key={`ellipsis-${idx}`} className="page-item disabled">
-                    <span className="page-link">…</span>
-                  </li>
-                ) : (
-                  <li key={p} className={`page-item ${p === currentPage ? 'active' : ''}`}>
-                    <button className="page-link" onClick={() => onPageChange(p as number)}>
-                      {p}
-                    </button>
-                  </li>
-                )
-              )}
-            <li className={`page-item ${currentPage >= pages ? 'disabled' : ''}`}>
-              <button className="page-link" onClick={() => onPageChange(currentPage + 1)}>
-                &rsaquo;
-              </button>
-            </li>
-          </ul>
-        </nav>
-      </div>
-    );
-  };
 
   const filterActive = searchTerm.trim().length > 0;
   const tabBadge = (count: number) => {
@@ -500,7 +450,8 @@ const SecretsPage: React.FC = () => {
                     </tbody>
                   </table>
                   <PaginationControls
-                    currentPage={secretsPage}
+                    page={secretsPage}
+                    pageSize={PAGE_SIZE}
                     total={filteredSecrets.length}
                     onPageChange={setSecretsPage}
                   />
@@ -973,7 +924,8 @@ const SecretsPage: React.FC = () => {
                     </tbody>
                   </table>
                   <PaginationControls
-                    currentPage={certsPage}
+                    page={certsPage}
+                    pageSize={PAGE_SIZE}
                     total={filteredCertificates.length}
                     onPageChange={setCertsPage}
                   />

@@ -1,3 +1,12 @@
+import {
+  CONSENT_LIMIT_RANGE,
+  ConsentLimitUnit,
+  consentLimitSecondsOf,
+  limitFieldsOf,
+  storedConsentLimit,
+  takesConsent,
+} from '../../utils/consentLimit';
+
 export type CredentialProviderType =
   | 'oauth2_authorization_code'
   | 'oauth2_client_credentials'
@@ -278,6 +287,69 @@ export function jwtFieldsOf(data: Record<string, unknown>): JwtFormFields {
     jwt_issuer: text('jwt_issuer'),
     jwt_subject: text('jwt_subject'),
   };
+}
+
+export const CONSENT_LIMIT_RANGE_MESSAGE = `Consent time limit must be a whole number from ${CONSENT_LIMIT_RANGE}, or empty to set none.`;
+
+/** What the consent time limit field says under itself while it holds a limit the gateway refuses. */
+export const CONSENT_LIMIT_FIELD_MESSAGE = `Enter a limit from ${CONSENT_LIMIT_RANGE}, or leave it empty.`;
+
+export interface ConsentLimitFields {
+  /** The number as typed; empty when the provider sets no limit. */
+  consent_limit_amount: string;
+  consent_limit_unit: ConsentLimitUnit;
+}
+
+export const NO_CONSENT_LIMIT: ConsentLimitFields = {
+  consent_limit_amount: '',
+  consent_limit_unit: 'hours',
+};
+
+/** The consent time limit of a loaded provider record, in its largest whole unit. */
+export function consentLimitOf(data: Record<string, unknown>): ConsentLimitFields {
+  const { amount, unit } = limitFieldsOf(storedConsentLimit(data.max_consent_age_secs));
+  return { consent_limit_amount: amount, consent_limit_unit: unit };
+}
+
+/**
+ * The `max_consent_age_secs` to save: the limit in seconds; `0`, which removes it, for an empty
+ * amount or a type nobody consents to; `null` for an amount the gateway would refuse.
+ */
+export function consentLimitSeconds(
+  form: ConsentLimitFields & { provider_type: CredentialProviderType }
+): number | null {
+  const amount = form.consent_limit_amount.trim();
+  if (!takesConsent(form.provider_type) || !amount) return 0;
+  return consentLimitSecondsOf(amount, form.consent_limit_unit);
+}
+
+/**
+ * Whether saving `limitSecs` can end consents already given: a limit shorter than the stored
+ * one or set where none was, or the stored one removed, since the gateway's default may then
+ * be the shorter. A longer limit never extends a consent, so it ends none.
+ */
+export function shortensConsentLimit(
+  limitSecs: number | null,
+  storedSecs: number | undefined
+): boolean {
+  if (limitSecs === null) return false;
+  if (limitSecs <= 0) return storedSecs !== undefined;
+  return storedSecs === undefined || limitSecs < storedSecs;
+}
+
+/** `ending_consents` of a `GET /credential-providers/{id}/consent-impact` answer, when it has one. */
+export function endingConsentsOf(answer: unknown): number | null {
+  if (!answer || typeof answer !== 'object') return null;
+  const ending = (answer as { ending_consents?: unknown }).ending_consents;
+  return typeof ending === 'number' && Number.isInteger(ending) && ending >= 0 ? ending : null;
+}
+
+/** The warning that saving ends `ending` active consents of the provider; none when it ends none. */
+export function consentImpactMessage(ending: number | null, providerName: string): string | null {
+  if (!ending) return null;
+  return ending === 1
+    ? `Saving ends 1 active ${providerName} consent now. That person approves again next time their agent needs ${providerName}.`
+    : `Saving ends ${ending} active ${providerName} consents now. Those people approve again next time their agent needs ${providerName}.`;
 }
 
 export const PROVIDER_TYPE_LABELS: Record<CredentialProviderType, string> = {

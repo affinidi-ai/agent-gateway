@@ -39,6 +39,7 @@ use base64::Engine as _;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
+use super::consent_age::{self, AskedAgain, ConsentAge, ConsentLimits};
 use super::grants::{DelegatedGrant, FailedRefresh, GrantKey, ObtainedTokens};
 use super::storage::{DelegationVaultStorage, RefreshError};
 use super::token_endpoint::{TokenFailure, TokenRequest};
@@ -105,6 +106,9 @@ pub enum GrantRefusal {
         subject: GrantSubject,
         /// For a caller's grant, [`connect_hint`] of the caller.
         hint: Option<String>,
+        /// Why a binding that had a grant has none: its consent ended at its
+        /// time limit.
+        cause: Option<AskedAgain>,
     },
     /// The vendor answered that the token lacks a scope, named when its
     /// challenge named a plain one.
@@ -123,6 +127,20 @@ impl GrantRefusal {
         Self::ConnectRequired {
             subject,
             hint: (subject == GrantSubject::Caller).then(|| connect_hint(&key.principal)),
+            cause: None,
+        }
+    }
+
+    /// `connect_required` for the binding of `key`, whose grant was removed
+    /// because its consent ended at its time limit.
+    pub fn consent_expired(
+        key: &GrantKey,
+        subject: GrantSubject,
+    ) -> Self {
+        Self::ConnectRequired {
+            subject,
+            hint: (subject == GrantSubject::Caller).then(|| connect_hint(&key.principal)),
+            cause: Some(AskedAgain::ConsentExpired),
         }
     }
 
@@ -147,27 +165,37 @@ impl GrantRefusal {
     /// A fixed message.
     pub fn message(&self) -> &'static str {
         match self {
-            Self::ConnectRequired {
-                subject: GrantSubject::Owner, ..
-            } => "The owner of this agent has not connected this account",
-            Self::ConnectRequired { .. } => "Connect your account to use this",
+            Self::ConnectRequired { subject, cause, .. } => match (subject, cause) {
+                (GrantSubject::Owner, Some(AskedAgain::ConsentExpired | AskedAgain::ConsentTooOld)) => {
+                    "The owner's connection of this account ended at its time limit"
+                }
+                (GrantSubject::Caller, Some(AskedAgain::ConsentExpired | AskedAgain::ConsentTooOld)) => {
+                    "Your connection ended at its time limit; connect your account again"
+                }
+                (GrantSubject::Owner, None) => "The owner of this agent has not connected this account",
+                (GrantSubject::Caller, None) => "Connect your account to use this",
+            },
             Self::ScopeInsufficient { .. } => "The connected account has not granted a permission this call needs",
             Self::ConnectorUnavailable => "This connection is unavailable; try again later",
         }
     }
 
     /// The JSON-RPC error's `data`, and the problem's extension members:
-    /// `reason`, then `subject` and `hint` or `scope` when there are any.
+    /// `reason`, then `subject`, `hint` and `cause`, or `scope`, when there
+    /// are any.
     pub fn data(&self) -> serde_json::Value {
         let mut data = serde_json::json!({ "reason": self.reason() });
         match self {
-            Self::ConnectRequired { subject, hint } => {
+            Self::ConnectRequired { subject, hint, cause } => {
                 data["subject"] = serde_json::json!(match subject {
                     GrantSubject::Owner => "owner",
                     GrantSubject::Caller => "caller",
                 });
                 if let Some(hint) = hint {
                     data["hint"] = serde_json::json!(hint);
+                }
+                if let Some(cause) = cause {
+                    data["cause"] = serde_json::json!(cause);
                 }
             }
             Self::ScopeInsufficient { scope: Some(scope) } => data["scope"] = serde_json::json!(scope),
@@ -262,19 +290,35 @@ pub struct ReleaseContext<'a> {
     /// How many refusals of a grant's refresh, other than `invalid_grant`,
     /// make a call that cannot use the grant answer `connect_required`.
     pub refusal_limit: u32,
+    /// The time limit the binding sets on the consent of its grants, in
+    /// seconds, beside its provider's and the gateway's.
+    pub max_consent_age_secs: Option<u64>,
 }
 
-static USES_IN_FLIGHT: std::sync::LazyLock<dashmap::DashSet<String>> = std::sync::LazyLock::new(dashmap::DashSet::new);
+/// The grants whose use is being recorded, each with the address of the vault
+/// that holds it: a grant's id is derived from its key, so two vaults in one
+/// process can hold grants of the same id.
+static USES_IN_FLIGHT: std::sync::LazyLock<dashmap::DashSet<(usize, String)>> =
+    std::sync::LazyLock::new(dashmap::DashSet::new);
 
-/// Held by the one task recording a grant's use, so concurrent requests
-/// before its write lands do not each spawn one.
-struct UseClaim(String);
+/// Held by the one task recording a grant's use in its vault, so concurrent
+/// requests before its write lands do not each spawn one.
+struct UseClaim((usize, String));
 
 impl UseClaim {
-    fn take(grant_id: &str) -> Option<Self> {
+    fn take(
+        vault: &Arc<dyn DelegationVaultStorage>,
+        grant_id: &str,
+    ) -> Option<Self> {
+        let claimed = (
+            Arc::as_ptr(vault)
+                .cast::<()>()
+                .addr(),
+            grant_id.to_string(),
+        );
         USES_IN_FLIGHT
-            .insert(grant_id.to_string())
-            .then(|| Self(grant_id.to_string()))
+            .insert(claimed.clone())
+            .then(|| Self(claimed))
     }
 }
 
@@ -296,7 +340,7 @@ pub fn record_use_in_background(
     if !grant.use_is_due(Utc::now()) {
         return;
     }
-    let Some(claim) = UseClaim::take(&grant.id) else {
+    let Some(claim) = UseClaim::take(vault, &grant.id) else {
         return;
     };
     let vault = Arc::clone(vault);
@@ -352,6 +396,71 @@ impl ReleaseContext<'_> {
         }
     }
 
+    /// The grant of `key`, while its consent is within the time limits of the
+    /// binding, of `provider` and of the gateway. One whose consent ended is
+    /// removed, whatever refresh token it holds, and revoked at the vendor in
+    /// the background: someone must connect again. Every release and every
+    /// refresh starts here, so no refresh carries a consent past its end.
+    async fn read_within_limits(
+        &self,
+        provider: &CredentialProvider,
+        key: &GrantKey,
+        subject: GrantSubject,
+    ) -> Result<DelegatedGrant, Refused> {
+        let grant = self
+            .read(key, subject)
+            .await?;
+        let limits = ConsentLimits::of(self.max_consent_age_secs, provider.max_consent_age_secs);
+        if limits.judge(grant.created_at, grant.consent_expires_at, Utc::now()) == ConsentAge::Current {
+            return Ok(grant);
+        }
+        self.end_consent(provider, key, &grant, limits.ends_for_binding_at(grant.created_at, grant.consent_expires_at))
+            .await;
+        Err(refused(GrantRefusal::consent_expired(key, subject), AskedAgain::ConsentExpired.as_str()))
+    }
+
+    /// Remove the grant of `key`, whose consent ended at `ended_at`, while it
+    /// is still the connection `grant` was read as, audit the expiry and
+    /// revoke it at the vendor in the background. One connected again since
+    /// is kept: its consent is another one.
+    async fn end_consent(
+        &self,
+        provider: &CredentialProvider,
+        key: &GrantKey,
+        grant: &DelegatedGrant,
+        ended_at: Option<chrono::DateTime<Utc>>,
+    ) {
+        let grant_id = key.record_id();
+        let surface_variant = crate::observability::policy_audit::current_request_variant();
+        match self
+            .vault
+            .delete_grant_of_connection(&grant_id, grant.created_at)
+            .await
+        {
+            Ok(Some(removed)) => {
+                tracing::info!(
+                    target: "credential_delegation",
+                    surface_variant = surface_variant.as_deref(),
+                    grant_id = %grant_id,
+                    "Consent ended at its time limit - removed the delegated grant; someone must connect again"
+                );
+                consent_age::record_grant_expiry(&removed, Some(&provider.name), ended_at, "release");
+                crate::observability::policy_audit::spawn_in_request(super::revocation::revoke_expired(
+                    vec![removed],
+                    self.revoker(provider),
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                target: "credential_delegation",
+                surface_variant = surface_variant.as_deref(),
+                grant_id = %grant_id,
+                error = %error,
+                "Failed to remove a delegated grant whose consent ended at its time limit"
+            ),
+        }
+    }
+
     /// The revoker of grants made with `provider`, on no management caller's
     /// behalf: a call's own removals and unkept tokens.
     fn revoker(
@@ -389,7 +498,7 @@ impl ReleaseContext<'_> {
         subject: GrantSubject,
     ) -> Result<DelegatedGrant, Refused> {
         let grant = self
-            .read(key, subject)
+            .read_within_limits(provider, key, subject)
             .await?;
         if !grant.refresh_due_at(Utc::now()) {
             return Ok(grant);
@@ -417,7 +526,7 @@ impl ReleaseContext<'_> {
         rejected: &DelegatedGrant,
     ) -> Result<DelegatedGrant, Refused> {
         let current = self
-            .read(key, subject)
+            .read_within_limits(provider, key, subject)
             .await?;
         if current.access_token != rejected.access_token {
             return Ok(current);
@@ -673,6 +782,7 @@ impl ReleaseContext<'_> {
             .exact_allowlist
             .map(str::to_string);
         let refusal_limit = self.refusal_limit;
+        let max_consent_age_secs = self.max_consent_age_secs;
         let provider = provider.clone();
         let key = key.clone();
         let done = RefreshDone(refresh_notice(&before.id));
@@ -683,6 +793,7 @@ impl ReleaseContext<'_> {
                 secrets: secrets.as_ref(),
                 exact_allowlist: exact_allowlist.as_deref(),
                 refusal_limit,
+                max_consent_age_secs,
             }
             .run_refresh(&provider, &key, subject, claim, forced, &before)
             .await
@@ -1195,14 +1306,120 @@ mod connect_hint_tests {
 
 #[cfg(test)]
 mod use_claim_tests {
-    use super::UseClaim;
+    use super::{UseClaim, record_use_in_background};
+    use crate::delegation_vault::grants::tests::{grant, key};
+    use crate::delegation_vault::storage::{DelegationVaultStorage, FileSystemDelegationVaultStore};
+    use std::sync::Arc;
 
-    #[test]
-    fn a_grant_has_one_use_claim_until_it_is_dropped() {
-        let first = UseClaim::take("claim-grant").expect("first claim");
-        assert!(UseClaim::take("claim-grant").is_none());
-        assert!(UseClaim::take("another-claim-grant").is_some());
+    pub(super) async fn vault(directory: &std::path::Path) -> Arc<dyn DelegationVaultStorage> {
+        crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig {
+            enabled: true,
+            key_env_var: "AG_TEST_MASTER_KEY".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        Arc::new(
+            FileSystemDelegationVaultStore::new(directory.into())
+                .await
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_grant_has_one_use_claim_in_its_vault_until_it_is_dropped() {
+        let (directory, other_directory) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let vault = vault(directory.path()).await;
+        let other = self::vault(other_directory.path()).await;
+        let first = UseClaim::take(&vault, "claim-grant").expect("first claim");
+        assert!(UseClaim::take(&vault, "claim-grant").is_none());
+        assert!(UseClaim::take(&Arc::clone(&vault), "claim-grant").is_none(), "the same vault, shared");
+        assert!(UseClaim::take(&vault, "another-claim-grant").is_some());
+        assert!(UseClaim::take(&other, "claim-grant").is_some(), "another vault's grant of the same id");
         drop(first);
-        assert!(UseClaim::take("claim-grant").is_some());
+        assert!(UseClaim::take(&vault, "claim-grant").is_some());
+    }
+
+    /// Two vaults in one process hold grants of the same id, since the id is
+    /// derived from the grant's key. A use being recorded in one of them does
+    /// not keep the other from recording its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_use_being_recorded_in_one_vault_does_not_stop_another_vaults_record() {
+        let (directory, other_directory) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let other = vault(other_directory.path()).await;
+        let vault = vault(directory.path()).await;
+        let stored = vault
+            .store_grant(grant(&key(), "access"))
+            .await
+            .unwrap()
+            .grant;
+        let _in_flight = UseClaim::take(&other, &stored.id).expect("the other vault's claim");
+
+        record_use_in_background(&vault, &stored, None);
+
+        // The recording task holds the vault's claim until its write has
+        // landed, and the vault is left alone meanwhile: a record is skipped
+        // while the vault is busy.
+        for _ in 0..200 {
+            if UseClaim::take(&vault, &stored.id).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            vault
+                .grant(&key())
+                .await
+                .unwrap()
+                .unwrap()
+                .last_used_at
+                .is_some(),
+            "the vault records its grant's use"
+        );
+    }
+}
+
+#[cfg(test)]
+mod consent_end_tests {
+    use super::ReleaseContext;
+    use super::use_claim_tests::vault;
+    use crate::delegation_vault::grants::tests::{grant, key};
+
+    /// The end of a grant's consent removes only the connection that was
+    /// judged. One made again since is kept, though the vendor handed back
+    /// the same access token, and no expiry is recorded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_end_of_a_grants_consent_keeps_a_connection_made_again_since() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = vault(directory.path()).await;
+        let key = key();
+        let mut judged = grant(&key, "access");
+        judged.created_at = chrono::Utc::now() - chrono::Duration::hours(2);
+        for connection in [judged.clone(), grant(&key, "access")] {
+            vault
+                .store_grant(connection)
+                .await
+                .unwrap();
+        }
+        let provider = crate::delegation_vault::revocation::tests::provider(None, "none", None);
+        let context = ReleaseContext {
+            vault: &vault,
+            secrets: None,
+            exact_allowlist: None,
+            refusal_limit: 3,
+            max_consent_age_secs: None,
+        };
+
+        let ((), events) = crate::audit::producer::capture(context.end_consent(&provider, &key, &judged, None)).await;
+
+        assert!(
+            vault
+                .grant(&key)
+                .await
+                .unwrap()
+                .is_some(),
+            "the connection made again is kept"
+        );
+        assert!(events.is_empty(), "{events:?}");
     }
 }

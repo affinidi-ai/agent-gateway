@@ -287,6 +287,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_claimed_refresh_that_completes_after_its_consent_was_limited_keeps_the_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileSystemDelegationVaultStore::new(directory.path().into())
+            .await
+            .unwrap();
+        let mut token = crate::delegation_vault::tests::make_token(Some(-60), true);
+        let granted = token.consent_granted_at;
+        token.consent_expires_at = Some(granted + chrono::Duration::hours(6));
+        let token = store
+            .store(token)
+            .await
+            .unwrap();
+        let claim = store
+            .claim_refresh(&token, 100)
+            .await
+            .unwrap();
+        let limited_end = granted + chrono::Duration::hours(2);
+        store
+            .limit_consent(&token.id, granted, limited_end)
+            .await
+            .unwrap()
+            .expect("the limit is stored");
+
+        let refreshed = store
+            .complete_refresh(claim, response(), 101)
+            .await
+            .expect("the refresh completes");
+
+        assert_eq!(refreshed.access_token, "refreshed-access");
+        assert_eq!(refreshed.consent_expires_at, Some(limited_end));
+        let stored = store
+            .get(&token.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.consent_expires_at, Some(limited_end));
+    }
+
+    #[tokio::test]
     async fn revoked_replaced_or_scope_widening_refreshes_cannot_publish() {
         for action in ["revoke", "replace", "widen", "expire"] {
             let directory = tempfile::tempdir().unwrap();

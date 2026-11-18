@@ -381,9 +381,13 @@ the gateway authorised, for whom, and under which policy.
 | Trust checks | A trust registry query returns a result to policy |
 | Trace terminated | A surface starts a fresh trace at an organisational boundary; the entry links the two trace IDs |
 | VP injected | The managed agent's identity presentation is attached to a request or response |
-| Token injected | A delegated credential is used on a user's behalf |
 | Consent granted | A user completes consent and a token is stored |
+| Consent ended or revoked | A consent reaches its time limit, or an operator revokes a token or all of a user's tokens |
 | Payments | A delegated agent-pay payment is taken, challenged, held for review, or refused |
+
+Each use of a delegated credential, such as a token injected or refreshed or a prompt for
+consent, is a line of the gateway's log and no audit record; see
+[Delegation events: audited or logged](OBSERVABILITY.md#governance-audit-forwarding).
 
 Entries are written as JSON Lines to a file that is rotated once it reaches its size cap, keeping
 every rotated file beside it by default, so no audit record is deleted; it can also be set to

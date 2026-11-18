@@ -7,11 +7,11 @@ use super::{
 };
 use axum::{
     Extension, Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -741,6 +741,22 @@ fn missing_type_fields(provider: &CredentialProvider) -> Option<Response> {
         .map(|message| (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": message }))).into_response())
 }
 
+/// Refuses a consent time limit of `secs` outside one minute to 365 days, and
+/// one on a provider of a type nobody consents to (`takes_consent` false).
+fn consent_limit_error(
+    takes_consent: bool,
+    secs: Option<u64>,
+) -> Option<Response> {
+    let secs = secs?;
+    let refusal = if takes_consent {
+        crate::config::credential_policy::validate_max_consent_age("max_consent_age_secs", secs).err()?
+    } else {
+        "max_consent_age_secs is set only on an oauth2_authorization_code provider, the type a person consents to"
+            .to_string()
+    };
+    Some((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": refusal }))).into_response())
+}
+
 /// The consent-flow rules a provider passes before it is stored: an
 /// `authorization_response_issuer` only where allowed, and for an authorization
 /// code provider without an `issuer`, an authorization endpoint, when it has
@@ -909,7 +925,11 @@ pub async fn create_provider(
         scope_comparison: req.scope_comparison,
         revocation_ends_authorization: req.revocation_ends_authorization,
         send_resource: req.send_resource,
+        max_consent_age_secs: req
+            .max_consent_age_secs
+            .filter(|secs| *secs != 0),
         consent_confirmation: req.consent_confirmation,
+        deactivated_at: None,
         created_at: now,
         updated_at: now,
     };
@@ -918,6 +938,9 @@ pub async fn create_provider(
         return error.into_response();
     }
     if let Some(response) = missing_type_fields(&provider) {
+        return response;
+    }
+    if let Some(response) = consent_limit_error(provider.takes_consent(), provider.max_consent_age_secs) {
         return response;
     }
 
@@ -1281,14 +1304,24 @@ pub async fn update_provider(
         scope_comparison: existing.scope_comparison,
         revocation_ends_authorization: existing.revocation_ends_authorization,
         send_resource: existing.send_resource,
+        // A `0` in the request removes the stored limit.
+        max_consent_age_secs: match req.max_consent_age_secs {
+            Some(0) => None,
+            Some(secs) => Some(secs),
+            None => existing.max_consent_age_secs,
+        },
         consent_confirmation: req
             .consent_confirmation
             .unwrap_or(existing.consent_confirmation),
+        deactivated_at: existing.deactivated_at,
         created_at: existing.created_at,
         updated_at: Utc::now(),
     };
 
     if let Some(response) = missing_type_fields(&updated) {
+        return response;
+    }
+    if let Some(response) = consent_limit_error(updated.takes_consent(), updated.max_consent_age_secs) {
         return response;
     }
 
@@ -1332,6 +1365,13 @@ pub async fn update_provider(
     if let Err(error) = refuse_gone_secrets(&state, &updated).await {
         return error.into_response();
     }
+    let updated = match stored_deactivation(&state, &updated.id).await {
+        Ok(deactivated_at) => CredentialProvider {
+            deactivated_at: deactivated_at.filter(|_| updated.takes_consent()),
+            ..updated
+        },
+        Err(refused) => return *refused,
+    };
 
     match state
         .store
@@ -1342,6 +1382,30 @@ pub async fn update_provider(
         Err(e) => {
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Failed to update: {}", e)})))
                 .into_response()
+        }
+    }
+}
+
+/// When provider `id` was deactivated, as it is stored now, or the answer that
+/// refuses when it is gone. An update reads it once it holds the provider
+/// lock, so it keeps a deactivation stored while it was being checked, and
+/// drops it only when the provider is retyped to one nobody consents to.
+async fn stored_deactivation(
+    state: &CredentialProviderState,
+    id: &str,
+) -> Result<Option<DateTime<Utc>>, Box<Response>> {
+    match state.store.get(id).await {
+        Ok(Some(stored)) => Ok(stored.deactivated_at),
+        Ok(None) => Err(Box::new(
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Credential provider not found"})))
+                .into_response(),
+        )),
+        Err(error) => {
+            warn!(target: "credential_delegation", id = %id, error = %error, "Failed to read a credential provider before its update");
+            Err(Box::new(
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to update"})))
+                    .into_response(),
+            ))
         }
     }
 }
@@ -1423,11 +1487,150 @@ pub async fn delete_provider(
         .0
 }
 
+/// POST /api/v1/credential-providers/{id}/deactivate
+pub async fn deactivate_provider(
+    State(state): State<CredentialProviderState>,
+    Path(id): Path<String>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+    caller: Option<Extension<AuthGuardOk>>,
+) -> impl IntoResponse {
+    set_provider_active(&state, &id, &context, &scope, caller.as_ref(), false).await
+}
+
+/// POST /api/v1/credential-providers/{id}/activate
+pub async fn activate_provider(
+    State(state): State<CredentialProviderState>,
+    Path(id): Path<String>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+    caller: Option<Extension<AuthGuardOk>>,
+) -> impl IntoResponse {
+    set_provider_active(&state, &id, &context, &scope, caller.as_ref(), true).await
+}
+
+/// The consent time limit a caller asks about before saving it.
+#[derive(Debug, serde::Deserialize)]
+pub struct ConsentImpactQuery {
+    /// Seconds, as a save takes them: `0` for no limit on the provider.
+    max_consent_age_secs: u64,
+}
+
+/// GET /api/v1/credential-providers/{id}/consent-impact?max_consent_age_secs=<seconds>
+///
+/// How many consents to provider `id` have not ended, and how many of them
+/// saving the limit asked about would end at once. Answered only to a caller
+/// who may save it, and refused as that save would be.
+pub async fn consent_impact(
+    State(state): State<CredentialProviderState>,
+    Path(id): Path<String>,
+    Query(query): Query<ConsentImpactQuery>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> Response {
+    let provider = match changeable_provider(&state, &id, &context, &scope).await {
+        Ok(provider) => provider,
+        Err(refused) => return *refused,
+    };
+    let tried_secs = (query.max_consent_age_secs > 0).then_some(query.max_consent_age_secs);
+    if let Some(refused) = consent_limit_error(provider.takes_consent(), tried_secs) {
+        return refused;
+    }
+    let Some(vault) = state.vault.as_deref() else {
+        return (StatusCode::OK, Json(crate::delegation_vault::sweep::ConsentImpact::default())).into_response();
+    };
+    match crate::delegation_vault::sweep::consent_impact(
+        vault,
+        state.surfaces.as_deref(),
+        &provider,
+        tried_secs,
+        Utc::now(),
+    )
+    .await
+    {
+        Ok(impact) => (StatusCode::OK, Json(impact)).into_response(),
+        Err(error) => {
+            warn!(
+                target: "credential_delegation",
+                provider_id = %provider.id,
+                error = %error,
+                "Failed to count the consents a consent time limit would end"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to count the provider's consents"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Deactivate provider `id`, or make it active again, for the caller of
+/// `context` and `scope`. A deactivated provider takes no new consent; the
+/// credentials people already consented to, and the provider's record, are
+/// left as they are. Only a provider a person consents to can be deactivated,
+/// and one already in the state asked for is answered as it is. The provider
+/// lock is held from the read of the provider to its save, so the change is
+/// made to the record as another write left it.
+async fn set_provider_active(
+    state: &CredentialProviderState,
+    id: &str,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+    caller: Option<&Extension<AuthGuardOk>>,
+    active: bool,
+) -> Response {
+    if let Err(refused) = changeable_provider(state, id, context, scope).await {
+        return *refused;
+    }
+    let _bindings = crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await;
+    let mut provider = match changeable_provider(state, id, context, scope).await {
+        Ok(provider) => provider,
+        Err(refused) => return *refused,
+    };
+    if !provider.takes_consent() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Only an oauth2_authorization_code provider, the type a person consents to, can be deactivated",
+                "code": "provider_takes_no_consent",
+            })),
+        )
+            .into_response();
+    }
+    if provider.is_deactivated() != active {
+        return (StatusCode::OK, Json(provider_body(&provider))).into_response();
+    }
+    // `updated_at` stays as it is: a `2026-07-28` consent is bound to a digest
+    // of its provider's record, and a deactivation must leave it valid.
+    provider.deactivated_at = (!active).then(Utc::now);
+    match state
+        .store
+        .update(provider)
+        .await
+    {
+        Ok(saved) => {
+            info!(
+                target: "credential_delegation",
+                id = %id,
+                actor = caller.map(|Extension(AuthGuardOk(user_id))| user_id.as_str()),
+                active,
+                "Credential provider activation changed via API"
+            );
+            (StatusCode::OK, Json(provider_body(&saved))).into_response()
+        }
+        Err(error) => {
+            warn!(target: "credential_delegation", id = %id, error = %error, "Failed to change a credential provider's activation");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to update"}))).into_response()
+        }
+    }
+}
+
 /// Provider `id` as stored now, when the caller of `context` and `scope` may
-/// delete it, or the answer that refuses. Read again once the provider lock is
-/// held, as a tenant move or another delete may have changed it while the
-/// caller waited for the lock.
-async fn deletable_provider(
+/// delete or deactivate it, or the answer that refuses. A delete reads it
+/// again once the provider lock is held, as a tenant move or another delete
+/// may have changed it while the caller waited for the lock.
+async fn changeable_provider(
     state: &CredentialProviderState,
     id: &str,
     context: &Option<Extension<PatTenantContext>>,
@@ -1485,14 +1688,14 @@ async fn remove_provider(
     scope: &Option<Extension<PatResourceScope>>,
     actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
 ) -> (Response, Option<tokio::task::JoinHandle<()>>) {
-    if let Err(refused) = deletable_provider(state, id, context, scope).await {
+    if let Err(refused) = changeable_provider(state, id, context, scope).await {
         return (*refused, None);
     }
     // Held, with the task that deletes the provider's grants, until the
     // provider is deleted, so no surface write binds it after the check below
     // found it unbound.
     let bindings = Arc::new(crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await);
-    let existing = match deletable_provider(state, id, context, scope).await {
+    let existing = match changeable_provider(state, id, context, scope).await {
         Ok(provider) => provider,
         Err(refused) => return (*refused, None),
     };
@@ -2128,6 +2331,437 @@ mod jwt_provider_tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "the rule holds on the merged provider: {body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_consent_provider_takes_a_time_limit_that_an_update_keeps_changes_or_removes() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, body) =
+            create(&state, with(authorization_code("github"), json!({"max_consent_age_secs": 21_600}))).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["max_consent_age_secs"], 21_600);
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (status, body) = update(&state, &id, json!({"description": "kept"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["max_consent_age_secs"], 21_600, "left out, the limit is kept");
+        let (status, body) = update(&state, &id, json!({"max_consent_age_secs": 3_600})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["max_consent_age_secs"], 3_600);
+        for refused in [59, 31_536_001] {
+            let (status, body) = update(&state, &id, json!({"max_consent_age_secs": refused})).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}: {body}");
+            assert_eq!(
+                body["error"],
+                format!("max_consent_age_secs must be from 60 to 31536000, got {refused}"),
+                "{refused}"
+            );
+        }
+        let (status, body) = update(&state, &id, json!({"max_consent_age_secs": 0})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.get("max_consent_age_secs")
+                .is_none(),
+            "0 removes the limit: {body}"
+        );
+
+        let (status, body) =
+            create(&state, with(authorization_code("unlimited"), json!({"max_consent_age_secs": 0}))).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(
+            body.get("max_consent_age_secs")
+                .is_none(),
+            "{body}"
+        );
+        let (status, body) =
+            create(&state, with(authorization_code("too-short"), json!({"max_consent_age_secs": 30}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "max_consent_age_secs must be from 60 to 31536000, got 30");
+
+        let mut service = authorization_code("svc");
+        service["provider_type"] = json!("oauth2_client_credentials");
+        service["max_consent_age_secs"] = json!(3_600);
+        let (status, body) = create(&state, service).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["error"],
+            "max_consent_age_secs is set only on an oauth2_authorization_code provider, the type a person consents to"
+        );
+    }
+
+    async fn impact(
+        state: &CredentialProviderState,
+        id: &str,
+        secs: u64,
+        context: Option<Extension<PatTenantContext>>,
+    ) -> (StatusCode, Value) {
+        let query = Query(ConsentImpactQuery { max_consent_age_secs: secs });
+        body_of(consent_impact(State(state.clone()), Path(id.into()), query, context, None).await).await
+    }
+
+    /// A consent to provider `id`, given `hours_ago`, as the vault stores it.
+    fn consent_given(
+        id: &str,
+        hours_ago: i64,
+    ) -> crate::delegation_vault::DelegationToken {
+        let given = Utc::now() - chrono::Duration::hours(hours_ago);
+        serde_json::from_value(json!({
+            "id": format!("token-{hours_ago}"), "agent_did": "did:web:agent.example",
+            "user_identity_hash": format!("sha256:user-{hours_ago}"), "credential_provider_id": id,
+            "provider_id": "github", "access_token": format!("access-{hours_ago}"), "token_type": "Bearer",
+            "scopes": ["repo"], "consent_granted_at": given, "created_at": given, "updated_at": given,
+        }))
+        .unwrap()
+    }
+
+    /// Before a shorter consent time limit is saved, the gateway says how many
+    /// of the provider's active consents saving it would end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_consent_time_limit_is_counted_against_the_active_consents_before_it_is_saved() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = with_key_material(&directory).await;
+        let vault = Arc::new(
+            crate::delegation_vault::storage::FileSystemDelegationVaultStore::new(directory.path().join("vault"))
+                .await
+                .unwrap(),
+        );
+        state.vault = Some(vault.clone());
+        let (status, body) =
+            create(&state, with(authorization_code("github"), json!({"max_consent_age_secs": 21_600}))).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for hours_ago in [1, 3, 7] {
+            crate::delegation_vault::storage::DelegationVaultStorage::store(
+                vault.as_ref(),
+                consent_given(&id, hours_ago),
+            )
+            .await
+            .unwrap();
+        }
+
+        let shorter = impact(&state, &id, 7_200, None).await;
+        let longer = impact(&state, &id, 86_400, None).await;
+        let none = impact(&state, &id, 0, None).await;
+
+        assert_eq!(shorter, (StatusCode::OK, json!({"active_consents": 2, "ending_consents": 1})));
+        assert_eq!(longer, (StatusCode::OK, json!({"active_consents": 2, "ending_consents": 0})));
+        assert_eq!(none, (StatusCode::OK, json!({"active_consents": 2, "ending_consents": 0})));
+        let stored = get_provider(State(state.clone()), Path(id.clone()), None, None)
+            .await
+            .into_response();
+        assert_eq!(body_of(stored).await.1["max_consent_age_secs"], 21_600, "asking saves nothing");
+    }
+
+    /// The question is refused as the save it is asked for would be, and is
+    /// answered only for a provider the caller may change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_consent_impact_is_refused_as_the_save_would_be() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (_, consented) = create(&state, authorization_code("github")).await;
+        let consented = consented["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, service) = create(&state, jwt_bearer("vertex")).await;
+        assert_eq!(status, StatusCode::CREATED, "{service}");
+        let service = service["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let tenant = Some(Extension(PatTenantContext {
+            token_id: "token-tenant-a".into(),
+            tenant_id: "tenant-a".into(),
+        }));
+
+        let without_vault = impact(&state, &consented, 3_600, None).await;
+        let too_short = impact(&state, &consented, 30, None).await;
+        let no_consent = impact(&state, &service, 3_600, None).await;
+        let no_consent_and_no_limit = impact(&state, &service, 0, None).await;
+        let missing = impact(&state, "no-such-provider", 3_600, None).await;
+        let not_the_tenants = impact(&state, &consented, 3_600, tenant).await;
+
+        assert_eq!(without_vault, (StatusCode::OK, json!({"active_consents": 0, "ending_consents": 0})));
+        assert_eq!(
+            too_short,
+            (StatusCode::BAD_REQUEST, json!({"error": "max_consent_age_secs must be from 60 to 31536000, got 30"}))
+        );
+        assert_eq!(no_consent.0, StatusCode::BAD_REQUEST, "{}", no_consent.1);
+        assert_eq!(
+            no_consent.1["error"],
+            "max_consent_age_secs is set only on an oauth2_authorization_code provider, the type a person consents to"
+        );
+        assert_eq!(no_consent_and_no_limit, (StatusCode::OK, json!({"active_consents": 0, "ending_consents": 0})));
+        assert_eq!(missing, (StatusCode::NOT_FOUND, json!({"error": "Credential provider not found"})));
+        assert_eq!(not_the_tenants.0, StatusCode::FORBIDDEN, "{}", not_the_tenants.1);
+    }
+
+    async fn set_active(
+        state: &CredentialProviderState,
+        id: &str,
+        active: bool,
+    ) -> (StatusCode, Value) {
+        let response = if active {
+            activate_provider(State(state.clone()), Path(id.into()), None, None, None)
+                .await
+                .into_response()
+        } else {
+            deactivate_provider(State(state.clone()), Path(id.into()), None, None, None)
+                .await
+                .into_response()
+        };
+        body_of(response).await
+    }
+
+    /// A provider a person consents to is deactivated and activated again
+    /// without being deleted: its record stays, an update keeps the state,
+    /// and asking for the state it is already in changes nothing. A provider
+    /// nobody consents to cannot be deactivated.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_consent_provider_is_deactivated_and_activated_again_and_never_deleted_by_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, body) = create(&state, authorization_code("github")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(
+            body.get("deactivated_at")
+                .is_none(),
+            "{body}"
+        );
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (status, deactivated) = set_active(&state, &id, false).await;
+        assert_eq!(status, StatusCode::OK, "{deactivated}");
+        let at = deactivated["deactivated_at"].clone();
+        assert!(at.is_string(), "{deactivated}");
+        assert_eq!(deactivated["name"], "GitHub", "the record is kept whole");
+        let (status, again) = set_active(&state, &id, false).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(again["deactivated_at"], at, "already deactivated: nothing changes");
+
+        let (status, updated) = update(&state, &id, json!({"description": "still here"})).await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["deactivated_at"], at, "an update keeps the provider deactivated");
+        let stored = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .expect("a deactivated provider is still stored");
+        assert!(stored.is_deactivated());
+
+        let (status, active) = set_active(&state, &id, true).await;
+        assert_eq!(status, StatusCode::OK, "{active}");
+        assert!(
+            active
+                .get("deactivated_at")
+                .is_none(),
+            "{active}"
+        );
+
+        let mut service = authorization_code("svc");
+        service["provider_type"] = json!("oauth2_client_credentials");
+        let (status, body) = create(&state, service).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, refused) = set_active(&state, body["id"].as_str().unwrap(), false).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+        assert_eq!(refused["code"], "provider_takes_no_consent");
+
+        let (status, _) = set_active(&state, "no-such-provider", false).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A deactivated provider retyped to one nobody consents to is no longer
+    /// deactivated: there is no consent left to stop, and such a provider
+    /// can be neither deactivated nor activated.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deactivated_provider_retyped_to_take_no_consent_is_no_longer_deactivated() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, body) = create(&state, authorization_code("github")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, deactivated) = set_active(&state, &id, false).await;
+        assert_eq!(status, StatusCode::OK, "{deactivated}");
+
+        let (status, retyped) = update(&state, &id, json!({"provider_type": "oauth2_client_credentials"})).await;
+
+        assert_eq!(status, StatusCode::OK, "{retyped}");
+        assert_eq!(retyped["provider_type"], "oauth2_client_credentials");
+        assert!(
+            retyped
+                .get("deactivated_at")
+                .is_none(),
+            "{retyped}"
+        );
+        let stored = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!stored.is_deactivated());
+    }
+
+    /// A provider store whose provider someone deactivates right after it is
+    /// first read: what an update sees when a deactivation is stored while
+    /// the update is being checked.
+    struct DeactivatedAfterFirstRead(Arc<dyn CredentialProviderStorage>, std::sync::atomic::AtomicBool);
+
+    #[async_trait::async_trait]
+    impl CredentialProviderStorage for DeactivatedAfterFirstRead {
+        async fn get(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<CredentialProvider>> {
+            let found = self.0.get(id).await?;
+            if let Some(provider) = &found
+                && !self
+                    .1
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let mut deactivated = provider.clone();
+                deactivated.deactivated_at = Some(Utc::now());
+                self.0
+                    .update(deactivated)
+                    .await?;
+            }
+            Ok(found)
+        }
+
+        async fn get_checked(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<CredentialProvider>> {
+            self.0.get_checked(id).await
+        }
+
+        async fn create(
+            &self,
+            provider: CredentialProvider,
+        ) -> anyhow::Result<CredentialProvider> {
+            self.0.create(provider).await
+        }
+
+        async fn list(&self) -> anyhow::Result<Vec<CredentialProvider>> {
+            self.0.list().await
+        }
+
+        async fn update(
+            &self,
+            provider: CredentialProvider,
+        ) -> anyhow::Result<CredentialProvider> {
+            self.0.update(provider).await
+        }
+
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<bool> {
+            self.0.delete(id).await
+        }
+
+        async fn find_by_provider_id(
+            &self,
+            tenant_id: Option<&str>,
+            provider_id: &str,
+        ) -> anyhow::Result<Option<CredentialProvider>> {
+            self.0
+                .find_by_provider_id(tenant_id, provider_id)
+                .await
+        }
+    }
+
+    /// An update keeps a deactivation stored while the update was being
+    /// checked: it stores the state the provider has once the update holds
+    /// the provider lock, not the one it read at its start.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_keeps_a_deactivation_stored_while_it_was_being_checked() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = with_key_material(&directory).await;
+        let (status, body) = create(&state, authorization_code("github")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        state.store = Arc::new(DeactivatedAfterFirstRead(state.store.clone(), Default::default()));
+
+        let (status, updated) = update(&state, &id, json!({"description": "edited meanwhile"})).await;
+
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["description"], "edited meanwhile");
+        assert!(updated["deactivated_at"].is_string(), "{updated}");
+        let stored = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.is_deactivated(), "the update did not undo the deactivation");
+        assert_eq!(stored.description.as_deref(), Some("edited meanwhile"));
+    }
+
+    /// A deactivation waits for a provider write that holds the provider
+    /// lock, and keeps what that write stored: it changes the provider as it
+    /// is stored once the lock is its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deactivation_keeps_an_edit_stored_while_it_waited() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, body) = create(&state, authorization_code("github")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let writing = crate::identity::handlers::surface_grants::hold_provider_bindings().await;
+        let deactivating = tokio::spawn({
+            let state = state.clone();
+            let id = id.clone();
+            async move { set_active(&state, &id, false).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while futures::FutureExt::now_or_never(crate::identity::handlers::surface_grants::hold_provider_bindings())
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the deactivation queues for the exclusive bindings lock");
+        assert!(!deactivating.is_finished(), "the deactivation waits for the write that holds the lock");
+        let mut edited = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        edited.description = Some("edited meanwhile".into());
+        state
+            .store
+            .update(edited)
+            .await
+            .unwrap();
+        drop(writing);
+
+        let (status, deactivated) = deactivating.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{deactivated}");
+        assert!(deactivated["deactivated_at"].is_string(), "{deactivated}");
+        assert_eq!(deactivated["description"], "edited meanwhile", "the edit is kept");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

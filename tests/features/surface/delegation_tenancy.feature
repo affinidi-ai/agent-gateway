@@ -13,18 +13,18 @@ Feature: Tenant reads of delegation vault tokens and audit records
     And tenant "tenant-a" owns the credential provider "calendar-a"
     And tenant "tenant-b" owns the credential provider "calendar-b"
     And the appliance-wide credential provider "calendar-global" exists
-    And the audit log holds a token injection of each credential provider and a revoke naming no provider
+    And the audit log holds a consent granted for each credential provider and a revoke naming no provider
     And the delegation vault holds a token of each credential provider
 
   Scenario: A tenant token reads only its own tenant's records in the Credential Delegation Audit Log
     When a token of tenant "tenant-a" reads the Credential Delegation Audit Log
     Then the audit read response status is 200
-    And the audit read shows only the token injection of credential provider "calendar-a"
+    And the audit read shows only the consent granted for credential provider "calendar-a"
 
   Scenario: A tenant token reads only its own tenant's records in the VP Audit Log
     When a token of tenant "tenant-a" reads the VP Audit Log
     Then the audit read response status is 200
-    And the audit read shows only the token injection of credential provider "calendar-a"
+    And the audit read shows only the consent granted for credential provider "calendar-a"
 
   Scenario: An access token scoped by required headers alone reads no record in the Credential Delegation Audit Log
     When an access token scoped by required headers alone reads the Credential Delegation Audit Log
@@ -35,13 +35,13 @@ Feature: Tenant reads of delegation vault tokens and audit records
     Given operator "ada" has the "administrator" role
     When administrator "ada" reads the Credential Delegation Audit Log
     Then the audit read response status is 200
-    And the audit read shows the token injection of every credential provider and the revoke naming no provider
+    And the audit read shows the consent granted for every credential provider and the revoke naming no provider
 
   Scenario: An administrator reads every tenant's records in the VP Audit Log
     Given operator "ada" has the "administrator" role
     When administrator "ada" reads the VP Audit Log
     Then the audit read response status is 200
-    And the audit read shows the token injection of every credential provider and the revoke naming no provider
+    And the audit read shows the consent granted for every credential provider and the revoke naming no provider
 
   Scenario: A tenant token lists only its own tenant's vault tokens
     When a token of tenant "tenant-a" lists the delegation vault

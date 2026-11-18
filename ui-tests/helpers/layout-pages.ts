@@ -48,8 +48,8 @@ const CREDENTIALS_TABS = tabs('credentials', [
     'jwt-verification',
     'credential-providers',
     'credential-tokens',
+    'delegated-access',
     'sts-clients',
-    'credential-audit',
 ]);
 const CREDENTIALS = ['credentials-search-input', ...CREDENTIALS_TABS];
 
@@ -146,7 +146,7 @@ const SIDEBAR_PAGES: LayoutPage[] = [
         actions: [
             ...CREDENTIALS,
             'credential-providers-add-button',
-            `credential-provider-delete-button-${FIXTURE_ID.credentialProvider}`,
+            `credential-provider-deactivate-button-${FIXTURE_ID.credentialProvider}`,
         ],
     },
     {
@@ -155,8 +155,20 @@ const SIDEBAR_PAGES: LayoutPage[] = [
         testIds: ['page-credentials', `credential-token-row-${FIXTURE_ID.delegationToken}`],
         actions: [
             ...CREDENTIALS,
+            `credential-token-expand-button-${FIXTURE_ID.delegationToken}`,
             `credential-token-revoke-user-button-${FIXTURE_ID.delegationToken}`,
+            `credential-token-limit-button-${FIXTURE_ID.delegationToken}`,
             `credential-token-revoke-button-${FIXTURE_ID.delegationToken}`,
+        ],
+    },
+    {
+        id: 'credentials-delegated-access',
+        route: '/credentials?tab=delegated-access',
+        testIds: ['page-credentials', `delegated-access-row-${FIXTURE_ID.delegationToken}`],
+        actions: [
+            ...CREDENTIALS,
+            'delegated-access-history-button',
+            `delegated-access-revoke-button-${FIXTURE_ID.delegationToken}`,
         ],
     },
     {
@@ -168,18 +180,6 @@ const SIDEBAR_PAGES: LayoutPage[] = [
             'sts-clients-add-button',
             `sts-client-edit-button-${FIXTURE_ID.stsClient}`,
             `sts-client-delete-button-${FIXTURE_ID.stsClient}`,
-        ],
-    },
-    {
-        id: 'credentials-credential-audit',
-        route: '/credentials?tab=credential-audit',
-        testIds: ['page-credentials', 'credential-audit-row-0'],
-        actions: [
-            ...CREDENTIALS,
-            'credential-audit-event-filter',
-            'credential-audit-refresh-button',
-            'credential-audit-row-0',
-            'credential-audit-provider-link-0',
         ],
     },
     {
