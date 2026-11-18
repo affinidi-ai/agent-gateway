@@ -1790,7 +1790,8 @@ search and category filter is the shared `SearchInput` and `FilterChipGroup`
 panels are a `card shadow mb-4` with the standard `card-header py-3` title (`h6 m-0
 font-weight-bold text-primary`) and their description in the body. A policy Type's name comes
 from the one `POLICY_TYPE_NAMES` map in `policyTemplates/types.ts`, and the editor sets no
-inline `style`. The exceptions are the selectable `.policy-template-row` cards and rows, `nav-link`
+inline `style` except `SearchInput`'s `wrapperStyle` for the full-width column search, as
+`LogsFilterBar` does. The exceptions are the selectable `.policy-template-row` cards and rows, `nav-link`
 tabs, the Rego reference heading toggle, `btn-close`, Back, the Rego view's package-mismatch
 alert with **Fix it** (Bootstrap `alert-danger`), and the Rules view's
 rule-kind badges (`.policy-rules__kind`, a neutral `--muted-text` outline for every kind, so a
