@@ -244,6 +244,36 @@ test.describe('Managed Agent Target authentication: credential provider', () => 
         });
     });
 
+    test('a stored format that ends in a line break blocks Save, before and after the editor is opened', async ({page}) => {
+        const saved: Request[] = [];
+        const stored = {
+            method: {
+                credential_provider: {
+                    provider_id: 'prov-1',
+                    header_name: 'X-Partner-Token',
+                    header_format: 'Token {value}\n',
+                },
+            },
+            auth_type: 'custom',
+            fallback: 'reject',
+        };
+        await mockSurface(page, surfaceFixture({auth: stored}), saved);
+        await page.goto(`${BASE_URL}/surfaces/${SURFACE_ID}`);
+        await expect(page.getByTestId('surface-node-target')).toBeVisible();
+        await saveButton(page).click();
+        await expectSaveBlocked(page, 'Header format must not contain CR, LF or NUL');
+        expect(saved).toHaveLength(0);
+
+        await page.getByTestId('surface-node-target').click();
+        await page.getByRole('button', {name: /Configure/}).click();
+        await expect(page.getByTestId('managed-agent-target-auth-header-format-error')).toHaveText(
+            'Header format must not contain CR, LF or NUL',
+        );
+        await saveButton(page).click();
+        await expectSaveBlocked(page, 'Header format must not contain CR, LF or NUL');
+        expect(saved).toHaveLength(0);
+    });
+
     test('a Managed Agent credential on an http Target shows an advisory and still saves', async ({page}) => {
         const saved: Request[] = [];
         await mockSurface(page, surfaceFixture({endpoint: 'http://agent.example.com'}), saved);

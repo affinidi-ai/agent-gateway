@@ -33,6 +33,14 @@ export function isTargetAuthProviderType(providerType: unknown): boolean {
   return typeof providerType === 'string' && TARGET_AUTH_PROVIDER_TYPES.includes(providerType);
 }
 
+/**
+ * A header name or format without the spaces and tabs typed around it. A line break or NUL
+ * stays, so the header rules report one that a stored setting has.
+ */
+export function trimSpaces(value: string): string {
+  return value.replace(/^[ \t]+|[ \t]+$/g, '');
+}
+
 /** The wire `target_auth` of a provider method, or undefined when no provider is picked. */
 export function providerTargetAuthToApi(auth: ProviderTargetAuth) {
   const providerId = auth.providerId.trim();
@@ -41,8 +49,8 @@ export function providerTargetAuthToApi(auth: ProviderTargetAuth) {
     method: {
       credential_provider: {
         provider_id: providerId,
-        header_name: auth.headerName.trim() || PROVIDER_TARGET_AUTH_DEFAULTS.headerName,
-        header_format: auth.headerFormat.trim() || PROVIDER_TARGET_AUTH_DEFAULTS.headerFormat,
+        header_name: trimSpaces(auth.headerName) || PROVIDER_TARGET_AUTH_DEFAULTS.headerName,
+        header_format: trimSpaces(auth.headerFormat) || PROVIDER_TARGET_AUTH_DEFAULTS.headerFormat,
         ...(auth.scopes ? { scopes: auth.scopes } : {}),
       },
     },

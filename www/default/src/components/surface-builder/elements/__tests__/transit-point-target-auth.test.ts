@@ -5,6 +5,7 @@ import {
   TP_CALLER_CHECK_PROBLEM,
   UNKNOWN_METHOD_NOTE,
   storedTargetAuth,
+  targetAuthHeader,
 } from '../_shared/providerTargetAuth';
 import {
   staticSecretAuthType,
@@ -94,6 +95,52 @@ describe('Transit Point Target authentication validation', () => {
       errors: { auth_header_name: 'Header name must not be the reserved header Host' },
       advisories: [TARGET_AUTH_HTTPS_PROBLEM],
       notes: [],
+    });
+  });
+
+  describe('a header name or format with something around it', () => {
+    const methods: Array<[string, Record<string, unknown>]> = [
+      ['a static secret', { auth_type: 'custom_header', auth_secret: 's' }],
+      ['a credential provider', { auth_type: 'credential_provider', auth_provider_id: 'prov-1' }],
+    ];
+
+    it.each(methods)(
+      'blocks a line break at the end for %s on an opened Transit Point, as on an unopened one',
+      (_, method) => {
+        const errors = {
+          auth_header_name: 'Header name must be an HTTP header name',
+          auth_header_format: 'Header format must not contain CR, LF or NUL',
+        };
+        const opened = tp({
+          ...method,
+          auth_header_name: 'X-Auth\r\n',
+          auth_header_format: 'Token {value}\n',
+        });
+        expect(transitPointTargetAuthProblems(opened).errors).toEqual(errors);
+        expect(targetAuthHeader(transitPointTargetAuth(opened))).toEqual({
+          headerName: 'X-Auth\r\n',
+          headerFormat: 'Token {value}\n',
+        });
+
+        const unopened = {
+          target_endpoint: 'https://partner.example.com',
+          _stored_target_auth: storedTargetAuth(transitPointTargetAuth(opened)),
+        };
+        expect(transitPointTargetAuthProblems(unopened).errors).toEqual(errors);
+      }
+    );
+
+    it.each(methods)('drops the spaces and tabs typed around it for %s', (_, method) => {
+      const typed = tp({
+        ...method,
+        auth_header_name: ' X-Auth ',
+        auth_header_format: '\tToken {value} ',
+      });
+      expect(transitPointTargetAuthProblems(typed).errors).toEqual({});
+      expect(targetAuthHeader(transitPointTargetAuth(typed))).toEqual({
+        headerName: 'X-Auth',
+        headerFormat: 'Token {value}',
+      });
     });
   });
 

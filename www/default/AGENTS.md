@@ -607,7 +607,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
     canvas data lists a different number of Transit Points names no node.
   - **A stored problem blocks too.** The gateway refuses a header name, format or clash problem
     on every save, one in a stored setting the operator did not edit included, so the dashboard
-    shows it as an error next to its field and blocks Save until it is fixed.
+    shows it as an error next to its field and blocks Save until it is fixed. The editors drop
+    only the spaces and tabs around a header name or format (`trimSpaces`), never a line break or
+    NUL, so a stored value that ends in one is reported whether or not its panel was opened.
   - **Advisories that allow Save.** A Target that is not `https://` (`http://`, `fabric://` and
     `a2a-proxy://` are not) and a leg that authenticates no caller (an Access Point with no source
     authentication, a Transit Point that authenticates no caller) are shown as an advisory

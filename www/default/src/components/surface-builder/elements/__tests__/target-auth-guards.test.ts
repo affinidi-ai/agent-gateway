@@ -11,6 +11,7 @@ import {
   PASSTHROUGH_NOTE,
   TARGET_AUTH_HTTPS_PROBLEM,
   UNKNOWN_METHOD_NOTE,
+  targetAuthHeader,
 } from '../_shared/providerTargetAuth';
 import {
   managedAgentTargetAuth,
@@ -172,6 +173,44 @@ describe('Managed Agent Target authentication validation', () => {
       target_auth_header_format: '{value}',
     });
     expect(fixed.errors).toEqual({});
+  });
+
+  it('blocks a stored line break at the end of a provider header name or format, and drops typed spaces', () => {
+    const config: any = managedAgentDefinition.configFromPayload!(
+      {
+        endpoint: 'https://agent.example.com',
+        auth: {
+          method: {
+            credential_provider: {
+              provider_id: 'prov-1',
+              header_name: 'X-Partner-Token\r\n',
+              header_format: 'Token {value}\n',
+            },
+          },
+          fallback: 'reject',
+        },
+      },
+      {}
+    );
+    expect(managedAgentTargetAuthProblems(config).errors).toEqual({
+      target_auth_header_name: 'Header name must be an HTTP header name',
+      target_auth_header_format: 'Header format must not contain CR, LF or NUL',
+    });
+    expect(targetAuthHeader(managedAgentTargetAuth(config))).toEqual({
+      headerName: 'X-Partner-Token\r\n',
+      headerFormat: 'Token {value}\n',
+    });
+
+    const typed = {
+      ...config,
+      target_auth_header_name: ' X-Partner-Token ',
+      target_auth_header_format: '\tToken {value} ',
+    };
+    expect(managedAgentTargetAuthProblems(typed).errors).toEqual({});
+    expect(targetAuthHeader(managedAgentTargetAuth(typed))).toEqual({
+      headerName: 'X-Partner-Token',
+      headerFormat: 'Token {value}',
+    });
   });
 });
 

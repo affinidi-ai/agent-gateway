@@ -22,7 +22,8 @@ changes:
         The Surface Builder applies the gateway's Target authentication rules while editing and
         shows each problem next to its field. A header name, header format or header clash
         problem blocks Save, in a stored setting the operator did not edit and in a variant
-        that is not on screen too, since the gateway refuses it on every save. The toast of a
+        that is not on screen too, since the gateway refuses it on every save. A stored name or
+        format that ends in a line break is reported as well, not trimmed away. The toast of a
         header clash offers Show me, which opens the Managed Agent or the Transit Point that has
         it. A Target that is not https, a leg that authenticates
         no caller and a fallback that passes a request through without the credential show an

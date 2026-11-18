@@ -10,6 +10,7 @@ import {
   noTargetAuthProblems,
   parseScopes,
   providerTargetAuthToApi,
+  trimSpaces,
 } from '../_shared/providerTargetAuth';
 import { authenticatesCallers } from './callerAuth';
 
@@ -49,6 +50,10 @@ function untrimmed(value: unknown): string {
   return typeof value === 'string' ? value : '';
 }
 
+function header(value: unknown): string {
+  return trimSpaces(untrimmed(value));
+}
+
 function editedTargetAuth(c: TransitPointTargetAuthForm): Record<string, unknown> | undefined {
   const type = c.auth_type;
   if (!type || type === 'none') return undefined;
@@ -68,15 +73,15 @@ function editedTargetAuth(c: TransitPointTargetAuthForm): Record<string, unknown
   switch (type) {
     case 'bearer':
       headerName = 'Authorization';
-      headerFormat = text(c.auth_header_format) || 'Bearer {value}';
+      headerFormat = header(c.auth_header_format) || 'Bearer {value}';
       break;
     case 'api_key':
-      headerName = text(c.auth_header_name) || 'X-API-Key';
-      headerFormat = text(c.auth_header_format) || '{value}';
+      headerName = header(c.auth_header_name) || 'X-API-Key';
+      headerFormat = header(c.auth_header_format) || '{value}';
       break;
     case 'custom_header':
-      headerName = text(c.auth_header_name) || 'X-Auth';
-      headerFormat = text(c.auth_header_format) || '{value}';
+      headerName = header(c.auth_header_name) || 'X-Auth';
+      headerFormat = header(c.auth_header_format) || '{value}';
       break;
     default:
       return undefined;
