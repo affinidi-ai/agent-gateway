@@ -1,5 +1,5 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import SurfaceDetailPage from '../SurfaceDetailPage';
@@ -634,6 +634,72 @@ describe('SurfaceDetailPage delete', () => {
     expect(screen.queryByTestId('surface-delete-button')).toBeNull();
   });
 
+  it('shows the delete button with surfaces.delete, even without surfaces.edit', async () => {
+    mockDeniedPermission = 'surfaces.edit';
+    renderWithList();
+
+    await openConfirmation();
+
+    expect(screen.getByTestId('surface-delete-confirm-confirm')).toBeEnabled();
+  });
+
+  it('cannot open the confirmation while a save runs', async () => {
+    jest.spyOn(apiClient, 'updateSurface').mockReturnValue(new Promise(() => {}));
+    const deleteSurface = jest.spyOn(apiClient, 'deleteSurface').mockResolvedValue();
+    renderWithList();
+    fireEvent.click(await screen.findByTestId('surface-save-button'));
+
+    expect(await screen.findByTestId('surface-delete-button')).toBeDisabled();
+    fireEvent.click(screen.getByTestId('surface-delete-button'));
+
+    expect(screen.queryByTestId('surface-delete-confirm')).toBeNull();
+    expect(deleteSurface).not.toHaveBeenCalled();
+  });
+
+  it('sends one delete when Delete is clicked twice', async () => {
+    const deleteSurface = jest
+      .spyOn(apiClient, 'deleteSurface')
+      .mockReturnValue(new Promise(() => {}));
+    renderWithList();
+    await openConfirmation();
+
+    fireEvent.click(screen.getByTestId('surface-delete-confirm-confirm'));
+    fireEvent.click(screen.getByTestId('surface-delete-confirm-confirm'));
+
+    expect(deleteSurface).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes the confirmation when the page moves to another surface', async () => {
+    const deleteSurface = jest.spyOn(apiClient, 'deleteSurface').mockResolvedValue();
+    render(
+      <MemoryRouter initialEntries={['/surfaces/s1']}>
+        <Routes>
+          <Route
+            path="/surfaces/:surfaceId"
+            element={
+              <>
+                <SurfaceDetailPage />
+                <LocationProbe />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    );
+    await openConfirmation();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open another surface' }));
+
+    await waitFor(() =>
+      expect((apiClient.getSurface as jest.Mock).mock.calls.map(call => call[0])).toContain('s2')
+    );
+    await screen.findByTestId('surface-delete-button');
+    await act(() => new Promise<void>(resolve => requestAnimationFrame(() => resolve())));
+
+    expect(screen.queryByTestId('surface-delete-confirm')).toBeNull();
+    expect(deleteSurface).not.toHaveBeenCalled();
+  });
+
   it('deletes the surface and returns to the surface list on Delete', async () => {
     const deleteSurface = jest.spyOn(apiClient, 'deleteSurface').mockResolvedValue();
     renderWithList();
@@ -648,11 +714,20 @@ describe('SurfaceDetailPage delete', () => {
   });
 
   it('closes the confirmation, shows the error and refocuses the delete button when the delete fails', async () => {
-    jest.spyOn(apiClient, 'deleteSurface').mockRejectedValue(new Error('Surface is in use'));
+    let rejectDelete: (error: Error) => void = () => {};
+    jest.spyOn(apiClient, 'deleteSurface').mockReturnValue(
+      new Promise<void>((_resolve, reject) => {
+        rejectDelete = reject;
+      })
+    );
     renderWithList();
     await openConfirmation();
 
     fireEvent.click(screen.getByTestId('surface-delete-confirm-confirm'));
+
+    expect(await screen.findByTestId('surface-delete-button')).toBeDisabled();
+    expect(screen.getByTestId('surface-delete-confirm-cancel')).toBeDisabled();
+    rejectDelete(new Error('Surface is in use'));
 
     expect(await screen.findByTestId('surface-error-alert')).toHaveTextContent('Surface is in use');
     expect(screen.queryByTestId('surface-delete-confirm')).toBeNull();
