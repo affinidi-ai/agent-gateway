@@ -6,6 +6,7 @@ import { useSafeNavigate } from '../../hooks/useSafeNavigate';
 import { usePageTitle } from '../../context/PageTitleContext';
 import { usePermissions } from '../../context/PermissionsContext';
 import { useDiscardWithUndo } from '../../components/surface-builder/hooks/useDiscardWithUndo';
+import { AppButton } from '../../components/shared/AppButton';
 import { Link } from '../../components/shared/Link';
 import { DOCS_URL } from '../../config/docs';
 import PolicySimulatePanel, { POLICY_SIMULATE_DEFAULT_INPUT } from './PolicySimulatePanel';
@@ -21,7 +22,7 @@ import TemplateGallery from './policyTemplates/TemplateGallery';
 import { BUILTIN_POLICY_TEMPLATES } from './policyTemplates/builtinPolicyTemplates';
 import { parsePolicyRules } from './policyTemplates/regoRules';
 import { BLANK_TEMPLATE_ID } from './policyTemplates/policyDefaults';
-import type { PolicyType } from './policyTemplates/types';
+import { POLICY_TYPE_NAMES, type PolicyType } from './policyTemplates/types';
 import { usePolicyTemplateActions } from './policyTemplates/usePolicyTemplateActions';
 
 interface PolicyDefinition {
@@ -36,11 +37,6 @@ interface PolicyDefinition {
   sample_input?: string;
   content_hash?: string;
 }
-
-const TYPE_NAME: Record<PolicyType, string> = {
-  gateway: 'Gateway',
-  agent_surface: 'Agent Surface',
-};
 
 /** Built-in templates in the policy, used or inserted, that have no variant for `type`. */
 function templatesWithoutType(
@@ -148,7 +144,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
       const other: PolicyType = newType === 'gateway' ? 'agent_surface' : 'gateway';
       showToast(
         'warning',
-        `${otherTypeOnly.join(', ')} ${one ? 'is' : 'are'} written for ${TYPE_NAME[other]} policies and ${one ? 'reads' : 'read'} input that ${TYPE_NAME[newType]} policies don't get. Check those rules before you create the policy.`
+        `${otherTypeOnly.join(', ')} ${one ? 'is' : 'are'} written for ${POLICY_TYPE_NAMES[other].name} policies and ${one ? 'reads' : 'read'} input that ${POLICY_TYPE_NAMES[newType].name} policies don't get. Check those rules before you create the policy.`
       );
     }
   };
@@ -161,7 +157,9 @@ const EditPolicyDefinitionPage: React.FC = () => {
   useEffect(() => {
     if (focusAddRules === 0) return;
     templatesColumnRef.current?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
-    templatesColumnRef.current?.querySelector<HTMLInputElement>('input[type="search"]')?.focus();
+    templatesColumnRef.current
+      ?.querySelector<HTMLInputElement>('input.search-input-field')
+      ?.focus();
   }, [focusAddRules]);
 
   useEffect(() => {
@@ -198,7 +196,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
     const actual = extractPackage(form.policy);
     if (actual && actual !== expected) {
       setPackageMismatch(
-        `Package is "${actual}" but should be "${expected}" for ${form.policy_type === 'gateway' ? 'Gateway' : 'Agent Surface'} policies.`
+        `Package is "${actual}" but should be "${expected}" for ${POLICY_TYPE_NAMES[form.policy_type].name} policies.`
       );
     } else {
       setPackageMismatch(null);
@@ -383,29 +381,34 @@ const EditPolicyDefinitionPage: React.FC = () => {
               <div className="d-flex align-items-center gap-2">
                 {!isCreateMode && canEditPolicies && (
                   <span title={isDirty ? 'Save the policy first' : undefined}>
-                    <button
-                      type="button"
-                      className={`btn btn-sm btn-outline-primary${templatePanel === 'save' ? ' active' : ''}`}
+                    <AppButton
+                      variant="outline-primary"
+                      className={templatePanel === 'save' ? 'active' : ''}
                       aria-pressed={templatePanel === 'save'}
                       disabled={isDirty}
                       onClick={() => togglePanel('save')}
+                      iconStart={<i className="fas fa-copy" aria-hidden="true" />}
                       data-testid="policy-templates-save-as-button"
                     >
-                      <i className="fas fa-copy me-1" aria-hidden="true" />
                       Save as template
-                    </button>
+                    </AppButton>
                   </span>
                 )}
                 {canEditPolicies && (
-                  <button
-                    className={`btn btn-sm btn-primary me-2 ${saving || !policyValid || !!packageMismatch ? 'disabled' : ''}`}
+                  <AppButton
+                    className="me-2"
                     data-testid="policy-definition-editor-save-button"
                     onClick={handleSave}
                     disabled={saving || !policyValid || !!packageMismatch}
+                    iconStart={
+                      <i
+                        className={`fas ${saving ? 'fa-spinner fa-spin' : 'fa-save'}`}
+                        aria-hidden="true"
+                      />
+                    }
                   >
-                    <i className={`fas ${saving ? 'fa-spinner fa-spin' : 'fa-save'}`}></i>
-                    {saving ? ' Saving...' : isCreateMode ? ' Create' : ' Save'}
-                  </button>
+                    {saving ? 'Saving...' : isCreateMode ? 'Create' : 'Save'}
+                  </AppButton>
                 )}
               </div>
             </div>
@@ -414,15 +417,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
               {error && (
                 <div className="alert alert-danger alert-dismissible fade show">
                   <i className="fas fa-exclamation-triangle me-2"></i>
-                  <span
-                    style={{
-                      whiteSpace: 'pre-wrap',
-                      fontFamily: 'Monaco, Consolas, "Courier New", monospace',
-                      fontSize: '0.8rem',
-                    }}
-                  >
-                    {error}
-                  </span>
+                  <span className="policy-error-text">{error}</span>
                   <button
                     type="button"
                     className="btn-close"

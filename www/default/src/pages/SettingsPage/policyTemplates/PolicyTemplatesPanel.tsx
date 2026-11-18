@@ -1,6 +1,10 @@
 import React, { useState } from 'react';
+import { AppButton } from '../../../components/shared/AppButton';
+import { Badge } from '../../../components/shared/Badge';
+import InfoBanner from '../../../components/shared/InfoBanner';
 import { defaultDecision, insertTemplateRules } from './regoTemplate';
 import { DecisionBadge } from './TemplateBadges';
+import TemplateFilterBar from './TemplateFilterBar';
 import {
   TemplateDocsLink,
   TemplateHowItDecides,
@@ -9,7 +13,7 @@ import {
 } from './TemplatePreview';
 import { useAllPolicyTemplates, usePolicyTemplates } from './usePolicyTemplates';
 import { useTemplateFilter } from './useTemplateFilter';
-import { CATEGORY_LABELS, type PolicyTemplate, type PolicyType } from './types';
+import { POLICY_TYPE_NAMES, type PolicyTemplate, type PolicyType } from './types';
 import './PolicyTemplates.css';
 
 type Source = 'builtin' | 'organization';
@@ -21,11 +25,6 @@ interface PolicyTemplatesPanelProps {
   /** `usesDefaultSettings` is false when a setting differs from its default. */
   onInsert: (template: PolicyTemplate, rego: string, usesDefaultSettings: boolean) => void;
 }
-
-const TYPE_LABEL: Record<PolicyType, string> = {
-  gateway: 'Gateway',
-  agent_surface: 'Agent Surfaces',
-};
 
 const ID_PREFIX = 'policy-templates';
 
@@ -103,13 +102,14 @@ const InsertPreview: React.FC<{
             </code>
           </pre>
           {!template.builtin && insert?.added && (
-            <div
-              className="alert alert-warning py-2 px-3 small"
-              data-testid="policy-templates-org-insert-warning"
-            >
-              <i className="fas fa-exclamation-triangle me-2" aria-hidden="true" />
-              This template was saved from a policy, so its rules are added as written. Rules
-              combine with OR: check that none of them allows requests this policy should deny.
+            <div data-testid="policy-templates-org-insert-warning">
+              <InfoBanner
+                variant="warning"
+                icon="fa-exclamation-triangle"
+                collapsible={false}
+                className="mb-2"
+                summary="This template was saved from a policy, so its rules are added as written. Rules combine with OR: check that none of them allows requests this policy should deny."
+              />
             </div>
           )}
           {insert && !insert.added && (
@@ -123,16 +123,14 @@ const InsertPreview: React.FC<{
       <TemplateHowItDecides template={template} idPrefix={ID_PREFIX} />
       <TemplateDocsLink template={template} testId="policy-templates-docs-link" />
       <div className="d-flex justify-content-end">
-        <button
-          type="button"
-          className="btn btn-sm btn-primary"
+        <AppButton
           disabled={!canInsert}
           onClick={() => rendered.rego && onInsert(template, rendered.rego, usesDefaultSettings)}
+          iconStart={<i className="fas fa-plus" aria-hidden="true" />}
           data-testid="policy-templates-insert-rules-button"
         >
-          <i className="fas fa-plus me-1" aria-hidden="true" />
           Add to policy
-        </button>
+        </AppButton>
       </div>
     </div>
   );
@@ -161,19 +159,17 @@ const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
   };
 
   return (
-    <div className="card mb-3 policy-templates-panel" data-testid="policy-templates-panel">
+    <div className="card shadow mb-4" data-testid="policy-templates-panel">
       <div className="card-header py-3">
-        <div className="small text-muted">
-          <i className="fas fa-layer-group me-1 text-primary" aria-hidden="true" />
-          Templates · {TYPE_LABEL[policyType]}
-        </div>
-        <h6 className="m-0 mt-1 font-weight-bold text-primary">Add rules from a template</h6>
-        <div className="small text-muted">
-          Pick a template, adjust its settings, and add its rules to the policy. Add several to
-          combine them.
-        </div>
+        <h6 className="m-0 font-weight-bold text-primary">
+          <i className="fas fa-layer-group" aria-hidden="true" /> Add rules from a template
+        </h6>
       </div>
       <div className="card-body">
+        <p className="text-muted small mb-2">
+          Pick a template, adjust its settings, and add its rules to the policy. Add several to
+          combine them.
+        </p>
         <ul className="nav nav-tabs mb-2" role="tablist">
           {(
             [
@@ -195,32 +191,16 @@ const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
             </li>
           ))}
         </ul>
-        <input
-          type="search"
-          className="form-control form-control-sm mb-2"
-          placeholder="e.g. role, trust, path"
-          aria-label="Search templates"
-          value={query}
-          onChange={e => setQuery(e.target.value)}
-          data-testid="policy-templates-search-input"
+        <TemplateFilterBar
+          query={query}
+          onQueryChange={setQuery}
+          category={category}
+          onCategoryChange={setCategory}
+          categories={categories}
+          testIdPrefix="policy-templates"
+          fullWidth
+          className="policy-template-filters--stacked mb-3"
         />
-        {categories.length > 1 && (
-          <ul className="nav nav-pills custom-channel-tabs gap-2 mb-3">
-            {(['all', ...categories] as const).map(key => (
-              <li className="nav-item" key={key}>
-                <button
-                  type="button"
-                  className={`nav-link py-1 ${category === key ? 'active' : ''}`}
-                  aria-pressed={category === key}
-                  onClick={() => setCategory(key)}
-                  data-testid={`policy-templates-category-${key}`}
-                >
-                  {key === 'all' ? 'All' : CATEGORY_LABELS[key]}
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
 
         {loading && (
           <div className="text-muted small">
@@ -258,7 +238,7 @@ const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
                     <span className="d-flex flex-column align-items-end gap-1">
                       <DecisionBadge decision={defaultDecision(t.rego)} />
                       {t.policy_input === 'mcp_tool' && (
-                        <span className="badge policy-template-reads">MCP tool policy</span>
+                        <Badge tone="secondary" value="MCP tool policy" />
                       )}
                     </span>
                   </button>
@@ -268,7 +248,8 @@ const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
             {otherTypeOnly > 0 && (
               <div className="small text-muted mt-2" data-testid="policy-templates-other-type-note">
                 {otherTypeOnly} {otherTypeOnly === 1 ? 'template is' : 'templates are'} for{' '}
-                {policyType === 'gateway' ? 'Agent Surface' : 'Gateway'} policies only.
+                {POLICY_TYPE_NAMES[policyType === 'gateway' ? 'agent_surface' : 'gateway'].name}{' '}
+                policies only.
               </div>
             )}
           </div>

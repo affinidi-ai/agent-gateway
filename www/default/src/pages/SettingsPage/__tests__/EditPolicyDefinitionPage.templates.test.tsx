@@ -172,7 +172,11 @@ describe('start a policy from the gallery', () => {
     fireEvent.click(screen.getByTestId('policy-template-gallery-show-all'));
     expect(cards().length).toBeGreaterThan(6);
 
-    fireEvent.click(screen.getByTestId('policy-template-gallery-category-trust_checks'));
+    fireEvent.click(
+      within(screen.getByTestId('policy-template-gallery-categories')).getByTestId(
+        'filter-chip-trust_checks'
+      )
+    );
     expect(cards().map(c => c.textContent)).toEqual([
       expect.stringContaining('Require Trust Registry recognition'),
       expect.stringContaining('Require verified credential subject'),
@@ -181,7 +185,11 @@ describe('start a policy from the gallery', () => {
     ]);
     expect(screen.queryByTestId('policy-template-card-blank')).toBeNull();
 
-    fireEvent.click(screen.getByTestId('policy-template-gallery-category-all'));
+    fireEvent.click(
+      within(screen.getByTestId('policy-template-gallery-categories')).getByTestId(
+        'filter-chip-all'
+      )
+    );
     fireEvent.change(screen.getByTestId('policy-template-gallery-search-input'), {
       target: { value: 'business' },
     });
@@ -433,7 +441,11 @@ describe('gallery focus and detail', () => {
     fireEvent.click(await card('blank'));
     expect(screen.getByTestId('policy-template-gallery-detail')).toHaveTextContent('Allow all');
 
-    fireEvent.click(screen.getByTestId('policy-template-gallery-category-trust_checks'));
+    fireEvent.click(
+      within(screen.getByTestId('policy-template-gallery-categories')).getByTestId(
+        'filter-chip-trust_checks'
+      )
+    );
     expect(screen.queryByTestId('policy-template-card-blank')).toBeNull();
     expect(screen.getByTestId('policy-template-gallery-detail')).not.toBeVisible();
     expect(screen.getByTestId('policy-template-gallery-use-button')).not.toBeVisible();
@@ -584,14 +596,20 @@ describe('templates panel', () => {
     fireEvent.click(await panelRow('all-trust-checks-pass'));
     fireEvent.change(screen.getByDisplayValue('Agent Surfaces'), { target: { value: 'gateway' } });
 
-    expect(await screen.findByTestId('policy-templates-panel')).toHaveTextContent('Gateway');
+    expect(await screen.findByTestId('policy-templates-other-type-note')).toHaveTextContent(
+      'for Agent Surface policies only'
+    );
     expect(screen.queryByTestId('policy-templates-preview')).toBeNull();
   });
 
   it('filters by category', async () => {
     renderAt('/policy-definitions/new?type=agent_surface');
     openAdd();
-    fireEvent.click(await screen.findByTestId('policy-templates-category-trust_checks'));
+    fireEvent.click(
+      within(await screen.findByTestId('policy-templates-categories')).getByTestId(
+        'filter-chip-trust_checks'
+      )
+    );
 
     const rows = screen.getAllByTestId(/^policy-templates-row-/);
     expect(rows.map(r => r.textContent)).toEqual([

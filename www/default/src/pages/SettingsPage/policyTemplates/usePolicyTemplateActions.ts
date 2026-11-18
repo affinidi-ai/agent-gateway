@@ -10,14 +10,9 @@ import {
   type RuleGroup,
 } from './regoRules';
 import { insertTemplateRules } from './regoTemplate';
-import type { PolicyTemplate, PolicyType } from './types';
+import { POLICY_TYPE_NAMES, type PolicyTemplate, type PolicyType } from './types';
 
 /** What the templates column shows instead of Add rules; null shows Add rules. */
-const TYPE_NAME: Record<PolicyType, string> = {
-  gateway: 'Gateway',
-  agent_surface: 'Agent Surfaces',
-};
-
 export type TemplatePanel = 'save';
 
 /** The policy form fields a template fills. */
@@ -83,7 +78,7 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
       message:
         template.policy_type === previous.policy_type
           ? `Filled from the template ${template.name}.`
-          : `Filled from the template ${template.name}. Type set to ${TYPE_NAME[template.policy_type]}.`,
+          : `Filled from the template ${template.name}. Type set to ${POLICY_TYPE_NAMES[template.policy_type].label}.`,
       onUndo: () => {
         setForm(f => ({ ...f, ...previous }));
         setUsedTemplate(previousUsed);

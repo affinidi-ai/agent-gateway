@@ -1,4 +1,6 @@
 import React, { useState } from 'react';
+import { AppButton } from '../../../components/shared/AppButton';
+import { Badge } from '../../../components/shared/Badge';
 import FieldHelp from '../../../components/shared/FieldHelp';
 import { Link } from '../../../components/shared/Link';
 import { defaultParameterValues, parseListInput, renderTemplate } from './regoTemplate';
@@ -107,20 +109,19 @@ export const TemplateHowItDecides: React.FC<{ template: PolicyTemplate; idPrefix
             <div className="policy-template-example">
               <span>{ex.name}</span>
               <span className="d-flex align-items-center gap-2">
-                <button
-                  type="button"
-                  className="btn btn-sm btn-link p-0"
+                <AppButton
+                  variant="link"
+                  className="p-0"
                   aria-expanded={open === i}
                   onClick={() => setOpen(o => (o === i ? null : i))}
                   data-testid={`${idPrefix}-example-input-${i}`}
                 >
                   {open === i ? 'Hide input' : 'Show input'}
-                </button>
-                <span
-                  className={`badge ${ex.expected === 'allow' ? 'text-bg-success' : 'text-bg-danger'}`}
-                >
-                  {ex.expected.toUpperCase()}
-                </span>
+                </AppButton>
+                <Badge
+                  tone={ex.expected === 'allow' ? 'success' : 'danger'}
+                  value={ex.expected.toUpperCase()}
+                />
               </span>
             </div>
             {open === i && (

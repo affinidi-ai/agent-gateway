@@ -29,13 +29,6 @@ const TOOL_INPUT_FIELDS: [string, string][] = [
   ['input.request.path', 'The request path'],
 ];
 
-const codeStyle: React.CSSProperties = {
-  fontSize: '0.85rem',
-  backgroundColor: 'var(--gray-50)',
-  color: 'var(--gray-800)',
-  border: '1px solid var(--gray-300)',
-};
-
 const Example: React.FC<{ icon: string; title: string; code: string }> = ({
   icon,
   title,
@@ -46,8 +39,8 @@ const Example: React.FC<{ icon: string; title: string; code: string }> = ({
       <i className={`fas ${icon} me-2`} aria-hidden="true" />
       {title}
     </h6>
-    <pre className="p-3 rounded mb-2" style={codeStyle}>
-      <code style={{ color: 'var(--gray-800)' }}>{code}</code>
+    <pre className="policy-preview-block policy-rego-reference-code p-3 rounded mb-2">
+      <code>{code}</code>
     </pre>
   </>
 );
@@ -92,8 +85,8 @@ const RegoReference: React.FC<{ policyType: PolicyType }> = ({ policyType }) => 
             Rules combine with OR: the request is allowed when any <code>allow</code> rule matches,
             otherwise the default decides.
           </p>
-          <pre className="p-3 rounded mb-3" style={codeStyle}>
-            <code style={{ color: 'var(--gray-800)' }}>{`package ${pkg}
+          <pre className="policy-preview-block policy-rego-reference-code p-3 rounded mb-3">
+            <code>{`package ${pkg}
 
 # Deny unless a rule below allows
 default allow := false

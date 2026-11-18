@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { Badge } from '../../../components/shared/Badge';
 import { simulatePolicy } from '../simulatePolicy';
 import type { PolicyDecision, PolicyTemplate, PolicyType } from './types';
 
@@ -114,11 +115,10 @@ const TemplateExamplesCheck: React.FC<TemplateExamplesCheckProps> = ({
                   >
                     <td>{ex.name}</td>
                     <td>
-                      <span
-                        className={`badge ${ex.expected === 'allow' ? 'text-bg-success' : 'text-bg-danger'}`}
-                      >
-                        {ex.expected.toUpperCase()}
-                      </span>
+                      <Badge
+                        tone={ex.expected === 'allow' ? 'success' : 'danger'}
+                        value={ex.expected.toUpperCase()}
+                      />
                     </td>
                     <td>
                       {o === null ? (
@@ -129,11 +129,10 @@ const TemplateExamplesCheck: React.FC<TemplateExamplesCheckProps> = ({
                       ) : 'error' in o ? (
                         <span className="text-danger small">{o.error}</span>
                       ) : (
-                        <span
-                          className={`badge ${o.decision === 'allow' ? 'text-bg-success' : 'text-bg-danger'}`}
-                        >
-                          {o.decision.toUpperCase()}
-                        </span>
+                        <Badge
+                          tone={o.decision === 'allow' ? 'success' : 'danger'}
+                          value={o.decision.toUpperCase()}
+                        />
                       )}
                     </td>
                   </tr>

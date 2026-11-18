@@ -17,12 +17,6 @@ import './PolicyTemplates.css';
 
 export type PolicyView = 'rules' | 'rego';
 
-const monoError: React.CSSProperties = {
-  whiteSpace: 'pre-wrap',
-  fontFamily: 'Monaco, Consolas, "Courier New", monospace',
-  fontSize: '0.8rem',
-};
-
 interface PolicyEditorSectionProps {
   step?: number;
   policy: string;
@@ -147,15 +141,15 @@ const PolicyEditorSection: React.FC<PolicyEditorSectionProps> = ({
           </span>
         )}
         {canEdit && (
-          <button
-            type="button"
-            className="btn btn-sm btn-outline-primary ms-auto"
+          <AppButton
+            variant="outline-primary"
+            className="ms-auto"
             onClick={onAdd}
+            iconStart={<i className="fas fa-plus" aria-hidden="true" />}
             data-testid="policy-templates-insert-button"
           >
-            <i className="fas fa-plus me-1" aria-hidden="true" />
             Add rules from a template
-          </button>
+          </AppButton>
         )}
       </div>
 
@@ -214,29 +208,25 @@ const PolicyEditorSection: React.FC<PolicyEditorSectionProps> = ({
           <div className="alert alert-danger compile-error-alert py-2 px-3 mt-2 mb-0">
             <i className="fas fa-exclamation-triangle me-2" aria-hidden="true" />
             {policyErrors.map((err, idx) => (
-              <span key={idx} style={monoError}>
+              <span key={idx} className="policy-error-text">
                 {err}
               </span>
             ))}
           </div>
         )}
         {packageMismatch && (
-          <div
-            className="alert alert-danger py-2 px-3 mt-2 mb-0 d-flex align-items-start"
-            style={{ fontSize: '0.85rem' }}
-          >
+          <div className="alert alert-danger policy-package-mismatch py-2 px-3 mt-2 mb-0 d-flex align-items-start">
             <i className="fas fa-exclamation-triangle me-2 mt-1 flex-shrink-0" aria-hidden="true" />
             <div>
               <strong>Package mismatch:</strong> {packageMismatch}
               {canEdit && (
-                <button
-                  type="button"
-                  className="btn btn-sm btn-danger ms-2 py-0 px-2"
-                  style={{ fontSize: '0.8rem' }}
+                <AppButton
+                  variant="danger"
+                  className="policy-fix-package-button ms-2 py-0 px-2"
                   onClick={onFixPackage}
                 >
                   Fix it
-                </button>
+                </AppButton>
               )}
             </div>
           </div>

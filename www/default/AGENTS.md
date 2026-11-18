@@ -1778,6 +1778,24 @@ separated by a rule:
   that follows its scroll, so the line numbers in the Rules view match, then compile errors and
   the package mismatch with **Fix it**.
 
+The editor and its templates use the shared dashboard components, not local copies: every
+action button is an `AppButton` (size `sm`; link-style actions use `variant="link"`), a default
+or template decision is the Audit Log's `audit-decision` pill (`DecisionBadge` in
+`TemplateBadges.tsx`, text such as "Default DENY"), an example's expected and actual decision
+and the neutral tags (MCP tool policy, Gateway only, reads `<path>` with the path in `<code>`)
+are `Badge`s, an alert the templates add that carries an action is a non-collapsible
+`InfoBanner` with the button as its child and the test id on a wrapping `div`, the template
+search and category filter is the shared `SearchInput` and `FilterChipGroup`
+(`TemplateFilterBar.tsx`), code blocks use `.policy-preview-block`, and the templates column's
+panels are a `card shadow mb-4` with the standard `card-header py-3` title (`h6 m-0
+font-weight-bold text-primary`) and their description in the body. A policy Type's name comes
+from the one `POLICY_TYPE_NAMES` map in `policyTemplates/types.ts`, and the editor sets no
+inline `style`. The exceptions are the selectable `.policy-template-row` cards and rows, `nav-link`
+tabs, the Rego reference heading toggle, `btn-close`, Back, the Rego view's package-mismatch
+alert with **Fix it** (main's Bootstrap `alert-danger`, kept as it was), and the Rules view's
+rule-kind badges (`.policy-rules__kind`, a neutral `--muted-text` outline for every kind, so a
+rule's kind never reads as an allow or deny decision).
+
 Without `policies.edit` the page is read-only, since the gateway refuses a create or save
 without it: a muted line with a lock icon under the intro says "You can view this policy but not
 change it." (`policy-definition-read-only-note`), the Rego textarea is `readOnly`, Name and
@@ -1859,8 +1877,9 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   variants under its catalogue id), each with its summary, default decision and category. A
   template with no variant for the selected Type shows "Agent Surface only" or "Gateway only"
   (`policy-template-card-type-badge`). A search (`policy-template-gallery-search-input`) and
-  category pills (`policy-template-gallery-category-<key>`) share `useTemplateFilter` with the
-  templates column; Allow all shows only while nothing filters. Six templates show until
+  category chips (`filter-chip-<key>`, `filter-chip-all` for All, inside
+  `policy-template-gallery-categories`) share `TemplateFilterBar` and `useTemplateFilter` with
+  the templates column; Allow all shows only while nothing filters. Six templates show until
   **Show all (N)** (`policy-template-gallery-show-all`). The help text above the grid points to
   **Add rules from a template** by name, not by where the column sits, since the column stacks
   under the editor below `xl`. Choosing a card selects it, shows its
@@ -1914,9 +1933,9 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   the policy's Type and says how many it leaves out (`policy-templates-other-type-note`), and
   starts over, with no template chosen, when Type changes. It has Built-in and Your
   organization tabs with counts (`policy-templates-tab-builtin`, `-organization`), a search
-  (`policy-templates-search-input`), category pills in the `custom-channel-tabs` style shown
-  when a tab holds more than one category (`policy-templates-category-<key>`), rows
-  (`policy-templates-row-<id>`) with a DENY or ALLOW outline badge, and a preview (with nothing
+  (`policy-templates-search-input`), category chips shown when a tab holds more than one
+  category (`filter-chip-<key>` inside `policy-templates-categories`), rows
+  (`policy-templates-row-<id>`) with a DENY or ALLOW decision pill, and a preview (with nothing
   selected it says to pick a template, `policy-templates-preview-empty`): description, default
   decision, setting fields (`policy-templates-param-<key>`), the lines it adds, How it decides
   with each example's input (`policy-templates-example-input-<i>`), the docs link
@@ -1930,7 +1949,7 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   an MCP tool template keeps its own note; every other
   standalone template says its rules allow requests outside what it restricts
   (`policy-templates-standalone-note`).
-  Adding an organisation template shows a warning that its rules are added as written and
+  Adding an organisation template shows a warning `InfoBanner` that its rules are added as written and
   combine with OR (`policy-templates-org-insert-warning`). An empty Your organization tab says
   how to add one.
 - **Add to policy** shows the lines it adds (`policy-templates-insert-preview`) and appends
@@ -1948,7 +1967,7 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   default decision sit in the section's status row, then come the rules written
   in the editor and one group per added template (`policy-rules-group-<n>`), each rule
   (`policy-rules-group-<n>-rule-<m>`) with an Allows, Deny reason (only a rule named
-  `deny_reason`) or Helper (every other name, `deny` included) outline badge, the
+  `deny_reason`) or Helper (every other name, `deny` included) neutral outline badge, the
   rule on one line, and its line numbers, which switch to the Rego view and select the rule
   (`-show-button`). A template group says which template it came from, the last added one is
   marked **Just added** (`policy-rules-just-added`), and **Remove**
@@ -1973,12 +1992,12 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   (`policy-rules-group-<n>-rule-<m>-in-use`: "Another rule uses this; remove that rule first")
   or under the group header (`policy-rules-group-<n>-in-use`), linked to the button by
   `aria-describedby`. A policy that allows
-  by default and has allow rules shows a warning (`policy-rules-allow-default-warning`) with
+  by default and has allow rules shows a warning `InfoBanner` (`policy-rules-allow-default-warning`) with
   **Deny by default** (`policy-rules-set-default-deny-button`). An empty Rego shows Default
   ALLOW and "An empty policy allows every request.", as the gateway treats it. Removing a group
   keeps the Just added mark and examples card while another group of that template remains. With no rules, an empty state
   (`policy-rules-empty`) offers **Add rules from a template** (`policy-rules-add-button`) and
-  **Write Rego** (`policy-rules-write-rego-button`). While the Rego doesn't compile a banner
+  **Write Rego** (`policy-rules-write-rego-button`). While the Rego doesn't compile a danger `InfoBanner`
   (`policy-rules-invalid-banner`) offers **Open Rego**
   (`policy-rules-invalid-open-rego-button`) and names a package mismatch when that is the
   cause, and while a bracket is open the view says so

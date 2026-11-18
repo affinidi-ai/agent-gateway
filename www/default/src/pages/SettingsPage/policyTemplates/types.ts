@@ -81,6 +81,12 @@ export interface PolicyTemplate {
   docs_label?: string;
 }
 
+/** A policy Type's names: `label` as the Type select shows it, `name` before "policies". */
+export const POLICY_TYPE_NAMES: Record<PolicyType, { label: string; name: string }> = {
+  gateway: { label: 'Gateway', name: 'Gateway' },
+  agent_surface: { label: 'Agent Surfaces', name: 'Agent Surface' },
+};
+
 export const CATEGORY_LABELS: Record<PolicyTemplateCategory, string> = {
   baseline: 'Baseline',
   authentication: 'Authentication',

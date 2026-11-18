@@ -1,4 +1,6 @@
 import React, { useState } from 'react';
+import { AppButton } from '../../../components/shared/AppButton';
+import { Badge } from '../../../components/shared/Badge';
 import FormSelect from '../../../components/shared/FormSelect';
 import FieldHelp from '../../../components/shared/FieldHelp';
 import { simulatePolicy } from '../simulatePolicy';
@@ -117,21 +119,11 @@ const SaveAsTemplatePanel: React.FC<SaveAsTemplatePanelProps> = ({
   };
 
   return (
-    <div
-      className="card shadow-sm mb-4 policy-templates-panel"
-      data-testid="policy-templates-save-panel"
-    >
-      <div className="card-header py-3 d-flex justify-content-between align-items-start">
-        <div>
-          <div className="small text-muted">
-            <i className="fas fa-copy me-1 text-primary" aria-hidden="true" />
-            Templates · Your organization
-          </div>
-          <h6 className="m-0 mt-1 font-weight-bold text-primary">Save as template</h6>
-          <div className="small text-muted">
-            Copies the saved version. Later edits to this policy don&apos;t change the template.
-          </div>
-        </div>
+    <div className="card shadow mb-4" data-testid="policy-templates-save-panel">
+      <div className="card-header py-3 d-flex justify-content-between align-items-center">
+        <h6 className="m-0 font-weight-bold text-primary">
+          <i className="fas fa-copy" aria-hidden="true" /> Save as template
+        </h6>
         <button
           type="button"
           className="btn-close"
@@ -141,6 +133,9 @@ const SaveAsTemplatePanel: React.FC<SaveAsTemplatePanelProps> = ({
         />
       </div>
       <div className="card-body">
+        <p className="text-muted small mb-3">
+          Copies the saved version. Later edits to this policy don&apos;t change the template.
+        </p>
         {error && (
           <div
             className="alert alert-danger py-2 px-3 small"
@@ -192,9 +187,15 @@ const SaveAsTemplatePanel: React.FC<SaveAsTemplatePanelProps> = ({
         <div className="d-flex flex-wrap gap-2 mb-3">
           <DecisionBadge decision={defaultDecision(savedPolicy)} prefix="Default" />
           {reads.map(r => (
-            <span key={r} className="badge policy-template-reads">
-              reads {r}
-            </span>
+            <Badge
+              key={r}
+              tone="secondary"
+              value={
+                <>
+                  reads <code className="text-reset">{r}</code>
+                </>
+              }
+            />
           ))}
         </div>
         <div className="mb-3">
@@ -215,36 +216,37 @@ const SaveAsTemplatePanel: React.FC<SaveAsTemplatePanelProps> = ({
                   }
                   data-testid={`policy-templates-save-example-name-${i}`}
                 />
-                <span
-                  className={`badge ${ex.expected === 'allow' ? 'text-bg-success' : 'text-bg-danger'}`}
-                >
-                  {ex.expected.toUpperCase()}
-                </span>
-                <button
-                  type="button"
-                  className="btn btn-sm btn-link text-danger p-0"
+                <Badge
+                  tone={ex.expected === 'allow' ? 'success' : 'danger'}
+                  value={ex.expected.toUpperCase()}
+                />
+                <AppButton
+                  variant="link"
+                  className="text-danger p-0"
                   aria-label={`Remove example ${i + 1}`}
                   onClick={() => setExamples(prev => prev.filter((_, j) => j !== i))}
                   data-testid={`policy-templates-save-example-remove-button-${i}`}
                 >
                   <i className="fas fa-trash" aria-hidden="true" />
-                </button>
+                </AppButton>
               </li>
             ))}
           </ul>
-          <button
-            type="button"
-            className="btn btn-sm btn-link px-0"
+          <AppButton
+            variant="link"
+            className="px-0"
             onClick={() => void addCurrentSample()}
             disabled={adding}
+            iconStart={
+              <i
+                className={`fas ${adding ? 'fa-spinner fa-spin' : 'fa-plus'}`}
+                aria-hidden="true"
+              />
+            }
             data-testid="policy-templates-save-add-example-button"
           >
-            <i
-              className={`fas ${adding ? 'fa-spinner fa-spin' : 'fa-plus'} me-1`}
-              aria-hidden="true"
-            />
             Add current sample input
-          </button>
+          </AppButton>
           <div className="small text-muted">
             Takes the JSON from the Test (dry-run) card and records the decision the saved version
             gives.
@@ -255,27 +257,26 @@ const SaveAsTemplatePanel: React.FC<SaveAsTemplatePanelProps> = ({
           <strong>Your organization</strong>.
         </div>
         <div className="d-flex justify-content-end gap-2">
-          <button
-            type="button"
-            className="btn btn-sm btn-outline-secondary"
+          <AppButton
+            variant="outline-secondary"
             onClick={onClose}
             data-testid="policy-templates-save-cancel-button"
           >
             Cancel
-          </button>
-          <button
-            type="button"
-            className="btn btn-sm btn-primary"
+          </AppButton>
+          <AppButton
             onClick={() => void save()}
             disabled={saving || !name.trim()}
+            iconStart={
+              <i
+                className={`fas ${saving ? 'fa-spinner fa-spin' : 'fa-save'}`}
+                aria-hidden="true"
+              />
+            }
             data-testid="policy-templates-save-button"
           >
-            <i
-              className={`fas ${saving ? 'fa-spinner fa-spin' : 'fa-save'} me-1`}
-              aria-hidden="true"
-            />
             Save template
-          </button>
+          </AppButton>
         </div>
       </div>
     </div>

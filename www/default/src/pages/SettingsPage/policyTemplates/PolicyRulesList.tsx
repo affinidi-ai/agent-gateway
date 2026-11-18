@@ -1,4 +1,7 @@
 import React from 'react';
+import { AppButton } from '../../../components/shared/AppButton';
+import { Badge } from '../../../components/shared/Badge';
+import InfoBanner from '../../../components/shared/InfoBanner';
 import type { ParsedPolicy, PolicyRule, RuleGroup, RuleKind } from './regoRules';
 
 interface PolicyRulesListProps {
@@ -64,22 +67,22 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
 }) => {
   if (!parsed.ok) {
     return (
-      <div
-        className="alert alert-warning py-2 px-3 small d-flex align-items-center justify-content-between gap-2"
-        data-testid="policy-rules-unparsed"
-      >
-        <span>
-          <i className="fas fa-exclamation-triangle me-2" aria-hidden="true" />
-          The rules can&apos;t be listed until every bracket in the Rego is closed.
-        </span>
-        <button
-          type="button"
-          className="btn btn-sm btn-outline-primary text-nowrap"
-          onClick={onWriteRego}
-          data-testid="policy-rules-open-rego-button"
+      <div data-testid="policy-rules-unparsed">
+        <InfoBanner
+          variant="warning"
+          icon="fa-exclamation-triangle"
+          collapsible={false}
+          className="mb-2"
+          summary="The rules can't be listed until every bracket in the Rego is closed."
         >
-          Open Rego
-        </button>
+          <AppButton
+            variant="outline-primary"
+            onClick={onWriteRego}
+            data-testid="policy-rules-open-rego-button"
+          >
+            Open Rego
+          </AppButton>
+        </InfoBanner>
       </div>
     );
   }
@@ -93,46 +96,48 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
   return (
     <div className="policy-rules" data-testid="policy-rules-list">
       {!valid && (
-        <div
-          className="alert alert-danger py-2 px-3 small d-flex align-items-center justify-content-between gap-2"
-          data-testid="policy-rules-invalid-banner"
-        >
-          <span>
-            <i className="fas fa-circle-exclamation me-2" aria-hidden="true" />
-            {packageMismatch
-              ? "The package doesn't match the policy Type, so the policy can't be saved."
-              : "The Rego doesn't compile, so the policy can't be saved."}
-          </span>
-          <button
-            type="button"
-            className="btn btn-sm btn-outline-primary text-nowrap"
-            onClick={onWriteRego}
-            data-testid="policy-rules-invalid-open-rego-button"
+        <div data-testid="policy-rules-invalid-banner">
+          <InfoBanner
+            variant="danger"
+            icon="fa-circle-exclamation"
+            collapsible={false}
+            className="mb-2"
+            summary={
+              packageMismatch
+                ? "The package doesn't match the policy Type, so the policy can't be saved."
+                : "The Rego doesn't compile, so the policy can't be saved."
+            }
           >
-            Open Rego
-          </button>
+            <AppButton
+              variant="outline-primary"
+              onClick={onWriteRego}
+              data-testid="policy-rules-invalid-open-rego-button"
+            >
+              Open Rego
+            </AppButton>
+          </InfoBanner>
         </div>
       )}
 
       {parsed.defaultDecision === 'allow' && allowRules && (
-        <div
-          className="alert alert-warning py-2 px-3 small d-flex align-items-center justify-content-between gap-2"
-          data-testid="policy-rules-allow-default-warning"
-        >
-          <span>
-            <i className="fas fa-exclamation-triangle me-2" aria-hidden="true" />
-            Every request is allowed by default, so the allow rules below change nothing.
-          </span>
-          {canEdit && (
-            <button
-              type="button"
-              className="btn btn-sm btn-outline-primary text-nowrap"
-              onClick={onSetDefaultDeny}
-              data-testid="policy-rules-set-default-deny-button"
-            >
-              Deny by default
-            </button>
-          )}
+        <div data-testid="policy-rules-allow-default-warning">
+          <InfoBanner
+            variant="warning"
+            icon="fa-exclamation-triangle"
+            collapsible={false}
+            className="mb-2"
+            summary="Every request is allowed by default, so the allow rules below change nothing."
+          >
+            {canEdit && (
+              <AppButton
+                variant="outline-primary"
+                onClick={onSetDefaultDeny}
+                data-testid="policy-rules-set-default-deny-button"
+              >
+                Deny by default
+              </AppButton>
+            )}
+          </InfoBanner>
         </div>
       )}
 
@@ -147,24 +152,21 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
           </div>
           {canEdit && (
             <div className="d-flex justify-content-center flex-wrap gap-2">
-              <button
-                type="button"
-                className="btn btn-sm btn-primary"
+              <AppButton
                 onClick={onAdd}
+                iconStart={<i className="fas fa-plus" aria-hidden="true" />}
                 data-testid="policy-rules-add-button"
               >
-                <i className="fas fa-plus me-1" aria-hidden="true" />
                 Add rules from a template
-              </button>
-              <button
-                type="button"
-                className="btn btn-sm btn-outline-primary"
+              </AppButton>
+              <AppButton
+                variant="outline-primary"
                 onClick={onWriteRego}
+                iconStart={<i className="fas fa-code" aria-hidden="true" />}
                 data-testid="policy-rules-write-rego-button"
               >
-                <i className="fas fa-code me-1" aria-hidden="true" />
                 Write Rego
-              </button>
+              </AppButton>
             </div>
           )}
         </div>
@@ -195,14 +197,12 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
                 )}
               </span>
               {group === lastJustAdded && (
-                <span className="badge text-bg-success" data-testid="policy-rules-just-added">
-                  Just added
-                </span>
+                <Badge tone="success" value="Just added" data-testid="policy-rules-just-added" />
               )}
               {isTemplate && canEdit && (
-                <button
-                  type="button"
-                  className="btn btn-sm btn-link text-danger p-0 ms-auto"
+                <AppButton
+                  variant="link"
+                  className="text-danger p-0 ms-auto"
                   disabled={groupInUse}
                   onClick={() => onRemoveGroup(group)}
                   aria-label={`Remove the rules from ${group.source.kind === 'template' ? group.source.name : 'the editor'}`}
@@ -210,7 +210,7 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
                   data-testid={`${testId}-remove-button`}
                 >
                   Remove
-                </button>
+                </AppButton>
               )}
             </div>
             {groupInUse && (
@@ -235,28 +235,25 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
                     className={`policy-rules__rule${inUse ? ' policy-rules__rule--in-use' : ''}`}
                     data-testid={ruleTestId}
                   >
-                    <span
-                      className={`badge policy-template-decision policy-rules__kind--${rule.kind}`}
-                      title={KIND_TITLE[rule.kind]}
-                    >
+                    <span className="badge policy-rules__kind" title={KIND_TITLE[rule.kind]}>
                       {KIND_LABEL[rule.kind]}
                     </span>
                     <code className="policy-rules__summary" title={rule.summary}>
                       {rule.summary}
                     </code>
-                    <button
-                      type="button"
-                      className="btn btn-sm btn-link p-0 text-nowrap"
+                    <AppButton
+                      variant="link"
+                      className="p-0 text-nowrap"
                       onClick={() => onShowRule(rule)}
                       aria-label={`Show ${rule.head} in the Rego`}
                       data-testid={`${ruleTestId}-show-button`}
                     >
                       {lineLabel(rule)}
-                    </button>
+                    </AppButton>
                     {canEdit && (
-                      <button
-                        type="button"
-                        className="btn btn-sm btn-link text-danger p-0 text-nowrap"
+                      <AppButton
+                        variant="link"
+                        className="text-danger p-0 text-nowrap"
                         disabled={inUse}
                         title={inUse ? RULE_IN_USE : undefined}
                         onClick={() => onRemoveRule(rule)}
@@ -265,7 +262,7 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
                         data-testid={`${ruleTestId}-remove-button`}
                       >
                         Remove
-                      </button>
+                      </AppButton>
                     )}
                     {inUse && (
                       <span

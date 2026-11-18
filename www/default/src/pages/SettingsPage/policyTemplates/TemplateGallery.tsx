@@ -1,4 +1,6 @@
 import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { AppButton } from '../../../components/shared/AppButton';
+import { Badge } from '../../../components/shared/Badge';
 import {
   ALLOW_ALL_POLICY,
   BLANK_TEMPLATE_ID,
@@ -8,6 +10,7 @@ import {
 import PolicySectionTitle from './PolicySectionTitle';
 import { defaultDecision } from './regoTemplate';
 import { DecisionBadge } from './TemplateBadges';
+import TemplateFilterBar from './TemplateFilterBar';
 import {
   renderWithText,
   TemplateDocsLink,
@@ -19,21 +22,11 @@ import {
 import type { UsedTemplate } from './usePolicyTemplateActions';
 import { templateEntryKey, useAllPolicyTemplates } from './usePolicyTemplates';
 import { useTemplateFilter } from './useTemplateFilter';
-import { CATEGORY_LABELS, type PolicyTemplate, type PolicyType } from './types';
+import { CATEGORY_LABELS, POLICY_TYPE_NAMES, type PolicyTemplate, type PolicyType } from './types';
 import './PolicyTemplates.css';
 
 const COLLAPSED_COUNT = 6;
 const ID_PREFIX = 'policy-template-gallery';
-
-const ONLY_LABEL: Record<PolicyType, string> = {
-  gateway: 'Gateway only',
-  agent_surface: 'Agent Surface only',
-};
-
-const TYPE_NAME: Record<PolicyType, string> = {
-  gateway: 'Gateway',
-  agent_surface: 'Agent Surfaces',
-};
 
 interface TemplateGalleryProps {
   policyType: PolicyType;
@@ -68,16 +61,16 @@ const ShowRego: React.FC<{ rego: string | null }> = ({ rego }) => {
   const regoId = useId();
   return (
     <>
-      <button
-        type="button"
-        className="btn btn-sm btn-link p-0 mb-2"
+      <AppButton
+        variant="link"
+        className="p-0 mb-2"
         aria-expanded={open}
         aria-controls={regoId}
         onClick={() => setOpen(o => !o)}
         data-testid="policy-template-gallery-show-rego"
       >
         {open ? 'Hide Rego' : 'Show Rego'}
-      </button>
+      </AppButton>
       {open && (
         <pre
           id={regoId}
@@ -112,9 +105,10 @@ const GalleryDetail: React.FC<{
       <div className="d-flex flex-wrap gap-2 mb-3">
         <DecisionBadge decision={defaultDecision(template.rego)} prefix="Default" />
         {template.policy_type !== policyType && (
-          <span className="badge policy-template-reads">
-            Using it sets Type to {TYPE_NAME[template.policy_type]}
-          </span>
+          <Badge
+            tone="secondary"
+            value={`Using it sets Type to ${POLICY_TYPE_NAMES[template.policy_type].label}`}
+          />
         )}
       </div>
       <TemplateSettingsFields template={template} settings={settings} idPrefix={ID_PREFIX} />
@@ -122,9 +116,7 @@ const GalleryDetail: React.FC<{
       <TemplateHowItDecides template={template} idPrefix={ID_PREFIX} />
       <TemplateDocsLink template={template} testId="policy-template-gallery-docs-link" />
       <div className="d-flex justify-content-end">
-        <button
-          type="button"
-          className="btn btn-sm btn-primary"
+        <AppButton
           disabled={!settings.rendered.rego}
           onClick={() =>
             settings.rendered.rego && onUse(template, settings.rendered.rego, settings.fieldText)
@@ -132,7 +124,7 @@ const GalleryDetail: React.FC<{
           data-testid="policy-template-gallery-use-button"
         >
           Use this template
-        </button>
+        </AppButton>
       </div>
     </div>
   );
@@ -198,7 +190,7 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
   const detailHidden = shownKey === BLANK_TEMPLATE_ID ? filtering : selectedIndex < 0;
 
   const changeRef = useRef<HTMLButtonElement>(null);
-  const searchRef = useRef<HTMLInputElement>(null);
+  const filtersRef = useRef<HTMLDivElement>(null);
   const gridRef = useRef<HTMLDivElement>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const [focusTarget, setFocusTarget] = useState<FocusTarget | null>(null);
@@ -207,7 +199,10 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
     if (focusTarget === 'change') changeRef.current?.focus();
     else if (focusTarget === 'heading') headingRef.current?.focus();
     else
-      (gridRef.current?.querySelector<HTMLElement>('.is-selected') ?? searchRef.current)?.focus();
+      (
+        gridRef.current?.querySelector<HTMLElement>('.is-selected') ??
+        filtersRef.current?.querySelector<HTMLElement>('input')
+      )?.focus();
     setFocusTarget(null);
   }, [focusTarget]);
 
@@ -260,10 +255,10 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
     <section className="policy-section" data-testid="policy-template-gallery">
       <PolicySectionTitle step={step} title="Start from">
         {!expanded && (
-          <button
-            type="button"
+          <AppButton
             ref={changeRef}
-            className="btn btn-sm btn-link p-0"
+            variant="link"
+            className="p-0"
             onClick={() => {
               setExpanded(true);
               setFocusTarget('card');
@@ -271,7 +266,7 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
             data-testid="policy-template-gallery-change-button"
           >
             Change
-          </button>
+          </AppButton>
         )}
       </PolicySectionTitle>
 
@@ -296,34 +291,16 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
             Pick a starting point to see what it does, then use it. You can add rules from more
             templates with <strong>Add rules from a template</strong>.
           </p>
-          <div className="d-flex flex-wrap gap-2 align-items-center mb-2">
-            <input
-              ref={searchRef}
-              type="search"
-              className="form-control form-control-sm policy-template-gallery__search"
-              placeholder="Search templates, e.g. role, trust, path"
-              aria-label="Search templates"
-              value={query}
-              onChange={e => setQuery(e.target.value)}
-              data-testid="policy-template-gallery-search-input"
+          <div ref={filtersRef}>
+            <TemplateFilterBar
+              query={query}
+              onQueryChange={setQuery}
+              category={category}
+              onCategoryChange={setCategory}
+              categories={categories}
+              testIdPrefix="policy-template-gallery"
+              className="mb-2"
             />
-            {categories.length > 1 && (
-              <ul className="nav nav-pills custom-channel-tabs gap-2 m-0">
-                {(['all', ...categories] as const).map(key => (
-                  <li className="nav-item" key={key}>
-                    <button
-                      type="button"
-                      className={`nav-link py-1 ${category === key ? 'active' : ''}`}
-                      aria-pressed={category === key}
-                      onClick={() => setCategory(key)}
-                      data-testid={`policy-template-gallery-category-${key}`}
-                    >
-                      {key === 'all' ? 'All' : CATEGORY_LABELS[key]}
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            )}
           </div>
 
           <div className="policy-template-gallery" ref={gridRef}>
@@ -344,15 +321,14 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
                 <>
                   <DecisionBadge decision={defaultDecision(t.rego)} prefix="Default" />
                   {t.policy_type !== policyType && (
-                    <span
-                      className="badge policy-template-reads"
+                    <Badge
+                      tone="secondary"
+                      value={`${POLICY_TYPE_NAMES[t.policy_type].name} only`}
                       data-testid="policy-template-card-type-badge"
-                    >
-                      {ONLY_LABEL[t.policy_type]}
-                    </span>
+                    />
                   )}
                   {t.policy_input === 'mcp_tool' && (
-                    <span className="badge policy-template-reads">MCP tool policy</span>
+                    <Badge tone="secondary" value="MCP tool policy" />
                   )}
                   <span className="policy-template-row__summary">
                     {t.builtin ? CATEGORY_LABELS[t.category] : 'Your organization'}
@@ -364,14 +340,14 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
           </div>
           {visible.length === 0 && <div className="text-muted small py-2">No templates match.</div>}
           {shown.length < visible.length && (
-            <button
-              type="button"
-              className="btn btn-sm btn-link p-0 mt-2"
+            <AppButton
+              variant="link"
+              className="p-0 mt-2"
               onClick={() => setShowAll(true)}
               data-testid="policy-template-gallery-show-all"
             >
               Show all ({visible.length})
-            </button>
+            </AppButton>
           )}
 
           {shownKey === BLANK_TEMPLATE_ID ? (
@@ -387,14 +363,9 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
               </p>
               <ShowRego rego={ALLOW_ALL_POLICY[policyType]} />
               <div className="d-flex justify-content-end">
-                <button
-                  type="button"
-                  className="btn btn-sm btn-primary"
-                  onClick={useBlank}
-                  data-testid="policy-template-gallery-use-button"
-                >
+                <AppButton onClick={useBlank} data-testid="policy-template-gallery-use-button">
                   Use this template
-                </button>
+                </AppButton>
               </div>
             </div>
           ) : (

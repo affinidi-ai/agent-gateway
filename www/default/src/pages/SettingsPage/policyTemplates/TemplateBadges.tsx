@@ -7,10 +7,10 @@ interface DecisionBadgeProps {
   prefix?: string;
 }
 
-/** A template's default decision: DENY, or ALLOW for a template that lets traffic through. */
+/** A template's default decision as the Audit Log's decision pill: DENY or ALLOW. */
 export const DecisionBadge: React.FC<DecisionBadgeProps> = ({ decision, prefix }) => (
   <span
-    className={`badge policy-template-decision policy-template-decision--${decision}`}
+    className={`audit-decision audit-decision--${decision}`}
     title={
       decision === 'allow'
         ? 'Allows requests that no rule denies'

@@ -48,28 +48,6 @@
   color: var(--muted-text);
 }
 
-.policy-template-decision {
-  background: transparent;
-  border: 1px solid currentColor;
-  flex-shrink: 0;
-}
-
-.policy-template-decision--deny {
-  color: var(--danger-text);
-}
-
-.policy-template-decision--allow {
-  color: var(--warning-text);
-}
-
-.policy-template-reads {
-  background: transparent;
-  color: var(--muted-text);
-  border: 1px solid var(--gray-300);
-  font-family: Monaco, Consolas, 'Courier New', monospace;
-  font-weight: 500;
-}
-
 .policy-template-preview {
   margin-top: 16px;
   padding-top: 12px;
@@ -109,7 +87,6 @@ body.dark-theme .policy-template-row.is-selected {
   background: rgba(96, 165, 250, 0.12);
 }
 
-body.dark-theme .policy-template-reads,
 body.dark-theme .policy-template-example,
 body.dark-theme .policy-template-preview {
   border-color: var(--dark-border);
@@ -155,16 +132,11 @@ body.dark-theme .policy-template-preview {
   color: inherit;
 }
 
-.policy-rules__kind--allow {
-  color: var(--success-text);
-}
-
-.policy-rules__kind--deny {
-  color: var(--danger-text);
-}
-
-.policy-rules__kind--helper {
+.policy-rules__kind {
+  background: transparent;
   color: var(--muted-text);
+  border: 1px solid currentColor;
+  flex-shrink: 0;
 }
 
 body.dark-theme .policy-rules__group + .policy-rules__group,
@@ -230,8 +202,16 @@ body.dark-theme .policy-rules__rule {
   padding-top: 6px;
 }
 
-.policy-template-gallery__search {
-  max-width: 280px;
+.policy-template-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.policy-template-filters--stacked {
+  flex-direction: column;
+  align-items: stretch;
 }
 
 .policy-template-gallery__summary {
@@ -331,10 +311,6 @@ body.dark-theme .policy-rego-gutter {
   background: var(--dark-card-bg, #1f2937);
 }
 
-.policy-templates-panel {
-  border: 1px solid var(--accent-blue-text);
-}
-
 .policy-templates-panel__layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -382,4 +358,22 @@ body.dark-theme .policy-templates-panel__placeholder {
 
 body.dark-theme .policy-template-gallery__detail {
   border-color: var(--accent-blue-text);
+}
+
+.policy-error-text {
+  white-space: pre-wrap;
+  font-family: Monaco, Consolas, 'Courier New', monospace;
+  font-size: 0.8rem;
+}
+
+.alert.policy-package-mismatch {
+  font-size: 0.85rem;
+}
+
+.btn.policy-fix-package-button {
+  font-size: 0.8rem;
+}
+
+.policy-rego-reference-code {
+  font-size: 0.85rem;
 }

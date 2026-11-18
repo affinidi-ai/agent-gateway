@@ -2,7 +2,7 @@ import React from 'react';
 import { CopyButton } from '../../components/shared/CopyButton';
 import FieldHelp from '../../components/shared/FieldHelp';
 import PolicySectionTitle from './policyTemplates/PolicySectionTitle';
-import type { PolicyType } from './policyTemplates/types';
+import { POLICY_TYPE_NAMES, type PolicyType } from './policyTemplates/types';
 
 interface PolicyDetailsSectionProps {
   step?: number;
@@ -121,8 +121,11 @@ const PolicyDetailsSection: React.FC<PolicyDetailsSectionProps> = ({
           onChange={e => onTypeChange(e.target.value as PolicyType)}
           data-testid="policy-definition-type-select"
         >
-          <option value="gateway">Gateway</option>
-          <option value="agent_surface">Agent Surfaces</option>
+          {(Object.keys(POLICY_TYPE_NAMES) as PolicyType[]).map(type => (
+            <option key={type} value={type}>
+              {POLICY_TYPE_NAMES[type].label}
+            </option>
+          ))}
         </select>
         <small className="form-text text-muted">
           {isCreateMode ? (
