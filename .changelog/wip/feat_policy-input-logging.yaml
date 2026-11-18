@@ -4,79 +4,37 @@ changes:
     - timestamp: '2026-11-12T00:00:00Z'
       title: ⭐ Capture a surface's OPA policy input live while a dashboard user listens
       description: >-
-        A dashboard WebSocket connection can listen to one surface's policy input with a
-        capture_policy_input message and stop with stop_capturing_policy_input. While at least one
-        connection listens, each request and response policy evaluation on that surface (on the
-        gateway, surface and appliance-wide planes, Transit Point slots included, on the direct,
-        Fabric and MCP proxy paths) is serialized once and queued for the listening connections only (up to 64 per connection,
-        then dropped for that connection, which is told how many it missed; while every listening
-        connection's queue is full, an evaluation is not masked or serialized), never through the
-        shared dashboard broadcast, as a
-        policy_input_captured update with its input,
-        the id, name and version of each policy definition the slot evaluated, the member that denied
-        a gateway or appliance-wide set (or failed to evaluate, on an appliance-wide plane), and its
-        allow, deny reason or error. A capture is masked and serialized after the plane's policy
-        engines are released, so a listen does not hold back policy updates or other evaluations
-        on that plane. Answers and captures are sent alongside the shared dashboard
-        updates without waiting behind them, and captures queued before a stop, or by an earlier
-        listen of the same surface, are not sent. The gateway policy of
-        an outbound request shows as its own gateway outbound slot. MCP tool policies, the
-        tools/list filtering of a surface policy and the fail-closed deny of a slot whose policy did
-        not compile are not captured. A listen naming a surface id that is empty, over 256 bytes or
-        holds a control character is refused. Credential-named values (in snake_case, camelCase or
-        with spaces, such as accessToken or "API Key"), JWTs and Bearer or Basic values
-        are masked first, also inside longer text, and an SD-JWT with its disclosures (a Bearer token of at least 12 token characters,
-        or 6 with a digit or symbol, and a Basic token that decodes to user:password; message text
-        such as "Basic authentication" is kept), and every query value in the request path and in
-        any absolute URL is redacted, as are the user name and password in any absolute URL. A JWT
-        is recognised by its header decoding to a JSON object, whatever whitespace that JSON holds,
-        including before its opening brace. A JWT joined to the word before it, as in CSRF=... or
-        session_..., is masked too, and a JWT followed by a dot and more text, as in
-        <JWT>.example.com, is masked with that text. The deny reason and evaluation error are masked the same way as the input.
-        A URL fragment holding name=value parameters, as an OAuth redirect's does, is masked like a
-        query. The operator's log redaction rules are then applied to every captured string and to
-        the reason and error, so their rules that match a value, such as credential assignments
-        in free text like password=..., agpat_ tokens and email addresses, mask captures too. Each
-        string field is also matched as a log line writes it, "name":"value", so a rule that
-        matches a field name with its value, such as the built-in quoted credential fields rule
-        for "clientsecret", masks the whole value. Listening needs surfaces.edit and policies.edit, is checked again on each
-        keep-alive ping before any queued capture is sent (captures still queued when access is
-        lost are discarded), and ends when the connection closes. Nothing is logged or stored, and the
-        surface configuration is not changed. Policy authors can see the input structure again
-        without the gateway logging it. See docs/POLICY.md.
+        Policy authors can see the input their policies run against again, without the gateway
+        logging it. Policy input capture is off until an administrator turns on the
+        policy_input_capture system feature flag under Settings, Admin, Feature Flags; a user's own
+        settings never turn it on. A dashboard user with surfaces.edit and policies.edit can then
+        listen to one surface's policy input over the dashboard WebSocket. While they listen, each
+        request and response policy evaluation on that surface (gateway, surface, Transit Point and
+        appliance-wide planes, on the direct, Fabric and MCP proxy paths; not MCP tool policies or
+        tools/list filtering) is sent to the listening connections only, with its slot, the policies
+        it ran, its decision and reason, and its input. Credentials in the input are masked by shape
+        and the operator's log redaction rules are applied, but message bodies and tool arguments
+        are otherwise sent as they are. Nothing is stored: listening ends when the user stops, the
+        connection closes, or a keep-alive check finds the session ended, a permission gone or the
+        flag off, and turning the flag off stops new captures at once. Each start and stop of a
+        listen is recorded as policy_input_capture_started and policy_input_capture_stopped, with
+        the user, the surface and the reason, in the VP Audit Log and Governance Audit integrations
+        that select them. See docs/POLICY.md.
     - timestamp: '2026-11-12T00:00:00Z'
       title: Show captured policy input and decisions live in a surface's Capture view
       description: >-
         The Surface Builder's Capture view has a Policy Input card with a Listen to policy input
-        button for users with both surfaces.edit and policies.edit. While listening, the card lists
-        each captured policy evaluation with its slot, the name and version of the policy it ran, its
-        decision and reason, and shows or copies its input to
-        try in the policy Test panel. Stopping, leaving the view or reloading the page ends
-        listening; pausing the payload capture does not, and the card keeps recording. It keeps the last 50 evaluations with a filter by policy slot, says when it is
-        waiting for the dashboard connection, and says that a multi-node appliance shows only this
-        node's requests. It warns how many evaluations were not shown when the surface sent them
-        faster than the dashboard could receive them. On a surface with no policy yet, it says a
-        request policy must be added before there is anything to capture. It is for developing and
-        testing policies only.
-    - timestamp: '2026-11-18T00:00:00Z'
-      title: Keep policy input capture off until an administrator turns its feature flag on
-      description: >-
-        Policy input capture now needs the policy_input_capture system feature flag, off by
-        default and set under Settings, Admin, Feature Flags by a user with settings.edit. A user's
-        own settings never turn it on. While it is off, the gateway refuses to listen with "policy
-        input capture is turned off" and captures nothing; turning it off stops new captures at once
-        and ends every listen at the next keep-alive check. The Capture view's Policy Input card
-        shows no Listen button and says capture is turned off. Watching live caller data is a
-        deliberate choice per gateway, never available by default.
-    - timestamp: '2026-11-18T00:00:00Z'
-      title: Record each start and stop of a policy input capture in the VP Audit Log
-      description: >-
-        Starting to listen to a surface's policy input records policy_input_capture_started, and
-        each end records policy_input_capture_stopped with its reason (stopped, connection_closed,
-        session_ended, permission_missing or turned_off), both naming the user and the surface, in
-        the VP Audit Log and any Governance Audit integration that selects them. Selecting either
-        records both. A refused listen records nothing. Who watched which surface's live policy
-        input, and for how long, is now on record.
+        button for users with both surfaces.edit and policies.edit, shown while the
+        policy_input_capture flag is on; otherwise the card says capture is turned off, or, when
+        the gateway settings could not be read, says so with a Retry. While
+        listening, the card lists each captured policy evaluation with its slot, the name and version
+        of the policy it ran, its decision and reason, and shows or copies its input to try in the
+        policy Test panel. Stopping, leaving the view or reloading the page ends listening; the
+        payload Pause does not, and the card says so. It keeps the last 50 evaluations with a filter
+        by policy slot, says when it is waiting for the dashboard connection or the gateway refused,
+        and warns how many evaluations were not shown when the surface sent them faster than the
+        dashboard could receive them. The Audit Log can filter by the two capture events. It is for
+        developing and testing policies only.
   changed:
     - timestamp: '2026-11-18T00:00:00Z'
       title: Make the Capture view's toolbar, route copy and card titles consistent
@@ -114,8 +72,8 @@ changes:
         behind was closed, and the page showed its reconnect dialog. It now skips the updates it
         missed and keeps reading; only a closed update channel ends it. At its next keep-alive it
         is sent one refresh_dashboard, however often it fell behind, so the page reloads its
-        dashboard stats. A burst of dashboard updates no longer forces a slow connection to
-        reconnect.
+        dashboard stats; the Edit Trust Registry page keeps any field edited since it loaded. A
+        burst of dashboard updates no longer forces a slow connection to reconnect.
     - timestamp: '2026-11-17T00:00:00Z'
       title: Mask camelCase and spaced credential names in exported OTLP attributes
       description: >-

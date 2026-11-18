@@ -666,7 +666,7 @@ neither lists them nor acts on them.
   `403`; payment gateways already connected keep taking payments and every read route still
   works. The dashboard hides its agent-pay UI while it is off, except the Payments page, which
   needs only `payments.view`. A user's own settings cannot
-  override this flag or `mediator_federation`
+  override this flag, `mediator_federation` or `policy_input_capture`
   ([`SYSTEM_ONLY_FLAGS`](../src/storage/settings_store.rs)). At startup the gateway turns it on
   when a payment gateway already exists and the flag has not been set either way, so an upgrade
   never hides a payment gateway that is taking payments.

@@ -20,12 +20,13 @@ jest.mock('../../../../context/PermissionsContext', () => ({
 
 const control = (
   surfaceId: string | undefined = 'surface-1',
-  meta: Partial<SurfaceMetaValue> = {}
+  meta: Partial<SurfaceMetaValue> = {},
+  payloadPaused = false
 ) => (
   <SurfaceMetaProvider
     value={{ isCreate: false, readOnly: false, surfaceId, ...meta } as SurfaceMetaValue}
   >
-    <PolicyInputCaptureControl />
+    <PolicyInputCaptureControl payloadPaused={payloadPaused} />
   </SurfaceMetaProvider>
 );
 
@@ -168,6 +169,19 @@ describe('PolicyInputCaptureControl', () => {
     expect(screen.getByTestId('policy-input-capture-waiting')).toHaveTextContent(
       'Waiting for the dashboard connection'
     );
+  });
+
+  it('says Pause holds payload capture only while payloads are paused during a listen', () => {
+    const { rerender } = render(control('surface-1', {}, true));
+    expect(screen.queryByTestId('policy-input-capture-paused-note')).not.toBeInTheDocument();
+
+    fireEvent.click(listenButton());
+    expect(screen.getByTestId('policy-input-capture-paused-note')).toHaveTextContent(
+      'Pause holds payload capture only; policy input keeps arriving. Use Stop listening to stop it.'
+    );
+
+    rerender(control('surface-1', {}, false));
+    expect(screen.queryByTestId('policy-input-capture-paused-note')).not.toBeInTheDocument();
   });
 
   it('ignores answers about another surface', () => {

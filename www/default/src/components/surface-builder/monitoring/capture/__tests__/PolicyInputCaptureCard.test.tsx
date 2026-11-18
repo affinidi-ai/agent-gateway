@@ -1,5 +1,5 @@
 import React from 'react';
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import type { AgentSurface } from '../../../../../api';
 import PolicyInputCaptureCard, { policyLabel, surfaceHasPolicy } from '../PolicyInputCaptureCard';
@@ -14,13 +14,15 @@ jest.mock('../../PolicyInputCaptureControl', () => ({
   default: () => <div data-testid="policy-input-capture" />,
 }));
 
-let mockCaptureFlag = { enabled: true, loaded: true };
+const mockRetry = jest.fn();
+let mockCaptureFlag = { enabled: true, loaded: true, loadFailed: false, retry: mockRetry };
 jest.mock('../../../../../utils/featureFlags', () => ({
   usePolicyInputCaptureFlag: () => mockCaptureFlag,
 }));
 
 beforeEach(() => {
-  mockCaptureFlag = { enabled: true, loaded: true };
+  mockRetry.mockClear();
+  mockCaptureFlag = { enabled: true, loaded: true, loadFailed: false, retry: mockRetry };
 });
 
 const Harness: React.FC = () => {
@@ -62,10 +64,11 @@ describe('PolicyInputCaptureCard', () => {
   });
 
   it('says capture is turned off, with no Listen control or hints, while the flag is off', () => {
-    mockCaptureFlag = { enabled: false, loaded: true };
+    mockCaptureFlag = { ...mockCaptureFlag, enabled: false };
 
     render(<PolicyInputCaptureCard captures={[]} hasPolicy={false} />);
 
+    expect(screen.queryByTestId('policy-input-capture-settings-error')).not.toBeInTheDocument();
     expect(screen.getByTestId('policy-input-capture-off')).toHaveTextContent(
       'Policy input capture is turned off on this gateway. An administrator can turn it on under Settings › Admin › Feature Flags (policy_input_capture).'
     );
@@ -75,7 +78,7 @@ describe('PolicyInputCaptureCard', () => {
   });
 
   it('shows neither the Listen control nor the off notice while the settings load', () => {
-    mockCaptureFlag = { enabled: false, loaded: false };
+    mockCaptureFlag = { ...mockCaptureFlag, enabled: false, loaded: false };
 
     render(<PolicyInputCaptureCard captures={[]} hasPolicy={false} />);
 
@@ -83,8 +86,23 @@ describe('PolicyInputCaptureCard', () => {
     expect(screen.queryByTestId('policy-input-capture-off')).not.toBeInTheDocument();
   });
 
+  it('says the settings could not be read, with a Retry, instead of the off notice', () => {
+    mockCaptureFlag = { ...mockCaptureFlag, enabled: false, loadFailed: true };
+
+    render(<PolicyInputCaptureCard captures={[]} hasPolicy={false} />);
+
+    expect(screen.getByTestId('policy-input-capture-settings-error')).toHaveTextContent(
+      'Could not read the gateway settings'
+    );
+    expect(screen.queryByTestId('policy-input-capture-off')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('policy-input-capture')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('policy-input-capture-settings-retry'));
+    expect(mockRetry).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps the evaluations already captured when the flag is off', () => {
-    mockCaptureFlag = { enabled: false, loaded: true };
+    mockCaptureFlag = { ...mockCaptureFlag, enabled: false };
     const capture: CapturedPolicyInput = {
       id: 1,
       timestamp: new Date('2026-11-13T10:00:00Z'),
@@ -244,7 +262,7 @@ describe('PolicyInputCaptureCard', () => {
 
   it('shows every slot again when the chosen slot has left the list', () => {
     const Clearable: React.FC = () => {
-      const { captures, clear } = usePolicyInputCaptureStream('surface-1', false);
+      const { captures, clear } = usePolicyInputCaptureStream('surface-1');
       return (
         <>
           <button onClick={clear}>clear</button>
@@ -272,8 +290,45 @@ describe('PolicyInputCaptureCard', () => {
     }
 
     expect(screen.getAllByTestId('policy-input-capture-row')).toHaveLength(MAX_POLICY_INPUTS);
+    expect(screen.getAllByTestId('policy-input-capture-reason')[0]).toHaveTextContent(
+      `evaluation ${MAX_POLICY_INPUTS + 2}`
+    );
+    expect(screen.queryByText('evaluation 0')).not.toBeInTheDocument();
+    expect(screen.queryByText('evaluation 2')).not.toBeInTheDocument();
+    expect(screen.getByText('evaluation 3')).toBeInTheDocument();
     expect(screen.getByTestId('policy-input-capture-kept')).toHaveTextContent(
       `The last ${MAX_POLICY_INPUTS} policy evaluations are kept`
+    );
+  });
+
+  it('formats an input only when its row is opened or copied, and copies it pretty-printed', async () => {
+    const toJSON = jest.fn(() => ({ a2a: { text: 'hello policy' } }));
+    const writeText = jest.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    const capture: CapturedPolicyInput = {
+      id: 1,
+      timestamp: new Date('2026-11-13T10:00:00Z'),
+      plane: 'surface',
+      engine: 'surface-1',
+      slot: 'target',
+      policies: [],
+      decision: 'allow',
+      input: { toJSON },
+    };
+
+    const { rerender } = render(<PolicyInputCaptureCard captures={[capture]} />);
+    rerender(<PolicyInputCaptureCard captures={[capture]} />);
+    expect(toJSON).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId('policy-input-capture-toggle'));
+    expect(toJSON).toHaveBeenCalled();
+    expect(screen.getByTestId('policy-input-capture-input')).toHaveTextContent('hello policy');
+
+    fireEvent.click(screen.getByTestId('policy-input-capture-copy'));
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith(
+        JSON.stringify({ a2a: { text: 'hello policy' } }, null, 2)
+      )
     );
   });
 

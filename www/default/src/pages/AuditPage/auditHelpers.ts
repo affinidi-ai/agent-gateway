@@ -32,6 +32,16 @@ export const CATEGORY_OPTIONS = [
   { value: 'policy_detached', label: 'Policy Detached', lowFrequency: true },
   { value: 'policy_attachment_changed', label: 'Policy Attachment Changed', lowFrequency: true },
   { value: 'policy_change_refused', label: 'Policy Change Refused', lowFrequency: true },
+  {
+    value: 'policy_input_capture_started',
+    label: 'Policy Input Capture Started',
+    lowFrequency: true,
+  },
+  {
+    value: 'policy_input_capture_stopped',
+    label: 'Policy Input Capture Stopped',
+    lowFrequency: true,
+  },
 ] as const;
 
 /**

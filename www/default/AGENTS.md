@@ -643,7 +643,12 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   an `alert alert-info` (`policy-input-capture-off`) says "Policy input capture is turned off on
   this gateway. An administrator can turn it on under Settings › Admin › Feature Flags
   (`policy_input_capture`)." Evaluations already in the list stay. Until the settings have loaded
-  the card shows neither the button nor that notice. When the gateway's flag is turned off while
+  the card shows neither the button nor that notice. When the settings could not be read
+  (`state.settingsLoadFailed` in `AppContext`, set while `settings` holds `FALLBACK_SETTINGS`;
+  `usePolicyInputCaptureFlag` returns it as `loadFailed` and is its only reader), the card shows
+  an `alert alert-danger` (`policy-input-capture-settings-error`) saying "Could not read the
+  gateway settings" with an `outline-danger` **Retry** (`policy-input-capture-settings-retry`)
+  that calls `actions.loadSettings`, in place of the turned-off notice. When the gateway's flag is turned off while
   the page still reads it on, the gateway's refusal (`policy input capture is turned off`) ends
   listening and shows as the inline error, like any other refusal.
 - Capture is live and lasts only while the view is open: the button turns into **Stop
@@ -656,7 +661,10 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   socket reconnect. There is no duration and no admin API call.
 - While listening, a green "Listening" indicator shows when the dashboard socket is connected
   (`state.wsStatus === 'CONNECTED'`), and a warning "Waiting for the dashboard connection" in its
-  place otherwise.
+  place otherwise. While the Capture view's Pause holds the payload stream during a listen, a
+  muted line (`policy-input-capture-paused-note`) says "Pause holds payload capture only; policy
+  input keeps arriving. Use Stop listening to stop it." (`SurfaceCapturePanel` passes
+  `stream.isPaused` to the card as `payloadPaused`, and the card to the control.)
 - The button needs both `surfaces.edit` and `policies.edit`; without either it is disabled with
   "Needs permission to edit surfaces and policies" beside it. When the gateway ends listening
   (`listening: false` with an `error`, such as a refusal, an ended session or a permission lost at
@@ -686,7 +694,10 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   left the list (cleared or rolled off) falls back to all slots. With none it says to
   listen and send a request, and that on an appliance with several nodes only requests served by
   this dashboard's node show. Clear applies to it too; Pause holds only the payload
-  stream, so the card keeps every evaluation of a listen while payloads are paused. When the gateway reports
+  stream, so the card keeps every evaluation of a listen while payloads are paused, and says so
+  while a listen is on. Each row's input is formatted as JSON only when its row is opened or
+  its copy button is clicked (`CopyButton` takes `text` as a string or a function that builds
+  it). When the gateway reports
   captures it dropped for this dashboard (`policy_input_skipped`), a warning alert
   (`policy-input-capture-skipped`) above the list says how many evaluations were not shown;
   Clear resets it. The header stacks
@@ -704,16 +715,21 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   credentials masked, reach only the listening user, are neither logged nor stored, are for
   developing and testing policies only, and stop when listening stops sits behind the button's
   `FieldHelp`.
+- The Audit Log's Category filter offers `policy_input_capture_started` and
+  `policy_input_capture_stopped` ("Policy Input Capture Started" / "Stopped", in the overflow
+  menu like the other low-frequency categories).
 
 | Policy input capture element                    | Test id                                                                |
 | ----------------------------------------------- | ---------------------------------------------------------------------- |
 | Control, button, listening, missing permission  | `policy-input-capture`, `policy-input-capture-listen`, `policy-input-capture-listening`, `policy-input-capture-not-allowed` |
 | Waiting for the connection                      | `policy-input-capture-waiting`                                         |
+| Pause note while listening                      | `policy-input-capture-paused-note`                                     |
 | Hint line (kept count), slot filter             | `policy-input-capture-kept`, `policy-input-capture-slot-filter`        |
 | Warning line, skipped notice                    | `policy-input-capture-warning`, `policy-input-capture-skipped`         |
 | Help and error                                  | `field-help-policy-input-capture`, `policy-input-capture-error`        |
 | Card, empty state, no-policy note, row          | `policy-input-capture-card`, `policy-input-capture-empty`, `policy-input-capture-no-policy`, `policy-input-capture-row` |
 | Turned-off notice                               | `policy-input-capture-off`                                             |
+| Settings read error, its Retry                  | `policy-input-capture-settings-error`, `policy-input-capture-settings-retry` |
 | Reason, input toggle, input, copy               | `policy-input-capture-reason`, `policy-input-capture-toggle`, `policy-input-capture-input`, `policy-input-capture-copy` |
 | Policy the slot ran                             | `policy-input-capture-policy`                                          |
 

@@ -141,8 +141,9 @@ struct WsSubscription {
     user_id: String,
 }
 
-/// A connection's subscription is dropped however the connection ends, the gateway shutting
-/// down included, so every listen still open is recorded as ended because the connection closed.
+/// A connection's subscription is dropped however the connection ends, so every listen still
+/// open when it closes is recorded as ended because the connection closed. A gateway restart or
+/// crash may end listens without a stop record.
 impl Drop for WsSubscription {
     fn drop(&mut self) {
         let mut open: Vec<String> = self
@@ -169,8 +170,11 @@ impl Drop for WsSubscription {
     }
 }
 
-/// Why a listen was refused or ended: the connection's session has ended, or it has none.
+/// Why a listen was refused or ended: the connection's session has ended.
 const SESSION_ENDED: &str = "your dashboard session has ended; sign in again";
+
+/// Why a listen was refused: the connection has no dashboard sign-in.
+const NO_SIGN_IN: &str = "policy input capture needs dashboard sign-in";
 
 /// Why a listen was refused or ended: the user lacks a permission listening needs.
 const PERMISSION_MISSING: &str = "needs surfaces.edit and policies.edit";
@@ -181,6 +185,7 @@ const TURNED_OFF: &str = "policy input capture is turned off";
 /// Why a connection may not listen to policy input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ListenRefusal {
+    NoSignIn,
     SessionEnded,
     TurnedOff,
     PermissionMissing,
@@ -190,17 +195,19 @@ impl ListenRefusal {
     /// What the client is told.
     fn message(self) -> &'static str {
         match self {
+            Self::NoSignIn => NO_SIGN_IN,
             Self::SessionEnded => SESSION_ENDED,
             Self::TurnedOff => TURNED_OFF,
             Self::PermissionMissing => PERMISSION_MISSING,
         }
     }
 
-    /// Why a listen this refusal ends is recorded as stopped.
+    /// Why a listen this refusal ends is recorded as stopped. A connection without a
+    /// sign-in never starts a listen, so `NoSignIn` ends none.
     fn stop(self) -> crate::delegation_vault::audit::PolicyInputCaptureStop {
         use crate::delegation_vault::audit::PolicyInputCaptureStop;
         match self {
-            Self::SessionEnded => PolicyInputCaptureStop::SessionEnded,
+            Self::NoSignIn | Self::SessionEnded => PolicyInputCaptureStop::SessionEnded,
             Self::TurnedOff => PolicyInputCaptureStop::TurnedOff,
             Self::PermissionMissing => PolicyInputCaptureStop::PermissionMissing,
         }
@@ -344,12 +351,12 @@ impl WsCaller {
         Self::allowed(caller, &[crate::rbac::Feature::LogsView]).await
     }
 
-    /// Why `caller` may not listen to policy input: its session has ended (or it has
-    /// none), policy input capture is turned off, or its user lacks a permission. `None`
-    /// when it may listen.
+    /// Why `caller` may not listen to policy input: it has no dashboard sign-in, its
+    /// session has ended, policy input capture is turned off, or its user lacks a
+    /// permission. `None` when it may listen.
     async fn policy_input_refusal(caller: Option<&Self>) -> Option<ListenRefusal> {
         let Some(live) = caller else {
-            return Some(ListenRefusal::SessionEnded);
+            return Some(ListenRefusal::NoSignIn);
         };
         if !live
             .sessions
@@ -437,14 +444,18 @@ fn policy_input_listen_answer(
 }
 
 /// Whether a listen message's `surface_id` can name a surface: not empty, at most
-/// [`MAX_SURFACE_ID_LEN`] bytes and free of control characters, so it cannot forge a log
-/// line.
+/// [`MAX_SURFACE_ID_LEN`] bytes and free of control, bidi and zero-width characters, so it
+/// cannot forge a log line or display as another id.
 fn is_valid_surface_id(surface_id: &str) -> bool {
     !surface_id.is_empty()
         && surface_id.len() <= MAX_SURFACE_ID_LEN
-        && !surface_id
-            .chars()
-            .any(char::is_control)
+        && !surface_id.chars().any(|c| {
+            c.is_control()
+                || matches!(
+                    c,
+                    '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+                )
+        })
 }
 
 /// The answer to a listen message without a valid surface id: a refused listen says why,
@@ -494,6 +505,9 @@ async fn listen_to_policy_input(
         return policy_input_listen_answer(&surface_id, false, Some(refusal.message()));
     }
     let mut subscription = subscription.write().await;
+    if let Some(refusal) = WsCaller::policy_input_refusal(caller).await {
+        return policy_input_listen_answer(&surface_id, false, Some(refusal.message()));
+    }
     if !subscription.listens_to(&surface_id) {
         if subscription
             .policy_input
@@ -564,12 +578,21 @@ async fn recheck_policy_input(
 
 /// The keep-alive recheck of policy input listening: when `caller` may no longer listen,
 /// every listen stops and the captures already queued in `captures` are discarded, so
-/// none reaches the client. Returns the answers telling the client which listens stopped.
+/// none reaches the client. A connection without listens skips the recheck. Returns the
+/// answers telling the client which listens stopped.
 async fn recheck_at_keep_alive(
     subscription: &RwLock<WsSubscription>,
     caller: Option<&WsCaller>,
     captures: &mut tokio::sync::mpsc::Receiver<QueuedCapture>,
 ) -> Vec<String> {
+    if subscription
+        .read()
+        .await
+        .policy_input
+        .is_empty()
+    {
+        return Vec::new();
+    }
     let (allowed, stopped) = recheck_policy_input(subscription, caller).await;
     if !allowed {
         while captures.try_recv().is_ok() {}
@@ -2012,31 +2035,34 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_due_recheck_that_revokes_access_runs_before_a_queued_capture_is_sent() {
-        let dir = TempDir::new().unwrap();
-        let caller =
-            caller_for(guard_with_user(&dir, crate::auth::types::UserRole::Administrator).await, "user-1").await;
-        let (captures_tx, captures) = tokio::sync::mpsc::channel(8);
-        let subscription = tokio::sync::RwLock::new(super::WsSubscription::new(captures_tx));
-        super::listen_to_policy_input(&subscription, Some(&caller), listen_message("ws-recheck-first"), true).await;
-        capture_on("ws-recheck-first", true);
-        caller
-            .sessions
-            .remove_sessions_for_user("user-1")
-            .await;
-        let (_, updates) = tokio::sync::broadcast::channel::<super::WsUpdate>(1);
-        let (_, answers) = tokio::sync::mpsc::channel(1);
-        let (sink, sent) = futures::channel::mpsc::channel(8);
-        let mut ping_interval = tokio::time::interval(super::KEEP_ALIVE_INTERVAL);
-        ping_interval.tick().await;
-        tokio::time::advance(super::KEEP_ALIVE_INTERVAL).await;
+        for run in 0..32 {
+            let surface_id = format!("ws-recheck-first-{run}");
+            let dir = TempDir::new().unwrap();
+            let caller =
+                caller_for(guard_with_user(&dir, crate::auth::types::UserRole::Administrator).await, "user-1").await;
+            let (captures_tx, captures) = tokio::sync::mpsc::channel(8);
+            let subscription = tokio::sync::RwLock::new(super::WsSubscription::new(captures_tx));
+            super::listen_to_policy_input(&subscription, Some(&caller), listen_message(&surface_id), true).await;
+            capture_on(&surface_id, true);
+            caller
+                .sessions
+                .remove_sessions_for_user("user-1")
+                .await;
+            let (_, updates) = tokio::sync::broadcast::channel::<super::WsUpdate>(1);
+            let (_, answers) = tokio::sync::mpsc::channel(1);
+            let (sink, sent) = futures::channel::mpsc::channel(8);
+            let mut ping_interval = tokio::time::interval(super::KEEP_ALIVE_INTERVAL);
+            ping_interval.tick().await;
+            tokio::time::advance(super::KEEP_ALIVE_INTERVAL).await;
 
-        super::send_loop(sink, updates, answers, captures, &subscription, Some(&caller), ping_interval).await;
+            super::send_loop(sink, updates, answers, captures, &subscription, Some(&caller), ping_interval).await;
 
-        let sent = sent_messages(sent);
-        assert_eq!(sent.len(), 2, "{sent:?}");
-        assert_eq!(sent[0]["surface_id"], "ws-recheck-first");
-        assert_eq!(sent[0]["error"], super::SESSION_ENDED);
-        assert_eq!(sent[1], "ping");
+            let sent = sent_messages(sent);
+            assert_eq!(sent.len(), 2, "run {run}: {sent:?}");
+            assert_eq!(sent[0]["surface_id"], surface_id.as_str());
+            assert_eq!(sent[0]["error"], super::SESSION_ENDED);
+            assert_eq!(sent[1], "ping");
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -2216,7 +2242,7 @@ mod tests {
         let anonymous =
             answer(super::listen_to_policy_input(&subscription, None, listen_message("ws-anonymous"), true).await);
         assert_eq!(anonymous["listening"], false);
-        assert_eq!(anonymous["error"], super::SESSION_ENDED);
+        assert_eq!(anonymous["error"], "policy input capture needs dashboard sign-in");
         assert!(!is_captured("ws-anonymous"));
 
         let dir = TempDir::new().unwrap();
@@ -2235,6 +2261,50 @@ mod tests {
             assert_eq!(refused["error"], "invalid surface id", "{forged:?}");
             assert!(!is_captured(forged), "{forged:?}");
         }
+    }
+
+    #[test]
+    fn a_surface_id_with_a_bidi_or_zero_width_character_is_invalid() {
+        assert!(super::is_valid_surface_id("surface-1_ok"));
+        for forged in ["alpha\u{202e}ahpla", "al\u{200b}pha", "alpha\u{2066}", "\u{feff}alpha"] {
+            assert!(!super::is_valid_surface_id(forged), "{forged:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_start_waiting_for_the_subscription_is_refused_when_the_session_ends_meanwhile() {
+        use crate::audit::producer::capture;
+        use crate::policies::input_capture::is_captured;
+
+        let dir = TempDir::new().unwrap();
+        let admin =
+            caller_for(guard_with_user(&dir, crate::auth::types::UserRole::Administrator).await, "user-1").await;
+        let subscription = subscription();
+
+        let (refused, records) = capture(async {
+            let held = subscription.write().await;
+            let starting =
+                super::listen_to_policy_input(&subscription, Some(&admin), listen_message("ws-late-start"), true);
+            tokio::pin!(starting);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), &mut starting)
+                    .await
+                    .is_err(),
+                "the start waits for the subscription"
+            );
+            admin
+                .sessions
+                .remove_sessions_for_user("user-1")
+                .await;
+            drop(held);
+            answer(starting.await)
+        })
+        .await;
+
+        assert_eq!(refused["listening"], false);
+        assert_eq!(refused["error"], super::SESSION_ENDED);
+        assert!(!is_captured("ws-late-start"));
+        assert!(capture_records(&records).is_empty(), "{records:?}");
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@ import type { AgentSurface } from '../../../../api';
 import { formatDateTime } from '../../../../utils/stringUtils';
 import { usePolicyInputCaptureFlag } from '../../../../utils/featureFlags';
 import { showToast } from '../../../../utils/toaster';
+import { AppButton } from '../../../shared/AppButton';
 import { CopyButton } from '../../../shared/CopyButton';
 import PolicyInputCaptureControl from '../PolicyInputCaptureControl';
 import {
@@ -17,6 +18,8 @@ interface PolicyInputCaptureCardProps {
   hasPolicy?: boolean;
   /** How many evaluations the gateway dropped for this dashboard because it fell behind. */
   skipped?: number;
+  /** Whether the Capture view's Pause holds the payload stream. */
+  payloadPaused?: boolean;
 }
 
 /**
@@ -65,6 +68,8 @@ const decisionBadge = (decision: string) => {
 export const policyLabel = (policy: CapturedPolicy): string =>
   policy.name || policy.id || 'inline policy';
 
+const formatInput = (input: unknown): string => JSON.stringify(input, null, 2);
+
 const PolicyNames: React.FC<{ capture: CapturedPolicyInput }> = ({ capture }) => {
   if (capture.policies.length === 0) return null;
   return (
@@ -93,8 +98,9 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
   captures,
   hasPolicy = true,
   skipped = 0,
+  payloadPaused = false,
 }) => {
-  const { enabled, loaded } = usePolicyInputCaptureFlag();
+  const { enabled, loaded, loadFailed, retry } = usePolicyInputCaptureFlag();
   const [openId, setOpenId] = useState<number | null>(null);
   const [slot, setSlot] = useState<string>('');
   const slots = Array.from(new Set(captures.map(capture => capture.slot))).sort();
@@ -123,10 +129,30 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
             rows
           </small>
         </div>
-        {enabled && <PolicyInputCaptureControl />}
+        {enabled && <PolicyInputCaptureControl payloadPaused={payloadPaused} />}
       </div>
       <div className="card-body">
-        {loaded && !enabled && (
+        {loadFailed && (
+          <div
+            className="alert alert-danger mb-3"
+            role="alert"
+            style={{ fontSize: '14px' }}
+            data-testid="policy-input-capture-settings-error"
+          >
+            <i className="fas fa-exclamation-circle me-2" aria-hidden="true" />
+            Could not read the gateway settings, so whether policy input capture is on is not known.
+            <AppButton
+              variant="outline-danger"
+              size="sm"
+              className="ms-3"
+              data-testid="policy-input-capture-settings-retry"
+              onClick={() => void retry()}
+            >
+              Retry
+            </AppButton>
+          </div>
+        )}
+        {loaded && !enabled && !loadFailed && (
           <div
             className="alert alert-info mb-3"
             style={{ fontSize: '14px' }}
@@ -198,7 +224,6 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
                 </thead>
                 <tbody>
                   {shown.map(capture => {
-                    const input = JSON.stringify(capture.input, null, 2);
                     const open = openId === capture.id;
                     return (
                       <React.Fragment key={capture.id}>
@@ -208,7 +233,7 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
                           </td>
                           <td>
                             <span className="badge text-bg-secondary">{capture.slot}</span>
-                            {capture.surfaceVariant && capture.surfaceVariant !== '_base_' && (
+                            {capture.surfaceVariant && (
                               <span className="badge text-bg-secondary ms-2">
                                 {capture.surfaceVariant}
                               </span>
@@ -236,7 +261,7 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
                               {open ? 'Hide input' : 'Show input'}
                             </button>
                             <CopyButton
-                              text={input}
+                              text={() => formatInput(capture.input)}
                               title="Copy the input"
                               onCopyError={() =>
                                 showToast('error', 'Could not copy to the clipboard')
@@ -253,7 +278,7 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
                                 style={{ maxHeight: 400, overflow: 'auto' }}
                                 data-testid="policy-input-capture-input"
                               >
-                                {input}
+                                {formatInput(capture.input)}
                               </pre>
                             </td>
                           </tr>

@@ -1022,14 +1022,17 @@ listening to a surface's policy input (group Policies); see
 - `policy_input_capture_started`: a user started listening to a surface's policy input. `actor`
   names the user, and the top level carries `surface_id`. A refused listen records nothing.
 - `policy_input_capture_stopped`: a listen ended. `reason` is `stopped` (the user stopped it),
-  `connection_closed` (the dashboard connection closed), `session_ended`, `permission_missing`
-  (the user lost `surfaces.edit` or `policies.edit`) or `turned_off` (the `policy_input_capture`
-  feature flag was turned off), the last three found at a keep-alive check. `actor` and
-  `surface_id` are as on the start.
+  `connection_closed` (the dashboard connection closed), `session_ended` (the session is no
+  longer live: it expired or was signed out, or the user's role or status changed, which ends
+  their sessions), `permission_missing` (an RBAC configuration change removed
+  `surfaces.edit` or `policies.edit` from the user's role) or `turned_off` (the
+  `policy_input_capture` feature flag was turned off), the last three found at a keep-alive check.
+  `actor` and `surface_id` are as on the start.
 
 Each is recorded wherever the other is selected, whether or not it is selected itself
-(`RECEIVED_WITH` in `src/audit/catalog.rs`), so a sink never holds a start without its end. Each
-is also logged at info.
+(`RECEIVED_WITH` in `src/audit/catalog.rs`), so a sink that selects either holds both for every
+listen that ends while the gateway runs. A gateway restart or crash can end a listen without a
+stop record. Each is also logged at info.
 
 A `2026-07-28` MCP proxy tool call whose path parameter makes a URL segment `.` or `..` (or an ambiguous one above a non-root `base_url` path) is answered `400` with `-32602` "Invalid tool arguments" before anything is sent, and writes no request event.
 

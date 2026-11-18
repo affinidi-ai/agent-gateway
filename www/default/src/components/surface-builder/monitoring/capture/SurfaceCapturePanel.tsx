@@ -270,6 +270,7 @@ const SurfaceCapturePanel: React.FC<SurfaceCapturePanelProps> = ({
       <PolicyInputCaptureCard
         captures={policyInputs.captures}
         skipped={policyInputs.skipped}
+        payloadPaused={stream.isPaused}
         hasPolicy={!surface || surfaceHasPolicy(surface)}
       />
 

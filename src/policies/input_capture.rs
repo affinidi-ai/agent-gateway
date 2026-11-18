@@ -479,7 +479,8 @@ fn apply_redaction_rules(
 /// The value `text` of field `key` with the redaction rules applied: [`REDACTED`] when a rule
 /// that needs the field's name changes it, that is when the field written as JSON,
 /// `"<key>":"<value>"`, redacts differently from the value redacted on its own, and otherwise
-/// the value redacted on its own. A rule that changes only the key doesn't count.
+/// the value redacted on its own. A rule that changes only the key, so that the field redacts
+/// to the key redacted on its own followed by the value redacted on its own, doesn't count.
 fn redact_field(
     key: &str,
     text: &str,
@@ -492,7 +493,8 @@ fn redact_field(
     let redacted_field = redactor
         .redact(&format!("{key}{}", Value::from(text)))
         .into_owned();
-    if redacted_field != format!("{key}{}", Value::from(redacted_value.as_str())) && redacted_field.starts_with(&key) {
+    let redacted_key = redactor.redact(&key);
+    if redacted_field != format!("{redacted_key}{}", Value::from(redacted_value.as_str())) {
         REDACTED.to_string()
     } else {
         redacted_value
@@ -501,7 +503,7 @@ fn redact_field(
 
 /// Replace every credential in `value` with [`REDACTED`]: the value of a key named like a
 /// credential, a JWT, and a `Bearer` or `Basic` authorization value.
-pub fn mask_credentials(value: &mut Value) {
+fn mask_credentials(value: &mut Value) {
     match value {
         Value::Object(map) => {
             for (key, entry) in map.iter_mut() {
@@ -1716,6 +1718,21 @@ mod tests {
         assert_eq!(redact_field("note", "kept", &redactor), "kept");
         assert_eq!(redact_field("path", path, &redactor), redactor.redact(path));
         assert_ne!(redact_field("path", path, &redactor), REDACTED);
+    }
+
+    #[test]
+    fn a_rule_that_replaces_a_whole_field_masks_its_value() {
+        let redactor = crate::observability::LogRedactor::from_config(&crate::config::types::LogRedactionConfig {
+            enabled: true,
+            rules: vec![crate::config::types::LogRedactionRule {
+                name: "SSN fields".to_string(),
+                pattern: r#""ssn"\s*:\s*"[^"]*""#.to_string(),
+                replacement: "[REDACTED-SSN]".to_string(),
+            }],
+        });
+
+        assert_eq!(redact_field("ssn", "123-45-6789", &redactor), REDACTED);
+        assert_eq!(redact_field("note", "123-45-6789", &redactor), "123-45-6789");
     }
 
     #[test]

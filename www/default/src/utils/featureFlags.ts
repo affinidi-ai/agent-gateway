@@ -20,11 +20,22 @@ export const policyInputCaptureEnabled = (settings: Settings | null | undefined)
 
 /**
  * `policy_input_capture` from the loaded settings, and whether they have loaded
- * yet: before they have, the flag reads off.
+ * yet: before they have, the flag reads off. `loadFailed` says the settings could
+ * not be read, so the flag reads off without being off; `retry` loads them again.
  */
-export function usePolicyInputCaptureFlag(): { enabled: boolean; loaded: boolean } {
-  const { state } = useApp();
-  return { enabled: policyInputCaptureEnabled(state.settings), loaded: state.settings !== null };
+export function usePolicyInputCaptureFlag(): {
+  enabled: boolean;
+  loaded: boolean;
+  loadFailed: boolean;
+  retry: () => Promise<void>;
+} {
+  const { state, actions } = useApp();
+  return {
+    enabled: policyInputCaptureEnabled(state.settings),
+    loaded: state.settings !== null,
+    loadFailed: state.settingsLoadFailed,
+    retry: actions.loadSettings,
+  };
 }
 
 /** Permissions any one of which opens Connections: a payment-gateways-only caller only while agent-pay is on. */

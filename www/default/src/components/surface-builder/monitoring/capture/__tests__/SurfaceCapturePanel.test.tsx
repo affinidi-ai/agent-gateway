@@ -16,7 +16,9 @@ jest.mock('../../../../../utils/useFabricResolver', () => ({
 
 jest.mock('../../PolicyInputCaptureControl', () => ({
   __esModule: true,
-  default: () => <div data-testid="policy-input-capture" />,
+  default: ({ payloadPaused }: { payloadPaused?: boolean }) => (
+    <div data-testid="policy-input-capture" data-payload-paused={String(Boolean(payloadPaused))} />
+  ),
 }));
 
 jest.mock('../../../../../utils/featureFlags', () => ({
@@ -47,7 +49,15 @@ const renderPanel = () =>
 describe('SurfaceCapturePanel', () => {
   it('keeps recording policy input while payload capture is paused', () => {
     renderPanel();
+    expect(screen.getByTestId('policy-input-capture')).toHaveAttribute(
+      'data-payload-paused',
+      'false'
+    );
     fireEvent.click(screen.getByRole('button', { name: /Pause/ }));
+    expect(screen.getByTestId('policy-input-capture')).toHaveAttribute(
+      'data-payload-paused',
+      'true'
+    );
 
     policyInputCaptured();
     dispatch({ type: 'policy_input_skipped', skipped: 2 });

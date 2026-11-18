@@ -75,7 +75,8 @@ pub fn built_in_rules() -> Vec<LogRedactionRule> {
 /// Exported attribute names whose values are credentials. An attribute is one when its
 /// name, ignoring case, is one of these or ends with one after a `.`, `_`, `-` or space. A
 /// lowercase letter or digit followed by an uppercase letter also separates words, so
-/// `accessToken` reads as `access_token`.
+/// `accessToken` reads as `access_token`; a name also matches without that split, so
+/// `passWord` reads as `password`.
 const CREDENTIAL_ATTRIBUTE_NAMES: &[&str] = &[
     "authorization",
     "cookie",
@@ -100,10 +101,23 @@ const CREDENTIAL_ATTRIBUTE_NAMES: &[&str] = &[
 const WHOLE_CREDENTIAL_ATTRIBUTE_NAMES: &[&str] = &["key", "auth", "pat"];
 
 pub(crate) fn is_credential_attribute(name: &str) -> bool {
+    is_credential_name(&normalized_attribute_name(name, true))
+        || is_credential_name(&normalized_attribute_name(name, false))
+}
+
+/// `name` lowercased with `.`, `-` and space read as `_`, and, when `split_case` is set, a
+/// lowercase letter or digit followed by an uppercase letter separated by `_`.
+fn normalized_attribute_name(
+    name: &str,
+    split_case: bool,
+) -> String {
     let mut normalized = String::with_capacity(name.len() + 4);
     let mut previous: Option<char> = None;
     for c in name.chars() {
-        if c.is_ascii_uppercase() && previous.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit()) {
+        if split_case
+            && c.is_ascii_uppercase()
+            && previous.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit())
+        {
             normalized.push('_');
         }
         normalized.push(match c {
@@ -112,16 +126,18 @@ pub(crate) fn is_credential_attribute(name: &str) -> bool {
         });
         previous = Some(c);
     }
-    if WHOLE_CREDENTIAL_ATTRIBUTE_NAMES.contains(&normalized.as_str()) {
-        return true;
-    }
-    CREDENTIAL_ATTRIBUTE_NAMES
-        .iter()
-        .any(|credential| {
-            normalized
-                .strip_suffix(credential)
-                .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('_'))
-        })
+    normalized
+}
+
+fn is_credential_name(normalized: &str) -> bool {
+    WHOLE_CREDENTIAL_ATTRIBUTE_NAMES.contains(&normalized)
+        || CREDENTIAL_ATTRIBUTE_NAMES
+            .iter()
+            .any(|credential| {
+                normalized
+                    .strip_suffix(credential)
+                    .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('_'))
+            })
 }
 
 static UUID: LazyLock<Regex> = LazyLock::new(|| {
@@ -1391,6 +1407,9 @@ mod tests {
             "Key",
             "auth",
             "pat",
+            "passWord",
+            "PassWd",
+            "JSessionId",
         ] {
             assert!(is_credential_attribute(name), "{name} must be treated as a credential");
         }

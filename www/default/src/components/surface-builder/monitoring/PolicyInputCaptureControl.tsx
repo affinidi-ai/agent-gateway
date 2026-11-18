@@ -5,11 +5,18 @@ import { usePermissions } from '../../../context/PermissionsContext';
 import FieldHelp from '../../shared/FieldHelp';
 import { useOptionalSurfaceMeta } from '../SurfaceMetaContext';
 
+interface PolicyInputCaptureControlProps {
+  /** Whether the Capture view's Pause holds the payload stream, which policy input ignores. */
+  payloadPaused?: boolean;
+}
+
 /**
  * Starts and stops listening to the surface's policy input on the dashboard WebSocket.
  * Listening lasts while this view stays open: leaving it, or reloading the page, stops it.
  */
-const PolicyInputCaptureControl: React.FC = () => {
+const PolicyInputCaptureControl: React.FC<PolicyInputCaptureControlProps> = ({
+  payloadPaused = false,
+}) => {
   const meta = useOptionalSurfaceMeta();
   const { hasPermission } = usePermissions();
   const { state, actions } = useApp();
@@ -105,6 +112,12 @@ const PolicyInputCaptureControl: React.FC = () => {
         <span className="text-warning small" data-testid="policy-input-capture-waiting">
           <i className="fas fa-plug me-1"></i>
           Waiting for the dashboard connection; nothing is captured until it is back
+        </span>
+      )}
+      {listening && payloadPaused && (
+        <span className="text-muted small" data-testid="policy-input-capture-paused-note">
+          Pause holds payload capture only; policy input keeps arriving. Use Stop listening to stop
+          it.
         </span>
       )}
       {!allowed && (

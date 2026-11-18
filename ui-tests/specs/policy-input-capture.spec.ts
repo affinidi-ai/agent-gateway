@@ -7,7 +7,7 @@
  * policy_input_capture feature flag off the card says capture is turned off.
  */
 
-import type {APIRequestContext, Page} from '@playwright/test';
+import type {APIRequestContext, Page, WebSocket} from '@playwright/test';
 import {expect, test} from '../helpers/fixtures';
 import {setSystemFeatureFlag, withFeatureFlag} from '../helpers/featureFlags';
 
@@ -78,6 +78,20 @@ async function capture(page: Page, detail: Record<string, unknown>) {
     );
 }
 
+/** Whether a dashboard WebSocket frame is the gateway's answer that it listens to the surface. */
+function isListeningAnswer(payload: string | Buffer): boolean {
+    try {
+        const message = JSON.parse(typeof payload === 'string' ? payload : payload.toString());
+        return (
+            message?.type === 'policy_input_capture' &&
+            message.surface_id === SURFACE_ID &&
+            message.listening === true
+        );
+    } catch {
+        return false;
+    }
+}
+
 // The gateway refuses to listen while the flag is off, so this live listen needs the
 // appliance's stored flag on; it is put back as it was afterwards.
 test.describe('Policy input capture, listening', () => {
@@ -95,11 +109,20 @@ test.describe('Policy input capture, listening', () => {
     });
 
     test('listens live, shows a captured evaluation and stops', async ({page}) => {
+        // The dashboard socket opens when the page loads, before the Capture view is shown.
+        const dashboardSocket: Promise<WebSocket> = page.waitForEvent('websocket', (ws) =>
+            new URL(ws.url()).pathname.endsWith('/api/ws'),
+        );
         await openCaptureView(page);
+        const socket = await dashboardSocket;
         const listen = page.getByTestId('policy-input-capture-listen');
         await expect(listen).toHaveText(/Listen to policy input/);
 
+        const listeningAnswer = socket.waitForEvent('framereceived', {
+            predicate: ({payload}) => isListeningAnswer(payload),
+        });
         await listen.click();
+        await listeningAnswer;
         await expect(page.getByTestId('policy-input-capture-listening')).toBeVisible();
         await expect(listen).toHaveText(/Stop listening/);
         await expect(page.getByTestId('policy-input-capture-error')).toHaveCount(0);

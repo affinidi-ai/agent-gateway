@@ -141,10 +141,13 @@ request on the dashboard WebSocket, with no admin API route and nothing stored o
 - `{"type": "capture_policy_input", "surface_id": "<id>"}` starts listening, and
   `{"type": "stop_capturing_policy_input", "surface_id": "<id>"}` stops it.
 - The gateway answers each with `{"type": "policy_input_capture", "surface_id", "listening"}`, and
-  an `error` when it refuses or ends a listen: `your dashboard session has ended; sign in again`
-  (the connection has no live session), `policy input capture is turned off` (the flag is off),
-  `needs surfaces.edit and policies.edit`, `invalid surface
-  id` (empty, over 256 bytes or holding a control character) or `listening to too many surfaces on this connection` (more than
+  an `error` when it refuses or ends a listen: `policy input capture needs dashboard sign-in` (the
+  connection carries no signed-in dashboard user, as when the gateway serves the dashboard without
+  authentication or without role checks), `your dashboard session has ended; sign
+  in again` (the connection's session is no longer live), `policy input capture is turned off` (the
+  flag is off), `needs surfaces.edit and policies.edit`, `invalid surface
+  id` (empty, over 256 bytes, or holding a control character or a bidirectional or zero-width
+  format character) or `listening to too many surfaces on this connection` (more than
   10). The answer to a stop has no `error`, even when its surface id is not valid.
 - Starting needs the flag on and a dashboard session whose user holds `surfaces.edit` and
   `policies.edit` ([`RBAC.md`](RBAC.md#policy-input-capture)). The session, the flag and the
@@ -155,11 +158,13 @@ request on the dashboard WebSocket, with no admin API route and nothing stored o
   sent, and the captures still queued when access is lost are discarded. A client that has not
   read a message within 10 seconds is disconnected, so it cannot delay the check.
 - Each listen that starts records `policy_input_capture_started`, and each that ends records
-  `policy_input_capture_stopped` with its reason, in the VP Audit Log and any Governance Audit
-  integration that selects either one ([`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)).
-  A refused listen records nothing.
-- Listening ends when the connection closes, so reloading or leaving the page ends it. The
-  dashboard sends its listens again after a reconnect.
+  `policy_input_capture_stopped` with its reason, in the VP Audit Log when auditing selects either
+  event and in any Governance Audit integration that selects either one
+  ([`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)). Each start and stop is also
+  written to the log at info, whatever auditing selects. A refused listen records nothing.
+- Listening ends when the connection closes, so reloading or leaving the page ends it. Captures
+  still queued when the connection closes are not sent. The dashboard sends its listens again
+  after a reconnect.
 - Captures and `policy_input_skipped` notices queued before a stop, or by an earlier listen to
   the same surface, are not sent; those of the connection's other surfaces still are.
 
@@ -181,7 +186,7 @@ it one `policy_input_captured` update, once the policy has decided:
 | `timestamp` | When the policy decided, RFC 3339 |
 | `slot` | The policy, in words: `inbound` (the Access Point policy), `target` (the Target's request policy), `inbound variant <alias>`, `target variant <alias>`, `outbound`, `transit <alias>`, `response` (the Target's response policy), `transit <alias> response`, `gateway` (the gateway-level policy on an inbound request), `gateway outbound` (the gateway-level policy on an outbound request, `input.gateway.direction` `outbound`) or `appliance <plane>` (an appliance-wide plane) |
 | `transit_point` | The Transit Point alias, for a Transit Point request or response policy |
-| `policies` | The policy definitions the slot evaluated, each `{"id", "name", "version"}`: one for a surface slot, every member of the set for the gateway and appliance-wide planes; a legacy inline gateway policy has neither `id` nor `name` |
+| `policies` | The policy definitions the slot evaluated, each `{"id", "name", "version"}`: one for a surface slot, every member of the set for the gateway and appliance-wide planes; a legacy inline gateway policy has neither `id` nor `name`. A monitor-only appliance-wide member is listed without its outcome: a deny it would have made does not change `decision` or `decided_by` |
 | `decided_by` | The `id` of the member that denied, when a gateway or appliance-wide set denies, or that failed to evaluate, on an appliance-wide plane |
 | `plane` | `surface`, `gateway` or `appliance` |
 | `engine` | The compiled policy key: the surface id, `inbound:`, `outbound:`, `variant:` or `transit:<surface>:<alias>` for a surface request policy, `response:<policy definition id>` or `response:transit:<surface>:<alias>` for a response policy, the gateway id, or the appliance-wide plane |
@@ -193,14 +198,15 @@ it one `policy_input_captured` update, once the policy has decided:
 Policies run appliance-wide, gateway, Access Point, Target, and a deny ends the chain, so a slot
 after it sends nothing. Captures are sent on the direct, Fabric and MCP proxy paths alike. MCP tool
 policies, the `tools/list` filtering of a surface policy, and a fail-closed deny of a slot whose
-policy did not compile (no policy is evaluated, so there is no input to show) are not captured. A
+policy did not compile (the request is denied before any policy runs) are not captured. A
 surface with no
 policy of its own has no surface evaluation to capture, so only a gateway or appliance-wide policy
 that applies to it is shown; to see the input of each request, add a request policy first (one that
 allows everything is enough). The Capture view says so while the surface has none.
 
 Only a dashboard WebSocket opened with a session (`websocket_require_auth`, on by default) can
-listen; a socket without a session never receives captures. Nothing is written to the log or
+listen; a socket that carries no signed-in dashboard user is refused with `policy input capture
+needs dashboard sign-in` and never receives captures. Nothing is written to the log or
 stored, so a capture is gone once it has been sent. A listen is checked against the user's
 permissions, not against the surface: dashboard sessions are appliance-wide, so a user with both
 permissions can listen to any surface, and a listen naming a surface that does not exist receives
@@ -229,10 +235,11 @@ is shown as the request log line shows it: query parameter names are kept and ev
 becomes `<redacted>`, since a request received over Fabric carries the caller's full path and query,
 and capability ids in the path are shortened. Masking matches these shapes only, so a credential in
 another shape, such as an opaque key under a field name that is not a credential name, is sent as
-it is. Policies still see the full path. Headers that
+it is. Object keys are never masked: only values are, so a credential used as a key is sent as it
+is. Policies still see the full path. Headers that
 carry credentials never reach the policy input. After this masking, the operator's
 [log redaction rules](CONFIGURATION_REFERENCE.md#log-redaction) (`logging.redaction.rules`) are
-applied to every string in the input, to each string field as a log line writes it
+applied to every string value in the input, to each string field as a log line writes it
 (`"name":"value"`, so a rule that matches a field name with its value, such as the built-in quoted
 credential fields rule for `"clientsecret":"..."`, masks the whole value as `<redacted>`), and to
 the deny reason and error, so a capture masks at least what the log masks. The built-in rules also catch credential assignments in free text
