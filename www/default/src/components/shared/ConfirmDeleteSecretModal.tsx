@@ -11,7 +11,10 @@ interface ConfirmDeleteSecretModalProps {
   onConfirm: () => void;
 }
 
-/** Asks before deleting a secret other resources still use; confirming forces the delete. */
+/**
+ * Asks before deleting a secret other resources still use; confirming forces the delete. While
+ * the delete runs the buttons stay focusable and ignore clicks, so focus stays in the dialog.
+ */
 const ConfirmDeleteSecretModal: React.FC<ConfirmDeleteSecretModalProps> = ({
   secretName,
   conflict,
@@ -21,7 +24,7 @@ const ConfirmDeleteSecretModal: React.FC<ConfirmDeleteSecretModalProps> = ({
 }) => (
   <Modal
     show
-    onHide={onCancel}
+    onHide={busy ? undefined : onCancel}
     centered
     aria-labelledby="confirm-delete-secret-title"
     data-testid="confirm-delete-secret-modal"
@@ -39,8 +42,8 @@ const ConfirmDeleteSecretModal: React.FC<ConfirmDeleteSecretModalProps> = ({
     <Modal.Footer>
       <Button
         variant="secondary"
-        onClick={onCancel}
-        disabled={busy}
+        onClick={busy ? undefined : onCancel}
+        aria-disabled={busy}
         autoFocus
         data-testid="confirm-delete-secret-cancel"
       >
@@ -48,11 +51,11 @@ const ConfirmDeleteSecretModal: React.FC<ConfirmDeleteSecretModalProps> = ({
       </Button>
       <Button
         variant="danger"
-        onClick={onConfirm}
-        disabled={busy}
+        onClick={busy ? undefined : onConfirm}
+        aria-disabled={busy}
         data-testid="confirm-delete-secret-confirm"
       >
-        Delete secret anyway
+        {busy ? 'Deleting…' : 'Delete secret anyway'}
       </Button>
     </Modal.Footer>
   </Modal>

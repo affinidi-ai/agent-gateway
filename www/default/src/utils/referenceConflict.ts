@@ -1,6 +1,4 @@
-export type ReferenceKind = 'surface' | 'credential_provider' | 'a2a_proxy' | 'sts_client';
-
-export interface ConflictReference {
+interface ConflictReference {
   kind: string;
   id: string;
   name: string;
@@ -13,15 +11,16 @@ export interface ReferenceConflict {
   hiddenReferences: number;
 }
 
-const KIND_LABELS: Record<ReferenceKind, string> = {
+const KIND_LABELS: Readonly<Record<string, string>> = {
   surface: 'Surface',
   credential_provider: 'Credential provider',
   a2a_proxy: 'A2A proxy',
   sts_client: 'STS client',
 };
 
+/** The name of a reference kind, or the kind itself for one the dashboard does not know. */
 export function referenceKindLabel(kind: string): string {
-  return KIND_LABELS[kind as ReferenceKind] ?? kind;
+  return KIND_LABELS[kind] ?? kind;
 }
 
 /**

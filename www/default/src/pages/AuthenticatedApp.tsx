@@ -644,7 +644,7 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                 <Route
                   path="/credentials"
                   element={
-                    <ProtectedRoute permissionsAny={['settings.view', 'credential_providers.view']}>
+                    <ProtectedRoute permission={['settings.view', 'credential_providers.view']}>
                       <CredentialsPage />
                     </ProtectedRoute>
                   }
