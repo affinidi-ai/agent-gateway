@@ -458,10 +458,9 @@ fn apply_redaction_rules(
     match value {
         Value::Object(map) => {
             for (key, entry) in map.iter_mut() {
-                if matches!(entry, Value::String(text) if field_is_redacted(key, text, redactor)) {
-                    *entry = Value::String(REDACTED.to_string());
-                } else {
-                    apply_redaction_rules(entry, redactor);
+                match entry {
+                    Value::String(text) => *text = redact_field(key, text, redactor),
+                    _ => apply_redaction_rules(entry, redactor),
                 }
             }
         }
@@ -477,27 +476,27 @@ fn apply_redaction_rules(
     }
 }
 
-/// Whether a redaction rule that needs the field's name changes its value: the field written
-/// as JSON, `"<key>":"<value>"`, redacts differently from the value redacted on its own. A
-/// rule that changes only the key doesn't count.
-fn field_is_redacted(
+/// The value `text` of field `key` with the redaction rules applied: [`REDACTED`] when a rule
+/// that needs the field's name changes it, that is when the field written as JSON,
+/// `"<key>":"<value>"`, redacts differently from the value redacted on its own, and otherwise
+/// the value redacted on its own. A rule that changes only the key doesn't count.
+fn redact_field(
     key: &str,
     text: &str,
     redactor: &crate::observability::LogRedactor,
-) -> bool {
-    let key = format!("{}:", Value::String(key.to_string()));
-    let redacted_field = redactor
-        .redact(&format!("{key}{}", Value::String(text.to_string())))
+) -> String {
+    let redacted_value = redactor
+        .redact(text)
         .into_owned();
-    let redacted_value = format!(
-        "{key}{}",
-        Value::String(
-            redactor
-                .redact(text)
-                .into_owned()
-        )
-    );
-    redacted_field != redacted_value && redacted_field.starts_with(&key)
+    let key = format!("{}:", Value::from(key));
+    let redacted_field = redactor
+        .redact(&format!("{key}{}", Value::from(text)))
+        .into_owned();
+    if redacted_field != format!("{key}{}", Value::from(redacted_value.as_str())) && redacted_field.starts_with(&key) {
+        REDACTED.to_string()
+    } else {
+        redacted_value
+    }
 }
 
 /// Replace every credential in `value` with [`REDACTED`]: the value of a key named like a
@@ -532,7 +531,8 @@ pub fn mask_credentials(value: &mut Value) {
 /// takes `=` only as trailing padding, so `CSRF=` in front of a JWT is not part of it. A
 /// word joined to the header by `-`, `_` or `.`, as in `session_`, is matched with it, and
 /// [`header_start_before_last_dot`] or [`header_start`] finds where in that run the header
-/// starts. The payload is the third group.
+/// starts. The groups, the joined words, the header and the payload, are what
+/// [`jwt_candidate_parts`] reads from a candidate without resolving them.
 static EMBEDDED_JWT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"\b([A-Za-z0-9_.-]*[-_.])?((?:e[wy]|I[ACH]|C[QSXgin]|D[QSX])[A-Za-z0-9_-]+={0,2})\.([A-Za-z0-9_=-]+)\.[A-Za-z0-9_=-]*(?:~[A-Za-z0-9_=.-]*)*",
@@ -540,9 +540,16 @@ static EMBEDDED_JWT: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid JWT pattern")
 });
 
-/// The encodings a JWT header can start with; see [`EMBEDDED_JWT`].
-static HEADER_PREFIX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(?:e[wy]|I[ACH]|C[QSXgin]|D[QSX])").expect("valid JWT header prefix pattern"));
+/// Whether `text` starts with an encoding a JWT header can start with; see [`EMBEDDED_JWT`].
+fn starts_like_jwt_header(text: &[u8]) -> bool {
+    matches!(
+        text,
+        [b'e', b'w' | b'y', ..]
+            | [b'I', b'A' | b'C' | b'H', ..]
+            | [b'C', b'Q' | b'S' | b'X' | b'g' | b'i' | b'n', ..]
+            | [b'D', b'Q' | b'S' | b'X', ..]
+    )
+}
 
 /// The most header starts [`header_start`] decodes for one candidate, which keeps masking
 /// linear in the text length.
@@ -558,7 +565,7 @@ fn header_start(lead: &str) -> Option<usize> {
     (0..bytes.len())
         .rev()
         .filter(|&start| {
-            (start == 0 || matches!(bytes[start - 1], b'-' | b'_' | b'.')) && HEADER_PREFIX.is_match(&lead[start..])
+            (start == 0 || matches!(bytes[start - 1], b'-' | b'_' | b'.')) && starts_like_jwt_header(&bytes[start..])
         })
         .take(MAX_HEADER_STARTS)
         .find(|&start| is_jwt_header(&lead[start..]))
@@ -628,19 +635,7 @@ fn mask_text(text: &str) -> Option<String> {
     let masked = URL_USERINFO
         .replace_all(&masked, |caps: &regex::Captures<'_>| format!("{}{REDACTED}@", &caps[1]))
         .into_owned();
-    let masked = EMBEDDED_JWT
-        .replace_all(&masked, |caps: &regex::Captures<'_>| {
-            let glue = caps
-                .get(1)
-                .map_or("", |glue| glue.as_str());
-            let lead = format!("{glue}{}", &caps[2]);
-            match header_start_before_last_dot(&lead).or_else(|| header_start(&lead)) {
-                Some(start) => format!("{}{REDACTED}", &lead[..start]),
-                None if is_jwt_header(&caps[3]) => REDACTED.to_string(),
-                None => caps[0].to_string(),
-            }
-        })
-        .into_owned();
+    let masked = mask_embedded_jwts(&masked);
     let masked = AUTHORIZATION
         .replace_all(&masked, |caps: &regex::Captures<'_>| {
             if is_authorization_token(&caps[1], &caps[3]) {
@@ -653,6 +648,42 @@ fn mask_text(text: &str) -> Option<String> {
     (masked != text).then_some(masked)
 }
 
+/// `text` with each [`EMBEDDED_JWT`] candidate that holds a JWT masked. Candidates are found
+/// without resolving the pattern's groups, which would scan each candidate again, slowly, and
+/// a candidate can span a long run of joined words; [`jwt_candidate_parts`] splits it instead.
+/// A candidate it can't split is masked whole.
+fn mask_embedded_jwts(text: &str) -> String {
+    let mut masked = String::with_capacity(text.len());
+    let mut kept_from = 0;
+    for candidate in EMBEDDED_JWT.find_iter(text) {
+        masked.push_str(&text[kept_from..candidate.start()]);
+        match jwt_candidate_parts(candidate.as_str()) {
+            Some((lead, payload)) => match header_start_before_last_dot(lead).or_else(|| header_start(lead)) {
+                Some(start) => {
+                    masked.push_str(&lead[..start]);
+                    masked.push_str(REDACTED);
+                }
+                None if is_jwt_header(payload) => masked.push_str(REDACTED),
+                None => masked.push_str(candidate.as_str()),
+            },
+            None => masked.push_str(REDACTED),
+        }
+        kept_from = candidate.end();
+    }
+    masked.push_str(&text[kept_from..]);
+    masked
+}
+
+/// The lead, the joined words and header before the payload, and the payload of an
+/// [`EMBEDDED_JWT`] candidate. The header, payload and signature hold no `.` or `~` and the
+/// joined words no `~`, so the candidate before its first `~` ends in
+/// `.<payload>.<signature>`.
+fn jwt_candidate_parts(candidate: &str) -> Option<(&str, &str)> {
+    let token = candidate.split('~').next()?;
+    let (lead_and_payload, _signature) = token.rsplit_once('.')?;
+    lead_and_payload.rsplit_once('.')
+}
+
 /// The shortest `Bearer` token taken as a credential when it is only letters. Shorter
 /// words ("Bearer arms") are message text.
 const MIN_AUTHORIZATION_TOKEN_LEN: usize = 12;
@@ -661,9 +692,17 @@ const MIN_AUTHORIZATION_TOKEN_LEN: usize = 12;
 /// `-._~+/=`.
 const MIN_MARKED_TOKEN_LEN: usize = 6;
 
+/// Whether `text` is one authorization value: `Bearer` or `Basic`, whitespace and a token
+/// [`is_authorization_token`] takes. Other text is told apart by its first word alone.
 fn is_authorization_value(text: &str) -> bool {
-    text.split_once(char::is_whitespace)
-        .is_some_and(|(scheme, token)| is_authorization_token(scheme, token.trim()))
+    ["bearer", "basic"]
+        .into_iter()
+        .any(|scheme| {
+            text.get(..scheme.len())
+                .is_some_and(|word| word.eq_ignore_ascii_case(scheme))
+                && text[scheme.len()..].starts_with(char::is_whitespace)
+                && is_authorization_token(scheme, text[scheme.len()..].trim())
+        })
 }
 
 /// Whether `token` after `scheme` is a credential. A `Basic` token is one when it
@@ -1598,12 +1637,85 @@ mod tests {
     }
 
     #[test]
+    fn a_jwt_candidate_splits_into_the_groups_the_pattern_matches() {
+        let texts = [
+            format!("see {JWT} here"),
+            format!("session_{JWT}"),
+            format!("CSRF={JWT}"),
+            format!("Cisco.com.{JWT}"),
+            format!("{JWT}.Cisco.com.au"),
+            format!("{JWT}.{JWT}"),
+            format!("the cookie session_{JWT}~WyJzIiwibiJd~ expired"),
+            format!("{JWT}~WyJzIiwibiJd~{JWT}"),
+            "a-Ci-x.a.b Ci.a.b~Ci.a.b~ v1-2.3.4 eyes.on.it".to_string(),
+            format!("{}x.a.b", "Ci-".repeat(50)),
+        ];
+        for text in &texts {
+            let found: Vec<_> = EMBEDDED_JWT
+                .find_iter(text)
+                .map(|candidate| jwt_candidate_parts(candidate.as_str()))
+                .collect();
+            let captured: Vec<_> = EMBEDDED_JWT
+                .captures_iter(text)
+                .map(|caps| {
+                    let lead = caps.get(0).unwrap().start()..caps.get(2).unwrap().end();
+                    Some((&text[lead], caps.get(3).unwrap().as_str()))
+                })
+                .collect();
+
+            assert!(!found.is_empty(), "{text}");
+            assert_eq!(found, captured, "{text}");
+        }
+    }
+
+    #[test]
+    fn only_the_jwt_header_encodings_start_like_a_header() {
+        for prefix in ["ew", "ey", "IA", "IC", "IH", "CQ", "CS", "CX", "Cg", "Ci", "Cn", "DQ", "DS", "DX"] {
+            assert!(starts_like_jwt_header(format!("{prefix}J").as_bytes()), "{prefix}");
+        }
+        for text in ["", "e", "eA", "Cz", "ci", "DA", "Ix", "xey"] {
+            assert!(!starts_like_jwt_header(text.as_bytes()), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_authorization_value_is_a_scheme_whitespace_and_a_token() {
+        let basic = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode("user:password")
+        };
+        for text in [
+            "Bearer abcdefghijklmnop".to_string(),
+            "bearer\tabc-123".to_string(),
+            "BEARER  abcdefghijklmnop".to_string(),
+            format!("Basic {basic}"),
+        ] {
+            assert!(is_authorization_value(&text), "{text}");
+        }
+        for text in [
+            "Bearer arms",
+            "Bearerabcdefghijklmnop",
+            "Basic authentication",
+            "Bear abcdefghijklmnop",
+            "the Bearer abcdefghijklmnop",
+            "Bearer",
+            "é Bearer abcdefghijklmnop",
+            "",
+        ] {
+            assert!(!is_authorization_value(text), "{text}");
+        }
+    }
+
+    #[test]
     fn a_rule_that_changes_only_a_field_name_leaves_its_value() {
         let redactor = crate::observability::opentelemetry::log_redactor();
-        assert!(!field_is_redacted("alice@example.test", "kept", &redactor));
-        assert!(field_is_redacted("clientsecret", "s3cr3t", &redactor));
-        assert!(!field_is_redacted("note", "kept", &redactor));
-        assert!(!field_is_redacted("path", "/a2a/agent?token=t-secret", &redactor));
+        let path = "/a2a/agent?token=t-secret";
+
+        assert_eq!(redact_field("alice@example.test", "kept", &redactor), "kept");
+        assert_eq!(redact_field("clientsecret", "s3cr3t", &redactor), REDACTED);
+        assert_eq!(redact_field("note", "kept", &redactor), "kept");
+        assert_eq!(redact_field("path", path, &redactor), redactor.redact(path));
+        assert_ne!(redact_field("path", path, &redactor), REDACTED);
     }
 
     #[test]
