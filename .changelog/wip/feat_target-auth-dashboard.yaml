@@ -8,9 +8,10 @@ changes:
         The dashboard uses credential_providers.view, .edit and .delete for credential
         providers, as the Admin API already did. A user with view but not edit sees a read-only
         provider editor, and Add and Delete need .edit and .delete. The Credentials page opens
-        with either settings.view or credential_providers.view. Upgrade note: a user who only
-        had settings.edit now needs credential_providers.edit to edit providers in the
-        dashboard.
+        with either settings.view or credential_providers.view, and its JWT Verification,
+        Credential Tokens and Delegated Access tabs need settings.view. Upgrade note: a user who
+        only had settings.edit now needs credential_providers.edit to add or edit providers and
+        credential_providers.delete to delete one in the dashboard.
     - timestamp: '2026-11-02T11:45:39Z'
       title: Validate Target authentication in the Surface Builder and save it unchanged
       description: >-
@@ -21,8 +22,7 @@ changes:
         block Save: the gateway refuses it only when its rule is enforce, and a save in warn
         shows the gateway's warning. Saving keeps stored fields the editor does
         not show, and an unopened Transit Point keeps its Target authentication. The credential
-        provider method gains an optional Scopes input, and Subject is required for JWT bearer
-        providers.
+        provider method gains an optional Scopes input.
     - timestamp: '2026-11-02T11:45:40Z'
       title: Warn before deleting a secret that other resources use
       description: >-

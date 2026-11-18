@@ -13,7 +13,10 @@ jest.mock('../SettingsPage/CredentialProvidersTab', () => () => (
   <div data-testid="providers-tab" />
 ));
 jest.mock('../CredentialsPage/CredentialTokensTab', () => () => <div data-testid="tokens-tab" />);
-jest.mock('../CredentialsPage/CredentialAuditTab', () => () => <div data-testid="audit-tab" />);
+jest.mock('../CredentialsPage/DelegatedAccessTab', () => () => <div data-testid="delegated-tab" />);
+jest.mock('../CredentialsPage/useDelegationVault', () => ({
+  useDelegationVault: () => ({ tokens: [], providers: {}, loading: false, vaultError: null }),
+}));
 jest.mock('../CredentialsPage/StsClientsTab', () => () => <div data-testid="sts-tab" />);
 
 const Search = () => <div data-testid="search">{useLocation().search}</div>;
@@ -41,6 +44,26 @@ describe('CredentialsPage tab permissions', () => {
     );
     expect(screen.getByTestId('providers-tab')).toBeInTheDocument();
     expect(screen.queryByTestId('credentials-jwt-verification-tab-trigger')).toBeNull();
+    expect(screen.queryByTestId('credentials-credential-tokens-tab-trigger')).toBeNull();
+    expect(screen.queryByTestId('credentials-delegated-access-tab-trigger')).toBeNull();
+  });
+
+  it('leaves the Delegated Access tab for a user without settings.view', () => {
+    mockGranted = new Set(['credential_providers.view']);
+    visit('/credentials?tab=delegated-access');
+
+    expect(screen.queryByTestId('delegated-tab')).toBeNull();
+    expect(screen.getByTestId('search')).toHaveTextContent('?tab=credential-providers');
+  });
+
+  it('shows the Delegated Access tab for settings.view', () => {
+    mockGranted = new Set(['settings.view']);
+    visit('/credentials?tab=delegated-access');
+
+    expect(screen.getByTestId('credentials-delegated-access-tab-trigger')).toHaveAttribute(
+      'aria-selected',
+      'true'
+    );
   });
 
   it('opens on JWT Verification for settings.view', () => {
