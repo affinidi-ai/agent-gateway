@@ -1641,8 +1641,9 @@ impl MetricsStore {
         self.metrics_retention_minutes
     }
 
-    /// Totals and p95 latency of the retained Access Point (inbound) connections across
-    /// `surface_ids`, in one pass.
+    /// Totals and p95 latency of the retained Access Point (inbound) requests across
+    /// `surface_ids`, in one pass. Response rows are skipped, so a call recorded as a request
+    /// and a response counts once.
     pub async fn inbound_traffic(
         &self,
         surface_ids: &[&str],
@@ -1656,6 +1657,7 @@ impl MetricsStore {
             .iter()
             .filter(|conn| {
                 conn.transit_point.is_none()
+                    && conn.direction == ConnectionDirection::Request
                     && surface_ids.contains(
                         &conn
                             .channel_config_id
@@ -2926,6 +2928,39 @@ mod tests {
                 .inbound_traffic(&["s3"])
                 .await,
             super::InboundTraffic::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_traffic_counts_each_request_once_ignoring_response_rows() {
+        let store = MetricsStore::new(1000);
+        let response = |status, latency_ms| {
+            let mut row = with_status(metric("s1", latency_ms, None), status);
+            row.direction = super::ConnectionDirection::Response;
+            row
+        };
+        {
+            let mut connections = store
+                .connections
+                .write()
+                .await;
+            connections.push(metric("s1", Some(100), None));
+            connections.push(response(super::ConnectionStatus::Success, Some(9_000)));
+            connections.push(with_status(metric("s1", Some(200), None), super::ConnectionStatus::Failed));
+            connections.push(response(super::ConnectionStatus::Failed, Some(9_000)));
+            connections.push(response(super::ConnectionStatus::GatewayFault, None));
+        }
+
+        assert_eq!(
+            store
+                .inbound_traffic(&["s1"])
+                .await,
+            super::InboundTraffic {
+                total: 2,
+                failed: 1,
+                gateway_faults: 0,
+                p95_latency_ms: Some(200),
+            }
         );
     }
 

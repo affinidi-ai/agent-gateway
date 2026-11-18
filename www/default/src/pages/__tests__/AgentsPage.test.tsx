@@ -3,7 +3,9 @@ import { fireEvent, render, screen, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import AgentsPage from '../AgentsPage';
+import { DOCS_URL } from '../../config/docs';
 import { AgentListResponse, AgentRecord, apiClient } from '../../api';
+import { usePermissions } from '../../context/PermissionsContext';
 
 jest.mock('../../api', () => ({
   apiClient: {
@@ -11,7 +13,16 @@ jest.mock('../../api', () => ({
   },
 }));
 
+jest.mock('../../context/PermissionsContext', () => ({
+  usePermissions: jest.fn(),
+}));
+
 const mockedListAgents = apiClient.listAgents as jest.Mock;
+const mockedUsePermissions = usePermissions as jest.Mock;
+const grant = (...permissions: string[]) =>
+  mockedUsePermissions.mockReturnValue({
+    hasPermission: (permission: string) => permissions.includes(permission),
+  });
 
 const LONG_DID = 'did:webvh:QmYAuadF1234567890:agent-gateway1.example.com:surface:abcdef12';
 
@@ -37,6 +48,7 @@ const renderPage = () =>
       <Routes>
         <Route path="/agent-registry" element={<AgentsPage />} />
         <Route path="/agent-registry/:agentId" element={<div data-testid="details-route" />} />
+        <Route path="/surfaces/new" element={<div data-testid="new-surface-route" />} />
         <Route path="/surfaces/:surfaceId" element={<div data-testid="surface-route" />} />
       </Routes>
     </MemoryRouter>
@@ -45,6 +57,7 @@ const renderPage = () =>
 describe('AgentsPage', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    grant('surfaces.view', 'surfaces.edit');
   });
 
   it('lists rows with a count badge and display labels', async () => {
@@ -314,7 +327,46 @@ describe('AgentsPage', () => {
   it('shows the empty state', async () => {
     mockedListAgents.mockResolvedValue(list());
     renderPage();
-    expect(await screen.findByText('No agents yet')).toBeInTheDocument();
+    expect(await screen.findByText('No managed agents yet')).toBeInTheDocument();
+  });
+
+  it('opens the surface creation flow from the empty state link', async () => {
+    mockedListAgents.mockResolvedValue(list());
+    renderPage();
+
+    const add = await screen.findByTestId('agents-add-surface-link');
+    expect(add.tagName).toBe('A');
+    expect(add).toHaveTextContent('Create a surface');
+    expect(add).toHaveAttribute('href', '/surfaces/new');
+    fireEvent.click(add);
+    expect(await screen.findByTestId('new-surface-route')).toBeInTheDocument();
+  });
+
+  it('links to the surfaces docs from the empty state', async () => {
+    mockedListAgents.mockResolvedValue(list());
+    renderPage();
+
+    const docs = await screen.findByRole('link', { name: /What’s a surface\?/ });
+    expect(docs).toHaveAttribute('href', DOCS_URL.surfaces);
+    expect(docs).toHaveAttribute('target', '_blank');
+  });
+
+  it('offers no surface creation in the empty state to a user who cannot edit surfaces', async () => {
+    grant('surfaces.view');
+    mockedListAgents.mockResolvedValue(list());
+    renderPage();
+
+    expect(await screen.findByText('No managed agents yet')).toBeInTheDocument();
+    expect(screen.queryByTestId('agents-add-surface-link')).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /What’s a surface\?/ })).toBeInTheDocument();
+  });
+
+  it('offers no surface creation in the empty state while the list failed to load', async () => {
+    mockedListAgents.mockRejectedValue(new Error('Internal Server Error'));
+    renderPage();
+
+    expect(await screen.findByTestId('agents-load-error')).toBeInTheDocument();
+    expect(screen.queryByTestId('agents-add-surface-link')).not.toBeInTheDocument();
   });
 
   it('shows the error state and retries', async () => {

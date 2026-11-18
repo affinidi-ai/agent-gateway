@@ -457,11 +457,24 @@ async fn personal_access_token_reads_agent_card_of_surface(world: &mut SurfaceWo
 #[when("the operator reads the agent card of the surface's agent")]
 async fn operator_reads_agent_card_of_surface(world: &mut SurfaceWorld) {
     let path = surface_agent_path(world, "/agent-card");
+    operator_reads_agent_card(world, &path).await;
+}
+
+#[when("the operator reads the agent card of the surface's agent through that surface")]
+async fn operator_reads_agent_card_through_surface(world: &mut SurfaceWorld) {
+    let path = surface_agent_path(world, &format!("/agent-card?surface_id={SURFACE_ID}"));
+    operator_reads_agent_card(world, &path).await;
+}
+
+async fn operator_reads_agent_card(
+    world: &mut SurfaceWorld,
+    path: &str,
+) {
     let response = world
         .admin_client
         .as_ref()
         .expect("the operator session must exist")
-        .send_recorded_json::<Value>(Method::GET, &path, None)
+        .send_recorded_json::<Value>(Method::GET, path, None)
         .await
         .expect("reading the agent card as the operator");
     world.admin_response = Some(response);
@@ -518,10 +531,32 @@ fn agent_answer_names_surface(world: &mut SurfaceWorld) {
 
 #[then("the agent card is unavailable because only an operator may read it")]
 fn agent_card_is_operator_only(world: &mut SurfaceWorld) {
+    assert_agent_card_unavailable(world, "operator_only");
+}
+
+#[then("the agent card is unavailable because none of the agent's surfaces is running")]
+fn agent_card_is_not_running(world: &mut SurfaceWorld) {
+    assert_agent_card_unavailable(world, "not_running");
+}
+
+#[then("the agent card can't be read through that surface")]
+fn agent_card_surface_unavailable(world: &mut SurfaceWorld) {
+    let body = &management_response(world).body;
+    assert_eq!(
+        (&body["error"], &body["code"]),
+        (&json!("Not Found"), &json!("surface_unavailable")),
+        "the agent card answer: {body}"
+    );
+}
+
+fn assert_agent_card_unavailable(
+    world: &SurfaceWorld,
+    reason: &str,
+) {
     let body = &management_response(world).body;
     assert_eq!(
         (&body["available"], &body["reason"], body.get("card")),
-        (&json!(false), &json!("operator_only"), None),
+        (&json!(false), &json!(reason), None),
         "the agent card answer: {body}"
     );
 }

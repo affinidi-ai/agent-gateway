@@ -23,7 +23,7 @@ use crate::bdd_support::config::modern_consent::PUBLIC_ORIGIN;
 use crate::bdd_support::json_rpc::McpVersion;
 use crate::bdd_support::mcp_consent::ConsentRequest;
 use crate::bdd_support::oidc::OidcProvider;
-use crate::world::G2gWorld;
+use crate::world::{AgentTraffic, G2gWorld, TRAFFIC_TIMEOUT};
 
 const FABRIC_GATEWAY_DID_META_KEY: &str = "x-affinidi-fabric-gateway-did";
 const AGENT_IDENTITY_BINDING_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity-binding/v1";
@@ -1070,6 +1070,40 @@ pub async fn the_relay_was_refused_after_calls(
 ) {
     assert_eq!(world.relayed_transit_point_calls, Some(calls), "body={:?}", world.response_body);
     assert_eq!(world.response_status, Some(status), "body={:?}", world.response_body);
+}
+
+#[then(expr = "the operator sees {int} more request(s), none failed, in the traffic of the agent of surface {string}")]
+pub async fn operator_sees_more_requests_in_agent_traffic(
+    world: &mut G2gWorld,
+    more: u64,
+    surface_name: String,
+) {
+    let baseline = *world
+        .agent_traffic_baseline
+        .get(&surface_name)
+        .unwrap_or_else(|| panic!("the operator must read the traffic of the agent of surface '{surface_name}' first"));
+    let deadline = tokio::time::Instant::now() + TRAFFIC_TIMEOUT;
+    while world
+        .agent_traffic_of_surface(&surface_name)
+        .await
+        .total_requests
+        < baseline.total_requests + more
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let traffic = world
+        .settled_agent_traffic_of_surface(&surface_name)
+        .await;
+    assert_eq!(
+        traffic,
+        AgentTraffic {
+            total_requests: baseline.total_requests + more,
+            failed: baseline.failed,
+        },
+        "traffic of the agent of surface '{surface_name}' before the caller's action: {baseline:?}; caller_status={:?}",
+        world.response_status
+    );
 }
 
 #[then(expr = "managed agent {string} served its agent card once")]
