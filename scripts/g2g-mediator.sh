@@ -74,8 +74,12 @@ if [[ "${needs_regen}" -eq 1 ]]; then
   pushd "${ABS_TARGET}" >/dev/null
 
   # Newer wizards refuse an unencrypted file:// secret store for a container
-  # deployment unless it is accepted explicitly; older ones reject the flag as
-  # unknown, so pass it only when this image advertises it. Read the help into a
+  # deployment unless it is accepted explicitly. This stack is a throwaway test
+  # mediator whose keys are generated per scenario and deleted with the temp
+  # dir, so the acceptance is made here rather than asked of the caller; a
+  # mediator meant to outlive a test is provisioned by
+  # scripts/mediator/user-data-v2.sh, which asks. Older wizards reject the flag
+  # as unknown, so pass it only when this image advertises it. Read the help into a
   # variable rather than piping it: a probe the daemon refused — which happens
   # under a parallel run — would otherwise be indistinguishable from an image
   # without the flag, and the setup that follows would fail on the refusal.

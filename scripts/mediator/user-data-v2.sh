@@ -81,25 +81,34 @@ if [ "$DID_METHOD" = "webvh" ]; then
 fi
 RECIPE_EXTRA_KEY_SUITES=""
 [ "$USE_P256_KEY_SUITE" = "true" ] && RECIPE_EXTRA_KEY_SUITES='extra_key_suites = ["p256"]'
-# Newer wizards refuse an unencrypted file:// secret store outside a local
-# deployment unless it is accepted explicitly; older ones reject the recipe key
-# as unknown, so set it only when this image advertises the matching flag.
+# This recipe stores the mediator's keys in a plaintext file. From v0.53.0 the
+# wizard refuses that for a server deployment unless the operator accepts it,
+# and this script does not decide that for them: set
+# MEDIATOR_ALLOW_PLAINTEXT_FILE=true to accept it (development and throwaway
+# hosts), or provision the mediator with an encrypted store or a secret manager
+# instead. Older wizards reject the recipe key as unknown, so it is written only
+# when this image advertises the matching flag.
 RECIPE_ALLOW_PLAINTEXT_FILE=""
-setup_help=""
-for _ in 1 2 3; do
-  if setup_help="$(docker run --rm --entrypoint mediator-setup "$MEDIATOR_IMAGE" --help 2>/dev/null)" \
-    && [ -n "$setup_help" ]; then
-    break
+if [ "${MEDIATOR_ALLOW_PLAINTEXT_FILE:-false}" = "true" ]; then
+  setup_help=""
+  for _ in 1 2 3; do
+    if setup_help="$(docker run --rm --entrypoint mediator-setup "$MEDIATOR_IMAGE" --help 2>/dev/null)" \
+      && [ -n "$setup_help" ]; then
+      break
+    fi
+    sleep 2
+  done
+  if [ -z "$setup_help" ]; then
+    echo "could not read mediator-setup --help from $MEDIATOR_IMAGE" >&2
+    exit 1
   fi
-  sleep 2
-done
-if [ -z "$setup_help" ]; then
-  echo "could not read mediator-setup --help from $MEDIATOR_IMAGE" >&2
-  exit 1
+  case "$setup_help" in
+    *--allow-plaintext-file*)
+      RECIPE_ALLOW_PLAINTEXT_FILE="allow_plaintext_file = true"
+      echo "⚠️  MEDIATOR_ALLOW_PLAINTEXT_FILE=true: the mediator's keys are stored unencrypted on disk." >&2
+      ;;
+  esac
 fi
-case "$setup_help" in
-  *--allow-plaintext-file*) RECIPE_ALLOW_PLAINTEXT_FILE="allow_plaintext_file = true" ;;
-esac
 # admin = "skip" when an external admin DID is supplied; mediator-setup then
 # omits the generated admin credential and we inject the DID into mediator.toml.
 RECIPE_ADMIN_MODE="generate"

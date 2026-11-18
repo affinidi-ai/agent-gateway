@@ -18,14 +18,17 @@ changes:
         affinidi-did-resolver-cache-sdk 0.8.57 and didwebvh-rs 0.8.2. Trust Task types now come
         from the SDK's own generated module, so the direct trust-tasks-rs dependency is gone.
     - timestamp: '2026-11-18T12:30:00Z'
-      title: Restart a Connection Point whose mediator account cannot be read
+      title: Restart a Connection Point whose mediator stops answering for its account
       description: >-
         A mediator that has lost an account cannot deliver its own answer to that account
-        either, so the gateway's account probe timed out instead of being refused, and a probe
-        it could not read left the listener alone: the Connection Point stayed unreachable
-        until a later probe happened to be answered. Two unread probes in a row now restart the
-        listener, the same repair a missing account gets, and an account that could not be read
-        is probed again after five seconds instead of a full interval.
+        either, so the gateway's account probe went unanswered instead of being refused, and an
+        unanswered probe left the listener alone: the Connection Point stayed unreachable until
+        a later probe happened to be answered. A second unanswered probe in a row now restarts
+        the listener, the same repair a missing account gets, and then the fourth, eighth and so
+        on, so a mediator that stays silent is retried ever more slowly. Only the Connection
+        Points whose probe went unanswered are re-probed after five seconds; every other one
+        keeps the thirty-second cadence. A probe the mediator answered, even with a refusal,
+        still changes nothing: the socket is carrying traffic.
   removed: []
   security: []
   breaking: []

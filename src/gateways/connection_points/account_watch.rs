@@ -33,16 +33,19 @@ const RECEIVE_LIST_REOPEN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How many listeners are checked at once.
 const CONCURRENT_ACCOUNT_CHECKS: usize = 4;
 
-/// How soon an account the mediator could not answer for is probed again,
-/// instead of waiting a whole [`ACCOUNT_CHECK_INTERVAL`].
-const UNREADABLE_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// How soon an account whose probe timed out is probed again, instead of
+/// waiting a whole [`ACCOUNT_CHECK_INTERVAL`]. Only the listeners that timed
+/// out are re-probed on that pass, so a mediator that cannot answer for one
+/// Connection Point does not pull every other one into a faster cadence.
+const UNANSWERED_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 
-/// How many probes in a row may fail to read an account before the listener is
-/// restarted anyway. A mediator that has lost the account cannot deliver its
-/// own answer to it either, so the probe times out instead of being refused;
-/// waiting for a refusal that cannot arrive would leave the Connection Point
-/// unreachable.
-const UNREADABLE_RESTART_LIMIT: u32 = 2;
+/// How many probes in a row may go unanswered before the listener is restarted
+/// anyway. A mediator that has lost the account cannot deliver its own answer
+/// to it either, so the probe times out instead of being refused; waiting for a
+/// refusal that cannot arrive would leave the Connection Point unreachable.
+/// Only a timeout counts: a probe the mediator did answer, even with a refusal
+/// or an error, says the socket still carries traffic.
+const UNANSWERED_RESTART_LIMIT: u32 = 2;
 
 /// What [`ATMError::mediator_code`] reads out of the problem report a mediator
 /// before v0.52 answers with when it no longer has the requesting account
@@ -58,7 +61,7 @@ const UNKNOWN_ACCOUNT_CODE: &str =
 pub(crate) type AccountProbe = Result<Result<Account, ATMError>, tokio::time::error::Elapsed>;
 
 /// What a probe of the Connection Point's own mediator account calls for.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AccountRepair {
     /// The account accepts messages, or it could not be read.
     Nothing,
@@ -71,12 +74,14 @@ pub(crate) enum AccountRepair {
 }
 
 /// What [`check_listener`] did with one listener.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AccountCheck {
     /// The listener is not connected, so its mediator session is not probed.
     Skipped,
-    /// The account could not be read, so nothing was changed.
+    /// The mediator answered, but not with the account, so nothing was changed.
     Unreadable,
+    /// The mediator did not answer the probe at all.
+    Unanswered,
     /// The account accepts messages.
     Healthy,
     /// The account needed `repair`, with the repair's outcome.
@@ -158,106 +163,126 @@ pub(crate) fn account_repair(
 fn is_account_not_found(error: &ATMError) -> bool {
     error
         .mediator_code()
-        .is_some_and(|code| code == ACCOUNT_NOT_FOUND_DESCRIPTOR || code == UNKNOWN_ACCOUNT_CODE)
+        .is_some_and(says_the_account_is_gone)
+}
+
+/// Whether `code` is a mediator saying it no longer holds *our* account: the
+/// descriptor of the problem report a mediator before v0.52 answers with, or
+/// the code `messaging/account/get` declares for it. Any other task's
+/// `unknownAccount` may be about a peer's account, not ours.
+pub(crate) fn says_the_account_is_gone(code: &str) -> bool {
+    code == ACCOUNT_NOT_FOUND_DESCRIPTOR || code == UNKNOWN_ACCOUNT_CODE
+}
+
+/// How often each listener's probe has gone unanswered in a row, and which of
+/// them the next pass should visit.
+#[derive(Debug, Default)]
+struct UnansweredProbes {
+    consecutive: std::collections::HashMap<String, u32>,
+}
+
+impl UnansweredProbes {
+    /// Whether another unanswered probe of `connection_point_id` restarts its
+    /// listener: on the second unanswered probe in a row, and then at doubling
+    /// counts, so a mediator that stays silent is retried ever more slowly
+    /// instead of on every pass.
+    fn restart_due(
+        &self,
+        connection_point_id: &str,
+    ) -> bool {
+        let consecutive = self
+            .consecutive
+            .get(connection_point_id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        consecutive >= UNANSWERED_RESTART_LIMIT && consecutive.is_power_of_two()
+    }
+
+    /// Records one pass: how long to wait before the next one, and which
+    /// listeners it should visit — only those whose probe went unanswered, so
+    /// a mediator silent for one Connection Point does not pull every other
+    /// one into the faster cadence. An empty set means every listener.
+    fn record(
+        &mut self,
+        pass: &[(String, AccountCheck)],
+    ) -> (Duration, std::collections::HashSet<String>) {
+        let seen: std::collections::HashSet<&str> = pass
+            .iter()
+            .map(|(connection_point_id, _)| connection_point_id.as_str())
+            .collect();
+        self.consecutive
+            .retain(|connection_point_id, _| seen.contains(connection_point_id.as_str()));
+
+        let mut unanswered = std::collections::HashSet::new();
+        for (connection_point_id, check) in pass {
+            let consecutive = self
+                .consecutive
+                .entry(connection_point_id.clone())
+                .or_insert(0);
+            if matches!(check, AccountCheck::Unanswered) {
+                *consecutive = consecutive.saturating_add(1);
+                unanswered.insert(connection_point_id.clone());
+            } else {
+                // Any answer, including a refusal and a restart that followed
+                // the silence, starts the count again.
+                *consecutive = 0;
+            }
+        }
+
+        let delay = if unanswered.is_empty() {
+            ACCOUNT_CHECK_INTERVAL
+        } else {
+            UNANSWERED_RECHECK_INTERVAL
+        };
+        (delay, unanswered)
+    }
 }
 
 /// Probes every active listener's account on an interval until the manager
 /// is dropped.
 pub(crate) fn spawn(manager: Weak<ConnectionPointListenerManager>) {
     crate::observability::spawn_traced_task("connection_points.account_watch", async move {
-        let mut unreadable = std::collections::HashMap::new();
+        let mut unanswered = UnansweredProbes::default();
         let mut delay = ACCOUNT_CHECK_INTERVAL;
+        let mut focus: std::collections::HashSet<String> = std::collections::HashSet::new();
         loop {
             tokio::time::sleep(delay).await;
             let Some(manager) = manager.upgrade() else {
                 break;
             };
-            let checks = futures::stream::iter(
-                manager
-                    .get_active_listeners()
-                    .await,
-            )
-            .map(|listener| {
-                let manager = &manager;
-                async move {
-                    let check = check_listener(manager, &listener, &ListenerSession).await;
-                    (listener, check)
-                }
-            })
-            .buffer_unordered(CONCURRENT_ACCOUNT_CHECKS)
-            .collect::<Vec<_>>()
-            .await;
-            let checked = checks
-                .iter()
-                .map(|(listener, _)| {
-                    listener
-                        .connection_point_id
-                        .clone()
+            let listeners: Vec<ListenerInfo> = manager
+                .get_active_listeners()
+                .await
+                .into_iter()
+                .filter(|listener| focus.is_empty() || focus.contains(&listener.connection_point_id))
+                .collect();
+            let pass = futures::stream::iter(listeners)
+                .map(|listener| {
+                    let manager = &manager;
+                    let restart_due = unanswered.restart_due(&listener.connection_point_id);
+                    async move {
+                        let check = check_listener(manager, &listener, &ListenerSession, restart_due).await;
+                        (listener.connection_point_id, check)
+                    }
                 })
-                .collect::<std::collections::HashSet<_>>();
-            unreadable.retain(|connection_point_id, _| checked.contains(connection_point_id));
-            let mut any_unreadable = false;
-            for (listener, check) in checks {
-                let failures = unreadable
-                    .entry(
-                        listener
-                            .connection_point_id
-                            .clone(),
-                    )
-                    .or_insert(0u32);
-                *failures = match check {
-                    AccountCheck::Unreadable => failures.saturating_add(1),
-                    _ => 0,
-                };
-                if *failures == 0 {
-                    continue;
-                }
-                any_unreadable = true;
-                if !restarts_an_unreadable_account(*failures) {
-                    continue;
-                }
-                warn!(
-                    connection_point = %listener.name,
-                    consecutive_failures = *failures,
-                    "The mediator account could not be read; restarting the Connection Point to re-authenticate and re-register"
-                );
-                *failures = 0;
-                if let Err(error) = manager
-                    .restart_listener_if_current(
-                        &listener.connection_point_id,
-                        &listener.instance_id,
-                        LISTENER_RESTART_TIMEOUT,
-                    )
-                    .await
-                {
-                    warn!(connection_point = %listener.name, "Restarting the Connection Point failed: {error}");
-                }
-            }
-            delay = next_probe_delay(any_unreadable);
+                .buffer_unordered(CONCURRENT_ACCOUNT_CHECKS)
+                .collect::<Vec<_>>()
+                .await;
+            (delay, focus) = unanswered.record(&pass);
         }
     });
 }
 
-/// Whether an account unread `consecutive` times in a row has the listener
-/// restarted, the same repair a missing account gets.
-fn restarts_an_unreadable_account(consecutive: u32) -> bool {
-    consecutive >= UNREADABLE_RESTART_LIMIT
-}
-
-/// How long to wait before the next pass: a short recheck while any account
-/// could not be read, the full interval otherwise.
-fn next_probe_delay(any_unreadable: bool) -> Duration {
-    if any_unreadable {
-        UNREADABLE_RECHECK_INTERVAL
-    } else {
-        ACCOUNT_CHECK_INTERVAL
-    }
-}
-
+/// Probes one listener's account and performs the repair it calls for.
+/// `restart_due` says this listener's probe has gone unanswered often enough
+/// that another silent probe restarts it; the restart runs here, inside the
+/// caller's bounded concurrency, rather than serially after the pass.
 async fn check_listener(
     manager: &ConnectionPointListenerManager,
     listener: &ListenerInfo,
     mediator: &impl MediatorAccount,
+    restart_due: bool,
 ) -> AccountCheck {
     let connected = matches!(
         listener
@@ -272,18 +297,36 @@ async fn check_listener(
     }
 
     let probe = mediator.probe(listener).await;
-    let repair = account_repair(&probe, &listener.inbound_acl);
+    let unanswered = probe.is_err();
+    let repair = match account_repair(&probe, &listener.inbound_acl) {
+        // The mediator never answered, and it has not answered the probes
+        // before this one either: restart rather than wait for a refusal that
+        // a lost account cannot receive.
+        AccountRepair::Nothing if unanswered && restart_due => AccountRepair::RestartListener,
+        repair => repair,
+    };
     let repaired = match repair {
+        AccountRepair::Nothing if unanswered => {
+            debug!(connection_point = %listener.name, "The mediator did not answer the account probe; leaving the listener as it is");
+            return AccountCheck::Unanswered;
+        }
         AccountRepair::Nothing if !matches!(probe, Ok(Ok(_))) => {
             debug!(connection_point = %listener.name, "Could not read the mediator account; leaving the listener as it is");
             return AccountCheck::Unreadable;
         }
         AccountRepair::Nothing => return AccountCheck::Healthy,
         AccountRepair::RestartListener => {
-            warn!(
-                connection_point = %listener.name,
-                "The mediator no longer has this Connection Point's account; restarting it to re-authenticate and re-register"
-            );
+            if unanswered {
+                warn!(
+                    connection_point = %listener.name,
+                    "The mediator has not answered this Connection Point's account probe; restarting it to re-authenticate and re-register"
+                );
+            } else {
+                warn!(
+                    connection_point = %listener.name,
+                    "The mediator no longer has this Connection Point's account; restarting it to re-authenticate and re-register"
+                );
+            }
             manager
                 .restart_listener_if_current(
                     &listener.connection_point_id,
@@ -424,6 +467,9 @@ mod tests {
     /// receive-list re-openings, each taking `reopen_delay`.
     struct StubMediator {
         probe: fn() -> AccountProbe,
+        /// A mediator that never answers the probe, as one that has lost the
+        /// account cannot: it has nowhere to deliver its own answer.
+        silent: bool,
         reopen_delay: Duration,
         reopened: std::sync::atomic::AtomicUsize,
     }
@@ -432,8 +478,16 @@ mod tests {
         fn answering(probe: fn() -> AccountProbe) -> Self {
             Self {
                 probe,
+                silent: false,
                 reopen_delay: Duration::ZERO,
                 reopened: Default::default(),
+            }
+        }
+
+        fn silent() -> Self {
+            Self {
+                silent: true,
+                ..Self::answering(|| probed_account("explicitDeny"))
             }
         }
 
@@ -449,6 +503,11 @@ mod tests {
             &self,
             _: &ListenerInfo,
         ) -> AccountProbe {
+            if self.silent {
+                return Err(tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+                    .await
+                    .unwrap_err());
+            }
             (self.probe)()
         }
 
@@ -497,7 +556,7 @@ mod tests {
                 .write()
                 .await
                 .status = status;
-            assert_eq!(check_listener(&manager, &listener, &mediator).await, AccountCheck::Skipped);
+            assert_eq!(check_listener(&manager, &listener, &mediator, false).await, AccountCheck::Skipped);
         }
     }
 
@@ -507,11 +566,11 @@ mod tests {
         let (manager, listener, _issuer_dir) = connected_listener(root.path(), "probed").await;
 
         let open = StubMediator::answering(|| probed_account("explicitDeny"));
-        assert_eq!(check_listener(&manager, &listener, &open).await, AccountCheck::Healthy);
+        assert_eq!(check_listener(&manager, &listener, &open, false).await, AccountCheck::Healthy);
         assert_eq!(open.reopened(), 0);
 
         let unreachable = StubMediator::answering(|| probe_error(ATMError::TransportError("connection reset".into())));
-        assert_eq!(check_listener(&manager, &listener, &unreachable).await, AccountCheck::Unreadable);
+        assert_eq!(check_listener(&manager, &listener, &unreachable, false).await, AccountCheck::Unreadable);
         assert_eq!(unreachable.reopened(), 0);
         assert!(
             manager
@@ -529,7 +588,7 @@ mod tests {
 
         let closed = StubMediator::answering(|| probed_account("explicitAllow"));
         assert_eq!(
-            check_listener(&manager, &listener, &closed).await,
+            check_listener(&manager, &listener, &closed, false).await,
             AccountCheck::Repaired(AccountRepair::ReopenReceiveList, Ok(()))
         );
         assert_eq!(closed.reopened(), 1);
@@ -540,7 +599,7 @@ mod tests {
             ..StubMediator::answering(|| probed_account("explicitAllow"))
         };
         assert_eq!(
-            check_listener(&manager, &listener, &hanging).await,
+            check_listener(&manager, &listener, &hanging, false).await,
             AccountCheck::Repaired(
                 AccountRepair::ReopenReceiveList,
                 Err(format!("timed out after {RECEIVE_LIST_REOPEN_TIMEOUT:?}"))
@@ -555,7 +614,7 @@ mod tests {
         let mediator = StubMediator::answering(missing_account);
 
         assert_eq!(
-            check_listener(&manager, &listener, &mediator).await,
+            check_listener(&manager, &listener, &mediator, false).await,
             AccountCheck::Repaired(AccountRepair::RestartListener, Err("Connection point 'cp-1' not found".into())),
             "the restart reads the Connection Point to start it again"
         );
@@ -565,25 +624,94 @@ mod tests {
             .register_test_listener(replacement)
             .await;
         assert_eq!(
-            check_listener(&manager, &listener, &mediator).await,
+            check_listener(&manager, &listener, &mediator, false).await,
             AccountCheck::Repaired(AccountRepair::RestartListener, Ok(())),
             "a listener another caller replaced is kept"
         );
         assert_eq!(mediator.reopened(), 0);
     }
 
-    #[test]
-    fn an_account_unread_twice_in_a_row_restarts_the_listener() {
-        let restarted = (0..=4)
-            .filter(|failures| restarts_an_unreadable_account(*failures))
-            .collect::<Vec<_>>();
-        assert_eq!(restarted, [2, 3, 4], "a single unreadable probe is tolerated, the second is not");
+    #[tokio::test]
+    async fn an_unanswered_probe_restarts_the_listener_only_when_one_is_due() {
+        let root = tempfile::TempDir::new().unwrap();
+        let (manager, listener, _issuer_dir) = connected_listener(root.path(), "probed").await;
+        let silent = StubMediator::silent();
+
+        assert_eq!(
+            check_listener(&manager, &listener, &silent, false).await,
+            AccountCheck::Unanswered,
+            "a first silent probe is tolerated"
+        );
+        assert_eq!(
+            check_listener(&manager, &listener, &silent, true).await,
+            AccountCheck::Repaired(AccountRepair::RestartListener, Err("Connection point 'cp-1' not found".into())),
+            "a silent probe restarts the listener once one is due"
+        );
+    }
+
+    fn pass(outcomes: &[(&str, AccountCheck)]) -> Vec<(String, AccountCheck)> {
+        outcomes
+            .iter()
+            .map(|(connection_point_id, check)| ((*connection_point_id).to_string(), check.clone()))
+            .collect()
     }
 
     #[test]
-    fn an_unreadable_account_is_probed_again_sooner() {
-        assert_eq!(next_probe_delay(true), UNREADABLE_RECHECK_INTERVAL);
-        assert_eq!(next_probe_delay(false), ACCOUNT_CHECK_INTERVAL);
-        assert!(UNREADABLE_RECHECK_INTERVAL < ACCOUNT_CHECK_INTERVAL);
+    fn only_consecutive_silence_makes_a_restart_due() {
+        let mut probes = UnansweredProbes::default();
+
+        assert!(!probes.restart_due("cp-1"), "the first unanswered probe is tolerated");
+        probes.record(&pass(&[("cp-1", AccountCheck::Unanswered)]));
+        assert!(probes.restart_due("cp-1"), "the second in a row is not");
+
+        probes.record(&pass(&[("cp-1", AccountCheck::Healthy)]));
+        assert!(!probes.restart_due("cp-1"), "an answered probe starts the count again");
+
+        probes.record(&pass(&[("cp-1", AccountCheck::Unanswered)]));
+        assert!(probes.restart_due("cp-1"));
+        probes.record(&pass(&[("cp-1", AccountCheck::Repaired(AccountRepair::RestartListener, Ok(())))]));
+        assert!(!probes.restart_due("cp-1"), "a restart answers the silence");
+    }
+
+    #[test]
+    fn a_mediator_that_stays_silent_is_restarted_ever_more_slowly() {
+        let mut probes = UnansweredProbes::default();
+        let due = (0..16)
+            .map(|_| {
+                let due = probes.restart_due("cp-1");
+                probes.record(&pass(&[("cp-1", AccountCheck::Unanswered)]));
+                due
+            })
+            .enumerate()
+            .filter_map(|(probe, due)| due.then_some(probe + 1))
+            .collect::<Vec<_>>();
+
+        assert_eq!(due, [2, 4, 8, 16], "restarts back off instead of repeating every pass");
+    }
+
+    #[test]
+    fn only_the_listeners_that_went_unanswered_are_probed_again_sooner() {
+        let mut probes = UnansweredProbes::default();
+
+        let (delay, focus) =
+            probes.record(&pass(&[("cp-1", AccountCheck::Healthy), ("cp-2", AccountCheck::Unreadable)]));
+        assert_eq!(delay, ACCOUNT_CHECK_INTERVAL, "an answered refusal keeps the usual cadence");
+        assert!(focus.is_empty(), "every listener is probed on the next pass");
+
+        let (delay, focus) =
+            probes.record(&pass(&[("cp-1", AccountCheck::Healthy), ("cp-2", AccountCheck::Unanswered)]));
+        assert_eq!(delay, UNANSWERED_RECHECK_INTERVAL);
+        assert_eq!(focus, std::collections::HashSet::from(["cp-2".to_string()]), "only the silent one");
+        assert!(UNANSWERED_RECHECK_INTERVAL < ACCOUNT_CHECK_INTERVAL);
+    }
+
+    #[test]
+    fn a_listener_that_is_gone_is_forgotten() {
+        let mut probes = UnansweredProbes::default();
+        probes.record(&pass(&[("cp-1", AccountCheck::Unanswered)]));
+        assert!(probes.restart_due("cp-1"));
+
+        probes.record(&pass(&[("cp-2", AccountCheck::Healthy)]));
+        assert!(!probes.restart_due("cp-1"), "a listener no longer checked keeps no count");
     }
 }
