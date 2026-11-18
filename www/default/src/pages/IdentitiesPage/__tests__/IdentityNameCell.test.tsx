@@ -1,6 +1,7 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
+import { topAndTail } from '../../../utils/stringUtils';
 import {
   CredentialPrincipalLabel,
   IdentityNameCell,
@@ -36,6 +37,23 @@ describe('IdentityNameCell', () => {
 
     fireEvent.click(screen.getByTestId('identities-copy-did-button'));
     await waitFor(() => expect(navigator.clipboard.writeText).toHaveBeenCalledWith(LONG_DID));
+  });
+
+  it('renders the full and the shorter DID when compactDid is set', () => {
+    render(<IdentityNameCell identity={{ did: LONG_DID }} showName={false} compactDid />);
+
+    const code = screen.getByTitle(LONG_DID);
+    const full = within(code).getByText(topAndTail(LONG_DID, 20, 16));
+    const compact = within(code).getByText(topAndTail(LONG_DID, 12, 10));
+    expect(full).toHaveClass('identities-did-full');
+    expect(compact).toHaveClass('identities-did-compact');
+  });
+
+  it('renders a single DID without compactDid', () => {
+    render(<IdentityNameCell identity={{ did: LONG_DID }} showName={false} />);
+
+    expect(screen.getByTitle(LONG_DID)).toHaveTextContent(topAndTail(LONG_DID, 20, 16));
+    expect(screen.queryByText(topAndTail(LONG_DID, 12, 10))).not.toBeInTheDocument();
   });
 
   it('prefers the live surface name for surface-named identities', () => {

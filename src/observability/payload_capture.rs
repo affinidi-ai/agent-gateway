@@ -15,7 +15,6 @@ pub async fn broadcast_payload_capture_async(
     response_payload: Option<serde_json::Value>,
     validation_status: &str,
     validation_error: Option<String>,
-    identity_hash: Option<String>,
 ) {
     broadcast_payload_capture_extended(
         ws_state,
@@ -28,7 +27,6 @@ pub async fn broadcast_payload_capture_async(
         response_payload,
         validation_status,
         validation_error,
-        identity_hash,
     )
     .await;
 }
@@ -47,15 +45,7 @@ pub async fn broadcast_payload_capture_extended(
     outbound_response: Option<serde_json::Value>,
     validation_status: &str,
     validation_error: Option<String>,
-    identity_hash: Option<String>,
 ) {
-    // Store payload in metrics if we have an identity hash
-    if let (Some(metrics), Some(hash)) = (metrics_store, &identity_hash) {
-        metrics
-            .store_last_payload(hash.clone(), inbound_request.clone())
-            .await;
-    }
-
     // Always store the latest payload for this channel (regardless of identity)
     if let Some(metrics) = metrics_store {
         metrics
@@ -115,7 +105,6 @@ mod tests {
             &serde_json::json!({"jsonrpc": "2.0"}),
             None,
             "valid",
-            None,
             None,
         )
         .await;

@@ -20,6 +20,8 @@ interface IdentityNameCellProps {
   showName?: boolean;
   showDid?: boolean;
   fallbackName?: string;
+  /** Also render a shorter DID that `.identities-table` shows instead on narrow screens. */
+  compactDid?: boolean;
 }
 
 export const parseAgentName = (name: string): { host: string; local: string } | null => {
@@ -80,12 +82,15 @@ export const IdentityNameCell: React.FC<IdentityNameCellProps> = ({
   showName = true,
   showDid = true,
   fallbackName,
+  compactDid = false,
 }) => {
   const shared = showName && isSharedManagedDid(identity);
   const displayName = showName && !shared ? identity.display_name : undefined;
   const pending = showName && !shared && !displayName && identity.display_name_pending === true;
   const didIsPrimary = !shared && !displayName && !pending;
   const nameOnlyFallback = !showDid && didIsPrimary;
+  const fullDid = topAndTail(identity.did, 20, 16);
+  const shortDid = compactDid ? topAndTail(identity.did, 12, 10) : fullDid;
 
   return (
     <div className="d-inline-flex flex-column">
@@ -135,7 +140,14 @@ export const IdentityNameCell: React.FC<IdentityNameCellProps> = ({
             style={{ fontSize: didIsPrimary ? undefined : '0.75rem', whiteSpace: 'nowrap' }}
             title={identity.did}
           >
-            {topAndTail(identity.did, 20, 16)}
+            {shortDid !== fullDid ? (
+              <>
+                <span className="identities-did-full">{fullDid}</span>
+                <span className="identities-did-compact">{shortDid}</span>
+              </>
+            ) : (
+              fullDid
+            )}
           </code>
           <CopyButton
             text={identity.did}

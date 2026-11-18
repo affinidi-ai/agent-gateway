@@ -7276,8 +7276,7 @@ async fn process_charged_forward_request(
                     &request_payload,
                     response_payload,
                     validation_status,
-                    None,                    // validation_error
-                    caller_identity.clone(), // identity_hash
+                    None, // validation_error
                 )
                 .await;
 
@@ -8750,7 +8749,6 @@ async fn handle_a2a_proxy_forward(
             response_payload,
             validation_status,
             None,
-            caller_identity,
         )
         .await;
     }
@@ -9156,7 +9154,6 @@ async fn handle_mcp_proxy_forward(
                     Some(mcp_response.clone()),
                     "success", // MCP protocol doesn't have A2A extension validation
                     None,
-                    None, // identity_hash
                 )
                 .await;
             }
@@ -9296,7 +9293,6 @@ async fn handle_mcp_proxy_forward(
                     None,
                     "mcp_error", // Custom status for MCP errors
                     Some(format!("MCP Proxy Error: {}", error_msg)),
-                    None,
                 )
                 .await;
             }

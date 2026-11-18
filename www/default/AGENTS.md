@@ -60,6 +60,12 @@ Applies to:
    offers a Refresh button (`wizard-mediator-refresh-button`) in that state and below the list, since
    a directory can take a moment to answer after the gateway starts; a load error shows as
    `wizard-mediator-load-error`.
+10. Dashboard routes are served from the gateway root, so a top-level route must not share a
+    prefix with a gateway channel (`/agents`, `/payments`, `/routes`, ... in
+    `config/examples/gateway.example.json`). In-app navigation still works, but refresh, deep links
+    and new tabs reach the proxy and return 404. Agent endpoints default to `/agents/<surface-name>`,
+    so `/agents` in particular is never a dashboard route. Add every new top-level route to
+    `SPA_RESERVED_TOP_LEVEL` in `src/proxy/paths.rs`.
 
 ## Toasts
 
@@ -1694,7 +1700,8 @@ parts `IdentityNameCell`, `IdentitySurfaceCell`, `IdentityOriginBadge`,
   surface name show no badge. Without a display name, it shows `metadata.agent_name` when that
   is a non-empty string, else a muted, italic "Unnamed Agent".
 - The **DID** column (`IdentityNameCell` with `showName={false}`) shows the shortened DID in
-  monospace with a copy button for the full DID, then the version badge and SCID when set.
+  monospace with a copy button for the full DID, then the version badge and SCID when set,
+  on a second line.
 - The table has no Usage Count column; the usage count is still in the expanded details and
   the API.
 - A **shared managed DID** is the managed agent on more than one live surface: its
@@ -1883,6 +1890,178 @@ to it over `fabric://`) shows the gateway's message.
 | Detail overview                          | `payment-gateway-name-input`, `-description-input`, `-did`, `-status`, `-offer`, `-offer-error`, `-save-button`, `-toggle-status-button`, `-pending-note`, `-verify-button` |
 | Detail surfaces, used by, health         | `payment-gateway-surfaces-refresh-button`, `-surfaces-error`, `-surfaces-empty`, `-surface-<id>`, `payment-gateway-surface-manifest-<id>-*`, `-used-by-<id>`, `-used-by-link-<id>`, `-used-by-empty`, `-used-by-error`, `-ping-button`, `-ping-result` |
 | Use as payment gateway                   | `gateways-use-as-payment-button-<id>` (Gateways tab), `gateway-use-as-payment-button` (edit page)                                                             |
+
+## Agents page
+
+`/agent-registry` (`pages/AgentsPage.tsx`, table in `pages/AgentsPage/AgentsTable.tsx`) and
+`/agent-registry/:agentId` (`pages/AgentDetailPage.tsx`, header and tabs in `pages/AgentDetailPage/`)
+are read-only and need `surfaces.view`. They call only `apiClient.listAgents`, `getAgent` and
+`getAgentCard` (`/v1/agents`), never `/v1/dashboard/stats`. There is no create, edit, duplicate,
+disable or rotate action: the API has no write endpoints for agents. Styles are in
+`pages/AgentsPage/AgentRegistry.css`, built on the theme variables with `body.dark-theme` overrides.
+
+- One record per managed agent: the gateway groups the surfaces that target the same agent and
+  returns them in display-name order (case-insensitive, then id); the page does not re-sort.
+  MCP surfaces front tool servers, not agents, so `/v1/agents` leaves them out (`is_listed` in
+  `src/identity/handlers/agents.rs`) and their details and card return 404. The page adds no
+  protocol filter of its own.
+- The Agents page shows no status anywhere: no list column, filter or dimmed rows, no
+  details header badge.
+- Each list row is a link (`role="link"`, named by the agent name and endpoint host) and ends with a
+  chevron cell (`agents-row-chevron`); Enter or Space on the row opens the details.
+- The details page has three tabs, **Agent Card** (opened first), **Connection** and **Traffic**.
+  Identities and surfaces are shown only in the list, never repeated on the details page.
+- The details page sets the top-bar title to the agent name (**Unnamed agent** without one) with
+  `usePageTitle`; while loading, or when the agent is missing, the route default stays. The
+  back button is `btn-outline-secondary`.
+- Opening another agent's details clears the shown record and loads again; only the answer for
+  the current `agentId` (and its latest load) updates the page, so a late answer for the previous
+  agent never replaces it.
+- The list filters client-side by text only: the display name (**Unnamed agent** included), every
+  surface name in the record, and the route label (`agentMatchesFilter`).
+- Columns: Agent, Route, Protocol, Identities, Used by surfaces, Trust registry, Last activity.
+  The protocol badge (`agents-protocol-badge`) uses the Surfaces page's colours (A2A
+  `text-bg-primary`, AP2 `text-bg-warning`, MCP `text-bg-info`, else `text-bg-secondary`).
+  The count badges of **Identities** and **Used by surfaces** match the Surfaces page's Transit
+  Points count: a square `badge text-bg-primary`, not a pill.
+  **Used by surfaces** shows a count badge and the surface names joined with commas on one
+  truncated line, with the full list in the tooltip. It has no links. **Identities** shows the same
+  count badge, then the first DID in `identities`, shortened in the middle and muted with a copy
+  button, and `+N` for the rest; every DID is in the tooltip. Without any it shows **No DID**: a warning badge
+  while surfaces use the agent (the API does not say which surface holds which DID), muted text
+  otherwise.
+- The agent name (`agents-name`) is the strongest text in a row; DIDs stay muted. The table's
+  column headers (`agents-table`) keep the uppercase `.table-sm` default, like the Surfaces page.
+- **Agent** shows the endpoint host under the name (`endpointHost`: the URL origin with its scheme, such as `https://agent.example`, the A2A proxy,
+  or `gateway/channel`), so rows with the same name can be told apart. A proxy or gateway shows
+  `target_name` from `GET /v1/agents`, or its id when the name is `null` or blank; the
+  `a2a-proxy://` and `fabric://` schemes are never shown. An endpoint `connectionTarget` cannot
+  show gets no line.
+- Raw API values are never shown. `pages/AgentsPage/agentLabels.ts` maps them: runtime `url`,
+  `a2a-proxy`, `gateway` to the route Direct, Proxied, Fabric, and the protocol badge to the
+  protocol only (`A2A`), never the route. Shared badges are in `pages/AgentsPage/AgentBadges.tsx`.
+- The route is called **Route** everywhere (list column, Connection heading). The list renders it
+  with `AgentRouteBadge`: a neutral bordered badge (`badge text-bg-light border
+  agent-route-badge`) with the route icon and label, its meaning (`routeDescription`) as the
+  tooltip and as visually hidden text (`agents-runtime`). The details page shows no route badge:
+  not in the header, not on the Connection tab, whose description says the route.
+- An agent with a `null` name shows **Unnamed agent** in muted text, in the list and the details
+  header, with the endpoint host beside it in the header (`agent-details-endpoint-host`). The API
+  names Direct, Proxied and Fabric agents from their Agent Card; a Proxied or Fabric name comes
+  from the card the gateway serves and can take a refresh of the list to appear after the
+  background lookup. A canvas target name that only names a surface (a surface's own name, or a
+  generated `<kind>_surface_<n>`) is never the agent's name.
+- **Trust registry** shows **Recorded** with the Agent Identities page's badge
+  (`TrustRecorderStateBadge`, state `recorded`: success tone, no icon), with a tooltip saying
+  recording is not trust, when `trust_registry.recorded` is true, else **Not recorded**
+  (`badge-none`), with no tooltip.
+- Agent `id` is opaque and never read as a surface id; surface links come from `surfaces[]`.
+- The **Connection** tab (`AgentDetailPage/ConnectionTab.tsx`) is read-only and has no surfaces
+  list. Built from `endpoint` by `connectionTarget`, it shows a **Route** heading with a one-line
+  description of the route under it, then a Field / Value table styled like the Agent Card's
+  **Changes by the gateway** table (`agent-preview-changes`; the target rows; a URL endpoint has a
+  copy button). It has no route path diagram. Under it, a **Trust registry** section
+  (`agent-connection-trust-registry`) lists `trust_registry.registries` in the same table style:
+  Trust registry (name, else id; links to the registry page only with `trust_registries.edit`),
+  Identity (`AgentDid`) and Status (`TrustRecorderStateBadge`, with the reason text under it).
+  Without outcomes it says no identity was sent to a trust registry. The Agents API fills
+  `registries` on the details only: the best outcome per (registry, DID) across the agent's
+  surfaces, for its current identities.
+  The API
+  returns a URL endpoint without credentials, query string or fragment, and `connectionTarget`
+  drops any that arrive; there is no "hidden" note. An endpoint whose host is `redacted.invalid`
+  (the API could not strip its credentials) shows **Can't be shown** (`agent-connection-endpoint`),
+  like any endpoint `connectionTarget` cannot parse. An
+  `a2a-proxy://` or `fabric://` target shows the A2A proxy or remote gateway by its name
+  (`target_name`, plain text, with the id as its tooltip), or by its
+  id when the API returns no name. It links to the A2A proxy or remote gateway page only when
+  the viewer has `a2a_proxies.edit` or `gateways.edit`, which those pages need; otherwise it is
+  plain text.
+- The Agent Card is untrusted: render it as plain text only (no HTML, Markdown or links). The tab
+  opens on a visual **Preview**
+  (`AgentDetailPage/AgentCardPreview.tsx`, reading known A2A card fields defensively, with the URL
+  as text) and toggles to the raw **JSON**. The toggle follows `VpViewer`: `AppButton`s with an icon
+  and a label (`fa-eye` Preview, `fa-code` JSON), `primary` when active and `outline-secondary`
+  otherwise. The copy button shows in the JSON view only, inside it: right-aligned on its own row
+  above the JSON, never in the toggle row or over the scrolling JSON. It looks like `VpViewer`'s
+  copy button: an `outline-secondary` `AppButton` with `fa-copy` and "Copy", switching to a green
+  `fa-check` and "Copied" for two seconds. The Preview sits directly in the tab's
+  card body, with no inner card or "Agent Card" label, then a **Skills** section
+  (`agent-card-preview-skills`, a heading with the count, then each skill's name and description).
+- After Skills, the Preview ends with **Changes by the gateway** (`agent-card-gateway-changes`,
+  `AgentDetailPage/gatewayChanges.ts`), a `table-sm` of what the gateway changed, compared with
+  the API's `upstream_card`, with columns **Field**, **Change** and **Value**. **Change** is a
+  badge (`<row>-change`): **Rewritten** (`text-bg-warning`) when the field existed before,
+  **Added** (`text-bg-primary`) when it did not, **Removed** (`text-bg-secondary`) when the
+  served card dropped it. **Value** (`<row>`) is what callers get, in semibold code, `-` when
+  missing; a rewritten or removed one has a muted "Was <value>" line under it, its code muted too
+  so the new value stands out (`<row>-was`), an added one none. `code` in `agent-preview-changes`
+  cells is `inline-block` so wrapped chips don't overlap. Rows:
+  the URL first (`-url`), then each extension the upstream card lacks or carries differently
+  (`-extension`; paired with the next upstream extension the served card dropped, which is its
+  "Was"; the identity-credential extension reads **Identity credential**), each followed by a
+  **DID** row (`-did`) when its `params.did` differs from the paired extension's, and a
+  **Verifiable Presentation** row (`-vp`) when it carries `params.verifiablePresentation`. That
+  row's **Show** / **Hide** button (`-vp-toggle-button`, `aria-expanded`) expands the
+  presentation in a row under it spanning all three columns (`-vp-view`), never in a modal, with `VpViewer`'s `VpView` (Readable /
+  Raw JSON, Copy in Raw JSON). Then each dropped upstream extension no added one replaces
+  (`-removed`), and each other changed top-level field, JSON for a non-string (`-other-<field>`).
+  With no `upstream_card` (a generated card) only the identity-credential extension is listed.
+  The table's borders use the section divider colour (`--gray-200`, `--dark-border` in the dark
+  theme) and the Field column the heading colour, in both themes. Field cells are `td`
+  (`.agent-preview-change-field`), never `th`, since the global `.table-sm th` rule gives every
+  `th` a light background, uppercase text and a 2px border. A served card with no identity-credential
+  extension adds a muted line under the table (`-no-did`): "This surface has no DID, so the card
+  carries no identity credential." Nothing changed, no section. While the URL is listed here, the
+  card details above leave out their **URL** row.
+- The JSON view highlights the card with `VpViewer`'s tokenizer (`tokenizeJson`) in the
+  `.vp-json-pre` style, wrapping long values (`.agent-card-json`).
+- The Agent Card tab shows the card the gateway serves, for every route, read through one surface.
+  Its header (`agent-card-source`, `data-source`) reads "Served by <surface> · <source>": the
+  surface is the API's `surface_id`, named from the agent's surfaces, as a `SurfaceLinkButton`
+  to `/surfaces/<id>` (`agent-card-surface`), or a `FormSelect` (`agent-card-surface-select`)
+  over `card_surface_ids` when there are several, followed by an **Open surface** link to the
+  selected one (`agent-card-open-surface-button`); choosing one reloads the card with
+  `?surface_id=`, and an earlier answer is ignored. The source
+  (`agent-card-source-text`) maps the API's `source`: `fetched` **Fetched & rewritten by the
+  gateway** (Direct), `generated` **Generated by the A2A proxy** (Proxied), `remote_gateway`
+  **Relayed from the remote gateway** (Fabric); an unknown or missing one is left out. A
+  `not_running` answer for a chosen surface keeps the select above the message. `not_running`
+  reads "None of this agent's surfaces is running on this gateway".
+- Activity and traffic exist only inside the metrics retention window, so labels name it
+  (`None in last 6h`, `Requests (last 6h)`) from the `window_minutes` that `GET /v1/agents` and
+  `GET /v1/agents/{id}` (`traffic.window_minutes`) return. There is no 7-day card.
+  **Failed requests** is `failed` + `gateway_faults`. Traffic counts Access Point (inbound)
+  requests only; Transit Point (outbound) calls are not counted.
+- With no requests in the window, the Traffic tab shows one `EmptyState`, "No requests in the last
+  6h" (`agent-traffic-empty`), in place of the cards.
+- The API returns agent totals only, so the Traffic tab has no per-surface breakdown.
+
+| Element                         | Test id                                                                                         |
+| ------------------------------- | ----------------------------------------------------------------------------------------------- |
+| Pages                           | `page-agents`, `page-agent-details`                                                             |
+| List row, chevron               | `agents-row-<id>`, `agents-row-chevron`                                                         |
+| List filter, count, retry       | `agents-filter-input`, `agents-count`, `agents-retry-button`                                    |
+| List load error, no match       | `agents-load-error`, `agents-no-match`                                                          |
+| Name, unnamed, endpoint host    | `agents-name`, `agents-unnamed`, `agents-endpoint-host`                                         |
+| Runtime, protocol, activity     | `agents-runtime`, `agents-protocol-badge`, `agents-last-activity`                               |
+| Surfaces, count, names          | `agents-surfaces`, `agents-surfaces-count`, `agents-surface-names`                              |
+| Identities, count, more         | `agents-identities`, `agents-identities-count`, `agents-identities-more`                        |
+| DID, copy, none                 | `agents-did`, `agents-copy-did-button`, `agents-no-did`                                         |
+| Trust registry                  | `agents-trust-recorded`, `agents-trust-not-recorded`                                            |
+| Back, details retry             | `agent-back-button`, `agent-retry-button`                                                       |
+| Details not found, load error   | `agent-not-found`, `agent-load-error`                                                           |
+| Details header                  | `agent-details-header`, `-name`, `-endpoint-host`                                               |
+| Details tabs                    | `agent-details-tabs`, `agent-tab-<agent-card\|connection\|traffic>`                             |
+| Agent Card states               | `agent-card-tab`, `-loading`, `-error`, `-retry-button`, `agent-card-<no_agent_card\|not_running\|operator_only>` |
+| Agent Card source               | `agent-card-source`, `-source-text`, `agent-card-surface`, `agent-card-surface-select`, `agent-card-open-surface-button` |
+| Changes by the gateway          | `agent-card-gateway-changes`, `-no-did`; rows `-url`, `-extension`, `-did`, `-vp`, `-removed`, `-other-<field>`, each with `-change` and `-was`; `-vp-toggle-button`, `-vp-view` |
+| Connection tab                  | `agent-connection-tab`, `-description`, `-path`, `-caller-hop`, `-surfaces-hop`, `-target`, `-copy-endpoint` |
+| Connection target rows          | `agent-connection-endpoint`, `-proxy`, `-proxy-link`, `-gateway`, `-gateway-link`, `-remote-surface` |
+| Agent Card JSON, copy           | `agent-card-json`, `agent-card-copy-button`                                                     |
+| Agent Card view toggle, preview | `agent-card-view-preview`, `-view-json`, `agent-card-preview`, `-preview-name`, `-preview-details`, `-preview-skills`, `-preview-empty` |
+| Traffic cards, empty            | `agent-traffic-tab`, `agent-traffic-requests`, `-failed`, `-p95`, `agent-traffic-empty` |
+| Connection                      | `agent-connection-tab`, `-endpoint`, `-proxy`, `-proxy-link`, `-gateway`, `-gateway-link`, `-remote-surface` |
 
 ## Remote gateway Issuer DIDs
 
@@ -2226,10 +2405,18 @@ room for its text.
   or target label longer than that is cut to 22 characters plus `...` by `cutLabel` in
   `MetricsFlowVisualization.tsx`, so a long DID cannot run across its neighbours or past the
   chart edge; `Anonymous` is unchanged and the hover tooltip shows the full value.
-- **Identities table**: ten columns, so `.identities-table` (`dashboard.css`) keeps
+- **Identities table**: up to eleven columns, so `.identities-table` (`dashboard.css`) keeps
   Bootstrap's `table-sm` horizontal cell padding (0.25rem) instead of the 0.75rem of the
-  shared `.table-sm` rules. The table fits its box at 1280px wide with every row action
-  inside it; the DID keeps its title and copy button.
+  shared `.table-sm` rules. The Name (`.identities-name`, 14rem) and Agent Surface
+  (`.identities-surface`, 12rem) cells wrap long values inside a capped width; the Origin badges
+  wrap. Attestation, UAI and Created (`.identities-col-wide-only`) show only at 2000px wide and
+  above. Below 1600px, Trust Score and Last Used (`.identities-col-mid-up`) hide too, and the
+  DID cell (`IdentityNameCell` with `compactDid`) shows a shorter DID. The expanded details always
+  show Created, Last Used and the Trust Score (`identities-detail-trust-score`), and for an
+  identity without Agent DNA its UAI (`identities-detail-uai`); with Agent DNA the Agent DNA
+  card shows the UAI. The table fits its box from the 1280px viewport that
+  `laptop-layout.spec.ts` checks up to the 1512px and 1728px laptop viewports, with every row
+  action inside it; the DID keeps its title and copy button.
 - **Connection Points actions**: the row actions sit in a 6rem wide wrapping block (two
   buttons per line) with no left margins, so the Actions column stays near 120px and the
   Name and Mediator columns keep their room. Add a new row action inside that block.

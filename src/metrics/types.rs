@@ -213,6 +213,17 @@ pub struct SurfaceStats {
     pub last_activity: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Request totals and p95 latency of the retained Access Point (inbound) connections of
+/// some surfaces. Transit Point (outbound) connections are not counted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InboundTraffic {
+    pub total: usize,
+    pub failed: usize,
+    pub gateway_faults: usize,
+    /// `None` without latency samples.
+    pub p95_latency_ms: Option<u64>,
+}
+
 /// Identity-channel connection statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdentityChannelStats {

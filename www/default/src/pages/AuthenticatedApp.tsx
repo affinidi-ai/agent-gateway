@@ -37,6 +37,8 @@ const PageLoader: React.FC = () => (
 
 // Lazy load all pages
 const IdentitiesPage = lazy(() => import('./IdentitiesPage'));
+const AgentsPage = lazy(() => import('./AgentsPage'));
+const AgentDetailPage = lazy(() => import('./AgentDetailPage'));
 const SurfacesPage = lazy(() => import('./SurfacesPage'));
 const GatewaysPage = lazy(() => import('./GatewaysPage'));
 const ConnectionsPage = lazy(() => import('./ConnectionsPage'));
@@ -287,6 +289,22 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                 />
                 <Route path="/identities" element={<IdentitiesPage />} />
                 <Route path="/identities/:did" element={<IdentitiesPage />} />
+                <Route
+                  path="/agent-registry"
+                  element={
+                    <ProtectedRoute permission="surfaces.view">
+                      <AgentsPage />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/agent-registry/:agentId"
+                  element={
+                    <ProtectedRoute permission="surfaces.view">
+                      <AgentDetailPage />
+                    </ProtectedRoute>
+                  }
+                />
                 <Route
                   path="/surfaces"
                   element={

@@ -819,6 +819,8 @@ mod tests {
             .route("/v1/identity/resolve-did", get(ok_handler))
             .route("/v1/metrics/config", get(ok_handler))
             .route("/v1/agents", get(ok_handler))
+            .route("/v1/agents/a1", get(ok_handler))
+            .route("/v1/agents/a1/agent-card", get(ok_handler))
             .route("/v1/onboard/create-temp-surface", get(ok_handler))
             .route("/v1/gateway/config", get(ok_handler))
             .route("/agents-api/v1/sign-jwt", get(ok_handler))
@@ -1019,6 +1021,8 @@ mod tests {
             "/v1/certificates",
             "/v1/metrics/config",
             "/v1/agents",
+            "/v1/agents/a1",
+            "/v1/agents/a1/agent-card",
             "/v1/onboard/create-temp-surface",
             "/v1/gateway/config",
             "/agents-api/v1/sign-jwt",

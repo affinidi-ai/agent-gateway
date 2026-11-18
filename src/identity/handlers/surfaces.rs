@@ -2552,29 +2552,23 @@ struct CardPreviewCaller<'a> {
     user_id: &'a str,
 }
 
-const CARD_FETCH_LIMITED: &str = "Too many card fetches; try again in a few seconds";
+pub(crate) const CARD_FETCH_LIMITED: &str = "Too many card fetches; try again in a few seconds";
 
-/// The agent card preview of a surface the caller may read, or for a refresh,
-/// change. A surface of another tenant is `404`, never its card, and a tenant token
-/// never makes the gateway fetch an appliance-wide surface's card.
-async fn agent_card_preview(
+/// The agent card preview of `surface`, which the caller may already read. A tenant
+/// token never makes the gateway fetch an appliance-wide surface's card.
+pub(crate) async fn surface_card_preview(
     state: &IdentityApiState,
-    surface_id: &str,
-    caller: &CardPreviewCaller<'_>,
+    surface: &AgentSurface,
+    context: Option<&PatTenantContext>,
+    user_id: &str,
     request: crate::proxy::card_preview::PreviewRequest,
-) -> Result<Response, SurfaceApiError> {
+) -> Result<crate::proxy::card_preview::AgentCardPreview, crate::proxy::card_preview::RateLimited> {
     use crate::proxy::card_preview::{
-        AgentCardPreview, PreviewCaller, PreviewRequest, RateLimited, UnsupportedReason, preview_memory,
-        unsupported_reason,
+        AgentCardPreview, PreviewCaller, UnsupportedReason, preview_memory, unsupported_reason,
     };
 
-    let access = match request {
-        PreviewRequest::Read => SurfaceAccess::Read,
-        PreviewRequest::Refresh => SurfaceAccess::Mutate,
-    };
-    let (_store, surface) = load_surface_or_404(state, surface_id, caller.context, caller.scope, access).await?;
-    let unsupported = |reason| Ok(Json(AgentCardPreview::unsupported(&surface.surface_id, reason)).into_response());
-    if let Some(reason) = unsupported_reason(&surface, caller.context.is_some(), crate::server::mode::is_standby()) {
+    let unsupported = |reason| Ok(AgentCardPreview::unsupported(&surface.surface_id, reason));
+    if let Some(reason) = unsupported_reason(surface, context.is_some(), crate::server::mode::is_standby()) {
         return unsupported(reason);
     }
     let Some(proxy_state) = state
@@ -2591,16 +2585,31 @@ async fn agent_card_preview(
         return unsupported(UnsupportedReason::NotA2a);
     }
 
-    let preview_caller = PreviewCaller {
-        user_id: caller.user_id,
-        tenant_id: caller
-            .context
-            .map(|context| context.tenant_id.as_str()),
+    let caller = PreviewCaller {
+        user_id,
+        tenant_id: context.map(|context| context.tenant_id.as_str()),
     };
-    match preview_memory()
-        .preview(&proxy_state, &preview_caller, request)
+    preview_memory()
+        .preview(&proxy_state, &caller, request)
         .await
-    {
+}
+
+/// The agent card preview of a surface the caller may read, or for a refresh,
+/// change. A surface of another tenant is `404`, never its card.
+async fn agent_card_preview(
+    state: &IdentityApiState,
+    surface_id: &str,
+    caller: &CardPreviewCaller<'_>,
+    request: crate::proxy::card_preview::PreviewRequest,
+) -> Result<Response, SurfaceApiError> {
+    use crate::proxy::card_preview::{PreviewRequest, RateLimited};
+
+    let access = match request {
+        PreviewRequest::Read => SurfaceAccess::Read,
+        PreviewRequest::Refresh => SurfaceAccess::Mutate,
+    };
+    let (_store, surface) = load_surface_or_404(state, surface_id, caller.context, caller.scope, access).await?;
+    match surface_card_preview(state, &surface, caller.context, caller.user_id, request).await {
         Ok(preview) => Ok(Json(preview).into_response()),
         Err(RateLimited { retry_after_secs }) => {
             warn!(surface_id = %surface.surface_id, "Agent card preview refused: fetch limit reached");

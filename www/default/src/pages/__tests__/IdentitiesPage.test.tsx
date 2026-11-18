@@ -1450,6 +1450,35 @@ describe('IdentitiesPage', () => {
       expect(screen.getAllByText('Identity Hash:')).toHaveLength(1);
       expect(screen.getByText('hash-caller')).toBeInTheDocument();
     });
+
+    describe('expanded details for hidden columns', () => {
+      const detailRow = {
+        did: 'did:key:detail',
+        identity_hash: 'hash-detail',
+        created_at: '2026-01-01T00:00:00Z',
+      };
+
+      it('shows the trust score and UAI of an identity without Agent DNA', async () => {
+        renderWithStats([{ ...detailRow, trust_score: 0.85, uai: 'uai:1:detail' }]);
+
+        fireEvent.click(await screen.findByTestId('identities-row-did:key:detail'));
+
+        expect(screen.getByTestId('identities-detail-trust-score')).toHaveTextContent('85%');
+        expect(screen.getByTestId('identities-detail-uai')).toHaveTextContent('uai:1:detail');
+      });
+
+      it('leaves out an unset trust score and the UAI when Agent DNA is present', async () => {
+        renderWithStats([
+          { ...detailRow, uai: 'uai:1:top', metadata: { agentDNA: { uai: 'uai:1:dna' } } },
+        ]);
+
+        fireEvent.click(await screen.findByTestId('identities-row-did:key:detail'));
+
+        expect(screen.getByText('Identity Hash:')).toBeInTheDocument();
+        expect(screen.queryByTestId('identities-detail-trust-score')).not.toBeInTheDocument();
+        expect(screen.queryByTestId('identities-detail-uai')).not.toBeInTheDocument();
+      });
+    });
   });
   describe('trust recorder status', () => {
     const recorder = (state: string, extra: Record<string, unknown> = {}) => ({

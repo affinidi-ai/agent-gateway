@@ -27,7 +27,6 @@ pub mod user_settings;
 pub mod version;
 
 // Re-export commonly used types and functions for convenience
-pub use agents::get_agents;
 pub use config::{
     get_networking_config, get_payment_policy, get_surface_routing_config, reload_configuration, reload_single_channel,
 };

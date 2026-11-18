@@ -333,11 +333,21 @@ surface was deleted, with a red "Revoked" badge, shows a deleted surface as plai
 _Identities page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page).
 
+The Identities table hides Attestation, UAI and Created below 2000px and Trust Score and Last
+Used below 1600px, and the expanded row shows the Trust Score, Created, Last Used and UAI; see
+_Laptop layouts_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#laptop-layouts).
+
 The Agent Cards view of an A2A or AP2 surface shows the managed agent's card beside the served card,
 and the Managed Agent panel shows its fetch status, including a card served without a managed
 identity, in the warning tone; a card refused for its identity names the identity error; see
 _Agent Cards tab_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#agent-cards-tab).
+
+The read-only Agents page at `/agent-registry` needs `surfaces.view` and lists one row per managed
+agent, built by the gateway from the surfaces that target it; MCP surfaces are left out and no
+status is shown. Its Agent Card tab shows the card the gateway serves for Direct, Proxied and
+Fabric routes with a **Card source** row; see _Agents page_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#agents-page).
 
 The Identities page shows one row per surface Managed Agent, with its earlier DIDs (from its
 responses and from its Transit Points) and certificate or API key rotations listed as

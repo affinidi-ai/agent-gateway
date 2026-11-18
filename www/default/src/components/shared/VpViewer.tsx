@@ -80,8 +80,8 @@ const ReadableRows: React.FC<{ rows: ReadableRow[]; nested?: boolean }> = ({ row
   </dl>
 );
 
-export const VpJwtRow: React.FC<{ vpJwt: string }> = ({ vpJwt }) => {
-  const [showModal, setShowModal] = React.useState(false);
+/** The decoded presentation with its Readable / Raw JSON switch, and Copy in the Raw JSON view. */
+export const VpView: React.FC<{ vpJwt: string }> = ({ vpJwt }) => {
   const { parsed } = React.useMemo(() => parseVp(vpJwt), [vpJwt]);
   const readableRows = React.useMemo(() => (parsed ? buildReadableRows(parsed) : []), [parsed]);
   const [view, setView] = React.useState<'readable' | 'raw'>('readable');
@@ -97,6 +97,73 @@ export const VpJwtRow: React.FC<{ vpJwt: string }> = ({ vpJwt }) => {
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
+
+  return (
+    <>
+      <div className="d-flex align-items-center gap-2 mb-3" role="group" aria-label="VP view mode">
+        <AppButton
+          variant={view === 'readable' ? 'primary' : 'outline-secondary'}
+          size="sm"
+          onClick={() => setView('readable')}
+          disabled={readableRows.length === 0}
+          aria-pressed={view === 'readable'}
+          iconStart={<i className="fas fa-list-ul me-1" aria-hidden="true" />}
+        >
+          Readable
+        </AppButton>
+        <AppButton
+          variant={view === 'raw' ? 'primary' : 'outline-secondary'}
+          size="sm"
+          onClick={() => setView('raw')}
+          aria-pressed={view === 'raw'}
+          iconStart={<i className="fas fa-code me-1" aria-hidden="true" />}
+        >
+          Raw JSON
+        </AppButton>
+        {view === 'raw' && (
+          <AppButton
+            variant="outline-secondary"
+            size="sm"
+            className="ms-auto"
+            onClick={handleCopy}
+            title="Copy JSON to clipboard"
+            iconStart={
+              <i
+                className={`fas ${copied ? 'fa-check text-success' : 'fa-copy'} me-1`}
+                aria-hidden="true"
+              />
+            }
+          >
+            {copied ? 'Copied' : 'Copy'}
+          </AppButton>
+        )}
+      </div>
+      {view === 'readable' && readableRows.length > 0 ? (
+        <div className="vp-readable-wrap" style={{ maxHeight: '60vh', overflow: 'auto' }}>
+          <ReadableRows rows={readableRows} />
+        </div>
+      ) : (
+        <pre className="vp-json-pre mb-0">
+          <code>
+            {jsonTokens.map((token, i) =>
+              token.type === 'plain' ? (
+                <React.Fragment key={i}>{token.value}</React.Fragment>
+              ) : (
+                <span key={i} className={`json-${token.type}`}>
+                  {token.value}
+                </span>
+              )
+            )}
+          </code>
+        </pre>
+      )}
+    </>
+  );
+};
+
+export const VpJwtRow: React.FC<{ vpJwt: string }> = ({ vpJwt }) => {
+  const [showModal, setShowModal] = React.useState(false);
+  const { parsed } = React.useMemo(() => parseVp(vpJwt), [vpJwt]);
 
   const handleDownload = () => {
     const isJson = !looksLikeJwt(vpJwt);
@@ -150,67 +217,7 @@ export const VpJwtRow: React.FC<{ vpJwt: string }> = ({ vpJwt }) => {
           </Modal.Title>
         </Modal.Header>
         <Modal.Body>
-          <div
-            className="d-flex align-items-center gap-2 mb-3"
-            role="group"
-            aria-label="VP view mode"
-          >
-            <AppButton
-              variant={view === 'readable' ? 'primary' : 'outline-secondary'}
-              size="sm"
-              onClick={() => setView('readable')}
-              disabled={readableRows.length === 0}
-              aria-pressed={view === 'readable'}
-              iconStart={<i className="fas fa-list-ul me-1" aria-hidden="true" />}
-            >
-              Readable
-            </AppButton>
-            <AppButton
-              variant={view === 'raw' ? 'primary' : 'outline-secondary'}
-              size="sm"
-              onClick={() => setView('raw')}
-              aria-pressed={view === 'raw'}
-              iconStart={<i className="fas fa-code me-1" aria-hidden="true" />}
-            >
-              Raw JSON
-            </AppButton>
-            {view === 'raw' && (
-              <AppButton
-                variant="outline-secondary"
-                size="sm"
-                className="ms-auto"
-                onClick={handleCopy}
-                title="Copy JSON to clipboard"
-                iconStart={
-                  <i
-                    className={`fas ${copied ? 'fa-check text-success' : 'fa-copy'} me-1`}
-                    aria-hidden="true"
-                  />
-                }
-              >
-                {copied ? 'Copied' : 'Copy'}
-              </AppButton>
-            )}
-          </div>
-          {view === 'readable' && readableRows.length > 0 ? (
-            <div className="vp-readable-wrap" style={{ maxHeight: '60vh', overflow: 'auto' }}>
-              <ReadableRows rows={readableRows} />
-            </div>
-          ) : (
-            <pre className="vp-json-pre mb-0">
-              <code>
-                {jsonTokens.map((token, i) =>
-                  token.type === 'plain' ? (
-                    <React.Fragment key={i}>{token.value}</React.Fragment>
-                  ) : (
-                    <span key={i} className={`json-${token.type}`}>
-                      {token.value}
-                    </span>
-                  )
-                )}
-              </code>
-            </pre>
-          )}
+          <VpView vpJwt={vpJwt} />
         </Modal.Body>
         <Modal.Footer>
           <AppButton variant="outline-secondary" size="sm" onClick={() => setShowModal(false)}>
