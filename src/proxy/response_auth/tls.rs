@@ -27,6 +27,15 @@ use crate::source_auth::models::MtlsTrust;
 
 static SETTINGS: LazyLock<TlsSettingsCache> = LazyLock::new(TlsSettingsCache::default);
 
+/// TLS settings built for a surface's Response authentication by mTLS, with the stamp of what
+/// they were built from: the setting and every certificate it names, so the stamp changes when
+/// a certificate is renewed.
+#[derive(Clone)]
+pub struct TargetTls {
+    pub config: Arc<ClientConfig>,
+    pub stamp: [u8; 32],
+}
+
 /// The TLS settings the gateway reaches `surface`'s Target with: `None` without Response
 /// authentication by mTLS, and [`ResponseAuthFailure::Unverifiable`] when a certificate it names
 /// cannot be used (missing, inactive, outside the surface's tenant, of the wrong kind, a client
@@ -34,17 +43,10 @@ static SETTINGS: LazyLock<TlsSettingsCache> = LazyLock::new(TlsSettingsCache::de
 pub async fn target_tls(
     surface: &AgentSurface,
     certificates: Option<&Arc<dyn CertificateStore>>,
-) -> Result<Option<Arc<ClientConfig>>, ResponseAuthFailure> {
+) -> Result<Option<TargetTls>, ResponseAuthFailure> {
     SETTINGS
         .settings(surface, certificates)
         .await
-}
-
-/// What the mTLS settings [`target_tls`] last built for `surface` and its setting were built
-/// from: the setting and every certificate it names, so it changes when a certificate is
-/// renewed. `None` before any were built.
-pub fn tls_stamp(surface: &AgentSurface) -> Option<[u8; 32]> {
-    SETTINGS.stamp(surface)
 }
 
 /// Drops every mTLS setting built for the surface `surface_id`, so a changed or deleted surface
@@ -110,6 +112,7 @@ struct TlsSettingsCache {
 }
 
 impl TlsSettingsCache {
+    #[cfg(test)]
     fn stamp(
         &self,
         surface: &AgentSurface,
@@ -142,7 +145,7 @@ impl TlsSettingsCache {
         &self,
         surface: &AgentSurface,
         certificates: Option<&Arc<dyn CertificateStore>>,
-    ) -> Result<Option<Arc<ClientConfig>>, ResponseAuthFailure> {
+    ) -> Result<Option<TargetTls>, ResponseAuthFailure> {
         let Some(ResponseAuthConfig::Mtls(config)) = surface
             .target
             .response_auth
@@ -158,12 +161,15 @@ impl TlsSettingsCache {
             .get(&key)
             .filter(|built| built.0 == stamp)
         {
-            return Ok(Some(Arc::clone(&built.1)));
+            return Ok(Some(TargetTls {
+                config: Arc::clone(&built.1),
+                stamp,
+            }));
         }
         let built = Arc::new(material.client_config(config)?);
         self.built
             .insert(key, (stamp, Arc::clone(&built)));
-        Ok(Some(built))
+        Ok(Some(TargetTls { config: built, stamp }))
     }
 }
 
@@ -757,6 +763,7 @@ pub(super) mod tests {
             .await
             .expect("usable settings")
             .expect("an mTLS surface has settings")
+            .config
     }
 
     #[tokio::test]
@@ -984,21 +991,25 @@ pub(super) mod tests {
         let mut surface = surface(None, pinned(&["bravo"]));
         surface.surface_id = "legacy-sse-renewal".to_string();
         let base = "https://127.0.0.1:9443";
-        let key = |surface: &AgentSurface| {
+        let built = || async {
+            target_tls(&surface, Some(&store))
+                .await
+                .expect("usable settings")
+                .expect("an mTLS surface has settings")
+        };
+        let key = |tls: TargetTls| {
             crate::mcp::sse_transport::session_key(
                 base,
-                Some(crate::mcp::sse_transport::ResponseCheck { surface, secrets: None }),
+                Some(crate::mcp::sse_transport::ResponseCheck {
+                    surface: &surface,
+                    secrets: None,
+                    stamp: Some(tls.stamp),
+                }),
             )
         };
 
-        target_tls(&surface, Some(&store))
-            .await
-            .expect("usable settings");
-        let before = key(&surface);
-        target_tls(&surface, Some(&store))
-            .await
-            .expect("usable settings");
-        assert_eq!(key(&surface), before, "the same session while unchanged");
+        let before = key(built().await);
+        assert_eq!(key(built().await), before, "the same session while unchanged");
 
         store
             .update(
@@ -1017,11 +1028,8 @@ pub(super) mod tests {
             )
             .await
             .expect("certificate renewed");
-        target_tls(&surface, Some(&store))
-            .await
-            .expect("usable settings");
 
-        assert_ne!(key(&surface), before, "a new session after the renewal");
+        assert_ne!(key(built().await), before, "a new session after the renewal");
     }
 
     #[tokio::test]
@@ -1093,7 +1101,7 @@ pub(super) mod tests {
     async fn tenant_client_certificate_outcome(
         mode: crate::config::credential_policy::RuleMode,
         client_owner: Option<&str>,
-    ) -> Result<Option<Arc<ClientConfig>>, ResponseAuthFailure> {
+    ) -> Result<Option<TargetTls>, ResponseAuthFailure> {
         let (_dir, store) = store().await;
         put(&store, "bravo", CertificateKind::ClientLeaf, &self_signed(&["127.0.0.1"]), false, None).await;
         put(&store, "gateway", CertificateKind::ClientLeaf, &self_signed(&["gateway.example"]), true, client_owner)

@@ -308,10 +308,20 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   certificate or on an `http://` Target. The gateway's refusal (`target.response_auth…`, or
   `variants['<alias>'].target.response_auth…` in that variant's view) and its `Warning` headers
   show in the section with the field name in plain words; a warning stays until the endpoint or
-  the setting changes. Test ids, with prefix `managed-agent-response-auth`: `-section`,
+  the setting changes. A save sends every variant as a complete override, which replaces the
+  base's setting with the variant's own, so while the base view has a setting, an
+  `InfoBanner` warning (`-variants-warning`) names the variants whose snapshot has an HTTP or
+  HTTPS Target and no setting (`variantsWithoutResponseAuth`; a variant never opened has no
+  snapshot and is saved from the base, so it is not named). Its **Copy to variants** button
+  (`-copy-to-variants`, disabled while the base setting is incomplete or the surface is
+  read-only) writes the base value, in its wire shape, into those snapshots only, so the next
+  Save sends it in each one's `overrides.target`; it never saves by itself, and the warning
+  disappears once no variant is left without it. Test ids, with prefix
+  `managed-agent-response-auth`: `-section`,
   `-method`, `-header`, `-secret`, `-add-secret-link`, `-http-warning`, `-trust-mode`,
   `-trust-certificates`, `-trust-cert-<id>`, `-add-certificate-link`, `-client-cert`,
-  `-certificates-error`, `-unsupported`, `-problem`, `-save-warning`, `-save-error`, and
+  `-certificates-error`, `-unsupported`, `-variants-warning`, `-copy-to-variants`, `-problem`,
+  `-save-warning`, `-save-error`, and
   `field-help-managed-agent-response-auth` / `-client-cert`.
 - The Agent Identity panel (`identity/IdentityPanel.tsx`) disables **From API Key** on the
   Managed Agent response identity (`response:identity-protected`), since the key picker lists

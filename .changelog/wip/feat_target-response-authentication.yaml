@@ -22,14 +22,20 @@ changes:
         request, before identity resolution, response policy, payment capture or a grant refresh
         use it, and the
         VP Audit Log records a request_rejected with reason target_response_auth_failed. MCP tool
-        discovery of a saved surface runs the same check. A PUT that leaves the setting out keeps
+        discovery of a saved surface runs the same check, and the dashboard reads a managed
+        agent's name from its Agent Card under it, showing no name when the check fails. A PUT
+        that leaves the setting out keeps
         the stored one; null removes it. A save refuses the setting on a proxy://, a2a-proxy:// or
         fabric:// Target, mtls on an http Target or on a Target bound by external consent, a header the Target authentication header rules refuse, certificates of the
         wrong kind or without the client certificate's key, a secret or certificate of
         another tenant, an inactive certificate, a key secret holding no non-blank key, and a key
-        secret the gateway also sends to the Target or a Transit Point or accepts from callers,
-        and an API key on an http Target follows credential_policy.target_https.
-        Variants may set their own. A release without this setting does not load a surface that
+        secret the gateway also sends to the Target or a Transit Point (directly, in enabled
+        $SECRET: custom metadata or through a credential provider it sends) or accepts from
+        callers, and a credential provider update that would read a surface's key secret for a
+        provider that surface sends is refused. An API key on an http Target follows
+        credential_policy.target_https; there the key is sent unencrypted and gives no
+        protection on the network path, so use https, or mtls. Variants may set their own; the dashboard warns in the base view
+        about variants that keep none and can copy the base setting into them. A release without this setting does not load a surface that
         sets it.
     - timestamp: '2026-11-18T00:00:00Z'
       title: Update lettre to 0.11.24 to fix SMTP injection and STARTTLS advisories

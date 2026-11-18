@@ -112,6 +112,42 @@ export function responseAuthToWire(endpoint: unknown, value: unknown): unknown {
   return undefined;
 }
 
+export interface VariantRef {
+  id: string;
+  alias: string;
+}
+
+function targetOf(snapshot: unknown): Record<string, unknown> {
+  const target = isObject(snapshot) ? snapshot.target : undefined;
+  return isObject(target) ? target : {};
+}
+
+/**
+ * The variants whose own http(s) Target has no Response authentication. A
+ * save sends every variant as a complete override, which replaces the base
+ * surface's setting with the variant's own. A variant without a snapshot is
+ * saved from the base, so it is never listed.
+ */
+export function variantsWithoutResponseAuth(
+  variants: readonly VariantRef[],
+  snapshotOf: (id: string) => unknown
+): VariantRef[] {
+  return variants.filter(v => {
+    const snapshot = snapshotOf(v.id);
+    if (snapshot === undefined) return false;
+    const target = targetOf(snapshot);
+    return (
+      isResponseAuthTarget(target.endpoint) && responseAuthMethod(target.response_auth) === 'off'
+    );
+  });
+}
+
+/** `snapshot` with its Target's Response authentication set to `value`. */
+export function withResponseAuth(snapshot: unknown, value: unknown): Record<string, unknown> {
+  const base = isObject(snapshot) ? snapshot : {};
+  return { ...base, target: { ...targetOf(snapshot), response_auth: value } };
+}
+
 const FIELD_WORDS: Array<[string, string]> = [
   ['.api_key.header_name', 'The response header'],
   ['.mtls.server_trust', 'The trusted server certificate'],

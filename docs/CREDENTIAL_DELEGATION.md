@@ -48,6 +48,17 @@ already lacks one is refused every update until the update names it. On a token 
 is still http and not listed in `insecure_token_endpoints`, naming a missing client secret
 reference is refused as well (see [https token endpoints](#https-token-endpoints)).
 
+An update is refused with `400` when the provider's service token would read a secret (its API
+key, client ID and secret, signing key or certificate) that is the Response authentication
+`api_key.secret_id` of a surface, or of a variant as it resolves, that sends the provider to its
+Target or a Transit Point, by `credential_provider` Target authentication, an
+`outbound_credentials` binding or a Transit Point's `transit_credentials`: `Secret '<id>' is the
+Response authentication key of surface '<name>' (<surface_id>), which sends this provider to its
+Target or a Transit Point`. The surface is named only to a caller that may view it (`a surface`
+otherwise), and only the surfaces that may reference the provider are read. A surface save
+refuses the same overlap from its side (see
+[Response authentication](SOURCE_AUTH.md#response-authentication)).
+
 ### Records that are still in use
 
 A credential provider or secret is not deleted while another record uses it, so a surface or

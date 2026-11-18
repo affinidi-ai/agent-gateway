@@ -635,9 +635,10 @@ pub async fn discover_mcp_tools<S: McpProxyStore>(
                 "Tool discovery is not supported for fabric:// MCP targets".to_string(),
             ));
         } else {
-            let check = crate::mcp::sse_transport::ResponseCheck {
+            let unbuilt = crate::mcp::sse_transport::ResponseCheck {
                 surface: &surface,
                 secrets: secrets_store.as_ref(),
+                stamp: None,
             };
             let tls = crate::proxy::response_auth::hop_tls(
                 &surface,
@@ -645,7 +646,14 @@ pub async fn discover_mcp_tools<S: McpProxyStore>(
                 crate::proxy::server::get_certificates_store().as_ref(),
             )
             .await
-            .map_err(|failure| refused_discovery(Some(check), failure))?;
+            .map_err(|failure| refused_discovery(Some(unbuilt), failure))?;
+            let check = crate::mcp::sse_transport::ResponseCheck {
+                stamp: tls
+                    .as_ref()
+                    .map(|tls| tls.stamp),
+                ..unbuilt
+            };
+            let tls = tls.map(|tls| tls.config);
             let pinned_client = pin_discovery_client(endpoint, move |url, timeout| {
                 crate::egress::pinned_forward_client_with_tls(url, timeout, tls.as_deref())
             })

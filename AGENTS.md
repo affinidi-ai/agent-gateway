@@ -369,7 +369,8 @@ versions in the expanded row, each earlier DID with its own actions; rows carry 
 The Managed Agent panel's **Response Authentication** section writes `target.response_auth`
 (Off, API key or mTLS), is shown only for an HTTP or HTTPS Target, offers mTLS only on an
 `https://` one, keeps a stored setting the operator did not edit and sends `null` once it is
-switched off; see _Surface Builder_ in
+switched off. In the base view it names the variants that keep no setting of their own and
+offers **Copy to variants**, which never saves by itself; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Agent Identity panel doesn't offer From API Key on the Managed Agent's response identity,

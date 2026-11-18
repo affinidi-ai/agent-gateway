@@ -1411,8 +1411,9 @@ event. Every hop to the Target runs it:
   each message it posts, `notifications/initialized` included: an answer to any of them that
   fails refuses the session, which is never kept. A session is shared only by surfaces without
   the setting, so a surface with it never uses a session another surface opened. A session under
-  mTLS is also keyed by the certificates its TLS settings were built from, so a renewed
-  certificate opens a new session rather than reusing one that trusts the old certificate. A
+  mTLS is also keyed by the certificates of the TLS settings its connection was built with, so a
+  renewed certificate opens a new session rather than reusing one that trusts the old
+  certificate, and a session opened just before a renewal is kept under the old certificates. A
   new session of a surface on a Target URL closes that surface's sessions on the same URL under
   the same setting with an older certificate; its sessions under another setting, such as
   another variant's, are kept. Saving or deleting the surface, or reloading the configuration,
@@ -1474,9 +1475,14 @@ resolves:
   response ([`src/identity/handlers/surface_response_auth.rs`](../src/identity/handlers/surface_response_auth.rs));
 - names as `api_key.secret_id` a secret the gateway sends to the Target or a Transit Point or
   accepts from callers: the `secret_id` of a `static_secret` Target authentication, of a Transit Point's
-  `static_secret` `target_auth`, of `caller_key`, or of an Access Point `api_key` caller
-  authentication method, so neither the managed agent nor a caller already holds the key its
-  responses are checked against;
+  `static_secret` `target_auth`, of `caller_key`, of an Access Point `api_key` caller
+  authentication method, or of an enabled `$SECRET:<id>` value in the Target's or the shared
+  transit custom metadata (disabled custom metadata does not count), or a secret a credential
+  provider the surface sends reads for its service token (its API key, client ID and secret,
+  signing key or certificate), whether the provider is the Target's or a Transit Point's
+  `credential_provider` Target authentication, an `outbound_credentials` binding or a Transit
+  Point's `transit_credentials`, so neither the managed agent, another agent nor a caller
+  already holds the key its responses are checked against;
 - names a secret or certificate that does not exist or belongs to another tenant (an
   appliance-wide one is accepted, as for a Transit Point's `source_auth`; see
   [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md)), an inactive certificate, or a secret that holds no
@@ -1491,7 +1497,17 @@ resolves:
   without its private key;
 - reads its key from an `http://` Target while `[credential_policy] target_https` is `enforce`,
   unless the stored surface already had the same setting on the same Target. In `warn`, the
-  default, the save goes through with a `Warning: 299` header and a logged warning.
+  default, the save goes through with a `Warning: 299` header and a logged warning. On an
+  `http://` Target the key is sent unencrypted and gives no protection on the network path, so
+  use an `https://` Target, or `mtls`.
+
+The rule against a shared secret also holds from the provider's side: an update of a credential
+provider is refused with `400` when its service token would read a secret that is the
+`api_key.secret_id` of a surface, or of a variant as it resolves, that sends the provider on any
+of the paths above: `Secret '<id>' is the Response authentication key of surface '<name>'
+(<surface_id>), which sends this provider to its Target or a Transit Point`, naming the surface
+only to a caller that may view it (`a surface` otherwise). Only the surfaces that may reference
+the provider are read ([`src/credential_providers/handlers.rs`](../src/credential_providers/handlers.rs)).
 
 An omitted `response_auth` in a `PUT` of the surface keeps the stored one; `"response_auth":
 null` removes it. The same holds for a variant's `overrides.target`, in the surface `PUT` and in

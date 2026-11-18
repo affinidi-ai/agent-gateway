@@ -801,15 +801,17 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tracing::info;
 
-use crate::config::response_auth::ResponseAuthConfig;
-use crate::proxy::response_auth::{ResponseAuthFailure, authenticate_sent, tls_stamp};
+use crate::proxy::response_auth::{ResponseAuthFailure, authenticate_sent};
 
 /// The surface whose Response authentication every response of a Legacy SSE session is
-/// checked against, the stream and each message POST alike, and the secrets its key is read from.
+/// checked against, the stream and each message POST alike, the secrets its key is read from,
+/// and the stamp of the mTLS settings the session's client was built with
+/// ([`crate::proxy::response_auth::TargetTls`]), `None` without them.
 #[derive(Clone, Copy)]
 pub struct ResponseCheck<'a> {
     pub surface: &'a crate::config::agent_surface::AgentSurface,
     pub secrets: Option<&'a Arc<dyn crate::secrets::SecretsStore>>,
+    pub stamp: Option<[u8; 32]>,
 }
 
 /// Why a request over a Legacy SSE session got no response.
@@ -838,8 +840,9 @@ pub struct SessionKey {
 }
 
 /// The surface part of a [`SessionKey`]. An mTLS setting adds the stamp of the TLS settings
-/// the hop just built ([`tls_stamp`]), so a renewed certificate opens a new session rather
-/// than reusing one that trusts the old certificate.
+/// the session's client was built with ([`ResponseCheck::stamp`]), so a renewed certificate
+/// opens a new session rather than reusing one that trusts the old certificate, and a session
+/// opened with the old settings is never stored under the new stamp.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 struct SurfaceSessionKey {
     surface_id: String,
@@ -886,10 +889,7 @@ pub(crate) fn session_key(
                     .surface_id
                     .clone(),
                 setting: serde_json::to_string(setting).unwrap_or_default(),
-                stamp: match setting {
-                    ResponseAuthConfig::Mtls(_) => tls_stamp(check.surface),
-                    ResponseAuthConfig::ApiKey(_) => None,
-                },
+                stamp: check.stamp,
             })
         }),
     }
@@ -1801,6 +1801,7 @@ mod tests {
         let check = ResponseCheck {
             surface: &surface,
             secrets: Some(&secrets),
+            stamp: None,
         };
 
         let answer =
@@ -1819,6 +1820,7 @@ mod tests {
         let check = ResponseCheck {
             surface: &surface,
             secrets: Some(&secrets),
+            stamp: None,
         };
         for (case, stream_key, post_key) in [
             ("a stream without the key", None, Some(crate::proxy::response_auth::BRAVO_KEY)),
@@ -1858,6 +1860,7 @@ mod tests {
         let check = ResponseCheck {
             surface: &surface,
             secrets: Some(&secrets),
+            stamp: None,
         };
         let manager = UpstreamSseSessionManager::new();
 
@@ -1933,7 +1936,14 @@ mod tests {
         base: &str,
         surface: &crate::config::agent_surface::AgentSurface,
     ) -> SessionKey {
-        session_key(base, Some(ResponseCheck { surface, secrets: None }))
+        session_key(
+            base,
+            Some(ResponseCheck {
+                surface,
+                secrets: None,
+                stamp: None,
+            }),
+        )
     }
 
     fn plain_key(base: &str) -> SessionKey {
@@ -1971,6 +1981,7 @@ mod tests {
         let check = ResponseCheck {
             surface: &surface,
             secrets: Some(&secrets),
+            stamp: None,
         };
 
         manager
@@ -2082,11 +2093,12 @@ mod tests {
             .expect("an mTLS surface has TLS settings");
         let base = format!("https://127.0.0.1:{port}");
         let (client, _) =
-            crate::egress::pinned_forward_client_with_tls(&base, std::time::Duration::from_secs(5), Some(&tls))
+            crate::egress::pinned_forward_client_with_tls(&base, std::time::Duration::from_secs(5), Some(&tls.config))
                 .unwrap();
         let check = ResponseCheck {
             surface: &surface,
             secrets: None,
+            stamp: Some(tls.stamp),
         };
 
         let outcome = send_via_persistent_sse(&client, &base, TOOLS_CALL, "test", 1024 * 1024, Some(check)).await;
@@ -2094,6 +2106,64 @@ mod tests {
         assert!(
             matches!(outcome, Err(LegacySseError::Unauthenticated(ResponseAuthFailure::ServerUntrusted))),
             "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_sse_session_is_kept_under_the_stamp_of_the_settings_its_client_was_built_with() {
+        let (_port, _dir, store) = crate::proxy::response_auth::untrusted_target().await;
+        let surface = bravo_surface(crate::proxy::response_auth::pinned_bravo());
+        let built = || async {
+            crate::proxy::response_auth::target_tls(&surface, Some(&store))
+                .await
+                .unwrap()
+                .expect("an mTLS surface has TLS settings")
+                .stamp
+        };
+        let first = built().await;
+        let renewed = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).expect("renewed certificate");
+        store
+            .update(
+                "bravo",
+                crate::certificates::UpdateCertificateRequest {
+                    name: None,
+                    description: None,
+                    tags: None,
+                    kind: None,
+                    certificate_pem: Some(renewed.cert.pem()),
+                    private_key_pem: None,
+                    expires_at: None,
+                    active: None,
+                    identity_did: None,
+                },
+            )
+            .await
+            .expect("certificate renewed");
+        let second = built().await;
+        assert_ne!(first, second, "the renewal changes the stamp");
+        let base = keyed_legacy_upstream(None, None, None).await;
+        let manager = UpstreamSseSessionManager::new();
+        let check = ResponseCheck {
+            surface: &surface,
+            secrets: None,
+            stamp: Some(first),
+        };
+
+        manager
+            .get_or_connect(&reqwest::Client::new(), &base, "test", 1024 * 1024, Some(check))
+            .await
+            .map_err(|error| error.to_string())
+            .expect("the session connects");
+
+        let kept = kept_keys(&manager).await;
+        assert_eq!(kept, [session_key(&base, Some(check))].into());
+        assert!(
+            kept.iter().all(|key| key
+                .surface
+                .as_ref()
+                .and_then(|surface| surface.stamp)
+                == Some(first)),
+            "kept under the stamp of the settings the client was built with: {kept:?}"
         );
     }
 
@@ -2114,7 +2184,14 @@ mod tests {
             .unwrap(),
         );
         let key = |surface: &crate::config::agent_surface::AgentSurface| {
-            session_key(base, Some(ResponseCheck { surface, secrets: None }))
+            session_key(
+                base,
+                Some(ResponseCheck {
+                    surface,
+                    secrets: None,
+                    stamp: None,
+                }),
+            )
         };
 
         assert_eq!(key(&plain), plain_key(base), "a surface without the setting shares the upstream's session");

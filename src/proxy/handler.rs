@@ -4371,11 +4371,16 @@ async fn proxy_charged_request(
         Ok(target_tls) => target_tls,
         Err(failure) => return Ok(crate::proxy::response_auth::refuse(failure, &audit_facts, &body_bytes)),
     };
+    let target_tls_stamp = target_tls
+        .as_ref()
+        .map(|tls| tls.stamp);
     let mut forward_client: Option<reqwest::Client> = target_grant
         .as_ref()
         .map(|route| route.client().clone());
     if forward_client.is_none() && !is_a2a_proxy_target && !is_mcp_proxy_target {
-        match pinned_target_client(&state, &channel_name, &target_url, &audit_facts, target_tls).await {
+        match pinned_target_client(&state, &channel_name, &target_url, &audit_facts, target_tls.map(|tls| tls.config))
+            .await
+        {
             Ok(client) => forward_client = Some(client),
             Err(blocked) => return Ok(blocked),
         }
@@ -8203,6 +8208,7 @@ async fn proxy_charged_request(
             Some(crate::mcp::sse_transport::ResponseCheck {
                 surface: &state.surface,
                 secrets: state.secrets_store.as_ref(),
+                stamp: target_tls_stamp,
             }),
         )
         .await

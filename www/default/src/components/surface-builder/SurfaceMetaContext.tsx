@@ -70,6 +70,10 @@ export interface SurfaceMetaValue {
   apiKeyStatuses?: ApiKeyStatuses;
   /** DIDs of the Authorities register; `null` while it loads or when it could not be loaded. */
   authorityDids?: ReadonlySet<string> | null;
+  /** Aliases of the variants whose own http(s) Target has no Response authentication; set in the base view only. */
+  variantsWithoutResponseAuth?: readonly string[];
+  /** Gives those variants the base's Response authentication `value`, without saving. */
+  onCopyResponseAuthToVariants?: (value: unknown) => void;
   /** Selects the Access Point and points at the Caller Context element in the palette. */
   onConfigureAuthentication?: () => void;
   setName: (v: string) => void;

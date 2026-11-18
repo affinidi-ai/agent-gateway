@@ -1,5 +1,5 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import ManagedAgentPanel from '../managed-agent/ManagedAgentPanel';
 import ResponseAuthSection from '../managed-agent/ResponseAuthSection';
@@ -10,7 +10,10 @@ import {
   responseAuthSaveError,
   responseAuthToWire,
   responseAuthWarnings,
+  variantsWithoutResponseAuth,
+  withResponseAuth,
 } from '../managed-agent/responseAuth';
+import { useVariantSnapshots } from '../../variants/useVariantSnapshots';
 import { managedAgentDefinition } from '../managed-agent/definition';
 import { apiClient } from '../../../../api';
 import { registry } from '../index';
@@ -202,6 +205,66 @@ describe('Response Authentication section', () => {
       <ResponseAuthSection endpoint="https://agent.example" value={MTLS} onChange={jest.fn()} />
     );
     expect(await screen.findByTestId(`${T}-certificates-error`)).toBeInTheDocument();
+  });
+
+  function renderInView(
+    meta: Partial<SurfaceMetaValue>,
+    value: unknown = API_KEY,
+    endpoint = 'https://agent.example'
+  ) {
+    return render(
+      <SurfaceMetaProvider value={meta as SurfaceMetaValue}>
+        <ResponseAuthSection endpoint={endpoint} value={value} onChange={jest.fn()} />
+      </SurfaceMetaProvider>
+    );
+  }
+
+  it('warns in the base view about the variants without the setting', () => {
+    renderInView({ variantsWithoutResponseAuth: ['beta', 'canary'] });
+    expect(screen.getByTestId(`${T}-variants-warning`)).toHaveTextContent(
+      "Variants beta, canary don't check the Managed Agent's responses: each variant keeps its own setting."
+    );
+  });
+
+  it('names a single variant in the singular', () => {
+    renderInView({ variantsWithoutResponseAuth: ['beta'] });
+    expect(screen.getByTestId(`${T}-variants-warning`)).toHaveTextContent(
+      "Variant beta doesn't check the Managed Agent's responses"
+    );
+  });
+
+  it('does not warn in a variant view, with no variant left out, or while Off', () => {
+    const cases: Array<[Partial<SurfaceMetaValue>, unknown]> = [
+      [{ activeVariantAlias: 'beta', variantsWithoutResponseAuth: ['canary'] }, API_KEY],
+      [{ variantsWithoutResponseAuth: [] }, API_KEY],
+      [{}, API_KEY],
+      [{ variantsWithoutResponseAuth: ['beta'] }, null],
+    ];
+    for (const [meta, value] of cases) {
+      const { unmount } = renderInView(meta, value);
+      expect(screen.queryByTestId(`${T}-variants-warning`)).not.toBeInTheDocument();
+      unmount();
+    }
+  });
+
+  it('copies the base setting in its wire shape when asked, and only then', () => {
+    const copy = jest.fn();
+    renderInView({ variantsWithoutResponseAuth: ['beta'], onCopyResponseAuthToVariants: copy });
+    expect(copy).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId(`${T}-copy-to-variants`));
+    expect(copy).toHaveBeenCalledTimes(1);
+    expect(copy).toHaveBeenCalledWith(API_KEY);
+  });
+
+  it('does not offer the copy while the base setting is incomplete or the surface is read-only', () => {
+    const { unmount } = renderInView(
+      { variantsWithoutResponseAuth: ['beta'], onCopyResponseAuthToVariants: jest.fn() },
+      { api_key: { header_name: 'X-Agent-Key', secret_id: '' } }
+    );
+    expect(screen.getByTestId(`${T}-copy-to-variants`)).toBeDisabled();
+    unmount();
+    renderInView({ variantsWithoutResponseAuth: ['beta'] });
+    expect(screen.getByTestId(`${T}-copy-to-variants`)).toBeDisabled();
   });
 
   it("shows the gateway's refusal and warnings for this view in plain words", async () => {
@@ -461,5 +524,107 @@ describe('target.response_auth on save', () => {
     node.config = { ...node.config, endpoint: 'proxy://tools' };
     const overrides = computeOverridesFromPayload(registry.buildPayload(makeCtx(nodes)));
     expect(overrides.target).toMatchObject({ response_auth: null });
+  });
+});
+
+describe('Response authentication copied to variants', () => {
+  const stored = {
+    access_point: { route: '/a2a', protocol: 'a2a' },
+    target: { endpoint: 'https://agent.example' },
+    variants: [
+      {
+        id: 'v-beta',
+        alias: 'beta',
+        name: 'Beta',
+        overrides: { complete: true, target: { endpoint: 'https://beta.example' } },
+      },
+      {
+        id: 'v-canary',
+        alias: 'canary',
+        name: 'Canary',
+        overrides: {
+          complete: true,
+          target: { endpoint: 'https://canary.example', response_auth: MTLS },
+        },
+      },
+      {
+        id: 'v-fabric',
+        alias: 'fabric',
+        name: 'Fabric',
+        overrides: { complete: true, target: { endpoint: 'fabric://gw-2/surface-2' } },
+      },
+      {
+        id: 'v-legacy',
+        alias: 'legacy',
+        name: 'Legacy',
+        overrides: { target: { endpoint: 'http://legacy.example' } },
+      },
+    ],
+  };
+  const liveBase = {
+    ...stored,
+    target: { ...stored.target, response_auth: API_KEY },
+    variants: undefined,
+  };
+
+  function hydrated() {
+    const { result } = renderHook(() => useVariantSnapshots());
+    act(() => {
+      result.current.hydrateFromPayload(stored);
+    });
+    return result;
+  }
+
+  it('lists the variants with an http(s) Target and no setting, which a save sends as complete', () => {
+    const result = hydrated();
+    expect(
+      variantsWithoutResponseAuth(result.current.variants, result.current.getSnapshot).map(
+        v => v.alias
+      )
+    ).toEqual(['beta', 'legacy']);
+  });
+
+  it('never lists a variant without a snapshot, since the save freezes it from the base', () => {
+    expect(variantsWithoutResponseAuth([{ id: 'new', alias: 'new' }], () => undefined)).toEqual([]);
+  });
+
+  it('sends the copied setting in each listed variant and keeps the others as they are', () => {
+    const result = hydrated();
+    const missing = variantsWithoutResponseAuth(
+      result.current.variants,
+      result.current.getSnapshot
+    );
+    act(() => {
+      for (const v of missing) {
+        result.current.setSnapshot(
+          v.id,
+          withResponseAuth(result.current.getSnapshot(v.id), API_KEY)
+        );
+      }
+    });
+    expect(
+      variantsWithoutResponseAuth(result.current.variants, result.current.getSnapshot)
+    ).toEqual([]);
+
+    const wire = result.current.buildVariantsWireSlice(liveBase);
+    const sent = Object.fromEntries(
+      wire.variants.map(v => [v.alias, v.overrides?.target?.response_auth])
+    );
+    expect(sent).toEqual({
+      beta: API_KEY,
+      canary: MTLS,
+      fabric: undefined,
+      legacy: API_KEY,
+    });
+    expect(wire.basePayload.target.response_auth).toEqual(API_KEY);
+  });
+
+  it('keeps the rest of the variant snapshot when setting its Response authentication', () => {
+    expect(
+      withResponseAuth({ name: 'x', target: { endpoint: 'https://b.example', auth: 'a' } }, MTLS)
+    ).toEqual({
+      name: 'x',
+      target: { endpoint: 'https://b.example', auth: 'a', response_auth: MTLS },
+    });
   });
 });

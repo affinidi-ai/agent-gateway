@@ -3716,7 +3716,7 @@ async fn fetch_agent_card(
             return None;
         }
     };
-    let client = match forward_client_for(card_url, timeout, tls).await {
+    let client = match forward_client_for(card_url, timeout, tls.map(|tls| tls.config)).await {
         Ok(client) => client,
         Err(error) => {
             channel_warn!(
@@ -5988,7 +5988,10 @@ async fn process_charged_forward_request(
             .await;
         }
     };
-    let client = match forward_client_for(&target_url, timeout, target_tls).await {
+    let target_tls_stamp = target_tls
+        .as_ref()
+        .map(|tls| tls.stamp);
+    let client = match forward_client_for(&target_url, timeout, target_tls.map(|tls| tls.config)).await {
         Ok(client) => client,
         Err(error) => {
             channel_warn!(
@@ -6620,6 +6623,7 @@ async fn process_charged_forward_request(
     let legacy_sse_check = crate::mcp::sse_transport::ResponseCheck {
         surface: &surface,
         secrets: response_secrets.as_ref(),
+        stamp: target_tls_stamp,
     };
     if surface_protocol == crate::config::ChannelProtocol::Mcp && modern_request.is_none() && !body_bytes.is_empty() {
         // Check if a persistent session already exists (cheap read lock check)

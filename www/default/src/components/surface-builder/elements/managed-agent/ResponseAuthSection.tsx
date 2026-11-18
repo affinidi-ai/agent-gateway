@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Form } from 'react-bootstrap';
 import FieldHelp from '../../../shared/FieldHelp';
+import { AppButton } from '../../../shared/AppButton';
+import InfoBanner from '../../../shared/InfoBanner';
 import AddResourceLink from '../../../shared/AddResourceLink';
 import { deepLinks } from '../../../../utils/deepLinks';
 import type { CertificateKind, MtlsTrust } from '../../../../types';
@@ -63,6 +65,9 @@ const ResponseAuthSection: React.FC<Props> = ({ endpoint, value, onChange }) => 
   const showSavedWarnings = savedWarnings.length > 0 && warnedAt === signature;
   const refusal = responseAuthSaveError(meta?.saveError, variant);
   const problems = responseAuthProblems(endpoint, value);
+  const uncheckedVariants =
+    !variant && method !== 'off' ? (meta?.variantsWithoutResponseAuth ?? []) : [];
+  const copyToVariants = meta?.onCopyResponseAuthToVariants;
 
   const changeMethod = (next: ResponseAuthMethod) => {
     if (next === 'off') onChange(null);
@@ -315,6 +320,33 @@ const ResponseAuthSection: React.FC<Props> = ({ endpoint, value, onChange }) => 
             </div>
           )}
         </>
+      )}
+
+      {uncheckedVariants.length > 0 && (
+        <div role="status" className="mb-2" data-testid={`${T}-variants-warning`}>
+          <InfoBanner
+            title="Variants keep their own setting"
+            icon="fa-exclamation-triangle"
+            variant="warning"
+            collapsible={false}
+            summary={
+              uncheckedVariants.length === 1
+                ? `Variant ${uncheckedVariants[0]} doesn't check the Managed Agent's responses: each variant keeps its own setting.`
+                : `Variants ${uncheckedVariants.join(', ')} don't check the Managed Agent's responses: each variant keeps its own setting.`
+            }
+          >
+            <AppButton
+              variant="secondary"
+              size="sm"
+              className="mt-2"
+              onClick={() => copyToVariants?.(value)}
+              disabled={!copyToVariants || problems.length > 0}
+              data-testid={`${T}-copy-to-variants`}
+            >
+              Copy to variants
+            </AppButton>
+          </InfoBanner>
+        </div>
       )}
 
       {showSavedWarnings &&

@@ -173,6 +173,10 @@ export interface SurfaceFormShellProps {
   apiKeyStatuses?: ApiKeyStatuses;
   /** DIDs of the Authorities register; `null` while it loads or when it could not be loaded. */
   authorityDids?: ReadonlySet<string> | null;
+  /** Aliases of the variants whose own http(s) Target has no Response authentication. */
+  variantsWithoutResponseAuth?: readonly string[];
+  /** Gives those variants the base's Response authentication, without saving. */
+  onCopyResponseAuthToVariants?: (value: unknown) => void;
 }
 
 /** True when `variantId` is the default variant in the canvas's variant catalog. */
@@ -335,6 +339,8 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
   legacyAccessPoint,
   apiKeyStatuses,
   authorityDids,
+  variantsWithoutResponseAuth,
+  onCopyResponseAuthToVariants,
 }) => {
   const surfacePolicyIds =
     surfacePolicyLoadState.status === 'loaded' ? surfacePolicyLoadState.ids : null;
@@ -862,6 +868,8 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
         legacyAccessPoint,
         apiKeyStatuses,
         authorityDids,
+        variantsWithoutResponseAuth,
+        onCopyResponseAuthToVariants,
         onConfigureAuthentication: handleConfigureAuthentication,
         setName: setMeta.setName,
         setDescription: setMeta.setDescription,

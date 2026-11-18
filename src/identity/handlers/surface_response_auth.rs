@@ -1,7 +1,8 @@
 //! Save-time rules for Response authentication (`target.response_auth`), on the surface and
 //! each variant as it resolves: only an http or https Target, which a managed agent answers,
 //! may set it; its header is held to the Target authentication header rules; its API key secret
-//! is none the surface sends to the Target or a Transit Point or accepts from callers, and holds a
+//! is none the surface sends to the Target or a Transit Point (directly, through a credential
+//! provider or in enabled `$SECRET:` custom metadata) or accepts from callers, and holds a
 //! non-blank key; its certificates are active; and an API key
 //! read from an `http://` Target follows `credential_policy.target_https`: saved with a
 //! warning in `warn`, refused in `enforce` unless the stored surface already had the same
@@ -12,14 +13,15 @@
 use tracing::warn;
 
 use crate::certificates::{Certificate, CertificateKind, CertificateStore};
-use crate::config::TargetAuthMethod;
 use crate::config::agent_surface::AgentSurface;
 use crate::config::agent_surface_variants::SurfaceOverrides;
 use crate::config::credential_policy::credential_policy;
 use crate::config::response_auth::{MtlsResponseAuth, ResponseAuthConfig};
 use crate::config::target_auth_rules::{TargetCredentialRule, is_header_name, reserved_header, same_header_name};
+use crate::credential_providers::storage::CredentialProviderStorage;
 use crate::source_auth::SourceAuthConfig;
 use crate::source_auth::models::MtlsTrust;
+use crate::tenancy::ResourceKind;
 
 use super::surfaces::SurfaceApiError;
 
@@ -60,6 +62,7 @@ pub(super) fn validate_response_auth_rules(
     let enforced = credential_policy()
         .target_https
         .is_enforced();
+    let upstream = super::surface_tenancy::sent_upstream(surface)?;
     let mut warned = Vec::new();
     for Placed { field, view, setting } in placed(surface)? {
         if !is_http_url(&setting.endpoint) && !is_https_url(&setting.endpoint) {
@@ -78,11 +81,9 @@ pub(super) fn validate_response_auth_rules(
         if let Some(rule) = header_rule(&view, &config.header_name) {
             return Err(SurfaceApiError::BadRequest(format!("{field}.api_key.header_name {rule}")));
         }
-        if shares_a_secret(&view, &config.secret_id) {
-            return Err(SurfaceApiError::BadRequest(format!(
-                "{field}.api_key.secret_id must not be a secret the gateway sends to the Target or a Transit Point \
-                 or accepts from callers"
-            )));
+        let sent_secrets = sent_by(&upstream, setting.variant_id.as_deref(), ResourceKind::Secrets);
+        if shares_a_secret(&view, sent_secrets, &config.secret_id) {
+            return Err(shared_secret(&field));
         }
         if is_http_url(&setting.endpoint) {
             let message = in_clear(&field);
@@ -440,35 +441,97 @@ fn header_rule(
         .map(|(_, used_by)| format!("{header_name} is already sent to the Target by {used_by}"))
 }
 
-/// Whether `secret_id` is a secret `view` also sends to its Target, by Target authentication or
-/// `caller_key`, sends to a Transit Point by its Target authentication, or accepts from its
-/// callers by an API key method, so the managed agent, another agent, or a caller would already
-/// hold the key its responses are checked against.
-fn shares_a_secret(
-    view: &AgentSurface,
-    secret_id: &str,
-) -> bool {
-    fn static_secret(auth: &crate::config::TargetAuthConfig) -> Option<&str> {
-        match &auth.method {
-            TargetAuthMethod::StaticSecret { secret_id, .. } => Some(secret_id.as_str()),
-            _ => None,
+fn shared_secret(field: &str) -> SurfaceApiError {
+    SurfaceApiError::BadRequest(format!(
+        "{field}.api_key.secret_id must not be a secret the gateway sends to the Target or a Transit Point or \
+         accepts from callers"
+    ))
+}
+
+/// The ids of `kind` that the view of `variant_id` (`None` for the base surface) sends upstream,
+/// from [`super::surface_tenancy::sent_upstream`].
+fn sent_by<'a>(
+    upstream: &'a [(Option<String>, ResourceKind, String)],
+    variant_id: Option<&'a str>,
+    kind: ResourceKind,
+) -> impl Iterator<Item = &'a str> {
+    upstream
+        .iter()
+        .filter(move |(sender, sent_kind, _)| sender.as_deref() == variant_id && *sent_kind == kind)
+        .map(|(_, _, id)| id.as_str())
+}
+
+/// An API key `target.response_auth` of one view of a surface, the base surface or a variant
+/// as it resolves, with the field it is reported under and the credential providers that view
+/// sends to its Target or a Transit Point.
+pub(crate) struct ResponseKey {
+    pub field: String,
+    pub secret_id: String,
+    pub provider_ids: Vec<String>,
+}
+
+/// Every API key `target.response_auth` of `surface`, base and each variant as it resolves.
+pub(crate) fn response_keys(surface: &AgentSurface) -> Result<Vec<ResponseKey>, SurfaceApiError> {
+    let upstream = super::surface_tenancy::sent_upstream(surface)?;
+    Ok(placed(surface)?
+        .into_iter()
+        .filter_map(|Placed { field, setting, .. }| {
+            let ResponseAuthConfig::ApiKey(config) = setting.response_auth else {
+                return None;
+            };
+            let provider_ids = sent_by(&upstream, setting.variant_id.as_deref(), ResourceKind::CredentialProviders)
+                .map(str::to_string)
+                .collect();
+            Some(ResponseKey {
+                field,
+                secret_id: config.secret_id,
+                provider_ids,
+            })
+        })
+        .collect())
+}
+
+/// Refuses an API key `target.response_auth` of `surface`, or of a variant as it resolves, whose
+/// secret is one a credential provider that view sends to its Target or a Transit Point (by
+/// Target authentication or a credential binding) reads for its service token
+/// ([`crate::credential_providers::CredentialProvider::service_token_secret_refs`]). Whether
+/// each provider exists and the surface may use it is checked with the surface's other
+/// references.
+pub(super) async fn validate_response_auth_provider_secrets(
+    providers: Option<&dyn CredentialProviderStorage>,
+    surface: &AgentSurface,
+) -> Result<(), SurfaceApiError> {
+    for ResponseKey { field, secret_id, provider_ids } in response_keys(surface)? {
+        for provider_id in provider_ids {
+            let provider = providers
+                .ok_or_else(|| SurfaceApiError::InternalError("Credential provider store is not configured".into()))?
+                .get(&provider_id)
+                .await
+                .map_err(|error| super::surface_tenancy::internal("Credential provider", error))?
+                .ok_or_else(|| super::surface_tenancy::inaccessible("Credential provider"))?;
+            if provider
+                .service_token_secret_refs()
+                .contains(&secret_id.as_str())
+            {
+                return Err(shared_secret(&field));
+            }
         }
     }
-    let target_auth = view
-        .target
-        .auth
-        .as_ref()
-        .and_then(static_secret);
-    let transit_auth = view
-        .transit
-        .iter()
-        .flat_map(|transit| transit.points.iter())
-        .filter_map(|point| {
-            point
-                .target_auth
-                .as_ref()
-                .and_then(static_secret)
-        });
+    Ok(())
+}
+
+/// Whether `secret_id` is a secret `view` also sends to its Target or a Transit Point (`sent`:
+/// by Target authentication or enabled custom metadata), sends to its Target by `caller_key`,
+/// or accepts from its callers by an API key method, so the managed agent, another agent, or a
+/// caller would already hold the key its responses are checked against.
+fn shares_a_secret<'a>(
+    view: &AgentSurface,
+    mut sent: impl Iterator<Item = &'a str>,
+    secret_id: &str,
+) -> bool {
+    if sent.any(|used| used == secret_id) {
+        return true;
+    }
     let caller_key = view
         .caller_key
         .as_ref()
@@ -480,10 +543,8 @@ fn shares_a_secret(
             SourceAuthConfig::ApiKey(config) => Some(config.secret_id.as_str()),
             _ => None,
         });
-    target_auth
+    caller_key
         .into_iter()
-        .chain(transit_auth)
-        .chain(caller_key)
         .chain(caller_api_keys)
         .any(|used| used == secret_id)
 }
@@ -771,6 +832,132 @@ mod tests {
         body["variants"] = json!([{"id": "beta-id", "alias": "beta", "name": "Beta",
             "overrides": {"target": {"auth": target_auth_with("bravo-key")}}}]);
         assert_eq!(check(&body), Err(format!("variants['beta'].{SHARED_SECRET}")));
+    }
+
+    fn metadata_with_key(enabled: bool) -> Value {
+        json!({"enabled": enabled, "payload": {"agent": {"key": "$SECRET:bravo-key"}}})
+    }
+
+    #[test]
+    fn test_a_key_secret_sent_in_enabled_custom_metadata_is_refused_on_the_surface_and_a_variant() {
+        let mut target = surface("https://bravo.example", api_key("X-Agent-Key"));
+        target["target"]["custom_metadata"] = metadata_with_key(true);
+        let mut transit = surface("https://bravo.example", api_key("X-Agent-Key"));
+        transit["transit"] = json!({"points": [{"id": "tp-1", "alias": "partner",
+            "target_endpoint": "https://partner.example/agent"}], "custom_metadata": metadata_with_key(true)});
+        for (case, body) in [("the Target's", target), ("the Transit Points'", transit)] {
+            assert_eq!(check(&body), Err(SHARED_SECRET.to_string()), "{case}");
+        }
+
+        let mut variant = surface("https://bravo.example", api_key("X-Agent-Key"));
+        variant["variants"] = json!([{"id": "beta-id", "alias": "beta", "name": "Beta",
+            "overrides": {"target": {"custom_metadata": metadata_with_key(true)}}}]);
+        assert_eq!(check(&variant), Err(format!("variants['beta'].{SHARED_SECRET}")));
+    }
+
+    #[test]
+    fn test_a_key_secret_in_disabled_custom_metadata_saves() {
+        let mut body = surface("https://bravo.example", api_key("X-Agent-Key"));
+        body["target"]["custom_metadata"] = metadata_with_key(false);
+        body["transit"] = json!({"points": [{"id": "tp-1", "alias": "partner",
+            "target_endpoint": "https://partner.example/agent"}], "custom_metadata": metadata_with_key(false)});
+        assert_eq!(check(&body), Ok(()));
+    }
+
+    /// [`validate_response_auth_provider_secrets`] for `body`, with the API key provider `keyed`
+    /// reading `bravo-key`, the client credentials provider `client` sending it as its client
+    /// secret, and the API key provider `other` reading a secret of its own.
+    async fn provider_refusal(body: &Value) -> Result<(), String> {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = crate::credential_providers::storage::FileSystemCredentialProviderStore::new(dir.path().join("p"))
+            .await
+            .expect("provider store");
+        for provider in [
+            json!({"id": "keyed", "provider_type": "api_key", "api_key_secret_ref": "bravo-key"}),
+            json!({"id": "client", "provider_type": "oauth2_client_credentials",
+                "token_endpoint": "https://idp.example/token",
+                "client_id_secret_ref": "client-id", "client_secret_secret_ref": "bravo-key"}),
+            json!({"id": "other", "provider_type": "api_key", "api_key_secret_ref": "other-key"}),
+        ] {
+            let mut provider = provider;
+            provider["name"] = provider["id"].clone();
+            provider["provider_id"] = provider["id"].clone();
+            provider["created_at"] = json!("2026-10-30T00:00:00Z");
+            provider["updated_at"] = json!("2026-10-30T00:00:00Z");
+            store
+                .create(serde_json::from_value(provider).expect("provider parses"))
+                .await
+                .expect("provider stored");
+        }
+        validate_response_auth_provider_secrets(Some(&store), &parse(body))
+            .await
+            .map_err(|error| match error {
+                SurfaceApiError::BadRequest(message) => message,
+                other => panic!("unexpected error {other:?}"),
+            })
+    }
+
+    fn provider_auth(provider_id: &str) -> Value {
+        json!({"method": {"credential_provider": {"provider_id": provider_id}}})
+    }
+
+    #[tokio::test]
+    async fn test_a_key_secret_a_credential_provider_sends_is_refused_on_each_path() {
+        let keyed = |change: &dyn Fn(&mut Value)| {
+            let mut body = surface("https://bravo.example", api_key("X-Agent-Key"));
+            change(&mut body);
+            body
+        };
+        let point = |extra: Value| {
+            let mut point =
+                json!({"id": "tp-1", "alias": "partner", "target_endpoint": "https://partner.example/agent"});
+            point
+                .as_object_mut()
+                .expect("point")
+                .extend(
+                    extra
+                        .as_object()
+                        .expect("extra")
+                        .clone(),
+                );
+            json!({"points": [point]})
+        };
+        for (case, body) in [
+            ("Target authentication", keyed(&|body| body["target"]["auth"] = provider_auth("keyed"))),
+            (
+                "a credential binding",
+                keyed(&|body| body["outbound_credentials"] = json!([{"credential_provider_id": "keyed"}])),
+            ),
+            (
+                "a Transit Point's Target authentication",
+                keyed(&|body| body["transit"] = point(json!({"target_auth": provider_auth("keyed")}))),
+            ),
+            (
+                "a Transit Point's credential binding",
+                keyed(&|body| {
+                    body["transit"] = point(json!({"transit_credentials": {"credential_provider_id": "keyed"}}))
+                }),
+            ),
+            ("a client secret", keyed(&|body| body["target"]["auth"] = provider_auth("client"))),
+        ] {
+            assert_eq!(provider_refusal(&body).await, Err(SHARED_SECRET.to_string()), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_key_secret_a_variants_credential_provider_sends_is_refused_by_its_alias() {
+        let mut body = surface("https://bravo.example", api_key("X-Agent-Key"));
+        body["variants"] = json!([{"id": "beta-id", "alias": "beta", "name": "Beta",
+            "overrides": {"target": {"auth": provider_auth("keyed")}}}]);
+        assert_eq!(provider_refusal(&body).await, Err(format!("variants['beta'].{SHARED_SECRET}")));
+    }
+
+    #[tokio::test]
+    async fn test_a_credential_provider_reading_other_secrets_saves() {
+        let mut body = surface("https://bravo.example", api_key("X-Agent-Key"));
+        body["target"]["auth"] = provider_auth("other");
+        body["outbound_credentials"] = json!([{"credential_provider_id": "other"}]);
+        assert_eq!(provider_refusal(&body).await, Ok(()));
     }
 
     #[test]

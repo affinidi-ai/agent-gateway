@@ -746,7 +746,8 @@ impl TargetCardFetch<'_> {
                 .as_ref(),
         )
         .await
-        .map_err(|failure| self.refuse_unauthenticated(failure))?;
+        .map_err(|failure| self.refuse_unauthenticated(failure))?
+        .map(|tls| tls.config);
         let credential = self
             .target_credential()
             .await?;

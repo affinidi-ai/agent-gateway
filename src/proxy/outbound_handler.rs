@@ -3386,7 +3386,9 @@ async fn read_agent_card(
         let logged_url = loggable::url(card_url);
         let candidate = card_url.clone();
         let tls = match &check {
-            Some(check) => crate::proxy::response_auth::hop_tls(check.surface, card_url, check.certificates).await?,
+            Some(check) => crate::proxy::response_auth::hop_tls(check.surface, card_url, check.certificates)
+                .await?
+                .map(|tls| tls.config),
             None => None,
         };
         let client = match tokio::task::spawn_blocking(move || {

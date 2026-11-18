@@ -20,8 +20,8 @@ mod tls;
 pub(crate) use tests::{BRAVO_KEY, BRAVO_KEY_HEADER, api_key_bravo, bravo_key_store};
 #[cfg(test)]
 pub(crate) use tls::tests::{pinned_bravo, trusted_target, untrusted_target};
+pub use tls::{TargetTls, handshake_failure, target_tls};
 pub(crate) use tls::{forget_all_tls_settings, forget_tls_settings};
-pub use tls::{handshake_failure, target_tls, tls_stamp};
 
 use std::sync::Arc;
 
@@ -146,7 +146,7 @@ pub async fn hop_tls(
     surface: &AgentSurface,
     url: &str,
     certificates: Option<&Arc<dyn crate::certificates::CertificateStore>>,
-) -> Result<Option<Arc<rustls::ClientConfig>>, ResponseAuthFailure> {
+) -> Result<Option<TargetTls>, ResponseAuthFailure> {
     let Some(setting) = surface
         .target
         .response_auth

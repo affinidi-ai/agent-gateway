@@ -79,6 +79,13 @@ pub async fn validate_surface_references(
     )
     .await?;
     super::surface_response_auth::validate_response_auth_secrets(state.secrets_store.as_deref(), surface).await?;
+    super::surface_response_auth::validate_response_auth_provider_secrets(
+        state
+            .credential_provider_store
+            .as_deref(),
+        surface,
+    )
+    .await?;
     super::surface_caller_key::validate_caller_key_secret(state, surface).await?;
     let https_proxies = super::surface_target_auth::https_mcp_proxies(state).await;
     super::surface_target_auth::validate_target_auth_rules(surface, stored, &https_proxies)
@@ -1268,6 +1275,19 @@ fn sent_credentials(surface: &AgentSurface) -> Result<Vec<SentCredential>, Surfa
         }
     }
     Ok(sent)
+}
+
+/// The secrets and credential providers `surface` sends to its Target or a Transit Point, by
+/// Target authentication, a credential binding or enabled custom metadata, each with the id of
+/// the variant whose view sends it (`None` for the base surface).
+pub(crate) fn sent_upstream(
+    surface: &AgentSurface
+) -> Result<Vec<(Option<String>, ResourceKind, String)>, SurfaceApiError> {
+    Ok(sent_credentials(surface)?
+        .into_iter()
+        .filter(|credential| credential.sent && credential.destination != Destination::Caller)
+        .map(|credential| (credential.variant_id, credential.kind, credential.id))
+        .collect())
 }
 
 /// The references `saved` keeps from `stored`: those that every leg of `saved` sending them
