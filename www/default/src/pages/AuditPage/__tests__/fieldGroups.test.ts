@@ -188,6 +188,30 @@ describe('fieldGroups', () => {
       ]);
     });
 
+    it('lists the outcome and the Target status of a credential the Target refused', () => {
+      const groups = groupByLabel(
+        baseEntry({
+          event: {
+            request_rejected: {
+              stage: 'forward',
+              reason: 'target_auth_failed',
+              http_status: 500,
+              target_auth: { outcome: 'refused_by_target', upstream_status: 401 },
+            },
+          },
+        }),
+        null,
+        null
+      );
+      expect(groups['Refusal']).toEqual([
+        { term: 'Stage', value: 'forward' },
+        { term: 'Reason', value: 'target auth failed' },
+        { term: 'HTTP status', value: '500' },
+        { term: 'Credential outcome', value: 'refused by target' },
+        { term: 'Target status', value: '401' },
+      ]);
+    });
+
     it('lists the Target credential outcome and OAuth error of a target_auth_failed record', () => {
       const groups = groupByLabel(
         baseEntry({

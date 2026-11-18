@@ -45,11 +45,16 @@ export interface RequestRejectedData {
   rpc_error_code?: number | null;
   /** On `unknown_variant` only: the alias the URL named. Caller-chosen text. */
   requested_variant?: string | null;
-  /** On `target_auth_failed` only: whether the request was refused or forwarded without the credential. */
+  /**
+   * On `target_auth_failed` only: whether the gateway refused the request, the Target refused
+   * the credential, or the request was forwarded without the credential.
+   */
   target_auth?: {
-    outcome: 'rejected' | 'passthrough';
+    outcome: 'rejected' | 'refused_by_target' | 'passthrough';
     /** The token endpoint's OAuth `error` code, when it returned one. */
     oauth_error?: string | null;
+    /** On `refused_by_target` only: the status the Target refused the credential with. */
+    upstream_status?: number | null;
   } | null;
 }
 

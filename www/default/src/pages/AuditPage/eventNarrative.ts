@@ -310,6 +310,17 @@ export function describeEntry(entry: AuditEntry, userName?: UserNameResolver): E
         summary: `Forwarded on ${where} without the Target credential: target auth failed, and the fallback is passthrough.`,
       };
     }
+    if (rejected.target_auth?.outcome === 'refused_by_target') {
+      const status = rejected.target_auth.upstream_status;
+      return {
+        title: 'Target refused the credential',
+        tone,
+        summary: `The Target on ${where} refused the gateway's credential${
+          status != null ? ` with ${status}` : ''
+        }.`,
+        detail: answered,
+      };
+    }
     return {
       title: 'Request refused',
       tone,
