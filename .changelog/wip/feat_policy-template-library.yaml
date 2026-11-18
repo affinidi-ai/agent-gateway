@@ -2,23 +2,42 @@ branch: feat/policy-template-library
 changes:
   added:
     - timestamp: '2026-11-18T12:38:12Z'
-      title: Start, extend and share policies from templates in the policy editor
+      title: Start and build policies from templates in the policy editor
       description: >-
-        The policy editor offers templates for common policies: deny by default, require an
-        authenticated caller, allow by JWT claim or role, allow by JWT issuer and audience,
-        restrict MCP tools by role, require Trust Registry recognition, require a verified
-        credential subject, allowlist outbound destinations, allow during business hours,
-        a monitor-only baseline, and allow only when all trust checks passed, plus HTTP
-        method, path and subject allowlists. A Template field on the create form fills Name, Description, Type and Rego,
-        and a templates panel previews each template, lets its settings (such as the minimum
-        number of passing trust checks) fill the Rego, shows how it decides on example
-        requests, copies its Rego, and inserts its rules into the policy being created, so
-        several templates can be combined. On a saved policy, Insert template appends a
-        template's rules and checks its examples against the draft with the existing dry-run,
-        and Save as template keeps the policy as an organisation template for the browser
+        Creating a policy starts from a gallery of templates for common policies: deny by
+        default, require an authenticated caller, allow by JWT claim or role, allow by JWT
+        issuer and audience, restrict MCP tools by role, require Trust Registry recognition,
+        require a verified credential subject, allowlist outbound destinations, allow during
+        business hours, a monitor-only baseline, all or at least N trust checks pass, and HTTP
+        method, path, surface and subject allowlists, plus MCP tool policies for tool bindings
+        on the MCP Proxy hop. Templates follow the Apply Policies guides and link to their own
+        docs section. The gallery offers templates of either type, and a chosen template fills
+        Name, Description, Type and Rego, and Customise settings changes its settings, which are
+        checked before use.
+        Add rules from a template appends a template's rules to a new or saved policy, so
+        several can be combined, and on a saved policy checks the template's examples with the
+        existing dry-run. A Rules view lists the policy's rules grouped by the template they
+        came from, removes a template's rules, and switches an allow-all policy to deny by
+        default. Save as template keeps a policy as an organisation template for the browser
         session. Built-in templates ship with the dashboard; no gateway API changes.
-  changed: []
-  fixed: []
+  changed:
+    - timestamp: '2026-11-18T18:00:00Z'
+      title: Redesign the policy editor into Details and Policy sections
+      description: >-
+        The policy create and edit pages group Name, Description, Type and an Enabled switch
+        into one Details section, keep the templates in a column beside the editor so opening
+        one never resizes the form, show a saved policy's ID and SHA on one line with copy
+        buttons, and show the policy as a Rules view or the Rego, with line numbers in the
+        editor, an empty state that offers templates or Rego, and a banner when the Rego
+        doesn't compile.
+  fixed:
+    - timestamp: '2026-11-18T18:00:00Z'
+      title: Describe the policy input the gateway sends in the policy editor
+      description: >-
+        The policy editor's Rego reference and the dry-run sample input used input.jwt, which
+        gateway and surface policies never get, so policies copied from them never matched.
+        They now use input.source_auth, list the other caller fields, and describe the separate
+        input of policies bound to MCP tools, which does carry input.jwt.
   removed: []
   security: []
   breaking: []

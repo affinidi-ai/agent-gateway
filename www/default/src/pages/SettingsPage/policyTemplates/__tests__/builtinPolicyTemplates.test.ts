@@ -55,9 +55,22 @@ describe('built-in policy templates', () => {
     );
   });
 
-  it('reads caller identity from source_auth, never from an input.jwt path', () => {
-    for (const t of BUILTIN_POLICY_TEMPLATES) {
-      expect(t.rego).not.toMatch(/input\.jwt\b/);
-    }
+  it('reads input.jwt only in templates for MCP tool bindings, which are Agent Surface only', () => {
+    const toolTemplates = BUILTIN_POLICY_TEMPLATES.filter(t => t.policy_input === 'mcp_tool');
+    const others = BUILTIN_POLICY_TEMPLATES.filter(t => t.policy_input !== 'mcp_tool');
+    expect(toolTemplates.length).toBeGreaterThan(0);
+    expect(toolTemplates.every(t => t.policy_type === 'agent_surface')).toBe(true);
+    expect(toolTemplates.every(t => t.category === 'mcp_tool_policies')).toBe(true);
+    expect(others.filter(t => /input\.jwt\b/.test(t.rego)).map(t => t.id)).toEqual([]);
   });
+
+  it.each(BUILTIN_POLICY_TEMPLATES.map(t => [t.id, t] as const))(
+    '%s links to a section of a policy docs page',
+    (_id, template) => {
+      expect(template.docs_href).toMatch(
+        /^https:\/\/docs\.affinidi\.com\/products\/affinidi-trust-fabric\/agent-gateway\/.+\/#[a-z0-9_-]+$/
+      );
+      expect(template.docs_label?.trim()).toBeTruthy();
+    }
+  );
 });

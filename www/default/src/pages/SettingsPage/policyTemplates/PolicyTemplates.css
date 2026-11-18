@@ -114,3 +114,249 @@ body.dark-theme .policy-template-example,
 body.dark-theme .policy-template-preview {
   border-color: var(--dark-border);
 }
+
+.policy-rules__group + .policy-rules__group {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--gray-200);
+}
+
+.policy-rules__group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.policy-rules__rule {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  margin-bottom: 4px;
+  border: 1px solid var(--gray-200);
+  border-radius: var(--radius-sm);
+}
+
+.policy-rules__summary {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: inherit;
+}
+
+.policy-rules__kind--allow {
+  color: var(--success-text);
+}
+
+.policy-rules__kind--deny {
+  color: var(--danger-text);
+}
+
+.policy-rules__kind--helper {
+  color: var(--muted-text);
+}
+
+body.dark-theme .policy-rules__group + .policy-rules__group,
+body.dark-theme .policy-rules__rule {
+  border-color: var(--dark-border);
+}
+
+.policy-section + .policy-section {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--gray-200);
+}
+
+.policy-section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.policy-section-title h6 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.policy-section-title__step {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  font-size: 12px;
+  color: #fff;
+  background: var(--primary-solid);
+}
+
+.policy-section-title__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.policy-template-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 8px;
+}
+
+.policy-template-card {
+  flex-direction: column;
+  justify-content: flex-start;
+  height: 100%;
+}
+
+.policy-template-card__meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 6px;
+}
+
+.policy-template-gallery__search {
+  max-width: 280px;
+}
+
+.policy-template-gallery__summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--gray-200);
+  border-radius: var(--radius-sm);
+}
+
+.policy-details__ids {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+}
+
+.policy-details__readonly {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.policy-details__readonly-value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 360px;
+  color: inherit;
+}
+
+.policy-editor__status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.policy-rules__empty {
+  text-align: center;
+  padding: 20px 12px;
+  border: 1px dashed var(--gray-300);
+  border-radius: var(--radius-sm);
+}
+
+.policy-rego-editor {
+  display: flex;
+  border: 1px solid var(--gray-300);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.policy-rego-editor.is-invalid {
+  border-color: var(--danger-text);
+}
+
+.policy-rego-gutter {
+  margin: 0;
+  /* The extra bottom space matches the textarea's horizontal scrollbar, so the last lines line up. */
+  padding: 0.375rem 0.5rem calc(0.375rem + 16px);
+  font-family: var(--bs-font-monospace);
+  min-width: 3rem;
+  overflow: hidden;
+  text-align: right;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  color: var(--muted-text);
+  background: var(--gray-100);
+  border-right: 1px solid var(--gray-300);
+  user-select: none;
+}
+
+.policy-rego-editor .policy-rego-textarea {
+  font-size: 0.875rem;
+  line-height: 1.5;
+  padding: 0.375rem 0.5rem;
+  border: 0;
+  border-radius: 0;
+  resize: vertical;
+  white-space: pre;
+  overflow: auto;
+}
+
+body.dark-theme .policy-section + .policy-section,
+body.dark-theme .policy-template-gallery__summary,
+body.dark-theme .policy-rules__empty,
+body.dark-theme .policy-rego-editor,
+body.dark-theme .policy-rego-gutter {
+  border-color: var(--dark-border);
+}
+
+body.dark-theme .policy-rego-gutter {
+  background: var(--dark-card-bg, #1f2937);
+}
+
+.policy-templates-panel {
+  border: 1px solid var(--accent-blue-text);
+}
+
+.policy-templates-panel__layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+}
+
+.policy-templates-panel__list {
+  max-height: 520px;
+  overflow-y: auto;
+}
+
+.policy-templates-panel__placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 120px;
+  color: var(--muted-text);
+  border: 1px dashed var(--gray-300);
+  border-radius: var(--radius-sm);
+}
+
+body.dark-theme .policy-templates-panel__placeholder {
+  border-color: var(--dark-border);
+}
+
+@media (min-width: 1200px) {
+  .policy-templates-column {
+    position: sticky;
+    top: calc(var(--topbar-height) + 1rem);
+    max-height: calc(100vh - var(--topbar-height) - 2rem);
+    overflow-y: auto;
+  }
+}

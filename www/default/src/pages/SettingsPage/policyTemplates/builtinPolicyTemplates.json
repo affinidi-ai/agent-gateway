@@ -13,10 +13,20 @@
     "examples": [
       {
         "name": "Any request",
-        "input": { "http": { "method": "GET", "path": "/" } },
+        "input": {
+          "http": {
+            "method": "GET",
+            "path": "/"
+          }
+        },
         "expected": "deny"
       }
-    ]
+    ],
+    "docs": {
+      "page": "opaPoliciesConceptPage",
+      "anchor": "default-allow-vs-default-deny",
+      "label": "Concept: default allow vs default deny"
+    }
   },
   {
     "id": "require-authentication",
@@ -35,7 +45,9 @@
           "source_auth": {
             "method": "jwt_bearer",
             "subject": "user@example.com",
-            "claims": { "sub": "user@example.com" }
+            "claims": {
+              "sub": "user@example.com"
+            }
           }
         },
         "expected": "allow"
@@ -53,10 +65,20 @@
       },
       {
         "name": "No caller authentication",
-        "input": { "http": { "method": "GET", "path": "/" } },
+        "input": {
+          "http": {
+            "method": "GET",
+            "path": "/"
+          }
+        },
         "expected": "deny"
       }
-    ]
+    ],
+    "docs": {
+      "page": "applyOpaPoliciesGuide",
+      "anchor": "steps",
+      "label": "Guide: Apply OPA policies"
+    }
   },
   {
     "id": "allow-by-jwt-claim",
@@ -90,7 +112,10 @@
           "source_auth": {
             "method": "jwt_bearer",
             "subject": "ops@example.com",
-            "claims": { "sub": "ops@example.com", "role": "admin" }
+            "claims": {
+              "sub": "ops@example.com",
+              "role": "admin"
+            }
           }
         },
         "expected": "allow"
@@ -101,7 +126,10 @@
           "source_auth": {
             "method": "jwt_bearer",
             "subject": "guest@example.com",
-            "claims": { "sub": "guest@example.com", "role": "viewer" }
+            "claims": {
+              "sub": "guest@example.com",
+              "role": "viewer"
+            }
           }
         },
         "expected": "deny"
@@ -112,12 +140,20 @@
           "source_auth": {
             "method": "jwt_bearer",
             "subject": "lead@example.com",
-            "claims": { "sub": "lead@example.com", "role": ["viewer", "admin"] }
+            "claims": {
+              "sub": "lead@example.com",
+              "role": ["viewer", "admin"]
+            }
           }
         },
         "expected": "allow"
       }
-    ]
+    ],
+    "docs": {
+      "page": "jwtClaimsGuide",
+      "anchor": "steps",
+      "label": "Guide: Use JWT claims to control access"
+    }
   },
   {
     "id": "allow-by-jwt-issuer-audience",
@@ -190,119 +226,169 @@
         },
         "expected": "deny"
       }
-    ]
+    ],
+    "docs": {
+      "page": "opaPoliciesReferencePage",
+      "anchor": "inputsource_auth",
+      "label": "Reference: input.source_auth"
+    }
   },
   {
     "id": "restrict-mcp-tools-by-role",
     "name": "Restrict MCP tools by role",
-    "summary": "Only the listed roles may call the listed tools.",
-    "description": "Allows a call to one of the listed MCP tools only when the caller's JWT role is one of the listed roles. Every other request, including other tools, is allowed. Use it as the whole policy: inserted into another policy it would allow requests that policy denies.",
+    "summary": "Admins call any tool; other callers only the safe tools.",
+    "description": "Allows callers with an admin role to call any MCP tool, other authenticated callers to call only the listed safe tools, and authenticated callers to use other MCP methods such as tools/list. Use it as the whole policy: inserted into another policy it would allow requests that policy denies.",
     "category": "allow_deny_lists",
     "policy_types": ["agent_surface"],
     "standalone": true,
-    "rules": "default allow := false\n\nrestricted_tool_call if {\n  input.mcp.method == \"tools/call\"\n  input.mcp.tool_name in {{tools}}\n}\n\nallow if not restricted_tool_call\n\nallow if {\n  restricted_tool_call\n  input.source_auth.method == \"jwt_bearer\"\n  input.source_auth.claims.role in {{roles}}\n}",
+    "rules": "default allow := false\n\nallow if {\n  input.source_auth.claims.role in {{admin_roles}}\n  input.mcp.method == \"tools/call\"\n}\n\nallow if {\n  input.source_auth.subject\n  input.mcp.method == \"tools/call\"\n  input.mcp.tool_name in {{safe_tools}}\n}\n\nallow if {\n  input.source_auth.subject\n  input.mcp.method != \"tools/call\"\n}",
     "parameters": [
       {
-        "key": "tools",
-        "label": "Restricted tools",
-        "kind": "string_list",
-        "default": ["delete_record"],
-        "help": "MCP tool names, separated by commas."
-      },
-      {
-        "key": "roles",
-        "label": "Roles that may call them",
+        "key": "admin_roles",
+        "label": "Admin roles",
         "kind": "string_list",
         "default": ["admin"],
-        "help": "Values of the JWT role claim, separated by commas."
+        "help": "Values of the JWT role claim that may call any tool, separated by commas."
+      },
+      {
+        "key": "safe_tools",
+        "label": "Safe tools",
+        "kind": "string_list",
+        "default": ["search", "summarise", "translate"],
+        "help": "MCP tools every authenticated caller may call, separated by commas."
       }
     ],
-    "reads": ["mcp.tool_name", "source_auth.claims.role"],
+    "reads": ["source_auth.claims.role", "source_auth.subject", "mcp.method", "mcp.tool_name"],
     "examples": [
       {
-        "name": "Admin calls a restricted tool",
+        "name": "Admin calls any tool",
         "input": {
-          "mcp": { "method": "tools/call", "tool_name": "delete_record" },
+          "mcp": {
+            "method": "tools/call",
+            "tool_name": "delete_record"
+          },
           "source_auth": {
             "method": "jwt_bearer",
             "subject": "ops@example.com",
-            "claims": { "role": "admin" }
+            "claims": {
+              "sub": "ops@example.com",
+              "role": "admin"
+            }
           }
         },
         "expected": "allow"
       },
       {
-        "name": "Viewer calls a restricted tool",
+        "name": "Viewer calls a safe tool",
         "input": {
-          "mcp": { "method": "tools/call", "tool_name": "delete_record" },
+          "mcp": {
+            "method": "tools/call",
+            "tool_name": "search"
+          },
           "source_auth": {
             "method": "jwt_bearer",
             "subject": "guest@example.com",
-            "claims": { "role": "viewer" }
+            "claims": {
+              "sub": "guest@example.com",
+              "role": "viewer"
+            }
           }
         },
-        "expected": "deny"
+        "expected": "allow"
       },
       {
         "name": "Viewer calls another tool",
         "input": {
-          "mcp": { "method": "tools/call", "tool_name": "search" },
+          "mcp": {
+            "method": "tools/call",
+            "tool_name": "delete_record"
+          },
           "source_auth": {
             "method": "jwt_bearer",
             "subject": "guest@example.com",
-            "claims": { "role": "viewer" }
+            "claims": {
+              "sub": "guest@example.com",
+              "role": "viewer"
+            }
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Viewer lists the tools",
+        "input": {
+          "mcp": {
+            "method": "tools/list"
+          },
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "guest@example.com",
+            "claims": {
+              "sub": "guest@example.com",
+              "role": "viewer"
+            }
           }
         },
         "expected": "allow"
+      },
+      {
+        "name": "Unauthenticated caller lists the tools",
+        "input": {
+          "mcp": {
+            "method": "tools/list"
+          }
+        },
+        "expected": "deny"
       }
-    ]
+    ],
+    "docs": {
+      "page": "opaPoliciesConceptPage",
+      "anchor": "mcp-surface-restrict-tool-access-by-role",
+      "label": "Concept: restrict tool access by role"
+    }
   },
   {
     "id": "require-trust-registry-recognition",
     "name": "Require Trust Registry recognition",
-    "summary": "Allow only when the named trust check passed.",
-    "description": "Allows a request only when the Trust Check with the given id ran on the target and every authority it asked recognised the agent. Denies when that check failed or did not run.",
+    "summary": "Allow only agents the Trust Registry recognises.",
+    "description": "Allows a request only when the calling agent has a DID and the Trust Registry recognised it. Needs Extract Trust Registry Data on the surface; without it input.agent is absent and every request is denied.",
     "category": "trust_checks",
     "policy_types": ["agent_surface"],
-    "rules": "default allow := false\n\ntrust_check_passed(check_id) if {\n  results := [r | some r in input.trust_check_results.target; r.id == check_id]\n  count(results) > 0\n  every r in results { r.ok }\n}\n\nallow if trust_check_passed({{check_id}})",
-    "parameters": [
-      {
-        "key": "check_id",
-        "label": "Trust Check id",
-        "kind": "string",
-        "default": "registry-recognition",
-        "help": "The id of the Trust Check element on the surface."
-      }
-    ],
-    "reads": ["trust_check_results.target"],
+    "rules": "default allow := false\n\nallow if {\n  input.agent.did\n  input.agent.trust_verification == true\n}",
+    "parameters": [],
+    "reads": ["agent.did", "agent.trust_verification"],
     "examples": [
       {
-        "name": "Check passed",
+        "name": "Recognised agent",
         "input": {
-          "trust_check_results": {
-            "target": [
-              { "id": "registry-recognition", "ok": true },
-              { "id": "other", "ok": false }
-            ]
+          "agent": {
+            "did": "did:web:agent.example.com",
+            "trust_verification": true
           }
         },
         "expected": "allow"
       },
       {
-        "name": "Check failed",
+        "name": "Agent not recognised",
         "input": {
-          "trust_check_results": {
-            "target": [{ "id": "registry-recognition", "ok": false }]
+          "agent": {
+            "did": "did:web:agent.example.com",
+            "trust_verification": false
           }
         },
         "expected": "deny"
       },
       {
-        "name": "Check did not run",
-        "input": { "trust_check_results": { "target": [{ "id": "other", "ok": true }] } },
+        "name": "No Trust Registry data",
+        "input": {},
         "expected": "deny"
       }
-    ]
+    ],
+    "docs": {
+      "page": "opaPoliciesConceptPage",
+      "anchor": "a2a-surface-require-trusted-agents",
+      "label": "Concept: require trusted agents"
+    }
   },
   {
     "id": "require-verified-credential-subject",
@@ -356,7 +442,12 @@
         },
         "expected": "deny"
       }
-    ]
+    ],
+    "docs": {
+      "page": "opaPoliciesReferencePage",
+      "anchor": "inputextension_identity",
+      "label": "Reference: input.extension_identity"
+    }
   },
   {
     "id": "allowlist-outbound-destinations",
@@ -381,23 +472,38 @@
       {
         "name": "Outbound to a listed destination",
         "input": {
-          "gateway": { "direction": "outbound", "target_id": "https://api.example.com/v1/orders" }
+          "gateway": {
+            "direction": "outbound",
+            "target_id": "https://api.example.com/v1/orders"
+          }
         },
         "expected": "allow"
       },
       {
         "name": "Outbound elsewhere",
         "input": {
-          "gateway": { "direction": "outbound", "target_id": "https://unknown.example.net/" }
+          "gateway": {
+            "direction": "outbound",
+            "target_id": "https://unknown.example.net/"
+          }
         },
         "expected": "deny"
       },
       {
         "name": "Inbound request",
-        "input": { "gateway": { "direction": "inbound" } },
+        "input": {
+          "gateway": {
+            "direction": "inbound"
+          }
+        },
         "expected": "allow"
       }
-    ]
+    ],
+    "docs": {
+      "page": "opaPoliciesReferencePage",
+      "anchor": "inputgateway",
+      "label": "Reference: input.gateway"
+    }
   },
   {
     "id": "allow-during-business-hours",
@@ -413,6 +519,7 @@
         "label": "Days",
         "kind": "string_list",
         "default": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+        "allowed": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
         "help": "English day names, separated by commas."
       },
       {
@@ -431,6 +538,7 @@
         "default": 17,
         "min": 1,
         "max": 24,
+        "after": "start_hour",
         "help": "Requests are allowed until this hour starts. Must be later than From hour."
       },
       {
@@ -438,11 +546,17 @@
         "label": "Time zone",
         "kind": "string",
         "default": "UTC",
+        "format": "time_zone",
         "help": "An IANA time zone, for example Europe/Berlin or Asia/Singapore."
       }
     ],
     "reads": [],
-    "examples": []
+    "examples": [],
+    "docs": {
+      "page": "opaPoliciesReferencePage",
+      "anchor": "policy-input-reference",
+      "label": "Reference: policy input"
+    }
   },
   {
     "id": "all-trust-checks-pass",
@@ -460,8 +574,14 @@
         "input": {
           "trust_check_results": {
             "target": [
-              { "id": "registry", "ok": true },
-              { "id": "credential", "ok": true }
+              {
+                "id": "registry",
+                "ok": true
+              },
+              {
+                "id": "credential",
+                "ok": true
+              }
             ]
           }
         },
@@ -472,8 +592,14 @@
         "input": {
           "trust_check_results": {
             "target": [
-              { "id": "registry", "ok": true },
-              { "id": "credential", "ok": false }
+              {
+                "id": "registry",
+                "ok": true
+              },
+              {
+                "id": "credential",
+                "ok": false
+              }
             ]
           }
         },
@@ -481,10 +607,19 @@
       },
       {
         "name": "No checks ran",
-        "input": { "trust_check_results": { "target": [] } },
+        "input": {
+          "trust_check_results": {
+            "target": []
+          }
+        },
         "expected": "deny"
       }
-    ]
+    ],
+    "docs": {
+      "page": "opaPoliciesReferencePage",
+      "anchor": "inputtrust_check_results",
+      "label": "Reference: input.trust_check_results"
+    }
   },
   {
     "id": "at-least-n-trust-checks-pass",
@@ -512,9 +647,18 @@
         "input": {
           "trust_check_results": {
             "target": [
-              { "id": "a", "ok": true },
-              { "id": "b", "ok": true },
-              { "id": "c", "ok": false }
+              {
+                "id": "a",
+                "ok": true
+              },
+              {
+                "id": "b",
+                "ok": true
+              },
+              {
+                "id": "c",
+                "ok": false
+              }
             ]
           }
         },
@@ -525,9 +669,18 @@
         "input": {
           "trust_check_results": {
             "target": [
-              { "id": "a", "ok": true },
-              { "id": "b", "ok": false },
-              { "id": "c", "ok": false }
+              {
+                "id": "a",
+                "ok": true
+              },
+              {
+                "id": "b",
+                "ok": false
+              },
+              {
+                "id": "c",
+                "ok": false
+              }
             ]
           }
         },
@@ -535,10 +688,19 @@
       },
       {
         "name": "No checks ran",
-        "input": { "trust_check_results": { "target": [] } },
+        "input": {
+          "trust_check_results": {
+            "target": []
+          }
+        },
         "expected": "deny"
       }
-    ]
+    ],
+    "docs": {
+      "page": "opaPoliciesReferencePage",
+      "anchor": "inputtrust_check_results",
+      "label": "Reference: input.trust_check_results"
+    }
   },
   {
     "id": "allow-http-methods",
@@ -561,15 +723,30 @@
     "examples": [
       {
         "name": "GET request",
-        "input": { "http": { "method": "GET", "path": "/" } },
+        "input": {
+          "http": {
+            "method": "GET",
+            "path": "/"
+          }
+        },
         "expected": "allow"
       },
       {
         "name": "POST request",
-        "input": { "http": { "method": "POST", "path": "/" } },
+        "input": {
+          "http": {
+            "method": "POST",
+            "path": "/"
+          }
+        },
         "expected": "deny"
       }
-    ]
+    ],
+    "docs": {
+      "page": "applyOpaPoliciesGuide",
+      "anchor": "common-policy-patterns",
+      "label": "Guide: common policy patterns"
+    }
   },
   {
     "id": "allow-path-prefixes",
@@ -592,15 +769,74 @@
     "examples": [
       {
         "name": "Path /public/docs",
-        "input": { "http": { "method": "GET", "path": "/public/docs" } },
+        "input": {
+          "http": {
+            "method": "GET",
+            "path": "/public/docs"
+          }
+        },
         "expected": "allow"
       },
       {
         "name": "Path /admin",
-        "input": { "http": { "method": "GET", "path": "/admin" } },
+        "input": {
+          "http": {
+            "method": "GET",
+            "path": "/admin"
+          }
+        },
         "expected": "deny"
       }
-    ]
+    ],
+    "docs": {
+      "page": "opaPoliciesReferencePage",
+      "anchor": "inputhttp",
+      "label": "Reference: input.http"
+    }
+  },
+  {
+    "id": "allow-listed-surfaces",
+    "name": "Allow listed surfaces",
+    "summary": "Allow only requests to the listed surfaces.",
+    "description": "Allows a request only when it is for one of the listed surfaces, by name. Useful for a policy enforced across every surface.",
+    "category": "routing_paths",
+    "policy_types": ["gateway", "agent_surface"],
+    "rules": "default allow := false\n\nallow if input.channel.name in {{surfaces}}",
+    "parameters": [
+      {
+        "key": "surfaces",
+        "label": "Surface names",
+        "kind": "string_list",
+        "default": ["public-mcp"],
+        "help": "Surface names, separated by commas."
+      }
+    ],
+    "reads": ["channel.name"],
+    "examples": [
+      {
+        "name": "Listed surface",
+        "input": {
+          "channel": {
+            "name": "public-mcp"
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Other surface",
+        "input": {
+          "channel": {
+            "name": "private-mcp"
+          }
+        },
+        "expected": "deny"
+      }
+    ],
+    "docs": {
+      "page": "applyOpaPoliciesGuide",
+      "anchor": "common-policy-patterns",
+      "label": "Guide: common policy patterns"
+    }
   },
   {
     "id": "allow-listed-subjects",
@@ -627,7 +863,9 @@
           "source_auth": {
             "method": "jwt_bearer",
             "subject": "user@example.com",
-            "claims": { "sub": "user@example.com" }
+            "claims": {
+              "sub": "user@example.com"
+            }
           }
         },
         "expected": "allow"
@@ -638,12 +876,19 @@
           "source_auth": {
             "method": "jwt_bearer",
             "subject": "someone@example.com",
-            "claims": { "sub": "someone@example.com" }
+            "claims": {
+              "sub": "someone@example.com"
+            }
           }
         },
         "expected": "deny"
       }
-    ]
+    ],
+    "docs": {
+      "page": "opaPoliciesReferencePage",
+      "anchor": "inputsource_auth",
+      "label": "Reference: input.source_auth"
+    }
   },
   {
     "id": "allow-all-monitor",
@@ -659,9 +904,257 @@
     "examples": [
       {
         "name": "Any request",
-        "input": { "http": { "method": "POST", "path": "/" } },
+        "input": {
+          "http": {
+            "method": "POST",
+            "path": "/"
+          }
+        },
         "expected": "allow"
       }
-    ]
+    ],
+    "docs": {
+      "page": "opaPoliciesConceptPage",
+      "anchor": "default-allow-vs-default-deny",
+      "label": "Concept: default allow vs default deny"
+    }
+  },
+  {
+    "category": "mcp_tool_policies",
+    "policy_types": ["agent_surface"],
+    "input": "mcp_tool",
+    "id": "tool-allow-authenticated",
+    "name": "Tool policy: allow authenticated callers",
+    "summary": "For a tool binding: allow any caller with a token.",
+    "description": "For a policy bound to MCP tools on the MCP Proxy hop: allows a call when the caller's token has a subject.",
+    "rules": "default allow := false\n\nallow if input.jwt.sub",
+    "parameters": [],
+    "reads": ["jwt.sub"],
+    "examples": [
+      {
+        "name": "Caller with a token",
+        "input": {
+          "mcp": {
+            "method": "search"
+          },
+          "channel": {
+            "name": "tools",
+            "protocol": "mcp"
+          },
+          "jwt": {
+            "sub": "user@example.com"
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Caller without a token",
+        "input": {
+          "mcp": {
+            "method": "search"
+          },
+          "channel": {
+            "name": "tools",
+            "protocol": "mcp"
+          }
+        },
+        "expected": "deny"
+      }
+    ],
+    "docs": {
+      "page": "mcpToolPoliciesGuide",
+      "anchor": "example-policies",
+      "label": "Guide: per-tool MCP policies"
+    }
+  },
+  {
+    "category": "mcp_tool_policies",
+    "policy_types": ["agent_surface"],
+    "input": "mcp_tool",
+    "id": "tool-allow-by-jwt-claim",
+    "name": "Tool policy: allow by JWT claim",
+    "summary": "For a tool binding: allow callers whose claim has a listed value.",
+    "description": "For a policy bound to MCP tools on the MCP Proxy hop: allows a call when a claim in the caller's token, a single value or a list, has one of the listed values. Covers admin-only and subscription-based access.",
+    "rules": "default allow := false\n\ntool_claim_values(v) := [v] if is_string(v)\n\ntool_claim_values(v) := v if is_array(v)\n\nallow if {\n  some v in tool_claim_values(input.jwt[{{claim}}])\n  v in {{values}}\n}",
+    "parameters": [
+      {
+        "key": "claim",
+        "label": "Claim",
+        "kind": "string",
+        "default": "role",
+        "help": "The token claim to read, for example role or subscription."
+      },
+      {
+        "key": "values",
+        "label": "Allowed values",
+        "kind": "string_list",
+        "default": ["admin"],
+        "help": "Values of the claim, separated by commas."
+      }
+    ],
+    "reads": ["jwt"],
+    "examples": [
+      {
+        "name": "Role admin",
+        "input": {
+          "mcp": {
+            "method": "search"
+          },
+          "channel": {
+            "name": "tools",
+            "protocol": "mcp"
+          },
+          "jwt": {
+            "sub": "ops@example.com",
+            "role": "admin"
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Role viewer",
+        "input": {
+          "mcp": {
+            "method": "search"
+          },
+          "channel": {
+            "name": "tools",
+            "protocol": "mcp"
+          },
+          "jwt": {
+            "sub": "guest@example.com",
+            "role": "viewer"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "No token",
+        "input": {
+          "mcp": {
+            "method": "search"
+          },
+          "channel": {
+            "name": "tools",
+            "protocol": "mcp"
+          }
+        },
+        "expected": "deny"
+      }
+    ],
+    "docs": {
+      "page": "mcpToolPoliciesGuide",
+      "anchor": "example-policies",
+      "label": "Guide: per-tool MCP policies"
+    }
+  },
+  {
+    "category": "mcp_tool_policies",
+    "policy_types": ["agent_surface"],
+    "input": "mcp_tool",
+    "id": "tool-role-with-deny-reason",
+    "name": "Tool policy: admin role with a deny reason",
+    "summary": "For a tool binding: allow one role and record why others were denied.",
+    "description": "For a policy bound to MCP tools on the MCP Proxy hop: allows callers with the admin role and sets deny_reason when the token has no role or another role. The reason is written to the audit log only, not the response.",
+    "rules": "default allow := false\n\nallow if input.jwt.role == {{admin_role}}\n\ndeny_reason := \"The caller's token has no role\" if not input.jwt.role\n\ndeny_reason := sprintf(\"Role %v may not call this tool\", [input.jwt.role]) if {\n  input.jwt.role\n  input.jwt.role != {{admin_role}}\n}",
+    "parameters": [
+      {
+        "key": "admin_role",
+        "label": "Allowed role",
+        "kind": "string",
+        "default": "admin",
+        "help": "The role claim value that may call the tool."
+      }
+    ],
+    "reads": ["jwt.role"],
+    "examples": [
+      {
+        "name": "Role admin",
+        "input": {
+          "mcp": {
+            "method": "search"
+          },
+          "channel": {
+            "name": "tools",
+            "protocol": "mcp"
+          },
+          "jwt": {
+            "sub": "ops@example.com",
+            "role": "admin"
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Role viewer",
+        "input": {
+          "mcp": {
+            "method": "search"
+          },
+          "channel": {
+            "name": "tools",
+            "protocol": "mcp"
+          },
+          "jwt": {
+            "sub": "guest@example.com",
+            "role": "viewer"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "No role",
+        "input": {
+          "mcp": {
+            "method": "search"
+          },
+          "channel": {
+            "name": "tools",
+            "protocol": "mcp"
+          },
+          "jwt": {
+            "sub": "guest@example.com"
+          }
+        },
+        "expected": "deny"
+      }
+    ],
+    "docs": {
+      "page": "mcpToolPoliciesGuide",
+      "anchor": "example-policies",
+      "label": "Guide: per-tool MCP policies"
+    }
+  },
+  {
+    "category": "mcp_tool_policies",
+    "policy_types": ["agent_surface"],
+    "input": "mcp_tool",
+    "id": "tool-allow-every-caller",
+    "name": "Tool policy: allow every caller",
+    "summary": "For a tool binding: the tool entry list is the only control.",
+    "description": "For a policy bound to MCP tools on the MCP Proxy hop: allows every call, so only the tools listed on the binding decide what can be called.",
+    "rules": "default allow := true",
+    "parameters": [],
+    "reads": [],
+    "examples": [
+      {
+        "name": "Caller without a token",
+        "input": {
+          "mcp": {
+            "method": "search"
+          },
+          "channel": {
+            "name": "tools",
+            "protocol": "mcp"
+          }
+        },
+        "expected": "allow"
+      }
+    ],
+    "docs": {
+      "page": "mcpToolPoliciesGuide",
+      "anchor": "example-policies",
+      "label": "Guide: per-tool MCP policies"
+    }
   }
 ]

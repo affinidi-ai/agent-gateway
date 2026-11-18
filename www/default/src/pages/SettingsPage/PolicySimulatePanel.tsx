@@ -1,10 +1,11 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { simulatePolicy, type SimulateResult } from './simulatePolicy';
+import type { PolicyType } from './policyTemplates/types';
 
 interface PolicySimulatePanelProps {
   policyId: string;
   /** The policy type currently selected in the editor (may be unsaved). */
-  policyType: 'gateway' | 'agent_surface';
+  policyType: PolicyType;
   /** The current editor Rego — evaluated as a draft so unsaved edits are tested. */
   draftPolicy: string;
   /** Saved sample input, owned by the editor form so it persists on save. */
@@ -15,7 +16,11 @@ interface PolicySimulatePanelProps {
 }
 
 export const POLICY_SIMULATE_DEFAULT_INPUT = `{
-  "jwt": { "sub": "user@example.com", "role": "admin" },
+  "source_auth": {
+    "method": "jwt_bearer",
+    "subject": "user@example.com",
+    "claims": { "sub": "user@example.com", "role": "admin" }
+  },
   "http": { "method": "POST", "path": "/", "headers": {} },
   "gateway": { "direction": "inbound" }
 }`;

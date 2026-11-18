@@ -1,5 +1,11 @@
 import type { PolicyType } from './types';
 
+/** The view the Policy section opens in: the Rego for a blank new policy, else the rules. */
+export const DEFAULT_POLICY_VIEW = { create: 'rego', edit: 'rules' } as const;
+
+/** The Start from choice for the default policy. */
+export const BLANK_TEMPLATE_ID = 'blank';
+
 export const EXPECTED_PACKAGE: Record<PolicyType, string> = {
   gateway: 'gateway.policy',
   agent_surface: 'surface.policy',

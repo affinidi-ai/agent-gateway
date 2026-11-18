@@ -4,6 +4,7 @@ import type {
   PolicyTemplate,
   PolicyTemplateParameter,
 } from './types';
+import { TEMPLATE_BEGIN_PREFIX, TEMPLATE_END_PREFIX } from './regoRules';
 
 const PACKAGE_LINE = /^\s*package\s+/;
 const IMPORT_LINE = /^\s*import\s+/;
@@ -37,14 +38,35 @@ function toRegoLiteral(param: PolicyTemplateParameter, value: unknown): Literal 
   if (param.kind === 'string') {
     const text = typeof value === 'string' ? value.trim() : '';
     if (!text) return { error: 'Enter a value.' };
+    if (param.format === 'time_zone') {
+      const zone = canonicalTimeZone(text);
+      if (!zone) return { error: 'Enter an IANA time zone, for example Europe/Berlin.' };
+      return { literal: JSON.stringify(zone) };
+    }
     return { literal: JSON.stringify(text) };
   }
   const items = Array.isArray(value) ? value : [];
-  const cleaned = Array.from(
-    new Set(items.map(v => (typeof v === 'string' ? v.trim() : '')).filter(Boolean))
-  );
+  let cleaned = items.map(v => (typeof v === 'string' ? v.trim() : '')).filter(Boolean);
+  if (param.allowed) {
+    const byLowerCase = new Map(param.allowed.map(a => [a.toLowerCase(), a]));
+    const unknown = cleaned.find(v => !byLowerCase.has(v.toLowerCase()));
+    if (unknown) {
+      return { error: `"${unknown}" isn't accepted. Use ${param.allowed.join(', ')}.` };
+    }
+    cleaned = cleaned.map(v => byLowerCase.get(v.toLowerCase()) as string);
+  }
+  cleaned = Array.from(new Set(cleaned));
   if (cleaned.length === 0) return { error: 'Enter at least one value.' };
   return { literal: `{${cleaned.map(v => JSON.stringify(v)).join(', ')}}` };
+}
+
+/** The canonical spelling of an IANA time zone name, or null for a name that isn't one. */
+function canonicalTimeZone(name: string): string | null {
+  try {
+    return new Intl.DateTimeFormat('en-US', { timeZone: name }).resolvedOptions().timeZone;
+  } catch {
+    return null;
+  }
 }
 
 export interface RenderResult {
@@ -63,6 +85,22 @@ export function renderTemplate(template: PolicyTemplate, values: ParameterValues
       continue;
     }
     rego = rego.split(`{{${param.key}}}`).join(result.literal);
+  }
+  for (const param of template.parameters) {
+    if (param.kind !== 'integer' || !param.after || errors[param.key] || errors[param.after]) {
+      continue;
+    }
+    const earlier = template.parameters.find(p => p.key === param.after);
+    const value = values[param.key] ?? param.default;
+    const earlierValue = earlier ? (values[earlier.key] ?? earlier.default) : undefined;
+    if (
+      earlier &&
+      typeof earlierValue === 'number' &&
+      typeof value === 'number' &&
+      value <= earlierValue
+    ) {
+      errors[param.key] = `Must be later than ${earlier.label}.`;
+    }
   }
   return { rego: Object.keys(errors).length > 0 ? null : rego, errors };
 }
@@ -97,9 +135,9 @@ export interface InsertResult {
 }
 
 /**
- * Appends a template's rules to an existing module. The template's `package` and
- * `default allow` lines are never copied, since a module has one of each; its imports go
- * after the existing `package` line unless the policy already has them.
+ * Appends a template's rules to an existing module between begin and end comments naming the
+ * template. The template's `default allow` line is never copied, and its `package` line only
+ * when the module has none; its imports go after the `package` line unless already present.
  */
 export function insertTemplateRules(
   existingPolicy: string,
@@ -125,13 +163,17 @@ export function insertTemplateRules(
   );
   const added = body.join('\n');
 
-  const existingLines = existingPolicy.replace(/\s+$/, '').split('\n');
+  const existingLines = existingPolicy.trim() ? existingPolicy.replace(/\s+$/, '').split('\n') : [];
+  if (!existingLines.some(l => PACKAGE_LINE.test(l))) {
+    const templatePackage = templateLines.find(l => PACKAGE_LINE.test(l));
+    if (templatePackage) existingLines.unshift(templatePackage.trim(), '');
+  }
   if (newImports.length > 0) {
     const packageIndex = existingLines.findIndex(l => PACKAGE_LINE.test(l));
     existingLines.splice(packageIndex + 1, 0, ...newImports);
   }
   const safeName = templateName.replace(LINE_BREAKS, ' ').trim();
-  const policy = `${existingLines.join('\n')}\n\n# Inserted from template: ${safeName}\n${added}\n`;
+  const policy = `${existingLines.join('\n').replace(/\s+$/, '')}\n\n${TEMPLATE_BEGIN_PREFIX}${safeName}\n${added}\n${TEMPLATE_END_PREFIX}${safeName}\n`;
 
   return { policy, added, droppedDefault, existingDefault: explicitDefault(existingPolicy) };
 }

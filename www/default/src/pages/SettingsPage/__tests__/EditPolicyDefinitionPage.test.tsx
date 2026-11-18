@@ -86,11 +86,11 @@ describe('EditPolicyDefinitionPage — instructions panel', () => {
   it('expands and collapses when the title is clicked', () => {
     renderCreateForm();
 
-    fireEvent.click(screen.getByText('Policy Instructions & Examples'));
+    fireEvent.click(screen.getByText('Rego reference'));
     expect(toggle()).toHaveAttribute('aria-expanded', 'true');
     expect(body()).toHaveClass('show');
 
-    fireEvent.click(screen.getByText('Policy Instructions & Examples'));
+    fireEvent.click(screen.getByText('Rego reference'));
     expect(toggle()).toHaveAttribute('aria-expanded', 'false');
     expect(body()).not.toHaveClass('show');
   });
@@ -103,9 +103,9 @@ describe('EditPolicyDefinitionPage — instructions panel', () => {
 
   it('keeps the title a heading that holds the toggle button', () => {
     renderCreateForm();
-    const heading = screen.getByRole('heading', { name: /Policy Instructions & Examples/i });
+    const heading = screen.getByRole('heading', { name: /Rego reference/i });
     expect(heading).toContainElement(toggle());
-    expect(screen.getByRole('button', { name: /Policy Instructions & Examples/i })).toBe(toggle());
+    expect(screen.getByRole('button', { name: /Rego reference/i })).toBe(toggle());
   });
 
   it('points the toggle at the body it expands', () => {
@@ -141,5 +141,15 @@ describe('EditPolicyDefinitionPage — instructions panel', () => {
   it('keeps the examples in the DOM for the selected policy type', () => {
     renderCreateForm();
     expect(body()).toHaveTextContent('package gateway.policy');
+  });
+
+  it('describes the caller context input and the MCP tool policy input apart', () => {
+    renderCreateForm();
+    const callerFields = screen.getByTestId('policy-instructions-input-fields');
+    expect(callerFields).toHaveTextContent('input.source_auth.claims');
+    expect(callerFields).not.toHaveTextContent('input.jwt');
+    expect(screen.getByTestId('policy-instructions-tool-input-fields')).toHaveTextContent(
+      'input.jwt.<claim>'
+    );
   });
 });

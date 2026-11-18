@@ -8,7 +8,8 @@ export type PolicyTemplateCategory =
   | 'trust_checks'
   | 'routing_paths'
   | 'allow_deny_lists'
-  | 'time';
+  | 'time'
+  | 'mcp_tool_policies';
 
 export type PolicyTemplateParameter =
   | {
@@ -18,6 +19,8 @@ export type PolicyTemplateParameter =
       default: number;
       min: number;
       max: number;
+      /** Key of another integer setting this one must be greater than. */
+      after?: string;
       help?: string;
     }
   | {
@@ -25,6 +28,8 @@ export type PolicyTemplateParameter =
       label: string;
       kind: 'string';
       default: string;
+      /** `time_zone` accepts IANA time zone names only. */
+      format?: 'time_zone';
       help?: string;
     }
   | {
@@ -32,6 +37,8 @@ export type PolicyTemplateParameter =
       label: string;
       kind: 'string_list';
       default: string[];
+      /** The only values accepted, matched without regard to case. */
+      allowed?: string[];
       help?: string;
     };
 
@@ -64,7 +71,14 @@ export interface PolicyTemplate {
    * so inserting them into another policy, whose rules combine with OR, would widen access.
    */
   standalone?: boolean;
+  /**
+   * `mcp_tool`: the template is for a policy bound to MCP tools on the MCP Proxy hop, whose
+   * input is the tool call (`input.jwt`, `input.mcp.method`), not the request's caller context.
+   */
+  policy_input?: 'mcp_tool';
   docs_href?: string;
+  /** The text of the docs link, naming the guide or reference section it opens. */
+  docs_label?: string;
 }
 
 export const CATEGORY_LABELS: Record<PolicyTemplateCategory, string> = {
@@ -74,4 +88,5 @@ export const CATEGORY_LABELS: Record<PolicyTemplateCategory, string> = {
   routing_paths: 'Routing & paths',
   allow_deny_lists: 'Allow / deny lists',
   time: 'Time',
+  mcp_tool_policies: 'MCP tool policies',
 };

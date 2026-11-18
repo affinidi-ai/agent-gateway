@@ -21,6 +21,8 @@ interface CatalogueEntry {
   category: string;
   policy_types: string[];
   standalone?: boolean;
+  input?: 'mcp_tool';
+  docs: { page: keyof typeof DOCS_URL; anchor: string; label: string };
   rules: string;
   parameters: unknown[];
   reads: string[];
@@ -41,12 +43,14 @@ function expand(entry: CatalogueEntry, policyType: PolicyType): PolicyTemplate {
     examples: entry.examples as PolicyTemplateExample[],
     builtin: true,
     standalone: entry.standalone ?? false,
-    docs_href: DOCS_URL.policies,
+    ...(entry.input ? { policy_input: entry.input } : {}),
+    docs_href: `${DOCS_URL[entry.docs.page]}#${entry.docs.anchor}`,
+    docs_label: entry.docs.label,
   };
 }
 
 export const BUILTIN_POLICY_TEMPLATES: readonly PolicyTemplate[] = (
-  catalogue as CatalogueEntry[]
+  catalogue as unknown as CatalogueEntry[]
 ).flatMap(entry =>
   entry.policy_types
     .filter((t): t is PolicyType => t === 'gateway' || t === 'agent_surface')

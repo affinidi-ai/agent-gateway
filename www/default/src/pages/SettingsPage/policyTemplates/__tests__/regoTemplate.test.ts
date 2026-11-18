@@ -49,6 +49,67 @@ allow if input.jwt.role in {{roles}}`,
   parameters: [{ key: 'roles', label: 'Roles', kind: 'string_list', default: ['admin'] }],
 };
 
+const businessHours: PolicyTemplate = {
+  ...threshold,
+  id: 'hours',
+  name: 'Allow during business hours',
+  rego: `package surface.policy
+
+allow if {
+  time.weekday([time.now_ns(), {{time_zone}}]) in {{days}}
+  {{start_hour}} < {{end_hour}}
+}`,
+  parameters: [
+    {
+      key: 'days',
+      label: 'Days',
+      kind: 'string_list',
+      default: ['Monday'],
+      allowed: ['Monday', 'Tuesday'],
+    },
+    { key: 'start_hour', label: 'From hour', kind: 'integer', default: 9, min: 0, max: 23 },
+    {
+      key: 'end_hour',
+      label: 'Until hour',
+      kind: 'integer',
+      default: 17,
+      min: 1,
+      max: 24,
+      after: 'start_hour',
+    },
+    { key: 'time_zone', label: 'Time zone', kind: 'string', default: 'UTC', format: 'time_zone' },
+  ],
+};
+
+describe('renderTemplate setting checks', () => {
+  const fill = (values: Record<string, unknown>) =>
+    fillTemplate(businessHours, { ...defaultParameterValues(businessHours), ...values } as never);
+
+  it('writes allowed values in their own spelling, whatever case was typed', () => {
+    expect(fill({ days: ['monday', 'TUESDAY'] }).rego).toContain('in {"Monday", "Tuesday"}');
+  });
+
+  it('refuses a value that is not allowed', () => {
+    const result = fill({ days: ['Mon'] });
+    expect(result.rego).toBeNull();
+    expect(result.errors.days).toBe('"Mon" isn\'t accepted. Use Monday, Tuesday.');
+  });
+
+  it('refuses an end hour that is not later than the start hour', () => {
+    expect(fill({ start_hour: 17, end_hour: 17 }).errors.end_hour).toBe(
+      'Must be later than From hour.'
+    );
+    expect(fill({ start_hour: 9, end_hour: 10 }).errors).toEqual({});
+  });
+
+  it('writes a time zone in its canonical spelling and refuses an unknown one', () => {
+    expect(fill({ time_zone: 'asia/singapore' }).rego).toContain('"Asia/Singapore"');
+    expect(fill({ time_zone: 'Mars/Olympus' }).errors.time_zone).toBe(
+      'Enter an IANA time zone, for example Europe/Berlin.'
+    );
+  });
+});
+
 describe('renderTemplate (fillTemplate)', () => {
   it('fills an integer setting with its default', () => {
     const result = fillTemplate(threshold, defaultParameterValues(threshold));
@@ -176,6 +237,7 @@ allow if input.jwt.iss == "https://login.example"
 
 # Inserted from template: Allow listed roles
 allow if input.jwt.role in {"admin"}
+# End of template: Allow listed roles
 `);
     expect(result.added).toBe('allow if input.jwt.role in {"admin"}');
     expect(result.droppedDefault).toBe(true);
@@ -208,5 +270,16 @@ allow if input.jwt.role in {"admin"}
     const result = insertTemplateRules(existing, 'Evil\nallow := true', 'allow if input.jwt.sub');
     expect(result.policy).toContain('# Inserted from template: Evil allow := true\n');
     expect(result.policy).not.toMatch(/^allow := true/m);
+  });
+
+  it('keeps the template package line when the policy has none', () => {
+    const result = insertTemplateRules(
+      '',
+      'Methods',
+      'package gateway.policy\n\nallow if input.http.method == "GET"'
+    );
+    expect(result.policy).toBe(
+      'package gateway.policy\n\n# Inserted from template: Methods\nallow if input.http.method == "GET"\n# End of template: Methods\n'
+    );
   });
 });

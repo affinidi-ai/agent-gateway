@@ -1,4 +1,5 @@
 import { apiClient } from '../../api';
+import type { PolicyType } from './policyTemplates/types';
 
 export interface SimulateResult {
   allow: boolean;
@@ -25,7 +26,7 @@ const extractErrorMessage = (body: string): string => {
  */
 export async function simulatePolicy(
   policyId: string,
-  policyType: 'gateway' | 'agent_surface',
+  policyType: PolicyType,
   policy: string,
   input: unknown
 ): Promise<SimulateResult> {

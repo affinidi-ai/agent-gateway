@@ -3,16 +3,16 @@ import { Tab, Tabs } from 'react-bootstrap';
 import { useSearchParams } from 'react-router-dom';
 import SearchInput from '../components/shared/SearchInput';
 import PolicyListTab from './PoliciesPage/PolicyListTab';
-
-type TabKey = 'gateway' | 'agent_surface';
+import type { PolicyType } from './SettingsPage/policyTemplates/types';
 
 const PoliciesPage: React.FC = () => {
-  const validTabs: TabKey[] = ['gateway', 'agent_surface'];
+  const validTabs: PolicyType[] = ['gateway', 'agent_surface'];
 
   const [searchParams, setSearchParams] = useSearchParams();
-  const tabFromUrl = searchParams.get('tab') as TabKey | null;
-  const initialTab: TabKey = tabFromUrl && validTabs.includes(tabFromUrl) ? tabFromUrl : 'gateway';
-  const [activeTab, setActiveTab] = useState<TabKey>(initialTab);
+  const tabFromUrl = searchParams.get('tab') as PolicyType | null;
+  const initialTab: PolicyType =
+    tabFromUrl && validTabs.includes(tabFromUrl) ? tabFromUrl : 'gateway';
+  const [activeTab, setActiveTab] = useState<PolicyType>(initialTab);
   const [searchTerm, setSearchTerm] = useState('');
 
   const [gatewayCount, setGatewayCount] = useState(0);
@@ -45,7 +45,7 @@ const PoliciesPage: React.FC = () => {
       <Tabs
         activeKey={activeTab}
         onSelect={k => {
-          const next = (k as TabKey) || 'gateway';
+          const next = (k as PolicyType) || 'gateway';
           setActiveTab(next);
           setSearchParams({ tab: next }, { replace: true });
         }}
