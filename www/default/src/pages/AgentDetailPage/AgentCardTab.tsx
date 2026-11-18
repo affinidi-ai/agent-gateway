@@ -1,6 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { AgentCardResponse, AgentCardSource, AgentSurfaceRef, apiClient } from '../../api';
+import {
+  AgentCardResponse,
+  AgentCardSource,
+  AgentSurfaceRef,
+  ApiError,
+  apiClient,
+} from '../../api';
 import { AppButton } from '../../components/shared/AppButton';
 import FormSelect from '../../components/shared/FormSelect';
 import { tokenizeJson } from '../../components/shared/jsonHighlight';
@@ -146,6 +152,7 @@ const AgentCardTab: React.FC<AgentCardTabProps> = ({ agentId, surfaces }) => {
   const [response, setResponse] = useState<AgentCardResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
+  const [surfaceUnavailable, setSurfaceUnavailable] = useState(false);
   const [view, setView] = useState<CardView>('preview');
   const [surfaceId, setSurfaceId] = useState<string | undefined>(undefined);
   const latest = useRef(0);
@@ -159,10 +166,13 @@ const AgentCardTab: React.FC<AgentCardTabProps> = ({ agentId, surfaces }) => {
     try {
       setLoading(true);
       setFailed(false);
+      setSurfaceUnavailable(false);
       const card = await apiClient.getAgentCard(agentId, surfaceId);
       if (request === latest.current) setResponse(card);
-    } catch {
-      if (request === latest.current) setFailed(true);
+    } catch (err) {
+      if (request !== latest.current) return;
+      if (surfaceId && err instanceof ApiError && err.status === 404) setSurfaceUnavailable(true);
+      else setFailed(true);
     } finally {
       if (request === latest.current) setLoading(false);
     }
@@ -202,25 +212,32 @@ const AgentCardTab: React.FC<AgentCardTabProps> = ({ agentId, surfaces }) => {
 
   const cardSurfaceIds = response.card_surface_ids ?? [];
 
-  if (!response.available) {
+  if (surfaceUnavailable && surfaceId) {
     return (
       <>
-        {surfaceId && cardSurfaceIds.length > 1 && (
-          <div className="d-flex align-items-center gap-2 mb-2">
-            <span className="text-muted">Served by</span>
-            <SurfacePicker
-              ids={cardSurfaceIds}
-              value={surfaceId}
-              names={names}
-              onChange={setSurfaceId}
-            />
-          </div>
-        )}
-        <div className="text-muted py-4 text-center" data-testid={`agent-card-${response.reason}`}>
+        <div className="d-flex align-items-center gap-2 mb-2">
+          <span className="text-muted">Served by</span>
+          <SurfacePicker
+            ids={cardSurfaceIds}
+            value={surfaceId}
+            names={names}
+            onChange={setSurfaceId}
+          />
+        </div>
+        <div className="text-muted py-4 text-center" data-testid="agent-card-surface-unavailable">
           <i className="fas fa-id-card fa-2x mb-2 d-block" aria-hidden="true" />
-          {UNAVAILABLE_TEXT[response.reason] ?? "Agent Card isn't available"}
+          The Agent Card can&apos;t be read through this surface on this gateway
         </div>
       </>
+    );
+  }
+
+  if (!response.available) {
+    return (
+      <div className="text-muted py-4 text-center" data-testid={`agent-card-${response.reason}`}>
+        <i className="fas fa-id-card fa-2x mb-2 d-block" aria-hidden="true" />
+        {UNAVAILABLE_TEXT[response.reason] ?? "Agent Card isn't available"}
+      </div>
     );
   }
 

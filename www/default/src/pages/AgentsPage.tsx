@@ -118,6 +118,10 @@ const AgentsPage: React.FC = () => {
                 icon="fa-robot"
                 title="No agents yet"
                 body="Each Agent Surface's managed agent is listed here. Create a surface to add one."
+                ctaLabel="Add Agent Surface"
+                ctaIcon="fa-plus"
+                onCtaClick={() => navigate('/surfaces/new')}
+                ctaTestId="agents-add-surface-button"
                 docsHref={DOCS_URL.createFirstSurface}
               />
             )

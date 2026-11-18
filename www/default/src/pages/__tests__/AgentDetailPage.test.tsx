@@ -568,6 +568,59 @@ describe('AgentDetailPage', () => {
     expect(screen.getByTestId('agent-card-surface-select')).toHaveTextContent('oxygen');
   });
 
+  it('keeps the picker when the card cannot be read through the picked surface', async () => {
+    const { ApiError } = jest.requireMock('../../api');
+    mockedGetAgent.mockResolvedValue(
+      details({
+        surfaces: [
+          { surface_id: 's1', name: 'helium', protocol: 'a2a', route: '/helium' },
+          { surface_id: 's2', name: 'oxygen', protocol: 'a2a', route: '/oxygen' },
+        ],
+      })
+    );
+    mockedGetAgentCard.mockImplementation((_id: string, surfaceId?: string) =>
+      surfaceId === 's2'
+        ? Promise.reject(new ApiError('Not Found', 404))
+        : Promise.resolve({
+            available: true,
+            card: { name: 'From helium' },
+            source: 'fetched',
+            surface_id: 's1',
+            card_surface_ids: ['s1', 's2'],
+          })
+    );
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Agent Card/);
+    await screen.findByTestId('agent-card-preview-name');
+
+    fireEvent.click(screen.getByTestId('agent-card-surface-select'));
+    fireEvent.click(await screen.findByRole('option', { name: /oxygen/ }));
+
+    expect(await screen.findByTestId('agent-card-surface-unavailable')).toHaveTextContent(
+      "The Agent Card can't be read through this surface on this gateway"
+    );
+    expect(screen.queryByTestId('agent-card-error')).not.toBeInTheDocument();
+    const select = screen.getByTestId('agent-card-surface-select');
+    expect(select).toHaveTextContent('oxygen');
+
+    fireEvent.click(select);
+    fireEvent.click(await screen.findByRole('option', { name: /helium/ }));
+    expect(await screen.findByText('From helium')).toBeInTheDocument();
+  });
+
+  it('shows a load error for a 404 when no surface was picked', async () => {
+    const { ApiError } = jest.requireMock('../../api');
+    mockedGetAgent.mockResolvedValue(details());
+    mockedGetAgentCard.mockRejectedValue(new ApiError('Not Found', 404));
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Agent Card/);
+
+    expect(await screen.findByTestId('agent-card-error')).toBeInTheDocument();
+    expect(screen.queryByTestId('agent-card-surface-unavailable')).not.toBeInTheDocument();
+  });
+
   it('opens the surface serving the card from its link', async () => {
     mockedGetAgent.mockResolvedValue(details());
     mockedGetAgentCard.mockResolvedValue({

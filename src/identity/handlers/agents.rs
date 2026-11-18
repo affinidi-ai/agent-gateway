@@ -1377,8 +1377,8 @@ fn chosen_card_surfaces<'a>(
 
 /// The card the gateway serves for the agent, read through the agent card preview of the
 /// requested surface, or else the first of its [`card_surfaces`] that runs here, so a direct
-/// URL, A2A proxy and Fabric target each give the card callers get. Fetches are limited and
-/// audited as previews.
+/// URL, A2A proxy and Fabric target each give the card callers get. `404` for a requested
+/// surface that isn't running here. Fetches are limited and audited as previews.
 async fn agent_card_response(
     state: &IdentityApiState,
     group: &AgentGroup<'_>,
@@ -1405,6 +1405,9 @@ async fn agent_card_response(
             return Ok(response);
         }
     }
+    if requested.is_some() {
+        return Err(AgentApiError::NotFound);
+    }
     let mut response = AgentCardResponse::unavailable(AgentCardUnavailable::NotRunning);
     response.card_surface_ids = card_surface_ids;
     Ok(response)
@@ -1412,8 +1415,8 @@ async fn agent_card_response(
 
 /// The Agent Card the gateway serves for the managed agent, or why it isn't available.
 /// `502` when the gateway has no card to show, with no upstream detail, `404` for a
-/// `surface_id` the card can't be read through, and `429` past the agent card preview's
-/// fetch limit.
+/// `surface_id` the card can't be read through or that isn't running, and `429` past the
+/// agent card preview's fetch limit.
 pub async fn get_agent_card(
     Path(id): Path<String>,
     Query(query): Query<AgentCardQuery>,

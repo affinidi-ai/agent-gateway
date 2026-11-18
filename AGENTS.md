@@ -297,8 +297,11 @@ _Agent Cards tab_ in
 
 The read-only Agents page at `/agent-registry` needs `surfaces.view` and lists one row per managed
 agent, built by the gateway from the surfaces that target it; MCP surfaces are left out and no
-status is shown. Its Agent Card tab shows the card the gateway serves for Direct, Proxied and
-Fabric routes with a **Card source** row; see _Agents page_ in
+status is shown. Its empty state offers **Add Agent Surface**, which opens `/surfaces/new`. Its
+Agent Card tab shows the card the gateway serves for Direct, Proxied and Fabric routes with a
+**Card source** row, and keeps the surface picker when the card can't be read through the
+chosen surface; see
+_Agents page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#agents-page).
 
 The Identities page shows one row per surface Managed Agent, with its earlier DIDs (from its

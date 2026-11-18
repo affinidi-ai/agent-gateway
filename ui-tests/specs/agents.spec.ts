@@ -43,16 +43,26 @@ const cardOf = (name: string): CardAnswer => ({
   json: { available: true, card: { name, skills: [] }, source: "fetched" },
 });
 
-/** Answers the Agents API from fixtures; every other request reaches the gateway. */
+/**
+ * Answers the Agents API from fixtures; every other request reaches the gateway. `card` may
+ * depend on the `surface_id` the card is read through.
+ */
 async function serveAgents(
   page: Page,
-  { list = 200, card }: { list?: number; card?: CardAnswer } = {},
+  {
+    list = 200,
+    agents = [timeAsker, oxygen],
+    card,
+  }: {
+    list?: number;
+    agents?: ReturnType<typeof record>[];
+    card?: CardAnswer | ((surfaceId: string | null) => CardAnswer);
+  } = {},
 ) {
-  const agents = [timeAsker, oxygen];
   await page.route(/\/api\/v1\/agents(\/[^?]*)?(\?.*)?$/, async (route: Route) => {
-    const path = new URL(route.request().url()).pathname;
+    const url = new URL(route.request().url());
     const [, id, tail] =
-      path.match(/\/api\/v1\/agents(?:\/([^/]+))?(\/agent-card)?$/) ?? [];
+      url.pathname.match(/\/api\/v1\/agents(?:\/([^/]+))?(\/agent-card)?$/) ?? [];
     if (!id) {
       await route.fulfill(
         list === 200
@@ -67,7 +77,10 @@ async function serveAgents(
       return;
     }
     if (tail) {
-      const answer = card ?? cardOf(agent.name);
+      const answer =
+        typeof card === "function"
+          ? card(url.searchParams.get("surface_id"))
+          : (card ?? cardOf(agent.name));
       await route.fulfill({ status: answer.status, json: answer.json });
       return;
     }
@@ -126,6 +139,54 @@ test.describe("Agents page", () => {
 
     await expect(page.getByTestId("agents-load-error")).toBeVisible();
     await expect(page.getByTestId("agents-retry-button")).toBeVisible();
+  });
+
+  test("opens the surface creation flow from the empty list", async ({ page }) => {
+    await serveAgents(page, { agents: [] });
+    await openAgents(page);
+
+    await page.getByTestId("agents-add-surface-button").click();
+
+    await expect(page).toHaveURL(/\/surfaces\/new$/);
+  });
+
+  test("keeps the surface picker when the card can't be read through the picked surface", async ({
+    page,
+  }) => {
+    const twoSurfaces = {
+      ...timeAsker,
+      surfaces: [
+        { surface_id: "helium-id", name: "helium" },
+        { surface_id: "oxygen-id", name: "oxygen" },
+      ],
+    };
+    await serveAgents(page, {
+      agents: [twoSurfaces],
+      card: (surfaceId) =>
+        surfaceId === "oxygen-id"
+          ? { status: 404, json: { error: "Not Found" } }
+          : {
+              status: 200,
+              json: {
+                ...(cardOf("TimeAsker").json as object),
+                surface_id: "helium-id",
+                card_surface_ids: ["helium-id", "oxygen-id"],
+              },
+            },
+    });
+    await page.goto(`${BASE_URL}/agent-registry/${timeAsker.id}`);
+    await expect(page.getByTestId("agent-card-preview-name")).toHaveText(
+      "TimeAsker",
+    );
+
+    await page.getByTestId("agent-card-surface-select").click();
+    await page.getByRole("option", { name: /oxygen/ }).click();
+
+    await expect(page.getByTestId("agent-card-surface-unavailable")).toBeVisible();
+    await expect(page.getByTestId("agent-card-error")).toHaveCount(0);
+    await expect(page.getByTestId("agent-card-surface-select")).toContainText(
+      "oxygen",
+    );
   });
 
   test("shows a failed Agent Card read with Retry", async ({ page }) => {

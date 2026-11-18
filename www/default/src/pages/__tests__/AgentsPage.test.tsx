@@ -37,6 +37,7 @@ const renderPage = () =>
       <Routes>
         <Route path="/agent-registry" element={<AgentsPage />} />
         <Route path="/agent-registry/:agentId" element={<div data-testid="details-route" />} />
+        <Route path="/surfaces/new" element={<div data-testid="new-surface-route" />} />
         <Route path="/surfaces/:surfaceId" element={<div data-testid="surface-route" />} />
       </Routes>
     </MemoryRouter>
@@ -315,6 +316,24 @@ describe('AgentsPage', () => {
     mockedListAgents.mockResolvedValue(list());
     renderPage();
     expect(await screen.findByText('No agents yet')).toBeInTheDocument();
+  });
+
+  it('opens the surface creation flow from the empty state', async () => {
+    mockedListAgents.mockResolvedValue(list());
+    renderPage();
+
+    const add = await screen.findByTestId('agents-add-surface-button');
+    expect(add).toHaveTextContent('Add Agent Surface');
+    fireEvent.click(add);
+    expect(await screen.findByTestId('new-surface-route')).toBeInTheDocument();
+  });
+
+  it('offers no surface creation in the empty state while the list failed to load', async () => {
+    mockedListAgents.mockRejectedValue(new Error('Internal Server Error'));
+    renderPage();
+
+    expect(await screen.findByTestId('agents-load-error')).toBeInTheDocument();
+    expect(screen.queryByTestId('agents-add-surface-button')).not.toBeInTheDocument();
   });
 
   it('shows the error state and retries', async () => {
