@@ -37,6 +37,18 @@ changes:
         token endpoint's OAuth error code. A request forwarded without the credential because
         the fallback is passthrough is titled Forwarded without Target credential in the warning
         tone instead of Request refused.
+    - timestamp: '2026-11-18T08:00:00Z'
+      title: Advise on a passthrough fallback and an Access Point that checks no caller
+      description: >-
+        The Managed Agent editor now shows an advisory when its Access Point checks no caller,
+        as the Transit Point panel already did, and both editors show one when the fallback
+        passes a request through without the credential. Neither blocks Save. Every Target
+        authentication message now opens with Error, Advisory or Warning.
+    - timestamp: '2026-11-18T08:00:01Z'
+      title: Show a credential the Target refused in the Audit Log
+      description: >-
+        Audit Log records whose credential outcome is refused_by_target are titled Target
+        refused the credential and show the status the Target answered with.
   fixed:
     - timestamp: '2026-11-03T12:30:00Z'
       title: Stop the dashboard bringing back a Target credential removed through the API
@@ -45,6 +57,30 @@ changes:
         data of a surface, and a later dashboard save rebuilt a credential that had been removed
         through the API, sending it to a Target that had since changed. The form fields now come
         only from the stored Target authentication.
+    - timestamp: '2026-11-18T08:00:02Z'
+      title: Keep a stored Target authentication the Managed Agent editor cannot show
+      description: >-
+        A Managed Agent whose stored Target authentication uses a method the editor has no form
+        for lost it on the next dashboard save. It is now saved unchanged until the operator
+        chooses a secret or a provider, as on a Transit Point, and the editor says so.
+    - timestamp: '2026-11-18T08:00:03Z'
+      title: Compare Target authentication header names as the gateway does
+      description: >-
+        The reserved name check and the header clash check ignore letter case and read an
+        underscore as a hyphen, and the clash check counts the token header of every JWT Bearer
+        caller method that forwards it. The dashboard no longer accepts a header name the
+        gateway then refuses on save.
+    - timestamp: '2026-11-18T08:00:04Z'
+      title: Stop the false https advisory on an MCP proxy Target
+      description: >-
+        A proxy:// Target no longer shows the not https advisory. The gateway decides that rule
+        from the MCP proxy's base URL, which the editor does not see.
+    - timestamp: '2026-11-18T08:00:05Z'
+      title: Announce Target authentication messages to screen readers
+      description: >-
+        Target authentication messages sit in live regions that stay on the page, the missing
+        provider message and the Transit Point header errors are tied to their inputs, and the
+        secret delete dialog keeps focus on its buttons while the delete runs.
   removed:
     - timestamp: '2026-11-02T11:45:38Z'
       title: Remove the OIDC Providers dashboard pages
@@ -52,5 +88,13 @@ changes:
         The OIDC Providers list and editor called an API the gateway does not serve. The pages
         are removed, and /oidc-providers and every path under it redirect to the Credential
         providers tab.
-  security: []
+  security:
+    - timestamp: '2026-11-18T08:00:06Z'
+      title: Keep Target authentication settings out of the saved canvas data
+      description: >-
+        The Target authentication form fields are no longer written to a surface's canvas data,
+        and a Managed Agent or Transit Point restored from canvas data comes back without a
+        Target authentication. Stored fields the editor does not show are dropped when the
+        operator picks another secret or provider, so they cannot follow a credential they were
+        not set for.
   breaking: []
