@@ -199,6 +199,7 @@ const PolicyEditorSection: React.FC<PolicyEditorSectionProps> = ({
             wrap="off"
             spellCheck={false}
             value={policy}
+            readOnly={!canEdit}
             onChange={e => onPolicyChange(e.target.value)}
             onScroll={syncGutter}
             placeholder="...add policy here..."
@@ -227,14 +228,16 @@ const PolicyEditorSection: React.FC<PolicyEditorSectionProps> = ({
             <i className="fas fa-exclamation-triangle me-2 mt-1 flex-shrink-0" aria-hidden="true" />
             <div>
               <strong>Package mismatch:</strong> {packageMismatch}
-              <button
-                type="button"
-                className="btn btn-sm btn-danger ms-2 py-0 px-2"
-                style={{ fontSize: '0.8rem' }}
-                onClick={onFixPackage}
-              >
-                Fix it
-              </button>
+              {canEdit && (
+                <button
+                  type="button"
+                  className="btn btn-sm btn-danger ms-2 py-0 px-2"
+                  style={{ fontSize: '0.8rem' }}
+                  onClick={onFixPackage}
+                >
+                  Fix it
+                </button>
+              )}
             </div>
           </div>
         )}

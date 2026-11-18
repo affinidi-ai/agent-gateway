@@ -24,6 +24,14 @@ changes:
         identical copy left by the same template added twice can go. Save as template keeps a policy as an organisation template for the current
         browser tab. Built-in templates ship with the dashboard; no gateway API changes.
   changed:
+    - timestamp: '2026-11-18T22:00:00Z'
+      title: Show the policy editor read-only to users who can't edit policies
+      description: >-
+        Without the policies.edit permission the policy editor shows the policy read-only: the
+        Rego and Details can't be changed, there is no Create or Save button, Ctrl+S does
+        nothing, a package mismatch offers no Fix it, there is no Test (dry-run) panel, and a
+        note says the policy can be viewed but not changed. Saving and the dry-run already
+        needed that permission, so the page no longer offers actions the gateway refuses.
     - timestamp: '2026-11-18T20:00:00Z'
       title: Start new policies as deny by default
       description: >-

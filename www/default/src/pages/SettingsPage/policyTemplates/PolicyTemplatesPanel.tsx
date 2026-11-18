@@ -43,30 +43,39 @@ const InsertPreview: React.FC<{
   const forToolBinding = template.policy_input === 'mcp_tool';
   const refused = !!template.standalone || forToolBinding;
   const canInsert = !!insert?.added && !refused;
+  const defaultOnly = !forToolBinding && !!insert && !insert.added;
+  const decision = defaultDecision(template.rego);
+  const noteTestId = forToolBinding
+    ? 'policy-templates-mcp-tool-note'
+    : defaultOnly
+      ? 'policy-templates-default-only-note'
+      : 'policy-templates-standalone-note';
 
   return (
     <div className="policy-template-preview" data-testid="policy-templates-preview">
       <h6 className="fw-bold mb-1">{template.name}</h6>
       <p className="text-muted small mb-2">{template.description}</p>
       <div className="mb-3">
-        <DecisionBadge decision={defaultDecision(template.rego)} prefix="Default" />
+        <DecisionBadge decision={decision} prefix="Default" />
       </div>
 
       <TemplateSettingsFields template={template} settings={settings} idPrefix={ID_PREFIX} />
 
       {refused ? (
         <>
-          <div
-            className="alert alert-info py-2 px-3 small"
-            data-testid={
-              forToolBinding ? 'policy-templates-mcp-tool-note' : 'policy-templates-standalone-note'
-            }
-          >
+          <div className="alert alert-info py-2 px-3 small" data-testid={noteTestId}>
             <i className="fas fa-info-circle me-2" aria-hidden="true" />
             {forToolBinding ? (
               <>
                 This template is for a policy bound to MCP tools on the MCP Proxy hop, which reads{' '}
                 <code>input.jwt</code> and the tool name. Use it as a whole policy.
+              </>
+            ) : defaultOnly ? (
+              <>
+                This template only sets the default decision, so it adds no rules to a policy. To{' '}
+                {decision} by default, change <code>default allow</code> to{' '}
+                <code>{decision === 'allow' ? 'true' : 'false'}</code> in the Rego, or pick it under
+                Start from on a new policy.
               </>
             ) : (
               <>

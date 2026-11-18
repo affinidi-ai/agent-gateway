@@ -708,7 +708,37 @@ describe('add rules while creating a policy', () => {
     openAdd();
     fireEvent.click(await row('restrict-mcp-tools-by-role'));
     expect(screen.getByTestId('policy-templates-standalone-note')).toBeInTheDocument();
+    expect(screen.queryByTestId('policy-templates-default-only-note')).toBeNull();
     expect(screen.getByTestId('policy-templates-insert-rules-button')).toBeDisabled();
+  });
+
+  it('says Deny by default only sets the default decision', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    openAdd();
+    fireEvent.click(await row('deny-by-default'));
+    expect(screen.getByTestId('policy-templates-default-only-note')).toHaveTextContent(
+      'only sets the default decision, so it adds no rules to a policy. To deny by default, change default allow to false in the Rego, or pick it under Start from on a new policy.'
+    );
+    expect(screen.queryByTestId('policy-templates-standalone-note')).toBeNull();
+    expect(screen.getByTestId('policy-templates-insert-rules-button')).toBeDisabled();
+  });
+
+  it('says Monitor-only baseline only sets an allow default', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    openAdd();
+    fireEvent.click(await row('allow-all-monitor'));
+    expect(screen.getByTestId('policy-templates-default-only-note')).toHaveTextContent(
+      'change default allow to true'
+    );
+    expect(screen.getByTestId('policy-templates-insert-rules-button')).toBeDisabled();
+  });
+
+  it('keeps the MCP tool note on a tool template that only sets the default', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    openAdd();
+    fireEvent.click(await row('tool-allow-every-caller'));
+    expect(screen.getByTestId('policy-templates-mcp-tool-note')).toBeInTheDocument();
+    expect(screen.queryByTestId('policy-templates-default-only-note')).toBeNull();
   });
 });
 
@@ -799,6 +829,81 @@ describe('insert a template into a saved policy', () => {
     await screen.findByText('Edit Policy: partner-only');
     expect(screen.queryByTestId('policy-templates-insert-button')).toBeNull();
     expect(screen.queryByTestId('policy-templates-save-as-button')).toBeNull();
+  });
+});
+
+describe('read-only without policies.edit', () => {
+  const title = (section: string) =>
+    within(screen.getByTestId(section)).getAllByRole('heading', { level: 6 })[0].textContent;
+  const titles = () => [title('policy-details-section'), title('policy-editor-section')];
+
+  it('shows a saved policy read-only, with no Save', async () => {
+    mockCanEdit = false;
+    mockGateway();
+    renderAt('/policy-definitions/partner-only');
+    await screen.findByText('Edit Policy: partner-only');
+    expect(screen.getByTestId('policy-definition-read-only-note')).toHaveTextContent(
+      'You can view this policy but not change it.'
+    );
+    expect(rego()).toHaveAttribute('readonly');
+    expect(screen.queryByTestId('policy-definition-editor-save-button')).toBeNull();
+    expect(screen.getByTestId('policy-definition-name-input')).toHaveAttribute('readonly');
+    expect(screen.getByTestId('policy-definition-description-input')).toHaveAttribute('readonly');
+    expect(screen.getByTestId('policy-definition-enabled-switch')).toBeDisabled();
+    expect(screen.getByTestId('policy-definition-type-select')).toBeDisabled();
+    expect(titles()).toEqual(['Details', 'Policy']);
+  });
+
+  it('offers no dry-run', async () => {
+    mockCanEdit = false;
+    mockGateway();
+    renderAt('/policy-definitions/partner-only');
+    await screen.findByText('Edit Policy: partner-only');
+    expect(screen.queryByTestId('policy-simulate-panel')).toBeNull();
+  });
+
+  it('saves nothing on Ctrl+S', async () => {
+    mockCanEdit = false;
+    mockGateway();
+    renderAt('/policy-definitions/partner-only');
+    await screen.findByText('Edit Policy: partner-only');
+    fireEvent.keyDown(document, { key: 's', ctrlKey: true });
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(false);
+  });
+
+  it('offers no Fix it on a package mismatch', async () => {
+    mockCanEdit = false;
+    mockGateway({ ...SAVED, policy: 'package gateway.policy\n\ndefault allow := false' });
+    renderAt('/policy-definitions/partner-only');
+    await screen.findByText(/Package mismatch/);
+    expect(screen.queryByRole('button', { name: 'Fix it' })).toBeNull();
+  });
+
+  it('numbers no section on the create form', () => {
+    mockCanEdit = false;
+    renderAt('/policy-definitions/new?type=agent_surface');
+    expect(titles()).toEqual(['Details', 'Policy']);
+    expect(screen.queryByTestId('policy-definition-editor-save-button')).toBeNull();
+  });
+
+  it('changes nothing for a user with policies.edit', async () => {
+    mockGateway();
+    renderAt('/policy-definitions/partner-only');
+    await screen.findByText('Edit Policy: partner-only');
+    expect(screen.queryByTestId('policy-definition-read-only-note')).toBeNull();
+    expect(rego()).not.toHaveAttribute('readonly');
+    expect(screen.getByTestId('policy-definition-editor-save-button')).toBeInTheDocument();
+    expect(screen.getByTestId('policy-definition-name-input')).not.toHaveAttribute('readonly');
+    expect(screen.getByTestId('policy-definition-enabled-switch')).toBeEnabled();
+  });
+
+  it('numbers the three sections on the create form', () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    expect([title('policy-template-gallery'), ...titles()]).toEqual([
+      '1Start from',
+      '2Details',
+      '3Policy',
+    ]);
   });
 });
 

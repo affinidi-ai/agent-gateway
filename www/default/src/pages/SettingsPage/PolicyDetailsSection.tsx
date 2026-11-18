@@ -7,6 +7,7 @@ import type { PolicyType } from './policyTemplates/types';
 interface PolicyDetailsSectionProps {
   step?: number;
   isCreateMode: boolean;
+  readOnly: boolean;
   name: string;
   description: string;
   policyType: PolicyType;
@@ -44,6 +45,7 @@ const ReadOnlyValue: React.FC<{ label: string; value: string; help: string; test
 const PolicyDetailsSection: React.FC<PolicyDetailsSectionProps> = ({
   step,
   isCreateMode,
+  readOnly,
   name,
   description,
   policyType,
@@ -71,6 +73,7 @@ const PolicyDetailsSection: React.FC<PolicyDetailsSectionProps> = ({
           type="text"
           className="form-control form-control-sm"
           value={name}
+          readOnly={readOnly}
           onChange={e => onNameChange(e.target.value)}
           placeholder="e.g. Require Authentication"
           data-testid="policy-definition-name-input"
@@ -92,6 +95,7 @@ const PolicyDetailsSection: React.FC<PolicyDetailsSectionProps> = ({
           type="text"
           className="form-control form-control-sm"
           value={description}
+          readOnly={readOnly}
           onChange={e => onDescriptionChange(e.target.value)}
           placeholder="What does this policy do?"
           data-testid="policy-definition-description-input"
@@ -112,7 +116,7 @@ const PolicyDetailsSection: React.FC<PolicyDetailsSectionProps> = ({
           id="policy-type-select"
           className="form-control form-control-sm dropdown-styling"
           value={policyType}
-          disabled={!isCreateMode}
+          disabled={!isCreateMode || readOnly}
           title={!isCreateMode ? "A policy's type is fixed once created." : undefined}
           onChange={e => onTypeChange(e.target.value as PolicyType)}
           data-testid="policy-definition-type-select"
@@ -148,6 +152,7 @@ const PolicyDetailsSection: React.FC<PolicyDetailsSectionProps> = ({
             role="switch"
             id="policy-enabled"
             checked={enabled}
+            disabled={readOnly}
             onChange={e => onEnabledChange(e.target.checked)}
             data-testid="policy-definition-enabled-switch"
           />

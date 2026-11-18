@@ -107,6 +107,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
   const [focusAddRules, setFocusAddRules] = useState(0);
   const { hasPermission } = usePermissions();
   const canEditPolicies = hasPermission('policies.edit');
+  const numbered = isCreateMode && canEditPolicies;
   const {
     templatePanel,
     setTemplatePanel,
@@ -302,6 +303,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
 
   // Keyboard shortcut Ctrl+S / Cmd+S
   useEffect(() => {
+    if (!canEditPolicies) return;
     const handler = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 's') {
         e.preventDefault();
@@ -310,7 +312,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
     };
     document.addEventListener('keydown', handler);
     return () => document.removeEventListener('keydown', handler);
-  }, [saving, handleSave]);
+  }, [saving, handleSave, canEditPolicies]);
 
   const templatesPanel = (
     <PolicyTemplatesPanel
@@ -394,15 +396,17 @@ const EditPolicyDefinitionPage: React.FC = () => {
                     </button>
                   </span>
                 )}
-                <button
-                  className={`btn btn-sm btn-primary me-2 ${saving || !policyValid || !!packageMismatch ? 'disabled' : ''}`}
-                  data-testid="policy-definition-editor-save-button"
-                  onClick={handleSave}
-                  disabled={saving || !policyValid || !!packageMismatch}
-                >
-                  <i className={`fas ${saving ? 'fa-spinner fa-spin' : 'fa-save'}`}></i>
-                  {saving ? ' Saving...' : isCreateMode ? ' Create' : ' Save'}
-                </button>
+                {canEditPolicies && (
+                  <button
+                    className={`btn btn-sm btn-primary me-2 ${saving || !policyValid || !!packageMismatch ? 'disabled' : ''}`}
+                    data-testid="policy-definition-editor-save-button"
+                    onClick={handleSave}
+                    disabled={saving || !policyValid || !!packageMismatch}
+                  >
+                    <i className={`fas ${saving ? 'fa-spinner fa-spin' : 'fa-save'}`}></i>
+                    {saving ? ' Saving...' : isCreateMode ? ' Create' : ' Save'}
+                  </button>
+                )}
               </div>
             </div>
 
@@ -435,8 +439,14 @@ const EditPolicyDefinitionPage: React.FC = () => {
                   Learn more
                 </Link>
               </p>
+              {!canEditPolicies && (
+                <p className="text-muted small mb-3" data-testid="policy-definition-read-only-note">
+                  <i className="fas fa-lock me-1" aria-hidden="true" />
+                  You can view this policy but not change it.
+                </p>
+              )}
 
-              {isCreateMode && canEditPolicies && (
+              {numbered && (
                 <TemplateGallery
                   step={1}
                   policyType={form.policy_type}
@@ -454,8 +464,9 @@ const EditPolicyDefinitionPage: React.FC = () => {
               )}
 
               <PolicyDetailsSection
-                step={isCreateMode ? 2 : undefined}
+                step={numbered ? 2 : undefined}
                 isCreateMode={isCreateMode}
+                readOnly={!canEditPolicies}
                 name={form.name}
                 description={form.description}
                 policyType={form.policy_type}
@@ -469,7 +480,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
               />
 
               <PolicyEditorSection
-                step={isCreateMode ? 3 : undefined}
+                step={numbered ? 3 : undefined}
                 policy={form.policy}
                 policyType={form.policy_type}
                 onPolicyChange={editPolicy}
@@ -510,7 +521,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
               onDismiss={dismissInsertedTemplate}
             />
           )}
-          {!isCreateMode && form.id && (
+          {!isCreateMode && form.id && canEditPolicies && (
             <PolicySimulatePanel
               policyId={form.id}
               policyType={form.policy_type}

@@ -1757,7 +1757,8 @@ the list page's error alert and the editor's error toast. Every value is rendere
 ## Policy definition editor
 
 The create and edit pages share one editor card in three sections, each titled by
-`PolicySectionTitle` (numbered 1 to 3 on the create form only), separated by a rule:
+`PolicySectionTitle` (numbered 1 to 3 on the create form, for users with `policies.edit` only),
+separated by a rule:
 
 - **Start from** (create only): `TemplateGallery` (`policy-template-gallery`), described under
   _Policy templates_.
@@ -1776,6 +1777,15 @@ The create and edit pages share one editor card in three sections, each titled b
   (`policy-rego-textarea`, `wrap="off"`) with a line-number gutter (`.policy-rego-gutter`)
   that follows its scroll, so the line numbers in the Rules view match, then compile errors and
   the package mismatch with **Fix it**.
+
+Without `policies.edit` the page is read-only, since the gateway refuses a create or save
+without it: a muted line with a lock icon under the intro says "You can view this policy but not
+change it." (`policy-definition-read-only-note`), the Rego textarea is `readOnly`, Name and
+Description are `readOnly`, Type and Enabled are disabled, there is no Create or Save button
+(`policy-definition-editor-save-button`), Ctrl+S does nothing, a package mismatch offers no
+**Fix it**, and no section shows a step number. There is no Test (dry-run) panel
+(`policy-simulate-panel`), since the gateway's simulate endpoint also needs `policies.edit`,
+and no gallery, templates column, Add rules, Remove or Save as template (below).
 
 The **Rego reference** panel in the Rego view is collapsed by default. It lists the two inputs a
 policy can get, each with a link to its section of the OPA policies reference page: the
@@ -1913,6 +1923,13 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   (`policy-templates-docs-link`) and **Add to policy**
   (`policy-templates-insert-rules-button`). A standalone or MCP tool template shows its note
   and its whole Rego (`policy-templates-rego-preview`) instead, and Add to policy is disabled.
+  A standalone template whose rules add nothing beyond its `default allow` line, such as Deny
+  by default and Monitor-only baseline, stays in the list with a note that it only sets the
+  default decision and adds no rules, and that changing `default allow` in the Rego or picking
+  it under Start from on a new policy sets that default (`policy-templates-default-only-note`);
+  an MCP tool template keeps its own note; every other
+  standalone template says its rules allow requests outside what it restricts
+  (`policy-templates-standalone-note`).
   Adding an organisation template shows a warning that its rules are added as written and
   combine with OR (`policy-templates-org-insert-warning`). An empty Your organization tab says
   how to add one.
