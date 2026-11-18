@@ -102,3 +102,21 @@ paths:
               x-gateway-file:
                 pointer: /data
                 encoding: base64url
+  /weather/{city}/broken-attachment:
+    get:
+      operationId: get_broken_attachment
+      summary: Declare a file in an encoding the gateway does not read
+      parameters:
+        - name: city
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: A malformed file declaration
+          content:
+            application/json:
+              x-gateway-file:
+                pointer: /data
+                encoding: hex

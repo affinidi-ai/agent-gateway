@@ -2027,7 +2027,7 @@ async fn process_modern_mcp_request_with_headers(
                         "Tool request body cannot be safely encoded",
                     )
                 })?;
-            tool.metadata.output_schema = super::modern_rest::output_schema(&server.openapi_spec, &tool.metadata)
+            let (output_schema, file) = super::modern_rest::answer_contract(&server.openapi_spec, &tool.metadata)
                 .map_err(|_| {
                     failure(
                         StatusCode::BAD_REQUEST,
@@ -2035,9 +2035,7 @@ async fn process_modern_mcp_request_with_headers(
                         "Tool output schema cannot be validated offline",
                     )
                 })?;
-            let file = super::modern_rest::file_answer(&server.openapi_spec, &tool.metadata).map_err(|_| {
-                failure(StatusCode::BAD_REQUEST, error_codes::INVALID_PARAMS, "Tool file answer is not usable")
-            })?;
+            tool.metadata.output_schema = output_schema;
             (tool, file, arguments, content_type)
         };
         crate::url_validation::reject_cloud_metadata_url(&proxy.base_url).map_err(|_| {
@@ -2721,9 +2719,9 @@ impl StoredToolCall {
             .and_then(|base_url| legacy_base_directory(&base_url))
             .map_err(|_| super::modern_rest::RestError::Target.to_string())?;
         let mut metadata = tool.metadata.clone();
-        metadata.output_schema =
-            super::modern_rest::output_schema(spec, &metadata).map_err(|error| error.to_string())?;
-        let file = super::modern_rest::file_answer(spec, &metadata).map_err(|error| error.to_string())?;
+        let (output_schema, file) =
+            super::modern_rest::answer_contract(spec, &metadata).map_err(|error| error.to_string())?;
+        metadata.output_schema = output_schema;
         let content_type =
             super::modern_rest::request_content_type(spec, &metadata).map_err(|error| error.to_string())?;
         Ok(Self {
@@ -3258,7 +3256,8 @@ fn initialize_result(proxy: &McpProxy) -> serde_json::Value {
 }
 
 /// The `tools/list` result of a legacy MCP Proxy: every tool `server` loaded
-/// from its spec.
+/// from its spec, apart from one whose answer declares a file the gateway
+/// cannot read, which a call to it is refused for.
 fn tools_list_result(
     proxy: &McpProxy,
     server: &McpServer,
@@ -3268,6 +3267,15 @@ fn tools_list_result(
     let tools: Vec<serde_json::Value> = tool_names
         .iter()
         .filter_map(|tool_name| server.get_tool_metadata(tool_name))
+        .filter(|metadata| {
+            match super::modern_rest::file_answer(&server.openapi_spec, metadata) {
+                Ok(_) => true,
+                Err(error) => {
+                    warn!(proxy_id = %proxy.id, tool = %metadata.name, error = %error, "Exclude tool with an unusable file answer");
+                    false
+                }
+            }
+        })
         .map(|metadata| {
             let input_schema = if proxy.flatten_post_params {
                 flatten_input_schema(&metadata.parameters)

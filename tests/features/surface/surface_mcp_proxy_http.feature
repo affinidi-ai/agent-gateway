@@ -227,6 +227,24 @@ Feature: Routing through a proxy:// MCP target
     Then the response status is 200
     And the MCP tool result is an error saying "REST response does not carry the file its tool declares"
 
+  Scenario: A tool whose declared file the gateway cannot read is left out of the tool catalog
+    When the caller sends an MCP tools/list request
+    Then the response status is 200
+    And the MCP response tool catalog includes a tool named "get_weather_attachment"
+    And the MCP response tool catalog does not include a tool named "get_broken_attachment"
+
+  Scenario: A 2026-07-28 tool catalog advertises no output schema for a tool answering a file
+    When the caller asks the MCP surface for available tools using protocol version "2026-07-28"
+    Then the response status is 200
+    And the MCP response tool catalog's tool "get_weather_attachment" advertises no output schema
+    And the MCP response tool catalog does not include a tool named "get_broken_attachment"
+
+  Scenario: A 2026-07-28 call to a tool whose declared file the gateway cannot read is refused
+    When the caller invokes the MCP tool "get_broken_attachment" for city "Paris" using protocol version "2026-07-28"
+    Then the response status is 400
+    And the MCP response is a JSON-RPC error with code -32602
+    And REST API "bravo" was not called
+
   Scenario: A 2026-07-28 tool call returns JSON the REST API serves under a non-JSON content type as text
     Given REST API "bravo" answers its weather as "application/octet-stream"
     When the caller invokes the MCP tool "get_weather" for city "Paris" using protocol version "2026-07-28"
