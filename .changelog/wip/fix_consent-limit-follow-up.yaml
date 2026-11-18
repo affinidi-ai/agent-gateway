@@ -93,5 +93,16 @@ changes:
         the gateway does with a delegated credential on each call is written to the gateway log,
         unless `[logging] delegation_events` is false.
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-11-18T14:00:00Z'
+      title: Update lettre to 0.11.24 for six SMTP advisories
+      description: >-
+        The mail library the e-mail integration sends with, lettre 0.11.22, has six advisories:
+        a panic on a mailbox display name that holds a line break and a panic on an EHLO reply
+        line of only white space, each a denial of service; missing dot-stuffing after a bare
+        line feed or carriage return, which allows SMTP command injection; a message for an
+        address with a quoted local part going to a different address; unbounded buffering of an
+        SMTP reply, which lets a malicious server exhaust memory; and STARTTLS response
+        injection, which lets a man in the middle forge SMTP replies. The lock file now takes
+        lettre 0.11.24, with email-encoding 0.4.3. No code changes.
   breaking: []
