@@ -71,10 +71,20 @@ pub(super) fn compile_schema(schema: &Value) -> Result<jsonschema::Validator, Re
         .map_err(|_| RestError::Arguments)
 }
 
-pub(super) fn output_schema(
-    spec: &Value,
+/// The OpenAPI extension on a JSON media type of an operation's answer that
+/// says the answer carries a file ([`FileAnswer`]).
+const FILE_EXTENSION: &str = "x-gateway-file";
+
+/// The longest JSON Pointer a [`FileAnswer`] may name.
+const MAX_FILE_POINTER: usize = 256;
+
+/// The JSON media type, with its schema, of the first answer
+/// `metadata`'s operation declares among its success statuses and then
+/// `default`.
+fn json_answer<'spec>(
+    spec: &'spec Value,
     metadata: &ToolMetadata,
-) -> Result<Option<Value>, RestError> {
+) -> Result<Option<&'spec Value>, RestError> {
     let path = spec
         .get("paths")
         .and_then(|paths| paths.get(&metadata.path))
@@ -112,35 +122,120 @@ pub(super) fn output_schema(
                     })
                     .map(|(_, media)| media)
             });
-        let Some(body_schema) = media.and_then(|media| media.get("schema")) else { continue };
-        let mut schema = metadata
-            .output_schema
-            .clone()
-            .unwrap_or_else(|| {
-                json!({
-                    "type": "object", "required": ["status", "body"], "additionalProperties": false,
-                    "properties": {"status": {"type": "integer", "minimum": 100, "maximum": 599},
-                        "body": {"oneOf": [true]}}
-                })
-            });
-        match schema
-            .pointer_mut("/properties/body/oneOf")
-            .and_then(Value::as_array_mut)
-        {
-            Some(variants) if !variants.is_empty() => variants[0] = body_schema.clone(),
-            _ => {
-                let properties = schema
-                    .get_mut("properties")
-                    .and_then(Value::as_object_mut)
-                    .ok_or(RestError::Arguments)?;
-                properties.insert("body".into(), json!({"oneOf": [body_schema]}));
-            }
+        if let Some(media) = media.filter(|media| media.get("schema").is_some()) {
+            return Ok(Some(media));
         }
-        retain_component_schemas(&mut schema, spec)?;
-        compile_schema(&schema)?;
-        return Ok(Some(schema));
     }
     Ok(None)
+}
+
+/// The output schema of `metadata`'s tool: its JSON answer's schema as the
+/// `body` of a status and body. A tool whose answer carries a file
+/// ([`file_answer`]) has none, since it answers the file, not the JSON.
+pub(super) fn output_schema(
+    spec: &Value,
+    metadata: &ToolMetadata,
+) -> Result<Option<Value>, RestError> {
+    let Some(media) = json_answer(spec, metadata)? else { return Ok(None) };
+    if let Some(declared) = media.get(FILE_EXTENSION) {
+        FileAnswer::declared(declared)?;
+        return Ok(None);
+    }
+    let body_schema = &media["schema"];
+    let mut schema = metadata
+        .output_schema
+        .clone()
+        .unwrap_or_else(|| {
+            json!({
+                "type": "object", "required": ["status", "body"], "additionalProperties": false,
+                "properties": {"status": {"type": "integer", "minimum": 100, "maximum": 599},
+                    "body": {"oneOf": [true]}}
+            })
+        });
+    match schema
+        .pointer_mut("/properties/body/oneOf")
+        .and_then(Value::as_array_mut)
+    {
+        Some(variants) if !variants.is_empty() => variants[0] = body_schema.clone(),
+        _ => {
+            let properties = schema
+                .get_mut("properties")
+                .and_then(Value::as_object_mut)
+                .ok_or(RestError::Arguments)?;
+            properties.insert("body".into(), json!({"oneOf": [body_schema]}));
+        }
+    }
+    retain_component_schemas(&mut schema, spec)?;
+    compile_schema(&schema)?;
+    Ok(Some(schema))
+}
+
+/// A file a REST API answers inside its JSON, as a string of base64 or
+/// base64url, declared by the operation's JSON answer with
+/// `x-gateway-file`: `{"pointer": "/data", "encoding": "base64url"}`. A
+/// success answer of the tool is then the decoded file as an embedded
+/// resource, never the JSON around it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FileAnswer {
+    /// The JSON Pointer (RFC 6901) of the string holding the file.
+    pointer: String,
+    encoding: FileEncoding,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum FileEncoding {
+    /// RFC 4648 section 4, padded or not.
+    Base64,
+    /// RFC 4648 section 5, padded or not.
+    Base64url,
+}
+
+impl FileAnswer {
+    fn declared(declared: &Value) -> Result<Self, RestError> {
+        let file: Self = serde::Deserialize::deserialize(declared).map_err(|_| RestError::Arguments)?;
+        if !file.pointer.starts_with('/') || file.pointer.len() > MAX_FILE_POINTER {
+            return Err(RestError::Arguments);
+        }
+        Ok(file)
+    }
+
+    /// The file `body` carries: the string at the pointer of its JSON,
+    /// decoded. `None` when `body` is not JSON, has no string there or the
+    /// string is not in the declared encoding.
+    fn bytes(
+        &self,
+        body: &[u8],
+    ) -> Option<Vec<u8>> {
+        use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+        const EITHER_PADDING: GeneralPurposeConfig =
+            GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent);
+        const BASE64: GeneralPurpose = GeneralPurpose::new(&base64::alphabet::STANDARD, EITHER_PADDING);
+        const BASE64URL: GeneralPurpose = GeneralPurpose::new(&base64::alphabet::URL_SAFE, EITHER_PADDING);
+        let answer: Value = serde_json::from_slice(body).ok()?;
+        let encoded = answer
+            .pointer(&self.pointer)?
+            .as_str()?;
+        match self.encoding {
+            FileEncoding::Base64 => BASE64.decode(encoded),
+            FileEncoding::Base64url => BASE64URL.decode(encoded),
+        }
+        .ok()
+    }
+}
+
+/// The file `metadata`'s tool answers inside its JSON, when its operation's
+/// JSON answer declares one with `x-gateway-file`. A declaration that is not
+/// a [`FileAnswer`] refuses the tool, as an unusable output schema does.
+pub(super) fn file_answer(
+    spec: &Value,
+    metadata: &ToolMetadata,
+) -> Result<Option<FileAnswer>, RestError> {
+    json_answer(spec, metadata)?
+        .and_then(|media| media.get(FILE_EXTENSION))
+        .map(FileAnswer::declared)
+        .transpose()
 }
 
 pub(super) fn routing_spec(spec: &Value) -> Result<Value, RestError> {
@@ -642,6 +737,7 @@ async fn add_body(
 pub(super) async fn call(
     base_url: &str,
     metadata: &ToolMetadata,
+    file: Option<&FileAnswer>,
     arguments: &Value,
     target_headers: &HeaderMap,
     limits: &McpHttpConfig,
@@ -652,6 +748,7 @@ pub(super) async fn call(
     send(
         base_url,
         metadata,
+        file,
         arguments,
         target_headers,
         limits,
@@ -683,6 +780,7 @@ pub(super) async fn call(
 pub(super) async fn call_through_transit_point(
     base_url: &str,
     metadata: &ToolMetadata,
+    file: Option<&FileAnswer>,
     arguments: &Value,
     target_headers: &HeaderMap,
     limits: &McpHttpConfig,
@@ -694,6 +792,7 @@ pub(super) async fn call_through_transit_point(
     send(
         base_url,
         metadata,
+        file,
         arguments,
         target_headers,
         limits,
@@ -745,6 +844,7 @@ async fn pinned_client(
 async fn send(
     base_url: &str,
     metadata: &ToolMetadata,
+    file: Option<&FileAnswer>,
     arguments: &Value,
     target_headers: &HeaderMap,
     limits: &McpHttpConfig,
@@ -914,6 +1014,14 @@ async fn send(
             return Err(RestError::Limit);
         }
         body.extend_from_slice(&chunk);
+    }
+    if let Some(file) = file.filter(|_| status.is_success()) {
+        return Ok(match file.bytes(&body) {
+            Some(bytes) => CallToolResult::success(vec![binary_content(&url, None, &bytes)]),
+            None => CallToolResult::error(vec![ContentBlock::text(
+                "REST response does not carry the file its tool declares",
+            )]),
+        });
     }
     let is_image = !body.is_empty()
         && content_type
@@ -1135,6 +1243,7 @@ mod tests {
         let result = call(
             &base,
             &tool,
+            None,
             &json!({"request_body": {"message": "hello world", "count": 2}}),
             &HeaderMap::new(),
             &limits,
@@ -1153,6 +1262,7 @@ mod tests {
         let result = call(
             &base,
             &tool,
+            None,
             &arguments,
             &HeaderMap::new(),
             &limits,
@@ -1172,6 +1282,7 @@ mod tests {
             call(
                 &base,
                 &tool,
+                None,
                 &arguments,
                 &HeaderMap::new(),
                 &bounded,
@@ -1347,6 +1458,7 @@ mod tests {
             let result = call(
                 &base,
                 &tool,
+                None,
                 &json!({}),
                 &HeaderMap::new(),
                 &limits,
@@ -1381,6 +1493,7 @@ mod tests {
         let image = call(
             &base,
             &metadata("/image"),
+            None,
             &json!({}),
             &HeaderMap::new(),
             &limits,
@@ -1395,8 +1508,18 @@ mod tests {
         assert_eq!(image["content"][0]["mimeType"], "image/png");
         assert!(
             matches!(
-                call(&base, &metadata("/ok"), &json!({}), &HeaderMap::new(), &limits, "application/json", None, None)
-                    .await,
+                call(
+                    &base,
+                    &metadata("/ok"),
+                    None,
+                    &json!({}),
+                    &HeaderMap::new(),
+                    &limits,
+                    "application/json",
+                    None,
+                    None
+                )
+                .await,
                 Err(RestError::Target)
             ),
             "a backend that resolves to loopback is refused at call time"
@@ -1406,6 +1529,7 @@ mod tests {
                 call(
                     &base,
                     &metadata(path),
+                    None,
                     &json!({}),
                     &HeaderMap::new(),
                     &limits,
@@ -1476,6 +1600,7 @@ mod tests {
                 let result = call(
                     &base,
                     &metadata(path),
+                    None,
                     &json!({}),
                     &HeaderMap::new(),
                     &limits,
@@ -1527,6 +1652,7 @@ mod tests {
         let mismatched = call(
             &base,
             &schema_tool,
+            None,
             &json!({}),
             &HeaderMap::new(),
             &limits,
@@ -1544,6 +1670,196 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("hello")
+        );
+        tasks.shutdown().await;
+    }
+
+    #[test]
+    fn a_file_answer_is_declared_on_the_json_answer_and_a_malformed_declaration_refuses_the_tool() {
+        let spec = |declared: Option<Value>| {
+            let mut media = json!({"schema": {"type": "object"}});
+            if let Some(declared) = declared {
+                media[FILE_EXTENSION] = declared;
+            }
+            json!({
+                "paths": {
+                    "/file": {"get": {"responses": {"200": {"content": {"application/json": media}}}}},
+                    "/shared": {"get": {"responses": {"200": {"$ref": "#/components/responses/File"}}}}
+                },
+                "components": {"responses": {"File": {"content": {"application/json": {
+                    "schema": {"type": "object"}, FILE_EXTENSION: {"pointer": "/file/content", "encoding": "base64"}
+                }}}}}
+            })
+        };
+        let declared = spec(Some(json!({"pointer": "/data", "encoding": "base64url"})));
+        assert_eq!(
+            file_answer(&declared, &metadata("/file")).unwrap(),
+            Some(FileAnswer {
+                pointer: "/data".into(),
+                encoding: FileEncoding::Base64url
+            })
+        );
+        assert_eq!(
+            output_schema(&declared, &metadata("/file")).unwrap(),
+            None,
+            "a tool answering a file has no output schema"
+        );
+        assert_eq!(
+            file_answer(&declared, &metadata("/shared")).unwrap(),
+            Some(FileAnswer {
+                pointer: "/file/content".into(),
+                encoding: FileEncoding::Base64
+            })
+        );
+        let undeclared = spec(None);
+        assert_eq!(file_answer(&undeclared, &metadata("/file")).unwrap(), None);
+        assert!(
+            output_schema(&undeclared, &metadata("/file"))
+                .unwrap()
+                .is_some()
+        );
+        for malformed in [
+            json!({"pointer": "data", "encoding": "base64url"}),
+            json!({"pointer": "", "encoding": "base64url"}),
+            json!({"pointer": format!("/{}", "a".repeat(MAX_FILE_POINTER)), "encoding": "base64url"}),
+            json!({"pointer": "/data"}),
+            json!({"pointer": "/data", "encoding": "hex"}),
+            json!({"pointer": "/data", "encoding": "Base64"}),
+            json!({"pointer": "/data", "encoding": "base64url", "media_type": "application/pdf"}),
+            json!({"encoding": "base64url"}),
+            json!("/data"),
+            json!(true),
+        ] {
+            let spec = spec(Some(malformed.clone()));
+            assert!(file_answer(&spec, &metadata("/file")).is_err(), "{malformed}");
+            assert!(output_schema(&spec, &metadata("/file")).is_err(), "{malformed}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_inside_a_json_answer_arrives_as_an_embedded_resource_with_its_bytes() {
+        use axum::response::IntoResponse;
+
+        const FILE: &[u8] = b"%PDF-1.7\n\xfb\xff\xbf\x00\x01";
+        let engine = |alphabet: &base64::alphabet::Alphabet, padded: bool| {
+            base64::engine::GeneralPurpose::new(
+                alphabet,
+                base64::engine::GeneralPurposeConfig::new().with_encode_padding(padded),
+            )
+        };
+        let padded = engine(&base64::alphabet::URL_SAFE, true).encode(FILE);
+        let unpadded = engine(&base64::alphabet::URL_SAFE, false).encode(FILE);
+        let standard = engine(&base64::alphabet::STANDARD, true).encode(FILE);
+        assert!(padded.ends_with('=') && padded.contains(['-', '_']), "{padded}");
+        assert!(standard.contains(['+', '/']), "{standard}");
+        let answers = [
+            ("/padded", json!({"size": FILE.len(), "data": padded})),
+            ("/unpadded", json!({"size": FILE.len(), "data": unpadded})),
+            ("/nested", json!({"file": {"content": standard.clone()}})),
+            ("/missing", json!({"size": FILE.len()})),
+            ("/number", json!({"data": 5})),
+            ("/garbled", json!({"data": "not base64!"})),
+            ("/other-alphabet", json!({"data": standard})),
+        ];
+        let mut app = axum::Router::new()
+            .route("/not-json", axum::routing::get(|| async { "plain words" }))
+            .route(
+                "/denied",
+                axum::routing::get(|| async {
+                    (axum::http::StatusCode::FORBIDDEN, axum::Json(json!({"error": "no access to this file"})))
+                        .into_response()
+                }),
+            );
+        for (path, answer) in answers {
+            app = app.route(path, axum::routing::get(move || async move { axum::Json(answer).into_response() }));
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let limits = McpHttpConfig::default();
+        let fetch = |path: &'static str, pointer: &'static str, encoding: &'static str| {
+            let base = base.clone();
+            let limits = limits.clone();
+            async move {
+                let file = FileAnswer::declared(&json!({"pointer": pointer, "encoding": encoding})).unwrap();
+                let result = call(
+                    &base,
+                    &metadata(path),
+                    Some(&file),
+                    &json!({}),
+                    &HeaderMap::new(),
+                    &limits,
+                    "application/json",
+                    Some(base.as_str()),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    result
+                        .structured_content
+                        .is_none(),
+                    "{path}"
+                );
+                serde_json::to_value(result).unwrap()
+            }
+        };
+        for (path, pointer, encoding) in [
+            ("/padded", "/data", "base64url"),
+            ("/unpadded", "/data", "base64url"),
+            ("/nested", "/file/content", "base64"),
+        ] {
+            let result = fetch(path, pointer, encoding).await;
+            assert_eq!(result["isError"], false, "{path}");
+            assert_eq!(
+                result["content"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(1),
+                "{path}"
+            );
+            assert_eq!(result["content"][0]["type"], "resource", "{path}");
+            assert_eq!(result["content"][0]["resource"]["mimeType"], "application/octet-stream", "{path}");
+            assert_eq!(result["content"][0]["resource"]["uri"], format!("{base}{path}"), "{path}");
+            let blob = base64::engine::general_purpose::STANDARD
+                .decode(
+                    result["content"][0]["resource"]["blob"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(blob, FILE, "{path}");
+        }
+        for (path, encoding) in [
+            ("/missing", "base64url"),
+            ("/number", "base64url"),
+            ("/garbled", "base64url"),
+            ("/other-alphabet", "base64url"),
+            ("/not-json", "base64url"),
+        ] {
+            let result = fetch(path, "/data", encoding).await;
+            assert_eq!(result["isError"], true, "{path}");
+            assert_eq!(
+                result["content"],
+                json!([{"type": "text", "text": "REST response does not carry the file its tool declares"}]),
+                "{path}: the answer is never quoted back"
+            );
+        }
+        let denied = fetch("/denied", "/data", "base64url").await;
+        assert_eq!(denied["isError"], true);
+        assert_eq!(denied["content"][0]["type"], "text", "a failed answer is the REST API's own error");
+        assert!(
+            denied["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("no access to this file")
         );
         tasks.shutdown().await;
     }
@@ -1579,6 +1895,7 @@ mod tests {
                 call(
                     &base,
                     &tool,
+                    None,
                     &json!({}),
                     &HeaderMap::new(),
                     &limits,
@@ -1650,6 +1967,7 @@ mod tests {
             let result = call(
                 &base,
                 &metadata(path),
+                None,
                 &json!({}),
                 &HeaderMap::new(),
                 &limits,
@@ -1710,6 +2028,7 @@ mod tests {
                 let answer = call_through_transit_point(
                     &base,
                     &metadata("/files"),
+                    None,
                     &json!({}),
                     &headers,
                     &limits,
@@ -1787,6 +2106,7 @@ mod tests {
                 let answer = call_through_transit_point(
                     &base,
                     &metadata("/files"),
+                    None,
                     &json!({}),
                     &HeaderMap::new(),
                     &limits,
@@ -1874,6 +2194,7 @@ mod tests {
                 let answer = call_through_transit_point(
                     &origin,
                     &post,
+                    None,
                     &json!({"request_body": body}),
                     &HeaderMap::new(),
                     &limits,

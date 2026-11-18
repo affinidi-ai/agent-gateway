@@ -1978,7 +1978,7 @@ async fn process_modern_mcp_request_with_headers(
                 "Tool arguments must be an object",
             ));
         }
-        let (tool, arguments, content_type) = {
+        let (tool, file, arguments, content_type) = {
             let server = server.read().await;
             let mut tool = server
                 .get_tool(name)
@@ -2035,7 +2035,10 @@ async fn process_modern_mcp_request_with_headers(
                         "Tool output schema cannot be validated offline",
                     )
                 })?;
-            (tool, arguments, content_type)
+            let file = super::modern_rest::file_answer(&server.openapi_spec, &tool.metadata).map_err(|_| {
+                failure(StatusCode::BAD_REQUEST, error_codes::INVALID_PARAMS, "Tool file answer is not usable")
+            })?;
+            (tool, file, arguments, content_type)
         };
         crate::url_validation::reject_cloud_metadata_url(&proxy.base_url).map_err(|_| {
             failure(StatusCode::BAD_GATEWAY, error_codes::INTERNAL_ERROR, "MCP proxy target is not permitted")
@@ -2071,6 +2074,7 @@ async fn process_modern_mcp_request_with_headers(
             super::modern_rest::call(
                 &proxy.base_url,
                 &tool.metadata,
+                file.as_ref(),
                 &arguments,
                 &target_headers,
                 &config,
@@ -2697,10 +2701,12 @@ fn tool_call_leaves_base(
 
 /// What a credentialed legacy tool call sends through the gateway's REST client, worked out once
 /// per call rather than per retry: the [`legacy_base_directory`] of the proxy's `base_url`, the tool with its
-/// output schema, the request content type, and the egress allow-list its backend is vetted with.
+/// output schema, the file its answer carries, the request content type, and the egress allow-list its
+/// backend is vetted with.
 struct StoredToolCall {
     directory: Url,
     metadata: rmcp_openapi::ToolMetadata,
+    file: Option<super::modern_rest::FileAnswer>,
     content_type: String,
     egress_allowlist: Option<String>,
 }
@@ -2717,11 +2723,13 @@ impl StoredToolCall {
         let mut metadata = tool.metadata.clone();
         metadata.output_schema =
             super::modern_rest::output_schema(spec, &metadata).map_err(|error| error.to_string())?;
+        let file = super::modern_rest::file_answer(spec, &metadata).map_err(|error| error.to_string())?;
         let content_type =
             super::modern_rest::request_content_type(spec, &metadata).map_err(|error| error.to_string())?;
         Ok(Self {
             directory,
             metadata,
+            file,
             content_type,
             egress_allowlist: rest_egress_allowlist(proxy),
         })
@@ -2754,6 +2762,7 @@ async fn call_legacy_tool(
     super::modern_rest::call(
         stored.directory.as_str(),
         &stored.metadata,
+        stored.file.as_ref(),
         arguments,
         credential_headers,
         limits,
@@ -3404,6 +3413,7 @@ pub async fn serve_through_transit_point(
             match super::modern_rest::call_through_transit_point(
                 stored.directory.as_str(),
                 &stored.metadata,
+                stored.file.as_ref(),
                 &arguments,
                 &headers,
                 limits,
@@ -5012,6 +5022,128 @@ mod tests {
         let error = call(3073).await.unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_GATEWAY);
         assert_eq!(error.message, "MCP tool result exceeds the configured limit");
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn owned_modern_file_answers_arrive_decoded_and_advertise_no_output_schema() {
+        use serde_json::json;
+
+        let app = axum::Router::new()
+            .route(
+                "/attachments/{id}",
+                axum::routing::get(|| async { axum::Json(json!({"size": 4, "data": "AAECAw"})) }),
+            )
+            .route("/items", axum::routing::get(|| async { axum::Json(json!({"items": []})) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let answer = |declared: serde_json::Value| {
+            json!({"200": {"description": "OK", "content": {"application/json": {
+                "schema": {"type": "object"}, "x-gateway-file": declared
+            }}}})
+        };
+        let proxy = McpProxy::new(
+            "File tools".into(),
+            String::new(),
+            base,
+            json!({
+                "openapi": "3.0.0", "info": {"title": "Tools", "version": "1.0"}, "paths": {
+                    "/attachments/{id}": {"get": {
+                        "operationId": "read_attachment",
+                        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+                        "responses": answer(json!({"pointer": "/data", "encoding": "base64url"}))
+                    }},
+                    "/broken/{id}": {"get": {
+                        "operationId": "broken_attachment",
+                        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+                        "responses": answer(json!({"pointer": "/data", "encoding": "hex"}))
+                    }},
+                    "/items": {"get": {
+                        "operationId": "list_items",
+                        "responses": {"200": {"description": "OK", "content": {"application/json": {
+                            "schema": {"type": "object"}
+                        }}}}
+                    }}
+                }
+            })
+            .to_string(),
+            "/mcp".into(),
+            "/file-tools".into(),
+        );
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "surface-file-tools", "name": "Surface file tools",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/file-tools", "protocol": "mcp"},
+            "target": {"endpoint": format!("proxy://{}", proxy.id)}
+        }))
+        .unwrap();
+        let manager = super::McpServerManager::new();
+        manager
+            .create_server(&proxy)
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+        let versions = crate::mcp::request_validation::MODERN_ONLY_POLICY;
+        let send = |method: &str, params: Option<serde_json::Value>| {
+            let mut request = owned_modern_request("tools/list");
+            request.method = method.to_string();
+            if params.is_some() {
+                request.params = params;
+            }
+            let prepared = client
+                .post(format!("proxy://{}", proxy.id))
+                .body("{}")
+                .build()
+                .unwrap();
+            let (proxy, surface, client) = (&proxy, &surface, &client);
+            async move {
+                super::handle_modern_surface_request(proxy, surface, &request, prepared, client, versions, None).await
+            }
+        };
+        let listed = send("tools/list", None)
+            .await
+            .unwrap();
+        let tools = listed["result"]["tools"]
+            .as_array()
+            .unwrap();
+        let tool = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+        };
+        assert!(tool("list_items").unwrap()["outputSchema"].is_object());
+        assert!(
+            tool("read_attachment")
+                .unwrap()
+                .get("outputSchema")
+                .is_none(),
+            "a tool answering a file advertises no output schema"
+        );
+        assert!(tool("broken_attachment").is_none(), "a malformed file declaration drops the tool: {tools:?}");
+        let read = send("tools/call", Some(json!({"name": "read_attachment", "arguments": {"id": "a1"}})))
+            .await
+            .unwrap();
+        assert_eq!(read["result"]["isError"], false, "{read}");
+        assert!(
+            read["result"]
+                .get("structuredContent")
+                .is_none(),
+            "{read}"
+        );
+        assert_eq!(read["result"]["content"][0]["type"], "resource", "{read}");
+        assert_eq!(read["result"]["content"][0]["resource"]["blob"], "AAECAw==", "{read}");
+        assert_eq!(read["result"]["content"][0]["resource"]["mimeType"], "application/octet-stream", "{read}");
+        let refused = send("tools/call", Some(json!({"name": "broken_attachment", "arguments": {"id": "a1"}})))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
         tasks.shutdown().await;
     }
 

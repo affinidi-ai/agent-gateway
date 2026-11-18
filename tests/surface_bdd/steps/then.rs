@@ -3494,6 +3494,73 @@ fn mcp_tool_result_is_rest_api_file_as_embedded_resource(
     );
 }
 
+#[then(expr = "the MCP tool result is the file inside REST API {string}'s JSON as an embedded {string} resource")]
+fn mcp_tool_result_is_file_inside_rest_api_json_as_embedded_resource(
+    world: &mut SurfaceWorld,
+    actor_name: String,
+    mime_type: String,
+) {
+    let configured = &get_observed_target_for_actor(world, &actor_name, TargetActorKind::RestApi)
+        .configured_response
+        .body;
+    let expected = configured
+        .get("data")
+        .and_then(|data| data.as_str())
+        .map(|data| {
+            base64::engine::general_purpose::URL_SAFE
+                .decode(data)
+                .expect("the configured file is base64url")
+        })
+        .unwrap_or_else(|| {
+            panic!("REST API '{actor_name}' must be configured with a file in its JSON. Configured: {configured}")
+        });
+    let body = get_response_body_value(world);
+    assert_eq!(
+        body.pointer("/result/isError"),
+        Some(&serde_json::Value::Bool(false)),
+        "expected a successful MCP tool result. Body: {body}"
+    );
+    assert_eq!(
+        body.pointer("/result/content/0/type")
+            .and_then(|value| value.as_str()),
+        Some("resource"),
+        "expected an embedded resource. Body: {body}"
+    );
+    assert_eq!(
+        body.pointer("/result/content/0/resource/mimeType")
+            .and_then(|value| value.as_str()),
+        Some(mime_type.as_str()),
+        "Body: {body}"
+    );
+    let blob = body
+        .pointer("/result/content/0/resource/blob")
+        .and_then(|value| value.as_str())
+        .map(|blob| {
+            base64::engine::general_purpose::STANDARD
+                .decode(blob)
+                .expect("an embedded resource's blob is base64")
+        });
+    assert_eq!(blob, Some(expected), "the file's bytes must arrive decoded. Body: {body}");
+}
+
+#[then(expr = "the MCP tool result is an error saying {string}")]
+fn mcp_tool_result_is_an_error_saying(
+    world: &mut SurfaceWorld,
+    text: String,
+) {
+    let body = get_response_body_value(world);
+    assert_eq!(
+        body.pointer("/result/isError"),
+        Some(&serde_json::Value::Bool(true)),
+        "expected an MCP tool result with isError true. Body: {body}"
+    );
+    assert_eq!(
+        body.pointer("/result/content"),
+        Some(&serde_json::json!([{"type": "text", "text": text}])),
+        "Body: {body}"
+    );
+}
+
 #[then(expr = "the MCP tool result without the Target credential matches REST API {string} response")]
 fn mcp_tool_result_without_target_credential_matches_rest_api_response(
     world: &mut SurfaceWorld,
