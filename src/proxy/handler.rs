@@ -8080,32 +8080,16 @@ async fn proxy_charged_request(
     // never reach the caller.
     let mut upstream_response = match (target_grant.as_ref(), released_target_grant) {
         (Some(route), Some(released)) => {
-            let retried = matches!(
-                crate::delegation_vault::release::vendor_answer(
-                    upstream_response.status(),
-                    upstream_response.headers()
-                ),
-                crate::delegation_vault::release::VendorAnswer::TokenRejected
-            );
             match route
                 .answer(&state, released, upstream_response, target_grant_retry)
                 .await
             {
-                Ok(mut response) => {
-                    if retried
-                        && let Err(failure) = crate::proxy::response_auth::authenticate_response(
-                            &state.surface,
-                            response.headers_mut(),
-                            state.secrets_store.as_ref(),
-                        )
-                        .await
-                    {
-                        connection_guard
-                            .decrement()
-                            .await;
-                        return Ok(crate::proxy::response_auth::refuse(failure, &audit_facts, &body_bytes));
-                    }
-                    response
+                Ok(response) => response,
+                Err(crate::proxy::target_grant::TargetGrantRefusal::ResponseUnauthenticated(failure)) => {
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Ok(crate::proxy::response_auth::refuse(failure, &audit_facts, &body_bytes));
                 }
                 Err(refused) => {
                     connection_guard

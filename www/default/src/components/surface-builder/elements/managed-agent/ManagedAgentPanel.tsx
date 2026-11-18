@@ -18,6 +18,7 @@ import AgentCardFetchLine from '../../agent-card/AgentCardFetchLine';
 import PartnerGrantReleaseSection, { isHttpTarget } from './PartnerGrantReleaseSection';
 import A2aProxyEndpointFields, { type A2aProxyOption } from './A2aProxyEndpointFields';
 import ResponseAuthSection from './ResponseAuthSection';
+import { isResponseAuthTarget } from './responseAuth';
 
 interface McpProxy {
   id: string;
@@ -407,7 +408,7 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
         </div>
       )}
 
-      {isHttpTarget(config.endpoint) && (
+      {isResponseAuthTarget(config.endpoint) && (
         <ResponseAuthSection
           endpoint={config.endpoint}
           value={config.response_auth}

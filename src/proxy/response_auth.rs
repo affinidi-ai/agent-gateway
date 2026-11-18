@@ -18,9 +18,9 @@ mod tls;
 
 #[cfg(test)]
 pub(crate) use tests::{BRAVO_KEY, BRAVO_KEY_HEADER, api_key_bravo, bravo_key_store};
-pub(crate) use tls::forget_tls_settings;
 #[cfg(test)]
 pub(crate) use tls::tests::{pinned_bravo, untrusted_target};
+pub(crate) use tls::{forget_all_tls_settings, forget_tls_settings};
 pub use tls::{handshake_failure, target_tls, tls_stamp};
 
 use std::sync::Arc;
@@ -202,13 +202,17 @@ async fn accepted_keys(
         return Err(ResponseAuthFailure::Unverifiable);
     }
     let value = Zeroizing::new(secret.value);
-    if value
-        .split(',')
-        .all(|key| key.trim().is_empty())
-    {
+    if !holds_a_key(&value) {
         return Err(ResponseAuthFailure::Unverifiable);
     }
     Ok(value)
+}
+
+/// Whether a secret's `value` holds at least one non-blank comma-separated key.
+pub(crate) fn holds_a_key(value: &str) -> bool {
+    value
+        .split(',')
+        .any(|key| !key.trim().is_empty())
 }
 
 /// Refuses a request whose Target response failed with `failure`: logs the reason, records a

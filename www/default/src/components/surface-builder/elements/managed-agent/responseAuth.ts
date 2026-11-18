@@ -1,5 +1,4 @@
 import type { MtlsTrust } from '../../../../types';
-import { isHttpTarget } from './PartnerGrantReleaseSection';
 
 export interface ApiKeyResponseAuth {
   api_key: { header_name: string; secret_id: string };
@@ -20,8 +19,27 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Whether `endpoint` is a URL with one of `protocols` and a host, read as the
+ * gateway's Response authentication rules read it: trimmed, scheme in any case.
+ */
+function hasProtocol(endpoint: unknown, protocols: string[]): boolean {
+  if (typeof endpoint !== 'string') return false;
+  try {
+    const url = new URL(endpoint.trim());
+    return protocols.includes(url.protocol) && url.host !== '';
+  } catch {
+    return false;
+  }
+}
+
+/** Whether `endpoint` is a Target Response authentication can be set on: an http or https URL. */
+export function isResponseAuthTarget(endpoint: unknown): boolean {
+  return hasProtocol(endpoint, ['http:', 'https:']);
+}
+
 export function isHttpsTarget(endpoint: unknown): boolean {
-  return typeof endpoint === 'string' && endpoint.startsWith('https://');
+  return hasProtocol(endpoint, ['https:']);
 }
 
 /** The method a stored or edited `response_auth` uses; a shape the panel cannot read is `unsupported`. */
@@ -57,7 +75,7 @@ export function withTrustCertificateIds(trust: MtlsTrust, ids: string[]): MtlsTr
  * the setting is not sent for one.
  */
 export function responseAuthProblems(endpoint: unknown, value: unknown): string[] {
-  if (!isHttpTarget(endpoint)) return [];
+  if (!isResponseAuthTarget(endpoint)) return [];
   const method = responseAuthMethod(value);
   if (method === 'api_key') {
     const { header_name, secret_id } = (value as ApiKeyResponseAuth).api_key;
@@ -90,7 +108,7 @@ export function responseAuthProblems(endpoint: unknown, value: unknown): string[
  */
 export function responseAuthToWire(endpoint: unknown, value: unknown): unknown {
   if (value === null) return null;
-  if (isObject(value)) return isHttpTarget(endpoint) ? value : null;
+  if (isObject(value)) return isResponseAuthTarget(endpoint) ? value : null;
   return undefined;
 }
 

@@ -53,6 +53,12 @@ pub(crate) fn forget_tls_settings(surface_id: &str) {
     SETTINGS.forget(surface_id);
 }
 
+/// Drops every mTLS setting built for any surface, so a configuration reload keeps none built
+/// from a surface it no longer serves as it was.
+pub(crate) fn forget_all_tls_settings() {
+    SETTINGS.forget_all();
+}
+
 /// [`ResponseAuthFailure::ServerUntrusted`] when `error`, from sending a request to the Target of
 /// `surface`, is a TLS handshake whose server certificate failed the surface's mTLS server trust.
 /// Any other error, a Target that cannot be reached among them, is `None`.
@@ -128,6 +134,10 @@ impl TlsSettingsCache {
             .retain(|(id, _), _| id != surface_id);
     }
 
+    fn forget_all(&self) {
+        self.built.clear();
+    }
+
     async fn settings(
         &self,
         surface: &AgentSurface,
@@ -189,14 +199,14 @@ impl Material {
         }
         let mut trust = Vec::with_capacity(ids.len());
         for id in ids {
-            trust.push(usable(surface, store.as_ref(), id, trust_kind).await?);
+            trust.push(usable(surface, store.as_ref(), id, trust_kind, false).await?);
         }
         let client = match config
             .client_certificate_id
             .as_deref()
         {
             Some(id) => {
-                let certificate = usable(surface, store.as_ref(), id, CertificateKind::ClientLeaf).await?;
+                let certificate = usable(surface, store.as_ref(), id, CertificateKind::ClientLeaf, true).await?;
                 if certificate
                     .private_key_pem
                     .as_deref()
@@ -286,26 +296,37 @@ impl Material {
     }
 }
 
-/// `id` from `store`, when it is active, of `kind` and one `surface` may use.
+/// `id` from `store`, when it is active, of `kind` and one `surface` may use. A certificate the
+/// gateway `sent` is also held to `tenant_credential_isolation`, so under `enforce` a tenant
+/// surface cannot present an appliance-wide client certificate.
 async fn usable(
     surface: &AgentSurface,
     store: &dyn CertificateStore,
     id: &str,
     kind: CertificateKind,
+    sent: bool,
 ) -> Result<Certificate, ResponseAuthFailure> {
+    let may_reference = |certificate: &Certificate| {
+        let (owner, referenced) = (
+            surface.tenant_id.as_deref(),
+            certificate
+                .tenant_id
+                .as_deref(),
+        );
+        if sent {
+            crate::tenancy::can_reference_with_rule(
+                owner,
+                referenced,
+                crate::config::credential_policy::credential_policy().tenant_credential_isolation,
+            )
+        } else {
+            crate::tenancy::can_reference(owner, referenced)
+        }
+    };
     let why = match store.get(id).await {
         Ok(Some(certificate)) if !certificate.active => "it is inactive",
         Ok(Some(certificate)) if certificate.kind != kind => "it is not of the kind the setting needs",
-        Ok(Some(certificate))
-            if !crate::tenancy::can_reference(
-                surface.tenant_id.as_deref(),
-                certificate
-                    .tenant_id
-                    .as_deref(),
-            ) =>
-        {
-            "it is outside the surface's tenant"
-        }
+        Ok(Some(certificate)) if !may_reference(&certificate) => "it is outside the surface's tenant",
         Ok(Some(certificate)) => return Ok(certificate),
         Ok(None) => "it does not exist",
         Err(_) => "the certificate store could not be read",
@@ -917,6 +938,26 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn test_forgetting_all_drops_every_surfaces_settings() {
+        let (_dir, store) = store().await;
+        put(&store, "bravo", CertificateKind::ClientLeaf, &self_signed(&["127.0.0.1"]), false, None).await;
+        let cache = TlsSettingsCache::default();
+        let first = surface(None, pinned(&["bravo"]));
+        let mut second = surface(None, pinned(&["bravo"]));
+        second.surface_id = "surface-2".to_string();
+        let built = settings(&cache, &first, &store).await;
+        settings(&cache, &second, &store).await;
+        assert_eq!(cache.built.len(), 2);
+
+        cache.forget_all();
+
+        assert_eq!(cache.built.len(), 0);
+        assert_eq!(cache.stamp(&first), None);
+        assert_eq!(cache.stamp(&second), None);
+        assert!(!Arc::ptr_eq(&built, &settings(&cache, &first, &store).await), "built again after forgetting");
+    }
+
+    #[tokio::test]
     async fn test_a_renewed_certificate_opens_a_new_legacy_sse_session() {
         let (_dir, store) = store().await;
         put(&store, "bravo", CertificateKind::ClientLeaf, &self_signed(&["127.0.0.1"]), false, None).await;
@@ -1027,6 +1068,72 @@ pub(super) mod tests {
                 .await;
             assert!(matches!(outcome, Ok(Some(_))), "{owner:?}");
         }
+    }
+
+    async fn tenant_client_certificate_outcome(
+        mode: crate::config::credential_policy::RuleMode,
+        client_owner: Option<&str>,
+    ) -> Result<Option<Arc<ClientConfig>>, ResponseAuthFailure> {
+        let (_dir, store) = store().await;
+        put(&store, "bravo", CertificateKind::ClientLeaf, &self_signed(&["127.0.0.1"]), false, None).await;
+        put(&store, "gateway", CertificateKind::ClientLeaf, &self_signed(&["gateway.example"]), true, client_owner)
+            .await;
+        let mut presenting = pinned(&["bravo"]);
+        presenting["client_certificate_id"] = json!("gateway");
+        let surface = surface(Some("tenant-a"), presenting);
+        let policy: &'static crate::config::credential_policy::CredentialPolicyConfig =
+            Box::leak(Box::new(crate::config::credential_policy::CredentialPolicyConfig {
+                tenant_credential_isolation: mode,
+                ..Default::default()
+            }));
+        crate::config::credential_policy::TEST_CREDENTIAL_POLICY
+            .scope(policy, async {
+                TlsSettingsCache::default()
+                    .settings(&surface, Some(&store))
+                    .await
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_an_appliance_wide_client_certificate_is_refused_to_a_tenant_surface_only_under_enforce() {
+        use crate::config::credential_policy::RuleMode;
+        assert!(matches!(tenant_client_certificate_outcome(RuleMode::Warn, None).await, Ok(Some(_))), "warn");
+        assert_eq!(
+            tenant_client_certificate_outcome(RuleMode::Enforce, None)
+                .await
+                .err(),
+            Some(ResponseAuthFailure::Unverifiable),
+            "enforce"
+        );
+        for mode in [RuleMode::Warn, RuleMode::Enforce] {
+            assert!(
+                matches!(tenant_client_certificate_outcome(mode, Some("tenant-a")).await, Ok(Some(_))),
+                "the tenant's own client certificate under {mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_an_appliance_wide_server_trust_certificate_stays_usable_under_enforce() {
+        let (_dir, store) = store().await;
+        put(&store, "bravo", CertificateKind::ClientLeaf, &self_signed(&["127.0.0.1"]), false, None).await;
+        let policy: &'static crate::config::credential_policy::CredentialPolicyConfig =
+            Box::leak(Box::new(crate::config::credential_policy::CredentialPolicyConfig {
+                tenant_credential_isolation: crate::config::credential_policy::RuleMode::Enforce,
+                ..Default::default()
+            }));
+        let surface = surface(Some("tenant-a"), pinned(&["bravo"]));
+
+        let outcome = crate::config::credential_policy::TEST_CREDENTIAL_POLICY
+            .scope(policy, async {
+                TlsSettingsCache::default()
+                    .settings(&surface, Some(&store))
+                    .await
+            })
+            .await;
+
+        assert!(matches!(outcome, Ok(Some(_))));
     }
 
     #[tokio::test]

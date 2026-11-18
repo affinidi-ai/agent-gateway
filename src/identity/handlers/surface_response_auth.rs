@@ -1,7 +1,8 @@
 //! Save-time rules for Response authentication (`target.response_auth`), on the surface and
 //! each variant as it resolves: only an http or https Target, which a managed agent answers,
 //! may set it; its header is held to the Target authentication header rules; its API key secret
-//! is none the surface sends to the Target or accepts from callers; and an API key
+//! is none the surface sends to the Target or a Transit Point or accepts from callers, and holds a
+//! non-blank key; its certificates are active; and an API key
 //! read from an `http://` Target follows `credential_policy.target_https`: saved with a
 //! warning in `warn`, refused in `enforce` unless the stored surface already had the same
 //! setting on the same Target. mTLS needs an `https://` Target not bound by external consent
@@ -41,7 +42,8 @@ struct Placed {
 /// Refuses the first `target.response_auth` of `surface` that breaks a rule: a Target that is
 /// not an http or https URL, mTLS on a Target that is not https ([`mtls_rule`]), a header that
 /// is not an HTTP field name, is reserved or is already sent to the Target, a key secret the
-/// surface also sends to the Target or accepts from callers ([`shares_a_secret`]), and an API key on
+/// surface also sends to the Target or a Transit Point or accepts from callers ([`shares_a_secret`]),
+/// and an API key on
 /// an `http://` Target while `credential_policy.target_https` is `enforce`, unless `stored` had
 /// the same setting on the same Target. An `http://` Target in `warn` is logged and saved.
 pub(super) fn validate_response_auth_rules(
@@ -77,8 +79,8 @@ pub(super) fn validate_response_auth_rules(
         }
         if shares_a_secret(&view, &config.secret_id) {
             return Err(SurfaceApiError::BadRequest(format!(
-                "{field}.api_key.secret_id must not be a secret the gateway sends to the Target or accepts from \
-                 callers"
+                "{field}.api_key.secret_id must not be a secret the gateway sends to the Target or a Transit Point \
+                 or accepts from callers"
             )));
         }
         if is_http_url(&setting.endpoint) {
@@ -226,9 +228,9 @@ fn mtls_rule(
 }
 
 /// Refuses an mTLS `target.response_auth` of `surface`, or of a variant as it resolves, that
-/// names a certificate of the wrong kind: `pinned` server trust takes client leaf certificates,
-/// `ca` server trust CA certificates, and the client certificate is a client leaf certificate
-/// stored with its private key. Whether each certificate exists and the surface may use it is
+/// names a certificate of the wrong kind or an inactive one: `pinned` server trust takes client
+/// leaf certificates, `ca` server trust CA certificates, and the client certificate is a client
+/// leaf certificate stored with its private key. Whether each certificate exists and the surface may use it is
 /// checked with the surface's other references.
 pub(super) async fn validate_response_auth_certificates(
     certificates: Option<&dyn CertificateStore>,
@@ -243,14 +245,16 @@ pub(super) async fn validate_response_auth_certificates(
             MtlsTrust::Ca { .. } => CertificateKind::Ca,
         };
         for id in config.trust_certificate_ids() {
-            if stored_certificate(certificates, id)
-                .await?
-                .kind
-                != trust_kind
-            {
+            let certificate = stored_certificate(certificates, id).await?;
+            if certificate.kind != trust_kind {
                 return Err(SurfaceApiError::BadRequest(format!(
                     "{field}.mtls.server_trust certificate {id} must be a {} certificate",
                     kind_name(trust_kind)
+                )));
+            }
+            if !certificate.active {
+                return Err(SurfaceApiError::BadRequest(format!(
+                    "{field}.mtls.server_trust certificate {id} must be active"
                 )));
             }
         }
@@ -267,6 +271,9 @@ pub(super) async fn validate_response_auth_certificates(
                 kind_name(CertificateKind::ClientLeaf)
             )));
         }
+        if !certificate.active {
+            return Err(SurfaceApiError::BadRequest(format!("{field}.mtls.client_certificate_id {id} must be active")));
+        }
         if certificate
             .private_key_pem
             .as_deref()
@@ -274,6 +281,33 @@ pub(super) async fn validate_response_auth_certificates(
         {
             return Err(SurfaceApiError::BadRequest(format!(
                 "{field}.mtls.client_certificate_id {id} must be stored with its private key"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses an API key `target.response_auth` of `surface`, or of a variant as it resolves, whose
+/// secret holds no non-blank key, which the request path could never match. Whether the secret
+/// exists and the surface may use it is checked with the surface's other references.
+pub(super) async fn validate_response_auth_secrets(
+    secrets: Option<&dyn crate::secrets::SecretsStore>,
+    surface: &AgentSurface,
+) -> Result<(), SurfaceApiError> {
+    for Placed { field, setting, .. } in placed(surface)? {
+        let ResponseAuthConfig::ApiKey(config) = &setting.response_auth else {
+            continue;
+        };
+        let secret = secrets
+            .ok_or_else(|| SurfaceApiError::InternalError("Secrets store is not configured".to_string()))?
+            .get_by_secret_id(&config.secret_id)
+            .await
+            .map_err(|error| super::surface_tenancy::internal("Secret", error))?
+            .ok_or_else(|| super::surface_tenancy::inaccessible("Secret"))?;
+        if !crate::proxy::response_auth::holds_a_key(&zeroize::Zeroizing::new(secret.value)) {
+            return Err(SurfaceApiError::BadRequest(format!(
+                "{field}.api_key.secret_id {} must hold at least one non-blank key",
+                config.secret_id
             )));
         }
     }
@@ -373,19 +407,33 @@ fn header_rule(
 }
 
 /// Whether `secret_id` is a secret `view` also sends to its Target, by Target authentication or
-/// `caller_key`, or accepts from its callers by an API key method, so the managed agent, or a
-/// caller, would already hold the key its responses are checked against.
+/// `caller_key`, sends to a Transit Point by its Target authentication, or accepts from its
+/// callers by an API key method, so the managed agent, another agent, or a caller would already
+/// hold the key its responses are checked against.
 fn shares_a_secret(
     view: &AgentSurface,
     secret_id: &str,
 ) -> bool {
+    fn static_secret(auth: &crate::config::TargetAuthConfig) -> Option<&str> {
+        match &auth.method {
+            TargetAuthMethod::StaticSecret { secret_id, .. } => Some(secret_id.as_str()),
+            _ => None,
+        }
+    }
     let target_auth = view
         .target
         .auth
         .as_ref()
-        .and_then(|auth| match &auth.method {
-            TargetAuthMethod::StaticSecret { secret_id, .. } => Some(secret_id.as_str()),
-            _ => None,
+        .and_then(static_secret);
+    let transit_auth = view
+        .transit
+        .iter()
+        .flat_map(|transit| transit.points.iter())
+        .filter_map(|point| {
+            point
+                .target_auth
+                .as_ref()
+                .and_then(static_secret)
         });
     let caller_key = view
         .caller_key
@@ -400,6 +448,7 @@ fn shares_a_secret(
         });
     target_auth
         .into_iter()
+        .chain(transit_auth)
         .chain(caller_key)
         .chain(caller_api_keys)
         .any(|used| used == secret_id)
@@ -596,7 +645,7 @@ mod tests {
     }
 
     const SHARED_SECRET: &str = "target.response_auth.api_key.secret_id must not be a secret the gateway sends to \
-                                 the Target or accepts from callers";
+                                 the Target or a Transit Point or accepts from callers";
 
     fn target_auth_with(secret_id: &str) -> Value {
         json!({"method": {"static_secret": {
@@ -623,6 +672,27 @@ mod tests {
         {
             assert_eq!(check(&body), Err(SHARED_SECRET.to_string()), "{case}");
         }
+    }
+
+    fn transit_point_with(secret_id: &str) -> Value {
+        json!({"id": "tp-1", "alias": "partner", "target_endpoint": "https://partner.example/agent",
+            "target_auth": target_auth_with(secret_id)})
+    }
+
+    #[test]
+    fn test_a_key_secret_a_transit_point_sends_is_refused_on_the_surface_and_a_variant() {
+        let mut base = surface("https://bravo.example", api_key("X-Agent-Key"));
+        base["transit"] = json!({"points": [transit_point_with("bravo-key")]});
+        assert_eq!(check(&base), Err(SHARED_SECRET.to_string()));
+
+        let mut variant = surface("https://bravo.example", api_key("X-Agent-Key"));
+        variant["variants"] = json!([{"id": "beta-id", "alias": "beta", "name": "Beta",
+            "overrides": {"transit": {"points": [transit_point_with("bravo-key")]}}}]);
+        assert_eq!(check(&variant), Err(format!("variants['beta'].{SHARED_SECRET}")));
+
+        let mut distinct = surface("https://bravo.example", api_key("X-Agent-Key"));
+        distinct["transit"] = json!({"points": [transit_point_with("partner-key")]});
+        assert_eq!(check(&distinct), Ok(()), "a Transit Point secret of its own");
     }
 
     #[test]
@@ -900,7 +970,11 @@ mod tests {
         }
     }
 
-    async fn certificates(stored: &[(&str, CertificateKind, bool)]) -> (tempfile::TempDir, Box<dyn CertificateStore>) {
+    /// A certificate store holding each `(id, kind, with_key)`, inactive when named in `inactive`.
+    async fn certificates_with_inactive(
+        stored: &[(&str, CertificateKind, bool)],
+        inactive: &[&str],
+    ) -> (tempfile::TempDir, Box<dyn CertificateStore>) {
         let dir = tempfile::tempdir().expect("temp dir");
         let store = crate::certificates::FilesystemCertificateStore::new(dir.path().to_path_buf())
             .await
@@ -917,7 +991,7 @@ mod tests {
                         certificate_pem: "-----BEGIN CERTIFICATE-----".to_string(),
                         private_key_pem: with_key.then(|| "-----BEGIN PRIVATE KEY-----".to_string()),
                         expires_at: None,
-                        active: None,
+                        active: Some(!inactive.contains(id)),
                         identity_did: None,
                     },
                     id.to_string(),
@@ -933,7 +1007,15 @@ mod tests {
         response_auth: Value,
         stored: &[(&str, CertificateKind, bool)],
     ) -> Result<(), String> {
-        let (_dir, store) = certificates(stored).await;
+        certificate_refusal_with_inactive(response_auth, stored, &[]).await
+    }
+
+    async fn certificate_refusal_with_inactive(
+        response_auth: Value,
+        stored: &[(&str, CertificateKind, bool)],
+        inactive: &[&str],
+    ) -> Result<(), String> {
+        let (_dir, store) = certificates_with_inactive(stored, inactive).await;
         validate_response_auth_certificates(
             Some(store.as_ref()),
             &parse(&surface("https://bravo.example", response_auth)),
@@ -995,6 +1077,72 @@ mod tests {
             ("a missing certificate", mtls(pinned()), vec![client], "Certificate reference is not accessible"),
         ] {
             assert_eq!(certificate_refusal(response_auth, &stored).await, Err(refusal.to_string()), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_an_inactive_server_trust_or_client_certificate_is_refused() {
+        let stored =
+            [("bravo-cert", CertificateKind::ClientLeaf, false), ("gateway-cert", CertificateKind::ClientLeaf, true)];
+        assert_eq!(
+            certificate_refusal_with_inactive(mtls(pinned()), &stored, &["bravo-cert"]).await,
+            Err("target.response_auth.mtls.server_trust certificate bravo-cert must be active".to_string())
+        );
+        assert_eq!(
+            certificate_refusal_with_inactive(mtls(pinned()), &stored, &["gateway-cert"]).await,
+            Err("target.response_auth.mtls.client_certificate_id gateway-cert must be active".to_string())
+        );
+        assert_eq!(certificate_refusal_with_inactive(mtls(pinned()), &stored, &[]).await, Ok(()), "both active");
+    }
+
+    async fn secret_refusal(
+        body: &Value,
+        value: &str,
+    ) -> Result<(), String> {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = crate::secrets::FilesystemSecretsStore::new_async(
+            dir.path()
+                .to_str()
+                .expect("utf-8 path"),
+        )
+        .await
+        .expect("secrets store");
+        crate::secrets::SecretsStore::create(
+            &store,
+            crate::secrets::CreateSecretRequest {
+                tenant_id: None,
+                name: "bravo-key".to_string(),
+                secret_id: "bravo-key".to_string(),
+                description: None,
+                value: value.to_string(),
+                secret_type: "General".to_string(),
+                tags: vec![],
+            },
+        )
+        .await
+        .expect("secret stored");
+        validate_response_auth_secrets(Some(&store), &parse(body))
+            .await
+            .map_err(|error| match error {
+                SurfaceApiError::BadRequest(message) => message,
+                other => panic!("unexpected error {other:?}"),
+            })
+    }
+
+    #[tokio::test]
+    async fn test_a_key_secret_without_a_non_blank_key_is_refused_on_the_surface_and_a_variant() {
+        const BLANK: &str = "target.response_auth.api_key.secret_id bravo-key must hold at least one non-blank key";
+        let base = surface("https://bravo.example", api_key("X-Agent-Key"));
+        for blank in ["", "   ", " , ,"] {
+            assert_eq!(secret_refusal(&base, blank).await, Err(BLANK.to_string()), "{blank:?}");
+        }
+        let mut variant = surface("https://bravo.example", mtls(pinned()));
+        variant["variants"] = json!([{"id": "beta-id", "alias": "beta", "name": "Beta",
+            "overrides": {"target": {"response_auth": api_key("X-Agent-Key")}}}]);
+        assert_eq!(secret_refusal(&variant, " , ").await, Err(format!("variants['beta'].{BLANK}")));
+
+        for held in ["bravo-secret", " , bravo-secret", "old-key,new-key"] {
+            assert_eq!(secret_refusal(&base, held).await, Ok(()), "{held:?}");
         }
     }
 }

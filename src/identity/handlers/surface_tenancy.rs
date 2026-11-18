@@ -78,6 +78,7 @@ pub async fn validate_surface_references(
         surface,
     )
     .await?;
+    super::surface_response_auth::validate_response_auth_secrets(state.secrets_store.as_deref(), surface).await?;
     super::surface_caller_key::validate_caller_key_secret(state, surface).await?;
     let https_proxies = super::surface_target_auth::https_mcp_proxies(state).await;
     super::surface_target_auth::validate_target_auth_rules(surface, stored, &https_proxies)
@@ -1080,7 +1081,8 @@ async fn credential_provider_has_issuer(
 pub(crate) struct SurfaceReferenceKey {
     pub kind: ResourceKind,
     pub id: String,
-    /// A secret a tenant surface sends upstream, which must not be appliance-wide.
+    /// A secret or client certificate a tenant surface sends upstream, which must not be
+    /// appliance-wide.
     pub same_tenant: bool,
     /// Named only by `$SECRET:` helpers in custom metadata. A surface with no tenant may name
     /// any secret there, even one that does not exist.
@@ -1352,7 +1354,7 @@ impl ReferenceAuthorizer<'_> {
             }
             ResourceKind::Secrets => self.secret(reference).await,
             ResourceKind::Certificates => {
-                self.certificate(&reference.id)
+                self.certificate(reference)
                     .await
             }
             ResourceKind::JwtVerificationStrategies => {
@@ -1453,22 +1455,25 @@ impl ReferenceAuthorizer<'_> {
             return Err(inaccessible("Secret"));
         };
         self.ensure(resource.tenant_id.as_deref(), ResourceKind::Secrets, &resource.secret_id, "Secret")?;
-        if reference.same_tenant
-            && !can_reference_with_rule(
-                self.owner_tenant_id,
-                resource.tenant_id.as_deref(),
-                self.rule_for(ResourceKind::Secrets, id),
-            )
-        {
+        if !self.may_send(reference, resource.tenant_id.as_deref()) {
             return Err(inaccessible("Secret"));
         }
         Ok(())
     }
 
+    fn may_send(
+        &self,
+        reference: &SurfaceReferenceKey,
+        resource_tenant_id: Option<&str>,
+    ) -> bool {
+        may_send_reference(reference, self.owner_tenant_id, resource_tenant_id, &self.grandfathered, self.isolation)
+    }
+
     async fn certificate(
         &self,
-        id: &str,
+        reference: &SurfaceReferenceKey,
     ) -> Result<(), SurfaceApiError> {
+        let id = reference.id.as_str();
         let store = self
             .state
             .certificate_store
@@ -1479,7 +1484,11 @@ impl ReferenceAuthorizer<'_> {
             .await
             .map_err(|error| internal("Certificate", error))?
             .ok_or_else(|| inaccessible("Certificate"))?;
-        self.ensure(resource.tenant_id.as_deref(), ResourceKind::Certificates, &resource.id, "Certificate")
+        self.ensure(resource.tenant_id.as_deref(), ResourceKind::Certificates, &resource.id, "Certificate")?;
+        if !self.may_send(reference, resource.tenant_id.as_deref()) {
+            return Err(inaccessible("Certificate"));
+        }
+        Ok(())
     }
 
     async fn jwt_strategy(
@@ -1826,6 +1835,24 @@ fn listed_owners<'a>(
     }
 }
 
+/// Whether a surface of `owner_tenant_id` may hold `reference` to a resource of
+/// `resource_tenant_id`: always, unless the surface sends it (`same_tenant`), which holds it to
+/// tenant isolation by [`reference_rule`].
+fn may_send_reference(
+    reference: &SurfaceReferenceKey,
+    owner_tenant_id: Option<&str>,
+    resource_tenant_id: Option<&str>,
+    grandfathered: &[(ResourceKind, String)],
+    isolation: RuleMode,
+) -> bool {
+    !reference.same_tenant
+        || can_reference_with_rule(
+            owner_tenant_id,
+            resource_tenant_id,
+            reference_rule(grandfathered, isolation, reference.kind, &reference.id),
+        )
+}
+
 /// How strictly a reference is held to tenant isolation: one the save keeps from the stored
 /// surface (`grandfathered`) is held only to `isolation`, any other is held to `enforce`.
 fn reference_rule(
@@ -1916,12 +1943,14 @@ fn collect_effective_surface_references(
             push_reference(references, ResourceKind::Secrets, &config.secret_id)
         }
         Some(crate::config::response_auth::ResponseAuthConfig::Mtls(config)) => {
-            for id in config
-                .trust_certificate_ids()
-                .iter()
-                .chain(&config.client_certificate_id)
-            {
+            for id in config.trust_certificate_ids() {
                 push_reference(references, ResourceKind::Certificates, id);
+            }
+            if let Some(id) = config
+                .client_certificate_id
+                .as_ref()
+            {
+                push_reference_with_rule(references, ResourceKind::Certificates, id, true);
             }
         }
         None => {}
@@ -3159,8 +3188,38 @@ mod tests {
 
         let keys = collect_surface_reference_keys(&surface).unwrap();
 
-        for certificate_id in ["bravo-cert", "gateway-cert", "beta-ca"] {
+        for certificate_id in ["bravo-cert", "beta-ca"] {
             assert!(!key(&keys, ResourceKind::Certificates, certificate_id).same_tenant, "{certificate_id}");
+        }
+        assert!(key(&keys, ResourceKind::Certificates, "gateway-cert").same_tenant, "the client certificate is sent");
+    }
+
+    #[test]
+    fn an_appliance_wide_mtls_client_certificate_is_refused_on_a_tenant_surface_and_a_server_trust_one_is_not() {
+        let surface: AgentSurface = serde_json::from_value(serde_json::json!({
+            "name": "s", "tenant_id": "tenant-a",
+            "access_point": {"listen_address": "0.0.0.0:8443", "route": "/s", "protocol": "a2a"},
+            "target": {"endpoint": "https://bravo.example",
+                "response_auth": {"mtls": {"server_trust": {"type": "pinned", "certificate_ids": ["bravo-cert"]},
+                    "client_certificate_id": "gateway-cert"}}}
+        }))
+        .unwrap();
+        let keys = collect_surface_reference_keys(&surface).unwrap();
+        let allowed = |id: &str, isolation: RuleMode, certificate_tenant: Option<&str>| {
+            may_send_reference(
+                key(&keys, ResourceKind::Certificates, id),
+                Some("tenant-a"),
+                certificate_tenant,
+                &[],
+                isolation,
+            )
+        };
+
+        for isolation in [RuleMode::Warn, RuleMode::Enforce] {
+            assert!(!allowed("gateway-cert", isolation, None), "appliance-wide client certificate {isolation:?}");
+            assert!(allowed("gateway-cert", isolation, Some("tenant-a")), "own client certificate {isolation:?}");
+            assert!(!allowed("gateway-cert", isolation, Some("tenant-b")), "other tenant's {isolation:?}");
+            assert!(allowed("bravo-cert", isolation, None), "appliance-wide server trust {isolation:?}");
         }
     }
 

@@ -4,6 +4,8 @@ import '@testing-library/jest-dom';
 import ManagedAgentPanel from '../managed-agent/ManagedAgentPanel';
 import ResponseAuthSection from '../managed-agent/ResponseAuthSection';
 import {
+  isHttpsTarget,
+  isResponseAuthTarget,
   responseAuthProblems,
   responseAuthSaveError,
   responseAuthToWire,
@@ -71,6 +73,14 @@ describe('Response Authentication section', () => {
     for (const endpoint of ['fabric://gw-2/surface-2', 'proxy://tools', 'a2a-proxy://worker']) {
       const { unmount } = render(<ManagedAgentPanel {...panelProps({ endpoint })} />);
       expect(screen.queryByTestId(`${T}-section`)).not.toBeInTheDocument();
+      unmount();
+    }
+  });
+
+  it('shows on an http or https Target with an upper-case scheme or surrounding spaces', () => {
+    for (const endpoint of ['HTTPS://agent.example', '  http://agent.example  ']) {
+      const { unmount } = render(<ManagedAgentPanel {...panelProps({ endpoint })} />);
+      expect(screen.getByTestId(`${T}-method`)).toHaveValue('off');
       unmount();
     }
   });
@@ -204,6 +214,44 @@ describe('Response Authentication section', () => {
 });
 
 describe('Response Authentication rules and messages', () => {
+  it('reads the Target as the gateway does: trimmed, scheme in any case, with a host', () => {
+    for (const endpoint of [
+      'https://agent.example',
+      'http://agent.example',
+      'HTTPS://agent.example',
+      'Http://agent.example',
+      ' https://agent.example ',
+    ]) {
+      expect(isResponseAuthTarget(endpoint)).toBe(true);
+    }
+    for (const endpoint of [
+      'proxy://tools',
+      'fabric://gw/s',
+      'a2a-proxy://worker',
+      'http://',
+      'not a url',
+      '',
+      undefined,
+    ]) {
+      expect(isResponseAuthTarget(endpoint)).toBe(false);
+    }
+    expect(isHttpsTarget('HTTPS://agent.example')).toBe(true);
+    expect(isHttpsTarget('  https://agent.example\n')).toBe(true);
+    expect(isHttpsTarget('HTTP://agent.example')).toBe(false);
+    expect(isHttpsTarget('fabric://gw/s')).toBe(false);
+  });
+
+  it('checks the setting on an upper-case or padded https Target', () => {
+    expect(responseAuthProblems('HTTPS://a.example', MTLS)).toEqual([]);
+    expect(responseAuthProblems(' https://a.example ', MTLS)).toEqual([]);
+    expect(responseAuthProblems('HTTP://a.example', MTLS)).toEqual([
+      'mTLS needs an https:// Target',
+    ]);
+    expect(
+      responseAuthProblems('HTTPS://a.example', { api_key: { header_name: 'X', secret_id: '' } })
+    ).toEqual(['Select the secret holding the key']);
+  });
+
   it('blocks an API key without a header or secret and mTLS without a certificate or on http', () => {
     expect(responseAuthProblems('https://a.example', API_KEY)).toEqual([]);
     expect(responseAuthProblems('https://a.example', MTLS)).toEqual([]);
@@ -309,6 +357,16 @@ describe('target.response_auth on save', () => {
       'response_auth'
     );
   });
+
+  it.each(['HTTPS://agent.example', '  https://agent.example  ', 'HTTP://agent.example'])(
+    'keeps a stored setting on a Target set through the API as %p',
+    endpoint => {
+      expect(targetSavedAgain({ endpoint, response_auth: MTLS }).target.response_auth).toEqual(
+        MTLS
+      );
+      expect(responseAuthToWire(endpoint, API_KEY)).toBe(API_KEY);
+    }
+  );
 
   it('writes what the panel set, in the wire shape', () => {
     expect(responseAuthToWire('https://a.example', MTLS)).toBe(MTLS);

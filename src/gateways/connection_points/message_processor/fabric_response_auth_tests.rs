@@ -157,6 +157,80 @@ async fn a_fabric_request_is_served_only_when_the_managed_agents_answer_carries_
     );
 }
 
+/// Funds agent-pay only held for a peer's request are voided, not captured, when the managed
+/// agent answers without its key.
+#[tokio::test]
+async fn funds_held_for_a_fabric_request_whose_answer_lacks_the_key_are_voided_not_captured() {
+    use crate::payments_ledger::SettleAction;
+    use crate::payments_ledger::settlement::SettlementStatus;
+    use crate::payments_ledger::settlement::tests::{Scripted, answer};
+    use crate::proxy::handler::agent_pay_gate::{install_test_transport, tests::MockGate};
+
+    if ran_in_child("ATG_FABRIC_RESPONSE_AUTH_VOID_CHILD").await {
+        return;
+    }
+    let gateway = format!("fabric-response-auth-gate-{}", uuid::Uuid::new_v4());
+    install_test_transport(
+        &gateway,
+        MockGate::answering(
+            200,
+            &[
+                ("Payment-Receipt", "authorization-receipt"),
+                ("payment-authorization", "auth-fabric-response-key"),
+                ("payment-capture-deadline", "2099-01-01T00:00:00Z"),
+            ],
+            json!({}),
+        ),
+    );
+    let settlement = Scripted::settling(vec![answer(SettlementStatus::Voided)]);
+    crate::payments_ledger::settlement::install_test_client(&gateway, settlement.clone());
+    let agent = ManagedAgent::start().await;
+    let mut paid = authenticated_surface(&agent.url, api_key_bravo());
+    paid.target.payment_policy = Some(
+        serde_json::from_value(json!({"type": "agent_pay", "payment_gateway_id": gateway,
+            "payment_surface_id": "pay-1", "require_all": true}))
+        .unwrap(),
+    );
+    let root = tempfile::tempdir().unwrap();
+    let _receiver = receiver(root.path(), &paid).await;
+    let (_dir, secrets) = bravo_key_store().await;
+    super::init_secrets_store(secrets).await;
+    let message = forward_request(
+        root.path(),
+        json!({ "x-api-key": CALLER_KEY, "Content-Type": "application/json",
+            "payment-signature": format!("proof-{}", uuid::Uuid::new_v4()) }),
+        json!({ "jsonrpc": "2.0", "id": 7, "method": "message/send",
+            "params": { "message": { "role": "user", "messageId": "m-1", "parts": [{ "kind": "text", "text": "hi" }] } } }),
+    );
+
+    let (response, events) = crate::audit::producer::capture(forward_response(&message)).await;
+
+    assert_eq!(response["status"], 502, "{response}");
+    assert_eq!(body_of(&response)["error"]["message"], REFUSAL_MESSAGE, "{response}");
+    assert_eq!(fabric_response_auth_refusals(&events), [true], "{events:?}");
+    let mut settled = Vec::new();
+    for _ in 0..200 {
+        settled = settlement
+            .settled
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, action, _)| *action)
+            .collect();
+        if !settled.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(settled, vec![SettleAction::Void]);
+    assert_eq!(
+        agent
+            .calls
+            .load(Ordering::SeqCst),
+        1
+    );
+}
+
 /// A managed agent that fails the mTLS server trust ends the connection in the handshake,
 /// and the peer's request is refused and recorded as a Fabric request refusal.
 #[tokio::test]

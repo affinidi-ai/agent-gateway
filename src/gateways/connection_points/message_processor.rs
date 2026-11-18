@@ -3590,9 +3590,9 @@ fn credentialed_card_fetch_refusal(target_status: u16) -> (u16, String) {
 /// authentication, resolved from the gateway's secrets store. A credential that
 /// cannot be resolved yields no card, or under `fallback: passthrough` a card
 /// read without it. The outcome is cached per surface and Target authentication
-/// for the card cache's TTLs, so a request neither fetches the card nor resolves
-/// the credential again, and a variant with its own Target authentication reads
-/// its own card. A Target that is not an `http(s)` URL, such as a `proxy://` MCP
+/// and Response authentication for the card cache's TTLs, so a request neither
+/// fetches the card nor resolves the credential again, and a variant with its own
+/// Target or Response authentication reads its own card. A Target that is not an `http(s)` URL, such as a `proxy://` MCP
 /// proxy, has no card to read, so no credential is resolved for it.
 async fn policy_agent_card(
     surface: &crate::config::agent_surface::AgentSurface,
@@ -3610,14 +3610,15 @@ async fn policy_agent_card(
                 .trim_end_matches('/')
         ),
     };
-    let target_auth = serde_json::to_string(&surface.target.auth).unwrap_or_default();
+    let target_settings =
+        serde_json::to_string(&(&surface.target.auth, &surface.target.response_auth)).unwrap_or_default();
     if let Some(card) =
-        crate::proxy::agent_card_cache::lookup_surface_card(&surface.surface_id, &card_url, &target_auth)
+        crate::proxy::agent_card_cache::lookup_surface_card(&surface.surface_id, &card_url, &target_settings)
     {
         return card;
     }
     let card = read_policy_agent_card(surface, &card_url, config_id).await;
-    crate::proxy::agent_card_cache::insert_surface_card(&surface.surface_id, &card_url, &target_auth, card.clone());
+    crate::proxy::agent_card_cache::insert_surface_card(&surface.surface_id, &card_url, &target_settings, card.clone());
     card
 }
 

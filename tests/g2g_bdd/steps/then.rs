@@ -785,6 +785,34 @@ async fn gateway_issued_no_managed_agent_identity(
     assert!(managed.is_empty(), "expected gateway {gateway} to issue no Managed Agent identity, observed: {managed:?}");
 }
 
+#[then(expr = "gateway {int} issued a managed agent identity")]
+async fn gateway_issued_a_managed_agent_identity(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let admin = &world
+        .harness()
+        .gw(gateway)
+        .admin;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let managed = admin
+            .managed_agent_identities()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("the Identities dashboard of gateway {gateway} must be readable: {error:#}")
+            });
+        if !managed.is_empty() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected gateway {gateway} to issue a Managed Agent identity, observed none"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 #[then(
     expr = "managed agent {string} received the forwarded request carrying an identity presentation issued by gateway {int}"
 )]

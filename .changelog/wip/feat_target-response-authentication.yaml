@@ -26,8 +26,9 @@ changes:
         the stored one; null removes it. A save refuses the setting on a proxy://, a2a-proxy:// or
         fabric:// Target, mtls on an http Target or on a Target bound by external consent, a header the Target authentication header rules refuse, certificates of the
         wrong kind or without the client certificate's key, a secret or certificate of
-        another tenant, and a key secret the gateway also sends to the Target or accepts from
-        callers, and an API key on an http Target follows credential_policy.target_https.
+        another tenant, an inactive certificate, a key secret holding no non-blank key, and a key
+        secret the gateway also sends to the Target or a Transit Point or accepts from callers,
+        and an API key on an http Target follows credential_policy.target_https.
         Variants may set their own. A release without this setting does not load a surface that
         sets it.
     - timestamp: '2026-11-18T00:00:00Z'

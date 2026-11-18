@@ -1338,7 +1338,8 @@ It covers the response leg only: the answers the Managed Agent sends back to the
 call the managed agent makes through one of the surface's Transit Points is authenticated by
 that Transit Point's own `source_auth` (see
 [Transit Point source authentication](#transit-point-source-authentication)), not by
-`response_auth`.
+`response_auth`. It covers the surface's Target only: responses from a Transit Point's
+destination are not checked.
 
 ```json
 "target": {
@@ -1353,7 +1354,8 @@ the new one, moving the agent to it and then removing the old one. A response pa
 header holds exactly one value equal to one of the keys, compared in constant time
 ([`src/proxy/response_auth.rs`](../src/proxy/response_auth.rs)). The header is removed whatever
 the outcome, so the caller never receives the key. A variant may set its own `response_auth`,
-or clear it as a complete variant, as with `target.auth`.
+or clear it as a complete variant, as with `target.auth`. A variant saved from the dashboard is
+complete and carries its own `response_auth`, so each such variant needs its own setting.
 
 An `api_key` check runs on the answer, so it runs after the request was sent: a server that
 answers at the Target URL without being the managed agent has already received the request,
@@ -1387,7 +1389,8 @@ public CAs are never consulted ([`src/proxy/response_auth/tls.rs`](../src/proxy/
 which the gateway presents to the managed agent so that both ends of the link are proven by
 keys. The TLS settings are built once per surface and setting, so each variant with a setting
 of its own keeps its own, built again when a certificate the setting names changes, and dropped
-when the surface is saved or deleted. The check is the TLS handshake itself: a server certificate that
+when the surface is saved or deleted, on configuration reload and on the periodic disk refresh
+(`cache_refresh_interval_secs`). The check is the TLS handshake itself: a server certificate that
 fails the trust ends the connection before any response exists, and the request is refused as
 below. Any other connection failure, such as a Target that cannot be reached, is answered as
 before. The gateway tells the two apart by the TLS error it receives
@@ -1397,8 +1400,10 @@ The check runs right after the Target answers, success or error, before the resp
 by anything else: before managed identity is resolved, a credential is issued for it, the Trust
 Recorder writes, response policy runs or a held payment is captured. On a Target bound by
 external consent it runs before a refusal of the token refreshes the grant, so an answer that
-fails never refreshes or retries, and the retry's answer is checked again. A streamed answer is
-checked on its response headers before the first event. Every hop to the Target runs it:
+fails never refreshes or retries, and the retry's answer is checked again. An answer with a
+status listed in `networking.retry.retryable_status_codes` that fails the check is refused with
+`502` and never retried. A streamed answer is checked on its response headers before the first
+event. Every hop to the Target runs it:
 
 - the Access Point's direct forward, with its A2A event streams, MCP Streamable HTTP streams
   and the Legacy SSE stream passed through to the caller;
@@ -1454,13 +1459,17 @@ resolves:
   Target by Target authentication, a credential binding, a forwarded caller token, header
   metadata mapping or `caller_key` (the
   [Target authentication header rules](CREDENTIAL_DELEGATION.md#target-authentication-rules));
-- names as `api_key.secret_id` a secret the gateway sends to the Target or accepts from
-  callers: the `secret_id` of a `static_secret` Target authentication, of `caller_key`, or of
-  an Access Point `api_key` caller authentication method, so neither the managed agent nor a
-  caller already holds the key its responses are checked against;
+- names as `api_key.secret_id` a secret the gateway sends to the Target or a Transit Point or
+  accepts from callers: the `secret_id` of a `static_secret` Target authentication, of a Transit Point's
+  `static_secret` `target_auth`, of `caller_key`, or of an Access Point `api_key` caller
+  authentication method, so neither the managed agent nor a caller already holds the key its
+  responses are checked against;
 - names a secret or certificate that does not exist or belongs to another tenant (an
   appliance-wide one is accepted, as for a Transit Point's `source_auth`; see
-  [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md));
+  [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md)), an inactive certificate, or a secret that holds no
+  non-blank key;
+- names, while `[credential_policy] tenant_credential_isolation` is `enforce`, an mTLS
+  `client_certificate_id` that is not the surface's own tenant's;
 - sets `mtls` on a Target bound by external consent (`consent_mode: external`), whatever the
   stored surface held; use `api_key` there;
 - sets `mtls` on a Target that is not `https`, names no `server_trust` certificate, asks a `ca`
@@ -1475,6 +1484,12 @@ An omitted `response_auth` in a `PUT` of the surface keeps the stored one; `"res
 null` removes it. The same holds for a variant's `overrides.target`, in the surface `PUT` and in
 `PUT /v1/surfaces/{id}/variants/{variant_id}`, for a variant already stored under that id; a
 variant whose overrides send no `target` keeps nothing.
+
+Switching `api_key` on or off without the caller ever seeing the key: set `response_auth` before
+the managed agent starts sending the key header, and when removing it, stop the agent sending
+the header first, since without the setting the header passes through to the caller. In a
+deployment where several nodes share `_storage/`, set `response_auth` only once every node runs
+a release with Response authentication: an older node does not load a surface that sets it.
 
 Rolling back to a release without Response authentication: the Target refuses unknown fields,
 so that release does not load a surface that sets `response_auth`. The surface stops serving
