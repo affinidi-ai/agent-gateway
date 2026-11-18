@@ -8999,12 +8999,6 @@ async fn handle_mcp_proxy_forward(
 
     channel_info!(config_id, "📨 Handling MCP request via proxy '{}' (ID: {})", proxy.name, proxy.id);
 
-    // Get global HTTP client for policy-aware requests (timeout, retry, circuit breaker, mirroring)
-    let fallback_client = reqwest::Client::new();
-    let http_client = GLOBAL_HTTP_CLIENT
-        .get()
-        .unwrap_or(&fallback_client);
-
     // Get policy manager for circuit breaker support
     let policy_manager = GLOBAL_POLICY_MANAGER.get();
 
@@ -9118,7 +9112,6 @@ async fn handle_mcp_proxy_forward(
                     prepared,
                     surface,
                     policy_manager,
-                    http_client,
                     &surface.name,
                     sent_token.as_ref(),
                 )

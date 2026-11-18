@@ -779,6 +779,33 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   loopback and private receivers are allowed, cloud metadata is blocked, redirects are not followed.
   The mediator directory request (`AG_MEDIATOR_DIRECTORY_URL`, [`INTEGRATIONS.md`](INTEGRATIONS.md#mediator-directory))
   uses the same client and the same rules.
+- `egress::pinned_forward_client` pins every **traffic mirror** request
+  (`target.networking.mirror.endpoint`, `src/proxy/mirror.rs`) on the direct, `fabric://` and owned MCP
+  Proxy paths, so the mirror gets the same send-time check as the Target: a cloud metadata address is
+  never contacted, the connection is pinned to the address resolved for that request, and a 3xx is
+  returned rather than followed. The lookup and the send share one `timeout_secs` budget: a resolver
+  that does not answer in time refuses the mirror, though the lookup keeps its blocking thread until
+  the OS resolver returns. The mirror is sent the caller headers the Target is sent, never one the
+  Target is refused: a header named like a Target credential header is dropped, and a Target bound by
+  external consent gets only the protocol headers, so its mirror does too. A refused mirror is never
+  contacted: a direct or MCP Proxy request logs a warning and continues, and a `fabric://` request
+  that waits for its mirror answers `503` with the failure class and the text "the mirror request did
+  not complete" (see [Known limitations](#known-limitations)). A fire-and-forget mirror is vetted
+  inside its own task, so slow DNS never delays the live request. Saving a surface or variant also
+  refuses a mirror endpoint that is not `http` or `https`, that carries credentials (`user:pass@`, as
+  for the Target) or that names cloud metadata, with `400`
+  `target.networking.mirror.endpoint: <reason>`, and a `timeout_secs` of zero or above 30 with `400`
+  `target.networking.mirror.timeout_secs: <reason>`; that check resolves no DNS, so the send-time
+  check is the control for a surface written without the admin API (a hand edit under `_storage/`, a
+  restore, DynamoDB), and a stored `timeout_secs` above 30 runs as 30. Loopback and private addresses
+  stay allowed, as for the Target, so an editor can still point a mirror at an internal service. Each
+  mirrored request resolves DNS on a blocking-pool thread and builds a fresh client; none is pooled,
+  because a cached client would reopen the rebinding window. A stored surface whose mirror would be
+  refused still loads: each mirrored request logs one refusal, and the surface gets `400` on its next
+  save, for any edit, until the mirror is fixed. With `HTTP_PROXY` or `HTTPS_PROXY` set, the pinned
+  client sends through the proxy, which resolves the host again, as for the Target above; the gateway
+  must still resolve the host itself first, so a mirror host that only the proxy can resolve is
+  refused, as such a Target is.
 - `egress::pinned_forward_client` also pins the **agent-card fetch** from an
   `http(s)` surface target whenever it carries `target.auth`
   (`src/proxy/handler/agent_card.rs`), so the
@@ -997,6 +1024,15 @@ documented here so operators can assess exposure.
   naming `169.254.169.254` is fetched. Keep the flag off wherever an instance
   metadata service is reachable. See
   [DID resolution host policy](#did-resolution-host-policy).
+- **A waited `fabric://` mirror names its failure class to the caller.** The `503` says which of
+  `blocked by egress policy`, `DNS resolution failed`, `internal error`, `timeout`, `connection
+  refused`, `invalid request` or `network error` stopped the mirror. The last four existed before the
+  mirror had an egress guard; the first three came with it. The caller who receives the class is the
+  remote caller of the surface, who need not be the party that edits it, and on a loopback or private
+  mirror it tells a closed port from a timeout or an unresolvable name. Neither a URL nor a path is
+  sent. Returning one generic `503` and logging the class is a possible tightening. See
+  [Other pinned egress sinks](#other-pinned-egress-sinks).
+
 - **Agent name resolution is open to DNS rebinding.** The `agent-names` resolver
   checks the host's addresses and then connects through its own client without
   pinning one, so a caller-controlled host whose DNS answer changes between the

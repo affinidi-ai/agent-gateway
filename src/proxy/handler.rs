@@ -24,6 +24,7 @@ use crate::a2a::{
 use crate::observability::broadcast_payload_capture_async;
 use crate::observability::loggable;
 use crate::proxy::backend_identity::ProtectedAgentIdentity;
+use crate::proxy::mirror;
 use crate::server::ConnectionGuard;
 use crate::state::{MultiSurfaceProxyState, ProxyState};
 use crate::{channel_debug, channel_error, channel_info, channel_warn};
@@ -196,6 +197,31 @@ fn forwards_ap_caller_header(
         header_metadata_mapping,
         forwarded_source_auth_header,
     ) && !is_credential_header(name, credential_headers)
+}
+
+/// Whether a caller header goes on to an Access Point's Target: what
+/// [`forwards_ap_caller_header`] forwards, or, for a Target bound by external consent
+/// (`bound_target`), only what [`crate::proxy::target_grant::forwards_caller_header`] forwards.
+/// A traffic mirror is sent the same headers, so it is never given one the Target is refused.
+fn forwards_target_header(
+    name: &str,
+    bound_target: bool,
+    source_auth_headers: &[&str],
+    header_metadata_mapping: Option<&crate::config::header_metadata_mapping::HeaderMetadataMappingConfig>,
+    forwarded_source_auth_header: Option<&str>,
+    credential_headers: &[&str],
+) -> bool {
+    if bound_target {
+        crate::proxy::target_grant::forwards_caller_header(name, source_auth_headers, header_metadata_mapping)
+    } else {
+        forwards_ap_caller_header(
+            name,
+            source_auth_headers,
+            header_metadata_mapping,
+            forwarded_source_auth_header,
+            credential_headers,
+        )
+    }
 }
 
 /// Whether `name` is one of `credential_headers`, the headers the gateway fills with a
@@ -6537,17 +6563,14 @@ async fn proxy_charged_request(
     let bound_target = crate::proxy::target_grant::binds_the_target(&state.surface);
     let credential_headers = target_credential_header_names(&state.surface);
     let forwards_header = |name: &str| {
-        if bound_target {
-            crate::proxy::target_grant::forwards_caller_header(name, &source_cred_headers, header_metadata_mapping)
-        } else {
-            forwards_ap_caller_header(
-                name,
-                &source_cred_headers,
-                header_metadata_mapping,
-                forwarded_source_auth_header,
-                &credential_headers,
-            )
-        }
+        forwards_target_header(
+            name,
+            bound_target,
+            &source_cred_headers,
+            header_metadata_mapping,
+            forwarded_source_auth_header,
+            &credential_headers,
+        )
     };
 
     // Build upstream request. The forward send uses the per-request pinned,
@@ -7594,113 +7617,72 @@ async fn proxy_charged_request(
     }
 
     // Traffic mirroring - send duplicate request to mirror endpoint (if configured)
-    if let Some(mirror_config) = state.surface.mirror() {
-        // Check if we should mirror this request based on percentage
-        let should_mirror = if mirror_config.percentage >= 100 {
-            true
-        } else if mirror_config.percentage == 0 {
-            false
-        } else {
-            use rand::Rng;
-            let mut rng = rand::rng();
-            rng.random_range(0..100) < mirror_config.percentage
-        };
+    if let Some(mirror_config) = state.surface.mirror()
+        && mirror::selected(mirror_config.percentage)
+    {
+        let mirror_endpoint_for_log = loggable::url(&mirror_config.endpoint);
+        let mirror_request = mirror::MirrorRequest::new(mirror_config, method.clone(), body_bytes.clone())
+            .headers_from(&headers, |name| {
+                forwards_target_header(
+                    name,
+                    bound_target,
+                    &source_cred_headers,
+                    header_metadata_mapping,
+                    None,
+                    &credential_headers,
+                )
+            })
+            .mirrored(Some(&trace_id));
 
-        if should_mirror {
-            let mirror_endpoint = mirror_config.endpoint.clone();
-            let mirror_endpoint_for_log = loggable::url(&mirror_endpoint);
-            let mirror_timeout = std::time::Duration::from_secs(mirror_config.timeout_secs);
-            let wait_for_response = mirror_config.wait_for_response;
-            let channel_name_clone = channel_name.to_string();
-            let client_clone = state.client.clone();
-            let trace_id_clone = trace_id.clone();
-
-            // Clone the request for mirroring
-            if let Some(_mirror_req) = upstream_req.try_clone() {
-                // Build mirror URL (replace target with mirror endpoint)
-                let mirror_url = mirror_endpoint.clone();
-                let mirror_req = client_clone
-                    .request(method.clone(), &mirror_url)
-                    .body(body_bytes.clone())
-                    .timeout(mirror_timeout);
-
-                // Copy headers
-                let mut mirror_req_with_headers = mirror_req;
-                for (key, value) in headers.iter() {
-                    if should_forward_ap_request_header_with_mapping(
-                        key.as_str(),
-                        &source_cred_headers,
-                        header_metadata_mapping,
-                        None,
-                    ) {
-                        mirror_req_with_headers = mirror_req_with_headers.header(key.as_str(), value.as_bytes());
-                    }
-                }
-                mirror_req_with_headers =
-                    mirror_req_with_headers.header("X-Gateway-Trace-Id", format!("{}-mirror", trace_id_clone));
-                mirror_req_with_headers = mirror_req_with_headers.header("X-Mirrored-Request", "true");
-
-                if wait_for_response {
-                    // Wait for mirror response (blocking)
-                    match mirror_req_with_headers
-                        .send()
-                        .await
-                    {
-                        Ok(resp) => {
-                            info!(
-                                channel = channel_name_clone,
-                                mirror_endpoint = mirror_endpoint_for_log,
-                                status = resp.status().as_u16(),
-                                trace_id = trace_id_clone,
-                                "Mirror request completed"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                channel = channel_name_clone,
-                                mirror_endpoint = mirror_endpoint_for_log,
-                                error = %e.without_url(),
-                                trace_id = trace_id_clone,
-                                "Mirror request failed"
-                            );
-                        }
-                    }
-                } else {
-                    // Fire-and-forget mirror request
-                    let config_id_clone = config_id.to_string();
-                    let mirror_endpoint_for_task = mirror_endpoint_for_log.clone();
-                    tokio::spawn(async move {
-                        match mirror_req_with_headers
-                            .send()
-                            .await
-                        {
-                            Ok(resp) => {
-                                channel_info!(
-                                    config_id_clone,
-                                    "Mirror request completed (async): endpoint={}, status={}",
-                                    mirror_endpoint_for_task,
-                                    resp.status().as_u16()
-                                );
-                            }
-                            Err(e) => {
-                                channel_warn!(
-                                    config_id_clone,
-                                    "Mirror request failed (async): endpoint={}, error={}",
-                                    mirror_endpoint_for_task,
-                                    e.without_url()
-                                );
-                            }
-                        }
-                    });
-                    debug!(
+        if mirror_config.wait_for_response {
+            match mirror::send(mirror_request).await {
+                Ok(status) => {
+                    info!(
                         channel = channel_name,
                         mirror_endpoint = mirror_endpoint_for_log,
-                        "Mirror request sent (fire-and-forget)"
+                        status = status.as_u16(),
+                        trace_id = trace_id,
+                        "Mirror request completed"
                     );
                 }
-            } else {
-                warn!(channel = channel_name, "Failed to clone request for mirroring");
+                Err(e) => {
+                    warn!(
+                        channel = channel_name,
+                        mirror_endpoint = mirror_endpoint_for_log,
+                        error = %e,
+                        trace_id = trace_id,
+                        "Mirror request failed"
+                    );
+                }
             }
+        } else {
+            let config_id_clone = config_id.to_string();
+            let mirror_endpoint_for_task = mirror_endpoint_for_log.clone();
+            tokio::spawn(async move {
+                match mirror::send(mirror_request).await {
+                    Ok(status) => {
+                        channel_info!(
+                            config_id_clone,
+                            "Mirror request completed (async): endpoint={}, status={}",
+                            mirror_endpoint_for_task,
+                            status.as_u16()
+                        );
+                    }
+                    Err(e) => {
+                        channel_warn!(
+                            config_id_clone,
+                            "Mirror request failed (async): endpoint={}, error={}",
+                            mirror_endpoint_for_task,
+                            e
+                        );
+                    }
+                }
+            });
+            debug!(
+                channel = channel_name,
+                mirror_endpoint = mirror_endpoint_for_log,
+                "Mirror request sent (fire-and-forget)"
+            );
         }
     }
 
@@ -12157,32 +12139,8 @@ async fn handle_fabric_request_inner(
 
     // Traffic mirroring for fabric:// protocol - send duplicate request to mirror endpoint (if configured)
     if let Some(mirror_config) = state.surface.mirror() {
-        // Check if we should mirror this request based on percentage
-        let should_mirror = if mirror_config.percentage >= 100 {
-            true
-        } else if mirror_config.percentage == 0 {
-            false
-        } else {
-            use rand::Rng;
-            let mut rng = rand::rng();
-            rng.random_range(0..100) < mirror_config.percentage
-        };
-
-        if should_mirror {
-            let mirror_endpoint = mirror_config.endpoint.clone();
-            let mirror_endpoint_for_log = loggable::url(&mirror_endpoint);
-            let mirror_timeout = std::time::Duration::from_secs(mirror_config.timeout_secs);
-            let wait_for_response = mirror_config.wait_for_response;
-            let client = crate::http_client::with_timeout(mirror_timeout).unwrap_or_else(|_| reqwest::Client::new());
-            let trace_id_clone = trace_id.clone();
-
-            // Build mirror request
-            let mirror_req = client
-                .request(method.clone(), &mirror_endpoint)
-                .body(body_bytes.to_vec())
-                .timeout(mirror_timeout);
-
-            // Copy headers
+        if mirror::selected(mirror_config.percentage) {
+            let mirror_endpoint_for_log = loggable::url(&mirror_config.endpoint);
             let source_cred_headers = state
                 .surface
                 .source_credential_headers();
@@ -12190,89 +12148,70 @@ async fn handle_fabric_request_inner(
                 .surface
                 .access_point
                 .header_metadata_mapping_if_supported();
-            let mut mirror_req_with_headers = mirror_req;
-            for (key, value) in headers.iter() {
-                if should_forward_ap_request_header_with_mapping(
-                    key.as_str(),
-                    &source_cred_headers,
-                    header_metadata_mapping,
-                    None,
-                ) {
-                    mirror_req_with_headers = mirror_req_with_headers.header(key.as_str(), value.as_bytes());
-                }
-            }
-            mirror_req_with_headers =
-                mirror_req_with_headers.header("X-Gateway-Trace-Id", format!("{}-mirror", trace_id_clone));
-            mirror_req_with_headers = mirror_req_with_headers.header("X-Mirrored-Request", "true");
-            mirror_req_with_headers = mirror_req_with_headers.header("X-Fabric-Gateway", gateway_id);
-            mirror_req_with_headers = mirror_req_with_headers.header("X-Fabric-Channel", channel_id);
+            let bound_target = crate::proxy::target_grant::binds_the_target(&state.surface);
+            let credential_headers = target_credential_header_names(&state.surface);
+            let mirror_request = mirror::MirrorRequest::new(mirror_config, method.clone(), body_bytes.to_vec())
+                .headers_from(&headers, |name| {
+                    forwards_target_header(
+                        name,
+                        bound_target,
+                        &source_cred_headers,
+                        header_metadata_mapping,
+                        None,
+                        &credential_headers,
+                    )
+                })
+                .mirrored(Some(&trace_id))
+                .header("X-Fabric-Gateway", gateway_id)
+                .header("X-Fabric-Channel", channel_id);
 
-            if wait_for_response {
+            if mirror_config.wait_for_response {
                 // Wait for mirror response (blocking) - fabric request will be blocked if mirror fails
-                match mirror_req_with_headers
-                    .send()
-                    .await
-                {
-                    Ok(resp) => {
+                match mirror::send(mirror_request).await {
+                    Ok(status) => {
                         channel_info!(
                             config_id,
                             "Fabric mirror request completed: endpoint={}, status={}",
                             mirror_endpoint_for_log,
-                            resp.status().as_u16()
+                            status.as_u16()
                         );
                     }
                     Err(e) => {
-                        let error_type = if e.is_timeout() {
-                            "timeout"
-                        } else if e.is_connect() {
-                            "connection refused"
-                        } else if e.is_request() {
-                            "invalid request"
-                        } else {
-                            "network error"
-                        };
-
+                        let error_type = e.kind();
                         channel_error!(
                             config_id,
                             "Fabric mirror request failed ({}): endpoint={}, error={}",
                             error_type,
                             mirror_endpoint_for_log,
-                            e.without_url()
+                            e
                         );
 
                         // For synchronous mirroring, return error if mirror fails
                         connection_guard
                             .decrement()
                             .await;
-                        return Err(create_error_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            &format!("Traffic mirroring failed ({error_type}): the mirror endpoint is unreachable"),
-                        ));
+                        return Err(create_error_response(StatusCode::SERVICE_UNAVAILABLE, &e.caller_message()));
                     }
                 }
             } else {
                 // Fire-and-forget mirror request
-                let mirror_endpoint_clone = mirror_endpoint_for_log.clone();
                 let config_id_clone = config_id.to_string();
                 tokio::spawn(async move {
-                    match mirror_req_with_headers
-                        .send()
-                        .await
-                    {
-                        Ok(resp) => {
+                    match mirror::send(mirror_request).await {
+                        Ok(status) => {
                             channel_info!(
                                 config_id_clone,
                                 "Fabric mirror request completed (async): endpoint={}, status={}",
-                                mirror_endpoint_clone,
-                                resp.status().as_u16()
+                                mirror_endpoint_for_log,
+                                status.as_u16()
                             );
                         }
                         Err(e) => {
                             channel_warn!(
                                 config_id_clone,
                                 "Fabric mirror request failed (async): endpoint={}, error={}",
-                                mirror_endpoint_clone,
-                                e.without_url()
+                                mirror_endpoint_for_log,
+                                e
                             );
                         }
                     }
@@ -15872,7 +15811,6 @@ async fn handle_mcp_proxy_request_inner(
                 prepared,
                 &state.surface,
                 state.policy_manager.as_ref(),
-                &state.client,
                 channel_name,
                 sent_token.as_ref(),
             )
@@ -24249,6 +24187,33 @@ allow if {
         assert!(text.contains("error=error sending request "), "{text}");
         assert!(!text.contains("endpoint-key-value"), "a log holds the target's query value: {text}");
         assert!(!text.contains("for url"), "a log holds the reqwest error URL: {text}");
+    }
+}
+
+#[cfg(test)]
+mod target_header_filter_tests {
+    use super::forwards_target_header;
+
+    #[test]
+    fn a_header_named_like_a_target_credential_header_is_not_forwarded() {
+        for name in ["x-target-key", "X-Target-Key", "x_target_key"] {
+            assert!(!forwards_target_header(name, false, &[], None, None, &["X-Target-Key"]), "{name}");
+        }
+        assert!(forwards_target_header("accept-language", false, &[], None, None, &["X-Target-Key"]));
+    }
+
+    #[test]
+    fn a_target_bound_by_consent_is_forwarded_only_the_protocol_headers() {
+        assert!(!forwards_target_header("accept-language", true, &[], None, None, &[]));
+        assert!(!forwards_target_header("x-forwarded-for", true, &[], None, None, &[]));
+        assert!(forwards_target_header("mcp-session-id", true, &[], None, None, &[]));
+    }
+
+    #[test]
+    fn the_forwarded_token_header_goes_on_only_when_the_caller_names_it() {
+        assert!(forwards_target_header("x-jwt", false, &[], None, Some("x-jwt"), &[]));
+        assert!(!forwards_target_header("x-jwt", false, &["x-jwt"], None, None, &[]));
+        assert!(forwards_target_header("x-jwt", false, &["x-jwt"], None, Some("x-jwt"), &[]));
     }
 }
 

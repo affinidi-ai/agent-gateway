@@ -419,6 +419,38 @@ impl AdminApiClient {
         surface_id: &str,
         patch: &Value,
     ) -> Result<Value> {
+        let (url, response) = self
+            .send_surface_patch(surface_id, patch)
+            .await?;
+        let response_status = response.status();
+        let response_body = response
+            .text()
+            .await
+            .context("read PATCH response body")?;
+        if !response_status.is_success() {
+            bail!("PATCH {url} failed with status {response_status}: {response_body}");
+        }
+        serde_json::from_str(&response_body)
+            .with_context(|| format!("decode PATCH response from {url}: {response_body}"))
+    }
+
+    /// PATCH a surface with `application/merge-patch+json` and keep the response whatever its status.
+    pub async fn patch_surface_recorded(
+        &self,
+        surface_id: &str,
+        patch: &Value,
+    ) -> Result<RecordedResponse> {
+        let (_, response) = self
+            .send_surface_patch(surface_id, patch)
+            .await?;
+        recorded_response(response).await
+    }
+
+    async fn send_surface_patch(
+        &self,
+        surface_id: &str,
+        patch: &Value,
+    ) -> Result<(String, reqwest::Response)> {
         let url = self.admin_url(&format!("/v1/surfaces/{surface_id}"));
         let mut request = self.http.patch(&url);
         if let Some(token) = self
@@ -435,16 +467,7 @@ impl AdminApiClient {
             .send()
             .await
             .with_context(|| format!("PATCH {url}"))?;
-        let response_status = response.status();
-        let response_body = response
-            .text()
-            .await
-            .context("read PATCH response body")?;
-        if !response_status.is_success() {
-            bail!("PATCH {url} failed with status {response_status}: {response_body}");
-        }
-        serde_json::from_str(&response_body)
-            .with_context(|| format!("decode PATCH response from {url}: {response_body}"))
+        Ok((url, response))
     }
 
     fn admin_url(
