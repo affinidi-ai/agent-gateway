@@ -105,10 +105,9 @@ export interface ManagedAgentSurroundings {
 
 /**
  * What is wrong with the Managed Agent's Target authentication. A header name or format
- * problem in a new or changed setting blocks the save; the same problem in a setting the
- * gateway keeps as stored (same auth, same endpoint) only warns. A Target that is not https,
- * or an Access Point that checks no caller, is an advisory: the gateway refuses it only while
- * `target_https` or `target_source_auth` is `enforce`.
+ * problem blocks the save, in a stored setting too: the gateway refuses it on every save. A
+ * Target that is not https, or an Access Point that checks no caller, is an advisory: the
+ * gateway refuses it only while `target_https` or `target_source_auth` is `enforce`.
  */
 export function managedAgentTargetAuthProblems(
   c: Form,
@@ -126,7 +125,7 @@ export function managedAgentTargetAuthProblems(
   }
   const auth = managedAgentTargetAuth(c);
   if (!auth) return noTargetAuthProblems();
-  const result = classifyTargetAuthProblems(auth, text(c.endpoint), c[STORED_TARGET_AUTH_KEY], {
+  const result = classifyTargetAuthProblems(auth, text(c.endpoint), 'managed-agent', {
     headerName: 'target_auth_header_name',
     headerFormat: 'target_auth_header_format',
   });

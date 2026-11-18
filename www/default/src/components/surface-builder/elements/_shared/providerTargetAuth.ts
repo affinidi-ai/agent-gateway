@@ -80,15 +80,11 @@ export function providerTargetAuthFromApi(targetAuth: unknown): ProviderTargetAu
 export const STORED_TARGET_AUTH_KEY = '_stored_target_auth';
 
 export interface StoredTargetAuth {
-  endpoint: string;
   auth: Record<string, unknown> | null;
 }
 
-export function storedTargetAuth(endpoint: unknown, auth: unknown): StoredTargetAuth {
-  return {
-    endpoint: typeof endpoint === 'string' ? endpoint : '',
-    auth: auth && typeof auth === 'object' ? (auth as Record<string, unknown>) : null,
-  };
+export function storedTargetAuth(auth: unknown): StoredTargetAuth {
+  return { auth: record(auth) };
 }
 
 export function record(value: unknown): Record<string, unknown> | null {
@@ -246,23 +242,30 @@ export function targetAuthHeader(
   };
 }
 
+/** The leg a Target authentication is on: the Managed Agent's Target, or a Transit Point's. */
+export type TargetAuthLeg = 'managed-agent' | 'transit-point';
+
 /**
- * Whether the gateway decides the https rule from something the editor cannot see: a `proxy://`
- * Target meets it when its MCP proxy's `base_url` is https.
+ * Whether the gateway decides the https rule from something the editor cannot see: the Managed
+ * Agent's `proxy://` Target meets it when its MCP proxy's `base_url` is https. A Transit Point's
+ * target endpoint is checked as it is written.
  */
-function httpsDecidedElsewhere(endpoint: string): boolean {
-  return endpoint.trim().toLowerCase().startsWith('proxy://');
+function httpsDecidedElsewhere(endpoint: string, leg: TargetAuthLeg): boolean {
+  return leg === 'managed-agent' && endpoint.trim().toLowerCase().startsWith('proxy://');
 }
 
 /**
  * The rules a Target authentication meets on its own: the header it sets, its value format and
- * an https Target. A setting equal to the stored one, on the same endpoint, is not refused by
- * the gateway, so it is reported only as a warning.
+ * an https Target.
  */
-export function targetAuthFieldProblems(auth: unknown, endpoint: string): TargetAuthFieldProblems {
+export function targetAuthFieldProblems(
+  auth: unknown,
+  endpoint: string,
+  leg: TargetAuthLeg
+): TargetAuthFieldProblems {
   const header = targetAuthHeader(auth);
   if (!header) return {};
-  const https = isHttpsTarget(endpoint) || httpsDecidedElsewhere(endpoint);
+  const https = isHttpsTarget(endpoint) || httpsDecidedElsewhere(endpoint, leg);
   return {
     headerName: headerNameProblem(header.headerName) ?? undefined,
     headerFormat: headerFormatProblem(header.headerFormat) ?? undefined,
@@ -275,22 +278,9 @@ export function stableJson(value: unknown): string {
   return JSON.stringify(sortKeys(value));
 }
 
-/** Whether the gateway keeps this setting as stored: same Target endpoint and same auth. */
-export function isStoredTargetAuth(
-  stored: StoredTargetAuth | undefined,
-  auth: unknown,
-  endpoint: string
-): boolean {
-  return (
-    !!stored?.auth && stored.endpoint === endpoint && stableJson(stored.auth) === stableJson(auth)
-  );
-}
-
 export interface TargetAuthProblems {
   /** What blocks the save, by form field. */
   errors: Record<string, string>;
-  /** Problems the gateway keeps as stored. */
-  warnings: string[];
   /** Breaches of a rule the gateway refuses only while that rule is `enforce`. */
   advisories: string[];
   /** Advice with no gateway rule behind it. */
@@ -299,36 +289,32 @@ export interface TargetAuthProblems {
 
 export const noTargetAuthProblems = (): TargetAuthProblems => ({
   errors: {},
-  warnings: [],
   advisories: [],
   notes: [],
 });
 
 /**
- * Sorts what `targetAuthFieldProblems` finds for one leg. A header name or format problem in a
- * new or changed setting blocks the save, under the form field `fields` names; the same problem
- * in a setting the gateway keeps as stored (same auth, same endpoint) only warns. A Target that
- * is not https is an advisory, and a passthrough fallback is a note.
+ * Sorts what `targetAuthFieldProblems` finds for one leg. A header name or format problem blocks
+ * the save, under the form field `fields` names, a stored one the operator did not edit
+ * included: the gateway refuses it on every save. A Target that is not https is an advisory, and
+ * a passthrough fallback is a note.
  */
 export function classifyTargetAuthProblems(
   auth: Record<string, unknown>,
   endpoint: string,
-  stored: StoredTargetAuth | undefined,
+  leg: TargetAuthLeg,
   fields: { headerName: string; headerFormat: string }
 ): TargetAuthProblems {
   const result = noTargetAuthProblems();
-  const problems = targetAuthFieldProblems(auth, endpoint);
+  const problems = targetAuthFieldProblems(auth, endpoint, leg);
   if (problems.endpoint) result.advisories.push(problems.endpoint);
   if (auth.fallback === 'passthrough') result.notes.push(PASSTHROUGH_NOTE);
-  const kept = isStoredTargetAuth(stored, auth, endpoint);
   const found: Array<[string, string | undefined]> = [
     [fields.headerName, problems.headerName],
     [fields.headerFormat, problems.headerFormat],
   ];
   for (const [field, message] of found) {
-    if (!message) continue;
-    if (kept) result.warnings.push(message);
-    else result.errors[field] = message;
+    if (message) result.errors[field] = message;
   }
   return result;
 }

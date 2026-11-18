@@ -601,31 +601,33 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
     leg already sends (a binding, header metadata mapping, the token header of any JWT Bearer
     caller method that forwards it) blocks Save, on the Managed Agent or on the Transit Point it
     belongs to.
+  - **A stored problem blocks too.** The gateway refuses a header name, format or clash problem
+    on every save, one in a stored setting the operator did not edit included, so the dashboard
+    shows it as an error next to its field and blocks Save until it is fixed.
   - **Advisories that allow Save.** A Target that is not `https://` (`http://`, `fabric://` and
     `a2a-proxy://` are not) and a leg that authenticates no caller (an Access Point with no source
     authentication, a Transit Point that authenticates no caller) are shown as an advisory
     (`*-target-auth-advisories`, warning styling) and never block Save: the gateway refuses them
     on save only while its `target_https` or `target_source_auth` rule is `enforce`, and in
-    `warn` saves with a `Warning: 299` header. The dashboard does not read the rule mode. A
-    `proxy://` Target gets no https advisory, since the gateway decides it from the MCP proxy's
-    `base_url`, which the editor does not see. The Managed Agent editors learn whether the
+    `warn` saves with a `Warning: 299` header. The dashboard does not read the rule mode. The
+    Managed Agent's `proxy://` Target gets no https advisory, since the gateway decides it from
+    the MCP proxy's `base_url`, which the editor does not see; a Transit Point's `proxy://`
+    target endpoint does, since the gateway checks it as written. The Managed Agent editors learn whether the
     Access Point checks its callers from `accessPointChecksCallers` in `SurfaceMetaContext`,
     which the surface pages set from the draft payload (`hasCallerAuthentication`). After a
     save in `warn` the header's message shows in the save toast and the surface page's save
     warnings banner; in `enforce` the gateway's 400 shows in the page's error alert. The
-    whole-surface caller check is a `warning` issue in `validateSurfacePayload`.
+    whole-surface caller check is a `warning` issue in `validateSurfacePayload`, left out when
+    the stored surface already had it on the same leg with the same setting and endpoint.
   - **Advice with no gateway rule.** The same box also shows a passthrough fallback (the
     request goes on without the credential when the credential cannot be resolved) and a stored
     method the editor cannot show, each ending "Save is allowed".
-  - **Messages name their kind.** `TargetAuthProblemNotice` opens every message with **Error:**,
-    **Advisory:** or **Warning:**, so colour is not the only difference, and keeps its
+  - **Messages name their kind.** `TargetAuthProblemNotice` opens every message with **Error:**
+    or **Advisory:**, so colour is not the only difference, and keeps its
     `role="alert"` and `role="status"` regions mounted while empty, so a message that appears is
     announced.
-  - **Stored settings are kept.** The gateway refuses only a new or changed header problem, so one
-    on a stored setting left unedited (same auth, same endpoint) shows as a warning
-    (`*-target-auth-warnings`) and does not block Save.
-  - **Lossless save.** Each Managed Agent and Transit Point keeps the stored `target_auth` and
-    endpoint in the node config (`_stored_target_auth`); the edited fields are merged onto it
+  - **Lossless save.** Each Managed Agent and Transit Point keeps the stored `target_auth` in
+    the node config (`_stored_target_auth`); the edited fields are merged onto it
     (`mergeTargetAuth`), so a field the editor does not show survives. That holds while the edit
     keeps the stored credential: another method kind, secret or provider replaces the stored
     setting, so nothing unseen follows a credential it was not set for. A Transit Point whose
@@ -1684,7 +1686,10 @@ word it only through `utils/surfaceVariant.ts`, which the Metrics page uses too.
   group. With outcome `passthrough` the request was forwarded without the Target credential: it is
   titled **Forwarded without Target credential** in the warn tone, not as a refusal. With outcome
   `refused_by_target` the Target refused the gateway's credential: it is titled **Target refused
-  the credential** in the deny tone, and `upstream_status` shows as **Target status**.
+  the credential** in the deny tone, and `upstream_status` shows as **Target status**. When the
+  failing credential is a Transit Point's, `target_auth.transit_point` carries its alias: both
+  summaries name that Transit Point in place of the Target, and it shows as **Transit Point**
+  in the Refusal group.
 - `requested_variant` is caller-chosen text: render it as React text only.
 - The Metrics page shows the `$alias` badge for a configured alias only, never for `_base_`.
 

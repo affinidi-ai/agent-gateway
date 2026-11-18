@@ -243,7 +243,8 @@ test.describe('Credential providers: permissions', () => {
 
         await page.keyboard.press('Meta+s');
         await page.keyboard.press('Control+s');
-        await page.waitForTimeout(300);
+        await expect(page.getByTestId('credential-provider-editor-save-button')).toHaveCount(0);
+        await page.waitForLoadState('networkidle');
         expect(puts).toHaveLength(0);
     });
 

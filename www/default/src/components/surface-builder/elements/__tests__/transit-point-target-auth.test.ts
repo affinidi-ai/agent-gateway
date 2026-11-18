@@ -44,7 +44,6 @@ describe('Transit Point Target authentication validation', () => {
   it('passes a valid setting', () => {
     expect(transitPointTargetAuthProblems(tp())).toEqual({
       errors: {},
-      warnings: [],
       advisories: [],
       notes: [],
     });
@@ -84,22 +83,24 @@ describe('Transit Point Target authentication validation', () => {
     });
   });
 
-  it('keeps an unedited stored Transit Point header problem non-blocking', () => {
-    const stored = {
-      endpoint: 'http://partner.example.com',
-      auth: staticSecret('Host', '{value}'),
-    };
+  it('blocks a stored Transit Point header problem the operator did not edit', () => {
+    const auth = staticSecret('Host', '{value}');
     const config = {
-      target_endpoint: stored.endpoint,
-      _stored_target_auth: stored,
-      target_auth: stored.auth,
+      target_endpoint: 'http://partner.example.com',
+      _stored_target_auth: storedTargetAuth(auth),
+      target_auth: auth,
     };
     expect(transitPointTargetAuthProblems(config)).toEqual({
-      errors: {},
-      warnings: ['Header name must not be the reserved header Host'],
+      errors: { auth_header_name: 'Header name must not be the reserved header Host' },
       advisories: [TARGET_AUTH_HTTPS_PROBLEM],
       notes: [],
     });
+  });
+
+  it('advises on a proxy:// target endpoint, which the gateway exempts only on the Managed Agent', () => {
+    expect(
+      transitPointTargetAuthProblems(tp({ target_endpoint: 'proxy://docs' })).advisories
+    ).toEqual([TARGET_AUTH_HTTPS_PROBLEM]);
   });
 });
 
@@ -111,7 +112,7 @@ describe('Transit Point scopes', () => {
     auth_header_name: 'Authorization',
     auth_header_format: 'Bearer {value}',
     auth_fallback: 'passthrough',
-    _stored_target_auth: storedTargetAuth('https://partner.example.com', providerAuth),
+    _stored_target_auth: storedTargetAuth(providerAuth),
     ...over,
   });
   const scopes = (config: Record<string, unknown>) =>
@@ -163,7 +164,7 @@ describe('a stored Transit Point method the panel cannot show', () => {
     expect(
       transitPointTargetAuthProblems({
         target_endpoint: 'https://partner.example.com',
-        _stored_target_auth: storedTargetAuth('https://partner.example.com', unknownMethodAuth),
+        _stored_target_auth: storedTargetAuth(unknownMethodAuth),
       }).notes
     ).toEqual([UNKNOWN_METHOD_NOTE]);
   });

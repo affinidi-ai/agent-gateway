@@ -116,20 +116,18 @@ export function transitPointTargetAuth(c: Form): Record<string, unknown> | undef
 
 /**
  * What is wrong with the Transit Point's Target authentication. A header name or format problem
- * in a new or changed setting blocks the save; the same problem in a setting the gateway keeps as
- * stored (same auth, same endpoint) only warns. A Target that is not https, or a Transit Point
- * that authenticates no caller, is an advisory: the gateway refuses it only while `target_https`
- * or `target_source_auth` is `enforce`.
+ * blocks the save, in a stored setting too: the gateway refuses it on every save. A target
+ * endpoint that is not https, `proxy://` included, or a Transit Point that authenticates no
+ * caller, is an advisory: the gateway refuses it only while `target_https` or
+ * `target_source_auth` is `enforce`.
  */
 export function transitPointTargetAuthProblems(c: Form): TargetAuthProblems {
   const auth = transitPointTargetAuth(c);
   if (!c || !auth) return noTargetAuthProblems();
-  const result = classifyTargetAuthProblems(
-    auth,
-    untrimmed(c.target_endpoint),
-    c[STORED_TARGET_AUTH_KEY],
-    { headerName: 'auth_header_name', headerFormat: 'auth_header_format' }
-  );
+  const result = classifyTargetAuthProblems(auth, untrimmed(c.target_endpoint), 'transit-point', {
+    headerName: 'auth_header_name',
+    headerFormat: 'auth_header_format',
+  });
   if (!authenticatesCallers(c)) result.advisories.push(TP_CALLER_CHECK_PROBLEM);
   if (!knownTargetAuthMethod(auth)) result.notes.push(UNKNOWN_METHOD_NOTE);
   return result;

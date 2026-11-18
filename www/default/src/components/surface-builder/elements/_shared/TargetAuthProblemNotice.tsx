@@ -3,7 +3,6 @@ import React from 'react';
 interface TargetAuthProblemNoticeProps {
   testId: string;
   errors: string[];
-  warnings: string[];
   advisories?: string[];
   notes?: string[];
 }
@@ -12,15 +11,14 @@ interface TargetAuthProblemNoticeProps {
 export const targetAuthErrorsId = (testId: string) => `${testId}-errors`;
 
 /**
- * What blocks the save (errors), what the gateway keeps as stored (warnings), what the gateway
- * saves with a warning unless its rule is `enforce` (advisories) and advice with no rule behind
- * it (notes). Each kind opens with its name, so colour is not the only thing that tells them
- * apart, and sits in a live region that stays mounted, so a message that appears is announced.
+ * What blocks the save (errors), what the gateway saves with a warning unless its rule is
+ * `enforce` (advisories) and advice with no rule behind it (notes). Each kind opens with its
+ * name, so colour is not the only thing that tells them apart, and sits in a live region that
+ * stays mounted, so a message that appears is announced.
  */
 const TargetAuthProblemNotice: React.FC<TargetAuthProblemNoticeProps> = ({
   testId,
   errors,
-  warnings,
   advisories = [],
   notes = [],
 }) => (
@@ -52,16 +50,6 @@ const TargetAuthProblemNotice: React.FC<TargetAuthProblemNoticeProps> = ({
           {notes.map(message => (
             <div key={message}>
               <strong>Advisory:</strong> {message}. Save is allowed.
-            </div>
-          ))}
-        </div>
-      )}
-      {warnings.length > 0 && (
-        <div className="alert alert-warning py-2 small" data-testid={`${testId}-warnings`}>
-          {warnings.map(message => (
-            <div key={message}>
-              <strong>Warning:</strong> {message}. The gateway keeps it as stored until you change
-              it.
             </div>
           ))}
         </div>

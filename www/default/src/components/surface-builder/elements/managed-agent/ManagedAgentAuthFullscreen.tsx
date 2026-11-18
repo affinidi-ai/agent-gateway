@@ -42,7 +42,7 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
   const [secrets, setSecrets] = useState<SecretOption[]>([]);
   const [loadingSecrets, setLoadingSecrets] = useState(false);
   const accessPointChecksCallers = useOptionalSurfaceMeta()?.accessPointChecksCallers;
-  const { errors, warnings, advisories, notes } = managedAgentTargetAuthProblems(config, {
+  const { errors, advisories, notes } = managedAgentTargetAuthProblems(config, {
     accessPointChecksCallers,
   });
 
@@ -97,7 +97,6 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
         <TargetAuthProblemNotice
           testId="managed-agent-target-auth"
           errors={[]}
-          warnings={warnings}
           advisories={advisories}
           notes={notes}
         />

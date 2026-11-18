@@ -778,7 +778,7 @@ class ElementRegistry {
         delete tpConfig.header_metadata_mapping;
         delete tpConfig.trust_check_list;
         delete tpConfig.trust_check_migrated;
-        tpConfig[STORED_TARGET_AUTH_KEY] = storedTargetAuth(tp.target_endpoint, tp.target_auth);
+        tpConfig[STORED_TARGET_AUTH_KEY] = storedTargetAuth(tp.target_auth);
       }
       nodes.push({
         id: tpId,

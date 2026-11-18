@@ -1,11 +1,11 @@
 /**
  * The Target authentication rules that need the whole surface: a header another credential on
  * the same leg already sends, and a Target credential on a leg that does not check its callers.
- * The gateway refuses a new or changed header clash on save, and keeps one the stored surface
- * already had on the same leg, with the same setting and endpoint; so does this. Header names
- * are compared as the gateway compares them: any letter case, `_` read as `-`. A leg that
- * checks no callers is refused only while `target_source_auth` is `enforce`, so it is reported
- * as an advisory.
+ * The gateway refuses a header clash on every save, one the stored surface already had
+ * included; so does this. Header names are compared as the gateway compares them: any letter
+ * case, `_` read as `-`. A leg that checks no callers is refused only while `target_source_auth`
+ * is `enforce`, so it is reported as an advisory, and not again when the stored surface already
+ * had it on the same leg, with the same setting and endpoint.
  */
 import {
   MA_CALLER_CHECK_PROBLEM,
@@ -167,10 +167,10 @@ export interface TargetAuthBreach {
   message: string;
 }
 
-/** Every breach `surface` has that `stored` did not already have. */
+/** Every header clash `surface` has, and every missing caller check `stored` did not have. */
 export function targetAuthBreaches(surface: unknown, stored: unknown): TargetAuthBreach[] {
   const kept = breaches(stored);
   return breaches(surface)
-    .filter(breach => !kept.some(old => sameBreach(old, breach)))
+    .filter(breach => breach.rule !== 'callers' || !kept.some(old => sameBreach(old, breach)))
     .map(({ nodeId, rule, message }) => ({ nodeId, rule, message }));
 }

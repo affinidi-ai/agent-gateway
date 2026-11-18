@@ -84,7 +84,6 @@ describe('Managed Agent Target authentication validation', () => {
   it('passes a valid setting', () => {
     expect(managedAgentTargetAuthProblems(maConfig())).toEqual({
       errors: {},
-      warnings: [],
       advisories: [],
       notes: [],
     });
@@ -154,32 +153,25 @@ describe('Managed Agent Target authentication validation', () => {
     });
   });
 
-  it('keeps an unedited stored header problem non-blocking, and blocks it once the setting is edited', () => {
-    const stored = { endpoint: 'http://agent.example.com', auth: staticSecret('Host', 'Bearer') };
+  it('blocks a stored header problem the operator did not edit, as the gateway refuses it on every save', () => {
     const config: any = managedAgentDefinition.configFromPayload!(
-      { endpoint: stored.endpoint, auth: stored.auth },
+      { endpoint: 'http://agent.example.com', auth: staticSecret('Host', 'Bearer') },
       {}
     );
     const problems = managedAgentTargetAuthProblems(config);
-    expect(problems.errors).toEqual({});
-    expect(problems.warnings).toHaveLength(2);
+    expect(problems.errors).toEqual({
+      target_auth_header_name: 'Header name must not be the reserved header Host',
+      target_auth_header_format: 'Header format must contain {value} exactly once',
+    });
     expect(problems.advisories).toEqual([TARGET_AUTH_HTTPS_PROBLEM]);
-    expect(registry.getValidationErrors('target', config)).toEqual([]);
+    expect(registry.getValidationErrors('target', config)).toHaveLength(2);
 
-    const edited = managedAgentTargetAuthProblems({
+    const fixed = managedAgentTargetAuthProblems({
       ...config,
-      target_auth_header_name: 'Bad Name',
+      target_auth_header_name: 'X-Api-Key',
+      target_auth_header_format: '{value}',
     });
-    expect(edited.errors.target_auth_header_name).toBe('Header name must be an HTTP header name');
-    const moved = managedAgentTargetAuthProblems({
-      ...config,
-      endpoint: 'http://other.example.com',
-    });
-    expect(Object.keys(moved.errors).sort()).toEqual([
-      'target_auth_header_format',
-      'target_auth_header_name',
-    ]);
-    expect(moved.advisories).toEqual([TARGET_AUTH_HTTPS_PROBLEM]);
+    expect(fixed.errors).toEqual({});
   });
 });
 

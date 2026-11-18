@@ -390,7 +390,6 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
         <TargetAuthProblemNotice
           testId="transit-point-target-auth"
           errors={Object.values(targetAuthProblems.errors)}
-          warnings={targetAuthProblems.warnings}
           advisories={targetAuthProblems.advisories}
           notes={targetAuthProblems.notes}
         />

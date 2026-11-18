@@ -113,7 +113,7 @@ describe('Target authentication rules that need the whole surface', () => {
     ]);
   });
 
-  it('keeps a breach the stored surface already had on the same leg, setting and endpoint', () => {
+  it('keeps a missing caller check the stored surface already had on the same leg, setting and endpoint', () => {
     const open = surface({ access_point: {} });
     expect(breachMessages(open, open)).toEqual([]);
     const changed = surface({
@@ -128,7 +128,7 @@ describe('Target authentication rules that need the whole surface', () => {
     expect(breachMessages(moved, open)).toHaveLength(1);
   });
 
-  it('reports a header clash as a blocking issue only when the stored surface is given', () => {
+  it('reports a header clash as a blocking issue, one the stored surface already had included', () => {
     const open = surface({
       outbound_credentials: [
         { inject_as: { type: 'custom_header', name: 'x-api-key', format: '{value}' } },
@@ -140,7 +140,7 @@ describe('Target authentication rules that need the whole surface', () => {
     ).toHaveLength(1);
     expect(
       validateSurfacePayload(open, { stored: open }).filter(i => i.severity === 'error')
-    ).toEqual([]);
+    ).toHaveLength(1);
   });
 });
 
@@ -223,12 +223,24 @@ describe('header clash as the gateway compares names', () => {
     expect(clash('X-Api-Key', 'x-github-token')).toEqual([]);
   });
 
-  it('keeps a stored clash whose keys come in another order', () => {
+  it('refuses a clash the stored surface already had', () => {
     const stored = {
       name: 's',
       protocol: 'mcp',
       access_point: { caller_authentication: { methods: [{ type: 'api_key' }] } },
       outbound_credentials: [{ inject_as: { type: 'custom_header', name: 'X-Token' } }],
+      target: { endpoint: 'https://agent.example.com', auth: staticSecret('X-Token', '{value}') },
+    };
+    expect(breachMessages(stored, stored)).toEqual([
+      'target.auth.header_name X-Token is already sent by a credential binding',
+    ]);
+  });
+
+  it('keeps a stored missing caller check whose keys come in another order', () => {
+    const stored = {
+      name: 's',
+      protocol: 'mcp',
+      access_point: {},
       target: { endpoint: 'https://agent.example.com', auth: staticSecret('X-Token', '{value}') },
     };
     const reordered = {

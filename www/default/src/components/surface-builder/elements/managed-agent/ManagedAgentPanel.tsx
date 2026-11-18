@@ -403,7 +403,6 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
             <TargetAuthProblemNotice
               testId="managed-agent-panel-target-auth"
               errors={[...Object.values(targetAuthProblems.errors)]}
-              warnings={targetAuthProblems.warnings}
               advisories={targetAuthProblems.advisories}
               notes={targetAuthProblems.notes}
             />

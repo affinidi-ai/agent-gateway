@@ -16,13 +16,16 @@ changes:
       title: Validate Target authentication in the Surface Builder and save it unchanged
       description: >-
         The Surface Builder applies the gateway's Target authentication rules while editing and
-        shows each problem next to its field. A new or changed header name, header format or header
-        clash blocks Save, and a stored one the operator did not edit shows a warning. A Target
-        that is not https or a leg that authenticates no caller shows an advisory and does not
-        block Save: the gateway refuses it only when its rule is enforce, and a save in warn
-        shows the gateway's warning. Saving keeps stored fields the editor does
-        not show, and an unopened Transit Point keeps its Target authentication. The credential
-        provider method gains an optional Scopes input.
+        shows each problem next to its field. A header name, header format or header clash
+        problem blocks Save, in a stored setting the operator did not edit too, since the
+        gateway refuses it on every save. A Target that is not https, a leg that authenticates
+        no caller and a fallback that passes a request through without the credential show an
+        advisory and do not block Save: the gateway refuses the first two only when their rule
+        is enforce, and a save in warn shows the gateway's warning. The Managed Agent editor
+        shows the caller advisory as the Transit Point panel does, and every message opens with
+        Error or Advisory. Saving keeps stored fields the editor does not show, and an unopened
+        Transit Point keeps its Target authentication. The credential provider method gains an
+        optional Scopes input.
     - timestamp: '2026-11-02T11:45:40Z'
       title: Warn before deleting a secret that other resources use
       description: >-
@@ -36,19 +39,9 @@ changes:
         Audit Log records of a Target credential failure show the credential outcome and the
         token endpoint's OAuth error code. A request forwarded without the credential because
         the fallback is passthrough is titled Forwarded without Target credential in the warning
-        tone instead of Request refused.
-    - timestamp: '2026-11-18T08:00:00Z'
-      title: Advise on a passthrough fallback and an Access Point that checks no caller
-      description: >-
-        The Managed Agent editor now shows an advisory when its Access Point checks no caller,
-        as the Transit Point panel already did, and both editors show one when the fallback
-        passes a request through without the credential. Neither blocks Save. Every Target
-        authentication message now opens with Error, Advisory or Warning.
-    - timestamp: '2026-11-18T08:00:01Z'
-      title: Show a credential the Target refused in the Audit Log
-      description: >-
-        Audit Log records whose credential outcome is refused_by_target are titled Target
-        refused the credential and show the status the Target answered with.
+        tone instead of Request refused. A credential the Target refused is titled Target
+        refused the credential and shows the status the Target answered with. When the failing
+        credential belongs to a Transit Point, the record names that Transit Point.
   fixed:
     - timestamp: '2026-11-03T12:30:00Z'
       title: Stop the dashboard bringing back a Target credential removed through the API
@@ -73,8 +66,10 @@ changes:
     - timestamp: '2026-11-18T08:00:04Z'
       title: Stop the false https advisory on an MCP proxy Target
       description: >-
-        A proxy:// Target no longer shows the not https advisory. The gateway decides that rule
-        from the MCP proxy's base URL, which the editor does not see.
+        A Managed Agent's proxy:// Target no longer shows the not https advisory. The gateway
+        decides that rule from the MCP proxy's base URL, which the editor does not see. A
+        Transit Point's proxy:// target endpoint still shows it, as the gateway checks it as
+        written.
     - timestamp: '2026-11-18T08:00:05Z'
       title: Announce Target authentication messages to screen readers
       description: >-

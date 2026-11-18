@@ -121,6 +121,11 @@ const savedProvider = (request: Request): Json =>
         .points[0].target_auth.method.credential_provider;
 
 const saveButton = (page: Page) => page.locator('button.btn-primary:has(.fa-save)');
+
+/** Waits for the toast a blocked Save shows, so a later request count is read after the click was handled. */
+async function expectSaveBlocked(page: Page, reason: string) {
+    await expect(page.locator('#app-toast')).toContainText(reason);
+}
 const transitPoint = (page: Page) => page.getByTestId('surface-node-transit-point-a2a');
 
 test.describe('Transit Point Target authentication', () => {
@@ -142,7 +147,7 @@ test.describe('Transit Point Target authentication', () => {
             'transit-point-target-auth-errors',
         );
         await saveButton(page).click();
-        await page.waitForTimeout(300);
+        await expectSaveBlocked(page, 'Header name must not be the reserved header Host');
         expect(saved).toHaveLength(0);
 
         await page.getByPlaceholder('X-Auth').fill('X-Partner-Key');
@@ -198,7 +203,7 @@ test.describe('Transit Point Target authentication', () => {
 
     test('an unopened Transit Point saves its stored target_auth unchanged', async ({page}) => {
         const saved: Request[] = [];
-        const stored = staticSecret('Host');
+        const stored = {...staticSecret('X-Partner-Key'), future_field: {keep: true}};
         await mockSurface(page, surfaceFixture({target_auth: stored}), saved);
         await page.goto(`${BASE_URL}/surfaces/${SURFACE_ID}`);
         await expect(page.getByTestId('surface-node-target')).toBeVisible();
@@ -207,6 +212,17 @@ test.describe('Transit Point Target authentication', () => {
         await expect.poll(() => saved.length).toBe(1);
         const points = (saved[0].postDataJSON().transit as {points: Array<{target_auth: Json}>}).points;
         expect(points[0].target_auth).toEqual(stored);
+    });
+
+    test('a stored reserved header on an unopened Transit Point blocks Save, as the gateway refuses it on every save', async ({page}) => {
+        const saved: Request[] = [];
+        await mockSurface(page, surfaceFixture({target_auth: staticSecret('Host')}), saved);
+        await page.goto(`${BASE_URL}/surfaces/${SURFACE_ID}`);
+        await expect(page.getByTestId('surface-node-target')).toBeVisible();
+
+        await saveButton(page).click();
+        await expectSaveBlocked(page, 'Header name must not be the reserved header Host');
+        expect(saved).toHaveLength(0);
     });
 
     test('the scopes an operator types on a Transit Point are saved', async ({page}) => {

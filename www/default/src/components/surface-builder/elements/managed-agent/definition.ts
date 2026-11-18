@@ -179,7 +179,7 @@ export const managedAgentDefinition: NodeDefinition = {
     } else {
       c.inject_vp = true;
     }
-    c[STORED_TARGET_AUTH_KEY] = storedTargetAuth(slice?.endpoint, slice?.auth);
+    c[STORED_TARGET_AUTH_KEY] = storedTargetAuth(slice?.auth);
     if (slice?.auth) {
       const ta = slice.auth;
       c.target_auth_enabled = true;

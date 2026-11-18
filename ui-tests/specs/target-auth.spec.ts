@@ -11,7 +11,7 @@
  *
  * The gateway API is mocked with `page.route`. Line breaks cannot be typed into a text input
  * (the browser removes them), so the CR/LF rule is covered by a stored setting that already
- * carries one, which the dashboard keeps and warns about. The Jest suite covers typed values.
+ * carries one, which blocks Save until it is fixed. The Jest suite covers typed values.
  *
  * Deleting a secret that credential providers use is covered in `credential-providers.spec.ts`.
  */
@@ -129,6 +129,11 @@ async function pickProvider(page: Page) {
 
 const saveButton = (page: Page) => page.locator('button.btn-primary:has(.fa-save)');
 
+/** Waits for the toast a blocked Save shows, so a later request count is read after the click was handled. */
+async function expectSaveBlocked(page: Page, reason: string) {
+    await expect(page.locator('#app-toast')).toContainText(reason);
+}
+
 test.describe('Managed Agent Target authentication: credential provider', () => {
     test('a valid setting saves with its scopes and loads unchanged', async ({page}) => {
         const saved: Request[] = [];
@@ -177,7 +182,7 @@ test.describe('Managed Agent Target authentication: credential provider', () => 
             'Header name must not be the reserved header Host',
         );
         await saveButton(page).click();
-        await page.waitForTimeout(300);
+        await expectSaveBlocked(page, 'Header name must not be the reserved header Host');
         expect(saved).toHaveLength(0);
 
         await page.locator('#target-auth-header-name').fill('X-Host');
@@ -195,14 +200,14 @@ test.describe('Managed Agent Target authentication: credential provider', () => 
             'Header format must contain {value} exactly once',
         );
         await saveButton(page).click();
-        await page.waitForTimeout(300);
+        await expectSaveBlocked(page, 'Header format must contain {value} exactly once');
         expect(saved).toHaveLength(0);
 
         await page.locator('#target-auth-header-format').fill('Bearer {value}');
         await expect(page.getByTestId('managed-agent-target-auth-header-format-error')).toHaveCount(0);
     });
 
-    test('an unedited stored format with a line break is kept and saved unchanged, and editing it blocks Save', async ({page}) => {
+    test('a stored format with a line break blocks Save until it is fixed, as the gateway refuses it on every save', async ({page}) => {
         const saved: Request[] = [];
         const stored = {
             method: {
@@ -220,25 +225,23 @@ test.describe('Managed Agent Target authentication: credential provider', () => 
         await page.getByTestId('surface-node-target').click();
         await page.getByRole('button', {name: /Configure/}).click();
 
-        await expect(page.getByTestId('managed-agent-target-auth-warnings')).toContainText(
+        await expect(page.getByTestId('managed-agent-target-auth-header-format-error')).toHaveText(
             'Header format must not contain CR, LF or NUL',
         );
-        await expect(page.getByTestId('managed-agent-target-auth-errors')).toHaveCount(0);
+        await saveButton(page).click();
+        await expectSaveBlocked(page, 'Header format must not contain CR, LF or NUL');
+        expect(saved).toHaveLength(0);
 
+        await page.locator('#target-auth-header-format').fill('Token {value}');
+        await expect(page.getByTestId('managed-agent-target-auth-header-format-error')).toHaveCount(0);
         await saveButton(page).click();
         await expect.poll(() => saved.length).toBe(1);
-        expect((saved[0].postDataJSON().target as {auth: Json}).auth).toEqual(stored);
-
-        await page.reload();
-        await page.getByTestId('surface-node-target').click();
-        await page.getByRole('button', {name: /Configure/}).click();
-        await page.locator('#target-auth-header-format').fill('Token');
-        await expect(page.getByTestId('managed-agent-target-auth-header-format-error')).toHaveText(
-            'Header format must contain {value} exactly once',
-        );
-        await saveButton(page).click();
-        await page.waitForTimeout(300);
-        expect(saved).toHaveLength(1);
+        expect((saved[0].postDataJSON().target as {auth: Json}).auth).toEqual({
+            ...stored,
+            method: {
+                credential_provider: {...stored.method.credential_provider, header_format: 'Token {value}'},
+            },
+        });
     });
 
     test('a Managed Agent credential on an http Target shows an advisory and still saves', async ({page}) => {
@@ -299,7 +302,7 @@ test.describe('Managed Agent Target authentication: credential provider', () => 
 
         await expect(page.getByTestId('managed-agent-target-auth-provider-error')).toBeVisible();
         await saveButton(page).click();
-        await page.waitForTimeout(300);
+        await expectSaveBlocked(page, 'Pick the credential provider whose token authenticates this Managed Agent');
         expect(saved).toHaveLength(0);
     });
 
@@ -314,7 +317,7 @@ test.describe('Managed Agent Target authentication: credential provider', () => 
             'Header name must be an HTTP header name',
         );
         await saveButton(page).click();
-        await page.waitForTimeout(300);
+        await expectSaveBlocked(page, 'Header name must be an HTTP header name');
         expect(saved).toHaveLength(0);
 
         await page.locator('#target-auth-header-name').fill('X-Good-Name');
