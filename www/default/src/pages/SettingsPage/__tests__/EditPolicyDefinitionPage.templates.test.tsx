@@ -360,6 +360,136 @@ describe('the used template', () => {
   });
 });
 
+describe('gallery focus and detail', () => {
+  const changeButton = () => screen.getByTestId('policy-template-gallery-change-button');
+  const search = () => screen.getByTestId('policy-template-gallery-search-input');
+
+  it('moves focus to Change after Use, also for Allow all', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    await useCard('allow-http-methods');
+    expect(changeButton()).toHaveFocus();
+
+    fireEvent.click(changeButton());
+    await useCard('blank');
+    expect(changeButton()).toHaveFocus();
+  });
+
+  it('moves focus to the selected card after Change', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    await useCard('allow-http-methods');
+    fireEvent.click(changeButton());
+    expect(screen.getByTestId('policy-template-card-allow-http-methods')).toHaveFocus();
+  });
+
+  it('moves focus to the search after Change when no shown card is selected', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    fireEvent.change(await screen.findByTestId('policy-template-gallery-search-input'), {
+      target: { value: 'business' },
+    });
+    await useCard('allow-during-business-hours');
+    act(() => mockUndo.last?.());
+    fireEvent.click(changeButton());
+    expect(search()).toHaveFocus();
+  });
+
+  it('moves focus to the detail heading when a card is selected', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    fireEvent.click(await card('allow-http-methods'));
+    const heading = screen.getByTestId('policy-template-gallery-detail-heading');
+    expect(heading).toHaveTextContent('Allow listed HTTP methods');
+    expect(heading).toHaveFocus();
+
+    fireEvent.click(screen.getByTestId('policy-template-card-blank'));
+    expect(screen.getByTestId('policy-template-gallery-detail-heading')).toHaveFocus();
+  });
+
+  it('shows no detail for a card the search hides', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    expect(await screen.findByTestId('policy-template-gallery-detail')).toBeInTheDocument();
+    fireEvent.change(search(), { target: { value: 'business' } });
+    expect(screen.getByTestId('policy-template-gallery-detail')).not.toBeVisible();
+
+    fireEvent.change(search(), { target: { value: 'no such template' } });
+    expect(screen.getByText('No templates match.')).toBeInTheDocument();
+    expect(screen.getByTestId('policy-template-gallery-use-button')).not.toBeVisible();
+  });
+
+  it('keeps settings typed in the detail while a search hides its card', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    fireEvent.click(await card('allow-http-methods'));
+    fireEvent.change(screen.getByTestId('policy-template-gallery-param-methods'), {
+      target: { value: 'DELETE' },
+    });
+    fireEvent.change(search(), { target: { value: 'zzz' } });
+    expect(screen.getByTestId('policy-template-gallery-detail')).not.toBeVisible();
+
+    fireEvent.change(search(), { target: { value: '' } });
+    expect(screen.getByTestId('policy-template-gallery-detail')).toBeVisible();
+    expect(screen.getByTestId('policy-template-gallery-param-methods')).toHaveValue('DELETE');
+  });
+
+  it('shows no Allow all detail while a filter hides its card', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    fireEvent.click(await card('blank'));
+    expect(screen.getByTestId('policy-template-gallery-detail')).toHaveTextContent('Allow all');
+
+    fireEvent.click(screen.getByTestId('policy-template-gallery-category-trust_checks'));
+    expect(screen.queryByTestId('policy-template-card-blank')).toBeNull();
+    expect(screen.getByTestId('policy-template-gallery-detail')).not.toBeVisible();
+    expect(screen.getByTestId('policy-template-gallery-use-button')).not.toBeVisible();
+  });
+
+  it('names Add rules from a template in its help text', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    const gallery = await screen.findByTestId('policy-template-gallery');
+    expect(gallery).toHaveTextContent('Add rules from a template');
+    expect(gallery).not.toHaveTextContent('column on the right');
+  });
+
+  it('shows the Rego the settings render to behind a collapsed Show Rego', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    fireEvent.click(await card('allow-http-methods'));
+    const toggle = screen.getByTestId('policy-template-gallery-show-rego');
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByTestId('policy-template-gallery-rego')).toBeNull();
+
+    fireEvent.click(toggle);
+    const block = screen.getByTestId('policy-template-gallery-rego');
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    expect(block).toHaveClass('policy-preview-block');
+    expect(block).toHaveTextContent('allow if input.http.method in {"GET"}');
+
+    fireEvent.change(screen.getByTestId('policy-template-gallery-param-methods'), {
+      target: { value: 'DELETE' },
+    });
+    expect(screen.getByTestId('policy-template-gallery-rego')).toHaveTextContent(
+      'allow if input.http.method in {"DELETE"}'
+    );
+  });
+
+  it('shows the Allow all Rego behind Show Rego', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    fireEvent.click(await card('blank'));
+    expect(screen.queryByTestId('policy-template-gallery-rego')).toBeNull();
+    fireEvent.click(screen.getByTestId('policy-template-gallery-show-rego'));
+    expect(screen.getByTestId('policy-template-gallery-rego')).toHaveTextContent(
+      'default allow = true'
+    );
+  });
+
+  it('says there is no Rego while a setting is invalid', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    fireEvent.click(await card('at-least-n-trust-checks-pass'));
+    fireEvent.click(screen.getByTestId('policy-template-gallery-show-rego'));
+    fireEvent.change(screen.getByTestId('policy-template-gallery-param-min_passing'), {
+      target: { value: '0' },
+    });
+    expect(screen.getByTestId('policy-template-gallery-rego')).toHaveTextContent(
+      'Fix the settings above to see the Rego.'
+    );
+  });
+});
+
 describe('template settings in the gallery', () => {
   it('fills a setting into the Rego when the template is used', async () => {
     renderAt('/policy-definitions/new?type=agent_surface');

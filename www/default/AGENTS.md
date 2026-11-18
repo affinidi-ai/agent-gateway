@@ -1851,10 +1851,20 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   (`policy-template-card-type-badge`). A search (`policy-template-gallery-search-input`) and
   category pills (`policy-template-gallery-category-<key>`) share `useTemplateFilter` with the
   templates column; Allow all shows only while nothing filters. Six templates show until
-  **Show all (N)** (`policy-template-gallery-show-all`). Choosing a card selects it and shows its
-  detail in place under the grid (`policy-template-gallery-detail`), built from
+  **Show all (N)** (`policy-template-gallery-show-all`). The help text above the grid points to
+  **Add rules from a template** by name, not by where the column sits, since the column stacks
+  under the editor below `xl`. Choosing a card selects it, shows its
+  detail in place under the grid (`policy-template-gallery-detail`) and moves focus to the
+  detail's heading (`policy-template-gallery-detail-heading`, `tabIndex={-1}`). The detail shows
+  only while its card is among the cards shown, so a search or category that hides the selected
+  card, Allow all included, hides its detail and Use (`hidden`); the hidden detail stays
+  mounted, so settings typed there are still there when the filter is cleared. Allow all's detail has its description,
+  **Show Rego** with `ALLOW_ALL_POLICY` and Use. A template's detail is built from
   `TemplatePreview.tsx` like the column's preview: description, default decision, a note when
-  using it sets the Type, setting fields (`policy-template-gallery-param-<key>`), **How it
+  using it sets the Type, setting fields (`policy-template-gallery-param-<key>`), **Show Rego**
+  (`policy-template-gallery-show-rego`, collapsed by default), which shows the Rego the current
+  settings render to in a `policy-preview-block` (`policy-template-gallery-rego`), or "Fix the
+  settings above to see the Rego." while a setting is invalid, **How it
   decides** with each example's sample input behind **Show input**
   (`policy-template-gallery-example-input-<i>`, `-json`), the docs link
   (`policy-template-gallery-docs-link`) and **Use this template**
@@ -1872,9 +1882,11 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   template is used and the Rego is `DEFAULT_POLICY`, and "Custom Rego" otherwise: once rules were added or
   removed, the Type changed to one the template doesn't serve, or the Rego was edited by hand.
   Undo of Use, Allow all, Add rules, Remove, Remove rule and Deny by default restores the Rego
-  and the used template together. **Change** (`policy-template-gallery-change-button`) reopens
+  and the used template together. Use, of a template or Allow all, moves focus to **Change**
+  (`policy-template-gallery-change-button`), which reopens
   it with the used card selected and its settings as they were used, also after a hand edit,
-  and Use there replaces the Rego. After a discard and Undo the page keeps only the form, so no
+  and moves focus to the selected card, or to the search when no shown card is selected. Use
+  there replaces the Rego. After a discard and Undo the page keeps only the form, so no
   card is selected over Rego other than `DEFAULT_POLICY`. Changing Type keeps the Rego, whose
   package the Type select rewrites as before, keeps a template that serves both Types used,
   with its settings, and shows a warning toast naming any built-in template in it, used or

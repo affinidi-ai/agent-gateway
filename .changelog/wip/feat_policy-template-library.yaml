@@ -12,7 +12,7 @@ changes:
         method, path, surface and subject allowlists, plus MCP tool policies for tool bindings
         on the MCP Proxy hop. Templates follow the Apply Policies guides and link to their own
         docs section. The gallery offers templates of either type; choosing one shows its
-        settings, how it decides on sample inputs, and its docs link in place, and Use this
+        settings, its Rego, how it decides on sample inputs, and its docs link in place, and Use this
         template fills Name, Description, Type and Rego with settings that are checked first.
         Add rules from a template appends a template's rules to a new or saved policy, so
         several can be combined, and on a saved policy checks the template's examples with the

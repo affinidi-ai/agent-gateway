@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import {
   ALLOW_ALL_POLICY,
   BLANK_TEMPLATE_ID,
@@ -46,17 +46,68 @@ interface TemplateGalleryProps {
   onUseTemplate: (template: PolicyTemplate, rego: string, fieldText: FieldText) => void;
 }
 
-/** The selected card's detail: settings, how it decides, docs and Use this template. */
+type FocusTarget = 'change' | 'card' | 'heading';
+
+const DetailHeading = React.forwardRef<HTMLHeadingElement, { children: React.ReactNode }>(
+  ({ children }, ref) => (
+    <h6
+      ref={ref}
+      tabIndex={-1}
+      className="fw-bold mb-1"
+      data-testid="policy-template-gallery-detail-heading"
+    >
+      {children}
+    </h6>
+  )
+);
+DetailHeading.displayName = 'DetailHeading';
+
+/** The Rego a detail renders to, collapsed until asked for; null while a setting is invalid. */
+const ShowRego: React.FC<{ rego: string | null }> = ({ rego }) => {
+  const [open, setOpen] = useState(false);
+  const regoId = useId();
+  return (
+    <>
+      <button
+        type="button"
+        className="btn btn-sm btn-link p-0 mb-2"
+        aria-expanded={open}
+        aria-controls={regoId}
+        onClick={() => setOpen(o => !o)}
+        data-testid="policy-template-gallery-show-rego"
+      >
+        {open ? 'Hide Rego' : 'Show Rego'}
+      </button>
+      {open && (
+        <pre
+          id={regoId}
+          className="policy-preview-block rounded p-2 mb-3 small"
+          data-testid="policy-template-gallery-rego"
+        >
+          <code>{rego ?? 'Fix the settings above to see the Rego.'}</code>
+        </pre>
+      )}
+    </>
+  );
+};
+
+/** The selected card's detail: settings, its Rego, how it decides, docs and Use this template. */
 const GalleryDetail: React.FC<{
   template: PolicyTemplate;
   policyType: PolicyType;
   initialText?: FieldText;
+  headingRef: React.Ref<HTMLHeadingElement>;
+  hidden: boolean;
   onUse: (template: PolicyTemplate, rego: string, fieldText: FieldText) => void;
-}> = ({ template, policyType, initialText, onUse }) => {
+}> = ({ template, policyType, initialText, headingRef, hidden, onUse }) => {
   const settings = useTemplateSettings(template, initialText);
   return (
-    <div className="policy-template-gallery__detail" data-testid="policy-template-gallery-detail">
-      <h6 className="fw-bold mb-1">{template.name}</h6>
+    <div
+      className="policy-template-gallery__detail"
+      hidden={hidden}
+      data-testid="policy-template-gallery-detail"
+    >
+      <DetailHeading ref={headingRef}>{template.name}</DetailHeading>
       <p className="text-muted small mb-2">{template.description}</p>
       <div className="d-flex flex-wrap gap-2 mb-3">
         <DecisionBadge decision={defaultDecision(template.rego)} prefix="Default" />
@@ -67,6 +118,7 @@ const GalleryDetail: React.FC<{
         )}
       </div>
       <TemplateSettingsFields template={template} settings={settings} idPrefix={ID_PREFIX} />
+      <ShowRego rego={settings.rendered.rego} />
       <TemplateHowItDecides template={template} idPrefix={ID_PREFIX} />
       <TemplateDocsLink template={template} testId="policy-template-gallery-docs-link" />
       <div className="d-flex justify-content-end">
@@ -134,8 +186,6 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
   // The card whose detail is open: the applied one until the user picks another.
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const shownKey = selectedKey ?? appliedKey;
-  const selected = all.find(t => templateEntryKey(t) === shownKey) ?? null;
-
   const filtering = query.trim() !== '' || category !== 'all';
   // The selected template stays in view even when it is past the first few cards.
   const selectedIndex = visible.findIndex(t => templateEntryKey(t) === shownKey);
@@ -143,16 +193,36 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
     showAll || filtering || selectedIndex >= COLLAPSED_COUNT
       ? visible
       : visible.slice(0, COLLAPSED_COUNT);
+  // A detail stays mounted, keeping its settings, but shows only while its card does.
+  const selected = all.find(t => templateEntryKey(t) === shownKey) ?? null;
+  const detailHidden = shownKey === BLANK_TEMPLATE_ID ? filtering : selectedIndex < 0;
 
-  const use = (template: PolicyTemplate, rego: string, fieldText: FieldText) => {
-    onUseTemplate(template, rego, fieldText);
+  const changeRef = useRef<HTMLButtonElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const gridRef = useRef<HTMLDivElement>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const [focusTarget, setFocusTarget] = useState<FocusTarget | null>(null);
+  useEffect(() => {
+    if (!focusTarget) return;
+    if (focusTarget === 'change') changeRef.current?.focus();
+    else if (focusTarget === 'heading') headingRef.current?.focus();
+    else
+      (gridRef.current?.querySelector<HTMLElement>('.is-selected') ?? searchRef.current)?.focus();
+    setFocusTarget(null);
+  }, [focusTarget]);
+
+  const collapse = () => {
     setSelectedKey(null);
     setExpanded(false);
+    setFocusTarget('change');
+  };
+  const use = (template: PolicyTemplate, rego: string, fieldText: FieldText) => {
+    onUseTemplate(template, rego, fieldText);
+    collapse();
   };
   const useBlank = () => {
     onPickBlank();
-    setSelectedKey(null);
-    setExpanded(false);
+    collapse();
   };
 
   const summaryName =
@@ -174,7 +244,10 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
       type="button"
       className={`policy-template-row policy-template-card${shownKey === key ? ' is-selected' : ''}`}
       aria-pressed={shownKey === key}
-      onClick={() => setSelectedKey(key)}
+      onClick={() => {
+        setSelectedKey(key);
+        setFocusTarget('heading');
+      }}
       data-testid={testId}
     >
       <span className="policy-template-row__name">{name}</span>
@@ -189,8 +262,12 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
         {!expanded && (
           <button
             type="button"
+            ref={changeRef}
             className="btn btn-sm btn-link p-0"
-            onClick={() => setExpanded(true)}
+            onClick={() => {
+              setExpanded(true);
+              setFocusTarget('card');
+            }}
             data-testid="policy-template-gallery-change-button"
           >
             Change
@@ -217,10 +294,11 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
         <>
           <p className="text-muted small mb-2">
             Pick a starting point to see what it does, then use it. You can add rules from more
-            templates in the column on the right.
+            templates with <strong>Add rules from a template</strong>.
           </p>
           <div className="d-flex flex-wrap gap-2 align-items-center mb-2">
             <input
+              ref={searchRef}
               type="search"
               className="form-control form-control-sm policy-template-gallery__search"
               placeholder="Search templates, e.g. role, trust, path"
@@ -248,7 +326,7 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
             )}
           </div>
 
-          <div className="policy-template-gallery">
+          <div className="policy-template-gallery" ref={gridRef}>
             {!filtering &&
               card(
                 BLANK_TEMPLATE_ID,
@@ -299,13 +377,15 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
           {shownKey === BLANK_TEMPLATE_ID ? (
             <div
               className="policy-template-gallery__detail"
+              hidden={detailHidden}
               data-testid="policy-template-gallery-detail"
             >
-              <h6 className="fw-bold mb-1">Allow all (blank)</h6>
+              <DetailHeading ref={headingRef}>Allow all (blank)</DetailHeading>
               <p className="text-muted small mb-3">
                 The default allow-all policy. Every request is allowed until you add rules and
                 change <code>default allow</code> to <code>false</code>.
               </p>
+              <ShowRego rego={ALLOW_ALL_POLICY[policyType]} />
               <div className="d-flex justify-content-end">
                 <button
                   type="button"
@@ -324,6 +404,8 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
                 template={selected}
                 policyType={policyType}
                 initialText={usedTemplate?.id === selected.id ? usedTemplate.fieldText : undefined}
+                headingRef={headingRef}
+                hidden={detailHidden}
                 onUse={use}
               />
             )
