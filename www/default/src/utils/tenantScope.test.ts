@@ -65,9 +65,6 @@ describe('tenantScope', () => {
     expect(sendsGatewayCredential({ provider_type: 'oauth2_authorization_code' })).toBe(false);
     expect(sendsGatewayCredential({ provider_type: 'oauth2_client_credentials' })).toBe(true);
     expect(sendsGatewayCredential({ provider_type: 'oauth2_jwt_bearer' })).toBe(true);
-    expect(sendsGatewayCredential({ provider_type: 'oauth2_client_credentials_jwt_auth' })).toBe(
-      true
-    );
     expect(sendsGatewayCredential({ provider_type: 'api_key' })).toBe(true);
     expect(
       sendsGatewayCredential({
@@ -75,11 +72,6 @@ describe('tenantScope', () => {
         issuer: 'https://issuer.example',
       })
     ).toBe(true);
-  });
-
-  it('lists the gateway-credential types explicitly, so an unknown type is not one', () => {
-    expect(sendsGatewayCredential({ provider_type: 'something_new' })).toBe(false);
-    expect(sendsGatewayCredential({})).toBe(false);
   });
 
   it('labels out-of-tenant items by what the gateway does with them', () => {

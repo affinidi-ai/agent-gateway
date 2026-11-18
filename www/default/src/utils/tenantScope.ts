@@ -1,5 +1,3 @@
-import { isTargetAuthProviderType } from '../components/surface-builder/elements/_shared/providerTargetAuth';
-
 export interface TenantOwned {
   tenant_id?: string | null;
 }
@@ -12,17 +10,16 @@ export const OTHER_TENANT_LABEL = 'another tenant, refused by the gateway';
 export type OwnerTenant = string | null | undefined;
 
 /**
- * A provider of one of the types a Target authentication can use sends the gateway's own
- * credential. Any other type, an authorization code provider among them, sends the user's token,
- * so the gateway lets a tenant surface keep using an appliance-wide one. A provider with an issuer
- * (external consent) is held to the tenant rule like those: the gateway refuses an appliance-wide
- * one outside its own tenant.
+ * An authorization code provider sends the user's own token, so the gateway lets a tenant
+ * surface keep using an appliance-wide one; every other type sends the gateway's credential.
+ * A provider with an issuer (external consent) is held to the tenant rule like those: the
+ * gateway refuses an appliance-wide one outside its own tenant.
  */
 export function sendsGatewayCredential(provider: {
   provider_type?: string;
   issuer?: string | null;
 }): boolean {
-  return isTargetAuthProviderType(provider.provider_type) || Boolean(provider.issuer);
+  return provider.provider_type !== 'oauth2_authorization_code' || Boolean(provider.issuer);
 }
 
 /** Appliance-wide items a tenant owner may still use, beside its own. */
