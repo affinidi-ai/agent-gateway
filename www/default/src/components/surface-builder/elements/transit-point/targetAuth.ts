@@ -2,27 +2,62 @@ import {
   STORED_TARGET_AUTH_KEY,
   StoredTargetAuth,
   TP_CALLER_CHECK_PROBLEM,
-  isStoredTargetAuth,
+  TargetAuthProblems,
+  UNKNOWN_METHOD_NOTE,
+  classifyTargetAuthProblems,
+  knownTargetAuthMethod,
   mergedTargetAuth,
+  noTargetAuthProblems,
   parseScopes,
   providerTargetAuthToApi,
-  targetAuthFieldProblems,
 } from '../_shared/providerTargetAuth';
 import { authenticatesCallers } from './callerAuth';
+
+/** A Transit Point's Target authentication form, as its node config holds it. */
+export interface TransitPointTargetAuthForm {
+  target_endpoint?: unknown;
+  auth_type?: unknown;
+  auth_secret?: unknown;
+  auth_provider_id?: unknown;
+  auth_header_name?: unknown;
+  auth_header_format?: unknown;
+  auth_scopes?: unknown;
+  auth_fallback?: unknown;
+  [STORED_TARGET_AUTH_KEY]?: StoredTargetAuth;
+  [key: string]: unknown;
+}
+
+type Form = TransitPointTargetAuthForm | null | undefined;
+
+/** The form's keys, which come only from the stored surface and never from the canvas data. */
+export const TRANSIT_POINT_TARGET_AUTH_FORM_KEYS: ReadonlyArray<keyof TransitPointTargetAuthForm> =
+  [
+    'auth_type',
+    'auth_secret',
+    'auth_provider_id',
+    'auth_header_name',
+    'auth_header_format',
+    'auth_scopes',
+    'auth_fallback',
+  ];
 
 function text(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-function editedTargetAuth(c: any): Record<string, unknown> | undefined {
+function untrimmed(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+function editedTargetAuth(c: TransitPointTargetAuthForm): Record<string, unknown> | undefined {
   const type = c.auth_type;
   if (!type || type === 'none') return undefined;
   if (type === 'credential_provider') {
     return providerTargetAuthToApi({
-      providerId: typeof c.auth_provider_id === 'string' ? c.auth_provider_id : '',
-      headerName: typeof c.auth_header_name === 'string' ? c.auth_header_name : '',
-      headerFormat: typeof c.auth_header_format === 'string' ? c.auth_header_format : '',
-      fallback: c.auth_fallback,
+      providerId: untrimmed(c.auth_provider_id),
+      headerName: untrimmed(c.auth_header_name),
+      headerFormat: untrimmed(c.auth_header_format),
+      fallback: c.auth_fallback === 'passthrough' ? 'passthrough' : 'reject',
       scopes: c.auth_scopes === undefined ? undefined : parseScopes(c.auth_scopes),
     });
   }
@@ -70,19 +105,13 @@ export function staticSecretAuthType(
 
 /**
  * The Transit Point's wire `target_auth`. A Transit Point whose auth form was never opened
- * sends the stored one unchanged; an edited one is laid over the stored one, so a field the
- * panel does not show survives. `undefined` when none is set.
+ * sends the stored one unchanged, whatever its method; an edited one is laid over the stored
+ * one, so a field the panel does not show survives. `undefined` when none is set.
  */
-export function transitPointTargetAuth(c: any): Record<string, unknown> | undefined {
-  const stored: StoredTargetAuth | undefined = c?.[STORED_TARGET_AUTH_KEY];
+export function transitPointTargetAuth(c: Form): Record<string, unknown> | undefined {
+  const stored = c?.[STORED_TARGET_AUTH_KEY];
   if (!c?.auth_type) return stored?.auth ?? undefined;
   return mergedTargetAuth(stored, editedTargetAuth(c));
-}
-
-export interface TransitPointTargetAuthProblems {
-  errors: Record<string, string>;
-  warnings: string[];
-  advisories: string[];
 }
 
 /**
@@ -92,23 +121,16 @@ export interface TransitPointTargetAuthProblems {
  * that authenticates no caller, is an advisory: the gateway refuses it only while `target_https`
  * or `target_source_auth` is `enforce`.
  */
-export function transitPointTargetAuthProblems(c: any): TransitPointTargetAuthProblems {
-  const result: TransitPointTargetAuthProblems = { errors: {}, warnings: [], advisories: [] };
+export function transitPointTargetAuthProblems(c: Form): TargetAuthProblems {
   const auth = transitPointTargetAuth(c);
-  if (!auth) return result;
-  const endpoint = typeof c.target_endpoint === 'string' ? c.target_endpoint : '';
-  const problems = targetAuthFieldProblems(auth, endpoint);
-  const found: Array<[string, string | undefined]> = [
-    ['auth_header_name', problems.headerName],
-    ['auth_header_format', problems.headerFormat],
-  ];
-  if (problems.endpoint) result.advisories.push(problems.endpoint);
+  if (!c || !auth) return noTargetAuthProblems();
+  const result = classifyTargetAuthProblems(
+    auth,
+    untrimmed(c.target_endpoint),
+    c[STORED_TARGET_AUTH_KEY],
+    { headerName: 'auth_header_name', headerFormat: 'auth_header_format' }
+  );
   if (!authenticatesCallers(c)) result.advisories.push(TP_CALLER_CHECK_PROBLEM);
-  const kept = isStoredTargetAuth(c[STORED_TARGET_AUTH_KEY], auth, endpoint);
-  for (const [field, message] of found) {
-    if (!message) continue;
-    if (kept) result.warnings.push(message);
-    else result.errors[field] = message;
-  }
+  if (!knownTargetAuthMethod(auth)) result.notes.push(UNKNOWN_METHOD_NOTE);
   return result;
 }

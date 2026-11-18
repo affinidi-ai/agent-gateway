@@ -1,6 +1,5 @@
 import { registry } from '../index';
 import { buildCanvasBlob } from '../registry';
-import type { SurfaceContext } from '../types';
 import { managedAgentDefinition } from '../managed-agent/definition';
 import {
   headerFormatProblem,
@@ -8,59 +7,23 @@ import {
   RESERVED_HEADERS,
   isHttpsTarget,
   mergeTargetAuth,
+  MA_CALLER_CHECK_PROBLEM,
+  PASSTHROUGH_NOTE,
   TARGET_AUTH_HTTPS_PROBLEM,
-  TP_CALLER_CHECK_PROBLEM,
+  UNKNOWN_METHOD_NOTE,
 } from '../_shared/providerTargetAuth';
-import { managedAgentTargetAuthProblems } from '../managed-agent/targetAuth';
-import { staticSecretAuthType, transitPointTargetAuthProblems } from '../transit-point/targetAuth';
-import { targetAuthBreaches } from '../targetAuthRules';
-import { validateSurfacePayload } from '../validateSurface';
-
-const breachMessages = (surface: unknown, stored: unknown) =>
-  targetAuthBreaches(surface, stored).map(breach => breach.message);
-
-function makeCtx(nodes: any[]): SurfaceContext {
-  return {
-    protocol: 'a2a',
-    surfaceMeta: { name: 'guards', tags: [], status: 'active' },
-    allNodes: nodes,
-    nodesOfType: type => nodes.filter(n => n.type === type),
-    firstNodeOfType: type => nodes.find(n => n.type === type),
-  };
-}
-
-const staticSecret = (headerName: string, headerFormat: string) => ({
-  method: {
-    static_secret: { secret_id: 's', header_name: headerName, header_format: headerFormat },
-  },
-  fallback: 'reject',
-});
-
-const providerAuth = {
-  method: {
-    credential_provider: {
-      provider_id: 'prov-1',
-      header_name: 'Authorization',
-      header_format: 'Bearer {value}',
-      scopes: ['read', 'write'],
-    },
-  },
-  auth_type: 'bearer',
-  target_identifier: null,
-  fallback: 'passthrough',
-  future_field: { keep: true },
-};
-
-const maConfig = (over: Record<string, unknown> = {}) => ({
-  endpoint: 'https://agent.example.com',
-  target_auth_enabled: true,
-  target_auth_source: 'secret',
-  target_auth_secret_id: 's',
-  target_auth_type: 'custom',
-  target_auth_header_name: 'X-Api-Key',
-  target_auth_header_format: '{value}',
-  ...over,
-});
+import {
+  managedAgentTargetAuth,
+  managedAgentTargetAuthProblems,
+} from '../managed-agent/targetAuth';
+import {
+  makeCtx,
+  maConfig,
+  providerAuth,
+  roundTrip,
+  staticSecret,
+  unknownMethodAuth,
+} from '../testing/targetAuthFixtures';
 
 describe('header and endpoint rules', () => {
   it.each([
@@ -117,25 +80,13 @@ describe('reserved header names', () => {
   });
 });
 
-describe('Transit Point auth type of a stored static secret', () => {
-  it('reads a Bearer format as bearer only under the Authorization header', () => {
-    expect(staticSecretAuthType('Authorization', 'Bearer {value}')).toBe('bearer');
-    expect(staticSecretAuthType('authorization', 'Bearer {value}')).toBe('custom_header');
-    expect(staticSecretAuthType('X-Partner', 'Bearer {value}')).toBe('custom_header');
-  });
-
-  it('keeps the api key and custom header readings', () => {
-    expect(staticSecretAuthType('X-API-Key', '{value}')).toBe('api_key');
-    expect(staticSecretAuthType('X-Auth', 'Token {value}')).toBe('custom_header');
-  });
-});
-
 describe('Managed Agent Target authentication validation', () => {
   it('passes a valid setting', () => {
     expect(managedAgentTargetAuthProblems(maConfig())).toEqual({
       errors: {},
       warnings: [],
       advisories: [],
+      notes: [],
     });
   });
 
@@ -232,218 +183,6 @@ describe('Managed Agent Target authentication validation', () => {
   });
 });
 
-describe('Transit Point Target authentication validation', () => {
-  const tp = (over: Record<string, unknown> = {}) => ({
-    target_endpoint: 'https://partner.example.com',
-    auth_type: 'custom_header',
-    auth_secret: 's',
-    auth_header_name: 'X-Auth',
-    auth_header_format: '{value}',
-    ...over,
-  });
-
-  it('passes a valid setting', () => {
-    expect(transitPointTargetAuthProblems(tp())).toEqual({
-      errors: {},
-      warnings: [],
-      advisories: [],
-    });
-  });
-
-  it('blocks a bad header name and a bad format, and only advises on a Target that is not https', () => {
-    expect(transitPointTargetAuthProblems(tp({ auth_header_name: 'Upgrade' })).errors).toEqual({
-      auth_header_name: 'Header name must not be the reserved header Upgrade',
-    });
-    expect(transitPointTargetAuthProblems(tp({ auth_header_format: 'x' })).errors).toEqual({
-      auth_header_format: 'Header format must contain {value} exactly once',
-    });
-    const fabric = transitPointTargetAuthProblems(tp({ target_endpoint: 'fabric://g/s' }));
-    expect(fabric.errors).toEqual({});
-    expect(fabric.advisories).toEqual([TARGET_AUTH_HTTPS_PROBLEM]);
-  });
-
-  it('advises, without blocking, on a Target credential on a Transit Point that checks no caller, and passes its twin', () => {
-    const open = transitPointTargetAuthProblems(
-      tp({ require_transit_token: false, allow_unauthenticated_callers: true })
-    );
-    expect(open.errors).toEqual({});
-    expect(open.advisories).toEqual([TP_CALLER_CHECK_PROBLEM]);
-    expect(
-      transitPointTargetAuthProblems(
-        tp({ require_transit_token: false, source_auth: { type: 'api_key' } })
-      ).advisories
-    ).toEqual([]);
-  });
-
-  it('blocks Save through the element validation', () => {
-    expect(
-      registry.getValidationErrors('transit-point-a2a', tp({ auth_header_name: 'Host' }))
-    ).toContainEqual({
-      field: 'auth_header_name',
-      message: 'Header name must not be the reserved header Host',
-    });
-  });
-
-  it('keeps an unedited stored Transit Point header problem non-blocking', () => {
-    const stored = {
-      endpoint: 'http://partner.example.com',
-      auth: staticSecret('Host', '{value}'),
-    };
-    const config = {
-      target_endpoint: stored.endpoint,
-      _stored_target_auth: stored,
-      target_auth: stored.auth,
-    };
-    expect(transitPointTargetAuthProblems(config)).toEqual({
-      errors: {},
-      warnings: ['Header name must not be the reserved header Host'],
-      advisories: [TARGET_AUTH_HTTPS_PROBLEM],
-    });
-  });
-});
-
-describe('Target authentication rules that need the whole surface', () => {
-  const surface = (over: Record<string, unknown> = {}): any => ({
-    name: 's',
-    protocol: 'mcp',
-    access_point: {
-      caller_authentication: { methods: [{ type: 'api_key' }] },
-    },
-    target: { endpoint: 'https://agent.example.com', auth: staticSecret('X-Api-Key', '{value}') },
-    ...over,
-  });
-
-  it('passes a valid surface', () => {
-    expect(breachMessages(surface(), null)).toEqual([]);
-  });
-
-  it('counts a forwarded JWT only on the first caller method, as the gateway does', () => {
-    const forwarding = { type: 'jwt_bearer', forward_header: true };
-    const withMethods = (methods: unknown[]) =>
-      surface({
-        access_point: { caller_authentication: { methods } },
-        target: {
-          endpoint: 'https://agent.example.com',
-          auth: staticSecret('Authorization', 'Bearer {value}'),
-        },
-      });
-    expect(breachMessages(withMethods([forwarding]), null)).toHaveLength(1);
-    expect(breachMessages(withMethods([{ type: 'api_key' }, forwarding]), null)).toEqual([]);
-  });
-
-  it('blocks a header the Access Point maps from metadata, and passes a different one', () => {
-    const mapped = (name: string) =>
-      surface({
-        protocol: undefined,
-        access_point: {
-          protocol: 'a2a',
-          caller_authentication: { methods: [{ type: 'api_key' }] },
-          header_metadata_mapping: { headers: [{ header: 'x-tenant' }] },
-        },
-        target: { endpoint: 'https://agent.example.com', auth: staticSecret(name, '{value}') },
-      });
-    expect(breachMessages(mapped('X-Tenant'), null)).toEqual([
-      'target.auth.header_name X-Tenant is already sent by header metadata mapping',
-    ]);
-    expect(breachMessages(mapped('X-Other'), null)).toEqual([]);
-  });
-
-  it('reports a Target credential on a surface whose Access Point checks no caller, and passes its twin', () => {
-    const open = surface({ access_point: {} });
-    expect(breachMessages(open, null)).toEqual([
-      'target.auth: Target authentication sends a credential, so it needs source authentication on the Access Point',
-    ]);
-    const resource = surface({ access_point: {}, mcp_http: { authorization: { resource: 'r' } } });
-    expect(breachMessages(resource, null)).toEqual([]);
-  });
-
-  it('blocks a header another credential on the leg already sends, and passes its twin', () => {
-    const clash = surface({
-      outbound_credentials: [
-        { inject_as: { type: 'custom_header', name: 'x-api-key', format: '{value}' } },
-      ],
-    });
-    expect(breachMessages(clash, null)).toEqual([
-      'target.auth.header_name X-Api-Key is already sent by a credential binding',
-    ]);
-    const bearer = surface({
-      target: {
-        endpoint: 'https://agent.example.com',
-        auth: staticSecret('Authorization', 'Bearer {value}'),
-      },
-      outbound_credentials: [{ inject_as: { type: 'bearer_header' } }],
-    });
-    expect(breachMessages(bearer, null)).toEqual([
-      'target.auth.header_name Authorization is already sent by a credential binding',
-    ]);
-    const other = surface({ outbound_credentials: [{ inject_as: { type: 'bearer_header' } }] });
-    expect(breachMessages(other, null)).toEqual([]);
-  });
-
-  it('applies the rules to a Transit Point, where a withheld fabric credential avoids the duplicate', () => {
-    const point = (endpoint: string, extra: Record<string, unknown> = {}) =>
-      surface({
-        outbound_credentials: [{ inject_as: { type: 'bearer_header' } }],
-        transit: {
-          points: [
-            {
-              id: 'tp',
-              alias: 'partner',
-              protocol: 'mcp',
-              target_endpoint: endpoint,
-              require_transit_token: true,
-              target_auth: staticSecret('Authorization', 'Bearer {value}'),
-              ...extra,
-            },
-          ],
-        },
-      });
-    expect(breachMessages(point('https://p.example.com'), null)).toEqual([
-      "transit.points['partner'].target_auth.header_name Authorization is already sent by a credential binding",
-    ]);
-    expect(breachMessages(point('fabric://g/s'), null)).toEqual([]);
-    expect(
-      breachMessages(
-        point('https://p.example.com', { require_transit_token: false, source_auth: undefined }),
-        null
-      )
-    ).toEqual([
-      "transit.points['partner'].target_auth.header_name Authorization is already sent by a credential binding",
-      "transit.points['partner'].target_auth: Target authentication sends a credential, so it needs a Transit Point that authenticates its callers",
-    ]);
-  });
-
-  it('keeps a breach the stored surface already had on the same leg, setting and endpoint', () => {
-    const open = surface({ access_point: {} });
-    expect(breachMessages(open, open)).toEqual([]);
-    const changed = surface({
-      access_point: {},
-      target: { endpoint: 'https://agent.example.com', auth: staticSecret('X-Other', '{value}') },
-    });
-    expect(breachMessages(changed, open)).toHaveLength(1);
-    const moved = surface({
-      access_point: {},
-      target: { endpoint: 'https://moved.example.com', auth: open.target.auth },
-    });
-    expect(breachMessages(moved, open)).toHaveLength(1);
-  });
-
-  it('reports a header clash as a blocking issue only when the stored surface is given', () => {
-    const open = surface({
-      outbound_credentials: [
-        { inject_as: { type: 'custom_header', name: 'x-api-key', format: '{value}' } },
-      ],
-    });
-    expect(validateSurfacePayload(open).filter(i => i.severity === 'error')).toEqual([]);
-    expect(
-      validateSurfacePayload(open, { stored: null }).filter(i => i.severity === 'error')
-    ).toHaveLength(1);
-    expect(
-      validateSurfacePayload(open, { stored: open }).filter(i => i.severity === 'error')
-    ).toEqual([]);
-  });
-});
-
 describe('lossless Target authentication save', () => {
   const apiSurface: any = {
     name: 'lossless',
@@ -466,12 +205,6 @@ describe('lossless Target authentication save', () => {
         },
       ],
     },
-  };
-
-  const roundTrip = (surface: any, edit?: (nodes: any[]) => void) => {
-    const nodes = registry.nodesFromPayload(surface);
-    edit?.(nodes);
-    return registry.buildPayload(makeCtx(nodes)) as any;
   };
 
   it('saves a loaded surface without edits with equal Target authentication', () => {
@@ -569,55 +302,178 @@ describe('lossless Target authentication save', () => {
   });
 });
 
-describe('Target authentication whole-surface problems in the Surface Builder', () => {
-  const base = (over: Record<string, unknown> = {}): any => ({
-    name: 's',
-    protocol: 'mcp',
-    access_point: { caller_authentication: { methods: [{ type: 'api_key' }] } },
-    target: { endpoint: 'https://agent.example.com', auth: staticSecret('X-Api-Key', '{value}') },
-    ...over,
-  });
-  const issuesFor = (surface: any) =>
-    validateSurfacePayload(surface, { stored: null }).filter(i => i.path === 'target.auth');
-
-  it('warns, without blocking Save, about a Target credential when the Access Point checks no caller', () => {
-    const issues = issuesFor(base({ access_point: {} }));
-    expect(issues).toEqual([expect.objectContaining({ severity: 'warning', nodeId: 'target' })]);
-    expect(issuesFor(base())).toEqual([]);
-  });
-
-  it('blocks Save when a credential binding already sends the Target credential header', () => {
-    const issues = issuesFor(
-      base({
-        outbound_credentials: [
-          { inject_as: { type: 'custom_header', name: 'X-Api-Key', format: '{value}' } },
-        ],
-      })
+describe('header names as the gateway compares them', () => {
+  it('refuses a reserved name written with underscores or another letter case', () => {
+    expect(headerNameProblem('X_Transit_Token')).toBe(
+      'Header name must not be the reserved header X-Transit-Token'
     );
-    expect(issues).toEqual([expect.objectContaining({ severity: 'error', nodeId: 'target' })]);
+    expect(headerNameProblem('x_caller_did')).toBe(
+      'Header name must not be the reserved header X-Caller-Did'
+    );
   });
 
-  it('reports a Transit Point problem on that Transit Point, not on the Managed Agent', () => {
-    const issues = issuesFor(
-      base({
-        target: { endpoint: 'https://agent.example.com' },
-        outbound_credentials: [{ inject_as: { type: 'bearer_header' } }],
-        transit: {
-          points: [
-            {
-              id: 'tp',
-              alias: 'partner',
-              protocol: 'mcp',
-              target_endpoint: 'https://p.example.com',
-              require_transit_token: true,
-              target_auth: staticSecret('Authorization', 'Bearer {value}'),
-            },
-          ],
+  it('allows an underscore name that is not reserved', () => {
+    expect(headerNameProblem('x_api_key')).toBeNull();
+  });
+});
+
+describe('Managed Agent Target authentication advice', () => {
+  it('advises when the Access Point checks no caller, and not when it does or is not known', () => {
+    const problems = (accessPointChecksCallers?: boolean) =>
+      managedAgentTargetAuthProblems(maConfig(), { accessPointChecksCallers });
+    expect(problems(false).advisories).toEqual([MA_CALLER_CHECK_PROBLEM]);
+    expect(problems(false).errors).toEqual({});
+    expect(problems(true).advisories).toEqual([]);
+    expect(problems().advisories).toEqual([]);
+  });
+
+  it('notes a passthrough fallback without blocking the save', () => {
+    const passthrough = managedAgentTargetAuthProblems(
+      maConfig({ target_auth_fallback: 'passthrough' })
+    );
+    expect(passthrough.notes).toEqual([PASSTHROUGH_NOTE]);
+    expect(passthrough.errors).toEqual({});
+    expect(managedAgentTargetAuthProblems(maConfig()).notes).toEqual([]);
+  });
+
+  it('gives no https advisory for a proxy:// Target, whose MCP proxy decides it', () => {
+    expect(
+      managedAgentTargetAuthProblems(maConfig({ endpoint: 'proxy://docs' })).advisories
+    ).toEqual([]);
+    expect(
+      managedAgentTargetAuthProblems(maConfig({ endpoint: 'http://agent' })).advisories
+    ).toEqual([TARGET_AUTH_HTTPS_PROBLEM]);
+  });
+});
+
+describe('a stored Target authentication method the editor cannot show', () => {
+  const surface: any = {
+    name: 'unknown-method',
+    protocol: 'a2a',
+    access_point: { route: '/unknown', listen_address: '0.0.0.0:8443', protocol: 'a2a' },
+    target: { endpoint: 'https://agent.example.com', auth: unknownMethodAuth },
+  };
+
+  it('is saved unchanged on the Managed Agent and noted', () => {
+    expect(roundTrip(surface).target.auth).toEqual(unknownMethodAuth);
+    const config = registry.nodesFromPayload(surface).find(n => n.type === 'target')?.config;
+    expect(managedAgentTargetAuthProblems(config).notes).toEqual([UNKNOWN_METHOD_NOTE]);
+  });
+
+  it('is replaced once the operator chooses a secret, and removed when turned off', () => {
+    const chosen = roundTrip(surface, nodes => {
+      Object.assign(nodes.find(n => n.type === 'target').config, {
+        target_auth_source: 'secret',
+        target_auth_secret_id: 's',
+        target_auth_type: 'custom',
+        target_auth_header_name: 'X-Api-Key',
+        target_auth_header_format: '{value}',
+      });
+    });
+    expect(chosen.target.auth.method).toEqual(staticSecret('X-Api-Key', '{value}').method);
+    const off = roundTrip(surface, nodes => {
+      nodes.find(n => n.type === 'target').config.target_auth_enabled = false;
+    });
+    expect(off.target.auth).toBeUndefined();
+  });
+
+  it('sends nothing for a new setting with no secret chosen', () => {
+    expect(managedAgentTargetAuth({ target_auth_enabled: true })).toBeUndefined();
+  });
+});
+
+describe('unseen fields and a changed credential', () => {
+  const provider = (providerId: string) => ({
+    method: {
+      credential_provider: {
+        provider_id: providerId,
+        header_name: 'Authorization',
+        header_format: 'Bearer {value}',
+      },
+    },
+    fallback: 'reject',
+  });
+
+  it('keeps unseen fields while the provider stays the same', () => {
+    const merged = mergeTargetAuth(providerAuth, provider('prov-1')) as any;
+    expect(merged.future_field).toEqual({ keep: true });
+    expect(merged.method.credential_provider.scopes).toEqual(['read', 'write']);
+  });
+
+  it('drops unseen fields and stored scopes when another provider is picked', () => {
+    const merged = mergeTargetAuth(providerAuth, provider('prov-2')) as any;
+    expect(merged).toEqual(provider('prov-2'));
+  });
+
+  it('drops unseen fields when another secret is picked', () => {
+    const stored = { ...staticSecret('X-Api-Key', '{value}'), future_field: 1 };
+    const edited = {
+      method: {
+        static_secret: { secret_id: 'other', header_name: 'X-Api-Key', header_format: '{value}' },
+      },
+      fallback: 'reject',
+    };
+    expect(mergeTargetAuth(stored, edited)).toEqual(edited);
+  });
+});
+
+describe('Target authentication and the canvas data', () => {
+  const surface: any = {
+    name: 'canvas',
+    protocol: 'a2a',
+    access_point: { route: '/canvas', listen_address: '0.0.0.0:8443', protocol: 'a2a' },
+    target: { endpoint: 'https://agent.example.com', auth: providerAuth },
+    transit: {
+      points: [
+        {
+          id: 'tp-1',
+          alias: 'partner',
+          protocol: 'a2a',
+          target_endpoint: 'https://partner.example.com',
+          require_transit_token: true,
+          target_auth: staticSecret('X-Auth', '{value}'),
         },
-      })
-    );
-    expect(issues).toEqual([
-      expect.objectContaining({ severity: 'error', nodeId: 'transit-point-1' }),
-    ]);
+      ],
+    },
+  };
+  const authKey =
+    /^(target_auth|_stored_target_auth|auth_(type|secret|provider_id|scopes|fallback|header_name|header_format))/;
+
+  it('writes no Target authentication key to the canvas data', () => {
+    const nodes = registry.nodesFromPayload(surface);
+    Object.assign(nodes.find(n => n.type === 'transit-point-a2a')!.config, {
+      auth_type: 'custom_header',
+      auth_secret: 's',
+      auth_header_name: 'X-Auth',
+      auth_header_format: '{value}',
+    });
+    const blob = buildCanvasBlob(nodes.map(n => ({ ...n })));
+    const keys = blob.nodes.flatMap(node => Object.keys(node.config ?? {}));
+    expect(keys.length).toBeGreaterThan(0);
+    expect(keys.filter(key => authKey.test(key))).toEqual([]);
+  });
+
+  it('restores a Transit Point the stored surface no longer has without a Target authentication', () => {
+    const blob = buildCanvasBlob(registry.nodesFromPayload(surface).map(n => ({ ...n })));
+    const point = blob.nodes.find(node => node.type === 'transit-point-a2a')!;
+    point.config = {
+      ...point.config,
+      auth_type: 'custom_header',
+      auth_secret: 's',
+      auth_header_name: 'X-Auth',
+      auth_header_format: '{value}',
+      target_auth: staticSecret('X-Auth', '{value}'),
+    };
+    const withoutPoint = { ...surface, canvas: blob, transit: { points: [] } };
+    const restored = registry
+      .nodesFromPayload(withoutPoint)
+      .filter(n => n.type === 'transit-point-a2a');
+    for (const node of restored) {
+      expect(Object.keys(node.config ?? {}).filter(key => authKey.test(key))).toEqual([]);
+    }
+    const saved = registry.buildPayload(makeCtx(registry.nodesFromPayload(withoutPoint))) as any;
+    for (const saved_point of saved.transit?.points ?? []) {
+      expect(saved_point.target_auth).toBeUndefined();
+    }
   });
 });

@@ -32,12 +32,6 @@ export interface ValidationIssue {
   path?: string;
 }
 
-/**
- * Validate the built payload. Cheap, side-effect-free, no async. Caller
- * access never blocks a save and raises no issue here: the gateway's save
- * answers with a `Warning` header for a public, a not-ready, and a legacy
- * Access Point that admits every caller.
- */
 export interface ValidateSurfaceOptions {
   /**
    * The stored surface, or null for a new one. When given, a Target authentication rule that
@@ -46,6 +40,12 @@ export interface ValidateSurfaceOptions {
   stored?: unknown;
 }
 
+/**
+ * Validate the built payload. Cheap, side-effect-free, no async. Caller
+ * access never blocks a save and raises no issue here: the gateway's save
+ * answers with a `Warning` header for a public, a not-ready, and a legacy
+ * Access Point that admits every caller.
+ */
 export function validateSurfacePayload(
   payload: any,
   options: ValidateSurfaceOptions = {}

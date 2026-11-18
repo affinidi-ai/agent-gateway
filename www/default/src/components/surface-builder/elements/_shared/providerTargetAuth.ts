@@ -91,16 +91,36 @@ export function storedTargetAuth(endpoint: unknown, auth: unknown): StoredTarget
   };
 }
 
-function record(value: unknown): Record<string, unknown> | null {
+export function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
 }
 
+/** `object` without `key`. */
+export function omitKey<T extends Record<string, unknown>>(
+  object: T,
+  key: string
+): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(object).filter(([name]) => name !== key));
+}
+
+/** The method of a wire `target_auth` the editor can show, or null for any other method. */
+export function knownTargetAuthMethod(auth: unknown): Record<string, unknown> | null {
+  const { method } = record(auth) ?? {};
+  if (method === 'static_secret') return record(auth);
+  const tagged = record(method);
+  return record(tagged?.static_secret) ?? record(tagged?.credential_provider);
+}
+
+const CREDENTIAL_ID_KEYS = ['secret_id', 'provider_id'];
+
 /**
  * The edited Target authentication laid over the stored one, so a field the editor does not
- * show (`target_identifier`, an unknown key) survives the save. A method of another kind than
- * the stored one replaces it; empty scopes are left out, which clears stored ones.
+ * show (`target_identifier`, an unknown key) survives the save. That holds only while the edit
+ * keeps the stored credential: a method of another kind, another secret or another provider
+ * replaces the stored setting, so nothing unseen follows a credential it was not set for. Empty
+ * scopes are left out, which clears stored ones.
  */
 export function mergeTargetAuth(
   stored: Record<string, unknown> | null | undefined,
@@ -112,8 +132,12 @@ export function mergeTargetAuth(
   const kind = Object.keys(editedMethod)[0];
   const storedInner = record(storedMethod[kind]);
   const editedInner = record(editedMethod[kind]);
-  const method =
-    storedInner && editedInner ? { [kind]: { ...storedInner, ...editedInner } } : editedMethod;
+  const sameCredential =
+    !!storedInner &&
+    !!editedInner &&
+    CREDENTIAL_ID_KEYS.every(key => storedInner[key] === editedInner[key]);
+  if (!sameCredential) return withoutEmptyScopes(edited);
+  const method = { [kind]: { ...storedInner, ...editedInner } };
   return withoutEmptyScopes({ ...stored, ...edited, method });
 }
 
@@ -123,9 +147,7 @@ function withoutEmptyScopes(auth: Record<string, unknown>): Record<string, unkno
   if (!method || !provider || !Array.isArray(provider.scopes) || provider.scopes.length > 0) {
     return auth;
   }
-  const { scopes: _empty, ...rest } = provider;
-  void _empty;
-  return { ...auth, method: { ...method, credential_provider: rest } };
+  return { ...auth, method: { ...method, credential_provider: omitKey(provider, 'scopes') } };
 }
 
 /** The edited auth merged onto the stored one; `undefined` when the edit has no auth. */
@@ -175,11 +197,22 @@ export const MA_CALLER_CHECK_PROBLEM =
 export const TP_CALLER_CHECK_PROBLEM =
   'Target authentication sends a credential, so it needs a Transit Point that authenticates its callers';
 
+export const UNKNOWN_METHOD_NOTE =
+  'This Target authentication uses a method the editor cannot show. It is kept as stored until you choose another';
+export const PASSTHROUGH_NOTE =
+  'The fallback passes a request through without the credential when the credential cannot be resolved';
+
+/** Whether two header names are the same to the gateway: any letter case, `_` read as `-`. */
+export function sameHeaderName(a: string, b: string): boolean {
+  const fold = (name: string) => name.toLowerCase().replace(/_/g, '-');
+  return fold(a) === fold(b);
+}
+
 export function headerNameProblem(name: string): string | null {
   if (!name || !/^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$/.test(name)) {
     return 'Header name must be an HTTP header name';
   }
-  const reserved = RESERVED_HEADERS.find(r => r.toLowerCase() === name.toLowerCase());
+  const reserved = RESERVED_HEADERS.find(header => sameHeaderName(header, name));
   return reserved ? `Header name must not be the reserved header ${reserved}` : null;
 }
 
@@ -214,6 +247,14 @@ export function targetAuthHeader(
 }
 
 /**
+ * Whether the gateway decides the https rule from something the editor cannot see: a `proxy://`
+ * Target meets it when its MCP proxy's `base_url` is https.
+ */
+function httpsDecidedElsewhere(endpoint: string): boolean {
+  return endpoint.trim().toLowerCase().startsWith('proxy://');
+}
+
+/**
  * The rules a Target authentication meets on its own: the header it sets, its value format and
  * an https Target. A setting equal to the stored one, on the same endpoint, is not refused by
  * the gateway, so it is reported only as a warning.
@@ -221,11 +262,17 @@ export function targetAuthHeader(
 export function targetAuthFieldProblems(auth: unknown, endpoint: string): TargetAuthFieldProblems {
   const header = targetAuthHeader(auth);
   if (!header) return {};
+  const https = isHttpsTarget(endpoint) || httpsDecidedElsewhere(endpoint);
   return {
     headerName: headerNameProblem(header.headerName) ?? undefined,
     headerFormat: headerFormatProblem(header.headerFormat) ?? undefined,
-    endpoint: isHttpsTarget(endpoint) ? undefined : TARGET_AUTH_HTTPS_PROBLEM,
+    endpoint: https ? undefined : TARGET_AUTH_HTTPS_PROBLEM,
   };
+}
+
+/** A wire value as JSON with its object keys in one order, so equal values compare equal. */
+export function stableJson(value: unknown): string {
+  return JSON.stringify(sortKeys(value));
 }
 
 /** Whether the gateway keeps this setting as stored: same Target endpoint and same auth. */
@@ -235,10 +282,55 @@ export function isStoredTargetAuth(
   endpoint: string
 ): boolean {
   return (
-    !!stored?.auth &&
-    stored.endpoint === endpoint &&
-    JSON.stringify(sortKeys(stored.auth)) === JSON.stringify(sortKeys(auth))
+    !!stored?.auth && stored.endpoint === endpoint && stableJson(stored.auth) === stableJson(auth)
   );
+}
+
+export interface TargetAuthProblems {
+  /** What blocks the save, by form field. */
+  errors: Record<string, string>;
+  /** Problems the gateway keeps as stored. */
+  warnings: string[];
+  /** Breaches of a rule the gateway refuses only while that rule is `enforce`. */
+  advisories: string[];
+  /** Advice with no gateway rule behind it. */
+  notes: string[];
+}
+
+export const noTargetAuthProblems = (): TargetAuthProblems => ({
+  errors: {},
+  warnings: [],
+  advisories: [],
+  notes: [],
+});
+
+/**
+ * Sorts what `targetAuthFieldProblems` finds for one leg. A header name or format problem in a
+ * new or changed setting blocks the save, under the form field `fields` names; the same problem
+ * in a setting the gateway keeps as stored (same auth, same endpoint) only warns. A Target that
+ * is not https is an advisory, and a passthrough fallback is a note.
+ */
+export function classifyTargetAuthProblems(
+  auth: Record<string, unknown>,
+  endpoint: string,
+  stored: StoredTargetAuth | undefined,
+  fields: { headerName: string; headerFormat: string }
+): TargetAuthProblems {
+  const result = noTargetAuthProblems();
+  const problems = targetAuthFieldProblems(auth, endpoint);
+  if (problems.endpoint) result.advisories.push(problems.endpoint);
+  if (auth.fallback === 'passthrough') result.notes.push(PASSTHROUGH_NOTE);
+  const kept = isStoredTargetAuth(stored, auth, endpoint);
+  const found: Array<[string, string | undefined]> = [
+    [fields.headerName, problems.headerName],
+    [fields.headerFormat, problems.headerFormat],
+  ];
+  for (const [field, message] of found) {
+    if (!message) continue;
+    if (kept) result.warnings.push(message);
+    else result.errors[field] = message;
+  }
+  return result;
 }
 
 function sortKeys(value: unknown): unknown {
