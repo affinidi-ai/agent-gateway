@@ -17,6 +17,7 @@ use crate::mcp::continuations::{
 use crate::mcp::modern::{RequiredClientCapability, require_client_capability};
 use crate::mcp::request_validation::{McpRequestValidationError, ValidatedModernMessage};
 use crate::mcp::resource_server::McpResourceServerConfig;
+use crate::mcp::subscriptions::SubscriptionLifetime;
 use crate::source_auth::AuthenticatedIdentity;
 use crate::sts::mcp_profile::McpIssuerProfile;
 
@@ -182,6 +183,7 @@ pub async fn prepare_direct(
     agent_did: Option<&str>,
     route: ContinuationRoute,
     unpaid: bool,
+    stream: Option<&mut SubscriptionLifetime>,
 ) -> Result<ModernDelegationResult, ModernDelegationError> {
     let strategies = state
         .source_auth_middleware
@@ -229,7 +231,7 @@ pub async fn prepare_direct(
         provider_egress: None,
         isolation: crate::config::credential_policy::credential_policy().tenant_credential_isolation,
     }
-    .prepare_with_payment(request, now_secs()?, unpaid)
+    .prepare_call(request, now_secs()?, unpaid, stream)
     .await
 }
 
@@ -249,6 +251,7 @@ pub async fn prepare_transit(
     runtime: &crate::mcp::continuations::config::ContinuationRuntime,
     context: &mut crate::proxy::outbound_handler::OutboundPipelineContext,
     request: &ValidatedModernMessage,
+    stream: Option<&mut SubscriptionLifetime>,
 ) -> Result<ModernDelegationResult, ModernDelegationError> {
     let identity = context
         .authenticated_identity
@@ -303,7 +306,7 @@ pub async fn prepare_transit(
         provider_egress: None,
         isolation: crate::config::credential_policy::credential_policy().tenant_credential_isolation,
     };
-    if fabric_caller {
+    let result = if fabric_caller {
         prepared
             .prepare_existing_grants(request, now_secs()?)
             .await
@@ -311,7 +314,22 @@ pub async fn prepare_transit(
         prepared
             .prepare(request, now_secs()?)
             .await
+    };
+    ending_with_its_consents(result, stream)
+}
+
+/// `result`, with `stream`, the stream the prepared call opens, ended no
+/// later than the earliest end of the consents whose credentials the call
+/// carries. Every way into this module from a request path goes through
+/// here, so no path opens a stream that outlives a consent it carries.
+fn ending_with_its_consents(
+    result: Result<ModernDelegationResult, ModernDelegationError>,
+    stream: Option<&mut SubscriptionLifetime>,
+) -> Result<ModernDelegationResult, ModernDelegationError> {
+    if let (Ok(ModernDelegationResult::Prepared(prepared)), Some(stream)) = (&result, stream) {
+        prepared.restrict_to_consents(stream);
     }
+    result
 }
 
 pub fn now_secs() -> Result<u64, ContinuationError> {
@@ -481,7 +499,25 @@ impl ModernDelegationContext<'_> {
         Ok(selected)
     }
 
-    pub async fn prepare(
+    /// Prepares `request`'s delegated credentials for a caller who may be
+    /// asked for consent, `unpaid` when the payment its surface charges has
+    /// not been taken, and ends `stream`, the stream the call opens, no later
+    /// than the earliest end of the consents whose credentials it carries.
+    pub async fn prepare_call(
+        &self,
+        request: &ValidatedModernMessage,
+        now: u64,
+        unpaid: bool,
+        stream: Option<&mut SubscriptionLifetime>,
+    ) -> Result<ModernDelegationResult, ModernDelegationError> {
+        ending_with_its_consents(
+            self.prepare_with_payment(request, now, unpaid)
+                .await,
+            stream,
+        )
+    }
+
+    async fn prepare(
         &self,
         request: &ValidatedModernMessage,
         now: u64,
@@ -494,7 +530,7 @@ impl ModernDelegationContext<'_> {
     /// only a grant already stored and never starts consent, which a person
     /// gives by connecting to this gateway directly, so a caller with no grant
     /// gets [`ModernDelegationError::ConsentNotAvailableForPartners`].
-    pub async fn prepare_existing_grants(
+    async fn prepare_existing_grants(
         &self,
         request: &ValidatedModernMessage,
         now: u64,
@@ -503,7 +539,7 @@ impl ModernDelegationContext<'_> {
             .await
     }
 
-    pub async fn prepare_with_payment(
+    async fn prepare_with_payment(
         &self,
         request: &ValidatedModernMessage,
         now: u64,
@@ -1035,9 +1071,9 @@ impl PreparedDelegation {
 
     /// Ends `lifetime`, a stream this call opens, no later than the earliest
     /// end of the consents whose credentials the call carries.
-    pub fn restrict_to_consents(
+    fn restrict_to_consents(
         &self,
-        lifetime: &mut crate::mcp::subscriptions::SubscriptionLifetime,
+        lifetime: &mut SubscriptionLifetime,
     ) {
         if let Some(end) = self.consent_ends_at {
             lifetime.restrict_to_end(end);
@@ -3109,6 +3145,78 @@ mod tests {
             .store_consent(chrono::Duration::days(400), None)
             .await;
         assert_eq!(unlimited.prepare().await, (None, vec![], true));
+    }
+
+    /// A consent given ahead of this gateway's clock is not used and is
+    /// kept: the caller is asked for consent as one with no stored credential
+    /// is, with nothing said of an earlier access, and no expiry is recorded.
+    #[tokio::test]
+    async fn a_modern_consent_given_ahead_of_the_clock_is_kept_and_not_used() {
+        let minutes = chrono::Duration::minutes;
+        let ahead = ConsentFixture::new(Some(3_600)).await;
+        ahead
+            .store_consent(-minutes(10), None)
+            .await;
+        assert_eq!(
+            ahead.prepare().await,
+            (
+                Some("Authorize access to the provider. The agent may use this access for 1 hour.".to_string()),
+                vec![],
+                true
+            )
+        );
+
+        let within_the_skew = ConsentFixture::new(Some(3_600)).await;
+        within_the_skew
+            .store_consent(-minutes(4), None)
+            .await;
+        assert_eq!(
+            within_the_skew
+                .prepare()
+                .await,
+            (None, vec![], true),
+            "clocks may differ by five minutes"
+        );
+    }
+
+    /// A call that opens a stream is prepared with that stream, which then
+    /// ends no later than the earliest end of the consents whose credentials
+    /// the call carries: the end stored with a consent, or the binding's own
+    /// limit. A consent under no limit leaves the stream its lifetime.
+    #[tokio::test]
+    async fn a_stream_is_prepared_to_end_with_the_consent_it_carries() {
+        let minutes = chrono::Duration::minutes;
+        let hour = std::time::Duration::from_secs(3_600);
+        let left_of_a_stream = |fixture: ConsentFixture| async move {
+            let mut stream = SubscriptionLifetime::new(hour, None);
+            let prepared = fixture
+                .context()
+                .prepare_call(&ConsentFixture::tool_call(), 10, false, Some(&mut stream))
+                .await;
+            assert!(matches!(prepared, Ok(ModernDelegationResult::Prepared(_))), "the call carries the credential");
+            stream.time_left().as_secs()
+        };
+
+        let stored_end = ConsentFixture::new(None).await;
+        stored_end
+            .store_consent(minutes(10), Some(minutes(5)))
+            .await;
+        let left = left_of_a_stream(stored_end).await;
+        assert!((240..=300).contains(&left), "the stream ends with the consent, in five minutes: {left}s");
+
+        let bindings_limit = ConsentFixture::new(Some(900)).await;
+        bindings_limit
+            .store_consent(minutes(10), None)
+            .await;
+        let left = left_of_a_stream(bindings_limit).await;
+        assert!((240..=300).contains(&left), "the binding's limit ends it five minutes from now: {left}s");
+
+        let unlimited = ConsentFixture::new(None).await;
+        unlimited
+            .store_consent(minutes(10), None)
+            .await;
+        let left = left_of_a_stream(unlimited).await;
+        assert!(left > 3_500, "a consent under no limit leaves the stream its hour: {left}s");
     }
 
     /// A consent resumed from its staged record is judged like one read from

@@ -1294,7 +1294,7 @@ the request's id, with the reason in its `data`; on any other (`http`, A2A) it i
 | --- | --- | --- | --- |
 | `connect_required` | `403`, `-32001` | No grant is stored for the binding and principal; it expired and cannot be refreshed; its refresh token was refused (`invalid_grant`, which deletes and revokes it); the authorization server refused its refresh otherwise as often as `external_consent_refresh_refusals` allows since it last succeeded, and the grant cannot be used (it is kept: [Refreshing a grant](#refreshing-a-grant)); a refresh died part way, which may have spent the refresh token; its consent ended at its [time limit](#consent-time-limit), which deletes and revokes it; or it was asked for beyond the binding's scopes as saved now (a binding narrowed since: below) | `subject`: `owner` or `caller`. `cause`: `consent_expired`, for a grant whose consent ended. For `caller`, `hint`: 16 bytes, base64url, of the SHA-256 of `agent-gateway-connect-hint\n` and the caller's identity hash, so whoever runs the connect can check that the person who signs in is that caller |
 | `scope_insufficient` | `403`, `-32001` | The vendor answered `403` with a `Bearer` challenge whose `error` is `insufficient_scope` | `scope`, when the challenge names one made of scope names only (letters, digits and `._:/-+=@`, at most 512 characters); a wider scope is never asked for silently |
-| `connector_unavailable` | `503`, `-32603` | Anything a new connect would not fix: the token endpoint cannot be reached, failed or refused the client (`invalid_client`), the client's secret cannot be resolved, the grant is waiting out a refresh failure, the vendor answered `401` without a `Bearer` challenge that rejects the token (`invalid_token`), or again after the grant was refreshed, the grant was refreshed or connected again while the vendor refused an earlier token, the provider is gone, has no issuer, is of another tenant or is [no longer permitted](#permitted-issuers), the Transit Point's target is not a public `https` URL with the origin of the provider's `resource` nor an MCP Proxy that sends there, or that MCP Proxy has changed since its binding was pinned or its spec has a method override header ([Through an MCP Proxy](#through-an-mcp-proxy)), the binding names no subject, the surface also has `outbound_credentials`, its Access Point's callers are not ones a grant may go to ([above](#external-consent-on-a-transit-point)), at-rest encryption is not active, the identity hash pepper is not configured or the grants stored were written under another pepper ([Grants by binding](#grants-by-binding)), or the resource is no longer permitted for its issuer | |
+| `connector_unavailable` | `503`, `-32603` | Anything a new connect would not fix: the token endpoint cannot be reached, failed or refused the client (`invalid_client`), the client's secret cannot be resolved, the grant is waiting out a refresh failure, the vendor answered `401` without a `Bearer` challenge that rejects the token (`invalid_token`), or again after the grant was refreshed, the grant was refreshed or connected again while the vendor refused an earlier token, the provider is gone, has no issuer, is of another tenant or is [no longer permitted](#permitted-issuers), the provider was [deactivated](#deactivating-a-provider) and the binding has no usable grant (nobody is told to start a connect that would be refused), the grant's consent time is ahead of the gateway's clock (the grant is kept: [When a consent ends](#when-a-consent-ends)), the Transit Point's target is not a public `https` URL with the origin of the provider's `resource` nor an MCP Proxy that sends there, or that MCP Proxy has changed since its binding was pinned or its spec has a method override header ([Through an MCP Proxy](#through-an-mcp-proxy)), the binding names no subject, the surface also has `outbound_credentials`, its Access Point's callers are not ones a grant may go to ([above](#external-consent-on-a-transit-point)), at-rest encryption is not active, the identity hash pepper is not configured or the grants stored were written under another pepper ([Grants by binding](#grants-by-binding)), or the resource is no longer permitted for its issuer | |
 
 A `caller` binding is refused, `connector_unavailable`, for a caller named by anything but an
 identity hash. A binding that some other path reached with a provider that has an `issuer`, the
@@ -2375,6 +2375,18 @@ The connection's limit is the provider's, else the default, else the ceiling, an
 than the ceiling. A consent given through a binding lasts the shorter of the binding's limit
 and the connection's.
 
+The two `[credential_policy]` keys reach the consents the vault already holds, not only new
+ones, and the ceiling is also the limit of every provider that sets none. So setting either key
+ends every stored consent older than it: each the next time a request needs it, and the rest at
+the first hourly pass, ten minutes after startup. The grants by binding among them are revoked
+at the vendor, which cannot be undone. No request previews this, as
+[`consent-impact`](#when-a-consent-ends) does for a provider's own limit, so the gateway says it
+when it starts. While either key is set, an active node logs at `WARN`, on the
+`credential_delegation` target, how many stored consents the two keys end that the providers'
+and bindings' own limits would keep, and how many of those are grants by binding. To keep them,
+stop the gateway before the first pass and raise or remove the key; a consent a request needed
+in the meantime has already ended.
+
 ### When a consent ends
 
 The end is fixed when the person consents: the consent time plus the limit in force then. That
@@ -2408,8 +2420,19 @@ be: `400` for a limit outside the range, or for any limit on a provider nobody c
 consents to counts no consent, since its tokens are service tokens. The credential provider
 editor shows the count as a warning under **Consent time limit**.
 
-A consent time more than five minutes ahead of the gateway's clock counts as ended whenever a
-limit applies, and so does one that no limit can be added to.
+A consent time more than five minutes ahead of the gateway's clock, as after a failover to a
+node whose clock lags or a backward clock step, says that a clock is wrong, not that the consent
+ended. Whenever a limit applies, such a credential is not used and is kept:
+
+- a caller of an agent-keyed token is asked for consent as a caller with no stored credential
+  is;
+- a caller of a grant by binding gets `connector_unavailable` (`503`);
+- the hourly pass leaves both where they are and counts them.
+
+Nothing is deleted and nothing is revoked at the vendor, so the consent is used again once the
+clocks agree. Each such refusal, and each pass that left such consents, logs a `WARN` on the
+`credential_delegation` target. A consent whose time limit cannot be added to its consent time
+counts as ended.
 
 The vault list and read (`GET /api/v1/delegation-vault` and `GET /api/v1/delegation-vault/{id}`)
 and the grants report (`GET /api/v1/delegation-vault/grants`) show this end as
@@ -2433,7 +2456,9 @@ again. A request that read the credential a moment before its end finishes its c
 limit is checked when the credential is released, not while a response streams. A
 `2026-07-28` `subscriptions/listen` stream is held to the limit all the same: one opened with
 a consented credential ends no later than that consent's end, the earliest of them when it
-carries several. The end is taken as it stands when the stream opens, so a limit an operator
+carries several, whichever way the call arrives or leaves: an Access Point, a Transit Point,
+Fabric receive, or a `fabric://` Target that the credential is sent on to. The end is taken as
+it stands when the stream opens, so a limit an operator
 sets on the consent later reaches a stream that is already open only when it is opened again,
 at most the surface's `mcp_http.stream_max_lifetime_secs` (an hour by default) after the new
 end. A revoke ends open streams within about a second.
@@ -3167,7 +3192,7 @@ A deactivated provider takes no new consent, and nothing else changes:
 | --- | --- |
 | The provider's record | Kept whole, and still editable: an edit keeps the provider deactivated, also one saved at the same moment as the deactivation. Retyped to a type nobody consents to, it is no longer deactivated. Tokens, grants, bindings and audit records keep pointing to it |
 | Credentials people already consented to | Injected and refreshed as before, until they end at their [time limit](#consent-time-limit) or are revoked. A `2026-07-28` consent stays bound to its provider: the deactivation is left out of the provider digest, and `updated_at` is not changed. An edit of the provider still ends its `2026-07-28` consents, as it does while the provider is active, and nobody can give a new one until the provider is activated |
-| A caller with no stored credential, or one whose consent ended | No consent is asked for. The binding records `provider_unavailable` with detail `provider_deactivated` and the request is refused `503`; on the `2026-07-28` path it is refused as unavailable, with no input request |
+| A caller with no stored credential, or one whose consent ended | No consent is asked for. The binding records `provider_unavailable` with detail `provider_deactivated` and the request is refused `503`; on the `2026-07-28` path it is refused as unavailable, with no input request. A binding by external consent that has no usable grant answers `connector_unavailable` (`503`) in place of `connect_required`, logged with the reason `provider_deactivated`: nobody is told to start a connect that the connect API refuses |
 | A consent link minted earlier, or a consent on its way to the vendor | Refused at the start page, the start POST, the confirmation and the callback with `provider_deactivated` (`400`); nothing is stored and no code is exchanged |
 | The connect API | `POST .../connects` and `.../complete` answer `409` `provider_deactivated`; a refused completion leaves the connect open |
 

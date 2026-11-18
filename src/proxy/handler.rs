@@ -6487,6 +6487,7 @@ async fn proxy_charged_request(
             payment
                 .as_ref()
                 .is_some_and(agent_pay_gate::Intake::is_unpaid),
+            subscription_lifetime.as_mut(),
         )
         .await
         {
@@ -6500,9 +6501,6 @@ async fn proxy_charged_request(
                 body_bytes = prepared
                     .rewrite_body(&body_bytes)
                     .map_err(|error| ModernDelegationError::from(error).response(request))?;
-                if let Some(lifetime) = subscription_lifetime.as_mut() {
-                    prepared.restrict_to_consents(lifetime);
-                }
                 modern_request = Some(prepared.request.clone());
                 modern_delegation = Some(prepared);
             }
@@ -11029,7 +11027,7 @@ async fn handle_fabric_request_inner(
         mcp_metadata_context,
         mcp_verified_binding,
         mcp_classification,
-        subscription_lifetime,
+        mut subscription_lifetime,
         mcp_continuations,
         payment,
     } = request;
@@ -12083,6 +12081,7 @@ async fn handle_fabric_request_inner(
                     peer_did: remote_gateway_did.clone(),
                 },
                 payment.is_some_and(agent_pay_gate::Intake::is_unpaid),
+                subscription_lifetime.as_mut(),
             )
             .await
             {

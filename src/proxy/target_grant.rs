@@ -974,7 +974,8 @@ impl TargetGrantRoute {
                 Refused {
                     refusal: GrantRefusal::connect_required(&key, self.subject),
                     reason: "grant_beyond_the_bindings_scopes",
-                },
+                }
+                .of(&self.provider),
             ));
         }
         let headers = self

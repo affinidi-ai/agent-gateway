@@ -1166,6 +1166,11 @@ fn init_logging(
         Ok(level) => level,
         Err(e) => anyhow::bail!("Cannot parse log level: {}", e),
     };
+    audit::producer::set_delegation_event_logging(
+        config
+            .logging
+            .delegation_events,
+    );
 
     // Build the log redactor from gateway.json config (compiled once, shared via Arc)
     let redactor = observability::LogRedactor::from_config(&config.logging.redaction);

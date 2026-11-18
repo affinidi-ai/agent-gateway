@@ -500,6 +500,13 @@ gateway's: ship the log, or export the `credential_delegation` target over OTLP
 ([`opentelemetry.logs.targets`](CONFIGURATION_REFERENCE.md#metricsjson)), where they are
 needed for longer.
 
+One line is written for every delegated call, so on a busy gateway these events are most of
+what the log grows by. A deployment that does not want them sets
+`[logging] delegation_events = false` in `config.toml`, which is read at startup: the gateway
+then writes none of the ten events anywhere, not to stderr, the log file or OTLP. The audited
+delegation events are unaffected, and so are the other lines of the `credential_delegation`
+target, its warnings among them.
+
 A selection made before may still name one of these events, and the name selects nothing: the gateway drops it from the stored `audit_events` when it loads its settings
 and from any `audit_events` or event set it is asked to save, where any other unknown name is
 refused. An event set left with no other event is refused as empty, and reported by the startup

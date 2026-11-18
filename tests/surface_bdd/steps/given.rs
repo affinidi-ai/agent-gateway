@@ -4521,27 +4521,7 @@ async fn operator_has_limited_the_surfaces_binding(
     world: &mut SurfaceWorld,
     seconds: u64,
 ) {
-    use crate::bdd_support::config::single_surface_fixture::SEEDED_SURFACE_ID;
-    crate::steps::when::ensure_admin_session(world).await;
-    let client = world
-        .admin_client
-        .as_ref()
-        .expect("admin client must exist");
-    let stored = client
-        .get_surface_recorded(SEEDED_SURFACE_ID)
-        .await
-        .expect("read the surface through the admin API");
-    assert_eq!(stored.status, 200, "reading the surface: {}", stored.body);
-    let mut surface = stored.body;
-    let bindings = surface["outbound_credentials"]
-        .as_array_mut()
-        .unwrap_or_else(|| panic!("the surface has no outbound_credentials"));
-    assert_eq!(bindings.len(), 1, "the surface has one binding to limit: {bindings:?}");
-    bindings[0]["max_consent_age_secs"] = serde_json::json!(seconds);
-    let saved = client
-        .update_surface_recorded(SEEDED_SURFACE_ID, &surface)
-        .await
-        .expect("save the surface through the admin API");
+    let saved = crate::steps::when::limit_the_surfaces_binding(world, seconds).await;
     assert_eq!(saved.status, 200, "limiting the surface's binding: {}", saved.body);
 }
 
@@ -4560,12 +4540,51 @@ async fn operator_has_limited_the_callers_consent(
     assert_eq!(response.status, 200, "limiting the caller's consent: {}", response.body);
 }
 
-/// Moves the consent of every delegated credential the gateway holds back by
-/// `seconds`: the time it was given, and its end when it has one. The vault is
-/// read from disk on every request, so the gateway sees the older consent
-/// without a restart.
 #[given(expr = "the caller's consent was given {int} seconds ago")]
 fn callers_consent_was_given_seconds_ago(
+    world: &mut SurfaceWorld,
+    seconds: i64,
+) {
+    move_the_callers_consent_back(world, seconds);
+}
+
+/// A consent time ahead of the gateway's clock, as a node whose clock runs
+/// ahead writes one.
+#[given(expr = "the caller's consent is dated {int} seconds ahead of the gateway's clock")]
+fn callers_consent_is_dated_ahead_of_the_clock(
+    world: &mut SurfaceWorld,
+    seconds: i64,
+) {
+    move_the_callers_consent_back(world, -seconds);
+}
+
+/// The delegation vault is read when the gateway starts, so a scenario stores
+/// the consent before anything starts it.
+#[given(expr = "the delegation vault already holds a consent to OAuth provider {string} given {int} seconds ago")]
+fn vault_already_holds_a_consent(
+    world: &mut SurfaceWorld,
+    provider: String,
+    seconds: i64,
+) {
+    assert!(!crate::steps::when::gateway_is_running(world), "the consent is stored before the gateway starts");
+    assert!(
+        world
+            .surface_config
+            .credential_delegation
+            .as_ref()
+            .is_some_and(|delegation| delegation.provider_id == provider),
+        "the surface must require delegated credentials from OAuth provider {provider:?} first"
+    );
+    world
+        .surface_config
+        .stored_consent_age_secs = Some(seconds);
+}
+
+/// Moves the consent of every delegated credential the gateway holds back by
+/// `seconds`: the time it was given, and its end when it has one. The vault is
+/// read from disk on every request, so the gateway sees the moved consent
+/// without a restart.
+fn move_the_callers_consent_back(
     world: &mut SurfaceWorld,
     seconds: i64,
 ) {

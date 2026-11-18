@@ -1,0 +1,76 @@
+branch: fix/consent-limit-follow-up
+changes:
+  added:
+    - timestamp: '2026-11-18T12:00:00Z'
+      title: Add a setting that keeps per-call delegation events out of the log
+      description: >-
+        The per-call credential delegation events (token_injected, token_refreshed,
+        refresh_failed, consent_required, token_not_found and the five elicitation events) are
+        one INFO line of the gateway log for every delegated call, and agent-gateway.log is
+        neither rotated nor removed by age, so on a busy gateway they are most of what the file
+        grows by. `[logging] delegation_events = false` in config.toml, read at startup, now
+        writes none of them anywhere: not to stderr, the log file or OTLP. The default, true,
+        keeps the lines. The audited delegation events (consent_granted, consent_expired,
+        consent_limited, token_revoked and the others) are unaffected, and so are the other
+        lines of the credential_delegation log target.
+  changed:
+    - timestamp: '2026-11-18T12:00:00Z'
+      title: Warn at startup how many stored consents a gateway consent limit ends
+      description: >-
+        `[credential_policy] default_max_consent_age_secs` and `max_consent_age_ceiling_secs`
+        reach the consents the vault already holds, and the ceiling is also the limit of every
+        provider that sets none. Setting either therefore ends every stored consent older than
+        it, at the latest at the first hourly pass ten minutes after startup, and revokes the
+        grants by binding among them at the vendor, with no request that previews it. While
+        either key is set, an active node now logs a WARN when it starts with how many stored
+        consents the two keys end that the providers' and bindings' own limits would keep, and
+        how many of them are grants by binding, so an operator can stop the gateway and change
+        the key before the first pass. docs/CONFIGURATION_REFERENCE.md and
+        docs/CREDENTIAL_DELEGATION.md now say that the ceiling is also a fallback limit and
+        that both keys end consents already stored.
+    - timestamp: '2026-11-18T12:00:00Z'
+      title: Document that tenant access tokens no longer read per-call delegation events
+      description: >-
+        The per-call credential delegation events are written to the gateway log only, and the
+        log is given to appliance-wide callers only. A tenant's access token, which read these
+        events for its own providers while they were audit records, therefore has no way to
+        read them. docs/ACCESS_TOKENS.md and docs/RBAC.md now say so, with what a tenant still
+        reads (consent_granted, consent_expired, consent_limited, token_revoked) and how an
+        operator hands a tenant its events: export the credential_delegation log target and
+        filter it by provider_id. The upgrade note of the change that moved the events says it
+        too.
+  fixed:
+    - timestamp: '2026-11-18T12:00:00Z'
+      title: Keep a consent whose consent time is ahead of the gateway's clock
+      description: >-
+        Under any consent time limit, a stored consent whose consent time was more than five
+        minutes ahead of the gateway's clock counted as ended: an agent-keyed token was deleted,
+        and a grant by binding was deleted and revoked at the vendor, on the next request or at
+        the hourly pass. A node whose clock lags, a failover to one, or a backward clock step
+        therefore ended fresh consents for good. Such a consent is now left unused and kept. A
+        caller of an agent-keyed token is asked for consent as one with no stored credential is,
+        a caller of a grant by binding gets connector_unavailable (503), and the hourly pass
+        skips both and counts them. Nothing is revoked at the vendor, each refusal and each pass
+        logs a WARN, and the consent is used again once the clocks agree.
+    - timestamp: '2026-11-18T12:00:00Z'
+      title: Stop telling callers to connect to a deactivated credential provider
+      description: >-
+        A binding by external consent on a deactivated provider answered connect_required to a
+        caller with no usable grant, and the connect API then refused the connect with 409
+        provider_deactivated, so the caller was sent to a step that could not succeed. Such a
+        binding now answers connector_unavailable (503), logged and audited with the reason
+        provider_deactivated, on an Access Point's Target and on a Transit Point alike. A grant
+        given before the deactivation is released and refreshed as before.
+    - timestamp: '2026-11-18T12:00:00Z'
+      title: End a listen stream through a fabric Target with the consent it carries
+      description: >-
+        A 2026-07-28 subscriptions/listen stream that carries a consented credential ends no
+        later than that consent's end. The cap was applied by each request path after it had
+        prepared the credentials, and the path that forwards to a `fabric://` Target with
+        delegated credentials sent over Fabric did not apply it, so such a stream could outlive
+        its consent by up to the surface's stream_max_lifetime_secs. The cap is now part of
+        preparing the credentials, so every path that opens a stream names it: an Access
+        Point, a Transit Point, Fabric receive and a `fabric://` Target.
+  removed: []
+  security: []
+  breaking: []

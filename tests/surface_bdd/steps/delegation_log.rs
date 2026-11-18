@@ -19,6 +19,16 @@ fn gateway_keeps_its_log_of_delegation_events(world: &mut SurfaceWorld) {
         .logs_at_info = true;
 }
 
+/// `[logging] delegation_events` is read when the gateway starts, so a
+/// scenario sets it before anything starts the gateway.
+#[given("the gateway is set to log no per-call delegation events")]
+fn gateway_is_set_to_log_no_per_call_delegation_events(world: &mut SurfaceWorld) {
+    assert!(!gateway_is_running(world), "the gateway reads its logging settings when it starts");
+    world
+        .surface_config
+        .logs_no_delegation_events = true;
+}
+
 type LoggedEvent = HashMap<String, String>;
 
 /// The `key=value` fields of every `Delegation event` line in the gateway log. A value a
@@ -176,4 +186,42 @@ async fn gateway_log_records_two_callers_of_one_agent(
         })
         .collect();
     crate::steps::then::assert_one_agent_did(&agents, &events);
+}
+
+/// The log holds the gateway's other lines and, a moment after the request
+/// was answered, no delegation event.
+#[then("the gateway log records no delegation event")]
+async fn gateway_log_records_no_delegation_event(world: &mut SurfaceWorld) {
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !gateway_log(world)
+            .trim()
+            .is_empty(),
+        "the scenario must keep the gateway log"
+    );
+    let events = delegation_events(world);
+    assert!(events.is_empty(), "the gateway log records delegation events: {events:?}");
+}
+
+/// The gateway says when it starts how many stored consents its own default
+/// or ceiling ends: one warning, naming the agent-keyed tokens and the grants
+/// by binding apart.
+#[then(expr = "the gateway log warns that the gateway's own consent time limits end {int} stored consent(s)")]
+async fn gateway_log_warns_of_its_own_consent_limits(
+    world: &mut SurfaceWorld,
+    count: usize,
+) {
+    let named = format!("ending_tokens={count} ending_grants=0");
+    let mut log = String::new();
+    for _ in 0..50 {
+        log = gateway_log(world);
+        if log
+            .lines()
+            .any(|line| line.contains("The gateway's consent time limits end stored consents") && line.contains(&named))
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("the gateway log holds no warning with {named:?}:\n{log}");
 }

@@ -154,6 +154,20 @@ fn stamp_with_request(event: &mut DelegationAuditEvent) {
     }
 }
 
+/// Whether the per-call delegation events are written to the gateway log, as
+/// `[logging] delegation_events` says. On until startup says otherwise.
+static LOG_DELEGATION_EVENTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Sets, at startup, whether the per-call delegation events are written to the
+/// gateway log.
+pub fn set_delegation_event_logging(enabled: bool) {
+    LOG_DELEGATION_EVENTS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn delegation_event_logging() -> bool {
+    LOG_DELEGATION_EVENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether a logged event would be written anywhere, so that it is worth
 /// building.
 fn logs_delegation_events() -> bool {
@@ -164,7 +178,18 @@ fn logs_delegation_events() -> bool {
     {
         return true;
     }
-    tracing::enabled!(target: "credential_delegation", tracing::Level::INFO)
+    delegation_event_logging() && tracing::enabled!(target: "credential_delegation", tracing::Level::INFO)
+}
+
+/// Writes `event` to the gateway log while the deployment logs the per-call
+/// delegation events (`enabled`).
+fn write_to_log(
+    event: &DelegationAuditEvent,
+    enabled: bool,
+) {
+    if enabled {
+        log_event(event);
+    }
 }
 
 /// Writes a logged event to the gateway log, with the id and surface variant
@@ -173,7 +198,7 @@ fn logs_delegation_events() -> bool {
 /// in.
 fn log(mut event: DelegationAuditEvent) {
     stamp_with_request(&mut event);
-    log_event(&event);
+    write_to_log(&event, delegation_event_logging());
     #[cfg(test)]
     if let Ok(captured) = CAPTURING.try_with(Arc::clone) {
         captured.lock().push(event);
@@ -401,6 +426,26 @@ mod tests {
         ] {
             assert!(lines[0].contains(field), "{field}: {}", lines[0]);
         }
+    }
+
+    /// A deployment that does not log the per-call delegation events writes
+    /// no line for one. The default writes it.
+    #[test]
+    fn a_logged_event_is_written_only_while_the_deployment_logs_them() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        write_to_log(&injected(), false);
+        assert_eq!(logs.text(), "", "nothing is written while the setting is off");
+
+        write_to_log(&injected(), true);
+        let text = logs.text();
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.contains("Delegation event"))
+                .count(),
+            1,
+            "{text}"
+        );
     }
 
     /// A logged event carries the id of the request it was written in.

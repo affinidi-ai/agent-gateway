@@ -123,6 +123,12 @@ pub struct SurfaceConfigBuilder {
     pub max_consent_age_ceiling_secs: Option<u64>,
     /// The gateway logs warnings and keeps its log for the scenario to read.
     pub keeps_gateway_log: bool,
+    /// `[logging] delegation_events = false`: the gateway writes no per-call delegation event
+    /// to its log.
+    pub logs_no_delegation_events: bool,
+    /// The delegation vault holds, before the gateway starts, a consent to the surface's OAuth
+    /// provider given this many seconds ago, with no end stored.
+    pub stored_consent_age_secs: Option<i64>,
     /// The gateway writes its log files to `_storage/logs`, the directory the log routes act on.
     pub writes_log_directory: bool,
     /// The gateway serves a dashboard build from `www/` at `/`, falling back to its
@@ -293,6 +299,8 @@ impl Default for SurfaceConfigBuilder {
             default_max_consent_age_secs: None,
             max_consent_age_ceiling_secs: None,
             keeps_gateway_log: false,
+            logs_no_delegation_events: false,
+            stored_consent_age_secs: None,
             writes_log_directory: false,
             serves_dashboard: false,
             gateway_prefixes: Vec::new(),
