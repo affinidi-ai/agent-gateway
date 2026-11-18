@@ -116,6 +116,15 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
     setWizardState(prev => ({ ...prev, currentStep: step }));
   };
 
+  // Back from Connect returns to Mediator Access only once a refusal or a resume showed
+  // it. A paused gateway that failed for another reason has no step to go back to (its
+  // link was already accepted), so its error offers Retry and Cancel only.
+  const connectBack = accessStepShown
+    ? () => goToStep('mediator-access')
+    : wizardState.gateway
+      ? undefined
+      : () => goToStep('enter-link');
+
   const nextStep = () => {
     const nextIndex = currentStepIndex + 1;
     if (nextIndex < steps.length) {
@@ -261,7 +270,7 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
             didMethod={wizardState.didMethod}
             acceptorMediatorId={wizardState.acceptorMediatorId}
             onConnected={handleConnected}
-            onBack={() => goToStep('mediator-access')}
+            onBack={connectBack}
             onCancel={handleCancel}
           />
         );

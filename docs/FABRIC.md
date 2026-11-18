@@ -393,7 +393,8 @@ Connection Point that keeps the invitation, its secret and the reserved permanen
 their keys and state on disk, survive a restart, and last until the invitation expires: the
 Connection Point's own expiry, and for an acceptance the invitation's `expires_time`, capped at
 seven days, or seven days without one. The startup cleanup of orphaned key directories keeps the
-keys of a reserved permanent DID while a stored Connection Point reserves it. The same expiry
+keys of a permanent DID minted ahead of the pairing, a reservation or an acceptance's
+`secure_cp_id`, while a stored Connection Point names it. The same expiry
 bounds an acceptance's wait for approval, with or without the pause: a `pending` acceptance whose
 temporary Connection Point is unexpired survives a restart, and its listener is started again. A
 restart removes a paused gateway whose invitation has expired, and a `pending` one with no

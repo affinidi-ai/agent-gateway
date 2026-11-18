@@ -27,16 +27,19 @@ const mockConnectMounts = jest.fn();
 jest.mock(
   '../../components/gateway-add-via-oob/ConnectStep',
   () =>
-    ({ continueGatewayId, onRefused }: any) => {
+    ({ continueGatewayId, onRefused, onBack }: any) => {
       mockConnectMounts(continueGatewayId);
       return (
-        <button
-          onClick={() =>
-            onRefused({ did: 'did:peer:2.tmp', label: 'Temporary DID for the handshake' })
-          }
-        >
-          refuse
-        </button>
+        <>
+          <button
+            onClick={() =>
+              onRefused({ did: 'did:peer:2.tmp', label: 'Temporary DID for the handshake' })
+            }
+          >
+            refuse
+          </button>
+          {onBack && <button onClick={onBack}>back</button>}
+        </>
       );
     }
 );
@@ -120,4 +123,11 @@ test('continuing from Connections shows the DIDs at once, without testing the co
   expect(await screen.findByTestId('mediator-access-did-temporary')).toBeInTheDocument();
   expect(mockConnectMounts).not.toHaveBeenCalled();
   expect(post).not.toHaveBeenCalled();
+});
+
+test('a failure of the first try offers no Back to the DIDs to allow', async () => {
+  startPairing();
+
+  expect(await screen.findByText('refuse')).toBeInTheDocument();
+  expect(screen.queryByText('back')).not.toBeInTheDocument();
 });

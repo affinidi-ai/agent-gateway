@@ -12,7 +12,8 @@ interface ConnectStepProps {
   didMethod?: string;
   acceptorMediatorId?: string;
   onConnected: (gateway: any) => void;
-  onBack: () => void;
+  /** Left out when there is no earlier step to go back to; the error then offers Retry only. */
+  onBack?: () => void;
   onCancel: () => void;
   /** The connect-via-OOB route that creates the record. */
   endpoint?: string;
@@ -144,16 +145,18 @@ const ConnectStep: React.FC<ConnectStepProps> = ({
                 Cancel
               </AppButton>
               <div className="d-flex gap-2">
-                <AppButton
-                  type="button"
-                  variant="secondary"
-                  size="md"
-                  onClick={onBack}
-                  iconStart={<i className="fas fa-arrow-left"></i>}
-                  data-testid="wizard-back"
-                >
-                  Back
-                </AppButton>
+                {onBack && (
+                  <AppButton
+                    type="button"
+                    variant="secondary"
+                    size="md"
+                    onClick={onBack}
+                    iconStart={<i className="fas fa-arrow-left"></i>}
+                    data-testid="wizard-back"
+                  >
+                    Back
+                  </AppButton>
+                )}
                 <AppButton
                   type="button"
                   variant="primary"

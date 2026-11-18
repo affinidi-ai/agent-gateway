@@ -1063,7 +1063,15 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
         .complete(
             async move {
                 let _held_until_saved = provided_lock;
-                store.create(&record).await
+                let stored = store.create(&record).await;
+                // Handed over on the write's own task, so a cancelled request cannot report
+                // the reserved DID failed while its record is stored.
+                if stored.is_ok()
+                    && let Some(reservation) = reservation
+                {
+                    reservation.hand_over();
+                }
+                stored
             },
             saved,
         )
@@ -1072,9 +1080,6 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
             error!("Failed to create connection point: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create connection point: {}", e))
         })?;
-    if let Some(reservation) = reservation {
-        reservation.hand_over();
-    }
 
     if connection_point.awaiting_mediator_access {
         info!("Connection point {} saved, waiting for mediator access", connection_point.id);
