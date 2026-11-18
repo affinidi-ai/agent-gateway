@@ -254,7 +254,8 @@ async fn asks_to_listen(
     operator: String,
     surface_name: &str,
 ) {
-    let answer = ask_to_listen(world, Some(&operator), surface_name, true).await;
+    let named = (operator != THE_OPERATOR).then_some(operator.as_str());
+    let answer = ask_to_listen(world, named, surface_name, true).await;
     world
         .dashboard_listen_answers
         .insert(operator, answer);
