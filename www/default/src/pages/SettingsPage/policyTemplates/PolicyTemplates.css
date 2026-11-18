@@ -1,0 +1,116 @@
+.policy-template-list {
+  display: grid;
+  gap: 6px;
+}
+
+.policy-template-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  text-align: left;
+  color: inherit;
+  background: #fff;
+  border: 1px solid var(--gray-300);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.policy-template-row:hover {
+  background: var(--gray-100);
+}
+
+.policy-template-row:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 1px;
+}
+
+.policy-template-row.is-selected {
+  border-color: var(--accent-blue-text);
+  box-shadow: 0 0 0 1px var(--accent-blue-text);
+  background: rgba(74, 144, 226, 0.08);
+}
+
+.policy-template-row__text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.policy-template-row__name {
+  font-weight: 600;
+}
+
+.policy-template-row__summary {
+  font-size: 11px;
+  color: var(--muted-text);
+}
+
+.policy-template-decision {
+  background: transparent;
+  border: 1px solid currentColor;
+  flex-shrink: 0;
+}
+
+.policy-template-decision--deny {
+  color: var(--danger-text);
+}
+
+.policy-template-decision--allow {
+  color: var(--warning-text);
+}
+
+.policy-template-reads {
+  background: transparent;
+  color: var(--muted-text);
+  border: 1px solid var(--gray-300);
+  font-family: Monaco, Consolas, 'Courier New', monospace;
+  font-weight: 500;
+}
+
+.policy-template-preview {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--gray-200);
+}
+
+.policy-template-preview pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.policy-template-number {
+  max-width: 7rem;
+}
+
+.policy-template-example {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  margin-bottom: 4px;
+  border: 1px solid var(--gray-200);
+  border-radius: var(--radius-sm);
+}
+
+body.dark-theme .policy-template-row {
+  background: var(--dark-card-bg, #1f2937);
+  border-color: var(--dark-border);
+}
+
+body.dark-theme .policy-template-row:hover {
+  background: rgba(74, 144, 226, 0.08);
+}
+
+body.dark-theme .policy-template-row.is-selected {
+  background: rgba(96, 165, 250, 0.12);
+}
+
+body.dark-theme .policy-template-reads,
+body.dark-theme .policy-template-example,
+body.dark-theme .policy-template-preview {
+  border-color: var(--dark-border);
+}

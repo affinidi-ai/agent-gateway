@@ -1,14 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { apiClient } from '../../api';
-
-interface SimulateResult {
-  allow: boolean;
-  reason?: string;
-  policy_type: string;
-  version?: number;
-  content_hash: string;
-  query: string;
-}
+import { simulatePolicy, type SimulateResult } from './simulatePolicy';
 
 interface PolicySimulatePanelProps {
   policyId: string;
@@ -28,16 +19,6 @@ export const POLICY_SIMULATE_DEFAULT_INPUT = `{
   "http": { "method": "POST", "path": "/", "headers": {} },
   "gateway": { "direction": "inbound" }
 }`;
-
-/** Pull the `error` field out of a JSON error body; falls back to the raw text. */
-const extractErrorMessage = (body: string): string => {
-  try {
-    const parsed = JSON.parse(body) as { error?: string };
-    return parsed.error ?? body;
-  } catch {
-    return body;
-  }
-};
 
 /**
  * Dry-run the policy currently in the editor against a sample input, without
@@ -85,19 +66,7 @@ const PolicySimulatePanel: React.FC<PolicySimulatePanelProps> = ({
     }
     try {
       setRunning(true);
-      const resp = await apiClient.fetch(
-        `/api/v1/policy-definitions/${encodeURIComponent(policyId)}/simulate`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ input, policy: draftPolicy, policy_type: policyType }),
-        }
-      );
-      if (!resp.ok) {
-        const detail = await resp.text().catch(() => '');
-        throw new Error(extractErrorMessage(detail) || `Dry-run failed: ${resp.statusText}`);
-      }
-      setResult((await resp.json()) as SimulateResult);
+      setResult(await simulatePolicy(policyId, policyType, draftPolicy, input));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Dry-run failed');

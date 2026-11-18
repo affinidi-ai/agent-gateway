@@ -1,0 +1,212 @@
+import {
+  defaultDecision,
+  defaultParameterValues,
+  insertTemplateRules,
+  parseListInput,
+  renderTemplate as fillTemplate,
+} from '../regoTemplate';
+import type { PolicyTemplate } from '../types';
+
+const threshold: PolicyTemplate = {
+  id: 'threshold',
+  name: 'At least N trust checks pass',
+  summary: '',
+  description: '',
+  category: 'trust_checks',
+  policy_type: 'agent_surface',
+  rego: `package surface.policy
+
+default allow := false
+
+allow if {
+  passing := [r | some r in input.trust_check_results.target; r.ok]
+  count(passing) >= {{min_passing}}
+}`,
+  parameters: [
+    {
+      key: 'min_passing',
+      label: 'Minimum passing checks',
+      kind: 'integer',
+      default: 2,
+      min: 1,
+      max: 50,
+    },
+  ],
+  reads: [],
+  examples: [],
+  builtin: true,
+};
+
+const roles: PolicyTemplate = {
+  ...threshold,
+  id: 'roles',
+  name: 'Allow listed roles',
+  rego: `package surface.policy
+
+default allow := false
+
+allow if input.jwt.role in {{roles}}`,
+  parameters: [{ key: 'roles', label: 'Roles', kind: 'string_list', default: ['admin'] }],
+};
+
+describe('renderTemplate (fillTemplate)', () => {
+  it('fills an integer setting with its default', () => {
+    const result = fillTemplate(threshold, defaultParameterValues(threshold));
+    expect(result.errors).toEqual({});
+    expect(result.rego).toContain('count(passing) >= 2');
+    expect(result.rego).not.toContain('{{');
+  });
+
+  it('fills an integer setting with a value inside its range', () => {
+    const result = fillTemplate(threshold, { min_passing: 5 });
+    expect(result.rego).toContain('count(passing) >= 5');
+  });
+
+  it('refuses an integer below its minimum and returns no Rego', () => {
+    const result = fillTemplate(threshold, { min_passing: 0 });
+    expect(result.rego).toBeNull();
+    expect(result.errors.min_passing).toBe('Enter a whole number from 1 to 50.');
+  });
+
+  it('refuses a fractional integer setting', () => {
+    expect(fillTemplate(threshold, { min_passing: 2.5 }).rego).toBeNull();
+  });
+
+  it('renders a list setting as a Rego set of string literals', () => {
+    const result = fillTemplate(roles, { roles: ['admin', 'operator'] });
+    expect(result.rego).toContain('allow if input.jwt.role in {"admin", "operator"}');
+  });
+
+  it('escapes quotes and backslashes so a value cannot end the string literal', () => {
+    const result = fillTemplate(roles, { roles: ['a" } allow := true #'] });
+    expect(result.rego).toContain('{"a\\" } allow := true #"}');
+    expect(result.rego).not.toMatch(/^allow := true/m);
+  });
+
+  it('refuses an empty list setting', () => {
+    const result = fillTemplate(roles, { roles: [] });
+    expect(result.rego).toBeNull();
+    expect(result.errors.roles).toBe('Enter at least one value.');
+  });
+
+  it('drops blank and duplicate list entries', () => {
+    const result = fillTemplate(roles, { roles: [' admin ', '', 'admin', 'ops'] });
+    expect(result.rego).toContain('in {"admin", "ops"}');
+  });
+
+  it('falls back to the default for a setting that has no value', () => {
+    const result = fillTemplate(roles, {});
+    expect(result.rego).toContain('in {"admin"}');
+  });
+});
+
+describe('renderTemplate with a single-value setting', () => {
+  const zone: PolicyTemplate = {
+    ...threshold,
+    id: 'zone',
+    rego: 'package surface.policy\n\nzone := {{time_zone}}',
+    parameters: [{ key: 'time_zone', label: 'Time zone', kind: 'string', default: 'UTC' }],
+  };
+
+  it('renders the trimmed value as one string literal', () => {
+    expect(fillTemplate(zone, { time_zone: ' Europe/Berlin ' }).rego).toContain(
+      'zone := "Europe/Berlin"'
+    );
+  });
+
+  it('escapes a quote so the value stays one string', () => {
+    expect(fillTemplate(zone, { time_zone: 'a" || true' }).rego).toContain(
+      'zone := "a\\" || true"'
+    );
+  });
+
+  it('refuses a blank value', () => {
+    const out = fillTemplate(zone, { time_zone: '  ' });
+    expect(out.rego).toBeNull();
+    expect(out.errors.time_zone).toBe('Enter a value.');
+  });
+});
+
+describe('parseListInput', () => {
+  it('splits on commas and new lines and trims each value', () => {
+    expect(parseListInput('admin, operator\n auditor ')).toEqual(['admin', 'operator', 'auditor']);
+  });
+
+  it('returns an empty list for blank input', () => {
+    expect(parseListInput('  ,\n ')).toEqual([]);
+  });
+});
+
+describe('defaultDecision', () => {
+  it('reads deny from default allow := false', () => {
+    expect(defaultDecision('package p\n\ndefault allow := false')).toBe('deny');
+  });
+
+  it('reads allow from the legacy default allow = true form', () => {
+    expect(defaultDecision('package p\n# comment\ndefault allow = true')).toBe('allow');
+  });
+
+  it('treats a module without a default as deny', () => {
+    expect(defaultDecision('package p\nallow if input.jwt.sub')).toBe('deny');
+  });
+});
+
+describe('insertTemplateRules', () => {
+  const existing = `package surface.policy
+
+default allow := false
+
+allow if input.jwt.iss == "https://login.example"`;
+
+  it('appends the rules without the package line or the default', () => {
+    const result = insertTemplateRules(
+      existing,
+      'Allow listed roles',
+      `package surface.policy
+
+default allow := false
+
+allow if input.jwt.role in {"admin"}`
+    );
+    expect(result.policy).toBe(`package surface.policy
+
+default allow := false
+
+allow if input.jwt.iss == "https://login.example"
+
+# Inserted from template: Allow listed roles
+allow if input.jwt.role in {"admin"}
+`);
+    expect(result.added).toBe('allow if input.jwt.role in {"admin"}');
+    expect(result.droppedDefault).toBe(true);
+  });
+
+  it('reports that the existing policy allows by default', () => {
+    const result = insertTemplateRules(
+      'package surface.policy\n\ndefault allow = true',
+      'Roles',
+      'package surface.policy\n\nallow if input.jwt.sub'
+    );
+    expect(result.existingDefault).toBe('allow');
+    expect(result.droppedDefault).toBe(false);
+  });
+
+  it('places a new import after the package line and skips one already present', () => {
+    const result = insertTemplateRules(
+      'package surface.policy\nimport rego.v1\n\ndefault allow := false',
+      'T',
+      'package surface.policy\nimport rego.v1\nimport future.keywords.every\n\nallow if input.jwt.sub'
+    );
+    const lines = result.policy.split('\n');
+    expect(lines[0]).toBe('package surface.policy');
+    expect(lines[1]).toBe('import future.keywords.every');
+    expect(lines[2]).toBe('import rego.v1');
+    expect(result.policy.match(/import rego\.v1/g)).toHaveLength(1);
+  });
+
+  it('keeps a template name with a line break inside the comment', () => {
+    const result = insertTemplateRules(existing, 'Evil\nallow := true', 'allow if input.jwt.sub');
+    expect(result.policy).toContain('# Inserted from template: Evil allow := true\n');
+    expect(result.policy).not.toMatch(/^allow := true/m);
+  });
+});

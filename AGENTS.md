@@ -424,6 +424,15 @@ holds the payload stream only (the Policy Input card says so while a listen is o
 titles share one style; see _Policy input capture_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#policy-input-capture).
 
+The policy editor offers policy templates without a gateway API: a **Template** field on the
+create form (Blank, which is the default allow-all policy, then built-in and organisation
+templates), a templates side panel with settings that fill the Rego and **Insert rules** to
+combine several templates in a new policy, **Insert template** and
+**Save as template** on a saved policy (`policies.edit`), and a Template examples card that runs
+an inserted template's examples through the existing simulate endpoint. Built-in templates ship
+in the dashboard and organisation templates last for the browser session; see _Policy
+templates_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#policy-templates).
+
 The Dashboard shows the metrics **Delete** button only to users with `settings.edit`; see
 _Maintenance actions_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#maintenance-actions).
 

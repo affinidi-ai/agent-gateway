@@ -1,0 +1,24 @@
+branch: feat/policy-template-library
+changes:
+  added:
+    - timestamp: '2026-11-18T12:38:12Z'
+      title: Start, extend and share policies from templates in the policy editor
+      description: >-
+        The policy editor offers templates for common policies: deny by default, require an
+        authenticated caller, allow by JWT claim or role, allow by JWT issuer and audience,
+        restrict MCP tools by role, require Trust Registry recognition, require a verified
+        credential subject, allowlist outbound destinations, allow during business hours,
+        a monitor-only baseline, and allow only when all trust checks passed, plus HTTP
+        method, path and subject allowlists. A Template field on the create form fills Name, Description, Type and Rego,
+        and a templates panel previews each template, lets its settings (such as the minimum
+        number of passing trust checks) fill the Rego, shows how it decides on example
+        requests, copies its Rego, and inserts its rules into the policy being created, so
+        several templates can be combined. On a saved policy, Insert template appends a
+        template's rules and checks its examples against the draft with the existing dry-run,
+        and Save as template keeps the policy as an organisation template for the browser
+        session. Built-in templates ship with the dashboard; no gateway API changes.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

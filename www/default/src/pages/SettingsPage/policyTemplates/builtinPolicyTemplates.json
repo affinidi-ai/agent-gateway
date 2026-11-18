@@ -1,0 +1,667 @@
+[
+  {
+    "id": "deny-by-default",
+    "name": "Deny by default",
+    "summary": "Nothing is allowed until a rule allows it.",
+    "description": "Denies every request. Start here and insert or write the rules that allow what you need.",
+    "category": "baseline",
+    "policy_types": ["gateway", "agent_surface"],
+    "standalone": true,
+    "rules": "default allow := false",
+    "parameters": [],
+    "reads": [],
+    "examples": [
+      {
+        "name": "Any request",
+        "input": { "http": { "method": "GET", "path": "/" } },
+        "expected": "deny"
+      }
+    ]
+  },
+  {
+    "id": "require-authentication",
+    "name": "Require authenticated caller",
+    "summary": "Allow only callers that authenticated.",
+    "description": "Allows a request only when the caller authenticated with one of the surface's Caller Context methods. Denies callers whose credential was missing or invalid, and requests on a surface without caller authentication.",
+    "category": "authentication",
+    "policy_types": ["agent_surface"],
+    "rules": "default allow := false\n\nallow if {\n  input.source_auth.method\n  input.source_auth.method != \"failed\"\n}",
+    "parameters": [],
+    "reads": ["source_auth.method"],
+    "examples": [
+      {
+        "name": "Verified JWT caller",
+        "input": {
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "user@example.com",
+            "claims": { "sub": "user@example.com" }
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Failed API key",
+        "input": {
+          "source_auth": {
+            "method": "failed",
+            "attempted_method": "api_key",
+            "reason": "unknown key"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "No caller authentication",
+        "input": { "http": { "method": "GET", "path": "/" } },
+        "expected": "deny"
+      }
+    ]
+  },
+  {
+    "id": "allow-by-jwt-claim",
+    "name": "Allow by JWT claim or role",
+    "summary": "Allow only JWT callers whose claim has one of the listed values.",
+    "description": "Allows a request when the caller authenticated with a JWT and the chosen claim, such as role, holds one of the listed values. A claim that is a list matches when any of its values is listed. Denies every other caller.",
+    "category": "authentication",
+    "policy_types": ["agent_surface"],
+    "rules": "default allow := false\n\njwt_claim_values(v) := [v] if is_string(v)\n\njwt_claim_values(v) := v if is_array(v)\n\nallow if {\n  input.source_auth.method == \"jwt_bearer\"\n  some v in jwt_claim_values(input.source_auth.claims[{{claim}}])\n  v in {{values}}\n}",
+    "parameters": [
+      {
+        "key": "claim",
+        "label": "Claim",
+        "kind": "string",
+        "default": "role",
+        "help": "The JWT claim to check, for example role, roles or groups."
+      },
+      {
+        "key": "values",
+        "label": "Allowed values",
+        "kind": "string_list",
+        "default": ["admin"],
+        "help": "Separate values with commas."
+      }
+    ],
+    "reads": ["source_auth.claims"],
+    "examples": [
+      {
+        "name": "Role admin",
+        "input": {
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "ops@example.com",
+            "claims": { "sub": "ops@example.com", "role": "admin" }
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Role viewer",
+        "input": {
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "guest@example.com",
+            "claims": { "sub": "guest@example.com", "role": "viewer" }
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Roles list with admin",
+        "input": {
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "lead@example.com",
+            "claims": { "sub": "lead@example.com", "role": ["viewer", "admin"] }
+          }
+        },
+        "expected": "allow"
+      }
+    ]
+  },
+  {
+    "id": "allow-by-jwt-issuer-audience",
+    "name": "Allow by JWT issuer and audience",
+    "summary": "Allow only tokens from listed issuers for listed audiences.",
+    "description": "Allows a request only when the caller's JWT was issued by one of the listed issuers and names one of the listed audiences. Denies every other caller.",
+    "category": "authentication",
+    "policy_types": ["agent_surface"],
+    "rules": "default allow := false\n\njwt_audiences contains a if {\n  a := input.source_auth.claims.aud\n  is_string(a)\n}\n\njwt_audiences contains a if {\n  is_array(input.source_auth.claims.aud)\n  some a in input.source_auth.claims.aud\n}\n\nallow if {\n  input.source_auth.method == \"jwt_bearer\"\n  input.source_auth.claims.iss in {{issuers}}\n  some a in jwt_audiences\n  a in {{audiences}}\n}",
+    "parameters": [
+      {
+        "key": "issuers",
+        "label": "Allowed issuers",
+        "kind": "string_list",
+        "default": ["https://login.example.com"],
+        "help": "Exact iss values, separated by commas."
+      },
+      {
+        "key": "audiences",
+        "label": "Allowed audiences",
+        "kind": "string_list",
+        "default": ["https://gateway.example.com"],
+        "help": "Exact aud values, separated by commas."
+      }
+    ],
+    "reads": ["source_auth.claims.iss", "source_auth.claims.aud"],
+    "examples": [
+      {
+        "name": "Listed issuer and audience",
+        "input": {
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "user@example.com",
+            "claims": {
+              "sub": "user@example.com",
+              "iss": "https://login.example.com",
+              "aud": ["https://gateway.example.com"]
+            }
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Other issuer",
+        "input": {
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "user@example.com",
+            "claims": {
+              "sub": "user@example.com",
+              "iss": "https://other.example.com",
+              "aud": "https://gateway.example.com"
+            }
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Other audience",
+        "input": {
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "user@example.com",
+            "claims": {
+              "sub": "user@example.com",
+              "iss": "https://login.example.com",
+              "aud": "https://other.example.com"
+            }
+          }
+        },
+        "expected": "deny"
+      }
+    ]
+  },
+  {
+    "id": "restrict-mcp-tools-by-role",
+    "name": "Restrict MCP tools by role",
+    "summary": "Only the listed roles may call the listed tools.",
+    "description": "Allows a call to one of the listed MCP tools only when the caller's JWT role is one of the listed roles. Every other request, including other tools, is allowed. Use it as the whole policy: inserted into another policy it would allow requests that policy denies.",
+    "category": "allow_deny_lists",
+    "policy_types": ["agent_surface"],
+    "standalone": true,
+    "rules": "default allow := false\n\nrestricted_tool_call if {\n  input.mcp.method == \"tools/call\"\n  input.mcp.tool_name in {{tools}}\n}\n\nallow if not restricted_tool_call\n\nallow if {\n  restricted_tool_call\n  input.source_auth.method == \"jwt_bearer\"\n  input.source_auth.claims.role in {{roles}}\n}",
+    "parameters": [
+      {
+        "key": "tools",
+        "label": "Restricted tools",
+        "kind": "string_list",
+        "default": ["delete_record"],
+        "help": "MCP tool names, separated by commas."
+      },
+      {
+        "key": "roles",
+        "label": "Roles that may call them",
+        "kind": "string_list",
+        "default": ["admin"],
+        "help": "Values of the JWT role claim, separated by commas."
+      }
+    ],
+    "reads": ["mcp.tool_name", "source_auth.claims.role"],
+    "examples": [
+      {
+        "name": "Admin calls a restricted tool",
+        "input": {
+          "mcp": { "method": "tools/call", "tool_name": "delete_record" },
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "ops@example.com",
+            "claims": { "role": "admin" }
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Viewer calls a restricted tool",
+        "input": {
+          "mcp": { "method": "tools/call", "tool_name": "delete_record" },
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "guest@example.com",
+            "claims": { "role": "viewer" }
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Viewer calls another tool",
+        "input": {
+          "mcp": { "method": "tools/call", "tool_name": "search" },
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "guest@example.com",
+            "claims": { "role": "viewer" }
+          }
+        },
+        "expected": "allow"
+      }
+    ]
+  },
+  {
+    "id": "require-trust-registry-recognition",
+    "name": "Require Trust Registry recognition",
+    "summary": "Allow only when the named trust check passed.",
+    "description": "Allows a request only when the Trust Check with the given id ran on the target and every authority it asked recognised the agent. Denies when that check failed or did not run.",
+    "category": "trust_checks",
+    "policy_types": ["agent_surface"],
+    "rules": "default allow := false\n\ntrust_check_passed(check_id) if {\n  results := [r | some r in input.trust_check_results.target; r.id == check_id]\n  count(results) > 0\n  every r in results { r.ok }\n}\n\nallow if trust_check_passed({{check_id}})",
+    "parameters": [
+      {
+        "key": "check_id",
+        "label": "Trust Check id",
+        "kind": "string",
+        "default": "registry-recognition",
+        "help": "The id of the Trust Check element on the surface."
+      }
+    ],
+    "reads": ["trust_check_results.target"],
+    "examples": [
+      {
+        "name": "Check passed",
+        "input": {
+          "trust_check_results": {
+            "target": [
+              { "id": "registry-recognition", "ok": true },
+              { "id": "other", "ok": false }
+            ]
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Check failed",
+        "input": {
+          "trust_check_results": {
+            "target": [{ "id": "registry-recognition", "ok": false }]
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Check did not run",
+        "input": { "trust_check_results": { "target": [{ "id": "other", "ok": true }] } },
+        "expected": "deny"
+      }
+    ]
+  },
+  {
+    "id": "require-verified-credential-subject",
+    "name": "Require verified credential subject",
+    "summary": "Allow only listed caller DIDs the gateway verified.",
+    "description": "Allows a request only when the gateway verified the caller's DID, from an identity presentation or a bound source credential, and that DID is on the list. Denies unverified and unlisted callers.",
+    "category": "trust_checks",
+    "policy_types": ["agent_surface"],
+    "rules": "default allow := false\n\nallow if {\n  input.extension_identity.verified == true\n  input.extension_identity.did in {{dids}}\n}",
+    "parameters": [
+      {
+        "key": "dids",
+        "label": "Allowed DIDs",
+        "kind": "string_list",
+        "default": ["did:web:agent.example.com"],
+        "help": "Caller DIDs, separated by commas."
+      }
+    ],
+    "reads": ["extension_identity.did", "extension_identity.verified"],
+    "examples": [
+      {
+        "name": "Verified listed DID",
+        "input": {
+          "extension_identity": {
+            "did": "did:web:agent.example.com",
+            "verification": "vp",
+            "verified": true
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Unverified listed DID",
+        "input": {
+          "extension_identity": {
+            "did": "did:web:agent.example.com",
+            "verification": "unverified",
+            "verified": false
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Verified other DID",
+        "input": {
+          "extension_identity": {
+            "did": "did:web:other.example.com",
+            "verification": "vp",
+            "verified": true
+          }
+        },
+        "expected": "deny"
+      }
+    ]
+  },
+  {
+    "id": "allowlist-outbound-destinations",
+    "name": "Allowlist outbound destinations",
+    "summary": "Allow outbound calls only to the listed destinations.",
+    "description": "Allows a Transit Point call only when its destination starts with one of the listed prefixes. Inbound requests are allowed. Use it as the whole policy: inserted into another policy it would allow requests that policy denies.",
+    "category": "routing_paths",
+    "policy_types": ["agent_surface"],
+    "standalone": true,
+    "rules": "default allow := false\n\nallow if input.gateway.direction != \"outbound\"\n\nallow if {\n  input.gateway.direction == \"outbound\"\n  some prefix in {{destinations}}\n  startswith(input.gateway.target_id, prefix)\n}",
+    "parameters": [
+      {
+        "key": "destinations",
+        "label": "Allowed destination prefixes",
+        "kind": "string_list",
+        "default": ["https://api.example.com/"],
+        "help": "Start of each allowed destination URL, separated by commas."
+      }
+    ],
+    "reads": ["gateway.direction", "gateway.target_id"],
+    "examples": [
+      {
+        "name": "Outbound to a listed destination",
+        "input": {
+          "gateway": { "direction": "outbound", "target_id": "https://api.example.com/v1/orders" }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Outbound elsewhere",
+        "input": {
+          "gateway": { "direction": "outbound", "target_id": "https://unknown.example.net/" }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Inbound request",
+        "input": { "gateway": { "direction": "inbound" } },
+        "expected": "allow"
+      }
+    ]
+  },
+  {
+    "id": "allow-during-business-hours",
+    "name": "Allow during business hours",
+    "summary": "Allow requests only on listed days between two hours.",
+    "description": "Allows a request only on the listed weekdays, from the start hour until the end hour, in the chosen time zone. Rate limits are set on the surface's Rate Limit panel, not in policy.",
+    "category": "time",
+    "policy_types": ["gateway", "agent_surface"],
+    "rules": "default allow := false\n\nallow if {\n  now := time.now_ns()\n  time.weekday([now, {{time_zone}}]) in {{days}}\n  [hour, _, _] := time.clock([now, {{time_zone}}])\n  hour >= {{start_hour}}\n  hour < {{end_hour}}\n}",
+    "parameters": [
+      {
+        "key": "days",
+        "label": "Days",
+        "kind": "string_list",
+        "default": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+        "help": "English day names, separated by commas."
+      },
+      {
+        "key": "start_hour",
+        "label": "From hour",
+        "kind": "integer",
+        "default": 9,
+        "min": 0,
+        "max": 23,
+        "help": "First allowed hour, 0 to 23."
+      },
+      {
+        "key": "end_hour",
+        "label": "Until hour",
+        "kind": "integer",
+        "default": 17,
+        "min": 1,
+        "max": 24,
+        "help": "Requests are allowed until this hour starts. Must be later than From hour."
+      },
+      {
+        "key": "time_zone",
+        "label": "Time zone",
+        "kind": "string",
+        "default": "UTC",
+        "help": "An IANA time zone, for example Europe/Berlin or Asia/Singapore."
+      }
+    ],
+    "reads": [],
+    "examples": []
+  },
+  {
+    "id": "all-trust-checks-pass",
+    "name": "All trust checks pass",
+    "summary": "Allow only if every trust check succeeded.",
+    "description": "Allows a request only if at least one trust check ran on the target and every one succeeded. Denies when any check failed or none ran.",
+    "category": "trust_checks",
+    "policy_types": ["agent_surface"],
+    "rules": "default allow := false\n\nallow if {\n  count(input.trust_check_results.target) > 0\n  every r in input.trust_check_results.target { r.ok }\n}",
+    "parameters": [],
+    "reads": ["trust_check_results.target"],
+    "examples": [
+      {
+        "name": "2 checks, both pass",
+        "input": {
+          "trust_check_results": {
+            "target": [
+              { "id": "registry", "ok": true },
+              { "id": "credential", "ok": true }
+            ]
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "2 checks, 1 fails",
+        "input": {
+          "trust_check_results": {
+            "target": [
+              { "id": "registry", "ok": true },
+              { "id": "credential", "ok": false }
+            ]
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "No checks ran",
+        "input": { "trust_check_results": { "target": [] } },
+        "expected": "deny"
+      }
+    ]
+  },
+  {
+    "id": "at-least-n-trust-checks-pass",
+    "name": "At least N trust checks pass",
+    "summary": "Threshold instead of all-or-nothing. Has a setting.",
+    "description": "Allows a request when the number of passing trust checks on the target reaches your threshold. Denies when fewer pass, or when no checks ran.",
+    "category": "trust_checks",
+    "policy_types": ["agent_surface"],
+    "rules": "default allow := false\n\nallow if {\n  passing := [r | some r in input.trust_check_results.target; r.ok]\n  count(passing) >= {{min_passing}}\n}",
+    "parameters": [
+      {
+        "key": "min_passing",
+        "label": "Minimum passing checks",
+        "kind": "integer",
+        "default": 2,
+        "min": 1,
+        "max": 20,
+        "help": "Updates the Rego below. You can still edit the code after using the template."
+      }
+    ],
+    "reads": ["trust_check_results.target"],
+    "examples": [
+      {
+        "name": "3 checks, 2 pass",
+        "input": {
+          "trust_check_results": {
+            "target": [
+              { "id": "a", "ok": true },
+              { "id": "b", "ok": true },
+              { "id": "c", "ok": false }
+            ]
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "3 checks, 1 passes",
+        "input": {
+          "trust_check_results": {
+            "target": [
+              { "id": "a", "ok": true },
+              { "id": "b", "ok": false },
+              { "id": "c", "ok": false }
+            ]
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "No checks ran",
+        "input": { "trust_check_results": { "target": [] } },
+        "expected": "deny"
+      }
+    ]
+  },
+  {
+    "id": "allow-http-methods",
+    "name": "Allow listed HTTP methods",
+    "summary": "Allow only the listed HTTP methods.",
+    "description": "Allows a request only when its HTTP method is on the list, for example to keep a surface read-only.",
+    "category": "routing_paths",
+    "policy_types": ["gateway", "agent_surface"],
+    "rules": "default allow := false\n\nallow if input.http.method in {{methods}}",
+    "parameters": [
+      {
+        "key": "methods",
+        "label": "Allowed methods",
+        "kind": "string_list",
+        "default": ["GET"],
+        "help": "Upper case, separated by commas."
+      }
+    ],
+    "reads": ["http.method"],
+    "examples": [
+      {
+        "name": "GET request",
+        "input": { "http": { "method": "GET", "path": "/" } },
+        "expected": "allow"
+      },
+      {
+        "name": "POST request",
+        "input": { "http": { "method": "POST", "path": "/" } },
+        "expected": "deny"
+      }
+    ]
+  },
+  {
+    "id": "allow-path-prefixes",
+    "name": "Allow listed paths",
+    "summary": "Allow only requests under the listed path prefixes.",
+    "description": "Allows a request only when its path starts with one of the listed prefixes.",
+    "category": "routing_paths",
+    "policy_types": ["gateway", "agent_surface"],
+    "rules": "default allow := false\n\nallow if {\n  some prefix in {{prefixes}}\n  startswith(input.http.path, prefix)\n}",
+    "parameters": [
+      {
+        "key": "prefixes",
+        "label": "Allowed path prefixes",
+        "kind": "string_list",
+        "default": ["/public/"],
+        "help": "Separate prefixes with commas."
+      }
+    ],
+    "reads": ["http.path"],
+    "examples": [
+      {
+        "name": "Path /public/docs",
+        "input": { "http": { "method": "GET", "path": "/public/docs" } },
+        "expected": "allow"
+      },
+      {
+        "name": "Path /admin",
+        "input": { "http": { "method": "GET", "path": "/admin" } },
+        "expected": "deny"
+      }
+    ]
+  },
+  {
+    "id": "allow-listed-subjects",
+    "name": "Allow listed subjects",
+    "summary": "Allow only the listed JWT subjects.",
+    "description": "Allows a request only when the caller authenticated with a JWT whose subject is on the list. Denies every other caller.",
+    "category": "allow_deny_lists",
+    "policy_types": ["agent_surface"],
+    "rules": "default allow := false\n\nallow if {\n  input.source_auth.method == \"jwt_bearer\"\n  input.source_auth.subject in {{subjects}}\n}",
+    "parameters": [
+      {
+        "key": "subjects",
+        "label": "Allowed subjects",
+        "kind": "string_list",
+        "default": ["user@example.com"],
+        "help": "Separate subjects with commas."
+      }
+    ],
+    "reads": ["source_auth.subject"],
+    "examples": [
+      {
+        "name": "Listed subject",
+        "input": {
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "user@example.com",
+            "claims": { "sub": "user@example.com" }
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Other subject",
+        "input": {
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "someone@example.com",
+            "claims": { "sub": "someone@example.com" }
+          }
+        },
+        "expected": "deny"
+      }
+    ]
+  },
+  {
+    "id": "allow-all-monitor",
+    "name": "Monitor-only baseline",
+    "summary": "Lets everything through. For observing traffic only.",
+    "description": "Allows every request. Each decision is still recorded in the Audit Log, so you can watch traffic before writing a stricter policy. To try a stricter policy without blocking, use the Monitor option of global enforcement on the Policies list instead.",
+    "category": "baseline",
+    "policy_types": ["gateway", "agent_surface"],
+    "standalone": true,
+    "rules": "default allow := true",
+    "parameters": [],
+    "reads": [],
+    "examples": [
+      {
+        "name": "Any request",
+        "input": { "http": { "method": "POST", "path": "/" } },
+        "expected": "allow"
+      }
+    ]
+  }
+]

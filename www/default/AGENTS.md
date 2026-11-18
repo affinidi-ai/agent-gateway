@@ -1764,6 +1764,78 @@ title is `policy-instructions-title`, the arrow `policy-instructions-chevron` si
 button and flips with the state, and the body is `policy-instructions-body`. Build collapsible
 panels the same way, and do not put `role="button"` on a wrapper around a heading.
 
+### Policy templates
+
+Policy templates live in `pages/SettingsPage/policyTemplates/`. The editor never calls a
+template API: built-in templates ship with the dashboard in `builtinPolicyTemplates.json`,
+and organisation templates saved from a policy are kept in `policyTemplateStore.ts` for the
+browser session. The store's functions are async so a gateway API can replace them without
+touching the components.
+
+- **Catalogue.** A JSON entry holds its rules without a `package` line and lists the
+  `policy_types` it serves; `builtinPolicyTemplates.ts` adds the package per type. Every entry
+  must compile on the gateway's Regorus and give each example's `expected` decision, and may
+  read only fields of the gateway's `PolicyInput` (`src/surface_context/mod.rs`). Caller
+  identity is `input.source_auth` (`method`, and for `jwt_bearer` its `subject` and `claims`);
+  there is no `input.jwt`. Templates that read `source_auth` or `trust_check_results` list only
+  `agent_surface`. A setting is a `{{key}}` placeholder with `kind` `integer` (`min`, `max`),
+  `string` or `string_list`. A template that reads the clock (`time.now_ns()`) has no examples.
+  An entry is `standalone` when its rules allow requests outside what it restricts (such as
+  Restrict MCP tools by role and Allowlist outbound destinations), so inserting them would widen
+  another policy; Insert refuses it (`policy-templates-standalone-note`).
+  `builtinPolicyTemplates.test.ts` checks every entry renders under its package. The catalogue
+  holds the starter templates of the template library except rate controls, which are set on
+  the surface's Rate Limit panel.
+- **Rendering.** `regoTemplate.ts` fills settings as Rego literals: integers checked against
+  their range, list values as JSON string literals in a set, so a value cannot end its string.
+  A setting that fails its check shows its error under the field and blocks Use and Insert.
+- **Template field** (create mode only, after Description): `TemplateField`, a `FormSelect`
+  (`policy-definition-template-select`) listing **Blank** first, then built-in, then
+  organisation templates of the selected Type, each described with its default decision and
+  summary. Blank is the editor's default policy (`policyDefaults.ts`), which allows all
+  traffic. Choosing a template fills Name, Description, Type and Rego with the defaults of its
+  settings, shows "Pre-filled from the template. Edit freely." under Name
+  (`policy-definition-prefilled-hint`) and offers Undo in an undo toast. Changing Type after a
+  template clears the field's selection and keeps the Rego, whose package the Type select
+  rewrites as before.
+- **Templates panel** (`PolicyTemplatesPanel`, `policy-templates-panel`): an in-page card in a
+  `col-xl-5` beside the editor card (`col-xl-7`), never a modal. **Browse templates**
+  (`policy-templates-browse-button`) opens it in create mode, **Insert template**
+  (`policy-templates-insert-button`, edit mode, `policies.edit`) in insert mode. It has
+  Built-in and Your organization tabs with counts (`policy-templates-tab-builtin`,
+  `-organization`), a search (`policy-templates-search-input`), category pills in the
+  `custom-channel-tabs` style shown when a tab holds more than one category
+  (`policy-templates-category-<key>`), rows (`policy-templates-row-<id>`) with a DENY or ALLOW
+  outline badge, and a preview: description, default decision and `reads` badges, setting
+  fields (`policy-templates-param-<key>`), the rendered Rego, How it decides, Docs, **Copy
+  Rego** (`policy-templates-copy-button`), **Insert rules**
+  (`policy-templates-insert-rules-button`) and, on the create form, **Use this template**
+  (`policy-templates-use-button`). An empty Your organization tab says how to add one.
+- **Insert rules** appends the template's rules to the Rego in the editor under a
+  `# Inserted from template: <name>` comment and offers Undo. The template's `package` and
+  `default allow` lines are never copied and its imports go after the policy's `package` line.
+  When the Rego allows by default, a warning says an added allow rule changes nothing
+  (`policy-templates-allow-default-warning`). A template's helper rules that depend on its
+  settings are Rego functions taking the setting as an argument, so inserting the same template
+  twice with different settings keeps both checks apart.
+- **Insert while creating.** On the create form, Use this template replaces Name, Description,
+  Type and Rego, while Insert rules only adds rules, keeps the panel open so several templates
+  can be combined, and sets the Template field to **Custom Rego**.
+- **Insert into a saved policy** shows the lines it adds (`policy-templates-insert-preview`),
+  closes the panel, and shows the **Template examples**
+  card (`policy-template-examples-card`) above Test (dry-run): each example runs through
+  `POST /policy-definitions/{id}/simulate` with the draft Rego, and a row whose decision
+  differs from the expected one is highlighted. Examples are written for the default settings,
+  so when a setting was changed before inserting, the card says so
+  (`policy-template-examples-changed-settings`) and highlights no row. The panel scrolls into
+  view when it opens, since below the `xl` breakpoint it stacks under the editor card.
+- **Save as template** (`policy-templates-save-as-button`, edit mode, `policies.edit`) is
+  disabled while the policy has unsaved edits. Its panel (`policy-templates-save-panel`) copies
+  the saved version with a name, summary and category; **Add current sample input**
+  (`policy-templates-save-add-example-button`) records the decision the saved version gives
+  for the Test (dry-run) sample input. A name already used for that type is refused
+  (`policy-templates-save-error`).
+
 ## Audit page: policy changes
 
 The seven policy change events (`policy_created`, `policy_updated`, `policy_deleted`,

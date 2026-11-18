@@ -14,6 +14,10 @@ jest.mock('../../../api', () => ({
   },
 }));
 
+jest.mock('../../../context/PermissionsContext', () => ({
+  usePermissions: () => ({ hasPermission: () => true }),
+}));
+
 function renderCreateForm() {
   return render(
     <PageTitleProvider>
