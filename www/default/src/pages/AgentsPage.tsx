@@ -6,6 +6,7 @@ import { Badge } from '../components/shared/Badge';
 import { EmptyState } from '../components/shared/EmptyState';
 import SearchInput from '../components/shared/SearchInput';
 import { DOCS_URL } from '../config/docs';
+import { usePermissions } from '../context/PermissionsContext';
 import AgentsTable from './AgentsPage/AgentsTable';
 import { agentMatchesFilter } from './AgentsPage/agentLabels';
 import './AgentsPage/AgentRegistry.css';
@@ -16,6 +17,8 @@ import './AgentsPage/AgentRegistry.css';
  */
 const AgentsPage: React.FC = () => {
   const navigate = useNavigate();
+  const { hasPermission } = usePermissions();
+  const canAddSurface = hasPermission('surfaces.edit');
 
   const [agents, setAgents] = useState<AgentRecord[]>([]);
   const [retentionMinutes, setRetentionMinutes] = useState<number | undefined>(undefined);
@@ -116,9 +119,18 @@ const AgentsPage: React.FC = () => {
             !error && (
               <EmptyState
                 icon="fa-robot"
-                title="No agents yet"
-                body="Each Agent Surface's managed agent is listed here. Create a surface to add one."
-                docsHref={DOCS_URL.createFirstSurface}
+                title="No managed agents yet"
+                body="Agents show up here once they’re connected through a surface. Create a surface in Agent GW to start routing, securing, and monitoring your agents in one place."
+                {...(canAddSurface
+                  ? {
+                      ctaLabel: 'Create a surface',
+                      ctaTo: '/surfaces/new',
+                      ctaTestId: 'agents-add-surface-link',
+                    }
+                  : {})}
+                docsHref={DOCS_URL.surfaces}
+                docsLabel="What’s a surface?"
+                docsPlacement="actions"
               />
             )
           ) : visible.length === 0 ? (

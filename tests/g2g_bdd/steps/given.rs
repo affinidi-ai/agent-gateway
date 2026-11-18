@@ -1369,6 +1369,20 @@ async fn vp_audit_log_of_gateway_keeps_every_audit_event(
         .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must keep every audit event: {error:#}"));
 }
 
+#[given(expr = "the operator has read the traffic of the agent of surface {string}")]
+async fn operator_has_read_agent_traffic_of_surface(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    world.start().await;
+    let traffic = world
+        .settled_agent_traffic_of_surface(&surface_name)
+        .await;
+    world
+        .agent_traffic_baseline
+        .insert(surface_name, traffic);
+}
+
 #[given(expr = "gateway {int} surface {string} takes its managed identity from the fixed DID {string}")]
 pub fn surface_takes_managed_identity_from_fixed_did(
     world: &mut G2gWorld,

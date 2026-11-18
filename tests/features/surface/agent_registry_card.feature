@@ -20,3 +20,19 @@ Feature: Agent registry card
     When the operator reads the agent card of the surface's agent
     Then the admin API response status is 200
     And the agent card is available with source "generated"
+
+  Scenario: The card of an agent whose surfaces aren't running is unavailable
+    Given an A2A surface targeting managed agent "bravo"
+    And the operator has looked up the surface's agent
+    And the operator has disabled the stored surface
+    When the operator reads the agent card of the surface's agent
+    Then the admin API response status is 200
+    And the agent card is unavailable because none of the agent's surfaces is running
+
+  Scenario: The card read through a surface that isn't running is not found
+    Given an A2A surface targeting managed agent "bravo"
+    And the operator has looked up the surface's agent
+    And the operator has disabled the stored surface
+    When the operator reads the agent card of the surface's agent through that surface
+    Then the admin API response status is 404
+    And the agent card can't be read through that surface

@@ -303,6 +303,9 @@ impl AgentCardResponse {
 #[derive(Debug)]
 pub enum AgentApiError {
     NotFound,
+    /// The card can't be read through the requested surface: it is not one of the card
+    /// surfaces or isn't running here. A `404` the dashboard tells apart from a missing agent.
+    SurfaceUnavailable,
     BadGateway,
     /// The caller or the surface used up its card fetches; retry after this many seconds.
     RateLimited(u64),
@@ -318,6 +321,13 @@ impl IntoResponse for AgentApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             AgentApiError::NotFound => (StatusCode::NOT_FOUND, "Not Found"),
+            AgentApiError::SurfaceUnavailable => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "Not Found", "code": "surface_unavailable"})),
+                )
+                    .into_response();
+            }
             AgentApiError::BadGateway => (StatusCode::BAD_GATEWAY, "Bad Gateway"),
             AgentApiError::RateLimited(retry_after_secs) => {
                 return (
@@ -1360,7 +1370,8 @@ fn currently_served(preview: AgentCardPreview) -> Option<Value> {
 }
 
 /// The surfaces to read the card through: `requested` alone, or every one of `surfaces` in
-/// order when none is requested. `404` for a requested surface that is not one of them.
+/// order when none is requested. `surface_unavailable` for a requested surface that is not
+/// one of them.
 fn chosen_card_surfaces<'a>(
     surfaces: &[&'a AgentSurface],
     requested: Option<&str>,
@@ -1371,14 +1382,14 @@ fn chosen_card_surfaces<'a>(
             .iter()
             .find(|surface| surface.surface_id == id)
             .map(|surface| vec![*surface])
-            .ok_or(AgentApiError::NotFound),
+            .ok_or(AgentApiError::SurfaceUnavailable),
     }
 }
 
 /// The card the gateway serves for the agent, read through the agent card preview of the
 /// requested surface, or else the first of its [`card_surfaces`] that runs here, so a direct
-/// URL, A2A proxy and Fabric target each give the card callers get. Fetches are limited and
-/// audited as previews.
+/// URL, A2A proxy and Fabric target each give the card callers get. `surface_unavailable`
+/// for a requested surface that isn't running here. Fetches are limited and audited as previews.
 async fn agent_card_response(
     state: &IdentityApiState,
     group: &AgentGroup<'_>,
@@ -1405,14 +1416,18 @@ async fn agent_card_response(
             return Ok(response);
         }
     }
+    if requested.is_some() {
+        return Err(AgentApiError::SurfaceUnavailable);
+    }
     let mut response = AgentCardResponse::unavailable(AgentCardUnavailable::NotRunning);
     response.card_surface_ids = card_surface_ids;
     Ok(response)
 }
 
 /// The Agent Card the gateway serves for the managed agent, or why it isn't available.
-/// `502` when the gateway has no card to show, with no upstream detail, `404` for a
-/// `surface_id` the card can't be read through, and `429` past the agent card preview's
+/// `502` when the gateway has no card to show, with no upstream detail, `404` for an agent
+/// outside the caller's scope, `404` with code `surface_unavailable` for a `surface_id` the
+/// card can't be read through or that isn't running, and `429` past the agent card preview's
 /// fetch limit.
 pub async fn get_agent_card(
     Path(id): Path<String>,
@@ -2476,6 +2491,19 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_surface_unavailable_response_is_a_coded_not_found() {
+        let response = AgentApiError::SurfaceUnavailable.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({ "error": "Not Found", "code": "surface_unavailable" })
+        );
+    }
+
     fn in_tenant(
         mut surface: AgentSurface,
         tenant_id: &str,
@@ -2610,7 +2638,7 @@ mod tests {
 
         assert_eq!(ids(chosen_card_surfaces(&surfaces, None).expect("all")), ["s1", "s2"]);
         assert_eq!(ids(chosen_card_surfaces(&surfaces, Some("s2")).expect("one")), ["s2"]);
-        assert!(matches!(chosen_card_surfaces(&surfaces, Some("s3")), Err(AgentApiError::NotFound)));
+        assert!(matches!(chosen_card_surfaces(&surfaces, Some("s3")), Err(AgentApiError::SurfaceUnavailable)));
     }
 
     #[test]
