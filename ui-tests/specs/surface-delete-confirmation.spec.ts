@@ -2,7 +2,8 @@
  * Surface delete confirmation tests
  *
  * Asserts the surface page's delete button sends nothing and opens a
- * confirmation, that Cancel sends no DELETE, and that Delete sends one and
+ * confirmation dialog with focus on Cancel, that Cancel sends no DELETE and
+ * returns focus to the delete button, and that Delete sends one and
  * returns to the surface list.
  */
 
@@ -57,17 +58,22 @@ test.describe('Surface delete confirmation', () => {
 
         await page.getByTestId('surface-delete-button').click();
 
-        const confirmation = page.getByRole('dialog', {name: 'Delete Surface?'});
+        const confirmation = page.getByTestId('surface-delete-dialog');
         await expect(confirmation).toBeVisible();
         await expect(confirmation).toContainText(
             'You are about to permanently delete this surface and all associated configuration. This action cannot be undone.',
         );
         await expect(confirmation).toContainText('Are you sure you want to continue?');
-        await expect(page.getByTestId('surface-delete-confirm-confirm')).toHaveText('Delete');
+        await expect(page.getByTestId('surface-delete-dialog-name')).toHaveText(
+            'Delete Surface delete fixture?',
+        );
+        await expect(page.getByTestId('surface-delete-dialog-confirm')).toHaveText('Delete');
+        await expect(page.getByTestId('surface-delete-dialog-cancel')).toBeFocused();
 
-        await page.getByTestId('surface-delete-confirm-cancel').click();
+        await page.keyboard.press('Enter');
 
         await expect(confirmation).toBeHidden();
+        await expect(page.getByTestId('surface-delete-button')).toBeFocused();
         await expect(page).toHaveURL(new RegExp(`/surfaces/${SURFACE_ID}$`));
         expect(deletes).toHaveLength(0);
     });
@@ -76,7 +82,7 @@ test.describe('Surface delete confirmation', () => {
         const deletes = await openSurface(page);
 
         await page.getByTestId('surface-delete-button').click();
-        await page.getByTestId('surface-delete-confirm-confirm').click();
+        await page.getByTestId('surface-delete-dialog-confirm').click();
 
         await expect(page).toHaveURL(/\/surfaces$/);
         expect(deletes).toHaveLength(1);

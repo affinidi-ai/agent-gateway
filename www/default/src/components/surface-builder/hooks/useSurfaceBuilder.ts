@@ -899,8 +899,10 @@ export function useSurfaceBuilder<T extends SurfaceBuilderState>(
   // Global keyboard shortcuts: undo/redo + arrow-key nudge. Cmd+S is
   // owned by the page (see useSaveShortcut) — it has no business living
   // inside the builder hook because the save action is page-specific.
+  // None of them reach the canvas while a modal dialog covers it.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      if (document.querySelector('[aria-modal="true"]')) return;
       const isMeta = e.metaKey || e.ctrlKey;
       if (isMeta && e.key === 'z' && !e.shiftKey) {
         e.preventDefault();

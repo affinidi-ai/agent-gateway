@@ -1,15 +1,19 @@
 branch: fix/add-surface-deletion-confirmation
 changes:
   added: []
-  changed:
+  changed: []
+  fixed:
     - timestamp: '2026-11-16T15:57:06Z'
       title: Confirm surface deletion before deleting it
       description: >-
-        The surface page's delete button now opens a "Delete Surface?" confirmation that says
-        the surface and all its configuration are deleted permanently, and deletes only after
-        Delete is clicked; Cancel, Escape or a click outside deletes nothing. It replaces the
-        two-click button, which made it too easy to delete a surface without noticing.
-  fixed: []
+        The surface page's delete button now opens a "Delete Surface?" confirmation dialog that
+        names the surface, says it and all its configuration are deleted permanently, and deletes only after
+        Delete is clicked; Cancel or the close button deletes nothing. The dialog takes focus on
+        Cancel, so keyboard users reach it directly, and while it is open neither Cmd/Ctrl+S nor
+        the canvas shortcuts (Delete, Escape, undo) act on the surface behind it. The delete button
+        now shows only to users with surfaces.delete, the permission the gateway checks, instead of
+        surfaces.edit. It replaces the two-click button, which made it too easy to delete a
+        surface without noticing.
   removed: []
   security: []
   breaking: []

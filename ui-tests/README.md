@@ -271,6 +271,7 @@ Reserved patterns:
 | Wizard navigation | `wizard-next`, `wizard-back`, `wizard-submit` | (shared across all wizards) |
 | Surface Builder canvas node | `surface-node-<type>` | `surface-node-payment` |
 | Surface Builder save | `surface-save-button`, `surface-error-alert` | (the save button and the refused-save banner on `/surfaces/<id>`) |
+| Surface delete | `surface-delete-button`, `surface-delete-dialog`, `surface-delete-dialog-name`, `surface-delete-dialog-confirm`, `surface-delete-dialog-cancel` | (the delete button on `/surfaces/<id>` and its confirmation dialog) |
 
 If you need a testid that does not yet exist on the dashboard, add it to the React
 component first (see the `data-testid` rules in [`www/default/AGENTS.md`](../www/default/AGENTS.md)),

@@ -70,8 +70,11 @@ are the consumer; the convention is documented in
 | Canvas node   | `surface-node-<type>`, for example `surface-node-payment`                            |
 
 An indexed or per-row button keeps the `-button` suffix before the index or id, for example
-`payments-details-button-<id>`. On `/surfaces/<id>` the save button is `surface-save-button`
-and the banner for a refused save is `surface-error-alert`.
+`payments-details-button-<id>`. On `/surfaces/<id>` the save button is `surface-save-button`,
+the banner for a refused save is `surface-error-alert`, and the delete button is
+`surface-delete-button`, which opens `surface-delete-dialog` with
+`surface-delete-dialog-name`, `surface-delete-dialog-confirm` and
+`surface-delete-dialog-cancel` (see _Surface delete_).
 
 ## CLI consent page
 
@@ -1278,21 +1281,28 @@ surface has been deleted." (`api-key-surface-deleted-info`) at the top of Key In
 ## Surface delete
 
 The surface page's delete button (`surface-delete-button`, `btn-danger` with a trash icon, shown
-only with edit rights) sends nothing: it opens `surface-delete-confirm`, the shared inline
-confirmation `components/shared/ConfirmPopover.tsx` (a speech bubble to the left of the button,
-`role="dialog"` named by its title). Its title "Delete Surface?" carries a red warning icon
-(`fa-triangle-exclamation text-danger`), and its body reads "You are about to permanently delete
-this surface and all associated configuration. This action cannot be undone." then "Are you sure
-you want to continue?". **Delete** (`surface-delete-confirm-confirm`, `btn-danger`) sends the
-`DELETE`; **Cancel** (`surface-delete-confirm-cancel`), the close button, Escape and a click
-outside send nothing. Both buttons are disabled while the delete runs. A delete succeeds with the
-toast `Surface "<name>" deleted` and returns to `/surfaces`; a failed one closes the confirmation
-and shows the gateway's message in `surface-error-alert`.
+only with `surfaces.delete`, which the gateway requires for the `DELETE`; `surfaces.edit` alone
+shows Save but no delete button) sends nothing: it opens `surface-delete-dialog`, a modal built on the
+shared `components/shared/WarningDialog.tsx`, like the API key delete dialog. Its title "Delete
+Surface?" carries the dialog's red warning icon. Its body first names the surface,
+"Delete `<name>`?" in bold (`surface-delete-dialog-name`, the surface id when it has no
+name), then reads "You are about to permanently
+delete this surface and all associated configuration. This action cannot be undone." then "Are
+you sure you want to continue?". **Cancel** (`surface-delete-dialog-cancel`) takes focus when the
+dialog opens; it and the close button send nothing and return focus to the delete button.
+**Delete** (`surface-delete-dialog-confirm`, `btn-danger`, a spinner while it runs) sends the
+`DELETE`. While the delete runs, Delete shows a spinner, Delete and Cancel are disabled, the
+close button only dismisses the dialog (the delete still finishes), and the page's delete button
+shows a spinner. Delete is also disabled while a save runs, and Cmd/Ctrl+S does not save while the
+dialog is open. A delete succeeds with the toast `Surface "<name>" deleted` and returns to
+`/surfaces`; a failed one closes the dialog and shows the gateway's message in
+`surface-error-alert`. The dialog closes if the page moves to another surface.
 
-`ConfirmPopover` is the shared inline confirmation: the Policies list's delete and Enforce
-globally confirmations (`policy-confirm-popover`) use it too. Each use passes its own `testId`;
-the confirm and Cancel buttons are `<testId>-confirm` and `<testId>-cancel`. Its styles are the
-`.confirm-popover*` classes in `dashboard.css`.
+The Surface Builder's keyboard shortcuts (undo and redo, Delete/Backspace, Escape, arrow nudge)
+do nothing while a modal (`aria-modal="true"`) is open, so a key pressed in this dialog never
+edits the canvas behind it.
+
+Confirm a destructive action that can't be undone with `WarningDialog`, not an inline popover.
 
 ## Authority delete
 
