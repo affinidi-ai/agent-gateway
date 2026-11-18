@@ -201,6 +201,25 @@ impl Drop for PresentationSigner {
     }
 }
 
+/// Waits until the clock is past the latest version's `versionTime`, which has whole-second
+/// precision: a did:webvh version must be dated strictly after the one before it, and not in the
+/// future.
+async fn wait_past_version_time(jsonl: &str) {
+    let latest = jsonl
+        .lines()
+        .last()
+        .and_then(|line| serde_json::from_str::<Value>(line).ok())
+        .and_then(|entry| {
+            entry["versionTime"]
+                .as_str()
+                .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
+        })
+        .expect("the published DID log has a versionTime");
+    while Utc::now().timestamp() <= latest.timestamp() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 async fn serve_log(State(log): State<Arc<RwLock<Vec<String>>>>) -> String {
     log.read()
         .expect("the DID log lock")
@@ -266,6 +285,7 @@ impl PresentationSigner {
             .read()
             .expect("the DID log lock")
             .join("\n");
+        wait_past_version_time(&jsonl).await;
         let mut state = DIDWebVHState::default();
         state
             .resolve_log(&self.signer.did, &jsonl, None)
