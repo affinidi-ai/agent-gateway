@@ -45,9 +45,9 @@ make run-debug
 
 `make install-deps` is a one-time macOS/Homebrew setup. `make run-debug` builds the dashboard and debug Rust binary, generates local certificates and keys, prepares the local environment, starts the Gateway, and starts the frontend development server.
 
-`make install-deps` warns instead of failing when a step cannot finish, and each warning says what to run next, so read its closing lines:
+`make install-deps` runs every step even when one cannot finish, and each warning says what to run next, so read its closing lines:
 
-- Git hooks are not installed when `core.hooksPath` is set in your Git configuration (the warning prints the commands for the configuration that holds it), or when you run `make install-deps SKIP_GIT_HOOKS=1` to manage this repository's hooks yourself. Without them the pre-commit checks, gitleaks included, do not run locally; `make install-git-hooks` installs them once the cause is resolved.
+- Git hooks are not installed when `core.hooksPath` is set in your Git configuration (the warning prints the commands for the configuration that holds it), or when you run `make install-deps SKIP_GIT_HOOKS=1` to manage this repository's hooks yourself. Without them the pre-commit checks, gitleaks included, do not run locally; `make install-git-hooks` installs them once the cause is resolved. A refused hook install is the one outcome that leaves the target non-zero, after the warnings; the acknowledged skip and every other warning end at zero.
 - The Python packages go into `.venv`. If that step cannot finish, everything else still completes and only `make lint-changelog` is affected; `make install-python-deps` retries it on its own.
 
 During initial configuration, the setup may ask for public inbound and outbound URLs. Press Enter to use the local defaults unless you are intentionally testing through a configured public tunnel.

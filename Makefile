@@ -187,7 +187,10 @@ install-python-deps: ## Install the Python packages the changelog tooling needs,
 # yourself, and only 1, true or yes mean that; every other value installs hooks,
 # so SKIP_GIT_HOOKS=0 does not silently skip them. Shared between
 # install-git-hooks and the closing notice in install-deps so the two agree.
-SKIP_HOOKS_CHECK = skip_hooks=0; case "$$(printf '%s' "$(SKIP_GIT_HOOKS)" | tr 'A-Z' 'a-z')" in 1|true|yes) skip_hooks=1;; esac
+# Exported so the check reads it as shell data: pasted into the command text, a
+# value carrying a quote, a backtick or a `$` would reshape the recipe.
+export SKIP_GIT_HOOKS
+SKIP_HOOKS_CHECK = skip_hooks=0; case "$$(printf '%s' "$${SKIP_GIT_HOOKS:-}" | tr 'A-Z' 'a-z')" in 1|true|yes) skip_hooks=1;; esac
 SKIP_HOOKS_NOTICE = echo "$(YELLOW)⏭️  SKIP_GIT_HOOKS set: hooks were NOT installed. This repo's pre-commit checks, gitleaks included, will not run locally.$(NC)"
 
 install-git-hooks: ## Install git hooks via pre-commit framework (SKIP_GIT_HOOKS=1 if you manage hooks yourself)
@@ -197,7 +200,10 @@ install-git-hooks: ## Install git hooks via pre-commit framework (SKIP_GIT_HOOKS
 	@# not move that setting aside for you: a dependency target that clears it
 	@# loses it wherever it was set if it is killed before restoring it. So it
 	@# refuses, prints the commands for the scope that actually holds the value,
-	@# and never reports hooks git would ignore as installed.
+	@# and never reports hooks git would ignore as installed. Presence of the key
+	@# decides, not its value: `git config core.hooksPath ""` is set, resolves
+	@# hooks against an empty path and runs none, and `git config --get` exits
+	@# non-zero only when the key is absent.
 	@set -e; \
 	$(SKIP_HOOKS_CHECK); \
 	if [ "$$skip_hooks" = 1 ]; then \
@@ -208,8 +214,7 @@ install-git-hooks: ## Install git hooks via pre-commit framework (SKIP_GIT_HOOKS
 		echo "$(RED)❌ pre-commit not found. Install it: brew install pre-commit$(NC)"; \
 		exit 1; \
 	}; \
-	hooks_path=$$(git config --get core.hooksPath || true); \
-	if [ -n "$$hooks_path" ]; then \
+	if hooks_path=$$(git config --get core.hooksPath); then \
 		if git config --local --get core.hooksPath >/dev/null 2>&1; then scope="--local"; \
 		elif git config --global --get core.hooksPath >/dev/null 2>&1; then scope="--global"; \
 		else scope=""; fi; \
@@ -245,12 +250,17 @@ install-deps: ## Install all local development dependencies (macOS)
 	@# would not: `.SHELLFLAGS` runs each recipe with -eu, so a failing
 	@# install-rust-deps would take the target down before anything warned, leaving
 	@# no hooks and no message. Run directly, those targets keep their own
-	@# behaviour; only this target treats them as non-fatal. The order is the order
-	@# of the work: the brew formulas include the pre-commit that the hooks step
-	@# needs. brew is not silenced, because a formula that fails to install is why a
-	@# later step cannot find its tool.
+	@# behaviour; only this target treats them as non-fatal, and only a refused
+	@# hook install leaves this target non-zero. The brew step comes before the
+	@# hooks step because $(DEPS) supplies the pre-commit it needs. brew is not
+	@# silenced, because a formula that fails to install is why a later step cannot
+	@# find its tool. install-rust-deps warns over its own brew failure and still
+	@# exits 0, so its formulas are re-probed here the way verify-rust-deps does.
 	@rust_ok=1; \
 	$(MAKE) install-rust-deps || rust_ok=0; \
+	if [ "$$rust_ok" = 1 ] && command -v brew >/dev/null 2>&1; then \
+		brew ls --version $(RUST_DEPS) >/dev/null 2>&1 || rust_ok=0; \
+	fi; \
 	python_ok=1; \
 	venv_ok=1; \
 	$(MAKE) install-python-deps || python_ok=0; \
@@ -299,7 +309,8 @@ install-deps: ## Install all local development dependencies (macOS)
 		echo "$(YELLOW)⚠️  The $(VENV) install did not complete; see the warning above.$(NC)"; \
 		echo "$(YELLOW)   'make lint-changelog' falls back to the python3 on PATH, which has PyYAML, so it still works.$(NC)"; \
 		echo "$(YELLOW)   Re-run 'make install-python-deps' to repair $(VENV).$(NC)"; \
-	fi
+	fi; \
+	if [ "$$hooks_ok" = 0 ]; then exit 1; fi
 
 # ==============================================================================
 # Build Commands
