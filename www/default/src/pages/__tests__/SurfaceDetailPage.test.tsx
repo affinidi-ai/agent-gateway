@@ -551,79 +551,77 @@ describe('SurfaceDetailPage delete', () => {
       </MemoryRouter>
     );
 
-  const openDialog = async () => {
+  const openConfirmation = async () => {
     fireEvent.click(await screen.findByTestId('surface-delete-button'));
-    return screen.findByTestId('surface-delete-dialog');
+    return screen.findByTestId('surface-delete-confirm');
   };
 
-  it('asks for confirmation in a modal and deletes nothing on the first click', async () => {
+  it('asks for confirmation, naming the surface, and deletes nothing on the first click', async () => {
     const deleteSurface = jest.spyOn(apiClient, 'deleteSurface').mockResolvedValue();
     renderWithList();
 
-    const dialog = await openDialog();
+    const confirmation = await openConfirmation();
 
-    expect(screen.getByRole('dialog', { name: 'Delete Surface?' })).toBe(dialog);
-    expect(dialog).toHaveAttribute('aria-modal', 'true');
-    expect(dialog).toHaveTextContent(
+    expect(screen.getByRole('dialog', { name: 'Delete Surface?' })).toBe(confirmation);
+    expect(screen.getByTestId('surface-delete-confirm-name')).toHaveTextContent('Delete agent?');
+    expect(confirmation).toHaveTextContent(
       'You are about to permanently delete this surface and all associated configuration. This action cannot be undone.'
     );
-    expect(dialog).toHaveTextContent('Are you sure you want to continue?');
-    expect(screen.getByTestId('surface-delete-dialog-name')).toHaveTextContent('Delete agent?');
-    expect(screen.getByTestId('surface-delete-dialog-confirm')).toHaveTextContent('Delete');
-    expect(screen.getByTestId('surface-delete-dialog-cancel')).toHaveFocus();
+    expect(confirmation).toHaveTextContent('Are you sure you want to continue?');
     expect(deleteSurface).not.toHaveBeenCalled();
   });
 
   it('names the surface by its id when it has no name', async () => {
     jest.spyOn(apiClient, 'getSurface').mockResolvedValue({ ...surface, name: '' });
     renderWithList();
-    await openDialog();
+    await openConfirmation();
 
-    expect(screen.getByTestId('surface-delete-dialog-name')).toHaveTextContent('Delete s1?');
+    expect(screen.getByTestId('surface-delete-confirm-name')).toHaveTextContent('Delete s1?');
   });
 
-  it('closes without deleting on Cancel and returns focus to the delete button', async () => {
+  it('focuses Cancel, and on Cancel closes without deleting and refocuses the delete button', async () => {
     const deleteSurface = jest.spyOn(apiClient, 'deleteSurface').mockResolvedValue();
     renderWithList();
-    await openDialog();
+    await openConfirmation();
 
-    fireEvent.click(screen.getByTestId('surface-delete-dialog-cancel'));
+    const cancel = screen.getByTestId('surface-delete-confirm-cancel');
+    expect(cancel).toHaveFocus();
+    fireEvent.click(cancel);
 
-    expect(screen.queryByTestId('surface-delete-dialog')).toBeNull();
+    expect(screen.queryByTestId('surface-delete-confirm')).toBeNull();
     expect(screen.getByTestId('surface-delete-button')).toHaveFocus();
     expect(deleteSurface).not.toHaveBeenCalled();
   });
 
-  it('closes without deleting on the close button', async () => {
+  it('closes without deleting on Escape', async () => {
     const deleteSurface = jest.spyOn(apiClient, 'deleteSurface').mockResolvedValue();
     renderWithList();
-    await openDialog();
+    await openConfirmation();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+    fireEvent.keyDown(document, { key: 'Escape' });
 
-    expect(screen.queryByTestId('surface-delete-dialog')).toBeNull();
+    expect(screen.queryByTestId('surface-delete-confirm')).toBeNull();
     expect(deleteSurface).not.toHaveBeenCalled();
   });
 
-  it('deletes the surface and returns to the surface list on Delete', async () => {
-    const deleteSurface = jest.spyOn(apiClient, 'deleteSurface').mockResolvedValue();
+  it('closes when the delete button is clicked again', async () => {
     renderWithList();
-    await openDialog();
+    await openConfirmation();
 
-    fireEvent.click(screen.getByTestId('surface-delete-dialog-confirm'));
+    fireEvent.click(screen.getByTestId('surface-delete-button'));
 
-    expect(await screen.findByTestId('surfaces-list')).toBeInTheDocument();
-    expect(deleteSurface).toHaveBeenCalledTimes(1);
-    expect(deleteSurface).toHaveBeenCalledWith('s1');
-    expect(showToast).toHaveBeenCalledWith('success', 'Surface "agent" deleted');
+    expect(screen.queryByTestId('surface-delete-confirm')).toBeNull();
   });
 
-  it('does not save on Cmd+S while the dialog is open', async () => {
+  it('does not save on Cmd+S while the confirmation is open', async () => {
     const updateSurface = jest.spyOn(apiClient, 'updateSurface');
     renderWithList();
-    await openDialog();
+    await openConfirmation();
 
-    fireEvent.keyDown(window, { key: 's', metaKey: true });
+    fireEvent.keyDown(screen.getByTestId('surface-delete-confirm-cancel'), {
+      key: 's',
+      metaKey: true,
+    });
 
     expect(updateSurface).not.toHaveBeenCalled();
   });
@@ -636,15 +634,29 @@ describe('SurfaceDetailPage delete', () => {
     expect(screen.queryByTestId('surface-delete-button')).toBeNull();
   });
 
-  it('closes the dialog and shows the error when the delete fails', async () => {
+  it('deletes the surface and returns to the surface list on Delete', async () => {
+    const deleteSurface = jest.spyOn(apiClient, 'deleteSurface').mockResolvedValue();
+    renderWithList();
+    await openConfirmation();
+
+    fireEvent.click(screen.getByTestId('surface-delete-confirm-confirm'));
+
+    expect(await screen.findByTestId('surfaces-list')).toBeInTheDocument();
+    expect(deleteSurface).toHaveBeenCalledTimes(1);
+    expect(deleteSurface).toHaveBeenCalledWith('s1');
+    expect(showToast).toHaveBeenCalledWith('success', 'Surface "agent" deleted');
+  });
+
+  it('closes the confirmation, shows the error and refocuses the delete button when the delete fails', async () => {
     jest.spyOn(apiClient, 'deleteSurface').mockRejectedValue(new Error('Surface is in use'));
     renderWithList();
-    await openDialog();
+    await openConfirmation();
 
-    fireEvent.click(screen.getByTestId('surface-delete-dialog-confirm'));
+    fireEvent.click(screen.getByTestId('surface-delete-confirm-confirm'));
 
     expect(await screen.findByTestId('surface-error-alert')).toHaveTextContent('Surface is in use');
-    expect(screen.queryByTestId('surface-delete-dialog')).toBeNull();
+    expect(screen.queryByTestId('surface-delete-confirm')).toBeNull();
     expect(screen.queryByTestId('surfaces-list')).toBeNull();
+    expect(screen.getByTestId('surface-delete-button')).toHaveFocus();
   });
 });
