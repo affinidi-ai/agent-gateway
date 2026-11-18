@@ -211,6 +211,32 @@ pub(crate) fn is_captured(surface_id: &str) -> bool {
         .is_some_and(|listeners| !listeners.is_empty())
 }
 
+/// Whether an evaluation of `input` would be captured: a dashboard connection listens to its
+/// surface and policy input capture is turned on.
+pub(crate) fn is_listened(input: &Value) -> bool {
+    surface_of(input).is_some_and(is_captured) && capture_turned_on()
+}
+
+/// Whether a listener of `surface_id` has room in its queue for a capture. When none has,
+/// each counts the capture as missed, so it is told at its next capture.
+fn has_room_for_capture(surface_id: &str) -> bool {
+    let Some(listeners) = LISTENERS.get(surface_id) else {
+        return false;
+    };
+    if listeners
+        .iter()
+        .any(|listener| listener.captures.capacity() > 0)
+    {
+        return true;
+    }
+    for listener in listeners.iter() {
+        listener
+            .skipped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    false
+}
+
 /// The surface a policy input belongs to: `input.channel.config_id` for a request
 /// policy, `input.surface.id` for a response policy.
 fn surface_of(input: &Value) -> Option<&str> {
@@ -284,7 +310,8 @@ pub struct Capture {
 
 /// Start capturing the evaluation of `input` by `plane` (`gateway`, `surface` or
 /// `appliance`), `engine` naming the evaluated policy slot, when a dashboard connection
-/// listens to its surface and policy input capture is turned on. `policies` lists the policy
+/// listens to its surface and policy input capture is turned on. When every listener's queue
+/// is full the evaluation is counted as missed and not masked. `policies` lists the policy
 /// definitions the slot evaluates; it is called only when the evaluation is captured.
 pub fn begin(
     plane: &str,
@@ -293,7 +320,7 @@ pub fn begin(
     policies: impl FnOnce() -> Vec<CapturedPolicy>,
 ) -> Option<Capture> {
     let surface_id = surface_of(input)?;
-    if !is_captured(surface_id) || !capture_turned_on() {
+    if !is_captured(surface_id) || !capture_turned_on() || !has_room_for_capture(surface_id) {
         return None;
     }
     let (slot, transit_point) = if plane == "gateway"
@@ -725,14 +752,54 @@ mod tests {
     }
 
     #[test]
+    fn an_evaluation_is_not_captured_while_every_listener_queue_is_full() {
+        let (queue, mut received) = mpsc::channel(1);
+        let _listening = listen("input-capture-no-room", queue);
+        let input = json!({ "channel": { "config_id": "input-capture-no-room" } });
+        begin("surface", "input-capture-no-room", &input, Vec::new)
+            .unwrap()
+            .finish(Ok((true, None)));
+        let mut listed = false;
+
+        let capture = begin("surface", "input-capture-no-room", &input, || {
+            listed = true;
+            Vec::new()
+        });
+
+        assert!(capture.is_none());
+        assert!(!listed);
+        assert_eq!(received_captures(&mut received).len(), 1);
+        begin("surface", "input-capture-no-room", &input, Vec::new)
+            .unwrap()
+            .finish(Ok((true, None)));
+        let after = received_captures(&mut received);
+        assert_eq!(after.len(), 1, "{after:?}");
+        assert_eq!(after[0]["type"], "policy_input_skipped");
+        assert_eq!(after[0]["skipped"], 1);
+    }
+
+    #[test]
+    fn an_evaluation_is_listened_only_while_its_surface_is() {
+        let input = json!({ "channel": { "config_id": "input-capture-is-listened" } });
+        assert!(!is_listened(&input));
+
+        let (_listening, _received) = listening("input-capture-is-listened");
+
+        assert!(is_listened(&input));
+        assert!(!is_listened(&json!({ "channel": { "config_id": "input-capture-not-listened" } })));
+        set_turned_on_in_this_thread(false);
+        assert!(!is_listened(&input));
+    }
+
+    #[test]
     fn a_listener_that_missed_captures_is_told_how_many_before_the_next_one() {
         let (queue, mut received) = mpsc::channel(2);
         let _listening = listen("input-capture-skipped", queue);
         let input = json!({ "channel": { "config_id": "input-capture-skipped" } });
         let capture = || {
-            begin("surface", "input-capture-skipped", &input, Vec::new)
-                .unwrap()
-                .finish(Ok((true, None)))
+            if let Some(capture) = begin("surface", "input-capture-skipped", &input, Vec::new) {
+                capture.finish(Ok((true, None)));
+            }
         };
 
         for _ in 0..4 {
@@ -1653,17 +1720,29 @@ mod tests {
 
     fn masked(text: &str) -> (Value, std::time::Duration) {
         let mut value = Value::String(text.to_string());
-        let started = std::time::Instant::now();
+        let started = thread_cpu_time();
         mask_credentials(&mut value);
-        (value, started.elapsed())
+        (value, thread_cpu_time() - started)
+    }
+
+    /// The CPU time this thread has used. Unlike wall time, it leaves out the time the tests
+    /// running beside it take the CPU away.
+    fn thread_cpu_time() -> std::time::Duration {
+        let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) }, 0);
+        std::time::Duration::new(
+            u64::try_from(now.tv_sec).expect("CPU time is not negative"),
+            u32::try_from(now.tv_nsec).expect("nanoseconds fit in u32"),
+        )
     }
 
     /// Masks the text `build(scale)` makes, checks each result against the expected text it
     /// returns, and asserts that eight times the input takes under 24 times as long: linear
-    /// masking takes about 8, quadratic 64. The scale doubles until a run takes at least
-    /// 20 ms, so timer and scheduler noise stay small next to it, and each size keeps the
-    /// fastest of three runs. The bound compares the build with itself, so it holds however
-    /// slow the build is, coverage instrumentation included.
+    /// masking takes about 8, quadratic 64. Runs are timed in this thread's CPU time, so tests
+    /// running in parallel do not count. The scale doubles until a run takes at least 20 ms,
+    /// so timer noise stays small next to it, and each size keeps the fastest of three runs.
+    /// The bound compares the build with itself, so it holds however slow the build is,
+    /// coverage instrumentation included.
     fn assert_masking_is_linear(build: impl Fn(usize) -> (String, String)) {
         let fastest = |scale| {
             let (text, expected) = build(scale);

@@ -9,12 +9,15 @@ changes:
         connection listens, each request and response policy evaluation on that surface (on the
         gateway, surface and appliance-wide planes, Transit Point slots included, on the direct,
         Fabric and MCP proxy paths) is serialized once and queued for the listening connections only (up to 64 per connection,
-        then dropped for that connection, which is told how many it missed), never through the
+        then dropped for that connection, which is told how many it missed; while every listening
+        connection's queue is full, an evaluation is not masked or serialized), never through the
         shared dashboard broadcast, as a
         policy_input_captured update with its input,
         the id, name and version of each policy definition the slot evaluated, the member that denied
         a gateway or appliance-wide set (or failed to evaluate, on an appliance-wide plane), and its
-        allow, deny reason or error. Answers and captures are sent alongside the shared dashboard
+        allow, deny reason or error. A capture is masked and serialized after the plane's policy
+        engines are released, so a listen does not hold back policy updates or other evaluations
+        on that plane. Answers and captures are sent alongside the shared dashboard
         updates without waiting behind them, and captures queued before a stop, or by an earlier
         listen of the same surface, are not sent. The gateway policy of
         an outbound request shows as its own gateway outbound slot. MCP tool policies, the

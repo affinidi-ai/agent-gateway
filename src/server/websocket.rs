@@ -1954,14 +1954,14 @@ mod tests {
         surface_id: &str,
         allow: bool,
     ) {
-        crate::policies::input_capture::begin(
+        if let Some(capture) = crate::policies::input_capture::begin(
             "surface",
             surface_id,
             &serde_json::json!({ "channel": { "config_id": surface_id } }),
             Vec::new,
-        )
-        .unwrap()
-        .finish(Ok((allow, None)));
+        ) {
+            capture.finish(Ok((allow, None)));
+        }
     }
 
     #[tokio::test]

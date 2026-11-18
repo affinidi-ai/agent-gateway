@@ -153,7 +153,15 @@ impl OpaEngine {
         &self,
         input: serde_json::Value,
     ) -> Result<PolicyDecision, String> {
-        let input_json = serde_json::to_string(&input).map_err(|e| format!("Failed to serialize input: {}", e))?;
+        self.evaluate_borrowed(&input)
+    }
+
+    /// [`Self::evaluate`] for a caller that keeps using `input` afterwards.
+    pub fn evaluate_borrowed(
+        &self,
+        input: &serde_json::Value,
+    ) -> Result<PolicyDecision, String> {
+        let input_json = serde_json::to_string(input).map_err(|e| format!("Failed to serialize input: {}", e))?;
         self.evaluate_prepared(&input_json)
     }
 

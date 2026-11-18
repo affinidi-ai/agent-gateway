@@ -167,8 +167,10 @@ A surface's policy input is captured while at least one connection listens to it
 listening connections receive the captures, each through its own queue of at most 64; a capture
 that finds a connection's queue full is dropped for that connection, and the connection is told how
 many it missed with `{"type": "policy_input_skipped", "config_id", "skipped"}` before its next
-capture. The Capture view shows that count. Capture runs on the node the dashboard is connected to:
-requests another node of the appliance serves are not captured there.
+capture. While every listening connection's queue is full, an evaluation is counted as missed for
+each of them and its input is not masked or serialized. The Capture view shows that count.
+Capture runs on the node the dashboard is connected to: requests another node of the appliance
+serves are not captured there.
 
 While a connection listens, each evaluation of a request or response policy on the surface sends
 it one `policy_input_captured` update, once the policy has decided:

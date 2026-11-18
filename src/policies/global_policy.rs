@@ -417,30 +417,35 @@ impl GlobalPolicyManager {
         plane: &str,
         input: &serde_json::Value,
     ) -> GlobalDecision {
-        let engines = self
-            .engines
-            .read()
-            .expect("engines lock poisoned");
-        let Some(set) = engines.get(plane) else {
-            return GlobalDecision::allow();
+        let listened = super::input_capture::is_listened(input);
+        let (policies, decision, error) = {
+            let engines = self
+                .engines
+                .read()
+                .expect("engines lock poisoned");
+            let Some(set) = engines.get(plane) else {
+                return GlobalDecision::allow();
+            };
+            if set.broken {
+                return GlobalDecision::deny("Appliance-wide policy failed to compile", None, None, None, None);
+            }
+            let Some(query) = plane_query(plane) else {
+                return GlobalDecision::allow();
+            };
+            let policies = listened.then(|| {
+                set.policies
+                    .iter()
+                    .map(|p| super::input_capture::CapturedPolicy {
+                        id: Some(p.policy_id.clone()),
+                        name: Some(p.policy_name.clone()),
+                        version: p.version,
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let (decision, error) = Self::evaluate_set(set, plane, query, input);
+            (policies, decision, error)
         };
-        if set.broken {
-            return GlobalDecision::deny("Appliance-wide policy failed to compile", None, None, None, None);
-        }
-        let Some(query) = plane_query(plane) else {
-            return GlobalDecision::allow();
-        };
-        let capture = super::input_capture::begin("appliance", plane, input, || {
-            set.policies
-                .iter()
-                .map(|p| super::input_capture::CapturedPolicy {
-                    id: Some(p.policy_id.clone()),
-                    name: Some(p.policy_name.clone()),
-                    version: p.version,
-                })
-                .collect()
-        });
-        let (decision, error) = Self::evaluate_set(set, plane, query, input);
+        let capture = policies.and_then(|policies| super::input_capture::begin("appliance", plane, input, || policies));
         if let Some(capture) = capture {
             let decided_by = if decision.allow {
                 None

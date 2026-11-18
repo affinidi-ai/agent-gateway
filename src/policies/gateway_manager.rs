@@ -282,9 +282,10 @@ impl GatewayPolicyManager {
         gateway_id: &str,
         input: serde_json::Value,
     ) -> Result<GatewayPolicyDecisionWithEvidence, String> {
+        let listened = super::input_capture::is_listened(&input);
         // Snapshot the compiled set under a brief read lock; evaluation is then
         // lock-free on the cheap engine clones.
-        let (members, capture): (Vec<GatewayMember>, _) = {
+        let (members, captured_policies): (Vec<GatewayMember>, _) = {
             let engines = self
                 .engines
                 .read()
@@ -294,14 +295,14 @@ impl GatewayPolicyManager {
                     set.iter()
                         .map(|c| (c.engine.clone(), c.policy_definition_id.clone(), c.version, c.content_hash.clone()))
                         .collect(),
-                    super::input_capture::begin("gateway", gateway_id, &input, || {
+                    listened.then(|| {
                         set.iter()
                             .map(|c| super::input_capture::CapturedPolicy {
                                 id: c.policy_definition_id.clone(),
                                 name: c.policy_name.clone(),
                                 version: c.version,
                             })
-                            .collect()
+                            .collect::<Vec<_>>()
                     }),
                 ),
                 _ => {
@@ -323,6 +324,8 @@ impl GatewayPolicyManager {
                 }
             }
         };
+        let capture = captured_policies
+            .and_then(|policies| super::input_capture::begin("gateway", gateway_id, &input, || policies));
 
         debug!(gateway_id = %gateway_id, member_count = members.len(), "Evaluating gateway-level OPA policy set");
         let result = Self::evaluate_members(&members, &input);
