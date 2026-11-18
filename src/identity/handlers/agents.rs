@@ -1008,7 +1008,7 @@ fn recorder_store() -> Option<Arc<TrustRecorderStatusStore>> {
 /// The cached Agent Card name of a surface's target; never waits for a fetch.
 fn cached_card_name(surface: &AgentSurface) -> Option<String> {
     CardLocation::for_surface(surface)
-        .and_then(|location| TargetCardNameService::global().lookup_or_spawn(&surface.surface_id, &location))
+        .and_then(|location| TargetCardNameService::global().lookup_or_spawn_for(surface, &location))
 }
 
 /// The name of the card the gateway serves through a surface, read when the surface's

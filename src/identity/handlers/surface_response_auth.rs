@@ -41,7 +41,8 @@ struct Placed {
 
 /// Refuses the first `target.response_auth` of `surface` that breaks a rule: a Target that is
 /// not an http or https URL, mTLS on a Target that is not https ([`mtls_rule`]), a header that
-/// is not an HTTP field name, is reserved or is already sent to the Target, a key secret the
+/// is not an HTTP field name, is reserved, has a meaning on the response ([`RESPONSE_HEADERS`])
+/// or is already sent to the Target, a key secret the
 /// surface also sends to the Target or a Transit Point or accepts from callers ([`shares_a_secret`]),
 /// and an API key on
 /// an `http://` Target while `credential_policy.target_https` is `enforce`, unless `stored` had
@@ -377,6 +378,33 @@ fn placed(surface: &AgentSurface) -> Result<Vec<Placed>, SurfaceApiError> {
         .collect())
 }
 
+/// Response headers the gateway reads from the Target's response or passes on to the caller with
+/// a meaning for it, including the payment headers it sets; the key header, removed from every
+/// response, must not be one of them.
+const RESPONSE_HEADERS: [&str; 21] = [
+    "Content-Type",
+    "Content-Encoding",
+    "Content-Range",
+    "Content-Disposition",
+    "Location",
+    "Set-Cookie",
+    "WWW-Authenticate",
+    "Cache-Control",
+    "ETag",
+    "Last-Modified",
+    "Vary",
+    "Retry-After",
+    "Payment-Required",
+    "Payment-Response",
+    "Payment-Receipt",
+    "Payment-Receipt-VC-Fingerprint",
+    "Payment-Authorization",
+    "Payment-Capture-Deadline",
+    "X-Payment-Required",
+    "X-Payment-Response",
+    "X-Payment-Receipt",
+];
+
 /// The header rule `header_name` breaks on `view`, worded to follow the field name.
 fn header_rule(
     view: &AgentSurface,
@@ -387,6 +415,12 @@ fn header_rule(
     }
     if let Some(reserved) = reserved_header(header_name) {
         return Some(format!("must not be the reserved header {reserved}"));
+    }
+    if let Some(meaningful) = RESPONSE_HEADERS
+        .into_iter()
+        .find(|name| same_header_name(name, header_name))
+    {
+        return Some(format!("must not be {meaningful}, which the gateway reads or sets on the Target's response"));
     }
     let mut sent = super::surface_target_auth::target_leg_headers(view);
     sent.extend(
@@ -605,6 +639,33 @@ mod tests {
                     "{header_name:?} {mode:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_a_header_the_gateway_reads_or_sets_on_the_response_is_refused_on_the_surface_and_a_variant() {
+        for (header_name, name) in [("content_type", "Content-Type"), ("PAYMENT-RESPONSE", "Payment-Response")] {
+            let rule = format!("must not be {name}, which the gateway reads or sets on the Target's response");
+            assert_eq!(
+                check(&surface("https://bravo.example", api_key(header_name))),
+                Err(format!("target.response_auth.api_key.header_name {rule}")),
+                "{header_name}"
+            );
+            let mut variant = surface("https://bravo.example", api_key("X-Agent-Key"));
+            variant["variants"] = json!([{"id": "beta-id", "alias": "beta", "name": "Beta",
+                "overrides": {"target": {"response_auth": api_key(header_name)}}}]);
+            assert_eq!(
+                check(&variant),
+                Err(format!("variants['beta'].target.response_auth.api_key.header_name {rule}")),
+                "{header_name} on a variant"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_header_of_its_own_that_resembles_a_response_header_saves() {
+        for header_name in ["X-Agent-Content-Type", "Payment-Agent-Key"] {
+            assert_eq!(check(&surface("https://bravo.example", api_key(header_name))), Ok(()), "{header_name}");
         }
     }
 

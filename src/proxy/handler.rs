@@ -7962,6 +7962,9 @@ async fn proxy_charged_request(
                         break Ok(resp);
                     }
                     Err(e) => {
+                        if crate::proxy::response_auth::handshake_failure(&state.surface, &e).is_some() {
+                            break Err(e);
+                        }
                         if attempt <= retry_config.max_attempts {
                             let e = e.without_url();
                             warn!(channel = channel_name, attempt = attempt, error = %e, "Request failed, will retry");

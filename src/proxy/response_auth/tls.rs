@@ -639,6 +639,14 @@ pub(super) mod tests {
     }
 
     async fn serve(certificate: &Issued) -> TlsServer {
+        serve_answering(certificate, "ok").await
+    }
+
+    /// [`serve`] answering `body` instead of `ok`.
+    async fn serve_answering(
+        certificate: &Issued,
+        body: &'static str,
+    ) -> TlsServer {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let config = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
             .with_safe_default_protocol_versions()
@@ -688,8 +696,10 @@ pub(super) mod tests {
                             Ok(read) => request.extend_from_slice(&buffer[..read]),
                         }
                     }
+                    let answer =
+                        format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
                     let _ = stream
-                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                        .write_all(answer.as_bytes())
                         .await;
                     let _ = stream.shutdown().await;
                 });
@@ -709,6 +719,16 @@ pub(super) mod tests {
         let (dir, store) = store().await;
         put(&store, "bravo", CertificateKind::ClientLeaf, &self_signed(&["127.0.0.1"]), false, None).await;
         let server = serve(&self_signed(&["127.0.0.1"])).await;
+        (server.port, dir, store)
+    }
+
+    /// A TLS server on 127.0.0.1 answering `200` with `body`, holding the certificate `bravo`
+    /// that [`pinned_bravo`] trusts, and a certificate store holding it.
+    pub(crate) async fn trusted_target(body: &'static str) -> (u16, tempfile::TempDir, Arc<dyn CertificateStore>) {
+        let (dir, store) = store().await;
+        let bravo = self_signed(&["127.0.0.1"]);
+        put(&store, "bravo", CertificateKind::ClientLeaf, &bravo, false, None).await;
+        let server = serve_answering(&bravo, body).await;
         (server.port, dir, store)
     }
 

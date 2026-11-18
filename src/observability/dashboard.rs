@@ -2413,7 +2413,7 @@ pub(crate) async fn build_identity_list_with(
                 _ => None,
             };
             let card_name = managed_surface.and_then(|s| {
-                CardLocation::for_surface(s).and_then(|location| card_names.lookup_or_spawn(&s.surface_id, &location))
+                CardLocation::for_surface(s).and_then(|location| card_names.lookup_or_spawn_for(s, &location))
             });
             let managed_name: Option<ManagedDisplayName> = match managed_surface {
                 Some(s) => Some(resolve_managed_display_name(s, managed_ids, card_name.as_deref())),

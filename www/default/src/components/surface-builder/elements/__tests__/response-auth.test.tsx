@@ -117,6 +117,22 @@ describe('Response Authentication section', () => {
     });
   });
 
+  it.each(['HTTP://agent.example', '  http://agent.example  '])(
+    'warns about the API key in clear for %p',
+    endpoint => {
+      render(<ResponseAuthSection endpoint={endpoint} value={API_KEY} onChange={jest.fn()} />);
+      expect(screen.getByTestId(`${T}-http-warning`)).toHaveTextContent(/unencrypted/);
+    }
+  );
+
+  it.each(['https://agent.example', 'HTTPS://agent.example'])(
+    'does not warn for an https Target %p',
+    endpoint => {
+      render(<ResponseAuthSection endpoint={endpoint} value={API_KEY} onChange={jest.fn()} />);
+      expect(screen.queryByTestId(`${T}-http-warning`)).not.toBeInTheDocument();
+    }
+  );
+
   it('edits an API key and warns about an http:// Target', async () => {
     const onChange = jest.fn();
     render(

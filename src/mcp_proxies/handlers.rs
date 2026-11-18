@@ -910,10 +910,8 @@ async fn discover_remote_tools(
         "jsonrpc": "2.0",
         "method": "notifications/initialized"
     });
-    if let Err(error) = send(initialized_notification).await
-        && error.1 == DISCOVERY_REFUSED_MESSAGE
-    {
-        return Err(error);
+    if let Err(refused @ DiscoveryError::Refused(..)) = send(initialized_notification).await {
+        return Err(refused.into());
     }
 
     let tool_list_response = send(serde_json::json!({
@@ -953,6 +951,30 @@ fn tools_from_list_response(response: &serde_json::Value) -> Result<Vec<Discover
     Ok(tools)
 }
 
+/// Why one discovery request got no answer: the Target's response failed the surface's Response
+/// authentication, or the exchange failed otherwise. Each carries the answer to the management
+/// caller.
+enum DiscoveryError {
+    Refused(StatusCode, String),
+    Failed(StatusCode, String),
+}
+
+impl From<DiscoveryError> for (StatusCode, String) {
+    fn from(error: DiscoveryError) -> Self {
+        match error {
+            DiscoveryError::Refused(status, message) | DiscoveryError::Failed(status, message) => (status, message),
+        }
+    }
+}
+
+fn refused(
+    check: Option<crate::mcp::sse_transport::ResponseCheck<'_>>,
+    failure: crate::proxy::response_auth::ResponseAuthFailure,
+) -> DiscoveryError {
+    let (status, message) = refused_discovery(check, failure);
+    DiscoveryError::Refused(status, message)
+}
+
 async fn send_discovery_request(
     client: &reqwest::Client,
     target_endpoint: &str,
@@ -960,7 +982,7 @@ async fn send_discovery_request(
     channel_name: &str,
     extra_headers: Option<&ReqwestHeaderMap>,
     check: Option<crate::mcp::sse_transport::ResponseCheck<'_>>,
-) -> Result<String, (StatusCode, String)> {
+) -> Result<String, DiscoveryError> {
     let request_body = Bytes::from(request.to_string());
     // Discovery has no surface timeouts; the pinned client's
     // EXTERNAL_TIMEOUT_SECS already bounds the whole exchange.
@@ -996,18 +1018,19 @@ async fn send_discovery_request(
                 )
                 .await
                 .map_err(|e| match e {
-                    crate::mcp::sse_transport::LegacySseError::Unauthenticated(failure) => {
-                        refused_discovery(check, failure)
-                    }
-                    e => (StatusCode::BAD_GATEWAY, format!("Failed to communicate with MCP server over SSE: {}", e)),
+                    crate::mcp::sse_transport::LegacySseError::Unauthenticated(failure) => refused(check, failure),
+                    e => DiscoveryError::Failed(
+                        StatusCode::BAD_GATEWAY,
+                        format!("Failed to communicate with MCP server over SSE: {}", e),
+                    ),
                 });
             }
 
-            Err((StatusCode::BAD_GATEWAY, format!("MCP server returned {}", status)))
+            Err(DiscoveryError::Failed(StatusCode::BAD_GATEWAY, format!("MCP server returned {}", status)))
         }
         Ok(crate::mcp::sse_transport::UpstreamMcpResponse::SseStream { status, response, .. }) => {
             if !status.is_success() {
-                return Err((StatusCode::BAD_GATEWAY, format!("MCP server returned {}", status)));
+                return Err(DiscoveryError::Failed(StatusCode::BAD_GATEWAY, format!("MCP server returned {}", status)));
             }
 
             crate::mcp::sse_transport::consume_sse_response(response, &request_body, limits)
@@ -1021,14 +1044,12 @@ async fn send_discovery_request(
                         }
                         crate::mcp::sse_transport::SseConsumeError::NoResponse => StatusCode::BAD_GATEWAY,
                     };
-                    (status, format!("Failed to read MCP SSE response: {}", e))
+                    DiscoveryError::Failed(status, format!("Failed to read MCP SSE response: {}", e))
                 })
         }
-        Err(crate::mcp::sse_transport::McpRequestError::Unauthenticated(failure)) => {
-            Err(refused_discovery(check, failure))
-        }
+        Err(crate::mcp::sse_transport::McpRequestError::Unauthenticated(failure)) => Err(refused(check, failure)),
         Err(crate::mcp::sse_transport::McpRequestError::Body(e)) => {
-            Err((e.status_and_message().0, format!("Failed to reach MCP server: {}", e)))
+            Err(DiscoveryError::Failed(e.status_and_message().0, format!("Failed to reach MCP server: {}", e)))
         }
     }
 }

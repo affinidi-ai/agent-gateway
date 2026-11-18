@@ -19,7 +19,7 @@ mod tls;
 #[cfg(test)]
 pub(crate) use tests::{BRAVO_KEY, BRAVO_KEY_HEADER, api_key_bravo, bravo_key_store};
 #[cfg(test)]
-pub(crate) use tls::tests::{pinned_bravo, untrusted_target};
+pub(crate) use tls::tests::{pinned_bravo, trusted_target, untrusted_target};
 pub(crate) use tls::{forget_all_tls_settings, forget_tls_settings};
 pub use tls::{handshake_failure, target_tls, tls_stamp};
 
@@ -250,9 +250,13 @@ pub fn refuse(
     }
 }
 
-/// The `id` of `body` when it is a JSON-RPC request object, `null` when it has none.
+/// The `id` of `body` when it is a JSON-RPC request object, `null` when it has none or is a
+/// batch, which gets one error.
 fn jsonrpc_request_id(body: &[u8]) -> Option<serde_json::Value> {
     let request: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if request.is_array() {
+        return Some(serde_json::Value::Null);
+    }
     request
         .get("jsonrpc")
         .is_some()
@@ -642,6 +646,25 @@ pub(crate) mod tests {
         assert_eq!(
             serde_json::to_value(&events[0]).expect("serialises")["event"]["request_rejected"]["reason"],
             "target_response_auth_failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_refused_json_rpc_batch_gets_one_json_rpc_502_with_a_null_id() {
+        let request =
+            br#"[{"jsonrpc":"2.0","id":1,"method":"tools/list"},{"jsonrpc":"2.0","id":2,"method":"tools/list"}]"#;
+        let (response, events) =
+            crate::audit::producer::capture(async { refuse(ResponseAuthFailure::KeyMissing, &facts(), request) }).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = body(response).await;
+        assert!(body.is_object(), "{body}");
+        assert_eq!(body["id"], serde_json::Value::Null);
+        assert_eq!(body["error"]["code"], -32603);
+        assert_eq!(body["error"]["message"], REFUSAL_MESSAGE);
+        assert_eq!(
+            recorded(&events),
+            vec![(RejectionStage::Forward, RejectionReason::TargetResponseAuthFailed, Some(502), Some(-32603))]
         );
     }
 

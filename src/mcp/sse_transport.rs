@@ -830,60 +830,82 @@ impl From<String> for LegacySseError {
 
 /// The key a session is cached under: `base_url`, and for a surface with Response
 /// authentication also the surface and its setting, so its session is never one another
-/// surface opened, nor one opened under a setting it no longer has. An mTLS setting adds the
-/// stamp of the TLS settings the hop just built ([`tls_stamp`]), so a renewed certificate opens
-/// a new session rather than reusing one that trusts the old certificate.
-pub(crate) fn session_key(
-    base_url: &str,
-    check: Option<ResponseCheck<'_>>,
-) -> String {
-    match check.and_then(|check| {
-        check
-            .surface
-            .target
-            .response_auth
-            .as_ref()
-            .map(|setting| (check.surface, setting))
-    }) {
-        Some((surface, setting)) => {
-            let stamp = match setting {
-                ResponseAuthConfig::Mtls(_) => tls_stamp(surface).map(|stamp| format!("\n{stamp:02x?}")),
-                ResponseAuthConfig::ApiKey(_) => None,
-            };
-            format!("{}{}", setting_prefix(base_url, &surface.surface_id, setting), stamp.unwrap_or_default())
-        }
-        None => base_url.to_string(),
+/// surface opened, nor one opened under a setting it no longer has.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct SessionKey {
+    base_url: String,
+    surface: Option<SurfaceSessionKey>,
+}
+
+/// The surface part of a [`SessionKey`]. An mTLS setting adds the stamp of the TLS settings
+/// the hop just built ([`tls_stamp`]), so a renewed certificate opens a new session rather
+/// than reusing one that trusts the old certificate.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct SurfaceSessionKey {
+    surface_id: String,
+    setting: String,
+    stamp: Option<[u8; 32]>,
+}
+
+impl SessionKey {
+    /// Whether this is a session of the same surface on the same base URL under the same
+    /// setting as `fresh`, but with other certificates.
+    fn is_superseded_by(
+        &self,
+        fresh: &SessionKey,
+    ) -> bool {
+        self.base_url == fresh.base_url
+            && self
+                .surface
+                .as_ref()
+                .zip(fresh.surface.as_ref())
+                .is_some_and(|(stored, fresh)| {
+                    stored.surface_id == fresh.surface_id
+                        && stored.setting == fresh.setting
+                        && stored.stamp != fresh.stamp
+                })
     }
 }
 
-/// The start of every [`session_key`] of the surface `surface_id` on `base_url` under
-/// `setting`, whatever its certificates.
-fn setting_prefix(
+/// The [`SessionKey`] of a session to `base_url` checked against `check`.
+pub(crate) fn session_key(
     base_url: &str,
-    surface_id: &str,
-    setting: &ResponseAuthConfig,
-) -> String {
-    format!("{base_url}\n{surface_id}\n{}", serde_json::to_string(setting).unwrap_or_default())
-}
-
-/// Whether `key` is a [`session_key`] of a surface with Response authentication, of
-/// `surface_id` when one is given.
-fn is_surface_session(
-    key: &str,
-    surface_id: Option<&str>,
-) -> bool {
-    key.split('\n')
-        .nth(1)
-        .is_some_and(|stored| surface_id.is_none_or(|surface_id| surface_id == stored))
+    check: Option<ResponseCheck<'_>>,
+) -> SessionKey {
+    SessionKey {
+        base_url: base_url.to_string(),
+        surface: check.and_then(|check| {
+            let setting = check
+                .surface
+                .target
+                .response_auth
+                .as_ref()?;
+            Some(SurfaceSessionKey {
+                surface_id: check
+                    .surface
+                    .surface_id
+                    .clone(),
+                setting: serde_json::to_string(setting).unwrap_or_default(),
+                stamp: match setting {
+                    ResponseAuthConfig::Mtls(_) => tls_stamp(check.surface),
+                    ResponseAuthConfig::ApiKey(_) => None,
+                },
+            })
+        }),
+    }
 }
 
 /// Remove from `sessions` every session of a surface with Response authentication, of
 /// `surface_id` when one is given; dropping a session stops its reader.
 fn forget_from(
-    sessions: &mut HashMap<String, Arc<UpstreamSseSession>>,
+    sessions: &mut HashMap<SessionKey, Arc<UpstreamSseSession>>,
     surface_id: Option<&str>,
 ) {
-    sessions.retain(|key, _| !is_surface_session(key, surface_id));
+    sessions.retain(|key, _| {
+        key.surface
+            .as_ref()
+            .is_none_or(|stored| surface_id.is_some_and(|surface_id| surface_id != stored.surface_id))
+    });
 }
 
 /// `sent` once it passed `check`: a TLS handshake that failed the mTLS server trust, or a
@@ -1287,7 +1309,7 @@ fn with_caller_id(
 /// Used by GW2's message processor to maintain one SSE connection per
 /// upstream MCP server.
 pub struct UpstreamSseSessionManager {
-    pub sessions: RwLock<HashMap<String, Arc<UpstreamSseSession>>>,
+    pub sessions: RwLock<HashMap<SessionKey, Arc<UpstreamSseSession>>>,
 }
 
 impl UpstreamSseSessionManager {
@@ -1337,17 +1359,7 @@ impl UpstreamSseSessionManager {
 
         let session = UpstreamSseSession::connect(client, base_url, channel_name, max_event_bytes, check).await?;
         let session = Arc::new(session);
-        if let Some(setting) = check.and_then(|check| {
-            check
-                .surface
-                .target
-                .response_auth
-                .as_ref()
-                .map(|setting| setting_prefix(base_url, &check.surface.surface_id, setting))
-        }) {
-            let older_certificates = format!("{setting}\n");
-            sessions.retain(|stored, _| !stored.starts_with(&older_certificates));
-        }
+        sessions.retain(|stored, _| !stored.is_superseded_by(&key));
         sessions.insert(key, session.clone());
         Ok(session)
     }
@@ -1884,7 +1896,9 @@ mod tests {
     }
 
     /// `manager` holding an idle session under each of `keys`, with their readers.
-    async fn manager_with_sessions(keys: &[String]) -> (UpstreamSseSessionManager, Vec<tokio::task::JoinHandle<()>>) {
+    async fn manager_with_sessions(
+        keys: &[SessionKey]
+    ) -> (UpstreamSseSessionManager, Vec<tokio::task::JoinHandle<()>>) {
         let manager = UpstreamSseSessionManager::new();
         let mut readers = Vec::new();
         {
@@ -1898,16 +1912,14 @@ mod tests {
         (manager, readers)
     }
 
-    async fn kept_keys(manager: &UpstreamSseSessionManager) -> Vec<String> {
-        let mut kept: Vec<String> = manager
+    async fn kept_keys(manager: &UpstreamSseSessionManager) -> std::collections::HashSet<SessionKey> {
+        manager
             .sessions
             .read()
             .await
             .keys()
             .cloned()
-            .collect();
-        kept.sort();
-        kept
+            .collect()
     }
 
     async fn assert_stopped(reader: tokio::task::JoinHandle<()>) {
@@ -1920,8 +1932,12 @@ mod tests {
     fn surface_key(
         base: &str,
         surface: &crate::config::agent_surface::AgentSurface,
-    ) -> String {
+    ) -> SessionKey {
         session_key(base, Some(ResponseCheck { surface, secrets: None }))
+    }
+
+    fn plain_key(base: &str) -> SessionKey {
+        session_key(base, None)
     }
 
     fn another_setting() -> crate::config::agent_surface::AgentSurface {
@@ -1940,11 +1956,18 @@ mod tests {
         let base = keyed_legacy_upstream(key, key, key).await;
         let (_dir, secrets) = crate::proxy::response_auth::bravo_key_store().await;
         let surface = bravo_surface(crate::proxy::response_auth::api_key_bravo());
-        let older_certificates = format!("{}\n{:02x?}", surface_key(&base, &surface), [1u8]);
+        let mut older_certificates = surface_key(&base, &surface);
+        if let Some(stored) = older_certificates
+            .surface
+            .as_mut()
+        {
+            stored.stamp = Some([1u8; 32]);
+        }
         let variant = surface_key(&base, &another_setting());
         let other_surface = surface_key(&base, &another_surface());
         let (manager, mut readers) =
-            manager_with_sessions(&[older_certificates, variant.clone(), other_surface.clone(), base.clone()]).await;
+            manager_with_sessions(&[older_certificates, variant.clone(), other_surface.clone(), plain_key(&base)])
+                .await;
         let check = ResponseCheck {
             surface: &surface,
             secrets: Some(&secrets),
@@ -1956,9 +1979,10 @@ mod tests {
             .map_err(|error| error.to_string())
             .expect("the session connects");
 
-        let mut expected = vec![surface_key(&base, &surface), variant, other_surface, base.clone()];
-        expected.sort();
-        assert_eq!(kept_keys(&manager).await, expected);
+        assert_eq!(
+            kept_keys(&manager).await,
+            [surface_key(&base, &surface), variant, other_surface, plain_key(&base)].into()
+        );
         assert_stopped(readers.remove(0)).await;
         for reader in readers {
             assert!(!reader.is_finished(), "a variant's, another surface's and the shared session keep reading");
@@ -1976,7 +2000,7 @@ mod tests {
             surface_key(old_target, &surface),
             surface_key(base, &another_setting()),
             other_surface.clone(),
-            base.to_string(),
+            plain_key(base),
         ])
         .await;
 
@@ -1984,9 +2008,7 @@ mod tests {
             .forget_surface(&surface.surface_id)
             .await;
 
-        let mut expected = vec![other_surface, base.to_string()];
-        expected.sort();
-        assert_eq!(kept_keys(&manager).await, expected);
+        assert_eq!(kept_keys(&manager).await, [other_surface, plain_key(base)].into());
         for reader in readers.drain(..3) {
             assert_stopped(reader).await;
         }
@@ -2002,8 +2024,8 @@ mod tests {
         let (manager, mut readers) = manager_with_sessions(&[
             surface_key(base, &bravo_surface(crate::proxy::response_auth::api_key_bravo())),
             surface_key(other_upstream, &another_surface()),
-            base.to_string(),
-            other_upstream.to_string(),
+            plain_key(base),
+            plain_key(other_upstream),
         ])
         .await;
 
@@ -2011,13 +2033,43 @@ mod tests {
             .forget_all_surfaces()
             .await;
 
-        assert_eq!(kept_keys(&manager).await, vec![base.to_string(), other_upstream.to_string()]);
+        assert_eq!(kept_keys(&manager).await, [plain_key(base), plain_key(other_upstream)].into());
         for reader in readers.drain(..2) {
             assert_stopped(reader).await;
         }
         for reader in readers {
             assert!(!reader.is_finished(), "a shared session keeps reading");
         }
+    }
+
+    #[tokio::test]
+    async fn a_newline_in_a_surface_id_or_target_url_does_not_confuse_forgetting() {
+        let base = "http://bravo.example";
+        let mut split_id = bravo_surface(crate::proxy::response_auth::api_key_bravo());
+        split_id.surface_id = "a\nb".to_string();
+        let mut plain_id = split_id.clone();
+        plain_id.surface_id = "a".to_string();
+        let split_id_key = surface_key(base, &split_id);
+        let plain_id_key = surface_key(&format!("{base}\nb"), &plain_id);
+        let (manager, mut readers) =
+            manager_with_sessions(&[split_id_key.clone(), plain_id_key.clone(), plain_key(&format!("{base}\na"))])
+                .await;
+
+        manager
+            .forget_surface("a")
+            .await;
+
+        assert_eq!(kept_keys(&manager).await, [split_id_key, plain_key(&format!("{base}\na"))].into());
+        assert_stopped(readers.remove(1)).await;
+        assert!(!readers[0].is_finished(), "the surface \"a\\nb\" keeps reading");
+
+        manager
+            .forget_surface("a\nb")
+            .await;
+
+        assert_eq!(kept_keys(&manager).await, [plain_key(&format!("{base}\na"))].into());
+        assert_stopped(readers.remove(0)).await;
+        assert!(!readers[0].is_finished(), "a shared session keeps reading");
     }
 
     #[tokio::test]
@@ -2065,9 +2117,8 @@ mod tests {
             session_key(base, Some(ResponseCheck { surface, secrets: None }))
         };
 
-        assert_eq!(session_key(base, None), base);
-        assert_eq!(key(&plain), base, "a surface without the setting shares the upstream's session");
-        assert_ne!(key(&keyed), base);
+        assert_eq!(key(&plain), plain_key(base), "a surface without the setting shares the upstream's session");
+        assert_ne!(key(&keyed), plain_key(base));
         assert_ne!(key(&keyed), key(&other_surface), "another surface with the same setting");
         assert_ne!(key(&keyed), key(&other_setting), "the same surface under another setting");
     }

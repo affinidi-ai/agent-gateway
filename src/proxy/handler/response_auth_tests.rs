@@ -13,7 +13,7 @@ use crate::audit::request_events::{RejectionReason, RejectionStage};
 use crate::config::agent_surface::AgentSurface;
 use crate::delegation_vault::audit::{DelegationAuditAction, DelegationAuditEvent};
 use crate::proxy::response_auth::{
-    BRAVO_KEY, BRAVO_KEY_HEADER, REFUSAL_MESSAGE, api_key_bravo, bravo_key_store, pinned_bravo,
+    BRAVO_KEY, BRAVO_KEY_HEADER, REFUSAL_MESSAGE, api_key_bravo, bravo_key_store, pinned_bravo, untrusted_target,
 };
 
 const EVENT: &str = "the-targets-event";
@@ -115,11 +115,21 @@ fn mcp_call() -> (&'static str, Vec<(&'static str, &'static str)>, Value) {
 /// [`api_key_bravo`], and returns the status, the body and every audit record it wrote.
 async fn send(
     surface: AgentSurface,
+    request: (&str, Vec<(&str, &str)>, Value),
+) -> (StatusCode, String, Vec<DelegationAuditEvent>) {
+    send_with_certificates(surface, None, request).await
+}
+
+/// [`send`] with `certificates` as the gateway's certificate store.
+async fn send_with_certificates(
+    surface: AgentSurface,
+    certificates: Option<Arc<dyn crate::certificates::CertificateStore>>,
     (path, headers, body): (&str, Vec<(&str, &str)>, Value),
 ) -> (StatusCode, String, Vec<DelegationAuditEvent>) {
     let (_dir, secrets) = bravo_key_store().await;
     let mut router = super::variant_routing_tests::router(surface);
     router.secrets_store = Some(secrets);
+    router.certificates_store = certificates;
     let mut request = axum::http::Request::builder()
         .method("POST")
         .uri(path);
@@ -328,6 +338,37 @@ async fn a_retryable_answer_with_the_key_is_retried() {
             .load(Ordering::SeqCst),
         2
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_failing_the_mtls_trust_is_refused_after_one_connection_and_never_retried() {
+    let (port, _certificates_dir, certificates) = untrusted_target().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let relay = listener.local_addr().unwrap();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let accepted = Arc::clone(&connections);
+    tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            accepted.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                if let Ok(mut server) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut server).await;
+                }
+            });
+        }
+    });
+
+    let answer = send_with_certificates(
+        retrying(surface("mcp", &format!("https://{relay}"), pinned_bravo())),
+        Some(certificates),
+        mcp_call(),
+    )
+    .await;
+
+    assert_refused("a server failing the mTLS trust", &answer);
+    assert_eq!(connections.load(Ordering::SeqCst), 1, "one TLS connection, no retry");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

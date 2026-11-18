@@ -9,6 +9,7 @@ import { useApiKeySecrets, useCertificates } from '../caller-auth/useCallerAuthO
 import {
   DEFAULT_RESPONSE_AUTH_HEADER,
   isHttpsTarget,
+  isResponseAuthTarget,
   newResponseAuth,
   responseAuthMethod,
   responseAuthProblems,
@@ -191,7 +192,7 @@ const ResponseAuthSection: React.FC<Props> = ({ endpoint, value, onChange }) => 
               </AddResourceLink>
             </Form.Text>
           </Form.Group>
-          {endpoint.startsWith('http://') && (
+          {isResponseAuthTarget(endpoint) && !https && (
             <Form.Text
               className="d-block text-warning mb-2"
               style={{ fontSize: '10px' }}

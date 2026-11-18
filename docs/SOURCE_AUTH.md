@@ -1426,12 +1426,11 @@ event. Every hop to the Target runs it:
   Legacy SSE fallback. A
   failed check answers the management caller `502` with `The Target's response was refused: it
   failed the surface's Response authentication`, the reason only logged. A discovery of an
-  operator-typed `target_endpoint` has no surface and no check.
-
-One read is not checked: the dashboard's display name of a managed agent, read from the Target's
-agent card ([`src/identity/target_card_names.rs`](../src/identity/target_card_names.rs)). The name
-is self-asserted, never signed or published, and with a pinned or private-CA certificate it may
-not resolve.
+  operator-typed `target_endpoint` has no surface and no check;
+- the dashboard's display name of a managed agent, read from the Target's agent card
+  ([`src/identity/target_card_names.rs`](../src/identity/target_card_names.rs)): a card whose
+  answer fails, or whose setting cannot be checked, shows no name, the reason only logged (see
+  [Agent Card names](#agent-card-names)).
 
 Every hop picks its TLS settings and is refused without sending anything when the setting cannot
 be checked on the URL it sends to: any `response_auth` on a URL that is not `http` or `https`
@@ -1446,7 +1445,7 @@ yields no card, as a card that cannot be read does.
 
 A response that fails is refused with `502` and a body that names no reason: `Upstream response
 refused`, as a JSON-RPC `-32603` error echoing the request `id` when the request was a JSON-RPC
-request, otherwise as a problem response. The reason (`key_missing`, `key_mismatch`,
+request, as one such error with `id` `null` for a JSON-RPC batch, otherwise as a problem response. The reason (`key_missing`, `key_mismatch`,
 `server_untrusted` when the server certificate failed the mTLS trust, or `unverifiable` when a
 secret or certificate cannot be read or used: missing, inactive, outside the surface's tenant,
 of the wrong kind or holding no key) is logged, never a key, and the VP Audit Log records a
@@ -1465,6 +1464,14 @@ resolves:
   Target by Target authentication, a credential binding, a forwarded caller token, header
   metadata mapping or `caller_key` (the
   [Target authentication header rules](CREDENTIAL_DELEGATION.md#target-authentication-rules));
+- names as `api_key.header_name` a header the gateway reads or sets on the Target's response,
+  compared ignoring case and `_` against `-`: `Content-Type`, `Content-Encoding`,
+  `Content-Range`, `Content-Disposition`, `Location`, `Set-Cookie`, `WWW-Authenticate`,
+  `Cache-Control`, `ETag`, `Last-Modified`, `Vary`, `Retry-After`, or a payment header
+  (`Payment-Required`, `Payment-Response`, `Payment-Receipt`, `Payment-Receipt-VC-Fingerprint`,
+  `Payment-Authorization`, `Payment-Capture-Deadline`, `X-Payment-Required`,
+  `X-Payment-Response`, `X-Payment-Receipt`), since the key header is removed from every
+  response ([`src/identity/handlers/surface_response_auth.rs`](../src/identity/handlers/surface_response_auth.rs));
 - names as `api_key.secret_id` a secret the gateway sends to the Target or a Transit Point or
   accepts from callers: the `secret_id` of a `static_secret` Target authentication, of a Transit Point's
   `static_secret` `target_auth`, of `caller_key`, or of an Access Point `api_key` caller
@@ -2232,8 +2239,12 @@ target from the card the gateway serves for the surface instead (the A2A proxy's
 card, or the remote gateway's card), cached the same way per surface and running
 configuration, and also updated when the agent's card is read through the Agents API.
 
-Lookups are cached per surface for 300 seconds and are re-read when the target endpoint
-or card path changes, with a 5-second timeout for each card URL tried. The dashboard
+Lookups are cached per surface for 300 seconds and are re-read when the target endpoint,
+card path or `target.response_auth` changes, with a 5-second timeout for each card URL tried.
+On a surface with [Response authentication](#response-authentication) every card URL is
+dialled with its TLS settings and every answer checked by it: an answer that fails, or a
+setting that cannot be checked, shows no name, not even an earlier one, and no further card
+URL is tried. The dashboard
 never waits: until its first lookup finishes, and whenever the card has no valid `name`,
 a row shows the surface name. When the card cannot be read (unreachable, blocked by
 egress policy, a non-success status, an oversized body, or a non-JSON body), the row keeps
