@@ -145,7 +145,7 @@ test.describe("Agents page", () => {
     await serveAgents(page, { agents: [] });
     await openAgents(page);
 
-    await page.getByTestId("agents-add-surface-button").click();
+    await page.getByTestId("agents-add-surface-link").click();
 
     await expect(page).toHaveURL(/\/surfaces\/new$/);
   });
@@ -164,7 +164,7 @@ test.describe("Agents page", () => {
       agents: [twoSurfaces],
       card: (surfaceId) =>
         surfaceId === "oxygen-id"
-          ? { status: 404, json: { error: "Not Found" } }
+          ? { status: 404, json: { error: "Not Found", code: "surface_unavailable" } }
           : {
               status: 200,
               json: {

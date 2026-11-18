@@ -13,8 +13,9 @@ use cucumber::World;
 use serde_json::Value;
 
 use crate::bdd_support::actors::ActorRegistry;
-use crate::bdd_support::admin_client::GatewayRecord;
+use crate::bdd_support::admin_client::{AdminApiClient, GatewayRecord};
 use crate::bdd_support::config::fabric_surface_fixture::{SourceAuthSpec, SurfaceSpec};
+use crate::bdd_support::gateway_process::G2G_TEST_AUTH_TOKEN;
 use crate::bdd_support::json_rpc::{
     IdentityBindingProof, McpVersion, build_a2a_request_body, build_mcp_list_tools_body, build_mcp_tool_call_body,
     build_modern_mcp_list_tools_body, modern_mcp_request_headers,
@@ -23,6 +24,12 @@ use crate::bdd_support::mcp_consent::{ConsentRequest, exchange_identity_token};
 use crate::bdd_support::oidc::OidcProvider;
 use crate::bdd_support::policies::build_gateway_source_did_allow_policy;
 use crate::harness::multi_gateway::{FabricRouteReadyProbe, GatewayPlan, MultiGatewayHarness};
+
+const AGENTS_PATH: &str = "/v1/agents";
+/// How long an agent's traffic must stay unchanged to count as settled.
+pub const TRAFFIC_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long to wait for an agent's traffic to settle or to show a request.
+pub const TRAFFIC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A fabric link: `from_gw`'s `from_surface` forwards to `to_gw`'s
 /// `to_surface` over DIDComm once federation is complete.
@@ -377,6 +384,15 @@ pub struct G2gWorld {
     /// How many Transit Point calls of a relay between two managed agents
     /// were answered before one was refused.
     pub relayed_transit_point_calls: Option<usize>,
+    /// The traffic of a surface's agent the operator read before the caller's action, by surface name.
+    pub agent_traffic_baseline: HashMap<String, AgentTraffic>,
+}
+
+/// The Access Point request counts `GET /v1/agents/{id}` reports for an agent.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct AgentTraffic {
+    pub total_requests: u64,
+    pub failed: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -420,6 +436,7 @@ impl G2gWorld {
             caller_access_tokens: HashMap::new(),
             consent_request: None,
             relayed_transit_point_calls: None,
+            agent_traffic_baseline: HashMap::new(),
         }
     }
 
@@ -761,6 +778,70 @@ impl G2gWorld {
         }
     }
 
+    /// The traffic of the agent of surface `surface_name`, as its gateway's operator reads it
+    /// through `GET /v1/agents` and `GET /v1/agents/{id}`.
+    pub async fn agent_traffic_of_surface(
+        &self,
+        surface_name: &str,
+    ) -> AgentTraffic {
+        let (gw_index, surface_id) = self.surface(surface_name);
+        let operator = AdminApiClient::new(
+            self.harness()
+                .gw(gw_index)
+                .port,
+            G2G_TEST_AUTH_TOKEN,
+            "g2g-bdd-operator",
+        );
+        operator
+            .bootstrap_test_session()
+            .await
+            .unwrap_or_else(|error| panic!("the operator of gateway {gw_index} must sign in: {error:#}"));
+        let listed = operator
+            .send_recorded_json::<Value>(reqwest::Method::GET, AGENTS_PATH, None)
+            .await
+            .unwrap_or_else(|error| panic!("listing the agents of gateway {gw_index}: {error:#}"));
+        assert_eq!(listed.status, 200, "listing the agents of gateway {gw_index}: {}", listed.body);
+        let agent_id = agent_of_surface(&listed.body, &surface_id).unwrap_or_else(|| {
+            panic!("gateway {gw_index}'s agents list has no agent of surface '{surface_id}': {}", listed.body)
+        });
+        let read = operator
+            .send_recorded_json::<Value>(reqwest::Method::GET, &format!("{AGENTS_PATH}/{agent_id}"), None)
+            .await
+            .unwrap_or_else(|error| panic!("reading agent {agent_id} of gateway {gw_index}: {error:#}"));
+        assert_eq!(read.status, 200, "reading agent {agent_id} of gateway {gw_index}: {}", read.body);
+        let count = |field: &str| {
+            read.body["traffic"][field]
+                .as_u64()
+                .unwrap_or_else(|| panic!("agent {agent_id} has no traffic.{field}: {}", read.body))
+        };
+        AgentTraffic {
+            total_requests: count("total_requests"),
+            failed: count("failed"),
+        }
+    }
+
+    /// The agent's traffic once two reads [`TRAFFIC_SETTLE`] apart agree, since metrics are
+    /// recorded after the request that produced them.
+    pub async fn settled_agent_traffic_of_surface(
+        &self,
+        surface_name: &str,
+    ) -> AgentTraffic {
+        let deadline = tokio::time::Instant::now() + TRAFFIC_TIMEOUT;
+        let mut previous = self
+            .agent_traffic_of_surface(surface_name)
+            .await;
+        loop {
+            tokio::time::sleep(TRAFFIC_SETTLE).await;
+            let current = self
+                .agent_traffic_of_surface(surface_name)
+                .await;
+            if current == previous || tokio::time::Instant::now() >= deadline {
+                return current;
+            }
+            previous = current;
+        }
+    }
+
     pub async fn remember_fabric_forward_baseline(&mut self) {
         let Some(harness) = self.harness.as_ref() else {
             self.fabric_forward_baseline
@@ -799,6 +880,26 @@ impl G2gWorld {
             })
             .unwrap_or(false)
     }
+}
+
+/// The id of the agent in an agents list whose surfaces include `surface_id`.
+fn agent_of_surface<'a>(
+    body: &'a Value,
+    surface_id: &str,
+) -> Option<&'a str> {
+    body["agents"]
+        .as_array()?
+        .iter()
+        .find(|agent| {
+            agent["surfaces"]
+                .as_array()
+                .is_some_and(|surfaces| {
+                    surfaces
+                        .iter()
+                        .any(|surface| surface["surface_id"] == surface_id)
+                })
+        })?["id"]
+        .as_str()
 }
 
 /// Gives a Transit Point a target-leg Trust Check naming a trust registry stored

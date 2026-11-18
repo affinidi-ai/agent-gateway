@@ -23,8 +23,8 @@ changes:
         minutes. Each record carries `target_name`, the name of the A2A proxy or remote gateway the
         endpoint names when the caller may see it.
         `GET /v1/agents/{id}` adds each surface's protocol and route and the Access Point (inbound)
-        request totals and p95 latency across them over the metrics retention window; Transit Point
-        (outbound) calls are not counted. Both routes need surface view permission, group only
+        request totals and p95 latency across them over the metrics retention window, each request
+        counted once; Transit Point (outbound) calls are not counted. Both routes need surface view permission, group only
         surfaces in the caller's tenant and PAT resource scope, return 404 for an id outside it, and
         are not served when no auth backend is configured.
     - timestamp: '2026-10-29T15:00:00Z'
@@ -32,10 +32,13 @@ changes:
       description: >-
         Returns the card the gateway serves for the agent, read through the agent card preview of
         its first running A2A or AP2 surface, so URL, A2A proxy and remote gateway targets all show
-        a card. `source` says how the gateway obtains it: `fetched` (from the agent and rewritten),
+        a card. `?surface_id=` reads it through that surface instead, and answers `404` with code
+        `surface_unavailable` when that surface can't hold the card or isn't running on this
+        gateway. `source` says how the gateway obtains it: `fetched` (from the agent and rewritten),
         `generated` (by the A2A proxy) or `remote_gateway` (served over Fabric). Otherwise it
         answers `available: false` with `no_agent_card` (protocol is not A2A or AP2), `not_running`
-        (no surface of the agent runs on this gateway) or `operator_only` (a tenant token whose own
+        (no `surface_id` given and no surface of the agent runs on this gateway) or
+        `operator_only` (a tenant token whose own
         surfaces cannot reach the card and an appliance-wide surface can; nothing is fetched). Reads
         are audited and share the preview's per-user and per-surface fetch limits, with a 429 past
         them when there is no earlier preview. Viewing a card issues no DID, writes no Trust
@@ -71,8 +74,10 @@ changes:
         a badge with the first DID (all on hover), and flags **No DID** when surfaces use an agent
         without one, and last activity and **Traffic** are labelled with the metrics retention window the API
         returns. Opening another agent's
-        details clears the previous one, and a late answer for it is ignored. Needs surface view
-        permission.
+        details clears the previous one, and a late answer for it is ignored. When the card can't
+        be read through the chosen surface, the surface select stays above the message with a
+        **Retry**. With no agents, the empty list offers users who can edit surfaces an **Add
+        Agent Surface** action that opens `/surfaces/new`. Needs surface view permission.
   changed: []
   fixed: []
   removed: []

@@ -100,7 +100,8 @@ agent's endpoint names, and `null` for a URL endpoint, a missing record or anoth
 its Access Point runs on plus its route, or `null` when no listener with an external URL matches.
 `GET /v1/agents/{id}/agent-card` returns the card the gateway serves for the agent, read through
 the agent card preview of its first running A2A or AP2 surface, or of the one `?surface_id=` names
-(`404` when it is not one of `card_surface_ids` or isn't running on this gateway), with `source` naming how the
+(`404` with `"code": "surface_unavailable"` when it is not one of `card_surface_ids` or isn't
+running on this gateway; an agent outside the caller's scope is a plain `404`), with `source` naming how the
 gateway obtains it: `fetched` (a URL Target's card, rewritten), `generated` (by an A2A proxy) or
 `remote_gateway` (served over Fabric). It also returns `surface_id` (the surface read through),
 `card_surface_ids` (the surfaces the caller may read the card through, also on `not_running`) and

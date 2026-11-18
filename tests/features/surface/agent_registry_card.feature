@@ -35,3 +35,4 @@ Feature: Agent registry card
     And the operator has disabled the stored surface
     When the operator reads the agent card of the surface's agent through that surface
     Then the admin API response status is 404
+    And the agent card can't be read through that surface

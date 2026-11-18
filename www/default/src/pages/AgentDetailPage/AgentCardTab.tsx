@@ -171,7 +171,9 @@ const AgentCardTab: React.FC<AgentCardTabProps> = ({ agentId, surfaces }) => {
       if (request === latest.current) setResponse(card);
     } catch (err) {
       if (request !== latest.current) return;
-      if (surfaceId && err instanceof ApiError && err.status === 404) setSurfaceUnavailable(true);
+      if (surfaceId && err instanceof ApiError && err.code === 'surface_unavailable') {
+        setSurfaceUnavailable(true);
+      }
       else setFailed(true);
     } finally {
       if (request === latest.current) setLoading(false);
@@ -227,6 +229,16 @@ const AgentCardTab: React.FC<AgentCardTabProps> = ({ agentId, surfaces }) => {
         <div className="text-muted py-4 text-center" data-testid="agent-card-surface-unavailable">
           <i className="fas fa-id-card fa-2x mb-2 d-block" aria-hidden="true" />
           The Agent Card can&apos;t be read through this surface on this gateway
+          <div className="mt-2">
+            <AppButton
+              variant="outline-secondary"
+              size="sm"
+              onClick={loadCard}
+              data-testid="agent-card-surface-retry-button"
+            >
+              Retry
+            </AppButton>
+          </div>
         </div>
       </>
     );

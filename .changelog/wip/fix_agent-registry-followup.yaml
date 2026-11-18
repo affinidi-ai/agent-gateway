@@ -1,30 +1,8 @@
 branch: fix/agent-registry-followup
 changes:
-  added:
-    - timestamp: '2026-11-18T10:00:00Z'
-      title: Add an Add Agent Surface action to the empty Agents page
-      description: >-
-        The Agents page's "No agents yet" empty state gave no next step. It now has an
-        **Add Agent Surface** action that opens the surface creation flow at `/surfaces/new`.
-  changed:
-    - timestamp: '2026-11-18T10:00:00Z'
-      title: Answer 404 for an agent card read through a surface that isn't running
-      description: >-
-        `GET /v1/agents/{id}/agent-card?surface_id=` answered `200` with `available: false` and
-        `not_running` when the named surface could hold the card but isn't running on this
-        gateway, although the route documents `404` for a surface the card can't be read through.
-        It now answers `404`. Without `surface_id`, an agent none of whose surfaces runs here still
-        answers `not_running`. The Agent Card tab keeps its surface picker after such a `404`, so
-        another surface can be chosen.
-  fixed:
-    - timestamp: '2026-11-18T10:00:00Z'
-      title: Count each request received over Fabric once in agent traffic
-      description: >-
-        A call a surface receives over Fabric (forwarded to its Target, its A2A proxy or its MCP
-        Target) is recorded as a request row and a response row, and agent traffic counted both, so
-        `GET /v1/agents/{id}` and the Traffic tab showed about double the real requests, failures,
-        gateway faults and p95 samples for those surfaces. Agent traffic now counts request rows
-        only, which also corrects the rows already retained.
+  added: []
+  changed: []
+  fixed: []
   removed: []
   security: []
   breaking: []

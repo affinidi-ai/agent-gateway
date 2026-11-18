@@ -525,6 +525,16 @@ fn agent_card_is_not_running(world: &mut SurfaceWorld) {
     assert_agent_card_unavailable(world, "not_running");
 }
 
+#[then("the agent card can't be read through that surface")]
+fn agent_card_surface_unavailable(world: &mut SurfaceWorld) {
+    let body = &management_response(world).body;
+    assert_eq!(
+        (&body["error"], &body["code"]),
+        (&json!("Not Found"), &json!("surface_unavailable")),
+        "the agent card answer: {body}"
+    );
+}
+
 fn assert_agent_card_unavailable(
     world: &SurfaceWorld,
     reason: &str,
