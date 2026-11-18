@@ -5,7 +5,7 @@ import { defaultParameterValues, parseListInput, renderTemplate } from './regoTe
 import type { ParameterValues, PolicyTemplate } from './types';
 
 /** Raw text of each setting field, so a list can be typed with its commas. */
-type FieldText = Record<string, string>;
+export type FieldText = Record<string, string>;
 
 function initialFieldText(template: PolicyTemplate): FieldText {
   return Object.fromEntries(
@@ -26,13 +26,21 @@ function valuesFromText(template: PolicyTemplate, text: FieldText): ParameterVal
   );
 }
 
+/** The Rego a template renders to with its settings as typed. */
+export function renderWithText(template: PolicyTemplate, text: FieldText) {
+  return renderTemplate(template, valuesFromText(template, text));
+}
+
 /**
- * The settings of one template and the Rego they render to. Callers key the component that
- * uses it by template id, so choosing another template starts from that template's defaults.
+ * The settings of one template and the Rego they render to, starting from `initialText` or the
+ * defaults. Callers key the component that uses it by template id, so choosing another
+ * template starts over.
  */
-export function useTemplateSettings(template: PolicyTemplate) {
-  const [fieldText, setFieldText] = useState<FieldText>(() => initialFieldText(template));
-  const rendered = renderTemplate(template, valuesFromText(template, fieldText));
+export function useTemplateSettings(template: PolicyTemplate, initialText?: FieldText) {
+  const [fieldText, setFieldText] = useState<FieldText>(
+    () => initialText ?? initialFieldText(template)
+  );
+  const rendered = renderWithText(template, fieldText);
   const usesDefaultSettings =
     rendered.rego === renderTemplate(template, defaultParameterValues(template)).rego;
   const setField = (key: string, value: string) =>

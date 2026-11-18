@@ -1,14 +1,22 @@
 import React, { useMemo, useState } from 'react';
-import { BLANK_TEMPLATE_ID } from './policyDefaults';
+import {
+  ALLOW_ALL_POLICY,
+  BLANK_TEMPLATE_ID,
+  DEFAULT_POLICY,
+  DEFAULT_TEMPLATE_KEY,
+} from './policyDefaults';
 import PolicySectionTitle from './PolicySectionTitle';
 import { defaultDecision } from './regoTemplate';
 import { DecisionBadge } from './TemplateBadges';
 import {
+  renderWithText,
   TemplateDocsLink,
   TemplateHowItDecides,
   TemplateSettingsFields,
   useTemplateSettings,
+  type FieldText,
 } from './TemplatePreview';
+import type { UsedTemplate } from './usePolicyTemplateActions';
 import { templateEntryKey, useAllPolicyTemplates } from './usePolicyTemplates';
 import { useTemplateFilter } from './useTemplateFilter';
 import { CATEGORY_LABELS, type PolicyTemplate, type PolicyType } from './types';
@@ -30,20 +38,22 @@ const TYPE_NAME: Record<PolicyType, string> = {
 interface TemplateGalleryProps {
   policyType: PolicyType;
   step?: number;
-  /** The chosen template id, `blank`, or null once the Rego no longer follows one. */
-  appliedTemplateId: string | null;
+  /** The policy's Rego, which says whether it still follows the used template. */
+  policy: string;
+  usedTemplate: UsedTemplate | null;
   onPickBlank: () => void;
   /** Fills the form from the template, with the Rego its settings render to. */
-  onUseTemplate: (template: PolicyTemplate, rego: string) => void;
+  onUseTemplate: (template: PolicyTemplate, rego: string, fieldText: FieldText) => void;
 }
 
 /** The selected card's detail: settings, how it decides, docs and Use this template. */
 const GalleryDetail: React.FC<{
   template: PolicyTemplate;
   policyType: PolicyType;
-  onUse: (template: PolicyTemplate, rego: string) => void;
-}> = ({ template, policyType, onUse }) => {
-  const settings = useTemplateSettings(template);
+  initialText?: FieldText;
+  onUse: (template: PolicyTemplate, rego: string, fieldText: FieldText) => void;
+}> = ({ template, policyType, initialText, onUse }) => {
+  const settings = useTemplateSettings(template, initialText);
   return (
     <div className="policy-template-gallery__detail" data-testid="policy-template-gallery-detail">
       <h6 className="fw-bold mb-1">{template.name}</h6>
@@ -64,7 +74,9 @@ const GalleryDetail: React.FC<{
           type="button"
           className="btn btn-sm btn-primary"
           disabled={!settings.rendered.rego}
-          onClick={() => settings.rendered.rego && onUse(template, settings.rendered.rego)}
+          onClick={() =>
+            settings.rendered.rego && onUse(template, settings.rendered.rego, settings.fieldText)
+          }
           data-testid="policy-template-gallery-use-button"
         >
           Use this template
@@ -82,7 +94,8 @@ const GalleryDetail: React.FC<{
 const TemplateGallery: React.FC<TemplateGalleryProps> = ({
   policyType,
   step,
-  appliedTemplateId,
+  policy,
+  usedTemplate,
   onPickBlank,
   onUseTemplate,
 }) => {
@@ -99,14 +112,25 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
   const [expanded, setExpanded] = useState(true);
   const [showAll, setShowAll] = useState(false);
 
+  const isDefault = policy === DEFAULT_POLICY[policyType];
+  // The used template's card, or Deny by default while the Rego is still the new policy's own.
+  const appliedId =
+    usedTemplate?.id ?? (isDefault ? `${DEFAULT_TEMPLATE_KEY}:${policyType}` : null);
   const applied =
-    entries.flatMap(e => Object.values(e.variants)).find(t => t?.id === appliedTemplateId) ?? null;
+    entries.flatMap(e => Object.values(e.variants)).find(t => t?.id === appliedId) ?? null;
   const appliedKey =
-    appliedTemplateId === BLANK_TEMPLATE_ID
+    appliedId === BLANK_TEMPLATE_ID
       ? BLANK_TEMPLATE_ID
       : applied
         ? templateEntryKey(applied)
         : null;
+  const usedRego =
+    usedTemplate?.id === BLANK_TEMPLATE_ID
+      ? ALLOW_ALL_POLICY[policyType]
+      : usedTemplate && applied
+        ? renderWithText(applied, usedTemplate.fieldText).rego
+        : null;
+  const prefilled = usedRego !== null && policy === usedRego;
   // The card whose detail is open: the applied one until the user picks another.
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const shownKey = selectedKey ?? appliedKey;
@@ -120,8 +144,8 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
       ? visible
       : visible.slice(0, COLLAPSED_COUNT);
 
-  const use = (template: PolicyTemplate, rego: string) => {
-    onUseTemplate(template, rego);
+  const use = (template: PolicyTemplate, rego: string, fieldText: FieldText) => {
+    onUseTemplate(template, rego, fieldText);
     setSelectedKey(null);
     setExpanded(false);
   };
@@ -132,9 +156,11 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
   };
 
   const summaryName =
-    appliedTemplateId === BLANK_TEMPLATE_ID
-      ? 'Allow all (blank)'
-      : (applied?.name ?? 'Custom Rego');
+    usedTemplate && !prefilled
+      ? 'Custom Rego'
+      : usedTemplate?.id === BLANK_TEMPLATE_ID
+        ? 'Allow all (blank)'
+        : (applied?.name ?? 'Custom Rego');
 
   const card = (
     key: string,
@@ -179,7 +205,7 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
         >
           <span>
             Started from <strong>{summaryName}</strong>
-            {applied && (
+            {prefilled && usedTemplate?.id !== BLANK_TEMPLATE_ID && (
               <span className="text-muted" data-testid="policy-definition-prefilled-hint">
                 {' '}
                 · Pre-filled from the template. Edit freely.
@@ -297,6 +323,7 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
                 key={selected.id}
                 template={selected}
                 policyType={policyType}
+                initialText={usedTemplate?.id === selected.id ? usedTemplate.fieldText : undefined}
                 onUse={use}
               />
             )

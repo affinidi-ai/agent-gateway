@@ -18,11 +18,12 @@ jest.mock('../../../context/PermissionsContext', () => ({
   usePermissions: () => ({ hasPermission: (f: string) => f !== 'policies.edit' || mockCanEdit }),
 }));
 
-const mockUndo: { last?: () => void } = {};
+const mockUndo: { last?: () => void; message?: string } = {};
 jest.mock('../../../utils/toaster', () => ({
   ...jest.requireActual('../../../utils/toaster'),
-  showUndoToast: (options: { onUndo: () => void }) => {
+  showUndoToast: (options: { onUndo: () => void; message: string }) => {
     mockUndo.last = options.onUndo;
+    mockUndo.message = options.message;
   },
 }));
 
@@ -252,6 +253,110 @@ describe('start a policy from the gallery', () => {
 
     fireEvent.click(screen.getByTestId('policy-rules-set-default-deny-button'));
     expect(rego().value).toContain('default allow = false');
+  });
+});
+
+describe('the used template', () => {
+  const name = () => screen.getByPlaceholderText('e.g. Require Authentication');
+  const change = () => fireEvent.click(screen.getByTestId('policy-template-gallery-change-button'));
+
+  it('fills Name from the preselected Deny by default when it is used', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    expect(await card('deny-by-default')).toHaveAttribute('aria-pressed', 'true');
+    fireEvent.click(screen.getByTestId('policy-template-gallery-use-button'));
+
+    expect(name()).toHaveValue('Deny by default');
+    expect(mockUndo.message).toBe('Filled from the template Deny by default.');
+  });
+
+  it('reopens the used template with the settings it was used with', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    fireEvent.click(await card('at-least-n-trust-checks-pass'));
+    fireEvent.change(screen.getByTestId('policy-template-gallery-param-min_passing'), {
+      target: { value: '3' },
+    });
+    fireEvent.click(screen.getByTestId('policy-template-gallery-use-button'));
+    change();
+
+    expect(screen.getByTestId('policy-template-gallery-param-min_passing')).toHaveValue(3);
+    fireEvent.click(screen.getByTestId('policy-template-gallery-use-button'));
+    expect(rego().value).toContain('count(passing) >= 3');
+  });
+
+  it('selects no card over Rego restored by Undo after a discard', async () => {
+    const restored = `${SAVED.policy}\n`;
+    window.sessionStorage.setItem(
+      'policy-draft:new',
+      JSON.stringify({ ...SAVED, id: '', name: 'draft', policy: restored })
+    );
+    renderAt('/policy-definitions/new?type=agent_surface');
+    await waitFor(() => expect(rego().value).toBe(restored));
+
+    expect(await card('deny-by-default')).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.queryByTestId('policy-template-gallery-use-button')).toBeNull();
+  });
+
+  it('no longer says Pre-filled once a Use is undone', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    await useCard('all-trust-checks-pass');
+    expect(screen.getByTestId('policy-definition-prefilled-hint')).toBeInTheDocument();
+
+    act(() => mockUndo.last?.());
+
+    expect(screen.queryByTestId('policy-definition-prefilled-hint')).toBeNull();
+  });
+
+  it('undoes a Use made before a Type change back to the policy it replaced', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    await useCard('allow-http-methods');
+    fireEvent.change(screen.getByDisplayValue('Agent Surfaces'), { target: { value: 'gateway' } });
+    expect(screen.getByTestId('policy-definition-prefilled-hint')).toBeInTheDocument();
+
+    act(() => mockUndo.last?.());
+
+    expect(screen.getByDisplayValue('Agent Surfaces')).toBeInTheDocument();
+    expect(rego().value).toBe('package surface.policy\n\ndefault allow := false\n');
+    expect(screen.getByTestId('policy-template-gallery-summary')).toHaveTextContent(
+      'Started from Deny by default'
+    );
+    expect(screen.queryByTestId('policy-definition-prefilled-hint')).toBeNull();
+  });
+
+  it('says Custom Rego once Rego started from Allow all is edited by hand', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    await useCard('blank');
+    fireEvent.change(rego(), { target: { value: `${rego().value}\n# reviewed` } });
+    expect(screen.getByTestId('policy-template-gallery-summary')).toHaveTextContent(
+      'Started from Custom Rego'
+    );
+  });
+
+  it('keeps the used settings and Pre-filled across a Type change', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    fireEvent.click(await card('allow-http-methods'));
+    fireEvent.change(screen.getByTestId('policy-template-gallery-param-methods'), {
+      target: { value: 'DELETE' },
+    });
+    fireEvent.click(screen.getByTestId('policy-template-gallery-use-button'));
+    fireEvent.change(screen.getByDisplayValue('Agent Surfaces'), { target: { value: 'gateway' } });
+
+    expect(screen.getByTestId('policy-definition-prefilled-hint')).toBeInTheDocument();
+    change();
+    expect(screen.getByTestId('policy-template-gallery-param-methods')).toHaveValue('DELETE');
+  });
+
+  it('replaces hand-edited Rego when the used template is used again', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    await useCard('allow-http-methods');
+    fireEvent.change(rego(), { target: { value: `${rego().value}\n# reviewed` } });
+    expect(screen.queryByTestId('policy-definition-prefilled-hint')).toBeNull();
+
+    change();
+    fireEvent.click(screen.getByTestId('policy-template-gallery-use-button'));
+
+    expect(rego().value).not.toContain('# reviewed');
+    expect(name()).toHaveValue('Allow listed HTTP methods');
+    expect(screen.getByTestId('policy-definition-prefilled-hint')).toBeInTheDocument();
   });
 });
 

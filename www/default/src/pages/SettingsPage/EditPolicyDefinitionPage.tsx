@@ -42,10 +42,10 @@ const TYPE_NAME: Record<PolicyType, string> = {
   agent_surface: 'Agent Surface',
 };
 
-/** Built-in templates in the policy, applied or inserted, that have no variant for `type`. */
+/** Built-in templates in the policy, used or inserted, that have no variant for `type`. */
 function templatesWithoutType(
   policy: string,
-  appliedTemplateId: string | null,
+  usedTemplateId: string | undefined,
   type: PolicyType
 ): string[] {
   const forType = new Set(
@@ -60,7 +60,7 @@ function templatesWithoutType(
         g.source.kind === 'template' && otherOnly.has(g.source.name) ? [g.source.name] : []
       )
     : [];
-  const applied = BUILTIN_POLICY_TEMPLATES.find(t => t.id === appliedTemplateId);
+  const applied = BUILTIN_POLICY_TEMPLATES.find(t => t.id === usedTemplateId);
   if (applied && otherOnly.has(applied.name)) names.unshift(applied.name);
   return Array.from(new Set(names));
 }
@@ -111,8 +111,8 @@ const EditPolicyDefinitionPage: React.FC = () => {
     templatePanel,
     setTemplatePanel,
     togglePanel,
-    appliedTemplateId,
-    setAppliedTemplateId,
+    usedTemplate,
+    setUsedTemplate,
     insertedTemplate,
     dismissInsertedTemplate,
     justAdded,
@@ -135,11 +135,13 @@ const EditPolicyDefinitionPage: React.FC = () => {
         ? form.policy.replace(/^(\s*package\s+)[^\s{]+/m, `$1${expectedPkg}`)
         : form.policy;
     setForm({ ...form, policy_type: newType, policy });
-    // A template with a variant for the new Type stays chosen; any other stops applying.
-    const appliedKey = appliedTemplateId?.split(':')[0];
-    const sameTemplate = BUILTIN_POLICY_TEMPLATES.find(t => t.id === `${appliedKey}:${newType}`);
-    if (appliedTemplateId !== BLANK_TEMPLATE_ID) setAppliedTemplateId(sameTemplate?.id ?? null);
-    const otherTypeOnly = templatesWithoutType(policy, appliedTemplateId, newType);
+    // A used template with a variant for the new Type stays used, with its settings; any other stops.
+    const usedKey = usedTemplate?.id.split(':')[0];
+    const sameTemplate = BUILTIN_POLICY_TEMPLATES.find(t => t.id === `${usedKey}:${newType}`);
+    if (usedTemplate && usedTemplate.id !== BLANK_TEMPLATE_ID) {
+      setUsedTemplate(sameTemplate ? { ...usedTemplate, id: sameTemplate.id } : null);
+    }
+    const otherTypeOnly = templatesWithoutType(policy, usedTemplate?.id, newType);
     if (otherTypeOnly.length > 0) {
       const one = otherTypeOnly.length === 1;
       const other: PolicyType = newType === 'gateway' ? 'agent_surface' : 'gateway';
@@ -438,13 +440,14 @@ const EditPolicyDefinitionPage: React.FC = () => {
                 <TemplateGallery
                   step={1}
                   policyType={form.policy_type}
-                  appliedTemplateId={appliedTemplateId}
+                  policy={form.policy}
+                  usedTemplate={usedTemplate}
                   onPickBlank={() => {
                     pickBlank();
                     setView('rules');
                   }}
-                  onUseTemplate={(template, rego) => {
-                    applyTemplate(template, rego);
+                  onUseTemplate={(template, rego, fieldText) => {
+                    applyTemplate(template, rego, fieldText);
                     setView('rules');
                   }}
                 />

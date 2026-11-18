@@ -1,6 +1,6 @@
 import { useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import { showUndoToast } from '../../../utils/toaster';
-import { ALLOW_ALL_POLICY, BLANK_TEMPLATE_ID, DEFAULT_TEMPLATE_KEY } from './policyDefaults';
+import { ALLOW_ALL_POLICY, BLANK_TEMPLATE_ID } from './policyDefaults';
 import {
   parsePolicyRules,
   removeRule as removeRuleLines,
@@ -35,6 +35,12 @@ export interface InsertedTemplate {
   key: number;
 }
 
+/** The template last used from the gallery (`blank` for Allow all) and its settings as typed. */
+export interface UsedTemplate {
+  id: string;
+  fieldText: Record<string, string>;
+}
+
 /** The policy editor's template state and the actions that change the Rego, each with Undo. */
 export function usePolicyTemplateActions<T extends TemplateFormFields>(
   form: T,
@@ -42,26 +48,28 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
   isCreateMode: boolean
 ) {
   const [templatePanel, setTemplatePanel] = useState<TemplatePanel | null>(null);
-  // A new policy starts from Deny by default, whose Rego is the page's `DEFAULT_POLICY`.
-  const [appliedTemplateId, setAppliedTemplateId] = useState<string | null>(
-    () => `${DEFAULT_TEMPLATE_KEY}:${form.policy_type}`
-  );
+  // Only Use and Allow all set it; whether the Rego still follows it is derived from the Rego.
+  const [usedTemplate, setUsedTemplate] = useState<UsedTemplate | null>(null);
   const [insertedTemplate, setInsertedTemplate] = useState<InsertedTemplate | null>(null);
   const [justAdded, setJustAdded] = useState<string | null>(null);
   const regoRef = useRef<HTMLTextAreaElement>(null);
 
   const togglePanel = (panel: TemplatePanel) => setTemplatePanel(p => (p === panel ? null : panel));
 
-  const applyTemplate = (template: PolicyTemplate, rego: string) => {
+  const applyTemplate = (
+    template: PolicyTemplate,
+    rego: string,
+    fieldText: Record<string, string>
+  ) => {
     const previous: TemplateFormFields = {
       name: form.name,
       description: form.description,
       policy_type: form.policy_type,
       policy: form.policy,
     };
-    const previousTemplateId = appliedTemplateId;
-    // Customise settings re-applies the chosen template: keep the name and description as typed.
-    const reapplying = appliedTemplateId === template.id;
+    const previousUsed = usedTemplate;
+    // Using the used template again keeps the name and description as typed.
+    const reapplying = usedTemplate?.id === template.id;
     setForm(f => ({
       ...f,
       name: reapplying ? f.name : template.name,
@@ -69,7 +77,7 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
       policy_type: template.policy_type,
       policy: rego,
     }));
-    setAppliedTemplateId(template.id);
+    setUsedTemplate({ id: template.id, fieldText });
     setTemplatePanel(null);
     showUndoToast({
       message:
@@ -78,21 +86,21 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
           : `Filled from the template ${template.name}. Type set to ${TYPE_NAME[template.policy_type]}.`,
       onUndo: () => {
         setForm(f => ({ ...f, ...previous }));
-        setAppliedTemplateId(previousTemplateId);
+        setUsedTemplate(previousUsed);
       },
     });
   };
 
   const pickBlank = () => {
     const previousPolicy = form.policy;
-    const previousTemplateId = appliedTemplateId;
+    const previousUsed = usedTemplate;
     setForm(f => ({ ...f, policy: ALLOW_ALL_POLICY[f.policy_type] }));
-    setAppliedTemplateId(BLANK_TEMPLATE_ID);
+    setUsedTemplate({ id: BLANK_TEMPLATE_ID, fieldText: {} });
     showUndoToast({
       message: 'Started from Allow all (blank).',
       onUndo: () => {
         setForm(f => ({ ...f, policy: previousPolicy }));
-        setAppliedTemplateId(previousTemplateId);
+        setUsedTemplate(previousUsed);
       },
     });
   };
@@ -101,13 +109,11 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
   const insertTemplate = (template: PolicyTemplate, rego: string, usesDefaultSettings: boolean) => {
     const previousPolicy = form.policy;
     const previousInserted = insertedTemplate;
-    const previousTemplateId = appliedTemplateId;
+    const previousUsed = usedTemplate;
     const previousJustAdded = justAdded;
     setForm(f => ({ ...f, policy: insertTemplateRules(f.policy, template.name, rego).policy }));
     setJustAdded(template.name);
-    if (isCreateMode) {
-      setAppliedTemplateId(null);
-    } else {
+    if (!isCreateMode) {
       setInsertedTemplate(prev => ({ template, usesDefaultSettings, key: (prev?.key ?? 0) + 1 }));
     }
     showUndoToast({
@@ -115,28 +121,23 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
       onUndo: () => {
         setForm(f => ({ ...f, policy: previousPolicy }));
         setInsertedTemplate(previousInserted);
-        setAppliedTemplateId(previousTemplateId);
+        setUsedTemplate(previousUsed);
         setJustAdded(previousJustAdded);
       },
     });
   };
 
-  // Rego typed by hand no longer follows the template, so Customise settings can't replace it.
-  const editPolicy = (policy: string) => {
-    setForm(f => ({ ...f, policy }));
-    if (isCreateMode && appliedTemplateId !== BLANK_TEMPLATE_ID) setAppliedTemplateId(null);
-  };
+  const editPolicy = (policy: string) => setForm(f => ({ ...f, policy }));
 
   const changePolicyWithUndo = (policy: string, message: string, onUndo?: () => void) => {
     const previousPolicy = form.policy;
-    const previousTemplateId = appliedTemplateId;
+    const previousUsed = usedTemplate;
     setForm(f => ({ ...f, policy }));
-    if (isCreateMode) setAppliedTemplateId(null);
     showUndoToast({
       message,
       onUndo: () => {
         setForm(f => ({ ...f, policy: previousPolicy }));
-        setAppliedTemplateId(previousTemplateId);
+        setUsedTemplate(previousUsed);
         onUndo?.();
       },
     });
@@ -185,8 +186,8 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
     templatePanel,
     setTemplatePanel,
     togglePanel,
-    appliedTemplateId,
-    setAppliedTemplateId,
+    usedTemplate,
+    setUsedTemplate,
     insertedTemplate,
     dismissInsertedTemplate: () => setInsertedTemplate(null),
     justAdded,

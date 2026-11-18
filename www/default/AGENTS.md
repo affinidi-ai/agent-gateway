@@ -1840,7 +1840,8 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   template's body, so a template saved from a combined policy never nests groups.
 - **Start from gallery** (create only, `policies.edit`): `TemplateGallery` is the only place a
   policy starts from a template. A new policy starts from **Deny by default**: its Rego is
-  `DEFAULT_POLICY` (`policyDefaults.ts`, `default allow := false`) and that card is selected. The
+  `DEFAULT_POLICY` (`policyDefaults.ts`, `default allow := false`), and that card is selected
+  while no template was used and the Rego equals `DEFAULT_POLICY` for the Type. The
   grid of cards in the `.policy-template-row` style (`policy-template-card-blank`,
   `policy-template-card-<key>`, with `is-selected` and `aria-pressed`) holds **Allow all
   (blank)** first, whose Rego is `ALLOW_ALL_POLICY`, then one card per built-in and
@@ -1859,16 +1860,25 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   (`policy-template-gallery-docs-link`) and **Use this template**
   (`policy-template-gallery-use-button`), disabled while a setting is invalid. Nothing fills
   the form until Use, which fills Name, Description, Type and Rego with the settings shown and
-  offers Undo (the toast names a Type change), restoring only those four fields; using the
-  template already applied again keeps a Name and Description already in the form. The gallery
-  then collapses to one line (`policy-template-gallery-summary`): "Started from <name> ·
-  Pre-filled from the template. Edit freely." (`policy-definition-prefilled-hint`), "Allow all
-  (blank)", or "Custom Rego" once rules were added or removed, the Type changed to one the
-  template doesn't serve, or the Rego was edited by hand; Undo of those actions restores it.
-  **Change** (`policy-template-gallery-change-button`) reopens it with the applied card
-  selected. Changing Type keeps the Rego, whose package the Type select rewrites as before, keeps
-  a template that serves both Types applied, and shows a warning toast naming any built-in
-  template in it, applied or added, that has no variant for the new Type.
+  offers Undo (the toast names a Type change), which restores those four fields and the used
+  template. The page keeps
+  the used template, `usedTemplate: {id, fieldText} | null` in `usePolicyTemplateActions`, which
+  only Use and Allow all set (`blank` for Allow all); everything else is derived from it and the
+  Rego. Using the used template again keeps a Name and Description already in the form; using
+  any other card, Deny by default included, fills them. The gallery then collapses to one line
+  (`policy-template-gallery-summary`): "Started from <name> · Pre-filled from the template.
+  Edit freely." (`policy-definition-prefilled-hint`) or "Allow all (blank)" while the Rego
+  still equals what the used template renders to with its settings, "Deny by default" while no
+  template is used and the Rego is `DEFAULT_POLICY`, and "Custom Rego" otherwise: once rules were added or
+  removed, the Type changed to one the template doesn't serve, or the Rego was edited by hand.
+  Undo of Use, Allow all, Add rules, Remove, Remove rule and Deny by default restores the Rego
+  and the used template together. **Change** (`policy-template-gallery-change-button`) reopens
+  it with the used card selected and its settings as they were used, also after a hand edit,
+  and Use there replaces the Rego. After a discard and Undo the page keeps only the form, so no
+  card is selected over Rego other than `DEFAULT_POLICY`. Changing Type keeps the Rego, whose
+  package the Type select rewrites as before, keeps a template that serves both Types used,
+  with its settings, and shows a warning toast naming any built-in template in it, used or
+  added, that has no variant for the new Type.
 - **Templates column** (`PolicyTemplatesPanel`, `policy-templates-panel`): for users with
   `policies.edit` the page always has two columns, the editor card (`col-xl-8`) and a templates
   column (`col-xl-4`, `policy-templates-column`, sticky from `xl` below the top bar), so the
