@@ -7,6 +7,7 @@
  * is `enforce`, so it is reported as an advisory, and not again when the stored surface already
  * had it on the same leg, with the same setting and endpoint.
  */
+import { registry } from './registry';
 import {
   MA_CALLER_CHECK_PROBLEM,
   TP_CALLER_CHECK_PROBLEM,
@@ -17,7 +18,7 @@ import {
 } from './_shared/providerTargetAuth';
 
 interface Leg {
-  nodeId: string;
+  nodeId: string | undefined;
   transitPointId: string | null;
   endpoint: string;
   auth: unknown;
@@ -28,7 +29,7 @@ interface Leg {
 }
 
 interface Breach {
-  nodeId: string;
+  nodeId: string | undefined;
   transitPointId: string | null;
   endpoint: string;
   auth: string;
@@ -73,6 +74,23 @@ function supportsMetadataMapping(protocol: unknown): boolean {
   return protocol === 'a2a' || protocol === 'ap2';
 }
 
+/**
+ * The canvas node of each Transit Point, in the order of `transit.points`: the payload builder
+ * writes both lists from the same nodes, so a point and its node share a position. Canvas data
+ * that does not list `count` Transit Points names none, since no node beats the wrong one.
+ */
+function transitPointNodeIds(canvas: unknown, count: number): string[] {
+  const ids = array(record(canvas)?.nodes).flatMap(entry => {
+    const node = record(entry);
+    return typeof node?.id === 'string' &&
+      typeof node.type === 'string' &&
+      registry.isTransitPointType(node.type)
+      ? [node.id]
+      : [];
+  });
+  return ids.length === count ? ids : [];
+}
+
 function legs(surface: unknown): Leg[] {
   const payload = record(surface);
   if (!payload) return [];
@@ -102,7 +120,9 @@ function legs(surface: unknown): Leg[] {
       otherHeaders,
     });
   }
-  array(record(payload.transit)?.points).forEach((entry, index) => {
+  const points = array(record(payload.transit)?.points);
+  const pointNodeIds = transitPointNodeIds(payload.canvas, points.length);
+  points.forEach((entry, index) => {
     const point = record(entry);
     if (!point?.target_auth) return;
     const endpoint = typeof point.target_endpoint === 'string' ? point.target_endpoint : '';
@@ -116,7 +136,7 @@ function legs(surface: unknown): Leg[] {
     }
     const pointResource = record(point.mcp_http)?.authorization != null;
     found.push({
-      nodeId: `transit-point-${index + 1}`,
+      nodeId: pointNodeIds[index],
       transitPointId: typeof point.id === 'string' ? point.id : null,
       endpoint,
       auth: point.target_auth,
@@ -162,7 +182,7 @@ const sameBreach = (a: Breach, b: Breach) =>
   a.rule === b.rule;
 
 export interface TargetAuthBreach {
-  nodeId: string;
+  nodeId?: string;
   rule: 'duplicate' | 'callers';
   message: string;
 }

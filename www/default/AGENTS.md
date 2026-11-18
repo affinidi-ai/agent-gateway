@@ -601,7 +601,10 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
     leg already sends (a binding, header metadata mapping, the token header of any JWT Bearer
     caller method that forwards it) blocks Save, on the Managed Agent or on the Transit Point it
     belongs to. The surface page runs the clash check on the view being saved and on every other
-    variant, whose error names the variant.
+    variant, whose error names the variant. The toast's **Show me** selects the canvas node that
+    has the problem: a Transit Point's node is the one at its position among the Transit Point
+    nodes of the payload's `canvas.nodes`, never an id built from its index, and a payload whose
+    canvas data lists a different number of Transit Points names no node.
   - **A stored problem blocks too.** The gateway refuses a header name, format or clash problem
     on every save, one in a stored setting the operator did not edit included, so the dashboard
     shows it as an error next to its field and blocks Save until it is fixed.

@@ -172,28 +172,64 @@ describe('Target authentication whole-surface problems in the Surface Builder', 
     expect(issues).toEqual([expect.objectContaining({ severity: 'error', nodeId: 'target' })]);
   });
 
-  it('reports a Transit Point problem on that Transit Point, not on the Managed Agent', () => {
-    const issues = issuesFor(
-      base({
-        target: { endpoint: 'https://agent.example.com' },
-        outbound_credentials: [{ inject_as: { type: 'bearer_header' } }],
-        transit: {
-          points: [
-            {
-              id: 'tp',
-              alias: 'partner',
-              protocol: 'mcp',
-              target_endpoint: 'https://p.example.com',
-              require_transit_token: true,
-              target_auth: staticSecret('Authorization', 'Bearer {value}'),
-            },
-          ],
-        },
-      })
-    );
-    expect(issues).toEqual([
-      expect.objectContaining({ severity: 'error', nodeId: 'transit-point-1' }),
-    ]);
+  describe('a header clash on the second Transit Point', () => {
+    const point = (alias: string, over: Record<string, unknown> = {}) => ({
+      id: alias,
+      alias,
+      protocol: 'mcp',
+      target_endpoint: 'https://p.example.com',
+      require_transit_token: true,
+      ...over,
+    });
+    const clashOnSecondPoint = (canvasNodes?: unknown[]) =>
+      issuesFor(
+        base({
+          target: { endpoint: 'https://agent.example.com' },
+          outbound_credentials: [{ inject_as: { type: 'bearer_header' } }],
+          transit: {
+            points: [
+              point('first'),
+              point('partner', { target_auth: staticSecret('Authorization', 'Bearer {value}') }),
+            ],
+          },
+          ...(canvasNodes ? { canvas: { nodes: canvasNodes } } : {}),
+        })
+      );
+
+    it('is reported on the canvas node of that Transit Point, not on the Managed Agent', () => {
+      const issues = clashOnSecondPoint([
+        { id: 'access-point', type: 'access-point' },
+        { id: 'transit-point-a2a-1', type: 'transit-point-a2a' },
+        { id: 'target', type: 'target' },
+        { id: 'transit-point-mcp-1', type: 'transit-point-mcp' },
+      ]);
+      expect(issues).toEqual([
+        expect.objectContaining({ severity: 'error', nodeId: 'transit-point-mcp-1' }),
+      ]);
+    });
+
+    it('is reported on a canvas node that kept an id from an earlier save', () => {
+      const issues = clashOnSecondPoint([
+        { id: 'transit-point-mcp-4', type: 'transit-point-mcp' },
+        { id: 'transit-point-mcp-7', type: 'transit-point-mcp' },
+      ]);
+      expect(issues).toEqual([
+        expect.objectContaining({ severity: 'error', nodeId: 'transit-point-mcp-7' }),
+      ]);
+    });
+
+    it('names no node when the canvas data does not list every Transit Point', () => {
+      const message =
+        "transit.points['partner'].target_auth.header_name Authorization is already sent by a credential binding";
+      for (const canvasNodes of [
+        undefined,
+        [{ id: 'transit-point-mcp-1', type: 'transit-point-mcp' }],
+      ]) {
+        const issues = clashOnSecondPoint(canvasNodes);
+        expect(issues).toEqual([expect.objectContaining({ severity: 'error', message })]);
+        expect(issues[0].nodeId).toBeUndefined();
+      }
+    });
   });
 });
 

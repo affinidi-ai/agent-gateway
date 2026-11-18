@@ -3,9 +3,9 @@
  *
  * Covers the Target authentication of a Transit Point (an agent-initiated outbound route): a
  * reserved header name shown next to the field and blocking Save, a Target that is not https
- * and a Transit Point that authenticates no caller shown as advisories that allow Save, scopes
- * written and cleared, and a Transit Point left unopened keeping its stored `target_auth`,
- * whatever its method, through a save.
+ * and a Transit Point that authenticates no caller shown as advisories that allow Save, a header
+ * clash whose toast opens the Transit Point, scopes written and cleared, and a Transit Point left
+ * unopened keeping its stored `target_auth`, whatever its method, through a save.
  *
  * The gateway API is mocked with `page.route`.
  */
@@ -222,6 +222,28 @@ test.describe('Transit Point Target authentication', () => {
 
         await saveButton(page).click();
         await expectSaveBlocked(page, 'Header name must not be the reserved header Host');
+        expect(saved).toHaveLength(0);
+    });
+
+    test('Show me on a header clash opens the Transit Point that has it', async ({page}) => {
+        const saved: Request[] = [];
+        const clashing = {
+            header_metadata_mapping: {headers: [{header: 'x-tenant', field: 'tenant'}]},
+            target_auth: staticSecret('X-Tenant'),
+        };
+        await mockSurface(page, surfaceFixture(clashing), saved);
+        await page.goto(`${BASE_URL}/surfaces/${SURFACE_ID}`);
+        await expect(page.getByTestId('surface-node-target')).toBeVisible();
+        await expect(page.getByTestId('transit-point-target-auth-type')).toHaveCount(0);
+
+        await saveButton(page).click();
+        await expectSaveBlocked(
+            page,
+            "transit.points['partner'].target_auth.header_name X-Tenant is already sent by header metadata mapping",
+        );
+        await page.locator('#app-toast-action').click();
+
+        await expect(page.getByTestId('transit-point-target-auth-type')).toBeVisible();
         expect(saved).toHaveLength(0);
     });
 

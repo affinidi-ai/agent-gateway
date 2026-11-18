@@ -368,8 +368,9 @@ class ElementRegistry {
     const nodes: N[] = [];
 
     // IDs are deterministic everywhere: singletons use their bare type
-    // name (`access-point`, `target`, …), transit points use a 1-based
-    // counter (`transit-point-1`, …). The canvas blob layered on top
+    // name (`access-point`, `target`, …), transit points use their type
+    // and a 1-based counter (`transit-point-a2a-1`, …), or the id the
+    // canvas saved with their own `id`. The canvas blob layered on top
     // uses the same scheme, so a node and its layout always merge into
     // a single record.
     const apConfig = payload?.access_point ?? {};
