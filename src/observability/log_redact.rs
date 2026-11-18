@@ -135,6 +135,21 @@ fn is_fragment_of(
     uuid.start <= found.start && found.end <= uuid.end && found != uuid
 }
 
+/// Whether `found` is a fragment of one of `uuids`, the UUIDs of a text in order. Only the
+/// UUIDs that start at or before `found` and do not end before it can hold it, and a binary
+/// search skips the ones that end before it, so each match costs a logarithmic number of
+/// checks however many UUIDs the text holds.
+fn is_fragment_of_a_uuid(
+    found: &std::ops::Range<usize>,
+    uuids: &[std::ops::Range<usize>],
+) -> bool {
+    let first = uuids.partition_point(|uuid| uuid.end < found.start);
+    uuids[first..]
+        .iter()
+        .take_while(|uuid| uuid.start <= found.start)
+        .any(|uuid| is_fragment_of(found, uuid))
+}
+
 // ── Compiled ruleset ────────────────────────────────────────────────
 
 /// A single compiled rule: pre-compiled regex + replacement template.
@@ -200,10 +215,7 @@ impl LogRedactor {
                         let found = caps
                             .get(0)
                             .map_or(0..0, |m| m.range());
-                        if uuids
-                            .iter()
-                            .any(|uuid| is_fragment_of(&found, uuid))
-                        {
+                        if is_fragment_of_a_uuid(&found, &uuids) {
                             return caps[0].to_string();
                         }
                         let mut replaced = String::new();
@@ -550,6 +562,18 @@ impl<P: LogProcessor> LogProcessor for RedactingLogProcessor<P> {
 
 // ── Tests ───────────────────────────────────────────────────────────
 
+/// A redactor with the rules of the example gateway configuration, every one of them compiled.
+#[cfg(test)]
+pub(crate) fn example_redactor() -> Arc<LogRedactor> {
+    let example: serde_json::Value =
+        serde_json::from_str(include_str!("../../config/examples/gateway.example.json")).unwrap();
+    let config: crate::config::types::LogRedactionConfig =
+        serde_json::from_value(example["logging"]["redaction"].clone()).unwrap();
+    let redactor = LogRedactor::from_config(&config);
+    assert_eq!(redactor.rule_count(), config.rules.len(), "every example rule must compile");
+    redactor
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,12 +743,7 @@ mod tests {
 
     /// Redactor built from the `logging.redaction` rules of `gateway.example.json`.
     fn full_redactor() -> Arc<LogRedactor> {
-        let example: serde_json::Value =
-            serde_json::from_str(include_str!("../../config/examples/gateway.example.json")).unwrap();
-        let config: LogRedactionConfig = serde_json::from_value(example["logging"]["redaction"].clone()).unwrap();
-        let redactor = LogRedactor::from_config(&config);
-        assert_eq!(redactor.rule_count(), config.rules.len(), "every example rule must compile");
-        redactor
+        example_redactor()
     }
 
     // ── Category 1: Always masked (high-risk secrets) ───────────────
@@ -893,6 +912,34 @@ mod tests {
         let r = full_redactor();
         let result = r.redact("[CHANNEL:bf983d36-0281-4579-a1b2-c3d4e5f60718] Contact: +1-555-123-4567");
         assert_eq!(result.as_ref(), "[CHANNEL:bf983d36-0281-4579-a1b2-c3d4e5f60718] Contact: [REDACTED-PHONE]");
+    }
+
+    #[test]
+    fn test_a_match_is_a_uuid_fragment_only_inside_one_uuid() {
+        let uuids = [4..40, 45..81, 90..126];
+        for (found, expected) in [
+            (0..3, false),
+            (4..40, false),
+            (5..17, true),
+            (4..39, true),
+            (40..40, true),
+            (38..46, false),
+            (41..44, false),
+            (45..80, true),
+            (100..126, true),
+            (120..130, false),
+            (127..130, false),
+        ] {
+            assert_eq!(is_fragment_of_a_uuid(&found, &uuids), expected, "{found:?}");
+            assert_eq!(
+                uuids
+                    .iter()
+                    .any(|uuid| is_fragment_of(&found, uuid)),
+                expected,
+                "{found:?}"
+            );
+        }
+        assert!(!is_fragment_of_a_uuid(&(5..17), &[]));
     }
 
     #[test]

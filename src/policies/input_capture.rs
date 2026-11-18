@@ -1926,9 +1926,16 @@ mod tests {
     }
 
     fn masked(text: &str) -> (Value, std::time::Duration) {
+        masked_by(mask_credentials, text)
+    }
+
+    fn masked_by(
+        mask: impl Fn(&mut Value),
+        text: &str,
+    ) -> (Value, std::time::Duration) {
         let mut value = Value::String(text.to_string());
         let started = thread_cpu_time();
-        mask_credentials(&mut value);
+        mask(&mut value);
         (value, thread_cpu_time() - started)
     }
 
@@ -1957,11 +1964,19 @@ mod tests {
     /// build with itself, so it holds however slow the build is, coverage instrumentation
     /// included.
     fn assert_masking_is_linear(build: impl Fn(usize) -> (String, String)) {
+        assert_linear_masking_by(mask_credentials, build);
+    }
+
+    /// [`assert_masking_is_linear`] for the masking `mask` does.
+    fn assert_linear_masking_by(
+        mask: impl Fn(&mut Value),
+        build: impl Fn(usize) -> (String, String),
+    ) {
         let fastest = |scale| {
             let (text, expected) = build(scale);
             let elapsed = (0..3)
                 .map(|_| {
-                    let (value, elapsed) = masked(&text);
+                    let (value, elapsed) = masked_by(&mask, &text);
                     assert_eq!(value, Value::String(expected.clone()));
                     elapsed
                 })
@@ -1978,6 +1993,20 @@ mod tests {
         let (large, _) = fastest(scale * 8);
 
         assert!(large < small * 24, "{small:?} at scale {scale}, {large:?} at scale {}", scale * 8);
+    }
+
+    #[test]
+    fn surface_ids_are_kept_by_the_configured_redaction_rules_in_linear_time() {
+        let redactor = crate::observability::log_redact::example_redactor();
+        let id = "fb735810-d02c-4e7c-b555-123456789012 ";
+
+        assert_linear_masking_by(
+            |value| apply_redaction_rules(value, &redactor),
+            |scale| {
+                let ids = id.repeat(1_000 * scale);
+                (ids.clone(), ids)
+            },
+        );
     }
 
     #[test]
