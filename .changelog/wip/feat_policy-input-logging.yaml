@@ -31,11 +31,15 @@ changes:
         any absolute URL is redacted, as are the user name and password in any absolute URL. A JWT
         is recognised by its header decoding to a JSON object, whatever whitespace that JSON holds,
         including before its opening brace. A JWT joined to the word before it, as in CSRF=... or
-        session_..., is masked too. The deny reason and evaluation error are masked the same way as the input.
+        session_..., is masked too, and a JWT followed by a dot and more text, as in
+        <JWT>.example.com, is masked with that text. The deny reason and evaluation error are masked the same way as the input.
         A URL fragment holding name=value parameters, as an OAuth redirect's does, is masked like a
         query. The operator's log redaction rules are then applied to every captured string and to
         the reason and error, so their rules that match a value, such as credential assignments
-        in free text like password=..., agpat_ tokens and email addresses, mask captures too. Listening needs surfaces.edit and policies.edit, is checked again on each
+        in free text like password=..., agpat_ tokens and email addresses, mask captures too. Each
+        string field is also matched as a log line writes it, "name":"value", so a rule that
+        matches a field name with its value, such as the built-in quoted credential fields rule
+        for "clientsecret", masks the whole value. Listening needs surfaces.edit and policies.edit, is checked again on each
         keep-alive ping before any queued capture is sent (captures still queued when access is
         lost are discarded), and ends when the connection closes. Nothing is logged or stored, and the
         surface configuration is not changed. Policy authors can see the input structure again
@@ -48,7 +52,7 @@ changes:
         each captured policy evaluation with its slot, the name and version of the policy it ran, its
         decision and reason, and shows or copies its input to
         try in the policy Test panel. Stopping, leaving the view or reloading the page ends
-        listening. It keeps the last 50 evaluations with a filter by policy slot, says when it is
+        listening; pausing the payload capture does not, and the card keeps recording. It keeps the last 50 evaluations with a filter by policy slot, says when it is
         waiting for the dashboard connection, and says that a multi-node appliance shows only this
         node's requests. It warns how many evaluations were not shown when the surface sent them
         faster than the dashboard could receive them. On a surface with no policy yet, it says a
@@ -74,6 +78,13 @@ changes:
         records both. A refused listen records nothing. Who watched which surface's live policy
         input, and for how long, is now on record.
   changed:
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Make the Capture view's toolbar, route copy and card titles consistent
+      description: >-
+        The Capture view's Clear Payloads button is now Clear, outlined in red and titled to say it
+        clears captured payloads and policy inputs, so it no longer looks like the yellow Pause
+        button beside it, whose tooltip now says it pauses payload capture only. The Surface Route
+        copies with the dashboard's shared copy button, and every card title uses the same colour.
     - timestamp: '2026-11-17T00:00:00Z'
       title: Close a dashboard connection whose client stops reading for 10 seconds
       description: >-

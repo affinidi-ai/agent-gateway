@@ -399,6 +399,10 @@ request policy must be added first while the surface has none. It offers listeni
 see _Policy input capture_ and _Feature flags_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#policy-input-capture).
 
+The Capture view's **Clear** button clears captured payloads and policy inputs, its **Pause**
+holds the payload stream only, and its card titles share one style; see _Policy input capture_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#policy-input-capture).
+
 The Dashboard shows the metrics **Delete** button only to users with `settings.edit`; see
 _Maintenance actions_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#maintenance-actions).
 

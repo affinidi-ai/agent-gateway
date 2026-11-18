@@ -213,7 +213,8 @@ redaction, such as `token` or `api_key`), any JWT (three dot-separated base64url
 first decodes to a JSON object), and the token of any `Bearer` or `Basic`
 authorization value, also inside longer text (`Authorization: Bearer <redacted> please`). A
 JWT joined to the word before it, as in `CSRF=<redacted>` or `session_<redacted>`, is masked
-too. A `Bearer` token is one of letters, digits or `-._~+/=` that is at least 12 characters long, or at
+too, and a JWT followed by `.` and more text, as in `<JWT>.example.com` or `<JWT>.<JWT>`, is
+masked together with the dotted text after it. A `Bearer` token is one of letters, digits or `-._~+/=` that is at least 12 characters long, or at
 least 6 with a digit or one of those symbols; a `Basic` token is one that decodes as base64 to
 `user:password`. Message text such as `Basic authentication` or `Bearer arms` is kept. In every
 absolute URL in the input, query parameter names are kept and every query value becomes
@@ -231,8 +232,10 @@ another shape, such as an opaque key under a field name that is not a credential
 it is. Policies still see the full path. Headers that
 carry credentials never reach the policy input. After this masking, the operator's
 [log redaction rules](CONFIGURATION_REFERENCE.md#log-redaction) (`logging.redaction.rules`) are
-applied to every string in the input and to the deny reason and error, so a capture masks at least
-what the log masks. The built-in rules also catch credential assignments in free text
+applied to every string in the input, to each string field as a log line writes it
+(`"name":"value"`, so a rule that matches a field name with its value, such as the built-in quoted
+credential fields rule for `"clientsecret":"..."`, masks the whole value as `<redacted>`), and to
+the deny reason and error, so a capture masks at least what the log masks. The built-in rules also catch credential assignments in free text
 (`password=[REDACTED]`, `api_key: [REDACTED]`), `agpat_` tokens, PEM private keys and email
 addresses, each shown with the rule's replacement. With `logging.redaction.enabled` set to `false`
 only the masking above applies. The rules are read at startup. Message bodies, tool arguments and

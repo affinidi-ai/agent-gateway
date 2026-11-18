@@ -634,6 +634,10 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   payload history. Its header holds the **Listen to policy input** button
   (`monitoring/PolicyInputCaptureControl.tsx`), shown only on a saved surface (never while
   creating). The Monitoring view itself has only the Capture button.
+- The Capture view's toolbar holds **Pause**/**Resume** (payload capture only), **Clear**
+  (`btn-outline-danger`; it clears captured payloads and policy inputs) and **Copy All Stages**.
+  Every card title in the view is a `font-weight-bold text-primary` `h6`, and the Surface Route
+  line copies with the shared `CopyButton`.
 - The button is shown only while the `policy_input_capture` feature flag is on (see _Feature
   flags_). While it is off, the card shows no button, no empty-state hint and no no-policy note;
   an `alert alert-info` (`policy-input-capture-off`) says "Policy input capture is turned off on
@@ -681,10 +685,11 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   evaluations are kept and that one request can add several rows); a chosen slot that has
   left the list (cleared or rolled off) falls back to all slots. With none it says to
   listen and send a request, and that on an appliance with several nodes only requests served by
-  this dashboard's node show. Pause and Clear Payloads apply to it too. When the gateway reports
+  this dashboard's node show. Clear applies to it too; Pause holds only the payload
+  stream, so the card keeps every evaluation of a listen while payloads are paused. When the gateway reports
   captures it dropped for this dashboard (`policy_input_skipped`), a warning alert
   (`policy-input-capture-skipped`) above the list says how many evaluations were not shown;
-  Clear Payloads resets it. The header stacks
+  Clear resets it. The header stacks
   the title and count badge, then a warning line (`text-warning` with a triangle icon,
   `policy-input-capture-warning`): "For developing and testing policies only", then the muted
   hint line; the Listen control sits on the right.

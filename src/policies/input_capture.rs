@@ -448,15 +448,23 @@ fn mask_outcome_text(text: &str) -> String {
 }
 
 /// Apply the operator's log redaction rules (`logging.redaction.rules`) to every string
-/// in `value`, so the rules that match a value on its own mask captures too.
+/// in `value`. A string field is also matched as the log line shows it, `"<key>":"<value>"`,
+/// so a rule that matches a field name with its value, such as the built-in quoted
+/// credential fields rule, masks the whole value.
 fn apply_redaction_rules(
     value: &mut Value,
     redactor: &crate::observability::LogRedactor,
 ) {
     match value {
-        Value::Object(map) => map
-            .values_mut()
-            .for_each(|entry| apply_redaction_rules(entry, redactor)),
+        Value::Object(map) => {
+            for (key, entry) in map.iter_mut() {
+                if matches!(entry, Value::String(text) if field_is_redacted(key, text, redactor)) {
+                    *entry = Value::String(REDACTED.to_string());
+                } else {
+                    apply_redaction_rules(entry, redactor);
+                }
+            }
+        }
         Value::Array(items) => items
             .iter_mut()
             .for_each(|item| apply_redaction_rules(item, redactor)),
@@ -467,6 +475,29 @@ fn apply_redaction_rules(
         }
         _ => {}
     }
+}
+
+/// Whether a redaction rule that needs the field's name changes its value: the field written
+/// as JSON, `"<key>":"<value>"`, redacts differently from the value redacted on its own. A
+/// rule that changes only the key doesn't count.
+fn field_is_redacted(
+    key: &str,
+    text: &str,
+    redactor: &crate::observability::LogRedactor,
+) -> bool {
+    let key = format!("{}:", Value::String(key.to_string()));
+    let redacted_field = redactor
+        .redact(&format!("{key}{}", Value::String(text.to_string())))
+        .into_owned();
+    let redacted_value = format!(
+        "{key}{}",
+        Value::String(
+            redactor
+                .redact(text)
+                .into_owned()
+        )
+    );
+    redacted_field != redacted_value && redacted_field.starts_with(&key)
 }
 
 /// Replace every credential in `value` with [`REDACTED`]: the value of a key named like a
@@ -500,7 +531,8 @@ pub fn mask_credentials(value: &mut Value) {
 /// to `IA`, `IC`, `IH`, `CQ`, `CS`, `CX`, `Cg`, `Ci`, `Cn`, `DQ`, `DS` or `DX`. The header
 /// takes `=` only as trailing padding, so `CSRF=` in front of a JWT is not part of it. A
 /// word joined to the header by `-`, `_` or `.`, as in `session_`, is matched with it, and
-/// [`header_start`] finds where in that run the header starts. The payload is the third group.
+/// [`header_start_before_last_dot`] or [`header_start`] finds where in that run the header
+/// starts. The payload is the third group.
 static EMBEDDED_JWT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"\b([A-Za-z0-9_.-]*[-_.])?((?:e[wy]|I[ACH]|C[QSXgin]|D[QSX])[A-Za-z0-9_-]+={0,2})\.([A-Za-z0-9_=-]+)\.[A-Za-z0-9_=-]*(?:~[A-Za-z0-9_=.-]*)*",
@@ -530,6 +562,25 @@ fn header_start(lead: &str) -> Option<usize> {
         })
         .take(MAX_HEADER_STARTS)
         .find(|&start| is_jwt_header(&lead[start..]))
+}
+
+/// Where a JWT starts in `lead` when its header is a `.`-separated segment before the last,
+/// as in `<JWT>.Cisco.com.au` or `<JWT>.<JWT>`, whose candidate starts at the first JWT.
+/// Segments are tried from the left with [`header_start`], and one counts only when the
+/// segment after it is not empty. The last segment is [`header_start`]'s own case.
+fn header_start_before_last_dot(lead: &str) -> Option<usize> {
+    let mut segments = lead.split('.').peekable();
+    let mut offset = 0;
+    while let Some(segment) = segments.next() {
+        let next = segments.peek()?;
+        if !next.is_empty()
+            && let Some(start) = header_start(segment)
+        {
+            return Some(offset + start);
+        }
+        offset += segment.len() + 1;
+    }
+    None
 }
 
 /// `Bearer` or `Basic`, whitespace and the token after it, anywhere in a text.
@@ -583,7 +634,7 @@ fn mask_text(text: &str) -> Option<String> {
                 .get(1)
                 .map_or("", |glue| glue.as_str());
             let lead = format!("{glue}{}", &caps[2]);
-            match header_start(&lead) {
+            match header_start_before_last_dot(&lead).or_else(|| header_start(&lead)) {
                 Some(start) => format!("{}{REDACTED}", &lead[..start]),
                 None if is_jwt_header(&caps[3]) => REDACTED.to_string(),
                 None => caps[0].to_string(),
@@ -1518,6 +1569,44 @@ mod tests {
     }
 
     #[test]
+    fn a_field_the_log_masks_by_its_name_is_masked_in_the_capture() {
+        let _listening = listening("input-capture-field-rules");
+        let input = json!({
+            "channel": { "config_id": "input-capture-field-rules" },
+            "mcp": { "arguments": {
+                "clientsecret": "s3cr3t-value",
+                "accesstoken": "opaque-value",
+                "APIToken": "api-value",
+                "note": "kept text",
+                "contact": "alice@example.test",
+            } },
+        });
+
+        let update = update_json(
+            begin("surface", "input-capture-field-rules", &input, Vec::new)
+                .unwrap()
+                .into_update(Ok((true, None))),
+        );
+
+        let arguments = &update["input"]["mcp"]["arguments"];
+        assert_eq!(arguments["clientsecret"], REDACTED);
+        assert_eq!(arguments["accesstoken"], REDACTED);
+        assert_eq!(arguments["APIToken"], REDACTED);
+        assert_eq!(arguments["note"], "kept text");
+        assert_eq!(arguments["contact"], "[REDACTED-EMAIL]");
+        assert_eq!(update["input"]["channel"]["config_id"], "input-capture-field-rules");
+    }
+
+    #[test]
+    fn a_rule_that_changes_only_a_field_name_leaves_its_value() {
+        let redactor = crate::observability::opentelemetry::log_redactor();
+        assert!(!field_is_redacted("alice@example.test", "kept", &redactor));
+        assert!(field_is_redacted("clientsecret", "s3cr3t", &redactor));
+        assert!(!field_is_redacted("note", "kept", &redactor));
+        assert!(!field_is_redacted("path", "/a2a/agent?token=t-secret", &redactor));
+    }
+
+    #[test]
     fn a_url_with_an_apostrophe_still_has_its_query_masked() {
         let mut input = json!({
             "a2a": { "parts": [
@@ -1626,6 +1715,12 @@ mod tests {
                 format!("the cookie session_{REDACTED} expired"),
             ),
             (format!("the token {JWT}~WyJzIiwibiJd~ expired"), format!("the token {REDACTED} expired")),
+            (format!("token {JWT}.Cisco.com.au"), format!("token {REDACTED}")),
+            (format!("token {spaced}.Cisco.com.au"), format!("token {REDACTED}")),
+            (format!("Cisco.{spaced}.Cisco.com.au"), format!("Cisco.{REDACTED}")),
+            (format!("session_{spaced}.Cisco.com.au"), format!("session_{REDACTED}")),
+            (format!("{JWT}.{JWT}"), REDACTED.to_string()),
+            (format!("{spaced}.{spaced} expired"), format!("{REDACTED} expired")),
         ];
         for (text, expected) in cases {
             let (value, _) = masked(&text);
@@ -1780,7 +1875,7 @@ mod tests {
 
     #[test]
     fn a_jwt_after_a_long_glued_run_is_masked_in_linear_time() {
-        for unit in ["a-", "a-Ci-"] {
+        for unit in ["a-", "a-Ci-", "Ci-a.", "eyJh-Ci."] {
             assert_masking_is_linear(|scale| {
                 let glue = unit.repeat(3_000 * scale);
                 (format!("{glue}{JWT}"), format!("{glue}{REDACTED}"))

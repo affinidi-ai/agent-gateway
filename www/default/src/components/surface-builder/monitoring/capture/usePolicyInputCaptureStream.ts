@@ -31,22 +31,17 @@ export const MAX_POLICY_INPUTS = 50;
  * Subscribes to `policy_input_captured` ws-message custom events for the surface
  * `configId` and keeps the last `MAX_POLICY_INPUTS`, newest first, and counts the
  * evaluations `policy_input_skipped` says the gateway dropped for this dashboard.
- * Nothing is kept while `paused`.
+ * The payload stream's Pause doesn't apply: every evaluation of a listen is kept.
  */
-export function usePolicyInputCaptureStream(configId: string, paused: boolean) {
+export function usePolicyInputCaptureStream(configId: string) {
   const [captures, setCaptures] = useState<CapturedPolicyInput[]>([]);
   const [skipped, setSkipped] = useState(0);
-  const pausedRef = useRef(paused);
   const nextId = useRef(0);
-
-  useEffect(() => {
-    pausedRef.current = paused;
-  }, [paused]);
 
   useEffect(() => {
     const handler = (event: Event) => {
       const data = (event as CustomEvent).detail;
-      if (!data || data.config_id !== configId || pausedRef.current) return;
+      if (!data || data.config_id !== configId) return;
       if (data.type === 'policy_input_skipped') {
         const count = Number(data.skipped);
         if (Number.isFinite(count) && count > 0) setSkipped(total => total + count);

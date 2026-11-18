@@ -23,8 +23,8 @@ beforeEach(() => {
   mockCaptureFlag = { enabled: true, loaded: true };
 });
 
-const Harness: React.FC<{ paused?: boolean }> = ({ paused = false }) => {
-  const { captures, skipped } = usePolicyInputCaptureStream('surface-1', paused);
+const Harness: React.FC = () => {
+  const { captures, skipped } = usePolicyInputCaptureStream('surface-1');
   return <PolicyInputCaptureCard captures={captures} skipped={skipped} />;
 };
 
@@ -304,11 +304,5 @@ describe('PolicyInputCaptureCard', () => {
     expect(screen.getByTestId('policy-input-capture-skipped')).toHaveTextContent(
       '5 policy evaluations were not shown'
     );
-  });
-
-  it('keeps nothing while paused', () => {
-    render(<Harness paused />);
-    captured({});
-    expect(screen.queryByTestId('policy-input-capture-row')).not.toBeInTheDocument();
   });
 });

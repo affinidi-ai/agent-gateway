@@ -20,6 +20,8 @@ const TURNED_OFF: &str = "policy input capture is turned off";
 /// Why a listen is stopped once the operator's dashboard session ends.
 const SESSION_ENDED: &str = "your dashboard session has ended; sign in again";
 
+const PERMISSION_MISSING: &str = "needs surfaces.edit and policies.edit";
+
 /// Open the dashboard WebSocket as `operator`, once.
 async fn watch(
     world: &mut SurfaceWorld,
@@ -289,7 +291,7 @@ async fn named_operator_may_not_listen(
         .get(&operator)
         .unwrap_or_else(|| panic!("operator '{operator}' must have asked to listen to policy input"));
     assert_eq!(answer["listening"], false, "{answer}");
-    assert_eq!(answer["error"], "needs surfaces.edit and policies.edit", "{answer}");
+    assert_eq!(answer["error"], PERMISSION_MISSING, "{answer}");
 }
 
 #[when(expr = "the dashboard session of operator {string} ends")]
@@ -342,6 +344,36 @@ async fn operator_told_listening_stopped(
     surface_name: String,
 ) {
     wait_until_told_listening_stopped(world, &operator, &surface_name, SESSION_ENDED).await;
+}
+
+#[when(expr = "an administrator changes the role of operator {string} to {string}")]
+async fn administrator_changes_operator_role(
+    world: &mut SurfaceWorld,
+    operator: String,
+    role: String,
+) {
+    let admin = client(world, None).await;
+    let users = admin
+        .send_recorded_json(reqwest::Method::GET, "/v1/users", None::<&Value>)
+        .await
+        .expect("list the users");
+    assert!(users.status < 300, "listing the users: {}", users.body);
+    let user_id = users
+        .body
+        .as_array()
+        .and_then(|listed| {
+            listed
+                .iter()
+                .find(|user| user["username"] == operator.as_str())
+        })
+        .and_then(|user| user["user_id"].as_str())
+        .unwrap_or_else(|| panic!("operator '{operator}' must be a user: {}", users.body))
+        .to_string();
+    let changed = admin
+        .send_recorded_json(reqwest::Method::PUT, &format!("/v1/users/{user_id}"), Some(&json!({ "role": role })))
+        .await
+        .expect("change the operator's role");
+    assert!(changed.status < 300, "changing the role of operator '{operator}': {}", changed.body);
 }
 
 /// Turn policy input capture on or off: at once on a running gateway, or as soon as the admin
