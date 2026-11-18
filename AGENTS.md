@@ -295,6 +295,12 @@ identity, in the warning tone; a card refused for its identity names the identit
 _Agent Cards tab_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#agent-cards-tab).
 
+The read-only Agents page at `/agent-registry` needs `surfaces.view` and lists one row per managed
+agent, built by the gateway from the surfaces that target it; MCP surfaces are left out and no
+status is shown. Its Agent Card tab shows the card the gateway serves for Direct, Proxied and
+Fabric routes with a **Card source** row; see _Agents page_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#agents-page).
+
 The Identities page shows one row per surface Managed Agent, with its earlier DIDs (from its
 responses and from its Transit Points) and certificate or API key rotations listed as
 versions in the expanded row, each earlier DID with its own actions; rows carry only

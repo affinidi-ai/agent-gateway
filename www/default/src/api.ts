@@ -19,6 +19,8 @@ import {
   Task,
   TruncateLogsResult,
   TruncateMetricsResult,
+  TrustRecorderReason,
+  TrustRecorderState,
   TrustRecorderStatus,
   TrustRegistry,
   SurfacePaymentPolicy,
@@ -27,6 +29,7 @@ import {
 } from './types';
 
 // Agent Surface types
+import type { SurfaceProtocol } from './generated/SurfaceProtocol';
 import type { SurfaceStatus } from './generated/SurfaceStatus';
 import { extractErrorCode, formatApiError } from './utils/apiError';
 import { parseWarningHeader } from './utils/warningHeader';
@@ -87,6 +90,106 @@ export interface LimitItem {
   limit: number;
   current: number;
 }
+
+/** How the gateway reaches an agent, from its `target.endpoint` scheme. */
+export type AgentRuntime = 'url' | 'a2a-proxy' | 'gateway';
+
+/** `recorded`: at least one of the agent's identities was recorded to a trust registry. */
+/**
+ * The best Trust Recorder outcome of one identity in one Trust Registry. `trust_registry_name`
+ * is `null` when the viewer may not see that registry.
+ */
+export interface AgentRegistryOutcome {
+  trust_registry_id: string;
+  trust_registry_name: string | null;
+  did: string;
+  state: TrustRecorderState;
+  reason: TrustRecorderReason | null;
+}
+
+export interface AgentTrustRegistry {
+  recorded: boolean;
+  /** On the agent details only; absent in the list and when there is no outcome. */
+  registries?: AgentRegistryOutcome[];
+}
+
+export interface AgentSurfaceRef {
+  surface_id: string;
+  name: string;
+}
+
+/** `surface`: the surface's own agent DID. `managed`: a managed identity used on a surface. */
+export interface AgentIdentity {
+  did: string;
+  created_at: string | null;
+  source: 'surface' | 'managed';
+}
+
+/** One managed agent of GET /v1/agents, across every surface that targets it. `id` is opaque. */
+export interface AgentRecord {
+  id: string;
+  name: string | null;
+  protocol: SurfaceProtocol;
+  runtime: AgentRuntime;
+  endpoint: string;
+  tags: string[];
+  surfaces: AgentSurfaceRef[];
+  identities: AgentIdentity[];
+  trust_registry: AgentTrustRegistry;
+  last_activity_at: string | null;
+  /** The name of the A2A proxy or remote gateway the endpoint names; `null` when unknown. */
+  target_name?: string | null;
+}
+
+/** GET /v1/agents. `window_minutes` is the metrics retention window of `last_activity_at`. */
+export interface AgentListResponse {
+  agents: AgentRecord[];
+  window_minutes: number;
+}
+
+export interface AgentSurfaceSummary extends AgentSurfaceRef {
+  protocol: SurfaceProtocol;
+  route: string;
+  /** The URL callers reach the surface at; `null` when no listener has an external URL. */
+  public_url?: string | null;
+}
+
+/** Request totals over the metrics retention window (`window_minutes`). */
+export interface AgentTraffic {
+  window_minutes: number;
+  total_requests: number;
+  failed: number;
+  gateway_faults: number;
+  p95_latency_ms: number | null;
+}
+
+export interface AgentDetails extends AgentRecord {
+  surfaces: AgentSurfaceSummary[];
+  traffic: AgentTraffic;
+}
+
+/** How the gateway obtains the card it serves for an agent, from the agent's runtime. */
+export type AgentCardSource = 'fetched' | 'generated' | 'remote_gateway';
+
+/**
+ * The card the gateway serves for the agent, as callers get it, read through `surface_id`.
+ * `upstream_card` is the card before this gateway rewrote it (absent for a generated card).
+ * `card_surface_ids` lists the surfaces the card can be read through. Untrusted and not verified.
+ */
+export type AgentCardResponse =
+  | {
+      available: true;
+      card: unknown;
+      source: AgentCardSource;
+      surface_id?: string;
+      upstream_card?: unknown;
+      card_surface_ids?: string[];
+    }
+  | {
+      available: false;
+      reason: 'no_agent_card' | 'not_running' | 'operator_only';
+      card_surface_ids?: string[];
+    };
 
 class SessionManager {
   private static readonly YES_VALUE = '1';
@@ -556,6 +659,20 @@ class APIClient {
   // Appliance resource limits
   async getLimits(): Promise<LimitItem[]> {
     return this.request<LimitItem[]>('/limits');
+  }
+
+  // Agents (read-only)
+  async listAgents(): Promise<AgentListResponse> {
+    return this.request<AgentListResponse>('/agents');
+  }
+
+  async getAgent(id: string): Promise<AgentDetails> {
+    return this.request<AgentDetails>(`/agents/${encodeURIComponent(id)}`);
+  }
+
+  async getAgentCard(id: string, surfaceId?: string): Promise<AgentCardResponse> {
+    const query = surfaceId ? `?surface_id=${encodeURIComponent(surfaceId)}` : '';
+    return this.request<AgentCardResponse>(`/agents/${encodeURIComponent(id)}/agent-card${query}`);
   }
 
   // Agent Surfaces

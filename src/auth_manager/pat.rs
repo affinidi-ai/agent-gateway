@@ -67,7 +67,7 @@ pub enum PathScope {
     Unscoped,
 }
 
-const HANDLER_ENFORCED_FAMILIES: &[&str] = &["secrets", "api-keys", "certificates"];
+const HANDLER_ENFORCED_FAMILIES: &[&str] = &["secrets", "api-keys", "certificates", "agents"];
 
 fn classify_special_family(
     name: &str,
@@ -83,8 +83,11 @@ fn classify_special_family(
         | ("api-keys", [])
         | ("api-keys", [_])
         | ("api-keys", [_, _])
-        | ("api-keys", [_, _, "revoke" | "rotate"]) => Some(PathScope::HandlerEnforced),
-        ("secrets" | "certificates" | "api-keys", _) => Some(PathScope::DenyScoped),
+        | ("api-keys", [_, _, "revoke" | "rotate"])
+        | ("agents", [])
+        | ("agents", [_])
+        | ("agents", [_, "agent-card"]) => Some(PathScope::HandlerEnforced),
+        ("secrets" | "certificates" | "api-keys" | "agents", _) => Some(PathScope::DenyScoped),
         ("delegation-vault", ["connects"]) | ("delegation-vault", ["connects", _, "complete"]) => {
             Some(PathScope::HandlerEnforced)
         }
@@ -301,6 +304,17 @@ mod tests {
             assert_eq!(classify_resource_path(path), PathScope::Unscoped, "{path}");
         }
         assert_eq!(ResourceKind::from_path_family("delegation-vault"), Some(ResourceKind::DelegationVault));
+    }
+
+    #[test]
+    fn agent_routes_are_handler_enforced_over_listed_surfaces() {
+        for path in ["/api/v1/agents", "/api/v1/agents/9f2c", "/api/v1/agents/9f2c/agent-card", "/v1/agents/9f2c"] {
+            assert_eq!(classify_resource_path(path), PathScope::HandlerEnforced, "{path}");
+        }
+        for path in ["/v1/agents/id/future-action", "/v1/agents/id/agent-card/refresh"] {
+            assert_eq!(classify_resource_path(path), PathScope::DenyScoped, "{path}");
+        }
+        assert_eq!(ResourceKind::from_path_family("agents"), None);
     }
 
     #[test]

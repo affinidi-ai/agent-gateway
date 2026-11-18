@@ -361,6 +361,12 @@ may discover only with its own tenant's secrets: an appliance-wide secret is ref
 another tenant's, with `400` "Target auth secret is not accessible", whatever
 `tenant_credential_isolation` says, because discovery sends the secret to an endpoint the
 caller chose and stores nothing.
+`GET /v1/agents`, `GET /v1/agents/{id}` and `GET /v1/agents/{id}/agent-card` are
+handler-enforced over Surfaces: an agent groups the surfaces that target the same managed
+agent, and its id is an opaque hash of that target. Each handler groups only the surfaces the
+token can list, matching a PAT's resource pattern against `TENANT:{tenant}:surfaces:{id}` per
+surface, so a group never includes another tenant's or an out-of-scope surface, and an id no
+listed surface produces returns `404`.
 
 Ownership changes are administrator-only: `GET
 /v1/tenant-ownership/{kind}/{id}/impact` reports incoming/outgoing references and

@@ -403,6 +403,7 @@ pub fn is_public_request(
 /// during preparation, so keep the declaration on one line.
 const SPA_RESERVED_TOP_LEVEL: &[&str] = &[
     "access-tokens",
+    "agent-registry",
     "api-keys",
     "apikeys",
     "audit",

@@ -1,0 +1,162 @@
+.agents-row {
+  cursor: pointer;
+}
+
+.agents-row-chevron {
+  width: 1%;
+  color: var(--gray-400);
+}
+
+.agents-row:hover .agents-row-chevron,
+.agents-row:focus-visible .agents-row-chevron {
+  color: var(--accent-blue);
+}
+
+body.dark-theme .agents-row-chevron {
+  color: var(--dark-text-muted);
+}
+
+.agents-name {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--gray-800);
+}
+
+body.dark-theme .agents-name {
+  color: var(--dark-text-heading);
+}
+
+.agent-preview-head {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.agent-preview-avatar {
+  display: inline-flex;
+  flex: 0 0 44px;
+  align-items: center;
+  justify-content: center;
+  height: 44px;
+  font-size: 20px;
+  color: var(--gray-0);
+  background: var(--accent-blue);
+  border-radius: var(--radius-lg);
+}
+
+.agent-preview-title {
+  min-width: 0;
+}
+
+.agent-preview-name {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--gray-800);
+  overflow-wrap: anywhere;
+}
+
+.agent-preview-description {
+  font-size: 13px;
+  color: var(--gray-600);
+  overflow-wrap: anywhere;
+}
+
+.agent-preview-rows {
+  display: grid;
+  grid-template-columns: minmax(120px, max-content) 1fr;
+  gap: 6px 16px;
+  margin: 0;
+}
+
+.agent-preview-rows dt {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--gray-500);
+}
+
+.agent-preview-rows dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.agent-preview-skills,
+.agent-preview-gateway {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--gray-200);
+}
+
+.agent-preview-changes {
+  --bs-table-border-color: var(--gray-200);
+}
+
+/* Inline `code` reserves no space for its vertical padding, so the "Was" chip overlaps the
+   value above it. `inline-block` gives each chip a real box; a long value wraps inside it. */
+.agent-preview-changes td code {
+  display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.agent-preview-change-field {
+  font-weight: 600;
+  color: var(--gray-800);
+}
+
+.agent-card-json {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.agent-preview-skills-title,
+.agent-preview-section-title {
+  margin-bottom: 10px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--gray-800);
+}
+
+.agent-preview-skill-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-preview-skill-description {
+  font-size: 13px;
+  color: var(--gray-600);
+  overflow-wrap: anywhere;
+}
+
+body.dark-theme .agent-preview-name,
+body.dark-theme .agent-preview-skills-title,
+body.dark-theme .agent-preview-section-title {
+  color: var(--dark-text-heading);
+}
+
+body.dark-theme .agent-preview-description,
+body.dark-theme .agent-preview-skill-description,
+body.dark-theme .agent-preview-rows dt {
+  color: var(--dark-text-muted);
+}
+
+body.dark-theme .agent-preview-skills,
+body.dark-theme .agent-preview-gateway {
+  border-top-color: var(--dark-border);
+}
+
+body.dark-theme .agent-preview-changes {
+  --bs-table-border-color: var(--dark-border);
+}
+
+body.dark-theme .agent-preview-changes th,
+body.dark-theme .agent-preview-changes td {
+  border-color: var(--dark-border);
+}
+
+body.dark-theme .agent-preview-changes .agent-preview-change-field {
+  color: var(--dark-text-heading);
+}
