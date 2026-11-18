@@ -1,0 +1,37 @@
+branch: feat/ftl-31325-verify-proof-purpose
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-17T14:21:50Z'
+      title: Verify against the repaired gateway DID document at once, not after an hour
+      description: >-
+        Once an Active node has repaired the gateway DID document, or finds another node already
+        did, it removes the gateway DID and its did:web DID from its DID resolver cache; it waits
+        while another node still holds the gateway DID lock, so the old document is not cached
+        again. Before, the node could verify credentials against the cached pre-repair document,
+        which does not list the signing key, for up to an hour.
+  removed: []
+  security: []
+  breaking:
+    - timestamp: '2026-11-17T14:38:03Z'
+      title: ⭐ Reject presentations whose signing key is not allowed for the proof purpose
+      description: >-
+        Every presentation the gateway verifies, and every credential in it, must now be signed
+        with a key the signer's DID document lists under the proof's purpose: assertionMethod for
+        a credential, assertionMethod or authentication for the presentation. Before, any key in
+        the document was accepted. The check always runs and has no setting. A presentation that
+        fails it is rejected like one with a bad signature and counted in
+        agent_gateway_proof_purpose_mismatch_total: the request carries no caller identity, so
+        policies and Trust Checks that require one refuse it. Where this can occur: (1) Fabric
+        calls from a peer gateway on v1.0.9 or earlier whose gateway DID was created before
+        v1.0.9, since its DID document lists its signing key (#key-2) under no relationship and
+        the credentials it issues for its agents are rejected; once the peer upgrades to this
+        release it repairs its DID document on its next Active start, and this gateway fetches
+        the repaired document at the next refused presentation, at most once a minute per
+        signer; (2) agents, clients or partner gateways that present credentials signed with a
+        key their DID document lists only under authentication or keyAgreement, or that declare
+        another proof purpose; (3) the same presentations in connection point messages, A2A and
+        MCP identity extensions, Trust Check context and STS token exchange subject tokens.
+        Upgrade peer gateways before or together with this release, and watch the counter after
+        upgrading.

@@ -589,7 +589,26 @@ async fn repair_and_sync_gateway_did(
     issuer: &crate::identity::VCIssuer,
     storage: &Arc<dyn crate::storage::DidLogStorage>,
 ) {
-    repair_and_sync_gateway_did_within(issuer, storage, GATEWAY_DID_REPAIR_LOCK_TIMEOUT).await;
+    let resolver = crate::gateways::did_cache::try_shared_resolver().map(|resolver| resolver.as_ref());
+    repair_sync_and_evict_gateway_did(issuer, storage, GATEWAY_DID_REPAIR_LOCK_TIMEOUT, resolver).await;
+}
+
+/// Repairs the gateway DID and syncs the resolver index, then removes the gateway DIDs from
+/// `resolver`'s cache, unless the node is Standby or another node still holds the gateway DID
+/// lock: that node may not have written the repair yet, and evicting now would cache the
+/// pre-repair document again.
+#[cfg(feature = "didwebvh")]
+async fn repair_sync_and_evict_gateway_did(
+    issuer: &crate::identity::VCIssuer,
+    storage: &Arc<dyn crate::storage::DidLogStorage>,
+    lock_timeout: std::time::Duration,
+    resolver: Option<&affinidi_did_resolver_cache_sdk::DIDCacheClient>,
+) {
+    if repair_and_sync_gateway_did_within(issuer, storage, lock_timeout).await
+        && let Some(resolver) = resolver
+    {
+        evict_gateway_did_from_resolver_cache(issuer, resolver).await;
+    }
 }
 
 /// A gateway DID document that already lists the signing key, with an index that holds its
@@ -597,27 +616,28 @@ async fn repair_and_sync_gateway_did(
 /// DID lock, so two nodes Active at once repair the gateway DID and sync the index one after
 /// the other, and the second finds nothing left to do. A volume
 /// without the lock runs both unlocked, as before the lock; a lock held past `lock_timeout`
-/// leaves both to the holder and to the next start or promotion.
+/// leaves both to the holder and to the next start or promotion. Returns whether the gateway DID
+/// document is settled: false on a Standby node and while another node holds the lock.
 #[cfg(feature = "didwebvh")]
 async fn repair_and_sync_gateway_did_within(
     issuer: &crate::identity::VCIssuer,
     storage: &Arc<dyn crate::storage::DidLogStorage>,
     lock_timeout: std::time::Duration,
-) {
+) -> bool {
     use crate::storage::file_lock::LockOutcome;
 
     if crate::server::mode::is_standby() {
-        return;
+        return false;
     }
     if gateway_did_is_current(issuer, storage).await {
         debug!("Gateway DID document and resolver index are up to date; nothing to repair");
-        return;
+        return true;
     }
     let lock = issuer
         .lock_gateway_did(lock_timeout)
         .await;
     if crate::server::mode::is_standby() {
-        return;
+        return false;
     }
     match &lock {
         LockOutcome::Acquired(_) => {}
@@ -629,7 +649,7 @@ async fn repair_and_sync_gateway_did_within(
                 "Timed out waiting for the gateway DID lock; the gateway DID repair and its resolver index update run \
                  again on the next start or promotion"
             );
-            return;
+            return false;
         }
     }
     if let Err(e) = issuer
@@ -646,7 +666,7 @@ async fn repair_and_sync_gateway_did_within(
         Ok(did) => did,
         Err(e) => {
             warn!("Could not read the gateway DID; the resolver index is left as it is: {e:#}");
-            return;
+            return true;
         }
     };
     if gateway_did.starts_with("did:webvh:") && !crate::server::mode::is_standby() {
@@ -655,6 +675,25 @@ async fn repair_and_sync_gateway_did_within(
             .await
             .join("did.jsonl");
         sync_gateway_did_log(storage, &gateway_did, &log_src).await;
+    }
+    !crate::server::mode::is_standby()
+}
+
+/// Removes the gateway DIDs from `resolver`'s cache, so it resolves the gateway DID document as now
+/// published, whichever node repaired it and whether or not this repair ran.
+#[cfg(feature = "didwebvh")]
+async fn evict_gateway_did_from_resolver_cache(
+    issuer: &crate::identity::VCIssuer,
+    resolver: &affinidi_did_resolver_cache_sdk::DIDCacheClient,
+) {
+    for id in issuer.gateway_did_ids().await {
+        if resolver
+            .remove(&id)
+            .await
+            .is_some()
+        {
+            debug!("Removed {id} from the resolver cache after the gateway DID repair");
+        }
     }
 }
 
@@ -5353,6 +5392,139 @@ mod tests {
             indexed_assertion_method(&storage, &did).await,
             vec![format!("{did}#key-1"), format!("{did}#key-2")]
         );
+    }
+
+    #[cfg(feature = "didwebvh")]
+    async fn resolver_caching_gateway_did(
+        issuer: &crate::identity::VCIssuer
+    ) -> (affinidi_did_resolver_cache_sdk::DIDCacheClient, Vec<String>) {
+        use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+        let resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .unwrap();
+        let document: affinidi_did_common::Document = serde_json::from_str(
+            &std::fs::read_to_string(
+                issuer
+                    .get_storage_path()
+                    .await
+                    .join("did.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let ids = issuer.gateway_did_ids().await;
+        for id in &ids {
+            resolver
+                .get_cache()
+                .insert(DIDCacheClient::hash_did(id), document.clone())
+                .await;
+        }
+        (resolver, ids)
+    }
+
+    #[cfg(feature = "didwebvh")]
+    async fn cached_ids(
+        resolver: &affinidi_did_resolver_cache_sdk::DIDCacheClient,
+        ids: &[String],
+    ) -> Vec<String> {
+        let mut cached = Vec::new();
+        for id in ids {
+            let hash = affinidi_did_resolver_cache_sdk::DIDCacheClient::hash_did(id);
+            if resolver
+                .get_cache()
+                .get(&hash)
+                .await
+                .is_some()
+            {
+                cached.push(id.clone());
+            }
+        }
+        cached
+    }
+
+    #[cfg(feature = "didwebvh")]
+    async fn repair_with_cache(
+        issuer: &crate::identity::VCIssuer,
+        mode: crate::server::mode::ServerMode,
+        lock_timeout: std::time::Duration,
+    ) -> Vec<String> {
+        let (resolver, ids) = resolver_caching_gateway_did(issuer).await;
+        assert_eq!(cached_ids(&resolver, &ids).await, ids);
+        let index_dir = tempfile::tempdir().unwrap();
+        crate::server::mode::in_test_mode(
+            mode,
+            super::repair_sync_and_evict_gateway_did(issuer, &index(index_dir.path()), lock_timeout, Some(&resolver)),
+        )
+        .await;
+        cached_ids(&resolver, &ids).await
+    }
+
+    /// A repair removes the gateway DID and its parallel did:web DID from the resolver cache, so
+    /// the node verifies against the repaired document instead of the one it cached before.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn repair_evicts_the_gateway_did_from_the_resolver_cache() {
+        let (issuer, _keys) = crate::identity::test_helpers::test_vc_issuer_without_assertion_multikey().await;
+        assert_eq!(
+            issuer
+                .gateway_did_ids()
+                .await
+                .len(),
+            2,
+            "a did:webvh gateway has a parallel did:web DID"
+        );
+
+        let cached =
+            repair_with_cache(&issuer, crate::server::mode::ServerMode::Active, std::time::Duration::from_secs(5))
+                .await;
+
+        assert!(cached.is_empty(), "still cached: {cached:?}");
+    }
+
+    /// A node whose document another node already repaired still drops the copy it cached before.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn already_repaired_gateway_evicts_the_gateway_did_from_the_resolver_cache() {
+        let (issuer, _keys) = crate::identity::test_helpers::test_vc_issuer().await;
+
+        let cached =
+            repair_with_cache(&issuer, crate::server::mode::ServerMode::Active, std::time::Duration::from_secs(5))
+                .await;
+
+        assert!(cached.is_empty(), "still cached: {cached:?}");
+    }
+
+    /// While another node holds the gateway DID lock it may not have written the repair yet, so
+    /// the cached document stays rather than being resolved again before the repair lands.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn repair_waiting_for_the_lock_holder_keeps_the_resolver_cache() {
+        let (issuer, _keys) = crate::identity::test_helpers::test_vc_issuer_without_assertion_multikey().await;
+        let crate::storage::file_lock::LockOutcome::Acquired(_held) = issuer
+            .lock_gateway_did(std::time::Duration::ZERO)
+            .await
+        else {
+            panic!("the lock must be free");
+        };
+
+        let cached =
+            repair_with_cache(&issuer, crate::server::mode::ServerMode::Active, std::time::Duration::from_millis(50))
+                .await;
+
+        assert_eq!(cached, issuer.gateway_did_ids().await);
+    }
+
+    /// A Standby node serves no traffic and repairs nothing, so it leaves its resolver cache alone.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn standby_node_leaves_its_resolver_cache_alone() {
+        let (issuer, _keys) = crate::identity::test_helpers::test_vc_issuer().await;
+
+        let cached =
+            repair_with_cache(&issuer, crate::server::mode::ServerMode::Standby, std::time::Duration::from_secs(5))
+                .await;
+
+        assert_eq!(cached, issuer.gateway_did_ids().await);
     }
 
     /// A Standby node shares storage with the Active node, so it leaves the gateway DID log and
