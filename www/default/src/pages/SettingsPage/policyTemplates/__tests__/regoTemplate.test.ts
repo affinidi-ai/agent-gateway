@@ -104,6 +104,8 @@ describe('renderTemplate setting checks', () => {
 
   it('writes a time zone in its canonical spelling and refuses an unknown one', () => {
     expect(fill({ time_zone: 'asia/singapore' }).rego).toContain('"Asia/Singapore"');
+    expect(fill({ time_zone: '+01:00' }).errors.time_zone).toBeDefined();
+    expect(fill({ time_zone: '-08:00' }).errors.time_zone).toBeDefined();
     expect(fill({ time_zone: 'Mars/Olympus' }).errors.time_zone).toBe(
       'Enter an IANA time zone, for example Europe/Berlin.'
     );
@@ -270,6 +272,18 @@ allow if input.jwt.role in {"admin"}
     const result = insertTemplateRules(existing, 'Evil\nallow := true', 'allow if input.jwt.sub');
     expect(result.policy).toContain('# Inserted from template: Evil allow := true\n');
     expect(result.policy).not.toMatch(/^allow := true/m);
+  });
+
+  it('drops template markers from a template body, so groups never nest', () => {
+    const saved = insertTemplateRules(
+      'package p\n\ndefault allow := false\n',
+      'Methods',
+      'package p\n\nallow if input.http.method == "GET"'
+    ).policy;
+    const result = insertTemplateRules('package p\n\ndefault allow := false\n', 'Org combo', saved);
+    expect(result.policy.match(/# Inserted from template:/g)).toHaveLength(1);
+    expect(result.policy.match(/# End of template:/g)).toHaveLength(1);
+    expect(result.added).toBe('allow if input.http.method == "GET"');
   });
 
   it('keeps the template package line when the policy has none', () => {

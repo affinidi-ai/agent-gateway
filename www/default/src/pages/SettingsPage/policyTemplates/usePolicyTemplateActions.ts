@@ -1,8 +1,15 @@
 import { useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import { showUndoToast } from '../../../utils/toaster';
-import { BLANK_TEMPLATE_ID, DEFAULT_POLICY } from './policyDefaults';
-import { removeRuleGroup, setDefaultDeny, type PolicyRule, type RuleGroup } from './regoRules';
-import { defaultParameterValues, insertTemplateRules, renderTemplate } from './regoTemplate';
+import { ALLOW_ALL_POLICY, BLANK_TEMPLATE_ID, DEFAULT_TEMPLATE_KEY } from './policyDefaults';
+import {
+  parsePolicyRules,
+  removeRule as removeRuleLines,
+  removeRuleGroup,
+  setDefaultDeny,
+  type PolicyRule,
+  type RuleGroup,
+} from './regoRules';
+import { insertTemplateRules } from './regoTemplate';
 import type { PolicyTemplate, PolicyType } from './types';
 
 /** What the templates column shows instead of Add rules; null shows Add rules. */
@@ -11,7 +18,7 @@ const TYPE_NAME: Record<PolicyType, string> = {
   agent_surface: 'Agent Surfaces',
 };
 
-export type TemplatePanel = 'browse' | 'save';
+export type TemplatePanel = 'save';
 
 /** The policy form fields a template fills. */
 export interface TemplateFormFields {
@@ -35,7 +42,10 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
   isCreateMode: boolean
 ) {
   const [templatePanel, setTemplatePanel] = useState<TemplatePanel | null>(null);
-  const [appliedTemplateId, setAppliedTemplateId] = useState<string | null>(BLANK_TEMPLATE_ID);
+  // A new policy starts from Deny by default, whose Rego is the page's `DEFAULT_POLICY`.
+  const [appliedTemplateId, setAppliedTemplateId] = useState<string | null>(
+    () => `${DEFAULT_TEMPLATE_KEY}:${form.policy_type}`
+  );
   const [insertedTemplate, setInsertedTemplate] = useState<InsertedTemplate | null>(null);
   const [justAdded, setJustAdded] = useState<string | null>(null);
   const regoRef = useRef<HTMLTextAreaElement>(null);
@@ -50,10 +60,12 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
       policy: form.policy,
     };
     const previousTemplateId = appliedTemplateId;
+    // Customise settings re-applies the chosen template: keep the name and description as typed.
+    const reapplying = appliedTemplateId === template.id;
     setForm(f => ({
       ...f,
-      name: template.name,
-      description: template.description,
+      name: reapplying ? f.name : template.name,
+      description: reapplying ? f.description : template.description,
       policy_type: template.policy_type,
       policy: rego,
     }));
@@ -71,18 +83,13 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
     });
   };
 
-  const pickTemplate = (template: PolicyTemplate) => {
-    const { rego } = renderTemplate(template, defaultParameterValues(template));
-    if (rego) applyTemplate(template, rego);
-  };
-
   const pickBlank = () => {
     const previousPolicy = form.policy;
     const previousTemplateId = appliedTemplateId;
-    setForm(f => ({ ...f, policy: DEFAULT_POLICY[f.policy_type] }));
+    setForm(f => ({ ...f, policy: ALLOW_ALL_POLICY[f.policy_type] }));
     setAppliedTemplateId(BLANK_TEMPLATE_ID);
     showUndoToast({
-      message: 'Rego reset to the default policy.',
+      message: 'Started from Allow all (blank).',
       onUndo: () => {
         setForm(f => ({ ...f, policy: previousPolicy }));
         setAppliedTemplateId(previousTemplateId);
@@ -114,14 +121,22 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
     });
   };
 
+  // Rego typed by hand no longer follows the template, so Customise settings can't replace it.
+  const editPolicy = (policy: string) => {
+    setForm(f => ({ ...f, policy }));
+    if (isCreateMode && appliedTemplateId !== BLANK_TEMPLATE_ID) setAppliedTemplateId(null);
+  };
+
   const changePolicyWithUndo = (policy: string, message: string, onUndo?: () => void) => {
     const previousPolicy = form.policy;
+    const previousTemplateId = appliedTemplateId;
     setForm(f => ({ ...f, policy }));
     if (isCreateMode) setAppliedTemplateId(null);
     showUndoToast({
       message,
       onUndo: () => {
         setForm(f => ({ ...f, policy: previousPolicy }));
+        setAppliedTemplateId(previousTemplateId);
         onUndo?.();
       },
     });
@@ -131,17 +146,23 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
     const name = group.source.kind === 'template' ? group.source.name : '';
     const previousInserted = insertedTemplate;
     const previousJustAdded = justAdded;
-    if (name === justAdded) setJustAdded(null);
-    if (name === insertedTemplate?.template.name) setInsertedTemplate(null);
-    changePolicyWithUndo(
-      removeRuleGroup(form.policy, group),
-      `Removed the rules from the template ${name}.`,
-      () => {
-        setInsertedTemplate(previousInserted);
-        setJustAdded(previousJustAdded);
-      }
-    );
+    const policy = removeRuleGroup(form.policy, group);
+    // Another group from a template of the same name keeps its mark and examples card.
+    const after = parsePolicyRules(policy);
+    const nameRemains =
+      after.ok && after.groups.some(g => g.source.kind === 'template' && g.source.name === name);
+    if (!nameRemains) {
+      if (name === justAdded) setJustAdded(null);
+      if (name === insertedTemplate?.template.name) setInsertedTemplate(null);
+    }
+    changePolicyWithUndo(policy, `Removed the rules from the template ${name}.`, () => {
+      setInsertedTemplate(previousInserted);
+      setJustAdded(previousJustAdded);
+    });
   };
+
+  const removeRule = (rule: PolicyRule) =>
+    changePolicyWithUndo(removeRuleLines(form.policy, rule), `Removed the rule ${rule.head}.`);
 
   const denyByDefault = () =>
     changePolicyWithUndo(setDefaultDeny(form.policy), 'Requests are now denied by default.');
@@ -171,10 +192,11 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
     justAdded,
     regoRef,
     applyTemplate,
-    pickTemplate,
+    editPolicy,
     pickBlank,
     insertTemplate,
     removeGroup,
+    removeRule,
     denyByDefault,
     showRule,
   };

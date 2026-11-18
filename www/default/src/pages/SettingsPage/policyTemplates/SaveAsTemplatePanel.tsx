@@ -38,6 +38,12 @@ export function readsFromRego(rego: string): string[] {
   return Array.from(new Set(paths)).slice(0, 6);
 }
 
+/** One past the highest "Example N" name, so a removed example's number isn't reused. */
+function nextExampleNumber(examples: PolicyTemplateExample[]): number {
+  const numbers = examples.map(ex => Number(/^Example (\d+)$/.exec(ex.name)?.[1] ?? 0));
+  return Math.max(examples.length, ...numbers) + 1;
+}
+
 const SaveAsTemplatePanel: React.FC<SaveAsTemplatePanelProps> = ({
   policyId,
   policyType,
@@ -77,7 +83,7 @@ const SaveAsTemplatePanel: React.FC<SaveAsTemplatePanelProps> = ({
       setExamples(prev => [
         ...prev,
         {
-          name: `Example ${prev.length + 1}`,
+          name: `Example ${nextExampleNumber(prev)}`,
           input: input as Record<string, unknown>,
           expected: result.allow ? 'allow' : 'deny',
         },
@@ -245,7 +251,8 @@ const SaveAsTemplatePanel: React.FC<SaveAsTemplatePanelProps> = ({
           </div>
         </div>
         <div className="small text-muted mb-3">
-          Kept for this browser session and listed under <strong>Your organization</strong>.
+          Kept in this browser tab until it is closed, and listed under{' '}
+          <strong>Your organization</strong>.
         </div>
         <div className="d-flex justify-content-end gap-2">
           <button

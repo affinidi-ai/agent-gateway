@@ -10,7 +10,7 @@ import {
 /**
  * Policy templates served to the editor. Built-in templates ship with the dashboard;
  * organisation templates saved with {@link savePolicyTemplate} are kept in the tab's
- * `sessionStorage` until the gateway stores them, or in memory when storage is unavailable.
+ * `sessionStorage` for that tab, or in memory when storage is unavailable.
  */
 
 const STORAGE_KEY = 'policy-templates:organization';
@@ -26,6 +26,8 @@ export interface NewPolicyTemplate {
 }
 
 let unstoredTemplates: PolicyTemplate[] = [];
+// Set once a write fails, so reads come from memory instead of the stale stored list.
+let storageWriteFailed = false;
 const listeners = new Set<() => void>();
 
 function isStoredExample(value: unknown): value is PolicyTemplateExample {
@@ -51,7 +53,7 @@ function isStoredTemplate(value: unknown): value is PolicyTemplate {
     typeof t.description === 'string' &&
     typeof t.rego === 'string' &&
     typeof t.category === 'string' &&
-    t.category in CATEGORY_LABELS &&
+    Object.prototype.hasOwnProperty.call(CATEGORY_LABELS, t.category) &&
     (t.policy_type === 'gateway' || t.policy_type === 'agent_surface') &&
     Array.isArray(t.parameters) &&
     t.parameters.length === 0 &&
@@ -63,7 +65,25 @@ function isStoredTemplate(value: unknown): value is PolicyTemplate {
   );
 }
 
+/** A stored template rebuilt from its checked fields only, so nothing else reaches the editor. */
+function fromStored(t: PolicyTemplate): PolicyTemplate {
+  return {
+    id: t.id,
+    name: t.name,
+    summary: t.summary,
+    description: t.description,
+    category: t.category,
+    policy_type: t.policy_type,
+    rego: t.rego,
+    parameters: [],
+    reads: [...t.reads],
+    examples: t.examples.map(ex => ({ name: ex.name, input: ex.input, expected: ex.expected })),
+    builtin: false,
+  };
+}
+
 function readOrganizationTemplates(): PolicyTemplate[] {
+  if (storageWriteFailed) return unstoredTemplates;
   let raw: string | null;
   try {
     raw = window.sessionStorage.getItem(STORAGE_KEY);
@@ -73,7 +93,7 @@ function readOrganizationTemplates(): PolicyTemplate[] {
   if (raw === null) return [];
   try {
     const parsed: unknown = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter(isStoredTemplate) : [];
+    return Array.isArray(parsed) ? parsed.filter(isStoredTemplate).map(fromStored) : [];
   } catch {
     return [];
   }
@@ -83,8 +103,10 @@ function writeOrganizationTemplates(templates: PolicyTemplate[]): void {
   unstoredTemplates = templates;
   try {
     window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify(templates));
+    storageWriteFailed = false;
   } catch {
-    // Storage is unavailable; the templates last until the page reloads.
+    // Storage is unavailable or full; the templates last until the page reloads.
+    storageWriteFailed = true;
   }
 }
 

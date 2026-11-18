@@ -11,16 +11,23 @@ changes:
         business hours, a monitor-only baseline, all or at least N trust checks pass, and HTTP
         method, path, surface and subject allowlists, plus MCP tool policies for tool bindings
         on the MCP Proxy hop. Templates follow the Apply Policies guides and link to their own
-        docs section. The gallery offers templates of either type, and a chosen template fills
-        Name, Description, Type and Rego, and Customise settings changes its settings, which are
-        checked before use.
+        docs section. The gallery offers templates of either type; choosing one shows its
+        settings, how it decides on sample inputs, and its docs link in place, and Use this
+        template fills Name, Description, Type and Rego with settings that are checked first.
         Add rules from a template appends a template's rules to a new or saved policy, so
         several can be combined, and on a saved policy checks the template's examples with the
         existing dry-run. A Rules view lists the policy's rules grouped by the template they
-        came from, removes a template's rules, and switches an allow-all policy to deny by
-        default. Save as template keeps a policy as an organisation template for the browser
-        session. Built-in templates ship with the dashboard; no gateway API changes.
+        came from, removes a template's rules or a single rule (refusing a helper another rule still
+        uses), and switches an allow-all policy to deny by
+        default. Save as template keeps a policy as an organisation template for the current
+        browser tab. Built-in templates ship with the dashboard; no gateway API changes.
   changed:
+    - timestamp: '2026-11-18T20:00:00Z'
+      title: Start new policies as deny by default
+      description: >-
+        A new policy definition starts as default allow := false, the deny-by-default practice
+        the policy docs recommend, instead of allowing all traffic. Allow all (blank) stays a
+        starting point in the Start from gallery.
     - timestamp: '2026-11-18T18:00:00Z'
       title: Redesign the policy editor into Details and Policy sections
       description: >-

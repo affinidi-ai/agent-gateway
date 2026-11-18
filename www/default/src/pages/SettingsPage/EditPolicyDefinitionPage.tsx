@@ -18,6 +18,8 @@ import PolicyTemplatesPanel from './policyTemplates/PolicyTemplatesPanel';
 import SaveAsTemplatePanel from './policyTemplates/SaveAsTemplatePanel';
 import TemplateExamplesCheck from './policyTemplates/TemplateExamplesCheck';
 import TemplateGallery from './policyTemplates/TemplateGallery';
+import { BUILTIN_POLICY_TEMPLATES } from './policyTemplates/builtinPolicyTemplates';
+import { parsePolicyRules } from './policyTemplates/regoRules';
 import { BLANK_TEMPLATE_ID } from './policyTemplates/policyDefaults';
 import type { PolicyType } from './policyTemplates/types';
 import { usePolicyTemplateActions } from './policyTemplates/usePolicyTemplateActions';
@@ -33,6 +35,34 @@ interface PolicyDefinition {
   updated_at?: string;
   sample_input?: string;
   content_hash?: string;
+}
+
+const TYPE_NAME: Record<PolicyType, string> = {
+  gateway: 'Gateway',
+  agent_surface: 'Agent Surface',
+};
+
+/** Built-in templates in the policy, applied or inserted, that have no variant for `type`. */
+function templatesWithoutType(
+  policy: string,
+  appliedTemplateId: string | null,
+  type: PolicyType
+): string[] {
+  const forType = new Set(
+    BUILTIN_POLICY_TEMPLATES.filter(t => t.policy_type === type).map(t => t.name)
+  );
+  const otherOnly = new Set(
+    BUILTIN_POLICY_TEMPLATES.filter(t => !forType.has(t.name)).map(t => t.name)
+  );
+  const parsed = parsePolicyRules(policy);
+  const names = parsed.ok
+    ? parsed.groups.flatMap(g =>
+        g.source.kind === 'template' && otherOnly.has(g.source.name) ? [g.source.name] : []
+      )
+    : [];
+  const applied = BUILTIN_POLICY_TEMPLATES.find(t => t.id === appliedTemplateId);
+  if (applied && otherOnly.has(applied.name)) names.unshift(applied.name);
+  return Array.from(new Set(names));
 }
 
 function extractPackage(policy: string): string | null {
@@ -73,7 +103,6 @@ const EditPolicyDefinitionPage: React.FC = () => {
   const [view, setView] = useState<PolicyView>(
     DEFAULT_POLICY_VIEW[isCreateMode ? 'create' : 'edit']
   );
-  const [customiseTemplateId, setCustomiseTemplateId] = useState<string | null>(null);
   const templatesColumnRef = useRef<HTMLDivElement>(null);
   const [focusAddRules, setFocusAddRules] = useState(0);
   const { hasPermission } = usePermissions();
@@ -89,10 +118,11 @@ const EditPolicyDefinitionPage: React.FC = () => {
     justAdded,
     regoRef,
     applyTemplate,
-    pickTemplate,
+    editPolicy,
     pickBlank,
     insertTemplate,
     removeGroup,
+    removeRule,
     denyByDefault,
     showRule,
   } = usePolicyTemplateActions(form, setForm, isCreateMode);
@@ -105,7 +135,19 @@ const EditPolicyDefinitionPage: React.FC = () => {
         ? form.policy.replace(/^(\s*package\s+)[^\s{]+/m, `$1${expectedPkg}`)
         : form.policy;
     setForm({ ...form, policy_type: newType, policy });
-    if (appliedTemplateId !== BLANK_TEMPLATE_ID) setAppliedTemplateId(null);
+    // A template with a variant for the new Type stays chosen; any other stops applying.
+    const appliedKey = appliedTemplateId?.split(':')[0];
+    const sameTemplate = BUILTIN_POLICY_TEMPLATES.find(t => t.id === `${appliedKey}:${newType}`);
+    if (appliedTemplateId !== BLANK_TEMPLATE_ID) setAppliedTemplateId(sameTemplate?.id ?? null);
+    const otherTypeOnly = templatesWithoutType(policy, appliedTemplateId, newType);
+    if (otherTypeOnly.length > 0) {
+      const one = otherTypeOnly.length === 1;
+      const other: PolicyType = newType === 'gateway' ? 'agent_surface' : 'gateway';
+      showToast(
+        'warning',
+        `${otherTypeOnly.join(', ')} ${one ? 'is' : 'are'} written for ${TYPE_NAME[other]} policies and ${one ? 'reads' : 'read'} input that ${TYPE_NAME[newType]} policies don't get. Check those rules before you create the policy.`
+      );
+    }
   };
 
   const addTemplateRules: typeof insertTemplate = (...args) => {
@@ -270,25 +312,10 @@ const EditPolicyDefinitionPage: React.FC = () => {
 
   const templatesPanel = (
     <PolicyTemplatesPanel
-      key={`${form.policy_type}-${templatePanel}-${customiseTemplateId ?? ''}`}
-      mode={templatePanel === 'browse' ? 'browse' : 'insert'}
-      scrollIntoViewOnOpen={templatePanel !== null}
+      key={form.policy_type}
       policyType={form.policy_type}
       existingPolicy={form.policy}
-      initialTemplateId={
-        templatePanel === 'browse' ? (customiseTemplateId ?? undefined) : undefined
-      }
-      onUse={
-        templatePanel === 'browse'
-          ? (template, rego) => {
-              applyTemplate(template, rego);
-              setView('rules');
-            }
-          : undefined
-      }
       onInsert={addTemplateRules}
-      onSetDefaultDeny={denyByDefault}
-      onClose={templatePanel === 'browse' ? () => setTemplatePanel(null) : undefined}
     />
   );
 
@@ -303,7 +330,10 @@ const EditPolicyDefinitionPage: React.FC = () => {
       sampleInput={form.sample_input ?? POLICY_SIMULATE_DEFAULT_INPUT}
       onSaved={template => {
         setTemplatePanel(null);
-        showToast('success', `Template ${template.name} saved under Your organization.`);
+        showToast(
+          'success',
+          `Template ${template.name} saved under Your organization for this browser tab.`
+        );
       }}
       onClose={() => setTemplatePanel(null)}
     />
@@ -404,22 +434,18 @@ const EditPolicyDefinitionPage: React.FC = () => {
                 </Link>
               </p>
 
-              {isCreateMode && (
+              {isCreateMode && canEditPolicies && (
                 <TemplateGallery
                   step={1}
                   policyType={form.policy_type}
                   appliedTemplateId={appliedTemplateId}
                   onPickBlank={() => {
                     pickBlank();
-                    setView('rego');
-                  }}
-                  onPickTemplate={template => {
-                    pickTemplate(template);
                     setView('rules');
                   }}
-                  onCustomise={template => {
-                    setCustomiseTemplateId(template.id);
-                    setTemplatePanel('browse');
+                  onUseTemplate={(template, rego) => {
+                    applyTemplate(template, rego);
+                    setView('rules');
                   }}
                 />
               )}
@@ -443,7 +469,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
                 step={isCreateMode ? 3 : undefined}
                 policy={form.policy}
                 policyType={form.policy_type}
-                onPolicyChange={policy => setForm(f => ({ ...f, policy }))}
+                onPolicyChange={editPolicy}
                 view={view}
                 onViewChange={setView}
                 regoRef={regoRef}
@@ -464,6 +490,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
                 justAdded={justAdded}
                 onAdd={focusTemplatesColumn}
                 onRemoveGroup={removeGroup}
+                onRemoveRule={removeRule}
                 onSetDefaultDeny={denyByDefault}
                 onShowRule={showRule}
               />

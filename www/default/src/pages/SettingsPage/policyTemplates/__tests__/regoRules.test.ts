@@ -1,4 +1,10 @@
-import { parsePolicyRules, removeRuleGroup, setDefaultDeny } from '../regoRules';
+import {
+  parsePolicyRules,
+  removeRule,
+  removeRuleGroup,
+  ruleInUse,
+  setDefaultDeny,
+} from '../regoRules';
 import { insertTemplateRules } from '../regoTemplate';
 
 const groupsOf = (rego: string) => {
@@ -149,5 +155,61 @@ describe('setDefaultDeny', () => {
     expect(setDefaultDeny('package p\ndefault allow := false\n')).toBe(
       'package p\ndefault allow := false\n'
     );
+  });
+});
+
+describe('removeRule and ruleInUse', () => {
+  const rego = [
+    'package p',
+    '',
+    'default allow := false',
+    '',
+    '# Paths the Target must never see',
+    'unsafe if contains(input.http.path, "..")',
+    '',
+    'allow if {',
+    '  not unsafe',
+    '  input.http.method == "GET"',
+    '}',
+    '',
+    'allow if input.http.method == "HEAD"',
+  ].join('\n');
+  const rules = () => {
+    const parsed = parsePolicyRules(rego);
+    if (!parsed.ok) throw new Error('expected the policy to parse');
+    return { parsed, all: parsed.groups.flatMap(g => g.rules) };
+  };
+
+  it('removes one rule with the comment above it and keeps the rest', () => {
+    const { all } = rules();
+    const head = all.find(r => r.summary.startsWith('allow if input.http.method == "HEAD"'))!;
+    expect(removeRule(rego, head)).toBe(
+      'package p\n\ndefault allow := false\n\n# Paths the Target must never see\nunsafe if contains(input.http.path, "..")\n\nallow if {\n  not unsafe\n  input.http.method == "GET"\n}\n'
+    );
+    const helper = all.find(r => r.head === 'unsafe')!;
+    expect(removeRule(rego, helper)).not.toContain('Paths the Target must never see');
+  });
+
+  it('refuses a helper another rule refers to, but never an allow rule', () => {
+    const { parsed, all } = rules();
+    expect(ruleInUse(rego, parsed, all.find(r => r.head === 'unsafe')!)).toBe(true);
+    expect(all.filter(r => r.kind === 'allow').some(r => ruleInUse(rego, parsed, r))).toBe(false);
+  });
+
+  it('keeps refusing one of several different definitions of a used helper', () => {
+    const more = `${rego}\n\nunsafe if contains(input.http.path, "%2e")\n`;
+    const parsed = parsePolicyRules(more);
+    if (!parsed.ok) throw new Error('expected the policy to parse');
+    const helpers = parsed.groups.flatMap(g => g.rules).filter(r => r.head === 'unsafe');
+    expect(helpers.every(r => ruleInUse(more, parsed, r))).toBe(true);
+  });
+
+  it('lets a helper go when an identical copy of it remains', () => {
+    const twice = `${rego}\n\nunsafe if contains(input.http.path, "..")\n`;
+    const parsed = parsePolicyRules(twice);
+    if (!parsed.ok) throw new Error('expected the policy to parse');
+    const helpers = parsed.groups.flatMap(g => g.rules).filter(r => r.head === 'unsafe');
+    expect(helpers).toHaveLength(2);
+    expect(ruleInUse(twice, parsed, helpers[0])).toBe(false);
   });
 });

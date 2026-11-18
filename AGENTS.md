@@ -427,13 +427,14 @@ titles share one style; see _Policy input capture_ in
 The policy editor's create and edit pages share Start from (create only), Details and Policy
 sections. It offers policy templates without a gateway API, following the Apply Policies
 guides and linking each to its docs section: a **Start from** gallery of template cards on the
-create form (Blank, which is the default allow-all policy, then built-in and organisation
-templates of either Type, where choosing one sets the Type), a **Rules | Rego** view of the policy whose Rules view groups the
-rules by the template they came from and removes a template's rules, **Add rules from a template** there
+create form (a new policy starts from Deny by default; Allow all (blank), then built-in and
+organisation templates of either Type, each shown in place with its settings and example inputs
+before **Use this template** fills the form and sets the Type), a **Rules | Rego** view of the policy whose Rules view groups the
+rules by the template they came from and removes a template's rules or a single rule, **Add rules from a template** there
 (`policies.edit`) to combine several templates in a new or saved policy, **Save as template** on
 a saved policy (`policies.edit`), and a Template examples card that runs an added template's
 examples through the existing simulate endpoint. Built-in templates ship
-in the dashboard and organisation templates last for the browser session; see _Policy
+in the dashboard and organisation templates last for the browser tab; see _Policy
 templates_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#policy-templates).
 
 The Dashboard shows the metrics **Delete** button only to users with `settings.edit`; see

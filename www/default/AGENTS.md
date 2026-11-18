@@ -1771,8 +1771,8 @@ The create and edit pages share one editor card in three sections, each titled b
   `policy-view-rego`, `aria-pressed`), a status row with the rule count, default decision,
   compile status (`policy-compile-status`) and **Add rules from a template**. Both views stay
   mounted and the hidden one gets `d-none` (`policy-view-rules-panel`, `policy-view-rego-panel`).
-  A saved policy opens on Rules; a new one opens on Rego and moves to Rules when a template is
-  used or rules are added. The Rego view has the **Rego reference** panel, then the textarea
+  Both a new and a saved policy open on Rules; only Write Rego, Open Rego and a rule's line
+  numbers switch to the Rego view. The Rego view has the **Rego reference** panel, then the textarea
   (`policy-rego-textarea`, `wrap="off"`) with a line-number gutter (`.policy-rego-gutter`)
   that follows its scroll, so the line numbers in the Rules view match, then compile errors and
   the package mismatch with **Fix it**.
@@ -1797,14 +1797,18 @@ panels the same way, and do not put `role="button"` on a wrapper around a headin
 Policy templates live in `pages/SettingsPage/policyTemplates/`. The editor never calls a
 template API: built-in templates ship with the dashboard in `builtinPolicyTemplates.json`,
 and organisation templates saved from a policy are kept by `policyTemplateStore.ts` in the
-tab's `sessionStorage` (`policy-templates:organization`; entries that aren't templates are
-ignored, and without storage they last until reload). The store's functions are async so a
-gateway API can replace them without touching the components. The page's template state and
+tab's `sessionStorage` (`policy-templates:organization`), so they last in that browser tab
+until it is closed; the panel, the save toast and the changelog say so. On read the store
+keeps only entries whose fields check out (category an own key of `CATEGORY_LABELS`, each
+example with a text `name`, an object `input` and `expected` allow or deny) and rebuilds
+each from those fields; when a write fails it keeps the templates in memory until reload.
+Saving a template numbers new examples past the highest "Example N". The page's template state and
 the actions that change the Rego, each with Undo, live in `usePolicyTemplateActions`.
 
 - **Catalogue.** A JSON entry holds its rules without a `package` line and lists the
   `policy_types` it serves; `builtinPolicyTemplates.ts` adds the package per type. Every entry
-  must compile on the gateway's Regorus and give each example's `expected` decision, and may
+  must compile on the gateway's Regorus and give each example's `expected` decision (checked
+  by the author before a catalogue change; no repo test compiles Rego), and may
   read only fields of the gateway's `PolicyInput` (`src/surface_context/mod.rs`). Caller
   identity is `input.source_auth` (`method`, and for `jwt_bearer` its `subject` and `claims`);
   gateway and surface policies get no `input.jwt`. Templates that read `source_auth`,
@@ -1822,70 +1826,81 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   written in the listed spelling; Allow during business hours uses all three. A template that reads the clock (`time.now_ns()`) has no examples.
   An entry is `standalone` when its rules allow requests outside what it restricts (such as
   Restrict MCP tools by role and Allowlist outbound destinations), so inserting them would widen
-  another policy; Insert refuses it (`policy-templates-standalone-note`).
+  another policy; Add to policy refuses it (`policy-templates-standalone-note`). Allow listed
+  paths denies a path that contains `..`, `%2e`, a backslash or `%5c`.
   `builtinPolicyTemplates.test.ts` checks every entry renders under its package. The catalogue
   holds the starter templates of the template library except rate controls, which are set on
   the surface's Rate Limit panel.
 - **Rendering.** `regoTemplate.ts` fills settings as Rego literals: integers checked against
   their range, list values as JSON string literals in a set, so a value cannot end its string.
-  A setting that fails its check shows its error under the field and blocks Use and Insert.
-- **Start from gallery** (create only): `TemplateGallery`, a grid of cards in the
-  `.policy-template-row` style (`policy-template-card-blank`, `policy-template-card-<key>`, with
-  `is-selected` and `aria-pressed`): **Blank** first, then one card per built-in and
+  A setting that fails its check shows its error under the field and blocks Use and Add to
+  policy. A `time_zone` setting refuses a UTC offset such as `+01:00`, which browsers accept
+  and the gateway's Regorus does not; a name must start with a letter and hold no `:`.
+  `insertTemplateRules` drops `# Inserted from template:` / `# End of template:` lines from a
+  template's body, so a template saved from a combined policy never nests groups.
+- **Start from gallery** (create only, `policies.edit`): `TemplateGallery` is the only place a
+  policy starts from a template. A new policy starts from **Deny by default**: its Rego is
+  `DEFAULT_POLICY` (`policyDefaults.ts`, `default allow := false`) and that card is selected. The
+  grid of cards in the `.policy-template-row` style (`policy-template-card-blank`,
+  `policy-template-card-<key>`, with `is-selected` and `aria-pressed`) holds **Allow all
+  (blank)** first, whose Rego is `ALLOW_ALL_POLICY`, then one card per built-in and
   organisation template of either Type (`useAllPolicyTemplates` groups a built-in template's
   variants under its catalogue id), each with its summary, default decision and category. A
   template with no variant for the selected Type shows "Agent Surface only" or "Gateway only"
-  (`policy-template-card-type-badge`); choosing it sets the Type, and the undo toast says so. Blank
-  is the editor's default policy (`policyDefaults.ts`), which allows all traffic. A search
-  (`policy-template-gallery-search-input`) and category pills
-  (`policy-template-gallery-category-<key>`) share `useTemplateFilter` with the templates panel;
-  Blank shows only while nothing filters. Six templates show until **Show all (N)**
-  (`policy-template-gallery-show-all`). Choosing a card fills Name, Description, Type and Rego
-  with the defaults of its settings and offers Undo, which restores only those four fields.
-  The gallery then collapses to one line (`policy-template-gallery-summary`): "Started from
-  <name> · Pre-filled from the template. Edit freely." (`policy-definition-prefilled-hint`),
-  "Blank", or "Custom Rego" once rules were added, the Type changed, or the Rego was replaced,
-  with the template's docs link (`policy-template-gallery-docs-link`), **Change**
-  (`policy-template-gallery-change-button`) to reopen it and, for a template
-  with settings, **Customise settings** (`policy-template-gallery-customise-button`), which
-  opens the templates panel in browse mode with that template selected. Changing Type keeps
-  the Rego, whose package the Type select rewrites as before.
-- **Templates panel** (`PolicyTemplatesPanel`, `policy-templates-panel`): for users with
+  (`policy-template-card-type-badge`). A search (`policy-template-gallery-search-input`) and
+  category pills (`policy-template-gallery-category-<key>`) share `useTemplateFilter` with the
+  templates column; Allow all shows only while nothing filters. Six templates show until
+  **Show all (N)** (`policy-template-gallery-show-all`). Choosing a card selects it and shows its
+  detail in place under the grid (`policy-template-gallery-detail`), built from
+  `TemplatePreview.tsx` like the column's preview: description, default decision, a note when
+  using it sets the Type, setting fields (`policy-template-gallery-param-<key>`), **How it
+  decides** with each example's sample input behind **Show input**
+  (`policy-template-gallery-example-input-<i>`, `-json`), the docs link
+  (`policy-template-gallery-docs-link`) and **Use this template**
+  (`policy-template-gallery-use-button`), disabled while a setting is invalid. Nothing fills
+  the form until Use, which fills Name, Description, Type and Rego with the settings shown and
+  offers Undo (the toast names a Type change), restoring only those four fields; using the
+  template already applied again keeps a Name and Description already in the form. The gallery
+  then collapses to one line (`policy-template-gallery-summary`): "Started from <name> ·
+  Pre-filled from the template. Edit freely." (`policy-definition-prefilled-hint`), "Allow all
+  (blank)", or "Custom Rego" once rules were added or removed, the Type changed to one the
+  template doesn't serve, or the Rego was edited by hand; Undo of those actions restores it.
+  **Change** (`policy-template-gallery-change-button`) reopens it with the applied card
+  selected. Changing Type keeps the Rego, whose package the Type select rewrites as before, keeps
+  a template that serves both Types applied, and shows a warning toast naming any built-in
+  template in it, applied or added, that has no variant for the new Type.
+- **Templates column** (`PolicyTemplatesPanel`, `policy-templates-panel`): for users with
   `policies.edit` the page always has two columns, the editor card (`col-xl-8`) and a templates
-  column (`col-xl-4`, `policy-templates-column`, sticky from `xl` below the top bar), so opening
-  or closing a panel never changes the editor's width. Template examples, Test (dry-run) and
-  Version history sit in the editor column under the editor card, so a taller templates column
-  never pushes them down; without `policies.edit` the editor is full width and
-  there is no column. The column shows the Add rules panel (insert mode, no close button)
-  unless **Customise settings** in the gallery swaps in browse mode with the template selected
-  (`initialTemplateId`) or **Save as template** swaps in its panel; closing either returns to
-  Add rules. **Add rules from a template** (`policy-templates-insert-button`, in the Policy
-  section and the empty rules list) brings back the Add rules panel from any other panel,
-  scrolls to the column and focuses its search. The template list and the preview
-  stack; with nothing selected the preview says to pick a template
-  (`policy-templates-preview-empty`). The panel starts over, with no template chosen, when Type
-  changes. It has Built-in and Your organization tabs with counts (`policy-templates-tab-builtin`,
-  `-organization`), a search (`policy-templates-search-input`), category pills in the
-  `custom-channel-tabs` style shown when a tab holds more than one category
-  (`policy-templates-category-<key>`), rows (`policy-templates-row-<id>`) with a DENY or ALLOW
-  outline badge, and a preview: description, default decision and `reads` badges, setting
-  fields (`policy-templates-param-<key>`), the rendered Rego, How it decides, the template's docs link
-  named by its section (`policy-templates-docs-link`), **Copy
-  Rego** (`policy-templates-copy-button`), then **Use this template**
-  (`policy-templates-use-button`) in browse mode or **Add to policy**
-  (`policy-templates-insert-rules-button`) in insert mode. Add rules lists only templates of the
-  policy's Type and says how many it leaves out (`policy-templates-other-type-note`). An empty
-  Your organization tab says
+  column (`col-xl-4`, `policy-templates-column`, sticky from `xl` below the top bar), so the
+  editor's width never changes. Template examples, Test (dry-run) and Version history sit in
+  the editor column under the editor card, so a taller templates column never pushes them down;
+  without `policies.edit` the editor is full width and there is no column. The column only adds
+  rules ("Add rules from a template", no close button); only **Save as template** swaps in its
+  own panel, and closing it returns to Add rules. **Add rules from a template**
+  (`policy-templates-insert-button`, in the Policy section and the empty rules list) brings back
+  the Add rules panel, scrolls to the column and focuses its search. It lists only templates of
+  the policy's Type and says how many it leaves out (`policy-templates-other-type-note`), and
+  starts over, with no template chosen, when Type changes. It has Built-in and Your
+  organization tabs with counts (`policy-templates-tab-builtin`, `-organization`), a search
+  (`policy-templates-search-input`), category pills in the `custom-channel-tabs` style shown
+  when a tab holds more than one category (`policy-templates-category-<key>`), rows
+  (`policy-templates-row-<id>`) with a DENY or ALLOW outline badge, and a preview (with nothing
+  selected it says to pick a template, `policy-templates-preview-empty`): description, default
+  decision, setting fields (`policy-templates-param-<key>`), the lines it adds, How it decides
+  with each example's input (`policy-templates-example-input-<i>`), the docs link
+  (`policy-templates-docs-link`) and **Add to policy**
+  (`policy-templates-insert-rules-button`). A standalone or MCP tool template shows its note
+  and its whole Rego (`policy-templates-rego-preview`) instead, and Add to policy is disabled.
+  Adding an organisation template shows a warning that its rules are added as written and
+  combine with OR (`policy-templates-org-insert-warning`). An empty Your organization tab says
   how to add one.
 - **Add to policy** shows the lines it adds (`policy-templates-insert-preview`) and appends
   them to the end of the Rego between `# Inserted from template: <name>` and
   `# End of template: <name>` comments, offers Undo, and keeps the panel open so several
   templates can be combined, on the create form and on a saved policy. The template's `default
   allow` line is never copied, its `package` line only when the Rego has none, and its imports
-  go after the policy's `package` line. When the Rego allows by default, a warning says an added
-  allow rule changes nothing (`policy-templates-allow-default-warning`), with **Deny by
-  default** (`policy-templates-set-default-deny-button`), which sets `default allow` to `false`
-  with Undo. A template's helper rules that depend on its settings are Rego functions taking the
+  go after the policy's `package` line. When the Rego allows by default, the Rules view warns
+  that the allow rules change nothing (below). A template's helper rules that depend on its settings are Rego functions taking the
   setting as an argument, so adding the same template twice with different settings keeps both
   checks apart. On the create form an added template sets the gallery summary to **Custom
   Rego**, and the Policy section moves to the Rules view.
@@ -1898,13 +1913,21 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   (`-show-button`). A template group says which template it came from, the last added one is
   marked **Just added** (`policy-rules-just-added`), and **Remove**
   (`policy-rules-group-<n>-remove-button`, `policies.edit`) deletes the group's lines with Undo;
-  single rules have no Remove, since a helper can be used by another rule. A policy that allows
+  each rule has its own **Remove** (`policy-rules-group-<n>-rule-<m>-remove-button`,
+  `policies.edit`), which deletes the rule's lines and the comment lines directly above it, with
+  Undo. A helper rule that another rule still refers to can't be removed (the button is
+  disabled and its title says so), since removing it can widen the policy, for example under
+  `not helper`; one of several different definitions of a used helper counts as in use, and only
+  an identical copy left by the same template added twice frees it. A policy that allows
   by default and has allow rules shows a warning (`policy-rules-allow-default-warning`) with
-  **Deny by default** (`policy-rules-set-default-deny-button`). With no rules, an empty state
+  **Deny by default** (`policy-rules-set-default-deny-button`). An empty Rego shows Default
+  ALLOW and "An empty policy allows every request.", as the gateway treats it. Removing a group
+  keeps the Just added mark and examples card while another group of that template remains. With no rules, an empty state
   (`policy-rules-empty`) offers **Add rules from a template** (`policy-rules-add-button`) and
   **Write Rego** (`policy-rules-write-rego-button`). While the Rego doesn't compile a banner
   (`policy-rules-invalid-banner`) offers **Open Rego**
-  (`policy-rules-invalid-open-rego-button`), and while a bracket is open the view says so
+  (`policy-rules-invalid-open-rego-button`) and names a package mismatch when that is the
+  cause, and while a bracket is open the view says so
   (`policy-rules-unparsed`, with `policy-rules-open-rego-button`) instead of listing rules.
 - **Adding to a saved policy** also shows the **Template examples**
   card (`policy-template-examples-card`) above Test (dry-run): each example runs through

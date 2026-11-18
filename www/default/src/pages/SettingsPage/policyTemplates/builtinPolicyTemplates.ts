@@ -11,7 +11,7 @@ import type {
 
 /**
  * Catalogue entries hold the rules without a `package` line, so one entry serves every
- * policy type it lists. The JSON is also the input of the Regorus compile check.
+ * policy type it lists.
  */
 interface CatalogueEntry {
   id: string;

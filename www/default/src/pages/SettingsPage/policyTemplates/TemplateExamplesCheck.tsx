@@ -32,6 +32,8 @@ const TemplateExamplesCheck: React.FC<TemplateExamplesCheckProps> = ({
 
   useEffect(() => {
     let cancelled = false;
+    // Earlier decisions were for an earlier draft; show the rows as running until these return.
+    setOutcomes(template.examples.map(() => null));
     const timer = setTimeout(async () => {
       const results = await Promise.all(
         template.examples.map(async (ex): Promise<Outcome> => {
@@ -106,7 +108,7 @@ const TemplateExamplesCheck: React.FC<TemplateExamplesCheckProps> = ({
                 const mismatch = isMismatch(o, i);
                 return (
                   <tr
-                    key={ex.name}
+                    key={`${i}-${ex.name}`}
                     className={mismatch ? 'table-warning' : undefined}
                     data-testid={`policy-template-example-row-${i}`}
                   >

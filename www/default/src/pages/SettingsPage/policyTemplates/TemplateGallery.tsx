@@ -1,19 +1,30 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { BLANK_TEMPLATE_ID } from './policyDefaults';
 import PolicySectionTitle from './PolicySectionTitle';
 import { defaultDecision } from './regoTemplate';
 import { DecisionBadge } from './TemplateBadges';
-import { Link } from '../../../components/shared/Link';
+import {
+  TemplateDocsLink,
+  TemplateHowItDecides,
+  TemplateSettingsFields,
+  useTemplateSettings,
+} from './TemplatePreview';
 import { templateEntryKey, useAllPolicyTemplates } from './usePolicyTemplates';
 import { useTemplateFilter } from './useTemplateFilter';
 import { CATEGORY_LABELS, type PolicyTemplate, type PolicyType } from './types';
 import './PolicyTemplates.css';
 
 const COLLAPSED_COUNT = 6;
+const ID_PREFIX = 'policy-template-gallery';
 
 const ONLY_LABEL: Record<PolicyType, string> = {
   gateway: 'Gateway only',
   agent_surface: 'Agent Surface only',
+};
+
+const TYPE_NAME: Record<PolicyType, string> = {
+  gateway: 'Gateway',
+  agent_surface: 'Agent Surfaces',
 };
 
 interface TemplateGalleryProps {
@@ -22,22 +33,58 @@ interface TemplateGalleryProps {
   /** The chosen template id, `blank`, or null once the Rego no longer follows one. */
   appliedTemplateId: string | null;
   onPickBlank: () => void;
-  onPickTemplate: (template: PolicyTemplate) => void;
-  /** Opens the templates panel with the template selected, to change its settings. */
-  onCustomise: (template: PolicyTemplate) => void;
+  /** Fills the form from the template, with the Rego its settings render to. */
+  onUseTemplate: (template: PolicyTemplate, rego: string) => void;
 }
 
+/** The selected card's detail: settings, how it decides, docs and Use this template. */
+const GalleryDetail: React.FC<{
+  template: PolicyTemplate;
+  policyType: PolicyType;
+  onUse: (template: PolicyTemplate, rego: string) => void;
+}> = ({ template, policyType, onUse }) => {
+  const settings = useTemplateSettings(template);
+  return (
+    <div className="policy-template-gallery__detail" data-testid="policy-template-gallery-detail">
+      <h6 className="fw-bold mb-1">{template.name}</h6>
+      <p className="text-muted small mb-2">{template.description}</p>
+      <div className="d-flex flex-wrap gap-2 mb-3">
+        <DecisionBadge decision={defaultDecision(template.rego)} prefix="Default" />
+        {template.policy_type !== policyType && (
+          <span className="badge policy-template-reads">
+            Using it sets Type to {TYPE_NAME[template.policy_type]}
+          </span>
+        )}
+      </div>
+      <TemplateSettingsFields template={template} settings={settings} idPrefix={ID_PREFIX} />
+      <TemplateHowItDecides template={template} idPrefix={ID_PREFIX} />
+      <TemplateDocsLink template={template} testId="policy-template-gallery-docs-link" />
+      <div className="d-flex justify-content-end">
+        <button
+          type="button"
+          className="btn btn-sm btn-primary"
+          disabled={!settings.rendered.rego}
+          onClick={() => settings.rendered.rego && onUse(template, settings.rendered.rego)}
+          data-testid="policy-template-gallery-use-button"
+        >
+          Use this template
+        </button>
+      </div>
+    </div>
+  );
+};
+
 /**
- * The create form's Start from section: Blank, then one card per built-in and organisation
- * template of either type. A template for the other type only sets the Type when chosen.
+ * The create form's Start from section: Allow all (blank), then one card per built-in and
+ * organisation template of either type. Choosing a card shows its detail in place; Use this
+ * template fills the form, and a template for the other type sets the Type.
  */
 const TemplateGallery: React.FC<TemplateGalleryProps> = ({
   policyType,
   step,
   appliedTemplateId,
   onPickBlank,
-  onPickTemplate,
-  onCustomise,
+  onUseTemplate,
 }) => {
   const entries = useAllPolicyTemplates();
   // Each card stands for the variant of the current Type, or the template's only variant.
@@ -52,30 +99,63 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
   const [expanded, setExpanded] = useState(true);
   const [showAll, setShowAll] = useState(false);
 
-  // A template used from the templates panel collapses the gallery too.
-  useEffect(() => {
-    if (appliedTemplateId && appliedTemplateId !== BLANK_TEMPLATE_ID) setExpanded(false);
-  }, [appliedTemplateId]);
-
   const applied =
     entries.flatMap(e => Object.values(e.variants)).find(t => t?.id === appliedTemplateId) ?? null;
-  const appliedKey = applied ? templateEntryKey(applied) : null;
+  const appliedKey =
+    appliedTemplateId === BLANK_TEMPLATE_ID
+      ? BLANK_TEMPLATE_ID
+      : applied
+        ? templateEntryKey(applied)
+        : null;
+  // The card whose detail is open: the applied one until the user picks another.
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const shownKey = selectedKey ?? appliedKey;
+  const selected = all.find(t => templateEntryKey(t) === shownKey) ?? null;
+
   const filtering = query.trim() !== '' || category !== 'all';
-  // The chosen template stays in view even when it is past the first few cards.
-  const appliedIndex = visible.findIndex(t => templateEntryKey(t) === appliedKey);
+  // The selected template stays in view even when it is past the first few cards.
+  const selectedIndex = visible.findIndex(t => templateEntryKey(t) === shownKey);
   const shown =
-    showAll || filtering || appliedIndex >= COLLAPSED_COUNT
+    showAll || filtering || selectedIndex >= COLLAPSED_COUNT
       ? visible
       : visible.slice(0, COLLAPSED_COUNT);
 
-  const pick = (template: PolicyTemplate | null) => {
-    if (template) onPickTemplate(template);
-    else onPickBlank();
+  const use = (template: PolicyTemplate, rego: string) => {
+    onUseTemplate(template, rego);
+    setSelectedKey(null);
+    setExpanded(false);
+  };
+  const useBlank = () => {
+    onPickBlank();
+    setSelectedKey(null);
     setExpanded(false);
   };
 
   const summaryName =
-    appliedTemplateId === BLANK_TEMPLATE_ID ? 'Blank' : (applied?.name ?? 'Custom Rego');
+    appliedTemplateId === BLANK_TEMPLATE_ID
+      ? 'Allow all (blank)'
+      : (applied?.name ?? 'Custom Rego');
+
+  const card = (
+    key: string,
+    name: string,
+    summary: string,
+    meta: React.ReactNode,
+    testId: string
+  ) => (
+    <button
+      key={key}
+      type="button"
+      className={`policy-template-row policy-template-card${shownKey === key ? ' is-selected' : ''}`}
+      aria-pressed={shownKey === key}
+      onClick={() => setSelectedKey(key)}
+      data-testid={testId}
+    >
+      <span className="policy-template-row__name">{name}</span>
+      <span className="policy-template-row__summary">{summary}</span>
+      <span className="policy-template-card__meta">{meta}</span>
+    </button>
+  );
 
   return (
     <section className="policy-section" data-testid="policy-template-gallery">
@@ -106,33 +186,12 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
               </span>
             )}
           </span>
-          {applied?.docs_href && (
-            <Link
-              href={applied.docs_href}
-              external
-              variant="inline"
-              testId="policy-template-gallery-docs-link"
-            >
-              {applied.docs_label ?? 'Docs'}
-            </Link>
-          )}
-          {applied && applied.parameters.length > 0 && (
-            <button
-              type="button"
-              className="btn btn-sm btn-outline-primary"
-              onClick={() => onCustomise(applied)}
-              data-testid="policy-template-gallery-customise-button"
-            >
-              <i className="fas fa-sliders-h me-1" aria-hidden="true" />
-              Customise settings
-            </button>
-          )}
         </div>
       ) : (
         <>
           <p className="text-muted small mb-2">
-            Pick a proven pattern to fill the name, description and Rego, or start blank. You can
-            edit everything and add rules from more templates before you create the policy.
+            Pick a starting point to see what it does, then use it. You can add rules from more
+            templates in the column on the right.
           </p>
           <div className="d-flex flex-wrap gap-2 align-items-center mb-2">
             <input
@@ -164,84 +223,84 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
           </div>
 
           <div className="policy-template-gallery">
-            {!filtering && (
-              <button
-                type="button"
-                className={`policy-template-row policy-template-card${appliedTemplateId === BLANK_TEMPLATE_ID ? ' is-selected' : ''}`}
-                aria-pressed={appliedTemplateId === BLANK_TEMPLATE_ID}
-                onClick={() => pick(null)}
-                data-testid="policy-template-card-blank"
-              >
-                <span className="policy-template-row__name">Blank</span>
-                <span className="policy-template-row__summary">
-                  The default policy, which allows all traffic. Write your own rules.
-                </span>
-                <span className="policy-template-card__meta">
-                  <DecisionBadge decision="allow" prefix="Default" />
-                </span>
-              </button>
-            )}
+            {!filtering &&
+              card(
+                BLANK_TEMPLATE_ID,
+                'Allow all (blank)',
+                'Allows every request. Write your own rules.',
+                <DecisionBadge decision="allow" prefix="Default" />,
+                'policy-template-card-blank'
+              )}
             {shown.map(t => {
               const key = templateEntryKey(t);
-              const selected = key === appliedKey;
-              return (
-                <button
-                  key={key}
-                  type="button"
-                  className={`policy-template-row policy-template-card${selected ? ' is-selected' : ''}`}
-                  aria-pressed={selected}
-                  onClick={() => pick(t)}
-                  data-testid={`policy-template-card-${key}`}
-                >
-                  <span className="policy-template-row__name">{t.name}</span>
-                  <span className="policy-template-row__summary">{t.summary}</span>
-                  <span className="policy-template-card__meta">
-                    <DecisionBadge decision={defaultDecision(t.rego)} prefix="Default" />
-                    {t.policy_type !== policyType && (
-                      <span
-                        className="badge policy-template-reads"
-                        title={`Choosing it sets Type to ${t.policy_type === 'gateway' ? 'Gateway' : 'Agent Surfaces'}`}
-                        data-testid="policy-template-card-type-badge"
-                      >
-                        {ONLY_LABEL[t.policy_type]}
-                      </span>
-                    )}
-                    {t.policy_input === 'mcp_tool' && (
-                      <span className="badge policy-template-reads">MCP tool policy</span>
-                    )}
-                    <span className="policy-template-row__summary">
-                      {t.builtin ? CATEGORY_LABELS[t.category] : 'Your organization'}
+              return card(
+                key,
+                t.name,
+                t.summary,
+                <>
+                  <DecisionBadge decision={defaultDecision(t.rego)} prefix="Default" />
+                  {t.policy_type !== policyType && (
+                    <span
+                      className="badge policy-template-reads"
+                      data-testid="policy-template-card-type-badge"
+                    >
+                      {ONLY_LABEL[t.policy_type]}
                     </span>
+                  )}
+                  {t.policy_input === 'mcp_tool' && (
+                    <span className="badge policy-template-reads">MCP tool policy</span>
+                  )}
+                  <span className="policy-template-row__summary">
+                    {t.builtin ? CATEGORY_LABELS[t.category] : 'Your organization'}
                   </span>
-                </button>
+                </>,
+                `policy-template-card-${key}`
               );
             })}
           </div>
           {visible.length === 0 && <div className="text-muted small py-2">No templates match.</div>}
-          <div className="d-flex justify-content-between align-items-center mt-2">
-            {shown.length < visible.length ? (
-              <button
-                type="button"
-                className="btn btn-sm btn-link p-0"
-                onClick={() => setShowAll(true)}
-                data-testid="policy-template-gallery-show-all"
-              >
-                Show all ({visible.length})
-              </button>
-            ) : (
-              <span />
-            )}
-            {appliedTemplateId !== BLANK_TEMPLATE_ID && (
-              <button
-                type="button"
-                className="btn btn-sm btn-link p-0"
-                onClick={() => setExpanded(false)}
-                data-testid="policy-template-gallery-collapse-button"
-              >
-                Keep the current policy
-              </button>
-            )}
-          </div>
+          {shown.length < visible.length && (
+            <button
+              type="button"
+              className="btn btn-sm btn-link p-0 mt-2"
+              onClick={() => setShowAll(true)}
+              data-testid="policy-template-gallery-show-all"
+            >
+              Show all ({visible.length})
+            </button>
+          )}
+
+          {shownKey === BLANK_TEMPLATE_ID ? (
+            <div
+              className="policy-template-gallery__detail"
+              data-testid="policy-template-gallery-detail"
+            >
+              <h6 className="fw-bold mb-1">Allow all (blank)</h6>
+              <p className="text-muted small mb-3">
+                The default allow-all policy. Every request is allowed until you add rules and
+                change <code>default allow</code> to <code>false</code>.
+              </p>
+              <div className="d-flex justify-content-end">
+                <button
+                  type="button"
+                  className="btn btn-sm btn-primary"
+                  onClick={useBlank}
+                  data-testid="policy-template-gallery-use-button"
+                >
+                  Use this template
+                </button>
+              </div>
+            </div>
+          ) : (
+            selected && (
+              <GalleryDetail
+                key={selected.id}
+                template={selected}
+                policyType={policyType}
+                onUse={use}
+              />
+            )
+          )}
         </>
       )}
     </section>

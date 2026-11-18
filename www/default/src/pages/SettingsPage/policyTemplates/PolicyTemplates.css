@@ -360,3 +360,18 @@ body.dark-theme .policy-templates-panel__placeholder {
     overflow-y: auto;
   }
 }
+
+.policy-template-gallery__detail {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--accent-blue-text);
+  border-radius: var(--radius-sm);
+}
+
+.policy-template-example-item .policy-template-example {
+  margin-bottom: 4px;
+}
+
+body.dark-theme .policy-template-gallery__detail {
+  border-color: var(--accent-blue-text);
+}

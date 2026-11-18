@@ -752,10 +752,10 @@
     "id": "allow-path-prefixes",
     "name": "Allow listed paths",
     "summary": "Allow only requests under the listed path prefixes.",
-    "description": "Allows a request only when its path starts with one of the listed prefixes.",
+    "description": "Allows a request only when its path starts with one of the listed prefixes. Denies a path that contains .., %2e, a backslash or %5c.",
     "category": "routing_paths",
     "policy_types": ["gateway", "agent_surface"],
-    "rules": "default allow := false\n\nallow if {\n  some prefix in {{prefixes}}\n  startswith(input.http.path, prefix)\n}",
+    "rules": "default allow := false\n\npath_prefix_unsafe if contains(input.http.path, \"..\")\n\npath_prefix_unsafe if contains(lower(input.http.path), \"%2e\")\n\npath_prefix_unsafe if contains(input.http.path, \"\\\\\")\n\npath_prefix_unsafe if contains(lower(input.http.path), \"%5c\")\n\nallow if {\n  not path_prefix_unsafe\n  some prefix in {{prefixes}}\n  startswith(input.http.path, prefix)\n}",
     "parameters": [
       {
         "key": "prefixes",
@@ -783,6 +783,26 @@
           "http": {
             "method": "GET",
             "path": "/admin"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Path with ..",
+        "input": {
+          "http": {
+            "method": "GET",
+            "path": "/public/../admin"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Path with %2E%2E",
+        "input": {
+          "http": {
+            "method": "GET",
+            "path": "/public/%2E%2E/admin"
           }
         },
         "expected": "deny"
@@ -894,7 +914,7 @@
     "id": "allow-all-monitor",
     "name": "Monitor-only baseline",
     "summary": "Lets everything through. For observing traffic only.",
-    "description": "Allows every request. Each decision is still recorded in the Audit Log, so you can watch traffic before writing a stricter policy. To try a stricter policy without blocking, use the Monitor option of global enforcement on the Policies list instead.",
+    "description": "Allows every request, so you can watch traffic before writing a stricter policy: through the Audit Log when policy decisions are audited, or through policy input capture. To try a stricter policy without blocking, use the Monitor option of global enforcement on the Policies list instead.",
     "category": "baseline",
     "policy_types": ["gateway", "agent_surface"],
     "standalone": true,

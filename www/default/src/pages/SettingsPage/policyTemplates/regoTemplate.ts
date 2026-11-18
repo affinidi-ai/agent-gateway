@@ -4,7 +4,7 @@ import type {
   PolicyTemplate,
   PolicyTemplateParameter,
 } from './types';
-import { TEMPLATE_BEGIN_PREFIX, TEMPLATE_END_PREFIX } from './regoRules';
+import { isTemplateMarker, TEMPLATE_BEGIN_PREFIX, TEMPLATE_END_PREFIX } from './regoRules';
 
 const PACKAGE_LINE = /^\s*package\s+/;
 const IMPORT_LINE = /^\s*import\s+/;
@@ -60,10 +60,17 @@ function toRegoLiteral(param: PolicyTemplateParameter, value: unknown): Literal 
   return { literal: `{${cleaned.map(v => JSON.stringify(v)).join(', ')}}` };
 }
 
-/** The canonical spelling of an IANA time zone name, or null for a name that isn't one. */
+/**
+ * The canonical spelling of an IANA time zone name, or null for a name that isn't one. Browsers
+ * also accept UTC offsets such as `+01:00`, which the gateway's Regorus (chrono-tz) rejects, so
+ * a name must start with a letter and hold no `:`.
+ */
 function canonicalTimeZone(name: string): string | null {
+  const ianaName = (zone: string) => /^[A-Za-z]/.test(zone) && !zone.includes(':');
+  if (!ianaName(name)) return null;
   try {
-    return new Intl.DateTimeFormat('en-US', { timeZone: name }).resolvedOptions().timeZone;
+    const zone = new Intl.DateTimeFormat('en-US', { timeZone: name }).resolvedOptions().timeZone;
+    return ianaName(zone) ? zone : null;
   } catch {
     return null;
   }
@@ -158,7 +165,13 @@ export function insertTemplateRules(
   const droppedDefault = templateLines.some(l => DEFAULT_ALLOW_LINE.test(l));
   const body = trimBlankLines(
     templateLines.filter(
-      l => !PACKAGE_LINE.test(l) && !IMPORT_LINE.test(l) && !DEFAULT_ALLOW_LINE.test(l)
+      l =>
+        !PACKAGE_LINE.test(l) &&
+        !IMPORT_LINE.test(l) &&
+        !DEFAULT_ALLOW_LINE.test(l) &&
+        // A template saved from a policy that combined templates keeps their markers; dropping
+        // them stops groups nesting, so Remove takes out every rule of the inserted template.
+        !isTemplateMarker(l)
     )
   );
   const added = body.join('\n');

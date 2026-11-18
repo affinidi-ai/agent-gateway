@@ -58,6 +58,35 @@ describe('policyTemplateStore', () => {
     expect(await organization()).toEqual([]);
   });
 
+  it('rejects an inherited key as a category and drops fields it does not check', async () => {
+    const stored = JSON.parse(JSON.stringify(await savePolicyTemplate(NEW_TEMPLATE)));
+    window.sessionStorage.setItem(
+      'policy-templates:organization',
+      JSON.stringify([{ ...stored, category: 'toString' }])
+    );
+    expect(await organization()).toEqual([]);
+
+    window.sessionStorage.setItem(
+      'policy-templates:organization',
+      JSON.stringify([{ ...stored, standalone: false, docs_href: 'https://example.invalid/' }])
+    );
+    const [template] = await organization();
+    expect(template).not.toHaveProperty('docs_href');
+    expect(template).not.toHaveProperty('standalone');
+  });
+
+  it('keeps a saved template for the page when storage refuses the write', async () => {
+    const setItem = jest.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new Error('QuotaExceededError');
+    });
+    try {
+      await savePolicyTemplate({ ...NEW_TEMPLATE, name: 'Kept in memory' });
+      expect((await organization()).map(t => t.name)).toContain('Kept in memory');
+    } finally {
+      setItem.mockRestore();
+    }
+  });
+
   it('refuses a name already used for the same type', async () => {
     await savePolicyTemplate(NEW_TEMPLATE);
     await expect(savePolicyTemplate({ ...NEW_TEMPLATE, name: 'partner TRAFFIC' })).rejects.toThrow(

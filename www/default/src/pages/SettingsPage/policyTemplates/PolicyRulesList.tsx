@@ -7,11 +7,18 @@ interface PolicyRulesListProps {
   canEdit: boolean;
   /** False while the Rego doesn't compile. */
   valid: boolean;
+  /** The package doesn't match the Type, which the banner names instead of a compile error. */
+  packageMismatch: boolean;
+  /** An empty policy, which the gateway treats as allowing every request. */
+  empty: boolean;
   /** The template whose rules were added last, marked "Just added". */
   justAdded: string | null;
   onAdd: () => void;
   onWriteRego: () => void;
   onRemoveGroup: (group: RuleGroup) => void;
+  onRemoveRule: (rule: PolicyRule) => void;
+  /** A helper another rule still refers to, which Remove refuses. */
+  isRuleInUse: (rule: PolicyRule) => boolean;
   onSetDefaultDeny: () => void;
   onShowRule: (rule: PolicyRule) => void;
 }
@@ -38,10 +45,14 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
   parsed,
   canEdit,
   valid,
+  packageMismatch,
+  empty,
   justAdded,
   onAdd,
   onWriteRego,
   onRemoveGroup,
+  onRemoveRule,
+  isRuleInUse,
   onSetDefaultDeny,
   onShowRule,
 }) => {
@@ -82,7 +93,9 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
         >
           <span>
             <i className="fas fa-circle-exclamation me-2" aria-hidden="true" />
-            The Rego doesn&apos;t compile, so the policy can&apos;t be saved.
+            {packageMismatch
+              ? "The package doesn't match the policy Type, so the policy can't be saved."
+              : "The Rego doesn't compile, so the policy can't be saved."}
           </span>
           <button
             type="button"
@@ -122,8 +135,9 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
           <i className="fas fa-list-check fa-lg text-muted" aria-hidden="true" />
           <div className="fw-bold mt-2">No rules yet</div>
           <div className="small text-muted mb-2">
-            The default decision ({parsed.defaultDecision === 'allow' ? 'allow' : 'deny'}) applies
-            to every request.
+            {empty
+              ? 'An empty policy allows every request.'
+              : `The default decision (${parsed.defaultDecision === 'allow' ? 'allow' : 'deny'}) applies to every request.`}
           </div>
           {canEdit && (
             <div className="d-flex justify-content-center flex-wrap gap-2">
@@ -183,6 +197,7 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
                   type="button"
                   className="btn btn-sm btn-link text-danger p-0 ms-auto"
                   onClick={() => onRemoveGroup(group)}
+                  aria-label={`Remove the rules from ${group.source.kind === 'template' ? group.source.name : 'the editor'}`}
                   data-testid={`${testId}-remove-button`}
                 >
                   Remove
@@ -217,6 +232,23 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
                   >
                     {lineLabel(rule)}
                   </button>
+                  {canEdit && (
+                    <button
+                      type="button"
+                      className="btn btn-sm btn-link text-danger p-0 text-nowrap"
+                      disabled={isRuleInUse(rule)}
+                      title={
+                        isRuleInUse(rule)
+                          ? `Another rule uses ${rule.head}; remove that rule first`
+                          : undefined
+                      }
+                      onClick={() => onRemoveRule(rule)}
+                      aria-label={`Remove the rule ${rule.head}`}
+                      data-testid={`${testId}-rule-${ruleIndex}-remove-button`}
+                    >
+                      Remove
+                    </button>
+                  )}
                 </li>
               ))}
             </ul>

@@ -4,7 +4,7 @@ import FieldHelp from '../../../components/shared/FieldHelp';
 import PolicyRulesList from './PolicyRulesList';
 import PolicySectionTitle from './PolicySectionTitle';
 import RegoReference from './RegoReference';
-import { parsePolicyRules, type PolicyRule, type RuleGroup } from './regoRules';
+import { parsePolicyRules, ruleInUse, type PolicyRule, type RuleGroup } from './regoRules';
 import { DecisionBadge } from './TemplateBadges';
 import type { PolicyType } from './types';
 import './PolicyTemplates.css';
@@ -34,6 +34,7 @@ interface PolicyEditorSectionProps {
   justAdded: string | null;
   onAdd: () => void;
   onRemoveGroup: (group: RuleGroup) => void;
+  onRemoveRule: (rule: PolicyRule) => void;
   onSetDefaultDeny: () => void;
   /** Selects a rule's lines in the Rego textarea. */
   onShowRule: (rule: PolicyRule) => void;
@@ -57,12 +58,15 @@ const PolicyEditorSection: React.FC<PolicyEditorSectionProps> = ({
   justAdded,
   onAdd,
   onRemoveGroup,
+  onRemoveRule,
   onSetDefaultDeny,
   onShowRule,
 }) => {
   const parsed = useMemo(() => parsePolicyRules(policy), [policy]);
   const ruleCount = parsed.ok ? parsed.groups.reduce((n, g) => n + g.rules.length, 0) : 0;
   const valid = policyValid && !packageMismatch;
+  // The gateway treats an empty policy as allowing every request.
+  const empty = !policy.trim();
   const [pendingRule, setPendingRule] = useState<PolicyRule | null>(null);
   const gutterRef = useRef<HTMLPreElement>(null);
   const lineCount = Math.max(1, policy.split('\n').length);
@@ -115,7 +119,10 @@ const PolicyEditorSection: React.FC<PolicyEditorSectionProps> = ({
             <span className="text-muted small" data-testid="policy-rules-count">
               {ruleCount} {ruleCount === 1 ? 'rule' : 'rules'}
             </span>
-            <DecisionBadge decision={parsed.defaultDecision ?? 'deny'} prefix="Default" />
+            <DecisionBadge
+              decision={empty ? 'allow' : (parsed.defaultDecision ?? 'deny')}
+              prefix="Default"
+            />
           </>
         )}
         {isValidating && (
@@ -151,10 +158,14 @@ const PolicyEditorSection: React.FC<PolicyEditorSectionProps> = ({
           parsed={parsed}
           canEdit={canEdit}
           valid={valid || isValidating}
+          packageMismatch={!!packageMismatch}
+          empty={empty}
           justAdded={justAdded}
           onAdd={onAdd}
           onWriteRego={() => onViewChange('rego')}
           onRemoveGroup={onRemoveGroup}
+          onRemoveRule={onRemoveRule}
+          isRuleInUse={rule => ruleInUse(policy, parsed, rule)}
           onSetDefaultDeny={onSetDefaultDeny}
           onShowRule={showRule}
         />

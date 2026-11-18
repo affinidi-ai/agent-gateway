@@ -32,6 +32,11 @@ export const TEMPLATE_END_PREFIX = '# End of template: ';
 
 const BEGIN_MARKER = /^\s*#\s*Inserted from template:\s*(.*)$/;
 const END_MARKER = /^\s*#\s*End of template:/;
+
+/** True for a `# Inserted from template:` or `# End of template:` comment line. */
+export function isTemplateMarker(line: string): boolean {
+  return BEGIN_MARKER.test(line) || END_MARKER.test(line);
+}
 const DEFAULT_ALLOW = /^default\s+allow\s*:?=\s*(true|false)\b/;
 const DEFAULT_ALLOW_TRUE = /^(\s*default\s+allow\s*:?=\s*)true\b/m;
 const OPEN_ENDING = /(\bif|\belse|:=|=|,)$/;
@@ -192,4 +197,52 @@ export function removeRuleGroup(rego: string, group: RuleGroup): string {
 /** Turns `default allow := true` (or `= true`) into `false`, keeping the operator. */
 export function setDefaultDeny(rego: string): string {
   return rego.replace(DEFAULT_ALLOW_TRUE, '$1false');
+}
+
+/** A rule's name without `default` or a function's arguments, such as `allow` or `jwt_claim_values`. */
+export function ruleName(rule: PolicyRule): string {
+  return rule.head.replace(/^default\s+/, '').replace(/\(.*$/, '');
+}
+
+/**
+ * Whether removing a helper rule would leave another rule referring to it. Removing an `allow`
+ * or deny-reason rule only narrows the policy, but removing a helper can widen it: a rule that
+ * reads `not helper` matches everything once the helper is gone. A helper with another
+ * identical definition left, from the same template added twice, is free to remove.
+ */
+export function ruleInUse(rego: string, parsed: ParsedPolicy, rule: PolicyRule): boolean {
+  if (rule.kind !== 'helper' || !parsed.ok) return false;
+  const name = ruleName(rule);
+  const lines = rego.split('\n');
+  const text = (r: PolicyRule) =>
+    lines
+      .slice(r.startLine - 1, r.endLine)
+      .map(l => l.split('#')[0].trim())
+      .join(' ');
+  // Only an identical copy, from the same template added twice, leaves the helper unchanged;
+  // removing one of several different definitions weakens it.
+  const identicalCopy = parsed.groups
+    .flatMap(g => g.rules)
+    .some(r => r.startLine !== rule.startLine && ruleName(r) === name && text(r) === text(rule));
+  if (identicalCopy) return false;
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const reference = new RegExp(`(^|[^\\w.])${escaped}\\b`);
+  return lines.some(
+    (line, i) =>
+      (i + 1 < rule.startLine || i + 1 > rule.endLine) && reference.test(line.split('#')[0])
+  );
+}
+
+/** Removes one rule's lines, with the comment lines directly above it. */
+export function removeRule(rego: string, rule: PolicyRule): string {
+  const lines = rego.split('\n');
+  let start = rule.startLine - 1;
+  while (start > 0 && /^\s*#/.test(lines[start - 1]) && !isTemplateMarker(lines[start - 1])) {
+    start--;
+  }
+  lines.splice(start, rule.endLine - start);
+  return `${lines
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/\s+$/, '')}\n`;
 }
