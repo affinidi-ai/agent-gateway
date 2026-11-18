@@ -23,6 +23,7 @@ docker-compose.yml
 *.swp
 *.swo
 node_modules/
+.venv/
 *.pem
 *.key
 .cache

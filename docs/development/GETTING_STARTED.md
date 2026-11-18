@@ -31,7 +31,7 @@ Install these before starting:
 | Node.js and npm | Required to build and run the dashboard |
 | A WebAuthn-capable browser and authenticator | For example, Safari or Chrome with Touch ID, or a compatible security key |
 
-The dependency target installs the additional Rust tools, native packages, command-line tools, and Git hooks used by the repository.
+The dependency target installs the additional Rust tools, native packages, and command-line tools used by the repository, the Python packages the changelog tooling needs (into a repository-local `.venv`), and the Git hooks that run the pre-commit checks.
 
 ## Build And Run
 
@@ -43,6 +43,11 @@ make run-debug
 ```
 
 `make install-deps` is a one-time macOS/Homebrew setup. `make run-debug` builds the dashboard and debug Rust binary, generates local certificates and keys, prepares the local environment, starts the Gateway, and starts the frontend development server.
+
+`make install-deps` warns instead of failing when a step cannot finish, and each warning says what to run next, so read its closing lines:
+
+- Git hooks are not installed when `core.hooksPath` is set in your Git configuration (the warning prints the commands for the configuration that holds it), or when you run `make install-deps SKIP_GIT_HOOKS=1` to manage this repository's hooks yourself. Without them the pre-commit checks, gitleaks included, do not run locally; `make install-git-hooks` installs them once the cause is resolved.
+- The Python packages go into `.venv`. If that step cannot finish, everything else still completes and only `make lint-changelog` is affected; `make install-python-deps` retries it on its own.
 
 During initial configuration, the setup may ask for public inbound and outbound URLs. Press Enter to use the local defaults unless you are intentionally testing through a configured public tunnel.
 
