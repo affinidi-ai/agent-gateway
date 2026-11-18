@@ -1,5 +1,5 @@
 //! Policy input capture: while a dashboard connection listens to a surface's policy
-//! input, each policy evaluation on that surface is sent as a `policy_input_captured`
+//! input, each request and response policy evaluation on that surface is sent as a `policy_input_captured`
 //! WebSocket update with its input, credentials masked, and its outcome. Only the
 //! listening connections receive it; capture stops when the last of them stops listening
 //! or closes. Nothing is written to the log or stored.
@@ -388,7 +388,7 @@ fn mask_outcome_text(text: &str) -> String {
 }
 
 /// Apply the operator's log redaction rules (`logging.redaction.rules`) to every string
-/// in `value`, so a capture masks at least what the log masks.
+/// in `value`, so the rules that match a value on its own mask captures too.
 fn apply_redaction_rules(
     value: &mut Value,
     redactor: &crate::observability::LogRedactor,
@@ -492,7 +492,15 @@ fn mask_text(text: &str) -> Option<String> {
     let masked = URL_USERINFO
         .replace_all(&masked, |caps: &regex::Captures<'_>| format!("{}{REDACTED}@", &caps[1]))
         .into_owned();
-    let masked = mask_embedded_jwts(&masked);
+    let masked = EMBEDDED_JWT
+        .replace_all(&masked, |caps: &regex::Captures<'_>| {
+            if is_jwt_header(&caps[1]) {
+                REDACTED.to_string()
+            } else {
+                caps[0].to_string()
+            }
+        })
+        .into_owned();
     let masked = AUTHORIZATION
         .replace_all(&masked, |caps: &regex::Captures<'_>| {
             if is_authorization_token(&caps[1], &caps[3]) {
@@ -503,33 +511,6 @@ fn mask_text(text: &str) -> Option<String> {
         })
         .into_owned();
     (masked != text).then_some(masked)
-}
-
-/// `text` with each embedded JWT replaced by [`REDACTED`]. A candidate whose header does
-/// not decode is searched again from just after the first `-` in its header, or else from
-/// its first dot, so a word such as `Cisco-` or `Cisco.` in front of a JWT does not hide it.
-fn mask_embedded_jwts(text: &str) -> String {
-    let mut masked = String::with_capacity(text.len());
-    let mut copied = 0;
-    let mut from = 0;
-    while let Some(caps) = EMBEDDED_JWT.captures_at(text, from) {
-        let (Some(whole), Some(header)) = (caps.get(0), caps.get(1)) else {
-            break;
-        };
-        if is_jwt_header(header.as_str()) {
-            masked.push_str(&text[copied..whole.start()]);
-            masked.push_str(REDACTED);
-            copied = whole.end();
-            from = whole.end();
-        } else {
-            from = header
-                .as_str()
-                .find('-')
-                .map_or(header.end(), |dash| header.start() + dash + 1);
-        }
-    }
-    masked.push_str(&text[copied..]);
-    masked
 }
 
 /// The shortest `Bearer` token taken as a credential when it is only letters. Shorter
@@ -1472,21 +1453,7 @@ mod tests {
     }
 
     #[test]
-    fn a_word_that_looks_like_a_header_does_not_hide_the_jwt_after_it() {
-        let mut input = json!({ "a2a": { "parts": [
-            { "text": format!("Cisco.{JWT} and eyes.{JWT}") },
-            { "text": "Cisco.com.au and ICE.v2.bak" },
-        ] } });
-
-        mask_credentials(&mut input);
-
-        let parts = &input["a2a"]["parts"];
-        assert_eq!(parts[0]["text"], format!("Cisco.{REDACTED} and eyes.{REDACTED}"));
-        assert_eq!(parts[1]["text"], "Cisco.com.au and ICE.v2.bak");
-    }
-
-    #[test]
-    fn a_jwt_joined_to_a_word_by_a_dash_or_equals_sign_is_masked() {
+    fn a_jwt_after_a_word_and_an_equals_sign_is_masked() {
         use base64::Engine;
         let encode = |json: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
         let spaced = format!("{}.{}.c2ln", encode(r#" {"alg":"HS256"}"#), encode(r#"{"sub":"x"}"#));
@@ -1494,10 +1461,9 @@ mod tests {
         let mut input = json!({ "a2a": { "parts": [
             { "text": format!("CSRF={JWT}") },
             { "text": format!("X-CSRF-Token={JWT}") },
-            { "text": format!("Cisco-{JWT}") },
             { "text": format!("DSID={JWT}") },
-            { "text": format!("eyes-{JWT} ewe={JWT}") },
-            { "text": format!("DSID={spaced} Cisco-{spaced}") },
+            { "text": format!("ewe={JWT}") },
+            { "text": format!("DSID={spaced}") },
             { "text": "Cisco.com.au CQRS.handler.ts ICE.v2.bak" },
         ] } });
 
@@ -1506,11 +1472,31 @@ mod tests {
         let parts = &input["a2a"]["parts"];
         assert_eq!(parts[0]["text"], format!("CSRF={REDACTED}"));
         assert_eq!(parts[1]["text"], format!("X-CSRF-Token={REDACTED}"));
-        assert_eq!(parts[2]["text"], format!("Cisco-{REDACTED}"));
-        assert_eq!(parts[3]["text"], format!("DSID={REDACTED}"));
-        assert_eq!(parts[4]["text"], format!("eyes-{REDACTED} ewe={REDACTED}"));
-        assert_eq!(parts[5]["text"], format!("DSID={REDACTED} Cisco-{REDACTED}"));
-        assert_eq!(parts[6]["text"], "Cisco.com.au CQRS.handler.ts ICE.v2.bak");
+        assert_eq!(parts[2]["text"], format!("DSID={REDACTED}"));
+        assert_eq!(parts[3]["text"], format!("ewe={REDACTED}"));
+        assert_eq!(parts[4]["text"], format!("DSID={REDACTED}"));
+        assert_eq!(parts[5]["text"], "Cisco.com.au CQRS.handler.ts ICE.v2.bak");
+    }
+
+    fn masked(text: &str) -> (Value, std::time::Duration) {
+        let mut value = Value::String(text.to_string());
+        let started = std::time::Instant::now();
+        mask_credentials(&mut value);
+        (value, started.elapsed())
+    }
+
+    #[test]
+    fn a_megabyte_of_header_like_pieces_is_kept_in_linear_time() {
+        let dashes = format!("{}x.a.b", "Ci-".repeat(350_000));
+        let tildes = "Ci.a.b~".repeat(150_000);
+        let mixed = format!("{}{}x.a.b", "Ci.a.b~".repeat(75_000), "Ci-".repeat(175_000));
+
+        for text in [dashes, tildes, mixed] {
+            let (value, elapsed) = masked(&text);
+
+            assert!(elapsed < std::time::Duration::from_secs(2), "took {elapsed:?}");
+            assert_eq!(value, Value::String(text));
+        }
     }
 
     #[test]
