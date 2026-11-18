@@ -33,6 +33,7 @@ import { withCallerAccessSettled } from '../components/surface-builder/elements/
 import {
   accessPointStatus,
   chooseAccessPointNotice,
+  hasCallerAuthentication,
   savedAccessPointStatus,
 } from '../components/surface-builder/elements/access-point/readiness';
 import {
@@ -1788,6 +1789,7 @@ const SurfaceDetailPage: React.FC = () => {
         agentCardRefreshKey={saveCount}
         hasVariants={savedHasVariants}
         accessPointNotice={accessPointNotice}
+        accessPointChecksCallers={hasCallerAuthentication(livePayload)}
         legacyAccessPoint={legacyAccessPoint}
         apiKeyStatuses={apiKeyStatuses}
         authorityDids={authorityDids}

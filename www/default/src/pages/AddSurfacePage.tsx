@@ -26,6 +26,7 @@ import { withCallerAccessSettled } from '../components/surface-builder/elements/
 import {
   accessPointStatus,
   chooseAccessPointNotice,
+  hasCallerAuthentication,
 } from '../components/surface-builder/elements/access-point/readiness';
 import {
   DEFAULT_DIDWEBVH_CONFIG,
@@ -876,6 +877,7 @@ const AddSurfacePage: React.FC = () => {
         hasAttemptedSave={hasAttemptedSave}
         saveError={error}
         accessPointNotice={accessPointNotice}
+        accessPointChecksCallers={hasCallerAuthentication(draftPayload)}
         authorityDids={authorityDids}
         manageActions={
           <div className="d-flex gap-2">

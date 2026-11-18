@@ -5,7 +5,8 @@
  * format problems shown next to the fields and blocking Save, a Target that is not https and an
  * Access Point that checks no caller shown as advisories that allow Save (the gateway refuses
  * them only while its `target_https` or `target_source_auth` rule is `enforce`, and answers a
- * save in `warn` with a `Warning` header), and a valid setting, scopes included, saving and
+ * save in `warn` with a `Warning` header), advice for a passthrough fallback, a stored method
+ * the editor cannot show kept through a save, and a valid setting, scopes included, saving and
  * loading again unchanged.
  *
  * The gateway API is mocked with `page.route`. Line breaks cannot be typed into a text input
@@ -326,6 +327,10 @@ test.describe('Managed Agent Target authentication: credential provider', () => 
         await openTargetAuth(page);
         await pickProvider(page);
 
+        await expect(page.getByTestId('managed-agent-target-auth-advisories')).toContainText(
+            'it needs source authentication on the Access Point. Save is allowed',
+        );
+        await expect(page.getByTestId('managed-agent-target-auth-errors')).toHaveCount(0);
         await saveButton(page).click();
         await expect.poll(() => saved.length).toBe(1);
     });
@@ -393,6 +398,48 @@ test.describe('Managed Agent Target authentication: credential provider', () => 
             auth_type: 'custom',
             fallback: 'passthrough',
         };
+        await mockSurface(page, surfaceFixture({auth: stored}), saved);
+        await page.goto(`${BASE_URL}/surfaces/${SURFACE_ID}`);
+        await expect(page.getByTestId('surface-node-target')).toBeVisible();
+
+        await saveButton(page).click();
+        await expect.poll(() => saved.length).toBe(1);
+        expect((saved[0].postDataJSON().target as {auth: Json}).auth).toEqual(stored);
+    });
+
+    test('a passthrough fallback shows advice and still saves', async ({page}) => {
+        const saved: Request[] = [];
+        await mockSurface(page, surfaceFixture(), saved);
+        await openTargetAuth(page);
+        await pickProvider(page);
+        await page.locator('#target-auth-fallback').selectOption('passthrough');
+
+        await expect(page.getByTestId('managed-agent-target-auth-advisories')).toContainText(
+            'passes a request through without the credential when the credential cannot be resolved. Save is allowed',
+        );
+        await expect(page.getByTestId('managed-agent-target-auth-errors')).toHaveCount(0);
+        await saveButton(page).click();
+        await expect.poll(() => saved.length).toBe(1);
+    });
+
+    test('the missing provider message is tied to the provider select', async ({page}) => {
+        await mockSurface(page, surfaceFixture(), []);
+        await openTargetAuth(page);
+        await page.getByTestId('managed-agent-target-auth-source').selectOption('provider');
+
+        const select = page.getByTestId('managed-agent-target-auth-provider');
+        await expect(select).toHaveAttribute('aria-invalid', 'true');
+        await expect(select).toHaveAttribute('aria-describedby', 'target-auth-provider-error');
+        await expect(page.locator('#target-auth-provider-error')).toContainText('Pick the credential provider');
+
+        await select.selectOption('prov-1');
+        await expect(select).toHaveAttribute('aria-invalid', 'false');
+        await expect(page.locator('#target-auth-provider-error')).toHaveCount(0);
+    });
+
+    test('a stored method the editor cannot show is saved unchanged', async ({page}) => {
+        const saved: Request[] = [];
+        const stored = {method: {credential_lookup: {target_identifier: 'partner'}}, fallback: 'reject'};
         await mockSurface(page, surfaceFixture({auth: stored}), saved);
         await page.goto(`${BASE_URL}/surfaces/${SURFACE_ID}`);
         await expect(page.getByTestId('surface-node-target')).toBeVisible();

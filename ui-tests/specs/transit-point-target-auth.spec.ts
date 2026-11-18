@@ -3,8 +3,9 @@
  *
  * Covers the Target authentication of a Transit Point (an agent-initiated outbound route): a
  * reserved header name shown next to the field and blocking Save, a Target that is not https
- * and a Transit Point that authenticates no caller shown as advisories that allow Save, and a
- * Transit Point left unopened keeping its stored `target_auth` through a save.
+ * and a Transit Point that authenticates no caller shown as advisories that allow Save, scopes
+ * written and cleared, and a Transit Point left unopened keeping its stored `target_auth`,
+ * whatever its method, through a save.
  *
  * The gateway API is mocked with `page.route`.
  */
@@ -86,6 +87,39 @@ async function mockSurface(page: Page, initial: Json, saved: Request[]) {
     });
 }
 
+const providerAuth = (scopes: string[]): Json => ({
+    method: {
+        credential_provider: {
+            provider_id: 'prov-1',
+            header_name: 'Authorization',
+            header_format: 'Bearer {value}',
+            scopes,
+        },
+    },
+    fallback: 'reject',
+});
+
+const PROVIDER = {
+    id: 'prov-1',
+    name: 'Partner provider',
+    provider_id: 'partner',
+    provider_type: 'oauth2_client_credentials',
+    default_scopes: [],
+};
+
+/** Opens the Transit Point and chooses the stored provider again, which shows the Scopes input. */
+async function chooseStoredProvider(page: Page) {
+    await page.route(/\/api\/v1\/credential-providers\/?$/, route => route.fulfill({json: [PROVIDER]}));
+    await page.goto(`${BASE_URL}/surfaces/${SURFACE_ID}`);
+    await transitPoint(page).click();
+    await page.getByTestId('transit-point-target-auth-type').selectOption('credential_provider');
+    await page.getByTestId('transit-point-target-auth-provider').selectOption('prov-1');
+}
+
+const savedProvider = (request: Request): Json =>
+    (request.postDataJSON().transit as {points: Array<{target_auth: {method: {credential_provider: Json}}}>})
+        .points[0].target_auth.method.credential_provider;
+
 const saveButton = (page: Page) => page.locator('button.btn-primary:has(.fa-save)');
 const transitPoint = (page: Page) => page.getByTestId('surface-node-transit-point-a2a');
 
@@ -101,6 +135,11 @@ test.describe('Transit Point Target authentication', () => {
         await page.getByPlaceholder('X-Auth').fill('Host');
         await expect(page.getByTestId('transit-point-target-auth-errors')).toContainText(
             'Header name must not be the reserved header Host',
+        );
+        await expect(page.getByPlaceholder('X-Auth')).toHaveAttribute('aria-invalid', 'true');
+        await expect(page.getByPlaceholder('X-Auth')).toHaveAttribute(
+            'aria-describedby',
+            'transit-point-target-auth-errors',
         );
         await saveButton(page).click();
         await page.waitForTimeout(300);
@@ -160,6 +199,44 @@ test.describe('Transit Point Target authentication', () => {
     test('an unopened Transit Point saves its stored target_auth unchanged', async ({page}) => {
         const saved: Request[] = [];
         const stored = staticSecret('Host');
+        await mockSurface(page, surfaceFixture({target_auth: stored}), saved);
+        await page.goto(`${BASE_URL}/surfaces/${SURFACE_ID}`);
+        await expect(page.getByTestId('surface-node-target')).toBeVisible();
+
+        await saveButton(page).click();
+        await expect.poll(() => saved.length).toBe(1);
+        const points = (saved[0].postDataJSON().transit as {points: Array<{target_auth: Json}>}).points;
+        expect(points[0].target_auth).toEqual(stored);
+    });
+
+    test('the scopes an operator types on a Transit Point are saved', async ({page}) => {
+        const saved: Request[] = [];
+        await mockSurface(page, surfaceFixture({target_auth: providerAuth(['read'])}), saved);
+        await chooseStoredProvider(page);
+
+        await page.getByTestId('transit-point-target-auth-provider-scopes').fill('read write');
+        await saveButton(page).click();
+        await expect.poll(() => saved.length).toBe(1);
+        expect(savedProvider(saved[0]).scopes).toEqual(['read', 'write']);
+    });
+
+    test('emptying the scopes of a Transit Point clears the stored ones', async ({page}) => {
+        const saved: Request[] = [];
+        await mockSurface(page, surfaceFixture({target_auth: providerAuth(['read'])}), saved);
+        await chooseStoredProvider(page);
+
+        const scopes = page.getByTestId('transit-point-target-auth-provider-scopes');
+        await scopes.fill('write');
+        await scopes.fill('');
+        await saveButton(page).click();
+        await expect.poll(() => saved.length).toBe(1);
+        expect(savedProvider(saved[0])).not.toHaveProperty('scopes');
+        expect(savedProvider(saved[0]).provider_id).toBe('prov-1');
+    });
+
+    test('an unopened Transit Point saves a stored method the panel cannot show unchanged', async ({page}) => {
+        const saved: Request[] = [];
+        const stored = {method: {credential_lookup: {target_identifier: 'partner'}}, fallback: 'reject'};
         await mockSurface(page, surfaceFixture({target_auth: stored}), saved);
         await page.goto(`${BASE_URL}/surfaces/${SURFACE_ID}`);
         await expect(page.getByTestId('surface-node-target')).toBeVisible();

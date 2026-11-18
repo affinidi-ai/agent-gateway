@@ -6,6 +6,7 @@ import type { ConfigPanelProps } from '../types';
 import TargetAuthProviderSelect from '../_shared/TargetAuthProviderSelect';
 import TargetAuthProblemNotice from '../_shared/TargetAuthProblemNotice';
 import { managedAgentTargetAuthProblems } from './targetAuth';
+import { useOptionalSurfaceMeta } from '../../SurfaceMetaContext';
 
 interface SecretOption {
   id: string;
@@ -40,7 +41,10 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
   const source = config.target_auth_source === 'provider' ? 'provider' : 'secret';
   const [secrets, setSecrets] = useState<SecretOption[]>([]);
   const [loadingSecrets, setLoadingSecrets] = useState(false);
-  const { errors, warnings, advisories } = managedAgentTargetAuthProblems(config);
+  const accessPointChecksCallers = useOptionalSurfaceMeta()?.accessPointChecksCallers;
+  const { errors, warnings, advisories, notes } = managedAgentTargetAuthProblems(config, {
+    accessPointChecksCallers,
+  });
 
   useEffect(() => {
     setLoadingSecrets(true);
@@ -95,6 +99,7 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
           errors={[]}
           warnings={warnings}
           advisories={advisories}
+          notes={notes}
         />
 
         <div className="mb-3">
@@ -127,15 +132,19 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
               testId="managed-agent-target-auth-provider"
               value={config.target_auth_provider_id || ''}
               onChange={providerId => updateField('target_auth_provider_id', providerId)}
+              errorId={errors.target_auth_provider_id ? 'target-auth-provider-error' : undefined}
             />
-            {errors.target_auth_provider_id && (
-              <div
-                className="text-danger small mt-1"
-                data-testid="managed-agent-target-auth-provider-error"
-              >
-                {errors.target_auth_provider_id}
-              </div>
-            )}
+            <div role="alert">
+              {errors.target_auth_provider_id && (
+                <div
+                  className="text-danger small mt-1"
+                  id="target-auth-provider-error"
+                  data-testid="managed-agent-target-auth-provider-error"
+                >
+                  {errors.target_auth_provider_id}
+                </div>
+              )}
+            </div>
           </div>
         )}
 
@@ -232,15 +241,17 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
               errors.target_auth_header_name ? 'target-auth-header-name-error' : undefined
             }
           />
-          {errors.target_auth_header_name && (
-            <div
-              className="text-danger small"
-              id="target-auth-header-name-error"
-              data-testid="managed-agent-target-auth-header-name-error"
-            >
-              {errors.target_auth_header_name}
-            </div>
-          )}
+          <div role="alert">
+            {errors.target_auth_header_name && (
+              <div
+                className="text-danger small"
+                id="target-auth-header-name-error"
+                data-testid="managed-agent-target-auth-header-name-error"
+              >
+                {errors.target_auth_header_name}
+              </div>
+            )}
+          </div>
           <small className="form-text text-muted">
             The HTTP header name to inject (e.g., Authorization, X-API-Key)
           </small>
@@ -264,15 +275,17 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
                 errors.target_auth_header_format ? 'target-auth-header-format-error' : undefined
               }
             />
-            {errors.target_auth_header_format && (
-              <div
-                className="text-danger small"
-                id="target-auth-header-format-error"
-                data-testid="managed-agent-target-auth-header-format-error"
-              >
-                {errors.target_auth_header_format}
-              </div>
-            )}
+            <div role="alert">
+              {errors.target_auth_header_format && (
+                <div
+                  className="text-danger small"
+                  id="target-auth-header-format-error"
+                  data-testid="managed-agent-target-auth-header-format-error"
+                >
+                  {errors.target_auth_header_format}
+                </div>
+              )}
+            </div>
             <small className="form-text text-muted">
               Format for the header value. Use <code>{'{value}'}</code> as a placeholder for the
               secret value.

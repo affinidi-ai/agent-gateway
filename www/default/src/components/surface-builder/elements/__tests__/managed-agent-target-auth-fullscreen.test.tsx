@@ -1,5 +1,5 @@
 import React from 'react';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import ManagedAgentAuthFullscreen from '../managed-agent/ManagedAgentAuthFullscreen';
 import { apiClient } from '../../../../api';
@@ -7,8 +7,14 @@ import { apiClient } from '../../../../api';
 jest.mock('../../../../api', () => ({
   apiClient: { get: jest.fn(), fetch: jest.fn() },
 }));
-jest.mock('../_shared/TargetAuthProviderSelect', () => () => <div />);
-jest.mock('../../SurfaceMetaContext', () => ({ useSurfaceTenant: () => undefined }));
+jest.mock('../_shared/TargetAuthProviderSelect', () => (props: { errorId?: string }) => (
+  <div data-testid="provider-select" data-error-id={props.errorId ?? ''} />
+));
+const mockSurfaceMeta = jest.fn();
+jest.mock('../../SurfaceMetaContext', () => ({
+  useSurfaceTenant: () => undefined,
+  useOptionalSurfaceMeta: () => mockSurfaceMeta(),
+}));
 
 const renderPanel = (config: Record<string, unknown>, updateField = jest.fn()) => {
   render(
@@ -31,6 +37,7 @@ const base = {
 
 describe('Managed Agent Target authentication editor', () => {
   beforeEach(() => {
+    mockSurfaceMeta.mockReturnValue(null);
     (apiClient.get as jest.Mock).mockResolvedValue({ data: [] });
   });
 
@@ -72,7 +79,54 @@ describe('Managed Agent Target authentication editor', () => {
     });
     expect(screen.queryByTestId('managed-agent-target-auth-errors')).not.toBeInTheDocument();
     expect(screen.getByTestId('managed-agent-target-auth-advisories')).toHaveTextContent(
-      'its Target must be an https URL. Save is allowed'
+      'Advisory: Target authentication sends a credential, so its Target must be an https URL. Save is allowed'
     );
+  });
+
+  it('ties the missing provider message to the provider select and announces it', () => {
+    renderPanel({ ...base, target_auth_source: 'provider', target_auth_provider_id: '' });
+    const message = screen.getByTestId('managed-agent-target-auth-provider-error');
+    expect(message).toHaveTextContent('Pick the credential provider');
+    expect(
+      screen.getAllByRole('alert').some(region => within(region).queryByText(/Pick the credential/))
+    ).toBe(true);
+    expect(screen.getByTestId('provider-select')).toHaveAttribute('data-error-id', message.id);
+  });
+
+  it('ties no message to the provider select once a provider is picked', () => {
+    renderPanel({ ...base, target_auth_source: 'provider', target_auth_provider_id: 'prov-1' });
+    expect(
+      screen.queryByTestId('managed-agent-target-auth-provider-error')
+    ).not.toBeInTheDocument();
+    expect(screen.getByTestId('provider-select')).toHaveAttribute('data-error-id', '');
+  });
+
+  it('advises when the Access Point checks no caller, and not when it does', () => {
+    const config = { ...base, target_auth_source: 'secret', target_auth_secret_id: 's' };
+    mockSurfaceMeta.mockReturnValue({ accessPointChecksCallers: false });
+    renderPanel(config);
+    expect(screen.getByTestId('managed-agent-target-auth-advisories')).toHaveTextContent(
+      'it needs source authentication on the Access Point'
+    );
+  });
+
+  it('shows no caller advice when the Access Point checks its callers', () => {
+    mockSurfaceMeta.mockReturnValue({ accessPointChecksCallers: true });
+    renderPanel({ ...base, target_auth_source: 'secret', target_auth_secret_id: 's' });
+    expect(screen.queryByTestId('managed-agent-target-auth-advisories')).not.toBeInTheDocument();
+  });
+
+  it('advises on a passthrough fallback and keeps the live regions mounted', () => {
+    renderPanel({
+      ...base,
+      target_auth_source: 'secret',
+      target_auth_secret_id: 's',
+      target_auth_fallback: 'passthrough',
+    });
+    const advisories = screen.getByTestId('managed-agent-target-auth-advisories');
+    expect(advisories).toHaveTextContent('passes a request through without the credential');
+    expect(
+      within(screen.getByRole('status')).getByTestId('managed-agent-target-auth-advisories')
+    ).toBe(advisories);
   });
 });
