@@ -212,6 +212,28 @@ describe('fieldGroups', () => {
       ]);
     });
 
+    it('lists the Transit Point whose credential failed', () => {
+      const groups = groupByLabel(
+        baseEntry({
+          event: {
+            request_rejected: {
+              stage: 'forward',
+              reason: 'target_auth_failed',
+              target_auth: { outcome: 'passthrough', transit_point: 'partner' },
+            },
+          },
+        }),
+        null,
+        null
+      );
+      expect(groups['Refusal']).toEqual([
+        { term: 'Stage', value: 'forward' },
+        { term: 'Reason', value: 'target auth failed' },
+        { term: 'Credential outcome', value: 'passthrough' },
+        { term: 'Transit Point', value: 'partner' },
+      ]);
+    });
+
     it('lists the Target credential outcome and OAuth error of a target_auth_failed record', () => {
       const groups = groupByLabel(
         baseEntry({

@@ -303,19 +303,24 @@ export function describeEntry(entry: AuditEntry, userName?: UserNameResolver): E
         : entry.via_fabric
           ? 'Refused over Fabric, so no HTTP status was recorded.'
           : undefined;
+    const transitPoint = rejected.target_auth?.transit_point;
     if (isTargetAuthPassthrough(rejected)) {
+      const credential = transitPoint
+        ? `the credential of Transit Point ${transitPoint}`
+        : 'the Target credential';
       return {
         title: 'Forwarded without Target credential',
         tone,
-        summary: `Forwarded on ${where} without the Target credential: target auth failed, and the fallback is passthrough.`,
+        summary: `Forwarded on ${where} without ${credential}: target auth failed, and the fallback is passthrough.`,
       };
     }
     if (rejected.target_auth?.outcome === 'refused_by_target') {
       const status = rejected.target_auth.upstream_status;
+      const refusedBy = transitPoint ? `Transit Point ${transitPoint}` : 'The Target';
       return {
         title: 'Target refused the credential',
         tone,
-        summary: `The Target on ${where} refused the gateway's credential${
+        summary: `${refusedBy} on ${where} refused the gateway's credential${
           status != null ? ` with ${status}` : ''
         }.`,
         detail: answered,

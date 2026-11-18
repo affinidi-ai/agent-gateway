@@ -51,6 +51,8 @@ export interface RequestRejectedData {
    */
   target_auth?: {
     outcome: 'rejected' | 'refused_by_target' | 'passthrough';
+    /** The alias of the Transit Point whose credential failed; absent for the Target. */
+    transit_point?: string | null;
     /** The token endpoint's OAuth `error` code, when it returned one. */
     oauth_error?: string | null;
     /** On `refused_by_target` only: the status the Target refused the credential with. */

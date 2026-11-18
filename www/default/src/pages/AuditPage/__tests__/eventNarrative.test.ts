@@ -262,6 +262,26 @@ describe('eventNarrative', () => {
       expect(noStatus.summary).toBe("The Target on Orders refused the gateway's credential.");
     });
 
+    it('names the Transit Point whose credential failed, and the Target when there is none', () => {
+      const failure = (target_auth: Record<string, unknown>) =>
+        describeEntry(
+          at(
+            { request_rejected: { stage: 'forward', reason: 'target_auth_failed', target_auth } },
+            { channel_name: 'Orders' }
+          )
+        ).summary;
+
+      expect(failure({ outcome: 'passthrough', transit_point: 'partner' })).toBe(
+        'Forwarded on Orders without the credential of Transit Point partner: target auth failed, and the fallback is passthrough.'
+      );
+      expect(
+        failure({ outcome: 'refused_by_target', transit_point: 'partner', upstream_status: 403 })
+      ).toBe("Transit Point partner on Orders refused the gateway's credential with 403.");
+      expect(failure({ outcome: 'refused_by_target', transit_point: null })).toBe(
+        "The Target on Orders refused the gateway's credential."
+      );
+    });
+
     it('describes a disabled variant, a modern MCP refusal and a Fabric refusal', () => {
       const disabled = describeEntry(
         at(
