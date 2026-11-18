@@ -428,6 +428,37 @@ const EditCredentialProviderPage: React.FC = () => {
 
   const typeFields = providerTypeFields(form.provider_type, form.client_authentication);
 
+  // A disabled fieldset disables the buttons inside it, so a read-only editor shows the
+  // Callback URL above the form, where its copy button still works.
+  const callbackUrlNotice =
+    shownCallbackUrl && !form.issuer && form.provider_type === 'oauth2_authorization_code' ? (
+      <div
+        className="alert alert-success mt-2 mb-0"
+        style={{ fontSize: '14px' }}
+        data-testid="credential-provider-callback-url"
+      >
+        <i className="fas fa-info-circle me-2"></i>
+        <strong>Callback URL:</strong> {shownCallbackUrl}
+        <button
+          type="button"
+          className="btn btn-xs ms-2"
+          style={{ padding: '2px 6px', fontSize: '11px', outline: 'none' }}
+          onClick={e => {
+            navigator.clipboard.writeText(shownCallbackUrl);
+            const btn = e.currentTarget as HTMLButtonElement;
+            const originalHtml = btn.innerHTML;
+            btn.innerHTML = '<i class="fas fa-check"></i>';
+            setTimeout(() => {
+              btn.innerHTML = originalHtml;
+            }, 2000);
+          }}
+          title="Copy to clipboard"
+        >
+          <i className="fas fa-copy"></i>
+        </button>
+      </div>
+    ) : null;
+
   if (loading) {
     return (
       <div className="container-fluid text-center py-5">
@@ -509,6 +540,8 @@ const EditCredentialProviderPage: React.FC = () => {
               Learn more
             </Link>
           </p>
+
+          {readOnly && callbackUrlNotice}
 
           <form ref={formRef} onSubmit={handleSubmit}>
             <fieldset disabled={readOnly} className="border-0 p-0 m-0">
@@ -803,33 +836,7 @@ const EditCredentialProviderPage: React.FC = () => {
                         </div>
                       )}
 
-                      {shownCallbackUrl && (
-                        <div
-                          className="alert alert-success mt-2 mb-0"
-                          style={{ fontSize: '14px' }}
-                          data-testid="credential-provider-callback-url"
-                        >
-                          <i className="fas fa-info-circle me-2"></i>
-                          <strong>Callback URL:</strong> {shownCallbackUrl}
-                          <button
-                            type="button"
-                            className="btn btn-xs ms-2"
-                            style={{ padding: '2px 6px', fontSize: '11px', outline: 'none' }}
-                            onClick={e => {
-                              navigator.clipboard.writeText(shownCallbackUrl);
-                              const btn = e.currentTarget as HTMLButtonElement;
-                              const originalHtml = btn.innerHTML;
-                              btn.innerHTML = '<i class="fas fa-check"></i>';
-                              setTimeout(() => {
-                                btn.innerHTML = originalHtml;
-                              }, 2000);
-                            }}
-                            title="Copy to clipboard"
-                          >
-                            <i className="fas fa-copy"></i>
-                          </button>
-                        </div>
-                      )}
+                      {!readOnly && callbackUrlNotice}
                     </div>
                   )}
 

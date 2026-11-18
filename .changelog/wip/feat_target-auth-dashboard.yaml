@@ -7,11 +7,15 @@ changes:
       description: >-
         The dashboard uses credential_providers.view, .edit and .delete for credential
         providers, as the Admin API already did. A user with view but not edit sees a read-only
-        provider editor, and Add and Delete need .edit and .delete. The Credentials page opens
-        with either settings.view or credential_providers.view, and its JWT Verification,
-        Credential Tokens and Delegated Access tabs need settings.view. Upgrade note: a user who
+        provider editor, in which the Callback URL can still be copied, and Add and Delete need
+        .edit and .delete. The Credentials page opens with settings.view,
+        credential_providers.view or delegation_vault.view. Its JWT Verification tab needs
+        settings.view, and its Credential Tokens and Delegated Access tabs need
+        delegation_vault.view, which the vault API already asked for. Upgrade note: a user who
         only had settings.edit now needs credential_providers.edit to add or edit providers and
-        credential_providers.delete to delete one in the dashboard.
+        credential_providers.delete to delete one in the dashboard, and a user with
+        settings.view but not delegation_vault.view no longer sees the two vault tabs, whose
+        lists the gateway already refused to give them.
     - timestamp: '2026-11-02T11:45:39Z'
       title: Validate Target authentication in the Surface Builder and save it unchanged
       description: >-

@@ -1538,15 +1538,19 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   `/credential-providers/new` needs `credential_providers.edit`; `/credential-providers/:id`
   needs `credential_providers.view`. A user with view but not edit gets the editor read-only: the
   form is a disabled `fieldset`, there is no Save (`Cmd+S` and Enter do nothing), and
-  `credential-provider-editor-read-only-notice`, the first thing in the card, explains why. A
+  `credential-provider-editor-read-only-notice`, the first thing in the card, explains why.
+  The Callback URL notice (`credential-provider-callback-url`) then shows above the form
+  instead of inside it, since a disabled `fieldset` would disable its copy button. A
   save error shows in an alert (`credential-provider-editor-error`), and Back and Cancel (which
   reads **Back** while read-only) return to `/credentials?tab=credential-providers`. The tab
   shows **Add Provider** with `.edit` and the row delete button with `.delete`.
-- The Credentials page and its sidebar entry open for `settings.view` or
-  `credential_providers.view` (`ProtectedRoute`'s `permission` takes one permission or a list of
-  which any one is enough). The Credential Providers
-  tab needs `.view`; the JWT Verification, Credential Tokens and Delegated Access tabs need
-  `settings.view`. A user without `settings.view` lands on the Credential Providers tab.
+- The Credentials page and its sidebar entry open for `settings.view`,
+  `credential_providers.view` or `delegation_vault.view` (`ProtectedRoute`'s `permission` takes
+  one permission or a list of which any one is enough). The JWT Verification tab needs
+  `settings.view`, the Credential Providers tab `credential_providers.view`, and the Credential
+  Tokens and Delegated Access tabs `delegation_vault.view`, the permission the vault API asks
+  for. The page opens on the first of JWT Verification, Credential Providers and Credential
+  Tokens the user may see.
 - The credential provider routes live in `src/pages/credentialProviderRoutes.tsx`. The retired
   OIDC Providers pages are gone; `/oidc-providers` and every path under it redirect to
   `/credentials?tab=credential-providers`.

@@ -811,6 +811,33 @@ describe('EditCredentialProviderPage callback URL', () => {
     );
   });
 
+  it('lets a user without edit permission copy the Callback URL, outside the disabled form', async () => {
+    mockDenied = new Set(['credential_providers.edit']);
+    try {
+      renderProvider({
+        id: 'p1',
+        name: 'GitHub',
+        provider_id: 'github',
+        provider_type: 'oauth2_authorization_code',
+        authorization_endpoint: 'https://github.com/login/oauth/authorize',
+        token_endpoint: 'https://github.com/login/oauth/access_token',
+        client_id_secret_ref: 'CLIENT_ID',
+        client_secret_secret_ref: 'CLIENT_SECRET',
+        default_scopes: ['repo'],
+        token_refresh_enabled: true,
+        callback_path: '/v1/identity/oauth/callback/github',
+        callback_url: 'https://gw.example/v1/identity/oauth/callback/github',
+      });
+      const notices = await screen.findAllByTestId('credential-provider-callback-url');
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toHaveTextContent('https://gw.example/v1/identity/oauth/callback/github');
+      expect(within(notices[0]).getByTitle('Copy to clipboard')).toBeEnabled();
+      expect(screen.getByDisplayValue('GitHub')).toBeDisabled();
+    } finally {
+      mockDenied = new Set();
+    }
+  });
+
   it('saves a callback URL ending in the provider stored callback path', async () => {
     const record = {
       id: 'p1',

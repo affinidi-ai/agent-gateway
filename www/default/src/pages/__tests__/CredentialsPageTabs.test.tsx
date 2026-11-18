@@ -48,22 +48,26 @@ describe('CredentialsPage tab permissions', () => {
     expect(screen.queryByTestId('credentials-delegated-access-tab-trigger')).toBeNull();
   });
 
-  it('leaves the Delegated Access tab for a user without settings.view', () => {
-    mockGranted = new Set(['credential_providers.view']);
+  it('leaves the Delegated Access tab for a user without delegation_vault.view', () => {
+    mockGranted = new Set(['settings.view', 'credential_providers.view']);
     visit('/credentials?tab=delegated-access');
 
     expect(screen.queryByTestId('delegated-tab')).toBeNull();
-    expect(screen.getByTestId('search')).toHaveTextContent('?tab=credential-providers');
+    expect(screen.queryByTestId('credentials-credential-tokens-tab-trigger')).toBeNull();
+    expect(screen.getByTestId('search')).toHaveTextContent('?tab=jwt-verification');
   });
 
-  it('shows the Delegated Access tab for settings.view', () => {
-    mockGranted = new Set(['settings.view']);
-    visit('/credentials?tab=delegated-access');
+  it('shows the vault tabs, and no others, for delegation_vault.view alone', () => {
+    mockGranted = new Set(['delegation_vault.view']);
+    visit('/credentials');
 
-    expect(screen.getByTestId('credentials-delegated-access-tab-trigger')).toHaveAttribute(
+    expect(screen.getByTestId('credentials-credential-tokens-tab-trigger')).toHaveAttribute(
       'aria-selected',
       'true'
     );
+    expect(screen.getByTestId('credentials-delegated-access-tab-trigger')).toBeInTheDocument();
+    expect(screen.queryByTestId('credentials-jwt-verification-tab-trigger')).toBeNull();
+    expect(screen.queryByTestId('credentials-credential-providers-tab-trigger')).toBeNull();
   });
 
   it('opens on JWT Verification for settings.view', () => {

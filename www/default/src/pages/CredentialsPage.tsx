@@ -28,7 +28,7 @@ const VALID_TABS: TabKey[] = [
   'delegated-access',
   'sts-clients',
 ];
-const SETTINGS_TABS: TabKey[] = ['jwt-verification', 'credential-tokens', 'delegated-access'];
+const VAULT_TABS: TabKey[] = ['credential-tokens', 'delegated-access'];
 
 const CredentialsPage: React.FC = () => {
   const navigate = useNavigate();
@@ -36,8 +36,13 @@ const CredentialsPage: React.FC = () => {
   const tabFromUrl = searchParams.get('tab') as TabKey | null;
   const { hasPermission, loading: permissionsLoading } = usePermissions();
   const canViewProviders = !permissionsLoading && hasPermission('credential_providers.view');
-  const canViewSettingsTabs = !permissionsLoading && hasPermission('settings.view');
-  const defaultTab: TabKey = canViewSettingsTabs ? 'jwt-verification' : 'credential-providers';
+  const canViewStrategies = !permissionsLoading && hasPermission('settings.view');
+  const canViewVault = !permissionsLoading && hasPermission('delegation_vault.view');
+  const defaultTab: TabKey = canViewStrategies
+    ? 'jwt-verification'
+    : canViewProviders || !canViewVault
+      ? 'credential-providers'
+      : 'credential-tokens';
   const initialTab: TabKey =
     tabFromUrl && VALID_TABS.includes(tabFromUrl) ? tabFromUrl : defaultTab;
   const [activeTab, setActiveTab] = useState<TabKey>(initialTab);
@@ -57,17 +62,19 @@ const CredentialsPage: React.FC = () => {
     const hidden =
       (activeTab === 'sts-clients' && !canViewSts) ||
       (activeTab === 'credential-providers' && !canViewProviders) ||
-      (SETTINGS_TABS.includes(activeTab) && !canViewSettingsTabs);
+      (activeTab === 'jwt-verification' && !canViewStrategies) ||
+      (VAULT_TABS.includes(activeTab) && !canViewVault);
     if (hidden) {
-      const fallback: TabKey = canViewSettingsTabs ? 'jwt-verification' : 'credential-providers';
-      setActiveTab(fallback);
-      setSearchParams({ tab: fallback }, { replace: true });
+      setActiveTab(defaultTab);
+      setSearchParams({ tab: defaultTab }, { replace: true });
     }
   }, [
     activeTab,
+    defaultTab,
     canViewSts,
     canViewProviders,
-    canViewSettingsTabs,
+    canViewStrategies,
+    canViewVault,
     permissionsLoading,
     setSearchParams,
   ]);
@@ -109,7 +116,7 @@ const CredentialsPage: React.FC = () => {
         }}
         className="mb-3 custom-channel-tabs"
       >
-        {canViewSettingsTabs && (
+        {canViewStrategies && (
           <Tab
             eventKey="jwt-verification"
             tabAttrs={{ 'data-testid': 'credentials-jwt-verification-tab-trigger' }}
@@ -144,7 +151,7 @@ const CredentialsPage: React.FC = () => {
           </Tab>
         )}
 
-        {canViewSettingsTabs && (
+        {canViewVault && (
           <Tab
             eventKey="credential-tokens"
             tabAttrs={{ 'data-testid': 'credentials-credential-tokens-tab-trigger' }}
@@ -163,7 +170,7 @@ const CredentialsPage: React.FC = () => {
           </Tab>
         )}
 
-        {canViewSettingsTabs && (
+        {canViewVault && (
           <Tab
             eventKey="delegated-access"
             tabAttrs={{ 'data-testid': 'credentials-delegated-access-tab-trigger' }}
