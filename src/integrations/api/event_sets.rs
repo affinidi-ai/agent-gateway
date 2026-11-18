@@ -69,6 +69,10 @@ pub async fn update_event_set(
     Path(id): Path<String>,
     Json(request): Json<EventSetRequest>,
 ) -> Result<Json<EventSet>, ApiError> {
+    let _writing = stores
+        .event_sets
+        .lock_writes()
+        .await;
     let mut event_set = load(&stores, &id).await?;
     let (name, description) = validate_text(&request.name, &request.description)?;
     within_catalog(&request.events)?;
@@ -108,6 +112,10 @@ pub async fn delete_event_set(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     require_known_id(&id)?;
+    let _writing = stores
+        .event_sets
+        .lock_writes()
+        .await;
     refuse_while_used(&stores, "event set", |integration| integration.event_set_id == id).await?;
     let deleted = stores
         .event_sets

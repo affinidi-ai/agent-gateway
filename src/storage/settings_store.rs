@@ -244,6 +244,7 @@ fn parse_stored_settings(content: &str) -> serde_json::Result<DashboardSettings>
 #[derive(Clone)]
 pub struct SettingsStore {
     settings: Arc<RwLock<DashboardSettings>>,
+    writes: Arc<tokio::sync::Mutex<()>>,
     storage_path: PathBuf,
 }
 
@@ -256,8 +257,16 @@ impl SettingsStore {
 
         Self {
             settings: Arc::new(RwLock::new(DashboardSettings::default())),
+            writes: Arc::new(tokio::sync::Mutex::new(())),
             storage_path,
         }
+    }
+
+    /// Serialises changes to the settings on this process: a caller that
+    /// reads, changes and saves them holds the guard from the read to the
+    /// save, so no other change lands in between and is lost.
+    pub async fn lock_writes(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.writes.lock().await
     }
 
     /// Load settings from disk (async version)
@@ -468,6 +477,7 @@ impl SettingsStore {
         &self,
         flag: &str,
     ) -> Result<bool> {
+        let _writing = self.lock_writes().await;
         {
             let mut settings = self.settings.write().unwrap();
             if settings
@@ -753,6 +763,40 @@ mod tests {
             .unwrap();
         assert!(!store.flag_enabled("agent_pay_delegation"));
         assert!(store.flag_enabled("mediator_federation"));
+    }
+
+    /// A flag is not turned on while another change holds the write guard,
+    /// and the change is kept beside it.
+    #[tokio::test]
+    async fn a_flag_waits_for_a_change_in_progress() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = SettingsStore::new(temp_dir.path());
+        store.load().await.unwrap();
+
+        let ((), turned_on) = tokio::join!(
+            async {
+                let _writing = store.lock_writes().await;
+                let mut settings = store.get();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                settings.badge_threshold_minutes = 9;
+                store
+                    .update(settings)
+                    .unwrap();
+                store.save().await.unwrap();
+            },
+            store.enable_flag_if_unset("agent_pay_delegation")
+        );
+
+        assert!(turned_on.unwrap());
+        let reread = SettingsStore::new(temp_dir.path());
+        reread.load().await.unwrap();
+        assert_eq!(
+            reread
+                .get()
+                .badge_threshold_minutes,
+            9
+        );
+        assert!(reread.flag_enabled("agent_pay_delegation"));
     }
 
     #[tokio::test]

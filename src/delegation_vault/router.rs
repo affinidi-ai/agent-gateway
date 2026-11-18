@@ -685,7 +685,11 @@ mod tests {
         for refused in &results {
             consent::assert_refused(refused, StatusCode::FORBIDDEN, Some(&name));
         }
-        assert_eq!(consent::reasons(&events), [DelegationFailureReason::BrowserBindingMismatch; 6]);
+        assert_eq!(
+            consent::reasons(&events),
+            [DelegationFailureReason::BrowserBindingMismatch],
+            "a state is audited once per reason"
+        );
         assert_eq!(fixture.token_calls(), 0);
         assert_eq!(fixture.vault_records(), 0);
     }
@@ -1488,6 +1492,7 @@ mod tests {
     async fn a_callback_for_another_or_a_changed_provider_is_refused() {
         let fixture = consent::Fixture::new().await;
         let (callback_state, cookie) = fixture.begin().await;
+        let (unplain_state, unplain_cookie) = fixture.begin().await;
         let query = format!("code=vendor-code&state={callback_state}");
         let ((swapped, unplain), events) = capture(async {
             (
@@ -1495,14 +1500,14 @@ mod tests {
                     .callback("gitlab", &query, Some(&cookie))
                     .await,
                 fixture
-                    .callback("git%3Bhub%0A", &query, Some(&cookie))
+                    .callback("git%3Bhub%0A", &format!("code=vendor-code&state={unplain_state}"), Some(&unplain_cookie))
                     .await,
             )
         })
         .await;
         let name = consent::cookie_name(&cookie);
         consent::assert_refused(&swapped, StatusCode::BAD_REQUEST, Some(&name));
-        consent::assert_refused(&unplain, StatusCode::BAD_REQUEST, Some(&name));
+        consent::assert_refused(&unplain, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&unplain_cookie)));
         assert_eq!(
             audited_providers(&events),
             [Some("gitlab".to_string()), None],
@@ -1516,6 +1521,7 @@ mod tests {
         let mut retyped = fixture.provider();
         retyped.provider_type = crate::credential_providers::CredentialProviderType::OAuth2ClientCredentials;
         for changed in [external, renamed, retyped] {
+            let (changed_state, changed_cookie) = fixture.begin().await;
             fixture
                 .providers
                 .update(changed)
@@ -1523,21 +1529,21 @@ mod tests {
                 .unwrap();
             let (refused, events) = capture(async {
                 fixture
-                    .callback("github", &query, Some(&cookie))
+                    .callback("github", &format!("code=vendor-code&state={changed_state}"), Some(&changed_cookie))
                     .await
             })
             .await;
-            consent::assert_refused(&refused, StatusCode::BAD_REQUEST, Some(&name));
+            consent::assert_refused(&refused, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&changed_cookie)));
             assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentProviderMismatch]);
             assert_eq!(fixture.token_calls(), 0);
             assert_eq!(fixture.vault_records(), 0);
+            fixture
+                .providers
+                .update(fixture.provider())
+                .await
+                .unwrap();
         }
 
-        fixture
-            .providers
-            .update(fixture.provider())
-            .await
-            .unwrap();
         let accepted = fixture
             .callback("github", &query, Some(&cookie))
             .await;
@@ -1702,6 +1708,81 @@ mod tests {
         assert_eq!(after.status, StatusCode::OK, "the page still shows the link it describes");
     }
 
+    /// An audited refusal names the agent the sealed state was issued for, and
+    /// a state is audited at most once per reason: a start link posted again
+    /// and again gives one `consent_state_reused` record, a refusal of the same
+    /// state for another reason gives its own, and so does another state.
+    #[tokio::test]
+    async fn an_audited_refusal_names_the_agent_once_per_state_and_reason() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let fixture = consent::Fixture::new().await;
+        let clicked = [("sec-fetch-site", "same-origin"), ("sec-fetch-user", "?1"), ("sec-fetch-dest", "document")];
+        let state = consent::start_state(&fixture.start_url());
+        let other = consent::start_state(&fixture.start_url());
+        let first = fixture
+            .start_post(&state, &clicked)
+            .await;
+        assert_eq!(first.status, StatusCode::FOUND, "{}", first.body);
+        let second = fixture
+            .start_post(&other, &clicked)
+            .await;
+        assert_eq!(second.status, StatusCode::FOUND, "{}", second.body);
+
+        let (results, events) = capture(async {
+            let mut results = Vec::new();
+            for _ in 0..3 {
+                results.push(
+                    fixture
+                        .start_post(&state, &clicked)
+                        .await,
+                );
+            }
+            for _ in 0..2 {
+                results.push(
+                    fixture
+                        .start_post(&state, &[("origin", "https://attacker.example")])
+                        .await,
+                );
+            }
+            results.push(
+                fixture
+                    .start_post(&other, &clicked)
+                    .await,
+            );
+            results
+        })
+        .await;
+
+        for (index, refused) in results.iter().enumerate() {
+            let status = if matches!(index, 3 | 4) {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            consent::assert_refused(refused, status, None);
+        }
+        assert_eq!(
+            consent::reasons(&events),
+            [
+                DelegationFailureReason::ConsentStateReused,
+                DelegationFailureReason::CrossSiteConsentStart,
+                DelegationFailureReason::ConsentStateReused,
+            ]
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.agent_did.as_deref() == Some("did:web:agent.example")),
+            "{events:?}"
+        );
+        let text = logs.text();
+        let warnings = text
+            .lines()
+            .filter(|line| line.contains("WARN") && line.contains("OAuth consent refused"))
+            .count();
+        assert_eq!(warnings, 6, "every refusal is still logged: {text}");
+    }
+
     /// A start POST another site's page sends, or one no person clicked, is
     /// refused, so neither a cross-site form nor script on the gateway's origin
     /// can skip the start page and bind a browser to someone else's link;
@@ -1734,7 +1815,11 @@ mod tests {
         for refused in &results {
             consent::assert_refused(refused, StatusCode::FORBIDDEN, None);
         }
-        assert_eq!(consent::reasons(&events), [DelegationFailureReason::CrossSiteConsentStart; 8]);
+        assert_eq!(
+            consent::reasons(&events),
+            [DelegationFailureReason::CrossSiteConsentStart],
+            "a state is audited once per reason"
+        );
         let started = fixture
             .start_post(&state, &[("origin", "https://198.51.100.7")])
             .await;
@@ -1839,7 +1924,6 @@ mod tests {
     async fn a_provider_with_a_non_conforming_or_shared_redirect_uri_is_refused_at_start() {
         let fixture = consent::Fixture::new().await;
         let start_url = fixture.start_url();
-        let state = consent::start_state(&start_url);
         let mut other_tenant = fixture.provider();
         other_tenant.id = "github-tenant-b".to_string();
         other_tenant.tenant_id = Some("tenant-b".to_string());
@@ -1863,6 +1947,8 @@ mod tests {
             "https://198.51.100.7/v1/identity/oauth/callback/github?x=1",
             "https://198.51.100.7/elsewhere/github",
         ] {
+            let start_url = fixture.start_url();
+            let state = consent::start_state(&start_url);
             let mut provider = fixture.provider();
             provider.callback_url = Some(callback_url.to_string());
             fixture
@@ -1891,7 +1977,11 @@ mod tests {
             for refused in &results {
                 consent::assert_refused(refused, StatusCode::BAD_REQUEST, None);
             }
-            assert_eq!(consent::reasons(&events), [DelegationFailureReason::RedirectUriInvalid; 2], "{callback_url}");
+            assert_eq!(
+                consent::reasons(&events),
+                [DelegationFailureReason::RedirectUriInvalid],
+                "the page and the POST of one state are audited once: {callback_url}"
+            );
         }
     }
 

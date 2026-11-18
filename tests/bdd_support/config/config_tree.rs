@@ -163,7 +163,15 @@ pub struct GatewayBootstrapFixture {
     pub affinidi_terms_url: Option<String>,
     /// Dashboard settings the gateway starts with; defaults when absent.
     pub settings: Option<serde_json::Value>,
+    /// The audit events the settings directory records as already added to the stored selections.
+    pub audit_events_added: Option<Vec<String>>,
+    /// The audit events of the integration event set [`STORED_EVENT_SET_ID`] stored before the
+    /// gateway starts.
+    pub stored_event_set_events: Option<Vec<String>>,
 }
+
+/// The id of the integration event set a scenario stores before the gateway starts.
+pub const STORED_EVENT_SET_ID: &str = "5b0c6f8e-3f4d-4c1e-9a7b-2d8e1f0a9c31";
 
 impl GatewayBootstrapFixture {
     pub fn new(
@@ -192,6 +200,8 @@ impl GatewayBootstrapFixture {
             terms_enabled: false,
             affinidi_terms_url: None,
             settings: None,
+            audit_events_added: None,
+            stored_event_set_events: None,
         }
     }
 
@@ -365,6 +375,28 @@ pub fn write_gateway_config_tree(
     if let Some(settings) = &fixture.settings {
         std::fs::write(storage_dir.join("settings/settings.json"), serde_json::to_string_pretty(settings).unwrap())
             .unwrap();
+    }
+    if let Some(added) = &fixture.audit_events_added {
+        std::fs::write(storage_dir.join("settings/audit_events_added.json"), serde_json::to_string(added).unwrap())
+            .unwrap();
+    }
+    if let Some(events) = &fixture.stored_event_set_events {
+        let now = chrono::Utc::now().to_rfc3339();
+        let event_set = serde_json::json!({
+            "id": STORED_EVENT_SET_ID,
+            "name": "Stored selection",
+            "events": events
+                .iter()
+                .map(|event| format!("audit.{event}"))
+                .collect::<Vec<_>>(),
+            "created_at": now,
+            "updated_at": now,
+        });
+        std::fs::write(
+            storage_dir.join(format!("integrations/event_sets/{STORED_EVENT_SET_ID}.json")),
+            serde_json::to_string_pretty(&event_set).unwrap(),
+        )
+        .unwrap();
     }
     if with_toml {
         write_config_toml(base_dir, &storage_dir);
