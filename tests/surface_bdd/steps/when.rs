@@ -864,7 +864,7 @@ async fn send_request_to_path_and_record(
     send_json_request_to_path_and_record(world, path_and_query, body, headers).await;
 }
 
-async fn send_json_request_and_record(
+pub(crate) async fn send_json_request_and_record(
     world: &mut SurfaceWorld,
     body: serde_json::Value,
     headers: Vec<(String, String)>,

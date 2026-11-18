@@ -200,8 +200,10 @@ policy needs one (a policy that requires `input.identity_binding`, for example).
 a key that a cached DID
 document does not list, the gateway drops that document from its DID cache and verifies the whole
 presentation again, signatures included, against the document as now published, so a signer that
-has since fixed its document is accepted at once. It does this at most once a minute per signer DID,
-and puts the cached document back when the new one cannot be fetched. A peer
+has since fixed its document is accepted at once. It does this for each signer of the
+presentation whose cached document is out of date, such as both the holder and a credential's
+issuer, at most once a minute per signer DID, and puts a cached document back when the new one
+cannot be fetched. A peer
 on a release whose gateway DID document lists its signing key (`#key-2`) under no relationship has
 its presentations rejected until it upgrades, which repairs its document on its next start (see
 [Proof purpose metric](OBSERVABILITY.md#proof-purpose-metric)).

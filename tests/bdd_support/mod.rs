@@ -19,6 +19,7 @@ pub mod mock_server;
 pub mod oidc;
 pub mod passkey;
 pub mod policies;
+pub mod presentation_signer;
 pub mod redis_stream;
 pub mod sign_in_events;
 pub mod sse_client;

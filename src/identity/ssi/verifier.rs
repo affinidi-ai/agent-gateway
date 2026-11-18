@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
@@ -437,15 +437,16 @@ async fn proof_purpose_problem(
     }
 }
 
-/// Refuses, and counts, a proof in `proofs` that breaks `allowed`. With `refresh` set, a key missing
-/// from a document read from the DID cache fails with [`StaleSignerDocument`] instead, so the
-/// caller verifies the whole presentation again against the document as now published.
+/// Refuses, and counts, a proof in `proofs` that breaks `allowed`. A key missing from a document
+/// read from the DID cache fails with [`StaleSignerDocument`] instead, unless its signer is in
+/// `refreshed`, so the caller verifies the whole presentation again against the document as now
+/// published.
 async fn ensure_proof_purpose(
     proofs: &Proofs<AnySuite>,
     allowed: &[ProofPurpose],
     controllers: &impl ControllerProvider,
     cached: &CachedDocuments,
-    refresh: bool,
+    refreshed: &HashSet<String>,
     what: &str,
     role: &str,
 ) -> Result<()> {
@@ -453,14 +454,14 @@ async fn ensure_proof_purpose(
         let Some(problem) = proof_purpose_problem(proof, allowed, controllers).await else {
             continue;
         };
-        if refresh
-            && problem.reason == PurposeReason::NotListed
+        if problem.reason == PurposeReason::NotListed
             && let Ok(url) = DIDURL::new(
                 proof
                     .verification_method
                     .id()
                     .as_str(),
             )
+            && !refreshed.contains(url.did().as_str())
             && cached.contains(url.did().as_str())
             && may_refresh_signer_document(url.did().as_str())
         {
@@ -548,49 +549,73 @@ impl Verifier for LocalVerifier {
         &self,
         presentation: &Value,
     ) -> Result<VpVerificationResult> {
-        let first = self
-            .verify_vp_with(presentation, true)
-            .await;
-        let Some(stale) = first
-            .as_ref()
-            .err()
-            .and_then(|e| e.downcast_ref::<StaleSignerDocument>())
-        else {
-            return first;
-        };
-        let did = stale.did.clone();
-        let previous = self
-            .did_cache
-            .remove(&did)
-            .await;
-        let retried = self
-            .verify_vp_with(presentation, false)
-            .await;
-        let Some(previous) = previous.filter(|_| retried.is_err()) else {
-            return retried;
-        };
-        let cache = self.did_cache.get_cache();
-        let key = DIDCacheClient::hash_did(&did);
-        if cache
-            .get(&key)
-            .await
-            .is_some()
-        {
-            return retried;
+        let mut refreshed = HashSet::new();
+        let mut previous = Vec::new();
+        loop {
+            let result = self
+                .verify_vp_with(presentation, &refreshed)
+                .await;
+            match result
+                .as_ref()
+                .err()
+                .and_then(|e| e.downcast_ref::<StaleSignerDocument>())
+            {
+                Some(stale) if refreshed.insert(stale.did.clone()) => {
+                    let did = stale.did.clone();
+                    let cached = self
+                        .did_cache
+                        .remove(&did)
+                        .await;
+                    previous.push((did, cached));
+                }
+                _ if result.is_err()
+                    && self
+                        .restore_unfetched(previous)
+                        .await =>
+                {
+                    return self
+                        .verify_vp_with(presentation, &refreshed)
+                        .await;
+                }
+                _ => return result,
+            }
         }
-        cache
-            .insert(key, previous)
-            .await;
-        self.verify_vp_with(presentation, false)
-            .await
     }
 }
 
 impl LocalVerifier {
+    /// Puts back each evicted signer document that could not be fetched again, so a signer whose
+    /// host is unreachable is judged against what was cached rather than refused as unresolvable.
+    /// Returns whether any was put back.
+    async fn restore_unfetched(
+        &self,
+        previous: Vec<(String, Option<affinidi_did_common::Document>)>,
+    ) -> bool {
+        let cache = self.did_cache.get_cache();
+        let mut restored = false;
+        for (did, document) in previous {
+            let Some(document) = document else {
+                continue;
+            };
+            let key = DIDCacheClient::hash_did(&did);
+            if cache
+                .get(&key)
+                .await
+                .is_none()
+            {
+                cache
+                    .insert(key, document)
+                    .await;
+                restored = true;
+            }
+        }
+        restored
+    }
+
     async fn verify_vp_with(
         &self,
         presentation: &Value,
-        refresh: bool,
+        refreshed: &HashSet<String>,
     ) -> Result<VpVerificationResult> {
         let holder_did = presentation
             .get("holder")
@@ -643,7 +668,7 @@ impl LocalVerifier {
 
         ensure_proofs_controlled_by(&vp.proofs, &holder_did, "holder").context("VP proof binding failed")?;
         ensure_verified(vp.verify(&params).await, "VP")?;
-        ensure_proof_purpose(&vp.proofs, VP_PROOF_PURPOSES, &params.resolver, &cached, refresh, "VP", "vp").await?;
+        ensure_proof_purpose(&vp.proofs, VP_PROOF_PURPOSES, &params.resolver, &cached, refreshed, "VP", "vp").await?;
 
         let mut credentials = Vec::with_capacity(vcs.len());
         for (i, (vc_json, vc)) in vcs
@@ -661,7 +686,7 @@ impl LocalVerifier {
                 VC_PROOF_PURPOSES,
                 &params.resolver,
                 &cached,
-                refresh,
+                refreshed,
                 &format!("VC[{}]", i),
                 "vc",
             )
@@ -1494,6 +1519,55 @@ mod tests {
             .expect("the document as now published lists the key");
 
         assert_eq!(result.credentials.len(), 1);
+    }
+
+    fn listing_key_under_assertion_method(
+        did: &str,
+        cached: &affinidi_did_common::Document,
+    ) -> affinidi_did_common::Document {
+        let mut published = serde_json::to_value(cached).unwrap();
+        published["assertionMethod"] = json!([format!("{did}#key-2")]);
+        serde_json::from_value(published).unwrap()
+    }
+
+    #[tokio::test]
+    async fn holder_and_issuer_that_have_both_since_listed_their_keys_are_accepted() {
+        let issuer_key = JWK::generate_ed25519().unwrap();
+        let (issuer_did, issuer_cached) = did_web_signer(&issuer_key, &[]);
+        let holder_key = JWK::generate_ed25519().unwrap();
+        let (holder_did, holder_cached) = did_web_signer(&holder_key, &[]);
+        let f = Fixture {
+            issuer_config: signer_config(&issuer_did, &issuer_key),
+            issuer_did: issuer_did.clone(),
+            holder_key,
+            holder_did: holder_did.clone(),
+            verifier: LocalVerifier::new(verifier_with(&[]).await),
+        };
+        let vc = issue_vc(&f, &holder_did).await;
+        let vp = present(&f.holder_key, &holder_did, vec![vc]).await;
+        let mut client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .unwrap();
+        client.set_resolver(
+            affinidi_did_resolver_cache_sdk::MethodName::Web,
+            Box::new(PublishedDocuments(HashMap::from([
+                (issuer_did.clone(), listing_key_under_assertion_method(&issuer_did, &issuer_cached)),
+                (holder_did.clone(), listing_key_under_assertion_method(&holder_did, &holder_cached)),
+            ]))),
+        );
+        for (did, cached) in [(&issuer_did, issuer_cached), (&holder_did, holder_cached)] {
+            client
+                .get_cache()
+                .insert(DIDCacheClient::hash_did(did), cached)
+                .await;
+        }
+
+        let result = verify_under(&Arc::new(client), &vp)
+            .await
+            .expect("both documents as now published list their keys");
+
+        assert_eq!(result.holder_did, holder_did);
+        assert_eq!(result.credentials[0].issuer_did, issuer_did);
     }
 
     #[tokio::test]

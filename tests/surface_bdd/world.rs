@@ -14,6 +14,7 @@ use crate::bdd_support::jwt::JwksServer;
 use crate::bdd_support::mock_server::{MockResponse, MockServer, ReceivedRequest};
 use crate::bdd_support::oidc::OidcProvider;
 use crate::bdd_support::passkey::SoftPasskey;
+use crate::bdd_support::presentation_signer::PresentationSigner;
 use crate::bdd_support::redis_stream::RedisStreamStandIn;
 use crate::bdd_support::temp::TempDirGuard;
 
@@ -182,6 +183,8 @@ pub struct SurfaceWorld {
     pub api_keys: HashMap<String, (String, String)>,
     /// The Redis stream an integration delivers sign-in events to.
     pub sign_in_stream: Option<RedisStreamStandIn>,
+    /// The caller that signs the presentations the scenario sends.
+    pub presentation_signer: Option<PresentationSigner>,
     /// The passkeys console users registered in the scenario, by username.
     pub passkeys: HashMap<String, SoftPasskey>,
     /// The passkey sign-in started last and not yet finished.
@@ -277,6 +280,7 @@ impl SurfaceWorld {
             surface_agent_id: None,
             api_keys: HashMap::new(),
             sign_in_stream: None,
+            presentation_signer: None,
             passkeys: HashMap::new(),
             started_sign_in: None,
             sign_in_challenge_credentials: Vec::new(),
