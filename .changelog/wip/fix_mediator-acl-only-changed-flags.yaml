@@ -79,4 +79,12 @@ changes:
         and partial keep-alive requests bypassing the header timeout), and libz-sys
         from 1.1.31 to 1.1.33 for a zlib heap buffer overflow advisory. Restores a
         passing cargo audit.
+    - timestamp: '2026-11-18T10:00:00Z'
+      title: Update lettre to 0.11.24 for new SMTP advisories
+      description: >-
+        Bumps lettre from 0.11.22 to 0.11.24 (and email-encoding to 0.4.3), past the fixes for six
+        advisories published on 18 Nov: a panic on a mailbox display name with CR or LF, a panic on
+        a blank EHLO reply line, missing dot-stuffing after a bare LF or CR, a quoted local part
+        sent to another address, unbounded buffering of an SMTP reply, and STARTTLS response
+        injection. Restores a passing cargo audit.
   breaking: []
