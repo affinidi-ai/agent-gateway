@@ -3517,9 +3517,17 @@ pub async fn connect_via_oob<
             temp_announcement
                 .complete(
                     async move {
-                        point_store
+                        let stored = point_store
                             .create(&record)
-                            .await
+                            .await;
+                        // Handed over on the write's own task, so a cancelled request cannot
+                        // report the reserved DID failed while its record is stored.
+                        if stored.is_ok()
+                            && let Some(reservation) = reservation
+                        {
+                            reservation.hand_over();
+                        }
+                        stored
                     },
                     temp_payload,
                 )
@@ -3527,9 +3535,6 @@ pub async fn connect_via_oob<
                 .map_err(|e| {
                     (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create temporary connection point: {}", e))
                 })?;
-            if let Some(reservation) = reservation {
-                reservation.hand_over();
-            }
 
             info!("⏸  Gateway {} waits for the mediator to admit its DIDs", paused_gateway.id);
             let name =

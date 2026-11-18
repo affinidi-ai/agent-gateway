@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, waitFor } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import ConnectStep from '../ConnectStep';
 import { apiClient } from '../../../api';
@@ -12,7 +12,7 @@ jest.mock('../../../api', () => ({
 
 const mockedPost = apiClient.post as jest.Mock;
 
-const renderStep = (acceptorMediatorId: string, endpoint?: string) =>
+const renderStep = (acceptorMediatorId: string, endpoint?: string, onBack?: () => void) =>
   render(
     <ConnectStep
       endpoint={endpoint}
@@ -22,7 +22,7 @@ const renderStep = (acceptorMediatorId: string, endpoint?: string) =>
       description=""
       acceptorMediatorId={acceptorMediatorId}
       onConnected={jest.fn()}
-      onBack={jest.fn()}
+      onBack={onBack}
       onCancel={jest.fn()}
     />
   );
@@ -62,5 +62,16 @@ describe('ConnectStep', () => {
 
     await sentBody();
     expect(mockedPost.mock.calls[0][0]).toBe('/payment-gateways/connect-via-oob');
+  });
+
+  it('offers Back on a failure only when there is a step to go back to', async () => {
+    mockedPost.mockRejectedValue(new Error('Mediator unreachable (502)'));
+    const { unmount } = renderStep('');
+    expect(await screen.findByTestId('wizard-oob-connect-retry-button')).toBeInTheDocument();
+    expect(screen.queryByTestId('wizard-back')).not.toBeInTheDocument();
+    unmount();
+
+    renderStep('', undefined, jest.fn());
+    expect(await screen.findByTestId('wizard-back')).toBeInTheDocument();
   });
 });

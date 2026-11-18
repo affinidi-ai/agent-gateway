@@ -2715,9 +2715,11 @@ room for its text.
   card shows the UAI. The table fits its box from the 1280px viewport that
   `laptop-layout.spec.ts` checks up to the 1512px and 1728px laptop viewports, with every row
   action inside it; the DID keeps its title and copy button.
-- **Connection Points actions**: the row actions sit in a 6rem wide wrapping block (two
-  buttons per line) with no left margins, so the Actions column stays near 120px and the
-  Name and Mediator columns keep their room. Add a new row action inside that block.
+- **Connections row actions** (Agent Gateways and Connection Points): the row actions stay on
+  one line in a `d-flex flex-nowrap gap-2 align-items-center` block, with no left margins, and
+  `.app-button` never wraps its label. A window too narrow for the row scrolls the table
+  sideways (`table-responsive`) instead of stacking the buttons. Add a new row action inside
+  that block.
 
 ## Validation
 

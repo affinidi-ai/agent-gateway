@@ -66,9 +66,11 @@ impl FileSystemConnectionPointStore {
     /// `{id}.json` or `{id}.json.enc` config sibling at the base level. These are leftover
     /// DID secret folders from failed or incomplete connection attempts.
     ///
-    /// A permanent connection point reserved by a paused pairing has keys but no record
-    /// of its own until the pairing completes; its directory is kept while a stored
-    /// connection point still reserves it.
+    /// A permanent connection point an acceptance or a paused pairing minted ahead of
+    /// the pairing has keys but no record of its own until the pairing completes; its
+    /// directory is kept while a stored connection point still names it, as its
+    /// `reserved_permanent` or as the `secure_cp_id` an acceptance keeps in its
+    /// `oob_message`.
     pub async fn cleanup_orphaned_directories(&self) -> Result<usize> {
         use tracing::{info, warn};
 
@@ -77,8 +79,18 @@ impl FileSystemConnectionPointStore {
             .list_all()
             .await?
             .into_iter()
-            .filter_map(|point| point.reserved_permanent)
-            .map(|reserved| reserved.cp_id)
+            .flat_map(|point| {
+                let acceptance = point
+                    .oob_message
+                    .get("secure_cp_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                point
+                    .reserved_permanent
+                    .map(|reserved| reserved.cp_id)
+                    .into_iter()
+                    .chain(acceptance)
+            })
             .collect();
 
         let mut cleaned = 0;
@@ -903,6 +915,46 @@ mod tests {
                 .join("cps")
                 .join(format!("{}.json", cp.id))
                 .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_after_a_restart_keeps_the_permanent_keys_of_an_unpaused_acceptance() {
+        let dir = TempDir::new().unwrap();
+        let store = FileSystemConnectionPointStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut temporary = sample_cp();
+        temporary.oob_message = serde_json::json!({ "secure_cp_id": "acceptance-permanent" });
+        store
+            .create(&temporary)
+            .await
+            .unwrap();
+        let permanent_keys = dir
+            .path()
+            .join("acceptance-permanent");
+        tokio::fs::create_dir_all(&permanent_keys)
+            .await
+            .unwrap();
+        tokio::fs::write(permanent_keys.join("key_0.json"), b"{}")
+            .await
+            .unwrap();
+        drop(store);
+
+        let restarted = FileSystemConnectionPointStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let cleaned = restarted
+            .cleanup_orphaned_directories()
+            .await
+            .unwrap();
+
+        assert_eq!(cleaned, 0);
+        assert!(
+            permanent_keys
+                .join("key_0.json")
+                .exists(),
+            "the permanent keys a pending acceptance named must survive a restart"
         );
     }
 
