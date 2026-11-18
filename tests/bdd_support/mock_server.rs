@@ -190,8 +190,159 @@ struct MockState {
 
 pub struct MockServer {
     pub port: u16,
+    scheme: &'static str,
     state: Arc<Mutex<MockState>>,
     handle: tokio::task::JoinHandle<()>,
+    /// The leaf certificate each TLS client presented, in handshake order.
+    client_certificates: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+}
+
+/// A self-signed certificate for `localhost` and `127.0.0.1` with its private key, which a
+/// mock server serves TLS with or a scenario stores in the gateway.
+#[derive(Debug, Clone)]
+pub struct MockTls {
+    pub certificate_pem: String,
+    pub private_key_pem: String,
+    pub der: Vec<u8>,
+}
+
+impl MockTls {
+    pub fn generate() -> Self {
+        let key = rcgen::KeyPair::generate().expect("generate a key pair");
+        let certificate = rcgen::CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("certificate parameters")
+            .self_signed(&key)
+            .expect("self-sign the certificate");
+        Self {
+            certificate_pem: certificate.pem(),
+            private_key_pem: key.serialize_pem(),
+            der: certificate.der().to_vec(),
+        }
+    }
+
+    /// Serves this certificate and asks for, without requiring or checking, a client
+    /// certificate.
+    fn server_config(&self) -> Arc<rustls::ServerConfig> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let key = rustls_pemfile::private_key(
+            &mut self
+                .private_key_pem
+                .as_bytes(),
+        )
+        .expect("read the private key")
+        .expect("a private key");
+        let config = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .expect("TLS versions")
+            .with_client_cert_verifier(Arc::new(AnyClientCertificate(provider)))
+            .with_single_cert(vec![rustls::pki_types::CertificateDer::from(self.der.clone())], key)
+            .expect("server TLS configuration");
+        Arc::new(config)
+    }
+}
+
+/// Takes any client certificate, or none, so the mock can record what a client presented.
+#[derive(Debug)]
+struct AnyClientCertificate(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::server::danger::ClientCertVerifier for AnyClientCertificate {
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self
+                .0
+                .signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self
+                .0
+                .signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Accepts TLS connections and records the leaf certificate each client presented.
+#[derive(Clone)]
+struct RecordingAcceptor {
+    inner: axum_server::tls_rustls::RustlsAcceptor,
+    recorded: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+}
+
+impl<I, S> axum_server::accept::Accept<I, S> for RecordingAcceptor
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: Send + 'static,
+{
+    type Stream = tokio_rustls::server::TlsStream<I>;
+    type Service = S;
+    type Future = futures::future::BoxFuture<'static, std::io::Result<(Self::Stream, Self::Service)>>;
+
+    fn accept(
+        &self,
+        stream: I,
+        service: S,
+    ) -> Self::Future {
+        let inner = self.inner.clone();
+        let recorded = self.recorded.clone();
+        Box::pin(async move {
+            let (stream, service) = inner
+                .accept(stream, service)
+                .await?;
+            if let Some(leaf) = stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|chain| chain.first())
+            {
+                recorded
+                    .lock()
+                    .expect("client certificate record")
+                    .push(leaf.to_vec());
+            }
+            Ok((stream, service))
+        })
+    }
 }
 
 impl Debug for MockServer {
@@ -218,20 +369,31 @@ impl MockServer {
 
     pub async fn start_on_non_loopback_interface(response: impl Into<MockResponse>) -> Self {
         let host = discover_non_loopback_local_ip().to_string();
-        Self::start_with_bind_address(response, HashMap::new(), &host).await
+        Self::start_with_bind_address(response, HashMap::new(), &host, None).await
     }
 
     pub async fn start_with_extra_headers(
         response: impl Into<MockResponse>,
         extra_headers: HashMap<String, String>,
     ) -> Self {
-        Self::start_with_bind_address(response, extra_headers, "127.0.0.1").await
+        Self::start_with_bind_address(response, extra_headers, "127.0.0.1", None).await
+    }
+
+    /// A mock served over https with `tls`, recording the client certificate of each
+    /// connection.
+    pub async fn start_tls(
+        response: impl Into<MockResponse>,
+        extra_headers: HashMap<String, String>,
+        tls: &MockTls,
+    ) -> Self {
+        Self::start_with_bind_address(response, extra_headers, "127.0.0.1", Some(tls)).await
     }
 
     async fn start_with_bind_address(
         response: impl Into<MockResponse>,
         extra_headers: HashMap<String, String>,
         bind_address: &str,
+        tls: Option<&MockTls>,
     ) -> Self {
         let mut mock_response: MockResponse = response.into();
         for (name, value) in extra_headers {
@@ -262,13 +424,47 @@ impl MockServer {
             .unwrap()
             .port();
 
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .unwrap();
-        });
+        let client_certificates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handle = match tls {
+            None => tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .unwrap();
+            }),
+            Some(tls) => {
+                let acceptor = RecordingAcceptor {
+                    inner: axum_server::tls_rustls::RustlsAcceptor::new(
+                        axum_server::tls_rustls::RustlsConfig::from_config(tls.server_config()),
+                    ),
+                    recorded: client_certificates.clone(),
+                };
+                let server = axum_server::from_tcp(
+                    listener
+                        .into_std()
+                        .expect("a std listener"),
+                )
+                .expect("a TLS server on the listener");
+                tokio::spawn(async move {
+                    server
+                        .acceptor(acceptor)
+                        .serve(app.into_make_service())
+                        .await
+                        .unwrap();
+                })
+            }
+        };
 
-        Self { port, state, handle }
+        Self {
+            port,
+            scheme: if tls.is_some() {
+                "https"
+            } else {
+                "http"
+            },
+            state,
+            handle,
+            client_certificates,
+        }
     }
 
     pub async fn start_server_with_fixture(spec: MockAgentFixture) -> Self {
@@ -306,8 +502,10 @@ impl MockServer {
 
         Self {
             port: port_number,
+            scheme: "http",
             state,
             handle,
+            client_certificates: Arc::default(),
         }
     }
 
@@ -333,7 +531,15 @@ impl MockServer {
     }
 
     pub fn url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
+        format!("{}://127.0.0.1:{}", self.scheme, self.port)
+    }
+
+    /// The leaf certificate each TLS client presented, in handshake order.
+    pub fn client_certificates(&self) -> Vec<Vec<u8>> {
+        self.client_certificates
+            .lock()
+            .expect("client certificate record")
+            .clone()
     }
 
     pub fn non_loopback_url(&self) -> String {
@@ -951,6 +1157,55 @@ mod tests {
         assert_eq!(mock.request_count().await, 1);
         assert_eq!(requests[0].path_and_query, "/nested/path?foo=bar&baz=1");
         assert_eq!(requests[0].json_body(), serde_json::json!({"hello": "world"}));
+    }
+
+    #[tokio::test]
+    async fn a_tls_mock_serves_https_and_records_the_client_certificate() {
+        use rustls::pki_types::CertificateDer;
+
+        let served = super::MockTls::generate();
+        let presented = super::MockTls::generate();
+        let mock =
+            super::MockServer::start_tls(serde_json::json!({"ok": true}), std::collections::HashMap::new(), &served)
+                .await;
+        assert!(
+            mock.url()
+                .starts_with("https://127.0.0.1:"),
+            "{}",
+            mock.url()
+        );
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(served.der.clone()))
+            .unwrap();
+        let key = rustls_pemfile::private_key(
+            &mut presented
+                .private_key_pem
+                .as_bytes(),
+        )
+        .unwrap()
+        .unwrap();
+        let tls =
+            rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_client_auth_cert(vec![CertificateDer::from(presented.der.clone())], key)
+                .unwrap();
+        let response = reqwest::Client::builder()
+            .tls_backend_preconfigured(tls)
+            .build()
+            .unwrap()
+            .post(format!("{}/agent", mock.url()))
+            .json(&serde_json::json!({"hello": "world"}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(mock.request_count().await, 1);
+        assert_eq!(mock.client_certificates(), vec![presented.der.clone()]);
     }
 
     #[tokio::test]

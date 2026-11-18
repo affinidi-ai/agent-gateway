@@ -1,0 +1,391 @@
+import React from 'react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import '@testing-library/jest-dom';
+import ManagedAgentPanel from '../managed-agent/ManagedAgentPanel';
+import ResponseAuthSection from '../managed-agent/ResponseAuthSection';
+import {
+  responseAuthProblems,
+  responseAuthSaveError,
+  responseAuthToWire,
+  responseAuthWarnings,
+} from '../managed-agent/responseAuth';
+import { managedAgentDefinition } from '../managed-agent/definition';
+import { apiClient } from '../../../../api';
+import { registry } from '../index';
+import { computeOverridesFromPayload, resolveVariant } from '../../variants/resolve';
+import { SurfaceMetaProvider, type SurfaceMetaValue } from '../../SurfaceMetaContext';
+import type { CanvasNode, ConfigPanelProps, PayloadContext } from '../types';
+
+jest.mock('../../../../api', () => ({ apiClient: { get: jest.fn(), fetch: jest.fn() } }));
+
+const CERTIFICATES = [
+  { id: 'bravo-cert', name: 'Bravo server', kind: 'client_leaf', active: true },
+  { id: 'bravo-ca', name: 'Bravo CA', kind: 'ca', active: true },
+  { id: 'gateway-cert', name: 'Gateway client', kind: 'client_leaf', active: true },
+  { id: 'old-cert', name: 'Old', kind: 'client_leaf', active: false },
+];
+
+beforeEach(() => {
+  (apiClient.fetch as jest.Mock).mockResolvedValue({ ok: true, json: () => Promise.resolve([]) });
+  (apiClient.get as jest.Mock).mockImplementation((path: string) =>
+    Promise.resolve({
+      data:
+        path === '/certificates'
+          ? CERTIFICATES
+          : path === '/secrets/'
+            ? [{ id: 'bravo-key', name: 'Bravo key', secret_type: 'ApiKey' }]
+            : [],
+    })
+  );
+});
+
+const T = 'managed-agent-response-auth';
+const API_KEY = { api_key: { header_name: 'X-Agent-Key', secret_id: 'bravo-key' } };
+const MTLS = {
+  mtls: {
+    server_trust: { type: 'pinned', certificate_ids: ['bravo-cert'] },
+    client_certificate_id: 'gateway-cert',
+  },
+};
+
+function panelProps(
+  config: Record<string, unknown>
+): ConfigPanelProps & { updateField: jest.Mock } {
+  return {
+    node: { id: 'target', type: 'target', label: 'Managed Agent', configured: true, config },
+    config,
+    updateField: jest.fn(),
+    updateFields: jest.fn(),
+    protocol: 'a2a',
+    allNodes: [],
+  } as unknown as ConfigPanelProps & { updateField: jest.Mock };
+}
+
+describe('Response Authentication section', () => {
+  it('shows on an http or https Target only', () => {
+    for (const endpoint of ['https://agent.example', 'http://agent.example']) {
+      const { unmount } = render(<ManagedAgentPanel {...panelProps({ endpoint })} />);
+      expect(screen.getByTestId(`${T}-method`)).toHaveValue('off');
+      unmount();
+    }
+    for (const endpoint of ['fabric://gw-2/surface-2', 'proxy://tools', 'a2a-proxy://worker']) {
+      const { unmount } = render(<ManagedAgentPanel {...panelProps({ endpoint })} />);
+      expect(screen.queryByTestId(`${T}-section`)).not.toBeInTheDocument();
+      unmount();
+    }
+  });
+
+  it('does not offer mTLS on an http:// Target', () => {
+    render(<ManagedAgentPanel {...panelProps({ endpoint: 'http://agent.example' })} />);
+    const mtls = screen.getByRole('option', { name: /mTLS/ });
+    expect(mtls).toBeDisabled();
+    expect(mtls).toHaveTextContent('mTLS (needs an https:// Target)');
+  });
+
+  it('offers mTLS on an https:// Target', () => {
+    render(<ManagedAgentPanel {...panelProps({ endpoint: 'https://agent.example' })} />);
+    expect(screen.getByRole('option', { name: 'mTLS' })).toBeEnabled();
+  });
+
+  it('writes a new setting for the chosen method and null for Off', () => {
+    const props = panelProps({ endpoint: 'https://agent.example', response_auth: API_KEY });
+    render(<ManagedAgentPanel {...props} />);
+    fireEvent.change(screen.getByTestId(`${T}-method`), { target: { value: 'mtls' } });
+    expect(props.updateField).toHaveBeenLastCalledWith('response_auth', {
+      mtls: { server_trust: { type: 'pinned', certificate_ids: [] } },
+    });
+    fireEvent.change(screen.getByTestId(`${T}-method`), { target: { value: 'off' } });
+    expect(props.updateField).toHaveBeenLastCalledWith('response_auth', null);
+  });
+
+  it('starts an API key with the default header and no secret', () => {
+    const props = panelProps({ endpoint: 'https://agent.example' });
+    render(<ManagedAgentPanel {...props} />);
+    fireEvent.change(screen.getByTestId(`${T}-method`), { target: { value: 'api_key' } });
+    expect(props.updateField).toHaveBeenLastCalledWith('response_auth', {
+      api_key: { header_name: 'X-Agent-Key', secret_id: '' },
+    });
+  });
+
+  it('edits an API key and warns about an http:// Target', async () => {
+    const onChange = jest.fn();
+    render(
+      <ResponseAuthSection endpoint="http://agent.example" value={API_KEY} onChange={onChange} />
+    );
+    expect(screen.getByTestId(`${T}-http-warning`)).toHaveTextContent(/unencrypted/);
+    fireEvent.change(screen.getByTestId(`${T}-header`), { target: { value: 'X-Bravo' } });
+    expect(onChange).toHaveBeenLastCalledWith({
+      api_key: { header_name: 'X-Bravo', secret_id: 'bravo-key' },
+    });
+    await screen.findByRole('option', { name: 'Bravo key' });
+    expect(screen.getByTestId(`${T}-secret`)).toHaveValue('bravo-key');
+  });
+
+  it('lists only active certificates of the kind the trust takes, and clients for the client certificate', async () => {
+    const onChange = jest.fn();
+    render(
+      <ResponseAuthSection endpoint="https://agent.example" value={MTLS} onChange={onChange} />
+    );
+    expect(await screen.findByTestId(`${T}-trust-cert-bravo-cert`)).toBeInTheDocument();
+    expect(screen.queryByTestId(`${T}-trust-cert-bravo-ca`)).not.toBeInTheDocument();
+    expect(screen.queryByTestId(`${T}-trust-cert-old-cert`)).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Bravo server')).toBeChecked();
+    expect(screen.getByTestId(`${T}-client-cert`)).toHaveValue('gateway-cert');
+    expect(screen.queryByRole('option', { name: 'Bravo CA' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText('Gateway client'));
+    expect(onChange).toHaveBeenLastCalledWith({
+      mtls: {
+        server_trust: { type: 'pinned', certificate_ids: ['bravo-cert', 'gateway-cert'] },
+        client_certificate_id: 'gateway-cert',
+      },
+    });
+
+    fireEvent.change(screen.getByTestId(`${T}-client-cert`), { target: { value: '' } });
+    expect(onChange).toHaveBeenLastCalledWith({
+      mtls: { server_trust: { type: 'pinned', certificate_ids: ['bravo-cert'] } },
+    });
+
+    fireEvent.change(screen.getByTestId(`${T}-trust-mode`), { target: { value: 'ca' } });
+    expect(onChange).toHaveBeenLastCalledWith({
+      mtls: {
+        server_trust: { type: 'ca', ca_certificate_ids: [] },
+        client_certificate_id: 'gateway-cert',
+      },
+    });
+  });
+
+  it('keeps a stored certificate the store no longer lists selected, so it can be cleared', async () => {
+    const onChange = jest.fn();
+    const stored = { mtls: { server_trust: { type: 'pinned', certificate_ids: ['gone'] } } };
+    render(
+      <ResponseAuthSection endpoint="https://agent.example" value={stored} onChange={onChange} />
+    );
+    const gone = await screen.findByTestId(`${T}-trust-cert-gone`);
+    expect(gone).toBeChecked();
+    expect(screen.getByLabelText('gone (not in the certificate store)')).toBe(gone);
+    fireEvent.click(gone);
+    expect(onChange).toHaveBeenLastCalledWith({
+      mtls: { server_trust: { type: 'pinned', certificate_ids: [] } },
+    });
+  });
+
+  it('says when the certificate store cannot be read', async () => {
+    (apiClient.get as jest.Mock).mockRejectedValue(new Error('403'));
+    render(
+      <ResponseAuthSection endpoint="https://agent.example" value={MTLS} onChange={jest.fn()} />
+    );
+    expect(await screen.findByTestId(`${T}-certificates-error`)).toBeInTheDocument();
+  });
+
+  it("shows the gateway's refusal and warnings for this view in plain words", async () => {
+    const meta = {
+      saveError:
+        'target.response_auth.api_key.header_name must not be the reserved header Host (400)',
+      saveWarnings: [
+        'target.response_auth receives an API key, so its Target must be an https URL',
+        "Transit Point 'crm' does not authenticate its callers",
+      ],
+    } as unknown as SurfaceMetaValue;
+    render(
+      <SurfaceMetaProvider value={meta}>
+        <ResponseAuthSection endpoint="http://agent.example" value={API_KEY} onChange={jest.fn()} />
+      </SurfaceMetaProvider>
+    );
+    expect(screen.getByTestId(`${T}-save-error`)).toHaveTextContent(
+      'The gateway refused the last save: The response header must not be the reserved header Host'
+    );
+    await waitFor(() =>
+      expect(screen.getAllByTestId(`${T}-save-warning`).map(w => w.textContent)).toEqual([
+        'Response authentication receives an API key, so its Target must be an https URL',
+      ])
+    );
+  });
+});
+
+describe('Response Authentication rules and messages', () => {
+  it('blocks an API key without a header or secret and mTLS without a certificate or on http', () => {
+    expect(responseAuthProblems('https://a.example', API_KEY)).toEqual([]);
+    expect(responseAuthProblems('https://a.example', MTLS)).toEqual([]);
+    expect(
+      responseAuthProblems('https://a.example', { api_key: { header_name: ' ', secret_id: '' } })
+    ).toEqual(['Enter the response header name', 'Select the secret holding the key']);
+    expect(
+      responseAuthProblems('https://a.example', {
+        mtls: { server_trust: { type: 'ca', ca_certificate_ids: [] } },
+      })
+    ).toEqual(['Select at least one CA certificate']);
+    expect(responseAuthProblems('http://a.example', MTLS)).toEqual([
+      'mTLS needs an https:// Target',
+    ]);
+    expect(responseAuthProblems('fabric://gw/s', { api_key: {} })).toEqual([]);
+    expect(responseAuthProblems('https://a.example', null)).toEqual([]);
+  });
+
+  it('faults the Managed Agent node with the same rules', () => {
+    expect(
+      managedAgentDefinition.validate!({
+        endpoint: 'https://a.example',
+        response_auth: { api_key: { header_name: 'X-Agent-Key', secret_id: '' } },
+      })
+    ).toEqual([
+      {
+        field: 'response_auth',
+        message: 'Response Authentication: Select the secret holding the key',
+      },
+    ]);
+  });
+
+  it('routes refusals and warnings to the base or the variant they name', () => {
+    const variantError = "variants['beta'].target.response_auth.mtls needs an https Target (400)";
+    expect(responseAuthSaveError(variantError)).toBeNull();
+    expect(responseAuthSaveError(variantError, 'beta')).toBe('mTLS needs an https Target');
+    expect(responseAuthSaveError(variantError, 'gamma')).toBeNull();
+    expect(
+      responseAuthSaveError(
+        'target.response_auth.mtls.client_certificate_id gateway-cert must be stored with its private key'
+      )
+    ).toBe('The client certificate gateway-cert must be stored with its private key');
+    expect(responseAuthSaveError("transit.points[0]: Transit Point 'crm' x")).toBeNull();
+    expect(responseAuthSaveError(null)).toBeNull();
+    expect(
+      responseAuthWarnings(
+        [
+          'target.response_auth receives an API key, so its Target must be an https URL',
+          "variants['beta'].target.response_auth receives an API key, so its Target must be an https URL",
+        ],
+        'beta'
+      )
+    ).toEqual(['Response authentication receives an API key, so its Target must be an https URL']);
+  });
+});
+
+function makeCtx(nodes: CanvasNode[]): PayloadContext {
+  return {
+    protocol: 'a2a',
+    surfaceMeta: { name: 'response-auth', tags: [], status: 'active' },
+    allNodes: nodes,
+    nodesOfType: (type: string) => nodes.filter(n => n.type === type),
+    firstNodeOfType: (type: string) => nodes.find(n => n.type === type),
+  };
+}
+
+function targetSavedAgain(target: Record<string, unknown>, canvas?: unknown) {
+  const nodes = registry.nodesFromPayload({
+    access_point: { route: '/a2a', protocol: 'a2a' },
+    target,
+    ...(canvas ? { canvas } : {}),
+  });
+  return { nodes, target: registry.buildPayload(makeCtx(nodes)).target };
+}
+
+describe('target.response_auth on save', () => {
+  it.each([
+    ['an API key', API_KEY],
+    ['mTLS with pinned trust and a client certificate', MTLS],
+    [
+      'mTLS with CA trust',
+      { mtls: { server_trust: { type: 'ca', ca_certificate_ids: ['bravo-ca'] } } },
+    ],
+  ])('keeps a stored %s the operator did not edit verbatim', (_case, responseAuth) => {
+    const { target } = targetSavedAgain({
+      endpoint: 'https://agent.example',
+      response_auth: responseAuth,
+    });
+    expect(target.response_auth).toEqual(responseAuth);
+  });
+
+  it('sends null once switched off, and nothing for a surface that has none', () => {
+    const { nodes, target } = targetSavedAgain({
+      endpoint: 'https://agent.example',
+      response_auth: API_KEY,
+    });
+    expect(target.response_auth).toEqual(API_KEY);
+    const node = nodes.find(n => n.type === 'target')!;
+    node.config = { ...node.config, response_auth: null };
+    expect(registry.buildPayload(makeCtx(nodes)).target.response_auth).toBeNull();
+
+    expect(targetSavedAgain({ endpoint: 'https://agent.example' }).target).not.toHaveProperty(
+      'response_auth'
+    );
+  });
+
+  it('writes what the panel set, in the wire shape', () => {
+    expect(responseAuthToWire('https://a.example', MTLS)).toBe(MTLS);
+    expect(responseAuthToWire('http://a.example', API_KEY)).toBe(API_KEY);
+    expect(responseAuthToWire('https://a.example', null)).toBeNull();
+    expect(responseAuthToWire('https://a.example', undefined)).toBeUndefined();
+    expect(responseAuthToWire('fabric://peer/surface', API_KEY)).toBeNull();
+    expect(responseAuthToWire('fabric://peer/surface', undefined)).toBeUndefined();
+  });
+
+  it.each(['fabric://peer/surface', 'proxy://tools', 'a2a-proxy://worker'])(
+    'clears a stored one when the Target becomes %s, and sends nothing when there was none',
+    endpoint => {
+      const { nodes } = targetSavedAgain({
+        endpoint: 'https://agent.example',
+        response_auth: API_KEY,
+      });
+      const node = nodes.find(n => n.type === 'target')!;
+      node.config = { ...node.config, endpoint };
+      expect(registry.buildPayload(makeCtx(nodes)).target.response_auth).toBeNull();
+
+      expect(targetSavedAgain({ endpoint }).target).not.toHaveProperty('response_auth');
+    }
+  );
+
+  it('never brings back a setting the stored surface no longer has from the canvas blob', () => {
+    const canvas = {
+      version: 1,
+      nodes: [
+        {
+          id: 'target',
+          type: 'target',
+          label: 'Managed Agent',
+          config: { endpoint: 'https://agent.example', response_auth: API_KEY },
+        },
+      ],
+    };
+    const { target } = targetSavedAgain({ endpoint: 'https://agent.example' }, canvas);
+    expect(target).not.toHaveProperty('response_auth');
+  });
+
+  it('round-trips a variant override, sends null to clear it, and leaves out one never set', () => {
+    const base = {
+      access_point: { route: '/a2a', protocol: 'a2a' },
+      target: { endpoint: 'https://agent.example', response_auth: API_KEY },
+    };
+    const own = computeOverridesFromPayload({
+      ...base,
+      target: { ...base.target, response_auth: MTLS },
+    });
+    expect(own.target).toMatchObject({ response_auth: MTLS });
+    expect(resolveVariant(base, own).target.response_auth).toEqual(MTLS);
+
+    const off = computeOverridesFromPayload({
+      ...base,
+      target: { endpoint: base.target.endpoint, response_auth: null },
+    });
+    expect(off.complete).toBe(true);
+    expect(off.target).toEqual({ endpoint: base.target.endpoint, response_auth: null });
+    expect(resolveVariant(base, off).target.response_auth).toBeNull();
+
+    const none = computeOverridesFromPayload({
+      ...base,
+      target: { endpoint: base.target.endpoint },
+    });
+    expect(none.target).not.toHaveProperty('response_auth');
+    expect(resolveVariant(base, none).target).not.toHaveProperty('response_auth');
+  });
+
+  it('sends null for a variant whose override is cleared by moving its Target off http(s)', () => {
+    const nodes = registry.nodesFromPayload({
+      access_point: { route: '/a2a', protocol: 'a2a' },
+      target: { endpoint: 'https://agent.example', response_auth: MTLS },
+    });
+    const node = nodes.find(n => n.type === 'target')!;
+    node.config = { ...node.config, endpoint: 'proxy://tools' };
+    const overrides = computeOverridesFromPayload(registry.buildPayload(makeCtx(nodes)));
+    expect(overrides.target).toMatchObject({ response_auth: null });
+  });
+});

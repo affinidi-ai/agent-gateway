@@ -1324,6 +1324,143 @@ The target's response headers go back to the agent except hop-by-hop headers, `S
 `Set-Cookie2`, `WWW-Authenticate` and `Authentication-Info`, so a target cannot set cookies in the agent or send it to
 authenticate with the target directly. The response status is unchanged.
 
+## Response authentication
+
+Source authentication checks the caller and Target authentication lets the managed agent check
+the gateway. Response authentication (`target.response_auth`) lets the gateway check the
+managed agent: a response from the surface's Target is accepted only when it proves it comes
+from the registered managed agent. Without it the gateway trusts any server that answers at the
+Target URL, resolves the managed agent's identity from that answer and records it. It is opt-in
+and enforced only: a surface without the setting behaves as before, and there is no
+report-only mode.
+
+```json
+"target": {
+  "endpoint": "https://bravo.example/a2a",
+  "response_auth": { "api_key": { "header_name": "X-Agent-Key", "secret_id": "bravo-response-key" } }
+}
+```
+
+With `api_key`, the managed agent returns its key in `header_name` on every response. The
+secret `secret_id` holds the accepted keys, comma-separated, so a key can be rotated by adding
+the new one, moving the agent to it and then removing the old one. A response passes when the
+header holds exactly one value equal to one of the keys, compared in constant time
+([`src/proxy/response_auth.rs`](../src/proxy/response_auth.rs)). The header is removed whatever
+the outcome, so the caller never receives the key. A variant may set its own `response_auth`,
+or clear it as a complete variant, as with `target.auth`.
+
+```json
+"target": {
+  "endpoint": "https://bravo.example/a2a",
+  "response_auth": { "mtls": {
+    "server_trust": { "type": "pinned", "certificate_ids": ["bravo-server-cert"] },
+    "client_certificate_id": "gateway-client-cert"
+  } }
+}
+```
+
+With `mtls`, the gateway connects to the Target with TLS settings that trust only
+`server_trust`, which takes the [`MtlsTrust`](#mtls) shape of caller mTLS; the system's and
+public CAs are never consulted ([`src/proxy/response_auth/tls.rs`](../src/proxy/response_auth/tls.rs)):
+
+- `pinned` accepts a server certificate whose SHA-256 leaf fingerprint is that of one of
+  `certificate_ids`, stored `client_leaf` certificates. No chain, name or expiry is checked;
+  the handshake signature is still verified with that certificate's key.
+- `ca` accepts a server certificate that chains to one of `ca_certificate_ids`, stored `ca`
+  certificates, and is valid for the Target's host. `require_client_auth_eku` does not apply to
+  a server certificate, and `check_crl` and `require_ocsp` must be `false`.
+
+`client_certificate_id`, optional, is a stored `client_leaf` certificate with its private key,
+which the gateway presents to the managed agent so that both ends of the link are proven by
+keys. The TLS settings are built once per surface and built again when the setting or any
+certificate it names changes. The check is the TLS handshake itself: a server certificate that
+fails the trust ends the connection before any response exists, and the request is refused as
+below. Any other connection failure, such as a Target that cannot be reached, is answered as
+before. The gateway tells the two apart by the TLS error it receives
+(`handshake_failure` in the same file).
+
+The check runs right after the Target answers, success or error, before the response is read
+by anything else: before managed identity is resolved, a credential is issued for it, the Trust
+Recorder writes, response policy runs or a held payment is captured. A streamed answer is
+checked on its response headers before the first event. Every hop to the Target runs it:
+
+- the Access Point's direct forward, with its A2A event streams, MCP Streamable HTTP streams
+  and the Legacy SSE stream passed through to the caller;
+- the Legacy SSE fallback of an MCP Access Point, on the session's stream and on the answer to
+  each message it posts. A session is shared only by surfaces without the setting, so a
+  surface with it never uses a session another surface opened. A session under mTLS is also
+  keyed by the certificates its TLS settings were built from, so a renewed certificate opens a
+  new session rather than reusing one that trusts the old certificate;
+- the gateway's own agent card fetch, for the card route and the operator's card preview;
+- Fabric receive: a request a peer sends to this gateway's surface, buffered or framed, its
+  Legacy SSE fallback, and the agent card read for the surface's policy input and Trust Check
+  (`require_agent_context`), each against the receiving surface's own setting;
+- MCP tool discovery of a saved surface (`POST /v1/mcp-proxies/discover-tools` with
+  `surface_id`): the `initialize` and `tools/list` answers and their Legacy SSE fallback. A
+  failed check answers the management caller `502` with `The Target's response was refused: it
+  failed the surface's Response authentication`, the reason only logged. A discovery of an
+  operator-typed `target_endpoint` has no surface and no check.
+
+One read is not checked: the dashboard's display name of a managed agent, read from the Target's
+agent card ([`src/identity/target_card_names.rs`](../src/identity/target_card_names.rs)). The name
+is self-asserted, never signed or published, and with a pinned or private-CA certificate it may
+not resolve.
+
+Every hop picks its TLS settings and is refused without sending anything when the setting cannot
+be checked on the URL it sends to: any `response_auth` on a URL that is not `http` or `https`
+(a stored surface edited by hand to a `proxy://` or `a2a-proxy://` Target), `mtls` on one that
+is not `https`, or mTLS settings that cannot be built (`hop_tls` in
+[`src/proxy/response_auth.rs`](../src/proxy/response_auth.rs)). A save refuses `mtls` on a
+Target bound by external consent, whose requests go out on the vendor's client; the direct
+forward still refuses such a stored surface without sending it. A card that fails is never
+served and no identity credential is issued for it: the card route refuses it as below, a
+preview reports it as an upstream error without recording anything, and the policy card read
+yields no card, as a card that cannot be read does.
+
+A response that fails is refused with `502` and a body that names no reason: `Upstream response
+refused`, as a JSON-RPC `-32603` error echoing the request `id` when the request was a JSON-RPC
+request, otherwise as a problem response. The reason (`key_missing`, `key_mismatch`,
+`server_untrusted` when the server certificate failed the mTLS trust, or `unverifiable` when a
+secret or certificate cannot be read or used: missing, inactive, outside the surface's tenant,
+of the wrong kind or holding no key) is logged, never a key, and the VP Audit Log records a
+`request_rejected` with reason
+`target_response_auth_failed` (see [`OBSERVABILITY.md`](OBSERVABILITY.md)), with `via_fabric`
+set when a peer sent the request; the peer relays the `502` to its caller. Nothing from the
+refused response is used: no identity is resolved, no credential issued and no Trust Recorder
+record written, and no payment held for the request is captured.
+
+A save is refused with `400` when a `response_auth`, on the surface or on a variant as it
+resolves:
+
+- is set on a Target that is not an `http` or `https` URL: a `proxy://`, `a2a-proxy://` or
+  `fabric://` Target has no managed agent whose responses the gateway receives;
+- names a `header_name` that is not an HTTP field name, is reserved, or is already sent to the
+  Target by Target authentication, a credential binding, a forwarded caller token, header
+  metadata mapping or `caller_key` (the
+  [Target authentication header rules](CREDENTIAL_DELEGATION.md#target-authentication-rules));
+- names a secret or certificate that does not exist or belongs to another tenant (an
+  appliance-wide one is accepted, as for a Transit Point's `source_auth`; see
+  [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md));
+- sets `mtls` on a Target bound by external consent (`consent_mode: external`), whatever the
+  stored surface held; use `api_key` there;
+- sets `mtls` on a Target that is not `https`, names no `server_trust` certificate, asks a `ca`
+  trust for a CRL or OCSP check, or names a certificate of the wrong kind (`client_leaf` for
+  `pinned` and for the client certificate, `ca` for `ca`) or a client certificate stored
+  without its private key;
+- reads its key from an `http://` Target while `[credential_policy] target_https` is `enforce`,
+  unless the stored surface already had the same setting on the same Target. In `warn`, the
+  default, the save goes through with a `Warning: 299` header and a logged warning.
+
+An omitted `response_auth` in a `PUT` of the surface keeps the stored one; `"response_auth":
+null` removes it. The same holds for a variant's `overrides.target`, in the surface `PUT` and in
+`PUT /v1/surfaces/{id}/variants/{variant_id}`, for a variant already stored under that id; a
+variant whose overrides send no `target` keeps nothing.
+
+Rolling back to a release without Response authentication: the Target refuses unknown fields,
+so that release does not load a surface that sets `response_auth`. The surface stops serving
+rather than serving unchecked responses; remove the setting before rolling back to keep it
+serving.
+
 ## Managed identity
 
 A rule that derives the managed agent's DID. `ManagedIdentityConfig`

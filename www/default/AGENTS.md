@@ -288,6 +288,31 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   always-visible warning says a paired gateway that sends a person's own token gets that
   person's grant. A variant carries it in `overrides.target`. Test ids:
   `managed-agent-partner-grants-switch` and `managed-agent-partner-grants-warning`.
+- **Response Authentication** is the Managed Agent panel's
+  `managed-agent/ResponseAuthSection.tsx` (rules and wording in `managed-agent/responseAuth.ts`),
+  shown only for an HTTP or HTTPS Target. It edits `target.response_auth` in its wire shape:
+  **Off**, **API key** (response header, default `X-Agent-Key`, and a secret from
+  `useApiKeySecrets`) or **mTLS** (trust by pinned certificate or Certificate Authority, with
+  checkboxes listing the active `client_leaf` or `ca` certificates of `GET /certificates`, and an
+  optional client certificate from the `client_leaf` ones; the list does not say which have a
+  private key, so `FieldHelp` says one is needed and the gateway refuses the save otherwise).
+  mTLS is a disabled option on an `http://` Target, and its `FieldHelp` says why. An API key on
+  an `http://` Target shows an always-visible warning. A stored id the lists do not have stays
+  shown, so it can be cleared, and a shape the panel cannot read is kept as "Set through the API".
+  The Target's config takes `response_auth` only from the stored surface, never from the canvas
+  blob, so one removed through the API stays removed. The gateway keeps a stored one a `PUT`
+  leaves out, so Save sends the value unchanged when the operator did not edit it, `null` once
+  switched off or when the Target is no longer HTTP or HTTPS, and nothing when there is none. A
+  variant carries it in `overrides.target`, with `null` to clear its stored override. `validate`
+  blocks Save for an API key without a header or secret, and for mTLS without a trusted
+  certificate or on an `http://` Target. The gateway's refusal (`target.response_auth…`, or
+  `variants['<alias>'].target.response_auth…` in that variant's view) and its `Warning` headers
+  show in the section with the field name in plain words; a warning stays until the endpoint or
+  the setting changes. Test ids, with prefix `managed-agent-response-auth`: `-section`,
+  `-method`, `-header`, `-secret`, `-add-secret-link`, `-http-warning`, `-trust-mode`,
+  `-trust-certificates`, `-trust-cert-<id>`, `-add-certificate-link`, `-client-cert`,
+  `-certificates-error`, `-unsupported`, `-problem`, `-save-warning`, `-save-error`, and
+  `field-help-managed-agent-response-auth` / `-client-cert`.
 - The Agent Identity panel (`identity/IdentityPanel.tsx`) disables **From API Key** on the
   Managed Agent response identity (`response:identity-protected`), since the key picker lists
   API keys issued to callers, and none of them identifies the Managed Agent; the inbound and

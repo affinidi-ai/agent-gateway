@@ -745,6 +745,47 @@ async fn vp_audit_log_records_unsent_target_credential_over_fabric(
 }
 
 #[then(
+    expr = "the VP Audit Log of gateway {int} records that a Fabric request to surface {string} was refused for a Target response that is not authenticated"
+)]
+async fn vp_audit_log_records_fabric_request_refused_for_unauthenticated_target_response(
+    world: &mut G2gWorld,
+    gateway: usize,
+    surface_name: String,
+) {
+    let (_, surface_id) = world.surface(&surface_name);
+    let (found, events) = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .wait_for_audit_event(|event| {
+            event["event"]["request_rejected"]["reason"] == "target_response_auth_failed"
+                && event["via_fabric"] == true
+                && event["surface_id"] == surface_id.as_str()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must be readable: {error:#}"));
+    assert!(
+        found,
+        "expected gateway {gateway} to record a Fabric request to surface '{surface_id}' refused for an unauthenticated Target response, got {events:?}"
+    );
+}
+
+#[then(expr = "gateway {int} issued no managed agent identity")]
+async fn gateway_issued_no_managed_agent_identity(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let managed = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .managed_agent_identities()
+        .await
+        .unwrap_or_else(|error| panic!("the Identities dashboard of gateway {gateway} must be readable: {error:#}"));
+    assert!(managed.is_empty(), "expected gateway {gateway} to issue no Managed Agent identity, observed: {managed:?}");
+}
+
+#[then(
     expr = "managed agent {string} received the forwarded request carrying an identity presentation issued by gateway {int}"
 )]
 pub async fn managed_agent_received_forwarded_request_with_identity_presentation_issued_by_gateway(

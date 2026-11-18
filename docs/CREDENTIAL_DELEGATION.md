@@ -1137,6 +1137,12 @@ the same ones. The startup and reload credential policy report logs each stored 
 breaks a header or format rule, with rule `target_auth_header` and `enforced` true, beside its
 `target_https` and `target_source_auth` breaches.
 
+The `header_name` of Response authentication (`target.response_auth`), the header the managed
+agent returns its key in, is held to the same name and reserved-header rules, must not be a
+header Target authentication or `caller_key` already sends to the Target, and its key read from
+an `http://` Target follows `target_https`; see
+[Response authentication](SOURCE_AUTH.md#response-authentication).
+
 ### Target credential rules on the request path
 
 Before a `static_secret` or `credential_provider` credential is read or a token is requested,
@@ -1510,6 +1516,7 @@ API, the grants report and their removal take `"hop": "target"`.
 | `inject_as` | `bearer_header` or `custom_header`. The grant goes in a header, which replaces any of the same name; `meta`, which would put it in the body, is refused |
 | The only binding | `outbound_credentials` holds no other binding, and the surface has no Transit Points, its own or a variant's: `outbound_credentials` would apply on every Transit Point |
 | In place of every other credential | The Target has no `target.auth`, and the Access Point does not forward the caller's JWT (`forward_header`). The caller's own `Authorization`, and the header its credential came in, never reach the vendor |
+| Response authentication by API key only | `target.response_auth` may use `api_key` but not `mtls`: a request carrying the grant goes out on the vendor's client, not with the mTLS settings ([Response authentication](SOURCE_AUTH.md#response-authentication)) |
 | Callers | Authenticated by something the gateway can check, as on a Transit Point ([above](#external-consent-on-a-transit-point)): no `did_auth` without `allowed_dids`, no `jwt_bearer` without `audiences` or with an `audience_claim` other than `aud` unless the Access Point publishes `protected_resource`, and for `subject: caller` no `mcp_http.authorization` |
 | No presentation of the agent | No identity VP (`target.identity_injection.inject_vp`, or `identity_slots.inbound`), no enabled `target.workload_binding`, and the surface's DID, if it has one, injected in a header rather than `protocol_native`. A presentation of the managed agent, minted without an audience or a nonce, would describe the agent to the vendor, which could present it elsewhere |
 | No custom metadata | No enabled `target.custom_metadata`, which would send the vendor values of the gateway's, secrets-store references among them, in `_meta` or `X-Gateway-*` headers beside the grant |

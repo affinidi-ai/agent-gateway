@@ -18,6 +18,7 @@ pub mod policy_validation;
 pub mod settings;
 mod surface_caller_key;
 pub(crate) mod surface_grants;
+mod surface_response_auth;
 mod surface_target_auth;
 pub(crate) mod surface_tenancy;
 pub mod surfaces;

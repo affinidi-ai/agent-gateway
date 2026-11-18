@@ -804,6 +804,15 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     pass 8 Fabric crossings, recorded against its surface with the call's trace id, and on Fabric
     receive `transit_token_unavailable` (the peer is answered `503`): the managed agent should
     get a transit token for the request and it could not be issued.
+    `target_response_auth_failed` (`502`, with `rpc_error_code` `-32603` for a JSON-RPC
+    request): the Target's response failed the surface's Response authentication
+    (`target.response_auth`), or the request could not be checked and was not sent, so it was
+    refused before anything used it. Recorded on the Access Point's direct forward and its
+    Legacy SSE fallback, on Fabric receive (`via_fabric` set) and on the served agent card
+    route; the card preview, the policy card read and MCP tool discovery record nothing.
+    The record names no key, and the cause (`key_missing`, `key_mismatch`, `server_untrusted`
+    when the server certificate failed the mTLS trust, or `unverifiable`) is only logged; see
+    [`SOURCE_AUTH.md`](SOURCE_AUTH.md#response-authentication).
     `target_auth_failed`: the Target credential (`target.auth`, or a Transit Point's
     `target_auth`) was not sent, because it could not be obtained (a secret or provider that
     cannot be read, a token request that failed), a `[credential_policy]` rule in `enforce`

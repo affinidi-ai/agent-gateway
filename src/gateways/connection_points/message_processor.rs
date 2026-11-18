@@ -3483,11 +3483,13 @@ async fn authorize_fabric_sender(
 ///
 /// An HTTP(S) Target gets a client pinned to the address it resolved to, with
 /// redirects off, as on the direct path, so DNS cannot rebind it between
-/// vetting and connect. A cloud-metadata Target is refused. Other Targets
+/// vetting and connect, speaking TLS with `tls` when given: the surface's
+/// Response authentication by mTLS. A cloud-metadata Target is refused. Other Targets
 /// (`proxy://`) keep the pooled client, which never follows redirects either.
 async fn forward_client_for(
     target_url: &str,
     timeout: std::time::Duration,
+    tls: Option<Arc<rustls::ClientConfig>>,
 ) -> Result<reqwest::Client, ForwardClientError> {
     if !crate::config::agent_surface::endpoint_is_http_url(target_url) {
         return Ok(GLOBAL_HTTP_CLIENT
@@ -3496,7 +3498,11 @@ async fn forward_client_for(
             .unwrap_or_else(reqwest::Client::new));
     }
     let candidate = target_url.to_string();
-    match tokio::task::spawn_blocking(move || crate::egress::pinned_forward_client(&candidate, timeout)).await {
+    match tokio::task::spawn_blocking(move || {
+        crate::egress::pinned_forward_client_with_tls(&candidate, timeout, tls.as_deref())
+    })
+    .await
+    {
         Ok(Ok((client, _target))) => Ok(client),
         Ok(Err(error)) => Err(ForwardClientError::Blocked(error.to_string())),
         Err(error) => Err(ForwardClientError::VettingFailed(error.to_string())),
@@ -3674,23 +3680,42 @@ async fn read_policy_agent_card(
         .get()
         .copied()
         .unwrap_or(std::time::Duration::from_secs(30));
-    fetch_agent_card(card_url, credential.as_ref(), timeout, fabric_body_limits(surface), config_id).await
+    fetch_agent_card(surface, card_url, credential.as_ref(), timeout, fabric_body_limits(surface), config_id).await
 }
 
 /// Fetch the local Target's agent card for the GW2 policy context, through the
 /// same pinned, redirect-free client as the forward and within the buffered
 /// response bounds, with `credential` as its only header. A provider token the
 /// Target refuses as `invalid_token` is dropped, as on the forward, so the next
-/// read asks the provider for a new one. Any failure, including a blocked target
-/// or a redirect, yields no card.
+/// read asks the provider for a new one. The answer must pass `surface`'s
+/// Response authentication. Any failure, including a blocked target, a redirect
+/// or an answer that fails Response authentication, yields no card.
 async fn fetch_agent_card(
+    surface: &crate::config::agent_surface::AgentSurface,
     card_url: &str,
     credential: Option<&crate::proxy::handler::TargetCredential>,
     timeout: std::time::Duration,
     limits: crate::proxy::upstream_body::UpstreamBodyLimits,
     config_id: &str,
 ) -> Option<serde_json::Value> {
-    let client = match forward_client_for(card_url, timeout).await {
+    let tls = match crate::proxy::response_auth::hop_tls(
+        surface,
+        card_url,
+        crate::proxy::server::get_certificates_store().as_ref(),
+    )
+    .await
+    {
+        Ok(tls) => tls,
+        Err(failure) => {
+            channel_warn!(
+                config_id,
+                "GW2: No agent card for policy: the Target's Response authentication cannot be used ({})",
+                failure.reason()
+            );
+            return None;
+        }
+    };
+    let client = match forward_client_for(card_url, timeout, tls).await {
         Ok(client) => client,
         Err(error) => {
             channel_warn!(
@@ -3710,7 +3735,18 @@ async fn fetch_agent_card(
     {
         request = request.header(header_name.as_str(), header_value.as_str());
     }
-    let response = match request.send().await {
+    let mut sent = request.send().await;
+    if let Err(failure) =
+        crate::proxy::response_auth::authenticate_sent(surface, &mut sent, get_secrets_store().as_ref()).await
+    {
+        channel_warn!(
+            config_id,
+            "GW2: No agent card for policy: the Target's answer failed Response authentication ({})",
+            failure.reason()
+        );
+        return None;
+    }
+    let response = match sent {
         Ok(response) => response,
         Err(e) => {
             channel_warn!(
@@ -5933,7 +5969,25 @@ async fn process_charged_forward_request(
         .get()
         .copied()
         .unwrap_or(std::time::Duration::from_secs(30));
-    let client = match forward_client_for(&target_url, timeout).await {
+    let response_secrets = get_secrets_store();
+    let target_tls = match crate::proxy::response_auth::hop_tls(
+        &surface,
+        &target_url,
+        crate::proxy::server::get_certificates_store().as_ref(),
+    )
+    .await
+    {
+        Ok(target_tls) => target_tls,
+        Err(failure) => {
+            return axum_response_to_forward_result(crate::proxy::response_auth::refuse(
+                failure,
+                &audit_facts,
+                &body_bytes,
+            ))
+            .await;
+        }
+    };
+    let client = match forward_client_for(&target_url, timeout, target_tls).await {
         Ok(client) => client,
         Err(error) => {
             channel_warn!(
@@ -6562,6 +6616,10 @@ async fn process_charged_forward_request(
     // MCP shortcut: if we already have a persistent SSE session to this upstream
     // (established during a previous request that got 400), use it directly
     // instead of trying a plain POST that we know will fail.
+    let legacy_sse_check = crate::mcp::sse_transport::ResponseCheck {
+        surface: &surface,
+        secrets: response_secrets.as_ref(),
+    };
     if surface_protocol == crate::config::ChannelProtocol::Mcp && modern_request.is_none() && !body_bytes.is_empty() {
         // Check if a persistent session already exists (cheap read lock check)
         let has_session = {
@@ -6569,7 +6627,7 @@ async fn process_charged_forward_request(
                 .sessions
                 .read()
                 .await;
-            sessions.contains_key(&target_url)
+            sessions.contains_key(&crate::mcp::sse_transport::session_key(&target_url, Some(legacy_sse_check)))
         };
 
         if has_session {
@@ -6582,6 +6640,7 @@ async fn process_charged_forward_request(
                 &body_bytes,
                 channel_id,
                 fabric_max_response_bytes(),
+                Some(legacy_sse_check),
             )
             .await
             {
@@ -6615,6 +6674,14 @@ async fn process_charged_forward_request(
                         }),
                     };
                 }
+                Err(crate::mcp::sse_transport::LegacySseError::Unauthenticated(failure)) => {
+                    return axum_response_to_forward_result(crate::proxy::response_auth::refuse(
+                        failure,
+                        &audit_facts,
+                        &body_bytes,
+                    ))
+                    .await;
+                }
                 Err(e) => {
                     channel_warn!(config_id, "GW2: Persistent SSE session (reuse) failed: {}", e);
                     // Fall through to try plain POST as the session may have expired
@@ -6623,7 +6690,7 @@ async fn process_charged_forward_request(
         }
     }
 
-    let response = if let Some(request) = modern_request.as_ref()
+    let mut response = if let Some(request) = modern_request.as_ref()
         && let Some(proxy) = modern_proxy.as_ref()
     {
         let prepared = match req.build() {
@@ -6660,6 +6727,12 @@ async fn process_charged_forward_request(
             )).await,
         }
     } else { req.send().await };
+    if let Err(failure) =
+        crate::proxy::response_auth::authenticate_sent(&surface, &mut response, response_secrets.as_ref()).await
+    {
+        return axum_response_to_forward_result(crate::proxy::response_auth::refuse(failure, &audit_facts, &body_bytes))
+            .await;
+    }
     if let Ok(response) = response.as_ref() {
         crate::proxy::handler::forget_refused_target_token(
             get_delegation_vault_store().as_deref(),
@@ -6715,6 +6788,7 @@ async fn process_charged_forward_request(
                     &body_bytes,
                     channel_id,
                     fabric_max_response_bytes(),
+                    Some(legacy_sse_check),
                 )
                 .await
                 {
@@ -6749,6 +6823,14 @@ async fn process_charged_forward_request(
                                 "body": "",
                             }),
                         };
+                    }
+                    Err(crate::mcp::sse_transport::LegacySseError::Unauthenticated(failure)) => {
+                        return axum_response_to_forward_result(crate::proxy::response_auth::refuse(
+                            failure,
+                            &audit_facts,
+                            &body_bytes,
+                        ))
+                        .await;
                     }
                     Err(e) => {
                         channel_warn!(config_id, "GW2: Persistent SSE session also failed: {}", e);
@@ -9609,6 +9691,9 @@ mod target_grant_tests;
 mod fabric_partner_grant_tests;
 
 #[cfg(test)]
+mod fabric_response_auth_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::gateways::connection_points::messages::{MessageMetadata, ReceivedMessage};
@@ -11132,9 +11217,18 @@ mod tests {
             .unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await });
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "surface-1", "name": "surface-1",
+            "access_point": {"listen_address": "0.0.0.0:9000", "route": "/agent", "protocol": "a2a"},
+            "target": {"endpoint": format!("http://{address}")}
+        }))
+        .unwrap();
         let fetch = |path: &str| {
             let url = format!("http://{address}{path}");
-            async move { fetch_agent_card(&url, None, PATIENT, limits(1024, Some(PATIENT), PATIENT), "surface-1").await }
+            let surface = &surface;
+            async move {
+                fetch_agent_card(surface, &url, None, PATIENT, limits(1024, Some(PATIENT), PATIENT), "surface-1").await
+            }
         };
 
         assert_eq!(fetch("/card").await, Some(serde_json::json!({"name": "card"})));
@@ -11412,7 +11506,7 @@ mod tests {
         let timeout = std::time::Duration::from_secs(5);
         assert!(
             matches!(
-                forward_client_for("http://169.254.169.254/latest/meta-data/", timeout).await,
+                forward_client_for("http://169.254.169.254/latest/meta-data/", timeout, None).await,
                 Err(ForwardClientError::Blocked(_))
             ),
             "a cloud-metadata Target is refused by egress policy, and recorded as a block"
@@ -11441,7 +11535,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await });
 
         let target = format!("http://{address}/start");
-        let response = forward_client_for(&target, timeout)
+        let response = forward_client_for(&target, timeout, None)
             .await
             .expect("a loopback Target is allowed")
             .get(&target)

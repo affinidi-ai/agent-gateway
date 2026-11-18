@@ -155,17 +155,18 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
             .await
         }
     } else {
-        MockServer::start_with_extra_headers(
-            world
-                .collaborator_target(PRIMARY_COLLABORATOR_KEY)
-                .configured_response
-                .clone(),
-            world
-                .surface_config
-                .custom_response_headers
-                .clone(),
-        )
-        .await
+        let response = world
+            .collaborator_target(PRIMARY_COLLABORATOR_KEY)
+            .configured_response
+            .clone();
+        let headers = world
+            .surface_config
+            .custom_response_headers
+            .clone();
+        match &world.managed_agent_tls {
+            Some(tls) => MockServer::start_tls(response, headers, tls).await,
+            None => MockServer::start_with_extra_headers(response, headers).await,
+        }
     };
     let affinidi_well = if world.terms_enabled {
         let mut response = crate::bdd_support::mock_server::MockResponse::json(

@@ -1,0 +1,29 @@
+branch: feat/target-response-authentication
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-17T00:00:00Z'
+      title: Authenticate the managed agent's responses with Response authentication
+      description: >-
+        The gateway trusted any server that answered at a surface's Target URL, resolved the
+        managed agent's identity from its answer and recorded it, so a server answering in the
+        managed agent's place got the managed agent's DID. A surface can now set
+        target.response_auth to accept a response only when it carries one of the keys of a
+        registered secret in a response header, compared in constant time, with the header
+        removed before the caller sees the response, or, with mtls, only from an https server
+        whose certificate passes the configured pinned or CA trust, never the system's CAs,
+        optionally with the gateway presenting a stored client certificate. Any other response
+        is refused with 502 and a body that names no reason, a JSON-RPC error for a JSON-RPC
+        request, before identity resolution, response policy or payment capture use it, and the
+        VP Audit Log records a request_rejected with reason target_response_auth_failed. MCP tool
+        discovery of a saved surface runs the same check. A PUT that leaves the setting out keeps
+        the stored one; null removes it. A save refuses the setting on a proxy://, a2a-proxy:// or
+        fabric:// Target, mtls on an http Target or on a Target bound by external consent, a header the Target authentication header rules refuse, certificates of the
+        wrong kind or without the client certificate's key, and a secret or certificate of
+        another tenant, and an API key on an http Target follows credential_policy.target_https.
+        Variants may set their own. A release without this setting does not load a surface that
+        sets it.
+  breaking: []

@@ -18,8 +18,8 @@ use crate::trust_registries::TrustRegistryStore;
 
 use super::surfaces::SurfaceApiError;
 
-/// Validates the resources a surface references and the rules its Target authentication
-/// must meet. A tenant surface may not send an
+/// Validates the resources a surface references and the rules its Target authentication and
+/// Response authentication must meet. A tenant surface may not send an
 /// appliance-wide secret or credential provider upstream or back to its caller, nor the gateway
 /// credential of a provider holding a secret outside the provider's tenant: a reference that
 /// breaks that rule is refused unless `stored` (the surface as stored, if any) already sent it
@@ -33,6 +33,7 @@ pub async fn validate_surface_references(
     context: Option<&PatTenantContext>,
     scope: Option<&PatResourceScope>,
 ) -> Result<(), SurfaceApiError> {
+    super::surface_response_auth::validate_response_auth_rules(surface, stored)?;
     let isolation = crate::config::credential_policy::credential_policy().tenant_credential_isolation;
     let grandfathered = match stored {
         Some(stored) if stored.tenant_id == surface.tenant_id => {
@@ -70,6 +71,13 @@ pub async fn validate_surface_references(
         .provider_keys(&provider_key_ids(surface)?)
         .await?;
     validate_target_auth_methods(state, surface).await?;
+    super::surface_response_auth::validate_response_auth_certificates(
+        state
+            .certificate_store
+            .as_deref(),
+        surface,
+    )
+    .await?;
     super::surface_caller_key::validate_caller_key_secret(state, surface).await?;
     let https_proxies = super::surface_target_auth::https_mcp_proxies(state).await;
     super::surface_target_auth::validate_target_auth_rules(surface, stored, &https_proxies)
@@ -1899,6 +1907,25 @@ fn collect_effective_surface_references(
     }
 
     collect_target_auth_reference(surface.target.auth.as_ref(), references);
+    match surface
+        .target
+        .response_auth
+        .as_ref()
+    {
+        Some(crate::config::response_auth::ResponseAuthConfig::ApiKey(config)) => {
+            push_reference(references, ResourceKind::Secrets, &config.secret_id)
+        }
+        Some(crate::config::response_auth::ResponseAuthConfig::Mtls(config)) => {
+            for id in config
+                .trust_certificate_ids()
+                .iter()
+                .chain(&config.client_certificate_id)
+            {
+                push_reference(references, ResourceKind::Certificates, id);
+            }
+        }
+        None => {}
+    }
     if let Some(caller_key) = surface.caller_key.as_ref() {
         push_reference_with_rule(references, ResourceKind::Secrets, &caller_key.secret_id, true);
     }
@@ -3095,6 +3122,46 @@ mod tests {
         assert!(key(&keys, ResourceKind::Secrets, "target-secret").same_tenant);
         assert!(key(&keys, ResourceKind::Secrets, "point-secret").same_tenant);
         assert!(!key(&keys, ResourceKind::Secrets, "caller-secret").same_tenant);
+    }
+
+    #[test]
+    fn a_response_auth_secret_of_the_surface_and_each_variant_is_checked_and_may_be_appliance_wide() {
+        let surface: AgentSurface = serde_json::from_value(serde_json::json!({
+            "name": "s",
+            "access_point": {"listen_address": "0.0.0.0:8443", "route": "/s", "protocol": "a2a"},
+            "target": {"endpoint": "https://bravo.example",
+                "response_auth": {"api_key": {"header_name": "X-Agent-Key", "secret_id": "bravo-key"}}},
+            "variants": [{"id": "beta-id", "alias": "beta", "name": "Beta", "overrides": {"target": {
+                "response_auth": {"api_key": {"header_name": "X-Agent-Key", "secret_id": "beta-key"}}}}}]
+        }))
+        .unwrap();
+
+        let keys = collect_surface_reference_keys(&surface).unwrap();
+
+        for secret_id in ["bravo-key", "beta-key"] {
+            assert!(!key(&keys, ResourceKind::Secrets, secret_id).same_tenant, "{secret_id}");
+        }
+        assert_eq!(checked_secret_ids(&surface).unwrap(), ["beta-key", "bravo-key"]);
+    }
+
+    #[test]
+    fn the_certificates_of_an_mtls_response_auth_of_the_surface_and_each_variant_are_checked() {
+        let surface: AgentSurface = serde_json::from_value(serde_json::json!({
+            "name": "s",
+            "access_point": {"listen_address": "0.0.0.0:8443", "route": "/s", "protocol": "a2a"},
+            "target": {"endpoint": "https://bravo.example",
+                "response_auth": {"mtls": {"server_trust": {"type": "pinned", "certificate_ids": ["bravo-cert"]},
+                    "client_certificate_id": "gateway-cert"}}},
+            "variants": [{"id": "beta-id", "alias": "beta", "name": "Beta", "overrides": {"target": {
+                "response_auth": {"mtls": {"server_trust": {"type": "ca", "ca_certificate_ids": ["beta-ca"]}}}}}}]
+        }))
+        .unwrap();
+
+        let keys = collect_surface_reference_keys(&surface).unwrap();
+
+        for certificate_id in ["bravo-cert", "gateway-cert", "beta-ca"] {
+            assert!(!key(&keys, ResourceKind::Certificates, certificate_id).same_tenant, "{certificate_id}");
+        }
     }
 
     #[test]

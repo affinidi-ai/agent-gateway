@@ -247,20 +247,26 @@ fn validate_and_pin_inner(
     }
 }
 
-/// Builds a redirect-disabled client pinned to `target`'s vetted addresses.
+/// Builds a redirect-disabled client pinned to `target`'s vetted addresses,
+/// speaking TLS with `tls` when given and with reqwest's default TLS otherwise.
 ///
 /// `resolve_to_addrs` is builder-only in reqwest 0.13, so a fresh client is
 /// built per pinned target, which is acceptable for guarded egress.
 fn pinned_client(
     target: &PinnedTarget,
     timeout: Duration,
+    tls: Option<&rustls::ClientConfig>,
 ) -> Result<Client, EgressError> {
-    Client::builder()
+    let builder = Client::builder()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
-        .resolve_to_addrs(&target.host, &target.addrs)
-        .build()
-        .map_err(EgressError::Http)
+        .resolve_to_addrs(&target.host, &target.addrs);
+    match tls {
+        Some(tls) => builder.tls_backend_preconfigured(tls.clone()),
+        None => builder,
+    }
+    .build()
+    .map_err(EgressError::Http)
 }
 
 /// [`pinned_client`] for a vendor call of external consent, which carries a
@@ -324,9 +330,10 @@ fn pin_and_build(
     vetted_url: Url,
     blocked: impl Fn(IpAddr) -> bool,
     timeout: Duration,
+    tls: Option<&rustls::ClientConfig>,
 ) -> Result<(Client, PinnedTarget), EgressError> {
     let target = pin_url(vetted_url, blocked)?;
-    let client = pinned_client(&target, timeout)?;
+    let client = pinned_client(&target, timeout, tls)?;
     Ok((client, target))
 }
 
@@ -347,8 +354,22 @@ pub(crate) fn pinned_forward_client(
     raw_url: &str,
     timeout: Duration,
 ) -> Result<(Client, PinnedTarget), EgressError> {
+    pinned_forward_client_with_tls(raw_url, timeout, None)
+}
+
+/// [`pinned_forward_client`] speaking TLS with `tls` when given, such as the
+/// settings of a surface's Response authentication by mTLS
+/// ([`crate::proxy::response_auth::target_tls`]), which trust only the
+/// configured certificates and present the gateway's client certificate.
+///
+/// Resolves DNS (blocking OS resolver); call from a blocking context.
+pub(crate) fn pinned_forward_client_with_tls(
+    raw_url: &str,
+    timeout: Duration,
+    tls: Option<&rustls::ClientConfig>,
+) -> Result<(Client, PinnedTarget), EgressError> {
     let url = validate_url_not_cloud_metadata_host(raw_url).map_err(EgressError::Blocked)?;
-    pin_and_build(url, is_cloud_metadata_resolved_ip, timeout)
+    pin_and_build(url, is_cloud_metadata_resolved_ip, timeout, tls)
 }
 
 /// Vet an attacker-influenceable target with the Strict policy and return a
@@ -367,7 +388,7 @@ pub(crate) fn pinned_strict_client(
     timeout: Duration,
 ) -> Result<(Client, PinnedTarget), EgressError> {
     let url = validate_resolved_url(raw_url).map_err(EgressError::Blocked)?;
-    pin_and_build(url, |ip| EgressPolicy::Strict.is_blocked_ip(ip), timeout)
+    pin_and_build(url, |ip| EgressPolicy::Strict.is_blocked_ip(ip), timeout, None)
 }
 
 /// Vet and pin an authorization server's metadata URL, for a credential
@@ -521,7 +542,7 @@ pub(crate) fn pinned_configured_client(
     exact_allowlist: Option<&str>,
 ) -> Result<(Client, PinnedTarget), EgressError> {
     let target = validate_and_pin_inner(raw_url, EgressPolicy::Configured, exact_allowlist)?;
-    let client = pinned_client(&target, timeout)?;
+    let client = pinned_client(&target, timeout, None)?;
     Ok((client, target))
 }
 
@@ -553,7 +574,7 @@ pub(crate) async fn guarded_send_inner(
 
     for _ in 0..=MAX_REDIRECTS {
         let target = resolve_pin_blocking(current.clone(), policy, exact_allowlist).await?;
-        let client = pinned_client(&target, timeout)?;
+        let client = pinned_client(&target, timeout, None)?;
 
         let mut req = client
             .request(method.clone(), target.url.clone())
@@ -1379,7 +1400,7 @@ mod tests {
             host: addr.ip().to_string(),
             addrs: vec![addr],
         };
-        let client = pinned_client(&target, Duration::from_secs(5)).expect("pinned client must build");
+        let client = pinned_client(&target, Duration::from_secs(5), None).expect("pinned client must build");
 
         let resp = client
             .get(target.url.clone())

@@ -1263,7 +1263,9 @@ type SavedSurface = (axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResp
 /// each enabled view that reaches that binding's vendor without it or a
 /// credential of its own ([`unbound_vendor_view_warnings`]), and each Target
 /// authentication that breaks a `target_https` or `target_source_auth` rule in `warn`,
-/// and a `caller_key` its Target never or only in clear receives ([`super::surface_caller_key::caller_key_warnings`]).
+/// a `caller_key` its Target never or only in clear receives ([`super::surface_caller_key::caller_key_warnings`]),
+/// and each Response authentication that reads its API key from an `http://` Target
+/// ([`super::surface_response_auth::response_auth_warnings`]).
 async fn save_warnings(
     state: &IdentityApiState,
     surface: &AgentSurface,
@@ -1301,6 +1303,7 @@ async fn save_warnings(
         .chain(unbound_vendor_view_warnings(surface))
         .chain(super::surface_target_auth::target_rule_warnings(surface, &https_proxies))
         .chain(super::surface_caller_key::caller_key_warnings(surface))
+        .chain(super::surface_response_auth::response_auth_warnings(surface))
         .chain(stale_pins)
     {
         if let Some(value) = warning_header(&warning) {
@@ -3442,6 +3445,7 @@ pub async fn update_surface(
     retain_transit_caller_authentication(&mut surface, &existing, &sent);
     super::surface_caller_key::retain_caller_key(&mut surface, &existing, &sent);
     retain_browser_origins(&mut surface, &existing, &sent);
+    super::surface_response_auth::retain_response_auth(&mut surface, &existing, &sent);
 
     let (saved, warnings) = validate_and_save_surface(
         &state,
@@ -5446,7 +5450,8 @@ pub async fn update_variant(
     }
     // New overrides replace the stored ones, but keep the stored discovery
     // setting unless they remove it, and the Transit Points' caller
-    // authentication they leave out, as a PUT of the whole surface does.
+    // authentication and the Target's Response authentication they leave out,
+    // as a PUT of the whole surface does.
     let mut retained = Vec::new();
     if let Some(mut overrides) = body.overrides {
         if !removes_protected_resource(sent.pointer("/overrides/access_point"))
@@ -5479,6 +5484,11 @@ pub async fn update_variant(
         {
             settle_variant_put_points(points, &existing, &variant_id, sent.pointer("/overrides/transit/points"));
         }
+        super::surface_response_auth::retain_override_response_auth(
+            &mut overrides,
+            &variant.overrides,
+            sent.pointer("/overrides/target"),
+        );
         variant.overrides = overrides;
     }
     settle_retained_protected_resources(&mut surface, false, &retained, &state.network_config)?;
@@ -8574,6 +8584,7 @@ mod validation_tests {
             target: Target {
                 endpoint: "https://prod.example.com".to_string(),
                 auth: None,
+                response_auth: None,
                 policy: None,
                 response_policy: None,
                 payment_policy: None,

@@ -207,6 +207,28 @@ impl AdminApiClient {
             .unwrap_or_default())
     }
 
+    /// The Managed Agent identities the Identities dashboard lists (`GET /v1/dashboard/stats`).
+    pub async fn managed_agent_identities(&self) -> Result<Vec<Value>> {
+        let response = self
+            .send_recorded_json::<Value>(Method::GET, "/v1/dashboard/stats", None)
+            .await?;
+        if response.status != 200 {
+            bail!("reading the Identities dashboard failed with status {}: {}", response.status, response.body);
+        }
+        let Some(identities) = response
+            .body
+            .get("identities")
+            .and_then(Value::as_array)
+        else {
+            bail!("the dashboard stats list no identities: {}", response.body);
+        };
+        Ok(identities
+            .iter()
+            .filter(|identity| identity["origin"] == "managed")
+            .cloned()
+            .collect())
+    }
+
     /// Reads the VP Audit Log until a record satisfies `matches`, for up to
     /// five seconds, since records reach the log shortly after the request that
     /// produced them. Returns whether one matched and the events last read.
@@ -728,6 +750,13 @@ impl GatewayAdminClient {
     ) -> Result<(bool, Vec<Value>)> {
         self.client
             .wait_for_audit_event(matches)
+            .await
+    }
+
+    /// See [`AdminApiClient::managed_agent_identities`].
+    pub async fn managed_agent_identities(&self) -> Result<Vec<Value>> {
+        self.client
+            .managed_agent_identities()
             .await
     }
 

@@ -91,6 +91,7 @@ pub(crate) enum FetchFault {
     TooLarge,
     InvalidCard,
     Compressed,
+    ResponseUnauthenticated(crate::proxy::response_auth::ResponseAuthFailure),
     IdentityFailed {
         slot: crate::proxy::card_preview::CardIdentitySlot,
         error: crate::proxy::card_preview::CardIdentityError,
@@ -537,6 +538,34 @@ impl TargetCardFetch<'_> {
         CardFailure::new(fault, response)
     }
 
+    /// The card whose Target answer failed Response authentication with `failure`: it is never
+    /// served, and a served card is refused and recorded as the forward refuses such an answer.
+    fn refuse_unauthenticated(
+        &self,
+        failure: crate::proxy::response_auth::ResponseAuthFailure,
+    ) -> CardFailure {
+        let response = if self.mode.serves() {
+            crate::proxy::response_auth::refuse(
+                failure,
+                &crate::audit::request_events::RequestFacts {
+                    surface_id: &self.state.surface.surface_id,
+                    channel_name: self.channel_name(),
+                    trace_id: self.trace_id,
+                    via_fabric: false,
+                },
+                b"",
+            )
+        } else {
+            warn!(
+                channel = self.channel_name(),
+                reason = failure.reason(),
+                "Agent card preview refused a Target answer that failed Response authentication"
+            );
+            create_error_response(StatusCode::BAD_GATEWAY, crate::proxy::response_auth::REFUSAL_MESSAGE)
+        };
+        self.fail(FetchFault::ResponseUnauthenticated(failure), response)
+    }
+
     fn channel_name(&self) -> &str {
         self.state
             .surface
@@ -651,19 +680,20 @@ impl TargetCardFetch<'_> {
         }
     }
 
-    /// The client the card is fetched with. A served card without a credential uses
-    /// the shared client; a served card with one uses a client pinned to the vetted
-    /// address and records an egress block. A preview always uses a pinned client
-    /// and records nothing.
+    /// The client the card is fetched with, speaking TLS with `tls` when given. A
+    /// served card without a credential or TLS settings uses the shared client;
+    /// any other served card uses a client pinned to the vetted address and records
+    /// an egress block. A preview always uses a pinned client and records nothing.
     async fn client(
         &self,
         target_url: &str,
         credential_sent: bool,
+        tls: Option<Arc<rustls::ClientConfig>>,
     ) -> Result<reqwest::Client, CardFailure> {
         let state = self.state;
         let channel_name = self.channel_name();
         if !self.mode.serves() {
-            return unrecorded_pinned_client(state, target_url)
+            return unrecorded_pinned_client(state, target_url, tls)
                 .await
                 .map_err(|e| match e {
                     PinFailure::Egress(crate::egress::EgressError::Blocked(_)) => {
@@ -682,7 +712,7 @@ impl TargetCardFetch<'_> {
                     }
                 });
         }
-        if !credential_sent {
+        if !credential_sent && tls.is_none() {
             return Ok(state.client.clone());
         }
         super::pinned_target_client(
@@ -695,6 +725,7 @@ impl TargetCardFetch<'_> {
                 trace_id: self.trace_id,
                 via_fabric: false,
             },
+            tls,
         )
         .await
         .map_err(|response| self.fail(FetchFault::BlockedByEgress, response))
@@ -707,12 +738,21 @@ impl TargetCardFetch<'_> {
     ) -> Result<JsonValue, CardFailure> {
         let state = self.state;
         let channel_name = self.channel_name();
+        let tls = crate::proxy::response_auth::hop_tls(
+            &state.surface,
+            target_url,
+            state
+                .certificates_store
+                .as_ref(),
+        )
+        .await
+        .map_err(|failure| self.refuse_unauthenticated(failure))?;
         let credential = self
             .target_credential()
             .await?;
         let credential_sent = credential.is_some();
         let mut req = self
-            .client(target_url, credential_sent)
+            .client(target_url, credential_sent, tls)
             .await?
             .get(target_url);
 
@@ -755,18 +795,19 @@ impl TargetCardFetch<'_> {
             debug!(channel = channel_name, header = %header_name, "Injected target authentication header on agent card fetch");
         }
 
-        let response = req
-            .send()
+        let mut sent = req.send().await;
+        crate::proxy::response_auth::authenticate_sent(&state.surface, &mut sent, state.secrets_store.as_ref())
             .await
-            .map_err(|e| {
-                let fault = FetchFault::of_send(&e);
-                error!(
-                    channel = channel_name,
-                    error = %e.without_url(),
-                    "Failed to fetch agent card from upstream - bad gateway"
-                );
-                self.fail(fault, create_error_response(StatusCode::BAD_GATEWAY, "Failed to fetch from upstream"))
-            })?;
+            .map_err(|failure| self.refuse_unauthenticated(failure))?;
+        let response = sent.map_err(|e| {
+            let fault = FetchFault::of_send(&e);
+            error!(
+                channel = channel_name,
+                error = %e.without_url(),
+                "Failed to fetch agent card from upstream - bad gateway"
+            );
+            self.fail(fault, create_error_response(StatusCode::BAD_GATEWAY, "Failed to fetch from upstream"))
+        })?;
         super::forget_refused_target_token(
             state
                 .delegation_vault_store
@@ -847,10 +888,12 @@ impl std::fmt::Display for PinFailure {
     }
 }
 
-/// A client pinned to the vetted address of `target_url`. Nothing is recorded.
+/// A client pinned to the vetted address of `target_url`, speaking TLS with `tls`
+/// when given. Nothing is recorded.
 async fn unrecorded_pinned_client(
     state: &ProxyState,
     target_url: &str,
+    tls: Option<Arc<rustls::ClientConfig>>,
 ) -> Result<reqwest::Client, PinFailure> {
     let candidate = target_url.to_string();
     let timeout = std::time::Duration::from_secs(
@@ -859,7 +902,11 @@ async fn unrecorded_pinned_client(
             .a2a
             .timeout_seconds,
     );
-    match tokio::task::spawn_blocking(move || crate::egress::pinned_forward_client(&candidate, timeout)).await {
+    match tokio::task::spawn_blocking(move || {
+        crate::egress::pinned_forward_client_with_tls(&candidate, timeout, tls.as_deref())
+    })
+    .await
+    {
         Ok(Ok((client, _target))) => Ok(client),
         Ok(Err(e)) => Err(PinFailure::Egress(e)),
         Err(e) => Err(PinFailure::Task(e)),
@@ -1484,6 +1531,182 @@ mod tests {
             async move { json!({"isError": fetched.await.is_err()}) }
         };
         assert_a_refused_token_is_dropped(&fixture, &answer, "agent card fetch", call).await;
+    }
+
+    /// A Target serving `card`, with the managed agent's key in its answer when `key` is given.
+    async fn card_target(
+        card: &JsonValue,
+        key: Option<&'static str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let card = card.to_string();
+        let app = axum::Router::new().fallback(move || {
+            let card = card.clone();
+            async move {
+                let mut response = axum::response::Response::builder().header("content-type", "application/json");
+                if let Some(key) = key {
+                    response = response.header(crate::proxy::response_auth::BRAVO_KEY_HEADER, key);
+                }
+                response
+                    .body(axum::body::Body::from(card))
+                    .unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        (
+            url,
+            tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .unwrap()
+            }),
+        )
+    }
+
+    /// The state of a surface on `target` with `response_auth`, reading its secrets and
+    /// certificates from the given stores.
+    async fn state_with_response_auth(
+        target: &str,
+        response_auth: JsonValue,
+        secrets: Option<Arc<dyn crate::secrets::SecretsStore>>,
+        certificates: Option<Arc<dyn crate::certificates::CertificateStore>>,
+        metrics: &Arc<crate::metrics::MetricsStore>,
+    ) -> ProxyState {
+        let mut router = super::super::variant_routing_tests::router(surface(
+            json!({"endpoint": target, "response_auth": response_auth}),
+        ));
+        router.secrets_store = secrets;
+        router.certificates_store = certificates;
+        let state = router
+            .base_proxy_state("orders")
+            .await
+            .unwrap();
+        ProxyState {
+            metrics_store: Some(Arc::clone(metrics)),
+            ..state
+        }
+    }
+
+    fn response_auth_refusals(events: &[DelegationAuditEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event,
+                    DelegationAuditAction::RequestRejected {
+                        reason: RejectionReason::TargetResponseAuthFailed,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_card_whose_answer_carries_the_registered_key_is_built() {
+        let card = json!({"name": "Orders agent", "url": "http://agent.internal/a2a", "skills": []});
+        let (target, _server) = card_target(&card, Some(crate::proxy::response_auth::BRAVO_KEY)).await;
+        let (_dir, secrets) = crate::proxy::response_auth::bravo_key_store().await;
+        let metrics = Arc::new(crate::metrics::MetricsStore::new(10));
+        let state = state_with_response_auth(
+            &target,
+            crate::proxy::response_auth::api_key_bravo(),
+            Some(secrets),
+            None,
+            &metrics,
+        )
+        .await;
+
+        for mode in [CardMode::Preview, CardMode::Serve] {
+            let built = build(&state, mode)
+                .await
+                .unwrap_or_else(|failure| panic!("{mode:?}: {:?}", failure.fault));
+            assert_eq!(built.upstream, Some(card.clone()), "{mode:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_card_whose_answer_lacks_the_key_is_never_served_and_only_a_served_one_is_recorded() {
+        let card = json!({"name": "Impostor", "url": "http://agent.internal/a2a", "skills": []});
+        let (target, _server) = card_target(&card, None).await;
+        let (_dir, secrets) = crate::proxy::response_auth::bravo_key_store().await;
+        let metrics = Arc::new(crate::metrics::MetricsStore::new(10));
+        let state = state_with_response_auth(
+            &target,
+            crate::proxy::response_auth::api_key_bravo(),
+            Some(secrets),
+            None,
+            &metrics,
+        )
+        .await;
+
+        for (mode, recorded) in [(CardMode::Preview, 0), (CardMode::Serve, 1)] {
+            let (failure, events) = crate::audit::producer::capture(build(&state, mode)).await;
+            let failure = failure.unwrap_err();
+            assert_eq!(
+                failure.fault,
+                FetchFault::ResponseUnauthenticated(crate::proxy::response_auth::ResponseAuthFailure::KeyMissing),
+                "{mode:?}"
+            );
+            assert_eq!(failure.upstream, None, "{mode:?}: the card was kept");
+            assert_eq!(failure.response.status(), StatusCode::BAD_GATEWAY, "{mode:?}");
+            let body = axum::body::to_bytes(failure.response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: JsonValue = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["detail"], crate::proxy::response_auth::REFUSAL_MESSAGE, "{mode:?}");
+            assert_eq!(response_auth_refusals(&events), recorded, "{mode:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_card_from_a_server_that_fails_the_mtls_trust_is_refused() {
+        let (port, _dir, certificates) = crate::proxy::response_auth::untrusted_target().await;
+        let metrics = Arc::new(crate::metrics::MetricsStore::new(10));
+        let target = format!("https://127.0.0.1:{port}");
+        let state = state_with_response_auth(
+            &target,
+            crate::proxy::response_auth::pinned_bravo(),
+            None,
+            Some(certificates),
+            &metrics,
+        )
+        .await;
+
+        for mode in [CardMode::Preview, CardMode::Serve] {
+            let failure = build(&state, mode)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                failure.fault,
+                FetchFault::ResponseUnauthenticated(crate::proxy::response_auth::ResponseAuthFailure::ServerUntrusted),
+                "{mode:?}"
+            );
+            assert_eq!(failure.response.status(), StatusCode::BAD_GATEWAY, "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_card_whose_mtls_certificates_cannot_be_read_is_refused_before_the_target_is_asked() {
+        let target = RecordingTarget::start(StatusCode::OK, &[]).await;
+        let metrics = Arc::new(crate::metrics::MetricsStore::new(10));
+        let state =
+            state_with_response_auth(&target.url, crate::proxy::response_auth::pinned_bravo(), None, None, &metrics)
+                .await;
+
+        for mode in [CardMode::Preview, CardMode::Serve] {
+            let failure = build(&state, mode)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                failure.fault,
+                FetchFault::ResponseUnauthenticated(crate::proxy::response_auth::ResponseAuthFailure::Unverifiable),
+                "{mode:?}"
+            );
+        }
+        assert!(target.received().is_empty(), "the Target was asked");
     }
 
     #[test]
