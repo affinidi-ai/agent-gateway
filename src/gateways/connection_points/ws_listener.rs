@@ -2387,8 +2387,9 @@ fn is_from_peer(
     message.metadata.authenticated && peer_did.is_some() && message.from_did.as_deref() == peer_did
 }
 
-/// The mediator reports `account.not_found` when it no longer has this
-/// connection point's account (e.g. its store was flushed). Unlike
+/// The mediator reports that it no longer has this connection point's account
+/// (e.g. its store was flushed) as `account.not_found`, or, from v0.52, under
+/// the Trust Task code of the task it refused (`…:unknownAccount`). Unlike
 /// `recipient.unknown` or `access_list.denied`, which are about the remote
 /// peer, this is about us, and the stale socket cannot recover the account.
 /// Returns the report's code when the reader must end so the supervision loop
@@ -2405,7 +2406,7 @@ fn mediator_account_loss<'a>(
         .message_body
         .get("code")
         .and_then(|code| code.as_str())?;
-    if !code.contains("account.not_found") {
+    if !code.contains("account.not_found") && !code.ends_with(":unknownAccount") {
         return None;
     }
     if !mediator_reported(
@@ -2416,7 +2417,7 @@ fn mediator_account_loss<'a>(
     ) {
         warn!(
             from = ?received_msg.from_did,
-            "Ignoring an account.not_found problem report that did not come from the mediator"
+            "Ignoring a missing-account report that did not come from the mediator"
         );
         return None;
     }
@@ -5454,6 +5455,16 @@ mod tests {
         assert_eq!(
             super::mediator_account_loss(&received, &format!("{MEDIATOR_DID}#key-1")),
             Some("e.p.account.not_found")
+        );
+    }
+
+    #[test]
+    fn a_renamed_unknown_account_report_ends_the_reader() {
+        let received = mediator_problem_report(MEDIATOR_DID, "messaging/account/get:unknownAccount");
+
+        assert_eq!(
+            super::mediator_account_loss(&received, MEDIATOR_DID),
+            Some("e.p.messaging/account/get:unknownAccount")
         );
     }
 

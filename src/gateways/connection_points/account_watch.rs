@@ -11,9 +11,9 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use affinidi_messaging_sdk::errors::ATMError;
+use affinidi_messaging_sdk::tasks::messaging::account::get::v0_2::Account;
 use futures::StreamExt;
 use tracing::{debug, warn};
-use trust_tasks_rs::specs::messaging::account::get::v0_1::Account;
 
 use super::ws_listener::{ConnectionPointListenerManager, ConnectionStatus, ListenerInfo};
 use crate::comm::didcomm::client::DIDCommClient;
@@ -33,9 +33,27 @@ const RECEIVE_LIST_REOPEN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How many listeners are checked at once.
 const CONCURRENT_ACCOUNT_CHECKS: usize = 4;
 
-/// The problem-report code a mediator answers with when it no longer has the
-/// requesting account.
-const ACCOUNT_NOT_FOUND_CODE: &str = "e.p.account.not_found";
+/// How soon an account the mediator could not answer for is probed again,
+/// instead of waiting a whole [`ACCOUNT_CHECK_INTERVAL`].
+const UNREADABLE_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How many probes in a row may fail to read an account before the listener is
+/// restarted anyway. A mediator that has lost the account cannot deliver its
+/// own answer to it either, so the probe times out instead of being refused;
+/// waiting for a refusal that cannot arrive would leave the Connection Point
+/// unreachable.
+const UNREADABLE_RESTART_LIMIT: u32 = 2;
+
+/// What [`ATMError::mediator_code`] reads out of the problem report a mediator
+/// before v0.52 answers with when it no longer has the requesting account
+/// (`e.p.account.not_found`): its descriptor, without the `e.p.` prefix.
+const ACCOUNT_NOT_FOUND_DESCRIPTOR: &str = "account.not_found";
+
+/// The Trust Task code a mediator from v0.52 refuses `messaging/account/get`
+/// with when it no longer has the account. It arrives in a `trust-task-error`
+/// document, not a problem report.
+const UNKNOWN_ACCOUNT_CODE: &str =
+    affinidi_messaging_sdk::tasks::messaging::account::get::v0_2::error_codes::UNKNOWN_ACCOUNT.code;
 
 pub(crate) type AccountProbe = Result<Result<Account, ATMError>, tokio::time::error::Elapsed>;
 
@@ -134,20 +152,23 @@ pub(crate) fn account_repair(
     }
 }
 
+/// Whether the mediator refused the probe because it no longer holds the
+/// account, in either form it answers with: the problem report of a mediator
+/// before v0.52, or the `trust-task-error` document every later one sends.
 fn is_account_not_found(error: &ATMError) -> bool {
-    matches!(error, ATMError::ProblemReport(code, _, _) if code == ACCOUNT_NOT_FOUND_CODE)
+    error
+        .mediator_code()
+        .is_some_and(|code| code == ACCOUNT_NOT_FOUND_DESCRIPTOR || code == UNKNOWN_ACCOUNT_CODE)
 }
 
 /// Probes every active listener's account on an interval until the manager
 /// is dropped.
 pub(crate) fn spawn(manager: Weak<ConnectionPointListenerManager>) {
     crate::observability::spawn_traced_task("connection_points.account_watch", async move {
-        let mut interval =
-            tokio::time::interval_at(tokio::time::Instant::now() + ACCOUNT_CHECK_INTERVAL, ACCOUNT_CHECK_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut unreadable = std::collections::HashMap::new();
+        let mut delay = ACCOUNT_CHECK_INTERVAL;
         loop {
-            interval.tick().await;
+            tokio::time::sleep(delay).await;
             let Some(manager) = manager.upgrade() else {
                 break;
             };
@@ -175,30 +196,62 @@ pub(crate) fn spawn(manager: Weak<ConnectionPointListenerManager>) {
                 })
                 .collect::<std::collections::HashSet<_>>();
             unreadable.retain(|connection_point_id, _| checked.contains(connection_point_id));
+            let mut any_unreadable = false;
             for (listener, check) in checks {
                 let failures = unreadable
-                    .entry(listener.connection_point_id)
+                    .entry(
+                        listener
+                            .connection_point_id
+                            .clone(),
+                    )
                     .or_insert(0u32);
                 *failures = match check {
                     AccountCheck::Unreadable => failures.saturating_add(1),
                     _ => 0,
                 };
-                if warns_of_unreadable_account(*failures) {
-                    warn!(
-                        connection_point = %listener.name,
-                        consecutive_failures = *failures,
-                        "The mediator account could not be read; missing accounts are not being repaired"
-                    );
+                if *failures == 0 {
+                    continue;
+                }
+                any_unreadable = true;
+                if !restarts_an_unreadable_account(*failures) {
+                    continue;
+                }
+                warn!(
+                    connection_point = %listener.name,
+                    consecutive_failures = *failures,
+                    "The mediator account could not be read; restarting the Connection Point to re-authenticate and re-register"
+                );
+                *failures = 0;
+                if let Err(error) = manager
+                    .restart_listener_if_current(
+                        &listener.connection_point_id,
+                        &listener.instance_id,
+                        LISTENER_RESTART_TIMEOUT,
+                    )
+                    .await
+                {
+                    warn!(connection_point = %listener.name, "Restarting the Connection Point failed: {error}");
                 }
             }
+            delay = next_probe_delay(any_unreadable);
         }
     });
 }
 
-/// Whether the `consecutive`th failure in a row to read an account is logged
-/// at `warn`: the second, then at doubling intervals.
-fn warns_of_unreadable_account(consecutive: u32) -> bool {
-    consecutive >= 2 && consecutive.is_power_of_two()
+/// Whether an account unread `consecutive` times in a row has the listener
+/// restarted, the same repair a missing account gets.
+fn restarts_an_unreadable_account(consecutive: u32) -> bool {
+    consecutive >= UNREADABLE_RESTART_LIMIT
+}
+
+/// How long to wait before the next pass: a short recheck while any account
+/// could not be read, the full interval otherwise.
+fn next_probe_delay(any_unreadable: bool) -> Duration {
+    if any_unreadable {
+        UNREADABLE_RECHECK_INTERVAL
+    } else {
+        ACCOUNT_CHECK_INTERVAL
+    }
 }
 
 async fn check_listener(
@@ -273,9 +326,27 @@ mod tests {
         Ok(Err(error))
     }
 
+    /// A mediator from v0.52 refuses with a `trust-task-error` document
+    /// instead of a problem report, under the Trust Task code.
+    fn refusal(code: &str) -> ATMError {
+        let document = serde_json::json!({
+            "id": "urn:uuid:1",
+            "type": "https://trusttasks.org/spec/trust-task-error/0.6",
+            "threadId": "urn:uuid:2",
+            "payload": {
+                "code": code,
+                "message": "account not found",
+                "retryable": false,
+            },
+        });
+        ATMError::TrustTaskError(Box::new(
+            affinidi_messaging_sdk::errors::TrustTaskRefusal::from_document(&document).expect("a trust-task-error"),
+        ))
+    }
+
     #[test]
     fn account_not_found_is_recognised_only_from_its_problem_report() {
-        let missing = ATMError::ProblemReport(ACCOUNT_NOT_FOUND_CODE.into(), "gone".into(), "false".into());
+        let missing = ATMError::ProblemReport("e.p.account.not_found".into(), "gone".into(), "false".into());
         assert!(is_account_not_found(&missing));
 
         let other_report = ATMError::ProblemReport("e.p.access_list.denied".into(), "denied".into(), "false".into());
@@ -288,10 +359,28 @@ mod tests {
         assert!(!is_account_not_found(&near_miss));
     }
 
+    #[test]
+    fn account_not_found_is_recognised_from_a_trust_task_refusal() {
+        assert!(is_account_not_found(&refusal(UNKNOWN_ACCOUNT_CODE)));
+        assert!(!is_account_not_found(&refusal("messaging/account/get:notAuthorised")));
+    }
+
+    #[tokio::test]
+    async fn a_trust_task_refusal_restarts_the_listener() {
+        assert_eq!(
+            account_repair(&probe_error(refusal(UNKNOWN_ACCOUNT_CODE)), &InboundAcl::Open),
+            AccountRepair::RestartListener
+        );
+        assert_eq!(
+            account_repair(&probe_error(refusal("messaging/account/get:notAuthorised")), &InboundAcl::Open),
+            AccountRepair::Nothing
+        );
+    }
+
     #[tokio::test]
     async fn only_a_missing_account_restarts_the_listener() {
         let missing =
-            probe_error(ATMError::ProblemReport(ACCOUNT_NOT_FOUND_CODE.into(), "gone".into(), "false".into()));
+            probe_error(ATMError::ProblemReport("e.p.account.not_found".into(), "gone".into(), "false".into()));
         assert_eq!(account_repair(&missing, &InboundAcl::Open), AccountRepair::RestartListener);
 
         let other_report =
@@ -375,7 +464,7 @@ mod tests {
     }
 
     fn missing_account() -> AccountProbe {
-        probe_error(ATMError::ProblemReport(ACCOUNT_NOT_FOUND_CODE.into(), "gone".into(), "false".into()))
+        probe_error(ATMError::ProblemReport("e.p.account.not_found".into(), "gone".into(), "false".into()))
     }
 
     /// A manager running one connected listener, `instance_id`.
@@ -484,10 +573,17 @@ mod tests {
     }
 
     #[test]
-    fn repeated_unreadable_accounts_warn_at_doubling_intervals() {
-        let warned = (0..=40)
-            .filter(|failures| warns_of_unreadable_account(*failures))
+    fn an_account_unread_twice_in_a_row_restarts_the_listener() {
+        let restarted = (0..=4)
+            .filter(|failures| restarts_an_unreadable_account(*failures))
             .collect::<Vec<_>>();
-        assert_eq!(warned, [2, 4, 8, 16, 32]);
+        assert_eq!(restarted, [2, 3, 4], "a single unreadable probe is tolerated, the second is not");
+    }
+
+    #[test]
+    fn an_unreadable_account_is_probed_again_sooner() {
+        assert_eq!(next_probe_delay(true), UNREADABLE_RECHECK_INTERVAL);
+        assert_eq!(next_probe_delay(false), ACCOUNT_CHECK_INTERVAL);
+        assert!(UNREADABLE_RECHECK_INTERVAL < ACCOUNT_CHECK_INTERVAL);
     }
 }

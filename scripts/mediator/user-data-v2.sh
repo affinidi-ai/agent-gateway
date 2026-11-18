@@ -81,6 +81,25 @@ if [ "$DID_METHOD" = "webvh" ]; then
 fi
 RECIPE_EXTRA_KEY_SUITES=""
 [ "$USE_P256_KEY_SUITE" = "true" ] && RECIPE_EXTRA_KEY_SUITES='extra_key_suites = ["p256"]'
+# Newer wizards refuse an unencrypted file:// secret store outside a local
+# deployment unless it is accepted explicitly; older ones reject the recipe key
+# as unknown, so set it only when this image advertises the matching flag.
+RECIPE_ALLOW_PLAINTEXT_FILE=""
+setup_help=""
+for _ in 1 2 3; do
+  if setup_help="$(docker run --rm --entrypoint mediator-setup "$MEDIATOR_IMAGE" --help 2>/dev/null)" \
+    && [ -n "$setup_help" ]; then
+    break
+  fi
+  sleep 2
+done
+if [ -z "$setup_help" ]; then
+  echo "could not read mediator-setup --help from $MEDIATOR_IMAGE" >&2
+  exit 1
+fi
+case "$setup_help" in
+  *--allow-plaintext-file*) RECIPE_ALLOW_PLAINTEXT_FILE="allow_plaintext_file = true" ;;
+esac
 # admin = "skip" when an external admin DID is supplied; mediator-setup then
 # omits the generated admin credential and we inject the DID into mediator.toml.
 RECIPE_ADMIN_MODE="generate"
@@ -100,6 +119,7 @@ ${RECIPE_EXTRA_KEY_SUITES}
 
 [secrets]
 storage = "file://"
+${RECIPE_ALLOW_PLAINTEXT_FILE}
 
 [security]
 ssl = "none"

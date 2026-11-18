@@ -36,13 +36,13 @@ pub(crate) async fn create_webvh_did(
     base_url: &str,
 ) -> Result<WebVhCreateResult> {
     let temp_key_id = "did:key:temp#temp".to_string();
-    let raw_secret = didwebvh_rs::prelude::Secret::from_str(&temp_key_id, ed25519_private_jwk)
+    let raw_secret = didwebvh_rs::prelude::Secret::from_jwk_value(&temp_key_id, ed25519_private_jwk)
         .map_err(|e| anyhow::anyhow!("Failed to convert Ed25519 key to Secret: {}", e))?;
     let multibase_pubkey = raw_secret
         .get_public_keymultibase()
         .map_err(|e| anyhow::anyhow!("Failed to get multibase public key: {}", e))?;
     let did_key_id = format!("did:key:{0}#{0}", multibase_pubkey);
-    let mut auth_secret = didwebvh_rs::prelude::Secret::from_str(&did_key_id, ed25519_private_jwk)
+    let mut auth_secret = didwebvh_rs::prelude::Secret::from_jwk_value(&did_key_id, ed25519_private_jwk)
         .map_err(|e| anyhow::anyhow!("Failed to build auth secret: {}", e))?;
     auth_secret.id = did_key_id;
 
