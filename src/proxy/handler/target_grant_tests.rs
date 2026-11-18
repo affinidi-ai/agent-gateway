@@ -1967,6 +1967,70 @@ async fn an_unauthenticated_answer_to_the_targets_grant_is_refused_before_any_re
     }
 }
 
+/// A retry whose answer refuses the token again without the key is refused as a response that
+/// failed Response authentication, not as an unavailable connector.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unauthenticated_refusal_of_the_retry_is_refused_as_a_failed_response() {
+    use crate::audit::request_events::{RejectionReason, RejectionStage};
+    use crate::proxy::response_auth::{BRAVO_KEY, BRAVO_KEY_HEADER, REFUSAL_MESSAGE, api_key_bravo};
+
+    let fixture = Fixture::new(
+        vec![refresh_answer("second")],
+        vec![rejected_token().with_header(BRAVO_KEY_HEADER, BRAVO_KEY), rejected_token()],
+    )
+    .await;
+    crate::secrets::SecretsStore::create(
+        fixture
+            .router
+            .secrets_store
+            .as_deref()
+            .unwrap(),
+        crate::secrets::CreateSecretRequest {
+            tenant_id: None,
+            name: "Response key".into(),
+            secret_id: "bravo-key".into(),
+            description: None,
+            value: BRAVO_KEY.into(),
+            secret_type: "ApiKey".into(),
+            tags: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    let mut surface = vendor_surface("mcp", &format!("{}/mcp", fixture.vendor.origin()), "owner");
+    surface.target.response_auth = serde_json::from_value(api_key_bravo()).unwrap();
+    fixture.serve(surface).await;
+    fixture
+        .store(&owner_key(), "first")
+        .await;
+
+    let ((status, _, body), events) = crate::audit::producer::capture(fixture.send(mcp_call(Some(KEY)))).await;
+
+    assert_eq!(status.as_u16(), 502, "{body}");
+    assert_eq!(body["error"]["code"], -32603, "{body}");
+    assert_eq!(body["error"]["message"], REFUSAL_MESSAGE, "{body}");
+    let rejections: Vec<_> = events
+        .into_iter()
+        .filter_map(|event| match event.event {
+            crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                stage,
+                reason,
+                http_status,
+                ..
+            } => Some((stage, reason, http_status)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rejections, vec![(RejectionStage::Forward, RejectionReason::TargetResponseAuthFailed, Some(502))]);
+    assert_eq!(
+        fixture
+            .vendor
+            .requests()
+            .len(),
+        2
+    );
+}
+
 /// A stored surface, loaded without the save rules, that combines Response authentication by
 /// mTLS with a Target bound by external consent is refused `502` before anything is sent: the
 /// grant's own client cannot speak the surface's TLS settings.

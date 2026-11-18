@@ -89,6 +89,19 @@ pub async fn authenticate_response(
     }
 }
 
+/// Whether a response with `headers` passes [`authenticate_response`], checked on a copy so
+/// the response keeps its key header for the check that strips it.
+pub(crate) async fn passes(
+    surface: &AgentSurface,
+    headers: &HeaderMap,
+    secrets: Option<&Arc<dyn SecretsStore>>,
+) -> bool {
+    let mut copy = headers.clone();
+    authenticate_response(surface, &mut copy, secrets)
+        .await
+        .is_ok()
+}
+
 async fn authenticate_api_key(
     surface: &AgentSurface,
     config: &ApiKeyResponseAuth,

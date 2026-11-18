@@ -1070,8 +1070,8 @@ impl TargetGrantRoute {
     /// `connector_unavailable`, and keeps the fresh grant. A `401` without
     /// such a challenge, a refresh that fails for a reason a new connect would
     /// not fix, and a body too large to send again (`retry` is `None`) keep
-    /// the grant and answer `connector_unavailable`. Any other answer passes
-    /// through.
+    /// the grant and answer `connector_unavailable`. Any other answer, and a
+    /// retried answer that fails Response authentication, passes through.
     pub(crate) async fn answer(
         &self,
         state: &ProxyState,
@@ -1129,6 +1129,9 @@ impl TargetGrantRoute {
                 return Err(TargetGrantRefusal::RetryNotSent);
             }
         };
+        if !crate::proxy::response_auth::passes(surface, retried.headers(), state.secrets_store.as_ref()).await {
+            return Ok(retried);
+        }
         if let Err(refused) = vendor_answer_to_a_retry(retried.status(), retried.headers()) {
             drop(retried);
             return Err(refuse(surface, refused));

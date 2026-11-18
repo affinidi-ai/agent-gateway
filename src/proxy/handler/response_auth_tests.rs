@@ -12,7 +12,9 @@ use serde_json::{Value, json};
 use crate::audit::request_events::{RejectionReason, RejectionStage};
 use crate::config::agent_surface::AgentSurface;
 use crate::delegation_vault::audit::{DelegationAuditAction, DelegationAuditEvent};
-use crate::proxy::response_auth::{BRAVO_KEY, REFUSAL_MESSAGE, api_key_bravo, bravo_key_store, pinned_bravo};
+use crate::proxy::response_auth::{
+    BRAVO_KEY, BRAVO_KEY_HEADER, REFUSAL_MESSAGE, api_key_bravo, bravo_key_store, pinned_bravo,
+};
 
 const EVENT: &str = "the-targets-event";
 
@@ -259,6 +261,72 @@ async fn funds_held_for_a_target_response_without_the_key_are_voided_not_capture
             .requests
             .load(Ordering::SeqCst),
         1
+    );
+}
+
+/// A Target on 127.0.0.1 that answers the POSTs it receives with `answers` in turn, each
+/// `(status, keyed)`, the last one repeated, counting every request.
+async fn answering(answers: Vec<(StatusCode, bool)>) -> Target {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&requests);
+    let app = axum::Router::new().fallback(move || {
+        let index = counted.fetch_add(1, Ordering::SeqCst);
+        let (status, keyed) = answers[index.min(answers.len() - 1)];
+        async move {
+            let mut response = (
+                status,
+                [(CONTENT_TYPE, "application/json")],
+                json!({"jsonrpc": "2.0", "id": 1, "result": {"content": []}}).to_string(),
+            )
+                .into_response();
+            if keyed {
+                response.headers_mut().insert(
+                    HeaderName::from_bytes(BRAVO_KEY_HEADER.as_bytes()).expect("a valid header name"),
+                    HeaderValue::from_static(BRAVO_KEY),
+                );
+            }
+            response
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    Target { url, requests }
+}
+
+fn retrying(mut surface: AgentSurface) -> AgentSurface {
+    surface.target.networking = serde_json::from_value(json!({"retry": {"max_attempts": 2, "initial_backoff_ms": 1,
+        "max_backoff_ms": 1, "backoff_multiplier": 1.0, "retryable_status_codes": [503]}}))
+    .unwrap();
+    surface
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retryable_answer_without_the_key_is_refused_and_never_retried() {
+    let target = answering(vec![(StatusCode::SERVICE_UNAVAILABLE, false), (StatusCode::OK, true)]).await;
+    let answer = send(retrying(surface("mcp", &target.url, api_key_bravo())), mcp_call()).await;
+    assert_refused("an unkeyed 503", &answer);
+    assert_eq!(
+        target
+            .requests
+            .load(Ordering::SeqCst),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retryable_answer_with_the_key_is_retried() {
+    let target = answering(vec![(StatusCode::SERVICE_UNAVAILABLE, true), (StatusCode::OK, true)]).await;
+    let (status, body, events) = send(retrying(surface("mcp", &target.url, api_key_bravo())), mcp_call()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(refusals(&events).is_empty(), "{body}");
+    assert_eq!(
+        target
+            .requests
+            .load(Ordering::SeqCst),
+        2
     );
 }
 

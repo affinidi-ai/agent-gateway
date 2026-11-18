@@ -7915,13 +7915,27 @@ async fn proxy_charged_request(
                 match sent {
                     Ok(resp) => {
                         let status = resp.status();
+                        let retryable = retry_config
+                            .retryable_status_codes
+                            .contains(&status.as_u16());
+                        if retryable
+                            && state
+                                .surface
+                                .target
+                                .response_auth
+                                .is_some()
+                            && !crate::proxy::response_auth::passes(
+                                &state.surface,
+                                resp.headers(),
+                                state.secrets_store.as_ref(),
+                            )
+                            .await
+                        {
+                            break Ok(resp);
+                        }
 
                         // Check if we should retry based on status code
-                        if attempt <= retry_config.max_attempts
-                            && retry_config
-                                .retryable_status_codes
-                                .contains(&status.as_u16())
-                        {
+                        if attempt <= retry_config.max_attempts && retryable {
                             warn!(
                                 channel = channel_name,
                                 attempt = attempt,
