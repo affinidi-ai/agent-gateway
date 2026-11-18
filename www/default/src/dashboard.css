@@ -3996,15 +3996,14 @@ body.dark-theme .policy-preview-block code {
   border: none;
 }
 
-/* Confirm popover — speech-bubble balloon floated to the left of its anchor,
-   portalled to <body> and fixed-positioned so it never clips off the right
-   edge. */
+/* Confirm popover — speech-bubble balloon floated beside its anchor (left,
+   or right when the left has no room), portalled to <body> and fixed-positioned
+   inside the viewport; ConfirmPopover.tsx sets left, top and the tail's top. */
 .confirm-popover {
   position: fixed;
   z-index: 1100;
   width: 300px;
   max-width: calc(100vw - 32px);
-  transform: translate(-100%, -50%);
   background: #ffffff;
   border: 1px solid rgba(78, 115, 223, 0.4);
   border-radius: 10px;
@@ -4013,15 +4012,31 @@ body.dark-theme .policy-preview-block code {
   animation: confirm-popover-in 200ms ease-out;
 }
 
+.confirm-popover--right {
+  animation-name: confirm-popover-in-right;
+}
+
 @keyframes confirm-popover-in {
   from {
     opacity: 0;
-    transform: translate(calc(-100% + 6px), -50%);
+    transform: translateX(6px);
   }
 
   to {
     opacity: 1;
-    transform: translate(-100%, -50%);
+    transform: none;
+  }
+}
+
+@keyframes confirm-popover-in-right {
+  from {
+    opacity: 0;
+    transform: translateX(-6px);
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
   }
 }
 
@@ -4072,7 +4087,6 @@ body.dark-theme .policy-preview-block code {
 
 .confirm-popover__tail {
   position: absolute;
-  top: 50%;
   right: -10px;
   transform: translateY(-50%);
   width: 0;
@@ -4109,6 +4123,19 @@ body.dark-theme .confirm-popover__close:hover {
 body.dark-theme .confirm-popover__tail {
   border-left-color: #2a2f3a;
   filter: drop-shadow(1px 0 0 rgba(120, 150, 240, 0.5));
+}
+
+.confirm-popover--right .confirm-popover__tail {
+  right: auto;
+  left: -10px;
+  border-left: none;
+  border-right: 10px solid #ffffff;
+  filter: drop-shadow(-1px 0 0 rgba(78, 115, 223, 0.4));
+}
+
+body.dark-theme .confirm-popover--right .confirm-popover__tail {
+  border-right-color: #2a2f3a;
+  filter: drop-shadow(-1px 0 0 rgba(120, 150, 240, 0.5));
 }
 
 /* Dark theme - Clickable DID */

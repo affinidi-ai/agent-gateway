@@ -15,10 +15,49 @@ interface ConfirmPopoverProps {
   children: React.ReactNode;
 }
 
+const GAP = 12;
+const MARGIN = 8;
+const DEFAULT_WIDTH = 300;
+const TAIL_INSET = 16;
+
+interface Placement {
+  left: number;
+  top: number;
+  side: 'left' | 'right';
+  tailTop: number;
+}
+
+const clamp = (value: number, min: number, max: number) =>
+  Math.min(Math.max(value, min), Math.max(min, max));
+
 /**
- * A speech-bubble confirmation balloon that floats to the left of an anchor
- * element via a body portal, so it never clips off the right edge of the
- * viewport. Confirms a destructive action inline instead of a browser confirm.
+ * Places the balloon to the left of the anchor, or to its right when the left
+ * has no room, kept inside the viewport on both axes with the tail pointing at
+ * the anchor's middle.
+ */
+export function placeConfirmPopover(
+  anchor: Pick<DOMRect, 'left' | 'right' | 'top' | 'height'>,
+  size: { width: number; height: number },
+  viewport: { width: number; height: number }
+): Placement {
+  const roomLeft = anchor.left - GAP - MARGIN;
+  const roomRight = viewport.width - anchor.right - GAP - MARGIN;
+  const side = roomLeft >= size.width || roomLeft >= roomRight ? 'left' : 'right';
+  const left = clamp(
+    side === 'left' ? anchor.left - GAP - size.width : anchor.right + GAP,
+    MARGIN,
+    viewport.width - size.width - MARGIN
+  );
+  const middle = anchor.top + anchor.height / 2;
+  const top = clamp(middle - size.height / 2, MARGIN, viewport.height - size.height - MARGIN);
+  const tailTop = clamp(middle - top, TAIL_INSET, size.height - TAIL_INSET);
+  return { left, top, side, tailTop };
+}
+
+/**
+ * A speech-bubble confirmation balloon that floats beside an anchor element
+ * via a body portal, on the left when there is room and otherwise on the
+ * right, always inside the viewport. Confirms a destructive action inline instead of a browser confirm.
  * Dismisses on Escape or an outside click. Cancel takes focus when it opens and
  * focus returns to the anchor when it closes; no key reaches a window listener
  * while it is open.
@@ -39,19 +78,28 @@ const ConfirmPopover: React.FC<ConfirmPopoverProps> = ({
   const popRef = useRef<HTMLDivElement>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
   const titleId = useId();
-  const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
+  const [pos, setPos] = useState<Placement | null>(null);
 
   useEffect(() => {
     let raf = 0;
     const tick = () => {
-      const r = anchor.getBoundingClientRect();
-      setPos(prev => {
-        const next = { x: r.left, y: r.top + r.height / 2 };
-        if (prev && Math.abs(prev.x - next.x) < 0.5 && Math.abs(prev.y - next.y) < 0.5) {
-          return prev;
-        }
-        return next;
-      });
+      const next = placeConfirmPopover(
+        anchor.getBoundingClientRect(),
+        {
+          width: popRef.current?.offsetWidth || DEFAULT_WIDTH,
+          height: popRef.current?.offsetHeight ?? 0,
+        },
+        { width: window.innerWidth, height: window.innerHeight }
+      );
+      setPos(prev =>
+        prev &&
+        prev.side === next.side &&
+        Math.abs(prev.left - next.left) < 0.5 &&
+        Math.abs(prev.top - next.top) < 0.5 &&
+        Math.abs(prev.tailTop - next.tailTop) < 0.5
+          ? prev
+          : next
+      );
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
@@ -98,8 +146,8 @@ const ConfirmPopover: React.FC<ConfirmPopoverProps> = ({
   return createPortal(
     <div
       ref={popRef}
-      className="confirm-popover"
-      style={{ left: pos.x - 12, top: pos.y }}
+      className={`confirm-popover confirm-popover--${pos.side}`}
+      style={{ left: pos.left, top: pos.top }}
       role="dialog"
       aria-labelledby={titleId}
       data-testid={testId}
@@ -142,7 +190,7 @@ const ConfirmPopover: React.FC<ConfirmPopoverProps> = ({
           {busy ? '…' : confirmLabel}
         </button>
       </div>
-      <span className="confirm-popover__tail" />
+      <span className="confirm-popover__tail" style={{ top: pos.tailTop }} />
     </div>,
     document.body
   );

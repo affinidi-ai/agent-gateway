@@ -11,7 +11,8 @@ changes:
         after Delete is clicked; Cancel, Escape or a click outside deletes nothing. The
         confirmation takes focus on Cancel and gives it back to the delete button, and while it
         is open neither Cmd/Ctrl+S nor the canvas shortcuts act on the surface behind it. The
-        Policies list's confirmations get the same focus and key handling. The delete button now
+        Policies list's confirmations get the same focus and key handling. The confirmation opens
+        to the right of its button when there is no room on the left and stays inside the window. The delete button now
         shows only to users with surfaces.delete, the permission the gateway checks, instead of
         surfaces.edit. It replaces the two-click button, which made it too easy to delete a
         surface without noticing.

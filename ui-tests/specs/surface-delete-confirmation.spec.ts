@@ -3,8 +3,9 @@
  *
  * Asserts the surface page's delete button sends nothing and opens a
  * confirmation naming the surface with focus on Cancel, that Cancel sends no
- * DELETE and returns focus to the delete button, and that Delete sends one and
- * returns to the surface list.
+ * DELETE and returns focus to the delete button, that Delete sends one and
+ * returns to the surface list, and that the confirmation opens to the right of
+ * the button and stays inside the viewport when the sidebar is at the left edge.
  */
 
 import type {Page, Request} from '@playwright/test';
@@ -86,5 +87,29 @@ test.describe('Surface delete confirmation', () => {
 
         await expect(page).toHaveURL(/\/surfaces$/);
         expect(deletes).toHaveLength(1);
+    });
+
+    test('stays inside the viewport with the navigation collapsed and the narrowest builder sidebar', async ({page}) => {
+        await page.setViewportSize({width: 1280, height: 720});
+        await page.addInitScript(() => {
+            window.localStorage.setItem('dashboard-sidebar-collapsed', 'true');
+            window.localStorage.setItem('surface-builder-sidebar-width', '220');
+        });
+        await openSurface(page);
+
+        await page.getByTestId('surface-delete-button').click();
+
+        const confirmation = page.getByTestId('surface-delete-confirm');
+        await expect(confirmation).toBeVisible();
+        await expect(confirmation).toHaveClass(/confirm-popover--right/);
+        const box = await confirmation.boundingBox();
+        const trash = await page.getByTestId('surface-delete-button').boundingBox();
+        expect(box).not.toBeNull();
+        expect(trash).not.toBeNull();
+        expect(box!.x).toBeGreaterThanOrEqual(0);
+        expect(box!.y).toBeGreaterThanOrEqual(0);
+        expect(box!.x + box!.width).toBeLessThanOrEqual(1280);
+        expect(box!.y + box!.height).toBeLessThanOrEqual(720);
+        expect(box!.x).toBeGreaterThanOrEqual(trash!.x + trash!.width);
     });
 });

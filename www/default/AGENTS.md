@@ -1282,7 +1282,8 @@ surface has been deleted." (`api-key-surface-deleted-info`) at the top of Key In
 The surface page's delete button (`surface-delete-button`, `btn-danger` with a trash icon, shown
 only with `surfaces.delete`, which the gateway requires for the `DELETE`; `surfaces.edit` alone
 shows Save but no delete button) sends nothing: it opens `surface-delete-confirm`, a
-[confirm popover](#confirm-popover) to the left of the button, and clicking the button again
+[confirm popover](#confirm-popover) beside the button (on its right when the builder sidebar is
+at the window's left edge), and clicking the button again
 closes it. Its title "Delete Surface?" carries a red `fa-triangle-exclamation` icon. Its body
 first names the surface, "Delete `<name>`?" in bold (`surface-delete-confirm-name`, the surface
 id when it has no name), then reads "You are about to permanently delete this surface and all
@@ -1298,9 +1299,12 @@ in `surface-error-alert`. The popover closes if the page moves to another surfac
 
 ## Confirm popover
 
-`components/shared/ConfirmPopover.tsx` is the shared inline confirmation: a speech bubble to the
-left of the button that opened it (`role="dialog"` named by its title), portalled to `<body>`.
-Cancel takes focus when it opens and focus returns to that button when it closes, and while it
+`components/shared/ConfirmPopover.tsx` is the shared inline confirmation: a speech bubble beside
+the button that opened it (`role="dialog"` named by its title), portalled to `<body>`. It opens
+to the left of the button (`confirm-popover--left`) and flips to its right
+(`confirm-popover--right`) when the left has no room, as for the surface page's trash button in
+the builder sidebar with the navigation collapsed; it stays at least 8px inside the window on
+both axes, and its tail points at the button's middle. Cancel takes focus when it opens and focus returns to that button when it closes, and while it
 is open no key reaches a `window` listener, so the page's shortcuts (Cmd/Ctrl+S, the Surface
 Builder's canvas keys) never act behind it. Its `icon` is `fa-info-circle` (default) or
 `fa-triangle-exclamation`, shown red when `confirmVariant` is `danger`. Each use passes its own
