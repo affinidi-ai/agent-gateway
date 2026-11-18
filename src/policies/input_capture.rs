@@ -1831,32 +1831,39 @@ mod tests {
         )
     }
 
+    /// The shortest text [`assert_masking_is_linear`] times. The regex engine that resolves
+    /// captures changes as the text grows past a few tens of KiB, which raises the time per byte
+    /// once and then holds it, so both timed sizes are kept past that change.
+    const MIN_LINEAR_INPUT_BYTES: usize = 128 * 1024;
+
     /// Masks the text `build(scale)` makes, checks each result against the expected text it
     /// returns, and asserts that eight times the input takes under 24 times as long: linear
     /// masking takes about 8, quadratic 64. Runs are timed in this thread's CPU time, so tests
-    /// running in parallel do not count. The scale doubles until a run takes at least 20 ms,
-    /// so timer noise stays small next to it, and each size keeps the fastest of three runs.
-    /// The bound compares the build with itself, so it holds however slow the build is,
-    /// coverage instrumentation included.
+    /// running in parallel do not count. The scale doubles until the text is at least
+    /// [`MIN_LINEAR_INPUT_BYTES`] long and a run takes at least 20 ms, so timer noise stays
+    /// small next to it, and each size keeps the fastest of three runs. The bound compares the
+    /// build with itself, so it holds however slow the build is, coverage instrumentation
+    /// included.
     fn assert_masking_is_linear(build: impl Fn(usize) -> (String, String)) {
         let fastest = |scale| {
             let (text, expected) = build(scale);
-            (0..3)
+            let elapsed = (0..3)
                 .map(|_| {
                     let (value, elapsed) = masked(&text);
                     assert_eq!(value, Value::String(expected.clone()));
                     elapsed
                 })
                 .min()
-                .unwrap()
+                .unwrap();
+            (elapsed, text.len())
         };
         let mut scale = 1;
-        let mut small = fastest(scale);
-        while small < std::time::Duration::from_millis(20) && scale < 64 {
+        let (mut small, mut len) = fastest(scale);
+        while len < MIN_LINEAR_INPUT_BYTES || (small < std::time::Duration::from_millis(20) && scale < 64) {
             scale *= 2;
-            small = fastest(scale);
+            (small, len) = fastest(scale);
         }
-        let large = fastest(scale * 8);
+        let (large, _) = fastest(scale * 8);
 
         assert!(large < small * 24, "{small:?} at scale {scale}, {large:?} at scale {}", scale * 8);
     }
