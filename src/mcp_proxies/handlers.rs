@@ -760,11 +760,11 @@ fn refused_discovery(
         reason = failure.reason(),
         "MCP tool discovery refused a Target response that failed Response authentication"
     );
-    (
-        StatusCode::BAD_GATEWAY,
-        "The Target's response was refused: it failed the surface's Response authentication".to_string(),
-    )
+    (StatusCode::BAD_GATEWAY, DISCOVERY_REFUSED_MESSAGE.to_string())
 }
+
+const DISCOVERY_REFUSED_MESSAGE: &str =
+    "The Target's response was refused: it failed the surface's Response authentication";
 
 /// Build a per-request pinned, redirect-disabled client for MCP tool discovery.
 ///
@@ -910,7 +910,11 @@ async fn discover_remote_tools(
         "jsonrpc": "2.0",
         "method": "notifications/initialized"
     });
-    let _ = send(initialized_notification).await;
+    if let Err(error) = send(initialized_notification).await
+        && error.1 == DISCOVERY_REFUSED_MESSAGE
+    {
+        return Err(error);
+    }
 
     let tool_list_response = send(serde_json::json!({
         "jsonrpc": "2.0",
@@ -7069,11 +7073,25 @@ mod tests {
     /// An MCP server on 127.0.0.1 answering every POST with [`LOCAL_TOOLS`], with `key` in the
     /// key header of Response authentication when given, counting every request.
     async fn keyed_tools_server(key: Option<&'static str>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        keyed_tools_server_with_notification_key(key, key).await
+    }
+
+    /// [`keyed_tools_server`] whose answer to `notifications/initialized` carries
+    /// `notification_key` instead.
+    async fn keyed_tools_server_with_notification_key(
+        key: Option<&'static str>,
+        notification_key: Option<&'static str>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         use axum::response::IntoResponse;
         let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = Arc::clone(&requests);
-        let app = axum::Router::new().fallback(move || {
+        let app = axum::Router::new().fallback(move |body: String| {
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let key = if body.contains("notifications/initialized") {
+                notification_key
+            } else {
+                key
+            };
             async move {
                 let mut response =
                     ([(axum::http::header::CONTENT_TYPE, "application/json")], LOCAL_TOOLS).into_response();
@@ -7143,6 +7161,16 @@ mod tests {
                 "{key:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_by_surface_refuses_a_target_whose_initialized_notification_answer_lacks_the_key() {
+        let (endpoint, _) =
+            keyed_tools_server_with_notification_key(Some(crate::proxy::response_auth::BRAVO_KEY), None).await;
+        assert_eq!(
+            discover_with_response_auth(&endpoint, crate::proxy::response_auth::api_key_bravo()).await,
+            Err((StatusCode::BAD_GATEWAY, DISCOVERY_REFUSED.to_string()))
+        );
     }
 
     #[tokio::test]

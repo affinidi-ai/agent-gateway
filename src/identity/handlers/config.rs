@@ -111,6 +111,7 @@ async fn reload(state: &IdentityApiState) -> anyhow::Result<(usize, usize, bool,
     crate::proxy::agent_card_cache::invalidate_all();
     crate::proxy::backend_identity::forget_card_identity_warnings();
     crate::proxy::response_auth::forget_all_tls_settings();
+    crate::mcp::sse_transport::forget_all_surface_sessions();
 
     // Rewrite any legacy `channel.policy` definition to `surface.policy` before
     // the surfaces recompile below, so a definition added since startup (or one

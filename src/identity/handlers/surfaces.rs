@@ -4833,6 +4833,7 @@ async fn apply_surface_change_while_locked(
     crate::proxy::agent_card_cache::invalidate_all();
     crate::proxy::backend_identity::forget_card_identity_warning(surface_id);
     crate::proxy::response_auth::forget_tls_settings(surface_id);
+    crate::mcp::sse_transport::forget_surface_sessions(surface_id);
 
     let provider_key_gate = crate::identity::provider_key_gate::gate();
     let changed_id = match change {

@@ -1408,16 +1408,22 @@ event. Every hop to the Target runs it:
 - the Access Point's direct forward, with its A2A event streams, MCP Streamable HTTP streams
   and the Legacy SSE stream passed through to the caller;
 - the Legacy SSE fallback of an MCP Access Point, on the session's stream and on the answer to
-  each message it posts. A session is shared only by surfaces without the setting, so a
-  surface with it never uses a session another surface opened. A session under mTLS is also
-  keyed by the certificates its TLS settings were built from, so a renewed certificate opens a
-  new session rather than reusing one that trusts the old certificate;
+  each message it posts, `notifications/initialized` included: an answer to any of them that
+  fails refuses the session, which is never kept. A session is shared only by surfaces without
+  the setting, so a surface with it never uses a session another surface opened. A session under
+  mTLS is also keyed by the certificates its TLS settings were built from, so a renewed
+  certificate opens a new session rather than reusing one that trusts the old certificate. A
+  new session of a surface on a Target URL closes that surface's sessions on the same URL under
+  the same setting with an older certificate; its sessions under another setting, such as
+  another variant's, are kept. Saving or deleting the surface, or reloading the configuration,
+  closes its sessions on every Target URL;
 - the gateway's own agent card fetch, for the card route and the operator's card preview;
 - Fabric receive: a request a peer sends to this gateway's surface, buffered or framed, its
   Legacy SSE fallback, and the agent card read for the surface's policy input and Trust Check
   (`require_agent_context`), each against the receiving surface's own setting;
 - MCP tool discovery of a saved surface (`POST /v1/mcp-proxies/discover-tools` with
-  `surface_id`): the `initialize` and `tools/list` answers and their Legacy SSE fallback. A
+  `surface_id`): the `initialize`, `notifications/initialized` and `tools/list` answers and their
+  Legacy SSE fallback. A
   failed check answers the management caller `502` with `The Target's response was refused: it
   failed the surface's Response authentication`, the reason only logged. A discovery of an
   operator-typed `target_endpoint` has no surface and no check.
