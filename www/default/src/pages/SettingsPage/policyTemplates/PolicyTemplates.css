@@ -138,6 +138,14 @@ body.dark-theme .policy-template-preview {
   border-radius: var(--radius-sm);
 }
 
+.policy-rules__rule--in-use {
+  flex-wrap: wrap;
+}
+
+.policy-rules__in-use {
+  flex-basis: 100%;
+}
+
 .policy-rules__summary {
   flex: 1;
   min-width: 0;

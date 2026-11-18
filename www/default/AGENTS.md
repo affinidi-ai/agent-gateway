@@ -1908,17 +1908,32 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   `regoRules.ts` reads from the Rego as it changes: the rule count (`policy-rules-count`) and
   default decision sit in the section's status row, then come the rules written
   in the editor and one group per added template (`policy-rules-group-<n>`), each rule
-  (`policy-rules-group-<n>-rule-<m>`) with an Allows, Deny reason or Helper outline badge, the
+  (`policy-rules-group-<n>-rule-<m>`) with an Allows, Deny reason (only a rule named
+  `deny_reason`) or Helper (every other name, `deny` included) outline badge, the
   rule on one line, and its line numbers, which switch to the Rego view and select the rule
   (`-show-button`). A template group says which template it came from, the last added one is
   marked **Just added** (`policy-rules-just-added`), and **Remove**
   (`policy-rules-group-<n>-remove-button`, `policies.edit`) deletes the group's lines with Undo;
   each rule has its own **Remove** (`policy-rules-group-<n>-rule-<m>-remove-button`,
   `policies.edit`), which deletes the rule's lines and the comment lines directly above it, with
-  Undo. A helper rule that another rule still refers to can't be removed (the button is
-  disabled and its title says so), since removing it can widen the policy, for example under
-  `not helper`; one of several different definitions of a used helper counts as in use, and only
-  an identical copy left by the same template added twice frees it. A policy that allows
+  Undo. `regoRules.ts` decides which Remove is refused (`ruleInUse`, `groupInUse`): a rule is
+  in use when `allow` reads its name, directly or through other rules, from outside that rule,
+  such as `count(deny) == 0`, `not deny_x`, `not deny_reason`, a function call `h(x)` or
+  `data.<package>.<name>`, and a dotted rule such as `blocked.ip` is read by its first segment;
+  a template group is in use when `allow` reads a name the group defines through rules outside
+  the group. A read from `deny_reason` alone doesn't count, since the gateway decides on `allow`
+  and reads `deny_reason` only as text, so `deny` rules that only `deny_reason` reads are free;
+  names inside strings are not reads. While the Rego imports a `data` path, or reads `data`, its
+  package or a parent as a whole document (`data.<package>["name"]`, `doc := data.<package>`),
+  every rule but `allow` counts as in use. An `allow` rule, a rule with an identical definition
+  left (the same template added twice), and a group whose used rules all have identical copies
+  outside it can always be removed; one of several different definitions of a used name stays
+  in use. Rules are compared by their
+  code with comments removed and strings kept, so a `#` inside a string is code. A refused
+  Remove is disabled and says why in muted text under the rule
+  (`policy-rules-group-<n>-rule-<m>-in-use`: "Another rule uses this; remove that rule first")
+  or under the group header (`policy-rules-group-<n>-in-use`), linked to the button by
+  `aria-describedby`. A policy that allows
   by default and has allow rules shows a warning (`policy-rules-allow-default-warning`) with
   **Deny by default** (`policy-rules-set-default-deny-button`). An empty Rego shows Default
   ALLOW and "An empty policy allows every request.", as the gateway treats it. Removing a group

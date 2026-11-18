@@ -833,8 +833,37 @@ describe('remove one rule', () => {
     const helper = within(group).getByTestId('policy-rules-group-1-rule-0-remove-button');
     expect(helper).toBeDisabled();
     expect(helper).toHaveAttribute('title', expect.stringContaining('Another rule uses'));
+    expect(within(group).getByTestId('policy-rules-group-1-rule-0-in-use')).toHaveTextContent(
+      'Another rule uses this; remove that rule first'
+    );
     const allowRule = within(group).getAllByRole('button', { name: /Remove the rule allow/ });
     expect(allowRule[0]).toBeEnabled();
+    expect(within(group).queryByTestId('policy-rules-group-1-in-use')).toBeNull();
+  });
+
+  it('refuses to remove a deny rule that allow counts, and says why', async () => {
+    mockGateway({
+      ...SAVED,
+      policy:
+        'package surface.policy\n\ndefault allow := false\n\ndeny contains "no path" if not input.http.path\n\nallow if count(deny) == 0\n',
+    });
+    renderAt('/policy-definitions/partner-only');
+    expect(await screen.findByTestId('policy-rules-group-0-rule-0-remove-button')).toBeDisabled();
+    expect(screen.getByTestId('policy-rules-group-0-rule-0')).toHaveTextContent('Helper');
+    expect(screen.getByTestId('policy-rules-group-0-rule-0-in-use')).toBeVisible();
+    expect(screen.queryByTestId('policy-rules-group-0-rule-1-in-use')).toBeNull();
+  });
+
+  it('refuses to remove a template whose rule a rule outside it still reads', async () => {
+    mockGateway({
+      ...SAVED,
+      policy: `${SAVED.policy}\n\n# Inserted from template: Blocked callers\nblocked if input.x\n# End of template: Blocked callers\n\nallow if not blocked\n`,
+    });
+    renderAt('/policy-definitions/partner-only');
+    expect(await screen.findByTestId('policy-rules-group-1-remove-button')).toBeDisabled();
+    expect(screen.getByTestId('policy-rules-group-1-in-use')).toHaveTextContent(
+      'A rule outside this template uses its rules; remove that rule first'
+    );
   });
 
   it('shows no rule Remove to a viewer', async () => {

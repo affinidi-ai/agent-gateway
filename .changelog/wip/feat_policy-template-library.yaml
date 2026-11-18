@@ -17,9 +17,11 @@ changes:
         Add rules from a template appends a template's rules to a new or saved policy, so
         several can be combined, and on a saved policy checks the template's examples with the
         existing dry-run. A Rules view lists the policy's rules grouped by the template they
-        came from, removes a template's rules or a single rule (refusing a helper another rule still
-        uses), and switches an allow-all policy to deny by
-        default. Save as template keeps a policy as an organisation template for the current
+        came from, labelling only deny_reason as a Deny reason, removes a template's rules or a
+        single rule, and switches an allow-all policy to deny by default. Remove is refused, with
+        the reason shown under the rule or template, while the allow rule still reads that rule,
+        directly or through other rules; a read from deny_reason alone doesn't count, and an
+        identical copy left by the same template added twice can go. Save as template keeps a policy as an organisation template for the current
         browser tab. Built-in templates ship with the dashboard; no gateway API changes.
   changed:
     - timestamp: '2026-11-18T20:00:00Z'

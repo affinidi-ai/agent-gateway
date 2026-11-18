@@ -17,8 +17,10 @@ interface PolicyRulesListProps {
   onWriteRego: () => void;
   onRemoveGroup: (group: RuleGroup) => void;
   onRemoveRule: (rule: PolicyRule) => void;
-  /** A helper another rule still refers to, which Remove refuses. */
+  /** A rule `allow` still reads through other rules, which Remove refuses. */
   isRuleInUse: (rule: PolicyRule) => boolean;
+  /** A template group whose rules `allow` still reads from outside it, which Remove refuses. */
+  isGroupInUse: (group: RuleGroup) => boolean;
   onSetDefaultDeny: () => void;
   onShowRule: (rule: PolicyRule) => void;
 }
@@ -31,9 +33,12 @@ const KIND_LABEL: Record<RuleKind, string> = {
 
 const KIND_TITLE: Record<RuleKind, string> = {
   allow: 'Allows the request when its conditions match',
-  deny: 'Gives the reason a request was denied',
-  helper: 'Used by other rules; decides nothing on its own',
+  deny: 'Gives the reason a request was denied; does not decide it',
+  helper: 'Read by other rules; decides nothing on its own',
 };
+
+const RULE_IN_USE = 'Another rule uses this; remove that rule first';
+const GROUP_IN_USE = 'A rule outside this template uses its rules; remove that rule first';
 
 const lineLabel = (rule: PolicyRule) =>
   rule.startLine === rule.endLine
@@ -53,6 +58,7 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
   onRemoveGroup,
   onRemoveRule,
   isRuleInUse,
+  isGroupInUse,
   onSetDefaultDeny,
   onShowRule,
 }) => {
@@ -167,6 +173,7 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
       {parsed.groups.map((group, index) => {
         const isTemplate = group.source.kind === 'template';
         const testId = `policy-rules-group-${index}`;
+        const groupInUse = isTemplate && canEdit && isGroupInUse(group);
         return (
           <div
             className="policy-rules__group"
@@ -196,61 +203,82 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
                 <button
                   type="button"
                   className="btn btn-sm btn-link text-danger p-0 ms-auto"
+                  disabled={groupInUse}
                   onClick={() => onRemoveGroup(group)}
                   aria-label={`Remove the rules from ${group.source.kind === 'template' ? group.source.name : 'the editor'}`}
+                  aria-describedby={groupInUse ? `${testId}-in-use` : undefined}
                   data-testid={`${testId}-remove-button`}
                 >
                   Remove
                 </button>
               )}
             </div>
+            {groupInUse && (
+              <div
+                className="small text-muted ps-2 mb-1"
+                id={`${testId}-in-use`}
+                data-testid={`${testId}-in-use`}
+              >
+                {GROUP_IN_USE}
+              </div>
+            )}
             {group.rules.length === 0 && (
               <div className="small text-muted ps-2">No rules left from this template.</div>
             )}
             <ul className="list-unstyled mb-0">
-              {group.rules.map((rule, ruleIndex) => (
-                <li
-                  key={rule.startLine}
-                  className="policy-rules__rule"
-                  data-testid={`${testId}-rule-${ruleIndex}`}
-                >
-                  <span
-                    className={`badge policy-template-decision policy-rules__kind--${rule.kind}`}
-                    title={KIND_TITLE[rule.kind]}
+              {group.rules.map((rule, ruleIndex) => {
+                const ruleTestId = `${testId}-rule-${ruleIndex}`;
+                const inUse = canEdit && isRuleInUse(rule);
+                return (
+                  <li
+                    key={rule.startLine}
+                    className={`policy-rules__rule${inUse ? ' policy-rules__rule--in-use' : ''}`}
+                    data-testid={ruleTestId}
                   >
-                    {KIND_LABEL[rule.kind]}
-                  </span>
-                  <code className="policy-rules__summary" title={rule.summary}>
-                    {rule.summary}
-                  </code>
-                  <button
-                    type="button"
-                    className="btn btn-sm btn-link p-0 text-nowrap"
-                    onClick={() => onShowRule(rule)}
-                    aria-label={`Show ${rule.head} in the Rego`}
-                    data-testid={`${testId}-rule-${ruleIndex}-show-button`}
-                  >
-                    {lineLabel(rule)}
-                  </button>
-                  {canEdit && (
+                    <span
+                      className={`badge policy-template-decision policy-rules__kind--${rule.kind}`}
+                      title={KIND_TITLE[rule.kind]}
+                    >
+                      {KIND_LABEL[rule.kind]}
+                    </span>
+                    <code className="policy-rules__summary" title={rule.summary}>
+                      {rule.summary}
+                    </code>
                     <button
                       type="button"
-                      className="btn btn-sm btn-link text-danger p-0 text-nowrap"
-                      disabled={isRuleInUse(rule)}
-                      title={
-                        isRuleInUse(rule)
-                          ? `Another rule uses ${rule.head}; remove that rule first`
-                          : undefined
-                      }
-                      onClick={() => onRemoveRule(rule)}
-                      aria-label={`Remove the rule ${rule.head}`}
-                      data-testid={`${testId}-rule-${ruleIndex}-remove-button`}
+                      className="btn btn-sm btn-link p-0 text-nowrap"
+                      onClick={() => onShowRule(rule)}
+                      aria-label={`Show ${rule.head} in the Rego`}
+                      data-testid={`${ruleTestId}-show-button`}
                     >
-                      Remove
+                      {lineLabel(rule)}
                     </button>
-                  )}
-                </li>
-              ))}
+                    {canEdit && (
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-link text-danger p-0 text-nowrap"
+                        disabled={inUse}
+                        title={inUse ? RULE_IN_USE : undefined}
+                        onClick={() => onRemoveRule(rule)}
+                        aria-label={`Remove the rule ${rule.head}`}
+                        aria-describedby={inUse ? `${ruleTestId}-in-use` : undefined}
+                        data-testid={`${ruleTestId}-remove-button`}
+                      >
+                        Remove
+                      </button>
+                    )}
+                    {inUse && (
+                      <span
+                        className="policy-rules__in-use small text-muted"
+                        id={`${ruleTestId}-in-use`}
+                        data-testid={`${ruleTestId}-in-use`}
+                      >
+                        {RULE_IN_USE}
+                      </span>
+                    )}
+                  </li>
+                );
+              })}
             </ul>
           </div>
         );

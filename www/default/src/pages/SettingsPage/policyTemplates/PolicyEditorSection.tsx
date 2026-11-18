@@ -4,7 +4,13 @@ import FieldHelp from '../../../components/shared/FieldHelp';
 import PolicyRulesList from './PolicyRulesList';
 import PolicySectionTitle from './PolicySectionTitle';
 import RegoReference from './RegoReference';
-import { parsePolicyRules, ruleInUse, type PolicyRule, type RuleGroup } from './regoRules';
+import {
+  groupInUse,
+  parsePolicyRules,
+  ruleInUse,
+  type PolicyRule,
+  type RuleGroup,
+} from './regoRules';
 import { DecisionBadge } from './TemplateBadges';
 import type { PolicyType } from './types';
 import './PolicyTemplates.css';
@@ -165,7 +171,8 @@ const PolicyEditorSection: React.FC<PolicyEditorSectionProps> = ({
           onWriteRego={() => onViewChange('rego')}
           onRemoveGroup={onRemoveGroup}
           onRemoveRule={onRemoveRule}
-          isRuleInUse={rule => ruleInUse(policy, parsed, rule)}
+          isRuleInUse={rule => ruleInUse(parsed, rule)}
+          isGroupInUse={group => groupInUse(parsed, group)}
           onSetDefaultDeny={onSetDefaultDeny}
           onShowRule={showRule}
         />
