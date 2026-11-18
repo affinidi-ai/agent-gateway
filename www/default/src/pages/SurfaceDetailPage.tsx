@@ -1010,7 +1010,7 @@ const SurfaceDetailPage: React.FC = () => {
           // a payload `nodesFromSurface` can't decode will trip the
           // structural validator anyway.
         }
-        const variantIssues = validateSurfacePayload(snap);
+        const variantIssues = validateSurfacePayload(snap, { stored: null });
         const variantErr = variantIssues.find(i => i.severity === 'error');
         if (variantErr) {
           return {

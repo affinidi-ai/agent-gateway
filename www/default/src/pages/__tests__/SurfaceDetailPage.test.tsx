@@ -496,6 +496,103 @@ describe('SurfaceDetailPage API key references', () => {
   });
 });
 
+describe('SurfaceDetailPage Target authentication in variants', () => {
+  let updateSurface: jest.SpyInstance;
+
+  const targetAuth = (headerName: string) => ({
+    method: {
+      static_secret: {
+        secret_id: 'partner-key',
+        header_name: headerName,
+        header_format: '{value}',
+      },
+    },
+    auth_type: 'custom',
+    fallback: 'reject',
+  });
+
+  const withVariantTarget = (headerName: string): AgentSurface =>
+    ({
+      ...stored({
+        public: true,
+        caller_authentication: {
+          methods: [
+            {
+              type: 'api_key',
+              secret_id: 'caller-key',
+              extraction: { source: 'http_header', field: 'X-Api-Key' },
+            },
+          ],
+        },
+      }),
+      outbound_credentials: [
+        {
+          credential_provider_id: 'prov-1',
+          scopes: ['read'],
+          consent_mode: 'on_demand',
+          required_for: 'all',
+          inject_as: { type: 'bearer_header' },
+        },
+      ],
+      variants: [
+        {
+          id: 'v-beta',
+          alias: 'beta',
+          name: 'Beta',
+          overrides: {
+            target: { endpoint: 'https://agent.example', auth: targetAuth(headerName) },
+          },
+        },
+      ],
+    }) as unknown as AgentSurface;
+
+  const renderPage = async (surface: AgentSurface) => {
+    jest.spyOn(apiClient, 'getSurface').mockResolvedValue(surface);
+    updateSurface.mockImplementation(async (_id: string, payload: Partial<AgentSurface>) => ({
+      ...surface,
+      ...payload,
+    }));
+    render(
+      <MemoryRouter initialEntries={['/surfaces/srf-1']}>
+        <Routes>
+          <Route path="/surfaces/:surfaceId" element={<SurfaceDetailPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+    await screen.findByTestId('surface-save-button');
+  };
+
+  const errorToasts = () => toast.mock.calls.filter(c => c[0] === 'error').map(c => c[1]);
+
+  beforeEach(() => {
+    jest.restoreAllMocks();
+    toast.mockReset();
+    updateSurface = jest.spyOn(apiClient, 'updateSurface');
+  });
+
+  it('blocks Save from the base view on a header clash in an inactive variant, naming the variant', async () => {
+    await renderPage(withVariantTarget('Authorization'));
+
+    fireEvent.click(screen.getByTestId('surface-save-button'));
+
+    await waitFor(() =>
+      expect(errorToasts()).toEqual([
+        'Variant "Beta": target.auth.header_name Authorization is already sent by a credential binding',
+      ])
+    );
+    expect(updateSurface).not.toHaveBeenCalled();
+  });
+
+  it('saves when the variant sends its Target credential in a header nothing else sends', async () => {
+    await renderPage(withVariantTarget('X-Partner-Key'));
+
+    fireEvent.click(screen.getByTestId('surface-save-button'));
+
+    await waitFor(() => expect(updateSurface).toHaveBeenCalledTimes(1));
+    expect(errorToasts()).toEqual([]);
+  });
+});
+
 describe('SurfaceDetailPage serving status', () => {
   const renderPage = async (surface: AgentSurface) => {
     jest.spyOn(apiClient, 'getSurface').mockResolvedValue(surface);

@@ -34,8 +34,10 @@ export interface ValidationIssue {
 
 export interface ValidateSurfaceOptions {
   /**
-   * The stored surface, or null for a new one. When given, a Target authentication rule that
-   * needs the whole surface is checked, except a breach the stored surface already had.
+   * The stored surface, or null when there is none to compare with. When given, the Target
+   * authentication rules that need the whole surface are checked: a header clash is an error
+   * whatever was stored, and a leg that checks no caller a warning unless the stored surface
+   * already had it.
    */
   stored?: unknown;
 }

@@ -17,8 +17,8 @@ changes:
       description: >-
         The Surface Builder applies the gateway's Target authentication rules while editing and
         shows each problem next to its field. A header name, header format or header clash
-        problem blocks Save, in a stored setting the operator did not edit too, since the
-        gateway refuses it on every save. A Target that is not https, a leg that authenticates
+        problem blocks Save, in a stored setting the operator did not edit and in a variant
+        that is not on screen too, since the gateway refuses it on every save. A Target that is not https, a leg that authenticates
         no caller and a fallback that passes a request through without the credential show an
         advisory and do not block Save: the gateway refuses the first two only when their rule
         is enforce, and a save in warn shows the gateway's warning. The Managed Agent editor

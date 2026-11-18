@@ -600,7 +600,8 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
     the stored surface (`stored`, `null` for a new one): a header another credential on the same
     leg already sends (a binding, header metadata mapping, the token header of any JWT Bearer
     caller method that forwards it) blocks Save, on the Managed Agent or on the Transit Point it
-    belongs to.
+    belongs to. The surface page runs the clash check on the view being saved and on every other
+    variant, whose error names the variant.
   - **A stored problem blocks too.** The gateway refuses a header name, format or clash problem
     on every save, one in a stored setting the operator did not edit included, so the dashboard
     shows it as an error next to its field and blocks Save until it is fixed.
