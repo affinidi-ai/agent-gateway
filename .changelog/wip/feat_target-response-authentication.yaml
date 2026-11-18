@@ -30,4 +30,11 @@ changes:
         callers, and an API key on an http Target follows credential_policy.target_https.
         Variants may set their own. A release without this setting does not load a surface that
         sets it.
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Update lettre to 0.11.24 to fix SMTP injection and STARTTLS advisories
+      description: >-
+        lettre 0.11.22, which sends the gateway's email notifications, had advisories for SMTP
+        command injection through bare CR or LF, forged replies through STARTTLS response
+        injection, mail for a quoted local part sent to another address, and denial of service
+        from a panic or an unbounded SMTP reply. 0.11.24 fixes them.
   breaking: []
