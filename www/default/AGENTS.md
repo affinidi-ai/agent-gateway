@@ -89,8 +89,10 @@ are the consumer; the convention is documented in
 | Canvas node   | `surface-node-<type>`, for example `surface-node-payment`                            |
 
 An indexed or per-row button keeps the `-button` suffix before the index or id, for example
-`payments-details-button-<id>`. On `/surfaces/<id>` the save button is `surface-save-button`
-and the banner for a refused save is `surface-error-alert`.
+`payments-details-button-<id>`. On `/surfaces/<id>` the save button is `surface-save-button`,
+the banner for a refused save is `surface-error-alert`, and the delete button is
+`surface-delete-button`, which opens `surface-delete-confirm` with `surface-delete-confirm-name`,
+`surface-delete-confirm-confirm` and `surface-delete-confirm-cancel` (see _Surface delete_).
 
 ## CLI consent page
 
@@ -1521,6 +1523,52 @@ toast that stays until dismissed: "Revoke failed: <gateway message>".
 When the key's surface was deleted (`surface_deleted: true` on `GET /api-keys/{agent_id}/{key_id}`),
 the detail page shows the info alert "This API key is no longer in use because the associated
 surface has been deleted." (`api-key-surface-deleted-info`) at the top of Key Information.
+
+## Surface delete
+
+The surface page's delete button (`surface-delete-button`, `btn-danger` with a trash icon, shown
+only with `surfaces.delete`, which the gateway requires for the `DELETE`; `surfaces.edit` alone
+shows Save but no delete button) sends nothing: it opens `surface-delete-confirm`, a
+[confirm popover](#confirm-popover) beside the button (on its right when the builder sidebar is
+at the window's left edge), and clicking the button again
+closes it. Its title "Delete Surface?" carries a red `fa-triangle-exclamation` icon. Its body
+first names the surface, "Delete `<name>`?" in bold (`surface-delete-confirm-name`, the surface
+id when it has no name), then reads "You are about to permanently delete this surface and all
+associated configuration. This action cannot be undone." then "Are you sure you want to
+continue?". **Delete** (`surface-delete-confirm-confirm`, `btn-danger`) sends the `DELETE`;
+**Cancel** (`surface-delete-confirm-cancel`), the close button, Escape and a click outside send
+nothing. While the delete runs, Delete shows `…`, Delete, Cancel and the close button are
+disabled, Escape and a click outside do nothing, and the page's delete button shows a spinner.
+Delete is also disabled while a save runs, and Cmd/Ctrl+S does not save while the popover is
+open. A delete succeeds with the toast `Surface "<name>" deleted` and returns to `/surfaces`; a
+failed one closes the popover, returns focus to the delete button and shows the gateway's message
+in `surface-error-alert`. The popover closes if the page moves to another surface.
+
+## Confirm popover
+
+`components/shared/ConfirmPopover.tsx` is the shared inline confirmation: a speech bubble beside
+the button that opened it (`role="dialog"` named by its title), portalled to `<body>`. It opens
+to the left of the button (`confirm-popover--left`) and flips to its right
+(`confirm-popover--right`) when the left has no room, as for the surface page's trash button in
+the builder sidebar with the navigation collapsed; it stays at least 8px inside the window on
+both axes, and its tail points at the button's middle. Cancel takes focus when it opens and focus returns to that button when it closes, and while it
+is open no key reaches a `window` listener, so the page's shortcuts (Cmd/Ctrl+S, the Surface
+Builder's canvas keys) never act behind it. Its `icon` is `fa-info-circle` (default) or
+`fa-triangle-exclamation`, shown red when `confirmVariant` is `danger`. Each use passes its own
+`testId`; the confirm and Cancel buttons are `<testId>-confirm` and `<testId>-cancel`. Its
+styles are the `.confirm-popover*` classes in `dashboard.css`.
+
+Two pages use it:
+
+- **Surface delete** (`surface-delete-confirm`), above.
+- **Policies list** (`policy-confirm-popover`), from a row's delete and Enforce globally
+  actions: "Delete policy" with a red **Delete**, naming the policy and how many surfaces or
+  gateways reference it, and "Enforce globally" with **Continue**, naming how many will enforce
+  it. Confirm is disabled while that count loads.
+
+Use the popover to confirm one action on the button that triggers it. Use
+`components/shared/WarningDialog.tsx`, a centred modal, when the confirmation needs more room or
+blocks a flow, as API key delete and revoke and the Authority-in-use dialog do.
 
 ## Authority delete
 

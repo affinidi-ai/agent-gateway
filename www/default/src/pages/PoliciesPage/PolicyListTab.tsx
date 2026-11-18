@@ -7,7 +7,7 @@ import SearchInput from '../../components/shared/SearchInput';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { DOCS_URL } from '../../config/docs';
 import { apiClient } from '../../api';
-import PolicyConfirmPopover from './PolicyConfirmPopover';
+import ConfirmPopover from '../../components/shared/ConfirmPopover';
 import { useGlobalPolicyAssignments } from './useGlobalPolicyAssignments';
 
 export interface PolicyDefinition {
@@ -403,8 +403,9 @@ const PolicyListTab: React.FC<PolicyListTabProps> = ({
         )}
       </div>
       {confirmTarget && (
-        <PolicyConfirmPopover
+        <ConfirmPopover
           anchor={confirmTarget.anchor}
+          testId="policy-confirm-popover"
           title={confirmTarget.action === 'delete' ? 'Delete policy' : 'Enforce globally'}
           confirmLabel={confirmTarget.action === 'delete' ? 'Delete' : 'Continue'}
           confirmVariant={confirmTarget.action === 'delete' ? 'danger' : 'primary'}
@@ -434,7 +435,7 @@ const PolicyListTab: React.FC<PolicyListTabProps> = ({
                 : `All ${totalInPlane} ${scopeNoun}${totalInPlane === 1 ? '' : 's'} will enforce it, on top of each ${scopeNoun}'s own policy.`}
             </>
           )}
-        </PolicyConfirmPopover>
+        </ConfirmPopover>
       )}
     </div>
   );
