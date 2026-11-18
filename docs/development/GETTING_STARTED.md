@@ -29,9 +29,10 @@ Install these before starting:
 | Homebrew | Used by `make install-deps` |
 | Rust `1.99.1` or newer | The minimum version is declared in [`Cargo.toml`](../../Cargo.toml) |
 | Node.js and npm | Required to build and run the dashboard |
+| Python 3 with `venv` | Used by `make install-deps` for the changelog tooling, which it installs into a repository-local `.venv`. Debian and Ubuntu ship the venv support separately, in `python3-venv` |
 | A WebAuthn-capable browser and authenticator | For example, Safari or Chrome with Touch ID, or a compatible security key |
 
-The dependency target installs the additional Rust tools, native packages, and command-line tools used by the repository, the Python packages the changelog tooling needs (into a repository-local `.venv`), and the Git hooks that run the pre-commit checks.
+`make install-deps`, the macOS dependency target, installs the additional Rust tools, native packages, and command-line tools used by the repository, the Python packages the changelog tooling needs (into a repository-local `.venv`), and the Git hooks that run the pre-commit checks. Only the package installation is macOS-specific; on Linux you install the packages yourself and run the Python and Git hook targets directly, as [Linux (native)](#linux-native) describes.
 
 ## Build And Run
 
@@ -89,6 +90,15 @@ itself is pinned in `rust-toolchain.toml` and matches `rust-version` in `Cargo.t
 installs and selects it on the first cargo command in this repository — there is no separate step,
 and every developer and CI build use the same compiler. Changing it is a deliberate edit to that
 file.
+
+`make install-deps` is the macOS wrapper around the Homebrew packages plus two targets that work on every platform. Run those two yourself:
+
+```bash
+make install-git-hooks
+make install-python-deps
+```
+
+`make install-git-hooks` installs the hooks in [`.pre-commit-config.yaml`](../../.pre-commit-config.yaml), which run gitleaks over your commits; they are the only secret scanning in this repository, so without them nothing scans what you commit. It needs `pre-commit` on PATH first, from your distribution's package or `pipx install pre-commit`; pre-commit fetches gitleaks itself. `make install-python-deps` installs PyYAML into `.venv` for `make lint-changelog`, and names the package to install when `python3` cannot create a virtual environment.
 
 Build and run with the standard target. It calls `cargo build` and the frontend build directly, so it does not require the macOS Homebrew tool checks:
 

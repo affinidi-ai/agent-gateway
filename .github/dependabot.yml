@@ -6,7 +6,9 @@ version: 2
 # github-actions group at the bottom is the exception and batches majors with the
 # rest. An `ignore` entry needs an `update-types:` line on it, because a bare
 # `dependency-name:` is documented as ignoring the dependency for security
-# updates as well.
+# updates as well. The PyYAML pin the changelog tooling uses is maintained by
+# hand in the Makefile and in the three workflows that install it, and no
+# ecosystem here covers it.
 updates:
   # Minor and patch bumps ride in one weekly PR: one Cargo.lock, one CI run, one
   # review. Majors stay ungrouped, but that holds only for crates past 1.0:

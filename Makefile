@@ -82,7 +82,9 @@ DEPS := jq mdbook plantuml pre-commit gitleaks
 # already provides PyYAML and a clone where the venv could not be built.
 # The pin is updated by hand, and the workflows under .github/workflows install
 # the same version.
-VENV := .venv
+# `override` so a command-line VENV cannot point the `--clear` rebuild below at
+# another directory.
+override VENV := .venv
 PYTHON_DEPS := PyYAML==6.0.2
 COVERAGE_THRESHOLD ?= 37
 WWW_DIR ?= www/default
@@ -162,7 +164,7 @@ install-python-deps: ## Install the Python packages the changelog tooling needs,
 		exit 0; \
 	fi; \
 	if ! python3 -c 'import ensurepip' >/dev/null 2>&1; then \
-		echo "$(YELLOW)⚠️  python3 has no venv module, skipping. 'make lint-changelog' will not work.$(NC)"; \
+		echo "$(YELLOW)⚠️  python3 cannot create virtual environments, skipping. 'make lint-changelog' will not work.$(NC)"; \
 		echo "$(YELLOW)   Debian and Ubuntu ship it separately: apt install python3-venv, then re-run 'make install-python-deps'.$(NC)"; \
 		exit 0; \
 	fi; \
@@ -227,6 +229,8 @@ install-git-hooks: ## Install git hooks via pre-commit framework (SKIP_GIT_HOOKS
 			echo "$(RED)   Remove it there, or, if '$$hooks_path' chains to .git/hooks, run 'pre-commit install' by$(NC)"; \
 			echo "$(RED)   hand with the setting removed and put it back afterwards.$(NC)"; \
 		fi; \
+		echo "$(RED)   Set in more than one scope, it has to be unset in each; this lists every file that sets it:$(NC)"; \
+		echo "$(RED)     git config --show-origin --get-all core.hooksPath$(NC)"; \
 		echo "$(RED)   or acknowledge that you manage this repo's hooks yourself:$(NC)"; \
 		echo "$(RED)     make install-git-hooks SKIP_GIT_HOOKS=1$(NC)"; \
 		exit 1; \
@@ -234,26 +238,48 @@ install-git-hooks: ## Install git hooks via pre-commit framework (SKIP_GIT_HOOKS
 	pre-commit install; \
 	echo "$(GREEN)✅ Git hooks installed!$(NC)"
 
-install-deps: install-rust-deps install-python-deps ## Install all local development dependencies (macOS)
+install-deps: ## Install all local development dependencies (macOS)
 	@echo "$(BLUE)📦 Installing dependencies...$(NC)"
-	@# Not silenced: a formula that fails to install is why a later step cannot find
-	@# its tool, and discarding the reason here is what makes that look mysterious.
-	@# Still non-fatal, so one unavailable formula does not abort the whole install.
-	@brew install $(DEPS) || echo "$(YELLOW)⚠️  brew could not install one or more of: $(DEPS). The step that needs a missing tool will say so.$(NC)"
-	@# install-git-hooks exits non-zero when git would ignore the hooks it installs.
-	@# That is worth stopping for on its own, but not worth failing a full dependency
-	@# install over, so it is caught here and reprinted last, where it is still read.
-	@hooks_ok=1; \
+	@# Every step runs in the body and has its result captured, so the run always
+	@# reaches the closing lines and they name whatever is missing. Prerequisites
+	@# would not: `.SHELLFLAGS` runs each recipe with -eu, so a failing
+	@# install-rust-deps would take the target down before anything warned, leaving
+	@# no hooks and no message. Run directly, those targets keep their own
+	@# behaviour; only this target treats them as non-fatal. The order is the order
+	@# of the work: the brew formulas include the pre-commit that the hooks step
+	@# needs. brew is not silenced, because a formula that fails to install is why a
+	@# later step cannot find its tool.
+	@rust_ok=1; \
+	$(MAKE) install-rust-deps || rust_ok=0; \
+	python_ok=1; \
+	venv_ok=1; \
+	$(MAKE) install-python-deps || python_ok=0; \
+	if ! "$(VENV)/bin/python3" -c 'import yaml' >/dev/null 2>&1; then \
+		venv_ok=0; \
+		if ! python3 -c 'import yaml' >/dev/null 2>&1; then python_ok=0; fi; \
+	fi; \
+	brew_ok=1; \
+	brew install $(DEPS) || { \
+		brew_ok=0; \
+		echo "$(YELLOW)⚠️  brew could not install one or more of: $(DEPS). The step that needs a missing tool will say so.$(NC)"; \
+	}; \
+	hooks_ok=1; \
 	$(MAKE) install-git-hooks || hooks_ok=0; \
 	$(SKIP_HOOKS_CHECK); \
-	python_ok=1; \
-	if ! "$(VENV)/bin/python3" -c 'import yaml' >/dev/null 2>&1 && ! python3 -c 'import yaml' >/dev/null 2>&1; then \
-		python_ok=0; \
-	fi; \
-	if [ "$$hooks_ok" = 1 ] && [ "$$skip_hooks" = 0 ] && [ "$$python_ok" = 1 ]; then \
+	if [ "$$rust_ok" = 1 ] && [ "$$python_ok" = 1 ] && [ "$$venv_ok" = 1 ] && [ "$$brew_ok" = 1 ] && [ "$$hooks_ok" = 1 ] && [ "$$skip_hooks" = 0 ]; then \
 		echo "$(GREEN)✅ Dependencies installed!$(NC)"; \
 	else \
 		echo "$(BLUE)📦 Dependency install finished, see the warnings below.$(NC)"; \
+	fi; \
+	if [ "$$rust_ok" = 0 ]; then \
+		echo ""; \
+		echo "$(YELLOW)⚠️  Rust build dependencies were NOT fully installed; see the error above.$(NC)"; \
+		echo "$(YELLOW)   'make verify-rust-deps' names what is missing; re-run 'make install-rust-deps' to retry.$(NC)"; \
+	fi; \
+	if [ "$$brew_ok" = 0 ]; then \
+		echo ""; \
+		echo "$(YELLOW)⚠️  brew could not install one or more of: $(DEPS); see the error above.$(NC)"; \
+		echo "$(YELLOW)   The step that needs a missing tool will say so; install it and re-run 'make install-deps'.$(NC)"; \
 	fi; \
 	if [ "$$hooks_ok" = 0 ]; then \
 		echo ""; \
@@ -268,6 +294,11 @@ install-deps: install-rust-deps install-python-deps ## Install all local develop
 		echo ""; \
 		echo "$(YELLOW)⚠️  Python dependencies were NOT installed; see the warning above.$(NC)"; \
 		echo "$(YELLOW)   'make lint-changelog' will not work until 'make install-python-deps' succeeds.$(NC)"; \
+	elif [ "$$venv_ok" = 0 ]; then \
+		echo ""; \
+		echo "$(YELLOW)⚠️  The $(VENV) install did not complete; see the warning above.$(NC)"; \
+		echo "$(YELLOW)   'make lint-changelog' falls back to the python3 on PATH, which has PyYAML, so it still works.$(NC)"; \
+		echo "$(YELLOW)   Re-run 'make install-python-deps' to repair $(VENV).$(NC)"; \
 	fi
 
 # ==============================================================================
