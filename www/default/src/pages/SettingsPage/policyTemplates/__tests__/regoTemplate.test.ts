@@ -190,6 +190,26 @@ describe('renderTemplate with a single-value setting', () => {
   });
 });
 
+describe('renderTemplate with several settings', () => {
+  const claimValues: PolicyTemplate = {
+    ...threshold,
+    id: 'claim_values',
+    rego: 'package surface.policy\n\nallow if input.jwt[{{claim}}] in {{values}}',
+    parameters: [
+      { key: 'claim', label: 'Claim', kind: 'string', default: 'role' },
+      { key: 'values', label: 'Values', kind: 'string_list', default: ['admin'] },
+    ],
+  };
+
+  it('keeps a placeholder typed inside a value as text', () => {
+    const result = fillTemplate(claimValues, { claim: 'x{{values}}', values: ['admin'] });
+    expect(result.rego).toBe(
+      'package surface.policy\n\nallow if input.jwt["x{{values}}"] in {"admin"}'
+    );
+    expect(result.rego?.match(/\{"admin"\}/g)).toHaveLength(1);
+  });
+});
+
 describe('parseListInput', () => {
   it('splits on commas and new lines and trims each value', () => {
     expect(parseListInput('admin, operator\n auditor ')).toEqual(['admin', 'operator', 'auditor']);

@@ -84,14 +84,14 @@ export interface RenderResult {
 
 export function renderTemplate(template: PolicyTemplate, values: ParameterValues): RenderResult {
   const errors: Record<string, string> = {};
-  let rego = template.rego;
+  const literals = new Map<string, string>();
   for (const param of template.parameters) {
     const result = toRegoLiteral(param, values[param.key] ?? param.default);
     if ('error' in result) {
       errors[param.key] = result.error;
       continue;
     }
-    rego = rego.split(`{{${param.key}}}`).join(result.literal);
+    literals.set(param.key, result.literal);
   }
   for (const param of template.parameters) {
     if (param.kind !== 'integer' || !param.after || errors[param.key] || errors[param.after]) {
@@ -109,7 +109,12 @@ export function renderTemplate(template: PolicyTemplate, values: ParameterValues
       errors[param.key] = `Must be later than ${earlier.label}.`;
     }
   }
-  return { rego: Object.keys(errors).length > 0 ? null : rego, errors };
+  if (Object.keys(errors).length > 0) return { rego: null, errors };
+  const rego = template.rego.replace(
+    /\{\{([^{}]+)\}\}/g,
+    (placeholder, key: string) => literals.get(key) ?? placeholder
+  );
+  return { rego, errors };
 }
 
 /** The decision a module gives when no rule matches; a module without a default denies. */
