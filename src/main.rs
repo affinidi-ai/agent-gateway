@@ -895,7 +895,8 @@ fn log_startup_summary(
     gateway_config: &GatewayConfig,
 ) {
     info!(
-        "Startup configuration: source={}, server_mode={:?}, auth_mode={:?}, secrets_backend={}, log_redaction={}",
+        "Startup configuration: source={}, server_mode={:?}, auth_mode={:?}, secrets_backend={}, log_redaction={}, \
+         delegation_events={}",
         bootstrap_config.channel_config_source,
         bootstrap_config.server_mode,
         bootstrap_config.auth_mode,
@@ -908,8 +909,22 @@ fn log_startup_summary(
             "on"
         } else {
             "off"
+        },
+        if gateway_config
+            .logging
+            .delegation_events
+        {
+            "on"
+        } else {
+            "off"
         }
     );
+    if !gateway_config
+        .logging
+        .delegation_events
+    {
+        warn!("[logging] delegation_events is false: the per-call credential delegation events are written nowhere");
+    }
     if !bootstrap_config
         .logging
         .redaction

@@ -2376,16 +2376,20 @@ than the ceiling. A consent given through a binding lasts the shorter of the bin
 and the connection's.
 
 The two `[credential_policy]` keys reach the consents the vault already holds, not only new
-ones, and the ceiling is also the limit of every provider that sets none. So setting either key
-ends every stored consent older than it: each the next time a request needs it, and the rest at
-the first hourly pass, ten minutes after startup. The grants by binding among them are revoked
-at the vendor, which cannot be undone. No request previews this, as
-[`consent-impact`](#when-a-consent-ends) does for a provider's own limit, so the gateway says it
-when it starts. While either key is set, an active node logs at `WARN`, on the
-`credential_delegation` target, how many stored consents the two keys end that the providers'
-and bindings' own limits would keep, and how many of those are grants by binding. To keep them,
-stop the gateway before the first pass and raise or remove the key; a consent a request needed
-in the meantime has already ended.
+ones: the default limits the consents of every provider that sets no limit of its own, and the
+ceiling limits every consent, those of a provider that sets no limit included when no default
+is set. So setting either key ends the stored consents it limits that are older than it: each
+the next time a request needs it, and the rest at the next hourly pass, the first of which runs
+ten minutes after startup. The grants by binding among them are revoked at the vendor, which
+cannot be undone. No request previews this, as [`consent-impact`](#when-a-consent-ends) does
+for a provider's own limit, so the gateway says it. While either key is set, a node logs at
+`WARN`, on the `credential_delegation` target, when it starts active and each time it becomes
+active, how many stored consents the two keys end that the providers' and bindings' own limits
+would keep, and how many of those are grants by binding. The count is taken at that moment, so
+a consent that passes the limit before the pass runs ends as well, and the grants of a provider
+that cannot be read are left out and named in a second `WARN`. To keep them, stop the gateway
+before the pass and raise or remove the key; a consent a request needed in the meantime has
+already ended.
 
 ### When a consent ends
 
@@ -2420,9 +2424,9 @@ be: `400` for a limit outside the range, or for any limit on a provider nobody c
 consents to counts no consent, since its tokens are service tokens. The credential provider
 editor shows the count as a warning under **Consent time limit**.
 
-A consent time more than five minutes ahead of the gateway's clock, as after a failover to a
-node whose clock lags or a backward clock step, says that a clock is wrong, not that the consent
-ended. Whenever a limit applies, such a credential is not used and is kept:
+A consent time more than five minutes and at most a day ahead of the gateway's clock, as after
+a failover to a node whose clock lags or a backward clock step, says that a clock is wrong, not
+that the consent ended. Whenever a limit applies, such a credential is not used and is kept:
 
 - a caller of an agent-keyed token is asked for consent as a caller with no stored credential
   is;
@@ -2431,8 +2435,12 @@ ended. Whenever a limit applies, such a credential is not used and is kept:
 
 Nothing is deleted and nothing is revoked at the vendor, so the consent is used again once the
 clocks agree. Each such refusal, and each pass that left such consents, logs a `WARN` on the
-`credential_delegation` target. A consent whose time limit cannot be added to its consent time
-counts as ended.
+`credential_delegation` target. The vault list and the Credentials page show such a consent as
+any other; only the log says it is not used. A consent is counted from the time it is dated, so
+one written by a node whose clock ran ahead can be used for its limit from that time, which is
+later than its limit after the person consented by as much as that clock was ahead, a day at
+most. A consent time more than a day ahead is no clock's doing and counts as ended, and so does
+a consent whose time limit cannot be added to its consent time.
 
 The vault list and read (`GET /api/v1/delegation-vault` and `GET /api/v1/delegation-vault/{id}`)
 and the grants report (`GET /api/v1/delegation-vault/grants`) show this end as
@@ -3192,7 +3200,7 @@ A deactivated provider takes no new consent, and nothing else changes:
 | --- | --- |
 | The provider's record | Kept whole, and still editable: an edit keeps the provider deactivated, also one saved at the same moment as the deactivation. Retyped to a type nobody consents to, it is no longer deactivated. Tokens, grants, bindings and audit records keep pointing to it |
 | Credentials people already consented to | Injected and refreshed as before, until they end at their [time limit](#consent-time-limit) or are revoked. A `2026-07-28` consent stays bound to its provider: the deactivation is left out of the provider digest, and `updated_at` is not changed. An edit of the provider still ends its `2026-07-28` consents, as it does while the provider is active, and nobody can give a new one until the provider is activated |
-| A caller with no stored credential, or one whose consent ended | No consent is asked for. The binding records `provider_unavailable` with detail `provider_deactivated` and the request is refused `503`; on the `2026-07-28` path it is refused as unavailable, with no input request. A binding by external consent that has no usable grant answers `connector_unavailable` (`503`) in place of `connect_required`, logged with the reason `provider_deactivated`: nobody is told to start a connect that the connect API refuses |
+| A caller with no stored credential, or one whose consent ended | No consent is asked for. The binding records `provider_unavailable` with detail `provider_deactivated` and the request is refused `503`; on the `2026-07-28` path it is refused as unavailable, with no input request. A binding by external consent that has no usable grant answers `connector_unavailable` (`503`) in place of `connect_required`: nobody is told to start a connect that the connect API refuses. The log keeps the reason the grant was refused for, such as `no_grant` or `consent_expired`, and a `WARN` says the provider is deactivated |
 | A consent link minted earlier, or a consent on its way to the vendor | Refused at the start page, the start POST, the confirmation and the callback with `provider_deactivated` (`400`); nothing is stored and no code is exchanged |
 | The connect API | `POST .../connects` and `.../complete` answer `409` `provider_deactivated`; a refused completion leaves the connect open |
 

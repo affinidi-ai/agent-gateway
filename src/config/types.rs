@@ -105,10 +105,6 @@ fn default_true() -> bool {
     true
 }
 
-fn is_true(value: &bool) -> bool {
-    *value
-}
-
 /// The `integration` section of `gateway.json`: the template placeholder syntax. Events,
 /// variables and endpoint types come from the integration event catalog instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -580,7 +576,7 @@ pub struct LoggingConfig {
     /// log: `token_injected` and the others the gateway logs and never audits
     /// ([`crate::audit::catalog::LOGGED_EVENTS`]). One is written for every
     /// delegated call, so a deployment that does not want them sets `false`.
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    #[serde(default = "default_true", skip_serializing_if = "crate::config::agent_surface::is_true")]
     pub delegation_events: bool,
 
     /// PII / secret redaction rules applied to all log output. Read from gateway.json only.

@@ -4545,7 +4545,7 @@ fn callers_consent_was_given_seconds_ago(
     world: &mut SurfaceWorld,
     seconds: i64,
 ) {
-    move_the_callers_consent_back(world, seconds);
+    move_the_callers_consent(world, chrono::Duration::seconds(-seconds));
 }
 
 /// A consent time ahead of the gateway's clock, as a node whose clock runs
@@ -4555,7 +4555,7 @@ fn callers_consent_is_dated_ahead_of_the_clock(
     world: &mut SurfaceWorld,
     seconds: i64,
 ) {
-    move_the_callers_consent_back(world, -seconds);
+    move_the_callers_consent(world, chrono::Duration::seconds(seconds));
 }
 
 /// The delegation vault is read when the gateway starts, so a scenario stores
@@ -4580,13 +4580,13 @@ fn vault_already_holds_a_consent(
         .stored_consent_age_secs = Some(seconds);
 }
 
-/// Moves the consent of every delegated credential the gateway holds back by
-/// `seconds`: the time it was given, and its end when it has one. The vault is
-/// read from disk on every request, so the gateway sees the moved consent
-/// without a restart.
-fn move_the_callers_consent_back(
+/// Moves the consent of the delegated credential the gateway holds by `by`,
+/// back in time when negative: the time it was given, and its end when it has
+/// one. The vault is read from disk on every request, so the gateway sees the
+/// moved consent without a restart.
+fn move_the_callers_consent(
     world: &mut SurfaceWorld,
-    seconds: i64,
+    by: chrono::Duration,
 ) {
     let vault_dir = world
         .infra
@@ -4595,12 +4595,12 @@ fn move_the_callers_consent_back(
         ._temp_dir
         .path()
         .join("_storage/delegation_vault");
-    let earlier = |token: &serde_json::Value, field: &str| {
+    let moved = |token: &serde_json::Value, field: &str| {
         token[field]
             .as_str()
             .map(|time| {
                 let time = chrono::DateTime::parse_from_rfc3339(time).expect("a stored time is RFC 3339");
-                serde_json::json!((time - chrono::Duration::seconds(seconds)).to_rfc3339())
+                serde_json::json!((time + by).to_rfc3339())
             })
     };
     let mut aged = 0;
@@ -4618,11 +4618,11 @@ fn move_the_callers_consent_back(
         let mut token: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("read a stored delegated credential"))
                 .expect("a stored delegated credential is JSON");
-        token["consent_granted_at"] = earlier(&token, "consent_granted_at").expect("a stored consent time");
-        if let Some(end) = earlier(&token, "consent_expires_at") {
+        token["consent_granted_at"] = moved(&token, "consent_granted_at").expect("a stored consent time");
+        if let Some(end) = moved(&token, "consent_expires_at") {
             token["consent_expires_at"] = end;
         }
-        std::fs::write(&path, serde_json::to_string_pretty(&token).unwrap()).expect("write the aged consent");
+        std::fs::write(&path, serde_json::to_string_pretty(&token).unwrap()).expect("write the moved consent");
         aged += 1;
     }
     assert_eq!(aged, 1, "the gateway must hold exactly one delegated credential");

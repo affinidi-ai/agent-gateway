@@ -346,7 +346,8 @@ tenant still reads what was decided about its providers' delegated access, such 
 `consent_granted`, `consent_expired`, `consent_limited` and `token_revoked`
 ([Delegation audit records](#delegation-audit-records)). An operator who has to hand a tenant
 its per-call events exports the `credential_delegation` log target and filters it by
-`provider_id`.
+`provider_id`. A `consent_required` line that asks for several providers at once names none of
+them, so those lines are told apart by `surface_id`.
 
 A feature-gated management route checks both the bound user's role and the PAT's feature
 scopes. The role-only routes listed in [`RBAC.md`](RBAC.md#permissions-endpoint) check only the

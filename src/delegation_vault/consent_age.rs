@@ -17,6 +17,12 @@ use crate::credential_providers::CredentialProvider;
 /// ([`ConsentAge::AheadOfClock`]).
 const CLOCK_SKEW_SECS: i64 = 300;
 
+/// How far ahead of this gateway's clock a consent time may lie and still be
+/// taken for the work of a clock that runs wrong. One dated further ahead
+/// counts as ended, so no consent is kept for ever, and none is used for
+/// longer than its limit by more than this.
+const MAX_CLOCK_LEAD_SECS: i64 = 24 * 60 * 60;
+
 /// Why a caller who consented before is asked for consent again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -59,9 +65,10 @@ pub enum ConsentAge {
     TooOldForBinding,
     /// Past its end, for every binding: the stored credential is removed.
     Ended,
-    /// Given further ahead of this gateway's clock than clocks may differ, so
-    /// its age cannot be told: the stored credential is not used, and it is
-    /// kept, since a clock that lags is put right and a consent removed is not.
+    /// Given further ahead of this gateway's clock than clocks may differ, by
+    /// a day at most, so its age cannot be told: the stored credential is not
+    /// used, and it is kept, since a clock that lags is put right and a
+    /// consent removed is not.
     AheadOfClock,
 }
 
@@ -174,7 +181,8 @@ impl ConsentLimits {
     /// limit applies, a consent time further ahead of `now` than clocks may
     /// differ is [`ConsentAge::AheadOfClock`]: only this gateway writes the
     /// consent time, so one ahead of its clock says that a clock is wrong,
-    /// not that the consent ended.
+    /// not that the consent ended. One more than a day ahead is no clock's
+    /// doing and counts as ended.
     pub fn judge(
         &self,
         granted_at: DateTime<Utc>,
@@ -186,11 +194,12 @@ impl ConsentLimits {
         if end.is_none() && binding_end.is_none() {
             return ConsentAge::Current;
         }
-        if granted_at > now + Duration::seconds(CLOCK_SKEW_SECS) {
-            return ConsentAge::AheadOfClock;
-        }
-        if end.is_some_and(|end| now >= end) {
+        let lead = granted_at.signed_duration_since(now);
+        if lead > Duration::seconds(MAX_CLOCK_LEAD_SECS) || end.is_some_and(|end| now >= end) {
             return ConsentAge::Ended;
+        }
+        if lead > Duration::seconds(CLOCK_SKEW_SECS) {
+            return ConsentAge::AheadOfClock;
         }
         if binding_end.is_some_and(|end| now >= end) {
             return ConsentAge::TooOldForBinding;
@@ -633,6 +642,12 @@ mod tests {
             "once the clocks agree the consent is used"
         );
         assert_eq!(limits.judge(at(CLOCK_SKEW_SECS + 1), None, at(CLOCK_SKEW_SECS + 3_601)), ConsentAge::Ended);
+        assert_eq!(limits.judge(at(MAX_CLOCK_LEAD_SECS), None, at(0)), ConsentAge::AheadOfClock);
+        assert_eq!(
+            limits.judge(at(MAX_CLOCK_LEAD_SECS + 1), None, at(0)),
+            ConsentAge::Ended,
+            "more than a day ahead is no clock's doing"
+        );
     }
 
     #[test]
@@ -655,11 +670,7 @@ mod tests {
         assert_eq!(limits.expires_at(at(0)), Some(at(0)));
         assert_eq!(limits.judge(at(0), None, at(0)), ConsentAge::Ended);
         let limits = ConsentLimits::under(None, Some(3_600), &unlimited());
-        assert_eq!(
-            limits.judge(DateTime::<Utc>::MAX_UTC, None, at(0)),
-            ConsentAge::AheadOfClock,
-            "a consent time no clock reaches is never used"
-        );
+        assert_eq!(limits.judge(DateTime::<Utc>::MAX_UTC, None, at(0)), ConsentAge::Ended);
     }
 
     #[test]

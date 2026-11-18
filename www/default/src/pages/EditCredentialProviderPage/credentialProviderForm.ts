@@ -325,8 +325,8 @@ export function consentLimitSeconds(
 
 /**
  * Whether saving `limitSecs` can end consents already given: a limit shorter than the stored
- * one or set where none was, or the stored one removed, since the gateway's default may then
- * be the shorter. A longer limit never extends a consent, so it ends none.
+ * one or set where none was, or the stored one removed, since the gateway's default or ceiling
+ * may then be the shorter. A longer limit never extends a consent, so it ends none.
  */
 export function shortensConsentLimit(
   limitSecs: number | null,

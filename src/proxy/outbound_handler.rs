@@ -5954,11 +5954,7 @@ async fn step_inject_external_grant(
             &provider.default_scopes,
         )
     {
-        let refused = crate::delegation_vault::release::Refused {
-            refusal: crate::delegation_vault::release::GrantRefusal::connect_required(&key, subject),
-            reason: "grant_beyond_the_bindings_scopes",
-        }
-        .of(&provider);
+        let refused = crate::delegation_vault::release::Refused::beyond_the_bindings_scopes(&provider, &key, subject);
         return Err(refuse_grant(ctx, refused.refusal, refused.reason));
     }
     let injection = binding

@@ -321,13 +321,20 @@ pub async fn prepare_transit(
 /// `result`, with `stream`, the stream the prepared call opens, ended no
 /// later than the earliest end of the consents whose credentials the call
 /// carries. Every way into this module from a request path goes through
-/// here, so no path opens a stream that outlives a consent it carries.
+/// here, so no path opens a stream that outlives a consent it carries: a
+/// `subscriptions/listen` that carries a consent under a time limit and
+/// comes with no stream to end is refused.
 fn ending_with_its_consents(
     result: Result<ModernDelegationResult, ModernDelegationError>,
     stream: Option<&mut SubscriptionLifetime>,
 ) -> Result<ModernDelegationResult, ModernDelegationError> {
-    if let (Ok(ModernDelegationResult::Prepared(prepared)), Some(stream)) = (&result, stream) {
-        prepared.restrict_to_consents(stream);
+    let Ok(ModernDelegationResult::Prepared(prepared)) = &result else {
+        return result;
+    };
+    match stream {
+        Some(stream) => prepared.restrict_to_consents(stream),
+        None if prepared.listens_under_a_consent_limit() => return Err(ContinuationError::Unavailable.into()),
+        None => {}
     }
     result
 }
@@ -1067,6 +1074,11 @@ impl PreparedDelegation {
         self.injections
             .extend(injections);
         Ok(())
+    }
+
+    /// Whether this call opens a stream and carries a consent that ends.
+    fn listens_under_a_consent_limit(&self) -> bool {
+        self.request.method == "subscriptions/listen" && self.consent_ends_at.is_some()
     }
 
     /// Ends `lifetime`, a stream this call opens, no later than the earliest
@@ -3217,6 +3229,33 @@ mod tests {
             .await;
         let left = left_of_a_stream(unlimited).await;
         assert!(left > 3_500, "a consent under no limit leaves the stream its hour: {left}s");
+    }
+
+    /// A `subscriptions/listen` that carries a consent under a time limit
+    /// must come with the stream it opens: prepared without one, it is
+    /// refused, since nothing would end the stream with the consent. Any
+    /// other call, and a listen under no limit, needs no stream.
+    #[test]
+    fn a_listen_under_a_consent_limit_is_refused_without_its_stream() {
+        let prepared = |method: &str, consent_ends_in: Option<chrono::Duration>| {
+            let mut request = ConsentFixture::tool_call();
+            request.method = method.into();
+            let mut prepared = PreparedDelegation::handling(request, Vec::new());
+            prepared.consent_ends_at = consent_ends_in.map(|ends_in| chrono::Utc::now() + ends_in);
+            Ok(ModernDelegationResult::Prepared(Box::new(prepared)))
+        };
+        let five_minutes = Some(chrono::Duration::minutes(5));
+
+        assert!(matches!(
+            ending_with_its_consents(prepared("subscriptions/listen", five_minutes), None),
+            Err(ModernDelegationError::Continuation(ContinuationError::Unavailable))
+        ));
+        assert!(ending_with_its_consents(prepared("subscriptions/listen", None), None).is_ok());
+        assert!(ending_with_its_consents(prepared("tools/call", five_minutes), None).is_ok());
+
+        let mut stream = SubscriptionLifetime::new(std::time::Duration::from_secs(3_600), None);
+        assert!(ending_with_its_consents(prepared("subscriptions/listen", five_minutes), Some(&mut stream)).is_ok());
+        assert!(stream.time_left().as_secs() <= 300, "the stream it comes with ends with the consent");
     }
 
     /// A consent resumed from its staged record is judged like one read from

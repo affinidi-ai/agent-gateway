@@ -20,9 +20,9 @@
 //! time limit ([`super::consent_age`]) that no request has needed since:
 //! agent-keyed tokens, and grants by binding, which it revokes as well. A
 //! consent given ahead of this gateway's clock is left where it is and
-//! counted. When it starts on an active node, the sweeper logs how many
-//! stored consents the gateway's own default or ceiling ends
-//! ([`Sweeper::gateway_limit_impact`]).
+//! counted. When it starts on an active node, and when its node becomes
+//! active, the sweeper logs how many stored consents the gateway's own
+//! default or ceiling ends ([`Sweeper::gateway_limit_impact`]).
 //!
 //! Grants are found by their file names, one binding at a time: the sweep
 //! reads one of the binding's grants to learn its surface, takes that
@@ -127,13 +127,16 @@ pub async fn consent_impact(
     tried_secs: Option<u64>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<ConsentImpact> {
-    let tokens = vault.list_all().await?;
+    if !provider.takes_consent() {
+        return Ok(ConsentImpact::default());
+    }
     let change = LimitChange {
         before: &|binding_secs| ConsentLimits::of(binding_secs, provider.max_consent_age_secs),
         after: &|binding_secs| ConsentLimits::of(binding_secs, tried_secs),
         ends_bound_consents: true,
     };
-    let (of_tokens, of_grants) = impact_of(vault, surfaces, provider, &tokens, &change, now).await?;
+    let of_tokens = token_impact(provider, &vault.list_all().await?, &change, now);
+    let of_grants = grant_impact(vault, surfaces, provider, &change, now).await?;
     Ok(ConsentImpact {
         active_consents: of_tokens.active_consents + of_grants.active_consents,
         ending_consents: of_tokens.ending_consents + of_grants.ending_consents,
@@ -150,27 +153,25 @@ struct LimitChange<'change> {
     ends_bound_consents: bool,
 }
 
-/// The consents to `provider` that have not ended `before` the `change`, and
-/// how many of them it ends, as of `now`: among `tokens`, its agent-keyed
-/// ones, and then those of its grants by binding that `surfaces` still serve.
-async fn impact_of(
-    vault: &dyn DelegationVaultStorage,
-    surfaces: Option<&dyn AgentSurfaceStore>,
+/// The agent-keyed consents to `provider` among `tokens` that have not ended
+/// before the `change`, and how many of them it ends, as of `now`. A provider
+/// nobody consents to has none.
+fn token_impact(
     provider: &CredentialProvider,
     tokens: &[super::DelegationToken],
     change: &LimitChange<'_>,
     now: DateTime<Utc>,
-) -> anyhow::Result<(ConsentImpact, ConsentImpact)> {
-    let (mut of_tokens, mut of_grants) = (ConsentImpact::default(), ConsentImpact::default());
+) -> ConsentImpact {
+    let mut impact = ConsentImpact::default();
     if !provider.takes_consent() {
-        return Ok((of_tokens, of_grants));
+        return impact;
     }
     let (before, after) = ((change.before)(None), (change.after)(None));
     for token in tokens
         .iter()
         .filter(|token| token.credential_provider_id == provider.id)
     {
-        of_tokens.count(
+        impact.count(
             !token_consent_ended(before, token, now),
             (change.ends_bound_consents
                 && token
@@ -179,8 +180,22 @@ async fn impact_of(
                 || token_consent_ended(after, token, now),
         );
     }
+    impact
+}
+
+/// The grants by binding of `provider` that `surfaces` still serve and that
+/// have not ended before the `change`, and how many of them it ends, as of
+/// `now`. Only a provider with external consent has any.
+async fn grant_impact(
+    vault: &dyn DelegationVaultStorage,
+    surfaces: Option<&dyn AgentSurfaceStore>,
+    provider: &CredentialProvider,
+    change: &LimitChange<'_>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<ConsentImpact> {
+    let mut impact = ConsentImpact::default();
     let Some(surfaces) = surfaces.filter(|_| provider.is_external_consent()) else {
-        return Ok((of_tokens, of_grants));
+        return Ok(impact);
     };
     let mut read = HashMap::new();
     for grant in vault
@@ -201,12 +216,12 @@ async fn impact_of(
             continue;
         };
         let binding_secs = crate::identity::handlers::surface_grants::binding_max_consent_age(surface, &grant);
-        of_grants.count(
+        impact.count(
             !grant_consent_ended((change.before)(binding_secs), &grant, now),
             grant_consent_ended((change.after)(binding_secs), &grant, now),
         );
     }
-    Ok((of_tokens, of_grants))
+    Ok(impact)
 }
 
 /// The stored consents that the gateway's own default or ceiling ends and the
@@ -267,18 +282,6 @@ fn grant_limits(
     ConsentLimits::of(crate::identity::handlers::surface_grants::binding_max_consent_age(surface, grant), provider_secs)
 }
 
-/// Whether the consent given at `granted_at`, stored with the end
-/// `stored_end`, lies ahead of this gateway's clock under `limits`: the
-/// hourly pass leaves such a consent where it is.
-fn consent_ahead_of_clock(
-    limits: ConsentLimits,
-    granted_at: DateTime<Utc>,
-    stored_end: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-) -> bool {
-    limits.judge(granted_at, stored_end, now) == ConsentAge::AheadOfClock
-}
-
 /// Whether `grant` is one `surface` serves under the id this gateway derives
 /// for it, with `default_scopes` its provider's. Any other is the daily
 /// sweep's to remove.
@@ -327,8 +330,9 @@ impl Sweeper {
     /// Try again the pending revocations kept, at once while the node is
     /// active and again each time it becomes active, then run the sweep every
     /// [`SWEEP_INTERVAL`], the first after [`FIRST_SWEEP_DELAY`], while the
-    /// node is active. A node that starts active first says how many stored
-    /// consents the gateway's own limits end ([`Self::warn_of_gateway_limits`]).
+    /// node is active. A node that starts active, and one that becomes active,
+    /// first says how many stored consents the gateway's own limits end
+    /// ([`Self::warn_of_gateway_limits`]).
     pub fn spawn(self) {
         tokio::spawn(async move {
             let mut mode_changes = crate::server::mode::subscribe_mode_changes();
@@ -357,6 +361,7 @@ impl Sweeper {
                         listening = !matches!(change, Err(tokio::sync::broadcast::error::RecvError::Closed));
                         if became_active(&change) && !crate::server::mode::is_standby() {
                             self.retry_pending_logged().await;
+                            self.warn_of_gateway_limits().await;
                         }
                         continue;
                     }
@@ -488,7 +493,9 @@ impl Sweeper {
 
     /// The stored consents that the gateway's own default or ceiling ends, as
     /// of `now`, and the limits of their providers and bindings would keep:
-    /// those of every provider a person consents to. Nothing is changed.
+    /// those of every provider a person consents to. The grants of a provider
+    /// that cannot be read are left out and logged, so the rest is still
+    /// counted. Nothing is changed.
     pub async fn gateway_limit_impact(
         &self,
         now: DateTime<Utc>,
@@ -503,19 +510,26 @@ impl Sweeper {
                 after: &|binding_secs| ConsentLimits::of(binding_secs, provider.max_consent_age_secs),
                 ends_bound_consents: false,
             };
-            let (of_tokens, of_grants) =
-                impact_of(self.vault.as_ref(), Some(self.surfaces.as_ref()), &provider, &tokens, &change, now).await?;
-            impact.tokens += of_tokens.ending_consents;
-            impact.grants += of_grants.ending_consents;
+            impact.tokens += token_impact(&provider, &tokens, &change, now).ending_consents;
+            match grant_impact(self.vault.as_ref(), Some(self.surfaces.as_ref()), &provider, &change, now).await {
+                Ok(of_grants) => impact.grants += of_grants.ending_consents,
+                Err(error) => tracing::warn!(
+                    target: "credential_delegation",
+                    provider_id = %provider.id,
+                    error = %error,
+                    "Failed to read a provider's grants to count those the gateway's consent time limits end; \
+                     they are left out of the count"
+                ),
+            }
         }
         Ok(impact)
     }
 
     /// While `[credential_policy]` sets a default or a ceiling on consents,
-    /// logs how many stored consents those two settings end. They reach the
-    /// consents already stored, no request previews them, and a grant revoked
-    /// at the vendor cannot be given back, so the operator is told before the
-    /// first pass.
+    /// logs how many stored consents those two settings end, as counted now.
+    /// They reach the consents already stored, no request previews them, and
+    /// a grant revoked at the vendor cannot be given back, so the operator is
+    /// told before the next pass.
     async fn warn_of_gateway_limits(&self) {
         let policy = crate::config::credential_policy::credential_policy();
         if policy
@@ -543,9 +557,8 @@ impl Sweeper {
                 max_consent_age_ceiling_secs = ?policy.max_consent_age_ceiling_secs,
                 ending_tokens = impact.tokens,
                 ending_grants = impact.grants,
-                first_pass_in_secs = FIRST_SWEEP_DELAY.as_secs(),
                 "The gateway's consent time limits end stored consents that their providers' own limits would \
-                 keep: each the next time a request needs it, the rest at the first hourly pass, and the grants \
+                 keep: each the next time a request needs it, the rest at the next hourly pass, and the grants \
                  by binding among them are revoked at the vendor. To keep them, stop the gateway before that \
                  pass and raise or remove the limit"
             ),
@@ -667,12 +680,13 @@ impl Sweeper {
                 }
             };
             let limits = ConsentLimits::of_provider(provider.as_ref());
-            if consent_ahead_of_clock(limits, token.consent_granted_at, token.consent_expires_at, now) {
-                report.consents_ahead_of_clock += 1;
-                continue;
-            }
-            if !token_consent_ended(limits, &token, now) {
-                continue;
+            match limits.judge(token.consent_granted_at, token.consent_expires_at, now) {
+                ConsentAge::Ended => {}
+                ConsentAge::AheadOfClock => {
+                    report.consents_ahead_of_clock += 1;
+                    continue;
+                }
+                ConsentAge::Current | ConsentAge::TooOldForBinding => continue,
             }
             let ended_at = limits.ends_at(token.consent_granted_at, token.consent_expires_at);
             let removed = consent_age::end_consent(self.vault.as_ref(), &token, ended_at, "sweep", None, |event| {
@@ -730,12 +744,13 @@ impl Sweeper {
                     .as_ref()
                     .and_then(|provider| provider.max_consent_age_secs),
             );
-            if consent_ahead_of_clock(limits, grant.created_at, grant.consent_expires_at, now) {
-                report.consents_ahead_of_clock += 1;
-                continue;
-            }
-            if !grant_consent_ended(limits, &grant, now) {
-                continue;
+            match limits.judge(grant.created_at, grant.consent_expires_at, now) {
+                ConsentAge::Ended | ConsentAge::TooOldForBinding => {}
+                ConsentAge::AheadOfClock => {
+                    report.consents_ahead_of_clock += 1;
+                    continue;
+                }
+                ConsentAge::Current => continue,
             }
             let ended_at = limits.ends_for_binding_at(grant.created_at, grant.consent_expires_at);
             if let Some(provider) = provider {

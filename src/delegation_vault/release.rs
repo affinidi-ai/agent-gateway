@@ -276,15 +276,35 @@ fn unavailable(reason: &'static str) -> Refused {
 impl Refused {
     /// What the caller of a binding of `provider` is told. A deactivated
     /// provider takes no new connect, so a refusal that asks for one says the
-    /// connection is unavailable instead.
+    /// connection is unavailable instead, which is logged. The reason stays
+    /// the one the grant was refused for, so what ended a grant is never
+    /// recorded as a deactivation.
     pub fn of(
         self,
         provider: &CredentialProvider,
     ) -> Self {
-        if provider.is_deactivated() && matches!(self.refusal, GrantRefusal::ConnectRequired { .. }) {
-            return unavailable("provider_deactivated");
+        if !provider.is_deactivated() || !matches!(self.refusal, GrantRefusal::ConnectRequired { .. }) {
+            return self;
         }
-        self
+        tracing::warn!(
+            target: "credential_delegation",
+            surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
+            provider_id = %provider.id,
+            reason = self.reason,
+            "The provider is deactivated and takes no new connect - the caller is told the connection is \
+             unavailable, not to connect"
+        );
+        unavailable(self.reason)
+    }
+
+    /// The refusal of a grant that was asked for beyond the scopes its
+    /// binding permits now, as a caller of `provider` is told.
+    pub fn beyond_the_bindings_scopes(
+        provider: &CredentialProvider,
+        key: &GrantKey,
+        subject: GrantSubject,
+    ) -> Self {
+        refused(GrantRefusal::connect_required(key, subject), "grant_beyond_the_bindings_scopes").of(provider)
     }
 }
 
@@ -1526,7 +1546,7 @@ mod consent_end_tests {
             .await
             .expect_err("there is no grant");
         assert_eq!(deactivated.refusal, GrantRefusal::ConnectorUnavailable);
-        assert_eq!(deactivated.reason, "provider_deactivated");
+        assert_eq!(deactivated.reason, "no_grant", "the reason stays the one the grant was refused for");
 
         vault
             .store_grant(grant(&key, "access"))
@@ -1537,5 +1557,31 @@ mod consent_end_tests {
             .await
             .expect("a grant given before the deactivation is released");
         assert_eq!(released.access_token, "access");
+    }
+
+    /// A grant asked for beyond its binding's scopes is told to connect again
+    /// only while its provider takes a connect. Any other refusal is left as
+    /// it is, whatever the provider's state.
+    #[test]
+    fn a_refusal_asks_for_a_connect_only_while_the_provider_takes_one() {
+        let key = key();
+        let mut provider = crate::delegation_vault::revocation::tests::provider(None, "none", None);
+        let beyond = |provider: &_| super::Refused::beyond_the_bindings_scopes(provider, &key, GrantSubject::Owner);
+
+        assert_eq!(beyond(&provider).refusal, GrantRefusal::connect_required(&key, GrantSubject::Owner));
+
+        provider.deactivated_at = Some(chrono::Utc::now());
+        let deactivated = beyond(&provider);
+        assert_eq!(deactivated.refusal, GrantRefusal::ConnectorUnavailable);
+        assert_eq!(deactivated.reason, "grant_beyond_the_bindings_scopes");
+        let scope = super::Refused {
+            refusal: GrantRefusal::ScopeInsufficient { scope: None },
+            reason: "scope_insufficient",
+        };
+        assert_eq!(
+            scope.clone().of(&provider),
+            scope,
+            "a missing scope is the vendor's answer, not a request to connect"
+        );
     }
 }
