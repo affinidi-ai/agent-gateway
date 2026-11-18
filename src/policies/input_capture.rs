@@ -438,11 +438,12 @@ pub fn mask_credentials(value: &mut Value) {
 /// JWT that follow it in an SD-JWT. A header starting with `{` encodes to `ey` or `ew`, and
 /// one starting with JSON whitespace (space, tab, newline or carriage return) before the `{`
 /// to `IA`, `IC`, `IH`, `CQ`, `CS`, `CX`, `Cg`, `Ci`, `Cn`, `DQ`, `DS` or `DX`. The header
-/// takes `=` only as trailing padding, so `CSRF=` in front of a JWT is not part of it;
-/// [`is_jwt_header`] decides whether the candidate is one.
+/// takes `=` only as trailing padding, so `CSRF=` in front of a JWT is not part of it. A
+/// word joined to the header by `-`, `_` or `.`, as in `session_`, is taken as glue up to the
+/// last joiner a header can follow; [`is_jwt_header`] decides whether the candidate is one.
 static EMBEDDED_JWT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"\b((?:e[wy]|I[ACH]|C[QSXgin]|D[QSX])[A-Za-z0-9_-]+={0,2})\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]*(?:~[A-Za-z0-9_=.-]*)*",
+        r"\b([A-Za-z0-9_.-]*[-_.])?((?:e[wy]|I[ACH]|C[QSXgin]|D[QSX])[A-Za-z0-9_-]+={0,2})\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]*(?:~[A-Za-z0-9_=.-]*)*",
     )
     .expect("valid JWT pattern")
 });
@@ -494,7 +495,12 @@ fn mask_text(text: &str) -> Option<String> {
         .into_owned();
     let masked = EMBEDDED_JWT
         .replace_all(&masked, |caps: &regex::Captures<'_>| {
-            if is_jwt_header(&caps[1]) {
+            let glue = caps
+                .get(1)
+                .map_or("", |glue| glue.as_str());
+            if is_jwt_header(&caps[2]) {
+                format!("{glue}{REDACTED}")
+            } else if !glue.is_empty() && is_jwt_header(&format!("{glue}{}", &caps[2])) {
                 REDACTED.to_string()
             } else {
                 caps[0].to_string()
@@ -1478,6 +1484,57 @@ mod tests {
         assert_eq!(parts[5]["text"], "Cisco.com.au CQRS.handler.ts ICE.v2.bak");
     }
 
+    #[test]
+    fn a_jwt_joined_to_the_word_before_it_is_masked() {
+        use base64::Engine;
+        let encode = |json: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+        let spaced = format!("{}.{}.c2ln", encode(r#" {"alg":"HS256"}"#), encode(r#"{"sub":"x"}"#));
+        let cases = [
+            (format!("Cisco-{JWT}"), format!("Cisco-{REDACTED}")),
+            (format!("X-CSRF-Token-{JWT}"), format!("X-CSRF-Token-{REDACTED}")),
+            (format!("session_{JWT}"), format!("session_{REDACTED}")),
+            (format!("Cisco.{JWT}"), format!("Cisco.{REDACTED}")),
+            (format!("eyes-{JWT}"), format!("eyes-{REDACTED}")),
+            (format!("Cisco-{spaced}"), format!("Cisco-{REDACTED}")),
+            (format!("session_{spaced}"), format!("session_{REDACTED}")),
+            (format!("Cisco.{spaced}"), format!("Cisco.{REDACTED}")),
+            (
+                format!("the cookie session_{JWT}~WyJzIiwibiJd~ expired"),
+                format!("the cookie session_{REDACTED} expired"),
+            ),
+            (format!("the token {JWT}~WyJzIiwibiJd~ expired"), format!("the token {REDACTED} expired")),
+        ];
+        for (text, expected) in cases {
+            let (value, _) = masked(&text);
+
+            assert_eq!(value, Value::String(expected), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_jwt_whose_header_holds_a_joiner_before_a_header_like_run_is_masked() {
+        use base64::Engine;
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"kid":"? "}"#);
+        assert_eq!(header, "eyJraWQiOiI_ICJ9");
+        let jwt = format!("{header}.eyJzdWIiOiJ4In0.c2ln");
+
+        assert_eq!(masked(&format!("see {jwt} here")).0, Value::String(format!("see {REDACTED} here")));
+        assert_eq!(masked(&format!("CSRF={jwt}")).0, Value::String(format!("CSRF={REDACTED}")));
+    }
+
+    #[test]
+    fn dotted_words_joined_to_the_word_before_them_are_kept() {
+        for text in [
+            "v1-2.3.4",
+            "build-2024.11.17",
+            "X-Request-Id=abc.def.ghi",
+            "key=value.with.dots",
+            "Cisco-Ci.a.b session_eyes.on.it",
+        ] {
+            assert_eq!(masked(text).0, Value::String(text.to_string()));
+        }
+    }
+
     fn masked(text: &str) -> (Value, std::time::Duration) {
         let mut value = Value::String(text.to_string());
         let started = std::time::Instant::now();
@@ -1491,12 +1548,25 @@ mod tests {
         let tildes = "Ci.a.b~".repeat(150_000);
         let mixed = format!("{}{}x.a.b", "Ci.a.b~".repeat(75_000), "Ci-".repeat(175_000));
 
-        for text in [dashes, tildes, mixed] {
+        let glued_dashes = format!("{}x.a.b", "a-".repeat(500_000));
+        let glued_dots = format!("{}b.c", "a.".repeat(500_000));
+
+        for text in [dashes, tildes, mixed, glued_dashes, glued_dots] {
             let (value, elapsed) = masked(&text);
 
             assert!(elapsed < std::time::Duration::from_secs(2), "took {elapsed:?}");
             assert_eq!(value, Value::String(text));
         }
+    }
+
+    #[test]
+    fn a_jwt_after_a_megabyte_glued_run_is_masked_in_linear_time() {
+        let glue = "a-".repeat(500_000);
+
+        let (value, elapsed) = masked(&format!("{glue}{JWT}"));
+
+        assert!(elapsed < std::time::Duration::from_secs(2), "took {elapsed:?}");
+        assert_eq!(value, Value::String(format!("{glue}{REDACTED}")));
     }
 
     #[test]

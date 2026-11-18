@@ -27,8 +27,8 @@ changes:
         such as "Basic authentication" is kept), and every query value in the request path and in
         any absolute URL is redacted, as are the user name and password in any absolute URL. A JWT
         is recognised by its header decoding to a JSON object, whatever whitespace that JSON holds,
-        including before its opening brace. A JWT after a word and an equals sign, as in CSRF=...,
-        is masked too. The deny reason and evaluation error are masked the same way as the input.
+        including before its opening brace. A JWT joined to the word before it, as in CSRF=... or
+        session_..., is masked too. The deny reason and evaluation error are masked the same way as the input.
         A URL fragment holding name=value parameters, as an OAuth redirect's does, is masked like a
         query. The operator's log redaction rules are then applied to every captured string and to
         the reason and error, so their rules that match a value, such as credential assignments

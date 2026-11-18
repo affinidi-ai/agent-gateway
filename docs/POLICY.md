@@ -200,9 +200,8 @@ named like a credential (the [credential names](CONFIGURATION_REFERENCE.md#log-r
 redaction, such as `token` or `api_key`), any JWT (three dot-separated base64url segments whose
 first decodes to a JSON object), and the token of any `Bearer` or `Basic`
 authorization value, also inside longer text (`Authorization: Bearer <redacted> please`). A
-JWT after a word and an equals sign, as in `CSRF=<redacted>`, is masked too; one joined to the
-word before it by `-`, `_` or `.` can be taken as part of that word and is then sent as it is. A
-`Bearer` token is one of letters, digits or `-._~+/=` that is at least 12 characters long, or at
+JWT joined to the word before it, as in `CSRF=<redacted>` or `session_<redacted>`, is masked
+too. A `Bearer` token is one of letters, digits or `-._~+/=` that is at least 12 characters long, or at
 least 6 with a digit or one of those symbols; a `Basic` token is one that decodes as base64 to
 `user:password`. Message text such as `Basic authentication` or `Bearer arms` is kept. In every
 absolute URL in the input, query parameter names are kept and every query value becomes
