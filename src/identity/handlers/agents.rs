@@ -2638,10 +2638,7 @@ mod tests {
 
         assert_eq!(ids(chosen_card_surfaces(&surfaces, None).expect("all")), ["s1", "s2"]);
         assert_eq!(ids(chosen_card_surfaces(&surfaces, Some("s2")).expect("one")), ["s2"]);
-        assert!(matches!(
-            chosen_card_surfaces(&surfaces, Some("s3")),
-            Err(AgentApiError::SurfaceUnavailable)
-        ));
+        assert!(matches!(chosen_card_surfaces(&surfaces, Some("s3")), Err(AgentApiError::SurfaceUnavailable)));
     }
 
     #[test]
