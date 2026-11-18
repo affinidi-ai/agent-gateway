@@ -72,9 +72,10 @@ routes that return log lines give them only to an appliance-wide caller (see [`R
 A connection listens to a surface's policy input with a `capture_policy_input` command and stops
 with `stop_capturing_policy_input`, each naming the `surface_id`; the gateway answers each with a
 `policy_input_capture` message saying whether the connection now listens, and why not when it
-refuses. Listening needs a session whose user holds `surfaces.edit` and `policies.edit`. The
-permission is checked again on each keep-alive ping, and a connection that loses it stops
-listening to every surface and is told so, and the captures still queued for it are dropped. Each
+refuses. Listening needs the `policy_input_capture` feature flag on and a session whose user holds
+`surfaces.edit` and `policies.edit`. The flag and the permissions are checked again on each
+keep-alive ping, and a connection that loses either stops listening to every surface and is told
+so, and the captures still queued for it are dropped. Each
 listening connection has its own queue of at most 64 `PolicyInputCaptured` updates; a capture that
 finds it full is dropped for that connection only, so a busy listened surface never reaches the
 broadcast or another connection. The connection is told how many it missed with a
@@ -1013,6 +1014,22 @@ for when a save changes a pin.
   carries `surface_id` and `channel_name`. A save that leaves the list as it was, a new surface
   without origins, and the load-time normalisation of a stored surface record none. Each is also
   logged at info.
+
+**Policy input capture events.** Raised by the dashboard WebSocket when a user starts or stops
+listening to a surface's policy input (group Policies); see
+[`POLICY.md`](POLICY.md#policy-input-capture).
+
+- `policy_input_capture_started`: a user started listening to a surface's policy input. `actor`
+  names the user, and the top level carries `surface_id`. A refused listen records nothing.
+- `policy_input_capture_stopped`: a listen ended. `reason` is `stopped` (the user stopped it),
+  `connection_closed` (the dashboard connection closed), `session_ended`, `permission_missing`
+  (the user lost `surfaces.edit` or `policies.edit`) or `turned_off` (the `policy_input_capture`
+  feature flag was turned off), the last three found at a keep-alive check. `actor` and
+  `surface_id` are as on the start.
+
+Each is recorded wherever the other is selected, whether or not it is selected itself
+(`RECEIVED_WITH` in `src/audit/catalog.rs`), so a sink never holds a start without its end. Each
+is also logged at info.
 
 A `2026-07-28` MCP proxy tool call whose path parameter makes a URL segment `.` or `..` (or an ambiguous one above a non-root `base_url` path) is answered `400` with `-32602` "Invalid tool arguments" before anything is sent, and writes no request event.
 

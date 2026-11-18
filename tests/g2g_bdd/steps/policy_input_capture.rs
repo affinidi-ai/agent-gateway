@@ -4,6 +4,21 @@ use serde_json::Value;
 use crate::bdd_support::dashboard_socket::DashboardSocket;
 use crate::world::G2gWorld;
 
+#[given(expr = "policy input capture is turned on on gateway {int}")]
+pub async fn capture_turned_on(
+    world: &mut G2gWorld,
+    gw_index: usize,
+) {
+    world.start().await;
+    world
+        .harness()
+        .gw(gw_index)
+        .admin
+        .set_feature_flags(&[("policy_input_capture", true)])
+        .await
+        .expect("turn policy input capture on");
+}
+
 #[given(expr = "the operator listens to the policy input of gateway {int} surface {string}")]
 pub async fn operator_listens(
     world: &mut G2gWorld,

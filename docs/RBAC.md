@@ -121,8 +121,10 @@ its own tenant: when only an appliance-wide surface could reach it, the answer i
 ## Policy input capture
 
 Listening to a surface's policy input on the dashboard WebSocket needs both `surfaces.edit` and
-`policies.edit`; a session missing either is refused, and one that loses either stops listening at
-the next keep-alive ping. Only the listening session receives the captured policy input. See [`POLICY.md`](POLICY.md#policy-input-capture).
+`policies.edit`, and the `policy_input_capture` system feature flag on; a session missing either
+permission is refused, and one that loses either stops listening at the next keep-alive ping.
+Turning the flag on or off needs `settings.edit`, like any system setting. Only the listening
+session receives the captured policy input. See [`POLICY.md`](POLICY.md#policy-input-capture).
 
 ## Payments admin API
 

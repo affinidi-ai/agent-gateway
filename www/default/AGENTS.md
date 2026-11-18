@@ -634,6 +634,14 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   payload history. Its header holds the **Listen to policy input** button
   (`monitoring/PolicyInputCaptureControl.tsx`), shown only on a saved surface (never while
   creating). The Monitoring view itself has only the Capture button.
+- The button is shown only while the `policy_input_capture` feature flag is on (see _Feature
+  flags_). While it is off, the card shows no button, no empty-state hint and no no-policy note;
+  an `alert alert-info` (`policy-input-capture-off`) says "Policy input capture is turned off on
+  this gateway. An administrator can turn it on under Settings › Admin › Feature Flags
+  (`policy_input_capture`)." Evaluations already in the list stay. Until the settings have loaded
+  the card shows neither the button nor that notice. When the gateway's flag is turned off while
+  the page still reads it on, the gateway's refusal (`policy input capture is turned off`) ends
+  listening and shows as the inline error, like any other refusal.
 - Capture is live and lasts only while the view is open: the button turns into **Stop
   listening**, and an effect keyed on the surface and the listening state sends
   `capture_policy_input` (and its cleanup `stop_capturing_policy_input`) on the dashboard
@@ -700,6 +708,7 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
 | Warning line, skipped notice                    | `policy-input-capture-warning`, `policy-input-capture-skipped`         |
 | Help and error                                  | `field-help-policy-input-capture`, `policy-input-capture-error`        |
 | Card, empty state, no-policy note, row          | `policy-input-capture-card`, `policy-input-capture-empty`, `policy-input-capture-no-policy`, `policy-input-capture-row` |
+| Turned-off notice                               | `policy-input-capture-off`                                             |
 | Reason, input toggle, input, copy               | `policy-input-capture-reason`, `policy-input-capture-toggle`, `policy-input-capture-input`, `policy-input-capture-copy` |
 | Policy the slot ran                             | `policy-input-capture-policy`                                          |
 
@@ -1345,7 +1354,9 @@ The delegation categories are the ones the gateway audits: `consent_granted`, `c
 (`token_injected`, `token_refreshed`, `refresh_failed`, `consent_required`, `token_not_found`
 and the elicitation events) is written to its log, or nowhere while `[logging] delegation_events`
 is `false`, and is no audit event, so the Audit Log offers no category for it and no link selects it. A record of one that an older gateway
-audited is still shown, with its label (`categoryLabel`).
+audited is still shown, with its label (`categoryLabel`). A category `categoryLabel` has no label
+for is named in title case from its event name (`auth_failed` as "Auth Failed"), with `API`, `DID`,
+`JWT`, `MCP` and `VP` in capitals, never as the raw lowercase name.
 
 - The Audit Log offers each delegation category in its Category filter, labels and narrates
   `consent_expired` ("Consent expired", a warning, apart from a revocation) and
@@ -2279,6 +2290,12 @@ Settings → **Admin** → **Feature Flags** is a table of the shared `FeatureFl
   payment gateway already exists and no operator has set it either way. The Connections permission
   list (`connectionsPermissions`) is shared by the route and the sidebar. When the settings cannot
   be loaded, `FALLBACK_SETTINGS` (every flag off) is used so the pages waiting for them render.
+- `policy_input_capture` (`settings-flag-policy_input_capture`) is default off and lets users
+  with `surfaces.edit` and `policies.edit` listen to a surface's policy input on its Capture
+  view (see _Policy input capture_). Read it through `utils/featureFlags.ts`
+  (`policyInputCaptureEnabled`, `usePolicyInputCaptureFlag`), never inline. The gateway checks the
+  same system flag: it refuses a listen while the flag is off and stops every listen at the next
+  keep-alive check after it is turned off.
 - `mediator_federation` is default off and experimental. On, the Connect via OOB wizard's
   details step (`gateway-add-via-oob/EnterDetailsStep.tsx`) shows a mediator picker
   (`wizard-oob-acceptor-mediator`) that lists only mediators with `status === 'active'` and

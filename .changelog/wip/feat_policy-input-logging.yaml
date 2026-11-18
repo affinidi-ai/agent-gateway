@@ -51,6 +51,25 @@ changes:
         faster than the dashboard could receive them. On a surface with no policy yet, it says a
         request policy must be added before there is anything to capture. It is for developing and
         testing policies only.
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Keep policy input capture off until an administrator turns its feature flag on
+      description: >-
+        Policy input capture now needs the policy_input_capture system feature flag, off by
+        default and set under Settings, Admin, Feature Flags by a user with settings.edit. A user's
+        own settings never turn it on. While it is off, the gateway refuses to listen with "policy
+        input capture is turned off" and captures nothing; turning it off stops new captures at once
+        and ends every listen at the next keep-alive check. The Capture view's Policy Input card
+        shows no Listen button and says capture is turned off. Watching live caller data is a
+        deliberate choice per gateway, never available by default.
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Record each start and stop of a policy input capture in the VP Audit Log
+      description: >-
+        Starting to listen to a surface's policy input records policy_input_capture_started, and
+        each end records policy_input_capture_stopped with its reason (stopped, connection_closed,
+        session_ended, permission_missing or turned_off), both naming the user and the surface, in
+        the VP Audit Log and any Governance Audit integration that selects them. Selecting either
+        records both. A refused listen records nothing. Who watched which surface's live policy
+        input, and for how long, is now on record.
   changed:
     - timestamp: '2026-11-17T00:00:00Z'
       title: Close a dashboard connection whose client stops reading for 10 seconds
@@ -60,6 +79,13 @@ changes:
         connection open indefinitely and hold back the keep-alive checks of its session and
         permissions.
   fixed:
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Name every Audit Log event in title case
+      description: >-
+        An Audit Log event the dashboard has no label for, such as auth_failed, rate_limited or
+        policy_input_capture_started, showed as its raw lowercase name ("auth failed"). It is now
+        named in title case ("Auth Failed"), with acronyms such as MCP and VP in capitals, like the
+        events that have a label.
     - timestamp: '2026-11-13T00:00:00Z'
       title: Keep surface ids whole in redacted logs so their Monitoring log shows them
       description: >-

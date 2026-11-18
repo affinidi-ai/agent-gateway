@@ -13,6 +13,12 @@ use crate::world::SurfaceWorld;
 const THE_OPERATOR: &str = "";
 /// Longer than the dashboard WebSocket's 30 s keep-alive interval.
 const KEEP_ALIVE_WAIT: Duration = Duration::from_secs(40);
+/// The system feature flag that allows policy input capture.
+const CAPTURE_FLAG: &str = "policy_input_capture";
+/// Why a listen is refused or stopped while policy input capture is turned off.
+const TURNED_OFF: &str = "policy input capture is turned off";
+/// Why a listen is stopped once the operator's dashboard session ends.
+const SESSION_ENDED: &str = "your dashboard session has ended; sign in again";
 
 /// Open the dashboard WebSocket as `operator`, once.
 async fn watch(
@@ -298,23 +304,21 @@ async fn operator_session_ends(
     assert!(ended.status < 300, "signing operator '{operator}' out: {}", ended.body);
 }
 
-#[then(
-    expr = "operator {string} is told by the next keep-alive check that listening to surface {string} stopped because the session ended"
-)]
-async fn operator_told_listening_stopped(
-    world: &mut SurfaceWorld,
-    operator: String,
-    surface_name: String,
+/// Wait up to one keep-alive check for `operator` to be told that listening to `surface_name`
+/// stopped with `error`.
+async fn wait_until_told_listening_stopped(
+    world: &SurfaceWorld,
+    operator: &str,
+    surface_name: &str,
+    error: &str,
 ) {
-    let surface_id = tracked_surface_id(world, &surface_name);
+    let surface_id = tracked_surface_id(world, surface_name);
     let stopped = |answer: &Value| {
-        answer["surface_id"] == surface_id.as_str()
-            && answer["listening"] == false
-            && answer["error"] == "your dashboard session has ended; sign in again"
+        answer["surface_id"] == surface_id.as_str() && answer["listening"] == false && answer["error"] == error
     };
     let deadline = tokio::time::Instant::now() + KEEP_ALIVE_WAIT;
     while tokio::time::Instant::now() < deadline {
-        if received_of(world, &operator, LISTEN_ANSWER)
+        if received_of(world, operator, LISTEN_ANSWER)
             .iter()
             .any(stopped)
         {
@@ -323,9 +327,148 @@ async fn operator_told_listening_stopped(
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     panic!(
-        "operator '{operator}' was not told that listening to surface '{surface_name}' stopped: {:#?}",
-        received_of(world, &operator, LISTEN_ANSWER)
+        "operator '{operator}' was not told that listening to surface '{surface_name}' stopped with '{error}': {:#?}",
+        received_of(world, operator, LISTEN_ANSWER)
     );
+}
+
+#[then(
+    expr = "operator {string} is told by the next keep-alive check that listening to surface {string} stopped because the session ended"
+)]
+async fn operator_told_listening_stopped(
+    world: &mut SurfaceWorld,
+    operator: String,
+    surface_name: String,
+) {
+    wait_until_told_listening_stopped(world, &operator, &surface_name, SESSION_ENDED).await;
+}
+
+/// Turn policy input capture on or off: at once on a running gateway, or as soon as the admin
+/// session opens on one that has not started, so the step never starts it early.
+async fn turn_capture(
+    world: &mut SurfaceWorld,
+    turned_on: bool,
+) {
+    if world.admin_client.is_some() {
+        client(world, None)
+            .await
+            .set_feature_flags(&[(CAPTURE_FLAG, turned_on)])
+            .await
+            .expect("set the policy input capture feature flag");
+    } else {
+        world
+            .pending_feature_flags
+            .push((CAPTURE_FLAG.to_string(), turned_on));
+    }
+}
+
+#[given("policy input capture is turned on")]
+async fn capture_is_turned_on(world: &mut SurfaceWorld) {
+    turn_capture(world, true).await;
+}
+
+#[given("policy input capture is turned off")]
+async fn capture_is_turned_off(world: &mut SurfaceWorld) {
+    turn_capture(world, false).await;
+}
+
+#[when("an administrator turns policy input capture off")]
+async fn administrator_turns_capture_off(world: &mut SurfaceWorld) {
+    turn_capture(world, false).await;
+}
+
+#[when(expr = "the operator asks to listen to the policy input of surface {string}")]
+async fn operator_asks_to_listen(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+) {
+    asks_to_listen(world, THE_OPERATOR.to_string(), &surface_name).await;
+}
+
+#[given(expr = "the operator has asked to listen to the policy input of surface {string}")]
+async fn operator_has_asked_to_listen(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+) {
+    asks_to_listen(world, THE_OPERATOR.to_string(), &surface_name).await;
+}
+
+#[when(expr = "the operator listens to the policy input of surface {string}")]
+async fn operator_starts_listening(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+) {
+    listens(world, None, &surface_name).await;
+}
+
+#[when(expr = "the operator stops listening to the policy input of surface {string}")]
+async fn operator_stops_listening(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+) {
+    operator_has_stopped_listening(world, surface_name).await;
+}
+
+#[then("the operator may not listen to policy input because policy input capture is turned off")]
+async fn operator_may_not_listen_while_turned_off(world: &mut SurfaceWorld) {
+    let answer = world
+        .dashboard_listen_answers
+        .get(THE_OPERATOR)
+        .expect("the operator must have asked to listen to policy input");
+    assert_eq!(answer["listening"], false, "{answer}");
+    assert_eq!(answer["error"], TURNED_OFF, "{answer}");
+}
+
+#[then(
+    expr = "the operator is told by the next keep-alive check that listening to surface {string} stopped because policy input capture is turned off"
+)]
+async fn operator_told_listening_stopped_while_turned_off(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+) {
+    wait_until_told_listening_stopped(world, THE_OPERATOR, &surface_name, TURNED_OFF).await;
+}
+
+/// Assert the VP Audit Log holds a `category` record of the operator on `surface_name`,
+/// with `reason` when one is given.
+async fn audit_log_records_capture(
+    world: &mut SurfaceWorld,
+    category: &str,
+    surface_name: &str,
+    reason: Option<&str>,
+) {
+    let user = crate::steps::policy_changes::user_id(world, None).await;
+    let surface_id = tracked_surface_id(world, surface_name);
+    let (found, events) = client(world, None)
+        .await
+        .wait_for_audit_event(|record| {
+            let details = &record["event"][category];
+            record["surface_id"] == surface_id.as_str()
+                && details["actor"]["id"] == user.as_str()
+                && reason.is_none_or(|reason| details["reason"] == reason)
+        })
+        .await
+        .expect("read the VP Audit Log");
+    assert!(found, "expected a {category} record for surface {surface_id}, got {events:?}");
+}
+
+#[then(expr = "the VP Audit Log records that the operator started capturing the policy input of surface {string}")]
+async fn audit_log_records_capture_started(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+) {
+    audit_log_records_capture(world, "policy_input_capture_started", &surface_name, None).await;
+}
+
+#[then(
+    expr = "the VP Audit Log records that the operator's capture of the policy input of surface {string} ended with reason {string}"
+)]
+async fn audit_log_records_capture_stopped(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+    reason: String,
+) {
+    audit_log_records_capture(world, "policy_input_capture_stopped", &surface_name, Some(&reason)).await;
 }
 
 /// Wait until `operator`'s Capture view has received a capture `matches` accepts,

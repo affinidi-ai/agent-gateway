@@ -135,6 +135,9 @@ pub struct SurfaceWorld {
     pub dashboard_sockets: HashMap<String, DashboardSocket>,
     /// The answer each operator got to its last request to listen to policy input.
     pub dashboard_listen_answers: HashMap<String, serde_json::Value>,
+    /// System feature flags a step set before the gateway started, set through the admin API
+    /// once the admin session opens.
+    pub pending_feature_flags: Vec<(String, bool)>,
     pub human_clients: HashMap<String, Vec<AdminApiClient>>,
     pub terms_enabled: bool,
     pub affinidi_cache_seeded: bool,
@@ -242,6 +245,7 @@ impl SurfaceWorld {
             operator_clients: HashMap::new(),
             dashboard_sockets: HashMap::new(),
             dashboard_listen_answers: HashMap::new(),
+            pending_feature_flags: Vec::new(),
             human_clients: HashMap::new(),
             terms_enabled: false,
             affinidi_cache_seeded: false,

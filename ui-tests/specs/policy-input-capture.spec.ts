@@ -3,11 +3,15 @@
  *
  * Asserts the Capture view's Policy Input card: listening is live over the
  * dashboard WebSocket, a captured evaluation shows its policy, decision and
- * input, stopping ends it, and a surface with no policy says so.
+ * input, stopping ends it, a surface with no policy says so, and with the
+ * policy_input_capture feature flag off the card says capture is turned off.
  */
 
-import type {Page} from '@playwright/test';
+import type {APIRequestContext, Page} from '@playwright/test';
 import {expect, test} from '../helpers/fixtures';
+import {setSystemFeatureFlag, withFeatureFlag} from '../helpers/featureFlags';
+
+const FLAG = 'policy_input_capture';
 
 const BASE_URL = process.env.AG_BASE_URL || 'http://localhost:8080';
 const SURFACE_ID = 'ui-test-policy-input-capture';
@@ -74,7 +78,22 @@ async function capture(page: Page, detail: Record<string, unknown>) {
     );
 }
 
-test.describe('Policy input capture', () => {
+// The gateway refuses to listen while the flag is off, so this live listen needs the
+// appliance's stored flag on; it is put back as it was afterwards.
+test.describe('Policy input capture, listening', () => {
+    let restoreFlags: (() => Promise<void>) | undefined;
+    let flagContext: APIRequestContext | undefined;
+
+    test.beforeAll(async ({playwright}) => {
+        flagContext = await playwright.request.newContext();
+        restoreFlags = await setSystemFeatureFlag(flagContext, BASE_URL, FLAG);
+    });
+
+    test.afterAll(async () => {
+        await restoreFlags?.();
+        await flagContext?.dispose();
+    });
+
     test('listens live, shows a captured evaluation and stops', async ({page}) => {
         await openCaptureView(page);
         const listen = page.getByTestId('policy-input-capture-listen');
@@ -98,8 +117,11 @@ test.describe('Policy input capture', () => {
         await expect(page.getByTestId('policy-input-capture-listening')).toHaveCount(0);
         await expect(listen).toHaveText(/Listen to policy input/);
     });
+});
 
+test.describe('Policy input capture', () => {
     test('says a surface with no policy has nothing to capture', async ({page}) => {
+        await withFeatureFlag(page, FLAG);
         await openCaptureView(page);
 
         await expect(page.getByTestId('policy-input-capture-no-policy')).toContainText(
@@ -108,5 +130,19 @@ test.describe('Policy input capture', () => {
         await expect(page.getByTestId('policy-input-capture-empty')).toContainText(
             'only requests served by the node this dashboard is connected to show',
         );
+    });
+
+    test('says capture is turned off and offers no Listen button while the flag is off', async ({page}) => {
+        await withFeatureFlag(page, FLAG, false);
+        await openCaptureView(page);
+
+        await expect(page.getByTestId('policy-input-capture-off')).toContainText(
+            'Policy input capture is turned off on this gateway',
+        );
+        await expect(page.getByTestId('policy-input-capture-off')).toContainText(
+            'Settings › Admin › Feature Flags',
+        );
+        await expect(page.getByTestId('policy-input-capture-listen')).toHaveCount(0);
+        await expect(page.getByTestId('policy-input-capture-empty')).toHaveCount(0);
     });
 });

@@ -18,8 +18,15 @@ describe('categoryLabel', () => {
     expect(categoryLabel(name)).toBe(label);
   });
 
-  it('falls back to the raw name with spaces for an unknown event', () => {
-    expect(categoryLabel('some_new_event')).toBe('some new event');
+  it.each([
+    ['some_new_event', 'Some New Event'],
+    ['auth_failed', 'Auth Failed'],
+    ['policy_input_capture_started', 'Policy Input Capture Started'],
+    ['policy_input_capture_stopped', 'Policy Input Capture Stopped'],
+    ['mcp_proxy_pin_changed', 'MCP Proxy Pin Changed'],
+    ['vp_audit_note', 'VP Audit Note'],
+  ])('names an event it has no label for, %s, in title case', (name, label) => {
+    expect(categoryLabel(name)).toBe(label);
   });
 });
 

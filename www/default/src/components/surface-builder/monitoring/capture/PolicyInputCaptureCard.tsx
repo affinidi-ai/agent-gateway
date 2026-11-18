@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import type { AgentSurface } from '../../../../api';
 import { formatDateTime } from '../../../../utils/stringUtils';
+import { usePolicyInputCaptureFlag } from '../../../../utils/featureFlags';
 import { showToast } from '../../../../utils/toaster';
 import { CopyButton } from '../../../shared/CopyButton';
 import PolicyInputCaptureControl from '../PolicyInputCaptureControl';
@@ -93,6 +94,7 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
   hasPolicy = true,
   skipped = 0,
 }) => {
+  const { enabled, loaded } = usePolicyInputCaptureFlag();
   const [openId, setOpenId] = useState<number | null>(null);
   const [slot, setSlot] = useState<string>('');
   const slots = Array.from(new Set(captures.map(capture => capture.slot))).sort();
@@ -121,9 +123,20 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
             rows
           </small>
         </div>
-        <PolicyInputCaptureControl />
+        {enabled && <PolicyInputCaptureControl />}
       </div>
       <div className="card-body">
+        {loaded && !enabled && (
+          <div
+            className="alert alert-info mb-3"
+            style={{ fontSize: '14px' }}
+            data-testid="policy-input-capture-off"
+          >
+            <i className="fas fa-info-circle me-2"></i>
+            Policy input capture is turned off on this gateway. An administrator can turn it on
+            under Settings › Admin › Feature Flags (<code>policy_input_capture</code>).
+          </div>
+        )}
         {skipped > 0 && (
           <div
             className="alert alert-warning mb-3"
@@ -135,7 +148,7 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
             surface sent them faster than this dashboard could receive them.
           </div>
         )}
-        {!hasPolicy && (
+        {enabled && !hasPolicy && (
           <div
             className="alert alert-info mb-3"
             style={{ fontSize: '14px' }}
@@ -148,11 +161,13 @@ const PolicyInputCaptureCard: React.FC<PolicyInputCaptureCardProps> = ({
           </div>
         )}
         {captures.length === 0 ? (
-          <p className="text-muted small mb-0" data-testid="policy-input-capture-empty">
-            Listen to policy input, then send a request to this surface. The input and the decision
-            of each policy evaluation show here, live. On an appliance with several nodes, only
-            requests served by the node this dashboard is connected to show.
-          </p>
+          enabled && (
+            <p className="text-muted small mb-0" data-testid="policy-input-capture-empty">
+              Listen to policy input, then send a request to this surface. The input and the
+              decision of each policy evaluation show here, live. On an appliance with several
+              nodes, only requests served by the node this dashboard is connected to show.
+            </p>
+          )
         ) : (
           <>
             <div className="d-flex justify-content-end mb-2">

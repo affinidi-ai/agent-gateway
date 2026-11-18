@@ -7,7 +7,8 @@ Feature: Live policy input capture
   listening or close the dashboard.
 
   Background:
-    Given A2A surface "alpha" exists for route "/example" with managed agent "bravo" as its target
+    Given policy input capture is turned on
+    And A2A surface "alpha" exists for route "/example" with managed agent "bravo" as its target
     And the operator has created a surface policy definition
     And the operator has added the policy definition to surface "alpha" as its request policy
 

@@ -6,7 +6,8 @@ Feature: Live policy input capture of the gateway-level policy
   through a Transit Point.
 
   Background:
-    Given gateway "gateway-1" with outbound listener
+    Given policy input capture is turned on
+    And gateway "gateway-1" with outbound listener
     And gateway "gateway-1" has surface "alpha" targeting A2A Server agent "agent-managed"
     And surface "alpha" uses path "/example"
 

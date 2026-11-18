@@ -16,6 +16,39 @@ use tokio::sync::mpsc;
 use crate::observability::loggable::REDACTED;
 use crate::server::WsUpdate;
 
+/// The system feature flag that allows policy input capture. Off unless set to `true`.
+pub const FLAG_POLICY_INPUT_CAPTURE: &str = "policy_input_capture";
+
+/// Whether policy input capture is turned on: the [`FLAG_POLICY_INPUT_CAPTURE`] system flag,
+/// read on every call so turning it off stops new captures at once. False when settings are
+/// unavailable.
+pub fn capture_turned_on() -> bool {
+    #[cfg(test)]
+    return TURNED_ON_IN_THIS_THREAD.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    turned_on_in(crate::storage::settings_store::global_settings_store())
+}
+
+/// Whether `settings` turn policy input capture on: [`FLAG_POLICY_INPUT_CAPTURE`] explicitly
+/// `true`. False without settings.
+fn turned_on_in(settings: Option<&crate::storage::settings_store::SettingsStore>) -> bool {
+    settings.is_some_and(|settings| settings.flag_enabled(FLAG_POLICY_INPUT_CAPTURE))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What [`capture_turned_on`] answers on this test thread. Tests share one process-wide
+    /// settings store, so each turns capture off on its own thread; [`turned_on_in`] is tested
+    /// against settings of its own.
+    static TURNED_ON_IN_THIS_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Makes [`capture_turned_on`] answer `turned_on` on this test thread.
+#[cfg(test)]
+pub(crate) fn set_turned_on_in_this_thread(turned_on: bool) {
+    TURNED_ON_IN_THIS_THREAD.with(|cell| cell.set(turned_on));
+}
+
 /// A serialized `policy_input_captured` update, or a `policy_input_skipped` update
 /// counting the captures dropped because the queue was full, queued for one listen:
 /// the surface it belongs to and the id of that listen's [`Listening`].
@@ -251,8 +284,8 @@ pub struct Capture {
 
 /// Start capturing the evaluation of `input` by `plane` (`gateway`, `surface` or
 /// `appliance`), `engine` naming the evaluated policy slot, when a dashboard connection
-/// listens to its surface. `policies` lists the policy definitions the slot evaluates;
-/// it is called only when the evaluation is captured.
+/// listens to its surface and policy input capture is turned on. `policies` lists the policy
+/// definitions the slot evaluates; it is called only when the evaluation is captured.
 pub fn begin(
     plane: &str,
     engine: &str,
@@ -260,7 +293,7 @@ pub fn begin(
     policies: impl FnOnce() -> Vec<CapturedPolicy>,
 ) -> Option<Capture> {
     let surface_id = surface_of(input)?;
-    if !is_captured(surface_id) {
+    if !is_captured(surface_id) || !capture_turned_on() {
         return None;
     }
     let (slot, transit_point) = if plane == "gateway"
@@ -439,14 +472,38 @@ pub fn mask_credentials(value: &mut Value) {
 /// one starting with JSON whitespace (space, tab, newline or carriage return) before the `{`
 /// to `IA`, `IC`, `IH`, `CQ`, `CS`, `CX`, `Cg`, `Ci`, `Cn`, `DQ`, `DS` or `DX`. The header
 /// takes `=` only as trailing padding, so `CSRF=` in front of a JWT is not part of it. A
-/// word joined to the header by `-`, `_` or `.`, as in `session_`, is taken as glue up to the
-/// last joiner a header can follow; [`is_jwt_header`] decides whether the candidate is one.
+/// word joined to the header by `-`, `_` or `.`, as in `session_`, is matched with it, and
+/// [`header_start`] finds where in that run the header starts. The payload is the third group.
 static EMBEDDED_JWT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"\b([A-Za-z0-9_.-]*[-_.])?((?:e[wy]|I[ACH]|C[QSXgin]|D[QSX])[A-Za-z0-9_-]+={0,2})\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]*(?:~[A-Za-z0-9_=.-]*)*",
+        r"\b([A-Za-z0-9_.-]*[-_.])?((?:e[wy]|I[ACH]|C[QSXgin]|D[QSX])[A-Za-z0-9_-]+={0,2})\.([A-Za-z0-9_=-]+)\.[A-Za-z0-9_=-]*(?:~[A-Za-z0-9_=.-]*)*",
     )
     .expect("valid JWT pattern")
 });
+
+/// The encodings a JWT header can start with; see [`EMBEDDED_JWT`].
+static HEADER_PREFIX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:e[wy]|I[ACH]|C[QSXgin]|D[QSX])").expect("valid JWT header prefix pattern"));
+
+/// The most header starts [`header_start`] decodes for one candidate, which keeps masking
+/// linear in the text length.
+const MAX_HEADER_STARTS: usize = 8;
+
+/// Where the JWT header starts in `lead`, the run before a candidate's first `.`: at the start
+/// of `lead` or just after a `-`, `_` or `.`, where a header encoding begins. Starts are tried
+/// from the right, at most [`MAX_HEADER_STARTS`] of them, and the first that decodes to a JSON
+/// object is taken. The start only decides how much of `lead` is kept: when none is found and
+/// the payload decodes to a JSON object, [`mask_text`] masks the whole of `lead`.
+fn header_start(lead: &str) -> Option<usize> {
+    let bytes = lead.as_bytes();
+    (0..bytes.len())
+        .rev()
+        .filter(|&start| {
+            (start == 0 || matches!(bytes[start - 1], b'-' | b'_' | b'.')) && HEADER_PREFIX.is_match(&lead[start..])
+        })
+        .take(MAX_HEADER_STARTS)
+        .find(|&start| is_jwt_header(&lead[start..]))
+}
 
 /// `Bearer` or `Basic`, whitespace and the token after it, anywhere in a text.
 static AUTHORIZATION: LazyLock<Regex> = LazyLock::new(|| {
@@ -498,12 +555,11 @@ fn mask_text(text: &str) -> Option<String> {
             let glue = caps
                 .get(1)
                 .map_or("", |glue| glue.as_str());
-            if is_jwt_header(&caps[2]) {
-                format!("{glue}{REDACTED}")
-            } else if !glue.is_empty() && is_jwt_header(&format!("{glue}{}", &caps[2])) {
-                REDACTED.to_string()
-            } else {
-                caps[0].to_string()
+            let lead = format!("{glue}{}", &caps[2]);
+            match header_start(&lead) {
+                Some(start) => format!("{}{REDACTED}", &lead[..start]),
+                None if is_jwt_header(&caps[3]) => REDACTED.to_string(),
+                None => caps[0].to_string(),
             }
         })
         .into_owned();
@@ -1512,14 +1568,74 @@ mod tests {
     }
 
     #[test]
-    fn a_jwt_whose_header_holds_a_joiner_before_a_header_like_run_is_masked() {
+    fn every_jwt_header_shape_is_masked_after_every_prefix_in_every_place() {
         use base64::Engine;
-        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"kid":"? "}"#);
-        assert_eq!(header, "eyJraWQiOiI_ICJ9");
-        let jwt = format!("{header}.eyJzdWIiOiJ4In0.c2ln");
+        let encode = |json: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+        let payload = encode(r#"{"sub":"matrix"}"#);
+        let signature = "c2lnbmF0dXJlLW1hdHJpeA";
+        let headers = [
+            encode(r#"{"alg":"HS256"}"#),
+            encode(r#"{"kid":"? "}"#),
+            encode(r#"{"kid":"> "}"#),
+            encode(r#"{   "kid":"? ","alg":"HS256"}"#),
+            encode("\t{\"alg\":\"HS256\"}"),
+            encode("\n{\"alg\":\"HS256\"}"),
+        ];
+        assert_eq!(headers[1], "eyJraWQiOiI_ICJ9");
+        assert_eq!(headers[2], "eyJraWQiOiI-ICJ9");
+        assert_eq!(headers[3], "eyAgICJraWQiOiI_ICIsImFsZyI6IkhTMjU2In0");
+        let tokens = headers
+            .iter()
+            .flat_map(|header| {
+                let jwt = format!("{header}.{payload}.{signature}");
+                [format!("{jwt}~WyJzIiwibiJd~"), jwt]
+            });
+        let prefixes = ["", "CSRF=", "session_", "Cisco-", "Cisco.", "Ci-", "a.b.", "X-CSRF-Token-"];
 
-        assert_eq!(masked(&format!("see {jwt} here")).0, Value::String(format!("see {REDACTED} here")));
-        assert_eq!(masked(&format!("CSRF={jwt}")).0, Value::String(format!("CSRF={REDACTED}")));
+        for token in tokens {
+            for prefix in prefixes {
+                let whole = format!("{prefix}{token}");
+                let sentence = format!("the value {prefix}{token} expired");
+
+                assert_eq!(masked(&whole).0, Value::String(format!("{prefix}{REDACTED}")), "{whole}");
+                assert_eq!(
+                    masked(&sentence).0,
+                    Value::String(format!("the value {prefix}{REDACTED} expired")),
+                    "{sentence}"
+                );
+                let outcome = mask_outcome_text(&sentence);
+                assert!(!outcome.contains(&payload) && !outcome.contains(signature), "{sentence} -> {outcome}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_jwt_whose_header_holds_more_header_like_runs_than_are_tried_is_still_masked() {
+        use base64::Engine;
+        let encode = |json: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+        let fields: Vec<String> = (0..25)
+            .map(|i| format!(r#""k{i:02}":"? ""#))
+            .collect();
+        let header = encode(&format!("{{{}}}", fields.join(",")));
+        let runs = Regex::new(r"[-_.](?:e[wy]|I[ACH]|C[QSXgin]|D[QSX])")
+            .unwrap()
+            .find_iter(&header)
+            .count();
+        assert!(runs > MAX_HEADER_STARTS, "{runs} runs in {header}");
+        let payload = encode(r#"{"sub":"many-runs"}"#);
+        let jwt = format!("{header}.{payload}.c2lnbmF0dXJl");
+
+        for text in [format!("see {jwt} here"), format!("session_{jwt}"), format!("the cookie session_{jwt} expired")] {
+            let (value, _) = masked(&text);
+            let outcome = mask_outcome_text(&text);
+
+            let value = value
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(!value.contains(&payload) && !value.contains("c2lnbmF0dXJl"), "{text} -> {value}");
+            assert!(!outcome.contains(&payload) && !outcome.contains("c2lnbmF0dXJl"), "{text} -> {outcome}");
+        }
     }
 
     #[test]
@@ -1542,31 +1658,55 @@ mod tests {
         (value, started.elapsed())
     }
 
-    #[test]
-    fn a_megabyte_of_header_like_pieces_is_kept_in_linear_time() {
-        let dashes = format!("{}x.a.b", "Ci-".repeat(350_000));
-        let tildes = "Ci.a.b~".repeat(150_000);
-        let mixed = format!("{}{}x.a.b", "Ci.a.b~".repeat(75_000), "Ci-".repeat(175_000));
-
-        let glued_dashes = format!("{}x.a.b", "a-".repeat(500_000));
-        let glued_dots = format!("{}b.c", "a.".repeat(500_000));
-
-        for text in [dashes, tildes, mixed, glued_dashes, glued_dots] {
-            let (value, elapsed) = masked(&text);
-
-            assert!(elapsed < std::time::Duration::from_secs(2), "took {elapsed:?}");
-            assert_eq!(value, Value::String(text));
+    /// Masks the text `build(scale)` makes, checks each result against the expected text it
+    /// returns, and asserts that eight times the input takes under 24 times as long: linear
+    /// masking takes about 8, quadratic 64. The scale doubles until a run takes at least
+    /// 20 ms, so timer and scheduler noise stay small next to it, and each size keeps the
+    /// fastest of three runs. The bound compares the build with itself, so it holds however
+    /// slow the build is, coverage instrumentation included.
+    fn assert_masking_is_linear(build: impl Fn(usize) -> (String, String)) {
+        let fastest = |scale| {
+            let (text, expected) = build(scale);
+            (0..3)
+                .map(|_| {
+                    let (value, elapsed) = masked(&text);
+                    assert_eq!(value, Value::String(expected.clone()));
+                    elapsed
+                })
+                .min()
+                .unwrap()
+        };
+        let mut scale = 1;
+        let mut small = fastest(scale);
+        while small < std::time::Duration::from_millis(20) && scale < 64 {
+            scale *= 2;
+            small = fastest(scale);
         }
+        let large = fastest(scale * 8);
+
+        assert!(large < small * 24, "{small:?} at scale {scale}, {large:?} at scale {}", scale * 8);
     }
 
     #[test]
-    fn a_jwt_after_a_megabyte_glued_run_is_masked_in_linear_time() {
-        let glue = "a-".repeat(500_000);
+    fn header_like_pieces_are_kept_in_linear_time() {
+        let kept = |text: String| (text.clone(), text);
+        assert_masking_is_linear(|scale| kept(format!("{}x.a.b", "Ci-".repeat(2_000 * scale))));
+        assert_masking_is_linear(|scale| kept("Ci.a.b~".repeat(1_000 * scale)));
+        assert_masking_is_linear(|scale| {
+            kept(format!("{}{}x.a.b", "Ci.a.b~".repeat(500 * scale), "Ci-".repeat(1_250 * scale)))
+        });
+        assert_masking_is_linear(|scale| kept(format!("{}x.a.b", "a-".repeat(3_000 * scale))));
+        assert_masking_is_linear(|scale| kept(format!("{}b.c", "a.".repeat(3_000 * scale))));
+    }
 
-        let (value, elapsed) = masked(&format!("{glue}{JWT}"));
-
-        assert!(elapsed < std::time::Duration::from_secs(2), "took {elapsed:?}");
-        assert_eq!(value, Value::String(format!("{glue}{REDACTED}")));
+    #[test]
+    fn a_jwt_after_a_long_glued_run_is_masked_in_linear_time() {
+        for unit in ["a-", "a-Ci-"] {
+            assert_masking_is_linear(|scale| {
+                let glue = unit.repeat(3_000 * scale);
+                (format!("{glue}{JWT}"), format!("{glue}{REDACTED}"))
+            });
+        }
     }
 
     #[test]
@@ -1612,6 +1752,47 @@ mod tests {
         assert!(begin("surface", "input-capture-stopped", &stopped, Vec::new).is_none());
         assert!(begin("gateway", "self", &unheard, Vec::new).is_none());
         assert!(begin("gateway", "self", &json!({ "http": {} }), Vec::new).is_none());
+    }
+
+    #[test]
+    fn nothing_is_captured_while_policy_input_capture_is_turned_off_even_for_a_listener() {
+        let (_listening, mut received) = listening("input-capture-turned-off");
+        let input = json!({ "channel": { "config_id": "input-capture-turned-off" } });
+        set_turned_on_in_this_thread(false);
+
+        let captured = begin("surface", "input-capture-turned-off", &input, Vec::new).is_some();
+
+        set_turned_on_in_this_thread(true);
+        assert!(!captured);
+        assert!(received_captures(&mut received).is_empty());
+        assert!(begin("surface", "input-capture-turned-off", &input, Vec::new).is_some());
+    }
+
+    #[test]
+    fn policy_input_capture_is_on_only_while_its_flag_is_explicitly_true() {
+        use crate::storage::settings_store::{DashboardSettings, SettingsStore};
+        let directory = tempfile::TempDir::new().unwrap();
+        let settings = SettingsStore::new(directory.path());
+        let set = |flags: &[(&str, bool)]| {
+            settings
+                .update(DashboardSettings {
+                    feature_flags: flags
+                        .iter()
+                        .map(|(flag, on)| (flag.to_string(), *on))
+                        .collect(),
+                    ..DashboardSettings::default()
+                })
+                .unwrap();
+        };
+
+        assert!(!turned_on_in(None), "no settings");
+        assert!(!turned_on_in(Some(&settings)), "unset");
+        set(&[(FLAG_POLICY_INPUT_CAPTURE, true)]);
+        assert!(turned_on_in(Some(&settings)));
+        set(&[(FLAG_POLICY_INPUT_CAPTURE, false)]);
+        assert!(!turned_on_in(Some(&settings)));
+        set(&[("agent_pay_delegation", true)]);
+        assert!(!turned_on_in(Some(&settings)), "another flag");
     }
 
     #[test]

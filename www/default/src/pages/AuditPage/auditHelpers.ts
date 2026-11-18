@@ -222,8 +222,22 @@ export function categoryLabel(name: string): string {
     case 'policy_change_refused':
       return CATEGORY_OPTIONS.find(option => option.value === name)?.label ?? name;
     default:
-      return name.replace(/_/g, ' ');
+      return titleCase(name);
   }
+}
+
+/** Words of an event name written in capitals. */
+const ACRONYMS = new Set(['api', 'did', 'jwt', 'mcp', 'vp']);
+
+/** `name`'s words in title case, `auth_failed` as `Auth Failed`, acronyms in capitals. */
+function titleCase(name: string): string {
+  return name
+    .split('_')
+    .filter(Boolean)
+    .map(word =>
+      ACRONYMS.has(word) ? word.toUpperCase() : word.charAt(0).toUpperCase() + word.slice(1)
+    )
+    .join(' ');
 }
 
 export function formatTimestamp(ts: string): string {

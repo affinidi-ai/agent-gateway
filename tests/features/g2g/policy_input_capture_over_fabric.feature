@@ -8,6 +8,7 @@ Feature: Live policy input capture of requests received over Fabric
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     And gateway 2 has a Gateway-level policy that rejects all fabric callers
+    And policy input capture is turned on on gateway 2
     And the operator listens to the policy input of gateway 2 surface "alpha"
     When the caller asks gateway 1 MCP surface "charlie" for available tools
     Then the response status is 403
@@ -18,6 +19,7 @@ Feature: Live policy input capture of requests received over Fabric
     And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     And gateway 2 has a Gateway-level policy that rejects all fabric callers
+    And policy input capture is turned on on gateway 2
     And the operator listens to the policy input of gateway 2 surface "alpha"
     When the caller sends a POST request to gateway 1 surface "charlie" path "/messages?token=bdd-fabric-query-secret"
     Then the response status is 403

@@ -27,7 +27,7 @@ const renderTab = (settings: Settings = SETTINGS) =>
   );
 
 describe('SystemTab feature flags', () => {
-  it.each(['metrics', 'agent_pay_delegation', 'mediator_federation'])(
+  it.each(['metrics', 'agent_pay_delegation', 'policy_input_capture', 'mediator_federation'])(
     'names the %s switch after its flag',
     flag => {
       renderTab();
@@ -66,6 +66,50 @@ describe('SystemTab feature flags', () => {
     await waitFor(() =>
       expect(updateSettings).toHaveBeenCalledWith({
         feature_flags: { metrics: false, agent_pay_delegation: true },
+      })
+    );
+  });
+
+  it('shows policy input capture off unless the flag is explicitly true', () => {
+    renderTab();
+    expect(screen.getByRole('switch', { name: 'policy_input_capture' })).not.toBeChecked();
+
+    renderTab({ feature_flags: { policy_input_capture: true } } as unknown as Settings);
+    expect(screen.getAllByRole('switch', { name: 'policy_input_capture' })[1]).toBeChecked();
+  });
+
+  it('turns policy input capture on with an explicit true and off with false', async () => {
+    const updateSettings = jest.fn().mockResolvedValue(undefined);
+    const { rerender } = render(
+      <SystemTab
+        isSubmitting={false}
+        onTruncateMetrics={jest.fn()}
+        settings={{ feature_flags: { metrics: false } } as unknown as Settings}
+        updateSettings={updateSettings}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('switch', { name: 'policy_input_capture' }));
+    await waitFor(() =>
+      expect(updateSettings).toHaveBeenCalledWith({
+        feature_flags: { metrics: false, policy_input_capture: true },
+      })
+    );
+
+    rerender(
+      <SystemTab
+        isSubmitting={false}
+        onTruncateMetrics={jest.fn()}
+        settings={
+          { feature_flags: { metrics: false, policy_input_capture: true } } as unknown as Settings
+        }
+        updateSettings={updateSettings}
+      />
+    );
+    fireEvent.click(screen.getByRole('switch', { name: 'policy_input_capture' }));
+    await waitFor(() =>
+      expect(updateSettings).toHaveBeenLastCalledWith({
+        feature_flags: { metrics: false, policy_input_capture: false },
       })
     );
   });

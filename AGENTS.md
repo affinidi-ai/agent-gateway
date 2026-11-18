@@ -394,7 +394,9 @@ _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-bui
 A surface's Capture view has a **Policy Input** card listing, live, the input and decision of each
 request and response policy evaluation (not MCP tool policies) while the user listens with its **Listen to policy input** button (users with
 both `surfaces.edit` and `policies.edit`; leaving the view or reloading stops it), and says a
-request policy must be added first while the surface has none; see _Policy input capture_ in
+request policy must be added first while the surface has none. It offers listening only while the
+`policy_input_capture` feature flag is on (default off), and otherwise says capture is turned off;
+see _Policy input capture_ and _Feature flags_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#policy-input-capture).
 
 The Dashboard shows the metrics **Delete** button only to users with `settings.edit`; see

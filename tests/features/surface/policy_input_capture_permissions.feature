@@ -3,6 +3,9 @@ Feature: Listening to policy input needs both surfaces.edit and policies.edit
   surfaces.edit and policies.edit. An operator whose role holds only one of them
   may not listen and receives nothing, and one whose session ends stops listening.
 
+  Background:
+    Given policy input capture is turned on
+
   Scenario: An operator who may edit surfaces and policies receives the policy input they listen to
     Given the "poweruser" role is granted "surfaces.edit"
     And the "poweruser" role is granted "policies.edit"

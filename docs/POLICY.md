@@ -132,22 +132,32 @@ rejects any tenant-scoped PAT with 403. See
 
 The gateway does not log the policy input. To write a policy against real requests, an operator
 listens to the policy input of one surface from its Capture view in the dashboard. It is meant for
-developing and testing policies, not for monitoring. Listening is a
+developing and testing policies, not for monitoring, so it is off until an administrator turns on
+the `policy_input_capture` system feature flag (Settings › Admin › Feature Flags, or
+`feature_flags.policy_input_capture` in `POST /api/v1/settings`). It is a system-only flag: a
+user's own settings never turn it on. Listening is a
 request on the dashboard WebSocket, with no admin API route and nothing stored on the surface:
 
 - `{"type": "capture_policy_input", "surface_id": "<id>"}` starts listening, and
   `{"type": "stop_capturing_policy_input", "surface_id": "<id>"}` stops it.
 - The gateway answers each with `{"type": "policy_input_capture", "surface_id", "listening"}`, and
   an `error` when it refuses or ends a listen: `your dashboard session has ended; sign in again`
-  (the connection has no live session), `needs surfaces.edit and policies.edit`, `invalid surface
+  (the connection has no live session), `policy input capture is turned off` (the flag is off),
+  `needs surfaces.edit and policies.edit`, `invalid surface
   id` (empty, over 256 bytes or holding a control character) or `listening to too many surfaces on this connection` (more than
   10). The answer to a stop has no `error`, even when its surface id is not valid.
-- Starting needs a dashboard session whose user holds `surfaces.edit` and `policies.edit`
-  ([`RBAC.md`](RBAC.md#policy-input-capture)). The session and permissions are checked again on each
-  keep-alive ping; once the session ends or either permission is gone, the connection stops
-  listening to every surface and is told why. A due check runs before any queued capture is
+- Starting needs the flag on and a dashboard session whose user holds `surfaces.edit` and
+  `policies.edit` ([`RBAC.md`](RBAC.md#policy-input-capture)). The session, the flag and the
+  permissions are checked again on each keep-alive ping; once the session ends, the flag is turned
+  off or either permission is gone, the connection stops listening to every surface and is told
+  why. The flag is also read on every policy evaluation, so turning it off stops new captures at
+  once. A due check runs before any queued capture is
   sent, and the captures still queued when access is lost are discarded. A client that has not
   read a message within 10 seconds is disconnected, so it cannot delay the check.
+- Each listen that starts records `policy_input_capture_started`, and each that ends records
+  `policy_input_capture_stopped` with its reason, in the VP Audit Log and any Governance Audit
+  integration that selects either one ([`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)).
+  A refused listen records nothing.
 - Listening ends when the connection closes, so reloading or leaving the page ends it. The
   dashboard sends its listens again after a reconnect.
 - Captures and `policy_input_skipped` notices queued before a stop, or by an earlier listen to

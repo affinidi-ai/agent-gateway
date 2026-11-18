@@ -4,7 +4,8 @@ Feature: Live policy input capture on an MCP surface
   MCP method the caller sent.
 
   Background:
-    Given MCP surface "alpha" targets MCP server "bravo"
+    Given policy input capture is turned on
+    And MCP surface "alpha" targets MCP server "bravo"
     And MCP server "bravo" publishes a tool catalog
     And surface "alpha" has a request policy that allows every request
 

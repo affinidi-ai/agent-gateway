@@ -3,12 +3,25 @@ import { act, fireEvent, render, screen } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import type { AgentSurface } from '../../../../../api';
 import PolicyInputCaptureCard, { policyLabel, surfaceHasPolicy } from '../PolicyInputCaptureCard';
-import { MAX_POLICY_INPUTS, usePolicyInputCaptureStream } from '../usePolicyInputCaptureStream';
+import {
+  type CapturedPolicyInput,
+  MAX_POLICY_INPUTS,
+  usePolicyInputCaptureStream,
+} from '../usePolicyInputCaptureStream';
 
 jest.mock('../../PolicyInputCaptureControl', () => ({
   __esModule: true,
   default: () => <div data-testid="policy-input-capture" />,
 }));
+
+let mockCaptureFlag = { enabled: true, loaded: true };
+jest.mock('../../../../../utils/featureFlags', () => ({
+  usePolicyInputCaptureFlag: () => mockCaptureFlag,
+}));
+
+beforeEach(() => {
+  mockCaptureFlag = { enabled: true, loaded: true };
+});
 
 const Harness: React.FC<{ paused?: boolean }> = ({ paused = false }) => {
   const { captures, skipped } = usePolicyInputCaptureStream('surface-1', paused);
@@ -39,6 +52,54 @@ describe('PolicyInputCaptureCard', () => {
     render(<Harness />);
     expect(screen.getByTestId('policy-input-capture-empty')).toBeInTheDocument();
     expect(screen.getByTestId('policy-input-capture')).toBeInTheDocument();
+  });
+
+  it('offers listening and no off notice while the flag is on', () => {
+    render(<PolicyInputCaptureCard captures={[]} hasPolicy={false} />);
+
+    expect(screen.getByTestId('policy-input-capture')).toBeInTheDocument();
+    expect(screen.queryByTestId('policy-input-capture-off')).not.toBeInTheDocument();
+  });
+
+  it('says capture is turned off, with no Listen control or hints, while the flag is off', () => {
+    mockCaptureFlag = { enabled: false, loaded: true };
+
+    render(<PolicyInputCaptureCard captures={[]} hasPolicy={false} />);
+
+    expect(screen.getByTestId('policy-input-capture-off')).toHaveTextContent(
+      'Policy input capture is turned off on this gateway. An administrator can turn it on under Settings › Admin › Feature Flags (policy_input_capture).'
+    );
+    expect(screen.queryByTestId('policy-input-capture')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('policy-input-capture-empty')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('policy-input-capture-no-policy')).not.toBeInTheDocument();
+  });
+
+  it('shows neither the Listen control nor the off notice while the settings load', () => {
+    mockCaptureFlag = { enabled: false, loaded: false };
+
+    render(<PolicyInputCaptureCard captures={[]} hasPolicy={false} />);
+
+    expect(screen.queryByTestId('policy-input-capture')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('policy-input-capture-off')).not.toBeInTheDocument();
+  });
+
+  it('keeps the evaluations already captured when the flag is off', () => {
+    mockCaptureFlag = { enabled: false, loaded: true };
+    const capture: CapturedPolicyInput = {
+      id: 1,
+      timestamp: new Date('2026-11-13T10:00:00Z'),
+      plane: 'surface',
+      engine: 'surface-1',
+      slot: 'target',
+      policies: [],
+      decision: 'allow',
+      input: {},
+    };
+
+    render(<PolicyInputCaptureCard captures={[capture]} hasPolicy />);
+
+    expect(screen.getByTestId('policy-input-capture-off')).toBeInTheDocument();
+    expect(screen.getAllByTestId('policy-input-capture-row')).toHaveLength(1);
   });
 
   it('says a surface needs a policy only while it has none', () => {

@@ -555,6 +555,17 @@ pub async fn ensure_admin_session(world: &mut SurfaceWorld) {
         .bootstrap_test_session()
         .await
         .expect("test-support auth login should succeed");
+    let pending: Vec<(String, bool)> = std::mem::take(&mut world.pending_feature_flags);
+    if !pending.is_empty() {
+        let flags: Vec<(&str, bool)> = pending
+            .iter()
+            .map(|(flag, on)| (flag.as_str(), *on))
+            .collect();
+        client
+            .set_feature_flags(&flags)
+            .await
+            .expect("set the feature flags a step chose before the gateway started");
+    }
     world.admin_client = Some(client);
 }
 
