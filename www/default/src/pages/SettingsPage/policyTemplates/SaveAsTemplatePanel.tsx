@@ -162,7 +162,7 @@ const SaveAsTemplatePanel: React.FC<SaveAsTemplatePanelProps> = ({
           <label className="font-weight-bold" htmlFor="policy-template-save-summary">
             Summary{' '}
             <FieldHelp testId="field-help-policy-template-summary" ariaLabel="About Summary">
-              One line, shown in the Template field and the template list.
+              One line, shown on the template's card and in the template list.
             </FieldHelp>
           </label>
           <input

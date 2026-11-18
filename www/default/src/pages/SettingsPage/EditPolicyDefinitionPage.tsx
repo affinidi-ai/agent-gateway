@@ -96,9 +96,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
   const [policyErrors, setPolicyErrors] = useState<string[]>([]);
   const [packageMismatch, setPackageMismatch] = useState<string | null>(null);
   const [versionRefreshKey, setVersionRefreshKey] = useState(0);
-  const [view, setView] = useState<PolicyView>(
-    DEFAULT_POLICY_VIEW[isCreateMode ? 'create' : 'edit']
-  );
+  const [view, setView] = useState<PolicyView>(DEFAULT_POLICY_VIEW);
   const templatesColumnRef = useRef<HTMLDivElement>(null);
   const [focusAddRules, setFocusAddRules] = useState(0);
   const { hasPermission } = usePermissions();

@@ -2,7 +2,8 @@
  * Policy definition editor tests
  *
  * Asserts the "Rego reference" panel in the Rego view of the Create policy
- * page expands and collapses from anywhere on its header.
+ * page expands and collapses from anywhere on its header. The page opens on
+ * the Rules view, so each test switches to Rego first.
  */
 
 import {expect, test} from '../helpers/fixtures';
@@ -13,6 +14,7 @@ const BASE_URL = process.env.AG_BASE_URL || 'http://localhost:8080';
 test.describe('Policy definition editor — instructions panel', () => {
     test.beforeEach(async ({page}) => {
         await page.goto(`${BASE_URL}/policy-definitions/new`);
+        await page.getByTestId('policy-view-rego').click();
         await expect(page.getByTestId('policy-instructions-toggle')).toBeVisible();
     });
 

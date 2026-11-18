@@ -246,9 +246,9 @@ describe('start a policy from the gallery', () => {
     renderAt('/policy-definitions/new?type=agent_surface');
     fireEvent.click(await card('allow-http-methods'));
     fireEvent.click(screen.getByTestId('policy-template-gallery-example-input-0'));
-    expect(screen.getByTestId('policy-template-gallery-example-input-0-json')).toHaveTextContent(
-      '"method": "GET"'
-    );
+    const input = screen.getByTestId('policy-template-gallery-example-input-0-json');
+    expect(input).toHaveTextContent('"method": "GET"');
+    expect(input).toHaveClass('policy-template-example-input');
   });
 
   it('starts from Allow all and warns in the Rules view once allow rules are added', async () => {
@@ -261,6 +261,10 @@ describe('start a policy from the gallery', () => {
 
     fireEvent.click(screen.getByTestId('policy-rules-set-default-deny-button'));
     expect(rego().value).toContain('default allow = false');
+    expect(rego().value).not.toContain('# Allow all traffic by default');
+    expect(mockUndo.message).toBe(
+      'Requests are now denied by default. Undo restores the Rego from before this change.'
+    );
   });
 });
 
@@ -274,7 +278,9 @@ describe('the used template', () => {
     fireEvent.click(screen.getByTestId('policy-template-gallery-use-button'));
 
     expect(name()).toHaveValue('Deny by default');
-    expect(mockUndo.message).toBe('Filled from the template Deny by default.');
+    expect(mockUndo.message).toBe(
+      'Filled from the template Deny by default. Undo restores the form from before this change.'
+    );
   });
 
   it('reopens the used template with the settings it was used with', async () => {
@@ -840,7 +846,7 @@ describe('insert a template into a saved policy', () => {
     expect(screen.getByTestId('policy-rules-allow-default-warning')).toBeInTheDocument();
   });
 
-  it('hides Insert template and Save as template without policies.edit', async () => {
+  it('hides Add rules from a template and Save as template without policies.edit', async () => {
     mockCanEdit = false;
     mockGateway();
     renderAt('/policy-definitions/partner-only');

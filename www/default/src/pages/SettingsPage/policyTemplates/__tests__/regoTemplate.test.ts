@@ -262,17 +262,6 @@ allow if input.jwt.role in {"admin"}
 # End of template: Allow listed roles
 `);
     expect(result.added).toBe('allow if input.jwt.role in {"admin"}');
-    expect(result.droppedDefault).toBe(true);
-  });
-
-  it('reports that the existing policy allows by default', () => {
-    const result = insertTemplateRules(
-      'package surface.policy\n\ndefault allow = true',
-      'Roles',
-      'package surface.policy\n\nallow if input.jwt.sub'
-    );
-    expect(result.existingDefault).toBe('allow');
-    expect(result.droppedDefault).toBe(false);
   });
 
   it('places a new import after the package line and skips one already present', () => {

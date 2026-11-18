@@ -352,12 +352,13 @@ body.dark-theme .policy-templates-panel__placeholder {
   border-radius: var(--radius-sm);
 }
 
-.policy-template-example-item .policy-template-example {
-  margin-bottom: 4px;
+.policy-template-example-input {
+  max-height: 16rem;
+  overflow: auto;
 }
 
-body.dark-theme .policy-template-gallery__detail {
-  border-color: var(--accent-blue-text);
+.policy-template-example-item .policy-template-example {
+  margin-bottom: 4px;
 }
 
 .policy-error-text {

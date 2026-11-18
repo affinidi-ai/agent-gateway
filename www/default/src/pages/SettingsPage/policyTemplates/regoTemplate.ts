@@ -140,10 +140,6 @@ export interface InsertResult {
   policy: string;
   /** The rule lines appended to the policy. */
   added: string;
-  /** Whether the template's own `default allow` line was left out. */
-  droppedDefault: boolean;
-  /** The existing policy's `default allow`, or null when it has none. */
-  existingDefault: PolicyDecision | null;
 }
 
 /**
@@ -167,7 +163,6 @@ export function insertTemplateRules(
     .filter(l => IMPORT_LINE.test(l))
     .map(l => l.trim())
     .filter(l => !existingImports.has(l));
-  const droppedDefault = templateLines.some(l => DEFAULT_ALLOW_LINE.test(l));
   const body = trimBlankLines(
     templateLines.filter(
       l =>
@@ -193,5 +188,5 @@ export function insertTemplateRules(
   const safeName = templateName.replace(LINE_BREAKS, ' ').trim();
   const policy = `${existingLines.join('\n').replace(/\s+$/, '')}\n\n${TEMPLATE_BEGIN_PREFIX}${safeName}\n${added}\n${TEMPLATE_END_PREFIX}${safeName}\n`;
 
-  return { policy, added, droppedDefault, existingDefault: explicitDefault(existingPolicy) };
+  return { policy, added };
 }

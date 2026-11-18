@@ -50,6 +50,8 @@ export function isTemplateMarker(line: string): boolean {
 }
 const DEFAULT_ALLOW = /^default\s+allow\s*:?=\s*(true|false)\b/;
 const DEFAULT_ALLOW_TRUE = /^(\s*default\s+allow\s*:?=\s*)true\b/m;
+const ALLOW_ALL_COMMENT =
+  /^[ \t]*# Allow all traffic by default[ \t]*\r?\n(?=[ \t]*default\s+allow\s*:?=\s*true\b)/m;
 const OPEN_ENDING = /(\bif|\belse|:=|=|,)$/;
 const SUMMARY_LENGTH = 90;
 const DENY_REASON = 'deny_reason';
@@ -233,7 +235,7 @@ export function removeRuleGroup(rego: string, group: RuleGroup): string {
 
 /** Turns `default allow := true` (or `= true`) into `false`, keeping the operator. */
 export function setDefaultDeny(rego: string): string {
-  return rego.replace(DEFAULT_ALLOW_TRUE, '$1false');
+  return rego.replace(ALLOW_ALL_COMMENT, '').replace(DEFAULT_ALLOW_TRUE, '$1false');
 }
 
 /** A rule's name without `default` or a function's arguments, such as `allow` or `jwt_claim_values`. */

@@ -126,7 +126,7 @@ export const TemplateHowItDecides: React.FC<{ template: PolicyTemplate; idPrefix
             </div>
             {open === i && (
               <pre
-                className="policy-preview-block rounded p-2 mb-1 small"
+                className="policy-preview-block policy-template-example-input rounded p-2 mb-1 small"
                 data-testid={`${idPrefix}-example-input-${i}-json`}
               >
                 <code>{JSON.stringify(ex.input, null, 2)}</code>

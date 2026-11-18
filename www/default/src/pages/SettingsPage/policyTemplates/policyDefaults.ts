@@ -1,7 +1,7 @@
 import type { PolicyType } from './types';
 
-/** The view the Policy section opens in. */
-export const DEFAULT_POLICY_VIEW = { create: 'rules', edit: 'rules' } as const;
+/** The view the Policy section opens in, on a new and a saved policy. */
+export const DEFAULT_POLICY_VIEW = 'rules';
 
 /** The Start from choice for the allow-all policy. */
 export const BLANK_TEMPLATE_ID = 'blank';

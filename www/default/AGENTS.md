@@ -1895,7 +1895,8 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   settings render to in a `policy-preview-block` (`policy-template-gallery-rego`), or "Fix the
   settings above to see the Rego." while a setting is invalid, **How it
   decides** with each example's sample input behind **Show input**
-  (`policy-template-gallery-example-input-<i>`, `-json`), the docs link
+  (`policy-template-gallery-example-input-<i>`, `-json`, at most `16rem` tall and scrolling,
+  `.policy-template-example-input`), the docs link
   (`policy-template-gallery-docs-link`) and **Use this template**
   (`policy-template-gallery-use-button`), disabled while a setting is invalid. Nothing fills
   the form until Use, which fills Name, Description, Type and Rego with the settings shown and
@@ -1911,7 +1912,9 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   template is used and the Rego is `DEFAULT_POLICY`, and "Custom Rego" otherwise: once rules were added or
   removed, the Type changed to one the template doesn't serve, or the Rego was edited by hand.
   Undo of Use, Allow all, Add rules, Remove, Remove rule and Deny by default restores the Rego
-  and the used template together. Use, of a template or Allow all, moves focus to **Change**
+  and the used template together. Only the latest action can be undone, and its Undo drops
+  edits made since, so each toast ends "Undo restores the Rego from before this change." (Use:
+  "the form", since Use's Undo restores Name, Description, Type and Rego). Use, of a template or Allow all, moves focus to **Change**
   (`policy-template-gallery-change-button`), which reopens
   it with the used card selected and its settings as they were used, also after a hand edit,
   and moves focus to the selected card, or to the search when no shown card is selected. Use
@@ -1993,7 +1996,9 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   or under the group header (`policy-rules-group-<n>-in-use`), linked to the button by
   `aria-describedby`. A policy that allows
   by default and has allow rules shows a warning `InfoBanner` (`policy-rules-allow-default-warning`) with
-  **Deny by default** (`policy-rules-set-default-deny-button`). An empty Rego shows Default
+  **Deny by default** (`policy-rules-set-default-deny-button`), which sets `default allow` to
+  false and drops a `# Allow all traffic by default` comment directly above it, the one Allow
+  all and policies created before templates carry. An empty Rego shows Default
   ALLOW and "An empty policy allows every request.", as the gateway treats it. Removing a group
   keeps the Just added mark and examples card while another group of that template remains. With no rules, an empty state
   (`policy-rules-empty`) offers **Add rules from a template** (`policy-rules-add-button`) and

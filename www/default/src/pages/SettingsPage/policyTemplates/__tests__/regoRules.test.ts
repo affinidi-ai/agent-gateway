@@ -152,6 +152,18 @@ describe('setDefaultDeny', () => {
     );
   });
 
+  it('drops the allow-all comment above the default line', () => {
+    expect(
+      setDefaultDeny('package p\n\n# Allow all traffic by default\ndefault allow = true\n')
+    ).toBe('package p\n\ndefault allow = false\n');
+  });
+
+  it('keeps any other comment above the default line', () => {
+    expect(setDefaultDeny('package p\n\n# Baseline\ndefault allow = true\n')).toBe(
+      'package p\n\n# Baseline\ndefault allow = false\n'
+    );
+  });
+
   it('leaves a policy that already denies unchanged', () => {
     expect(setDefaultDeny('package p\ndefault allow := false\n')).toBe(
       'package p\ndefault allow := false\n'
