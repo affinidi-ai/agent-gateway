@@ -31,7 +31,7 @@ test.describe('Policy definition editor — instructions panel', () => {
 
         await expect(toggle).toHaveAttribute('aria-expanded', 'true');
         await expect(page.getByTestId('policy-instructions-body')).toBeVisible();
-        await expect(page.getByTestId('policy-instructions-body').getByText('Policy input')).toBeVisible();
+        await expect(page.getByTestId('policy-instructions-input-fields')).toBeVisible();
         await captureFullPage(page, 'policy-instructions-expanded-via-title');
     });
 
@@ -83,7 +83,7 @@ test.describe('Policy definition editor — instructions panel', () => {
     test('does not disturb the policy editor below it', async ({page}) => {
         const toggle = page.getByTestId('policy-instructions-toggle');
         await toggle.click();
-        const editor = page.getByPlaceholder('...add policy here...');
+        const editor = page.getByTestId('policy-rego-textarea');
         await editor.fill('package gateway.policy\ndefault allow = true');
         await expect(editor).toHaveValue('package gateway.policy\ndefault allow = true');
     });

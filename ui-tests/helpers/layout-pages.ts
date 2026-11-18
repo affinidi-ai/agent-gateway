@@ -670,7 +670,7 @@ const CREATE_PAGES: LayoutPage[] = [
         actions: [
             'policy-definition-editor-back-button',
             'policy-definition-editor-save-button',
-            'policy-instructions-toggle',
+            'policy-view-rego',
         ],
     },
     {
