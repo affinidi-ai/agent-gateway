@@ -1713,13 +1713,14 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
   **Used by surfaces** shows a count badge and the surface names joined with commas on one
   truncated line, with the full list in the tooltip. It has no links. **Identities** shows the same
   count badge, then the first DID in `identities`, shortened in the middle and muted with a copy
-  button, and `+N` for the rest; every DID is in the tooltip. Without any it shows **No DID**: a warning badge
-  while surfaces use the agent (the API does not say which surface holds which DID), muted text
-  otherwise.
+  button, and `+N` for the rest; every DID is in the tooltip. Without any it shows **No DID**: a
+  warning badge while surfaces use the agent (the API does not say which surface holds which DID),
+  muted text otherwise.
 - The agent name (`agents-name`) is the strongest text in a row; DIDs stay muted. The table's
   column headers (`agents-table`) keep the uppercase `.table-sm` default, like the Surfaces page.
-- **Agent** shows the endpoint host under the name (`endpointHost`: the URL origin with its scheme, such as `https://agent.example`, the A2A proxy,
-  or `gateway/channel`), so rows with the same name can be told apart. A proxy or gateway shows
+- **Agent** shows the endpoint host under the name (`endpointHost`: the URL origin with its
+  scheme, such as `https://agent.example`, the A2A proxy, or `gateway/channel`), so rows with the
+  same name can be told apart. A proxy or gateway shows
   `target_name` from `GET /v1/agents`, or its id when the name is `null` or blank; the
   `a2a-proxy://` and `fabric://` schemes are never shown. An endpoint `connectionTarget` cannot
   show gets no line.

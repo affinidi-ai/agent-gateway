@@ -173,8 +173,7 @@ const AgentCardTab: React.FC<AgentCardTabProps> = ({ agentId, surfaces }) => {
       if (request !== latest.current) return;
       if (surfaceId && err instanceof ApiError && err.code === 'surface_unavailable') {
         setSurfaceUnavailable(true);
-      }
-      else setFailed(true);
+      } else setFailed(true);
     } finally {
       if (request === latest.current) setLoading(false);
     }
