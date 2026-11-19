@@ -268,24 +268,33 @@ pub(super) struct FileAnswer {
 }
 
 /// Every file an operation's success answers declare, in the order they were
-/// read. An operation declares more than one when it answers several JSON
-/// media types, or a file on more than one status.
+/// read, beside every JSON media type those answers declare. An operation
+/// declares more than one file when it answers several JSON media types, or a
+/// file on more than one status.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct FileAnswers(Vec<FileAnswer>);
+pub(super) struct FileAnswers {
+    files: Vec<FileAnswer>,
+    /// Every JSON media type each success answer declares, whether or not it
+    /// declares a file, so an answer sent as a media type the operation
+    /// declares without one is answered as its JSON instead of another
+    /// media type's file.
+    media_types: Vec<(SuccessStatus, String)>,
+}
 
 impl FileAnswers {
     /// The file an answer of `status`, sent as `content_type`, carries: the
-    /// one declared on that status whose media type the answer names, or
-    /// else the first declared on it, so an answer whose media type is not
-    /// declared, or that names none at all, still carries the file its
-    /// status declares.
+    /// one declared on that status whose media type the answer names. An
+    /// answer of a media type that status declares without a file carries
+    /// none, so it is answered as its JSON. One whose media type that status
+    /// does not declare, or that names none at all, carries the first file
+    /// declared on the status.
     fn governing(
         &self,
         status: u16,
         content_type: Option<&str>,
     ) -> Option<&FileAnswer> {
         let declared = || {
-            self.0
+            self.files
                 .iter()
                 .filter(|file| file.status.names(status))
         };
@@ -294,14 +303,23 @@ impl FileAnswers {
                 .parse::<mime::Mime>()
                 .ok()
         });
-        answered
-            .and_then(|answered| {
-                declared().find(|file| {
-                    file.media_type
-                        .eq_ignore_ascii_case(answered.essence_str())
-                })
-            })
-            .or_else(|| declared().next())
+        let Some(answered) = answered else { return declared().next() };
+        let answered = answered.essence_str();
+        if let Some(file) = declared().find(|file| {
+            file.media_type
+                .eq_ignore_ascii_case(answered)
+        }) {
+            return Some(file);
+        }
+        let declared_without_file = self
+            .media_types
+            .iter()
+            .any(|(declared_on, media_type)| declared_on.names(status) && media_type.eq_ignore_ascii_case(answered));
+        if declared_without_file {
+            None
+        } else {
+            declared().next()
+        }
     }
 }
 
@@ -369,13 +387,15 @@ pub(super) fn file_answers(
     declared_files(&json_answers(spec, metadata)?)
 }
 
-/// The files the success answers declare. Every JSON media type of every
-/// success answer is read, so a malformed declaration on any of them refuses
-/// the tool.
+/// The files the success answers declare, beside every JSON media type those
+/// answers declare. Every JSON media type of every success answer is read, so
+/// a malformed declaration on any of them refuses the tool.
 fn declared_files(answers: &[JsonAnswer<'_>]) -> Result<Option<FileAnswers>, RestError> {
     let mut files = Vec::new();
+    let mut media_types = Vec::new();
     for answer in answers {
         for (media_type, media) in &answer.media {
+            media_types.push((answer.status, (*media_type).to_string()));
             let Some(declared) = media.get(FILE_EXTENSION) else { continue };
             files.push(FileAnswer {
                 declaration: FileDeclaration::declared(declared)?,
@@ -384,7 +404,7 @@ fn declared_files(answers: &[JsonAnswer<'_>]) -> Result<Option<FileAnswers>, Res
             });
         }
     }
-    Ok((!files.is_empty()).then_some(FileAnswers(files)))
+    Ok((!files.is_empty()).then_some(FileAnswers { files, media_types }))
 }
 
 pub(super) fn routing_spec(spec: &Value) -> Result<Value, RestError> {
@@ -1830,11 +1850,14 @@ mod tests {
         pointer: &str,
         encoding: &str,
     ) -> FileAnswers {
-        FileAnswers(vec![FileAnswer {
-            declaration: FileDeclaration::declared(&json!({"pointer": pointer, "encoding": encoding})).unwrap(),
-            status,
-            media_type: media_type.to_string(),
-        }])
+        FileAnswers {
+            files: vec![FileAnswer {
+                declaration: FileDeclaration::declared(&json!({"pointer": pointer, "encoding": encoding})).unwrap(),
+                status,
+                media_type: media_type.to_string(),
+            }],
+            media_types: vec![(status, media_type.to_string())],
+        }
     }
 
     /// The one file `spec` declares for `path`, for a spec that declares at
@@ -1844,8 +1867,8 @@ mod tests {
         path: &str,
     ) -> Option<FileAnswer> {
         let files = file_answers(spec, &metadata(path)).unwrap()?;
-        assert_eq!(files.0.len(), 1, "one declaration, got {:?}", files.0);
-        files.0.into_iter().next()
+        assert_eq!(files.files.len(), 1, "one declaration, got {:?}", files.files);
+        files.files.into_iter().next()
     }
 
     #[test]
@@ -2011,6 +2034,35 @@ mod tests {
             None,
             "the tool answers a file, so it advertises no output schema"
         );
+        let schema_only = file_answers(&declared, &metadata("/file"))
+            .unwrap()
+            .expect("the vendor media type declares a file");
+        assert!(
+            schema_only
+                .governing(200, Some("application/json"))
+                .is_none(),
+            "a media type the answer declares without a file is answered as its JSON"
+        );
+        assert_eq!(
+            schema_only
+                .governing(200, Some("application/vnd.example+json"))
+                .map(|file| file
+                    .declaration
+                    .pointer
+                    .clone()),
+            Some("/data".to_string()),
+            "the media type the file is declared on still carries it"
+        );
+        assert_eq!(
+            schema_only
+                .governing(200, None)
+                .map(|file| file
+                    .declaration
+                    .pointer
+                    .clone()),
+            Some("/data".to_string()),
+            "an answer naming no media type carries the first file of its status"
+        );
         let malformed = spec(json!({FILE_EXTENSION: {"pointer": "/data", "encoding": "hex"}}));
         assert!(
             file_answers(&malformed, &metadata("/file")).is_err(),
@@ -2024,7 +2076,7 @@ mod tests {
         let files = file_answers(&two, &metadata("/file"))
             .unwrap()
             .expect("both declarations are read");
-        assert_eq!(files.0.len(), 2, "{files:?}");
+        assert_eq!(files.files.len(), 2, "{files:?}");
         let pointer = |content_type: Option<&str>| {
             files
                 .governing(200, content_type)
@@ -2223,11 +2275,18 @@ mod tests {
             accepted["content"][0]["type"], "text",
             "a success answer the file was not declared on is answered as its JSON: {accepted}"
         );
-        let two_media_types = FileAnswers(vec![
-            declared_on(SuccessStatus::Exact(200), "application/json", "/data", "base64url").0[0].clone(),
-            declared_on(SuccessStatus::Exact(200), "application/vnd.example+json", "/file/content", "base64").0[0]
+        let two_media_types = FileAnswers {
+            files: vec![
+                declared_on(SuccessStatus::Exact(200), "application/json", "/data", "base64url").files[0].clone(),
+                declared_on(SuccessStatus::Exact(200), "application/vnd.example+json", "/file/content", "base64").files
+                    [0]
                 .clone(),
-        ]);
+            ],
+            media_types: vec![
+                (SuccessStatus::Exact(200), "application/json".to_string()),
+                (SuccessStatus::Exact(200), "application/vnd.example+json".to_string()),
+            ],
+        };
         let vendor = call(
             &base,
             &metadata("/vendor"),

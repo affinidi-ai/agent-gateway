@@ -579,13 +579,16 @@ decoded file as an embedded resource (`mimeType` `application/octet-stream`, `ur
 never the JSON around it, and the tool advertises no output schema; that
 answer when it is not JSON, has no string at the pointer or a string not in
 that encoding is the tool error "REST response does not carry the file its
-tool declares". Where an answer declares a file on several of its media types,
-the `Content-Type` the REST API answered picks which one that answer carries,
-ignoring its parameters; an answer whose media type the operation does not
-declare, or that names none at all, carries the first file declared on its
-status. Another answer is answered as it would be without the
-declaration: a success status the file was not declared on is its JSON, and a
-failure status is answered as usual. A declaration with another key, another
+tool declares". Where an answer lists several JSON media types, the
+`Content-Type` the REST API answered picks which declaration that answer
+carries, ignoring its parameters: the file declared on that media type, or no
+file at all when the operation declares that media type without one, so such
+an answer is its JSON as it was before any other media type of the answer
+declared a file. An answer whose media type the operation does not declare, or
+that names none at all, carries the first file declared on its status. Another
+answer is answered as it would be without the declaration: a success status
+the file was not declared on is its JSON, and a failure status is answered as
+usual. A declaration with another key, another
 encoding or no pointer, on any JSON media type of any success answer, drops
 the tool from `tools/list` and refuses a call to it, as an unusable output
 schema does. The
