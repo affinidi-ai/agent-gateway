@@ -951,7 +951,7 @@ impl KeyDirectory {
         &self,
         purpose: KeyPurpose,
         scope: &KeyScope,
-    ) -> KeyRef {
+    ) -> Result<KeyRef, VtaError> {
         if let (Some(surface_id), Some(variant_id)) = (
             scope
                 .surface_id
@@ -962,32 +962,41 @@ impl KeyDirectory {
         ) && let Some(m) = self.find(purpose, |s| {
             matches!(s, MappingScope::Variant { surface_id: sid, variant_id: vid } if sid == surface_id && vid == variant_id)
         }) {
-            return m;
+            return Ok(m);
         }
         if let Some(surface_id) = scope.surface_id.as_deref()
             && let Some(m) =
                 self.find(purpose, |s| matches!(s, MappingScope::Surface { surface_id: sid } if sid == surface_id))
         {
-            return m;
+            return Ok(m);
         }
         // The dashboard override outranks the `[vta]` block: an operator who
         // points the appliance at a paired connection in the UI expects that
-        // to win over a file they may not be able to edit. A malformed
-        // override is ignored rather than fatal — it cannot be rejected at
-        // startup like config can, and refusing to sign because an optional
-        // setting is wrong would take the appliance down.
+        // to win over a file they may not be able to edit. It is an explicit
+        // choice of signer, so one that cannot sign tokens refuses every
+        // purpose rather than splitting them between it and another key. A
+        // purpose its backend does not serve, such as a Data Integrity proof
+        // on a trust agent, still follows the `[vta]` defaults.
         if let Some(source) = self
             .appliance_default
             .as_ref()
             && let Some(signing) = source.signing()
-            && let Ok(key_ref) = signing_key_ref(&signing, purpose)
         {
-            return key_ref;
+            signing_key_ref(&signing, KeyPurpose::Jwt).map_err(|e| {
+                VtaError::Config(format!(
+                    "the gateway-wide default signing choice cannot sign tokens: {}",
+                    e.log_detail()
+                ))
+            })?;
+            if let Ok(key_ref) = signing_key_ref(&signing, purpose) {
+                return Ok(key_ref);
+            }
         }
-        self.defaults
+        Ok(self
+            .defaults
             .get(&purpose)
             .cloned()
-            .unwrap_or_else(|| KeyRef::local(purpose))
+            .unwrap_or_else(|| KeyRef::local(purpose)))
     }
 
     /// Whether `scope` has a mapping of its own: a variant or surface
@@ -1045,7 +1054,7 @@ impl KeyDirectory {
             .await?
         {
             Some(live) => live,
-            None => self.resolve(purpose, scope),
+            None => self.resolve(purpose, scope)?,
         };
         let KeyBackend::Vta { connection_id } = &key_ref.backend else {
             return Ok(key_ref);
@@ -1516,7 +1525,9 @@ mod tests {
     fn with_nothing_configured_every_purpose_resolves_to_the_local_key() {
         let dir = directory_with(None);
         for purpose in [KeyPurpose::Jwt, KeyPurpose::Credential, KeyPurpose::Proof] {
-            let resolved = dir.resolve(purpose, &KeyScope::default());
+            let resolved = dir
+                .resolve(purpose, &KeyScope::default())
+                .unwrap();
             assert_eq!(resolved, KeyRef::local(purpose), "purpose {purpose:?} must fall back to local");
         }
     }
@@ -1527,7 +1538,9 @@ mod tests {
         dir.defaults
             .insert(KeyPurpose::Jwt, vta_jwt_ref("appliance-key"));
 
-        let resolved = dir.resolve(KeyPurpose::Jwt, &KeyScope::surface("surface-a"));
+        let resolved = dir
+            .resolve(KeyPurpose::Jwt, &KeyScope::surface("surface-a"))
+            .unwrap();
         assert_eq!(
             resolved
                 .key_id
@@ -1552,6 +1565,7 @@ mod tests {
         };
         assert_eq!(
             dir.resolve(KeyPurpose::Jwt, &scope)
+                .unwrap()
                 .key_id
                 .as_ref()
                 .map(KeyId::as_str),
@@ -1560,6 +1574,7 @@ mod tests {
         // An unmapped variant of the same surface falls back to the surface.
         assert_eq!(
             dir.resolve(KeyPurpose::Jwt, &KeyScope::variant("surface-a", "variant-z"))
+                .unwrap()
                 .key_id
                 .as_ref()
                 .map(KeyId::as_str),
@@ -1595,7 +1610,9 @@ mod tests {
             .unwrap();
 
         // The JWT mapping must not be picked up by a credential resolution.
-        let resolved = dir.resolve(KeyPurpose::Credential, &KeyScope::surface("surface-a"));
+        let resolved = dir
+            .resolve(KeyPurpose::Credential, &KeyScope::surface("surface-a"))
+            .unwrap();
         assert_eq!(resolved, KeyRef::local(KeyPurpose::Credential));
     }
 
@@ -1835,7 +1852,9 @@ mod tests {
             .expect("the mapping installs");
 
         for purpose in [KeyPurpose::Jwt, KeyPurpose::Credential] {
-            let resolved = dir.resolve(purpose, &KeyScope::surface("surface-a"));
+            let resolved = dir
+                .resolve(purpose, &KeyScope::surface("surface-a"))
+                .unwrap();
             assert!(
                 matches!(&resolved.backend, KeyBackend::Vta { connection_id } if connection_id == "vta-a"),
                 "{purpose:?} must resolve the surface's agent, got {:?}",
@@ -2203,7 +2222,9 @@ mod tests {
             .expect("a disabled block always builds")
             .with_appliance_default(Arc::new(StubApplianceDefault(Some(appliance_vta_signing("vta-b")))));
 
-        let key_ref = dir.resolve(KeyPurpose::Jwt, &KeyScope::default());
+        let key_ref = dir
+            .resolve(KeyPurpose::Jwt, &KeyScope::default())
+            .unwrap();
         assert_eq!(
             key_ref.backend,
             KeyBackend::Vta {
@@ -2225,7 +2246,8 @@ mod tests {
             .with_appliance_default(Arc::new(StubApplianceDefault(None)));
 
         assert_eq!(
-            dir.resolve(KeyPurpose::Jwt, &KeyScope::default()),
+            dir.resolve(KeyPurpose::Jwt, &KeyScope::default())
+                .unwrap(),
             KeyRef::local(KeyPurpose::Jwt),
             "an unset override must leave the local default in place"
         );
@@ -2251,6 +2273,7 @@ mod tests {
 
         assert_eq!(
             dir.resolve(KeyPurpose::Jwt, &KeyScope::surface("s1"))
+                .unwrap()
                 .backend,
             KeyBackend::Vta {
                 connection_id: "vta-surface".to_string()
@@ -2259,28 +2282,58 @@ mod tests {
         );
     }
 
-    /// A malformed override must not take the appliance down. It cannot be
-    /// rejected at startup the way config can, so it is ignored and the
-    /// previous default stands.
+    /// A default that cannot sign tokens is an explicit choice of signer that
+    /// cannot be honoured, so every purpose refuses rather than tokens falling
+    /// back to another key while credentials follow the default.
     #[tokio::test]
-    async fn a_malformed_override_falls_through_instead_of_breaking_signing() {
+    async fn a_default_that_cannot_sign_tokens_refuses_every_purpose() {
         let (local, _tmp) = local_authority().await;
-        // `vta` backend with no key id is invalid for the `jwt` purpose (D-11).
-        let broken = crate::config::agent_surface::SurfaceSigningConfig {
+        let keyless = crate::config::agent_surface::SurfaceSigningConfig {
             backend: Some(crate::config::agent_surface::SigningBackendKind::Vta),
             connection_id: Some("vta-b".to_string()),
-            ..Default::default()
+            context_id: Some("ctx".to_string()),
+            key_id: None,
         };
         let dir = KeyDirectory::build(&VtaConfig::default(), Arc::clone(&local))
             .await
             .expect("a disabled block always builds")
-            .with_appliance_default(Arc::new(StubApplianceDefault(Some(broken))));
+            .with_appliance_default(Arc::new(StubApplianceDefault(Some(keyless))));
 
-        assert_eq!(
-            dir.resolve(KeyPurpose::Jwt, &KeyScope::default()),
-            KeyRef::local(KeyPurpose::Jwt),
-            "a broken override must fall through, not panic or poison signing"
-        );
+        for purpose in [KeyPurpose::Jwt, KeyPurpose::Credential, KeyPurpose::Proof] {
+            let error = dir
+                .resolve(purpose, &KeyScope::default())
+                .expect_err("a default that cannot sign tokens must not resolve");
+            assert!(
+                error
+                    .log_detail()
+                    .contains("key_id"),
+                "{purpose:?}: {}",
+                error.log_detail()
+            );
+        }
+    }
+
+    /// A trust agent default does not serve Data Integrity proofs, so those
+    /// follow the `[vta]` defaults while tokens and credentials follow it.
+    #[tokio::test]
+    async fn a_trust_agent_default_leaves_proofs_to_the_vta_defaults() {
+        let (local, _tmp) = local_authority().await;
+        let dir = KeyDirectory::build(&VtaConfig::default(), Arc::clone(&local))
+            .await
+            .expect("a disabled block always builds")
+            .with_appliance_default(Arc::new(StubApplianceDefault(Some(appliance_vta_signing("vta-b")))));
+
+        let backend = |purpose| {
+            dir.resolve(purpose, &KeyScope::default())
+                .unwrap()
+                .backend
+        };
+        let agent = KeyBackend::Vta {
+            connection_id: "vta-b".to_string(),
+        };
+        assert_eq!(backend(KeyPurpose::Jwt), agent);
+        assert_eq!(backend(KeyPurpose::Credential), agent);
+        assert_eq!(backend(KeyPurpose::Proof), KeyBackend::Local);
     }
 
     // ---- backwards compatibility -----------------------------------------
@@ -2297,7 +2350,9 @@ mod tests {
             .await
             .expect("a disabled block always builds");
 
-        let key_ref = dir.resolve(KeyPurpose::Jwt, &KeyScope::default());
+        let key_ref = dir
+            .resolve(KeyPurpose::Jwt, &KeyScope::default())
+            .unwrap();
         assert_eq!(key_ref, KeyRef::local(KeyPurpose::Jwt));
 
         let authority = dir
@@ -2361,6 +2416,7 @@ mod tests {
 
         assert_eq!(
             dir.resolve(KeyPurpose::Jwt, &KeyScope::surface("s1"))
+                .unwrap()
                 .key_id
                 .as_ref()
                 .map(KeyId::as_str),
@@ -2376,8 +2432,12 @@ mod tests {
         dir.with_surface(&surface_with("s2", Some(vta_signing("ctx-two", "key-two")), vec![]))
             .unwrap();
 
-        let first = dir.resolve(KeyPurpose::Jwt, &KeyScope::surface("s1"));
-        let second = dir.resolve(KeyPurpose::Jwt, &KeyScope::surface("s2"));
+        let first = dir
+            .resolve(KeyPurpose::Jwt, &KeyScope::surface("s1"))
+            .unwrap();
+        let second = dir
+            .resolve(KeyPurpose::Jwt, &KeyScope::surface("s2"))
+            .unwrap();
 
         // The `key_id` *is* the published `kid`, so different keys here means
         // a verifier can tell the two surfaces apart.
@@ -2416,7 +2476,9 @@ mod tests {
         .unwrap();
 
         // Inherits — a variant is a sparse delta, so absent means the surface's.
-        let inherited = dir.resolve(KeyPurpose::Jwt, &KeyScope::variant("s1", "v-plain"));
+        let inherited = dir
+            .resolve(KeyPurpose::Jwt, &KeyScope::variant("s1", "v-plain"))
+            .unwrap();
         assert_eq!(
             inherited
                 .context
@@ -2433,7 +2495,9 @@ mod tests {
         );
 
         // Overrides — only when the operator deliberately asked.
-        let own = dir.resolve(KeyPurpose::Jwt, &KeyScope::variant("s1", "v-own"));
+        let own = dir
+            .resolve(KeyPurpose::Jwt, &KeyScope::variant("s1", "v-own"))
+            .unwrap();
         assert_eq!(
             own.context
                 .as_ref()
@@ -2462,6 +2526,7 @@ mod tests {
 
         assert_eq!(
             dir.resolve(KeyPurpose::Jwt, &KeyScope::surface("s1"))
+                .unwrap()
                 .key_id
                 .as_ref()
                 .map(KeyId::as_str),
@@ -2493,6 +2558,7 @@ mod tests {
         // installed alongside a rejected variant.
         assert_eq!(
             dir.resolve(KeyPurpose::Jwt, &KeyScope::surface("s1"))
+                .unwrap()
                 .key_id
                 .as_ref()
                 .map(KeyId::as_str),
@@ -2551,7 +2617,9 @@ mod tests {
             .await
             .expect("build");
 
-        let key_ref = dir.resolve(KeyPurpose::Jwt, &KeyScope::default());
+        let key_ref = dir
+            .resolve(KeyPurpose::Jwt, &KeyScope::default())
+            .unwrap();
         assert_eq!(
             key_ref.backend,
             KeyBackend::Vta {
@@ -2575,7 +2643,11 @@ mod tests {
 
         // Unlisted purposes still fall back to local — the flat config only
         // ever described a JWT key.
-        assert_eq!(dir.resolve(KeyPurpose::Credential, &KeyScope::default()), KeyRef::local(KeyPurpose::Credential));
+        assert_eq!(
+            dir.resolve(KeyPurpose::Credential, &KeyScope::default())
+                .unwrap(),
+            KeyRef::local(KeyPurpose::Credential)
+        );
 
         let authority = dir
             .authority_for(&key_ref, KeyPurpose::Jwt)
