@@ -232,6 +232,9 @@ sdk_inbound_cache_bytes = 104857600  # 100 MiB
 level = "info"  # trace, debug, info, warn, error
 json = false    # Set to true for JSON-formatted logs
 log_directory = "../_storage/logs"  # Directory to write log files (logs to stdout only if not set)
+# The gateway writes one INFO line per delegated call ("Delegation event event=token_injected ...").
+# Set this to false to write none of these per-call events; the audited delegation events are unaffected.
+# delegation_events = true
 # Log redaction is set in gateway.json `logging.redaction`, not here. It is on by default.
 
 # VP Audit Log file rotation (optional; the defaults are shown).

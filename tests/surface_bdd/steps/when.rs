@@ -404,6 +404,14 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         );
     }
 
+    if world.gateway_did_without_assertion_multikey {
+        crate::steps::gateway_did::seed_gateway_did_without_assertion_multikey(
+            &temp_dir
+                .path()
+                .join("_storage/vc_keys"),
+        );
+    }
+
     if world.affinidi_cache_seeded {
         let cache_dir = temp_dir
             .path()
@@ -675,7 +683,7 @@ fn record_caller_response(
     });
 }
 
-fn record_admin_response(
+pub(crate) fn record_admin_response(
     world: &mut SurfaceWorld,
     response: crate::world::RecordedResponse,
 ) {
@@ -726,7 +734,7 @@ pub(crate) async fn fetch_surface_by_id(
     world.surface_lookup_response = Some(response);
 }
 
-fn get_tracked_surface_id(
+pub(crate) fn get_tracked_surface_id(
     world: &SurfaceWorld,
     action: &str,
 ) -> String {
@@ -741,7 +749,7 @@ fn get_tracked_surface_id(
         .unwrap_or_else(|| panic!("surface id must be set before {}", action))
 }
 
-fn get_current_admin_surface_body(
+pub(crate) fn get_current_admin_surface_body(
     world: &SurfaceWorld,
     action: &str,
 ) -> serde_json::Value {
@@ -753,7 +761,7 @@ fn get_current_admin_surface_body(
         .clone()
 }
 
-async fn update_created_surface(
+pub(crate) async fn update_created_surface(
     world: &mut SurfaceWorld,
     payload: serde_json::Value,
     action: &str,
@@ -1978,6 +1986,220 @@ async fn read_audit_log_as_operator(
     record_admin_response(world, response);
 }
 
+/// The delegated credentials an administrator sees in the delegation vault.
+pub(crate) async fn list_delegation_vault(world: &mut SurfaceWorld) -> Vec<serde_json::Value> {
+    ensure_admin_session(world).await;
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_recorded_json::<serde_json::Value>(reqwest::Method::GET, "/v1/delegation-vault", None)
+        .await
+        .expect("list the delegation vault through the admin API");
+    assert_eq!(response.status, 200, "listing the delegation vault: {}", response.body);
+    response
+        .body
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("the delegation vault is listed as an array, got {}", response.body))
+}
+
+#[when(expr = "the operator asks what a consent time limit of {int} seconds on OAuth provider {string} would end")]
+async fn operator_asks_what_a_consent_time_limit_would_end(
+    world: &mut SurfaceWorld,
+    seconds: u64,
+    provider: String,
+) {
+    ensure_admin_session(world).await;
+    let id = world
+        .surface_config
+        .provider_record_id(&provider);
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_recorded_json::<serde_json::Value>(
+            reqwest::Method::GET,
+            &format!("/v1/credential-providers/{id}/consent-impact?max_consent_age_secs={seconds}"),
+            None,
+        )
+        .await
+        .expect("ask the admin API what a consent time limit would end");
+    record_admin_response(world, response);
+}
+
+/// Sets the consent time limit of the surface's one binding to `seconds`, as
+/// an operator does through the admin API, and returns the answer.
+pub(crate) async fn limit_the_surfaces_binding(
+    world: &mut SurfaceWorld,
+    seconds: u64,
+) -> crate::world::RecordedResponse {
+    use crate::bdd_support::config::single_surface_fixture::SEEDED_SURFACE_ID;
+    ensure_admin_session(world).await;
+    let client = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist");
+    let stored = client
+        .get_surface_recorded(SEEDED_SURFACE_ID)
+        .await
+        .expect("read the surface through the admin API");
+    assert_eq!(stored.status, 200, "reading the surface: {}", stored.body);
+    let mut surface = stored.body;
+    let bindings = surface["outbound_credentials"]
+        .as_array_mut()
+        .unwrap_or_else(|| panic!("the surface has no outbound_credentials"));
+    assert_eq!(bindings.len(), 1, "the surface has one binding to limit: {bindings:?}");
+    bindings[0]["max_consent_age_secs"] = serde_json::json!(seconds);
+    client
+        .update_surface_recorded(SEEDED_SURFACE_ID, &surface)
+        .await
+        .expect("save the surface through the admin API")
+}
+
+#[when(expr = "the operator limits a consent used through the surface's binding to {int} seconds")]
+async fn operator_limits_the_surfaces_binding(
+    world: &mut SurfaceWorld,
+    seconds: u64,
+) {
+    let saved = limit_the_surfaces_binding(world, seconds).await;
+    world.admin_response = Some(saved);
+}
+
+/// Limits the consent of the one delegated credential the vault holds to
+/// `seconds` after it was given, as an operator does through the admin API,
+/// and records the answer.
+pub(crate) async fn limit_the_callers_consent(
+    world: &mut SurfaceWorld,
+    seconds: u64,
+) {
+    let held = list_delegation_vault(world).await;
+    assert_eq!(held.len(), 1, "expected one delegated credential to limit, got {held:?}");
+    let id = held[0]["id"]
+        .as_str()
+        .expect("a listed delegated credential has an id");
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_recorded_json(
+            reqwest::Method::PUT,
+            &format!("/v1/delegation-vault/{id}/consent-limit"),
+            Some(&serde_json::json!({ "max_consent_age_secs": seconds })),
+        )
+        .await
+        .expect("limit a consent through the admin API");
+    record_admin_response(world, response);
+}
+
+#[when(expr = "the operator limits the caller's consent to {int} seconds")]
+async fn operator_limits_the_callers_consent(
+    world: &mut SurfaceWorld,
+    seconds: u64,
+) {
+    limit_the_callers_consent(world, seconds).await;
+}
+
+/// Sets the consent time limit of credential provider `provider` to `seconds`,
+/// as an operator does through the admin API.
+pub(crate) async fn change_provider_consent_limit(
+    world: &mut SurfaceWorld,
+    provider: &str,
+    seconds: u64,
+) {
+    ensure_admin_session(world).await;
+    let id = world
+        .surface_config
+        .provider_record_id(provider);
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_recorded_json(
+            reqwest::Method::PUT,
+            &format!("/v1/credential-providers/{id}"),
+            Some(&serde_json::json!({ "max_consent_age_secs": seconds })),
+        )
+        .await
+        .expect("change the provider's consent time limit through the admin API");
+    assert_eq!(response.status, 200, "limiting consents to OAuth provider '{provider}': {}", response.body);
+    assert_eq!(response.body["max_consent_age_secs"], serde_json::json!(seconds), "{}", response.body);
+}
+
+#[when(expr = "the operator changes the consent time limit of OAuth provider {string} to {int} seconds")]
+async fn operator_changes_the_providers_consent_limit(
+    world: &mut SurfaceWorld,
+    provider: String,
+    seconds: u64,
+) {
+    change_provider_consent_limit(world, &provider, seconds).await;
+}
+
+/// Asks the admin API to deactivate the credential provider the surface
+/// binds, whatever its type, and keeps the answer.
+#[when("the operator deactivates the credential provider the surface binds")]
+async fn operator_deactivates_the_surfaces_credential_provider(world: &mut SurfaceWorld) {
+    ensure_admin_session(world).await;
+    let id = world
+        .surface_config
+        .credential_delegation
+        .as_ref()
+        .expect("the surface binds a credential provider")
+        .record_id()
+        .to_string();
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_recorded_json::<serde_json::Value>(
+            reqwest::Method::POST,
+            &format!("/v1/credential-providers/{id}/deactivate"),
+            None,
+        )
+        .await
+        .expect("ask the admin API to deactivate the provider");
+    record_admin_response(world, response);
+}
+
+/// Deactivates credential provider `provider`, or activates it again, as an
+/// operator does through the admin API.
+pub(crate) async fn set_oauth_provider_active(
+    world: &mut SurfaceWorld,
+    provider: &str,
+    active: bool,
+) {
+    ensure_admin_session(world).await;
+    let id = world
+        .surface_config
+        .provider_record_id(provider);
+    let action = if active {
+        "activate"
+    } else {
+        "deactivate"
+    };
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_recorded_json::<serde_json::Value>(
+            reqwest::Method::POST,
+            &format!("/v1/credential-providers/{id}/{action}"),
+            None,
+        )
+        .await
+        .expect("change the provider's activation through the admin API");
+    assert_eq!(response.status, 200, "{action} OAuth provider '{provider}': {}", response.body);
+    assert_eq!(
+        response
+            .body
+            .get("deactivated_at")
+            .is_some(),
+        !active,
+        "{}",
+        response.body
+    );
+}
+
 pub(crate) async fn read_delegation_audit_trail(world: &mut SurfaceWorld) {
     record_delegation_audit_trail(world).await;
     let response = world
@@ -2995,6 +3217,59 @@ pub(crate) async fn send_mcp_request_through_transit_point_path_with_headers(
     body: serde_json::Value,
     headers: Vec<(String, String)>,
 ) {
+    send_through_transit_point_path(world, agent_name, reqwest::Method::POST, path, Some(body), headers).await;
+}
+
+#[when(
+    expr = "managed agent {string} reads {string} with {word} through Transit Point {string} with its transit token"
+)]
+async fn managed_agent_reads_through_transit_point_with_its_token(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    document: String,
+    method: String,
+    transit_point: String,
+) {
+    let headers = with_transit_token(world, Vec::new());
+    read_through_transit_point(world, &agent_name, &method, &transit_point, &document, headers).await;
+}
+
+#[when(expr = "managed agent {string} reads {string} with {word} through Transit Point {string}")]
+async fn managed_agent_reads_through_transit_point(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    document: String,
+    method: String,
+    transit_point: String,
+) {
+    read_through_transit_point(world, &agent_name, &method, &transit_point, &document, Vec::new()).await;
+}
+
+async fn read_through_transit_point(
+    world: &mut SurfaceWorld,
+    agent_name: &str,
+    method: &str,
+    transit_point: &str,
+    document: &str,
+    headers: Vec<(String, String)>,
+) {
+    let method = match method {
+        "GET" => reqwest::Method::GET,
+        "HEAD" => reqwest::Method::HEAD,
+        other => panic!("a discovery read is a GET or HEAD, not {other}"),
+    };
+    let path = format!("/transit/{transit_point}/{}", document.trim_start_matches('/'));
+    send_through_transit_point_path(world, agent_name, method, &path, None, headers).await;
+}
+
+async fn send_through_transit_point_path(
+    world: &mut SurfaceWorld,
+    agent_name: &str,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+    headers: Vec<(String, String)>,
+) {
     world
         .actors
         .expect_target_kind(agent_name, TargetActorKind::ManagedAgent);
@@ -3012,18 +3287,18 @@ pub(crate) async fn send_mcp_request_through_transit_point_path_with_headers(
         .unwrap_or_else(|error| panic!("outbound listener did not become ready on port {outbound_port}: {error}"));
     let url = format!("http://127.0.0.1:{}{}", outbound_port, path);
 
-    world.sent_body = Some(body.clone());
-    let mut request = reqwest::Client::new()
-        .post(&url)
-        .header("content-type", "application/json");
+    let mut request = reqwest::Client::new().request(method, &url);
+    if let Some(body) = body {
+        world.sent_body = Some(body.clone());
+        request = request.json(&body);
+    }
     for (name, value) in headers {
         request = request.header(name, value);
     }
     let response = request
-        .json(&body)
         .send()
         .await
-        .expect("send MCP request through Transit Point");
+        .expect("send request through Transit Point");
 
     let status = response.status().as_u16();
     let headers = collect_headers(response.headers());
@@ -3801,6 +4076,21 @@ pub(crate) async fn post_consent_start_page(
         .send()
         .await
         .expect("confirm the consent start page")
+}
+
+/// Open the consent start page of the latest consent_required answer, as the
+/// person's browser does, whatever the gateway answers.
+#[when(expr = "the caller opens the consent start page for provider {string}")]
+async fn caller_opens_consent_start_page(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    let page = no_redirect_client()
+        .get(latest_consent_start_url(world, &provider))
+        .send()
+        .await
+        .expect("open the consent start page");
+    record_html_response(world, page).await;
 }
 
 /// The binding cookie a consent start POST set, as its `name=value` pair.

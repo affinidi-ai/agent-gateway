@@ -6,10 +6,10 @@ use std::sync::{Arc, LazyLock};
 use parking_lot::{Mutex, RwLock};
 use tracing::{debug, error, warn};
 
-use crate::audit::catalog::event_bit;
+use crate::audit::catalog::{event_bit, is_logged_only};
 use crate::audit::journal::Pending;
 use crate::audit::registry::{Sinks, sinks};
-use crate::delegation_vault::audit::{DelegationAuditEvent, action_category, new_event_id};
+use crate::delegation_vault::audit::{DelegationAuditEvent, action_category, log_event, new_event_id};
 use crate::metrics::backends::prometheus::{track_audit_record_produced, track_audit_records_lost};
 use crate::observability::policy_audit::{current_request_id, current_request_variant};
 
@@ -69,13 +69,19 @@ impl Producer {
         event_bit(category).is_some_and(|bit| self.sinks.wants(bit))
     }
 
-    /// Builds and submits a record only when a sink selects `category`.
+    /// Builds and submits a record only when a sink selects `category`. A
+    /// logged event ([`crate::audit::catalog::LOGGED_EVENTS`]) is built and
+    /// written to the gateway log instead, while that log takes it.
     pub fn emit(
         &self,
         category: &'static str,
         build: impl FnOnce() -> DelegationAuditEvent,
     ) {
-        if self.wants(category) {
+        if is_logged_only(category) {
+            if logs_delegation_events() {
+                log(build());
+            }
+        } else if self.wants(category) {
             self.submit(build());
         }
     }
@@ -83,20 +89,17 @@ impl Producer {
     /// Finalises a built record: stamped with the request's id and surface
     /// variant when it has none, held while a [`DeferredAudit`] scope is
     /// active, otherwise given an event id, addressed to the sinks that
-    /// select it now, and handed to the journal without waiting.
+    /// select it now, and handed to the journal without waiting. A logged
+    /// event is written to the gateway log and reaches no sink.
     pub fn submit(
         &self,
         mut event: DelegationAuditEvent,
     ) {
-        if event.request_id.is_none() {
-            event.request_id = current_request_id();
+        if is_logged_only(action_category(&event.event)) {
+            log(event);
+            return;
         }
-        if event
-            .surface_variant
-            .is_none()
-        {
-            event.surface_variant = current_request_variant();
-        }
+        stamp_with_request(&mut event);
         match DEFERRED.try_with(Arc::clone) {
             Ok(held) => held.lock().push(event),
             Err(_) => self.finalise(event),
@@ -139,24 +142,110 @@ impl Producer {
     }
 }
 
+fn stamp_with_request(event: &mut DelegationAuditEvent) {
+    if event.request_id.is_none() {
+        event.request_id = current_request_id();
+    }
+    if event
+        .surface_variant
+        .is_none()
+    {
+        event.surface_variant = current_request_variant();
+    }
+}
+
+/// Whether the per-call delegation events are written to the gateway log, as
+/// `[logging] delegation_events` says. On until startup says otherwise.
+static LOG_DELEGATION_EVENTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Sets, at startup, whether the per-call delegation events are written to the
+/// gateway log.
+pub fn set_delegation_event_logging(enabled: bool) {
+    LOG_DELEGATION_EVENTS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn delegation_event_logging() -> bool {
+    LOG_DELEGATION_EVENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether a logged event would be written anywhere, so that it is worth
+/// building.
+fn logs_delegation_events() -> bool {
+    #[cfg(test)]
+    if CAPTURING
+        .try_with(|_| ())
+        .is_ok()
+    {
+        return true;
+    }
+    delegation_event_logging() && tracing::enabled!(target: "credential_delegation", tracing::Level::INFO)
+}
+
+/// Writes `event` to the gateway log while the deployment logs the per-call
+/// delegation events (`enabled`).
+fn write_to_log(
+    event: &DelegationAuditEvent,
+    enabled: bool,
+) {
+    if enabled {
+        log_event(event);
+    }
+}
+
+/// Writes a logged event to the gateway log, with the id and surface variant
+/// of the request it belongs to. Under [`capture`] in a test it is returned
+/// with the audit records too, whatever [`DeferredAudit`] scope it is logged
+/// in.
+fn log(mut event: DelegationAuditEvent) {
+    stamp_with_request(&mut event);
+    write_to_log(&event, delegation_event_logging());
+    #[cfg(test)]
+    if let Ok(captured) = CAPTURING.try_with(Arc::clone) {
+        captured.lock().push(event);
+    }
+}
+
 tokio::task_local! {
     static DEFERRED: Arc<Mutex<Vec<DelegationAuditEvent>>>;
 }
 
 #[cfg(test)]
 tokio::task_local! {
-    static CAPTURING: ();
+    /// The list a [`capture`] returns.
+    static CAPTURING: Arc<Mutex<Vec<DelegationAuditEvent>>>;
 }
 
-/// Runs `future` treating every catalog event as selected, and returns the
-/// records it submitted instead of journalling them.
+/// Runs `future` treating every catalog event as selected, and returns what it
+/// recorded, in order: the records it submitted, instead of journalling them,
+/// and the events it wrote to the gateway log
+/// ([`crate::audit::catalog::LOGGED_EVENTS`]). [`capture_apart`] tells the two
+/// apart.
 #[cfg(test)]
 pub async fn capture<F: std::future::Future>(future: F) -> (F::Output, Vec<DelegationAuditEvent>) {
     let held = DeferredAudit::new(producer());
     let output = CAPTURING
-        .scope((), held.scope(future))
+        .scope(held.held.clone(), held.scope(future))
         .await;
     (output, held.take())
+}
+
+/// What a captured future recorded: the records an audit sink is offered, and
+/// the events written to the gateway log only.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct Recorded {
+    pub audited: Vec<DelegationAuditEvent>,
+    pub logged: Vec<DelegationAuditEvent>,
+}
+
+/// [`capture`], with the audit records apart from the logged events.
+#[cfg(test)]
+pub async fn capture_apart<F: std::future::Future>(future: F) -> (F::Output, Recorded) {
+    let (output, events) = capture(future).await;
+    let (logged, audited) = events
+        .into_iter()
+        .partition(|event| is_logged_only(action_category(&event.event)));
+    (output, Recorded { audited, logged })
 }
 
 /// [`capture`] for futures each run on a task of its own, so a multi-threaded
@@ -170,7 +259,7 @@ where
     let held = DeferredAudit::new(producer());
     let tasks: Vec<_> = futures
         .into_iter()
-        .map(|future| tokio::spawn(CAPTURING.scope((), DEFERRED.scope(held.held.clone(), future))))
+        .map(|future| tokio::spawn(CAPTURING.scope(held.held.clone(), DEFERRED.scope(held.held.clone(), future))))
         .collect();
     for task in tasks {
         task.await
@@ -190,12 +279,12 @@ where
     F::Output: Send + 'static,
 {
     #[cfg(test)]
-    if CAPTURING
-        .try_with(|_| ())
-        .is_ok()
+    if let Ok(captured) = CAPTURING.try_with(Arc::clone)
         && let Ok(held) = DEFERRED.try_with(Arc::clone)
     {
-        return crate::observability::policy_audit::spawn_in_request(CAPTURING.scope((), DEFERRED.scope(held, future)));
+        return crate::observability::policy_audit::spawn_in_request(
+            CAPTURING.scope(captured, DEFERRED.scope(held, future)),
+        );
     }
     crate::observability::policy_audit::spawn_in_request(future)
 }
@@ -293,6 +382,129 @@ mod tests {
     ) -> F::Output {
         use crate::observability::policy_audit::{RequestScope, in_request};
         in_request(RequestScope::new(id.to_string()), future).await
+    }
+
+    fn injected() -> DelegationAuditEvent {
+        let mut event = audit_event(
+            DelegationAuditAction::TokenInjected,
+            Some("did:web:agent.example"),
+            Some("sha256:user"),
+            Some("provider-1"),
+            Some("surface-1"),
+        );
+        event.scopes = Some(vec!["repo".to_string(), "read:org".to_string()]);
+        event.detail = Some("grant_by_binding:owner:target".to_string());
+        event
+    }
+
+    /// A logged event is written to the gateway log, naming who used whose
+    /// credential where, and is handed to no sink, whatever a sink names.
+    #[test]
+    fn a_logged_event_is_written_to_the_gateway_log_and_handed_to_no_sink() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let (producer, rx) = producer(&[(SinkId::AuditLog, &["token_injected", "consent_granted"])]);
+
+        assert!(!producer.wants("token_injected"));
+        producer.emit("token_injected", injected);
+        producer.submit(injected());
+
+        assert!(received(&rx).is_empty());
+        let text = logs.text();
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("Delegation event"))
+            .collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        for field in [
+            "event=token_injected",
+            r#"agent_did="did:web:agent.example""#,
+            "user_hash=sha256:user",
+            "provider_id=provider-1",
+            "surface_id=surface-1",
+            r#"scopes="repo,read:org""#,
+            r#"detail="grant_by_binding:owner:target""#,
+        ] {
+            assert!(lines[0].contains(field), "{field}: {}", lines[0]);
+        }
+    }
+
+    /// A deployment that does not log the per-call delegation events writes
+    /// no line for one. The default writes it.
+    #[test]
+    fn a_logged_event_is_written_only_while_the_deployment_logs_them() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        write_to_log(&injected(), false);
+        assert_eq!(logs.text(), "", "nothing is written while the setting is off");
+
+        write_to_log(&injected(), true);
+        let text = logs.text();
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.contains("Delegation event"))
+                .count(),
+            1,
+            "{text}"
+        );
+    }
+
+    /// A logged event carries the id of the request it was written in.
+    #[tokio::test]
+    async fn a_logged_event_names_its_request() {
+        let ((), recorded) = capture_apart(in_request("req-7", async {
+            producer(&[])
+                .0
+                .emit("token_injected", injected);
+        }))
+        .await;
+
+        assert_eq!(recorded.logged.len(), 1);
+        assert_eq!(
+            recorded.logged[0]
+                .request_id
+                .as_deref(),
+            Some("req-7")
+        );
+    }
+
+    /// A test reads what was recorded in order, and can tell the logged events
+    /// from the records an audit sink gets.
+    #[tokio::test]
+    async fn a_capture_returns_logged_events_with_the_audit_records_and_tells_them_apart() {
+        let record = || async {
+            crate::delegation_vault::audit::emit("token_injected", injected);
+            crate::delegation_vault::audit::emit("consent_granted", consent);
+        };
+        let ((), events) = capture(record()).await;
+        assert!(matches!(events[0].event, DelegationAuditAction::TokenInjected));
+        assert!(matches!(events[1].event, DelegationAuditAction::ConsentGranted));
+        assert_eq!(events.len(), 2);
+
+        let ((), recorded) = capture_apart(record()).await;
+        assert_eq!(recorded.logged.len(), 1);
+        assert!(matches!(recorded.logged[0].event, DelegationAuditAction::TokenInjected));
+        assert_eq!(recorded.audited.len(), 1);
+        assert!(matches!(recorded.audited[0].event, DelegationAuditAction::ConsentGranted));
+    }
+
+    /// A request path holds its audit records in a scope of its own until
+    /// the identity VP is known; an event logged inside it is captured too.
+    #[tokio::test]
+    async fn a_capture_returns_an_event_logged_inside_a_deferred_scope() {
+        let ((), recorded) = capture_apart(async {
+            let held = DeferredAudit::new(super::producer());
+            held.scope(async {
+                crate::delegation_vault::audit::emit("token_injected", injected);
+            })
+            .await;
+            held.flush_with_vp("vp");
+        })
+        .await;
+
+        assert_eq!(recorded.logged.len(), 1);
+        assert!(matches!(recorded.logged[0].event, DelegationAuditAction::TokenInjected));
+        assert_eq!(recorded.logged[0].vp_jwt, None, "a logged event is written at once, before the VP is known");
+        assert!(recorded.audited.is_empty());
     }
 
     #[test]

@@ -104,8 +104,18 @@ issuers, trust registries, and Connection Points each at their own path. Each do
 carries the verification methods and service endpoints another system needs to check a
 signature. The gateway's DID and newly created managed agent DIDs list the Multikey that signs
 their credentials and presentations (`#key-2`) under `assertionMethod`, so strict Data
-Integrity verifiers accept them. The gateway writes its DID log when it first starts, so a gateway that
-already has one keeps publishing the document it was created with.
+Integrity verifiers accept them; the gateway's DID also lists it under `authentication`, the
+proof purpose presentations conventionally claim. A gateway whose published DID document leaves
+the Multikey out of either adds it when it starts Active, or when a Standby node is promoted (see
+[Server mode](CONFIGURATION_RELOAD.md#server-mode)): a `did:webvh` DID gets a new log
+version signed with the gateway key, so the DID and its earlier versions stay as they are, and a
+`did:web` DID gets its document rewritten. No key is created or replaced: the new version and
+the stored `did.json` differ from what they held only by the Multikey added to
+`assertionMethod` and `authentication`. A document that lacks either relationship, publishes
+another key as its own `#key-2` or publishes `#key-2` more than once is left as it is; a stored `did.json` that is missing or does not parse
+is written again from the latest log version. A log that does not verify, or whose latest version
+is dated more than a second ahead of the node's clock, is left as it is and the gateway
+logs a warning; the repair runs again on the next start.
 
 ## Federation across organisations
 
@@ -169,7 +179,7 @@ both A2A and MCP surfaces and can be enabled on its own.
 | Timeouts | Three levels: overall request, connect (DNS and TCP handshake), and idle (the gap between data frames). A slow or unresponsive backend cannot hang a request indefinitely. |
 | Retries | Exponential backoff with configurable attempts, initial delay, maximum delay, and multiplier. You choose which status codes are retriable, typically 502, 503, and 504. |
 | Circuit breaker | Starts closed. After a configured run of consecutive failures it opens, and requests fail immediately without reaching the backend. After a timeout it goes half-open and lets a few test requests through; success closes it, failure reopens it. |
-| Traffic mirroring | Sends a percentage of production traffic to a shadow endpoint, fire-and-forget or waiting for the reply, with its own timeout. Mirrored requests carry an `X-Mirrored-Request` header. |
+| Traffic mirroring | Sends a percentage of production traffic to a shadow endpoint, fire-and-forget or waiting for the reply, with its own timeout. Mirrored requests carry an `X-Mirrored-Request` header. The mirror endpoint is held to the Target's cloud-metadata guard; see [`POLICY.md`](POLICY.md#other-pinned-egress-sinks). |
 | Variants | A named alternate configuration of a surface, reachable at its own route alias, so a change can run beside the live version without a separate surface record. Variants are selected by alias, not by traffic share. |
 
 The circuit breaker wraps the retry logic, which protects both the gateway and a failing
@@ -371,9 +381,13 @@ the gateway authorised, for whom, and under which policy.
 | Trust checks | A trust registry query returns a result to policy |
 | Trace terminated | A surface starts a fresh trace at an organisational boundary; the entry links the two trace IDs |
 | VP injected | The managed agent's identity presentation is attached to a request or response |
-| Token injected | A delegated credential is used on a user's behalf |
 | Consent granted | A user completes consent and a token is stored |
+| Consent ended or revoked | A consent reaches its time limit, or an operator revokes a token or all of a user's tokens |
 | Payments | A delegated agent-pay payment is taken, challenged, held for review, or refused |
+
+Each use of a delegated credential, such as a token injected or refreshed or a prompt for
+consent, is a line of the gateway's log and no audit record; see
+[Delegation events: audited or logged](OBSERVABILITY.md#governance-audit-forwarding).
 
 Entries are written as JSON Lines to a file that is rotated once it reaches its size cap, keeping
 every rotated file beside it by default, so no audit record is deleted; it can also be set to
@@ -552,7 +566,9 @@ A gateway starts in **active** or **standby** mode. A standby instance holds no
 listeners and reports itself unready, so a load balancer sends it no traffic. `SIGUSR1`
 promotes it and `SIGUSR2` steps it down. Two instances sharing storage can keep their
 caches in step with a periodic refresh. See
-[`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md#server-mode).
+[`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md#server-mode). Instances sharing storage
+need a volume whose file locks hold across hosts, so they create and repair one gateway DID; see
+[`DEPLOYMENT_REQUIREMENTS.md`](DEPLOYMENT_REQUIREMENTS.md#shared-storage-for-several-instances).
 
 Instances sharing storage also share the key that signs transit tokens, kept beside the
 gateway's own keys, so a managed agent's Transit Point calls are accepted by whichever

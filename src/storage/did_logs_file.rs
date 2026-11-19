@@ -64,11 +64,23 @@ impl DidLogStorage for FileDidLogStorage {
             .await
             .with_context(|| format!("open {:?} for append", path))?;
 
-        file.write_all(raw_json.as_bytes())
+        file.write_all(format!("{raw_json}\n").as_bytes())
             .await?;
-        file.write_all(b"\n").await?;
         file.flush().await?;
         Ok(())
+    }
+
+    async fn replace_raw(
+        &self,
+        did: &str,
+        raw_lines: &[&str],
+    ) -> Result<()> {
+        let path = self.path_for(did);
+        let mut content = raw_lines.join("\n");
+        content.push('\n');
+        crate::storage::did_artifacts::replace_file(&path, content.as_bytes())
+            .await
+            .with_context(|| format!("replace {:?}", path))
     }
 
     async fn load_all(
@@ -349,5 +361,57 @@ mod tests {
                 .unwrap();
             assert_eq!(loaded.len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn replace_raw_swaps_the_whole_log_and_keeps_the_bytes() {
+        let dir = tempdir().unwrap();
+        let storage = FileDidLogStorage::new(dir.path());
+        let did = "did:webvh:example";
+        for line in ["old-1", "old-2", "old-2"] {
+            storage
+                .append_raw(did, line)
+                .await
+                .unwrap();
+        }
+
+        storage
+            .replace_raw(did, &[r#"{"versionId":"1-a"}"#, r#"{"versionId":"2-b"}"#])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .load_all_raw(did)
+                .await
+                .unwrap(),
+            vec![r#"{"versionId":"1-a"}"#, r#"{"versionId":"2-b"}"#]
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .count(),
+            1,
+            "the temporary file must be renamed into place"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_raw_creates_a_log_that_did_not_exist() {
+        let dir = tempdir().unwrap();
+        let storage = FileDidLogStorage::new(dir.path().join("nested"));
+
+        storage
+            .replace_raw("did:webvh:example", &["only"])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .load_all_raw("did:webvh:example")
+                .await
+                .unwrap(),
+            vec!["only"]
+        );
     }
 }

@@ -60,6 +60,12 @@ Applies to:
    offers a Refresh button (`wizard-mediator-refresh-button`) in that state and below the list, since
    a directory can take a moment to answer after the gateway starts; a load error shows as
    `wizard-mediator-load-error`.
+10. Dashboard routes are served from the gateway root, so a top-level route must not share a
+    prefix with a gateway channel (`/agents`, `/payments`, `/routes`, ... in
+    `config/examples/gateway.example.json`). In-app navigation still works, but refresh, deep links
+    and new tabs reach the proxy and return 404. Agent endpoints default to `/agents/<surface-name>`,
+    so `/agents` in particular is never a dashboard route. Add every new top-level route to
+    `SPA_RESERVED_TOP_LEVEL` in `src/proxy/paths.rs`.
 
 ## Toasts
 
@@ -83,8 +89,10 @@ are the consumer; the convention is documented in
 | Canvas node   | `surface-node-<type>`, for example `surface-node-payment`                            |
 
 An indexed or per-row button keeps the `-button` suffix before the index or id, for example
-`payments-details-button-<id>`. On `/surfaces/<id>` the save button is `surface-save-button`
-and the banner for a refused save is `surface-error-alert`.
+`payments-details-button-<id>`. On `/surfaces/<id>` the save button is `surface-save-button`,
+the banner for a refused save is `surface-error-alert`, and the delete button is
+`surface-delete-button`, which opens `surface-delete-confirm` with `surface-delete-confirm-name`,
+`surface-delete-confirm-confirm` and `surface-delete-confirm-cancel` (see _Surface delete_).
 
 ## CLI consent page
 
@@ -543,7 +551,12 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   option. An `external` binding is read-only: its provider, scopes, consent mode and injection
   inputs are disabled, and only the switch that removes it stays enabled, with a line saying
   whose grant it uses and that changing or removing it revokes its grants
-  (`transit-point-binding-subject`): such a binding is changed through the API. The Credential
+  (`transit-point-binding-subject`): such a binding is changed through the API. A binding's
+  own consent time limit (`max_consent_age_secs`) has no control either: it round-trips through
+  the form (`consentLimitFieldOf`) and is shown as a line under the consent select
+  (`_shared/BindingConsentLimitNote.tsx`), in words from `describeConsentLimit`
+  (`transit-point-binding-consent-limit`, and `credential-delegation-binding-consent-limit` in the
+  Credential Delegation element), so a dashboard save never drops a limit set through the API. The Credential
   Delegation element (`_shared/OutboundCredentialsListSection.tsx`) does the same for the Access
   Point Target's binding with external consent in `outbound_credentials`
   (`credential-delegation-consent-mode-select`, `credential-delegation-binding-subject`), and asks
@@ -570,10 +583,27 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   `method.credential_provider`, and a Transit Point with the option but no provider blocks Save.
   Test ids: `managed-agent-target-auth-provider`, `transit-point-target-auth-provider`, each with
   `-add-link`, and `transit-point-target-auth-provider-header-name` / `-header-format`.
+- **Transit Point secret picker.** For Bearer Token, API Key Header and Custom Header, the Transit
+  Point panel picks the secret from the secrets store (`transit-point/TargetAuthSecretField.tsx`,
+  labelled **Secret Reference**) and saves its `secret_id` as `method.static_secret.secret_id`. Options come
+  from the shared `components/shared/SecretOptions.tsx` (`Name (secret_id)`, tenant-aware, all
+  secret types). A refresh icon button beside the select reloads only the list
+  (`useTargetAuthSecrets`); it uses the Managed Agent panel's sync icon and spin but sits beside
+  the field, not on the label line, so it isn't missed. **Add secret** below opens `/secrets/new`
+  in a new tab, and the help text never changes. A stored secret that no longer exists stays
+  selected as `<secret_id> (not found)` with a warning; an out-of-tenant one keeps its
+  `outOfTenantLabel` and is explained in full below the field. A list that can't load says
+  "Couldn't load secrets." with **Try again**, or, when the request is refused (403), "You don't
+  have access to secrets. Ask an administrator."; both keep the stored value and show no refresh
+  button. The element's `validate` blocks Save while no secret is picked
+  (`targetAuthSecretProblem`, field `auth_secret`), since an empty secret would otherwise drop
+  target authentication. Test ids: `transit-point-target-auth-secret`, with `-refresh`,
+  `-add-link`, `-error`, `-missing`, `-outside-tenant`, `-load-error`, `-retry` and `-denied`.
 - **Tenant-aware pickers.** A surface's tenant (`tenantId` in `SurfaceMetaContext`, from the stored
   surface's `tenant_id`; `null` is appliance-wide, absent while creating) decides what the credential
   provider pickers (`TargetAuthProviderSelect`, `TransitCredentialBindingSection`,
-  `OutboundCredentialsListSection`) and the Custom Metadata secret menu offer: only items with the
+  `OutboundCredentialsListSection`), the Transit Point secret picker (`TargetAuthSecretField`) and
+  the Custom Metadata secret menu offer: only items with the
   same `tenant_id` (`utils/tenantScope.ts`, `splitByTenant`). The delegation pickers
   (`TransitCredentialBindingSection`, `OutboundCredentialsListSection`) also offer a tenant surface
   appliance-wide authorization code providers, which send the user's own token and which the gateway
@@ -1101,12 +1131,172 @@ credential providers that use the strategy block the delete. The strategy editor
 on save (an issuer change a provider using the strategy would refuse) with the same
 `strategyDeleteError` text, so it names those providers and where to change them.
 
-## Credentials audit tab
+## Credential Tokens and Delegated Access tabs
 
-`pages/CredentialsPage/CredentialAuditTab.tsx` shows an expanded event's caller. **Subject** is
-the token's own `sub`; a **Principal** row (`credential-audit-caller-principal`) shows the value
-the caller's grants are keyed by, `caller.principal`, only when the JWT strategy names a claim
-other than `sub`.
+The Credentials page keeps its **Credential Tokens** tab (`pages/CredentialsPage/CredentialTokensTab.tsx`,
+tab key `credential-tokens`) and has a **Delegated Access** tab beside it
+(`pages/CredentialsPage/DelegatedAccessTab.tsx`, tab key `delegated-access`, trigger
+`credentials-delegated-access-tab-trigger`). The page calls `useDelegationVault()` once and
+hands its `vault` to both tabs, so a revoke or a limit made on one is what the other shows. The
+hook reads `GET /api/v1/delegation-vault` and `GET /api/v1/credential-providers` and owns the
+three changes to the tokens (`revoke`, `revokeUser`, `limitConsent`); a tab keeps only its
+toasts. `vault.refresh()` reads both lists again while they stay on screen, with no spinner. It
+runs when the gateway answers a change with `404` or `409`, since the list is then out of date
+(an entry the hourly removal or another operator already took, a consent given again), when a
+limit is saved without its new end in the answer, and when the Credential Providers tab reports
+a deactivate, an activate or a delete (`onProvidersChange`), so Delegated Access marks a
+deactivated provider without a reload. `vault.reload()`, behind the spinner, is the Retry of a
+failed read. The tabs still list the tokens when the providers cannot be read. A vault read the
+gateway refuses, or that gets no answer, shows `VaultReadError.tsx` in place of the list: the
+reason and **Retry** (`credential-tokens-read-error`, `delegated-access-read-error`, each with
+`-retry`), never the empty state, since a failed read says nothing about what the vault holds;
+Delegated Access then shows no count in its header.
+The shared rules live in `pages/CredentialsPage/delegatedAccess.ts` (`consentState`, `timeLeft`,
+`isActiveDelegation`, `isPersonsDelegation`, `consentLimitSecs`, `limitOutcome`,
+`limitOutcomeText`, `canLimitConsent`, `renewsAutomatically`, `agentName`, `providerName`,
+`matchesSearch`, `tokenStatus`, `consentEndSentence`, `consentEndValue`, `revokeAllLabel`,
+`shownTime`) and the page links in the shared `components/shared/PaginationControls.tsx`, which
+the Secrets page uses too: Previous page and Next page are named and disabled at the ends, and
+the page shown is `aria-current`. Its `clampPage` keeps the page shown inside the list, so
+revoking the last entry of the last page shows the page before it. The page search finds a
+token by its provider's name or id, its agent's DID or the name the agent is shown under, its
+user identity hash or a scope (`matchesSearch`). A scope badge wraps (`text-wrap text-break`),
+since a scope can be a long URL. A new view of the vault is a new tab, and both of these tabs
+stay.
+
+Both tabs name an agent with `AgentName.tsx`, which shows `agentName`: a `did:web` DID as its
+whole web address, the host and any path with each `:` as `/` and its port's `%3A` as `:`
+("pr-reviewer.example.com"), never cut; any other DID, and a `did:web` one with another percent
+escape or an unprintable character, shortened in the middle. The name is one chip that wraps
+after a dot or a slash, and inside a part (`text-break`) only when that part is wider than the
+cell. The full DID is the chip's tooltip.
+
+Both revoke one entry with the same text **Revoke** button, and show it, like every other
+control that changes a delegation, only to a user with `delegation_vault.delete`, the
+permission the routes ask for; without it the Actions column is not shown. A refused revoke
+toasts "Not revoked: " and the gateway's words, or its status where it gave none, and the entry
+stays. Escape cancels a two-step confirm, as a click elsewhere does (`useTwoStepDelete`).
+
+Credential Tokens lists every agent-keyed token, service tokens included.
+
+- The **Provider** column shows the provider's name, else its `provider_id` (`providerName`,
+  shared with Delegated Access's System column), and the search matches the name too; the
+  expanded row keeps **Provider ID**.
+- The **Consented** cell shows the consent time and, under it, the consent's end
+  (`credential-token-consent-end-<id>`): "Ends <date> (in 3 hours)", "Ended <date>", or "No time
+  limit" when the vault reports no `consent_expires_at`. The expanded row shows it as **Consent
+  Ends**, the date first.
+- The **Access Token** column (`credential-token-access-token-<id>`) is the access token's own
+  expiry, with "Renews automatically" under it while the gateway renews the token by itself
+  (`renewsAutomatically`: the provider's `token_refresh_enabled` is on, a refresh token is
+  stored, and the consent has not ended). An ended consent, a provider that does not refresh and
+  one that cannot be read show no such line. The expanded row keeps **Token Expires**.
+- The status badge reads "Consent ended" once the end has passed and "Ending soon" within 24 hours
+  of it; otherwise it is the access token's status (Active, Expired (refreshable), Expired)
+  (`tokenStatus`). The card header shows the title alone: no count of tokens and no count per
+  status.
+- A row opens its detail (`CredentialTokenDetail.tsx`, id and test id
+  `credential-token-detail-<id>`) on a
+  click anywhere in it, and from the chevron button in its first cell
+  (`credential-token-expand-button-<id>`, `aria-expanded`, `aria-controls` the detail), which
+  is how a keyboard reaches it.
+- **Limit duration** (`credential-token-limit-button-<id>`, `aria-expanded`, `aria-controls`
+  the panel, tooltip "Set how long after its consent this delegation ends") sits over
+  **Revoke** in the Actions cell, the two stacked at one width (`d-grid gap-1`), on a consent
+  an operator can limit (`canLimitConsent`: an Authorization Code provider's token whose
+  delegation is still active). It opens `ConsentLimitPanel.tsx` in a row of its own under the
+  token's row (`credential-token-limit-panel-<id>`, a `role="group"` named by its title), never
+  a modal or a browser dialog. The number takes the focus when the panel opens, and a second
+  click or **Cancel** (`credential-token-limit-cancel-<id>`) closes it; Cancel and a save put
+  the focus back on **Limit duration**. A search or a page change that hides the row closes the
+  panel, and it stays closed when the row is shown again. The panel is titled "Limit duration ·
+  <provider name>"
+  and reads "The agent may act for this person for at most [number] [minutes | hours | days]
+  after consent." (`credential-token-limit-input-<id>`, `credential-token-limit-unit-<id>`),
+  starting from the limit that applies now, or empty and in hours for a consent without one;
+  the unit select also offers seconds while the limit that applies is not a whole number of
+  minutes (`consentLimitUnitsFor`). A
+  line under it (`credential-token-limit-preview-<id>`, `aria-live`) says what the limit would
+  do, by `limitOutcome` in the words of `limitOutcomeText`: "Consent given <date>. With this limit it ends <date> (in 59
+  minutes).", "It already ends <date>. A limit only brings the end forward.", "This consent is
+  already older than that. Use Revoke to end it now.", or "Enter a whole number from 1 minute
+  to 365 days." **Save limit** (`credential-token-limit-save-<id>`, the shared `AppButton`,
+  `loading` while it saves, so it sends once) is enabled only for the first, sends
+  `PUT /api/v1/delegation-vault/{id}/consent-limit` with `max_consent_age_secs`
+  (`vault.limitConsent`), puts the answered `consent_expires_at` in the row, closes the panel
+  and toasts "Limit saved. <provider> access ends <date>." A refusal is shown under the field
+  (`credential-token-limit-error-<id>`, the input `is-invalid`, `aria-invalid` and described by
+  it) in the gateway's words, or as "The gateway could not be reached." when there was no
+  answer, and the panel stays open. A limit refused because the consent changed meanwhile
+  (`409`) also reads the vault again, so the row and the panel's preview show the consent as it
+  is now. A save that finishes after another row's panel was opened
+  updates its own row and leaves that panel open.
+- No modal and no browser dialog confirms a revoke. The row's **Revoke**
+  (`credential-token-revoke-button-<id>`) works as on Delegated Access: its first click asks with
+  a danger button that names the provider, beside **Cancel**
+  (`credential-token-revoke-cancel-button-<id>`). **Revoke all for this user**
+  (`credential-token-revoke-user-button-<id>`) is the shared `components/shared/TwoStepButton`,
+  for a two-step action that is not a delete: the first
+  click turns it into a danger button (`confirmAs="danger"`, never small or amber text) that says
+  how many of the user's listed delegations it ends, "Revoke all 2 for this user?" or "Revoke
+  this user's only delegation?" (`revokeAllLabel`), the second sends the `DELETE`, and a click
+  elsewhere or Escape cancels.
+- The expanded row links to the user's delegation records in the Audit Log
+  (`credential-token-view-activity-button-<id>`): the Audit Log opens with the user identity hash
+  as its text filter and the delegation categories selected. The link is shown only to a user
+  with `audit.view`.
+
+Delegated Access lists only active access: a token of an Authorization Code provider
+(`isPersonsDelegation`) whose consent has not ended and whose access token is valid or
+refreshable. It has no history of its own. Its header says "Active access only.", and "Ended and
+revoked access is in the history." after it only beside the History button; the empty state
+points at the history under the same condition.
+
+- Columns: User, System (the provider's name, else its `provider_id`), Agent, Access (scopes),
+  Status (Active, or Ending soon within 24 hours of the end), Ends (`delegated-access-ends-<id>`:
+  the time left, then the limit that applies to the consent, "6-hour limit" or "30-day limit"
+  (`consentLimitSecs`, from its consent time to the end the vault reports, so the sooner one
+  when the limit was shortened since; worded by `consentLimitLabel` in
+  `utils/consentLimit.ts`), then the date; or "No time limit"), Last Used and, with
+  `delegation_vault.delete`, a text
+  **Revoke** button (`delegated-access-revoke-button-<id>`, the shared `TwoStepButton` with
+  `confirmAs="danger"` and a `cancelTestId`). Its first click turns it into a danger button that
+  names what it ends, "Revoke GitHub access?" with the provider's name as System shows it, and
+  offers **Cancel** beside or under it (`delegated-access-revoke-cancel-button-<id>`, focus back
+  on Revoke); the second click sends the `DELETE`, and Cancel or a click elsewhere cancels. No
+  modal and no browser dialog. Rows are `delegated-access-row-<id>`; the header counts those
+  ending soon (`delegated-access-ending-soon-count`).
+- **History** (`delegated-access-history-button`) opens the Audit Log on the records of access
+  that ended: `consent_expired`, `token_revoked` and `user_tokens_revoked`. It is shown only to a
+  user with `audit.view`.
+- The list still loads when the providers cannot be read: every token then counts as a person's.
+
+## Credential delegation audit
+
+The credential delegation records are read in the Audit Log (`pages/AuditPage`), not on the
+Credentials page, and the Credentials tab row has no audit tab and no link in its place: a
+stored `/credentials?tab=credential-audit` opens the first tab, as any unknown tab does. The
+two ways from the Credentials page into the audit are **History** on Delegated Access and the
+link in a token's expanded row on Credential Tokens, both shown with `audit.view` and built by
+`auditLogPath` from `DELEGATION_ENDED_CATEGORIES` or `DELEGATION_CATEGORIES`
+(`pages/AuditPage/auditHelpers.ts`).
+
+The delegation categories are the ones the gateway audits: `consent_granted`, `consent_expired`,
+`consent_limited`, `token_revoked` and `user_tokens_revoked`. What the gateway does with a credential on each call
+(`token_injected`, `token_refreshed`, `refresh_failed`, `consent_required`, `token_not_found`
+and the elicitation events) is written to its log, or nowhere while `[logging] delegation_events`
+is `false`, and is no audit event, so the Audit Log offers no category for it and no link selects it. A record of one that an older gateway
+audited is still shown, with its label (`categoryLabel`).
+
+- The Audit Log offers each delegation category in its Category filter, labels and narrates
+  `consent_expired` ("Consent expired", a warning, apart from a revocation) and
+  `consent_limited` ("Consent limited", a warning: an operator made one consent end sooner,
+  with its new end and the one before it from the record's `detail`, and it was not revoked),
+  and shows them with the other delegation events. The narrative of a `consent_granted` record
+  given under a time limit adds "It ends <date>.", from the `consent_expires_at` in its `detail`.
+- Its Identity group shows **Subject**, the token's own `sub`, and a **Principal** row with the
+  value the caller's grants are keyed by, `caller.principal`, only when the JWT strategy names a
+  claim other than `sub`.
 
 ## Target authentication fallback
 
@@ -1241,6 +1431,62 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   (`credential-provider-external-notice`) in place of the type, endpoint, client, callback and
   additional parameter inputs, which the gateway keeps fixed; Save sends only its name,
   description, default scopes and token refresh (`externalProviderUpdate`).
+- An Authorization Code provider, external consent or not, has a **Consent time limit**
+  (`EditCredentialProviderPage/ConsentLimitSection.tsx`, rendered only for such a type): a whole
+  number (`credential-provider-consent-limit-input`, placeholder "Not set") and a unit select
+  (`credential-provider-consent-limit-unit-select`: minutes, hours or days, hours by default;
+  seconds only while the stored limit is not a whole number of minutes, `consentLimitUnitsFor`,
+  so such a limit loads and saves unchanged), with its explanation behind `FieldHelp`
+  (`field-help-consent-limit`). The line under
+  it says an empty field sets no limit on the provider and that the gateway's own default and
+  ceiling still apply, never that an empty field means no limit; the field is described by that
+  line (`aria-describedby`), and by the error before it while refused. A stored
+  `max_consent_age_secs` loads in its largest whole unit (`consentLimitOf`). Save always sends
+  `max_consent_age_secs` (`consentLimitSeconds`): the limit in seconds, or `0`, which removes it,
+  for an empty field and for every other provider type, where the field is not shown. A limit
+  outside one minute to 365 days, or not a whole number, is refused before anything is sent: the
+  banner at the top of the form summarises it (`CONSENT_LIMIT_RANGE_MESSAGE`), and the field is
+  marked invalid (`is-invalid`, `aria-invalid`, described by the message), says "Enter a limit
+  from 1 minute to 365 days, or leave it empty." under itself
+  (`credential-provider-consent-limit-error`, `invalid-feedback`) and takes the focus. Changing
+  the number or the unit clears the field's error. On a stored provider, a limit shorter than the
+  stored one, one set where none was, or an emptied field where a limit was stored (sent as `0`,
+  since the gateway's default or ceiling may then be the shorter) is sent to
+  `GET /credential-providers/{id}/consent-impact?max_consent_age_secs=<seconds>` once the field
+  has stayed unchanged for 400 ms (`EditCredentialProviderPage/useConsentImpact.ts`). While its
+  `ending_consents` is above 0, a warning under the field
+  (`credential-provider-consent-limit-impact`, the editor's `alert alert-warning`, inside the
+  `role="status"` region `credential-provider-consent-limit-impact-region`, which is there
+  before the warning is so that it is announced) says how many active consents saving ends now and that those people approve
+  again, with the provider's name (`consentImpactMessage`, singular for one). There is no warning
+  and no request for a new provider, for a limit that is longer, equal or refused, for an
+  empty field where no limit was stored, or once the type is changed to one nobody consents to,
+  and no warning for 0 or a failed request. The unit arithmetic and wording live in
+  `utils/consentLimit.ts`, with the range's wording (`CONSENT_LIMIT_RANGE`), which the line
+  under the field states only while the field is not refused, since the error then states it.
+  On such a provider the help under **Enable automatic token refresh** says tokens are
+  refreshed for as long as the consent lasts, pointing at the Consent time limit below, and
+  that the person approves again when it ends, whether or not a limit is set; every other type
+  keeps saying the connection works without reauthorizing.
+- A provider a person consents to (`takesConsent`: Authorization Code, external consent or not)
+  is deactivated, never deleted, from the dashboard. Its row on the Credential Providers tab has
+  **Deactivate** (`credential-provider-deactivate-button-<id>`, the shared two-step
+  `TwoStepButton`: the first click shows "Click again to deactivate", the second sends
+  `POST /credential-providers/{id}/deactivate`) in place of the delete button, which only the
+  other provider types keep. A deactivated row shows **Activate**
+  (`credential-provider-activate-button-<id>`, one click). Deactivate and Activate share one
+  outline style (`btn-outline-secondary`, text only), since the colour belongs to the **Status**
+  column (`credential-provider-status-<id>`, after Type, for every provider): an "Active" badge
+  (`text-bg-success`), or a "Deactivated" badge (`credential-provider-deactivated-badge-<id>`,
+  `text-bg-secondary`) with "No new consent" under it. The Type column shows only the type. The
+  row stays in the list either way. Deactivate and Activate are shown with
+  `credential_providers.edit`, the permission their routes ask for; the tab's other controls
+  keep `settings.edit`.
+  The editor shows a warning (`credential-provider-deactivated-notice`) that nobody can consent
+  again while access already given keeps working, and never sends `deactivated_at` on save. The
+  Delegated Access tab marks the access of a deactivated provider "No new consent"
+  (`delegated-access-provider-deactivated-<id>`), also right after a Deactivate on the same
+  page, since the tab tells the page (`onProvidersChange`). Success and failure are toasts.
 - The Credential Providers tab labels the types from `PROVIDER_TYPE_LABELS` in the same module, and
   shows a secondary badge after the type of a JWT Bearer provider that has a
   `client_authentication` (`credential-provider-client-authentication-badge`: Client ID only,
@@ -1294,6 +1540,52 @@ toast that stays until dismissed: "Revoke failed: <gateway message>".
 When the key's surface was deleted (`surface_deleted: true` on `GET /api-keys/{agent_id}/{key_id}`),
 the detail page shows the info alert "This API key is no longer in use because the associated
 surface has been deleted." (`api-key-surface-deleted-info`) at the top of Key Information.
+
+## Surface delete
+
+The surface page's delete button (`surface-delete-button`, `btn-danger` with a trash icon, shown
+only with `surfaces.delete`, which the gateway requires for the `DELETE`; `surfaces.edit` alone
+shows Save but no delete button) sends nothing: it opens `surface-delete-confirm`, a
+[confirm popover](#confirm-popover) beside the button (on its right when the builder sidebar is
+at the window's left edge), and clicking the button again
+closes it. Its title "Delete Surface?" carries a red `fa-triangle-exclamation` icon. Its body
+first names the surface, "Delete `<name>`?" in bold (`surface-delete-confirm-name`, the surface
+id when it has no name), then reads "You are about to permanently delete this surface and all
+associated configuration. This action cannot be undone." then "Are you sure you want to
+continue?". **Delete** (`surface-delete-confirm-confirm`, `btn-danger`) sends the `DELETE`;
+**Cancel** (`surface-delete-confirm-cancel`), the close button, Escape and a click outside send
+nothing. While the delete runs, Delete shows `…`, Delete, Cancel and the close button are
+disabled, Escape and a click outside do nothing, and the page's delete button shows a spinner.
+Delete is also disabled while a save runs, and Cmd/Ctrl+S does not save while the popover is
+open. A delete succeeds with the toast `Surface "<name>" deleted` and returns to `/surfaces`; a
+failed one closes the popover, returns focus to the delete button and shows the gateway's message
+in `surface-error-alert`. The popover closes if the page moves to another surface.
+
+## Confirm popover
+
+`components/shared/ConfirmPopover.tsx` is the shared inline confirmation: a speech bubble beside
+the button that opened it (`role="dialog"` named by its title), portalled to `<body>`. It opens
+to the left of the button (`confirm-popover--left`) and flips to its right
+(`confirm-popover--right`) when the left has no room, as for the surface page's trash button in
+the builder sidebar with the navigation collapsed; it stays at least 8px inside the window on
+both axes, and its tail points at the button's middle. Cancel takes focus when it opens and focus returns to that button when it closes, and while it
+is open no key reaches a `window` listener, so the page's shortcuts (Cmd/Ctrl+S, the Surface
+Builder's canvas keys) never act behind it. Its `icon` is `fa-info-circle` (default) or
+`fa-triangle-exclamation`, shown red when `confirmVariant` is `danger`. Each use passes its own
+`testId`; the confirm and Cancel buttons are `<testId>-confirm` and `<testId>-cancel`. Its
+styles are the `.confirm-popover*` classes in `dashboard.css`.
+
+Two pages use it:
+
+- **Surface delete** (`surface-delete-confirm`), above.
+- **Policies list** (`policy-confirm-popover`), from a row's delete and Enforce globally
+  actions: "Delete policy" with a red **Delete**, naming the policy and how many surfaces or
+  gateways reference it, and "Enforce globally" with **Continue**, naming how many will enforce
+  it. Confirm is disabled while that count loads.
+
+Use the popover to confirm one action on the button that triggers it. Use
+`components/shared/WarningDialog.tsx`, a centred modal, when the confirmation needs more room or
+blocks a flow, as API key delete and revoke and the Authority-in-use dialog do.
 
 ## Authority delete
 
@@ -1398,9 +1690,7 @@ only that.
   empty state, saying no records could be read and that this is not the log holding none. The
   toast stays, for the moment the read fails; the panel is what is still there after it fades.
   Refresh stays enabled while `error` is set, since a failed read leaves `total` at `0` and
-  Refresh is the way back. `CredentialAuditTab` shows the same failure as its own error line.
-- `pages/CredentialsPage/CredentialAuditTab.tsx` reads the same two fields from
-  `/v1/delegation-audit` and appends the same `+` to its badge and its `n–m of t` line.
+  Refresh is the way back.
 - `AuditLogSize.tsx` shows one line above the list, `Audit log: 312 MiB of 1 GiB`, with a thin
   bar: neutral under the configured size, amber over it, and over it a line naming the two
   things an operator can do. It is **usage against a mark, never a quota**: nothing is enforced
@@ -1475,7 +1765,8 @@ parts `IdentityNameCell`, `IdentitySurfaceCell`, `IdentityOriginBadge`,
   surface name show no badge. Without a display name, it shows `metadata.agent_name` when that
   is a non-empty string, else a muted, italic "Unnamed Agent".
 - The **DID** column (`IdentityNameCell` with `showName={false}`) shows the shortened DID in
-  monospace with a copy button for the full DID, then the version badge and SCID when set.
+  monospace with a copy button for the full DID, then the version badge and SCID when set,
+  on a second line.
 - The table has no Usage Count column; the usage count is still in the expanded details and
   the API.
 - A **shared managed DID** is the managed agent on more than one live surface: its
@@ -1793,6 +2084,191 @@ to it over `fabric://`) shows the gateway's message.
 | Detail surfaces, used by, health         | `payment-gateway-surfaces-refresh-button`, `-surfaces-error`, `-surfaces-empty`, `-surface-<id>`, `payment-gateway-surface-manifest-<id>-*`, `-used-by-<id>`, `-used-by-link-<id>`, `-used-by-empty`, `-used-by-error`, `-ping-button`, `-ping-result` |
 | Use as payment gateway                   | `gateways-use-as-payment-button-<id>` (Gateways tab), `gateway-use-as-payment-button` (edit page)                                                             |
 
+## Agents page
+
+`/agent-registry` (`pages/AgentsPage.tsx`, table in `pages/AgentsPage/AgentsTable.tsx`) and
+`/agent-registry/:agentId` (`pages/AgentDetailPage.tsx`, header and tabs in `pages/AgentDetailPage/`)
+are read-only and need `surfaces.view`. They call only `apiClient.listAgents`, `getAgent` and
+`getAgentCard` (`/v1/agents`), never `/v1/dashboard/stats`. There is no create, edit, duplicate,
+disable or rotate action: the API has no write endpoints for agents. Styles are in
+`pages/AgentsPage/AgentRegistry.css`, built on the theme variables with `body.dark-theme` overrides.
+
+- One record per managed agent: the gateway groups the surfaces that target the same agent and
+  returns them in display-name order (case-insensitive, then id); the page does not re-sort.
+  MCP surfaces front tool servers, not agents, so `/v1/agents` leaves them out (`is_listed` in
+  `src/identity/handlers/agents.rs`) and their details and card return 404. The page adds no
+  protocol filter of its own.
+- The Agents page shows no status anywhere: no list column, filter or dimmed rows, no
+  details header badge.
+- Each list row is a link (`role="link"`, named by the agent name and endpoint host) and ends with a
+  chevron cell (`agents-row-chevron`); Enter or Space on the row opens the details.
+- The details page has three tabs, **Agent Card** (opened first), **Connection** and **Traffic**.
+  Identities and surfaces are shown only in the list, never repeated on the details page.
+- The details page sets the top-bar title to the agent name (**Unnamed agent** without one) with
+  `usePageTitle`; while loading, or when the agent is missing, the route default stays. The
+  back button is `btn-outline-secondary`.
+- Opening another agent's details clears the shown record and loads again; only the answer for
+  the current `agentId` (and its latest load) updates the page, so a late answer for the previous
+  agent never replaces it.
+- The list filters client-side by text only: the display name (**Unnamed agent** included), every
+  surface name in the record, and the route label (`agentMatchesFilter`).
+- With no agents and no load error, the list shows the "No managed agents yet" `EmptyState`. For a
+  user with `surfaces.edit` it has a **Create a surface** in-app link (`agents-add-surface-link`,
+  `ctaTo`) that opens `/surfaces/new`, followed by a **What’s a surface?** docs link
+  (`DOCS_URL.surfaces`, `docsPlacement="actions"`); without `surfaces.edit` only the docs link
+  shows, since the page needs only `surfaces.view` and `/surfaces/new` needs `surfaces.edit`.
+- Columns: Agent, Route, Protocol, Identities, Used by surfaces, Trust registry, Last activity.
+  The protocol badge (`agents-protocol-badge`) uses the Surfaces page's colours (A2A
+  `text-bg-primary`, AP2 `text-bg-warning`, MCP `text-bg-info`, else `text-bg-secondary`).
+  The count badges of **Identities** and **Used by surfaces** match the Surfaces page's Transit
+  Points count: a square `badge text-bg-primary`, not a pill.
+  **Used by surfaces** shows a count badge and the surface names joined with commas on one
+  truncated line, with the full list in the tooltip. It has no links. **Identities** shows the same
+  count badge, then the first DID in `identities`, shortened in the middle and muted with a copy
+  button, and `+N` for the rest; every DID is in the tooltip. Without any it shows **No DID**: a
+  warning badge while surfaces use the agent (the API does not say which surface holds which DID),
+  muted text otherwise.
+- The agent name (`agents-name`) is the strongest text in a row; DIDs stay muted. The table's
+  column headers (`agents-table`) keep the uppercase `.table-sm` default, like the Surfaces page.
+- **Agent** shows the endpoint host under the name (`endpointHost`: the URL origin with its
+  scheme, such as `https://agent.example`, the A2A proxy, or `gateway/channel`), so rows with the
+  same name can be told apart. A proxy or gateway shows
+  `target_name` from `GET /v1/agents`, or its id when the name is `null` or blank; the
+  `a2a-proxy://` and `fabric://` schemes are never shown. An endpoint `connectionTarget` cannot
+  show gets no line.
+- Raw API values are never shown. `pages/AgentsPage/agentLabels.ts` maps them: runtime `url`,
+  `a2a-proxy`, `gateway` to the route Direct, Proxied, Fabric, and the protocol badge to the
+  protocol only (`A2A`), never the route. Shared badges are in `pages/AgentsPage/AgentBadges.tsx`.
+- The route is called **Route** everywhere (list column, Connection heading). The list renders it
+  with `AgentRouteBadge`: a neutral bordered badge (`badge text-bg-light border
+  agent-route-badge`) with the route icon and label, its meaning (`routeDescription`) as the
+  tooltip and as visually hidden text (`agents-runtime`). The details page shows no route badge:
+  not in the header, not on the Connection tab, whose description says the route.
+- An agent with a `null` name shows **Unnamed agent** in muted text, in the list and the details
+  header, with the endpoint host beside it in the header (`agent-details-endpoint-host`). The API
+  names Direct, Proxied and Fabric agents from their Agent Card; a Proxied or Fabric name comes
+  from the card the gateway serves and can take a refresh of the list to appear after the
+  background lookup. A canvas target name that only names a surface (a surface's own name, or a
+  generated `<kind>_surface_<n>`) is never the agent's name.
+- **Trust registry** shows **Recorded** with the Agent Identities page's badge
+  (`TrustRecorderStateBadge`, state `recorded`: success tone, no icon), with a tooltip saying
+  recording is not trust, when `trust_registry.recorded` is true, else **Not recorded**
+  (`badge-none`), with no tooltip.
+- Agent `id` is opaque and never read as a surface id; surface links come from `surfaces[]`.
+- The **Connection** tab (`AgentDetailPage/ConnectionTab.tsx`) is read-only and has no surfaces
+  list. Built from `endpoint` by `connectionTarget`, it shows a **Route** heading with a one-line
+  description of the route under it, then a Field / Value table styled like the Agent Card's
+  **Changes by the gateway** table (`agent-preview-changes`; the target rows; a URL endpoint has a
+  copy button). It has no route path diagram. Under it, a **Trust registry** section
+  (`agent-connection-trust-registry`) lists `trust_registry.registries` in the same table style:
+  Trust registry (name, else id; links to the registry page only with `trust_registries.edit`),
+  Identity (`AgentDid`) and Status (`TrustRecorderStateBadge`, with the reason text under it).
+  Without outcomes it says no identity was sent to a trust registry. The Agents API fills
+  `registries` on the details only: the best outcome per (registry, DID) across the agent's
+  surfaces, for its current identities.
+  The API
+  returns a URL endpoint without credentials, query string or fragment, and `connectionTarget`
+  drops any that arrive; there is no "hidden" note. An endpoint whose host is `redacted.invalid`
+  (the API could not strip its credentials) shows **Can't be shown** (`agent-connection-endpoint`),
+  like any endpoint `connectionTarget` cannot parse. An
+  `a2a-proxy://` or `fabric://` target shows the A2A proxy or remote gateway by its name
+  (`target_name`, plain text, with the id as its tooltip), or by its
+  id when the API returns no name. It links to the A2A proxy or remote gateway page only when
+  the viewer has `a2a_proxies.edit` or `gateways.edit`, which those pages need; otherwise it is
+  plain text.
+- The Agent Card is untrusted: render it as plain text only (no HTML, Markdown or links). The tab
+  opens on a visual **Preview**
+  (`AgentDetailPage/AgentCardPreview.tsx`, reading known A2A card fields defensively, with the URL
+  as text) and toggles to the raw **JSON**. The toggle follows `VpViewer`: `AppButton`s with an icon
+  and a label (`fa-eye` Preview, `fa-code` JSON), `primary` when active and `outline-secondary`
+  otherwise. The copy button shows in the JSON view only, inside it: right-aligned on its own row
+  above the JSON, never in the toggle row or over the scrolling JSON. It looks like `VpViewer`'s
+  copy button: an `outline-secondary` `AppButton` with `fa-copy` and "Copy", switching to a green
+  `fa-check` and "Copied" for two seconds. The Preview sits directly in the tab's
+  card body, with no inner card or "Agent Card" label, then a **Skills** section
+  (`agent-card-preview-skills`, a heading with the count, then each skill's name and description).
+- After Skills, the Preview ends with **Changes by the gateway** (`agent-card-gateway-changes`,
+  `AgentDetailPage/gatewayChanges.ts`), a `table-sm` of what the gateway changed, compared with
+  the API's `upstream_card`, with columns **Field**, **Change** and **Value**. **Change** is a
+  badge (`<row>-change`): **Rewritten** (`text-bg-warning`) when the field existed before,
+  **Added** (`text-bg-primary`) when it did not, **Removed** (`text-bg-secondary`) when the
+  served card dropped it. **Value** (`<row>`) is what callers get, in semibold code, `-` when
+  missing; a rewritten or removed one has a muted "Was <value>" line under it, its code muted too
+  so the new value stands out (`<row>-was`), an added one none. `code` in `agent-preview-changes`
+  cells is `inline-block` so wrapped chips don't overlap. Rows:
+  the URL first (`-url`), then each extension the upstream card lacks or carries differently
+  (`-extension`; paired with the next upstream extension the served card dropped, which is its
+  "Was"; the identity-credential extension reads **Identity credential**), each followed by a
+  **DID** row (`-did`) when its `params.did` differs from the paired extension's, and a
+  **Verifiable Presentation** row (`-vp`) when it carries `params.verifiablePresentation`. That
+  row's **Show** / **Hide** button (`-vp-toggle-button`, `aria-expanded`) expands the
+  presentation in a row under it spanning all three columns (`-vp-view`), never in a modal, with `VpViewer`'s `VpView` (Readable /
+  Raw JSON, Copy in Raw JSON). Then each dropped upstream extension no added one replaces
+  (`-removed`), and each other changed top-level field, JSON for a non-string (`-other-<field>`).
+  With no `upstream_card` (a generated card) only the identity-credential extension is listed.
+  The table's borders use the section divider colour (`--gray-200`, `--dark-border` in the dark
+  theme) and the Field column the heading colour, in both themes. Field cells are `td`
+  (`.agent-preview-change-field`), never `th`, since the global `.table-sm th` rule gives every
+  `th` a light background, uppercase text and a 2px border. A served card with no identity-credential
+  extension adds a muted line under the table (`-no-did`): "This surface has no DID, so the card
+  carries no identity credential." Nothing changed, no section. While the URL is listed here, the
+  card details above leave out their **URL** row.
+- The JSON view highlights the card with `VpViewer`'s tokenizer (`tokenizeJson`) in the
+  `.vp-json-pre` style, wrapping long values (`.agent-card-json`).
+- The Agent Card tab shows the card the gateway serves, for every route, read through one surface.
+  Its header (`agent-card-source`, `data-source`) reads "Served by <surface> · <source>": the
+  surface is the API's `surface_id`, named from the agent's surfaces, as a `SurfaceLinkButton`
+  to `/surfaces/<id>` (`agent-card-surface`), or a `FormSelect` (`agent-card-surface-select`)
+  over `card_surface_ids` when there are several, followed by an **Open surface** link to the
+  selected one (`agent-card-open-surface-button`); choosing one reloads the card with
+  `?surface_id=`, and an earlier answer is ignored. The source
+  (`agent-card-source-text`) maps the API's `source`: `fetched` **Fetched & rewritten by the
+  gateway** (Direct), `generated` **Generated by the A2A proxy** (Proxied), `remote_gateway`
+  **Relayed from the remote gateway** (Fabric); an unknown or missing one is left out. A `404`
+  with code `surface_unavailable` for a chosen surface (it isn't running on this gateway, or is
+  no longer one of the card surfaces) keeps the select, with the previous answer's
+  `card_surface_ids`, above "The Agent Card can't be read through this surface on this gateway"
+  (`agent-card-surface-unavailable`) and a **Retry** (`agent-card-surface-retry-button`) that
+  reads it through the same surface again. Any other failure, a plain `404` (the agent is gone)
+  or a `404` with no surface chosen is the load error. `not_running` reads "None of this
+  agent's surfaces is running on this gateway".
+- Activity and traffic exist only inside the metrics retention window, so labels name it
+  (`None in last 6h`, `Requests (last 6h)`) from the `window_minutes` that `GET /v1/agents` and
+  `GET /v1/agents/{id}` (`traffic.window_minutes`) return. There is no 7-day card.
+  **Failed requests** is `failed` + `gateway_faults`. Traffic counts Access Point (inbound)
+  requests only, each once (a forwarded call's response record is not counted again); Transit
+  Point (outbound) calls are not counted.
+- With no requests in the window, the Traffic tab shows one `EmptyState`, "No requests in the last
+  6h" (`agent-traffic-empty`), in place of the cards.
+- The API returns agent totals only, so the Traffic tab has no per-surface breakdown.
+
+| Element                         | Test id                                                                                         |
+| ------------------------------- | ----------------------------------------------------------------------------------------------- |
+| Pages                           | `page-agents`, `page-agent-details`                                                             |
+| List row, chevron               | `agents-row-<id>`, `agents-row-chevron`                                                         |
+| List filter, count, retry       | `agents-filter-input`, `agents-count`, `agents-retry-button`                                    |
+| List load error, no match       | `agents-load-error`, `agents-no-match`                                                          |
+| Empty state add surface         | `agents-add-surface-link`                                                                       |
+| Name, unnamed, endpoint host    | `agents-name`, `agents-unnamed`, `agents-endpoint-host`                                         |
+| Runtime, protocol, activity     | `agents-runtime`, `agents-protocol-badge`, `agents-last-activity`                               |
+| Surfaces, count, names          | `agents-surfaces`, `agents-surfaces-count`, `agents-surface-names`                              |
+| Identities, count, more         | `agents-identities`, `agents-identities-count`, `agents-identities-more`                        |
+| DID, copy, none                 | `agents-did`, `agents-copy-did-button`, `agents-no-did`                                         |
+| Trust registry                  | `agents-trust-recorded`, `agents-trust-not-recorded`                                            |
+| Back, details retry             | `agent-back-button`, `agent-retry-button`                                                       |
+| Details not found, load error   | `agent-not-found`, `agent-load-error`                                                           |
+| Details header                  | `agent-details-header`, `-name`, `-endpoint-host`                                               |
+| Details tabs                    | `agent-details-tabs`, `agent-tab-<agent-card\|connection\|traffic>`                             |
+| Agent Card states               | `agent-card-tab`, `-loading`, `-error`, `-retry-button`, `agent-card-<no_agent_card\|not_running\|operator_only>`, `agent-card-surface-unavailable`, `agent-card-surface-retry-button` |
+| Agent Card source               | `agent-card-source`, `-source-text`, `agent-card-surface`, `agent-card-surface-select`, `agent-card-open-surface-button` |
+| Changes by the gateway          | `agent-card-gateway-changes`, `-no-did`; rows `-url`, `-extension`, `-did`, `-vp`, `-removed`, `-other-<field>`, each with `-change` and `-was`; `-vp-toggle-button`, `-vp-view` |
+| Connection tab                  | `agent-connection-tab`, `-description`, `-path`, `-caller-hop`, `-surfaces-hop`, `-target`, `-copy-endpoint` |
+| Connection target rows          | `agent-connection-endpoint`, `-proxy`, `-proxy-link`, `-gateway`, `-gateway-link`, `-remote-surface` |
+| Agent Card JSON, copy           | `agent-card-json`, `agent-card-copy-button`                                                     |
+| Agent Card view toggle, preview | `agent-card-view-preview`, `-view-json`, `agent-card-preview`, `-preview-name`, `-preview-details`, `-preview-skills`, `-preview-empty` |
+| Traffic cards, empty            | `agent-traffic-tab`, `agent-traffic-requests`, `-failed`, `-p95`, `agent-traffic-empty` |
+| Connection                      | `agent-connection-tab`, `-endpoint`, `-proxy`, `-proxy-link`, `-gateway`, `-gateway-link`, `-remote-surface` |
+
 ## Remote gateway Issuer DIDs
 
 The **Remote** tab of a remote gateway starts with the **Issuer DIDs** card
@@ -2058,6 +2534,11 @@ identities: an integration receives every event of its event set, from every res
 
 ### Audit Log header
 
+- The **About the Audit Log** panel (`AuditInfoBanner`) lists the delegation events the gateway
+  audits in one **Credential delegation** bullet (`consent_granted`, `consent_expired`,
+  `consent_limited`, `token_revoked`, `user_tokens_revoked`) and says that what the gateway does
+  with a delegated credential on each call is not audited but written to the gateway log, unless
+  `[logging] delegation_events` is `false`. It names no per-call event as an audit event.
 - The Audit Log header shows `audit-forward-button` to users with `integrations.view`. It
   counts the active integrations, with an active endpoint, whose event set holds audit
   events (`useAuditForwarding`), and opens `/integrations`.
@@ -2135,16 +2616,21 @@ room for its text.
   or target label longer than that is cut to 22 characters plus `...` by `cutLabel` in
   `MetricsFlowVisualization.tsx`, so a long DID cannot run across its neighbours or past the
   chart edge; `Anonymous` is unchanged and the hover tooltip shows the full value.
-- **Identities table**: ten columns, so `.identities-table` (`dashboard.css`) keeps
+- **Identities table**: up to eleven columns, so `.identities-table` (`dashboard.css`) keeps
   Bootstrap's `table-sm` horizontal cell padding (0.25rem) instead of the 0.75rem of the
-  shared `.table-sm` rules. The table fits its box at 1280px wide with every row action
-  inside it; the DID keeps its title and copy button.
+  shared `.table-sm` rules. The Name (`.identities-name`, 14rem) and Agent Surface
+  (`.identities-surface`, 12rem) cells wrap long values inside a capped width; the Origin badges
+  wrap. Attestation, UAI and Created (`.identities-col-wide-only`) show only at 2000px wide and
+  above. Below 1600px, Trust Score and Last Used (`.identities-col-mid-up`) hide too, and the
+  DID cell (`IdentityNameCell` with `compactDid`) shows a shorter DID. The expanded details always
+  show Created, Last Used and the Trust Score (`identities-detail-trust-score`), and for an
+  identity without Agent DNA its UAI (`identities-detail-uai`); with Agent DNA the Agent DNA
+  card shows the UAI. The table fits its box from the 1280px viewport that
+  `laptop-layout.spec.ts` checks up to the 1512px and 1728px laptop viewports, with every row
+  action inside it; the DID keeps its title and copy button.
 - **Connection Points actions**: the row actions sit in a 6rem wide wrapping block (two
   buttons per line) with no left margins, so the Actions column stays near 120px and the
   Name and Mediator columns keep their room. Add a new row action inside that block.
-- **Credential Audit columns**: only Time, Event and the chevron column keep a fixed width.
-  Intent takes what its content needs, and its badge wraps (`text-wrap text-break`), so
-  Downstream Provider and Agent Surface keep room for their linked names.
 
 ## Validation
 

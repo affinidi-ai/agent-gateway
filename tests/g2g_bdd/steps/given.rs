@@ -954,6 +954,137 @@ pub async fn gateway_trusts_issuer_on_connection(
     );
 }
 
+/// The issuer DID a gateway holds for a peer can only come from a pairing or
+/// an issuer exchange, never from the admin API, so the record is edited where
+/// the gateway stores it while it is stopped.
+#[given(expr = "gateway {int} has recorded {string} as the issuer DID of gateway {int}")]
+pub async fn gateway_has_recorded_issuer_did_for_peer(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    issuer_did: String,
+    peer_gw: usize,
+) {
+    world.start().await;
+    let remote_id = remote_record_id(world, gw_index, peer_gw);
+    world
+        .harness_mut()
+        .restart_gateway_after_storage_edit(gw_index, |base_dir| {
+            record_remote_gateway_issuer_did(base_dir, &remote_id, &issuer_did)
+        })
+        .await
+        .unwrap_or_else(|error| panic!("{error:#}"));
+    wait_until_gateway_reaches_peer(world, gw_index, peer_gw).await;
+    let record = world
+        .harness()
+        .gw(gw_index)
+        .admin
+        .get_gateway(&remote_id)
+        .await
+        .unwrap_or_else(|error| panic!("read gateway {gw_index}'s record for gateway {peer_gw}: {error:#}"));
+    assert_eq!(
+        record.issuer_did.as_deref(),
+        Some(issuer_did.as_str()),
+        "gateway {gw_index}'s record for gateway {peer_gw} should carry the recorded issuer DID"
+    );
+}
+
+/// A restarted gateway reconnects to its mediator before it reaches its peer
+/// again; its answers may be refused, so a fabric ping is the readiness signal.
+async fn wait_until_gateway_reaches_peer(
+    world: &G2gWorld,
+    gw_index: usize,
+    peer_gw: usize,
+) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if world
+            .harness()
+            .ping(gw_index, peer_gw)
+            .await
+            .unwrap_or(false)
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "gateway {gw_index} did not reach gateway {peer_gw} within 60s of restarting"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+/// Sets `issuer_did` on the stored Remote gateway record `remote_id`, found
+/// as `{remote_id}.json` in a `gateways` directory under `base_dir`.
+fn record_remote_gateway_issuer_did(
+    base_dir: &std::path::Path,
+    remote_id: &str,
+    issuer_did: &str,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let path = find_stored_gateway_record(base_dir, &format!("{remote_id}.json"))
+        .with_context(|| format!("search {} for the stored record {remote_id}.json", base_dir.display()))?
+        .with_context(|| format!("no stored record {remote_id}.json under {}", base_dir.display()))?;
+    let mut record: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    record["issuer_did"] = Value::String(issuer_did.to_string());
+    std::fs::write(&path, serde_json::to_string_pretty(&record)?)?;
+    Ok(())
+}
+
+fn find_stored_gateway_record(
+    dir: &std::path::Path,
+    file_name: &str,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            if let Some(found) = find_stored_gateway_record(&path, file_name)? {
+                return Ok(Some(found));
+            }
+        } else if path.file_name() == Some(std::ffi::OsStr::new(file_name))
+            && path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                == Some(std::ffi::OsStr::new("gateways"))
+        {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+#[given(expr = "managed agent {string} response contains the agent-identity extension")]
+pub fn managed_agent_response_contains_agent_identity_extension(
+    world: &mut G2gWorld,
+    agent_name: String,
+) {
+    use crate::bdd_support::json_rpc::AGENT_IDENTITY_EXTENSION_URI as AGENT_IDENTITY_URI;
+    world
+        .topology
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    set_target_response(
+        world,
+        &agent_name,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "kind": "message",
+                "messageId": "msg-001",
+                "role": "agent",
+                "parts": [{ "kind": "text", "text": "response" }],
+                "extensions": [AGENT_IDENTITY_URI],
+                "metadata": {
+                    AGENT_IDENTITY_URI: {
+                        "softwareInfo": { "name": "managed-agent", "version": "2.0" },
+                        "cloudProvider": "local"
+                    }
+                }
+            }
+        }),
+    );
+}
+
 fn remote_record_id(
     world: &G2gWorld,
     gw_index: usize,
@@ -1236,6 +1367,30 @@ async fn vp_audit_log_of_gateway_keeps_every_audit_event(
         .enable_every_audit_event()
         .await
         .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must keep every audit event: {error:#}"));
+}
+
+#[given(expr = "the operator has read the traffic of the agent of surface {string}")]
+async fn operator_has_read_agent_traffic_of_surface(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    world.start().await;
+    let traffic = world
+        .settled_agent_traffic_of_surface(&surface_name)
+        .await;
+    world
+        .agent_traffic_baseline
+        .insert(surface_name, traffic);
+}
+
+#[given(expr = "gateway {int} surface {string} takes its managed identity from the fixed DID {string}")]
+pub fn surface_takes_managed_identity_from_fixed_did(
+    world: &mut G2gWorld,
+    _gw: usize,
+    surface_name: String,
+    did: String,
+) {
+    surface_spec_mut(world, &surface_name).fixed_managed_identity = Some(did);
 }
 
 #[given(expr = "gateway {int} surface {string} has managed identity enabled")]

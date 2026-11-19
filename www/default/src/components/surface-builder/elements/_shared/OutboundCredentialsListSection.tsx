@@ -10,6 +10,8 @@ import {
   splitByTenant,
 } from '../../../../utils/tenantScope';
 import { useSurfaceTenant } from '../../SurfaceMetaContext';
+import { consentLimitFieldOf } from '../../../../utils/consentLimit';
+import BindingConsentLimitNote from './BindingConsentLimitNote';
 
 interface CredentialProviderOption {
   id: string;
@@ -35,6 +37,8 @@ export interface OutboundCredentialFormRow {
   consent_mode: 'on_demand' | 'pre_authorize' | 'elicit' | 'external';
   /** Whose account an `external` binding's grant is: kept from the stored value. */
   subject?: 'owner' | 'caller';
+  /** The binding's consent time limit, in seconds: kept from the stored value and shown. */
+  max_consent_age_secs?: number;
   elicit_timeout_secs?: number;
   elicit_fallback?: 'on_demand' | 'fail';
   required_for_mode: 'all' | 'tools';
@@ -93,6 +97,7 @@ export function outboundCredentialFormToApi(f: OutboundCredentialFormRow): any |
       elicit_fallback: f.elicit_fallback ?? 'on_demand',
     }),
     ...(f.subject !== undefined && { subject: f.subject }),
+    ...(f.max_consent_age_secs !== undefined && { max_consent_age_secs: f.max_consent_age_secs }),
     inject_as,
   };
 }
@@ -127,6 +132,7 @@ export function outboundCredentialApiToForm(api: any): OutboundCredentialFormRow
     scopes: Array.isArray(api.scopes) ? api.scopes.join(', ') : '',
     consent_mode: api.consent_mode ?? 'on_demand',
     ...(api.subject === 'owner' || api.subject === 'caller' ? { subject: api.subject } : {}),
+    ...consentLimitFieldOf(api),
     elicit_timeout_secs: api.elicit_timeout_secs ?? 300,
     elicit_fallback: api.elicit_fallback ?? 'on_demand',
     required_for_mode,
@@ -369,6 +375,10 @@ const OutboundCredentialsListSection: React.FC<Props> = ({ rows, onChange }) => 
                   removing this binding revokes its grants.
                 </Form.Text>
               )}
+              <BindingConsentLimitNote
+                secs={row.max_consent_age_secs}
+                testId="credential-delegation-binding-consent-limit"
+              />
               {row.consent_mode === 'elicit' && (
                 <div className="mt-2 ps-2" style={{ borderLeft: '2px solid rgba(0,0,0,0.1)' }}>
                   <Form.Label className="small text-muted mb-0">

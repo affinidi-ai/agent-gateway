@@ -77,7 +77,9 @@ fn format_did_domain(base_url: &str) -> String {
 /// The library requires the signer's verification method to be a `did:key:` URI
 /// matching one of the DID log's `update_keys`; the signer derives the canonical
 /// `did:key:<mb>#<mb>` identifier from the key itself.
-fn build_signing_secret(private_key_jwk: &serde_json::Value) -> Result<crate::vta::local::VtaDiSigner, String> {
+pub(crate) fn build_signing_secret(
+    private_key_jwk: &serde_json::Value
+) -> Result<crate::vta::local::VtaDiSigner, String> {
     crate::vta::local::VtaDiSigner::from_jwk(private_key_jwk)
         .map_err(|e| format!("Failed to build signing key: {}", e.log_detail()))
 }

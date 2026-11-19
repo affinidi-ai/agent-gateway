@@ -4,6 +4,7 @@
 use anyhow::Result;
 use tracing::{info, warn};
 
+use super::event_set::is_logged_audit_event_id;
 use super::{DefinitionStores, Endpoint, EventSet, Integration};
 use crate::integrations::events::find_event;
 use crate::secrets::SecretsStore;
@@ -27,8 +28,9 @@ pub struct CheckReport {
 }
 
 /// Checks every endpoint (its configuration, its secret references resolved), event set (every
-/// event in the catalog) and integration (its endpoint and event set exist and its template
-/// fits the set). Nothing is changed.
+/// event in the catalog, but for those the gateway now only logs, which a save drops, and not
+/// only those) and integration (its endpoint and event set exist and its template fits the
+/// set). Nothing is changed.
 pub async fn check_definitions(
     endpoints: &[Endpoint],
     event_sets: &[EventSet],
@@ -49,11 +51,22 @@ pub async fn check_definitions(
             .events
             .iter()
             .map(String::as_str)
-            .filter(|event| find_event(event).is_none())
+            .filter(|event| find_event(event).is_none() && !is_logged_audit_event_id(event))
             .collect();
         if !unknown.is_empty() {
             let problem = format!("Unknown events: {}", unknown.join(", "));
             findings.push(finding("event set", &event_set.id, &event_set.name, problem));
+        } else if let Some(problem) = holds_only_logged_events(event_set) {
+            findings.push(finding("event set", &event_set.id, &event_set.name, problem));
+        } else {
+            let mut logged: Vec<&str> = event_set
+                .events
+                .iter()
+                .map(String::as_str)
+                .filter(|event| is_logged_audit_event_id(event))
+                .collect();
+            logged.sort_unstable();
+            crate::audit::catalog::warn_logged_only(&format!("The integration event set {}", event_set.id), &logged);
         }
     }
     for integration in integrations {
@@ -67,6 +80,25 @@ pub async fn check_definitions(
         integrations: integrations.len(),
         findings,
     }
+}
+
+/// The problem of a set whose every event the gateway now only logs: a save would leave it
+/// empty.
+fn holds_only_logged_events(event_set: &EventSet) -> Option<String> {
+    let mut events: Vec<&str> = event_set
+        .events
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if events.is_empty()
+        || !events
+            .iter()
+            .all(|event| is_logged_audit_event_id(event))
+    {
+        return None;
+    }
+    events.sort_unstable();
+    Some(format!("Holds only events the gateway now writes to its log: {}", events.join(", ")))
 }
 
 fn integration_problems(
@@ -245,6 +277,33 @@ mod tests {
         assert_eq!((report.endpoints, report.event_sets, report.integrations), (2, 2, 2));
     }
 
+    /// A set stored while the per-call delegation events were audit events
+    /// passes, as saving it does, unless it holds nothing else.
+    #[tokio::test]
+    async fn an_event_the_gateway_now_only_logs_fails_only_a_set_that_holds_nothing_else() {
+        let mut mixed = gateway_events();
+        mixed
+            .events
+            .insert("audit.token_injected".to_string());
+        let mut only_logged = gateway_events();
+        only_logged.name = "Uses".to_string();
+        only_logged.events = ["audit.token_injected".to_string(), "audit.consent_required".to_string()].into();
+
+        let report = check_definitions(&[], &[mixed, only_logged.clone()], &[], None).await;
+
+        assert_eq!(
+            report.findings,
+            [Finding {
+                kind: "event set",
+                id: only_logged.id,
+                name: "Uses".to_string(),
+                problem:
+                    "Holds only events the gateway now writes to its log: audit.consent_required, audit.token_injected"
+                        .to_string(),
+            }]
+        );
+    }
+
     #[tokio::test]
     async fn a_finding_never_shows_a_secret_or_a_slack_webhook_url() {
         let slack = |webhook_url: &str| {
@@ -332,5 +391,26 @@ mod tests {
                 .expect("list"),
             [orphan]
         );
+    }
+
+    /// A stored set that names an event the gateway now only logs beside
+    /// others passes the check, which warns that the event is no longer
+    /// delivered and where it is written now.
+    #[tokio::test]
+    async fn a_stored_set_that_names_an_event_the_gateway_now_only_logs_is_warned_about() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let mut mixed = gateway_events();
+        mixed
+            .events
+            .insert("audit.refresh_failed".to_string());
+
+        let report = check_definitions(&[], &[mixed, gateway_events()], &[], None).await;
+
+        assert_eq!(report.findings, []);
+        let text = logs.text();
+        assert_eq!(text.matches("WARN").count(), 1, "{text}");
+        for named in ["audit.refresh_failed", "credential_delegation"] {
+            assert!(text.contains(named), "{named}: {text}");
+        }
     }
 }

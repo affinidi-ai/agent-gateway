@@ -165,11 +165,28 @@ impl AdminApiClient {
 
     /// Turn the VP Audit Log on and keep every audit event on a running gateway.
     pub async fn enable_every_audit_event(&self) -> Result<()> {
+        self.keep_audit_events(&audit_log_keeping_every_event())
+            .await
+    }
+
+    /// Turn the VP Audit Log on and select only `events` on a running gateway.
+    pub async fn keep_only_audit_events(
+        &self,
+        events: &[&str],
+    ) -> Result<()> {
+        self.keep_audit_events(&serde_json::json!({"audit_enabled": true, "audit_events": events}))
+            .await
+    }
+
+    async fn keep_audit_events(
+        &self,
+        settings: &Value,
+    ) -> Result<()> {
         let response = self
-            .send_recorded_json(Method::POST, "/v1/settings", Some(&audit_log_keeping_every_event()))
+            .send_recorded_json(Method::POST, "/v1/settings", Some(settings))
             .await?;
         if !(200..300).contains(&response.status) {
-            bail!("keeping every audit event failed with status {}: {}", response.status, response.body);
+            bail!("selecting the audit events failed with status {}: {}", response.status, response.body);
         }
         Ok(())
     }
@@ -419,6 +436,38 @@ impl AdminApiClient {
         surface_id: &str,
         patch: &Value,
     ) -> Result<Value> {
+        let (url, response) = self
+            .send_surface_patch(surface_id, patch)
+            .await?;
+        let response_status = response.status();
+        let response_body = response
+            .text()
+            .await
+            .context("read PATCH response body")?;
+        if !response_status.is_success() {
+            bail!("PATCH {url} failed with status {response_status}: {response_body}");
+        }
+        serde_json::from_str(&response_body)
+            .with_context(|| format!("decode PATCH response from {url}: {response_body}"))
+    }
+
+    /// PATCH a surface with `application/merge-patch+json` and keep the response whatever its status.
+    pub async fn patch_surface_recorded(
+        &self,
+        surface_id: &str,
+        patch: &Value,
+    ) -> Result<RecordedResponse> {
+        let (_, response) = self
+            .send_surface_patch(surface_id, patch)
+            .await?;
+        recorded_response(response).await
+    }
+
+    async fn send_surface_patch(
+        &self,
+        surface_id: &str,
+        patch: &Value,
+    ) -> Result<(String, reqwest::Response)> {
         let url = self.admin_url(&format!("/v1/surfaces/{surface_id}"));
         let mut request = self.http.patch(&url);
         if let Some(token) = self
@@ -435,16 +484,7 @@ impl AdminApiClient {
             .send()
             .await
             .with_context(|| format!("PATCH {url}"))?;
-        let response_status = response.status();
-        let response_body = response
-            .text()
-            .await
-            .context("read PATCH response body")?;
-        if !response_status.is_success() {
-            bail!("PATCH {url} failed with status {response_status}: {response_body}");
-        }
-        serde_json::from_str(&response_body)
-            .with_context(|| format!("decode PATCH response from {url}: {response_body}"))
+        Ok((url, response))
     }
 
     fn admin_url(

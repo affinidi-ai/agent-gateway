@@ -110,6 +110,17 @@ impl GatewayNode {
             .await
             .with_context(|| format!("bootstrap test session on restarted gateway port {}", self.port))
     }
+
+    /// Stop the gateway, let `edit` change what it stored under its base
+    /// directory, then start it again, so the new process reads the edit.
+    pub async fn restart_after_storage_edit(
+        &mut self,
+        edit: impl FnOnce(&std::path::Path) -> Result<()>,
+    ) -> Result<()> {
+        self.gateway.stop();
+        edit(&self.base_dir)?;
+        self.restart().await
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -297,16 +308,35 @@ impl MultiGatewayHarness {
         &mut self,
         one_based_index: usize,
     ) -> Result<()> {
+        self.node_mut(one_based_index)?
+            .restart()
+            .await
+            .with_context(|| format!("restart gateway {one_based_index}"))
+    }
+
+    /// Restart one gateway after `edit` changed its stored records; see
+    /// [`GatewayNode::restart_after_storage_edit`].
+    pub async fn restart_gateway_after_storage_edit(
+        &mut self,
+        one_based_index: usize,
+        edit: impl FnOnce(&std::path::Path) -> Result<()>,
+    ) -> Result<()> {
+        self.node_mut(one_based_index)?
+            .restart_after_storage_edit(edit)
+            .await
+            .with_context(|| format!("restart gateway {one_based_index} after editing its storage"))
+    }
+
+    fn node_mut(
+        &mut self,
+        one_based_index: usize,
+    ) -> Result<&mut GatewayNode> {
         let i = one_based_index
             .checked_sub(1)
             .expect("gateway index must be 1-based");
-        let node = self
-            .nodes
+        self.nodes
             .get_mut(i)
-            .with_context(|| format!("no gateway at index {one_based_index}"))?;
-        node.restart()
-            .await
-            .with_context(|| format!("restart gateway {one_based_index}"))
+            .with_context(|| format!("no gateway at index {one_based_index}"))
     }
 
     /// The DID gateway `index` signs identity credentials with, read from its

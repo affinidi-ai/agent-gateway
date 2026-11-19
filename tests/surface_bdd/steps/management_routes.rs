@@ -6,11 +6,16 @@ use reqwest::{Method, header};
 use serde_json::{Value, json};
 
 use crate::bdd_support::admin_client::{AdminApiClient, RecordedResponse, recorded_response};
-use crate::steps::when::{ensure_gateway_running, gateway_is_running};
+use crate::steps::when::{ensure_admin_session, ensure_gateway_running, gateway_is_running};
 use crate::world::SurfaceWorld;
 
 const WELCOME_TEMPLATE_PATH: &str = "/v1/notifications/user-welcome-template";
 const PROBE_TOKEN_ENDPOINT: &str = "https://192.0.2.1/token";
+const AGENTS_PATH: &str = "/v1/agents";
+const SURFACE_ID: &str = "bdd-surface";
+const TENANT_HEADER: &str = "x-external-account";
+/// A personal access token resource pattern that matches every surface id.
+const ALL_SURFACES: &str = ".*";
 
 /// Who calls a management route in a scenario.
 enum Caller<'a> {
@@ -182,6 +187,76 @@ async fn send_welcome_notification(
     record(world, caller, Method::POST, "/v1/notifications/send-welcome", Some(&request)).await;
 }
 
+/// Mints a personal access token of `tenant`, limited to the tenant's surfaces that
+/// `surfaces` matches, for the scenario's personal access token steps.
+async fn hold_tenant_token(
+    world: &mut SurfaceWorld,
+    tenant: &str,
+    surfaces: &str,
+) {
+    ensure_admin_session(world).await;
+    let request = json!({
+        "name": "agents token",
+        "scopes": [],
+        "resource_pattern": format!("TENANT:${{x-external-account}}:surfaces:{surfaces}"),
+        "required_headers": [{"name": TENANT_HEADER, "pattern": tenant}],
+    });
+    let mut headers = header::HeaderMap::new();
+    headers.insert(TENANT_HEADER, header::HeaderValue::from_str(tenant).expect("a tenant header"));
+    let client = world
+        .admin_client
+        .as_ref()
+        .expect("the operator session must exist")
+        .personal_access_token_client(&request, headers)
+        .await;
+    world.personal_access_token_client = Some(client);
+}
+
+/// `/v1/agents/{id}` of the surface's agent, followed by `suffix`.
+fn surface_agent_path(
+    world: &SurfaceWorld,
+    suffix: &str,
+) -> String {
+    let id = world
+        .surface_agent_id
+        .as_deref()
+        .expect("the operator must have looked up the surface's agent");
+    format!("{AGENTS_PATH}/{id}{suffix}")
+}
+
+/// The id of the agent in an agents list that the surface under test uses.
+fn agent_of_surface(body: &Value) -> Option<&str> {
+    body["agents"]
+        .as_array()?
+        .iter()
+        .find(|agent| {
+            agent["surfaces"]
+                .as_array()
+                .is_some_and(|surfaces| {
+                    surfaces
+                        .iter()
+                        .any(|surface| surface["surface_id"] == SURFACE_ID)
+                })
+        })?["id"]
+        .as_str()
+}
+
+/// The id of the surface's agent, as the operator lists it.
+async fn agent_id_of_surface(world: &mut SurfaceWorld) -> String {
+    ensure_admin_session(world).await;
+    let listed = world
+        .admin_client
+        .as_ref()
+        .expect("the operator session must exist")
+        .send_recorded_json::<Value>(Method::GET, AGENTS_PATH, None)
+        .await
+        .expect("listing the agents as the operator");
+    assert_eq!(listed.status, 200, "listing the agents as the operator: {}", listed.body);
+    agent_of_surface(&listed.body)
+        .unwrap_or_else(|| panic!("the operator's agents list has no agent of {SURFACE_ID}: {}", listed.body))
+        .to_string()
+}
+
 #[given(expr = "a log file {string}")]
 async fn log_file(
     world: &mut SurfaceWorld,
@@ -211,6 +286,20 @@ async fn log_file(
         .unwrap_or_else(|error| panic!("writing log file {file_name}: {error}"));
 }
 
+/// Appends a line the dashboard reads as one log entry to the gateway's log file.
+#[given(expr = "the gateway log holds the line {string}")]
+fn gateway_log_holds_line(
+    world: &mut SurfaceWorld,
+    message: String,
+) {
+    let line = json!({"timestamp": "2026-01-01T00:00:00Z", "level": "INFO", "message": message});
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(log_directory(world).join("agent-gateway.log"))
+        .and_then(|mut file| file.write_all(format!("{line}\n").as_bytes()))
+        .unwrap_or_else(|error| panic!("writing the gateway log line: {error}"));
+}
+
 #[given(expr = "operator {string} holds a personal access token with scopes {string}")]
 async fn operator_holds_personal_access_token(
     world: &mut SurfaceWorld,
@@ -226,6 +315,28 @@ async fn operator_holds_personal_access_token(
         .personal_access_token_client(&request, header::HeaderMap::new())
         .await;
     world.personal_access_token_client = Some(client);
+}
+
+#[given(expr = "a personal access token of tenant {string}")]
+async fn tenant_personal_access_token(
+    world: &mut SurfaceWorld,
+    tenant: String,
+) {
+    hold_tenant_token(world, &tenant, ALL_SURFACES).await;
+}
+
+#[given(expr = "a personal access token of tenant {string} limited to surface {string}")]
+async fn surface_limited_tenant_personal_access_token(
+    world: &mut SurfaceWorld,
+    tenant: String,
+    surface: String,
+) {
+    hold_tenant_token(world, &tenant, &regex::escape(&surface)).await;
+}
+
+#[given("the operator has looked up the surface's agent")]
+async fn operator_looked_up_surface_agent(world: &mut SurfaceWorld) {
+    world.surface_agent_id = Some(agent_id_of_surface(world).await);
 }
 
 #[when(expr = "operator {string} removes old log files")]
@@ -324,6 +435,130 @@ async fn operator_validates_credential_provider(
     });
     record(world, Caller::Operator(&operator), Method::POST, "/v1/credential-providers/validate", Some(&provider))
         .await;
+}
+
+#[when("the personal access token lists the agents")]
+async fn personal_access_token_lists_agents(world: &mut SurfaceWorld) {
+    record(world, Caller::PersonalAccessToken, Method::GET, AGENTS_PATH, None).await;
+}
+
+#[when("the personal access token reads the surface's agent")]
+async fn personal_access_token_reads_surface_agent(world: &mut SurfaceWorld) {
+    let path = surface_agent_path(world, "");
+    record(world, Caller::PersonalAccessToken, Method::GET, &path, None).await;
+}
+
+#[when("the personal access token reads the agent card of the surface's agent")]
+async fn personal_access_token_reads_agent_card_of_surface(world: &mut SurfaceWorld) {
+    let path = surface_agent_path(world, "/agent-card");
+    record(world, Caller::PersonalAccessToken, Method::GET, &path, None).await;
+}
+
+#[when("the operator reads the agent card of the surface's agent")]
+async fn operator_reads_agent_card_of_surface(world: &mut SurfaceWorld) {
+    let path = surface_agent_path(world, "/agent-card");
+    operator_reads_agent_card(world, &path).await;
+}
+
+#[when("the operator reads the agent card of the surface's agent through that surface")]
+async fn operator_reads_agent_card_through_surface(world: &mut SurfaceWorld) {
+    let path = surface_agent_path(world, &format!("/agent-card?surface_id={SURFACE_ID}"));
+    operator_reads_agent_card(world, &path).await;
+}
+
+async fn operator_reads_agent_card(
+    world: &mut SurfaceWorld,
+    path: &str,
+) {
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("the operator session must exist")
+        .send_recorded_json::<Value>(Method::GET, path, None)
+        .await
+        .expect("reading the agent card as the operator");
+    world.admin_response = Some(response);
+}
+
+#[then(expr = "the agent card is available with source {string}")]
+fn agent_card_is_available_with_source(
+    world: &mut SurfaceWorld,
+    source: String,
+) {
+    let body = &management_response(world).body;
+    assert_eq!((&body["available"], &body["source"]), (&json!(true), &json!(source)), "the agent card answer: {body}");
+    assert!(body["card"]["name"].is_string(), "the agent card names the agent: {body}");
+}
+
+#[then("the agent card points at the gateway")]
+fn agent_card_points_at_gateway(world: &mut SurfaceWorld) {
+    let port = world
+        .infra
+        .as_ref()
+        .expect("the gateway must be running")
+        .gateway_port;
+    let body = &management_response(world).body;
+    let url = body["card"]["url"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the agent card names a url: {body}"));
+    assert!(url.contains(&format!("localhost:{port}")), "{url} does not point at the gateway");
+}
+
+#[then("the agents list names the surface")]
+fn agents_list_names_surface(world: &mut SurfaceWorld) {
+    let body = &management_response(world).body;
+    assert!(agent_of_surface(body).is_some(), "the agents list has no agent of {SURFACE_ID}: {body}");
+    assert!(body["window_minutes"].is_u64(), "the agents list names its window: {body}");
+}
+
+#[then("the agents list is empty")]
+fn agents_list_is_empty(world: &mut SurfaceWorld) {
+    let body = &management_response(world).body;
+    assert_eq!(body["agents"], json!([]), "the agents list: {body}");
+}
+
+#[then("the agent answer names the surface")]
+fn agent_answer_names_surface(world: &mut SurfaceWorld) {
+    let body = &management_response(world).body;
+    let surface_ids: Vec<&str> = body["surfaces"]
+        .as_array()
+        .expect("an agent lists its surfaces")
+        .iter()
+        .filter_map(|surface| surface["surface_id"].as_str())
+        .collect();
+    assert_eq!(surface_ids, vec![SURFACE_ID], "the agent's surfaces: {body}");
+}
+
+#[then("the agent card is unavailable because only an operator may read it")]
+fn agent_card_is_operator_only(world: &mut SurfaceWorld) {
+    assert_agent_card_unavailable(world, "operator_only");
+}
+
+#[then("the agent card is unavailable because none of the agent's surfaces is running")]
+fn agent_card_is_not_running(world: &mut SurfaceWorld) {
+    assert_agent_card_unavailable(world, "not_running");
+}
+
+#[then("the agent card can't be read through that surface")]
+fn agent_card_surface_unavailable(world: &mut SurfaceWorld) {
+    let body = &management_response(world).body;
+    assert_eq!(
+        (&body["error"], &body["code"]),
+        (&json!("Not Found"), &json!("surface_unavailable")),
+        "the agent card answer: {body}"
+    );
+}
+
+fn assert_agent_card_unavailable(
+    world: &SurfaceWorld,
+    reason: &str,
+) {
+    let body = &management_response(world).body;
+    assert_eq!(
+        (&body["available"], &body["reason"], body.get("card")),
+        (&json!(false), &json!(reason), None),
+        "the agent card answer: {body}"
+    );
 }
 
 #[then(expr = "the response reports {int} removed log file(s)")]

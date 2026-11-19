@@ -88,5 +88,19 @@ describe('Credential Delegation binding', () => {
       }
     });
     expect(screen.queryByTestId('credential-delegation-binding-subject')).toBeNull();
+    expect(screen.queryByTestId('credential-delegation-binding-consent-limit')).toBeNull();
+  });
+
+  it('shows a consent time limit set through the API', async () => {
+    render(
+      <OutboundCredentialsListSection
+        rows={[{ ...row('on_demand'), max_consent_age_secs: 2_592_000 }]}
+        onChange={() => {}}
+      />
+    );
+    await screen.findByText('Vendor');
+    expect(screen.getByTestId('credential-delegation-binding-consent-limit')).toHaveTextContent(
+      'Consent time limit: 30 days, set through the API.'
+    );
   });
 });

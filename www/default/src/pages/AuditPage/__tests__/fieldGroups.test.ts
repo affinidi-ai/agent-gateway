@@ -35,6 +35,26 @@ describe('fieldGroups', () => {
     });
   });
 
+  it('shows the principal a JWT strategy names beside the subject, only when there is one', () => {
+    const named = groupByLabel(
+      baseEntry({ caller: { auth_method: 'jwt_bearer', sub: 'abc-123', principal: 'alice' } }),
+      null,
+      null
+    );
+    expect(named['Identity']).toEqual(
+      expect.arrayContaining([
+        { term: 'Subject', value: 'abc-123', mono: true },
+        { term: 'Principal', value: 'alice', mono: true },
+      ])
+    );
+    const plain = groupByLabel(
+      baseEntry({ caller: { auth_method: 'jwt_bearer', sub: 'abc-123' } }),
+      null,
+      null
+    );
+    expect(plain['Identity'].map(item => item.term)).not.toContain('Principal');
+  });
+
   it('summarises a policy decision under Policy', () => {
     const pd: PolicyDecisionData = {
       scope: 'surface',

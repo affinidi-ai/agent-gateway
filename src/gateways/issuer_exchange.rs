@@ -19,6 +19,9 @@ use crate::messages::MessageType;
 
 /// How long the requester waits for the `gateway-issuer-response`.
 pub const ISSUER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a Fabric answer waits on the issuer exchange before it is refused;
+/// the exchange itself keeps running and records the issuer when it completes.
+pub const ANSWER_ISSUER_EXCHANGE_DEADLINE: Duration = Duration::from_secs(3);
 /// `expires_time` window on the request envelope.
 const ISSUER_REQUEST_EXPIRES_SECS: u64 = 30;
 
@@ -32,6 +35,8 @@ pub enum PeerIssuerError {
     Send(String),
     #[error("no gateway-issuer-response within {}s", ISSUER_REQUEST_TIMEOUT.as_secs())]
     Timeout,
+    #[error("issuer exchange still running after {}s", .0.as_secs())]
+    Pending(Duration),
     #[error("issuer response came from {actual:?}, expected {expected:?}")]
     UnexpectedResponder { expected: String, actual: String },
     #[error("issuer response has unexpected message type {0:?}")]

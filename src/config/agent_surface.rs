@@ -1998,7 +1998,7 @@ impl Default for SharedTransitConfig {
     }
 }
 
-fn is_true(value: &bool) -> bool {
+pub(crate) fn is_true(value: &bool) -> bool {
     *value
 }
 
@@ -2543,6 +2543,10 @@ pub struct TransitCredentials {
     /// proxy's pin is still this one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_proxy_pin: Option<String>,
+    /// Seconds a person's consent may be used through this binding, from one
+    /// minute to 365 days; the provider's limit, else the gateway's, when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_consent_age_secs: Option<u64>,
 }
 
 fn default_transit_elicit_timeout_secs() -> u64 {

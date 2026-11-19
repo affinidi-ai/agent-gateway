@@ -546,7 +546,7 @@ keep the rule in the Transit Point's own `response_policy`.
 | `input.transit.caller.verification` | `transit_token` | The call carries a valid transit token whose `user_identity_hash` came from source authentication on the Access Point. |
 | | `unverified` | A valid transit token names a caller DID but carries no verified principal: the DID was asserted or derived from request fields on the Access Point. |
 | | `fabric_peer` | The call carries a valid transit token this gateway issued for a request a paired gateway sent over Fabric (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). The peer gateway is verified, and named in `fabric`. The caller it sent the request for is verified only when the receiving surface's own `source_auth` or resource token verified a credential on that request with caller authentication that tells a partner's users apart (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)): then `verified` is `true` and `user_identity_hash` names that caller. An API key or other shared credential leaves it unverified. Whatever the peer says about its caller never verifies it. A rule on `verification == "transit_token"` never matches it. |
-| | `anonymous` | The call carries no valid transit token: none on a Transit Point that does not require one, one there that does not verify, or a discovery read (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A Transit Point that does not require a token still verifies one the agent sends, so a valid token is reported as above. There it names the caller to policy and to the Transit Point's [per-caller rate limit](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point) only: delegated credentials, Workload Binding and stream expiry still treat the call as carrying no token. A client the Transit Point authenticated does not change this. |
+| | `anonymous` | The call carries no valid transit token: none on a Transit Point that does not require one, or one there that does not verify (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A Transit Point that does not require a token still verifies one the agent sends, so a valid token is reported as above. There it names the caller to policy and to the Transit Point's [per-caller rate limit](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point) only: delegated credentials, Workload Binding and stream expiry still treat the call as carrying no token. A discovery read with a valid transit token is not anonymous; policy sees the named caller and can enforce rules on it. A client the Transit Point authenticated does not change this. |
 | `input.transit.caller.identity_source` | `gateway-computed`, `self-presented`, `verified-presentation` | How the Access Point established the caller DID. Absent when the token has none. |
 | | `fabric-presentation`, `fabric-asserted` | For a `fabric_peer` caller: the DID came from a presentation one of the connection's issuers signed, or from anything else the peer sent (or the request names no DID). |
 | `input.transit.caller.user_identity_hash` | lowercase hex SHA-256 | The caller's [identity hash](CREDENTIAL_DELEGATION.md#the-callers-identity-hash) the Access Point computed: the source-auth method, its issuer, the surface's tenant and the principal (for a JWT the value of its strategy's [`principal_claim`](SOURCE_AUTH.md#which-claim-names-a-jwt-caller), `sub` by default, with the claim's name when it is not `sub`; the API key name, DID or mTLS principal). The same subject verified by another method, issuer or tenant has another hash. For a `fabric_peer` caller it is the caller the receiving surface verified on the Fabric request, the same value for the same credential as on its Access Point. Present only when `verified`, and absent for a JWT without a non-empty string in its strategy's principal claim. |
@@ -779,6 +779,33 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   loopback and private receivers are allowed, cloud metadata is blocked, redirects are not followed.
   The mediator directory request (`AG_MEDIATOR_DIRECTORY_URL`, [`INTEGRATIONS.md`](INTEGRATIONS.md#mediator-directory))
   uses the same client and the same rules.
+- `egress::pinned_forward_client` pins every **traffic mirror** request
+  (`target.networking.mirror.endpoint`, `src/proxy/mirror.rs`) on the direct, `fabric://` and owned MCP
+  Proxy paths, so the mirror gets the same send-time check as the Target: a cloud metadata address is
+  never contacted, the connection is pinned to the address resolved for that request, and a 3xx is
+  returned rather than followed. The lookup and the send share one `timeout_secs` budget: a resolver
+  that does not answer in time refuses the mirror, though the lookup keeps its blocking thread until
+  the OS resolver returns. The mirror is sent the caller headers the Target is sent, never one the
+  Target is refused: a header named like a Target credential header is dropped, and a Target bound by
+  external consent gets only the protocol headers, so its mirror does too. A refused mirror is never
+  contacted: a direct or MCP Proxy request logs a warning and continues, and a `fabric://` request
+  that waits for its mirror answers `503` with the failure class and the text "the mirror request did
+  not complete" (see [Known limitations](#known-limitations)). A fire-and-forget mirror is vetted
+  inside its own task, so slow DNS never delays the live request. Saving a surface or variant also
+  refuses a mirror endpoint that is not `http` or `https`, that carries credentials (`user:pass@`, as
+  for the Target) or that names cloud metadata, with `400`
+  `target.networking.mirror.endpoint: <reason>`, and a `timeout_secs` of zero or above 30 with `400`
+  `target.networking.mirror.timeout_secs: <reason>`; that check resolves no DNS, so the send-time
+  check is the control for a surface written without the admin API (a hand edit under `_storage/`, a
+  restore, DynamoDB), and a stored `timeout_secs` above 30 runs as 30. Loopback and private addresses
+  stay allowed, as for the Target, so an editor can still point a mirror at an internal service. Each
+  mirrored request resolves DNS on a blocking-pool thread and builds a fresh client; none is pooled,
+  because a cached client would reopen the rebinding window. A stored surface whose mirror would be
+  refused still loads: each mirrored request logs one refusal, and the surface gets `400` on its next
+  save, for any edit, until the mirror is fixed. With `HTTP_PROXY` or `HTTPS_PROXY` set, the pinned
+  client sends through the proxy, which resolves the host again, as for the Target above; the gateway
+  must still resolve the host itself first, so a mirror host that only the proxy can resolve is
+  refused, as such a Target is.
 - `egress::pinned_forward_client` also pins the **agent-card fetch** from an
   `http(s)` surface target whenever it carries `target.auth`
   (`src/proxy/handler/agent_card.rs`), so the
@@ -855,7 +882,36 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   policy: loopback and private targets are allowed, cloud metadata is blocked,
   and redirects are not followed. The fetch has a 5-second timeout and a 64 KiB
   limit and always runs in the background for the dashboard, never on the
-  request path. See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#agent-card-names).
+  request path. `GET /v1/agents` starts it on a cache miss for every agent it
+  lists, so a tenant's list can start it for an appliance-wide surface's agent
+  and see that card's `name`, though the tenant's own card read answers
+  `operator_only`. See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#agent-card-names).
+- The **Agents API served card name lookup** (`src/identity/handlers/agents.rs`,
+  `card_preview.rs::served_card`) names agents behind an `a2a-proxy://` or
+  `fabric://` target. It builds the card the surface serves, as the
+  [Agent card preview](RBAC.md#agent-card-preview) does, so it follows the
+  same rules: the A2A proxy generates the card, and a `fabric://` card is read
+  from the remote gateway. It runs in the background on a cache miss, once per
+  surface per 5 minutes and at most 4 at once, is not rate limited or audited,
+  and issues no DID, writes no Trust Registry record and records no request.
+  As with the target card name, a tenant's list can start it for an
+  appliance-wide surface's agent and see that card's `name`.
+- The **Agents API Agent Card fetch** (`GET /v1/agents/{id}/agent-card`,
+  `src/identity/handlers/agents.rs`) is the surface's
+  [Agent card preview](RBAC.md#agent-card-preview) of the agent's first A2A or
+  AP2 surface that runs on this gateway, so it follows the same rules as the
+  preview and the surface's own card route: a URL Target's card is fetched
+  with the surface's Target Authentication and rewritten, an `a2a-proxy://`
+  Target's card is generated, and a `fabric://` Target's card is read from the
+  remote gateway. Serving it issues no DID, writes no Trust Registry record and
+  records no request. A tenant's token reads it only through a surface of its
+  own tenant, and gets `available: false` with `operator_only` and no fetch
+  when only an appliance-wide surface could, as the preview does. Each fetch
+  counts against the preview's per-user and per-surface limits and is audited;
+  past them the last preview of the surface answers, or `429` without one. The
+  response carries only the top-level A2A 0.3 and 1.0 Agent Card fields of the
+  card the gateway serves, and `502` when there is no card or it is not a JSON
+  object with a string `name`. See [`RBAC.md`](RBAC.md#agents-api).
 - The dashboard's **caller Agent Card fetch**
   (`src/observability/caller_names.rs`) reads a URL taken from the caller's own
   DID document, so the caller chooses it. It goes through
@@ -968,6 +1024,15 @@ documented here so operators can assess exposure.
   naming `169.254.169.254` is fetched. Keep the flag off wherever an instance
   metadata service is reachable. See
   [DID resolution host policy](#did-resolution-host-policy).
+- **A waited `fabric://` mirror names its failure class to the caller.** The `503` says which of
+  `blocked by egress policy`, `DNS resolution failed`, `internal error`, `timeout`, `connection
+  refused`, `invalid request` or `network error` stopped the mirror. The last four existed before the
+  mirror had an egress guard; the first three came with it. The caller who receives the class is the
+  remote caller of the surface, who need not be the party that edits it, and on a loopback or private
+  mirror it tells a closed port from a timeout or an unresolvable name. Neither a URL nor a path is
+  sent. Returning one generic `503` and logging the class is a possible tightening. See
+  [Other pinned egress sinks](#other-pinned-egress-sinks).
+
 - **Agent name resolution is open to DNS rebinding.** The `agent-names` resolver
   checks the host's addresses and then connects through its own client without
   pinning one, so a caller-controlled host whose DNS answer changes between the

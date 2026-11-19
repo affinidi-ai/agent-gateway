@@ -47,7 +47,7 @@ Feature: Audit log access and evidence
     And the audit read response says it reached the end of the history
 
   Scenario: Administrators can read full Credential Delegation Audit Log evidence
-    Given the Credential Delegation Audit Log contains a token injection for caller "alice" with email "alice@example.com" and name "Alice Example"
+    Given caller "alice" with email "alice@example.com" and name "Alice Example" has consented to and used a delegated credential
     And operator "ada" has the "administrator" role
     When administrator "ada" reads the Credential Delegation Audit Log
     Then the audit read response status is 200
@@ -61,7 +61,7 @@ Feature: Audit log access and evidence
     And operator "ada" has the "administrator" role
     When administrator "ada" reads the Credential Delegation Audit Log
     Then the audit read response status is 200
-    And the Credential Delegation Audit Log includes a token injection
+    And the Credential Delegation Audit Log includes a record of MCP tool "lookup_place"
     And the Credential Delegation Audit Log has no stored API-key secret values
     And the Credential Delegation Audit Log has no stored target-auth secret values
 

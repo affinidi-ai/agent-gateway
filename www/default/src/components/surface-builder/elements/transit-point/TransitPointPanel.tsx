@@ -18,6 +18,7 @@ import {
   providerTargetAuthFromApi,
 } from '../_shared/providerTargetAuth';
 import TransitCallerSection from './TransitCallerSection';
+import TargetAuthSecretField from './TargetAuthSecretField';
 import { newTransitPointId, deriveTransitPointAlias } from './factory';
 import GatewaySurfacePicker from '../_shared/GatewaySurfacePicker';
 import {
@@ -436,16 +437,11 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
         {config.auth_type &&
           config.auth_type !== 'none' &&
           config.auth_type !== 'credential_provider' && (
-            <Form.Group className="mt-2">
-              <Form.Label className="small text-muted mb-1">Secret Reference</Form.Label>
-              <Form.Control
-                size="sm"
-                type="text"
-                placeholder="secret-name"
-                value={config.auth_secret || ''}
-                onChange={e => updateField('auth_secret', e.target.value)}
-              />
-            </Form.Group>
+            <TargetAuthSecretField
+              value={config.auth_secret || ''}
+              onChange={secretId => updateField('auth_secret', secretId)}
+              error={errorByField?.auth_secret}
+            />
           )}
         {(config.auth_type === 'api_key' || config.auth_type === 'custom_header') && (
           <Form.Group className="mt-2">

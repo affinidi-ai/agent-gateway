@@ -1,0 +1,127 @@
+branch: feat/agent-registry-01
+changes:
+  added:
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Add a read-only Agents API with one record per managed agent
+      description: >-
+        `GET /v1/agents` lists one record per managed agent behind the non-deleted, non-MCP surfaces
+        the caller can access, with the metrics retention window as `window_minutes`. Surfaces whose
+        targets share an endpoint and Agent Card path are one agent, with an opaque id hashed from
+        that target. The endpoint drops credentials, query, fragment and a trailing slash, and its
+        scheme case; an `http` or `https` endpoint is parsed as a URL, which also drops host case,
+        and one that does not parse, or of another scheme with an `@` after its authority, is shown
+        as `redacted.invalid`, never raw. Each surface with such an endpoint is an agent of its own,
+        with an id hashed from the surface id, not the endpoint. A record carries the
+        Agent Card name (else the canvas target name of the most recently active surface, unless
+        that only names a surface: its own name or a generated `<kind>_surface_<n>`), the
+        credential-free endpoint, runtime, primary protocol, the union of its surfaces' tags, each
+        surface's own DID and current managed identity (the most recently used one, not the earlier
+        DIDs of its version history; every JWT-claim DID counts), every surface using it, whether any of its current identities was
+        recorded to a Trust Registry, and the latest activity across its surfaces. An agent behind
+        an A2A proxy or remote gateway target is named from the card the gateway serves for it,
+        built in the background as the agent card preview builds it and cached per surface for 5
+        minutes. Each record carries `target_name`, the name of the A2A proxy or remote gateway the
+        endpoint names when the caller may see it.
+        `GET /v1/agents/{id}` adds each surface's protocol and route and the Access Point (inbound)
+        request totals and p95 latency across them over the metrics retention window, each request
+        counted once; Transit Point (outbound) calls are not counted. Both routes need surface view permission, group only
+        surfaces in the caller's tenant and PAT resource scope, return 404 for an id outside it, and
+        are not served when no auth backend is configured.
+    - timestamp: '2026-10-29T15:00:00Z'
+      title: Add GET /v1/agents/{id}/agent-card to show the Agent Card served for an agent
+      description: >-
+        Returns the card the gateway serves for the agent, read through the agent card preview of
+        its first running A2A or AP2 surface, so URL, A2A proxy and remote gateway targets all show
+        a card. `?surface_id=` reads it through that surface instead, and answers `404` with code
+        `surface_unavailable` when that surface can't hold the card or isn't running on this
+        gateway. `source` says how the gateway obtains it: `fetched` (from the agent and rewritten),
+        `generated` (by the A2A proxy) or `remote_gateway` (served over Fabric). Otherwise it
+        answers `available: false` with `no_agent_card` (protocol is not A2A or AP2), `not_running`
+        (no `surface_id` given and no surface of the agent runs on this gateway) or
+        `operator_only` (a tenant token whose own
+        surfaces cannot reach the card and an appliance-wide surface can; nothing is fetched). Reads
+        are audited and share the preview's per-user and per-surface fetch limits, with a 429 past
+        them when there is no earlier preview. Viewing a card issues no DID, writes no Trust
+        Registry record and records no request. A missing card, a failed fetch or a card the
+        gateway refuses to serve returns a generic 502, never the preview's last good card. Same
+        permission, tenant and PAT scoping as the other Agents API routes.
+    - timestamp: '2026-10-29T18:00:00Z'
+      title: Add the read-only Agents page and agent details to the dashboard
+      description: >-
+        A new **Agents** sidebar entry, above **Surfaces**, opens `/agent-registry` and lists one
+        row per managed agent with its name ("Unnamed agent" when it has none) above the target it
+        reaches (the URL origin, or the A2A proxy or remote gateway by name, its id when it has
+        none), runtime and
+        protocol, identities, the number of surfaces using it as a badge followed by their names on
+        one line (the full list on hover), Trust Registry Recorded or Not recorded, and last activity, with a search over the agent and surface names and the runtime.
+        No surface status is shown. The page is not served at `/agents`, which is a gateway channel
+        prefix, and `agent-registry` is reserved so no channel prefix can take it. The details page
+        has **Agent Card** (opened first), **Connection** and **Traffic** tabs; identities and
+        surfaces are shown in the list and on **Connection**, which lists each surface as a link with the
+        URL callers use (`public_url` on each surface of `GET /v1/agents/{id}`), then shows how the
+        gateway reaches the agent, naming an A2A proxy or remote
+        gateway by its name (its id when it has none), with a URL endpoint's credentials,
+        query string and fragment removed, and "Can't be shown" for an endpoint the API redacted.
+        The Agent Card opens as a visual preview with a JSON view, and every value is shown as plain
+        text, under "Served by <surface> · <source>" (Fetched & rewritten by the gateway, Generated
+        by the A2A proxy or Relayed from the remote gateway), the surface as a link, or a surface
+        select with an **Open surface** link when several serve it, a **Changes by the gateway**
+        table (each changed field marked Rewritten, Added or Removed with what callers get and, for
+        a rewritten one, what it was; the Verifiable Presentation expands in place with Readable
+        and Raw JSON views; a surface without a DID says so) and highlighted JSON.
+        `GET /v1/agents/{id}/agent-card` takes `?surface_id=` and returns `surface_id`,
+        `card_surface_ids` and `upstream_card`. The list's **Identities** column shows the number of current identities as
+        a badge with the first DID (all on hover), and flags **No DID** when surfaces use an agent
+        without one, and last activity and **Traffic** are labelled with the metrics retention window the API
+        returns. Opening another agent's
+        details clears the previous one, and a late answer for it is ignored. When the card can't
+        be read through the chosen surface, the surface select stays above the message with a
+        **Retry**. With no agents, the empty list offers users who can edit surfaces a **Create a
+        surface** link that opens `/surfaces/new`, followed by a **What's a surface?** docs link
+        shown to everyone. Needs surface view permission.
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-10-29T12:00:00Z'
+      title: Stop exposing every identity's traffic and last payload on GET /v1/agents
+      description: >-
+        The previous `GET /v1/agents` had no feature gate and no tenant or PAT scoping, and returned
+        every DID's per-surface traffic with the last request payload seen for it. It is replaced by
+        the scoped Agents API, and the gateway no longer keeps the per-identity last payload in
+        memory.
+    - timestamp: '2026-11-16T13:00:00Z'
+      title: Stop sending target endpoint userinfo with target Agent Card fetches
+      description: >-
+        The background fetch of a target's Agent Card name for the dashboard used the surface's
+        target endpoint as configured, so `https://user:pass@host` sent those credentials to the
+        target. The userinfo is now dropped before the fetch, and an endpoint that does not parse as
+        a URL is not fetched.
+    - timestamp: '2026-11-16T15:00:00Z'
+      title: Return only Agent Card fields from GET /v1/agents/{id}/agent-card
+      description: >-
+        The route returned the whole JSON body of the card. It now returns only the top-level
+        A2A 0.3 and 1.0 Agent Card fields, and answers a body that is not a JSON object with a
+        string `name` with a generic 502, so other JSON a target serves is not passed on.
+    - timestamp: '2026-11-16T15:00:00Z'
+      title: Redact an Agents API endpoint whose scheme is not a valid URI scheme
+      description: >-
+        An endpoint such as `user:pass@host://x` was shown with the text before `://` as its
+        scheme, credentials included. An endpoint whose scheme is not an RFC 3986 scheme is now
+        shown as `redacted.invalid`, and each surface with a scheme-less redacted endpoint is an
+        agent of its own, as other redacted endpoints already are.
+  breaking:
+    - timestamp: '2026-11-13T12:00:00Z'
+      title: Reserve the agent-registry path for the dashboard
+      description: >-
+        `agent-registry` is now a dashboard page, so the gateway no longer serves a channel, MCP
+        proxy, proxy or redirect prefix under `/agent-registry`. A gateway whose configuration
+        uses that segment stops serving that prefix after the upgrade; move it to another path.
+    - timestamp: '2026-11-16T14:00:00Z'
+      title: Replace the GET /v1/agents response with one record per managed agent
+      description: >-
+        `GET /v1/agents` no longer returns each identity's per-surface traffic with its last
+        payload. It returns `agents`, one record per managed agent, and `window_minutes`. It now
+        needs surface view permission, lists only surfaces in the caller's tenant and PAT resource
+        scope, and is not served when no auth backend is configured. A client that reads the old
+        response must move to the new records.

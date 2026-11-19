@@ -79,6 +79,7 @@ export function fieldGroups(
   add(identity, 'Issuer', fieldStr(caller?.iss), { mono: true });
   add(identity, 'Audience', fieldStr(caller?.aud), { mono: true });
   add(identity, 'Subject', fieldStr(caller?.sub), { mono: true });
+  add(identity, 'Principal', fieldStr(caller?.principal), { mono: true });
   add(identity, 'Email', fieldStr(caller?.email ?? caller?.email_redacted));
   add(identity, 'Name', fieldStr(caller?.name ?? caller?.name_redacted));
 

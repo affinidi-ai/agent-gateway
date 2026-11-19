@@ -291,6 +291,14 @@ mod tests {
             unreachable!("append not used in tests")
         }
 
+        async fn replace_raw(
+            &self,
+            _did: &str,
+            _raw_lines: &[&str],
+        ) -> Result<()> {
+            unreachable!("replace_raw not used in tests")
+        }
+
         async fn load_all(
             &self,
             _did: &str,

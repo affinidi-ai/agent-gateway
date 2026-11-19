@@ -1767,12 +1767,12 @@ async fn no_payment_is_taken_for_the_targets_grant() {
     );
 }
 
-/// The injection of a refreshed grant into the one retry is audited as the
-/// first one is: under the caller's identity hash, whose grant it is or who
-/// acts as the owner, with the binding's subject in the detail; and the
-/// grant's use is recorded, on a task of its own.
+/// The injection of a refreshed grant into the one retry is logged as the
+/// first one is, and audited by neither: under the caller's identity hash,
+/// whose grant it is or who acts as the owner, with the binding's subject in
+/// the detail; and the grant's use is recorded, on a task of its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_retry_is_audited_under_its_caller_and_the_grants_use_recorded() {
+async fn the_retry_is_logged_under_its_caller_and_the_grants_use_recorded() {
     for (subject, key) in [("owner", owner_key()), ("caller", caller_key(&caller_principal()))] {
         let fixture = Fixture::new(vec![refresh_answer("second")], vec![rejected_token(), vendor_result()]).await;
         let target = format!("{}/mcp", fixture.vendor.origin());
@@ -1782,14 +1782,15 @@ async fn the_retry_is_audited_under_its_caller_and_the_grants_use_recorded() {
         fixture
             .store(&key, "first")
             .await;
-        let ((status, _, body), events) = crate::audit::producer::capture(async {
+        let ((status, _, body), recorded) = crate::audit::producer::capture_apart(async {
             fixture
                 .send(mcp_call(Some(KEY)))
                 .await
         })
         .await;
         assert_eq!(status, axum::http::StatusCode::OK, "{subject}: {body}");
-        let injected: Vec<_> = events
+        let injected: Vec<_> = recorded
+            .logged
             .iter()
             .filter(|event| matches!(event.event, crate::delegation_vault::audit::DelegationAuditAction::TokenInjected))
             .map(|event| {
@@ -1820,4 +1821,64 @@ async fn the_retry_is_audited_under_its_caller_and_the_grants_use_recorded() {
         let kept = kept.unwrap_or_else(|| panic!("{subject}: the grant's use is recorded"));
         assert_eq!(kept.access_token, "second", "{subject}");
     }
+}
+
+impl Fixture {
+    /// Deactivate the vendor's provider, as the management API does.
+    async fn deactivate_provider(&self) {
+        let providers = self
+            .router
+            .credential_provider_store
+            .as_ref()
+            .unwrap();
+        let mut provider = providers
+            .get("vendor")
+            .await
+            .unwrap()
+            .unwrap();
+        provider.deactivated_at = Some(chrono::Utc::now());
+        providers
+            .update(provider)
+            .await
+            .unwrap();
+    }
+}
+
+/// A deactivated provider takes no new connect, so a caller with no grant of
+/// it is not told to connect: the binding is unavailable (`503`), recorded
+/// with the reason `provider_deactivated`. A grant given before the
+/// deactivation still goes to the Target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_caller_without_a_grant_of_a_deactivated_provider_is_not_told_to_connect() {
+    let fixture = Fixture::new(vec![Answer::status(200)], vec![vendor_result()]).await;
+    let target = format!("{}/mcp", fixture.vendor.origin());
+    fixture
+        .serve(vendor_surface("mcp", &target, "caller"))
+        .await;
+    fixture
+        .deactivate_provider()
+        .await;
+
+    let (status, headers, body) = fixture
+        .send(mcp_call(Some(KEY)))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["data"], json!({"reason": "connector_unavailable"}));
+    assert_eq!(headers["cache-control"], "no-store");
+    assert!(
+        fixture
+            .vendor
+            .requests()
+            .is_empty(),
+        "nothing is sent to the Target"
+    );
+
+    fixture
+        .store(&caller_key(&caller_principal()), "my-access")
+        .await;
+    let (status, _, body) = fixture
+        .send(mcp_call(Some(KEY)))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(fixture.vendor_saw(), [(Some("Bearer my-access".to_string()), false)]);
 }

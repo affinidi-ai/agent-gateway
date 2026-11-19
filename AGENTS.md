@@ -212,6 +212,12 @@ surface a new DID; it revokes only after **Revoke API key**, and a failed revoke
 toast. See _API key
 delete_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#api-key-delete).
 
+Deleting a surface on its page opens a confirmation, "Delete Surface?", naming the surface,
+built on the shared `ConfirmPopover` with focus on **Cancel**, and deletes only after
+**Delete**; **Cancel** deletes nothing. The delete button needs `surfaces.delete`, and no page
+shortcut (Cmd/Ctrl+S, the canvas keys) acts while the popover is open. See _Surface delete_ and
+_Confirm popover_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-delete).
+
 The credential provider editor shows a **Consent confirmation** switch and its login client
 (ID and secret, both picked from the secrets store), endpoints, strategy (only the provider's
 tenant's and appliance-wide ones; appliance-wide only on a new provider), principal claim and a
@@ -230,9 +236,59 @@ The JWT verification strategy editor's Caller identity claim is editable only on
 see _JWT verification strategy editor_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#jwt-verification-strategy-editor).
 
-The Credentials audit tab shows a caller's Principal beside Subject when its strategy names a
-claim other than `sub`; see _Credentials audit tab_ in
-[`www/default/AGENTS.md`](www/default/AGENTS.md#credentials-audit-tab).
+The Credentials page keeps its **Credential Tokens** tab, which shows when each consent ends and
+confirms every revoke in place (two clicks, never a modal or a browser dialog; revoke-all asks
+with a danger button that names how many delegations it ends), and has a **Delegated Access**
+tab beside it that lists only active access, revokes it with a text **Revoke** whose confirm
+names the provider beside a Cancel, and opens the Audit Log as its history. Both tabs name a
+provider by its name, show an agent with a `did:web` DID by its whole host name, the full DID in
+the tooltip, and revoke one entry with the same text **Revoke**. Delegated Access shows the limit
+that applies to each consent in its Ends column, and the Credential Tokens **Access Token** column
+says "Renews automatically" while the gateway refreshes the token. On Credential Tokens a
+**Limit duration** button above **Revoke**, on each consent an agent can still act under, opens
+a panel in place under the row, never a modal: it sets how long after its consent that one
+delegation ends (`PUT /delegation-vault/{id}/consent-limit`) and offers Save only for a limit
+that brings the end forward. The Credential Tokens card header shows its title alone, with no
+count. Both tabs show the one read of the vault the page makes, so a change on one shows on the
+other; the page reads it again, with the lists left on screen, when the gateway answers a revoke
+or a limit with `404` or `409` and when a provider is deactivated, activated or deleted on the
+Credential Providers tab; a read that fails is shown as an error with a Retry, never as an
+empty list; and Revoke and Limit duration are shown only with `delegation_vault.delete`. A new
+view is a new tab, and both of these tabs stay. See
+_Credential Tokens and Delegated Access tabs_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#credential-tokens-and-delegated-access-tabs).
+
+The credential delegation records are read in the Audit Log. The Credentials page has no audit
+tab: **History** on Delegated Access and a token's expanded row on Credential Tokens open the
+Audit Log filtered to the delegation categories, the audited ones
+(consent granted, expired or limited, a token or a user's tokens revoked). What the gateway does on each
+call, such as a token injected or refreshed, is in its log (nowhere while
+`[logging] delegation_events` is `false`) and has no category, which the **About the Audit Log**
+panel says. The Audit Log
+shows a caller's Principal beside Subject when its strategy names a claim other than `sub`; see
+_Credential delegation audit_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#credential-delegation-audit).
+
+A credential provider a person consents to is deactivated, never deleted, from the dashboard:
+**Deactivate** (two clicks, in place) and **Activate** on the Credential Providers tab stop and
+restore new consent only, and the provider's row, its tokens and its audit records stay. The two
+buttons share one outline style, are shown with `credential_providers.edit`, and the list's
+Status column says "Active", or "Deactivated" with "No new consent" under it; see
+_Credential provider editor_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor) and
+[`docs/CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md#deactivating-a-provider).
+
+The credential provider editor's **Consent time limit** (Authorization Code providers only)
+writes `max_consent_age_secs`, `0` when empty, in minutes, hours or days (seconds only for a
+stored limit that is not a whole number of minutes), and says an empty field sets no limit on the
+provider while the gateway's own default and ceiling still apply. A refused limit is shown
+under the field, which is marked invalid and takes the focus. A limit shorter than the stored
+one, or a stored limit removed, warns under the field how many active consents saving ends, from
+`GET /credential-providers/{id}/consent-impact`. On such a provider the token
+refresh help says tokens are refreshed for as long as the consent lasts and that the person
+approves again when it ends. The Surface Builder keeps and
+shows a binding's own limit, which is set through the API; see _Credential provider editor_ and
+_Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
 
 The credential provider editor shows the inputs of the chosen type, picks the JWT signing key
 and certificate from the secrets store, keeps an authorization code provider's stored Callback URL
@@ -244,6 +300,10 @@ stored provider without a Callback URL shows the gateway's own one), and target
 authentication on a Managed Agent or Transit
 Point can take its credential from a credential provider; see _Credential provider editor_ and
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
+
+A Transit Point's static-secret target authentication picks its secret from a tenant-aware list
+with a refresh button beside it, and Save is blocked while no secret is picked; see _Surface
+Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 A Trust Check on a Managed Agent → Transit Point arrow belongs to that Transit Point and saves
 to `transit.points[i].trust_check_list` (new ones on A2A and AP2 Transit Points only); the
@@ -279,10 +339,10 @@ variants and refusals_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#audit-
 
 An audit response says what a read did not return in two fields: `truncated` (it stopped before
 the end of the history) and `dropped_records` (the history holds records it could not read).
-Either makes the counts lower bounds, so the Audit Log and the Credentials audit tab render every
+Either makes the counts lower bounds, so the Audit Log renders every
 number from that read with a trailing `+`, an empty page of such a read says the records searched
 held none rather than that the log is empty, and nothing else changes. A read the gateway could
-not make at all is answered with `500`, and both views show that failure — the Audit Log as an
+not make at all is answered with `500`, and the Audit Log shows that failure as an
 error panel with a Retry in place of its empty state, never as an empty log. The Audit Log also shows the size of the history against the advisory
 `[audit] vp_audit_log_soft_cap_bytes`, which enforces nothing, formatted by the one shared
 `utils/formatBytes.ts`; see _Audit page: partial reads and
@@ -303,11 +363,23 @@ surface was deleted, with a red "Revoked" badge, shows a deleted surface as plai
 _Identities page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page).
 
+The Identities table hides Attestation, UAI and Created below 2000px and Trust Score and Last
+Used below 1600px, and the expanded row shows the Trust Score, Created, Last Used and UAI; see
+_Laptop layouts_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#laptop-layouts).
+
 The Agent Cards view of an A2A or AP2 surface shows the managed agent's card beside the served card,
 and the Managed Agent panel shows its fetch status, including a card served without a managed
 identity, in the warning tone; a card refused for its identity names the identity error; see
 _Agent Cards tab_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#agent-cards-tab).
+
+The read-only Agents page at `/agent-registry` needs `surfaces.view` and lists one row per managed
+agent, built by the gateway from the surfaces that target it; MCP surfaces are left out and no
+status is shown. Its empty state offers a **Create a surface** link, which opens `/surfaces/new`,
+to users with `surfaces.edit` only. Its Agent Card tab shows the card the gateway serves for
+Direct, Proxied and Fabric routes with a **Card source** row, and keeps the surface picker, with a
+Retry, when the card can't be read through the chosen surface; see _Agents page_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#agents-page).
 
 The Identities page shows one row per surface Managed Agent, with its earlier DIDs (from its
 responses and from its Transit Points) and certificate or API key rotations listed as

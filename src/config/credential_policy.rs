@@ -30,6 +30,22 @@ impl RuleMode {
 pub const DEFAULT_TOKEN_REQUEST_TIMEOUT_SECS: u64 = 30;
 pub const MAX_TOKEN_REQUEST_TIMEOUT_SECS: u64 = 120;
 
+/// The shortest and longest a `max_consent_age_secs` may be: one minute and 365 days.
+pub const MIN_MAX_CONSENT_AGE_SECS: u64 = 60;
+pub const MAX_MAX_CONSENT_AGE_SECS: u64 = 31_536_000;
+
+/// Refuses a consent time limit, named `field`, outside one minute to 365 days.
+pub fn validate_max_consent_age(
+    field: &str,
+    secs: u64,
+) -> Result<(), String> {
+    if (MIN_MAX_CONSENT_AGE_SECS..=MAX_MAX_CONSENT_AGE_SECS).contains(&secs) {
+        Ok(())
+    } else {
+        Err(format!("{field} must be from {MIN_MAX_CONSENT_AGE_SECS} to {MAX_MAX_CONSENT_AGE_SECS}, got {secs}"))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct CredentialPolicyConfig {
@@ -47,6 +63,14 @@ pub struct CredentialPolicyConfig {
     pub insecure_token_endpoints: Vec<String>,
     /// Seconds a credential provider token request may take, 1 to 120.
     pub token_request_timeout_secs: u64,
+    /// Seconds a person's consent may be used when neither its credential provider nor its
+    /// binding sets `max_consent_age_secs`; no limit when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_max_consent_age_secs: Option<u64>,
+    /// The longest any consent may be used, in seconds, whatever a credential provider or a
+    /// binding sets, and the limit of a consent nothing else limits; none when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_consent_age_ceiling_secs: Option<u64>,
 }
 
 impl Default for CredentialPolicyConfig {
@@ -58,14 +82,30 @@ impl Default for CredentialPolicyConfig {
             target_source_auth: RuleMode::default(),
             insecure_token_endpoints: Vec::new(),
             token_request_timeout_secs: DEFAULT_TOKEN_REQUEST_TIMEOUT_SECS,
+            default_max_consent_age_secs: None,
+            max_consent_age_ceiling_secs: None,
         }
     }
 }
 
 impl CredentialPolicyConfig {
-    /// Refuses a `token_request_timeout_secs` of 0 or above 120, and an
-    /// `insecure_token_endpoints` entry that is not an absolute http URL without userinfo.
+    /// Refuses a `token_request_timeout_secs` of 0 or above 120, an
+    /// `insecure_token_endpoints` entry that is not an absolute http URL without userinfo, a
+    /// consent time limit outside one minute to 365 days, and a default above the ceiling.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(secs) = self.default_max_consent_age_secs {
+            validate_max_consent_age("default_max_consent_age_secs", secs)?;
+        }
+        if let Some(secs) = self.max_consent_age_ceiling_secs {
+            validate_max_consent_age("max_consent_age_ceiling_secs", secs)?;
+        }
+        if let (Some(default), Some(ceiling)) = (self.default_max_consent_age_secs, self.max_consent_age_ceiling_secs)
+            && default > ceiling
+        {
+            return Err(format!(
+                "default_max_consent_age_secs ({default}) must not be above max_consent_age_ceiling_secs ({ceiling})"
+            ));
+        }
         if !(1..=MAX_TOKEN_REQUEST_TIMEOUT_SECS).contains(&self.token_request_timeout_secs) {
             return Err(format!(
                 "token_request_timeout_secs must be from 1 to {MAX_TOKEN_REQUEST_TIMEOUT_SECS}, got {}",
@@ -292,6 +332,50 @@ mod tests {
         let config: CredentialPolicyConfig = toml::from_str("target_source_auth = \"enforce\"").unwrap();
         assert_eq!(config.target_https, RuleMode::Warn);
         assert_eq!(config.target_source_auth, RuleMode::Enforce);
+    }
+
+    #[test]
+    fn consent_time_limits_are_unset_by_default_and_take_configured_values() {
+        let config = CredentialPolicyConfig::default();
+        assert_eq!(config.default_max_consent_age_secs, None);
+        assert_eq!(config.max_consent_age_ceiling_secs, None);
+        assert_eq!(config.validate(), Ok(()));
+
+        let config: CredentialPolicyConfig =
+            toml::from_str("default_max_consent_age_secs = 21600\nmax_consent_age_ceiling_secs = 86400\n").unwrap();
+        assert_eq!(config.default_max_consent_age_secs, Some(21600));
+        assert_eq!(config.max_consent_age_ceiling_secs, Some(86400));
+        assert_eq!(config.validate(), Ok(()));
+
+        for accepted in [
+            "default_max_consent_age_secs = 60",
+            "max_consent_age_ceiling_secs = 31536000",
+            "default_max_consent_age_secs = 3600\nmax_consent_age_ceiling_secs = 3600",
+        ] {
+            let config: CredentialPolicyConfig = toml::from_str(accepted).unwrap();
+            assert_eq!(config.validate(), Ok(()), "{accepted}");
+        }
+    }
+
+    #[test]
+    fn a_consent_time_limit_out_of_range_or_a_default_above_the_ceiling_is_refused() {
+        for (configured, refusal) in [
+            ("default_max_consent_age_secs = 0", "default_max_consent_age_secs must be from 60 to 31536000, got 0"),
+            ("default_max_consent_age_secs = 59", "default_max_consent_age_secs must be from 60 to 31536000, got 59"),
+            (
+                "max_consent_age_ceiling_secs = 31536001",
+                "max_consent_age_ceiling_secs must be from 60 to 31536000, got 31536001",
+            ),
+            (
+                "default_max_consent_age_secs = 7200\nmax_consent_age_ceiling_secs = 3600",
+                "default_max_consent_age_secs (7200) must not be above max_consent_age_ceiling_secs (3600)",
+            ),
+        ] {
+            let config: CredentialPolicyConfig = toml::from_str(configured).unwrap();
+            assert_eq!(config.validate(), Err(refusal.to_string()), "{configured}");
+        }
+        assert!(toml::from_str::<CredentialPolicyConfig>("default_max_consent_age_secs = -1").is_err());
+        assert!(toml::from_str::<CredentialPolicyConfig>("max_consent_age_ceiling_secs = \"6h\"").is_err());
     }
 
     #[test]

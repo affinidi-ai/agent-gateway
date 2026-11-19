@@ -893,6 +893,9 @@ impl TargetGrantRoute {
                     .network_config
                     .external_consent_refresh_refusals,
             ),
+            max_consent_age_secs: self
+                .binding
+                .max_consent_age_secs,
         })
     }
 
@@ -966,13 +969,7 @@ impl TargetGrantRoute {
             &grant,
             &self.provider.default_scopes,
         ) {
-            return Err(refuse(
-                surface,
-                Refused {
-                    refusal: GrantRefusal::connect_required(&key, self.subject),
-                    reason: "grant_beyond_the_bindings_scopes",
-                },
-            ));
+            return Err(refuse(surface, Refused::beyond_the_bindings_scopes(&self.provider, &key, self.subject)));
         }
         let headers = self
             .headers_for(&grant)
@@ -1003,7 +1000,7 @@ impl TargetGrantRoute {
         grant: &DelegatedGrant,
     ) {
         crate::delegation_vault::release::record_use_in_background(release.vault, grant, None);
-        self.audit_injected(surface, &released.principal, released.caller.clone(), grant);
+        self.log_injected(surface, &released.principal, released.caller.clone(), grant);
     }
 
     /// The headers `grant` is sent in, as the binding's `inject_as` says.
@@ -1027,8 +1024,8 @@ impl TargetGrantRoute {
         Some(headers)
     }
 
-    /// Audit that the Target's grant was injected into a request.
-    fn audit_injected(
+    /// Log that the Target's grant was injected into a request.
+    fn log_injected(
         &self,
         surface: &AgentSurface,
         principal: &str,

@@ -23,7 +23,7 @@ use crate::bdd_support::config::modern_consent::PUBLIC_ORIGIN;
 use crate::bdd_support::json_rpc::McpVersion;
 use crate::bdd_support::mcp_consent::ConsentRequest;
 use crate::bdd_support::oidc::OidcProvider;
-use crate::world::G2gWorld;
+use crate::world::{AgentTraffic, G2gWorld, TRAFFIC_TIMEOUT};
 
 const FABRIC_GATEWAY_DID_META_KEY: &str = "x-affinidi-fabric-gateway-did";
 const AGENT_IDENTITY_BINDING_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity-binding/v1";
@@ -569,6 +569,118 @@ async fn vp_audit_log_of_gateway_records_verified_identity_binding(
     );
 }
 
+/// The record of the identity presentation a calling gateway received on a
+/// Fabric answer.
+fn is_presentation_received_on_answer(event: &Value) -> bool {
+    event["event"] == "vp_injected" && event["detail"] == "response_path_fabric_received"
+}
+
+/// An identity binding the calling gateway recorded for a Fabric answer; its
+/// own request-side bindings are not marked as received over Fabric.
+fn is_identity_binding_for_answer(event: &Value) -> bool {
+    event["via_fabric"] == true
+        && (event["event"]
+            .get("identity_binding_verified")
+            .is_some()
+            || event["event"]
+                .get("identity_binding_failed")
+                .is_some())
+}
+
+#[then(expr = "the VP Audit Log of gateway {int} records the identity presentation received on the answer")]
+async fn vp_audit_log_records_presentation_received_on_answer(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let (found, events) = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .wait_for_audit_event(is_presentation_received_on_answer)
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must be readable: {error:#}"));
+    assert!(
+        found,
+        "expected gateway {gateway} to record the identity presentation received on the answer, got {events:?}"
+    );
+}
+
+#[then(expr = "the VP Audit Log of gateway {int} records no identity presentation received on the answer")]
+async fn vp_audit_log_records_no_presentation_received_on_answer(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let (found, events) = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .wait_for_audit_event(is_presentation_received_on_answer)
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must be readable: {error:#}"));
+    assert!(
+        !found,
+        "expected gateway {gateway} to record no identity presentation received on the answer, got {events:?}"
+    );
+}
+
+#[then(expr = "the VP Audit Log of gateway {int} records no identity binding for the answer")]
+async fn vp_audit_log_records_no_identity_binding_for_answer(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let (found, events) = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .wait_for_audit_event(is_identity_binding_for_answer)
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must be readable: {error:#}"));
+    assert!(!found, "expected gateway {gateway} to record no identity binding for the answer, got {events:?}");
+}
+
+#[then(expr = "the VP Audit Log of gateway {int} records the answer's identity under the trace id of the request")]
+async fn vp_audit_log_records_answer_identity_under_request_trace_id(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let admin = &world
+        .harness()
+        .gw(gateway)
+        .admin;
+    let (found, events) = admin
+        .wait_for_audit_event(|event| {
+            event["via_fabric"] == true
+                && event["event"]
+                    .get("identity_binding_verified")
+                    .is_some()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must be readable: {error:#}"));
+    assert!(found, "expected gateway {gateway} to record a verified identity binding for the answer, got {events:?}");
+    let trace_of = |matches: &dyn Fn(&Value) -> bool| {
+        events
+            .iter()
+            .find(|event| matches(event))
+            .and_then(|event| event["trace_id"].as_str())
+            .map(str::to_string)
+    };
+    let binding_trace = trace_of(&|event| is_identity_binding_for_answer(event))
+        .unwrap_or_else(|| panic!("the answer's identity binding on gateway {gateway} has no trace id: {events:?}"));
+    assert_eq!(
+        trace_of(&is_presentation_received_on_answer).as_deref(),
+        Some(binding_trace.as_str()),
+        "the presentation received on the answer should carry the trace id of the answer's identity binding, got {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["trace_id"] == binding_trace.as_str()
+                && !is_identity_binding_for_answer(event)
+                && !is_presentation_received_on_answer(event)
+        }),
+        "gateway {gateway} should have another record of the request under trace id {binding_trace}, got {events:?}"
+    );
+}
+
 /// The audit outcome for a failed identity binding, as the step names it.
 fn audited_identity_binding_failure(reason: &str) -> &'static str {
     match reason {
@@ -958,6 +1070,40 @@ pub async fn the_relay_was_refused_after_calls(
 ) {
     assert_eq!(world.relayed_transit_point_calls, Some(calls), "body={:?}", world.response_body);
     assert_eq!(world.response_status, Some(status), "body={:?}", world.response_body);
+}
+
+#[then(expr = "the operator sees {int} more request(s), none failed, in the traffic of the agent of surface {string}")]
+pub async fn operator_sees_more_requests_in_agent_traffic(
+    world: &mut G2gWorld,
+    more: u64,
+    surface_name: String,
+) {
+    let baseline = *world
+        .agent_traffic_baseline
+        .get(&surface_name)
+        .unwrap_or_else(|| panic!("the operator must read the traffic of the agent of surface '{surface_name}' first"));
+    let deadline = tokio::time::Instant::now() + TRAFFIC_TIMEOUT;
+    while world
+        .agent_traffic_of_surface(&surface_name)
+        .await
+        .total_requests
+        < baseline.total_requests + more
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let traffic = world
+        .settled_agent_traffic_of_surface(&surface_name)
+        .await;
+    assert_eq!(
+        traffic,
+        AgentTraffic {
+            total_requests: baseline.total_requests + more,
+            failed: baseline.failed,
+        },
+        "traffic of the agent of surface '{surface_name}' before the caller's action: {baseline:?}; caller_status={:?}",
+        world.response_status
+    );
 }
 
 #[then(expr = "managed agent {string} served its agent card once")]

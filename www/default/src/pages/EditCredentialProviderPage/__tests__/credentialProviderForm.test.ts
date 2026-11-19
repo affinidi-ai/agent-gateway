@@ -1,10 +1,18 @@
+import { ConsentLimitUnit } from '../../../utils/consentLimit';
 import {
+  CredentialProviderType,
   EMPTY_CONSENT_CONFIRMATION_FIELDS,
   EMPTY_JWT_FIELDS,
+  NO_CONSENT_LIMIT,
   consentConfirmationField,
   consentConfirmationFieldsOf,
   consentConfirmationRedirectUri,
+  consentImpactMessage,
+  consentLimitOf,
+  consentLimitSeconds,
+  endingConsentsOf,
   missingConsentConfirmationField,
+  shortensConsentLimit,
   callbackUrlFor,
   callbackUrlToSave,
   isHttpsAddress,
@@ -286,6 +294,77 @@ describe('credential provider form', () => {
       jwt_issuer: '',
       jwt_signing_algorithm: undefined,
     });
+  });
+
+  it('reads a stored consent time limit in its largest whole unit', () => {
+    const limit = (amount: string, unit: ConsentLimitUnit) => ({
+      consent_limit_amount: amount,
+      consent_limit_unit: unit,
+    });
+    expect(consentLimitOf({ max_consent_age_secs: 21_600 })).toEqual(limit('6', 'hours'));
+    expect(consentLimitOf({ max_consent_age_secs: 2_592_000 })).toEqual(limit('30', 'days'));
+    expect(consentLimitOf({ max_consent_age_secs: 5_400 })).toEqual(limit('90', 'minutes'));
+    expect(consentLimitOf({ max_consent_age_secs: 90 })).toEqual(limit('90', 'seconds'));
+    expect(consentLimitOf({})).toEqual(NO_CONSENT_LIMIT);
+    expect(consentLimitOf({ max_consent_age_secs: 0 })).toEqual(NO_CONSENT_LIMIT);
+    expect(consentLimitOf({ max_consent_age_secs: '3600' })).toEqual(NO_CONSENT_LIMIT);
+  });
+
+  it('saves a consent time limit in seconds, 0 to remove it, and none out of range', () => {
+    const seconds = (
+      amount: string,
+      unit: ConsentLimitUnit,
+      provider_type: CredentialProviderType = 'oauth2_authorization_code'
+    ) =>
+      consentLimitSeconds({
+        provider_type,
+        consent_limit_amount: amount,
+        consent_limit_unit: unit,
+      });
+    expect(seconds('6', 'hours')).toBe(21_600);
+    expect(seconds(' 30 ', 'days')).toBe(2_592_000);
+    expect(seconds('1', 'minutes')).toBe(60);
+    expect(seconds('365', 'days')).toBe(31_536_000);
+    expect(seconds('', 'hours')).toBe(0);
+    expect(seconds('59', 'seconds')).toBeNull();
+    expect(seconds('366', 'days')).toBeNull();
+    expect(seconds('1.5', 'hours')).toBeNull();
+    expect(seconds('-1', 'hours')).toBeNull();
+    expect(seconds('0', 'hours')).toBeNull();
+    expect(seconds('6', 'hours', 'oauth2_client_credentials')).toBe(0);
+    expect(seconds('nonsense', 'hours', 'api_key')).toBe(0);
+  });
+
+  it('asks what a save ends for a shorter limit, a first one, or a stored one removed', () => {
+    expect(shortensConsentLimit(3_600, 21_600)).toBe(true);
+    expect(shortensConsentLimit(3_600, undefined)).toBe(true);
+    expect(shortensConsentLimit(21_600, 21_600)).toBe(false);
+    expect(shortensConsentLimit(86_400, 21_600)).toBe(false);
+    expect(shortensConsentLimit(0, 21_600)).toBe(true);
+    expect(shortensConsentLimit(0, undefined)).toBe(false);
+    expect(shortensConsentLimit(null, 21_600)).toBe(false);
+  });
+
+  it('reads how many consents a save ends, and nothing from an answer without a count', () => {
+    expect(endingConsentsOf({ active_consents: 5, ending_consents: 2 })).toBe(2);
+    expect(endingConsentsOf({ active_consents: 5, ending_consents: 0 })).toBe(0);
+    expect(endingConsentsOf({ active_consents: 5 })).toBeNull();
+    expect(endingConsentsOf({ ending_consents: '2' })).toBeNull();
+    expect(endingConsentsOf({ ending_consents: -1 })).toBeNull();
+    expect(endingConsentsOf({ ending_consents: 1.5 })).toBeNull();
+    expect(endingConsentsOf([])).toBeNull();
+    expect(endingConsentsOf(null)).toBeNull();
+  });
+
+  it('says how many active consents a save ends, and nothing when it ends none', () => {
+    expect(consentImpactMessage(2, 'GitHub')).toBe(
+      'Saving ends 2 active GitHub consents now. Those people approve again next time their agent needs GitHub.'
+    );
+    expect(consentImpactMessage(1, 'GitHub')).toBe(
+      'Saving ends 1 active GitHub consent now. That person approves again next time their agent needs GitHub.'
+    );
+    expect(consentImpactMessage(0, 'GitHub')).toBeNull();
+    expect(consentImpactMessage(null, 'GitHub')).toBeNull();
   });
 
   it('loads the JWT settings of a stored provider and drops an unknown algorithm', () => {

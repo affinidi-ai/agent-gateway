@@ -102,8 +102,9 @@ pub enum IssuerDidSource {
 }
 
 /// The issuer DIDs a remote gateway's identity presentations may come from:
-/// the attested one plus any an operator trusts for that connection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// the attested one plus any an operator trusts for that connection. The
+/// default, with neither, accepts no issuer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PeerIssuers {
     pub attested: Option<String>,
     pub trusted: Vec<String>,

@@ -446,7 +446,13 @@ pub struct DelegatedGrant {
     pub requested_scopes: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+    /// When the person connected, which is when they consented: a refresh
+    /// keeps it, and a new connect makes a new grant.
     pub created_at: DateTime<Utc>,
+    /// When the consent ends: `created_at` plus the time limit in force at the
+    /// connect. `None` for a grant connected under no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent_expires_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<DateTime<Utc>>,
@@ -523,6 +529,7 @@ impl std::fmt::Debug for DelegatedGrant {
             .field("requested_scopes", &self.requested_scopes)
             .field("expires_at", &self.expires_at)
             .field("created_at", &self.created_at)
+            .field("consent_expires_at", &self.consent_expires_at)
             .field("updated_at", &self.updated_at)
             .field("last_used_at", &self.last_used_at)
             .field("refreshed_at", &self.refreshed_at)
@@ -580,6 +587,7 @@ impl DelegatedGrant {
             requested_scopes: None,
             expires_at: tokens.expires_at,
             created_at: now,
+            consent_expires_at: None,
             updated_at: now,
             last_used_at: None,
             refreshed_at: Some(now),

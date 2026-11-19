@@ -1,16 +1,19 @@
 import React from 'react';
-import { render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { MemoryRouter } from 'react-router-dom';
 import CredentialProvidersTab, { providerDeleteError } from '../CredentialProvidersTab';
 import { apiClient } from '../../../api';
+import { showToast } from '../../../utils/toaster';
 
 jest.mock('../../../api', () => ({
   apiClient: { get: jest.fn(), put: jest.fn(), post: jest.fn(), fetch: jest.fn() },
 }));
+const mockHasPermission = jest.fn();
 jest.mock('../../../context/PermissionsContext', () => ({
-  usePermissions: () => ({ hasPermission: () => false, loading: false }),
+  usePermissions: () => ({ hasPermission: mockHasPermission, loading: false }),
 }));
+jest.mock('../../../utils/toaster', () => ({ showToast: jest.fn() }));
 
 const mockFetch = apiClient.fetch as jest.Mock;
 
@@ -142,5 +145,180 @@ describe('CredentialProvidersTab', () => {
         screen.queryByTestId('credential-provider-client-authentication-badge')
       ).not.toBeInTheDocument();
     });
+  });
+});
+
+describe('CredentialProvidersTab deactivation', () => {
+  const consented = (id: string, deactivated_at?: string) => ({
+    ...item(id, 'https://github.com/login/oauth/access_token', null),
+    provider_type: 'oauth2_authorization_code',
+    ...(deactivated_at ? { deactivated_at } : {}),
+  });
+  const posts = () => mockFetch.mock.calls.filter(([, options]) => options?.method === 'POST');
+
+  const renderTab = async (
+    providers: Record<string, unknown>[],
+    answer?: Record<string, unknown>,
+    {
+      may = () => true,
+      onProvidersChange = undefined,
+      refused = false,
+    }: {
+      may?: (permission: string) => boolean;
+      onProvidersChange?: () => void;
+      refused?: boolean;
+    } = {}
+  ) => {
+    mockHasPermission.mockImplementation(may);
+    mockFetch.mockImplementation((_url: string, options?: { method?: string }) => {
+      const changes = options?.method === 'POST';
+      return Promise.resolve({
+        ok: !(changes && refused),
+        status: changes && refused ? 409 : 200,
+        statusText: 'OK',
+        text: () => Promise.resolve(changes && refused ? '{"error":"Refused"}' : ''),
+        json: () => Promise.resolve(changes ? answer : providers),
+      });
+    });
+    render(
+      <MemoryRouter>
+        <CredentialProvidersTab onProvidersChange={onProvidersChange} />
+      </MemoryRouter>
+    );
+    await screen.findByRole('row', { name: new RegExp(`^${providers[0].name}`) });
+  };
+
+  it('offers no Deactivate or Activate to a user who may edit settings but not credential providers', async () => {
+    await renderTab(
+      [consented('github'), consented('salesforce', '2026-11-13T10:00:00Z')],
+      undefined,
+      { may: permission => permission === 'settings.edit' }
+    );
+
+    expect(screen.queryByTestId('credential-provider-deactivate-button-github')).toBeNull();
+    expect(screen.queryByTestId('credential-provider-activate-button-salesforce')).toBeNull();
+    expect(mockHasPermission).toHaveBeenCalledWith('credential_providers.edit');
+  });
+
+  it('offers Deactivate and Activate to a user who may edit credential providers', async () => {
+    await renderTab(
+      [consented('github'), consented('salesforce', '2026-11-13T10:00:00Z')],
+      undefined,
+      { may: permission => permission === 'credential_providers.edit' }
+    );
+
+    expect(screen.getByTestId('credential-provider-deactivate-button-github')).toBeInTheDocument();
+    expect(
+      screen.getByTestId('credential-provider-activate-button-salesforce')
+    ).toBeInTheDocument();
+  });
+
+  it('tells the page once a provider is activated, and not when the gateway refuses', async () => {
+    const onProvidersChange = jest.fn();
+    await renderTab([consented('github', '2026-11-13T10:00:00Z')], consented('github'), {
+      onProvidersChange,
+      refused: true,
+    });
+    fireEvent.click(screen.getByTestId('credential-provider-activate-button-github'));
+    await waitFor(() => expect(posts()).toHaveLength(1));
+    await waitFor(() =>
+      expect(showToast).toHaveBeenCalledWith('error', 'Failed to activate provider: Refused (409)')
+    );
+    expect(onProvidersChange).not.toHaveBeenCalled();
+  });
+
+  it('tells the page once a provider is deactivated', async () => {
+    const onProvidersChange = jest.fn();
+    await renderTab(
+      [consented('github')],
+      { ...consented('github'), deactivated_at: '2026-11-13T10:00:00Z' },
+      { onProvidersChange }
+    );
+    const button = screen.getByTestId('credential-provider-deactivate-button-github');
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    await waitFor(() => expect(onProvidersChange).toHaveBeenCalledTimes(1));
+  });
+
+  it('deactivates a provider a person consents to only on a second click, and never deletes it', async () => {
+    await renderTab([consented('github')], {
+      ...consented('github'),
+      deactivated_at: '2026-11-13T10:00:00Z',
+    });
+    expect(screen.queryByTestId('credential-provider-delete-button-github')).toBeNull();
+    const button = screen.getByTestId('credential-provider-deactivate-button-github');
+
+    fireEvent.click(button);
+    expect(button).toHaveTextContent('Click again to deactivate');
+    expect(posts()).toHaveLength(0);
+
+    fireEvent.click(button);
+    await waitFor(() => expect(posts()).toHaveLength(1));
+    expect(posts()[0][0]).toBe('/api/v1/credential-providers/github/deactivate');
+    expect(
+      await screen.findByTestId('credential-provider-deactivated-badge-github')
+    ).toHaveTextContent('Deactivated');
+    expect(screen.getByRole('row', { name: /^github/ })).toBeInTheDocument();
+    expect(screen.queryByTestId('credential-provider-deactivate-button-github')).toBeNull();
+    expect(screen.getByTestId('credential-provider-activate-button-github')).toBeInTheDocument();
+  });
+
+  it('activates a deactivated provider again', async () => {
+    await renderTab([consented('github', '2026-11-13T10:00:00Z')], consented('github'));
+    expect(screen.getByTestId('credential-provider-deactivated-badge-github')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('credential-provider-activate-button-github'));
+
+    await waitFor(() => expect(posts()).toHaveLength(1));
+    expect(posts()[0][0]).toBe('/api/v1/credential-providers/github/activate');
+    await waitFor(() =>
+      expect(screen.queryByTestId('credential-provider-deactivated-badge-github')).toBeNull()
+    );
+    expect(screen.getByTestId('credential-provider-deactivate-button-github')).toBeInTheDocument();
+  });
+
+  it('shows each provider status in a Status column, apart from its type', async () => {
+    await renderTab([consented('github'), consented('salesforce', '2026-11-13T10:00:00Z')]);
+    const status = (id: string) => screen.getByTestId(`credential-provider-status-${id}`);
+    const typeCell = (id: string) =>
+      within(screen.getByRole('row', { name: new RegExp(`^${id}`) })).getByText(
+        'Authorization Code'
+      );
+
+    expect(screen.getByRole('columnheader', { name: 'Status' })).toBeInTheDocument();
+    expect(status('github')).toHaveTextContent(/^Active$/);
+    expect(within(status('github')).getByText('Active')).toHaveClass('badge', 'text-bg-success');
+    expect(status('salesforce')).toHaveTextContent(/^DeactivatedNo new consent$/);
+    expect(screen.getByTestId('credential-provider-deactivated-badge-salesforce')).toHaveClass(
+      'badge',
+      'text-bg-secondary'
+    );
+    expect(status('salesforce')).toContainElement(
+      screen.getByTestId('credential-provider-deactivated-badge-salesforce')
+    );
+    expect(typeCell('salesforce')).not.toHaveTextContent('Deactivated');
+  });
+
+  it('gives Deactivate and Activate the same outline button style', async () => {
+    await renderTab([consented('github'), consented('salesforce', '2026-11-13T10:00:00Z')]);
+    const deactivate = screen.getByTestId('credential-provider-deactivate-button-github');
+    const activate = screen.getByTestId('credential-provider-activate-button-salesforce');
+
+    expect(deactivate).toHaveTextContent(/^Deactivate$/);
+    expect(deactivate.innerHTML).not.toContain('fa-');
+    for (const button of [deactivate, activate]) {
+      expect(button).toHaveClass('btn', 'btn-outline-secondary', 'btn-sm');
+      expect(button).not.toHaveClass('btn-outline-warning');
+      expect(button).not.toHaveClass('btn-outline-primary');
+    }
+  });
+
+  it('keeps Delete, and offers no Deactivate, on a provider nobody consents to', async () => {
+    await renderTab([item('billing', 'https://oauth2.googleapis.com/token', null)]);
+
+    expect(screen.getByTestId('credential-provider-delete-button-billing')).toBeInTheDocument();
+    expect(screen.queryByTestId('credential-provider-deactivate-button-billing')).toBeNull();
+    expect(screen.queryByTestId('credential-provider-activate-button-billing')).toBeNull();
   });
 });

@@ -55,7 +55,7 @@ impl EventSet {
     pub fn has_audit_events(&self) -> bool {
         self.events
             .iter()
-            .any(|event| event.starts_with(AUDIT_EVENT_PREFIX))
+            .any(|event| event.starts_with(AUDIT_EVENT_PREFIX) && !is_logged_audit_event_id(event))
     }
 
     /// Template variables in `content` that no event of the set fills, sorted.
@@ -105,18 +105,37 @@ fn collect_template_variables(
     }
 }
 
-/// The distinct `events`, when there is at least one and every one is in the catalog.
+/// Whether `event` is an audit event the gateway used to offer and now only writes to its
+/// log ([`crate::audit::catalog::LOGGED_EVENTS`]). A set stored before may still name it.
+pub fn is_logged_audit_event_id(event: &str) -> bool {
+    event
+        .strip_prefix(AUDIT_EVENT_PREFIX)
+        .is_some_and(crate::audit::catalog::is_logged_only)
+}
+
+/// The distinct `events`, when there is at least one and every one is in the catalog. An
+/// event the gateway now only logs is left out, with a warning that names it.
 pub fn validate_events(events: Vec<String>) -> Result<HashSet<String>, EventSetError> {
-    if events.is_empty() {
-        return Err(EventSetError::Empty);
-    }
-    // Sized by what it keeps, never by the caller's list: it grows to at most the catalog.
+    // Sized by what it keeps, never by the caller's list: each grows to at most the catalog.
     let mut unique = HashSet::new();
+    let mut logged = std::collections::BTreeSet::new();
     for event in events {
+        if is_logged_audit_event_id(&event) {
+            logged.insert(event);
+            continue;
+        }
         if find_event(&event).is_none() {
             return Err(EventSetError::UnknownEvent(event));
         }
         unique.insert(event);
+    }
+    let logged: Vec<&str> = logged
+        .iter()
+        .map(String::as_str)
+        .collect();
+    crate::audit::catalog::warn_logged_only("An integration event set", &logged);
+    if unique.is_empty() {
+        return Err(EventSetError::Empty);
     }
     Ok(unique)
 }
@@ -242,6 +261,41 @@ mod tests {
         );
     }
 
+    /// A set saved while the per-call delegation events were audit events still
+    /// names them; a save keeps the rest.
+    #[test]
+    fn drops_the_audit_events_the_gateway_now_only_logs() {
+        assert_eq!(
+            validate_events(events(&[
+                "audit.token_injected",
+                "audit.consent_granted",
+                "gateway.created",
+                "audit.consent_required"
+            ])),
+            Ok(unique(&["audit.consent_granted", "gateway.created"]))
+        );
+        for logged in crate::audit::catalog::LOGGED_EVENTS {
+            assert!(is_logged_audit_event_id(&format!("audit.{logged}")), "{logged}");
+        }
+        assert!(!is_logged_audit_event_id("audit.consent_granted"));
+    }
+
+    #[test]
+    fn a_set_of_nothing_but_events_the_gateway_now_only_logs_is_empty() {
+        assert_eq!(
+            validate_events(events(&["audit.token_injected", "audit.token_refreshed"])),
+            Err(EventSetError::Empty)
+        );
+    }
+
+    #[test]
+    fn only_an_audit_event_is_one_the_gateway_now_only_logs() {
+        for id in ["token_injected", "gateway.token_injected"] {
+            assert!(!is_logged_audit_event_id(id), "{id}");
+            assert_eq!(validate_events(events(&[id])), Err(EventSetError::UnknownEvent(id.to_string())));
+        }
+    }
+
     #[test]
     fn contains_only_its_own_events() {
         let set = EventSet::new("Ops".to_string(), String::new(), events(&["gateway.created"])).expect("valid set");
@@ -258,6 +312,11 @@ mod tests {
     fn knows_whether_it_holds_audit_events() {
         assert!(set(&["gateway.created", "audit.trust_check"]).has_audit_events());
         assert!(!set(&["gateway.created", "user.login"]).has_audit_events());
+        let mut stored_before = set(&["gateway.created"]);
+        stored_before
+            .events
+            .insert("audit.token_injected".to_string());
+        assert!(!stored_before.has_audit_events(), "an event the gateway now only logs is no audit event");
     }
 
     #[test]
@@ -286,5 +345,21 @@ mod tests {
         });
 
         assert_eq!(gateways.unknown_template_variables(&content), ["AMOUNT", "USERNAME", "_TEAM"]);
+    }
+
+    /// A save that leaves out events the gateway now only logs warns which
+    /// they were and where they are written now.
+    #[test]
+    fn leaving_out_events_the_gateway_now_only_logs_warns_which_they_were() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        validate_events(events(&["audit.refresh_failed", "gateway.created"])).unwrap();
+        validate_events(events(&["gateway.created"])).unwrap();
+
+        let text = logs.text();
+        assert_eq!(text.matches("WARN").count(), 1, "{text}");
+        for named in ["audit.refresh_failed", "credential_delegation"] {
+            assert!(text.contains(named), "{named}: {text}");
+        }
     }
 }

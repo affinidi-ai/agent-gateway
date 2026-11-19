@@ -1258,6 +1258,7 @@ fn transit_credential_binding(
             surface::ElicitFallback::Fail => ElicitFallback::Fail,
         },
         subject: None,
+        max_consent_age_secs: cred.max_consent_age_secs,
     })
 }
 

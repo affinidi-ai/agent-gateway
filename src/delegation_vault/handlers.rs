@@ -2,6 +2,7 @@
 
 use super::{
     DelegationToken, DelegationTokenListItem,
+    consent_age::{ConsentLimits, LimitRefusal, limit_detail, limited_end},
     notifier::SharedVaultPopulationNotifier,
     oauth,
     read_scope::{VaultReadScope, VaultReader},
@@ -20,7 +21,7 @@ use axum::{
     Extension, Form, Json,
     extract::{
         Path, Query, State,
-        rejection::{FormRejection, QueryRejection},
+        rejection::{FormRejection, JsonRejection, QueryRejection},
     },
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
@@ -134,6 +135,19 @@ async fn caller_read_scope(
         })
 }
 
+/// The metadata of `token`, its consent ending as the limits set now make
+/// it: at the end stored with it, or sooner under a limit `provider` has set
+/// or shortened since.
+fn token_metadata(
+    token: &DelegationToken,
+    provider: Option<&crate::credential_providers::CredentialProvider>,
+) -> DelegationTokenListItem {
+    let mut item = DelegationTokenListItem::from(token);
+    item.consent_expires_at =
+        ConsentLimits::of_provider(provider).ends_at(token.consent_granted_at, token.consent_expires_at);
+    item
+}
+
 /// GET /api/v1/delegation-vault
 pub async fn list_tokens(
     State(state): State<DelegationVaultState>,
@@ -164,10 +178,31 @@ pub async fn list_tokens(
         .await
     {
         Ok(tokens) => {
+            // An appliance-wide caller reads the vault while the providers cannot be read: each
+            // token then shows the end stored with it.
+            let providers: std::collections::HashMap<String, _> = match state
+                .provider_store
+                .list()
+                .await
+            {
+                Ok(providers) => providers
+                    .into_iter()
+                    .map(|provider| (provider.id.clone(), provider))
+                    .collect(),
+                Err(e) => {
+                    warn!(
+                        target: "credential_delegation",
+                        action = "list",
+                        error = %e,
+                        "Credential providers could not be read; each consent end is shown as stored"
+                    );
+                    Default::default()
+                }
+            };
             let items: Vec<DelegationTokenListItem> = tokens
                 .iter()
                 .filter(|t| scope.reads(Some(&t.credential_provider_id)))
-                .map(|t| t.into())
+                .map(|t| token_metadata(t, providers.get(&t.credential_provider_id)))
                 .collect();
             (StatusCode::OK, Json(serde_json::to_value(items).unwrap())).into_response()
         }
@@ -209,8 +244,21 @@ pub async fn get_token(
         .await
     {
         Ok(Some(token)) if scope.reads(Some(&token.credential_provider_id)) => {
+            let provider = state
+                .provider_store
+                .get(&token.credential_provider_id)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(
+                        target: "credential_delegation",
+                        action = "get",
+                        error = %e,
+                        "Credential provider could not be read; the consent end is shown as stored"
+                    );
+                    None
+                });
             // Return metadata only — never expose access_token/refresh_token via API
-            let item: DelegationTokenListItem = (&token).into();
+            let item = token_metadata(&token, provider.as_ref());
             (StatusCode::OK, Json(serde_json::to_value(item).unwrap())).into_response()
         }
         Ok(_) => {
@@ -231,30 +279,40 @@ pub async fn revoke_token(
     reader: VaultReader,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    // Fail closed: a revoke must be attributable to an authenticated actor.
-    let caller_ctx = match management_caller_context(caller.as_ref(), delegation.as_ref()) {
-        Some(ctx) => ctx,
-        None => {
+    let caller_ctx = match appliance_wide_caller(caller.as_ref(), delegation.as_ref(), &reader, "revoke", &id) {
+        Ok(caller_ctx) => caller_ctx,
+        Err(refused) => return *refused,
+    };
+
+    // Read for the audit record alone, which names whose access the revoke ended. A token
+    // that cannot be read is revoked all the same, and its record then names nobody.
+    let revoked = match state
+        .vault_store
+        .get(&id)
+        .await
+    {
+        Ok(revoked) => revoked,
+        Err(error) => {
             warn!(
                 target: "credential_delegation",
-                id = %id,
+                id = %loggable::untrusted(&id),
                 action = "revoke",
-                "Delegation token revoke rejected — no authenticated caller"
+                error = %loggable::untrusted(&error.to_string()),
+                "Delegation token could not be read before its revoke; the audit record names no agent, user or provider"
             );
-            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "no authenticated caller"})))
-                .into_response();
+            None
         }
     };
-    if !reader.is_appliance_wide() {
-        warn!(
-            target: "credential_delegation",
-            id = %loggable::untrusted(&id),
-            action = "revoke",
-            "Delegation token revoke refused: only an appliance-wide caller revokes"
-        );
-        return StatusCode::FORBIDDEN.into_response();
-    }
-
+    let provider_name = match &revoked {
+        Some(token) => state
+            .provider_store
+            .get(&token.credential_provider_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|provider| provider.name),
+        None => None,
+    };
     match state
         .vault_store
         .delete(&id)
@@ -271,12 +329,26 @@ pub async fn revoke_token(
             super::audit::emit("token_revoked", || {
                 let mut evt = super::audit::audit_event(
                     super::audit::DelegationAuditAction::TokenRevoked,
-                    None,
-                    None,
-                    None,
+                    revoked
+                        .as_ref()
+                        .map(|token| token.agent_did.as_str()),
+                    revoked.as_ref().map(|token| {
+                        token
+                            .user_identity_hash
+                            .as_str()
+                    }),
+                    revoked.as_ref().map(|token| {
+                        token
+                            .credential_provider_id
+                            .as_str()
+                    }),
                     None,
                 );
                 evt.token_id = Some(id.to_string());
+                evt.provider_name = provider_name;
+                evt.scopes = revoked
+                    .as_ref()
+                    .map(|token| token.scopes.clone());
                 evt.caller = Some(caller_ctx);
                 evt
             });
@@ -298,6 +370,138 @@ pub async fn revoke_token(
     }
 }
 
+/// The body of `PUT /api/v1/delegation-vault/{id}/consent-limit`.
+#[derive(Debug, Deserialize)]
+pub struct ConsentLimitBody {
+    max_consent_age_secs: u64,
+}
+
+/// PUT /api/v1/delegation-vault/{id}/consent-limit
+///
+/// Brings the end of one stored consent forward: it then ends
+/// `max_consent_age_secs` after it was given. Only a consent a person gave is
+/// limited, never to a later end than it has, and never to an end that has
+/// passed, since ending a consent now is a revoke. As a revoke, it is for an
+/// appliance-wide caller and audited with who did it.
+pub async fn limit_consent(
+    State(state): State<DelegationVaultState>,
+    caller: Option<Extension<AuthGuardOk>>,
+    delegation: Option<Extension<PatDelegationContext>>,
+    reader: VaultReader,
+    Path(id): Path<String>,
+    body: Result<Json<ConsentLimitBody>, JsonRejection>,
+) -> Response {
+    let bad_request = |code, error: &str| super::connect_api::error(StatusCode::BAD_REQUEST, code, error);
+
+    let caller_ctx = match appliance_wide_caller(caller.as_ref(), delegation.as_ref(), &reader, "limit", &id) {
+        Ok(caller_ctx) => caller_ctx,
+        Err(refused) => return *refused,
+    };
+    let Ok(Json(ConsentLimitBody { max_consent_age_secs })) = body else {
+        return bad_request("invalid_limit", "max_consent_age_secs is required: a whole number of seconds");
+    };
+    if let Err(refusal) =
+        crate::config::credential_policy::validate_max_consent_age("max_consent_age_secs", max_consent_age_secs)
+    {
+        return bad_request("invalid_limit", &refusal);
+    }
+
+    let failed = |error: &anyhow::Error| {
+        warn!(
+            target: "credential_delegation",
+            id = %loggable::untrusted(&id),
+            action = "limit",
+            error = %loggable::untrusted(&error.to_string()),
+            "Consent limit failed"
+        );
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to limit"}))).into_response()
+    };
+
+    let token = match state
+        .vault_store
+        .get(&id)
+        .await
+    {
+        Ok(Some(token)) => token,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Delegation token not found"})))
+                .into_response();
+        }
+        Err(error) => return failed(&error),
+    };
+    let provider = match state
+        .provider_store
+        .get(&token.credential_provider_id)
+        .await
+    {
+        Ok(Some(provider)) if provider.takes_consent() => provider,
+        Ok(_) => {
+            return bad_request(
+                "not_a_consent",
+                "Only a consent a person gave to an oauth2_authorization_code provider can be limited",
+            );
+        }
+        Err(error) => return failed(&error),
+    };
+    let previous_end =
+        ConsentLimits::of_provider(Some(&provider)).ends_at(token.consent_granted_at, token.consent_expires_at);
+    let end = match limited_end(token.consent_granted_at, previous_end, max_consent_age_secs, Utc::now()) {
+        Ok(end) => end,
+        Err(LimitRefusal::AlreadyOlder) => {
+            return bad_request(
+                "consent_older_than_limit",
+                "The consent is already older than this limit. Revoke it to end it now",
+            );
+        }
+        Err(LimitRefusal::NotSooner) => {
+            return bad_request(
+                "limit_not_sooner",
+                "The consent already ends at this limit or before it. A consent is never extended",
+            );
+        }
+    };
+    let limited = match state
+        .vault_store
+        .limit_consent(&id, token.consent_granted_at, end)
+        .await
+    {
+        Ok(Some(limited)) => limited,
+        Ok(None) => {
+            return super::connect_api::error(
+                StatusCode::CONFLICT,
+                "consent_changed",
+                "The consent changed while it was being limited. Read it again",
+            );
+        }
+        Err(error) => return failed(&error),
+    };
+
+    info!(
+        target: "credential_delegation",
+        id = %loggable::untrusted(&id),
+        actor = %caller_ctx.sub.as_deref().unwrap_or_default(),
+        action = "limit",
+        max_consent_age_secs,
+        "Consent limited via API"
+    );
+    super::audit::emit("consent_limited", || {
+        let mut event = super::audit::audit_event(
+            super::audit::DelegationAuditAction::ConsentLimited,
+            Some(&limited.agent_did),
+            Some(&limited.user_identity_hash),
+            Some(&limited.credential_provider_id),
+            None,
+        );
+        event.token_id = Some(limited.id.clone());
+        event.provider_name = Some(provider.name.clone());
+        event.scopes = Some(limited.scopes.clone());
+        event.detail = Some(limit_detail(limited.consent_granted_at, end, previous_end));
+        event.caller = Some(caller_ctx);
+        event
+    });
+    Json(token_metadata(&limited, Some(&provider))).into_response()
+}
+
 /// DELETE /api/v1/delegation-vault/by-user/{user_hash}
 pub async fn revoke_user_tokens(
     State(state): State<DelegationVaultState>,
@@ -306,29 +510,11 @@ pub async fn revoke_user_tokens(
     reader: VaultReader,
     Path(user_hash): Path<String>,
 ) -> impl IntoResponse {
-    // Fail closed: a mass-revoke must be attributable to an authenticated actor.
-    let caller_ctx = match management_caller_context(caller.as_ref(), delegation.as_ref()) {
-        Some(ctx) => ctx,
-        None => {
-            warn!(
-                target: "credential_delegation",
-                user_hash = %user_hash,
-                action = "revoke_all",
-                "Delegation mass-revoke rejected — no authenticated caller"
-            );
-            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "no authenticated caller"})))
-                .into_response();
-        }
-    };
-    if !reader.is_appliance_wide() {
-        warn!(
-            target: "credential_delegation",
-            user_hash = %loggable::untrusted(&user_hash),
-            action = "revoke_all",
-            "Delegation mass-revoke refused: only an appliance-wide caller revokes"
-        );
-        return StatusCode::FORBIDDEN.into_response();
-    }
+    let caller_ctx =
+        match appliance_wide_caller(caller.as_ref(), delegation.as_ref(), &reader, "revoke_all", &user_hash) {
+            Ok(caller_ctx) => caller_ctx,
+            Err(refused) => return *refused,
+        };
 
     match state
         .vault_store
@@ -338,7 +524,7 @@ pub async fn revoke_user_tokens(
         Ok(count) => {
             info!(
                 target: "credential_delegation",
-                user_hash = %user_hash,
+                user_hash = %loggable::untrusted(&user_hash),
                 count = %count,
                 actor = %caller_ctx.sub.as_deref().unwrap_or_default(),
                 action = "revoke_all",
@@ -534,7 +720,8 @@ fn refused_provider<'a>(
 /// The provider a consent state names, checked against the path: the stored
 /// provider still has the state's id and slug, is an authorization code
 /// provider without an issuer, and its `callback_path` ends in the path's
-/// segment.
+/// segment. A provider deactivated since the link was minted is refused at
+/// every stage, so a consent under way is not completed.
 async fn consent_provider(
     state: &DelegationVaultState,
     path_segment: &str,
@@ -555,7 +742,11 @@ async fn consent_provider(
                     .next()
                     == Some(path_segment) =>
         {
-            Ok(provider)
+            if provider.is_deactivated() {
+                Err(ConsentRefusal::bad_request(DelegationFailureReason::ProviderDeactivated))
+            } else {
+                Ok(provider)
+            }
         }
         Ok(_) => Err(ConsentRefusal::bad_request(DelegationFailureReason::ConsentProviderMismatch)),
         Err(e) => {
@@ -683,6 +874,15 @@ pub async fn consent_start_page(
     } else {
         start.scopes.join(", ")
     };
+    let time_limit = start
+        .max_consent_age_secs
+        .map(|secs| {
+            format!(
+                "<dt>Time limit</dt><dd>The agent may use it for {} after you approve. Then it asks you again.</dd>\n",
+                super::consent_age::describe(secs)
+            )
+        })
+        .unwrap_or_default();
     let page = format!(
         r#"<!DOCTYPE html>
 <html><head><title>Authorize {provider}</title></head>
@@ -694,7 +894,7 @@ pub async fn consent_start_page(
 <dt>Surface</dt><dd>{surface}</dd>
 <dt>Provider</dt><dd>{provider}</dd>
 <dt>Scopes</dt><dd><code>{scopes}</code></dd>
-</dl>
+{time_limit}</dl>
 <p>Continue only if you started this from your own application.</p>
 {sign_in_first}<form method="post" action="start">
 <input type="hidden" name="state" value="{state}">
@@ -1265,12 +1465,20 @@ pub async fn oauth_callback(
         .map(|domain| format!("did:web:{}", domain))
         .unwrap_or_else(|| "did:web:gateway.local".to_string());
 
+    // The lifetime the person was told, or the provider's limit as it is now when that was
+    // shortened while the consent was under way: the end named here is the end enforced.
+    let now = Utc::now();
+    let consent_expires_at = super::consent_age::earlier(
+        super::consent_age::end_of(now, oauth_state.max_consent_age_secs),
+        super::consent_age::ConsentLimits::of_provider(Some(&provider)).expires_at(now),
+    );
     let delegation_vc = oauth::build_delegation_vc(
         &gateway_did,
         &oauth_state.agent_did,
         &oauth_state.user_identity_hash,
         &provider,
         &granted_scopes,
+        consent_expires_at,
         state.vc_signer.as_ref(),
     )
     .await;
@@ -1292,7 +1500,6 @@ pub async fn oauth_callback(
         .expires_in
         .map(|secs| Utc::now() + Duration::seconds(secs));
 
-    let now = Utc::now();
     let delegation_token = DelegationToken {
         id: Uuid::new_v4().to_string(),
         agent_did: oauth_state.agent_did.clone(),
@@ -1313,6 +1520,7 @@ pub async fn oauth_callback(
         delegation_vc: delegation_vc_json,
         consent_identity: None,
         consent_granted_at: now,
+        consent_expires_at,
         last_used_at: None,
         created_at: now,
         updated_at: now,
@@ -1350,6 +1558,7 @@ pub async fn oauth_callback(
                 evt.provider_name = Some(provider.name.clone());
                 evt.token_id = Some(delegation_token_id_for_audit.clone());
                 evt.agent_identity_did = Some(oauth_state.agent_did.clone());
+                evt.detail = super::consent_age::grant_detail(None, consent_expires_at);
                 let surface = if let Some(ref cs) = state.agent_surface_store {
                     match cs
                         .get(&oauth_state.surface_id)
@@ -1474,7 +1683,7 @@ pub async fn oauth_callback(
 <h2 style="color: #22c55e;">Authorization Successful</h2>
 <p>{} access has been granted for scopes: <code>{}</code></p>
 <p>You may close this window and return to your application.</p>
-<p style="color: #666; font-size: 0.9em;">The agent can now access {} on your behalf.</p>
+<p style="color: #666; font-size: 0.9em;">The agent can now access {} on your behalf{}.</p>
 <script>
 // Attempt to close the window after a short delay
 setTimeout(function() {{ window.close(); }}, 3000);
@@ -1482,7 +1691,10 @@ setTimeout(function() {{ window.close(); }}, 3000);
 </body></html>"#,
         html_escape(&provider.name),
         html_escape(&granted_scopes.join(", ")),
-        html_escape(&provider.name)
+        html_escape(&provider.name),
+        consent_expires_at
+            .map(|end| format!(" until {}", end.format("%-d %B %Y, %H:%M UTC")))
+            .unwrap_or_default()
     ))
     .into_response();
     consent_page_headers(&mut response, "no-referrer");
@@ -1490,6 +1702,39 @@ setTimeout(function() {{ window.close(); }}, 3000);
         attach_binding_cookie(&mut response, cleared);
     }
     response
+}
+
+/// The caller of a change to the vault: authenticated, so the change can be
+/// attributed, and appliance-wide. Any other caller is refused, with `401` or a
+/// bare `403`, and the refusal is logged with the `action` and what it was on.
+fn appliance_wide_caller(
+    caller: Option<&Extension<AuthGuardOk>>,
+    delegation: Option<&Extension<PatDelegationContext>>,
+    reader: &VaultReader,
+    action: &'static str,
+    subject: &str,
+) -> Result<super::audit::AuditCallerContext, Box<Response>> {
+    let Some(caller_ctx) = management_caller_context(caller, delegation) else {
+        warn!(
+            target: "credential_delegation",
+            subject = %loggable::untrusted(subject),
+            action,
+            "Delegation vault change rejected: no authenticated caller"
+        );
+        return Err(Box::new(
+            (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "no authenticated caller"}))).into_response(),
+        ));
+    };
+    if !reader.is_appliance_wide() {
+        warn!(
+            target: "credential_delegation",
+            subject = %loggable::untrusted(subject),
+            action,
+            "Delegation vault change refused: only an appliance-wide caller makes it"
+        );
+        return Err(Box::new(StatusCode::FORBIDDEN.into_response()));
+    }
+    Ok(caller_ctx)
 }
 
 /// Resolve the authenticated management-API actor from the request extensions
@@ -1613,6 +1858,52 @@ mod audit_response_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The vault list shows when a consent ends as the limits set now make
+    /// it: sooner than the end stored with it under a limit its provider has
+    /// shortened since, never later, and by the stored end alone once the
+    /// provider is gone. A service token, which nobody consented to, has none.
+    #[test]
+    fn a_tokens_metadata_shows_when_its_consent_ends_under_the_limits_set_now() {
+        let provider = |provider_type: &str, limit: Option<u64>| {
+            let mut provider: crate::credential_providers::CredentialProvider =
+                serde_json::from_value(serde_json::json!({
+                    "id": "cp-1", "name": "Provider", "provider_id": "github", "provider_type": provider_type,
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap();
+            provider.max_consent_age_secs = limit;
+            provider
+        };
+        let mut token = crate::delegation_vault::tests::make_token(Some(3600), true);
+        let granted = token.consent_granted_at;
+        let stored_end = granted + Duration::hours(6);
+        token.consent_expires_at = Some(stored_end);
+        let end = |token: &DelegationToken, provider: Option<&crate::credential_providers::CredentialProvider>| {
+            token_metadata(token, provider).consent_expires_at
+        };
+
+        let shortened = provider("oauth2_authorization_code", Some(3_600));
+        assert_eq!(end(&token, Some(&shortened)), Some(granted + Duration::hours(1)));
+        let lengthened = provider("oauth2_authorization_code", Some(86_400));
+        assert_eq!(end(&token, Some(&lengthened)), Some(stored_end));
+        assert_eq!(end(&token, None), Some(stored_end), "a provider that is gone");
+
+        token.consent_expires_at = None;
+        assert_eq!(end(&token, Some(&shortened)), Some(granted + Duration::hours(1)), "a limit set since");
+        let service = provider("oauth2_client_credentials", Some(3_600));
+        assert_eq!(end(&token, Some(&service)), None);
+        assert_eq!(end(&token, None), None);
+        let item = serde_json::to_value(token_metadata(&token, None)).unwrap();
+        assert!(
+            item.get("access_token")
+                .is_none()
+                && item
+                    .get("refresh_token")
+                    .is_none(),
+            "{item}"
+        );
+    }
 
     /// The binding cookie carries the attributes that keep it on the gateway's
     /// own host, and a name or value that cannot be sent in a header is an

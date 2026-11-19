@@ -40,6 +40,9 @@ pub struct ResponseExtensionInspectionContext<'a> {
     pub surface: &'a crate::config::agent_surface::AgentSurface,
     pub response_rules_engine: &'a Option<Arc<crate::proxy::RulesEngine>>,
     pub metrics_store: &'a Option<Arc<crate::metrics::MetricsStore>>,
+    /// The answer's identity presentation was verified and its issuer trusted,
+    /// so its credential extension is not checked against the raw-payload rules.
+    pub verified_presentation: bool,
 }
 
 /// What the custom-metadata helpers of a request resolve against. Production code builds it
@@ -200,7 +203,6 @@ pub async fn inspect_message_extensions(
                     None,
                     "Non-JSON Body",
                     None,
-                    None,
                 )
                 .await;
             }
@@ -272,7 +274,6 @@ pub async fn inspect_message_extensions(
                     None,
                     "Failed Validation",
                     Some(error_msg.clone()),
-                    None,
                 )
                 .await;
                 return Err(crate::a2a::errors::create_error_response(StatusCode::FORBIDDEN, &error_msg));
@@ -292,7 +293,6 @@ pub async fn inspect_message_extensions(
                     None,
                     "MCP Inspection",
                     None,
-                    None,
                 )
                 .await;
             } else {
@@ -305,7 +305,6 @@ pub async fn inspect_message_extensions(
                     &body_json,
                     None,
                     "MCP No Meta",
-                    None,
                     None,
                 )
                 .await;
@@ -364,7 +363,6 @@ pub async fn inspect_message_extensions(
                                 None,
                                 "Failed Validation",
                                 Some(error_msg.clone()),
-                                None,
                             )
                             .await;
                             return Err(crate::a2a::errors::create_error_response(StatusCode::FORBIDDEN, &error_msg));
@@ -401,7 +399,6 @@ pub async fn inspect_message_extensions(
                             None,
                             "Failed Validation",
                             Some(error_msg.clone()),
-                            None,
                         )
                         .await;
                         return Err(crate::a2a::create_identity_error_response(
@@ -451,7 +448,6 @@ pub async fn inspect_message_extensions(
                                 None,
                                 "success",
                                 None,
-                                Some(result.hash.clone()),
                             )
                             .await;
                             return Ok(Some(result));
@@ -472,7 +468,6 @@ pub async fn inspect_message_extensions(
                                 None,
                                 "Failed Validation",
                                 Some(error_msg.clone()),
-                                None,
                             )
                             .await;
                             return Err(crate::a2a::create_identity_error_response(
@@ -500,7 +495,6 @@ pub async fn inspect_message_extensions(
                     None,
                     "success",
                     None,
-                    None,
                 )
                 .await;
                 return Ok(None);
@@ -517,7 +511,6 @@ pub async fn inspect_message_extensions(
                 &body_json,
                 None,
                 "MCP No Meta",
-                None,
                 None,
             )
             .await;
@@ -548,7 +541,6 @@ pub async fn inspect_message_extensions(
                 None,
                 "Failed Validation",
                 Some(error_msg.clone()),
-                None,
             )
             .await;
             return Err(crate::a2a::create_identity_error_response(
@@ -606,7 +598,6 @@ pub async fn inspect_message_extensions(
             None,
             "Failed Validation",
             Some(error_msg.clone()),
-            None,
         )
         .await;
         return Err(crate::a2a::create_identity_error_response(
@@ -672,7 +663,6 @@ pub async fn inspect_message_extensions(
                     None,
                     "Failed Validation",
                     Some(error_msg.clone()),
-                    None,
                 )
                 .await;
                 return Err(crate::a2a::create_identity_error_response(
@@ -692,7 +682,6 @@ pub async fn inspect_message_extensions(
                 &body_json,
                 None,
                 "No Extensions",
-                None,
                 None,
             )
             .await;
@@ -807,9 +796,6 @@ pub async fn inspect_message_extensions(
                                 None,
                                 "Failed Validation",
                                 Some(error_msg.clone()),
-                                identity_result
-                                    .as_ref()
-                                    .map(|r| r.hash.clone()),
                             )
                             .await;
                             return Err(crate::a2a::errors::create_error_response(StatusCode::FORBIDDEN, &error_msg));
@@ -885,7 +871,6 @@ pub async fn inspect_message_extensions(
                             None,
                             "Failed Validation",
                             Some(error_msg.clone()),
-                            None,
                         )
                         .await;
                         return Err(crate::a2a::create_identity_error_response(
@@ -955,7 +940,6 @@ pub async fn inspect_message_extensions(
                                 None,
                                 "Failed Validation",
                                 Some(error_msg.clone()),
-                                None,
                             )
                             .await;
                             return Err(crate::a2a::create_identity_error_response(
@@ -1015,9 +999,6 @@ pub async fn inspect_message_extensions(
             None,
             "Failed Validation",
             Some(error_msg.clone()),
-            identity_result
-                .as_ref()
-                .map(|r| r.hash.clone()),
         )
         .await;
         return Err(crate::a2a::create_identity_error_response(
@@ -1485,6 +1466,12 @@ pub async fn inspect_response_extensions(
             {
                 debug!(channel = ctx.channel_name, extension = extension_uri, "🔍 Response Extension Detected");
 
+                if ctx.verified_presentation
+                    && extension_uri == crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION
+                {
+                    continue;
+                }
+
                 // Validate if Affinidi agent identity extension is present (accept both raw identity and VP credential)
                 if extension_uri == crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION
                     || extension_uri == crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION
@@ -1603,6 +1590,98 @@ pub fn should_forward_request_header(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::identity::test_helpers::{SignedAgentPresentation, signed_agent_presentation};
+
+    /// The status inspection refuses `body` with, if any, on a surface whose
+    /// rules require `cloudProvider` to be `local`, watching both agent
+    /// identity extensions.
+    async fn inspected(
+        body: serde_json::Value,
+        verified_presentation: bool,
+    ) -> Option<axum::http::StatusCode> {
+        let config: crate::config::GatewayConfig = serde_json::from_value(serde_json::json!({
+            "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
+            "integration": {"variable_pattern": "\\$\\{([^}]+)\\}", "custom_variable_prefix": "_", "types": [],
+                "categories": []},
+            "extension_inspection": {"enabled": true, "watch_extensions": [
+                crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION,
+                crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION
+            ]}
+        }))
+        .unwrap();
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "name": "a-party",
+            "access_point": { "listen_address": "http://localhost:8700", "route": "/agents/a", "protocol": "a2a" },
+            "target": { "endpoint": "fabric://gw-2/b-party" }
+        }))
+        .unwrap();
+        let rules = Some(std::sync::Arc::new(
+            crate::proxy::RulesEngine::new(&crate::config::ExtensionRules {
+                json_schema: None,
+                rules: vec![crate::config::ValidationRule::Equals {
+                    path: "cloudProvider".to_string(),
+                    value: serde_json::json!("local"),
+                }],
+                filter_rules: vec![],
+                default_action: None,
+            })
+            .unwrap(),
+        ));
+        let context = super::ResponseExtensionInspectionContext {
+            config: &config,
+            channel_name: "a-party",
+            surface: &surface,
+            response_rules_engine: &rules,
+            metrics_store: &None,
+            verified_presentation,
+        };
+        super::inspect_response_extensions(&serde_json::to_vec(&body).unwrap(), &context)
+            .await
+            .err()
+            .map(|refusal| refusal.status())
+    }
+
+    fn answer_with(
+        extension: &str,
+        payload: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "kind": "message",
+                "role": "agent",
+                "parts": [],
+                "extensions": [extension],
+                "metadata": { extension: payload }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_verified_presentation_is_not_checked_against_the_raw_payload_rules() {
+        let answer = answer_with(
+            crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION,
+            serde_json::json!({ "verifiablePresentation": "signed.vp.jwt" }),
+        );
+
+        let unverified = inspected(answer.clone(), false).await;
+        let verified = inspected(answer, true).await;
+
+        assert_eq!(unverified, Some(axum::http::StatusCode::BAD_GATEWAY));
+        assert_eq!(verified, None, "a verified presentation skips the raw-payload rules");
+    }
+
+    #[tokio::test]
+    async fn a_raw_identity_is_still_checked_beside_a_verified_presentation() {
+        let answer = answer_with(
+            crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION,
+            serde_json::json!({ "cloudProvider": "elsewhere" }),
+        );
+
+        let result = inspected(answer, true).await;
+
+        assert_eq!(result, Some(axum::http::StatusCode::BAD_GATEWAY));
+    }
 
     fn test_facts() -> crate::audit::request_events::RequestFacts<'static> {
         crate::audit::request_events::RequestFacts {

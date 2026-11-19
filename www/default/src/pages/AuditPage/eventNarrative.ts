@@ -18,8 +18,20 @@ import {
 } from './auditHelpers';
 import type { AuditEntry, PolicyChangeActor, PolicyChangeData, PolicyChangeEvent } from './types';
 import { isBaseSurfaceVariant, surfaceVariantPhrase } from '../../utils/surfaceVariant';
+import { formatDateTime } from '../../utils/stringUtils';
 
 export type EventTone = 'allow' | 'deny' | 'warn' | 'neutral';
+
+/**
+ * The time a consent record's `detail` gives under `key`, as it is shown; `null` when the detail
+ * has no such time. The detail is `key:value` pairs joined by commas.
+ */
+function consentTime(detail: unknown, key: string): string | null {
+  if (typeof detail !== 'string') return null;
+  const pair = detail.split(',').find(part => part.startsWith(`${key}:`));
+  const time = pair ? new Date(pair.slice(key.length + 1)) : null;
+  return time && !Number.isNaN(time.getTime()) ? formatDateTime(time, true) : null;
+}
 
 /** A user's name for their id, when it is known. */
 export type UserNameResolver = (userId: string) => string | undefined;
@@ -83,7 +95,8 @@ export function eventTone(entry: AuditEntry): EventTone {
   if (tc) return tc.ok ? 'allow' : 'deny';
   if (requestRejected(entry)) return 'deny';
   const name = eventTypeName(entry);
-  if (name === 'consent_required') return 'warn';
+  if (name === 'consent_required' || name === 'consent_expired' || name === 'consent_limited')
+    return 'warn';
   if (DENY_EVENTS.has(name)) return 'deny';
   if (ALLOW_EVENTS.has(name)) return 'allow';
   return 'neutral';
@@ -358,14 +371,17 @@ export function describeEntry(entry: AuditEntry, userName?: UserNameResolver): E
         detail: scopes.length ? `Scopes: ${scopes.join(', ')}.` : undefined,
       };
     }
-    case 'consent_granted':
+    case 'consent_granted': {
+      const end = consentTime(entry.detail, 'consent_expires_at');
       return {
         title: 'Consent granted',
         tone,
         summary: provider
           ? `The user granted consent for ${provider}.`
           : 'The user granted consent.',
+        detail: end ? `It ends ${end}.` : undefined,
       };
+    }
     case 'consent_required':
       return {
         title: 'Consent required',
@@ -374,6 +390,29 @@ export function describeEntry(entry: AuditEntry, userName?: UserNameResolver): E
           ? `Access to ${provider} is paused until the user grants consent.`
           : 'Access is paused until the user grants consent.',
       };
+    case 'consent_expired':
+      return {
+        title: 'Consent expired',
+        tone,
+        summary: provider
+          ? `The consent for ${provider} reached its time limit, so the stored credential was removed.`
+          : 'A consent reached its time limit, so the stored credential was removed.',
+        detail: 'The person is asked to consent again the next time the agent needs it.',
+      };
+    case 'consent_limited': {
+      const end = consentTime(entry.detail, 'consent_expires_at');
+      const previous = consentTime(entry.detail, 'previous_end');
+      return {
+        title: 'Consent limited',
+        tone,
+        summary: provider
+          ? `An operator made the consent for ${provider} end sooner.`
+          : 'An operator made a consent end sooner.',
+        detail: end
+          ? `It now ends ${end}${previous ? `, not ${previous}` : ''}. The credential is used until then. It was not revoked.`
+          : 'The credential is used until its new end. It was not revoked.',
+      };
+    }
     case 'refresh_failed':
       return {
         title: 'Token refresh failed',

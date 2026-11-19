@@ -33,6 +33,22 @@ describe('AuditInfoBanner', () => {
     expect(body).toHaveTextContent('deduplicate on event_id');
   });
 
+  it('lists the audited delegation events and says the per-call ones go to the gateway log', () => {
+    render(<AuditInfoBanner open onToggle={jest.fn()} />);
+
+    const body = screen.getByTestId('audit-about-body');
+    [
+      'consent_granted',
+      'consent_expired',
+      'consent_limited',
+      'token_revoked',
+      'user_tokens_revoked',
+    ].forEach(event => expect(body).toHaveTextContent(event));
+    expect(body).not.toHaveTextContent('token_injected');
+    expect(body).toHaveTextContent('is not audited');
+    expect(body).toHaveTextContent('unless [logging] delegation_events is false');
+  });
+
   it('no longer claims every entry is sent or that forwarding is best-effort', () => {
     render(<AuditInfoBanner open onToggle={jest.fn()} />);
 

@@ -206,6 +206,50 @@ continues with no caller identity, only the audit record for the unverified DID 
 written, and no weaker identity source is consulted for that request, neither the identity
 binding VP nor a raw identity extension.
 
+The calling gateway checks the presentation on a `2xx` answer the same way, when the calling
+surface's Target is `fabric://` and the surface has a managed identity. The presentation must
+verify, which includes its holder being its credential's subject, and its issuer must be one of
+the issuers of the connection to the Remote gateway the Target names. The calling gateway
+establishes that gateway's issuer DID through the issuer exchange when its record does not hold
+one yet, and skips the exchange when the issuers its record holds already include the
+presentation's issuer. An answer waits at most 3 seconds for the exchange, where a request waits
+the exchange's full 10 seconds. Answers and requests that need the same gateway's issuer DID at
+once share one exchange, which keeps running after an answer stops waiting and records the issuer
+DID when it completes, so the next answer finds it. When the surface takes the agent's identity from the payload, a verified
+presentation from one of those issuers is that identity, in place of the raw `agent-identity/v1`
+extension the paired gateway replaced with it; the surface's identity schema and rules apply to
+that raw payload, which the calling gateway never receives, so the issuer check stands in for
+them. A surface that takes the identity from a key, a token claim, a certificate or a fixed DID
+keeps it: the presentation is still checked and recorded, but the answering agent's DID is not
+stored as an identity of the surface. A presentation the calling gateway has no VC issuer to verify
+counts as one that fails verification. A presentation
+that fails verification refuses the answer with `502` and records `identity_binding_failed` with
+outcome `invalid`. One whose issuer is not one of the connection's issuers, including when they
+cannot be established, also refuses the answer with `502`: the answering agent's DID is not
+stored, and the VP Audit Log records `identity_binding_failed` with outcome `untrusted`. A verified
+one records `identity_binding_verified` and the received presentation (`vp_injected`, detail
+`response_path_fabric_received`), both with `via_fabric: true` and the request's trace id. Answers
+to a Transit Point over Fabric, to MCP requests over Fabric, and agent cards fetched over Fabric
+are not checked.
+
+Accepted risk: an answer that carries no presentation is not checked. A paired gateway signs one
+only when its surface has a managed identity and it has a VC issuer, so an answer from any other
+paired surface carries the agent's raw `agent-identity/v1` extension instead, and a surface that
+takes the identity from the payload derives it from that extension under its own schema and
+rules, with no issuer check and no audit record. A paired gateway can therefore drop the
+presentation and send `x-identity` fields copied from another agent to be given that agent's
+identity. Only a gateway this one is paired with can do this; the mediator and the answering
+agent cannot remove a presentation the paired gateway adds.
+
+Accepted risk: the calling surface's identity schema and rules do not run on an answer that
+carries a verified presentation, and response extension inspection skips that presentation's
+credential extension while still checking every other watched extension. They are written for the raw `agent-identity/v1` extension,
+which the paired gateway checked against its own schema and rules and replaced, and the
+presentation's fields follow the paired gateway's schema, so checking them against the calling
+surface's could refuse legitimate agents. A paired gateway whose rules are looser than the
+calling surface's can therefore pass an agent the calling surface's rules would refuse; the issuer
+check is the only check the calling gateway applies.
+
 The presentation the receiving gateway signs for its agent's response, when the Target has a
 Workload Binding, names the caller as the user the agent acted for (`userIdentity`, with
 `delegated: true`) only when a presentation from one of the connection's issuers proved the
@@ -442,11 +486,14 @@ request received by the destination gateway:
    has Transit Points and the Target is an HTTP or HTTPS URL, the request carries a transit token
    this gateway issued for it, naming the peer, the hop count and, when step 5 verified one, the
    caller the surface's own source authentication verified, so the agent can call its own Transit
-   Points (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A public discovery `GET`, such as
-   an agent card fetch, carries none, nor does a request relayed to an MCP Target over the legacy
-   HTTP+SSE transport. The surface's `target.auth` goes only with a request whose caller was
-   vetted, and with the gateway's own agent card fetch, which follows the
-   [direct path's rules](#agent-card-fetch-over-fabric); any other discovery read gets none (see
+   Points (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A public discovery `GET` of the
+   surface, such as an agent card fetch, carries none, nor does a request relayed to an MCP Target
+   over the legacy HTTP+SSE transport. That is the token handed to this surface's Target; a
+   discovery read the agent sends through one of its own Transit Points still needs its own
+   token (see [Chains across gateways](#chains-across-gateways)). The surface's `target.auth` goes
+   only with a request whose caller was vetted, and with the gateway's own agent card fetch, which
+   follows the [direct path's rules](#agent-card-fetch-over-fabric); any other discovery read gets
+   none (see
    [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#target-authentication-from-a-credential-provider)).
    The Target's answer travels back as text, so the request, a framed stream's included, asks
    for an uncompressed one (`Accept-Encoding: identity`) in place of whatever the sender accepts;
@@ -763,11 +810,14 @@ request back and forth without end. A hop count bounds them.
 Hops are counted only across Fabric. A chain through an `http` Transit Point into another
 gateway's Access Point, or an agent calling an Access Point directly, its own gateway's
 included, starts again at 1, and so does a call without a transit token through a Transit Point
-that does not require one (it reads the count from a token the agent sends), a call
-through a Transit Point of a gateway with no transit token issuer, which reads no token, and a
-discovery read (a `GET` or `HEAD` of an agent card or other discovery document directly below
-the Transit Point) through any Transit Point, which reads no token either. So does a chain through a gateway that predates the hop count,
+that does not require one (it reads the count from a token the agent sends), and a call
+through a Transit Point of a gateway with no transit token issuer, which reads no token. So does a chain through a gateway that predates the hop count,
 which neither reads nor sends it. A peer that does not follow these rules can reset the count.
+
+Discovery reads (a `GET` or `HEAD` of an agent card or other discovery document directly below
+the Transit Point) require a transit token when the Transit Point is configured to require it and read hop count and trace id from the token, just like
+other Transit Point requests.
+
 The gateway's own read of a `fabric://` Transit Point target's agent card, for its Trust Checks
 or a policy with `require_agent_context`, is a discovery read too: it goes straight over Fabric,
 not through the Transit Point, with a count of 1 and a trace id of its own. It reads

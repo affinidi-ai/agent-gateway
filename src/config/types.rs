@@ -572,6 +572,13 @@ pub struct LoggingConfig {
     /// Directory to write log files (optional, logs to stdout if not set)
     pub log_directory: Option<String>,
 
+    /// Whether the per-call credential delegation events are written to the
+    /// log: `token_injected` and the others the gateway logs and never audits
+    /// ([`crate::audit::catalog::LOGGED_EVENTS`]). One is written for every
+    /// delegated call, so a deployment that does not want them sets `false`.
+    #[serde(default = "default_true", skip_serializing_if = "crate::config::agent_surface::is_true")]
+    pub delegation_events: bool,
+
     /// PII / secret redaction rules applied to all log output. Read from gateway.json only.
     #[serde(default, skip_serializing_if = "LogRedactionConfig::is_built_in")]
     pub redaction: LogRedactionConfig,
@@ -583,6 +590,7 @@ impl Default for LoggingConfig {
             level: default_log_level(),
             json: false,
             log_directory: None,
+            delegation_events: true,
             redaction: LogRedactionConfig::default(),
         }
     }
@@ -1248,6 +1256,11 @@ pub struct OutboundCredentialBinding {
     /// Required with `external`, refused with every other mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<crate::config::agent_surface::GrantSubject>,
+
+    /// Seconds a person's consent may be used through this binding, from one
+    /// minute to 365 days; the provider's limit, else the gateway's, when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_consent_age_secs: Option<u64>,
 }
 
 impl OutboundCredentialBinding {
@@ -4796,6 +4809,25 @@ mod log_redaction_config_tests {
                 .redaction
                 .is_built_in()
         );
+    }
+
+    #[test]
+    fn the_per_call_delegation_events_are_logged_unless_the_setting_says_no() {
+        let logging: LoggingConfig = toml::from_str("level = \"info\"").expect("parses");
+        assert!(logging.delegation_events, "on when the key is absent");
+        assert!(LoggingConfig::default().delegation_events);
+        assert!(
+            !serde_json::to_string(&logging)
+                .expect("serializes")
+                .contains("delegation_events"),
+            "the default is not written back"
+        );
+
+        let quiet: LoggingConfig = toml::from_str("delegation_events = false").expect("parses");
+        assert!(!quiet.delegation_events);
+        let read_back: LoggingConfig =
+            serde_json::from_str(&serde_json::to_string(&quiet).expect("serializes")).expect("parses");
+        assert!(!read_back.delegation_events, "a setting that is off is kept");
     }
 
     #[test]

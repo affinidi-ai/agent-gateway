@@ -424,6 +424,35 @@ fn validate_resolved_variants(surface: &AgentSurface) -> Result<(), SurfaceApiEr
         {
             return Err(SurfaceApiError::BadRequest(format!("{}: {}", label, e)));
         }
+        validate_mirror_endpoint(&resolved, &label)?;
+    }
+    Ok(())
+}
+
+/// Refuse a traffic mirror whose endpoint the Target's static check refuses (not an http(s)
+/// URL, embedded credentials, a cloud-provider metadata host) or whose `timeout_secs` is zero
+/// or above [`crate::proxy::mirror::MAX_TIMEOUT_SECS`]. Static only: resolves no DNS. Loopback
+/// and private addresses are allowed, as for the Target. The reason never repeats the URL.
+fn validate_mirror_endpoint(
+    surface: &AgentSurface,
+    label: &str,
+) -> Result<(), SurfaceApiError> {
+    let Some(mirror) = surface.mirror() else {
+        return Ok(());
+    };
+    let prefix = if label.is_empty() {
+        String::new()
+    } else {
+        format!("{label}: ")
+    };
+    crate::url_validation::validate_url_not_cloud_metadata_host(&mirror.endpoint).map_err(|reason| {
+        SurfaceApiError::BadRequest(format!("{prefix}target.networking.mirror.endpoint: {reason}"))
+    })?;
+    let max = crate::proxy::mirror::MAX_TIMEOUT_SECS;
+    if !(1..=max).contains(&mirror.timeout_secs) {
+        return Err(SurfaceApiError::BadRequest(format!(
+            "{prefix}target.networking.mirror.timeout_secs: must be between 1 and {max} seconds"
+        )));
     }
     Ok(())
 }
@@ -2552,29 +2581,23 @@ struct CardPreviewCaller<'a> {
     user_id: &'a str,
 }
 
-const CARD_FETCH_LIMITED: &str = "Too many card fetches; try again in a few seconds";
+pub(crate) const CARD_FETCH_LIMITED: &str = "Too many card fetches; try again in a few seconds";
 
-/// The agent card preview of a surface the caller may read, or for a refresh,
-/// change. A surface of another tenant is `404`, never its card, and a tenant token
-/// never makes the gateway fetch an appliance-wide surface's card.
-async fn agent_card_preview(
+/// The agent card preview of `surface`, which the caller may already read. A tenant
+/// token never makes the gateway fetch an appliance-wide surface's card.
+pub(crate) async fn surface_card_preview(
     state: &IdentityApiState,
-    surface_id: &str,
-    caller: &CardPreviewCaller<'_>,
+    surface: &AgentSurface,
+    context: Option<&PatTenantContext>,
+    user_id: &str,
     request: crate::proxy::card_preview::PreviewRequest,
-) -> Result<Response, SurfaceApiError> {
+) -> Result<crate::proxy::card_preview::AgentCardPreview, crate::proxy::card_preview::RateLimited> {
     use crate::proxy::card_preview::{
-        AgentCardPreview, PreviewCaller, PreviewRequest, RateLimited, UnsupportedReason, preview_memory,
-        unsupported_reason,
+        AgentCardPreview, PreviewCaller, UnsupportedReason, preview_memory, unsupported_reason,
     };
 
-    let access = match request {
-        PreviewRequest::Read => SurfaceAccess::Read,
-        PreviewRequest::Refresh => SurfaceAccess::Mutate,
-    };
-    let (_store, surface) = load_surface_or_404(state, surface_id, caller.context, caller.scope, access).await?;
-    let unsupported = |reason| Ok(Json(AgentCardPreview::unsupported(&surface.surface_id, reason)).into_response());
-    if let Some(reason) = unsupported_reason(&surface, caller.context.is_some(), crate::server::mode::is_standby()) {
+    let unsupported = |reason| Ok(AgentCardPreview::unsupported(&surface.surface_id, reason));
+    if let Some(reason) = unsupported_reason(surface, context.is_some(), crate::server::mode::is_standby()) {
         return unsupported(reason);
     }
     let Some(proxy_state) = state
@@ -2591,16 +2614,31 @@ async fn agent_card_preview(
         return unsupported(UnsupportedReason::NotA2a);
     }
 
-    let preview_caller = PreviewCaller {
-        user_id: caller.user_id,
-        tenant_id: caller
-            .context
-            .map(|context| context.tenant_id.as_str()),
+    let caller = PreviewCaller {
+        user_id,
+        tenant_id: context.map(|context| context.tenant_id.as_str()),
     };
-    match preview_memory()
-        .preview(&proxy_state, &preview_caller, request)
+    preview_memory()
+        .preview(&proxy_state, &caller, request)
         .await
-    {
+}
+
+/// The agent card preview of a surface the caller may read, or for a refresh,
+/// change. A surface of another tenant is `404`, never its card.
+async fn agent_card_preview(
+    state: &IdentityApiState,
+    surface_id: &str,
+    caller: &CardPreviewCaller<'_>,
+    request: crate::proxy::card_preview::PreviewRequest,
+) -> Result<Response, SurfaceApiError> {
+    use crate::proxy::card_preview::{PreviewRequest, RateLimited};
+
+    let access = match request {
+        PreviewRequest::Read => SurfaceAccess::Read,
+        PreviewRequest::Refresh => SurfaceAccess::Mutate,
+    };
+    let (_store, surface) = load_surface_or_404(state, surface_id, caller.context, caller.scope, access).await?;
+    match surface_card_preview(state, &surface, caller.context, caller.user_id, request).await {
         Ok(preview) => Ok(Json(preview).into_response()),
         Err(RateLimited { retry_after_secs }) => {
             warn!(surface_id = %surface.surface_id, "Agent card preview refused: fetch limit reached");
@@ -3267,6 +3305,7 @@ pub async fn create_surface(
     {
         return Err(SurfaceApiError::BadRequest(format!("target.endpoint: {}", e)));
     }
+    validate_mirror_endpoint(&surface, "")?;
 
     // Validate variant alias uniqueness
     validate_variant_aliases(&surface)?;
@@ -4301,6 +4340,7 @@ async fn validate_and_save_surface(
     {
         return Err(SurfaceApiError::BadRequest(format!("target.endpoint: {}", e)));
     }
+    validate_mirror_endpoint(&surface, "")?;
 
     validate_variant_aliases(&surface)?;
     validate_transit_points(
@@ -8742,6 +8782,167 @@ mod validation_tests {
                 },
             });
         validate_resolved_variants(&s).expect("disabled variant is skipped");
+    }
+
+    fn mirror_networking(endpoint: &str) -> crate::config::agent_surface::NetworkingConfig {
+        serde_json::from_value(serde_json::json!({ "mirror": { "endpoint": endpoint } })).expect("networking")
+    }
+
+    fn mirrored_surface(endpoint: &str) -> AgentSurface {
+        let mut s = base_surface();
+        s.target.networking = Some(mirror_networking(endpoint));
+        s
+    }
+
+    fn surface_with_variant_mirror(
+        endpoint: &str,
+        enabled: bool,
+    ) -> AgentSurface {
+        let mut s = base_surface();
+        s.variants
+            .push(SurfaceVariant {
+                id: "v-shadow".to_string(),
+                alias: "shadow".to_string(),
+                name: "shadow".to_string(),
+                description: String::new(),
+                enabled,
+                overrides: SurfaceOverrides {
+                    target: Some(TargetOverrides {
+                        networking: Some(mirror_networking(endpoint)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            });
+        s
+    }
+
+    fn bad_request(result: Result<(), SurfaceApiError>) -> String {
+        match result {
+            Err(SurfaceApiError::BadRequest(msg)) => msg,
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mirror_endpoint_accepts_a_surface_without_a_mirror() {
+        validate_mirror_endpoint(&base_surface(), "").expect("no mirror is valid");
+    }
+
+    #[test]
+    fn mirror_endpoint_accepts_public_loopback_and_private_http_urls() {
+        for endpoint in [
+            "https://mirror.example.com/copy",
+            "http://127.0.0.1:9000/copy",
+            "http://localhost:9000/copy",
+            "http://10.1.2.3/copy",
+            "http://192.168.1.5:8080/copy",
+        ] {
+            validate_mirror_endpoint(&mirrored_surface(endpoint), "")
+                .unwrap_or_else(|e| panic!("{endpoint} must be accepted: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn mirror_endpoint_refuses_cloud_metadata_without_repeating_the_path() {
+        for endpoint in [
+            "http://169.254.169.254/latest/meta-data/secret-path",
+            "http://169.254.170.2/v2/secret-path",
+            "http://metadata.google.internal/computeMetadata/secret-path",
+            "http://[::ffff:169.254.169.254]/secret-path",
+            "http://[fd00:ec2::254]/secret-path",
+        ] {
+            let msg = bad_request(validate_mirror_endpoint(&mirrored_surface(endpoint), ""));
+            assert!(msg.starts_with("target.networking.mirror.endpoint: "), "{msg}");
+            assert!(msg.contains("cloud-provider metadata"), "{endpoint}: {msg}");
+            assert!(!msg.contains("secret-path"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn mirror_endpoint_refuses_non_http_relative_and_credentialed_urls() {
+        for (endpoint, reason) in [
+            ("ftp://mirror.example.com/copy", "http"),
+            ("/relative/copy", "URL"),
+            ("http://user:pw@mirror.example.com/copy", "embedded credentials"),
+        ] {
+            let msg = bad_request(validate_mirror_endpoint(&mirrored_surface(endpoint), ""));
+            assert!(msg.starts_with("target.networking.mirror.endpoint: "), "{endpoint}: {msg}");
+            assert!(msg.contains(reason), "{endpoint}: {msg}");
+            assert!(!msg.contains("pw@"), "{msg}");
+        }
+    }
+
+    fn mirror_with_timeout(timeout_secs: u64) -> AgentSurface {
+        let mut s = base_surface();
+        s.target.networking = Some(
+            serde_json::from_value(serde_json::json!({
+                "mirror": { "endpoint": "https://mirror.example.com/copy", "timeout_secs": timeout_secs }
+            }))
+            .expect("networking"),
+        );
+        s
+    }
+
+    #[test]
+    fn mirror_timeout_outside_one_to_the_ceiling_is_refused_naming_the_field() {
+        for timeout_secs in [0, crate::proxy::mirror::MAX_TIMEOUT_SECS + 1, u64::MAX] {
+            let msg = bad_request(validate_mirror_endpoint(&mirror_with_timeout(timeout_secs), ""));
+            assert_eq!(
+                msg,
+                format!(
+                    "target.networking.mirror.timeout_secs: must be between 1 and {} seconds",
+                    crate::proxy::mirror::MAX_TIMEOUT_SECS
+                ),
+                "{timeout_secs}"
+            );
+        }
+    }
+
+    #[test]
+    fn mirror_timeout_from_one_second_to_the_ceiling_is_accepted() {
+        for timeout_secs in [1, 5, crate::proxy::mirror::MAX_TIMEOUT_SECS] {
+            validate_mirror_endpoint(&mirror_with_timeout(timeout_secs), "")
+                .unwrap_or_else(|e| panic!("{timeout_secs}s must be accepted: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn resolved_variants_refuse_a_variant_mirror_timeout_above_the_ceiling() {
+        let mut s = surface_with_variant_mirror("https://mirror.example.com/copy", true);
+        s.variants[0]
+            .overrides
+            .target
+            .as_mut()
+            .expect("target override")
+            .networking = Some(
+            serde_json::from_value(serde_json::json!({
+                "mirror": { "endpoint": "https://mirror.example.com/copy", "timeout_secs": 3600 }
+            }))
+            .expect("networking"),
+        );
+        let msg = bad_request(validate_resolved_variants(&s));
+        assert!(msg.starts_with("Variant 'shadow': target.networking.mirror.timeout_secs: "), "{msg}");
+    }
+
+    #[test]
+    fn resolved_variants_refuse_an_enabled_variant_mirror_on_cloud_metadata() {
+        let s = surface_with_variant_mirror("http://169.254.169.254/latest/secret-path", true);
+        let msg = bad_request(validate_resolved_variants(&s));
+        assert!(msg.starts_with("Variant 'shadow': target.networking.mirror.endpoint: "), "{msg}");
+        assert!(!msg.contains("secret-path"), "{msg}");
+    }
+
+    #[test]
+    fn resolved_variants_skip_a_disabled_variant_with_a_metadata_mirror() {
+        let s = surface_with_variant_mirror("http://169.254.169.254/latest/", false);
+        validate_resolved_variants(&s).expect("a disabled variant is not resolved");
+    }
+
+    #[test]
+    fn resolved_variants_accept_a_variant_mirror_on_a_private_address() {
+        let s = surface_with_variant_mirror("http://10.0.0.7/copy", true);
+        validate_resolved_variants(&s).expect("a private mirror is allowed");
     }
 
     fn api_key_caller(secret_id: &str) -> serde_json::Value {

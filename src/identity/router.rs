@@ -437,8 +437,6 @@ pub async fn create_identity_api_router(
         .route("/onboard/{uuid}/rpc", post(handlers::handle_onboarding_message))
         .route("/onboard/{uuid}/", post(handlers::handle_onboarding_message))
         .route("/onboard/{uuid}", post(handlers::handle_onboarding_message))
-        // Agent routes
-        .route("/v1/agents", get(handlers::get_agents))
         // Agents API routes (for local agents to onboard and verify JWTs).
         // NOTE: /agents-api/v1/sign-jwt is admin-only and registered on the
         // RBAC-gated `auth_manager_router` below, not here.
@@ -833,6 +831,22 @@ pub async fn create_identity_api_router(
             .route(
                 "/v1/surfaces/{surface_id}",
                 get(handlers::get_surface).layer(require_feature(s.clone(), r.clone(), Feature::SurfacesView)),
+            )
+            .route(
+                "/v1/agents",
+                get(handlers::agents::list_agents).layer(require_feature(s.clone(), r.clone(), Feature::SurfacesView)),
+            )
+            .route(
+                "/v1/agents/{id}",
+                get(handlers::agents::get_agent).layer(require_feature(s.clone(), r.clone(), Feature::SurfacesView)),
+            )
+            .route(
+                "/v1/agents/{id}/agent-card",
+                get(handlers::agents::get_agent_card).layer(require_feature(
+                    s.clone(),
+                    r.clone(),
+                    Feature::SurfacesView,
+                )),
             )
             .route(
                 "/v1/surfaces/{surface_id}/trust-recorder-status",

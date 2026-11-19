@@ -43,7 +43,7 @@ import {
   useVariantSnapshots,
   BASE_VARIANT_ID,
 } from '../components/surface-builder/variants/useVariantSnapshots';
-import { DeleteButton } from '../components/shared/DeleteButton';
+import ConfirmPopover from '../components/shared/ConfirmPopover';
 import {
   hydrateSurfaceCanvas,
   nodesFromSurface,
@@ -123,6 +123,7 @@ const SurfaceDetailPage: React.FC = () => {
   const navigate = useNavigate();
   const { hasPermission } = usePermissions();
   const canEdit = hasPermission('surfaces.edit');
+  const canDelete = hasPermission('surfaces.delete');
   const { getCurrentStats } = useApp();
 
   const [surface, setSurface] = useState<AgentSurface | null>(null);
@@ -131,6 +132,7 @@ const SurfaceDetailPage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [deleteAnchor, setDeleteAnchor] = useState<HTMLElement | null>(null);
   const [error, setError] = useState<string | null>(null);
   // `Warning` headers of the last save but the Access Point's, shown in the
   // banner and on the Transit Points they name.
@@ -1455,7 +1457,7 @@ const SurfaceDetailPage: React.FC = () => {
   };
 
   useSaveShortcut(() => {
-    if (saving || deleting || !canEdit) return;
+    if (saving || deleting || deleteAnchor || !canEdit) return;
     const blocking = computeBlockingReason();
     if (blocking) {
       showBlockingToast(blocking);
@@ -1465,18 +1467,23 @@ const SurfaceDetailPage: React.FC = () => {
   }, builder.commit);
 
   const handleDelete = async () => {
-    if (!surfaceId || !surface) return;
+    if (!surfaceId || !surface || saving || deleting) return;
     setDeleting(true);
     setError(null);
     try {
       await apiClient.deleteSurface(surfaceId);
-      showToast('success', `Surface "${surface.name}" deleted`);
+      showToast('success', `Surface "${surface.name || surfaceId}" deleted`);
       navigate('/surfaces');
     } catch (err: any) {
       setError(err.message || 'Failed to delete surface');
       setDeleting(false);
+      setDeleteAnchor(null);
     }
   };
+
+  useEffect(() => {
+    setDeleteAnchor(null);
+  }, [surfaceId]);
 
   // Compare the current form + canvas state against the last
   // load/save baseline. Skipped while loading or before the first
@@ -1846,13 +1853,48 @@ const SurfaceDetailPage: React.FC = () => {
                 {saving ? <i className="fas fa-spinner fa-spin" /> : <i className="fas fa-save" />}
               </button>
             )}
-            {canEdit && (
-              <DeleteButton
-                onDelete={handleDelete}
+            {canDelete && (
+              <button
+                type="button"
+                className="btn btn-danger btn-sm"
+                onClick={e => {
+                  const button = e.currentTarget;
+                  setDeleteAnchor(prev => (prev === button ? null : button));
+                }}
                 disabled={deleting || saving}
-                size="sm"
                 title="Delete this surface"
-              />
+                aria-label="Delete surface"
+                data-testid="surface-delete-button"
+              >
+                {deleting ? (
+                  <i className="fas fa-spinner fa-spin" />
+                ) : (
+                  <i className="fas fa-trash" />
+                )}
+              </button>
+            )}
+            {canDelete && deleteAnchor && (
+              <ConfirmPopover
+                anchor={deleteAnchor}
+                testId="surface-delete-confirm"
+                icon="fa-triangle-exclamation"
+                title="Delete Surface?"
+                confirmLabel="Delete"
+                confirmVariant="danger"
+                confirmDisabled={saving}
+                busy={deleting}
+                onConfirm={handleDelete}
+                onCancel={() => setDeleteAnchor(null)}
+              >
+                <p className="mb-2" data-testid="surface-delete-confirm-name">
+                  Delete <strong>{surface?.name || surfaceId}</strong>?
+                </p>
+                <p className="mb-2">
+                  You are about to permanently delete this surface and all associated configuration.
+                  This action cannot be undone.
+                </p>
+                <p className="mb-0">Are you sure you want to continue?</p>
+              </ConfirmPopover>
             )}
           </div>
         }

@@ -24,6 +24,7 @@ use crate::a2a::{
 use crate::observability::broadcast_payload_capture_async;
 use crate::observability::loggable;
 use crate::proxy::backend_identity::ProtectedAgentIdentity;
+use crate::proxy::mirror;
 use crate::server::ConnectionGuard;
 use crate::state::{MultiSurfaceProxyState, ProxyState};
 use crate::{channel_debug, channel_error, channel_info, channel_warn};
@@ -196,6 +197,31 @@ fn forwards_ap_caller_header(
         header_metadata_mapping,
         forwarded_source_auth_header,
     ) && !is_credential_header(name, credential_headers)
+}
+
+/// Whether a caller header goes on to an Access Point's Target: what
+/// [`forwards_ap_caller_header`] forwards, or, for a Target bound by external consent
+/// (`bound_target`), only what [`crate::proxy::target_grant::forwards_caller_header`] forwards.
+/// A traffic mirror is sent the same headers, so it is never given one the Target is refused.
+fn forwards_target_header(
+    name: &str,
+    bound_target: bool,
+    source_auth_headers: &[&str],
+    header_metadata_mapping: Option<&crate::config::header_metadata_mapping::HeaderMetadataMappingConfig>,
+    forwarded_source_auth_header: Option<&str>,
+    credential_headers: &[&str],
+) -> bool {
+    if bound_target {
+        crate::proxy::target_grant::forwards_caller_header(name, source_auth_headers, header_metadata_mapping)
+    } else {
+        forwards_ap_caller_header(
+            name,
+            source_auth_headers,
+            header_metadata_mapping,
+            forwarded_source_auth_header,
+            credential_headers,
+        )
+    }
 }
 
 /// Whether `name` is one of `credential_headers`, the headers the gateway fills with a
@@ -2949,7 +2975,7 @@ async fn proxy_charged_request(
         Some(crate::mcp::request_validation::McpRequestClassification::Modern(request)) => Some((**request).clone()),
         _ => None,
     };
-    let subscription_lifetime = if let Some(request) = modern_request
+    let mut subscription_lifetime = if let Some(request) = modern_request
         .as_ref()
         .filter(|request| request.method == "subscriptions/listen")
     {
@@ -5492,15 +5518,17 @@ async fn proxy_charged_request(
     // "deferred request VP injection" site below, after the resolver has
     // produced the per-binding `delegationAction` summary.
 
-    // ── Capture buffer for delegation audit events ─────────────────────
+    // ── Capture buffer for delegation audit records ────────────────────
     //
-    // The per-binding audit events (TokenInjected/Refreshed/ConsentRequired/
-    // elicitation_*) are emitted by `resolve_delegation_credentials` *before*
-    // we know the final `delegationAction` summary. We buffer them via a
-    // tokio task-local queue, then re-stamp each with the canonical identity
-    // VP after the deferred mint below. When workload-binding attestation is
-    // explicitly configured, that VP carries `workloadBinding.delegationAction`;
-    // otherwise it stays in the legacy `identityFields` shape.
+    // The audit records `resolve_delegation_credentials` submits, such as
+    // `consent_expired`, are submitted *before* we know the final
+    // `delegationAction` summary. We buffer them via a tokio task-local
+    // queue, then re-stamp each with the canonical identity VP after the
+    // deferred mint below. When workload-binding attestation is explicitly
+    // configured, that VP carries `workloadBinding.delegationAction`;
+    // otherwise it stays in the legacy `identityFields` shape. The events it
+    // only logs (`token_injected`, `consent_required` and the like) are
+    // written to the gateway log at once, without the VP.
     let deferred_audit = crate::audit::producer::DeferredAudit::new(crate::audit::producer::producer());
 
     // Note: outbound request body VP injection is deferred to after credential
@@ -6459,6 +6487,7 @@ async fn proxy_charged_request(
             payment
                 .as_ref()
                 .is_some_and(agent_pay_gate::Intake::is_unpaid),
+            subscription_lifetime.as_mut(),
         )
         .await
         {
@@ -6537,17 +6566,14 @@ async fn proxy_charged_request(
     let bound_target = crate::proxy::target_grant::binds_the_target(&state.surface);
     let credential_headers = target_credential_header_names(&state.surface);
     let forwards_header = |name: &str| {
-        if bound_target {
-            crate::proxy::target_grant::forwards_caller_header(name, &source_cred_headers, header_metadata_mapping)
-        } else {
-            forwards_ap_caller_header(
-                name,
-                &source_cred_headers,
-                header_metadata_mapping,
-                forwarded_source_auth_header,
-                &credential_headers,
-            )
-        }
+        forwards_target_header(
+            name,
+            bound_target,
+            &source_cred_headers,
+            header_metadata_mapping,
+            forwarded_source_auth_header,
+            &credential_headers,
+        )
     };
 
     // Build upstream request. The forward send uses the per-request pinned,
@@ -7091,17 +7117,11 @@ async fn proxy_charged_request(
             // Check for consent_required — if any binding needs consent, return immediately
             let mut consent_entries = Vec::new();
             for resolution in &delegation_results {
-                if let crate::proxy::credential_delegation::DelegationLookupResult::ConsentRequired {
-                    authorization_url,
-                    provider_name,
-                    scopes,
-                } = &resolution.result
+                if let Some(entry) = resolution
+                    .result
+                    .consent_entry()
                 {
-                    consent_entries.push(serde_json::json!({
-                        "provider_name": provider_name,
-                        "authorization_url": authorization_url,
-                        "scopes": scopes,
-                    }));
+                    consent_entries.push(entry);
                 }
             }
 
@@ -7602,113 +7622,72 @@ async fn proxy_charged_request(
     }
 
     // Traffic mirroring - send duplicate request to mirror endpoint (if configured)
-    if let Some(mirror_config) = state.surface.mirror() {
-        // Check if we should mirror this request based on percentage
-        let should_mirror = if mirror_config.percentage >= 100 {
-            true
-        } else if mirror_config.percentage == 0 {
-            false
-        } else {
-            use rand::Rng;
-            let mut rng = rand::rng();
-            rng.random_range(0..100) < mirror_config.percentage
-        };
+    if let Some(mirror_config) = state.surface.mirror()
+        && mirror::selected(mirror_config.percentage)
+    {
+        let mirror_endpoint_for_log = loggable::url(&mirror_config.endpoint);
+        let mirror_request = mirror::MirrorRequest::new(mirror_config, method.clone(), body_bytes.clone())
+            .headers_from(&headers, |name| {
+                forwards_target_header(
+                    name,
+                    bound_target,
+                    &source_cred_headers,
+                    header_metadata_mapping,
+                    None,
+                    &credential_headers,
+                )
+            })
+            .mirrored(Some(&trace_id));
 
-        if should_mirror {
-            let mirror_endpoint = mirror_config.endpoint.clone();
-            let mirror_endpoint_for_log = loggable::url(&mirror_endpoint);
-            let mirror_timeout = std::time::Duration::from_secs(mirror_config.timeout_secs);
-            let wait_for_response = mirror_config.wait_for_response;
-            let channel_name_clone = channel_name.to_string();
-            let client_clone = state.client.clone();
-            let trace_id_clone = trace_id.clone();
-
-            // Clone the request for mirroring
-            if let Some(_mirror_req) = upstream_req.try_clone() {
-                // Build mirror URL (replace target with mirror endpoint)
-                let mirror_url = mirror_endpoint.clone();
-                let mirror_req = client_clone
-                    .request(method.clone(), &mirror_url)
-                    .body(body_bytes.clone())
-                    .timeout(mirror_timeout);
-
-                // Copy headers
-                let mut mirror_req_with_headers = mirror_req;
-                for (key, value) in headers.iter() {
-                    if should_forward_ap_request_header_with_mapping(
-                        key.as_str(),
-                        &source_cred_headers,
-                        header_metadata_mapping,
-                        None,
-                    ) {
-                        mirror_req_with_headers = mirror_req_with_headers.header(key.as_str(), value.as_bytes());
-                    }
-                }
-                mirror_req_with_headers =
-                    mirror_req_with_headers.header("X-Gateway-Trace-Id", format!("{}-mirror", trace_id_clone));
-                mirror_req_with_headers = mirror_req_with_headers.header("X-Mirrored-Request", "true");
-
-                if wait_for_response {
-                    // Wait for mirror response (blocking)
-                    match mirror_req_with_headers
-                        .send()
-                        .await
-                    {
-                        Ok(resp) => {
-                            info!(
-                                channel = channel_name_clone,
-                                mirror_endpoint = mirror_endpoint_for_log,
-                                status = resp.status().as_u16(),
-                                trace_id = trace_id_clone,
-                                "Mirror request completed"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                channel = channel_name_clone,
-                                mirror_endpoint = mirror_endpoint_for_log,
-                                error = %e.without_url(),
-                                trace_id = trace_id_clone,
-                                "Mirror request failed"
-                            );
-                        }
-                    }
-                } else {
-                    // Fire-and-forget mirror request
-                    let config_id_clone = config_id.to_string();
-                    let mirror_endpoint_for_task = mirror_endpoint_for_log.clone();
-                    tokio::spawn(async move {
-                        match mirror_req_with_headers
-                            .send()
-                            .await
-                        {
-                            Ok(resp) => {
-                                channel_info!(
-                                    config_id_clone,
-                                    "Mirror request completed (async): endpoint={}, status={}",
-                                    mirror_endpoint_for_task,
-                                    resp.status().as_u16()
-                                );
-                            }
-                            Err(e) => {
-                                channel_warn!(
-                                    config_id_clone,
-                                    "Mirror request failed (async): endpoint={}, error={}",
-                                    mirror_endpoint_for_task,
-                                    e.without_url()
-                                );
-                            }
-                        }
-                    });
-                    debug!(
+        if mirror_config.wait_for_response {
+            match mirror::send(mirror_request).await {
+                Ok(status) => {
+                    info!(
                         channel = channel_name,
                         mirror_endpoint = mirror_endpoint_for_log,
-                        "Mirror request sent (fire-and-forget)"
+                        status = status.as_u16(),
+                        trace_id = trace_id,
+                        "Mirror request completed"
                     );
                 }
-            } else {
-                warn!(channel = channel_name, "Failed to clone request for mirroring");
+                Err(e) => {
+                    warn!(
+                        channel = channel_name,
+                        mirror_endpoint = mirror_endpoint_for_log,
+                        error = %e,
+                        trace_id = trace_id,
+                        "Mirror request failed"
+                    );
+                }
             }
+        } else {
+            let config_id_clone = config_id.to_string();
+            let mirror_endpoint_for_task = mirror_endpoint_for_log.clone();
+            tokio::spawn(async move {
+                match mirror::send(mirror_request).await {
+                    Ok(status) => {
+                        channel_info!(
+                            config_id_clone,
+                            "Mirror request completed (async): endpoint={}, status={}",
+                            mirror_endpoint_for_task,
+                            status.as_u16()
+                        );
+                    }
+                    Err(e) => {
+                        channel_warn!(
+                            config_id_clone,
+                            "Mirror request failed (async): endpoint={}, error={}",
+                            mirror_endpoint_for_task,
+                            e
+                        );
+                    }
+                }
+            });
+            debug!(
+                channel = channel_name,
+                mirror_endpoint = mirror_endpoint_for_log,
+                "Mirror request sent (fire-and-forget)"
+            );
         }
     }
 
@@ -9149,6 +9128,7 @@ async fn proxy_charged_request(
                     surface: &state.surface,
                     response_rules_engine: &state.identity_rules_engine,
                     metrics_store: &state.metrics_store,
+                    verified_presentation: false,
                 };
                 crate::protocols::extensions::inspect_response_extensions(&response_body, &response_ctx).await
             };
@@ -9446,7 +9426,6 @@ async fn proxy_charged_request(
                 response_json,
                 "success",
                 None,
-                identity_hash.clone(),
             )
             .await;
         }
@@ -11056,7 +11035,7 @@ async fn handle_fabric_request_inner(
         mcp_metadata_context,
         mcp_verified_binding,
         mcp_classification,
-        subscription_lifetime,
+        mut subscription_lifetime,
         mcp_continuations,
         payment,
     } = request;
@@ -12110,6 +12089,7 @@ async fn handle_fabric_request_inner(
                     peer_did: remote_gateway_did.clone(),
                 },
                 payment.is_some_and(agent_pay_gate::Intake::is_unpaid),
+                subscription_lifetime.as_mut(),
             )
             .await
             {
@@ -12165,32 +12145,8 @@ async fn handle_fabric_request_inner(
 
     // Traffic mirroring for fabric:// protocol - send duplicate request to mirror endpoint (if configured)
     if let Some(mirror_config) = state.surface.mirror() {
-        // Check if we should mirror this request based on percentage
-        let should_mirror = if mirror_config.percentage >= 100 {
-            true
-        } else if mirror_config.percentage == 0 {
-            false
-        } else {
-            use rand::Rng;
-            let mut rng = rand::rng();
-            rng.random_range(0..100) < mirror_config.percentage
-        };
-
-        if should_mirror {
-            let mirror_endpoint = mirror_config.endpoint.clone();
-            let mirror_endpoint_for_log = loggable::url(&mirror_endpoint);
-            let mirror_timeout = std::time::Duration::from_secs(mirror_config.timeout_secs);
-            let wait_for_response = mirror_config.wait_for_response;
-            let client = crate::http_client::with_timeout(mirror_timeout).unwrap_or_else(|_| reqwest::Client::new());
-            let trace_id_clone = trace_id.clone();
-
-            // Build mirror request
-            let mirror_req = client
-                .request(method.clone(), &mirror_endpoint)
-                .body(body_bytes.to_vec())
-                .timeout(mirror_timeout);
-
-            // Copy headers
+        if mirror::selected(mirror_config.percentage) {
+            let mirror_endpoint_for_log = loggable::url(&mirror_config.endpoint);
             let source_cred_headers = state
                 .surface
                 .source_credential_headers();
@@ -12198,89 +12154,70 @@ async fn handle_fabric_request_inner(
                 .surface
                 .access_point
                 .header_metadata_mapping_if_supported();
-            let mut mirror_req_with_headers = mirror_req;
-            for (key, value) in headers.iter() {
-                if should_forward_ap_request_header_with_mapping(
-                    key.as_str(),
-                    &source_cred_headers,
-                    header_metadata_mapping,
-                    None,
-                ) {
-                    mirror_req_with_headers = mirror_req_with_headers.header(key.as_str(), value.as_bytes());
-                }
-            }
-            mirror_req_with_headers =
-                mirror_req_with_headers.header("X-Gateway-Trace-Id", format!("{}-mirror", trace_id_clone));
-            mirror_req_with_headers = mirror_req_with_headers.header("X-Mirrored-Request", "true");
-            mirror_req_with_headers = mirror_req_with_headers.header("X-Fabric-Gateway", gateway_id);
-            mirror_req_with_headers = mirror_req_with_headers.header("X-Fabric-Channel", channel_id);
+            let bound_target = crate::proxy::target_grant::binds_the_target(&state.surface);
+            let credential_headers = target_credential_header_names(&state.surface);
+            let mirror_request = mirror::MirrorRequest::new(mirror_config, method.clone(), body_bytes.to_vec())
+                .headers_from(&headers, |name| {
+                    forwards_target_header(
+                        name,
+                        bound_target,
+                        &source_cred_headers,
+                        header_metadata_mapping,
+                        None,
+                        &credential_headers,
+                    )
+                })
+                .mirrored(Some(&trace_id))
+                .header("X-Fabric-Gateway", gateway_id)
+                .header("X-Fabric-Channel", channel_id);
 
-            if wait_for_response {
+            if mirror_config.wait_for_response {
                 // Wait for mirror response (blocking) - fabric request will be blocked if mirror fails
-                match mirror_req_with_headers
-                    .send()
-                    .await
-                {
-                    Ok(resp) => {
+                match mirror::send(mirror_request).await {
+                    Ok(status) => {
                         channel_info!(
                             config_id,
                             "Fabric mirror request completed: endpoint={}, status={}",
                             mirror_endpoint_for_log,
-                            resp.status().as_u16()
+                            status.as_u16()
                         );
                     }
                     Err(e) => {
-                        let error_type = if e.is_timeout() {
-                            "timeout"
-                        } else if e.is_connect() {
-                            "connection refused"
-                        } else if e.is_request() {
-                            "invalid request"
-                        } else {
-                            "network error"
-                        };
-
+                        let error_type = e.kind();
                         channel_error!(
                             config_id,
                             "Fabric mirror request failed ({}): endpoint={}, error={}",
                             error_type,
                             mirror_endpoint_for_log,
-                            e.without_url()
+                            e
                         );
 
                         // For synchronous mirroring, return error if mirror fails
                         connection_guard
                             .decrement()
                             .await;
-                        return Err(create_error_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            &format!("Traffic mirroring failed ({error_type}): the mirror endpoint is unreachable"),
-                        ));
+                        return Err(create_error_response(StatusCode::SERVICE_UNAVAILABLE, &e.caller_message()));
                     }
                 }
             } else {
                 // Fire-and-forget mirror request
-                let mirror_endpoint_clone = mirror_endpoint_for_log.clone();
                 let config_id_clone = config_id.to_string();
                 tokio::spawn(async move {
-                    match mirror_req_with_headers
-                        .send()
-                        .await
-                    {
-                        Ok(resp) => {
+                    match mirror::send(mirror_request).await {
+                        Ok(status) => {
                             channel_info!(
                                 config_id_clone,
                                 "Fabric mirror request completed (async): endpoint={}, status={}",
-                                mirror_endpoint_clone,
-                                resp.status().as_u16()
+                                mirror_endpoint_for_log,
+                                status.as_u16()
                             );
                         }
                         Err(e) => {
                             channel_warn!(
                                 config_id_clone,
                                 "Fabric mirror request failed (async): endpoint={}, error={}",
-                                mirror_endpoint_clone,
-                                e.without_url()
+                                mirror_endpoint_for_log,
+                                e
                             );
                         }
                     }
@@ -13550,6 +13487,65 @@ async fn handle_fabric_request_inner(
                 let is_well_known_card_response =
                     crate::proxy::paths::is_well_known_agent_card_path(uri.path()) && status < 400;
 
+                // ── Verify the answering agent's identity presentation ─────────
+                let mut answer_presentation_verified = false;
+                let presented_identity = if state
+                    .surface
+                    .managed_identity()
+                    .is_some()
+                    && (200..300).contains(&status)
+                    && !response_body.is_empty()
+                {
+                    let response_audit_facts = crate::audit::request_events::RequestFacts {
+                        surface_id: config_id,
+                        channel_name,
+                        trace_id: Some(trace_id.as_str()),
+                        via_fabric: true,
+                    };
+                    let listener_manager = state
+                        .listener_manager
+                        .read()
+                        .await
+                        .clone();
+                    match crate::proxy::fabric_identity::check_answer_identity(
+                        crate::proxy::fabric_identity::AnswerIdentityCheck {
+                            response_body: &response_body,
+                            surface: &state.surface,
+                            vc_issuer: state.vc_issuer.as_ref(),
+                            listener_manager,
+                            gateway_id,
+                            facts: &response_audit_facts,
+                            caller: authenticated_identity
+                                .as_ref()
+                                .map(crate::delegation_vault::audit::build_caller_context),
+                        },
+                    )
+                    .await
+                    {
+                        Ok(presentation) => presentation
+                            .inspect(|_| answer_presentation_verified = true)
+                            .filter(|_| {
+                                crate::proxy::backend_identity::slot_reads_response_body(
+                                    &state.surface,
+                                    crate::proxy::backend_identity::IdentitySlot::Protected,
+                                )
+                            })
+                            .map(|presentation| ProtectedAgentIdentity::Managed {
+                                did: presentation.agent_did,
+                                identity_fields: presentation.identity_fields,
+                            }),
+                        Err(refusal) => {
+                            error!(channel = channel_name, ?refusal, "Fabric: answer identity presentation refused");
+                            connection_guard
+                                .decrement()
+                                .await;
+                            return Err(create_error_response(StatusCode::BAD_GATEWAY, refusal.detail()));
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 // ── Step 12: Resolve Protected Agent Identity (fabric path) ─────
                 let is_agent_card_request = is_well_known_card_response || is_extended_card_response;
                 let identity_response_kind = crate::proxy::backend_identity::IdentityResponseKind::for_response(
@@ -13568,7 +13564,9 @@ async fn handle_fabric_request_inner(
                     .or(state
                         .identity_rules_engine
                         .as_ref());
-                let resolved_identity = if (200..300).contains(&status) && !response_body.is_empty() {
+                let resolved_identity = if let Some(identity) = presented_identity {
+                    identity
+                } else if (200..300).contains(&status) && !response_body.is_empty() {
                     match crate::proxy::backend_identity::resolve_protected_agent_identity(
                         response_body.as_bytes(),
                         &state.surface,
@@ -14189,7 +14187,6 @@ async fn handle_fabric_request_inner(
                         outbound_response,
                         validation_status,
                         None, // validation_error
-                        identity_hash.clone(),
                     )
                     .await;
 
@@ -14197,52 +14194,6 @@ async fn handle_fabric_request_inner(
                         "📡 Broadcast 4-stage payload capture for fabric flow (GW1) - channel: {}, config_id: {}",
                         channel_name, config_id
                     );
-                }
-
-                // Extract and verify backend agent identity from fabric response (multi-gateway only)
-                // This verifies VPs sent by GW2 instead of computing raw identity
-                let _agent_identity = if state
-                    .surface
-                    .managed_identity()
-                    .is_some()
-                {
-                    match crate::proxy::fabric_identity::extract_fabric_backend_agent_identity(
-                        &response_body,
-                        &state.surface,
-                        &state.identity_selector,
-                        channel_name,
-                    )
-                    .await
-                    {
-                        Ok(identity_opt) => {
-                            if let Some(ref agent_did) = identity_opt {
-                                info!(
-                                    channel = channel_name,
-                                    did = agent_did,
-                                    "Fabric: Verified backend agent identity from GW2"
-                                );
-                            }
-                            identity_opt
-                        }
-                        Err(e) => {
-                            // VP verification failed - reject the response (Policy: Option C)
-                            error!(channel = channel_name, error = %e, "Fabric: Backend agent VP verification failed");
-                            connection_guard
-                                .decrement()
-                                .await;
-                            return Err(create_error_response(
-                                StatusCode::BAD_GATEWAY,
-                                &format!("Backend agent identity verification failed: {}", e),
-                            ));
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                if let Some(ref agent_did) = _agent_identity {
-                    // Log for metrics/audit purposes
-                    debug!(channel = channel_name, did = agent_did, "Fabric: Backend agent DID extracted and verified");
                 }
 
                 // Inspect response extensions if enabled (same as direct path)
@@ -14295,6 +14246,7 @@ async fn handle_fabric_request_inner(
                                 surface: &state.surface,
                                 response_rules_engine: &state.identity_rules_engine,
                                 metrics_store: &state.metrics_store,
+                                verified_presentation: answer_presentation_verified,
                             };
                             crate::protocols::extensions::inspect_response_extensions(
                                 _response_body_bytes,
@@ -15866,7 +15818,6 @@ async fn handle_mcp_proxy_request_inner(
                 prepared,
                 &state.surface,
                 state.policy_manager.as_ref(),
-                &state.client,
                 channel_name,
                 sent_token.as_ref(),
             )
@@ -16072,7 +16023,6 @@ async fn handle_mcp_proxy_request_inner(
                 Some(response_json.clone()),
                 "success", // MCP protocol doesn't have A2A extension validation
                 None,
-                None, // identity_hash - MCP channels might not have identity tracking
             )
             .await;
 
@@ -16156,7 +16106,6 @@ async fn handle_mcp_proxy_request_inner(
                 None,
                 "mcp_error", // Custom status to differentiate MCP errors from A2A validation failures
                 Some(format!("MCP Proxy Error: {}", e)),
-                None,
             )
             .await;
 
@@ -24245,6 +24194,33 @@ allow if {
         assert!(text.contains("error=error sending request "), "{text}");
         assert!(!text.contains("endpoint-key-value"), "a log holds the target's query value: {text}");
         assert!(!text.contains("for url"), "a log holds the reqwest error URL: {text}");
+    }
+}
+
+#[cfg(test)]
+mod target_header_filter_tests {
+    use super::forwards_target_header;
+
+    #[test]
+    fn a_header_named_like_a_target_credential_header_is_not_forwarded() {
+        for name in ["x-target-key", "X-Target-Key", "x_target_key"] {
+            assert!(!forwards_target_header(name, false, &[], None, None, &["X-Target-Key"]), "{name}");
+        }
+        assert!(forwards_target_header("accept-language", false, &[], None, None, &["X-Target-Key"]));
+    }
+
+    #[test]
+    fn a_target_bound_by_consent_is_forwarded_only_the_protocol_headers() {
+        assert!(!forwards_target_header("accept-language", true, &[], None, None, &[]));
+        assert!(!forwards_target_header("x-forwarded-for", true, &[], None, None, &[]));
+        assert!(forwards_target_header("mcp-session-id", true, &[], None, None, &[]));
+    }
+
+    #[test]
+    fn the_forwarded_token_header_goes_on_only_when_the_caller_names_it() {
+        assert!(forwards_target_header("x-jwt", false, &[], None, Some("x-jwt"), &[]));
+        assert!(!forwards_target_header("x-jwt", false, &["x-jwt"], None, None, &[]));
+        assert!(forwards_target_header("x-jwt", false, &["x-jwt"], None, Some("x-jwt"), &[]));
     }
 }
 

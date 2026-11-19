@@ -461,7 +461,7 @@ async fn append_key_entry(
     .await
     .map_err(|e| config("update the DID", e.to_string()))?;
     let entry = serde_json::to_string(updated.log_entry()).map_err(|e| config("encode the entry", e.to_string()))?;
-    crate::storage::did_artifacts::append_did_log_raw(dir, &entry)
+    crate::storage::did_artifacts::append_did_log_raw(dir, &raw, &entry)
         .await
         .map_err(|e| config("publish the entry", e.to_string()))?;
     Ok(true)

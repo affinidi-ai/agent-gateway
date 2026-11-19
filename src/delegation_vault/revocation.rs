@@ -528,7 +528,7 @@ const RETRY_EXHAUSTED: &str = "retry:exhausted";
 
 /// A removed grant to revoke, with the pending revocation the vault keeps
 /// for it, when it could keep one.
-struct ToRevoke {
+pub(super) struct ToRevoke {
     grant: DelegatedGrant,
     kept: Option<DeferredRevocation>,
 }
@@ -1053,6 +1053,41 @@ pub async fn revoke_unkept(
     revoker: Revoker,
 ) {
     revoke_each(grants, &revoker, Some(UNKEPT_TOKENS)).await;
+}
+
+/// What the audit record of a revocation ends with when the grant was removed
+/// because its consent ended at its time limit.
+const CONSENT_EXPIRED: &str = super::consent_age::AskedAgain::ConsentExpired.as_str();
+
+/// Revoke grants removed because their consent ended at its time limit, as
+/// [`revoke_removed`] revokes removed grants, their audit records ending
+/// `,consent_expired`: the outcome of an expiry, which nobody revoked.
+pub async fn revoke_expired(
+    grants: Vec<DelegatedGrant>,
+    revoker: Revoker,
+) {
+    revoke_each(grants, &revoker, Some(CONSENT_EXPIRED)).await;
+}
+
+/// Keep `grants`, removed because their consent ended, as pending revocations
+/// for [`revoke_kept_expired`], so one that is never revoked is tried again by
+/// the daily sweep.
+pub(super) async fn keep_expired(
+    grants: Vec<DelegatedGrant>,
+    revoker: &Revoker,
+) -> Vec<ToRevoke> {
+    keep_pending(revoker.vault.as_ref(), &revoker.providers, grants).await
+}
+
+/// Revoke, in the background, the grants [`keep_expired`] kept, as
+/// [`revoke_expired`] does. Nothing waits for a vendor to answer.
+pub(super) fn revoke_kept_expired(
+    kept: Vec<ToRevoke>,
+    revoker: Revoker,
+) {
+    if !kept.is_empty() {
+        tokio::spawn(async move { decide_each(kept, &revoker, Some(CONSENT_EXPIRED), false).await });
+    }
 }
 
 /// Revoke grants already removed from the vault, at most

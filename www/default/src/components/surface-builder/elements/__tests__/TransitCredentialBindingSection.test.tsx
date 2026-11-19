@@ -68,5 +68,19 @@ describe('Transit Point credential binding', () => {
       }
     });
     expect(screen.queryByTestId('transit-point-binding-subject')).toBeNull();
+    expect(screen.queryByTestId('transit-point-binding-consent-limit')).toBeNull();
+  });
+
+  it('shows a consent time limit set through the API', async () => {
+    render(
+      <TransitCredentialBindingSection
+        value={{ ...binding('on_demand'), max_consent_age_secs: 21_600 }}
+        onChange={() => {}}
+      />
+    );
+    await screen.findByText('Vendor');
+    expect(screen.getByTestId('transit-point-binding-consent-limit')).toHaveTextContent(
+      'Consent time limit: 6 hours, set through the API.'
+    );
   });
 });

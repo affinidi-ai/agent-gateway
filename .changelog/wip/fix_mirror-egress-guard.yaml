@@ -1,0 +1,28 @@
+branch: fix/mirror-egress-guard
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-16T16:56:12Z'
+      title: Apply the Target egress guard to traffic mirror endpoints
+      description: >-
+        A traffic mirror endpoint was neither checked on save nor before sending, so a surface editor
+        could aim a mirror at a cloud metadata service. Saving a surface or variant now refuses a
+        mirror endpoint that is not http or https, that carries credentials or that names cloud
+        metadata, and a mirror timeout_secs of zero or above 30. Every mirrored request on the direct,
+        fabric:// and owned MCP Proxy paths resolves DNS once, is refused for a metadata address, is
+        pinned to the vetted address and does not follow redirects, all within the mirror's one
+        timeout_secs budget. The mirror is also sent only the caller headers the Target is sent: a
+        header named like a Target credential header is dropped, and a Target bound by external
+        consent gets its mirror only the protocol headers. Loopback and private addresses stay
+        allowed, as for the Target. On upgrade, a stored surface whose mirror would be refused still
+        loads, logs one refusal per request and gets 400 on its next save; a stored timeout_secs above
+        30 runs as 30; a fabric:// surface waiting on a refused mirror answers 503; a mirror that
+        answers with a redirect is no longer followed to the new location, and the log reports the
+        3xx as completed; a mirror URL with user:pass@ is refused, so a mirror that relied on it must
+        authenticate another way; a mirror that read a caller header the Target is refused stops
+        receiving it; and the gateway must resolve the mirror host itself even when HTTP_PROXY or
+        HTTPS_PROXY is set.
+  breaking: []

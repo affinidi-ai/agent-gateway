@@ -8,6 +8,8 @@ import {
   splitByTenant,
 } from '../../../../utils/tenantScope';
 import { useSurfaceTenant } from '../../SurfaceMetaContext';
+import { consentLimitFieldOf } from '../../../../utils/consentLimit';
+import BindingConsentLimitNote from './BindingConsentLimitNote';
 
 interface CredentialProviderOption {
   id: string;
@@ -35,6 +37,8 @@ export interface TransitCredentialsForm {
   elicit_fallback?: string;
   /** Whose account an `external` binding's grant is: kept from the stored value. */
   subject?: 'owner' | 'caller';
+  /** The binding's consent time limit, in seconds: kept from the stored value and shown. */
+  max_consent_age_secs?: number;
 }
 
 /** Labels of the consent modes the select shows only when they are stored. */
@@ -76,6 +80,9 @@ export function transitCredentialsFormToApi(f: TransitCredentialsForm | null | u
     ...(f.elicit_timeout_secs !== undefined ? { elicit_timeout_secs: f.elicit_timeout_secs } : {}),
     ...(f.elicit_fallback !== undefined ? { elicit_fallback: f.elicit_fallback } : {}),
     ...(f.subject !== undefined ? { subject: f.subject } : {}),
+    ...(f.max_consent_age_secs !== undefined
+      ? { max_consent_age_secs: f.max_consent_age_secs }
+      : {}),
   };
 }
 
@@ -107,6 +114,7 @@ export function transitCredentialsApiToForm(api: any): TransitCredentialsForm | 
       : {}),
     ...(api.elicit_fallback !== undefined ? { elicit_fallback: api.elicit_fallback } : {}),
     ...(api.subject === 'owner' || api.subject === 'caller' ? { subject: api.subject } : {}),
+    ...consentLimitFieldOf(api),
   };
 }
 
@@ -314,6 +322,10 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
                 removing this binding revokes its grants.
               </Form.Text>
             )}
+            <BindingConsentLimitNote
+              secs={value.max_consent_age_secs}
+              testId="transit-point-binding-consent-limit"
+            />
           </Form.Group>
 
           <Form.Group className="mb-2">

@@ -1086,7 +1086,7 @@ async fn outbound_proxy_handler_in_request_scope(
     // before anything is resolved or forwarded for it.
     step_check_fabric_hops(&ctx)?;
 
-    let subscription_lifetime = match ctx
+    let mut subscription_lifetime = match ctx
         .mcp_classification
         .as_ref()
     {
@@ -1168,33 +1168,29 @@ async fn outbound_proxy_handler_in_request_scope(
     // [7] Custom Metadata Injection
     step_inject_custom_metadata(&state, &mut ctx).await?;
 
-    // Public discovery reads (agent card, UCP well-known) are metadata-only
-    // reads — skip trust context, trust check, and OPA evaluation.
-    if !is_transit_discovery_read(&ctx) {
-        // [8] Trust Context Collection
-        step_collect_trust_context(&state, &mut ctx).await?;
+    // [8] Trust Context Collection
+    step_collect_trust_context(&state, &mut ctx).await?;
 
-        // [8b] Trust Check stage (target leg) — runs before any OPA so all
-        // three outbound OPA scopes see the same `input.trust_check_results`.
-        step_trust_check(&state, &mut ctx).await?;
+    // [8b] Trust Check stage (target leg) — runs before any OPA so all
+    // three outbound OPA scopes see the same `input.trust_check_results`.
+    step_trust_check(&state, &mut ctx).await?;
 
-        // [9] Gateway-Level OPA Policy
-        step_gateway_opa_policy(&state, &mut ctx).await?;
+    // [9] Gateway-Level OPA Policy
+    step_gateway_opa_policy(&state, &mut ctx).await?;
 
-        // [10] Surface-Level OPA Policy
-        step_surface_opa_policy(&state, &mut ctx).await?;
+    // [10] Surface-Level OPA Policy
+    step_surface_opa_policy(&state, &mut ctx).await?;
 
-        // [9.5] Per-Transit-Point OPA Policy (§6.2 step 10)
-        step_transit_point_opa_policy(&state, &mut ctx).await?;
+    // [9.5] Per-Transit-Point OPA Policy (§6.2 step 10)
+    step_transit_point_opa_policy(&state, &mut ctx).await?;
 
-        // [10.6] Per-Transit-Point MCP Tool Gating (tools/call leg) — blocks an
-        // outbound tools/call whose tool this TP's gating firewall hides.
-        step_transit_mcp_tool_gating(&state, &mut ctx).await?;
-    }
+    // [10.6] Per-Transit-Point MCP Tool Gating (tools/call leg) — blocks an
+    // outbound tools/call whose tool this TP's gating firewall hides.
+    step_transit_mcp_tool_gating(&state, &mut ctx).await?;
 
     // [11] Credential Injection (§5.3 / §6.2 step 12)
     // Inject delegated OAuth tokens from the credential vault, or signal consent_required.
-    if let Some(response) = step_prepare_modern_credentials(&state, &mut ctx).await? {
+    if let Some(response) = step_prepare_modern_credentials(&state, &mut ctx, subscription_lifetime.as_mut()).await? {
         return Ok(response);
     }
     step_inject_credentials(&state, &mut ctx).await?;
@@ -1305,23 +1301,6 @@ async fn validate_transit_token(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
-    // Public discovery reads (a GET or HEAD of an agent card or other discovery
-    // document at the Transit Point's root) are unauthenticated metadata reads.
-    // The transit token is a transit-point *authorization* control, so it
-    // doesn't apply to them — mirroring the discovery bypass the later
-    // identity/trust-context/trust-check/OPA stages already use. Without this an
-    // agent-card fetch through a transit point is rejected for a missing
-    // `X-Transit-Token` before it can reach those bypasses. The trace id stays the
-    // one `OutboundContext::new` derived (no token to adopt one from), which is
-    // fine for a standalone metadata read.
-    if is_transit_discovery_read(ctx) {
-        debug!(
-            request_id = %ctx.request_id,
-            "Transit token validation skipped for public discovery path"
-        );
-        return Ok(());
-    }
-
     let modern = matches!(
         ctx.mcp_classification
             .as_ref(),
@@ -4931,9 +4910,12 @@ async fn step_inject_trusted_identity(
     Ok(())
 }
 
+/// Prepares the delegated credentials of a `2026-07-28` MCP request, and ends
+/// `stream`, the stream the request opens, with the consents it carries.
 async fn step_prepare_modern_credentials(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
+    stream: Option<&mut crate::mcp::subscriptions::SubscriptionLifetime>,
 ) -> Result<Option<Response>, OutboundPipelineError> {
     use crate::proxy::credential_delegation::modern::{ModernDelegationError, ModernDelegationResult, prepare_transit};
     let Some(crate::mcp::request_validation::McpRequestClassification::Modern(request)) =
@@ -4974,7 +4956,7 @@ async fn step_prepare_modern_credentials(
             ModernDelegationError::from(crate::mcp::continuations::ContinuationError::Unavailable).response(&request),
         ));
     };
-    match prepare_transit(state, runtime, ctx, &request).await {
+    match prepare_transit(state, runtime, ctx, &request, stream).await {
         Ok(ModernDelegationResult::InputRequired(response)) => {
             Ok(Some(([("cache-control", "no-store")], axum::Json(response)).into_response()))
         }
@@ -5325,8 +5307,8 @@ fn refuse_partner_consent(ctx: &OutboundPipelineContext) -> OutboundPipelineErro
 /// The caller is the one [`delegation_caller_hash`] names. The channel's `outbound_credentials`
 /// bindings determine which credential providers to look up. A binding that applies
 /// but cannot be resolved refuses the request; it is never forwarded without the
-/// credential. A public discovery read carries no caller, so, as with target
-/// authentication, no caller's credential is released for it.
+/// credential. A discovery read is forwarded without a caller credential, so, as with
+/// target authentication, no caller's credential is released for it.
 async fn step_inject_credentials(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
@@ -5529,17 +5511,11 @@ async fn step_inject_credentials(
     // Check for consent_required — if any binding needs consent, return the signal
     let mut consent_entries = Vec::new();
     for resolution in &results {
-        if let crate::proxy::credential_delegation::DelegationLookupResult::ConsentRequired {
-            authorization_url,
-            provider_name,
-            scopes,
-        } = &resolution.result
+        if let Some(entry) = resolution
+            .result
+            .consent_entry()
         {
-            consent_entries.push(serde_json::json!({
-                "provider_name": provider_name,
-                "authorization_url": authorization_url,
-                "scopes": scopes,
-            }));
+            consent_entries.push(entry);
         }
     }
 
@@ -5785,6 +5761,8 @@ pub struct ReleasedGrant {
     key: crate::delegation_vault::grants::GrantKey,
     subject: crate::config::agent_surface::GrantSubject,
     injection: crate::config::types::CredentialInjection,
+    /// The binding's time limit on the consent of its grants.
+    max_consent_age_secs: Option<u64>,
 }
 
 /// [11a] A Transit Point's `consent_mode = external` binding: release the
@@ -5944,6 +5922,7 @@ async fn step_inject_external_grant(
         },
         None => return Err(refuse_external_grant(ctx, "no_subject")),
     };
+    let max_consent_age_secs = binding.max_consent_age_secs;
     let release = crate::delegation_vault::release::ReleaseContext {
         vault,
         secrets: state.secrets_store.as_ref(),
@@ -5955,6 +5934,7 @@ async fn step_inject_external_grant(
                 .network_config
                 .external_consent_refresh_refusals,
         ),
+        max_consent_age_secs,
     };
     let grant = match release
         .release(&provider, &key, subject)
@@ -5974,11 +5954,8 @@ async fn step_inject_external_grant(
             &provider.default_scopes,
         )
     {
-        return Err(refuse_grant(
-            ctx,
-            crate::delegation_vault::release::GrantRefusal::connect_required(&key, subject),
-            "grant_beyond_the_bindings_scopes",
-        ));
+        let refused = crate::delegation_vault::release::Refused::beyond_the_bindings_scopes(&provider, &key, subject);
+        return Err(refuse_grant(ctx, refused.refusal, refused.reason));
     }
     let injection = binding
         .inject_as
@@ -5990,7 +5967,7 @@ async fn step_inject_external_grant(
     // that carries it is sent ([`record_mcp_proxy_grant_sent`]).
     if !through_proxy {
         crate::delegation_vault::release::record_use_in_background(vault, &grant, Some(ctx.request_id.clone()));
-        audit_grant_injected(ctx, &caller, &provider, &grant, subject);
+        log_grant_injected(ctx, &caller, &provider, &grant, subject);
     }
     ctx.released_grant = Some(Box::new(ReleasedGrant {
         grant,
@@ -5998,6 +5975,7 @@ async fn step_inject_external_grant(
         key,
         subject,
         injection,
+        max_consent_age_secs,
     }));
     Ok(())
 }
@@ -6027,11 +6005,11 @@ fn record_mcp_proxy_grant_sent(
         );
     }
     let caller = delegation_caller_hash(ctx).unwrap_or_default();
-    audit_grant_injected(ctx, &caller, &released.provider, &released.grant, released.subject);
+    log_grant_injected(ctx, &caller, &released.provider, &released.grant, released.subject);
 }
 
-/// Audit that a grant by binding was injected into a request.
-fn audit_grant_injected(
+/// Log that a grant by binding was injected into a request.
+fn log_grant_injected(
     ctx: &OutboundPipelineContext,
     caller: &str,
     provider: &crate::credential_providers::CredentialProvider,
@@ -7112,9 +7090,8 @@ fn compute_outbound_remainder_path(
         .to_string()
 }
 
-/// Whether the request is a public discovery read of the Transit Point's target:
-/// a `GET` or `HEAD` of a discovery document at the target's root. It is
-/// forwarded without a transit token check, the request gates, or any credential.
+/// Whether the request is a discovery read of the Transit Point's target:
+/// a `GET` or `HEAD` of a discovery document at the target's root.
 fn is_transit_discovery_read(ctx: &OutboundPipelineContext) -> bool {
     crate::proxy::paths::is_transit_discovery_request(
         ctx.original_method.as_str(),
@@ -7129,8 +7106,8 @@ fn is_transit_discovery_read(ctx: &OutboundPipelineContext) -> bool {
     )
 }
 
-/// A public discovery read was not authenticated, so the gateway vouches for no
-/// caller on it; any other Transit Point request was.
+/// A discovery read is forwarded without a caller credential; any other Transit
+/// Point request carries one.
 fn transit_caller_assertion(ctx: &OutboundPipelineContext) -> crate::proxy::handler::CallerAssertion {
     if is_transit_discovery_read(ctx) {
         crate::proxy::handler::CallerAssertion::Unauthenticated
@@ -7259,6 +7236,7 @@ async fn step_answer_a_refused_grant(
         key,
         subject,
         injection,
+        max_consent_age_secs,
     } = *released;
     let Some(vault) = state
         .delegation_vault_store
@@ -7277,6 +7255,7 @@ async fn step_answer_a_refused_grant(
                 .network_config
                 .external_consent_refresh_refusals,
         ),
+        max_consent_age_secs,
     };
     let may_resend = ctx
         .body_bytes
@@ -7296,7 +7275,7 @@ async fn step_answer_a_refused_grant(
     // sent ([`record_mcp_proxy_grant_sent`]).
     if !is_mcp_proxy_transit_point(ctx) {
         let caller = delegation_caller_hash(ctx).unwrap_or_default();
-        audit_grant_injected(ctx, &caller, &provider, &fresh, subject);
+        log_grant_injected(ctx, &caller, &provider, &fresh, subject);
     }
     ctx.released_grant = Some(Box::new(ReleasedGrant {
         grant: fresh,
@@ -7304,6 +7283,7 @@ async fn step_answer_a_refused_grant(
         key,
         subject,
         injection,
+        max_consent_age_secs,
     }));
     let retried = forward_once(state, ctx).await?;
     if let Err(refused) = vendor_answer_to_a_retry(retried.status(), retried.headers()) {
@@ -8583,7 +8563,7 @@ mod tests {
                 "io.modelcontextprotocol/clientCapabilities": {"elicitation": {"url": {}}}}
         }});
         let mut ctx = context_for(&message, &surface);
-        let missing = step_prepare_modern_credentials(&state, &mut ctx)
+        let missing = step_prepare_modern_credentials(&state, &mut ctx, None)
             .await
             .unwrap()
             .unwrap();
@@ -8602,7 +8582,7 @@ mod tests {
                 .resource,
             resource
         );
-        let response = step_prepare_modern_credentials(&state, &mut ctx)
+        let response = step_prepare_modern_credentials(&state, &mut ctx, None)
             .await
             .unwrap()
             .unwrap();
@@ -8621,11 +8601,11 @@ mod tests {
             ) -> (StatusCode, serde_json::Value) {
                 // As in the flow below: the first pass asks for resource
                 // authorization, which source authentication then supplies.
-                let _ = step_prepare_modern_credentials(state, &mut ctx).await;
+                let _ = step_prepare_modern_credentials(state, &mut ctx, None).await;
                 step_source_auth(state, &mut ctx)
                     .await
                     .unwrap();
-                let response = step_prepare_modern_credentials(state, &mut ctx)
+                let response = step_prepare_modern_credentials(state, &mut ctx, None)
                     .await
                     .unwrap()
                     .expect("the credential step answers without forwarding");
@@ -8747,7 +8727,7 @@ mod tests {
                     .await
                     .unwrap();
                 assert!(
-                    step_prepare_modern_credentials(&state, &mut ctx)
+                    step_prepare_modern_credentials(&state, &mut ctx, None)
                         .await
                         .unwrap()
                         .is_none()
@@ -8793,7 +8773,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                step_prepare_modern_credentials(&state, &mut replay)
+                step_prepare_modern_credentials(&state, &mut replay, None)
                     .await
                     .unwrap()
                     .unwrap()
@@ -14845,7 +14825,7 @@ mod tests {
                 .is_none()
         );
 
-        let refused = prepare_transit(&state, &runtime, &mut ctx, &request)
+        let refused = prepare_transit(&state, &runtime, &mut ctx, &request, None)
             .await
             .err()
             .expect("the modern path refuses without a resource-server authorization");
@@ -14855,7 +14835,7 @@ mod tests {
         ctx.authenticated_by = None;
         ctx.transit_token_claims =
             Some(caller_claims(Some("did:example:agent"), Some("gateway-computed"), Some("abc123"), json!({})));
-        let refused = prepare_transit(&state, &runtime, &mut ctx, &request)
+        let refused = prepare_transit(&state, &runtime, &mut ctx, &request, None)
             .await
             .err()
             .expect("a caller only a transit token names is refused on the modern path too");
@@ -14909,7 +14889,7 @@ mod tests {
             ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
             ctx.transit_token_claims = Some(caller_claims(Some("did:example:agent"), None, None, json!({})));
 
-            let answer = step_prepare_modern_credentials(&state, &mut ctx)
+            let answer = step_prepare_modern_credentials(&state, &mut ctx, None)
                 .await
                 .unwrap();
             match (answer, refused) {
@@ -14976,7 +14956,7 @@ mod tests {
             ctx.authenticated_identity = Some(alice.clone());
             ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::ResourceToken);
             ctx.transit_token_claims = Some(claims);
-            let response = step_prepare_modern_credentials(&state, &mut ctx)
+            let response = step_prepare_modern_credentials(&state, &mut ctx, None)
                 .await
                 .unwrap()
                 .expect("a binding applies and no grant is prepared");
@@ -15903,42 +15883,124 @@ mod tests {
         );
     }
 
-    /// Only a `GET` or `HEAD` of a discovery document at the Transit Point's
-    /// root, as its target receives the path, skips the transit token, and
-    /// exactly those requests carry no caller credential.
-    #[tokio::test]
-    async fn only_a_discovery_read_at_the_transit_point_root_skips_the_transit_token() {
+    const TRANSIT_TEST_BASE: &str = "/outbound/surfaces/order/partner-a";
+    const TRANSIT_TEST_SURFACE: &str = "test-surf-001";
+
+    const TRANSIT_DISCOVERY_READS: [(Method, &str); 5] = [
+        (Method::GET, ".well-known/agent-card.json"),
+        (Method::HEAD, ".well-known/agent-card.json"),
+        (Method::GET, "agent.json"),
+        (Method::GET, "discovery"),
+        (Method::HEAD, "discovery/"),
+    ];
+
+    fn transit_token_test_state() -> (OutboundProxyState, crate::proxy::transit_token::TransitTokenIssuer) {
         let mut state = test_outbound_state();
-        state.transit_token_issuer = Some(Arc::new(crate::proxy::transit_token::TransitTokenIssuer::new(
+        let issuer = crate::proxy::transit_token::TransitTokenIssuer::new(
             crate::proxy::transit_token::TransitTokenKey::generate().unwrap(),
             "gw-test".to_string(),
-        )));
-        let base = "/outbound/surfaces/order/partner-a";
-        for (method, path, discovery) in [
-            (Method::GET, ".well-known/agent-card.json", true),
-            (Method::HEAD, ".well-known/agent-card.json", true),
-            (Method::GET, "agent.json", true),
-            (Method::GET, "discovery", true),
-            (Method::HEAD, "discovery/", true),
-            (Method::GET, "message/send", false),
-            (Method::POST, "agent.json", false),
-            (Method::GET, "x/admin/discovery", false),
-            (Method::HEAD, "x/admin/discovery", false),
-            (Method::GET, "admin/.well-known/agent-card.json", false),
-            (Method::GET, "admin%2Fdiscovery", false),
-            (Method::GET, "admin/%2e%2e/discovery", false),
-            (Method::GET, "admin/../discovery", false),
-            (Method::GET, "admin;/discovery", false),
-            (Method::GET, "discovery;x=1", false),
-        ] {
-            let mut ctx = test_pipeline_context();
-            ctx.original_method = method.clone();
-            ctx.request_path = format!("{base}/{path}");
+        );
+        state.transit_token_issuer = Some(Arc::new(issuer.clone()));
+        (state, issuer)
+    }
+
+    /// A Transit Point request for `path`, carrying a token `issuer` issued for
+    /// `token_surface_id` when one is given.
+    fn transit_request(
+        issuer: &crate::proxy::transit_token::TransitTokenIssuer,
+        method: &Method,
+        path: &str,
+        token_surface_id: Option<&str>,
+    ) -> OutboundPipelineContext {
+        let mut ctx = test_pipeline_context();
+        ctx.original_method = method.clone();
+        ctx.request_path = format!("{TRANSIT_TEST_BASE}/{path}");
+        Arc::make_mut(&mut ctx.surface).surface_id = TRANSIT_TEST_SURFACE.into();
+        if let Some(surface_id) = token_surface_id {
+            let token = issuer
+                .issue(
+                    surface_id,
+                    Some("did:web:gateway.example"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    vec!["partner-a".to_string()],
+                )
+                .unwrap();
+            ctx.original_headers
+                .insert("X-Transit-Token", token.parse().unwrap());
+        }
+        ctx
+    }
+
+    async fn transit_token_refusal(
+        state: &OutboundProxyState,
+        ctx: &mut OutboundPipelineContext,
+    ) -> String {
+        match step_validate_transit_token(state, ctx).await {
+            Err(OutboundPipelineError::TransitTokenInvalid(reason)) => reason,
+            other => panic!("expected a transit token refusal, got {other:?}"),
+        }
+    }
+
+    /// Only a `GET` or `HEAD` of a discovery document at the Transit Point's
+    /// root, as its target receives the path, carries no caller credential;
+    /// every request with a valid transit token passes the token check.
+    #[tokio::test]
+    async fn only_a_discovery_read_at_the_transit_point_root_carries_no_credential() {
+        let (state, issuer) = transit_token_test_state();
+        let other_requests = [
+            (Method::GET, "message/send"),
+            (Method::POST, "agent.json"),
+            (Method::GET, "x/admin/discovery"),
+            (Method::HEAD, "x/admin/discovery"),
+            (Method::GET, "admin/.well-known/agent-card.json"),
+            (Method::GET, "admin%2Fdiscovery"),
+            (Method::GET, "admin/%2e%2e/discovery"),
+            (Method::GET, "admin/../discovery"),
+            (Method::GET, "admin;/discovery"),
+            (Method::GET, "discovery;x=1"),
+        ];
+        for (method, path, discovery) in TRANSIT_DISCOVERY_READS
+            .iter()
+            .map(|(method, path)| (method, *path, true))
+            .chain(
+                other_requests
+                    .iter()
+                    .map(|(method, path)| (method, *path, false)),
+            )
+        {
+            let mut ctx = transit_request(&issuer, method, path, Some(TRANSIT_TEST_SURFACE));
 
             let result = step_validate_transit_token(&state, &mut ctx).await;
 
-            assert_eq!(result.is_ok(), discovery, "{method} {path}: {result:?}");
+            assert!(result.is_ok(), "{method} {path}: {result:?}");
             assert_eq!(transit_caller_assertion(&ctx).permits_target_credential(), !discovery, "{method} {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_discovery_read_without_a_transit_token_is_refused() {
+        let (state, issuer) = transit_token_test_state();
+        for (method, path) in &TRANSIT_DISCOVERY_READS {
+            let mut ctx = transit_request(&issuer, method, path, None);
+
+            let reason = transit_token_refusal(&state, &mut ctx).await;
+
+            assert_eq!(reason, "missing X-Transit-Token header", "{method} {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_discovery_read_with_a_transit_token_for_another_surface_is_refused() {
+        let (state, issuer) = transit_token_test_state();
+        for (method, path) in &TRANSIT_DISCOVERY_READS {
+            let mut ctx = transit_request(&issuer, method, path, Some("another-surface"));
+
+            let reason = transit_token_refusal(&state, &mut ctx).await;
+
+            assert_eq!(reason, "transit token was issued for another surface", "{method} {path}");
         }
     }
 
@@ -17793,7 +17855,7 @@ mod tests {
             }
 
             let mut modern = transit_point(modern_pipeline_context("tools/call"));
-            let response = step_prepare_modern_credentials(&state, &mut modern)
+            let response = step_prepare_modern_credentials(&state, &mut modern, None)
                 .await
                 .unwrap();
             assert_eq!(response.is_some(), delegates, "{endpoint} opted_in={opted_in}");
@@ -18804,6 +18866,7 @@ mod tests {
         assert_eq!(
             grant_refusal(&refused),
             Some(&GrantRefusal::ConnectRequired {
+                cause: None,
                 subject: crate::config::agent_surface::GrantSubject::Caller,
                 hint: Some(crate::delegation_vault::release::connect_hint(&caller)),
             })
@@ -18842,6 +18905,228 @@ mod tests {
             .unwrap();
         assert_eq!(kept.state(), "refresh_failed");
         assert!(vendor.requests().is_empty());
+    }
+
+    /// The fixture surface, its Transit Point's binding limiting a consent to
+    /// `max_consent_age_secs`.
+    fn fixture_surface_with_limit(
+        vendor: &crate::delegation_vault::revocation::tests::RecordingServer,
+        subject: &str,
+        max_consent_age_secs: u64,
+    ) -> crate::config::agent_surface::AgentSurface {
+        let mut point = vendor_transit_point(VENDOR_HOP, "fixture-vendor", subject);
+        point["target_endpoint"] = json!(format!("{}/mcp", vendor.origin()));
+        point["protocol"] = json!("http");
+        point["transit_credentials"]["max_consent_age_secs"] = json!(max_consent_age_secs);
+        transit_surface(json!([point]), json!([]))
+    }
+
+    /// A grant whose consent ended at its time limit is never sent and never
+    /// refreshed, though its refresh token would still work: it is removed,
+    /// revoked at the vendor and audited as an expiry, and the caller is told
+    /// to connect again and why. An owner's grant ends the same way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_whose_consent_ended_is_removed_revoked_and_asked_for_again() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::release::GrantRefusal;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let caller = "c".repeat(64);
+        for (subject, key, hint) in [
+            (
+                crate::config::agent_surface::GrantSubject::Caller,
+                GrantKey::caller(None, "transit-fabric", VENDOR_HOP, "fixture-vendor", &caller).unwrap(),
+                Some(crate::delegation_vault::release::connect_hint(&caller)),
+            ),
+            (
+                crate::config::agent_surface::GrantSubject::Owner,
+                GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor"),
+                None,
+            ),
+        ] {
+            let authorization_server =
+                RecordingServer::start_answering(vec![Answer::status(200), Answer::status(200)]).await;
+            let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+            let directory = tempfile::tempdir().unwrap();
+            let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+            let vault = state
+                .delegation_vault_store
+                .clone()
+                .unwrap();
+            let mut ended = crate::delegation_vault::grants::tests::grant(&key, "ended");
+            ended.expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
+            ended.created_at = chrono::Utc::now() - chrono::Duration::hours(2);
+            ended.consent_expires_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+            vault
+                .store_grant(ended.clone())
+                .await
+                .unwrap();
+            let name = match subject {
+                crate::config::agent_surface::GrantSubject::Owner => "owner",
+                crate::config::agent_surface::GrantSubject::Caller => "caller",
+            };
+            let surface = fixture_surface(&vendor, name, "http");
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+
+            let (refused, events) = crate::audit::producer::capture(send_with_grant(&state, &mut ctx)).await;
+
+            assert_eq!(
+                grant_refusal(&refused.unwrap_err()),
+                Some(&GrantRefusal::ConnectRequired {
+                    subject,
+                    hint,
+                    cause: Some(crate::delegation_vault::consent_age::AskedAgain::ConsentExpired),
+                }),
+                "{name}"
+            );
+            assert!(
+                vault
+                    .grant(&key)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{name}: the grant is removed"
+            );
+            assert!(vendor.requests().is_empty(), "{name}: the grant is never sent");
+            let expired: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    matches!(event.event, crate::delegation_vault::audit::DelegationAuditAction::ConsentExpired)
+                })
+                .collect();
+            assert_eq!(expired.len(), 1, "{name}");
+            assert_eq!(
+                expired[0]
+                    .user_identity_hash
+                    .as_deref(),
+                Some(key.principal.as_str()),
+                "{name}"
+            );
+            assert_eq!(
+                expired[0]
+                    .provider_id
+                    .as_deref(),
+                Some("fixture-vendor"),
+                "{name}"
+            );
+            assert_eq!(expired[0].token_id.as_deref(), Some(key.record_id().as_str()), "{name}");
+            let stamp = crate::delegation_vault::consent_age::stamp;
+            assert_eq!(
+                expired[0].detail,
+                Some(format!(
+                    "consent_granted_at:{},consent_expired_at:{},source:release",
+                    stamp(ended.created_at),
+                    stamp(
+                        ended
+                            .consent_expires_at
+                            .unwrap()
+                    )
+                )),
+                "{name}"
+            );
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while authorization_server
+                    .requests()
+                    .len()
+                    < 2
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            assert!(
+                authorization_server
+                    .requests()
+                    .iter()
+                    .all(|(head, _)| head.starts_with("POST /revoke ")),
+                "{name}: the authorization server is asked to revoke, never to refresh"
+            );
+            assert_eq!(
+                authorization_server.revoked_tokens(),
+                vec!["ended".to_string(), "ended-refresh".to_string()],
+                "{name}"
+            );
+        }
+    }
+
+    /// The binding's own limit ends a grant connected before it was set, and
+    /// one within every limit is sent as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bindings_time_limit_ends_an_older_grant_and_leaves_a_newer_one() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::release::GrantRefusal;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let caller = "c".repeat(64);
+        let key = GrantKey::caller(None, "transit-fabric", VENDOR_HOP, "fixture-vendor", &caller).unwrap();
+        for (age_minutes, ends) in [(30, false), (90, true)] {
+            let authorization_server = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+            let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+            let directory = tempfile::tempdir().unwrap();
+            let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+            let vault = state
+                .delegation_vault_store
+                .clone()
+                .unwrap();
+            let mut grant = crate::delegation_vault::grants::tests::grant(&key, "access");
+            let created_at = chrono::Utc::now() - chrono::Duration::minutes(age_minutes);
+            grant.created_at = created_at;
+            vault
+                .store_grant(grant)
+                .await
+                .unwrap();
+            let surface = fixture_surface_with_limit(&vendor, "caller", 3_600);
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+
+            let (sent, events) = crate::audit::producer::capture(send_with_grant(&state, &mut ctx)).await;
+            let expiries: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    matches!(event.event, crate::delegation_vault::audit::DelegationAuditAction::ConsentExpired)
+                })
+                .map(|event| event.detail.clone())
+                .collect();
+
+            if ends {
+                let stamp = crate::delegation_vault::consent_age::stamp;
+                assert_eq!(
+                    expiries,
+                    vec![Some(format!(
+                        "consent_granted_at:{},consent_expired_at:{},source:release",
+                        stamp(created_at),
+                        stamp(created_at + chrono::Duration::hours(1))
+                    ))],
+                    "the end is the one the binding's limit sets"
+                );
+                assert!(
+                    matches!(
+                        grant_refusal(&sent.unwrap_err()),
+                        Some(GrantRefusal::ConnectRequired {
+                            cause: Some(crate::delegation_vault::consent_age::AskedAgain::ConsentExpired),
+                            ..
+                        })
+                    ),
+                    "{age_minutes} minutes"
+                );
+                assert!(
+                    vault
+                        .grant(&key)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(vendor.requests().is_empty());
+            } else {
+                assert_eq!(sent.unwrap(), reqwest::StatusCode::OK, "{age_minutes} minutes");
+                assert!(expiries.is_empty(), "no expiry is recorded for a grant within its limit");
+                assert_eq!(vendor_bearers(&vendor), vec!["Bearer access".to_string()]);
+                assert!(
+                    vault
+                        .grant(&key)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+            }
+        }
     }
 
     /// A vendor's `401` to a grant that cannot be refreshed asks for a new
@@ -19920,7 +20205,7 @@ mod tests {
         ));
         assert!(
             matches!(
-                step_prepare_modern_credentials(&state, &mut modern).await,
+                step_prepare_modern_credentials(&state, &mut modern, None).await,
                 Err(OutboundPipelineError::McpValidation(error))
                     if error.code == crate::mcp::errors::error_codes::UNSUPPORTED_PROTOCOL_VERSION
             ),
@@ -19996,6 +20281,7 @@ mod tests {
         assert_eq!(
             grant_refusal(&refused),
             Some(&GrantRefusal::ConnectRequired {
+                cause: None,
                 subject: crate::config::agent_surface::GrantSubject::Owner,
                 hint: None,
             })
@@ -20357,6 +20643,7 @@ mod tests {
                 assert_eq!(
                     grant_refusal(&outcome.unwrap_err()),
                     Some(&GrantRefusal::ConnectRequired {
+                        cause: None,
                         subject: crate::config::agent_surface::GrantSubject::Owner,
                         hint: None,
                     }),
@@ -21015,6 +21302,7 @@ mod tests {
         store_grant(&state, key.clone(), "expired", -60).await;
         let surface = fixture_surface(&vendor, "caller", "mcp");
         let connect = Some(GrantRefusal::ConnectRequired {
+            cause: None,
             subject: crate::config::agent_surface::GrantSubject::Caller,
             hint: Some(crate::delegation_vault::release::connect_hint(&caller)),
         });
@@ -21100,6 +21388,7 @@ mod tests {
                     assert_eq!(
                         grant_refusal(&outcome.unwrap_err()),
                         Some(&GrantRefusal::ConnectRequired {
+                            cause: None,
                             subject: crate::config::agent_surface::GrantSubject::Owner,
                             hint: None,
                         }),
@@ -21450,6 +21739,53 @@ mod tests {
         );
     }
 
+    /// A Transit Point bound by external consent to a deactivated provider
+    /// tells no caller to connect, since the provider takes no new connect:
+    /// with no grant it is unavailable (`503`), and nothing is sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_missing_grant_of_a_deactivated_provider_is_unavailable() {
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let authorization_server = RecordingServer::start_answering(vec![Answer::status(500)]).await;
+        let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        let providers = state
+            .credential_provider_store
+            .as_ref()
+            .unwrap();
+        let mut provider = providers
+            .get("fixture-vendor")
+            .await
+            .unwrap()
+            .unwrap();
+        provider.deactivated_at = Some(chrono::Utc::now());
+        providers
+            .update(provider)
+            .await
+            .unwrap();
+        let surface = fixture_surface(&vendor, "caller", "mcp");
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"c".repeat(64)));
+
+        let refused = send_with_grant(&state, &mut ctx)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            grant_refusal(&refused),
+            Some(&crate::delegation_vault::release::GrantRefusal::ConnectorUnavailable)
+        );
+        let response = refused.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["data"], json!({"reason": "connector_unavailable"}));
+        assert!(vendor.requests().is_empty());
+    }
+
     /// A missing caller grant is refused `connect_required` with the caller's
     /// hint, as a JSON-RPC error with the request's id on an MCP Transit Point
     /// and a problem JSON on an `http` one; an MCP Transit Point asks its
@@ -21604,6 +21940,7 @@ mod tests {
         assert_eq!(
             grant_refusal(&refused),
             Some(&crate::delegation_vault::release::GrantRefusal::ConnectRequired {
+                cause: None,
                 subject: crate::config::agent_surface::GrantSubject::Owner,
                 hint: None,
             }),
@@ -24124,22 +24461,30 @@ mod tests {
         );
     }
 
-    /// A public discovery read needs no transit token and names no caller, so
-    /// it reaches the target without a delegated credential, as it does without
-    /// a target authentication one, rather than being refused.
+    /// A discovery read needs a transit token but carries no caller credential
+    /// to the target.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_public_discovery_read_through_a_credentialed_transit_point_carries_no_credential() {
+    async fn a_discovery_read_through_a_credentialed_transit_point_requires_token_but_carries_no_credential() {
         let directory = tempfile::tempdir().unwrap();
         let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
-        let (state, _) = delegation_pipeline(
+        let (mut state, issuer) = delegation_pipeline(
             directory.path(),
             &target.url,
             &[("granted", "mcp", binding("provider", json!({"type": "bearer_header"})))],
         )
         .await;
+
+        // Issue a valid transit token
+        let token = issuer
+            .issue("transit-fabric", Some("did:web:agent.example"), None, None, None, None, vec![])
+            .unwrap();
+
+        state.transit_token_issuer = Some(Arc::new(issuer));
+
         let request = Request::builder()
             .method("GET")
             .uri("/outbound/mcp/granted/.well-known/agent-card.json")
+            .header("X-Transit-Token", &token)
             .body(axum::body::Body::empty())
             .unwrap();
 

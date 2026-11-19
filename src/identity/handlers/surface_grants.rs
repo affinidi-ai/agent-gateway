@@ -189,6 +189,8 @@ pub(crate) struct ServedBinding<'a> {
     /// permits its provider's default scopes.
     pub scopes: &'a [String],
     pub subject: Option<GrantSubject>,
+    /// The time limit the binding sets on the consent of its grants.
+    pub max_consent_age_secs: Option<u64>,
 }
 
 /// The binding `served` on `surface`, as its grants are keyed.
@@ -283,6 +285,18 @@ fn holding_bindings<'a>(
         .collect()
 }
 
+/// The time limit the bindings of `surface` that hold `grant` set on its
+/// consent: the shortest, where the surface serves the binding in two places.
+pub(crate) fn binding_max_consent_age(
+    surface: &AgentSurface,
+    grant: &DelegatedGrant,
+) -> Option<u64> {
+    holding_bindings(surface, grant)
+        .iter()
+        .filter_map(|binding| binding.max_consent_age_secs)
+        .min()
+}
+
 /// Whether `surface` serves the binding `grant` is kept for: its tenant, hop,
 /// provider and subject, with the scopes the grant was asked for within the
 /// binding's, or `default_scopes`, its provider's, when it names none, in
@@ -322,6 +336,7 @@ pub(crate) fn served_external_bindings(surface: &AgentSurface) -> Vec<ServedBind
                     credential_provider_id: &binding.credential_provider_id,
                     scopes: &binding.scopes,
                     subject: binding.subject,
+                    max_consent_age_secs: binding.max_consent_age_secs,
                 })
         });
     let target = live_target_binding_lists(surface)
@@ -336,6 +351,7 @@ pub(crate) fn served_external_bindings(surface: &AgentSurface) -> Vec<ServedBind
                     credential_provider_id: &binding.credential_provider_id,
                     scopes: &binding.scopes,
                     subject: binding.subject,
+                    max_consent_age_secs: binding.max_consent_age_secs,
                 })
         });
     points.chain(target).collect()

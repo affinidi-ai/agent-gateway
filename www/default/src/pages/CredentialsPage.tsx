@@ -1,29 +1,36 @@
 import React, { useEffect, useState } from 'react';
 import { Tab, Tabs } from 'react-bootstrap';
-import { useSearchParams } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import SearchInput from '../components/shared/SearchInput';
 import StrategiesTab from './SettingsPage/StrategiesTab';
 import CredentialProvidersTab from './SettingsPage/CredentialProvidersTab';
 import CredentialTokensTab from './CredentialsPage/CredentialTokensTab';
-import CredentialAuditTab from './CredentialsPage/CredentialAuditTab';
+import DelegatedAccessTab from './CredentialsPage/DelegatedAccessTab';
 import StsClientsTab from './CredentialsPage/StsClientsTab';
+import { useDelegationVault } from './CredentialsPage/useDelegationVault';
 import { usePermissions } from '../context/PermissionsContext';
+import {
+  DELEGATION_CATEGORIES,
+  DELEGATION_ENDED_CATEGORIES,
+  auditLogPath,
+} from './AuditPage/auditHelpers';
 
 type TabKey =
   | 'jwt-verification'
   | 'credential-providers'
   | 'credential-tokens'
-  | 'credential-audit'
+  | 'delegated-access'
   | 'sts-clients';
 const VALID_TABS: TabKey[] = [
   'jwt-verification',
   'credential-providers',
   'credential-tokens',
-  'credential-audit',
+  'delegated-access',
   'sts-clients',
 ];
 
 const CredentialsPage: React.FC = () => {
+  const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const tabFromUrl = searchParams.get('tab') as TabKey | null;
   const initialTab: TabKey =
@@ -33,22 +40,24 @@ const CredentialsPage: React.FC = () => {
   const { hasPermission, loading: permissionsLoading } = usePermissions();
   const canViewAudit = !permissionsLoading && hasPermission('audit.view');
   const canViewSts = !permissionsLoading && hasPermission('sts_clients.view');
+  const vault = useDelegationVault();
 
   const [strategiesCount, setStrategiesCount] = useState(0);
   const [providersCount, setProvidersCount] = useState(0);
   const [tokensCount, setTokensCount] = useState(0);
-  const [auditCount, setAuditCount] = useState(0);
+  const [delegationsCount, setDelegationsCount] = useState(0);
   const [stsClientsCount, setStsClientsCount] = useState(0);
 
   useEffect(() => {
-    if (!permissionsLoading && !canViewAudit && activeTab === 'credential-audit') {
-      setActiveTab('jwt-verification');
-      setSearchParams({ tab: 'jwt-verification' }, { replace: true });
-    } else if (!permissionsLoading && !canViewSts && activeTab === 'sts-clients') {
+    if (!permissionsLoading && !canViewSts && activeTab === 'sts-clients') {
       setActiveTab('jwt-verification');
       setSearchParams({ tab: 'jwt-verification' }, { replace: true });
     }
-  }, [activeTab, canViewAudit, canViewSts, permissionsLoading, setSearchParams]);
+  }, [activeTab, canViewSts, permissionsLoading, setSearchParams]);
+
+  const viewHistory = () => navigate(auditLogPath(DELEGATION_ENDED_CATEGORIES));
+  const viewActivity = (userHash: string) =>
+    navigate(auditLogPath(DELEGATION_CATEGORIES, userHash));
 
   const filterActive = searchTerm.trim().length > 0;
   const tabBadge = (count: number) => {
@@ -68,7 +77,7 @@ const CredentialsPage: React.FC = () => {
             value={searchTerm}
             onChange={setSearchTerm}
             data-testid="credentials-search-input"
-            placeholder="Filter JWT Verification, Providers, Tokens, Audit..."
+            placeholder="Filter JWT Verification, Providers, Tokens, Access..."
             width="384px"
           />
         </div>
@@ -110,6 +119,7 @@ const CredentialsPage: React.FC = () => {
           <CredentialProvidersTab
             externalSearchTerm={searchTerm}
             onFilteredCountChange={setProvidersCount}
+            onProvidersChange={vault.refresh}
           />
         </Tab>
 
@@ -123,8 +133,27 @@ const CredentialsPage: React.FC = () => {
           }
         >
           <CredentialTokensTab
+            vault={vault}
             externalSearchTerm={searchTerm}
             onFilteredCountChange={setTokensCount}
+            onViewActivity={canViewAudit ? viewActivity : undefined}
+          />
+        </Tab>
+
+        <Tab
+          eventKey="delegated-access"
+          tabAttrs={{ 'data-testid': 'credentials-delegated-access-tab-trigger' }}
+          title={
+            <>
+              <i className="fas fa-user-check"></i> Delegated Access {tabBadge(delegationsCount)}
+            </>
+          }
+        >
+          <DelegatedAccessTab
+            vault={vault}
+            externalSearchTerm={searchTerm}
+            onFilteredCountChange={setDelegationsCount}
+            onViewHistory={canViewAudit ? viewHistory : undefined}
           />
         </Tab>
 
@@ -141,24 +170,6 @@ const CredentialsPage: React.FC = () => {
             <StsClientsTab
               externalSearchTerm={searchTerm}
               onFilteredCountChange={setStsClientsCount}
-            />
-          </Tab>
-        )}
-
-        {canViewAudit && (
-          <Tab
-            eventKey="credential-audit"
-            tabAttrs={{ 'data-testid': 'credentials-credential-audit-tab-trigger' }}
-            title={
-              <>
-                <i className="fas fa-clipboard-list"></i> Credential Delegation Audit{' '}
-                {tabBadge(auditCount)}
-              </>
-            }
-          >
-            <CredentialAuditTab
-              externalSearchTerm={searchTerm}
-              onFilteredCountChange={setAuditCount}
             />
           </Tab>
         )}

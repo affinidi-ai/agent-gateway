@@ -12,19 +12,27 @@ import { deepLinks } from '../utils/deepLinks';
 import { DOCS_URL } from '../config/docs';
 import ClientAuthenticationSelect from './EditCredentialProviderPage/ClientAuthenticationSelect';
 import ConsentConfirmationSection from './EditCredentialProviderPage/ConsentConfirmationSection';
+import ConsentLimitSection from './EditCredentialProviderPage/ConsentLimitSection';
 import JwtAssertionSection from './EditCredentialProviderPage/JwtAssertionSection';
-import { SecretOption as Secret, SecretOptions } from './EditCredentialProviderPage/SecretSelect';
+import { SecretOption as Secret, SecretOptions } from '../components/shared/SecretOptions';
 import { splitByTenant, type OwnerTenant } from '../utils/tenantScope';
+import { storedConsentLimit, takesConsent } from '../utils/consentLimit';
 import {
+  CONSENT_LIMIT_RANGE_MESSAGE,
+  ClientAuthentication,
+  ConsentLimitFields,
   ConsentConfirmationFormFields,
   CredentialProviderType,
   EMPTY_CONSENT_CONFIRMATION_FIELDS,
   EMPTY_JWT_FIELDS,
+  NO_CONSENT_LIMIT,
   consentConfirmationField,
   consentConfirmationFieldsOf,
   consentConfirmationRedirectUri,
   missingConsentConfirmationField,
   clientAuthenticationOf,
+  consentLimitOf,
+  consentLimitSeconds,
   JwtFormFields,
   entraRejectsResource,
   entraResourceMessage,
@@ -38,7 +46,8 @@ import {
   isHttpsAddress,
 } from './EditCredentialProviderPage/credentialProviderForm';
 
-interface CredentialProviderForm extends JwtFormFields, ConsentConfirmationFormFields {
+interface CredentialProviderForm
+  extends JwtFormFields, ConsentLimitFields, ConsentConfirmationFormFields {
   name: string;
   provider_id: string;
   provider_type: CredentialProviderType;
@@ -62,6 +71,9 @@ interface CredentialProviderForm extends JwtFormFields, ConsentConfirmationFormF
   issuer: string;
   /** Whether an external consent provider's token requests send its resource; never sent on save. */
   send_resource: boolean;
+  client_authentication: ClientAuthentication;
+  /** When the provider was deactivated; empty while it takes consent. Never sent on save. */
+  deactivated_at: string;
 }
 
 interface RoutingConfig {
@@ -90,6 +102,8 @@ const EMPTY_FORM: CredentialProviderForm = {
   resource: '',
   issuer: '',
   send_resource: true,
+  deactivated_at: '',
+  ...NO_CONSENT_LIMIT,
   ...EMPTY_JWT_FIELDS,
   ...EMPTY_CONSENT_CONFIRMATION_FIELDS,
 };
@@ -109,7 +123,10 @@ const EditCredentialProviderPage: React.FC = () => {
   const tokenEndpointIsHttp = /^http:\/\//i.test(form.token_endpoint.trim());
   const offeredSecretCount = splitByTenant(secrets, ownerTenant).offered.length;
   const [routingConfig, setRoutingConfig] = useState<RoutingConfig | null>(null);
+  const [consentLimitRefused, setConsentLimitRefused] = useState(false);
+  const [storedConsentLimitSecs, setStoredConsentLimitSecs] = useState<number | undefined>();
   const formRef = useRef<HTMLFormElement>(null);
+  const consentLimitRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     loadSecrets();
@@ -170,6 +187,7 @@ const EditCredentialProviderPage: React.FC = () => {
       }
 
       setOwnerTenant(data.tenant_id ?? null);
+      setStoredConsentLimitSecs(storedConsentLimit(data.max_consent_age_secs));
       setForm({
         name: data.name ?? '',
         provider_id: data.provider_id ?? '',
@@ -191,6 +209,8 @@ const EditCredentialProviderPage: React.FC = () => {
         resource: data.resource ?? '',
         issuer: data.issuer ?? '',
         send_resource: data.send_resource ?? true,
+        deactivated_at: data.deactivated_at ?? '',
+        ...consentLimitOf(data),
         client_authentication: clientAuthenticationOf(data),
         ...jwtFieldsOf(data),
         ...consentConfirmationFieldsOf(data),
@@ -212,6 +232,9 @@ const EditCredentialProviderPage: React.FC = () => {
     e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>
   ) => {
     const { name, value, type } = e.target;
+    if (name === 'consent_limit_amount' || name === 'consent_limit_unit') {
+      setConsentLimitRefused(false);
+    }
     if (type === 'checkbox') {
       setForm(prev => ({ ...prev, [name]: (e.target as HTMLInputElement).checked }));
     } else if (name === 'name' && isNew) {
@@ -280,6 +303,15 @@ const EditCredentialProviderPage: React.FC = () => {
         return;
       }
 
+      const consentLimit = consentLimitSeconds(form);
+      if (consentLimit === null) {
+        setError(CONSENT_LIMIT_RANGE_MESSAGE);
+        setConsentLimitRefused(true);
+        consentLimitRef.current?.focus();
+        return;
+      }
+
+      setConsentLimitRefused(false);
       setError(null);
 
       const scopes = form.default_scopes
@@ -298,6 +330,8 @@ const EditCredentialProviderPage: React.FC = () => {
             description: form.description.trim() || undefined,
             ...providerCredentialFields(form),
           };
+
+      body.max_consent_age_secs = consentLimit;
 
       if (!form.issuer && form.authorization_endpoint.trim()) {
         body.authorization_endpoint = form.authorization_endpoint.trim();
@@ -497,6 +531,19 @@ const EditCredentialProviderPage: React.FC = () => {
                 Shown alongside this provider's name in lists.
               </small>
             </div>
+
+            {form.deactivated_at && (
+              <div
+                className="alert alert-warning"
+                data-testid="credential-provider-deactivated-notice"
+                role="status"
+              >
+                <i className="fas fa-ban me-2"></i>
+                This provider is deactivated: nobody can consent to it again. Access people already
+                gave keeps working until it ends or is revoked. Activate it again on the Credential
+                Providers tab.
+              </div>
+            )}
 
             {form.issuer && (
               <div
@@ -984,11 +1031,24 @@ const EditCredentialProviderPage: React.FC = () => {
               </label>
               <div>
                 <small className="form-text text-muted">
-                  Access tokens are refreshed automatically using the stored refresh token whenever
-                  one is available, so this connection keeps working without needing to reauthorize.
+                  {takesConsent(form.provider_type)
+                    ? 'Access tokens are refreshed automatically using the stored refresh token for as long as the consent lasts (see Consent time limit below). When the consent ends, the person approves again.'
+                    : 'Access tokens are refreshed automatically using the stored refresh token whenever one is available, so this connection keeps working without needing to reauthorize.'}
                 </small>
               </div>
             </div>
+
+            {takesConsent(form.provider_type) && (
+              <ConsentLimitSection
+                form={form}
+                providerId={isNew ? undefined : id}
+                providerName={form.name.trim() || form.provider_id}
+                storedSecs={storedConsentLimitSecs}
+                refused={consentLimitRefused}
+                inputRef={consentLimitRef}
+                onChange={handleChange}
+              />
+            )}
 
             {/* Additional Params */}
             <div className="mb-3" hidden={!!form.issuer}>

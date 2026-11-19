@@ -1629,17 +1629,10 @@ async fn process_get_surfaces_response(message: &ReceivedMessage) -> ProcessingR
     ProcessingResult::ProcessedNoResponse
 }
 
-/// Extract caller identity from inbound fabric request (VP, extensions, MCP _meta).
-/// Extracted from `process_forward_request` to reduce async state-machine size.
-/// The verified gateway DID of the peer that sent a fabric envelope from
-/// `from_did`, running the issuer exchange when its Remote gateway record does
-/// not hold it yet. Fails closed: an unknown Connection Point, or a peer that
-/// cannot prove its issuer DID, is rejected.
-/// The issuers a forward-request's sender may present identities from: the
-/// paired gateway's attested issuer DID (fetched on demand when missing) plus
-/// the issuer DIDs an operator trusts for that connection. A peer with
-/// neither is rejected; a peer with operator-trusted issuers is admitted even
-/// when the attestation exchange fails, so a legacy peer can be trusted by hand.
+/// The issuers the paired gateway that sent a forward-request from `from_did`
+/// may present identities from; see
+/// [`ConnectionPointListenerManager::peer_issuers`]. Fails closed: a request
+/// with no sender, or from an unknown Connection Point, is rejected.
 async fn resolve_peer_issuers(from_did: Option<&str>) -> Result<crate::gateways::types::PeerIssuers, String> {
     let from_did = from_did.ok_or_else(|| "forward-request has no sender DID".to_string())?;
     let manager = GLOBAL_LISTENER_MANAGER
@@ -1649,25 +1642,9 @@ async fn resolve_peer_issuers(from_did: Option<&str>) -> Result<crate::gateways:
         .find_gateway_by_did(from_did)
         .await
         .ok_or_else(|| format!("unknown peer gateway {from_did}"))?;
-    let trusted = gateway.trusted_issuer_dids;
-    let attested = match gateway.issuer_did {
-        Some(issuer_did) => Some(issuer_did),
-        None => match manager
-            .ensure_peer_issuer_did(&gateway.id)
-            .await
-        {
-            Ok(issuer_did) => Some(issuer_did),
-            Err(e) if !trusted.is_empty() => {
-                warn!(
-                    gateway_id = gateway.id,
-                    "peer issuer DID not established ({e}); accepting only operator-trusted issuers for this connection"
-                );
-                None
-            }
-            Err(e) => return Err(format!("peer issuer DID not established for gateway {}: {e}", gateway.id)),
-        },
-    };
-    Ok(crate::gateways::types::PeerIssuers { attested, trusted })
+    manager
+        .peer_issuers(gateway, crate::gateways::issuer_exchange::ISSUER_REQUEST_TIMEOUT)
+        .await
 }
 
 fn forbidden_forward_response(message: &str) -> Value {
@@ -5380,7 +5357,7 @@ async fn process_charged_forward_request(
             axum::http::StatusCode::BAD_REQUEST, "Fabric request streams require an admitted modern MCP request",
         )).await;
     }
-    let subscription_lifetime = if let Some(request) = modern_request.as_ref().filter(|request| request.method == "subscriptions/listen") {
+    let mut subscription_lifetime = if let Some(request) = modern_request.as_ref().filter(|request| request.method == "subscriptions/listen") {
         let caller = crate::mcp::subscriptions::listen_caller(authenticated_identity.as_ref(), message.from_did.as_deref().unwrap_or_default());
         let Some(slot) = crate::mcp::subscriptions::ListenSlots::global().acquire(&crate::proxy::handler::listen_surface_key(&surface), &caller) else {
             return axum_response_to_forward_result(crate::mcp::subscriptions::listen_limit_error(request).into_response()).await;
@@ -5733,8 +5710,9 @@ async fn process_charged_forward_request(
                 vault: vault.as_ref(), providers: providers.as_ref(), strategies: strategies.as_ref(),
                 secrets: secrets.as_ref(), provider_egress: None,
                 isolation: crate::config::credential_policy::credential_policy().tenant_credential_isolation,
-            }.prepare_with_payment(request, crate::proxy::credential_delegation::modern::now_secs()?,
+            }.prepare_call(request, crate::proxy::credential_delegation::modern::now_secs()?,
                 payment.as_ref().is_some_and(crate::proxy::handler::agent_pay_gate::Intake::is_unpaid),
+                subscription_lifetime.as_mut(),
             ).await
         }).await;
         match result {
@@ -7305,8 +7283,7 @@ async fn process_charged_forward_request(
                     &request_payload,
                     response_payload,
                     validation_status,
-                    None,                    // validation_error
-                    caller_identity.clone(), // identity_hash
+                    None, // validation_error
                 )
                 .await;
 
@@ -8779,7 +8756,6 @@ async fn handle_a2a_proxy_forward(
             response_payload,
             validation_status,
             None,
-            caller_identity,
         )
         .await;
     }
@@ -9033,12 +9009,6 @@ async fn handle_mcp_proxy_forward(
 
     channel_info!(config_id, "📨 Handling MCP request via proxy '{}' (ID: {})", proxy.name, proxy.id);
 
-    // Get global HTTP client for policy-aware requests (timeout, retry, circuit breaker, mirroring)
-    let fallback_client = reqwest::Client::new();
-    let http_client = GLOBAL_HTTP_CLIENT
-        .get()
-        .unwrap_or(&fallback_client);
-
     // Get policy manager for circuit breaker support
     let policy_manager = GLOBAL_POLICY_MANAGER.get();
 
@@ -9152,7 +9122,6 @@ async fn handle_mcp_proxy_forward(
                     prepared,
                     surface,
                     policy_manager,
-                    http_client,
                     &surface.name,
                     sent_token.as_ref(),
                 )
@@ -9185,7 +9154,6 @@ async fn handle_mcp_proxy_forward(
                     Some(mcp_response.clone()),
                     "success", // MCP protocol doesn't have A2A extension validation
                     None,
-                    None, // identity_hash
                 )
                 .await;
             }
@@ -9325,7 +9293,6 @@ async fn handle_mcp_proxy_forward(
                     None,
                     "mcp_error", // Custom status for MCP errors
                     Some(format!("MCP Proxy Error: {}", error_msg)),
-                    None,
                 )
                 .await;
             }
