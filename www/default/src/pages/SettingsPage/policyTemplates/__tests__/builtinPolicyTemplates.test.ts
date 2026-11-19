@@ -41,6 +41,12 @@ describe('built-in policy templates', () => {
     }
   );
 
+  it('gives every template that adds rules examples for the Template examples card', () => {
+    const addsRules = BUILTIN_POLICY_TEMPLATES.filter(t => templateRole(t) === 'rules');
+    expect(addsRules.length).toBeGreaterThan(0);
+    expect(addsRules.filter(t => t.examples.length === 0).map(t => t.id)).toEqual([]);
+  });
+
   it('says a business-hours window past midnight counts on each listed day', () => {
     const template = BUILTIN_POLICY_TEMPLATES.find(
       t => t.id === 'business-hours-access-window:gateway'

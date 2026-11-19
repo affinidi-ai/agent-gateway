@@ -5,8 +5,9 @@ import PolicySectionTitle from './policyTemplates/PolicySectionTitle';
 import { POLICY_TYPE_NAMES, type PolicyType } from './policyTemplates/types';
 
 interface PolicyDetailsSectionProps {
-  step?: number;
   isCreateMode: boolean;
+  /** False when the Define button that opened the create page already set the Type. */
+  showType: boolean;
   readOnly: boolean;
   name: string;
   description: string;
@@ -42,8 +43,8 @@ const ReadOnlyValue: React.FC<{ label: string; value: string; help: string; test
 
 /** Name, description, type and status of a policy, plus its id and hash once saved. */
 const PolicyDetailsSection: React.FC<PolicyDetailsSectionProps> = ({
-  step,
   isCreateMode,
+  showType,
   readOnly,
   name,
   description,
@@ -56,20 +57,22 @@ const PolicyDetailsSection: React.FC<PolicyDetailsSectionProps> = ({
   onEnabledChange,
 }) => (
   <section className="policy-section" data-testid="policy-details-section">
-    <PolicySectionTitle step={step} title="Details" />
+    <PolicySectionTitle title="Details" icon="fa-info-circle" />
     <div className="row">
       <div className="col-12 mb-3">
-        <label className="font-weight-bold d-block mb-1" htmlFor="policy-name-input">
-          Name{' '}
+        <div className="field-label-with-help">
+          <label htmlFor="policy-name-input" className="mb-0">
+            Name <span className="text-danger">*</span>
+          </label>
           <FieldHelp testId="field-help-policy-definition-name" ariaLabel="About Name">
             A short, memorable label, this is what you&apos;ll see in the policy list and in
             audit-log entries when this policy makes a decision.
           </FieldHelp>
-        </label>
+        </div>
         <input
           id="policy-name-input"
           type="text"
-          className="form-control form-control-sm"
+          className="form-control"
           value={name}
           readOnly={readOnly}
           onChange={e => onNameChange(e.target.value)}
@@ -78,8 +81,10 @@ const PolicyDetailsSection: React.FC<PolicyDetailsSectionProps> = ({
         />
       </div>
       <div className="col-12 mb-3">
-        <label className="font-weight-bold d-block mb-1" htmlFor="policy-description-input">
-          Description{' '}
+        <div className="field-label-with-help">
+          <label htmlFor="policy-description-input" className="mb-0">
+            Description
+          </label>
           <FieldHelp
             testId="field-help-policy-definition-description"
             ariaLabel="About Description"
@@ -87,11 +92,11 @@ const PolicyDetailsSection: React.FC<PolicyDetailsSectionProps> = ({
             Shown in the policy list and version history, use it to note what this policy enforces
             and why, for whoever looks at this later.
           </FieldHelp>
-        </label>
+        </div>
         <textarea
           id="policy-description-input"
           rows={2}
-          className="form-control form-control-sm"
+          className="form-control"
           value={description}
           readOnly={readOnly}
           onChange={e => onDescriptionChange(e.target.value)}
@@ -101,50 +106,54 @@ const PolicyDetailsSection: React.FC<PolicyDetailsSectionProps> = ({
       </div>
     </div>
     <div className="row">
+      {showType && (
+        <div className="col-md-6 mb-3">
+          <div className="field-label-with-help">
+            <label htmlFor="policy-type-select" className="mb-0">
+              Type
+            </label>
+            <FieldHelp testId="field-help-policy-definition-type" ariaLabel="About Type">
+              Gateway policies attach to a gateway connection (your own appliance, or one remote
+              peer) and can also be enforced appliance-wide from the policy list. Agent Surface
+              policies apply only to one specific agent surface&apos;s traffic.
+            </FieldHelp>
+          </div>
+          <select
+            id="policy-type-select"
+            className="form-control dropdown-styling"
+            value={policyType}
+            disabled
+            title={
+              isCreateMode
+                ? 'Set by the Define button that opens this page.'
+                : "A policy's type is fixed once created."
+            }
+            data-testid="policy-definition-type-select"
+          >
+            {(Object.keys(POLICY_TYPE_NAMES) as PolicyType[]).map(type => (
+              <option key={type} value={type}>
+                {POLICY_TYPE_NAMES[type].label}
+              </option>
+            ))}
+          </select>
+          <small className="form-text text-muted">
+            <i className="fas fa-lock me-1" aria-hidden="true" />
+            {isCreateMode
+              ? "Set by the Define button that opens this page. It can't be changed here."
+              : "A policy's type is fixed once created."}
+          </small>
+        </div>
+      )}
       <div className="col-md-6 mb-3">
-        <label className="font-weight-bold d-block mb-1" htmlFor="policy-type-select">
-          Type{' '}
-          <FieldHelp testId="field-help-policy-definition-type" ariaLabel="About Type">
-            Gateway policies attach to a gateway connection (your own appliance, or one remote peer)
-            and can also be enforced appliance-wide from the policy list. Agent Surface policies
-            apply only to one specific agent surface&apos;s traffic.
-          </FieldHelp>
-        </label>
-        <select
-          id="policy-type-select"
-          className="form-control form-control-sm dropdown-styling"
-          value={policyType}
-          disabled
-          title={
-            isCreateMode
-              ? `Set by Define ${POLICY_TYPE_NAMES[policyType].name} Policy.`
-              : "A policy's type is fixed once created."
-          }
-          data-testid="policy-definition-type-select"
-        >
-          {(Object.keys(POLICY_TYPE_NAMES) as PolicyType[]).map(type => (
-            <option key={type} value={type}>
-              {POLICY_TYPE_NAMES[type].label}
-            </option>
-          ))}
-        </select>
-        <small className="form-text text-muted">
-          <i className="fas fa-lock me-1" aria-hidden="true" />
-          {isCreateMode
-            ? `Set by Define ${POLICY_TYPE_NAMES[policyType].name} Policy. It can't be changed.`
-            : "A policy's type is fixed once created."}
-        </small>
-      </div>
-      <div className="col-md-6 mb-3">
-        <span className="font-weight-bold d-block mb-1">
-          Status{' '}
+        <div className="field-label-with-help">
+          <span>Status</span>
           <FieldHelp testId="field-help-policy-definition-status" ariaLabel="About Status">
             When off, this policy is never evaluated. If this policy is also enforced Globally on
             the list page, turning it off will make every request in that plane fail closed (denied)
             until it&apos;s re-enabled or removed from Global enforcement. Global assignments set to
             Monitor only are unaffected: they just stop logging this policy&apos;s decisions.
           </FieldHelp>
-        </span>
+        </div>
         <div className="form-check form-switch">
           <input
             className="form-check-input"

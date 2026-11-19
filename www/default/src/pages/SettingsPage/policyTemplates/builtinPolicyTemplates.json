@@ -772,7 +772,7 @@
     "description": "Allows a request only when its path starts with one of the listed prefixes. Denies a path that contains .., %2e, a backslash or %5c.",
     "category": "routing_paths",
     "policy_types": ["gateway", "agent_surface"],
-    "rules": "default allow := false\n\npath_prefix_unsafe if contains(input.http.path, \"..\")\n\npath_prefix_unsafe if contains(lower(input.http.path), \"%2e\")\n\npath_prefix_unsafe if contains(input.http.path, \"\\\\\")\n\npath_prefix_unsafe if contains(lower(input.http.path), \"%5c\")\n\nallow if {\n  not path_prefix_unsafe\n  some prefix in {{prefixes}}\n  startswith(input.http.path, prefix)\n}",
+    "rules": "default allow := false\n\nallow if {\n  some prefix in {{prefixes}}\n  startswith(input.http.path, prefix)\n  not contains(input.http.path, \"..\")\n  not contains(lower(input.http.path), \"%2e\")\n  not contains(input.http.path, \"\\\\\")\n  not contains(lower(input.http.path), \"%5c\")\n}",
     "parameters": [
       {
         "key": "prefixes",

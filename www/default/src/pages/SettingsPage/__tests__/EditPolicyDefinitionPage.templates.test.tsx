@@ -4,9 +4,6 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { PageTitleProvider } from '../../../context/PageTitleContext';
 import { apiClient } from '../../../api';
 import EditPolicyDefinitionPage from '../EditPolicyDefinitionPage';
-import { sessionPolicyTemplateStore } from '../policyTemplates/policyTemplateServices';
-
-const savePolicyTemplate = sessionPolicyTemplateStore.save;
 
 jest.mock('../../../api', () => ({
   apiClient: {
@@ -41,6 +38,10 @@ const SAVED = {
   enabled: true,
   created_at: '2026-01-01T00:00:00Z',
 };
+
+/** A helper rule (line 5) that the allow rule (line 7) reads. */
+const HELPER_POLICY =
+  'package surface.policy\n\ndefault allow := false\n\nblocked if input.x\n\nallow if not blocked\n';
 
 function jsonResponse(body: unknown) {
   return { ok: true, json: async () => body, text: async () => JSON.stringify(body) };
@@ -218,20 +219,25 @@ describe('pick a template before the rest of the form', () => {
     expect(screen.getByTestId('policy-template-gallery-detail-panel')).toBeInTheDocument();
   });
 
-  it('locks the Type to the Define button that opened the page', async () => {
+  it('hides the Type set by the Define button and names it in the header', async () => {
     await renderNew('agent_surface');
-    const type = screen.getByTestId('policy-definition-type-select');
-    expect(type).toHaveValue('agent_surface');
-    expect(type).toBeDisabled();
-    expect(screen.getByTestId('policy-details-section')).toHaveTextContent(
-      "Set by Define Agent Surface Policy. It can't be changed."
-    );
+    expect(screen.queryByTestId('policy-definition-type-select')).toBeNull();
+    expect(screen.getByText('Create Agent Surface Policy')).toBeInTheDocument();
   });
 
-  it('locks a Gateway policy to Gateway too', async () => {
+  it('hides the Type of a Gateway policy too', async () => {
     await renderNew('gateway');
-    expect(screen.getByTestId('policy-definition-type-select')).toHaveValue('gateway');
-    expect(screen.getByTestId('policy-definition-type-select')).toBeDisabled();
+    expect(screen.queryByTestId('policy-definition-type-select')).toBeNull();
+    expect(screen.getByText('Create Gateway Policy')).toBeInTheDocument();
+  });
+
+  it('shows the Type, locked, when the page was opened without a Define button', async () => {
+    renderAt('/policy-definitions/new');
+    await applyCard('deny-by-default');
+    const type = await screen.findByTestId('policy-definition-type-select');
+    expect(type).toHaveValue('gateway');
+    expect(type).toBeDisabled();
+    expect(screen.getByText('Create Policy')).toBeInTheDocument();
   });
 
   it('closes a reopened gallery with Cancel and brings back Add rules', async () => {
@@ -368,7 +374,7 @@ describe('start a policy from the gallery', () => {
     changeGallery();
     await applyCard('allow-http-methods');
 
-    expect(screen.getByDisplayValue('Gateway')).toBeInTheDocument();
+    expect(screen.getByText('Create Gateway Policy')).toBeInTheDocument();
     expect(rego().value.startsWith('package gateway.policy')).toBe(true);
   });
 
@@ -844,16 +850,15 @@ describe('templates panel', () => {
     ]) {
       expect(screen.queryByTestId(`policy-templates-row-${id}:agent_surface`)).toBeNull();
     }
-    expect(screen.getByTestId('policy-templates-tab-builtin')).toHaveTextContent(
-      `Default templates (${rows.length})`
-    );
   });
 
-  it('shows an empty organization tab until a template is saved', async () => {
+  it('lists the built-in templates in one list, with no tabs', async () => {
     await renderNew();
-    openAdd();
-    fireEvent.click(await screen.findByTestId('policy-templates-tab-organization'));
-    expect(screen.getByTestId('policy-templates-organization-empty')).toBeInTheDocument();
+    const panel = await screen.findByTestId('policy-templates-panel');
+    expect(within(panel).queryAllByRole('tab')).toHaveLength(0);
+    expect(
+      within(panel).getByTestId('policy-templates-row-allow-http-methods:agent_surface')
+    ).toBeInTheDocument();
   });
 });
 
@@ -972,31 +977,6 @@ describe('insert a template into a saved policy', () => {
     expect(within(card).getByTestId('policy-template-example-row-1')).toHaveTextContent(
       /Role viewerDENYDENY/
     );
-    expect(within(card).queryByTestId('policy-template-examples-none')).toBeNull();
-  });
-
-  it('says a template has no examples instead of an empty table', async () => {
-    const saved = await savePolicyTemplate({
-      name: 'Partner GETs',
-      summary: 'GET only',
-      category: 'routing_paths',
-      policy_type: 'agent_surface',
-      rego: 'package surface.policy\n\nallow if input.http.method == "GET"',
-      reads: [],
-      examples: [],
-    });
-    mockGateway();
-    renderAt('/policy-definitions/partner-only');
-    fireEvent.click(await screen.findByTestId('policy-templates-insert-button'));
-    fireEvent.click(screen.getByTestId('policy-templates-tab-organization'));
-    fireEvent.click(await screen.findByTestId(`policy-templates-row-${saved.id}`));
-    fireEvent.click(screen.getByTestId('policy-templates-insert-rules-button'));
-
-    const card = await screen.findByTestId('policy-template-examples-card');
-    expect(within(card).getByTestId('policy-template-examples-none')).toHaveTextContent(
-      'This template has no examples.'
-    );
-    expect(within(card).queryByRole('table')).toBeNull();
   });
 
   it('does not flag examples as mismatches after a setting was changed', async () => {
@@ -1048,13 +1028,12 @@ describe('insert a template into a saved policy', () => {
     expect(screen.getByTestId('policy-rules-allow-default-warning')).toBeInTheDocument();
   });
 
-  it('hides Add rules from a template and Save as template without policies.edit', async () => {
+  it('hides Add rules from a template without policies.edit', async () => {
     mockCanEdit = false;
     mockGateway();
     renderAt('/policy-definitions/partner-only');
     await screen.findByText('Edit Policy: partner-only');
     expect(screen.queryByTestId('policy-templates-insert-button')).toBeNull();
-    expect(screen.queryByTestId('policy-templates-save-as-button')).toBeNull();
   });
 });
 
@@ -1123,12 +1102,12 @@ describe('read-only without policies.edit', () => {
     expect(screen.getByTestId('policy-definition-enabled-switch')).toBeEnabled();
   });
 
-  it('numbers the three sections on the create form', async () => {
+  it('titles the three sections on the create form without step numbers', async () => {
     await renderNew();
     expect([title('policy-template-gallery'), ...titles()]).toEqual([
-      '1Start from',
-      '2Details',
-      '3Policy',
+      'Start from',
+      'Details',
+      'Policy',
     ]);
   });
 });
@@ -1141,7 +1120,7 @@ describe('rules in this policy', () => {
     expect(within(card).getByTestId('policy-rules-count')).toHaveTextContent('1 rule');
     expect(within(card).getByTestId('policy-rules-group-0')).toHaveTextContent('Your rules');
     expect(within(card).getByTestId('policy-rules-group-0-rule-0')).toHaveTextContent(
-      /Allows.*allow if input\.jwt\.iss == "https:\/\/login\.example".*Line 5/
+      /Allows.*allow if input\.jwt\.iss == "https:\/\/login\.example".*5/
     );
 
     fireEvent.click(screen.getByTestId('policy-templates-insert-button'));
@@ -1270,6 +1249,27 @@ describe('policy section', () => {
     expect(screen.getByTestId('policy-view-rules-panel')).toHaveClass('d-none');
   });
 
+  it('shows the view switch as one joined control with the active half filled', async () => {
+    mockGateway();
+    renderAt('/policy-definitions/partner-only');
+    const rules = await screen.findByTestId('policy-view-rules');
+    const rego = screen.getByTestId('policy-view-rego');
+    expect(screen.getByRole('group', { name: 'Policy view' })).toHaveClass(
+      'btn-group',
+      'policy-view-switch'
+    );
+    expect(rules).toHaveClass('btn-primary');
+    expect(rego).toHaveClass('app-button-secondary');
+    expect(rego).toHaveAttribute('aria-pressed', 'false');
+
+    fireEvent.click(rego);
+
+    expect(rego).toHaveClass('btn-primary');
+    expect(rego).toHaveAttribute('aria-pressed', 'true');
+    expect(rules).toHaveClass('app-button-secondary');
+    expect(rules).not.toHaveClass('btn-primary');
+  });
+
   it('offers Add rules and Write Rego for a policy with no rules', async () => {
     mockGateway({ ...SAVED, policy: 'package surface.policy\n\ndefault allow := false\n' });
     renderAt('/policy-definitions/partner-only');
@@ -1303,25 +1303,6 @@ describe('policy section', () => {
 });
 
 describe('editing after a template', () => {
-  it('warns before adding an organisation template, whose rules are added as written', async () => {
-    await savePolicyTemplate({
-      name: 'Partner GETs',
-      summary: 'GET only',
-      category: 'routing_paths',
-      policy_type: 'agent_surface',
-      rego: 'package surface.policy\n\nallow if input.http.method == "GET"',
-      reads: [],
-      examples: [],
-    });
-    await renderNew();
-    fireEvent.click(await screen.findByTestId('policy-templates-tab-organization'));
-    fireEvent.click(screen.getByText('Partner GETs'));
-    expect(screen.getByTestId('policy-templates-org-insert-warning')).toHaveTextContent(
-      'combine with OR'
-    );
-    expect(screen.getByTestId('policy-templates-insert-rules-button')).toBeEnabled();
-  });
-
   it('labels an empty Rego as allowing every request, as the gateway treats it', async () => {
     await renderNew();
     fireEvent.change(rego(), { target: { value: '' } });
@@ -1515,20 +1496,16 @@ describe('remove one rule', () => {
   });
 
   it('refuses to remove a helper another rule still uses', async () => {
-    mockGateway();
+    mockGateway({ ...SAVED, policy: HELPER_POLICY });
     renderAt('/policy-definitions/partner-only');
-    fireEvent.click(await panelRow('allow-path-prefixes'));
-    fireEvent.click(screen.getByTestId('policy-templates-insert-rules-button'));
-    const group = screen.getByTestId('policy-rules-group-1');
-    const helper = within(group).getByTestId('policy-rules-group-1-rule-0-remove-button');
+    const group = await screen.findByTestId('policy-rules-group-0');
+    const helper = within(group).getByTestId('policy-rules-group-0-rule-0-remove-button');
     expect(helper).toBeDisabled();
     expect(helper).toHaveAttribute('title', expect.stringContaining('Another rule uses'));
-    expect(within(group).getByTestId('policy-rules-group-1-rule-0-in-use')).toHaveTextContent(
+    expect(within(group).getByTestId('policy-rules-group-0-rule-0-in-use')).toHaveTextContent(
       /^Another rule uses this \(allow, line \d+\); remove that rule first\.$/
     );
-    const allowRule = within(group).getAllByRole('button', { name: /Remove the rule allow/ });
-    expect(allowRule[0]).toBeEnabled();
-    expect(within(group).queryByTestId('policy-rules-group-1-in-use')).toBeNull();
+    expect(within(group).getByRole('button', { name: /Remove the rule allow/ })).toBeEnabled();
   });
 
   it('refuses to remove a deny rule that allow counts, and says why', async () => {
@@ -1655,59 +1632,6 @@ describe('undo', () => {
   });
 });
 
-describe('save a policy as a template', () => {
-  it('lists the saved template under Organization templates', async () => {
-    mockGateway();
-    renderAt('/policy-definitions/partner-only');
-    fireEvent.click(await screen.findByTestId('policy-templates-save-as-button'));
-    fireEvent.change(screen.getByTestId('policy-templates-save-name-input'), {
-      target: { value: 'Partner traffic only' },
-    });
-    fireEvent.click(screen.getByTestId('policy-templates-save-add-example-button'));
-    expect(await screen.findByTestId('policy-templates-save-example-name-0')).toHaveValue(
-      'Example 1'
-    );
-    fireEvent.click(screen.getByTestId('policy-templates-save-button'));
-    await waitFor(() => expect(screen.queryByTestId('policy-templates-save-panel')).toBeNull());
-
-    fireEvent.click(screen.getByTestId('policy-templates-insert-button'));
-    await waitFor(() =>
-      expect(screen.getByTestId('policy-templates-tab-organization')).toHaveTextContent(
-        'Organization templates (1)'
-      )
-    );
-    fireEvent.click(screen.getByTestId('policy-templates-tab-organization'));
-    expect(screen.getByText('Partner traffic only')).toBeInTheDocument();
-  });
-
-  it('is disabled while the policy has unsaved edits', async () => {
-    mockGateway();
-    renderAt('/policy-definitions/partner-only');
-    await screen.findByTestId('policy-templates-save-as-button');
-    fireEvent.change(rego(), { target: { value: `${SAVED.policy}\n# edited` } });
-    expect(screen.getByTestId('policy-templates-save-as-button')).toBeDisabled();
-  });
-
-  it('refuses a second template with the same name', async () => {
-    await savePolicyTemplate({
-      name: 'Partner-Only',
-      summary: '',
-      category: 'authentication',
-      policy_type: 'agent_surface',
-      rego: SAVED.policy,
-      reads: [],
-      examples: [],
-    });
-    mockGateway();
-    renderAt('/policy-definitions/partner-only');
-    fireEvent.click(await screen.findByTestId('policy-templates-save-as-button'));
-    fireEvent.click(screen.getByTestId('policy-templates-save-button'));
-    expect(await screen.findByTestId('policy-templates-save-error')).toHaveTextContent(
-      'A template named "partner-only" already exists.'
-    );
-  });
-});
-
 describe('the start after rules are added', () => {
   const summary = () => screen.getByTestId('policy-template-gallery-summary');
 
@@ -1795,12 +1719,10 @@ describe('the start after rules are added', () => {
 
 describe('why a rule cannot be removed', () => {
   it('names the rule that reads a helper', async () => {
-    mockGateway();
+    mockGateway({ ...SAVED, policy: HELPER_POLICY });
     renderAt('/policy-definitions/partner-only');
-    fireEvent.click(await panelRow('allow-path-prefixes'));
-    fireEvent.click(screen.getByTestId('policy-templates-insert-rules-button'));
-    expect(screen.getByTestId('policy-rules-group-1-rule-0-in-use')).toHaveTextContent(
-      /^Another rule uses this \(allow, line \d+\); remove that rule first\.$/
+    expect(await screen.findByTestId('policy-rules-group-0-rule-0-in-use')).toHaveTextContent(
+      'Another rule uses this (allow, line 7); remove that rule first.'
     );
   });
 
@@ -1859,68 +1781,20 @@ describe('template examples that differ', () => {
   });
 });
 
-describe('Save as template while the policy has unsaved changes', () => {
-  it('says why it is disabled, under the button', async () => {
+describe('built-in template badges', () => {
+  it('shows each card its category and no storage badge', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    const allowMethods = await card('allow-http-methods');
+    expect(allowMethods).toHaveTextContent('Routing & paths');
+    expect(allowMethods).not.toHaveTextContent('This tab only');
+    expect(allowMethods).not.toHaveTextContent('Organization template');
+  });
+
+  it('has no Save as template on a saved policy', async () => {
     mockGateway();
     renderAt('/policy-definitions/partner-only');
     await screen.findByText('Edit Policy: partner-only');
-    expect(screen.queryByTestId('policy-templates-save-as-hint')).toBeNull();
-
-    fireEvent.change(screen.getByTestId('policy-definition-name-input'), {
-      target: { value: 'partner-only-2' },
-    });
-    expect(screen.getByTestId('policy-templates-save-as-button')).toBeDisabled();
-    expect(screen.getByTestId('policy-templates-save-as-hint')).toHaveTextContent(
-      'Save your changes first.'
-    );
-  });
-});
-
-describe('organisation templates', () => {
-  const ORG = {
-    name: 'Partner GETs',
-    summary: 'GET only',
-    category: 'routing_paths' as const,
-    policy_type: 'agent_surface' as const,
-    rego: 'package surface.policy\n\nallow if input.http.method == "GET"',
-    reads: [],
-    examples: [],
-  };
-
-  it('marks them This tab only in the gallery, its detail and the column', async () => {
-    const saved = await savePolicyTemplate(ORG);
-    renderAt('/policy-definitions/new?type=agent_surface');
-    const orgCard = await card(saved.id);
-    expect(orgCard).toHaveTextContent('This tab only');
-    expect(await card('allow-http-methods')).not.toHaveTextContent('This tab only');
-    fireEvent.click(orgCard);
-    expect(screen.getByTestId('policy-template-gallery-detail')).toHaveTextContent('This tab only');
-
-    fireEvent.click(screen.getByTestId('policy-template-gallery-use-button'));
-    fireEvent.click(screen.getByTestId('policy-templates-tab-organization'));
-    const row = await screen.findByTestId(`policy-templates-row-${saved.id}`);
-    expect(row).toHaveTextContent('This tab only');
-    fireEvent.click(row);
-    expect(screen.getByTestId('policy-templates-preview')).toHaveTextContent('This tab only');
-  });
-
-  it('offers one saved from a whole policy only under Start from, not under Add rules', async () => {
-    const allowlist = await savePolicyTemplate({
-      ...ORG,
-      name: 'Partner outbound',
-      rego: 'package surface.policy\n\ndefault allow := false\n\nallow if input.gateway.direction != "outbound"\n\nallow if {\n  input.gateway.direction == "outbound"\n  some prefix in {"https://partner.example/"}\n  startswith(input.gateway.target_id, prefix)\n}\n',
-    });
-    const rules = await savePolicyTemplate(ORG);
-    renderAt('/policy-definitions/new?type=agent_surface');
-    expect(await card(allowlist.id)).toBeInTheDocument();
-    await applyCard('deny-by-default');
-    fireEvent.click(screen.getByTestId('policy-templates-tab-organization'));
-
-    expect(await screen.findByTestId(`policy-templates-row-${rules.id}`)).toBeInTheDocument();
-    expect(screen.queryByTestId(`policy-templates-row-${allowlist.id}`)).toBeNull();
-    expect(screen.getByTestId('policy-templates-tab-organization')).toHaveTextContent(
-      'Organization templates (1)'
-    );
+    expect(screen.queryByText('Save as template')).toBeNull();
   });
 
   it('marks no built-in as recommended', async () => {

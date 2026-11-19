@@ -2,7 +2,6 @@ import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { AppButton } from '../../../components/shared/AppButton';
 import { ALLOW_ALL_POLICY, BLANK_TEMPLATE_ID } from './policyDefaults';
 import { CUSTOM_POLICY_NAME, replaceText, type PolicyStart } from './policyStart';
-import { TemplateOriginBadges } from './TemplateBadges';
 import { TemplateDocsLink, TemplateHowItDecides, TemplateSettingsFields } from './TemplatePreview';
 import { useTemplateSettings } from './useTemplateSettings';
 import type { FieldText, PolicyTemplate, PolicyType, UsedTemplate } from './types';
@@ -131,11 +130,6 @@ const GalleryDetail: React.FC<{
     <div data-testid="policy-template-gallery-detail">
       <DetailHeading ref={headingRef}>{template.name}</DetailHeading>
       <p className="text-muted small mb-2">{template.description}</p>
-      {!template.builtin && (
-        <div className="d-flex flex-wrap gap-2 mb-3">
-          <TemplateOriginBadges template={template} />
-        </div>
-      )}
       <TemplateSettingsFields template={template} settings={settings} idPrefix={ID_PREFIX} />
       <ShowRego rego={settings.rendered.rego} />
       <TemplateHowItDecides template={template} idPrefix={ID_PREFIX} />

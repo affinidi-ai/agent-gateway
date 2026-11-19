@@ -6,7 +6,6 @@ import { useSafeNavigate } from '../../hooks/useSafeNavigate';
 import { usePageTitle } from '../../context/PageTitleContext';
 import { usePermissions } from '../../context/PermissionsContext';
 import { useDiscardWithUndo } from '../../components/surface-builder/hooks/useDiscardWithUndo';
-import { AppButton } from '../../components/shared/AppButton';
 import { Link } from '../../components/shared/Link';
 import { DOCS_URL } from '../../config/docs';
 import PolicySimulatePanel, { POLICY_SIMULATE_DEFAULT_INPUT } from './PolicySimulatePanel';
@@ -16,7 +15,6 @@ import PolicyDetailsSection from './PolicyDetailsSection';
 import { DEFAULT_POLICY_VIEW } from './policyTemplates/policyDefaults';
 import PolicyEditorSection, { type PolicyView } from './policyTemplates/PolicyEditorSection';
 import PolicyTemplatesPanel from './policyTemplates/PolicyTemplatesPanel';
-import SaveAsTemplatePanel from './policyTemplates/SaveAsTemplatePanel';
 import TemplateExamplesCheck from './policyTemplates/TemplateExamplesCheck';
 import TemplateGallery from './policyTemplates/TemplateGallery';
 import TemplateGalleryDetail from './policyTemplates/TemplateGalleryDetail';
@@ -24,7 +22,7 @@ import { parsePolicyRules } from './policyTemplates/regoRules';
 import { POLICY_TYPE_NAMES, type PolicyType } from './policyTemplates/types';
 import { usePolicyTemplateActions } from './policyTemplates/usePolicyTemplateActions';
 import { useTemplateGallery } from './policyTemplates/useTemplateGallery';
-import { useAllPolicyTemplates } from './policyTemplates/usePolicyTemplates';
+import { POLICY_TEMPLATE_LIBRARY } from './policyTemplates/builtinPolicyTemplates';
 import { groupsForOtherType } from './policyTemplates/policyStart';
 
 interface PolicyDefinition {
@@ -50,8 +48,9 @@ const EditPolicyDefinitionPage: React.FC = () => {
   const { id } = useParams<{ id: string }>();
   const [searchParams] = useSearchParams();
   const isCreateMode = !id || id === 'new';
-  const typeFromQuery: PolicyType =
-    searchParams.get('type') === 'agent_surface' ? 'agent_surface' : 'gateway';
+  const typeParam = searchParams.get('type');
+  const typeFromQuery: PolicyType = typeParam === 'agent_surface' ? 'agent_surface' : 'gateway';
+  const typeChosen = isCreateMode && (typeParam === 'gateway' || typeParam === 'agent_surface');
 
   const [form, setForm] = useState<PolicyDefinition>({
     id: '',
@@ -80,11 +79,8 @@ const EditPolicyDefinitionPage: React.FC = () => {
   const [focusAddRules, setFocusAddRules] = useState(0);
   const { hasPermission } = usePermissions();
   const canEditPolicies = hasPermission('policies.edit');
-  const numbered = isCreateMode && canEditPolicies;
+  const showGallery = isCreateMode && canEditPolicies;
   const {
-    templatePanel,
-    setTemplatePanel,
-    togglePanel,
     usedTemplate,
     templatePicked,
     setTemplatePicked,
@@ -102,10 +98,9 @@ const EditPolicyDefinitionPage: React.FC = () => {
     denyByDefault,
     showRule,
   } = usePolicyTemplateActions(form, setForm, isCreateMode);
-  const templateLibrary = useAllPolicyTemplates();
   const gallery = useTemplateGallery({
-    enabled: numbered,
-    entries: templateLibrary.entries,
+    enabled: showGallery,
+    entries: POLICY_TEMPLATE_LIBRARY.entries,
     policy: form.policy,
     policyType: form.policy_type,
     templatePicked,
@@ -128,10 +123,10 @@ const EditPolicyDefinitionPage: React.FC = () => {
         ? groupsForOtherType(
             parsePolicyRules(form.policy),
             form.policy_type,
-            templateLibrary.builtin
+            POLICY_TEMPLATE_LIBRARY.templates
           )
         : [],
-    [isCreateMode, form.policy, form.policy_type, templateLibrary.builtin]
+    [isCreateMode, form.policy, form.policy_type]
   );
   const writtenForOtherType = otherTypeGroups.find((t): t is PolicyType => t !== null) ?? null;
   const simulateRef = useRef<HTMLDivElement>(null);
@@ -327,7 +322,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
   const templatesPanel = (
     <PolicyTemplatesPanel
       policyType={form.policy_type}
-      library={templateLibrary}
+      library={POLICY_TEMPLATE_LIBRARY}
       existingPolicy={form.policy}
       isCreateMode={isCreateMode}
       onInsert={addTemplateRules}
@@ -335,7 +330,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
   );
 
   // The templates column is always there for an editor, so opening a panel never resizes the form.
-  const sidePanel = !canEditPolicies ? null : numbered && gallery.open ? (
+  const sidePanel = !canEditPolicies ? null : showGallery && gallery.open ? (
     <TemplateGalleryDetail
       selectedKey={gallery.selectedKey}
       selected={gallery.selected}
@@ -348,30 +343,12 @@ const EditPolicyDefinitionPage: React.FC = () => {
       onPickBlank={gallery.startCustom}
       onUseTemplate={gallery.pickTemplate}
     />
-  ) : templatePanel === 'save' ? (
-    <SaveAsTemplatePanel
-      policyId={form.id}
-      policyType={form.policy_type}
-      savedPolicy={(JSON.parse(baselineRef.current) as PolicyDefinition).policy}
-      defaultName={form.name}
-      defaultSummary={form.description}
-      sampleInput={form.sample_input ?? POLICY_SIMULATE_DEFAULT_INPUT}
-      onSaved={template => {
-        setTemplatePanel(null);
-        showToast(
-          'success',
-          `Template ${template.name} saved under Organization templates for this browser tab.`
-        );
-      }}
-      onClose={() => setTemplatePanel(null)}
-    />
   ) : (
     templatesPanel
   );
 
   // Add rules brings back the Add rules panel, then moves to its search once it has rendered.
   const focusTemplatesColumn = () => {
-    setTemplatePanel(null);
     if (gallery.open) gallery.close();
     setFocusAddRules(n => n + 1);
   };
@@ -403,34 +380,13 @@ const EditPolicyDefinitionPage: React.FC = () => {
             <div className="card-header py-3 d-flex justify-content-between align-items-center">
               <h6 className="m-0 font-weight-bold text-primary">
                 <i className="fas fa-shield-alt"></i>{' '}
-                {isCreateMode ? 'Create Policy' : `Edit Policy: ${form.name}`}
+                {!isCreateMode
+                  ? `Edit Policy: ${form.name}`
+                  : typeChosen
+                    ? `Create ${POLICY_TYPE_NAMES[form.policy_type].name} Policy`
+                    : 'Create Policy'}
               </h6>
               <div className="d-flex align-items-center gap-2">
-                {!isCreateMode && canEditPolicies && (
-                  <div className="position-relative">
-                    <AppButton
-                      variant="outline-primary"
-                      className={templatePanel === 'save' ? 'active' : ''}
-                      aria-pressed={templatePanel === 'save'}
-                      disabled={isDirty}
-                      aria-describedby={isDirty ? 'policy-templates-save-as-hint' : undefined}
-                      onClick={() => togglePanel('save')}
-                      iconStart={<i className="fas fa-copy" aria-hidden="true" />}
-                      data-testid="policy-templates-save-as-button"
-                    >
-                      Save as template
-                    </AppButton>
-                    {isDirty && (
-                      <small
-                        className="text-muted position-absolute top-100 end-0 text-nowrap"
-                        id="policy-templates-save-as-hint"
-                        data-testid="policy-templates-save-as-hint"
-                      >
-                        Save your changes first.
-                      </small>
-                    )}
-                  </div>
-                )}
                 {canEditPolicies && !choosing && (
                   <button
                     className={`btn btn-sm btn-primary me-2 ${saving || !policyValid || !!packageMismatch || !!writtenForOtherType ? 'disabled' : ''}`}
@@ -473,9 +429,8 @@ const EditPolicyDefinitionPage: React.FC = () => {
                 </p>
               )}
 
-              {numbered && (
+              {showGallery && (
                 <TemplateGallery
-                  step={1}
                   cards={gallery.cards}
                   surfaceOnly={gallery.surfaceOnly}
                   start={gallery.start}
@@ -492,8 +447,8 @@ const EditPolicyDefinitionPage: React.FC = () => {
               {!choosing && (
                 <>
                   <PolicyDetailsSection
-                    step={numbered ? 2 : undefined}
                     isCreateMode={isCreateMode}
+                    showType={!typeChosen}
                     readOnly={!canEditPolicies}
                     name={form.name}
                     description={form.description}
@@ -507,7 +462,6 @@ const EditPolicyDefinitionPage: React.FC = () => {
                   />
 
                   <PolicyEditorSection
-                    step={numbered ? 3 : undefined}
                     policy={form.policy}
                     policyType={form.policy_type}
                     onPolicyChange={editPolicy}

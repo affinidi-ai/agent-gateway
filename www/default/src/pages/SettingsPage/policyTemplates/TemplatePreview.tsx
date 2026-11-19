@@ -24,18 +24,20 @@ export const TemplateSettingsFields: React.FC<SettingsFieldsProps> = ({
       const err = settings.rendered.errors[p.key];
       return (
         <div className="mb-3" key={p.key}>
-          <label className="font-weight-bold" htmlFor={id}>
-            {p.label}{' '}
+          <div className="field-label-with-help">
+            <label htmlFor={id} className="mb-0">
+              {p.label}
+            </label>
             {p.help && (
               <FieldHelp testId={`field-help-${id}`} ariaLabel={`About ${p.label}`}>
                 {p.help}
               </FieldHelp>
             )}
-          </label>
+          </div>
           {p.kind === 'choice' ? (
             <select
               id={id}
-              className={`form-control form-control-sm dropdown-styling${err ? ' is-invalid' : ''}`}
+              className={`form-control dropdown-styling${err ? ' is-invalid' : ''}`}
               value={settings.fieldText[p.key] ?? ''}
               onChange={e => settings.setField(p.key, e.target.value)}
               data-testid={id}
@@ -52,7 +54,7 @@ export const TemplateSettingsFields: React.FC<SettingsFieldsProps> = ({
               type={p.kind === 'integer' ? 'number' : p.kind === 'time_of_day' ? 'time' : 'text'}
               min={p.kind === 'integer' ? p.min : undefined}
               max={p.kind === 'integer' ? p.max : undefined}
-              className={`form-control form-control-sm${p.kind === 'integer' ? ' policy-template-number' : ''}${p.kind === 'time_of_day' ? ' policy-template-time' : ''}${err ? ' is-invalid' : ''}`}
+              className={`form-control${p.kind === 'integer' ? ' policy-template-number' : ''}${p.kind === 'time_of_day' ? ' policy-template-time' : ''}${err ? ' is-invalid' : ''}`}
               value={settings.fieldText[p.key] ?? ''}
               onChange={e => settings.setField(p.key, e.target.value)}
               data-testid={id}

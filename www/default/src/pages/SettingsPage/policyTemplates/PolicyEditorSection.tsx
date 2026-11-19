@@ -12,7 +12,6 @@ import './PolicyTemplates.css';
 export type PolicyView = 'rules' | 'rego';
 
 interface PolicyEditorSectionProps {
-  step?: number;
   policy: string;
   policyType: PolicyType;
   onPolicyChange: (policy: string) => void;
@@ -40,7 +39,6 @@ interface PolicyEditorSectionProps {
 
 /** The policy itself: a Rules view of the Rego, and the Rego editor. */
 const PolicyEditorSection: React.FC<PolicyEditorSectionProps> = ({
-  step,
   policy,
   policyType,
   onPolicyChange,
@@ -91,8 +89,12 @@ const PolicyEditorSection: React.FC<PolicyEditorSectionProps> = ({
 
   return (
     <section className="policy-section" data-testid="policy-editor-section">
-      <PolicySectionTitle step={step} title="Policy">
-        <div className="btn-group btn-group-sm" role="group" aria-label="Policy view">
+      <PolicySectionTitle title="Policy" icon="fa-code">
+        <div
+          className="btn-group btn-group-sm policy-view-switch"
+          role="group"
+          aria-label="Policy view"
+        >
           {(
             [
               ['rules', 'Rules', 'fa-list-check'],
@@ -101,7 +103,7 @@ const PolicyEditorSection: React.FC<PolicyEditorSectionProps> = ({
           ).map(([key, label, icon]) => (
             <AppButton
               key={key}
-              variant={view === key ? 'primary' : 'outline-secondary'}
+              variant={view === key ? 'primary' : 'secondary'}
               aria-pressed={view === key}
               onClick={() => onViewChange(key)}
               iconStart={<i className={`fas ${icon}`} aria-hidden="true" />}
@@ -173,13 +175,15 @@ const PolicyEditorSection: React.FC<PolicyEditorSectionProps> = ({
 
       <div className={view === 'rego' ? '' : 'd-none'} data-testid="policy-view-rego-panel">
         <RegoReference policyType={policyType} />
-        <label className="font-weight-bold" htmlFor="policy-rego-input">
-          Policy Content (Rego){' '}
+        <div className="field-label-with-help">
+          <label htmlFor="policy-rego-input" className="mb-0">
+            Policy Content (Rego)
+          </label>
           <FieldHelp testId="field-help-policy-definition-content" ariaLabel="About Policy Content">
             Rego is the policy language OPA (Open Policy Agent) uses to evaluate these rules. See
             the Rego reference above for the input fields and examples.
           </FieldHelp>
-        </label>
+        </div>
         <div className={`policy-rego-editor${valid ? '' : ' is-invalid'}`}>
           <pre className="policy-rego-gutter" ref={gutterRef} aria-hidden="true">
             {Array.from({ length: lineCount }, (_, i) => i + 1).join('\n')}

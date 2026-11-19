@@ -1,22 +1,20 @@
 //! Compiles and evaluates the dashboard's built-in policy templates with the gateway's Regorus
 //! setup, so a template the dashboard offers is one the gateway loads and decides as described.
+//! The modules are the ones the dashboard renders, written by its `renderedTemplates.test.ts`.
 
 use serde_json::{Map, Value, json};
 
 const CATALOGUE: &str =
     include_str!("../../www/default/src/pages/SettingsPage/policyTemplates/builtinPolicyTemplates.json");
 
+const RENDERED_PATH: &str = "www/default/src/pages/SettingsPage/policyTemplates/__fixtures__/renderedTemplates.json";
+const RENDERED: &str =
+    include_str!("../../www/default/src/pages/SettingsPage/policyTemplates/__fixtures__/renderedTemplates.json");
+
 const NOW_NS_CALL: &str = "time.now_ns()";
 
 fn catalogue() -> Vec<Value> {
     serde_json::from_str(CATALOGUE).expect("the template catalogue is a JSON array")
-}
-
-fn template(id: &str) -> Value {
-    catalogue()
-        .into_iter()
-        .find(|t| t["id"] == id)
-        .unwrap_or_else(|| panic!("no template {id} in the catalogue"))
 }
 
 fn policy_types(template: &Value) -> Vec<&str> {
@@ -39,120 +37,18 @@ fn package_for(policy_type: &str) -> &'static str {
     }
 }
 
-/// The Rego literal for one parameter value, as `regoTemplate.ts` writes it.
-fn rego_literal(
-    param: &Value,
-    value: &Value,
-) -> String {
-    let key = param["key"]
-        .as_str()
-        .unwrap_or_default();
-    match param["kind"].as_str() {
-        Some("integer") => {
-            let n = value
-                .as_i64()
-                .unwrap_or_else(|| panic!("{key}: not a whole number: {value}"));
-            assert!(param["min"].as_i64() <= Some(n) && Some(n) <= param["max"].as_i64(), "{key}: {n} out of range");
-            n.to_string()
-        }
-        Some("string") => {
-            let text = value
-                .as_str()
-                .map(str::trim)
-                .unwrap_or_default();
-            assert!(!text.is_empty(), "{key}: empty string");
-            Value::from(text).to_string()
-        }
-        Some("choice") => param["options"]
-            .as_array()
-            .and_then(|options| {
-                options
-                    .iter()
-                    .find(|o| o["value"] == *value)
-            })
-            .and_then(|o| o["rego"].as_str())
-            .unwrap_or_else(|| panic!("{key}: {value} is not an option"))
-            .to_string(),
-        Some("time_of_day") => {
-            let text = value
-                .as_str()
-                .unwrap_or_default()
-                .trim();
-            let (hours, minutes) = text
-                .split_once(':')
-                .and_then(|(h, m)| Some((h.parse::<u32>().ok()?, m.parse::<u32>().ok()?)))
-                .filter(|(h, m)| *h < 24 && *m < 60)
-                .unwrap_or_else(|| panic!("{key}: {value} is not HH:MM"));
-            (hours * 60 + minutes).to_string()
-        }
-        Some("string_list") => {
-            let allowed: Option<Vec<&str>> = param["allowed"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .collect()
-                });
-            let mut items: Vec<String> = Vec::new();
-            for item in value
-                .as_array()
-                .unwrap_or_else(|| panic!("{key}: not a list"))
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-            {
-                let item = match &allowed {
-                    Some(allowed) => allowed
-                        .iter()
-                        .find(|a| a.eq_ignore_ascii_case(item))
-                        .unwrap_or_else(|| panic!("{key}: {item} is not accepted"))
-                        .to_string(),
-                    None => item.to_string(),
-                };
-                if !items.contains(&item) {
-                    items.push(item);
-                }
-            }
-            if items.is_empty() {
-                assert!(param["optional"] == true, "{key}: needs at least one value");
-                return "set()".to_string();
-            }
-            let literals: Vec<String> = items
-                .into_iter()
-                .map(|v| Value::from(v).to_string())
-                .collect();
-            format!("{{{}}}", literals.join(", "))
-        }
-        other => panic!("{key}: unknown parameter kind {other:?}"),
-    }
+/// The modules the dashboard renders, keyed `<id>:<type>` for a template with its defaults and
+/// `<id>:<variant>:<type>` for one with the settings its Jest test names.
+fn rendered_templates() -> Map<String, Value> {
+    serde_json::from_str(RENDERED).expect("the rendered templates are a JSON object")
 }
 
-/// The module the dashboard builds from a catalogue entry for `policy_type`, each parameter
-/// taken from `overrides` or else its default.
-fn render(
-    template: &Value,
-    policy_type: &str,
-    overrides: &Map<String, Value>,
-) -> String {
-    let mut rules = template["rules"]
-        .as_str()
-        .expect("rules is a string")
-        .to_string();
-    for param in template["parameters"]
-        .as_array()
-        .expect("parameters is a list")
-    {
-        let key = param["key"]
-            .as_str()
-            .expect("a parameter has a key");
-        let value = overrides
-            .get(key)
-            .unwrap_or(&param["default"]);
-        rules = rules.replace(&format!("{{{{{key}}}}}"), &rego_literal(param, value));
-    }
-    assert!(!rules.contains("{{"), "{}: a placeholder has no parameter: {rules}", template["id"]);
-    format!("package {}\n\n{rules}\n", package_for(policy_type))
+fn rendered(key: &str) -> String {
+    rendered_templates()
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("no rendered template {key}; regenerate {RENDERED_PATH}"))
+        .to_string()
 }
 
 /// The gateway's decision for `rego` on `input`, compiled and queried as the gateway does for
@@ -205,7 +101,7 @@ fn every_builtin_template_compiles_and_decides_its_examples() {
             .as_str()
             .unwrap_or_default();
         for policy_type in policy_types(template) {
-            let rego = render(template, policy_type, &Map::new());
+            let rego = rendered(&format!("{id}:{policy_type}"));
             for example in template["examples"]
                 .as_array()
                 .expect("examples is a list")
@@ -230,43 +126,37 @@ fn every_builtin_template_compiles_and_decides_its_examples() {
 }
 
 #[test]
+fn every_catalogue_template_has_a_rendered_module_under_its_package() {
+    let rendered = rendered_templates();
+    let mut missing = Vec::new();
+    for template in catalogue() {
+        let id = template["id"]
+            .as_str()
+            .unwrap_or_default();
+        for policy_type in policy_types(&template) {
+            let key = format!("{id}:{policy_type}");
+            match rendered
+                .get(&key)
+                .and_then(Value::as_str)
+            {
+                Some(rego) => assert!(
+                    rego.starts_with(&format!("package {}\n\n", package_for(policy_type))),
+                    "{key} is not under the {policy_type} package: {rego}"
+                ),
+                None => missing.push(key),
+            }
+        }
+    }
+    assert!(missing.is_empty(), "{RENDERED_PATH} has no module for {}; regenerate it", missing.join(", "));
+}
+
+#[test]
 fn a_rendered_template_decides_only_under_its_own_package() {
-    let template = template("allow-http-methods");
-    let rego = render(&template, "gateway", &Map::new());
+    let rego = rendered("allow-http-methods:gateway");
 
     assert_eq!(decide("gateway", &rego, &json!({"http": {"method": "GET"}})), Ok(true));
     assert_eq!(decide("gateway", &rego, &json!({"http": {"method": "DELETE"}})), Ok(false));
     assert_eq!(decide("agent_surface", &rego, &json!({"http": {"method": "GET"}})), Ok(false));
-}
-
-#[test]
-fn rendering_writes_parameters_as_rego_literals() {
-    let template = template("business-hours-access-window");
-    let overrides = json!({
-        "mode": "deny",
-        "days": [" saturday", "Sunday", "SUNDAY"],
-        "start_time": "22:00",
-        "end_time": "6:30",
-        "time_zone": " Europe/Berlin ",
-    });
-    let rego = render(&template, "gateway", overrides.as_object().unwrap());
-
-    assert!(rego.starts_with("package gateway.policy\n\n"), "{rego}");
-    assert!(rego.contains("allow if not in_access_window"), "{rego}");
-    assert!(rego.contains("access_minute >= 1320"), "{rego}");
-    assert!(rego.contains("access_minute < 390"), "{rego}");
-    assert!(rego.contains("1320 > 390"), "{rego}");
-    assert!(rego.contains(r#"in {"Saturday", "Sunday"}"#), "{rego}");
-    assert!(rego.contains(r#"time.clock([time.now_ns(), "Europe/Berlin"])"#), "{rego}");
-
-    let empty_days = render(
-        &template,
-        "gateway",
-        json!({"days": []})
-            .as_object()
-            .unwrap(),
-    );
-    assert!(empty_days.contains("count(set()) == 0"), "{empty_days}");
 }
 
 /// Nanoseconds since the epoch of an RFC 3339 instant.
@@ -277,24 +167,22 @@ fn instant_ns(rfc3339: &str) -> i64 {
         .expect("an instant in range")
 }
 
-/// The business-hours template's decision at `instant`, with `settings` over the defaults
-/// (Monday to Friday, 09:00 to 17:00, UTC, allow inside).
+/// The business-hours template's decision at `instant`, rendered with the settings the Jest
+/// test names `variant`, or with its defaults (Monday to Friday, 09:00 to 17:00, UTC, allow
+/// inside) for `None`.
 fn business_hours_allow(
     policy_type: &str,
-    settings: Value,
+    variant: Option<&str>,
     instant: &str,
 ) -> bool {
-    let template = template("business-hours-access-window");
-    let rego = render(
-        &template,
-        policy_type,
-        settings
-            .as_object()
-            .expect("settings is an object"),
-    );
-    assert!(rego.contains(NOW_NS_CALL), "the template no longer reads the clock: {rego}");
+    let key = match variant {
+        Some(variant) => format!("business-hours-access-window:{variant}:{policy_type}"),
+        None => format!("business-hours-access-window:{policy_type}"),
+    };
+    let rego = rendered(&key);
+    assert!(rego.contains(NOW_NS_CALL), "{key} no longer reads the clock: {rego}");
     let pinned = rego.replace(NOW_NS_CALL, &instant_ns(instant).to_string());
-    decide(policy_type, &pinned, &json!({})).unwrap_or_else(|e| panic!("{instant}: {e}"))
+    decide(policy_type, &pinned, &json!({})).unwrap_or_else(|e| panic!("{key} at {instant}: {e}"))
 }
 
 #[test]
@@ -316,7 +204,7 @@ fn business_hours_test_instants_fall_on_the_named_days() {
 #[test]
 fn business_hours_same_day_window_includes_its_start_and_excludes_its_end() {
     for policy_type in ["gateway", "agent_surface"] {
-        let at = |instant| business_hours_allow(policy_type, json!({}), instant);
+        let at = |instant| business_hours_allow(policy_type, None, instant);
         assert!(!at("2026-11-16T08:59:59Z"), "{policy_type}: Monday before the window");
         assert!(at("2026-11-16T09:00:00Z"), "{policy_type}: Monday at the start");
         assert!(at("2026-11-16T16:59:59Z"), "{policy_type}: Monday before the end");
@@ -329,8 +217,7 @@ fn business_hours_same_day_window_includes_its_start_and_excludes_its_end() {
 
 #[test]
 fn business_hours_overnight_window_spans_midnight_on_the_listed_dates() {
-    let overnight = || json!({"start_time": "22:00", "end_time": "06:00"});
-    let at = |instant| business_hours_allow("gateway", overnight(), instant);
+    let at = |instant| business_hours_allow("gateway", Some("overnight"), instant);
     assert!(!at("2026-11-16T12:00:00Z"), "Monday midday is outside");
     assert!(!at("2026-11-16T21:59:59Z"), "Monday before 22:00");
     assert!(at("2026-11-16T22:00:00Z"), "Monday at 22:00");
@@ -348,34 +235,30 @@ fn business_hours_overnight_window_spans_midnight_on_the_listed_dates() {
 
 #[test]
 fn business_hours_empty_days_list_means_every_day() {
-    let every_day = || json!({"days": []});
-    assert!(business_hours_allow("gateway", every_day(), "2026-11-21T12:00:00Z"), "Saturday midday");
-    assert!(business_hours_allow("agent_surface", every_day(), "2026-11-22T09:00:00Z"), "Sunday at the start");
-    assert!(!business_hours_allow("gateway", every_day(), "2026-11-22T08:00:00Z"), "Sunday before the window");
-    assert!(!business_hours_allow("gateway", every_day(), "2026-11-22T17:00:00Z"), "Sunday at the end");
-    let overnight_every_day = json!({"days": [], "start_time": "22:00", "end_time": "06:00"});
-    assert!(business_hours_allow("gateway", overnight_every_day, "2026-11-22T03:00:00Z"), "Sunday night");
+    assert!(business_hours_allow("gateway", Some("every-day"), "2026-11-21T12:00:00Z"), "Saturday midday");
+    assert!(business_hours_allow("agent_surface", Some("every-day"), "2026-11-22T09:00:00Z"), "Sunday at the start");
+    assert!(!business_hours_allow("gateway", Some("every-day"), "2026-11-22T08:00:00Z"), "Sunday before the window");
+    assert!(!business_hours_allow("gateway", Some("every-day"), "2026-11-22T17:00:00Z"), "Sunday at the end");
+    assert!(business_hours_allow("gateway", Some("every-day-overnight"), "2026-11-22T03:00:00Z"), "Sunday night");
 }
 
 #[test]
 fn business_hours_deny_mode_inverts_the_decision() {
     for policy_type in ["gateway", "agent_surface"] {
-        let at = |instant| business_hours_allow(policy_type, json!({"mode": "deny"}), instant);
+        let at = |instant| business_hours_allow(policy_type, Some("deny"), instant);
         assert!(!at("2026-11-16T09:00:00Z"), "{policy_type}: Monday at the start");
         assert!(!at("2026-11-16T16:59:59Z"), "{policy_type}: Monday before the end");
         assert!(at("2026-11-16T08:59:59Z"), "{policy_type}: Monday before the window");
         assert!(at("2026-11-16T17:00:00Z"), "{policy_type}: Monday at the end");
         assert!(at("2026-11-21T12:00:00Z"), "{policy_type}: Saturday is outside the window");
     }
-    let overnight_deny = || json!({"mode": "deny", "start_time": "22:00", "end_time": "06:00"});
-    assert!(!business_hours_allow("gateway", overnight_deny(), "2026-11-17T03:00:00Z"), "Tuesday night");
-    assert!(business_hours_allow("gateway", overnight_deny(), "2026-11-17T12:00:00Z"), "Tuesday midday");
+    assert!(!business_hours_allow("gateway", Some("overnight-deny"), "2026-11-17T03:00:00Z"), "Tuesday night");
+    assert!(business_hours_allow("gateway", Some("overnight-deny"), "2026-11-17T12:00:00Z"), "Tuesday midday");
 }
 
 #[test]
 fn business_hours_follows_the_time_zone_across_a_daylight_saving_change() {
-    let weekend_berlin = || json!({"days": ["Saturday", "Sunday"], "time_zone": "Europe/Berlin"});
-    let at = |instant| business_hours_allow("gateway", weekend_berlin(), instant);
+    let at = |instant| business_hours_allow("gateway", Some("weekend-berlin"), instant);
     assert!(!at("2026-03-28T07:59:59Z"), "Saturday 08:59:59 CET");
     assert!(at("2026-03-28T08:00:00Z"), "Saturday 09:00 CET");
     assert!(at("2026-03-28T15:59:59Z"), "Saturday 16:59:59 CET");
@@ -388,11 +271,23 @@ fn business_hours_follows_the_time_zone_across_a_daylight_saving_change() {
 
 #[test]
 fn business_hours_takes_the_day_from_the_time_zone() {
-    let friday_berlin =
-        json!({"days": ["Friday"], "start_time": "00:00", "end_time": "01:00", "time_zone": "Europe/Berlin"});
-    let saturday_berlin =
-        json!({"days": ["Saturday"], "start_time": "00:00", "end_time": "01:00", "time_zone": "Europe/Berlin"});
     let friday_night_utc = "2026-11-20T23:30:00Z";
-    assert!(!business_hours_allow("gateway", friday_berlin, friday_night_utc), "00:30 Saturday in Berlin");
-    assert!(business_hours_allow("gateway", saturday_berlin, friday_night_utc), "00:30 Saturday in Berlin");
+    assert!(
+        !business_hours_allow("gateway", Some("friday-first-hour-berlin"), friday_night_utc),
+        "00:30 Saturday in Berlin"
+    );
+    assert!(
+        business_hours_allow("gateway", Some("saturday-first-hour-berlin"), friday_night_utc),
+        "00:30 Saturday in Berlin"
+    );
+}
+
+#[test]
+fn business_hours_decides_settings_as_typed() {
+    let at = |instant| business_hours_allow("gateway", Some("typed-settings"), instant);
+    assert!(!at("2026-11-21T21:00:00Z"), "Saturday 22:00 in Berlin, typed as \" saturday\"");
+    assert!(!at("2026-11-22T05:29:59Z"), "Sunday 06:29:59 in Berlin, before Until typed as 6:30");
+    assert!(at("2026-11-22T05:30:00Z"), "Sunday 06:30 in Berlin, Until typed as 6:30");
+    assert!(at("2026-11-21T12:00:00Z"), "Saturday 13:00 in Berlin is outside the window");
+    assert!(at("2026-11-20T21:00:00Z"), "Friday 22:00 in Berlin: Friday is not listed");
 }

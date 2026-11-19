@@ -4,8 +4,7 @@ import { Badge } from '../../../components/shared/Badge';
 import { BLANK_TEMPLATE_ID } from './policyDefaults';
 import PolicySectionTitle from './PolicySectionTitle';
 import type { PolicyStart } from './policyStart';
-import { TemplateOriginBadges } from './TemplateBadges';
-import { templateEntryKey } from './usePolicyTemplates';
+import { templateEntryKey } from './policyTemplateLibrary';
 import { CATEGORY_LABELS, type PolicyTemplate, type UsedTemplate } from './types';
 import './PolicyTemplates.css';
 
@@ -16,7 +15,6 @@ interface TemplateGalleryProps {
   cards: PolicyTemplate[];
   /** Keys of the cards marked Agent surface only. */
   surfaceOnly: Set<string>;
-  step?: number;
   /** What the policy started from, while its Rego still follows it (`policyStart`). */
   start: PolicyStart | null;
   usedTemplate: UsedTemplate | null;
@@ -36,14 +34,13 @@ interface TemplateGalleryProps {
 type FocusTarget = 'change' | 'card' | 'shown';
 
 /**
- * The create form's Start from section: one card per built-in and organisation template of the
- * policy's Type, then Create custom policy. Choosing a card shows its detail in the templates
+ * The create form's Start from section: one card per template of the policy's Type, then
+ * Create custom policy. Choosing a card shows its detail in the templates
  * column (`TemplateGalleryDetail`), where Use this template fills the form.
  */
 const TemplateGallery: React.FC<TemplateGalleryProps> = ({
   cards,
   surfaceOnly,
-  step,
   start,
   usedTemplate,
   expanded,
@@ -113,7 +110,7 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
 
   return (
     <section className="policy-section" data-testid="policy-template-gallery" ref={sectionRef}>
-      <PolicySectionTitle step={step} title="Start from">
+      <PolicySectionTitle title="Start from" icon="fa-layer-group">
         {!expanded && (
           <AppButton
             ref={changeRef}
@@ -179,12 +176,11 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
                 t.name,
                 t.summary,
                 <>
-                  <TemplateOriginBadges template={t} />
                   {t.policy_input === 'mcp_tool' && (
                     <Badge tone="secondary" value="MCP tool policy" />
                   )}
                   <span className="policy-template-row__summary">
-                    {t.builtin ? CATEGORY_LABELS[t.category] : 'Organization template'}
+                    {CATEGORY_LABELS[t.category]}
                   </span>
                   {surfaceOnly.has(key) && (
                     <span

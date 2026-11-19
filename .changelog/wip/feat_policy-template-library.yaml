@@ -34,18 +34,17 @@ changes:
         Type remains. Start from names the template the policy started from and counts the
         templates added until a hand edit. On a saved policy a Template examples card checks the
         added template's examples with the existing dry-run, explains a row that differs and
-        loads its input into Test (dry-run), with Undo. Save as template keeps a saved policy
-        as an organization template for the current browser tab, marked This tab only, refuses
-        a name a template of that Type already has, and keeps a policy that holds a whole
-        policy's rules a whole policy. Default templates ship with the dashboard; no gateway API
-        changes.
+        loads its input into Test (dry-run), with Undo. The templates are a built-in catalogue
+        that ships with the dashboard; templates are not saved, stored or shared, and no
+        gateway API changes.
   changed:
     - timestamp: '2026-11-19T14:00:00Z'
-      title: Lock a new policy's Type to the Define button that opened it
+      title: Set a new policy's Type from the Define button that opened it
       description: >-
-        Define Gateway Policy and Define Agent Surface Policy set the new policy's Type, and
-        the Type select is now locked on the create page, as it already was once a policy is
-        saved, so a policy can't drift to a Type its templates were not written for.
+        Define Gateway Policy and Define Agent Surface Policy set the new policy's Type, so the
+        create page no longer shows a Type field and its header names the Type instead
+        ("Create Gateway Policy"). A policy can't drift to a Type its templates were not
+        written for. A saved policy still shows its Type, read-only.
     - timestamp: '2026-11-18T22:00:00Z'
       title: Show the policy editor read-only to users who can't edit policies
       description: >-

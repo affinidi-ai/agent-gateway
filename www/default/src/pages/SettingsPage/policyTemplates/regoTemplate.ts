@@ -4,7 +4,7 @@ import type {
   PolicyTemplate,
   PolicyTemplateParameter,
 } from './types';
-import { isTemplateMarker, TEMPLATE_BEGIN_PREFIX, TEMPLATE_END_PREFIX } from './regoRules';
+import { TEMPLATE_BEGIN_PREFIX, TEMPLATE_END_PREFIX } from './regoRules';
 
 const PACKAGE_LINE = /^\s*package\s+/;
 const IMPORT_LINE = /^\s*import\s+/;
@@ -187,13 +187,7 @@ export function insertTemplateRules(
     .filter(l => !existingImports.has(l));
   const body = trimBlankLines(
     templateLines.filter(
-      l =>
-        !PACKAGE_LINE.test(l) &&
-        !IMPORT_LINE.test(l) &&
-        !DEFAULT_ALLOW_LINE.test(l) &&
-        // A template saved from a policy that combined templates keeps their markers; dropping
-        // them stops groups nesting, so Remove takes out every rule of the inserted template.
-        !isTemplateMarker(l)
+      l => !PACKAGE_LINE.test(l) && !IMPORT_LINE.test(l) && !DEFAULT_ALLOW_LINE.test(l)
     )
   );
   const added = body.join('\n');

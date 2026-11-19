@@ -6,13 +6,13 @@ import {
   surfaceOnlyKeys,
   templateEntryKey,
   type TemplateEntry,
-} from './usePolicyTemplates';
+} from './policyTemplateLibrary';
 import type { AddedRules, FieldText, PolicyTemplate, PolicyType, UsedTemplate } from './types';
 
 interface TemplateGalleryOptions {
   /** False on a saved policy and for a user who can't edit policies: no gallery, no start. */
   enabled: boolean;
-  /** Every template, from `useAllPolicyTemplates`. */
+  /** Every template, from `POLICY_TEMPLATE_LIBRARY`. */
   entries: TemplateEntry[];
   policy: string;
   policyType: PolicyType;

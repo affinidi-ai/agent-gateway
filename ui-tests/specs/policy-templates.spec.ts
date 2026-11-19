@@ -133,10 +133,9 @@ async function deletePolicy(page: Page, policyId: string) {
 }
 
 test.describe('Policy templates on a saved policy', () => {
-    test('checks added rules against the template examples and saves the policy as a template', async ({page}) => {
+    test('checks added rules against the template examples', async ({page}) => {
         const suffix = `${Date.now()}-${test.info().workerIndex}`;
         const policyName = `UI test policy ${suffix}`;
-        const templateName = `UI test template ${suffix}`;
 
         await page.goto(`${BASE_URL}/policy-definitions/new?type=agent_surface`);
         await pickCard(page, 'allow-http-methods');
@@ -149,9 +148,6 @@ test.describe('Policy templates on a saved policy', () => {
         await page.waitForURL(/\/policy-definitions\/[0-9a-f-]{36}$/);
         const policyId = page.url().split('/').pop()!;
         try {
-            const saveAs = page.getByTestId('policy-templates-save-as-button');
-            await expect(saveAs).toBeEnabled();
-
             const column = page.getByTestId('policy-templates-column');
             await column.getByTestId('policy-templates-row-require-authentication:agent_surface').click();
             await column.getByTestId('policy-templates-insert-rules-button').click();
@@ -161,24 +157,6 @@ test.describe('Policy templates on a saved policy', () => {
             await expect(examples).toContainText('Require authenticated caller');
             await expect(examples.getByTestId('policy-template-example-row-2')).toBeVisible();
             await captureFullPage(page, 'policy-templates-examples-card');
-
-            await expect(saveAs).toBeDisabled();
-            await expect(save).toBeEnabled();
-            await save.click();
-            await expect(saveAs).toBeEnabled();
-            await saveAs.click();
-
-            const savePanel = column.getByTestId('policy-templates-save-panel');
-            await savePanel.getByTestId('policy-templates-save-name-input').fill(templateName);
-            await savePanel.getByTestId('policy-templates-save-button').click();
-            await expect(savePanel).toHaveCount(0);
-
-            await column.getByTestId('policy-templates-tab-organization').click();
-            await expect(column.getByTestId('policy-templates-organization-empty')).toHaveCount(0);
-            const orgRow = column.locator('[data-testid^="policy-templates-row-org:"]');
-            await expect(orgRow).toHaveCount(1);
-            await expect(orgRow).toContainText(templateName);
-            await captureFullPage(page, 'policy-templates-organization-tab');
         } finally {
             await deletePolicy(page, policyId);
         }

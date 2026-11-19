@@ -71,10 +71,11 @@ const Misfit: React.FC<{ testId: string; children: React.ReactNode }> = ({ testI
   </div>
 );
 
+const lineRange = (rule: PolicyRule) =>
+  rule.startLine === rule.endLine ? `${rule.startLine}` : `${rule.startLine}–${rule.endLine}`;
+
 const lineLabel = (rule: PolicyRule) =>
-  rule.startLine === rule.endLine
-    ? `Line ${rule.startLine}`
-    : `Lines ${rule.startLine}–${rule.endLine}`;
+  `${rule.startLine === rule.endLine ? 'Line' : 'Lines'} ${lineRange(rule)}`;
 
 /** The Rules view of the policy: the rules in the Rego, grouped by the template they came from. */
 const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
@@ -224,13 +225,11 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
         const groupReason = isTemplate && canEdit ? groupUse(group) : null;
         const groupInUse = groupReason !== null;
         const writtenFor = otherTypeGroups[index] ?? null;
+        const noEffect = allowByDefault && allows(group);
+        const ruleCount = group.rules.length;
         return (
-          <div
-            className="policy-rules__group"
-            key={`${group.startLine}-${index}`}
-            data-testid={testId}
-          >
-            <div className="policy-rules__group-header">
+          <div className="card mb-2" key={`${group.startLine}-${index}`} data-testid={testId}>
+            <div className="card-header py-2 policy-rules__group-header">
               <span className="small text-muted">
                 {group.source.kind === 'template' ? (
                   <>
@@ -244,6 +243,9 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
                     {startedFrom && ` · started from ${startedFrom}`}
                   </>
                 )}
+              </span>
+              <span className="small text-muted" data-testid={`${testId}-count`}>
+                {ruleCount} {ruleCount === 1 ? 'rule' : 'rules'}
               </span>
               {group === lastJustAdded && (
                 <Badge tone="success" value="Just added" data-testid="policy-rules-just-added" />
@@ -262,81 +264,110 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
                 </AppButton>
               )}
             </div>
-            {groupReason && (
-              <div
-                className="small text-muted ps-2 mb-1"
-                id={`${testId}-in-use`}
-                data-testid={`${testId}-in-use`}
-              >
-                {groupInUseText(groupReason)}
+            {(groupReason || writtenFor || noEffect || ruleCount === 0) && (
+              <div className="card-body py-2 policy-rules__notes">
+                {groupReason && (
+                  <div
+                    className="small text-muted mb-1"
+                    id={`${testId}-in-use`}
+                    data-testid={`${testId}-in-use`}
+                  >
+                    {groupInUseText(groupReason)}
+                  </div>
+                )}
+                {writtenFor && (
+                  <Misfit testId={`${testId}-other-type`}>
+                    Written for {POLICY_TYPE_NAMES[writtenFor].name} policies. It reads input{' '}
+                    {POLICY_TYPE_NAMES[otherTypeOf(writtenFor)].name} policies don&apos;t get.
+                    Remove it to create this policy.
+                  </Misfit>
+                )}
+                {noEffect && (
+                  <Misfit testId={`${testId}-no-effect`}>
+                    No effect while the default is ALLOW.
+                  </Misfit>
+                )}
+                {ruleCount === 0 && (
+                  <div className="small text-muted">No rules left from this template.</div>
+                )}
               </div>
             )}
-            {writtenFor && (
-              <Misfit testId={`${testId}-other-type`}>
-                Written for {POLICY_TYPE_NAMES[writtenFor].name} policies. It reads input{' '}
-                {POLICY_TYPE_NAMES[otherTypeOf(writtenFor)].name} policies don&apos;t get. Remove it
-                to create this policy.
-              </Misfit>
-            )}
-            {allowByDefault && allows(group) && (
-              <Misfit testId={`${testId}-no-effect`}>No effect while the default is ALLOW.</Misfit>
-            )}
-            {group.rules.length === 0 && (
-              <div className="small text-muted ps-2">No rules left from this template.</div>
-            )}
-            <ul className="list-unstyled mb-0">
-              {group.rules.map((rule, ruleIndex) => {
-                const ruleTestId = `${testId}-rule-${ruleIndex}`;
-                const reason = canEdit ? ruleUse(rule) : null;
-                const inUse = reason !== null;
-                return (
-                  <li
-                    key={rule.startLine}
-                    className={`policy-rules__rule${inUse ? ' policy-rules__rule--in-use' : ''}`}
-                    data-testid={ruleTestId}
-                  >
-                    <span className="badge policy-rules__kind" title={KIND_TITLE[rule.kind]}>
-                      {KIND_LABEL[rule.kind]}
-                    </span>
-                    <code className="policy-rules__summary" title={rule.summary}>
-                      {rule.summary}
-                    </code>
-                    <AppButton
-                      variant="link"
-                      className="p-0 text-nowrap"
-                      onClick={() => onShowRule(rule)}
-                      aria-label={`Show ${rule.head} in the Rego`}
-                      data-testid={`${ruleTestId}-show-button`}
-                    >
-                      {lineLabel(rule)}
-                    </AppButton>
+            {ruleCount > 0 && (
+              <table className="table table-sm align-middle mb-0 policy-rules__table">
+                <thead className="thead-light">
+                  <tr>
+                    <th className="policy-rules__col-kind">Kind</th>
+                    <th>Rule</th>
+                    <th className="policy-rules__col-line">Line</th>
                     {canEdit && (
-                      <AppButton
-                        variant="outline-danger"
-                        className="text-nowrap"
-                        disabled={inUse}
-                        title={reason ? ruleInUseText(reason) : undefined}
-                        onClick={() => onRemoveRule(rule)}
-                        aria-label={`Remove the rule ${rule.head}`}
-                        aria-describedby={inUse ? `${ruleTestId}-in-use` : undefined}
-                        data-testid={`${ruleTestId}-remove-button`}
-                      >
-                        Remove
-                      </AppButton>
+                      <th className="policy-rules__col-actions">
+                        <span className="visually-hidden">Actions</span>
+                      </th>
                     )}
-                    {reason && (
-                      <span
-                        className="policy-rules__in-use small text-muted"
-                        id={`${ruleTestId}-in-use`}
-                        data-testid={`${ruleTestId}-in-use`}
-                      >
-                        {ruleInUseText(reason)}
-                      </span>
-                    )}
-                  </li>
-                );
-              })}
-            </ul>
+                  </tr>
+                </thead>
+                <tbody>
+                  {group.rules.map((rule, ruleIndex) => {
+                    const ruleTestId = `${testId}-rule-${ruleIndex}`;
+                    const reason = canEdit ? ruleUse(rule) : null;
+                    const inUse = reason !== null;
+                    return (
+                      <tr key={rule.startLine} data-testid={ruleTestId}>
+                        <td>
+                          <span className="badge policy-rules__kind" title={KIND_TITLE[rule.kind]}>
+                            {KIND_LABEL[rule.kind]}
+                          </span>
+                        </td>
+                        <td>
+                          <code className="policy-rules__summary" title={rule.summary}>
+                            {rule.summary}
+                          </code>
+                          {reason && (
+                            <div
+                              className="small text-muted mt-1"
+                              id={`${ruleTestId}-in-use`}
+                              data-testid={`${ruleTestId}-in-use`}
+                            >
+                              {ruleInUseText(reason)}
+                            </div>
+                          )}
+                        </td>
+                        <td>
+                          <AppButton
+                            variant="outline-secondary"
+                            size="sm"
+                            className="text-nowrap font-monospace"
+                            iconStart={<i className="fas fa-code" aria-hidden="true" />}
+                            onClick={() => onShowRule(rule)}
+                            title="Show in the Rego"
+                            aria-label={`Show ${rule.head} in the Rego, ${lineLabel(rule).toLowerCase()}`}
+                            data-testid={`${ruleTestId}-show-button`}
+                          >
+                            {lineRange(rule)}
+                          </AppButton>
+                        </td>
+                        {canEdit && (
+                          <td className="text-end">
+                            <AppButton
+                              variant="outline-danger"
+                              size="sm"
+                              disabled={inUse}
+                              title={reason ? ruleInUseText(reason) : 'Remove'}
+                              onClick={() => onRemoveRule(rule)}
+                              aria-label={`Remove the rule ${rule.head}`}
+                              aria-describedby={inUse ? `${ruleTestId}-in-use` : undefined}
+                              data-testid={`${ruleTestId}-remove-button`}
+                            >
+                              <i className="fas fa-trash" aria-hidden="true" />
+                            </AppButton>
+                          </td>
+                        )}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
           </div>
         );
       })}

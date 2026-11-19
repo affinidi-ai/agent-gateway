@@ -21,9 +21,6 @@ import {
 const UNDO_REGO = 'Undo restores the Rego from before this change.';
 const UNDO_FORM = 'Undo restores the form from before this change.';
 
-/** What the templates column shows instead of Add rules; null shows Add rules. */
-export type TemplatePanel = 'save';
-
 /** The policy form fields a template fills. */
 export interface TemplateFormFields {
   name: string;
@@ -46,7 +43,6 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
   isCreateMode: boolean
 ) {
   const { notifyUndo } = usePolicyTemplateServices();
-  const [templatePanel, setTemplatePanel] = useState<TemplatePanel | null>(null);
   // Only Use and Allow all set it; whether the Rego still follows it is derived from the Rego.
   const [usedTemplate, setUsedTemplate] = useState<UsedTemplate | null>(null);
   // A new policy shows its Details and Policy sections only once a template is used.
@@ -57,8 +53,6 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
   const regoRef = useRef<HTMLTextAreaElement>(null);
   // The Name and Description the last Use filled in.
   const filledFieldsRef = useRef<{ name: string; description: string } | null>(null);
-
-  const togglePanel = (panel: TemplatePanel) => setTemplatePanel(p => (p === panel ? null : panel));
 
   const applyTemplate = (template: PolicyTemplate, rego: string, fieldText: FieldText) => {
     const previous = { name: form.name, description: form.description, policy: form.policy };
@@ -76,7 +70,6 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
     }));
     setUsedTemplate({ id: template.id, fieldText });
     setTemplatePicked(true);
-    setTemplatePanel(null);
     notifyUndo({
       message: `Filled from the template ${template.name}. ${UNDO_FORM}`,
       onUndo: () => {
@@ -196,9 +189,6 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
   };
 
   return {
-    templatePanel,
-    setTemplatePanel,
-    togglePanel,
     usedTemplate,
     templatePicked,
     setTemplatePicked,

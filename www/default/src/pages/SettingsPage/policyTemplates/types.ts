@@ -85,7 +85,6 @@ export interface PolicyTemplate {
   /** Input paths the policy reads, shown as tags. */
   reads: string[];
   examples: PolicyTemplateExample[];
-  builtin: boolean;
   /**
    * The template decides on its own: its rules allow requests outside what it restricts,
    * so inserting them into another policy, whose rules combine with OR, would widen access.

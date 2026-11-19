@@ -1,11 +1,10 @@
-import { BUILTIN_POLICY_TEMPLATES } from '../builtinPolicyTemplates';
+import { BUILTIN_POLICY_TEMPLATES, POLICY_TEMPLATE_LIBRARY } from '../builtinPolicyTemplates';
 import {
   galleryTemplates,
   groupTemplateEntries,
   surfaceOnlyKeys,
   templateEntryKey,
-} from '../usePolicyTemplates';
-import type { PolicyTemplate } from '../types';
+} from '../policyTemplateLibrary';
 
 describe('groupTemplateEntries', () => {
   it('groups the variants of a built-in template under its catalogue id', () => {
@@ -16,17 +15,20 @@ describe('groupTemplateEntries', () => {
     expect(Object.keys(trust.variants)).toEqual(['agent_surface']);
     expect(new Set(entries.map(e => e.key)).size).toBe(entries.length);
   });
+});
 
-  it('keeps an organisation template as its own entry', () => {
-    const org: PolicyTemplate = {
-      ...BUILTIN_POLICY_TEMPLATES[0],
-      id: 'org:abc-1',
-      builtin: false,
-    };
-    expect(templateEntryKey(org)).toBe('org:abc-1');
-    expect(groupTemplateEntries([org])).toEqual([
-      { key: 'org:abc-1', variants: { [org.policy_type]: org } },
-    ]);
+describe('POLICY_TEMPLATE_LIBRARY', () => {
+  it('holds every built-in template, Agent Surface variants first', () => {
+    const { templates, entries } = POLICY_TEMPLATE_LIBRARY;
+    expect(templates).toHaveLength(BUILTIN_POLICY_TEMPLATES.length);
+    const firstGateway = templates.findIndex(t => t.policy_type === 'gateway');
+    expect(templates.slice(firstGateway).every(t => t.policy_type === 'gateway')).toBe(true);
+    expect(entries.map(e => e.key)).toEqual(Array.from(new Set(templates.map(templateEntryKey))));
+  });
+
+  it('has no template outside the built-in catalogue', () => {
+    const builtinIds = new Set(BUILTIN_POLICY_TEMPLATES.map(t => t.id));
+    expect(POLICY_TEMPLATE_LIBRARY.templates.filter(t => !builtinIds.has(t.id))).toEqual([]);
   });
 });
 

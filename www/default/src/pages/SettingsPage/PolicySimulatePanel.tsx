@@ -144,7 +144,7 @@ const PolicySimulatePanel: React.FC<PolicySimulatePanelProps> = ({
           Evaluates the Rego currently in the editor (unsaved) against the sample <code>input</code>{' '}
           below. Nothing is enforced — no engine or live traffic is touched.
         </p>
-        <label className="font-weight-bold">
+        <label>
           Sample input JSON
           {sampleInput.trim() && !sampleInputError && (
             <span className="ms-2 text-success small">
@@ -171,13 +171,7 @@ const PolicySimulatePanel: React.FC<PolicySimulatePanelProps> = ({
             data-testid="policy-simulate-input-error"
           >
             <i className="fas fa-exclamation-triangle me-2"></i>
-            <span
-              style={{
-                whiteSpace: 'pre-wrap',
-                fontFamily: 'Monaco, Consolas, "Courier New", monospace',
-                fontSize: '0.8rem',
-              }}
-            >
+            <span className="policy-error-text">
               {`Sample input is not valid JSON: ${sampleInputError}`}
             </span>
           </div>
@@ -185,15 +179,7 @@ const PolicySimulatePanel: React.FC<PolicySimulatePanelProps> = ({
         {error && (
           <div className="alert alert-danger compile-error-alert py-2 px-3 mb-0">
             <i className="fas fa-exclamation-triangle me-2"></i>
-            <span
-              style={{
-                whiteSpace: 'pre-wrap',
-                fontFamily: 'Monaco, Consolas, "Courier New", monospace',
-                fontSize: '0.8rem',
-              }}
-            >
-              {error}
-            </span>
+            <span className="policy-error-text">{error}</span>
           </div>
         )}
         {result && (

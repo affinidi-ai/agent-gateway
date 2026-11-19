@@ -430,8 +430,8 @@ sections built from the shared dashboard components, and are read-only without
 [`www/default/AGENTS.md`](www/default/AGENTS.md#policy-definition-editor). Templates need no
 gateway API and link to their Apply Policies docs section. A new policy shows only the
 **Start from** gallery, with no card selected, until a template is used; Details and the
-Policy section, on the Rules view, appear after that. The gallery lists only the default and
-organization templates of the policy's Type, so **Define Gateway Policy** and **Define Agent
+Policy section, on the Rules view, appear after that. The gallery lists only the built-in
+templates of the policy's Type, so **Define Gateway Policy** and **Define Agent
 Surface Policy** each start from their own templates, the Type set by that button and never
 changeable, with a **Create custom policy** button
 under the list that starts a custom policy (allow-all Rego) at once, or shows it in the
@@ -449,12 +449,10 @@ as having no effect, and on a new policy a group written for the other Type is m
 blocks Create until it is removed. Once rules are added the gallery still names the
 template the policy started from and counts the templates added. **Add rules from a template**
 lists only templates that add rules, so several combine in a new or saved policy, and counts the
-whole policies and other-Type templates it leaves out. A saved policy offers
-**Save as template**, which keeps a policy holding a standalone template's rules a whole
-policy, and once rules are added a Template examples card runs their examples
-through the existing simulate endpoint, says why a row differs and loads its input in Test
-(dry-run), or says the template has no examples. Default templates ship with the dashboard; organization templates are ones a user
-saved with Save as template and last for the browser tab (marked This tab only); see
+whole policies and other-Type templates it leaves out. Once rules are added to a saved policy
+a Template examples card runs their examples through the existing simulate endpoint, says why
+a row differs and loads its input in Test (dry-run). Templates are the built-in catalogue that
+ships with the dashboard only; nothing saves, stores or shares a template; see
 _Policy templates_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#policy-templates).
 
 The Dashboard shows the metrics **Delete** button only to users with `settings.edit`; see

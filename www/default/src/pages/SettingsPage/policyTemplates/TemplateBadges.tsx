@@ -1,5 +1,4 @@
 import React from 'react';
-import { Badge } from '../../../components/shared/Badge';
 import { templateRole } from './regoTemplate';
 import type { PolicyDecision, PolicyTemplate } from './types';
 
@@ -46,17 +45,3 @@ export const RoleBadge: React.FC<{ role: 'policy' | 'rules' }> = ({ role }) => {
     </span>
   );
 };
-
-/** This tab only on an organisation template. */
-export const TemplateOriginBadges: React.FC<{ template: PolicyTemplate }> = ({ template }) => (
-  <>
-    {!template.builtin && (
-      <Badge
-        tone="info"
-        value="This tab only"
-        title="Kept in this browser tab until it closes"
-        data-testid="policy-template-tab-only-badge"
-      />
-    )}
-  </>
-);

@@ -2,20 +2,18 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AppButton } from '../../../components/shared/AppButton';
 import InfoBanner from '../../../components/shared/InfoBanner';
 import { defaultDecision, insertTemplateRules, templateRole } from './regoTemplate';
-import { DecisionBadge, TemplateOriginBadges, TemplateRoleBadge } from './TemplateBadges';
+import { DecisionBadge, TemplateRoleBadge } from './TemplateBadges';
 import TemplateFilterBar from './TemplateFilterBar';
 import { TemplateDocsLink, TemplateHowItDecides, TemplateSettingsFields } from './TemplatePreview';
 import { useTemplateSettings } from './useTemplateSettings';
-import { galleryTemplates, type PolicyTemplateLibrary } from './usePolicyTemplates';
+import { galleryTemplates, type PolicyTemplateLibrary } from './policyTemplateLibrary';
 import { useTemplateFilter } from './useTemplateFilter';
 import { POLICY_TYPE_NAMES, type PolicyTemplate, type PolicyType } from './types';
 import './PolicyTemplates.css';
 
-type Source = 'builtin' | 'organization';
-
 interface PolicyTemplatesPanelProps {
   policyType: PolicyType;
-  /** Every template, from `useAllPolicyTemplates`. */
+  /** Every template, from `POLICY_TEMPLATE_LIBRARY`. */
   library: PolicyTemplateLibrary;
   /** The editor's current Rego, which Add to policy appends to. */
   existingPolicy?: string;
@@ -58,7 +56,6 @@ const InsertPreview: React.FC<{
       <div className="d-flex flex-wrap gap-2 mb-3">
         <TemplateRoleBadge template={template} />
         <DecisionBadge decision={defaultDecision(template.rego)} />
-        <TemplateOriginBadges template={template} />
       </div>
 
       <TemplateSettingsFields template={template} settings={settings} idPrefix={ID_PREFIX} />
@@ -95,17 +92,6 @@ const InsertPreview: React.FC<{
           />
         </div>
       )}
-      {!template.builtin && canInsert && (
-        <div data-testid="policy-templates-org-insert-warning">
-          <InfoBanner
-            variant="warning"
-            icon="fa-exclamation-triangle"
-            collapsible={false}
-            className="mb-2"
-            summary="This template was saved from a policy, so its rules are added as written. Rules combine with OR: check that none of them allows requests this policy should deny."
-          />
-        </div>
-      )}
 
       <TemplateHowItDecides template={template} idPrefix={ID_PREFIX} />
       <TemplateDocsLink template={template} testId="policy-templates-docs-link" />
@@ -126,40 +112,24 @@ const InsertPreview: React.FC<{
 /** The templates column's Add rules panel: pick a template and add its rules to the Rego. */
 const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
   policyType,
-  library: { entries, loading: loadingByType, error },
+  library: { entries },
   existingPolicy = '',
   isCreateMode,
   onInsert,
 }) => {
-  // This Type's list decides the spinner and empty states; the left-out note counts the other
-  // Type too, so it waits for both.
-  const loading = loadingByType[policyType];
-  const allLoaded = !loadingByType.gateway && !loadingByType.agent_surface;
   const ofType = useMemo(() => galleryTemplates(entries, policyType), [entries, policyType]);
-  const allBuiltin = useMemo(() => ofType.filter(t => t.builtin), [ofType]);
-  const organization = useMemo(() => ofType.filter(t => !t.builtin), [ofType]);
-  const [source, setSource] = useState<Source>('builtin');
   const [selected, setSelected] = useState<PolicyTemplate | null>(null);
 
-  const builtin = useMemo(() => allBuiltin.filter(addsRules), [allBuiltin]);
-  const organizationRules = useMemo(() => organization.filter(addsRules), [organization]);
-  const sourceTemplates = source === 'builtin' ? builtin : organizationRules;
+  const rulesTemplates = useMemo(() => ofType.filter(addsRules), [ofType]);
   const { query, setQuery, category, setCategory, categories, visible } =
-    useTemplateFilter(sourceTemplates);
+    useTemplateFilter(rulesTemplates);
   // A template the search or category hides shows no preview until it is listed again.
   const shownSelected = visible.find(t => t.id === selected?.id) ?? null;
-  const wholePolicies =
-    allBuiltin.length + organization.length - builtin.length - organizationRules.length;
+  const wholePolicies = ofType.length - rulesTemplates.length;
   const otherTypeOnly = entries.filter(e => !e.variants[policyType]).length;
   const leftOut = wholePolicies + otherTypeOnly;
   const otherTypeName =
     POLICY_TYPE_NAMES[policyType === 'gateway' ? 'agent_surface' : 'gateway'].name;
-
-  const switchSource = (next: Source) => {
-    setSource(next);
-    setCategory('all');
-    setSelected(null);
-  };
 
   return (
     <div className="card shadow mb-4" data-testid="policy-templates-panel">
@@ -170,27 +140,6 @@ const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
       </div>
       <div className="card-body">
         <p className="text-muted small mb-2">Adds rules to the end of this policy.</p>
-        <ul className="nav nav-tabs mb-2" role="tablist">
-          {(
-            [
-              ['builtin', 'Default templates', builtin.length],
-              ['organization', 'Organization templates', organizationRules.length],
-            ] as const
-          ).map(([key, label, count]) => (
-            <li className="nav-item" role="presentation" key={key}>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={source === key}
-                className={`nav-link ${source === key ? 'active' : ''}`}
-                onClick={() => switchSource(key)}
-                data-testid={`policy-templates-tab-${key}`}
-              >
-                {label} ({count})
-              </button>
-            </li>
-          ))}
-        </ul>
         <TemplateFilterBar
           query={query}
           onQueryChange={setQuery}
@@ -202,20 +151,7 @@ const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
           className="policy-template-filters--stacked mb-3"
         />
 
-        {loading && (
-          <div className="text-muted small">
-            <span className="spinner-border spinner-border-sm me-2" role="status" />
-            Loading templates…
-          </div>
-        )}
-        {error && <div className="alert alert-danger py-2 px-3 small">{error}</div>}
-        {!loading && source === 'organization' && organization.length === 0 && (
-          <div className="text-muted small py-2" data-testid="policy-templates-organization-empty">
-            No organization templates yet. These are templates you saved from a policy in this tab.
-            To add one, open a saved policy and choose <strong>Save as template</strong>.
-          </div>
-        )}
-        {!loading && sourceTemplates.length > 0 && visible.length === 0 && (
+        {rulesTemplates.length > 0 && visible.length === 0 && (
           <div className="text-muted small py-2">No templates match.</div>
         )}
 
@@ -238,13 +174,12 @@ const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
                     <span className="d-flex flex-column align-items-end gap-1">
                       <TemplateRoleBadge template={t} />
                       <DecisionBadge decision={defaultDecision(t.rego)} />
-                      <TemplateOriginBadges template={t} />
                     </span>
                   </button>
                 </li>
               ))}
             </ul>
-            {allLoaded && leftOut > 0 && (
+            {leftOut > 0 && (
               <div className="small text-muted mt-2" data-testid="policy-templates-left-out-note">
                 {`${plural(leftOut, 'template', 'templates')} left out: ${[
                   wholePolicies > 0 &&

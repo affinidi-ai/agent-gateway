@@ -35,7 +35,7 @@ const Example: React.FC<{ icon: string; title: string; code: string }> = ({
   code,
 }) => (
   <>
-    <h6 className="font-weight-bold text-dark mb-2 mt-3">
+    <h6 className="font-weight-bold mb-2 mt-3">
       <i className={`fas ${icon} me-2`} aria-hidden="true" />
       {title}
     </h6>
@@ -96,7 +96,7 @@ allow if {
 }`}</code>
           </pre>
 
-          <h6 className="font-weight-bold text-dark mb-2">
+          <h6 className="font-weight-bold mb-2">
             <i className="fas fa-database me-2" aria-hidden="true" />
             Policy input
           </h6>
@@ -168,11 +168,11 @@ allow if {
           />
 
           <div className="alert alert-warning mb-0 mt-3">
-            <small className="text-dark">
-              <i className="fas fa-exclamation-triangle me-2 text-warning" aria-hidden="true" />
-              <strong>Best practice:</strong> start with{' '}
-              <code className="text-dark">default allow := false</code> and allow only what you
-              need. Caller identity and trust check results are set on Agent Surface policies.
+            <small>
+              <i className="fas fa-exclamation-triangle me-2" aria-hidden="true" />
+              <strong>Best practice:</strong> start with <code>default allow := false</code> and
+              allow only what you need. Caller identity and trust check results are set on Agent
+              Surface policies.
             </small>
           </div>
         </div>

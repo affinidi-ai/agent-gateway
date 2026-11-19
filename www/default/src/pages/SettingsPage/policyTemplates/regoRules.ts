@@ -45,7 +45,7 @@ const BEGIN_MARKER = /^\s*#\s*Inserted from template:\s*(.*)$/;
 const END_MARKER = /^\s*#\s*End of template:/;
 
 /** True for a `# Inserted from template:` or `# End of template:` comment line. */
-export function isTemplateMarker(line: string): boolean {
+function isTemplateMarker(line: string): boolean {
   return BEGIN_MARKER.test(line) || END_MARKER.test(line);
 }
 const DEFAULT_ALLOW = /^default\s+allow\s*:?=\s*(true|false)\b/;
