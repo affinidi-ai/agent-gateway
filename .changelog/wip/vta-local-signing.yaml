@@ -149,6 +149,20 @@ changes:
         session, and otherwise forgets the stale token and shows the sign-in form.
   removed: []
   security:
+    - timestamp: '2026-11-19T16:30:00Z'
+      title: Record trust agent changes and refusals as tamper-evident security records
+      description: >-
+        Creating, updating, pairing, verifying, revoking or deleting a trust
+        agent connection, provisioning or rotating its signing key, and rotating
+        or cancelling a control key each emit a governance audit event in a new
+        Key management group. Refusals of those routes (401, 403, 409, and 404
+        for a connection the caller may not see) emit trust_agent_change_refused,
+        and a signing change refused for lack of key_management.edit emits
+        signing_change_refused. Each record names its actor, is appended to a
+        SHA-256 hash chain under the audit directory before the response is
+        sent, is logged on the security_audit target and reaches the VP Audit
+        Log and integrations that select it, so an edited, removed or reordered
+        record is detectable.
     - timestamp: '2026-11-19T15:00:00Z'
       title: Refuse a credential whose revocation status the gateway cannot check
       description: >-
