@@ -211,6 +211,9 @@ jobs:
     env:
       # The required line-coverage floor for this service.
       COVERAGE_THRESHOLD: "37"
+      # Lowers peak memory of the instrumented build, which the runner kills otherwise.
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "false"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
