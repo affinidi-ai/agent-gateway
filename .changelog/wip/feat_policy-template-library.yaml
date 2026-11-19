@@ -56,7 +56,8 @@ changes:
         Choosing a card shows its details in the column beside the form, and the Details and
         Policy sections appear once a template, or Allow all (blank), is used, so a policy
         never starts from a template the user didn't choose. Change reopens the gallery, and
-        Cancel closes it again without using another template.
+        Cancel closes it again without using another template. Leaving the page and opening
+        Create Policy again starts fresh; only Undo on the discard notice brings the draft back.
     - timestamp: '2026-11-18T18:00:00Z'
       title: Redesign the policy editor into Details and Policy sections
       description: >-

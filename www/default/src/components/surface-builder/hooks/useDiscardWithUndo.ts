@@ -17,7 +17,15 @@ export interface DiscardSnapshot {
    * API response arrives) via the returned `popPendingRestore()`.
    */
   restore: (saved: string) => void;
+  /**
+   * Restore only when the editor is reopened by the toast's Undo; any other visit drops the
+   * snapshot, so the editor starts fresh.
+   */
+  restoreOnlyOnUndo?: boolean;
 }
+
+/** Navigation state the toast's Undo sets, so the editor can tell it was reopened by Undo. */
+const UNDO_STATE = { discardUndo: true } as const;
 
 export interface UseDiscardWithUndoOptions {
   dirty: boolean;
@@ -68,6 +76,9 @@ export function useDiscardWithUndo({
   // when the caller passes an inline object.
   const snapshotRef = useRef(snapshot);
   snapshotRef.current = snapshot;
+  const openedByUndoRef = useRef(
+    (location.state as { discardUndo?: boolean } | null)?.discardUndo === true
+  );
 
   // Tab / window close — only the native browser dialog is available here.
   useEffect(() => {
@@ -111,7 +122,7 @@ export function useDiscardWithUndo({
             showUndoToast({
               message,
               duration,
-              onUndo: () => navigate(editorPathRef.current),
+              onUndo: () => navigate(editorPathRef.current, { state: UNDO_STATE }),
               onExpire: clearSnapshot,
             }),
           0
@@ -134,7 +145,7 @@ export function useDiscardWithUndo({
     showUndoToast({
       message,
       duration,
-      onUndo: () => navigate(editorPath),
+      onUndo: () => navigate(editorPath, { state: UNDO_STATE }),
       onExpire: clearSnapshot,
     });
   }, [navigate, navigateTo, message, duration, saveSnapshot, clearSnapshot]);
@@ -146,6 +157,7 @@ export function useDiscardWithUndo({
     const saved = sessionStorage.getItem(snap.storageKey);
     if (!saved) return false;
     sessionStorage.removeItem(snap.storageKey);
+    if (snap.restoreOnlyOnUndo && !openedByUndoRef.current) return false;
     snap.restore(saved);
     return true;
   }, []); // stable — uses refs

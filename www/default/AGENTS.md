@@ -1978,6 +1978,10 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   second Enter can't replace; Cancel and Escape close it and return focus to Use; picking
   another card closes it. Replace applies the template with the usual Undo. After a discard and
   Undo the page keeps only the form, with the gallery collapsed and Details and Policy shown.
+  The editor restores a left draft only when the discard toast's Undo reopens it
+  (`restoreOnlyOnUndo` on the `useDiscardWithUndo` snapshot, which Undo marks with
+  `{ discardUndo: true }` navigation state); opened any other way it drops the draft and starts
+  fresh, with no template selected.
   Changing Type keeps the Rego, whose
   package line the Type select rewrites, and keeps a template that serves both Types used,
   with its settings. A used default template with no variant for the new Type gets a warning

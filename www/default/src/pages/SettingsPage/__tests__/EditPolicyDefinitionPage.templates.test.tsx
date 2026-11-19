@@ -61,10 +61,17 @@ function mockGateway(saved: typeof SAVED = SAVED) {
   });
 }
 
-function renderAt(path: string) {
+/** `openedByUndo` opens the page the way a discard toast's Undo does. */
+function renderAt(path: string, openedByUndo = false) {
+  const [pathname, search = ''] = path.split('?');
+  const entry = {
+    pathname,
+    search: search && `?${search}`,
+    state: openedByUndo ? { discardUndo: true } : null,
+  };
   return render(
     <PageTitleProvider>
-      <MemoryRouter initialEntries={[path]}>
+      <MemoryRouter initialEntries={[entry]}>
         <Routes>
           <Route path="/policy-definitions/:id" element={<EditPolicyDefinitionPage />} />
         </Routes>
@@ -408,7 +415,7 @@ describe('the used template', () => {
       'policy-draft:new',
       JSON.stringify({ ...SAVED, id: '', name: 'draft', policy: restored })
     );
-    renderAt('/policy-definitions/new?type=agent_surface');
+    renderAt('/policy-definitions/new?type=agent_surface', true);
     await waitFor(() => expect(rego().value).toBe(restored));
     expect(screen.getByTestId('policy-template-gallery-summary')).toHaveTextContent(
       'Started from Custom Rego'
@@ -418,6 +425,21 @@ describe('the used template', () => {
     expect(await card('deny-by-default')).toHaveAttribute('aria-pressed', 'false');
     expect(screen.getByTestId('policy-template-gallery-detail-empty')).toBeInTheDocument();
     expect(screen.queryByTestId('policy-template-gallery-use-button')).toBeNull();
+  });
+
+  it('starts fresh, dropping a left draft, when Create Policy is opened again without Undo', async () => {
+    window.sessionStorage.setItem(
+      'policy-draft:new',
+      JSON.stringify({ ...SAVED, id: '', name: 'draft', policy: `${SAVED.policy}\n` })
+    );
+    renderAt('/policy-definitions/new?type=agent_surface');
+    const cards = await screen.findAllByTestId(/^policy-template-card-(?!type)/);
+    for (const c of cards) expect(c).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByTestId('policy-template-gallery-detail-empty')).toBeInTheDocument();
+    expect(screen.queryByTestId('policy-template-gallery-summary')).toBeNull();
+    expect(screen.queryByPlaceholderText('e.g. Require Authentication')).toBeNull();
+    expect(screen.queryByTestId('policy-editor-section')).toBeNull();
+    expect(window.sessionStorage.getItem('policy-draft:new')).toBeNull();
   });
 
   it('no longer says Pre-filled once a Use is undone', async () => {

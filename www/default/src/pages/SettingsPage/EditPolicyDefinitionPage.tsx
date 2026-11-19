@@ -342,6 +342,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
     navigateTo: `/policies?tab=${form.policy_type}`,
     snapshot: {
       storageKey: `policy-draft:${id ?? 'new'}`,
+      restoreOnlyOnUndo: true,
       save: () => JSON.stringify(form),
       restore: saved => {
         try {
