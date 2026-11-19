@@ -1972,14 +1972,18 @@ mod tests {
     /// once and then holds it, so both timed sizes are kept past that change.
     const MIN_LINEAR_INPUT_BYTES: usize = 128 * 1024;
 
+    /// How many times [`assert_linear_masking_by`] masks each of its two texts.
+    const LINEAR_TIMING_ROUNDS: usize = 5;
+
     /// Masks the text `build(scale)` makes, checks each result against the expected text it
     /// returns, and asserts that eight times the input takes under 24 times as long: linear
     /// masking takes about 8, quadratic 64. Runs are timed in this thread's CPU time, so tests
-    /// running in parallel do not count. The scale doubles until the text is at least
-    /// [`MIN_LINEAR_INPUT_BYTES`] long and a run takes at least 20 ms, so timer noise stays
-    /// small next to it, and each size keeps the fastest of three runs. The bound compares the
-    /// build with itself, so it holds however slow the build is, coverage instrumentation
-    /// included.
+    /// running in parallel do not count. The scale is the smallest power of two whose text is
+    /// at least [`MIN_LINEAR_INPUT_BYTES`] long, so every machine compares the same two sizes.
+    /// The two texts are masked in turn, [`LINEAR_TIMING_ROUNDS`] times each, and each keeps
+    /// its fastest run, so a slower stretch of a busy test run slows both alike. The bound
+    /// compares the build with itself, so it holds however slow the build is, coverage
+    /// instrumentation included.
     fn assert_masking_is_linear(build: impl Fn(usize) -> (String, String)) {
         assert_linear_masking_by(mask_credentials, build);
     }
@@ -1989,27 +1993,35 @@ mod tests {
         mask: impl Fn(&mut Value),
         build: impl Fn(usize) -> (String, String),
     ) {
-        let fastest = |scale| {
-            let (text, expected) = build(scale);
-            let elapsed = (0..3)
-                .map(|_| {
-                    let (value, elapsed) = masked_by(&mask, &text);
-                    assert_eq!(value, Value::String(expected.clone()));
-                    elapsed
-                })
-                .min()
-                .unwrap();
-            (elapsed, text.len())
-        };
         let mut scale = 1;
-        let (mut small, mut len) = fastest(scale);
-        while len < MIN_LINEAR_INPUT_BYTES || (small < std::time::Duration::from_millis(20) && scale < 64) {
+        while build(scale).0.len() < MIN_LINEAR_INPUT_BYTES {
             scale *= 2;
-            (small, len) = fastest(scale);
         }
-        let (large, _) = fastest(scale * 8);
+        let small = build(scale);
+        let large = build(scale * 8);
+        let time = |(text, expected): &(String, String)| {
+            let (value, elapsed) = masked_by(&mask, text);
+            assert_eq!(value, Value::String(expected.clone()));
+            elapsed
+        };
+        let (mut small_time, mut large_time) = (std::time::Duration::MAX, std::time::Duration::MAX);
+        for _ in 0..LINEAR_TIMING_ROUNDS {
+            small_time = small_time.min(time(&small));
+            large_time = large_time.min(time(&large));
+        }
 
-        assert!(large < small * 24, "{small:?} at scale {scale}, {large:?} at scale {}", scale * 8);
+        assert!(
+            large_time < small_time * 24,
+            "{:?}…: {small_time:?} for {} bytes at scale {scale}, {large_time:?} for {} bytes at scale {}",
+            small
+                .0
+                .chars()
+                .take(16)
+                .collect::<String>(),
+            small.0.len(),
+            large.0.len(),
+            scale * 8
+        );
     }
 
     #[test]
