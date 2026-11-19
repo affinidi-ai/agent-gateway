@@ -2,13 +2,14 @@ import React from 'react';
 import { AppButton } from '../../../components/shared/AppButton';
 import { Badge } from '../../../components/shared/Badge';
 import InfoBanner from '../../../components/shared/InfoBanner';
-import type {
-  DecisionSummary,
-  ParsedPolicy,
-  PolicyRule,
-  RuleGroup,
-  RuleRole,
-  RuleUse,
+import {
+  splitConditions,
+  type DecisionSummary,
+  type ParsedPolicy,
+  type PolicyRule,
+  type RuleGroup,
+  type RuleRole,
+  type RuleUse,
 } from './regoRules';
 import { POLICY_TYPE_NAMES, type PolicyType } from './types';
 
@@ -372,6 +373,7 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
                     const reason = canEdit ? ruleUse(rule) : null;
                     const inUse = reason !== null;
                     const role = ruleRole(rule);
+                    const conditions = splitConditions(rule);
                     return (
                       <tr key={rule.startLine} data-testid={ruleTestId}>
                         <td>
@@ -384,9 +386,32 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
                           </span>
                         </td>
                         <td>
-                          <code className="policy-rules__summary" title={rule.summary}>
-                            {rule.summary}
-                          </code>
+                          {conditions && conditions.length > 1 ? (
+                            <ul
+                              className="list-unstyled mb-0"
+                              data-testid={`${ruleTestId}-conditions`}
+                            >
+                              {conditions.map((condition, k) => (
+                                <li
+                                  key={k}
+                                  className="text-truncate"
+                                  title={condition}
+                                  data-testid={`${ruleTestId}-condition-${k}`}
+                                >
+                                  {k > 0 && (
+                                    <>
+                                      <span className="text-muted small">and</span>{' '}
+                                    </>
+                                  )}
+                                  <code>{condition}</code>
+                                </li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <code className="policy-rules__summary" title={rule.summary}>
+                              {rule.summary}
+                            </code>
+                          )}
                           {reason && (
                             <div
                               className="small text-muted mt-1"

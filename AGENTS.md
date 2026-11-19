@@ -445,10 +445,11 @@ from a template**. The Policy section's
 **Rules | Rego** toggle lists the rules grouped by
 template, states above them what the policy decides (or that it can't, pointing to the Rego),
 marks each rule other than `allow` and `deny_reason` "Used by allow" or "Not used by allow",
-with Remove per group and per rule, disabled while `allow` reads the rule, with a
-reason that names the rule reading it; under Default ALLOW each group with allow rules is marked
-as having no effect, and on a new policy a group written for the other Type is marked and
-blocks Create until it is removed. Once rules are added the gallery still names the
+shows a plain allow rule's conditions one per line, joined by a muted "and", when it has
+several and splits cleanly (otherwise the rule stays on one line), with Remove per group and
+per rule, disabled while `allow` reads the rule, with a reason that names the rule reading
+it; under Default ALLOW each group with allow rules is marked as having no effect, and on a
+new policy a group written for the other Type is marked and blocks Create until it is removed. Once rules are added the gallery still names the
 template the policy started from and counts the templates added. **Add rules from a template**
 lists only templates that add rules, so several combine in a new or saved policy, and counts the
 whole policies and other-Type templates it leaves out. Once rules are added to a saved policy

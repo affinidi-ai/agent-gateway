@@ -10,6 +10,7 @@ import {
   ruleRoles,
   ruleUse,
   setDefaultDeny,
+  splitConditions,
   summarizeDecision,
   type DecisionSummary,
   type ParsedPolicy,
@@ -773,6 +774,146 @@ describe('isPlainAllow and isUnconditionalAllow', () => {
 
   it('reads a rule with another name as not plain', () => {
     expect(isPlainAllow(onlyRule('allowed if input.x'))).toBe(false);
+  });
+});
+
+describe('splitConditions', () => {
+  it.each<[string, string, string[] | null]>([
+    [
+      'every, one line',
+      'allow if {\n  every r in xs { r.ok }\n  count(xs) > 0\n}',
+      ['every r in xs { r.ok }', 'count(xs) > 0'],
+    ],
+    [
+      'every, multi-line',
+      'allow if {\n  every r in xs {\n    r.ok\n    r.x\n  }\n  y\n}',
+      ['every r in xs { r.ok; r.x }', 'y'],
+    ],
+    [
+      'set comprehension',
+      'allow if {\n  s := {x | some x in xs; x > 1}\n  count(s) > 0\n}',
+      ['s := {x | some x in xs; x > 1}', 'count(s) > 0'],
+    ],
+    [
+      'array comprehension',
+      'allow if {\n  a := [x | some x in xs; x > 1]\n  count(a) > 0\n}',
+      ['a := [x | some x in xs; x > 1]', 'count(a) > 0'],
+    ],
+    [
+      'object comprehension',
+      'allow if {\n  o := {k: v | some k, v in m; v > 1}\n  count(o) > 0\n}',
+      ['o := {k: v | some k, v in m; v > 1}', 'count(o) > 0'],
+    ],
+    [
+      'multi-line comprehension',
+      'allow if {\n  s := {x |\n    some x in xs\n    x > 1\n  }\n  count(s) > 0\n}',
+      ['s := {x | some x in xs; x > 1 }', 'count(s) > 0'],
+    ],
+    ['; in a block', 'allow if { a; b; c }', ['a', 'b', 'c']],
+    ['; mixed with newlines', 'allow if {\n  a; b\n  c\n}', ['a', 'b', 'c']],
+    ['trailing ;', 'allow if { a; }', ['a']],
+    ['old-style { a; b }', 'allow { a; b }', ['a', 'b']],
+    ['multi-line call', 'allow if {\n  count(\n    xs\n  ) > 0\n  y\n}', ['count(xs) > 0', 'y']],
+    [
+      'multi-line call args',
+      'allow if {\n  startswith(\n    input.path,\n    "/a"\n  )\n}',
+      ['startswith(input.path, "/a")'],
+    ],
+    ['binary op dangling at end of line', 'allow if {\n  x ==\n  y\n}', null],
+    ['binary op starting next line', 'allow if {\n  x\n  == y\n}', null],
+    [
+      'with on the same line',
+      'allow if {\n  f(x) with input.a as 1\n  y\n}',
+      ['f(x) with input.a as 1', 'y'],
+    ],
+    ['with on the next line', 'allow if {\n  f(x)\n  with input.a as 1\n}', null],
+    ['an index on the next line', 'allow if {\n  x := input.y\n  [0]\n  z\n}', null],
+    ['call arguments on the next line', 'allow if {\n  count\n  (xs) > 0\n  z\n}', null],
+    ['raw string with braces', 'allow if {\n  x == `{a}; }`\n  y\n}', ['x == `{a}; }`', 'y']],
+    ['raw string with an opening brace only', 'allow if {\n  x == `{`\n  y\n}', ['x == `{`', 'y']],
+    ['multi-line raw string', 'allow if {\n  x == `a\n  }`\n  y\n}', null],
+    ['one-line allow if x', 'allow if x', ['x']],
+    [
+      'one-line allow if with call',
+      'allow if startswith(input.path, "/a")',
+      ['startswith(input.path, "/a")'],
+    ],
+    ['one-line allow if on next line', 'allow if\n  input.x', ['input.x']],
+    ['string with ;', 'allow if {\n  x == "a;b"\n  y\n}', ['x == "a;b"', 'y']],
+    ['string with }', 'allow if {\n  x == "}"\n  y == "{"\n}', ['x == "}"', 'y == "{"']],
+    [
+      'string with escaped quote, ; and }',
+      'allow if {\n  x == "a\\"; }"\n  y\n}',
+      ['x == "a\\"; }"', 'y'],
+    ],
+    ['one-line string with ; and }', 'allow if x == "a;b}"', ['x == "a;b}"']],
+    ['else inside a string', 'allow if { x == "else" }', ['x == "else"']],
+    ['comment in the body', 'allow if {\n  a # c; d }\n  b\n}', ['a', 'b']],
+    ['split head', 'allow\nif {\n  a\n  b\n}', ['a', 'b']],
+    ['set literal expression, not a block', 'allow if {"a"} == x', null],
+    ['set == set expression', 'allow if {1} == {1}', null],
+    ['bare allow', 'allow', null],
+    ['allow := true', 'allow := true', null],
+    ['allow if true', 'allow if true', null],
+    ['allow { true }', 'allow { true }', null],
+    ['empty block', 'allow if {\n}', null],
+    [
+      'not / some lines',
+      'allow if {\n  some x in xs\n  not x.bad\n}',
+      ['some x in xs', 'not x.bad'],
+    ],
+    [
+      'object literal over lines',
+      'allow if {\n  o := {\n    "a": 1,\n    "b": 2,\n  }\n  o.a == 1\n}',
+      ['o := { "a": 1, "b": 2, }', 'o.a == 1'],
+    ],
+    ['an unknown character', 'allow if {\n  x ~ y\n  z\n}', null],
+    [
+      'whitespace collapsed outside strings only',
+      'allow if {\n  x  ==   "a  b"\n  y\n}',
+      ['x == "a  b"', 'y'],
+    ],
+  ])('%s', (_label, body, expected) => {
+    expect(splitConditions(onlyRule(body))).toEqual(expected);
+  });
+
+  it.each([
+    ['else', 'allow := true if { a } else := false'],
+    ['else on its own line', 'allow if {\n  a\n}\nelse := false if {\n  b\n}'],
+    ['else between plain bodies', 'allow if { a } else if { b }'],
+    [':= false', 'allow := false if { a; b }'],
+    [':= <expr>', 'allow := input.x if { a; b }'],
+    ['allow(x)', 'allow(x) if { x; y }'],
+    ['allow contains', 'allow contains x if { x := 1; y }'],
+    ['allow[x]', 'allow[x] if { x := 1; y }'],
+    ['allow.x', 'allow.x if { a; b }'],
+  ])('returns null for %s', (_label, body) => {
+    expect(splitConditions(onlyRule(body))).toBeNull();
+  });
+
+  it('returns null for a rule with another name', () => {
+    expect(splitConditions(onlyRule('allowed if { a; b }'))).toBeNull();
+  });
+
+  const builtinAllowRules = Object.entries(renderedTemplates as Record<string, string>).flatMap(
+    ([key, rego]) =>
+      groupsOf(rego)
+        .groups.flatMap(g => g.rules)
+        .filter(r => ruleName(r) === 'allow')
+        .map((rule, i) => [`${key} #${i}`, rule] as const)
+  );
+
+  const sourceConditionLines = (rule: PolicyRule) =>
+    rule.code.length > 1 && rule.code[0] === 'allow if {' && rule.code[rule.code.length - 1] === '}'
+      ? rule.code.slice(1, -1)
+      : [rule.code.join(' ').replace(/^allow if /, '')];
+
+  it('finds the built-in allow rules', () => {
+    expect(builtinAllowRules.length).toBeGreaterThan(20);
+  });
+
+  it.each(builtinAllowRules)('splits the built-in %s into its source lines', (_key, rule) => {
+    expect(splitConditions(rule)).toEqual(sourceConditionLines(rule));
   });
 });
 

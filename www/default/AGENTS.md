@@ -2117,7 +2117,16 @@ Create custom policy) in `useTemplateGallery`.
   directly or through other rules, so it changes what the policy decides") and "Not used by
   allow" otherwise (title "allow doesn't read this rule, so it doesn't change whether a request
   is allowed"); the walk starts from every rule whose read name is `allow`. Then the
-  rule on one line with its full text in `title`, and its line numbers, which switch to the Rego
+  rule on one line with its full text in `title`, except that a plain allow rule which
+  `splitConditions` in `regoRules.ts` splits into two or more conditions shows them as a
+  `ul.list-unstyled` (`policy-rules-group-<n>-rule-<m>-conditions`), one truncated `<code>`
+  line per condition (`-condition-<k>`, the condition in `title`), every line after the first
+  starting with a muted `small` "and"; a condition over several lines is flattened to one
+  (whitespace collapsed outside strings, `; ` where a newline separates expressions inside a
+  block). A rule that is not a plain allow, has `else`, one condition, no conditions, a raw
+  string over lines, a line that starts or ends mid-expression (such as `with` on the next
+  line) or a character the splitter doesn't know keeps the one-line view. Then its line
+  numbers, which switch to the Rego
   view and select the rule (`-show-button`): a small `outline-secondary` `AppButton` with a
   `fa-code` icon and only the numbers in monospace (`5`, `5–8`), since the column is headed
   Line; its title is "Show in the Rego" and its accessible name "Show <rule> in the Rego, line 5". The rules outside any template group are titled

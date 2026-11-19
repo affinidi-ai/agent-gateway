@@ -334,6 +334,60 @@ describe('PolicyRulesList decision summary', () => {
   });
 });
 
+describe('PolicyRulesList allow conditions', () => {
+  const conditions = () => screen.queryByTestId('policy-rules-group-0-rule-0-conditions');
+
+  it('lists each condition of an allow rule on its own line, the later ones after "and"', () => {
+    renderList(
+      'package p\n\ndefault allow := false\n\nallow if {\n  input.x\n  count(\n    input.y\n  ) > 0\n  not input.z\n}\n'
+    );
+    const list = conditions();
+    expect(list?.tagName).toBe('UL');
+    expect(list).toHaveClass('list-unstyled');
+    const lines = within(list!).getAllByRole('listitem');
+    expect(lines.map(l => l.textContent)).toEqual([
+      'input.x',
+      'and count(input.y) > 0',
+      'and not input.z',
+    ]);
+    lines.forEach((line, k) =>
+      expect(line).toHaveAttribute('data-testid', `policy-rules-group-0-rule-0-condition-${k}`)
+    );
+    expect(within(lines[0]).queryByText('and')).toBeNull();
+    expect(within(lines[1]).getByText('and')).toHaveClass('text-muted');
+    expect(within(lines[2]).getByText('not input.z').tagName).toBe('CODE');
+    expect(lines[1]).toHaveAttribute('title', 'count(input.y) > 0');
+    expect(
+      within(screen.getByTestId('policy-rules-group-0-rule-0')).queryByText(/^allow if/)
+    ).toBeNull();
+  });
+
+  it.each([
+    ['a single condition', 'allow if input.x', 'allow if input.x'],
+    [
+      'else',
+      'allow if {\n  input.x\n  input.y\n} else := false',
+      'allow if { input.x input.y } else := false',
+    ],
+    [
+      'a head that is not plain',
+      'allow := input.v if {\n  input.x\n  input.y\n}',
+      'allow := input.v if { input.x input.y }',
+    ],
+    [
+      'a with clause on the next line',
+      'allow if {\n  input.x\n  f(input.y)\n  with input.a as 1\n}',
+      'allow if { input.x f(input.y) with input.a as 1 }',
+    ],
+  ])('keeps the rule on one line for %s', (_label, rule, summary) => {
+    renderList(`package p\n\ndefault allow := false\n\n${rule}\n`);
+    expect(conditions()).toBeNull();
+    const code = within(screen.getByTestId('policy-rules-group-0-rule-0')).getByText(summary);
+    expect(code).toHaveClass('policy-rules__summary');
+    expect(code).toHaveAttribute('title', summary);
+  });
+});
+
 describe('DecisionBadge', () => {
   it('says what each default decision does in its tooltip', () => {
     render(<DecisionBadge decision="allow" />);

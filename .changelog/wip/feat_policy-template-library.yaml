@@ -29,7 +29,9 @@ changes:
         combined. A Rules | Rego toggle shows the policy, opening on Rules. The Rules view says
         in one line above the rules what the policy decides, or that it can't and to read the
         Rego, lists the policy's rules grouped by the template they came from, marks each rule
-        other than allow and deny_reason Used by allow or Not used by allow, removes a
+        other than allow and deny_reason Used by allow or Not used by allow, shows each
+        condition of an allow rule with several on its own line, the later ones after "and",
+        or the rule on one line when it can't be split cleanly, removes a
         template's rules or a single rule unless the allow rule still reads it, saying which
         rule does, switches an allow-all policy to deny by default, marks groups that have no
         effect while the

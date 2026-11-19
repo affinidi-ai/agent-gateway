@@ -363,9 +363,9 @@ export function groupUse(parsed: ParsedPolicy, group: RuleGroup): RuleUse | null
 const PLAIN_ALLOW_REST = /^(?::?=\s*true\b)?\s*(if\b|\{|$)/;
 
 /** The code after a plain allow's head and value, or null when the rule is not a plain allow. */
-function plainAllowBody(rule: PolicyRule): string | null {
+function plainAllowBody(rule: PolicyRule, separator = ' '): string | null {
   if (rule.head !== 'allow' || /\belse\b/.test(withoutStrings(rule.code))) return null;
-  const rest = rule.code.join(' ').slice('allow'.length).trim();
+  const rest = rule.code.join(separator).slice('allow'.length).trim();
   const match = rest.match(PLAIN_ALLOW_REST);
   if (!match) return null;
   return rest.slice(match[0].length - (match[1] === '{' ? 1 : 0)).trim();
@@ -386,6 +386,89 @@ export function isUnconditionalAllow(rule: PolicyRule): boolean {
   const inner = /^\{[\s\S]*\}$/.test(body) ? body.slice(1, -1).trim() : body;
   const statement = inner.replace(/;\s*$/, '').trim();
   return statement === '' || statement === 'true';
+}
+
+type Token = { text: string; start: number; end: number };
+
+const TOKEN = new RegExp(
+  `\\n|[ \\t\\r]+|${STRING_LITERAL.source}|[A-Za-z_]\\w*|\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?|:=|==|!=|<=|>=|[{}[\\]();,.|&+\\-*/%<>=:]`,
+  'y'
+);
+const OPENERS = ['{', '[', '('];
+const CLOSERS = ['}', ']', ')'];
+const INFIX = [':=', '==', '!=', '<=', '>=', '=', '<', '>', '+', '-', '*', '/', '%', '|', '&'];
+const JOINERS = [...INFIX, ',', '.', ':', ';', 'with', 'as', 'else', 'in', 'if', 'contains'];
+const STARTS_CONTINUATION = new Set([...JOINERS, ...CLOSERS, '[', '(']);
+const ENDS_CONTINUATION = new Set([...JOINERS, ...OPENERS, 'not', 'some', 'every']);
+
+/** Rego's tokens and newlines, or null for an unknown character or a string over lines. */
+function tokenize(src: string): Token[] | null {
+  const tokens: Token[] = [];
+  TOKEN.lastIndex = 0;
+  while (TOKEN.lastIndex < src.length) {
+    const start = TOKEN.lastIndex;
+    const match = TOKEN.exec(src);
+    if (!match) return null;
+    const text = match[0];
+    if (text.trim() === '' && text !== '\n') continue;
+    if (text.length > 1 && text.includes('\n')) return null;
+    tokens.push({ text, start, end: TOKEN.lastIndex });
+  }
+  return tokens;
+}
+
+const depthChange = (token: Token) =>
+  OPENERS.includes(token.text) ? 1 : CLOSERS.includes(token.text) ? -1 : 0;
+
+/** A condition on one line: a newline between two parts of it is a space, or `; ` where it separates expressions. */
+function flatten(src: string, tokens: Token[]): string {
+  return tokens
+    .map((token, i) => {
+      if (i === 0) return token.text;
+      const prev = tokens[i - 1];
+      const gap = src.slice(prev.end, token.start);
+      if (!gap) return token.text;
+      if (!gap.includes('\n')) return ` ${token.text}`;
+      if (prev.text === '(' || prev.text === '[' || token.text === ')' || token.text === ']') {
+        return token.text;
+      }
+      const continues = ENDS_CONTINUATION.has(prev.text) || STARTS_CONTINUATION.has(token.text);
+      return `${continues ? ' ' : '; '}${token.text}`;
+    })
+    .join('');
+}
+
+/**
+ * A plain, conditional allow rule's top-level conditions, each on one line, or null when the
+ * rule is not a plain allow, has no conditions, or can't be split without changing what it says.
+ */
+export function splitConditions(rule: PolicyRule): string[] | null {
+  const src = plainAllowBody(rule, '\n');
+  if (src === null || isUnconditionalAllow(rule)) return null;
+  let tokens = tokenize(src);
+  if (!tokens) return null;
+  while (tokens[0]?.text === '\n') tokens = tokens.slice(1);
+  if (tokens[0]?.text === '{') {
+    let depth = 0;
+    const close = tokens.findIndex(t => (depth += depthChange(t)) === 0);
+    if (close !== tokens.length - 1) return null;
+    tokens = tokens.slice(1, -1);
+  }
+
+  const segments: Token[][] = [[]];
+  let depth = 0;
+  for (const token of tokens) {
+    depth += depthChange(token);
+    if (depth < 0) return null;
+    if (depth === 0 && (token.text === ';' || token.text === '\n')) segments.push([]);
+    else if (token.text !== '\n') segments[segments.length - 1].push(token);
+  }
+  const conditions = segments.filter(s => s.length > 0);
+  if (depth !== 0 || conditions.length === 0) return null;
+  const continues = (s: Token[]) =>
+    STARTS_CONTINUATION.has(s[0].text) || ENDS_CONTINUATION.has(s[s.length - 1].text);
+  if (conditions.some(continues)) return null;
+  return conditions.map(s => flatten(src, s));
 }
 
 export type DecisionSummary =
