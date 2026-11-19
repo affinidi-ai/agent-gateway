@@ -585,7 +585,13 @@ carries, ignoring its parameters: the file declared on that media type, or no
 file at all when the operation declares that media type without one, so such
 an answer is its JSON as it was before any other media type of the answer
 declared a file. An answer whose media type the operation does not declare, or
-that names none at all, carries the first file declared on its status. Another
+that names none at all, carries the first file declared on its status. The
+declarations on one status must therefore describe the same file: the
+`Content-Type` that picks between them is the REST API's own, so a backend
+that answers another of the declared media types, or one the operation does
+not declare, has the gateway read the field that declaration names instead.
+The declaration a call decoded its answer with is logged at `debug` level,
+with the status and the media type it was declared on. Another
 answer is answered as it would be without the declaration: a success status
 the file was not declared on is its JSON, and a failure status is answered as
 usual. A declaration with another key, another

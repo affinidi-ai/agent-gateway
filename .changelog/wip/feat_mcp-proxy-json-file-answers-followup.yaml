@@ -1,7 +1,15 @@
 branch: feat/mcp-proxy-json-file-answers-followup
 changes:
   added: []
-  changed: []
+  changed:
+    - timestamp: '2026-11-19T14:00:00Z'
+      title: Log which x-gateway-file declaration decoded a REST answer
+      description: >-
+        A tool call that answers a file now logs, at debug level, the status and the media type of
+        the declaration it decoded the answer with, so an operator can see which of an operation's
+        declarations a backend's Content-Type selected. The MCP metadata reference says with it
+        that the declarations on one status must describe the same file, since the Content-Type
+        that picks between them is the backend's own.
   fixed:
     - timestamp: '2026-11-19T09:00:00Z'
       title: Read an x-gateway-file declaration on any JSON media type of a REST answer
@@ -17,5 +25,12 @@ changes:
         whose media type the operation does not declare, or that names none, carries the first file
         declared on its status.
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-11-19T14:05:00Z'
+      title: Release the buffered REST answer before decoding the file it carries
+      description: >-
+        Decoding a file a REST API answers inside its JSON held the buffered response body, its
+        parsed JSON and the decoded bytes at once, so a backend answering near the configured
+        response limit cost the gateway about three copies of that limit per call in flight. The
+        body is released as soon as it is parsed, leaving the parsed JSON and the decoded file.
   breaking: []

@@ -7,6 +7,7 @@ use futures::TryStreamExt;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp_openapi::{ExtractedParameters, ToolGenerator, ToolMetadata};
 use serde_json::{Value, json};
+use tracing::debug;
 use url::Url;
 
 use crate::config::McpHttpConfig;
@@ -353,18 +354,21 @@ impl FileDeclaration {
 
 impl FileAnswer {
     /// The file `body` carries: the string at the pointer of its JSON,
-    /// decoded. `None` when `body` is not JSON, has no string there or the
-    /// string is not in the declared encoding.
+    /// decoded. The buffered body is released once it is parsed, so the
+    /// parsed JSON and the decoded file are the only copies of the answer
+    /// held while it decodes. `None` when `body` is not JSON, has no string
+    /// there or the string is not in the declared encoding.
     fn bytes(
         &self,
-        body: &[u8],
+        body: Vec<u8>,
     ) -> Option<Vec<u8>> {
         use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
         const EITHER_PADDING: GeneralPurposeConfig =
             GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent);
         const BASE64: GeneralPurpose = GeneralPurpose::new(&base64::alphabet::STANDARD, EITHER_PADDING);
         const BASE64URL: GeneralPurpose = GeneralPurpose::new(&base64::alphabet::URL_SAFE, EITHER_PADDING);
-        let answer: Value = serde_json::from_slice(body).ok()?;
+        let answer: Value = serde_json::from_slice(&body).ok()?;
+        drop(body);
         let encoded = answer
             .pointer(&self.declaration.pointer)?
             .as_str()?;
@@ -1185,7 +1189,12 @@ async fn send(
         body.extend_from_slice(&chunk);
     }
     if let Some(file) = files.and_then(|files| files.governing(status.as_u16(), content_type.as_deref())) {
-        return Ok(match file.bytes(&body) {
+        debug!(
+            status = status.as_u16(),
+            media_type = %file.media_type,
+            "Decoding a REST answer with the x-gateway-file declaration of one of its media types"
+        );
+        return Ok(match file.bytes(body) {
             Some(bytes) => CallToolResult::success(vec![binary_content(&url, None, &bytes)]),
             None => CallToolResult::error(vec![ContentBlock::text(
                 "REST response does not carry the file its tool declares",
