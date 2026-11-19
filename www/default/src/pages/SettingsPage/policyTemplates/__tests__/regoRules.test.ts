@@ -83,7 +83,22 @@ describe('parsePolicyRules', () => {
       ['allow', 2, 5],
       ['helper', 6, 6],
     ]);
-    expect(rules[0].summary).toBe('allow if { input.http.path == "/a{" x := `raw }` }');
+    expect(rules[0].summary).toBe('allow if { input.http.path == "/a{"; x := `raw }` }');
+  });
+
+  it.each([
+    ['separate expressions', 'h if {\n  a\n  b >= 1\n}', 'h if { a; b >= 1 }'],
+    ['a multi-line call', 'h if {\n  f(\n    a,\n    b\n  )\n}', 'h if { f(a, b) }'],
+    ['an operator at a line end', 'h if {\n  a ==\n  b\n}', 'h if { a == b }'],
+    ['a string with spaces kept', 'h if {\n  x == "a  b"\n  y\n}', 'h if { x == "a  b"; y }'],
+    [
+      'a body brace on the next line',
+      'allow\n{\n  input.a\n  input.b\n}',
+      'allow { input.a; input.b }',
+    ],
+    ['a function head and next-line brace', 'h(x) = y\n{\n  y := x\n}', 'h(x) = y { y := x }'],
+  ])('shows a rule on one line, joining %s', (_label, body, expected) => {
+    expect(groupsOf(`package p\n${body}`).groups[0].rules[0].summary).toBe(expected);
   });
 
   it('reads old-style rules, a brace on the next line, and indented statements', () => {

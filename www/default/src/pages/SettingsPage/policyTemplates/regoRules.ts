@@ -154,7 +154,7 @@ function toRule(statement: Extract<Item, { type: 'statement' }>): PolicyRule | n
   const name = head.replace(/^default\s+/, '').replace(/\(.*$/, '');
   if (REGO_KEYWORD.test(name.split('.')[0])) return 'unparsed';
   const kind: RuleKind = name === 'allow' ? 'allow' : name === DENY_REASON ? 'deny' : 'helper';
-  const oneLine = statement.code.join(' ').replace(/\s+/g, ' ');
+  const oneLine = oneLineCode(statement.code);
   return {
     head,
     kind,
@@ -421,15 +421,21 @@ function tokenize(src: string): Token[] | null {
 const depthChange = (token: Token) =>
   OPENERS.includes(token.text) ? 1 : CLOSERS.includes(token.text) ? -1 : 0;
 
-/** A condition on one line: a newline between two parts of it is a space, or `; ` where it separates expressions. */
-function flatten(src: string, tokens: Token[]): string {
+/**
+ * A condition on one line: a newline between two parts of it is a space, or `; ` where it
+ * separates expressions. With `joinTopLevel`, a newline outside brackets is always a space.
+ */
+function flatten(src: string, tokens: Token[], joinTopLevel = false): string {
+  let depth = 0;
   return tokens
     .map((token, i) => {
+      const depthBefore = depth;
+      depth += depthChange(token);
       if (i === 0) return token.text;
       const prev = tokens[i - 1];
       const gap = src.slice(prev.end, token.start);
       if (!gap) return token.text;
-      if (!gap.includes('\n')) return ` ${token.text}`;
+      if (!gap.includes('\n') || (joinTopLevel && depthBefore === 0)) return ` ${token.text}`;
       if (prev.text === '(' || prev.text === '[' || token.text === ')' || token.text === ']') {
         return token.text;
       }
@@ -437,6 +443,21 @@ function flatten(src: string, tokens: Token[]): string {
       return `${continues ? ' ' : '; '}${token.text}`;
     })
     .join('');
+}
+
+/**
+ * A statement on one line, with `; ` where a newline separates expressions inside brackets;
+ * the scanner joins top-level lines only when they continue the statement.
+ */
+function oneLineCode(code: string[]): string {
+  const src = code.join('\n');
+  const tokens = tokenize(src);
+  if (!tokens) return src.replace(/\s+/g, ' ');
+  return flatten(
+    src,
+    tokens.filter(t => t.text !== '\n'),
+    true
+  );
 }
 
 /**

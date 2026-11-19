@@ -367,17 +367,17 @@ describe('PolicyRulesList allow conditions', () => {
     [
       'else',
       'allow if {\n  input.x\n  input.y\n} else := false',
-      'allow if { input.x input.y } else := false',
+      'allow if { input.x; input.y } else := false',
     ],
     [
       'a head that is not plain',
       'allow := input.v if {\n  input.x\n  input.y\n}',
-      'allow := input.v if { input.x input.y }',
+      'allow := input.v if { input.x; input.y }',
     ],
     [
       'a with clause on the next line',
       'allow if {\n  input.x\n  f(input.y)\n  with input.a as 1\n}',
-      'allow if { input.x f(input.y) with input.a as 1 }',
+      'allow if { input.x; f(input.y) with input.a as 1 }',
     ],
   ])('keeps the rule on one line for %s', (_label, rule, summary) => {
     renderList(`package p\n\ndefault allow := false\n\n${rule}\n`);

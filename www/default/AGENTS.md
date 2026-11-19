@@ -2118,7 +2118,9 @@ Create custom policy) in `useTemplateGallery`.
   directly or through other rules") and "Not used by
   allow" otherwise (title "allow doesn't read this rule, so it doesn't change whether a request
   is allowed"); the walk starts from every rule whose read name is `allow`. Then the
-  rule on one line with its full text in `title`, except that a plain allow rule which
+  rule on one line (`; ` where a newline separates expressions inside brackets, a space
+  otherwise, so `h if { a; b }` and `allow { a; b }` for a brace on the next line; whitespace
+  only collapsed when the text can't be tokenized) with its full text in `title`, except that a plain allow rule which
   `splitConditions` in `regoRules.ts` splits into two or more conditions shows them as a
   `ul.list-unstyled` (`policy-rules-group-<n>-rule-<m>-conditions`), one truncated `<code>`
   line per condition (`-condition-<k>`, the condition in `title`), every line after the first

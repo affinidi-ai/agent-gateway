@@ -102,6 +102,7 @@ test.describe('Policy templates on the create policy page', () => {
         await expect(page.getByTestId('policy-rules-group-0-rule-0-condition-1')).toHaveText(
             'and startswith(input.http.path, prefix)'
         );
+        await captureFullPage(page, 'policy-templates-rules-conditions');
     });
 
     test('states what the policy decides and marks the rules allow reads', async ({page}) => {
