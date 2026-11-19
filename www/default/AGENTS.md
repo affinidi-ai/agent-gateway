@@ -1779,9 +1779,13 @@ separated by a rule:
   the package mismatch with **Fix it**.
 
 The editor and its templates use the shared dashboard components, not local copies: every
-action button is an `AppButton` (size `sm`; link-style actions use `variant="link"`), a default
+action button the templates add is an `AppButton` (size `sm`; link-style actions use
+`variant="link"`), while the editor's own Save/Create and **Fix it** stay the plain Bootstrap
+`btn btn-sm` buttons they always were; a default
 or template decision is the Audit Log's `audit-decision` pill (`DecisionBadge` in
-`TemplateBadges.tsx`, text such as "Default DENY"), an example's expected and actual decision
+`TemplateBadges.tsx`, text such as "Default DENY"), red for DENY and amber
+(`.policy-decision--allow`, `--warning-text`) for ALLOW, because allowing by default is the less
+safe choice; an example's expected and actual decision
 and the neutral tags (MCP tool policy, Gateway only, reads `<path>` with the path in `<code>`)
 are `Badge`s, an alert the templates add that carries an action is a non-collapsible
 `InfoBanner` with the button as its child and the test id on a wrapping `div`, the template

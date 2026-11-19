@@ -132,6 +132,11 @@ body.dark-theme .policy-template-preview {
   color: inherit;
 }
 
+.audit-decision.policy-decision--allow {
+  background: rgba(245, 158, 11, 0.16);
+  color: var(--warning-text);
+}
+
 .policy-rules__kind {
   background: transparent;
   color: var(--muted-text);

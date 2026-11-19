@@ -220,13 +220,13 @@ const PolicyEditorSection: React.FC<PolicyEditorSectionProps> = ({
             <div>
               <strong>Package mismatch:</strong> {packageMismatch}
               {canEdit && (
-                <AppButton
-                  variant="danger"
-                  className="policy-fix-package-button ms-2 py-0 px-2"
+                <button
+                  type="button"
+                  className="btn btn-sm btn-danger ml-2 py-0 px-2 policy-fix-package-button"
                   onClick={onFixPackage}
                 >
                   Fix it
-                </AppButton>
+                </button>
               )}
             </div>
           </div>

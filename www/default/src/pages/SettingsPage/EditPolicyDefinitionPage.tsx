@@ -393,20 +393,15 @@ const EditPolicyDefinitionPage: React.FC = () => {
                   </span>
                 )}
                 {canEditPolicies && (
-                  <AppButton
-                    className="me-2"
+                  <button
+                    className={`btn btn-sm btn-primary me-2 ${saving || !policyValid || !!packageMismatch ? 'disabled' : ''}`}
                     data-testid="policy-definition-editor-save-button"
                     onClick={handleSave}
                     disabled={saving || !policyValid || !!packageMismatch}
-                    iconStart={
-                      <i
-                        className={`fas ${saving ? 'fa-spinner fa-spin' : 'fa-save'}`}
-                        aria-hidden="true"
-                      />
-                    }
                   >
-                    {saving ? 'Saving...' : isCreateMode ? 'Create' : 'Save'}
-                  </AppButton>
+                    <i className={`fas ${saving ? 'fa-spinner fa-spin' : 'fa-save'}`}></i>
+                    {saving ? ' Saving...' : isCreateMode ? ' Create' : ' Save'}
+                  </button>
                 )}
               </div>
             </div>
