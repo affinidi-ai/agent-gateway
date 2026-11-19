@@ -23,8 +23,8 @@ Feature: Policy input capture is off until an administrator turns it on
   Scenario: Turning policy input capture off stops new captures before the next keep-alive check
     Given policy input capture is turned on
     And the operator listens to the policy input of surface "alpha"
-    When an administrator turns policy input capture off
-    And the caller sends an A2A message/send request to surface "alpha" with text "hello policy"
+    And an administrator has turned policy input capture off
+    When the caller sends an A2A message/send request to surface "alpha" with text "hello policy"
     Then the response status is 200
     And the Capture view shows no policy input
 

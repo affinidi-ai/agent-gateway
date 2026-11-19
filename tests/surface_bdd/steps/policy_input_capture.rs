@@ -410,6 +410,11 @@ async fn administrator_turns_capture_off(world: &mut SurfaceWorld) {
     turn_capture(world, false).await;
 }
 
+#[given("an administrator has turned policy input capture off")]
+async fn administrator_has_turned_capture_off(world: &mut SurfaceWorld) {
+    turn_capture(world, false).await;
+}
+
 #[when(expr = "the operator asks to listen to the policy input of surface {string}")]
 async fn operator_asks_to_listen(
     world: &mut SurfaceWorld,
