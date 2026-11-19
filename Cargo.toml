@@ -191,7 +191,7 @@ scopeguard = "1.2"
 
 # x402 protocol implementation
 x402-types = "1.1"
-x402-facilitator-local = { version = "1.1.2", features = ["telemetry"] }
+x402-facilitator-local = { version = "2.0.2", features = ["telemetry"] }
 x402-chain-eip155 = { version = "1.1.1", features = [
     "facilitator",
     "telemetry",

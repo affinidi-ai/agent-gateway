@@ -770,7 +770,7 @@ dependencies = [
  "x402-chain-eip155",
  "x402-chain-solana",
  "x402-facilitator-local",
- "x402-types",
+ "x402-types 1.5.6",
  "x509-parser 0.18.1",
  "zeroize",
  "zip",
@@ -4499,7 +4499,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.118",
 ]
 
 [[package]]
@@ -5262,7 +5262,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8129,7 +8129,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.21.7",
+ "base64 0.22.1",
  "chrono",
  "getrandom 0.2.17",
  "http 1.4.2",
@@ -8513,7 +8513,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.45.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9414,7 +9414,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10298,7 +10298,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10365,7 +10365,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10386,7 +10386,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -14704,7 +14704,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -15944,7 +15944,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -16463,7 +16463,7 @@ dependencies = [
  "tracing",
  "tracing-core",
  "url",
- "x402-types",
+ "x402-types 1.5.6",
 ]
 
 [[package]]
@@ -16495,14 +16495,14 @@ dependencies = [
  "tracing",
  "tracing-core",
  "url",
- "x402-types",
+ "x402-types 1.5.6",
 ]
 
 [[package]]
 name = "x402-facilitator-local"
-version = "1.5.6"
+version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0668c07d2415afa241758a1b23d1dbd9325d193abbbf0b207df20689e561a9e"
+checksum = "1b024151f17ddbce57a22c82e25b314a773b655929ef9489439ea3b5925efe43"
 dependencies = [
  "axum",
  "opentelemetry 0.32.0",
@@ -16519,7 +16519,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry 0.33.0",
  "tracing-subscriber",
- "x402-types",
+ "x402-types 2.0.2",
 ]
 
 [[package]]
@@ -16532,6 +16532,23 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "regex",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "serde_with 3.21.0",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "x402-types"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23ef29b26928723dae166230f9f4f7139f66fe52804d19edd9241ae94b946179"
+dependencies = [
+ "alloy-primitives",
+ "async-trait",
+ "base64 0.22.1",
  "rust_decimal",
  "serde",
  "serde_json",
