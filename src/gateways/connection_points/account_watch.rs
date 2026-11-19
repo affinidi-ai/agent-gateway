@@ -82,6 +82,11 @@ enum AccountCheck {
     Unreadable,
     /// The mediator did not answer the probe at all.
     Unanswered,
+    /// The mediator did not answer, and the listener was restarted for it,
+    /// with the restart's outcome. Counted as silence, not as an answer: a
+    /// mediator that keeps saying nothing must be restarted ever more slowly,
+    /// which only works while the count survives the restart.
+    UnansweredAndRestarted(Result<(), String>),
     /// The account accepts messages.
     Healthy,
     /// The account needed `repair`, with the repair's outcome.
@@ -185,7 +190,8 @@ impl UnansweredProbes {
     /// Whether another unanswered probe of `connection_point_id` restarts its
     /// listener: on the second unanswered probe in a row, and then at doubling
     /// counts, so a mediator that stays silent is retried ever more slowly
-    /// instead of on every pass.
+    /// instead of on every pass. A restart does not clear the count — only an
+    /// answer does — so the gaps keep widening while the silence lasts.
     fn restart_due(
         &self,
         connection_point_id: &str,
@@ -220,12 +226,12 @@ impl UnansweredProbes {
                 .consecutive
                 .entry(connection_point_id.clone())
                 .or_insert(0);
-            if matches!(check, AccountCheck::Unanswered) {
+            if matches!(check, AccountCheck::Unanswered | AccountCheck::UnansweredAndRestarted(_)) {
                 *consecutive = consecutive.saturating_add(1);
                 unanswered.insert(connection_point_id.clone());
             } else {
-                // Any answer, including a refusal and a restart that followed
-                // the silence, starts the count again.
+                // Any answer starts the count again, including a refusal: the
+                // mediator is talking to this socket.
                 *consecutive = 0;
             }
         }
@@ -348,6 +354,9 @@ async fn check_listener(
     };
     if let Err(error) = &repaired {
         warn!(connection_point = %listener.name, ?repair, "Repairing the mediator account failed: {error}");
+    }
+    if unanswered && matches!(repair, AccountRepair::RestartListener) {
+        return AccountCheck::UnansweredAndRestarted(repaired);
     }
     AccountCheck::Repaired(repair, repaired)
 }
@@ -644,8 +653,8 @@ mod tests {
         );
         assert_eq!(
             check_listener(&manager, &listener, &silent, true).await,
-            AccountCheck::Repaired(AccountRepair::RestartListener, Err("Connection point 'cp-1' not found".into())),
-            "a silent probe restarts the listener once one is due"
+            AccountCheck::UnansweredAndRestarted(Err("Connection point 'cp-1' not found".into())),
+            "a silent probe restarts the listener once one is due, and stays counted as silence"
         );
     }
 
@@ -669,24 +678,50 @@ mod tests {
 
         probes.record(&pass(&[("cp-1", AccountCheck::Unanswered)]));
         assert!(probes.restart_due("cp-1"));
+        probes.record(&pass(&[("cp-1", AccountCheck::UnansweredAndRestarted(Ok(())))]));
+        assert!(
+            !probes.restart_due("cp-1"),
+            "the restart is counted as silence, so the next restart waits for the fourth probe"
+        );
+
         probes.record(&pass(&[("cp-1", AccountCheck::Repaired(AccountRepair::RestartListener, Ok(())))]));
-        assert!(!probes.restart_due("cp-1"), "a restart answers the silence");
+        assert!(!probes.restart_due("cp-1"), "a refused probe is an answer, so the count starts again");
     }
 
+    /// Feeds the tracker what the watch really produces for a mediator that
+    /// says nothing: a restart on the passes where one is due, silence on the
+    /// rest. Recording `Unanswered` on a restart pass would not exercise the
+    /// backoff, since the loop never produces that.
     #[test]
     fn a_mediator_that_stays_silent_is_restarted_ever_more_slowly() {
         let mut probes = UnansweredProbes::default();
-        let due = (0..16)
-            .map(|_| {
-                let due = probes.restart_due("cp-1");
-                probes.record(&pass(&[("cp-1", AccountCheck::Unanswered)]));
-                due
-            })
-            .enumerate()
-            .filter_map(|(probe, due)| due.then_some(probe + 1))
-            .collect::<Vec<_>>();
+        let mut restarted_on = Vec::new();
 
-        assert_eq!(due, [2, 4, 8, 16], "restarts back off instead of repeating every pass");
+        for probe in 1..=16 {
+            let check = if probes.restart_due("cp-1") {
+                restarted_on.push(probe);
+                AccountCheck::UnansweredAndRestarted(Ok(()))
+            } else {
+                AccountCheck::Unanswered
+            };
+            let (delay, focus) = probes.record(&pass(&[("cp-1", check)]));
+            assert_eq!(delay, UNANSWERED_RECHECK_INTERVAL, "silence keeps the faster re-probe");
+            assert!(focus.contains("cp-1"), "a restarted listener is probed again to confirm it recovered");
+        }
+
+        assert_eq!(restarted_on, [2, 4, 8, 16], "restarts back off instead of repeating every other pass");
+    }
+
+    #[test]
+    fn an_answer_after_a_restart_starts_the_backoff_again() {
+        let mut probes = UnansweredProbes::default();
+        probes.record(&pass(&[("cp-1", AccountCheck::Unanswered)]));
+        probes.record(&pass(&[("cp-1", AccountCheck::UnansweredAndRestarted(Ok(())))]));
+
+        let (delay, focus) = probes.record(&pass(&[("cp-1", AccountCheck::Healthy)]));
+        assert_eq!(delay, ACCOUNT_CHECK_INTERVAL, "a recovered listener goes back to the usual cadence");
+        assert!(focus.is_empty());
+        assert!(!probes.restart_due("cp-1"), "the next silent probe is tolerated again");
     }
 
     #[test]
