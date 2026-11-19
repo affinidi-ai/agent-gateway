@@ -68,6 +68,11 @@ changes:
         one never resizes the form, show a saved policy's ID and SHA on one line with copy
         buttons, and show the Rego with line numbers and a banner when it doesn't compile.
   fixed:
+    - timestamp: '2026-11-19T20:00:00Z'
+      title: Fit the policy editor's dry-run Run button to its label
+      description: >-
+        The Test (dry-run) panel's "Run against the draft above" button had a fixed width
+        narrower than its label, so the text spilled past the button. It now sizes to its label.
     - timestamp: '2026-11-18T18:00:00Z'
       title: Describe the policy input the gateway sends in the policy editor
       description: >-

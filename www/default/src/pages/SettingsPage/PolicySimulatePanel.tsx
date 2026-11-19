@@ -126,7 +126,6 @@ const PolicySimulatePanel: React.FC<PolicySimulatePanelProps> = ({
                 type="button"
                 className="btn btn-sm btn-outline-primary"
                 style={{
-                  width: '13rem',
                   whiteSpace: 'nowrap',
                   pointerEvents: disabled || autoRun ? 'none' : undefined,
                 }}
