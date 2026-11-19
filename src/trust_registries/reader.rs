@@ -170,8 +170,7 @@ async fn handle_refusal(
     }
     if is_request_thread(thid) {
         warn!(
-            // Peer-chosen: capped at 64 chars and Debug-escaped.
-            thid = ?thid.chars().take(64).collect::<String>(),
+            thid = ?for_log(thid, 64),
             "TR reader: refusal for '{}' answers a request no longer awaited, ignoring",
             connection.trust_registry_id
         );
@@ -179,8 +178,25 @@ async fn handle_refusal(
     }
     // Not a reply to a request → the registry rejected the gateway.
     let (code, comment) = refusal_reason(message, refusal);
-    error!("TR reader: refusal for '{}': {}: {}", connection.trust_registry_id, code, comment);
+    error!(
+        code = ?for_log(&code, 128),
+        comment = ?for_log(&comment, 256),
+        "TR reader: refusal for '{}'",
+        connection.trust_registry_id
+    );
     update_status(connection, TrustRegistryConnectionStatus::Failed, store, ws_state).await;
+}
+
+/// Peer-chosen text, capped so one field cannot fill the log; the caller
+/// renders it with `?` so a newline in it cannot forge a line.
+fn for_log(
+    value: &str,
+    max_chars: usize,
+) -> String {
+    value
+        .chars()
+        .take(max_chars)
+        .collect()
 }
 
 /// The code and explanation to log, read from whichever form the refusal
@@ -340,6 +356,34 @@ mod tests {
             .connection_status
     }
 
+    fn setup_message(msg_type: &str) -> DIDCommMessage {
+        DIDCommMessage::build(
+            uuid::Uuid::new_v4().to_string(),
+            msg_type.to_string(),
+            serde_json::json!({ "channel_did": "did:example:registry" }),
+        )
+        .thid(uuid::Uuid::new_v4().to_string())
+        .finalize()
+    }
+
+    #[tokio::test]
+    async fn setup_received_moves_the_registry_to_awaiting_approval() {
+        let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connecting).await;
+
+        handle_message(setup_message(connection::SETUP_RECEIVED), &connection, &store, &None).await;
+
+        assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::AwaitingApproval);
+    }
+
+    #[tokio::test]
+    async fn setup_approved_moves_the_registry_to_connected() {
+        let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::AwaitingApproval).await;
+
+        handle_message(setup_message(connection::SETUP_APPROVED), &connection, &store, &None).await;
+
+        assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Connected);
+    }
+
     #[tokio::test]
     async fn a_problem_report_answering_a_request_no_longer_awaited_keeps_the_status() {
         let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connected).await;
@@ -364,6 +408,7 @@ mod tests {
             assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Failed);
         }
     }
+
     #[tokio::test]
     async fn a_trust_task_error_answering_a_request_no_longer_awaited_keeps_the_status() {
         let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connected).await;

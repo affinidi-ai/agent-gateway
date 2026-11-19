@@ -413,12 +413,15 @@ fn problem_report_error(body: serde_json::Value) -> TrustRegistryError {
 
 /// The error a refusal produces when it arrives as the `trust-task-error`
 /// document a mediator from v0.52 sends, rather than as a problem report. The
-/// Trust Tasks code is kept as it arrived, carrying no `e.p.` prefix, so
-/// [`TrustRegistryError::is_conflict`] answers for it as it does for every
-/// code that is not a registry conflict.
+/// code is the one the mediator gives the same refusal in a problem report
+/// when it translated it (`details.mediatorCode`), so
+/// [`TrustRegistryError::is_conflict`] answers the same for a refusal in
+/// either form; otherwise it is the Trust Tasks code as it arrived.
 fn refusal_error(refusal: &TrustTaskRefusal) -> TrustRegistryError {
     TrustRegistryError::ProblemReport(
-        refusal.code.clone(),
+        refusal
+            .mediator_code()
+            .to_string(),
         refusal
             .message
             .clone()
@@ -4299,6 +4302,32 @@ mod tests {
             other => panic!("Expected ProblemReport, got {other:?}"),
         }
         assert!(!error.is_conflict(), "a mediator refusal is not a registry write conflict");
+    }
+
+    #[test]
+    fn a_refusal_the_mediator_translated_is_read_as_the_conflict_it_answers() {
+        let refusal = TrustTaskRefusal::from_document(&json!({
+            "id": "urn:uuid:00000000-0000-4000-8000-000000000003",
+            "type": "https://trusttasks.org/spec/trust-task-error/0.6",
+            "payload": {
+                "code": "registry/record/create:conflict",
+                "message": "Reference field already exists",
+                "retryable": false,
+                "details": { "mediatorCode": TR_CONFLICT_CODE },
+            },
+        }))
+        .expect("a trust-task-error");
+
+        let error = refusal_error(&refusal);
+
+        assert!(error.is_conflict(), "the code the same refusal carries as a problem report decides");
+        match error {
+            TrustRegistryError::ProblemReport(code, comment) => {
+                assert_eq!(code, TR_CONFLICT_CODE);
+                assert_eq!(comment, "Reference field already exists");
+            }
+            other => panic!("Expected ProblemReport, got {other:?}"),
+        }
     }
 
     #[test]

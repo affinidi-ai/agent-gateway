@@ -13,7 +13,8 @@ changes:
         routes a refusal in either form exactly as it has always routed a problem report — to
         the query waiting on it, ignored when that query is gone, and otherwise marking the
         registry Failed — and a refusal that answers a query reports its code instead of
-        failing to parse. Nothing about when a connection is rebuilt changes.
+        failing to parse. What triggers a rebuild is unchanged, and a registry the mediator
+        rejects is marked Failed as it was before v0.52, which a manual reconnect clears.
   removed: []
   security: []
   breaking: []
