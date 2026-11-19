@@ -1789,8 +1789,8 @@ because allowing by default is the less safe choice; the icons are `aria-hidden`
 switch with `body.dark-theme`, and the Audit Log's `.audit-decision` pill is left as it is; an
 example's expected and actual decision
 and the tags (MCP tool policy and reads `<path>` with the path in `<code>` in `secondary`,
-"Gateway only" / "Agent Surface only" and the Type note in `warning`, **Recommended** in
-`primary` and **This tab only** in `info`, both from `TemplateOriginBadges`) are `Badge`s, an alert the templates add that carries an action is a non-collapsible
+"Gateway only" / "Agent Surface only" and the Type note in `warning`, and **This tab only** in
+`info` from `TemplateOriginBadges`) are `Badge`s, an alert the templates add that carries an action is a non-collapsible
 `InfoBanner` with the button as its child and the test id on a wrapping `div`, the template
 search and category filter is the shared `SearchInput` and `FilterChipGroup`
 (`TemplateFilterBar.tsx`), code blocks use `.policy-preview-block`, and the templates column's
@@ -1841,9 +1841,7 @@ nothing more: not shared, published or enforced. `policyTemplateStore.ts` keeps 
 tab's `sessionStorage` (`policy-templates:organization`), so they last in that browser tab
 until it is closed; each one carries a **This tab only** badge
 (`policy-template-tab-only-badge`) on its card, detail, row and preview, and the Save as template
-panel and the save toast say so. A catalogue entry with `"recommended": true` (Deny by default,
-Require authenticated caller, Allow by JWT claim or role) carries a **Recommended** badge
-(`policy-template-recommended-badge`) on its card, detail, row and preview. On read the store
+panel and the save toast say so. No template is marked Recommended. On read the store
 keeps only entries whose fields check out (category an own key of `CATEGORY_LABELS`, each
 example with a text `name`, an object `input` and `expected` allow or deny) and rebuilds
 each from those fields; when a write fails it keeps the templates in memory until reload.

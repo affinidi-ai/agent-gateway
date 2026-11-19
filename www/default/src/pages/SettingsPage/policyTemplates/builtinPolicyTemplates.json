@@ -1,7 +1,6 @@
 [
   {
     "id": "deny-by-default",
-    "recommended": true,
     "name": "Deny by default",
     "summary": "Nothing is allowed until a rule allows it.",
     "description": "Denies every request. Start here and insert or write the rules that allow what you need.",
@@ -31,7 +30,6 @@
   },
   {
     "id": "require-authentication",
-    "recommended": true,
     "name": "Require authenticated caller",
     "summary": "Allow only callers that authenticated.",
     "description": "Allows a request only when the caller authenticated with one of the surface's Caller Context methods. Denies callers whose credential was missing or invalid, and requests on a surface without caller authentication.",
@@ -84,7 +82,6 @@
   },
   {
     "id": "allow-by-jwt-claim",
-    "recommended": true,
     "name": "Allow by JWT claim or role",
     "summary": "Allow only JWT callers whose claim has one of the listed values.",
     "description": "Allows a request when the caller authenticated with a JWT and the chosen claim, such as role, holds one of the listed values. A claim that is a list matches when any of its values is listed. Denies every other caller.",

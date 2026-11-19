@@ -1681,12 +1681,10 @@ describe('organisation templates', () => {
     expect(screen.getByTestId('policy-templates-preview')).toHaveTextContent('This tab only');
   });
 
-  it('marks the recommended built-ins in the gallery and the column', async () => {
+  it('marks no built-in as recommended', async () => {
     renderAt('/policy-definitions/new?type=agent_surface');
-    expect(await card('require-authentication')).toHaveTextContent('Recommended');
-    expect(await card('allow-by-jwt-claim')).toHaveTextContent('Recommended');
-    expect(await card('allow-http-methods')).not.toHaveTextContent('Recommended');
-    expect(await panelRow('require-authentication')).toHaveTextContent('Recommended');
-    expect(await panelRow('allow-http-methods')).not.toHaveTextContent('Recommended');
+    expect(await card('require-authentication')).not.toHaveTextContent('Recommended');
+    expect(await card('allow-by-jwt-claim')).not.toHaveTextContent('Recommended');
+    expect(await panelRow('require-authentication')).not.toHaveTextContent('Recommended');
   });
 });

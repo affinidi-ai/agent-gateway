@@ -76,8 +76,6 @@ export interface PolicyTemplate {
    * input is the tool call (`input.jwt`, `input.mcp.method`), not the request's caller context.
    */
   policy_input?: 'mcp_tool';
-  /** A built-in suggested as a place to start. */
-  recommended?: boolean;
   docs_href?: string;
   /** The text of the docs link, naming the guide or reference section it opens. */
   docs_label?: string;

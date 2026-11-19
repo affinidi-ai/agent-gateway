@@ -29,8 +29,7 @@ changes:
         the reason shown under the rule or template, while the allow rule still reads that rule,
         directly or through other rules; a read from deny_reason alone doesn't count, and an
         identical copy left by the same template added twice can go, and the reason names the
-        rule that reads it. Deny by default, Require authenticated caller and Allow by JWT claim
-        or role are marked Recommended. Once rules are added, Start from still names the template
+        rule that reads it. Once rules are added, Start from still names the template
         the policy started from and counts the templates added, and says Custom Rego only after
         a hand edit. The Add to policy preview says allow rules combine with OR. On a saved
         policy the template examples say which rows match, explain a row that differs, and load

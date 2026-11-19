@@ -47,12 +47,9 @@ export const RoleBadge: React.FC<{ role: 'policy' | 'rules' }> = ({ role }) => {
   );
 };
 
-/** Recommended on a suggested built-in, and This tab only on an organisation template. */
+/** This tab only on an organisation template. */
 export const TemplateOriginBadges: React.FC<{ template: PolicyTemplate }> = ({ template }) => (
   <>
-    {template.builtin && template.recommended && (
-      <Badge tone="primary" value="Recommended" data-testid="policy-template-recommended-badge" />
-    )}
     {!template.builtin && (
       <Badge
         tone="info"
