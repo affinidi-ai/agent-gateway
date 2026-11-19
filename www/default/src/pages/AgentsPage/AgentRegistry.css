@@ -16,16 +16,6 @@ body.dark-theme .agents-row-chevron {
   color: var(--dark-text-muted);
 }
 
-.agents-name {
-  font-size: 0.95rem;
-  font-weight: 600;
-  color: var(--gray-800);
-}
-
-body.dark-theme .agents-name {
-  color: var(--dark-text-heading);
-}
-
 .agent-preview-head {
   display: flex;
   gap: 12px;

@@ -2104,15 +2104,18 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
 - Columns: Agent, Route, Protocol, Identities, Used by surfaces, Trust registry, Last activity.
   The protocol badge (`agents-protocol-badge`) uses the Surfaces page's colours (A2A
   `text-bg-primary`, AP2 `text-bg-warning`, MCP `text-bg-info`, else `text-bg-secondary`).
-  The count badges of **Identities** and **Used by surfaces** match the Surfaces page's Transit
-  Points count: a square `badge text-bg-primary`, not a pill.
+  The count badge of **Used by surfaces** matches the Surfaces page's Transit Points count: a
+  square `badge text-bg-primary`, not a pill.
   **Used by surfaces** shows a count badge and the surface names joined with commas on one
-  truncated line, with the full list in the tooltip. It has no links. **Identities** shows the same
-  count badge, then the first DID in `identities`, shortened in the middle and muted with a copy
-  button, and `+N` for the rest; every DID is in the tooltip. Without any it shows **No DID**: a
-  warning badge while surfaces use the agent (the API does not say which surface holds which DID),
-  muted text otherwise.
-- The agent name (`agents-name`) is the strongest text in a row; DIDs stay muted. The table's
+  truncated line, with the full list in the tooltip. It has no links. **Identities** shows no DID,
+  only the count as text: "1 identity" or "N identities" (`identitiesLabel`), with every DID in
+  `identities` in the tooltip. Without any it shows **No identity**: a warning badge while
+  surfaces use the agent (the API does not say which surface holds which DID), muted text
+  otherwise.
+- The agent name matches the A2A Proxies list on the Proxies page: a plain `<strong>` at the
+  table's font size, with the endpoint host under it in `small text-muted`. An agent without a
+  name shows "Unnamed agent" the same way (`agents-unnamed`), never italic or muted. The name
+  (`agents-name`) is the strongest text in a row. The table's
   column headers (`agents-table`) keep the uppercase `.table-sm` default, like the Surfaces page.
 - **Agent** shows the endpoint host under the name (`endpointHost`: the URL origin with its
   scheme, such as `https://agent.example`, the A2A proxy, or `gateway/channel`), so rows with the
@@ -2176,7 +2179,7 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
   the API's `upstream_card`, with columns **Field**, **Change** and **Value**. **Change** is a
   badge (`<row>-change`): **Rewritten** (`text-bg-warning`) when the field existed before,
   **Added** (`text-bg-primary`) when it did not, **Removed** (`text-bg-secondary`) when the
-  served card dropped it. **Value** (`<row>`) is what callers get, in semibold code, `-` when
+  served card dropped it. **Value** (`<row>`) is what callers get, in regular-weight code, `-` when
   missing; a rewritten or removed one has a muted "Was <value>" line under it, its code muted too
   so the new value stands out (`<row>-was`), an added one none. `code` in `agent-preview-changes`
   cells is `inline-block` so wrapped chips don't overlap. Rows:
@@ -2236,8 +2239,8 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
 | Name, unnamed, endpoint host    | `agents-name`, `agents-unnamed`, `agents-endpoint-host`                                         |
 | Runtime, protocol, activity     | `agents-runtime`, `agents-protocol-badge`, `agents-last-activity`                               |
 | Surfaces, count, names          | `agents-surfaces`, `agents-surfaces-count`, `agents-surface-names`                              |
-| Identities, count, more         | `agents-identities`, `agents-identities-count`, `agents-identities-more`                        |
-| DID, copy, none                 | `agents-did`, `agents-copy-did-button`, `agents-no-did`                                         |
+| Identities, none                | `agents-identities`, `agents-no-identity`                                                       |
+| DID, copy                       | `agents-did`, `agents-copy-did-button`                                                          |
 | Trust registry                  | `agents-trust-recorded`, `agents-trust-not-recorded`                                            |
 | Back, details retry             | `agent-back-button`, `agent-retry-button`                                                       |
 | Details not found, load error   | `agent-not-found`, `agent-load-error`                                                           |

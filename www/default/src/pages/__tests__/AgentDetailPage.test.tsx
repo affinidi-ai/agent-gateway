@@ -864,6 +864,11 @@ describe('AgentDetailPage', () => {
     expect(within(changes).getByTestId('agent-card-gateway-did')).toHaveTextContent(
       /^did:web:rick\.example$/
     );
+    for (const testId of ['agent-card-gateway-extension', 'agent-card-gateway-did']) {
+      expect(
+        within(within(changes).getByTestId(testId)).getByText((_, el) => el?.tagName === 'CODE')
+      ).not.toHaveClass('fw-semibold');
+    }
     expect(within(changes).getByTestId('agent-card-gateway-did-change')).toHaveTextContent('Added');
     expect(within(changes).getByText('Verifiable Presentation')).toBeInTheDocument();
     expect(within(changes).getByTestId('agent-card-gateway-extension-change')).toHaveTextContent(

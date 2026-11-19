@@ -40,7 +40,7 @@ const PROTOCOL_BADGE_CLASSES: Record<string, string> = {
 };
 
 export const UNNAMED_AGENT = 'Unnamed agent';
-export const NO_DID = 'No DID';
+export const NO_IDENTITY = 'No identity';
 
 export function displayName(agent: Pick<AgentRecord, 'name'>): string {
   return agent.name ?? UNNAMED_AGENT;

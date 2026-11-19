@@ -1,0 +1,34 @@
+branch: fix/agent-registry-display
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-19T15:20:05Z'
+      title: Show agent names on the Agents page like the A2A Proxies list
+      description: >-
+        The Agents page showed agent names larger than the rest of the table and showed an
+        unnamed agent in muted italics. Every row now shows its name, or "Unnamed agent", in
+        plain bold text with the endpoint host small and muted under it, as the A2A Proxies list
+        on the Proxies page does.
+    - timestamp: '2026-11-19T15:20:05Z'
+      title: Show an agent's identity count instead of a cut-off DID on the Agents page
+      description: >-
+        The Identities column showed a count badge and the first DID, which did not fit and was
+        cut off. It now says "1 identity", "N identities" or "No identity", with every DID in the
+        tooltip and on the agent's page.
+    - timestamp: '2026-11-19T15:20:05Z'
+      title: Stop showing Agent Card change values in bold
+      description: >-
+        The Changes by the gateway table on an agent's Agent Card tab showed each value, such as
+        the identity credential and the DID, in bold. Values now use the regular weight of the
+        rest of the table.
+    - timestamp: '2026-11-19T15:20:05Z'
+      title: Focus Cancel as soon as a delete confirmation opens
+      description: >-
+        A delete confirmation, such as Delete Surface, waited one animation frame to position
+        itself before moving focus to Cancel, so a key pressed right after opening it could go to
+        the page instead. It now positions itself before it is first drawn and focuses Cancel
+        straight away, while still following its button as the page moves.
+  removed: []
+  security: []
+  breaking: []

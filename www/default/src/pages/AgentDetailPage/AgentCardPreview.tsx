@@ -38,7 +38,7 @@ const Value: React.FC<{ value: string | null }> = ({ value }) =>
   value === null ? (
     <span className="text-muted">-</span>
   ) : (
-    <code className="small text-break fw-semibold">{value}</code>
+    <code className="small text-break">{value}</code>
   );
 
 type ChangeKind = 'rewritten' | 'added' | 'removed';

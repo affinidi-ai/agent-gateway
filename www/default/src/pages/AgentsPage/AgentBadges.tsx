@@ -4,7 +4,7 @@ import { Badge } from '../../components/shared/Badge';
 import { TrustRecorderStateBadge } from '../../components/trust-recorder/TrustRecorderStateBadge';
 import { CopyButton } from '../../components/shared/CopyButton';
 import {
-  NO_DID,
+  NO_IDENTITY,
   identitiesLabel,
   protocolBadgeClass,
   protocolLabel,
@@ -84,26 +84,26 @@ export const AgentDid: React.FC<AgentDidProps> = ({ did, full = false, muted = f
 
 interface AgentIdentitiesProps {
   identities: AgentIdentity[];
-  /** How many surfaces use the agent; with none of them holding a DID, `No DID` is flagged. */
+  /** How many surfaces use the agent; with none of them holding a DID, `No identity` is flagged. */
   surfaceCount: number;
 }
 
 /**
- * A count badge, styled like the surfaces count, then the first DID; every DID is in the
- * tooltip. Without any, `No DID`, flagged as a warning while surfaces use the agent.
+ * "1 identity" or "N identities", with every DID in the tooltip. Without any, `No identity`,
+ * flagged as a warning while surfaces use the agent.
  */
 export const AgentIdentities: React.FC<AgentIdentitiesProps> = ({ identities, surfaceCount }) => {
   if (identities.length === 0) {
     if (surfaceCount === 0) {
       return (
-        <span className="text-muted small" data-testid="agents-no-did">
-          {NO_DID}
+        <span className="text-muted small" data-testid="agents-no-identity">
+          {NO_IDENTITY}
         </span>
       );
     }
     return (
       <Badge
-        value={NO_DID}
+        value={NO_IDENTITY}
         tone="warning"
         size="sm"
         prefix={<i className="fas fa-exclamation-triangle me-1" aria-hidden="true" />}
@@ -112,32 +112,17 @@ export const AgentIdentities: React.FC<AgentIdentitiesProps> = ({ identities, su
             ? 'The surface using this agent has no DID'
             : `None of the ${surfaceCount} surfaces using this agent has a DID`
         }
-        data-testid="agents-no-did"
+        data-testid="agents-no-identity"
       />
     );
   }
-  const [first] = identities;
-  const more = identities.length - 1;
   return (
-    <div
-      className="d-flex align-items-center gap-2 small"
-      style={{ maxWidth: '16rem' }}
+    <span
+      className="small text-nowrap"
       title={identities.map(identity => identity.did).join('\n')}
       data-testid="agents-identities"
     >
-      <span
-        className="badge text-bg-primary"
-        aria-label={identitiesLabel(identities.length)}
-        data-testid="agents-identities-count"
-      >
-        {identities.length}
-      </span>
-      <AgentDid did={first.did} muted />
-      {more > 0 && (
-        <span className="text-muted text-nowrap" data-testid="agents-identities-more">
-          +{more}
-        </span>
-      )}
-    </div>
+      {identitiesLabel(identities.length)}
+    </span>
   );
 };

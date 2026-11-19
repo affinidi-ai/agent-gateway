@@ -50,23 +50,17 @@ const AgentsTable: React.FC<AgentsTableProps> = ({ agents, retentionMinutes, onO
               data-testid={`agents-row-${agent.id}`}
             >
               <td>
-                {agent.name ? (
-                  <strong className="agents-name" data-testid="agents-name">
-                    {agent.name}
-                  </strong>
-                ) : (
-                  <span className="text-muted fst-italic" data-testid="agents-unnamed">
-                    {UNNAMED_AGENT}
-                  </span>
-                )}
+                <strong data-testid={agent.name ? 'agents-name' : 'agents-unnamed'}>
+                  {agent.name ?? UNNAMED_AGENT}
+                </strong>
                 {host && (
                   <div
-                    className="small text-muted text-truncate"
+                    className="text-truncate"
                     style={{ maxWidth: '14rem' }}
                     title={host}
                     data-testid="agents-endpoint-host"
                   >
-                    {host}
+                    <small className="text-muted">{host}</small>
                   </div>
                 )}
               </td>
