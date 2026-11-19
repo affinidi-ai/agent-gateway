@@ -398,8 +398,9 @@ const OPENERS = ['{', '[', '('];
 const CLOSERS = ['}', ']', ')'];
 const INFIX = [':=', '==', '!=', '<=', '>=', '=', '<', '>', '+', '-', '*', '/', '%', '|', '&'];
 const JOINERS = [...INFIX, ',', '.', ':', ';', 'with', 'as', 'else', 'in', 'if', 'contains'];
-const STARTS_CONTINUATION = new Set([...JOINERS, ...CLOSERS, '[', '(']);
+const STARTS_CONTINUATION = new Set([...JOINERS, ...CLOSERS]);
 const ENDS_CONTINUATION = new Set([...JOINERS, ...OPENERS, 'not', 'some', 'every']);
+const STARTS_CONDITION_CONTINUATION = new Set([...STARTS_CONTINUATION, '[', '(']);
 
 /** Rego's tokens and newlines, or null for an unknown character or a string over lines. */
 function tokenize(src: string): Token[] | null {
@@ -466,7 +467,7 @@ export function splitConditions(rule: PolicyRule): string[] | null {
   const conditions = segments.filter(s => s.length > 0);
   if (depth !== 0 || conditions.length === 0) return null;
   const continues = (s: Token[]) =>
-    STARTS_CONTINUATION.has(s[0].text) || ENDS_CONTINUATION.has(s[s.length - 1].text);
+    STARTS_CONDITION_CONTINUATION.has(s[0].text) || ENDS_CONTINUATION.has(s[s.length - 1].text);
   if (conditions.some(continues)) return null;
   return conditions.map(s => flatten(src, s));
 }
@@ -505,7 +506,7 @@ export function ruleRoles(parsed: ParsedPolicy): (rule: PolicyRule) => RuleRole 
   const document = !parsed.ok || parsed.readsPackageDocument;
   const { reached } = reachableFromAllow(allRules(parsed), () => false);
   return rule => {
-    if (rule.kind === 'allow') return 'allow';
+    if (readName(rule) === 'allow') return 'allow';
     if (rule.kind === 'deny') return 'deny-reason';
     return document || reached.has(readName(rule)) ? 'used-by-allow' : 'not-used-by-allow';
   };

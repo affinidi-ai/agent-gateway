@@ -31,12 +31,11 @@ changes:
         Rego, lists the policy's rules grouped by the template they came from, marks each rule
         other than allow and deny_reason Used by allow or Not used by allow, shows each
         condition of an allow rule with several on its own line, the later ones after "and",
-        or the rule on one line when it can't be split cleanly, removes a
-        template's rules or a single rule unless the allow rule still reads it, saying which
-        rule does, switches an allow-all policy to deny by default, marks groups that have no
-        effect while the
-        default is ALLOW, and on a new policy blocks Create while a group written for the other
-        Type remains. Start from names the template the policy started from and counts the
+        or the rule on one line when it can't be split cleanly, removes a template's rules or
+        a single rule unless the allow rule still reads it, saying which rule does, switches an
+        allow-all policy to deny by default, marks groups that have no effect while the default
+        is ALLOW, and on a new policy blocks Create while a group written for the other Type
+        remains. Start from names the template the policy started from and counts the
         templates added until a hand edit. On a saved policy a Template examples card checks the
         added template's examples with the existing dry-run, explains a row that differs and
         loads its input into Test (dry-run), with Undo. The templates are a built-in catalogue

@@ -55,8 +55,7 @@ const ROLE_LABEL: Record<RuleRole, string> = {
 const ROLE_TITLE: Record<RuleRole, string> = {
   allow: 'Allows the request when its conditions match',
   'deny-reason': 'Gives the reason a request was denied; does not decide it',
-  'used-by-allow':
-    'allow reads this rule, directly or through other rules, so it changes what the policy decides',
+  'used-by-allow': 'allow reads this rule, directly or through other rules',
   'not-used-by-allow':
     "allow doesn't read this rule, so it doesn't change whether a request is allowed",
 };

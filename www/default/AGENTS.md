@@ -2111,10 +2111,11 @@ Create custom policy) in `useTemplateGallery`.
   layout so the Rule column truncates instead of scrolling sideways. Each rule
   (`policy-rules-group-<n>-rule-<m>`, the row) has a neutral outline role badge
   (`policy-rules-group-<n>-rule-<m>-kind`, from `ruleRoles` in `regoRules.ts`, shown with or
-  without `policies.edit`): Allows, Deny reason (only a rule named `deny_reason`), or, for every
+  without `policies.edit`): Allows (every rule whose read name is `allow`, a dotted `allow.x`
+  included), Deny reason (only a rule named `deny_reason`), or, for every
   other name, `deny` included, "Used by allow" when `allow` reads it, directly or through other
   rules, or while the Rego reads its package as a whole document (title "allow reads this rule,
-  directly or through other rules, so it changes what the policy decides") and "Not used by
+  directly or through other rules") and "Not used by
   allow" otherwise (title "allow doesn't read this rule, so it doesn't change whether a request
   is allowed"); the walk starts from every rule whose read name is `allow`. Then the
   rule on one line with its full text in `title`, except that a plain allow rule which
@@ -2125,8 +2126,8 @@ Create custom policy) in `useTemplateGallery`.
   (whitespace collapsed outside strings, `; ` where a newline separates expressions inside a
   block). A rule that is not a plain allow, has `else`, one condition, no conditions, a raw
   string over lines, a line that starts or ends mid-expression (such as `with` on the next
-  line) or a character the splitter doesn't know keeps the one-line view. Then its line
-  numbers, which switch to the Rego
+  line), a condition that starts with `[` or `(`, or a character the splitter doesn't know
+  keeps the one-line view. Then its line numbers, which switch to the Rego
   view and select the rule (`-show-button`): a small `outline-secondary` `AppButton` with a
   `fa-code` icon and only the numbers in monospace (`5`, `5–8`), since the column is headed
   Line; its title is "Show in the Rego" and its accessible name "Show <rule> in the Rego, line 5". The rules outside any template group are titled

@@ -89,6 +89,21 @@ test.describe('Policy templates on the create policy page', () => {
         await expect(page.getByTestId('policy-rules-empty')).toBeVisible();
     });
 
+    test('lists the conditions of an allow rule one per line', async ({page}) => {
+        await pickCard(page, 'allow-path-prefixes');
+        await galleryDetail(page).getByTestId('policy-template-gallery-use-button').click();
+
+        const conditions = page.getByTestId('policy-rules-group-0-rule-0-conditions');
+        await expect(conditions).toBeVisible();
+        await expect(conditions.getByRole('listitem')).toHaveCount(6);
+        await expect(page.getByTestId('policy-rules-group-0-rule-0-condition-0')).toHaveText(
+            'some prefix in {"/public/"}'
+        );
+        await expect(page.getByTestId('policy-rules-group-0-rule-0-condition-1')).toHaveText(
+            'and startswith(input.http.path, prefix)'
+        );
+    });
+
     test('states what the policy decides and marks the rules allow reads', async ({page}) => {
         await page.setViewportSize({width: 1366, height: 768});
         await pickCard(page, 'business-hours-access-window');
@@ -102,11 +117,13 @@ test.describe('Policy templates on the create policy page', () => {
         await expect(helper).toHaveText('Used by allow');
         await expect(helper).toHaveAttribute(
             'title',
-            'allow reads this rule, directly or through other rules, so it changes what the policy decides'
+            'allow reads this rule, directly or through other rules'
         );
         await captureFullPage(page, 'policy-templates-rules-summary-laptop');
 
-        await page.getByTestId('topbar-theme-button').click();
+        if (!(await page.evaluate(() => document.body.classList.contains('dark-theme')))) {
+            await page.getByTestId('topbar-theme-button').click();
+        }
         await expect.poll(() => page.evaluate(() => document.body.classList.contains('dark-theme'))).toBe(true);
         await page.evaluate(() =>
             Promise.all(

@@ -829,6 +829,16 @@ describe('splitConditions', () => {
     ['with on the next line', 'allow if {\n  f(x)\n  with input.a as 1\n}', null],
     ['an index on the next line', 'allow if {\n  x := input.y\n  [0]\n  z\n}', null],
     ['call arguments on the next line', 'allow if {\n  count\n  (xs) > 0\n  z\n}', null],
+    [
+      'every with an inner line starting with [',
+      'allow if {\n  every x in input.xs {\n    y := x\n    [a, b] := y\n  }\n  input.ok\n}',
+      ['every x in input.xs { y := x; [a, b] := y }', 'input.ok'],
+    ],
+    [
+      'every with an inner line starting with (',
+      'allow if {\n  every x in input.xs {\n    y := x\n    (y + 1) > 0\n  }\n  input.ok\n}',
+      ['every x in input.xs { y := x; (y + 1) > 0 }', 'input.ok'],
+    ],
     ['raw string with braces', 'allow if {\n  x == `{a}; }`\n  y\n}', ['x == `{a}; }`', 'y']],
     ['raw string with an opening brace only', 'allow if {\n  x == `{`\n  y\n}', ['x == `{`', 'y']],
     ['multi-line raw string', 'allow if {\n  x == `a\n  }`\n  y\n}', null],
@@ -1054,10 +1064,19 @@ describe('ruleRoles', () => {
     ]);
   });
 
-  it('reads a dotted allow.x as used by allow, and a rule it reads too', () => {
+  it('reads a dotted allow.x as an allow rule, and a rule it reads as used by allow', () => {
     expect(roles('package p\nh if input.a\nallow.x := h')).toEqual([
       ['h', 'used-by-allow'],
-      ['allow.x', 'used-by-allow'],
+      ['allow.x', 'allow'],
+    ]);
+  });
+
+  it('reads a dotted allow.x beside a plain allow as an allow rule', () => {
+    expect(
+      roles('package p\ndefault allow := false\nallow if input.a\nallow.x if input.b')
+    ).toEqual([
+      ['allow', 'allow'],
+      ['allow.x', 'allow'],
     ]);
   });
 

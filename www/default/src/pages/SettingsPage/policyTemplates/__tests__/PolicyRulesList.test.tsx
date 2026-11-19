@@ -414,7 +414,7 @@ describe('PolicyRulesList role badges', () => {
     expect(kind(0)).toHaveTextContent(/^Used by allow$/);
     expect(kind(0)).toHaveAttribute(
       'title',
-      'allow reads this rule, directly or through other rules, so it changes what the policy decides'
+      'allow reads this rule, directly or through other rules'
     );
     expect(kind(0)).toHaveClass('policy-rules__kind');
     expect(kind(1)).toHaveTextContent(/^Allows$/);
