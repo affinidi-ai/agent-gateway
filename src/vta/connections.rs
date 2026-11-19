@@ -42,12 +42,9 @@ pub const BOOTSTRAP_CONNECTION_ID: &str = "vta-bootstrap";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VtaConnectionTransport {
-    /// REST over HTTPS (or plain HTTP for a loopback sidecar).
+    /// REST over HTTPS (or plain HTTP to a loopback address).
     #[default]
     Https,
-    /// REST over a unix domain socket — a bundled sidecar on the same host
-    /// (VTA-21), so the Trust Task surface is never exposed on a port.
-    Unix,
     /// Trust Tasks carried over DIDComm (VTA-27). Accepted so config written
     /// now stays valid, and rejected by [`VtaConnection::validate`] until the
     /// carrier lands.
@@ -88,8 +85,8 @@ pub struct VtaConnection {
     pub enabled: bool,
     #[serde(default)]
     pub transport: VtaConnectionTransport,
-    /// Base URL (`https`) or socket path (`unix`) of the VTA's Trust Task
-    /// surface.
+    /// Base URL of the VTA's Trust Task surface (`https`), or the mediator
+    /// (`didcomm`).
     pub endpoint: String,
     /// The VTA service DID, pinned so the gateway talks to the intended VTA.
     pub vta_did: String,
@@ -318,14 +315,11 @@ impl VtaConnection {
             // endpoint names the mediator instead.
             return Err("endpoint must name the mediator for the `didcomm` transport".to_string());
         }
-        if self.transport == VtaConnectionTransport::Unix {
-            return Err("transport `unix` is not yet supported; use `https` or `didcomm`".to_string());
-        }
         // A control key is how the gateway authenticates to the VTA. Without
         // one there is nothing to sign the handshake with, so an enabled
         // connection that lacks the reference is a misconfiguration rather than
         // an anonymous client.
-        // The bundled record is the exception: it authenticates with the key the
+        // The bootstrap record is the exception: it authenticates with the key the
         // bootstrap made, which is never in the secrets store, so it has no
         // reference to carry.
         if self.enabled
@@ -666,14 +660,13 @@ mod tests {
         c.transport = VtaConnectionTransport::Didcomm;
         c.validate()
             .expect("the didcomm carrier is wired (VTA-27)");
+    }
 
-        let mut c = connection("c1");
-        c.transport = VtaConnectionTransport::Unix;
-        assert!(
-            c.validate()
-                .unwrap_err()
-                .contains("unix")
-        );
+    #[test]
+    fn a_stored_unix_transport_no_longer_loads() {
+        let mut stored = serde_json::to_value(connection("c1")).unwrap();
+        stored["transport"] = serde_json::json!("unix");
+        assert!(serde_json::from_value::<VtaConnection>(stored).is_err());
     }
 
     #[tokio::test]

@@ -248,6 +248,21 @@ impl VtaRestClient {
     }
 
     async fn establish_once(&self) -> Result<(String, Arc<dyn SignerKeyProvider>), VtaError> {
+        self.handshake()
+            .await
+            .map(|(token, key, _)| (token, key))
+    }
+
+    /// Open a fresh session and return its access token with the trust agent's
+    /// answer as received, proof included, for a caller that has to check who
+    /// signed it. The answer holds the token: never log it.
+    pub async fn authenticate_with_answer(&self) -> Result<(String, Value), VtaError> {
+        self.handshake()
+            .await
+            .map(|(token, _, answer)| (token, answer))
+    }
+
+    async fn handshake(&self) -> Result<(String, Arc<dyn SignerKeyProvider>, Value), VtaError> {
         let (generation, key) = self.current_control();
         // 1. challenge (unsigned): payload = { subject: <control did> }.
         let challenge_doc = self.build_doc(key.did(), TASK_AUTH_CHALLENGE, json!({ "subject": key.did() }));
@@ -272,9 +287,10 @@ impl VtaRestClient {
             .expect("auth doc is an object")
             .insert("proof".to_string(), proof);
 
-        let auth: AuthenticateResponse = self
+        let answer: Value = self
             .post_trust_task("auth", &auth_doc, None)
             .await?;
+        let auth: AuthenticateResponse = parse_answer(&answer)?;
 
         let expires_at = Instant::now() + Duration::from_secs(auth.tokens.expires_in).saturating_sub(self.expiry_skew);
         let access_token = auth.tokens.access_token;
@@ -292,7 +308,7 @@ impl VtaRestClient {
             generation,
             key: Arc::clone(&key),
         });
-        Ok((token, key))
+        Ok((token, key, answer))
     }
 
     /// A live session's token and the key it was opened with, authenticating
@@ -320,6 +336,7 @@ impl VtaRestClient {
 
     /// A valid access token, authenticating (or re-authenticating on expiry)
     /// as needed. Tokens are cloned out of the memory-only cache for the call.
+    #[cfg(test)]
     pub async fn access_token(&self) -> Result<String, VtaError> {
         self.session_token()
             .await
@@ -396,15 +413,28 @@ impl VtaRestClient {
     ) -> Result<T, VtaError> {
         let generation = self.current_control().0;
         match self
-            .dispatch_signed_once(type_uri, payload.clone())
+            .dispatch_signed_once(type_uri, payload.clone(), true)
             .await
         {
             Err(e) if e.is_superseded() && self.current_control().0 != generation => {
-                self.dispatch_signed_once(type_uri, payload)
+                self.dispatch_signed_once(type_uri, payload, true)
                     .await
             }
             other => other,
         }
+    }
+
+    /// [`dispatch_signed`](Self::dispatch_signed) for a task that must not be
+    /// sent twice, such as `acl/swap-key`: the document goes out at most once,
+    /// so any refusal is the trust agent's answer to this request and not to a
+    /// repeat of one it already applied.
+    pub async fn dispatch_signed_at_most_once<T: DeserializeOwned>(
+        &self,
+        type_uri: &str,
+        payload: Value,
+    ) -> Result<T, VtaError> {
+        self.dispatch_signed_once(type_uri, payload, false)
+            .await
     }
 
     /// [`dispatch_signed`](Self::dispatch_signed) for a task the trust agent's
@@ -432,6 +462,7 @@ impl VtaRestClient {
         &self,
         type_uri: &str,
         payload: Value,
+        retry: bool,
     ) -> Result<T, VtaError> {
         let (token, key) = self.session_token().await?;
         let mut doc = self.build_doc(key.did(), type_uri, payload);
@@ -444,8 +475,14 @@ impl VtaRestClient {
             .rsplit('/')
             .nth(1)
             .unwrap_or("dispatch");
-        self.post_trust_task(operation, &doc, Some(&token))
-            .await
+        if retry {
+            self.post_trust_task(operation, &doc, Some(&token))
+                .await
+        } else {
+            self.resilience
+                .run_once(operation, || self.post_trust_task_once(&doc, Some(&token)))
+                .await
+        }
     }
 }
 /// Parse a VTA response body: either the flat shape, or a Trust-Task
@@ -457,6 +494,18 @@ fn parse_response<T: DeserializeOwned>(body: &str) -> Result<T, VtaError> {
     }
     let envelope: Value =
         serde_json::from_str(body).map_err(|e| VtaError::Protocol(format!("response is not JSON: {e}")))?;
+    payload_of(&envelope)
+}
+
+/// [`parse_response`] over an answer already parsed as JSON.
+fn parse_answer<T: DeserializeOwned>(answer: &Value) -> Result<T, VtaError> {
+    match <T as serde::Deserialize>::deserialize(answer) {
+        Ok(flat) => Ok(flat),
+        Err(_) => payload_of(answer),
+    }
+}
+
+fn payload_of<T: DeserializeOwned>(envelope: &Value) -> Result<T, VtaError> {
     let payload = envelope
         .get("payload")
         .ok_or_else(|| VtaError::Protocol("response has neither the expected shape nor a payload".to_string()))?;

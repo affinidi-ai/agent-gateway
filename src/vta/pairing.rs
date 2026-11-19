@@ -16,9 +16,11 @@
 //!    VTA. The gateway asserts this rather than assuming it: an over-privileged
 //!    grant is surfaced, because a gateway holding VTA admin invalidates the
 //!    custody story the integration exists to provide.
-//! 3. The VTA that answered is the one the operator meant — its DID is
-//!    **pinned** on the connection, so a later DNS or endpoint change cannot
-//!    silently redirect signing to a different agent.
+//! 3. The VTA that answered is the one the operator meant. Its answer to
+//!    authentication carries a proof that must verify against a DID's
+//!    document, and that DID is **pinned** on the connection, so a later DNS
+//!    or endpoint change cannot silently redirect signing to a different
+//!    agent.
 //!
 //! ## Fail closed, never silently local
 //!
@@ -202,7 +204,7 @@ pub fn begin_pairing(
 /// What a verification attempt observed on the VTA.
 #[derive(Debug, Clone)]
 pub struct VerificationOutcome {
-    /// The DID the VTA identified itself with.
+    /// The DID whose key signed the trust agent's answer to authentication.
     pub observed_vta_did: String,
     /// The grant the session token reports.
     pub scope: GrantScope,

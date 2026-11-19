@@ -2,7 +2,7 @@ use cucumber::{given, then, when};
 use reqwest::Method;
 use serde_json::{Value, json};
 
-use crate::bdd_support::custom_trust_agent::{CUSTOM_TRUST_AGENT_DID, CustomTrustAgent};
+use crate::bdd_support::custom_trust_agent::{AnswerSigner, CustomTrustAgent, custom_trust_agent_did};
 use crate::steps::credential_save::send;
 use crate::world::SurfaceWorld;
 
@@ -27,7 +27,7 @@ async fn connect(
         "enabled": true,
         "transport": "https",
         "endpoint": agent.url,
-        "vta_did": CUSTOM_TRUST_AGENT_DID,
+        "vta_did": custom_trust_agent_did(),
         "default_context_id": "custom",
         "control_identity": control_identity,
     });
@@ -94,6 +94,16 @@ async fn rolls_back_after_ten_seconds(world: &mut SurfaceWorld) {
     world
         .surface_config
         .connection_key_switch_timeout_secs = Some(10);
+}
+
+#[given("the custom trust agent signs its answers as another DID")]
+async fn custom_agent_signs_as_another_did(world: &mut SurfaceWorld) {
+    agent(world).sign_answers_as(AnswerSigner::Impostor);
+}
+
+#[given("the custom trust agent stops signing its answers")]
+async fn custom_agent_stops_signing(world: &mut SurfaceWorld) {
+    agent(world).sign_answers_as(AnswerSigner::Nobody);
 }
 
 #[given("the operator has rotated the custom connection's control key")]
@@ -266,5 +276,30 @@ async fn shows_rotation_time(world: &mut SurfaceWorld) {
             .get("rotation")
             .is_none(),
         "{custom}"
+    );
+}
+
+#[then("the custom connection is no longer connected and names the DID that answered")]
+async fn not_connected_naming_the_signer(world: &mut SurfaceWorld) {
+    let pairing = &body(world)["pairing"];
+    assert_eq!(pairing["state"], "degraded", "{}", body(world));
+    let error = pairing["last_error"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(error.contains(&CustomTrustAgent::impostor_did()), "{error}");
+    assert_eq!(pairing["pinned_vta_did"], custom_trust_agent_did(), "the pin is kept");
+}
+
+#[then("the custom connection is no longer connected because the answer was not signed")]
+async fn not_connected_unsigned(world: &mut SurfaceWorld) {
+    let pairing = &body(world)["pairing"];
+    assert_eq!(pairing["state"], "degraded", "{}", body(world));
+    assert!(
+        pairing["last_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not signed"),
+        "{}",
+        body(world)
     );
 }

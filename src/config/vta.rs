@@ -198,9 +198,9 @@ pub struct VtaConfig {
 
     /// What this appliance signs with when nobody has said (VTA-26).
     ///
-    /// `auto` (the default) keeps the local issuer key, whatever the install
-    /// looks like; `bundled` opts into the bundled agent. Settable explicitly
-    /// so a fleet or IaC install never needs the dashboard.
+    /// `auto` (the default) and `legacy_local` both keep the local issuer key;
+    /// `legacy_local` says so explicitly. Settable so a fleet or IaC install
+    /// never needs the dashboard.
     ///
     /// Ignored when [`Self::enabled`] is set: an explicitly configured agent
     /// always wins, because a default that could override configured behaviour
@@ -213,8 +213,10 @@ pub struct VtaConfig {
     #[serde(default)]
     pub base_url: Option<String>,
 
-    /// The VTA service DID (`did:webvh`). Pinned and resolved so the gateway
-    /// talks to the intended VTA. Required when `enabled`.
+    /// The VTA service DID. Named as the recipient of every Trust Task and the
+    /// audience of a control-key swap proof; nothing checks that the agent at
+    /// `base_url` holds it, so the agent's identity rests on TLS to that URL.
+    /// Required when `enabled`.
     #[serde(default)]
     pub vta_did: Option<String>,
 
@@ -333,7 +335,7 @@ pub struct VtaConfig {
 
     /// Older spelling of [`control_did_method`](Self::control_did_method):
     /// `true` means `did_webvh`, `false` means `did_key`. Read only when
-    /// `control_did_method` is absent and the deployment is not bundled.
+    /// `control_did_method` is absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish_auth_did: Option<bool>,
 
@@ -346,11 +348,11 @@ pub struct VtaConfig {
     #[serde(default)]
     pub auth_verification_method: Option<String>,
 
-    /// Optional expected AWS Nitro enclave PCR0 (hex). When set, the VTA
-    /// connector verifies the attestation surfaced on the auth challenge during
-    /// connect. Off by default (not wired in the initial PoC).
-    #[serde(default)]
-    pub expect_pcr0: Option<String>,
+    /// Read only to refuse it: the gateway does not check a trust agent's
+    /// enclave attestation, so a block that asks for one must not start as if
+    /// it did.
+    #[serde(default, skip_serializing)]
+    pub expect_pcr0: Option<serde::de::IgnoredAny>,
 
     /// Per-call timeout to the VTA in milliseconds (VTA-04). The gateway owns
     /// the deadline so a hung VTA cannot tie up a surface.
@@ -460,6 +462,12 @@ impl VtaConfig {
             return Err(
                 "[vta] context_did_hosting = \"vta_server\" needs context_did_server_id, the webvh hosting server \
                  registered on the trust agent"
+                    .to_string(),
+            );
+        }
+        if self.expect_pcr0.is_some() {
+            return Err(
+                "[vta] expect_pcr0 is not supported: the gateway does not check trust agent attestation; remove it"
                     .to_string(),
             );
         }
@@ -632,6 +640,21 @@ mod tests {
         let cfg = block("");
         assert_eq!(cfg.effective_control_did_method(), ControlDidMethod::DidWebvh);
         cfg.validate().expect("valid");
+    }
+
+    #[test]
+    fn an_attestation_expectation_is_refused_rather_than_ignored() {
+        let err = block("expect_pcr0 = \"abc123\"")
+            .validate()
+            .expect_err("not supported");
+        assert!(err.contains("expect_pcr0"), "{err}");
+
+        let disabled: VtaConfig = toml::from_str("expect_pcr0 = \"abc123\"").expect("parse");
+        assert!(disabled.validate().is_err(), "refused even while the block is off");
+
+        block("")
+            .validate()
+            .expect("absent is fine");
     }
 
     #[test]

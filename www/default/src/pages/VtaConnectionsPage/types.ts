@@ -3,7 +3,7 @@
  * `src/vta/pairing.rs`.
  */
 
-export type VtaTransport = 'https' | 'unix' | 'didcomm';
+export type VtaTransport = 'https' | 'didcomm';
 
 export type VtaConnectionStatus = 'unpaired' | 'connected' | 'error';
 

@@ -27,6 +27,39 @@ use crate::vta::client::VtaRestClient;
 use crate::vta::connections::{BOOTSTRAP_CONNECTION_ID, VtaConnection, VtaConnectionStorage, VtaConnectionTransport};
 use crate::vta::control_key::{ControlKey, SignerKeyProvider};
 
+/// The DID whose key signed a trust agent's `answer`, once its
+/// `eddsa-jcs-2022` proof verifies against that DID's document.
+///
+/// Says who signed, not who was expected: comparing it with the connection's
+/// trust agent DID is the caller's decision. An unsigned answer is refused,
+/// since nothing in it says which agent sent it.
+async fn answer_signer(
+    answer: &serde_json::Value,
+    did_cache: Arc<affinidi_did_resolver_cache_sdk::DIDCacheClient>,
+) -> Result<String, VtaError> {
+    let proof = answer
+        .get("proof")
+        .filter(|p| p.is_object())
+        .ok_or_else(|| {
+            VtaError::Protocol("the trust agent's answer is not signed, so it cannot be tied to its DID".to_string())
+        })?;
+    let signer = proof
+        .get("verificationMethod")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|vm| vm.split('#').next())
+        .filter(|did| !did.is_empty())
+        .ok_or_else(|| VtaError::Protocol("the trust agent's answer names no signing key".to_string()))?
+        .to_string();
+    let mut unsigned = answer.clone();
+    if let Some(members) = unsigned.as_object_mut() {
+        members.remove("proof");
+    }
+    crate::identity::ssi::di_jcs::verify_jcs_proof(&unsigned, proof, did_cache)
+        .await
+        .map_err(|e| VtaError::Protocol(format!("the trust agent's answer does not verify as `{signer}`: {e}")))?;
+    Ok(signer)
+}
+
 /// Cache key for a connector: a connection plus the key it signs with.
 ///
 /// The record separator cannot occur in a connection id or a key id, so no
@@ -236,13 +269,19 @@ impl VtaConnectionRegistry {
             self.max_concurrent,
             None,
         )?;
-        // The session token the VTA mints is the evidence: it states the role
-        // and contexts the customer actually granted.
-        let token = client.access_token().await?;
+        // The session token states the role and contexts the customer granted.
+        // It arrives inside the agent's signed answer, so the DID whose key
+        // signed that answer is the agent that issued it.
+        let (token, answer) = client
+            .authenticate_with_answer()
+            .await?;
+        crate::gateways::did_cache::init_shared_resolver()
+            .await
+            .map_err(|e| VtaError::Config(format!("no DID resolver to check the trust agent's answer with: {e}")))?;
+        let observed_vta_did =
+            answer_signer(&answer, Arc::clone(crate::gateways::did_cache::shared_resolver())).await?;
         Ok(crate::vta::pairing::VerificationOutcome {
-            // The client only completes the handshake against the DID it was
-            // pinned to, so reaching here means this is the agent that answered.
-            observed_vta_did: connection.vta_did.clone(),
+            observed_vta_did,
             scope: crate::vta::onboarding::GrantScope::from_session_token(&token)?,
         })
     }
@@ -409,10 +448,6 @@ impl VtaConnectionRegistry {
                     })?;
                 Ok(Arc::new(crate::vta::transport::DidCommTransport::new(channel, &connection.vta_did, self.timeout)))
             }
-            VtaConnectionTransport::Unix => Err(VtaError::Config(format!(
-                "VTA connection `{}` selects the `unix` carrier, which is not yet wired",
-                connection.id
-            ))),
         }
     }
 
@@ -998,14 +1033,78 @@ mod tests {
         over_didcomm
             .validate()
             .expect("the didcomm carrier is wired");
+    }
 
-        let mut over_unix = connection("c1", true);
-        over_unix.transport = VtaConnectionTransport::Unix;
+    async fn signed_answer(key: &ControlKey) -> serde_json::Value {
+        let answer = serde_json::json!({
+            "type": "https://trusttasks.org/spec/auth/authenticate/0.3#response",
+            "payload": { "session": { "id": "s" }, "tokens": { "accessToken": "t", "expiresIn": 3600 } },
+        });
+        let proof = crate::vta::di_proof::sign_document(&answer, key, "authentication")
+            .await
+            .expect("sign");
+        let mut signed = answer;
+        signed["proof"] = proof;
+        signed
+    }
+
+    async fn resolver() -> Arc<affinidi_did_resolver_cache_sdk::DIDCacheClient> {
+        crate::gateways::did_cache::init_shared_resolver()
+            .await
+            .expect("resolver");
+        Arc::clone(crate::gateways::did_cache::shared_resolver())
+    }
+
+    #[tokio::test]
+    async fn an_answer_is_attributed_to_the_did_whose_key_signed_it() {
+        let agent = ControlKey::from_seed([21u8; 32]);
+
+        let signer = answer_signer(&signed_answer(&agent).await, resolver().await)
+            .await
+            .expect("verifies");
+
+        assert_eq!(signer, agent.did());
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_answer_is_attributed_to_nobody() {
+        let mut answer = signed_answer(&ControlKey::from_seed([21u8; 32])).await;
+        answer
+            .as_object_mut()
+            .unwrap()
+            .remove("proof");
+
+        let err = answer_signer(&answer, resolver().await)
+            .await
+            .expect_err("unsigned");
+
+        assert!(detail(err).contains("not signed"));
+    }
+
+    #[tokio::test]
+    async fn an_answer_changed_after_signing_does_not_verify() {
+        let agent = ControlKey::from_seed([21u8; 32]);
+        let mut answer = signed_answer(&agent).await;
+        answer["payload"]["tokens"]["accessToken"] = serde_json::json!("forged");
+
+        let err = answer_signer(&answer, resolver().await)
+            .await
+            .expect_err("tampered");
+
+        assert!(detail(err).contains(agent.did()));
+    }
+
+    #[tokio::test]
+    async fn an_answer_naming_another_did_as_signer_does_not_verify() {
+        let agent = ControlKey::from_seed([21u8; 32]);
+        let other = ControlKey::from_seed([22u8; 32]);
+        let mut answer = signed_answer(&agent).await;
+        answer["proof"]["verificationMethod"] = serde_json::json!(other.verification_method());
+
         assert!(
-            over_unix
-                .validate()
-                .unwrap_err()
-                .contains("unix")
+            answer_signer(&answer, resolver().await)
+                .await
+                .is_err()
         );
     }
 }

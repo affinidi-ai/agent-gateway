@@ -7,6 +7,9 @@
 //! `authentication` keys, and checks the proof's signature against that key. A
 //! DID that was never granted is refused, and a DID that signs in again ends
 //! the session it had, so a call on the old token answers `token superseded`.
+//! Its answer to authentication is signed by its own `did:key`, as the real
+//! one signs every answer, unless a scenario makes it sign as another DID or
+//! not at all.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -23,7 +26,56 @@ use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-pub const CUSTOM_TRUST_AGENT_DID: &str = "did:key:z6MkfCustomTrustAgentForKeyRotationScenarios00000";
+const AGENT_SEED: [u8; 32] = [0x5a; 32];
+const IMPOSTOR_SEED: [u8; 32] = [0x5b; 32];
+
+fn did_key_of(seed: &[u8; 32]) -> String {
+    let public = ed25519_dalek::SigningKey::from_bytes(seed)
+        .verifying_key()
+        .to_bytes();
+    let mut bytes = vec![0xed, 0x01];
+    bytes.extend_from_slice(&public);
+    format!("did:key:{}", multibase::encode(multibase::Base::Base58Btc, bytes))
+}
+
+/// The DID the mock custom trust agent signs its answers as.
+pub fn custom_trust_agent_did() -> String {
+    did_key_of(&AGENT_SEED)
+}
+
+/// Who signs the agent's answer to authentication.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AnswerSigner {
+    #[default]
+    Agent,
+    Impostor,
+    Nobody,
+}
+
+/// Attach the `eddsa-jcs-2022` proof the real trust agent puts on its answers.
+fn sign_answer(
+    mut answer: Value,
+    seed: &[u8; 32],
+) -> Value {
+    use ed25519_dalek::Signer;
+    let did = did_key_of(seed);
+    let fragment = did
+        .strip_prefix("did:key:")
+        .unwrap_or_default();
+    let mut proof = json!({
+        "type": "DataIntegrityProof",
+        "cryptosuite": "eddsa-jcs-2022",
+        "created": "2026-01-01T00:00:00Z",
+        "verificationMethod": format!("{did}#{fragment}"),
+        "proofPurpose": "authentication",
+    });
+    let mut hash = Sha256::digest(jcs(&proof).as_bytes()).to_vec();
+    hash.extend(Sha256::digest(jcs(&answer).as_bytes()));
+    let signature = ed25519_dalek::SigningKey::from_bytes(seed).sign(&hash);
+    proof["proofValue"] = json!(multibase::encode(multibase::Base::Base58Btc, signature.to_bytes()));
+    answer["proof"] = proof;
+    answer
+}
 
 #[derive(Debug, Default)]
 struct AgentState {
@@ -34,6 +86,7 @@ struct AgentState {
     only_accepts: Option<String>,
     signed_in: Vec<(String, String)>,
     refused: Vec<String>,
+    answer_signer: AnswerSigner,
 }
 
 #[derive(Debug)]
@@ -248,8 +301,13 @@ async fn trust_tasks(
             .insert(issuer.clone(), token.clone());
         s.signed_in
             .push((issuer, fragment));
-        return Json(json!({ "session": { "id": "s" }, "tokens": { "accessToken": token, "expiresIn": 3600 } }))
-            .into_response();
+        let answer = json!({ "session": { "id": "s" }, "tokens": { "accessToken": token, "expiresIn": 3600 } });
+        let answer = match s.answer_signer {
+            AnswerSigner::Agent => sign_answer(answer, &AGENT_SEED),
+            AnswerSigner::Impostor => sign_answer(answer, &IMPOSTOR_SEED),
+            AnswerSigner::Nobody => answer,
+        };
+        return Json(answer).into_response();
     }
 
     let bearer = headers
@@ -332,6 +390,22 @@ impl CustomTrustAgent {
             .lock()
             .expect("mock state")
             .only_accepts = Some(fragment.to_string());
+    }
+
+    /// Who signs the agent's answers to authentication from now on.
+    pub fn sign_answers_as(
+        &self,
+        signer: AnswerSigner,
+    ) {
+        self.state
+            .lock()
+            .expect("mock state")
+            .answer_signer = signer;
+    }
+
+    /// The DID an impostor signs its answers as.
+    pub fn impostor_did() -> String {
+        did_key_of(&IMPOSTOR_SEED)
     }
 
     /// The fragment of the key the gateway last signed in with.

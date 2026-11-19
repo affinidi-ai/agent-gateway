@@ -124,9 +124,10 @@ pub struct GrantScope {
 
 impl GrantScope {
     /// Parse the `role` + `contexts` claims from a VTA session JWT (the access
-    /// token). This reads the token's **own** payload — the VTA already signed
-    /// it and the gateway holds it; this is self-inspection, not trust
-    /// establishment, so the signature is not re-verified here.
+    /// token). The token is signed with the agent's session key, which no DID
+    /// document publishes, so its signature is not checked here. Pairing
+    /// verification ties the token to the trust agent's DID through the signed
+    /// answer it arrived in.
     pub fn from_session_token(token: &str) -> Result<Self, VtaError> {
         let payload_b64 = token
             .split('.')

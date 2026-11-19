@@ -103,7 +103,6 @@ export function isOverPrivileged(pairing: PairingRecord): boolean {
 
 export const TRANSPORT_LABELS: Record<VtaTransport, string> = {
   https: 'HTTPS',
-  unix: 'Unix socket',
   didcomm: 'DIDComm via mediator',
 };
 
