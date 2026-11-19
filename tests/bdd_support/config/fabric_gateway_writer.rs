@@ -174,22 +174,15 @@ fn build_surface_fixture(
 
     if let Some(source_auth) = &surface.source_auth {
         let SourceAuthSpec::ApiKey { header_name, secret_id, .. } = source_auth;
-        let mut method = api_key_source_auth_method_json(header_name, secret_id);
-        if surface
-            .partner_api_key
-            .is_some()
-        {
-            method["id"] = serde_json::json!("bdd-primary-key");
-        }
+        let method = api_key_source_auth_method_json(header_name, secret_id);
         fixture = fixture.with_caller_auth_method(method);
     }
     if let Some(SourceAuthSpec::ApiKey { header_name, secret_id, .. }) = &surface.partner_api_key {
         let mut method = api_key_source_auth_method_json(header_name, secret_id);
-        method["id"] = serde_json::json!("bdd-partner-key");
+        method["identity"] = serde_json::json!({ "type": "from_api_key" });
         fixture = fixture
             .with_caller_auth_method(method)
-            .with_identity_slot("inbound", serde_json::json!({ "type": "from_api_key" }))
-            .with_identity_slot("inbound_source_method", serde_json::json!("bdd-partner-key"));
+            .with_identity_slot("inbound", serde_json::json!({ "type": "from_jwt_claim", "claim": "sub" }));
     }
     if surface.legacy_access_point {
         fixture = fixture.with_legacy_access_point();

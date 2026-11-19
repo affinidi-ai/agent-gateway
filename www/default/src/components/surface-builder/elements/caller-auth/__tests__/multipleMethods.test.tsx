@@ -184,9 +184,9 @@ describe('caller-auth with several methods', () => {
     expect(methodSelectionProblems({ methods: [JWT_METHOD, API_KEY_METHOD] })).toEqual([]);
   });
 
-  it('lets From JWT Claims identity rely only on a Caller Context whose methods are all JWT', () => {
+  it('lets an inbound From JWT Claims identity rely on a Caller Context with a JWT method to read', () => {
     const dependency = identityDefinition.featureDependencies!.find(d =>
-      d.description.startsWith('from_jwt_claim')
+      d.description.startsWith('An inbound from_jwt_claim')
     )!;
     const withMethods = (methods: unknown[]) =>
       ({
@@ -195,7 +195,8 @@ describe('caller-auth with several methods', () => {
     expect(dependency.check({ type: 'from_jwt_claim' }, withMethods([JWT_METHOD]))).toBe(true);
     expect(
       dependency.check({ type: 'from_jwt_claim' }, withMethods([JWT_METHOD, API_KEY_METHOD]))
-    ).toBe(false);
+    ).toBe(true);
+    expect(dependency.check({ type: 'from_jwt_claim' }, withMethods([API_KEY_METHOD]))).toBe(false);
   });
 });
 
@@ -259,6 +260,23 @@ describe('Caller Context editor: the method list', () => {
 
     expect(latest.config.methods[1].extraction_field).toBe('X-Partner-Key');
     expect(latest.config.methods[0]).toEqual(JWT_METHOD);
+  });
+
+  it('says on its row that a method identifies its own callers', () => {
+    const latest: { config?: any } = {};
+    render(
+      <Harness
+        initial={{
+          methods: [JWT_METHOD, { ...API_KEY_METHOD, identity: { type: 'from_api_key' } }],
+        }}
+        latest={latest}
+      />
+    );
+
+    expect(screen.queryByTestId('caller-auth-editor-method-0-identity')).not.toBeInTheDocument();
+    expect(screen.getByTestId('caller-auth-editor-method-1-identity')).toHaveTextContent(
+      'Identifies its callers From API Key'
+    );
   });
 
   it('adds a method from the menu and opens its settings', () => {

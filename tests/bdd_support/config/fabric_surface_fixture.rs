@@ -54,8 +54,8 @@ pub struct SurfaceSpec {
     pub access_point_public: Option<bool>,
     /// The Access Point's configured agent card location on the Target's origin.
     pub agent_card_path: Option<String>,
-    /// A second API Key method the inbound identity (`from_api_key`) is derived from;
-    /// a caller of the surface's first method is then refused.
+    /// A second API Key method that identifies its callers by their key, beside an
+    /// inbound identity from a JWT claim, which refuses the callers of the first method.
     pub partner_api_key: Option<SourceAuthSpec>,
 }
 

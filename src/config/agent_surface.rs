@@ -284,11 +284,6 @@ fn normalize_stored_browser_origins(value: &mut serde_json::Value) -> bool {
 pub struct SurfaceIdentitySlots {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inbound: Option<crate::source_auth::ManagedIdentityConfig>,
-    /// The caller-authentication method (by `id`) an inbound `from_jwt_claim`
-    /// or `from_api_key` identity is derived from. Unset: any method of the
-    /// identity's kind.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inbound_source_method: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protected: Option<crate::source_auth::ManagedIdentityConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4140,16 +4135,12 @@ impl AgentSurface {
     /// resource token (`mcp_http.authorization`, which replaces caller
     /// authentication), and its base or
     /// an enabled variant authenticates callers with neither protected
-    /// resource metadata, `on_failure: reject` nor an inbound `from_jwt_claim`
-    /// identity, which refuse failed callers on any Access Point.
+    /// resource metadata, `on_failure: reject` nor a caller identity that needs a
+    /// credential, which refuse failed callers on any Access Point.
     pub fn legacy_access_point_notice(&self) -> Option<&'static str> {
         let refused_only_as_legacy = |surface: &AgentSurface| {
             surface.has_source_auth()
-                && !surface
-                    .inbound_identity()
-                    .is_some_and(|identity| {
-                        matches!(identity, crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. })
-                    })
+                && !surface.caller_identity_needs_a_credential()
                 && surface
                     .access_point
                     .caller_authentication
@@ -4223,25 +4214,26 @@ impl AgentSurface {
                 .is_some_and(|http| http.authorization.is_some())
     }
 
+    /// Whether no caller identity can be derived without a valid credential: the
+    /// inbound identity is `from_jwt_claim`, a caller-authentication method sets
+    /// its own identity, or the callers of a method are refused for their valid
+    /// credential, so a caller with none is refused rather than served.
+    pub fn caller_identity_needs_a_credential(&self) -> bool {
+        self.inbound_identity()
+            .is_some_and(|identity| matches!(identity, crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. }))
+            || self.some_method_sets_its_own_identity()
+            || self.refuses_the_callers_of_a_method()
+    }
+
     /// Whether a caller whose credential is missing or invalid is refused
     /// before policy and the Target: on every Access Point that is not public
     /// (closed or legacy, whatever `on_failure` stores), and on a public one
-    /// whose inbound identity is `from_jwt_claim`, which derives no caller
-    /// identity without a valid JWT, that names the method its inbound identity
-    /// is derived from (`identity_slots.inbound_source_method`, which already
-    /// refuses a valid credential of another method), or that is edited by hand
+    /// whose caller identity needs a valid credential (see
+    /// [`Self::caller_identity_needs_a_credential`]), or that is edited by hand
     /// to `on_failure: reject`.
     pub fn rejects_failed_caller_authentication(&self) -> bool {
         self.access_point.public != Some(true)
-            || self
-                .identity_slots
-                .inbound_source_method
-                .is_some()
-            || self
-                .inbound_identity()
-                .is_some_and(|identity| {
-                    matches!(identity, crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. })
-                })
+            || self.caller_identity_needs_a_credential()
             || self
                 .access_point
                 .caller_authentication
@@ -5197,26 +5189,44 @@ mod tests {
     }
 
     #[test]
-    fn a_public_access_point_naming_the_inbound_identity_method_refuses_failed_callers() {
-        let build = |slots: serde_json::Value| {
+    fn a_public_access_point_whose_methods_set_their_own_identity_refuses_failed_callers() {
+        let build = |method_identity: Option<serde_json::Value>| {
+            let mut caller_authentication = api_key_caller_authentication();
+            if let Some(identity) = method_identity {
+                caller_authentication["methods"][0]["identity"] = identity;
+            }
             let mut stored = surface_with_access_point(
-                serde_json::json!({"public": true, "caller_authentication": api_key_caller_authentication()}),
+                serde_json::json!({"public": true, "caller_authentication": caller_authentication}),
             );
-            stored["identity_slots"] = slots;
+            stored["identity_slots"] = serde_json::json!({"inbound": {"type": "from_api_key"}});
             serde_json::from_value::<super::AgentSurface>(stored).unwrap()
         };
 
         assert!(
-            !build(serde_json::json!({"inbound": {"type": "from_api_key"}})).rejects_failed_caller_authentication(),
-            "without a named method a public from_api_key surface leaves failed callers to policy"
+            !build(None).rejects_failed_caller_authentication(),
+            "a public from_api_key surface leaves failed callers to policy"
         );
         assert!(
-            build(serde_json::json!({
-                "inbound": {"type": "from_api_key"},
-                "inbound_source_method": "partner-key"
-            }))
-            .rejects_failed_caller_authentication(),
-            "naming a method refuses them, as from_jwt_claim does"
+            build(Some(serde_json::json!({"type": "from_api_key"}))).rejects_failed_caller_authentication(),
+            "a method's own identity refuses them, as from_jwt_claim does"
+        );
+    }
+
+    #[test]
+    fn a_public_access_point_refusing_a_valid_method_also_refuses_failed_callers() {
+        let mut caller_authentication = api_key_caller_authentication();
+        caller_authentication["methods"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": ["a"]}));
+        let mut stored = surface_with_access_point(
+            serde_json::json!({"public": true, "caller_authentication": caller_authentication}),
+        );
+        stored["identity_slots"] = serde_json::json!({"inbound": {"type": "from_api_key"}});
+        let surface = serde_json::from_value::<super::AgentSurface>(stored).unwrap();
+        assert!(
+            surface.rejects_failed_caller_authentication(),
+            "a caller with no credential is refused as a valid JWT caller is"
         );
     }
 

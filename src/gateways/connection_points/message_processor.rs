@@ -5155,11 +5155,11 @@ async fn process_charged_forward_request(
                 };
                 match verified {
                     Ok(identity) => {
-                        if let Some(reason) = surface.inbound_source_method_refusal(auth_config) {
+                        if let Err(reason) = surface.inbound_identity_for(Some(auth_config)) {
                             channel_warn!(config_id, "GW2: Caller refused: {}", reason);
                             crate::metrics::backends::prometheus::track_managed_identity_resolve(
                                 &surface.name,
-                                surface.inbound_identity_mode_label(),
+                                surface.inbound_identity_mode_label(auth_config),
                                 "source_method_mismatch",
                                 0.0,
                             );

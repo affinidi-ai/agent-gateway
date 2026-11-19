@@ -9,7 +9,6 @@ import {
   readProtectedResource,
   resourceMissesRoute,
 } from './protectedResource';
-import { referencedMethodId } from '../identity/placement';
 import {
   buildMethod,
   defaultMethodConfig,
@@ -166,8 +165,7 @@ export const callerAuthDefinition: NodeDefinition = {
     const configured = readMethods(c);
     if (configured.length === 0) return undefined;
 
-    const referenced = referencedMethodId(ctx.allNodes);
-    const methods = configured.map(m => buildMethod(m, ctx.surfaceMeta.surface_id, referenced));
+    const methods = configured.map(m => buildMethod(m, ctx.surfaceMeta.surface_id));
     if (methods.some(m => m === undefined)) return undefined;
 
     const discovery =

@@ -2552,16 +2552,16 @@ async fn proxy_charged_request(
         };
         match verified {
             Ok(identity) => {
-                if let Some(reason) = state
+                if let Err(reason) = state
                     .surface
-                    .inbound_source_method_refusal(auth_config)
+                    .inbound_identity_for(Some(auth_config))
                 {
                     channel_warn!(config_id, "Caller refused: {}", reason);
                     crate::metrics::backends::prometheus::track_managed_identity_resolve(
                         &channel_name,
                         state
                             .surface
-                            .inbound_identity_mode_label(),
+                            .inbound_identity_mode_label(auth_config),
                         "source_method_mismatch",
                         0.0,
                     );
@@ -2677,6 +2677,11 @@ async fn proxy_charged_request(
     // success, or a `Failed` marker on a non-blocking caller-attributable
     // failure. `None` when no source auth is configured.
     let source_auth_failed = source_auth_failure.is_some();
+    let caller_inbound_identity = caller_inbound_identity(
+        &state.surface,
+        selected_source_auth,
+        authenticated_identity.is_some() && !source_auth_failed,
+    );
 
     let source_auth_context: Option<crate::surface_context::SourceAuthContext> = authenticated_identity
         .as_ref()
@@ -3420,7 +3425,13 @@ async fn proxy_charged_request(
             None
         };
     let mut pre_identity_agent_context = agent_context.clone();
-    bind_api_key_caller_did(&state.surface, method.as_str(), uri.path(), pre_identity_agent_context.as_mut(), None);
+    bind_api_key_caller_did(
+        caller_inbound_identity.as_ref(),
+        method.as_str(),
+        uri.path(),
+        pre_identity_agent_context.as_mut(),
+        None,
+    );
 
     // ── Trust Check stage placeholder ───────────────────────────────────────
     // The caller-leg Trust Check stage runs at the single post-identity seam
@@ -3986,6 +3997,7 @@ async fn proxy_charged_request(
                     trace_id: trace_id.clone(),
                     ucp_operation: ucp_operation.clone(),
                     authenticated_identity: authenticated_identity.clone(),
+                    inbound_identity: caller_inbound_identity.clone(),
                     source_auth_context: source_auth_context.clone(),
                     payment_context: payment_context.clone(),
                     mcp_metadata_context,
@@ -4253,6 +4265,7 @@ async fn proxy_charged_request(
                 trace_id,
                 ucp_operation,
                 authenticated_identity,
+                inbound_identity: caller_inbound_identity.clone(),
                 source_auth_context: source_auth_context.clone(),
                 payment_context,
                 mcp_metadata_context,
@@ -5262,9 +5275,15 @@ async fn proxy_charged_request(
     };
 
     // ── Configured caller identity (FromMtls / FromApiKey / Static) ─────────
-    if configured_caller_identity_applies(&state.surface, identity_result.is_some(), method.as_str(), uri.path()) {
+    if configured_caller_identity_applies(
+        caller_inbound_identity.as_ref(),
+        identity_result.is_some(),
+        method.as_str(),
+        uri.path(),
+    ) {
         match resolve_configured_caller_identity(
             &state,
+            caller_inbound_identity.as_ref(),
             method.as_str(),
             uri.path(),
             &channel_name,
@@ -5298,9 +5317,8 @@ async fn proxy_charged_request(
     // resolve — mirrors the Trust Check and surface OPA discovery bypasses.
     if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
         && identity_result.is_none()
-        && let Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim { claim, namespace_claims }) = state
-            .surface
-            .inbound_identity()
+        && let Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim { claim, namespace_claims }) =
+            caller_inbound_identity.as_ref()
     {
         let mode_label = "from_jwt_claim";
         let started = std::time::Instant::now();
@@ -5465,7 +5483,7 @@ async fn proxy_charged_request(
             identity_hash: Some(result.hash.clone()),
         });
     bind_api_key_caller_did(
-        &state.surface,
+        caller_inbound_identity.as_ref(),
         method.as_str(),
         uri.path(),
         agent_context.as_mut(),
@@ -10668,6 +10686,7 @@ async fn handle_onboarding_request(
 /// which is a fixed `500` counted as `api_key_id_missing`.
 async fn resolve_configured_caller_identity(
     state: &ProxyState,
+    inbound_identity: Option<&crate::source_auth::ManagedIdentityConfig>,
     method: &str,
     path: &str,
     channel_name: &str,
@@ -10681,10 +10700,7 @@ async fn resolve_configured_caller_identity(
     if crate::proxy::paths::is_public_request(method, path) {
         return Ok(None);
     }
-    if state
-        .surface
-        .inbound_identity_from_api_key()
-    {
+    if matches!(inbound_identity, Some(ManagedIdentityConfig::FromApiKey { .. })) {
         return resolve_presented_api_key_identity(
             state,
             channel_name,
@@ -10694,10 +10710,7 @@ async fn resolve_configured_caller_identity(
         )
         .await;
     }
-    let (mi, from_managed_slot) = match state
-        .surface
-        .inbound_identity()
-    {
+    let (mi, from_managed_slot) = match inbound_identity {
         Some(inbound) => (inbound.clone(), false),
         None => match state
             .surface
@@ -10832,26 +10845,50 @@ const CALLER_IDENTITY_UNRESOLVED: &str = "Caller identity could not be resolved"
 /// replaces any body identity, so a presented key cannot be traded for a VP's
 /// DID.
 fn configured_caller_identity_applies(
-    surface: &crate::config::agent_surface::AgentSurface,
+    inbound_identity: Option<&crate::source_auth::ManagedIdentityConfig>,
     body_identity_resolved: bool,
     method: &str,
     path: &str,
 ) -> bool {
     !body_identity_resolved
-        || (surface.inbound_identity_from_api_key() && !crate::proxy::paths::is_public_request(method, path))
+        || (identifies_by_presented_api_key(inbound_identity) && !crate::proxy::paths::is_public_request(method, path))
+}
+
+/// Whether the caller's inbound identity is the API key it presented.
+fn identifies_by_presented_api_key(inbound_identity: Option<&crate::source_auth::ManagedIdentityConfig>) -> bool {
+    matches!(inbound_identity, Some(crate::source_auth::ManagedIdentityConfig::FromApiKey { .. }))
+}
+
+/// The inbound identity of this request's caller: the identity of the method that
+/// verified it (see [`crate::config::agent_surface::AgentSurface::inbound_identity_for`]),
+/// or the surface's when no method verified the caller. A caller the method's
+/// identity refuses never gets here.
+fn caller_inbound_identity(
+    surface: &crate::config::agent_surface::AgentSurface,
+    selection: Option<crate::source_auth::models::SourceAuthSelection<'_>>,
+    verified: bool,
+) -> Option<crate::source_auth::ManagedIdentityConfig> {
+    let method = selection
+        .filter(|_| verified)
+        .map(|selection| selection.method);
+    surface
+        .inbound_identity_for(method)
+        .ok()
+        .flatten()
+        .cloned()
 }
 
 /// On an inbound `from_api_key` surface the caller is the presented key, so
 /// `input.agent.did` is the key's DID (or absent when none was resolved), never
 /// a DID the request body asserts. Other surfaces keep the body DID.
 fn bind_api_key_caller_did(
-    surface: &crate::config::agent_surface::AgentSurface,
+    inbound_identity: Option<&crate::source_auth::ManagedIdentityConfig>,
     method: &str,
     path: &str,
     agent: Option<&mut crate::surface_context::AgentContext>,
     extension_identity: Option<&crate::surface_context::ExtensionIdentityContext>,
 ) {
-    if surface.inbound_identity_from_api_key()
+    if identifies_by_presented_api_key(inbound_identity)
         && !crate::proxy::paths::is_public_request(method, path)
         && let Some(agent) = agent
     {
@@ -11096,6 +11133,8 @@ struct FabricSend<'a> {
     trace_id: String,
     ucp_operation: Option<String>,
     authenticated_identity: Option<crate::source_auth::AuthenticatedIdentity>,
+    /// The caller's inbound identity: its method's own, else the surface's.
+    inbound_identity: Option<crate::source_auth::ManagedIdentityConfig>,
     source_auth_context: Option<crate::surface_context::SourceAuthContext>,
     payment_context: Option<crate::surface_context::PaymentContext>,
     mcp_metadata_context: crate::mcp::meta::McpMetadataContext,
@@ -11145,6 +11184,7 @@ async fn handle_fabric_request_inner(
         trace_id,
         ucp_operation,
         authenticated_identity,
+        inbound_identity: caller_inbound_identity,
         source_auth_context,
         payment_context,
         mcp_metadata_context,
@@ -11373,9 +11413,15 @@ async fn handle_fabric_request_inner(
     }
 
     // ── Configured caller identity (FromMtls / FromApiKey / Static) ─────────
-    if configured_caller_identity_applies(&state.surface, identity_result.is_some(), method.as_str(), uri.path()) {
+    if configured_caller_identity_applies(
+        caller_inbound_identity.as_ref(),
+        identity_result.is_some(),
+        method.as_str(),
+        uri.path(),
+    ) {
         match resolve_configured_caller_identity(
             &state,
+            caller_inbound_identity.as_ref(),
             method.as_str(),
             uri.path(),
             channel_name,
@@ -11408,9 +11454,8 @@ async fn handle_fabric_request_inner(
     // resolve — mirrors the Trust Check and surface OPA discovery bypasses.
     if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
         && identity_result.is_none()
-        && let Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim { claim, namespace_claims }) = state
-            .surface
-            .inbound_identity()
+        && let Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim { claim, namespace_claims }) =
+            caller_inbound_identity.as_ref()
     {
         let mode_label = "from_jwt_claim";
         let started = std::time::Instant::now();
@@ -11634,7 +11679,7 @@ async fn handle_fabric_request_inner(
             None
         };
         bind_api_key_caller_did(
-            &state.surface,
+            caller_inbound_identity.as_ref(),
             method.as_str(),
             uri.path(),
             agent_ctx.as_mut(),
@@ -15296,7 +15341,15 @@ async fn evaluate_mcp_proxy_opa_policies(
             .await,
         );
     }
-    bind_api_key_caller_did(&state.surface, method, uri.path(), policy_input.agent.as_mut(), None);
+    bind_api_key_caller_did(
+        state
+            .surface
+            .inbound_identity(),
+        method,
+        uri.path(),
+        policy_input.agent.as_mut(),
+        None,
+    );
     policy_input.normalize_caller_did();
 
     // ── Trust Check stage (caller leg) ─────────────────────────────────────
@@ -23157,6 +23210,9 @@ allow if {
                 .clone();
             super::super::resolve_configured_caller_identity(
                 state,
+                state
+                    .surface
+                    .inbound_identity(),
                 "POST",
                 "/mcp",
                 &channel,
@@ -23358,6 +23414,9 @@ allow if {
 
             let result = super::super::resolve_configured_caller_identity(
                 &state,
+                state
+                    .surface
+                    .inbound_identity(),
                 "GET",
                 "/.well-known/agent-card.json",
                 &channel,
@@ -23596,16 +23655,21 @@ allow if {
                 None,
             );
 
-            assert!(super::super::configured_caller_identity_applies(&api_key, true, "POST", "/mcp"));
-            assert!(super::super::configured_caller_identity_applies(&api_key, false, "POST", "/mcp"));
+            assert!(super::super::configured_caller_identity_applies(api_key.inbound_identity(), true, "POST", "/mcp"));
+            assert!(super::super::configured_caller_identity_applies(
+                api_key.inbound_identity(),
+                false,
+                "POST",
+                "/mcp"
+            ));
             assert!(!super::super::configured_caller_identity_applies(
-                &api_key,
+                api_key.inbound_identity(),
                 true,
                 "GET",
                 "/.well-known/agent-card.json"
             ));
-            assert!(!super::super::configured_caller_identity_applies(&mtls, true, "POST", "/mcp"));
-            assert!(super::super::configured_caller_identity_applies(&mtls, false, "POST", "/mcp"));
+            assert!(!super::super::configured_caller_identity_applies(mtls.inbound_identity(), true, "POST", "/mcp"));
+            assert!(super::super::configured_caller_identity_applies(mtls.inbound_identity(), false, "POST", "/mcp"));
         }
 
         fn asserted_agent() -> crate::surface_context::AgentContext {
@@ -23635,24 +23699,30 @@ allow if {
             };
 
             let mut agent = asserted_agent();
-            super::super::bind_api_key_caller_did(&api_key, "POST", "/mcp", Some(&mut agent), Some(&key));
+            super::super::bind_api_key_caller_did(
+                api_key.inbound_identity(),
+                "POST",
+                "/mcp",
+                Some(&mut agent),
+                Some(&key),
+            );
             assert_eq!(agent.did.as_deref(), Some("did:webvh:key"));
             assert_eq!(agent.did_verification, Some(IdentityVerification::SourceAuth));
 
             let mut agent = asserted_agent();
-            super::super::bind_api_key_caller_did(&api_key, "POST", "/mcp", Some(&mut agent), None);
+            super::super::bind_api_key_caller_did(api_key.inbound_identity(), "POST", "/mcp", Some(&mut agent), None);
             assert_eq!(agent.did, None);
 
             let mut agent = asserted_agent();
             agent.did = None;
             agent.provider_did = Some("did:web:provider.example".into());
-            super::super::bind_api_key_caller_did(&api_key, "POST", "/mcp", Some(&mut agent), None);
+            super::super::bind_api_key_caller_did(api_key.inbound_identity(), "POST", "/mcp", Some(&mut agent), None);
             assert_eq!(agent.did, None);
             assert_eq!(agent.provider_did, None);
 
             let mut agent = asserted_agent();
             super::super::bind_api_key_caller_did(
-                &api_key,
+                api_key.inbound_identity(),
                 "GET",
                 "/.well-known/agent-card.json",
                 Some(&mut agent),
@@ -23735,7 +23805,13 @@ allow if {
             ];
             for surface in &surfaces {
                 let mut agent = asserted_agent();
-                super::super::bind_api_key_caller_did(surface, "POST", "/mcp", Some(&mut agent), Some(&key));
+                super::super::bind_api_key_caller_did(
+                    surface.inbound_identity(),
+                    "POST",
+                    "/mcp",
+                    Some(&mut agent),
+                    Some(&key),
+                );
                 assert_eq!(agent.did.as_deref(), Some("did:web:asserted.example"));
                 assert_eq!(agent.did_verification, None);
             }
@@ -24708,6 +24784,11 @@ mod fabric_send_tests {
                 trace_id: "trace-1".to_string(),
                 ucp_operation: None,
                 authenticated_identity: Some(caller),
+                inbound_identity: peer
+                    .state
+                    .surface
+                    .inbound_identity()
+                    .cloned(),
                 source_auth_context: None,
                 payment_context: None,
                 mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
@@ -24776,6 +24857,11 @@ mod fabric_send_tests {
                 trace_id: "trace-1".to_string(),
                 ucp_operation: None,
                 authenticated_identity: None,
+                inbound_identity: peer
+                    .state
+                    .surface
+                    .inbound_identity()
+                    .cloned(),
                 source_auth_context: None,
                 payment_context: None,
                 mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
@@ -24850,6 +24936,11 @@ mod fabric_send_tests {
                 trace_id: "trace-1".to_string(),
                 ucp_operation: None,
                 authenticated_identity: None,
+                inbound_identity: peer
+                    .state
+                    .surface
+                    .inbound_identity()
+                    .cloned(),
                 source_auth_context: None,
                 payment_context: None,
                 mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
@@ -24960,6 +25051,11 @@ mod fabric_send_tests {
                 trace_id: "trace-1".to_string(),
                 ucp_operation: None,
                 authenticated_identity: None,
+                inbound_identity: peer
+                    .state
+                    .surface
+                    .inbound_identity()
+                    .cloned(),
                 source_auth_context: None,
                 payment_context: None,
                 mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
@@ -25811,6 +25907,11 @@ mod fabric_send_tests {
                 trace_id: "trace-1".to_string(),
                 ucp_operation: None,
                 authenticated_identity: None,
+                inbound_identity: peer
+                    .state
+                    .surface
+                    .inbound_identity()
+                    .cloned(),
                 source_auth_context: None,
                 payment_context: None,
                 mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
@@ -25865,6 +25966,10 @@ mod fabric_send_tests {
         setup.state.surface = Arc::new(key_surface(&mut setup));
         let key_did = super::resolve_configured_caller_identity(
             &setup.state,
+            setup
+                .state
+                .surface
+                .inbound_identity(),
             "POST",
             "/a2a",
             "Fabric A2A",
@@ -25989,6 +26094,11 @@ mod fabric_send_tests {
                     trace_id: "trace-1".to_string(),
                     ucp_operation: None,
                     authenticated_identity: (!case.key_failed).then(|| key.clone()),
+                    inbound_identity: peer
+                        .state
+                        .surface
+                        .inbound_identity()
+                        .cloned(),
                     source_auth_context: Some(if case.key_failed {
                         crate::surface_context::SourceAuthContext::Failed {
                             attempted_method: "api_key_provider".to_string(),

@@ -192,10 +192,13 @@ impl AudienceClaim {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JwtBearerAuthConfig {
     /// Stable identifier of this method within its `methods` list, assigned by
-    /// the dashboard and kept across edits and reordering. Names the method an
-    /// inbound identity is derived from.
+    /// the dashboard and kept across edits and reordering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// How the inbound identity of this method's callers is derived, read from
+    /// the credential they presented. Unset: the surface's inbound identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<crate::source_auth::ManagedIdentityConfig>,
     /// UUID of the `JwtVerificationStrategy` to use for validation.
     pub jwt_verification_strategy_id: String,
 
@@ -237,6 +240,7 @@ fn default_token_scheme() -> String {
 impl Default for JwtBearerAuthConfig {
     fn default() -> Self {
         Self {
+            identity: None,
             id: None,
             jwt_verification_strategy_id: String::new(),
             audiences: Vec::new(),

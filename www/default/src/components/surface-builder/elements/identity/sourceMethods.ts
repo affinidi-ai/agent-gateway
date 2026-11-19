@@ -2,20 +2,16 @@ import {
   CALLER_AUTH_METHOD_SHORT_LABEL,
   credentialLocation,
   type CallerAuthMethodConfig,
+  type MethodIdentity,
 } from '../caller-auth/methods';
 
-export interface SourceMethodChoice {
-  id: string;
-  label: string;
-}
-
-/** Identity types that read the credential the caller presented, so they can name the method. */
-export const SOURCE_METHOD_TYPES: ReadonlySet<unknown> = new Set([
+/** Identity types that read the credential the caller presented. */
+export const CREDENTIAL_IDENTITY_TYPES: ReadonlySet<unknown> = new Set([
   'from_jwt_claim',
   'from_api_key',
 ]);
 
-/** Caller Context method types whose credential an inbound From API Key identity can read. */
+/** Caller Context method types whose credential a From API Key identity can read. */
 export const API_KEY_METHOD_TYPES: ReadonlySet<unknown> = new Set(['api_key', 'api_key_provider']);
 
 /** Whether an identity of this type can be derived from the credential of `method`. */
@@ -25,60 +21,35 @@ export function readsMethod(identityType: unknown, method: CallerAuthMethodConfi
   return false;
 }
 
-/** Whether every method is one an identity of this type can read. */
-export function readsEveryMethod(
-  identityType: unknown,
-  methods: CallerAuthMethodConfig[]
-): boolean {
-  return methods.length > 0 && methods.every(method => readsMethod(identityType, method));
+/** The identity type a method can set for its own callers, if any. */
+export function ownIdentityType(
+  method: CallerAuthMethodConfig
+): MethodIdentity['type'] | undefined {
+  if (method.method_type === 'jwt_bearer') return 'from_jwt_claim';
+  if (API_KEY_METHOD_TYPES.has(method.method_type)) return 'from_api_key';
+  return undefined;
 }
 
-/** The Caller Context methods an inbound identity of this type can read, in list order. */
-export function sourceMethodChoices(
-  identityType: unknown,
-  methods: CallerAuthMethodConfig[]
-): SourceMethodChoice[] {
-  return methods.flatMap((method, position) =>
-    method.id && readsMethod(identityType, method)
-      ? [
-          {
-            id: method.id,
-            label: `Method ${position + 1}: ${CALLER_AUTH_METHOD_SHORT_LABEL[method.method_type!]}, reads ${credentialLocation(method)}`,
-          },
-        ]
-      : []
-  );
+/** A new identity of `type` for a method's own callers. */
+export function newMethodIdentity(type: MethodIdentity['type']): MethodIdentity {
+  return type === 'from_jwt_claim' ? { type, claim: 'oid' } : { type };
 }
 
 /**
- * The method id an inbound identity is derived from, or `undefined` for none.
- * Only a surface with several methods names one. The stored choice wins; with
- * none, an identity beside methods it cannot all read takes the first it can,
- * and beside methods it can all read it takes any of them.
+ * Whether callers of `method` get an inbound identity: the method's own, or
+ * the surface's (`surfaceType`) when that reads no credential or reads this one.
  */
-export function effectiveSourceMethod(
-  config: Record<string, any> | undefined,
-  methods: CallerAuthMethodConfig[]
-): string | undefined {
-  if (!config || !SOURCE_METHOD_TYPES.has(config.type) || methods.length < 2) return undefined;
-  if (typeof config.source_method === 'string' && config.source_method) return config.source_method;
-  if (readsEveryMethod(config.type, methods)) return undefined;
-  return sourceMethodChoices(config.type, methods)[0]?.id;
+export function methodGetsIdentity(surfaceType: unknown, method: CallerAuthMethodConfig): boolean {
+  if (method.identity && ownIdentityType(method) === method.identity.type) return true;
+  return !CREDENTIAL_IDENTITY_TYPES.has(surfaceType) || readsMethod(surfaceType, method);
 }
 
-/** What the select shows for a stored method id that is no longer a choice. */
-export function unlistedMethodLabel(id: string, methods: CallerAuthMethodConfig[]): string {
-  const position = methods.findIndex(method => method.id === id);
-  if (position < 0) return 'Method no longer available';
-  const type = methods[position].method_type;
-  const kind = type ? CALLER_AUTH_METHOD_SHORT_LABEL[type] : 'another kind';
-  return `Method ${position + 1} is now ${kind}`;
+/** `Method N: <kind>, reads <location>`, as the per-method list names a method. */
+export function methodLabel(method: CallerAuthMethodConfig, position: number): string {
+  const kind = method.method_type ? CALLER_AUTH_METHOD_SHORT_LABEL[method.method_type] : 'Method';
+  return `Method ${position + 1}: ${kind}, reads ${credentialLocation(method)}`;
 }
 
-export const ANY_JWT_METHOD = 'Any JWT Bearer method';
-export const ANY_API_KEY_METHOD = 'Any API key method';
-
-export const NO_SOURCE_METHOD =
-  'No Caller Context method can supply this identity. Add a JWT Bearer method, or choose another extraction type.';
-export const NO_SOURCE_METHOD_API_KEY =
-  'No Caller Context method can supply this identity. Add an API Key or API Key Provider method, or choose another extraction type.';
+export const USES_SURFACE_IDENTITY = 'Uses this Identity';
+export const REFUSED_WITHOUT_OWN_IDENTITY =
+  'Callers of this method are refused: this Identity cannot read its credential. Give the method its own identity.';

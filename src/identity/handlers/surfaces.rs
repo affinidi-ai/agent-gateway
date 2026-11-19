@@ -131,7 +131,7 @@ fn validate_identity_extraction(
 }
 
 pub(crate) const INBOUND_API_KEY_NEEDS_API_KEY_CALLER: &str =
-    "Identity 'From API Key' needs every Caller Context method to be API Key or API Key Provider";
+    "Identity 'From API Key' needs an API Key or API Key Provider Caller Context method";
 pub(crate) const INBOUND_API_KEY_WITH_RESOURCE_TOKENS: &str = "Identity 'From API Key' cannot be used with \
      mcp_http.authorization, which identifies callers by their resource token; remove one of them";
 pub(crate) const INBOUND_API_KEY_ON_MCP_PROXY: &str =
@@ -173,14 +173,13 @@ fn configured_api_key_id<'a>(
 }
 
 /// Refuse `from_api_key` identities the request path cannot resolve: an
-/// inbound slot on a surface with a caller method other than an API key, whose
-/// callers it could not identify, and a stored slot without a key.
+/// inbound slot with no API key method to read, an inbound or method identity
+/// beside resource tokens or on a `proxy://` MCP Proxy, and a stored slot
+/// without a key.
 fn validate_api_key_identities(
     surface: &AgentSurface,
     label: &str,
 ) -> Result<(), SurfaceApiError> {
-    use crate::source_auth::SourceAuthConfig;
-
     let refuse = |message: &str| {
         let prefix = if label.is_empty() {
             String::new()
@@ -189,21 +188,15 @@ fn validate_api_key_identities(
         };
         SurfaceApiError::BadRequest(format!("{prefix}{message}"))
     };
-    let inbound_from_api_key = surface.inbound_identity_from_api_key();
-    if inbound_from_api_key {
-        let methods = surface.source_auth_methods();
-        let selected = surface
-            .identity_slots
-            .inbound_source_method
-            .is_some();
-        if !selected
-            && (methods.is_empty()
-                || !methods
-                    .iter()
-                    .all(|method| matches!(method, SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_))))
-        {
-            return Err(refuse(INBOUND_API_KEY_NEEDS_API_KEY_CALLER));
-        }
+    let methods = surface.source_auth_methods();
+    if surface.inbound_identity_from_api_key() && !surface.some_method_gets_an_identity() {
+        return Err(refuse(INBOUND_API_KEY_NEEDS_API_KEY_CALLER));
+    }
+    let identifies_by_api_key = surface.inbound_identity_from_api_key()
+        || methods.iter().any(|method| {
+            matches!(method.identity(), Some(crate::source_auth::ManagedIdentityConfig::FromApiKey { .. }))
+        });
+    if identifies_by_api_key {
         if surface
             .mcp_http
             .as_ref()
@@ -9416,30 +9409,23 @@ mod validation_tests {
         }
     }
 
-    fn with_id(
-        mut method: serde_json::Value,
-        id: &str,
-    ) -> serde_json::Value {
-        method["id"] = serde_json::json!(id);
-        method
+    #[test]
+    fn inbound_from_api_key_beside_a_jwt_method_reads_the_api_key_method() {
+        for (case, callers) in [
+            ("api key second", vec![jwt_caller(), provider_caller()]),
+            ("jwt second", vec![api_key_caller("caller-keys"), jwt_caller()]),
+        ] {
+            let s = inbound_api_key_surface(&callers);
+            assert!(validate_api_key_identities(&s, "").is_ok(), "{case}");
+        }
     }
 
     #[test]
-    fn inbound_from_api_key_beside_a_jwt_method_is_accepted_once_an_api_key_method_is_selected() {
-        let callers = [with_id(jwt_caller(), "users-jwt"), with_id(api_key_caller("caller-keys"), "partner-key")];
-        let mut s = inbound_api_key_surface(&callers);
-        assert_eq!(refusal(validate_api_key_identities(&s, "")), INBOUND_API_KEY_NEEDS_API_KEY_CALLER);
-        s.identity_slots
-            .inbound_source_method = Some("partner-key".to_string());
-        assert!(validate_api_key_identities(&s, "").is_ok());
-    }
-
-    #[test]
-    fn a_selection_leaves_the_other_inbound_from_api_key_rules_in_force() {
-        let callers = [with_id(jwt_caller(), "users-jwt"), with_id(api_key_caller("caller-keys"), "partner-key")];
-        let mut s = inbound_api_key_surface(&callers);
-        s.identity_slots
-            .inbound_source_method = Some("partner-key".to_string());
+    fn a_method_from_api_key_identity_keeps_the_other_from_api_key_rules_in_force() {
+        let mut key = api_key_caller("caller-keys");
+        key["identity"] = serde_json::json!({"type": "from_api_key"});
+        let mut s = inbound_api_key_surface(&[jwt_caller(), key]);
+        s.identity_slots.inbound = None;
         s.target.endpoint = "proxy://tools".to_string();
         s.access_point.protocol = SurfaceProtocol::Mcp;
         assert_eq!(refusal(validate_api_key_identities(&s, "")), INBOUND_API_KEY_ON_MCP_PROXY);
@@ -9449,21 +9435,21 @@ mod validation_tests {
     fn inbound_from_api_key_refusal_matches_the_dashboard_text() {
         assert_eq!(
             INBOUND_API_KEY_NEEDS_API_KEY_CALLER,
-            "Identity 'From API Key' needs every Caller Context method to be API Key or API Key Provider"
+            "Identity 'From API Key' needs an API Key or API Key Provider Caller Context method"
         );
     }
 
     #[test]
-    fn inbound_from_api_key_is_refused_unless_every_caller_method_is_an_api_key() {
-        for (case, caller) in [
-            ("no caller authentication", vec![]),
-            ("jwt only", vec![jwt_caller()]),
-            ("api key second", vec![jwt_caller(), provider_caller()]),
-            ("jwt second", vec![api_key_caller("caller-keys"), jwt_caller()]),
-        ] {
+    fn inbound_from_api_key_is_refused_without_an_api_key_method_to_read() {
+        for (case, caller) in [("no caller authentication", vec![]), ("jwt only", vec![jwt_caller()])] {
             let s = inbound_api_key_surface(&caller);
             assert!(refusal(validate_api_key_identities(&s, "")) == INBOUND_API_KEY_NEEDS_API_KEY_CALLER, "{case}");
         }
+
+        let mut jwt_with_own_identity = jwt_caller();
+        jwt_with_own_identity["identity"] = serde_json::json!({"type": "from_jwt_claim", "claim": "oid"});
+        let s = inbound_api_key_surface(&[jwt_with_own_identity]);
+        assert!(validate_api_key_identities(&s, "").is_ok(), "the jwt method's own identity serves its callers");
 
         let mut other_mode = inbound_api_key_surface(&[jwt_caller()]);
         other_mode
@@ -9613,7 +9599,6 @@ mod validation_tests {
             variant
                 .overrides
                 .identity_slots = Some(crate::config::agent_surface::SurfaceIdentitySlots {
-                inbound_source_method: None,
                 inbound: from_api_key(Some("stale-variant")),
                 protected: from_api_key(Some("variant-managed-key")),
                 external: None,
@@ -11026,6 +11011,7 @@ mod validation_tests {
         caller.methods.insert(
             0,
             SourceAuthConfig::ApiKey(ApiKeyAuthConfig {
+                identity: None,
                 id: None,
                 extraction: CredentialExtraction::HttpHeader { field: "X-API-Key".into() },
                 secret_id: "keys".into(),
