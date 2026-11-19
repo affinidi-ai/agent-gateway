@@ -596,25 +596,6 @@ impl VtaConfig {
             _ => ControlDidMethod::DidWebvh,
         }
     }
-
-    /// The operator-facing deployment tier, for the management API and the
-    /// dashboard. Reported even when the block is disabled, so the UI can say
-    /// "local key" rather than guessing.
-    pub fn tier(&self) -> &'static str {
-        if self.enabled {
-            "self-hosted"
-        } else {
-            "local"
-        }
-    }
-
-    /// Whether this deployment supports a key-custody claim: only when the
-    /// gateway signs through a separately operated trust agent. Local signing
-    /// keeps the keys on the gateway's own host, so nothing in product copy or
-    /// the dashboard may claim custody then.
-    pub fn supports_custody_claim(&self) -> bool {
-        self.enabled
-    }
 }
 
 #[cfg(test)]
@@ -1002,28 +983,6 @@ mod tests {
             .validate()
             .expect_err("a zero quota would refuse the very first surface");
         assert!(err.contains("max_contexts"), "explains the quota: {err}");
-    }
-
-    // ── Deployment tier ──────────────────────────────────────────────────
-
-    #[test]
-    fn a_connected_trust_agent_is_self_hosted_and_local_signing_claims_no_custody() {
-        let local = VtaConfig::default();
-        assert_eq!(local.tier(), "local");
-        assert!(!local.supports_custody_claim());
-
-        let appliance: VtaConfig = toml::from_str(
-            r#"
-            enabled = true
-            base_url = "https://vta.internal:8443"
-            vta_did = "did:webvh:vta.internal:agent"
-            context_id = "ctx-gateway"
-            signing_key_id = "key-gateway-jwt"
-            "#,
-        )
-        .expect("parse");
-        assert_eq!(appliance.tier(), "self-hosted");
-        assert!(appliance.supports_custody_claim());
     }
 
     #[test]

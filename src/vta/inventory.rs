@@ -171,6 +171,15 @@ fn mapping_for(
     }
 }
 
+/// The operator-facing deployment tier for whether the appliance signs through a trust agent.
+pub fn tier(through_trust_agent: bool) -> &'static str {
+    if through_trust_agent {
+        "self-hosted"
+    } else {
+        "local"
+    }
+}
+
 /// Whether the appliance signs through a trust agent: the gateway-wide default
 /// when it names a usable backend, else the `[vta]` block, as the key directory
 /// resolves it.
@@ -246,12 +255,7 @@ pub fn build(
 
     let through_trust_agent = signs_through_trust_agent(config, default_signing);
     KeyInventory {
-        tier: if through_trust_agent {
-            "self-hosted"
-        } else {
-            "local"
-        }
-        .to_string(),
+        tier: tier(through_trust_agent).to_string(),
         custody_claim: through_trust_agent,
         context_did_method: config
             .context_did_method

@@ -1424,14 +1424,20 @@ pub async fn vta_status(
     let control_did = bootstrap_control_did(config)
         .await
         .ok();
+    let through_trust_agent = crate::vta::inventory::signs_through_trust_agent(
+        config,
+        crate::storage::settings_store::global_settings()
+            .and_then(|settings| settings.default_signing)
+            .as_ref(),
+    );
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "enabled": config.enabled,
-            "tier": config.tier(),
+            "tier": crate::vta::inventory::tier(through_trust_agent),
             // False for local signing. Nothing in product copy may claim
             // custody when this is false.
-            "custody_claim": config.supports_custody_claim(),
+            "custody_claim": through_trust_agent,
             "auto_provision_contexts": config.auto_provision_contexts,
             "control_did": control_did,
             "control_did_method": config.effective_control_did_method().as_str(),

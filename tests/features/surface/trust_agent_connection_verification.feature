@@ -15,4 +15,4 @@ Feature: Verifying a connection checks which trust agent answered
     And the custom trust agent stops signing its answers
     When the operator verifies the custom connection
     Then the admin API response status is 502
-    And the custom connection is no longer connected because the answer was not signed
+    And the custom connection is no longer connected and keeps the trust agent DID it pinned

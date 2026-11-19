@@ -3,7 +3,7 @@ use cucumber::{given, then, when};
 use reqwest::Method;
 use serde_json::{Value, json};
 
-use crate::bdd_support::signing_trust_agent::{SIGNING_TRUST_AGENT_DID, SigningTrustAgent};
+use crate::bdd_support::signing_trust_agent::SigningTrustAgent;
 use crate::steps::credential_save::send;
 use crate::world::{RecordedResponse, SurfaceWorld};
 
@@ -93,7 +93,7 @@ async fn operator_has_connected_a_signing_trust_agent(
         "enabled": true,
         "transport": "https",
         "endpoint": agent.url,
-        "vta_did": SIGNING_TRUST_AGENT_DID,
+        "vta_did": agent.context_did(),
         "default_context_id": context_id,
         "control_identity": "did_key",
     });

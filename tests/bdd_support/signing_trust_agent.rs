@@ -21,8 +21,6 @@ use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-pub const SIGNING_TRUST_AGENT_DID: &str = "did:key:z6MkhSigningTrustAgentForSignedResultScenarios000";
-
 #[derive(Debug)]
 struct Agent {
     context_id: String,
@@ -106,6 +104,26 @@ fn sign_jws(
     json!({ "jws": format!("{input}.{}", b64(&signature.to_bytes())), "alg": "EdDSA", "keyId": agent.key_id })
 }
 
+/// Attach the `eddsa-jcs-2022` proof a trust agent puts on its answers, made with the key of its DID.
+fn sign_answer(
+    agent: &Agent,
+    mut answer: Value,
+) -> Value {
+    let mut proof = json!({
+        "type": "DataIntegrityProof",
+        "cryptosuite": "eddsa-jcs-2022",
+        "created": "2026-01-01T00:00:00Z",
+        "verificationMethod": agent.verification_method(),
+        "proofPurpose": "authentication",
+    });
+    let signature = agent
+        .signing
+        .sign(&eddsa_jcs_hash(&proof, &answer));
+    proof["proofValue"] = json!(multibase::encode(multibase::Base::Base58Btc, signature.to_bytes()));
+    answer["proof"] = proof;
+    answer
+}
+
 fn sign_document(
     agent: &Agent,
     request: &Value,
@@ -148,8 +166,8 @@ async fn trust_tasks(
     if task.contains("auth/authenticate") {
         let claims = json!({ "role": "initiator", "contexts": [agent.context_id] });
         let token = format!("h.{}.s", b64(claims.to_string().as_bytes()));
-        return Json(json!({ "session": { "id": "s" }, "tokens": { "accessToken": token, "expiresIn": 3600 } }))
-            .into_response();
+        let answer = json!({ "session": { "id": "s" }, "tokens": { "accessToken": token, "expiresIn": 3600 } });
+        return Json(sign_answer(&agent, answer)).into_response();
     }
     if task.contains("auth/whoami") {
         return answer(json!({

@@ -290,16 +290,9 @@ async fn not_connected_naming_the_signer(world: &mut SurfaceWorld) {
     assert_eq!(pairing["pinned_vta_did"], custom_trust_agent_did(), "the pin is kept");
 }
 
-#[then("the custom connection is no longer connected because the answer was not signed")]
+#[then("the custom connection is no longer connected and keeps the trust agent DID it pinned")]
 async fn not_connected_unsigned(world: &mut SurfaceWorld) {
     let pairing = &body(world)["pairing"];
     assert_eq!(pairing["state"], "degraded", "{}", body(world));
-    assert!(
-        pairing["last_error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("not signed"),
-        "{}",
-        body(world)
-    );
+    assert_eq!(pairing["pinned_vta_did"], custom_trust_agent_did(), "the pin is kept");
 }

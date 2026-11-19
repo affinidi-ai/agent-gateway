@@ -52,7 +52,6 @@ Feature: What the gateway signs through a trust agent verifies against the trust
     Then the response status is 422
     And MCP server "bravo" was not called
 
-  @known-bug
   Scenario: The managed agent's identity on a surface that signs through a trust agent carries a credential its context issued
     Given MCP surface "alpha" targets MCP server "bravo"
     And the surface has managed identity enabled
