@@ -184,7 +184,7 @@ describe('ElementRegistry', () => {
       expect(types('ap2')).not.toContain('transit-point-mcp');
       for (const variant of ['transit-point-a2a', 'transit-point-mcp', 'transit-point-ap2']) {
         expect(registry.paletteItems('didcomm').map(d => d.type)).not.toContain(variant);
-        // 'http' is the sentinel ElementPalette passes while a surface has no protocol
+        // a value outside the Protocol union must still be refused
         expect(registry.paletteItems('http' as never).map(d => d.type)).not.toContain(variant);
         expect(registry.get(variant as never)).toBeDefined();
       }

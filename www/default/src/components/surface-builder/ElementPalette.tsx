@@ -262,6 +262,7 @@ const ElementPalette: React.FC<ElementPaletteProps> = ({
         <input
           type="text"
           className="form-control form-control-sm"
+          data-testid="palette-filter"
           placeholder="Filter elements…"
           value={filter}
           onChange={e => setFilter(e.target.value)}
