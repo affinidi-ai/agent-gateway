@@ -32,7 +32,7 @@ changes:
         days later. Such a pending acceptance now survives a restart until then. pending_expiry_hours
         now applies only to acceptances stored before the expiry was recorded.
     - timestamp: '2026-11-17T09:05:00Z'
-      title: Keep the action buttons on one line on Connections, and button labels on one line everywhere
+      title: Keep Connections row actions and every button label on one line
       description: >-
         The action buttons of a gateway or a Connection Point no longer stack on narrow windows or in
         the Connection Points list; the table scrolls sideways instead. Across the dashboard, a
