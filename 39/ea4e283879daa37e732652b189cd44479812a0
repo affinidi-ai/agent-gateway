@@ -1,0 +1,21 @@
+.github/workflows/ci.yml
+  s_09d9fb08a24a2a::t_2cf126bf5b6f8c 44
+.changelog/wip/fix_coverage-runner-memory.yaml
+  s_09d9fb08a24a2a::t_9d324d6e4eaefe 11-13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "39ea4e283879daa37e732652b189cd44479812a0",
+  "prompts": {},
+  "sessions": {
+    "s_09d9fb08a24a2a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "466dd48f-7a3f-4943-8fe5-70b23f70855c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "raghavendrra.m <raghavendrra.m@affinidi.com>"
+    }
+  }
+}
