@@ -38,6 +38,7 @@ export const showToast = (
   // Create new toast element
   const toast = document.createElement('div');
   toast.id = 'app-toast';
+  toast.setAttribute('data-testid', 'app-toast');
   let timer: ReturnType<typeof setTimeout> | undefined;
   const close = () => {
     clearTimeout(timer);
@@ -200,6 +201,7 @@ export const showUndoToast = ({
 
   const toast = document.createElement('div');
   toast.id = 'app-toast';
+  toast.setAttribute('data-testid', 'app-toast');
   toast.innerHTML = `
     <div style="
       position:fixed;top:20px;right:20px;z-index:9999;

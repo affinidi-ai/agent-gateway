@@ -284,6 +284,8 @@ Reserved patterns:
 | Wizard navigation | `wizard-next`, `wizard-back`, `wizard-submit` | (shared across all wizards) |
 | Surface Builder canvas node | `surface-node-<type>` | `surface-node-payment` |
 | Surface Builder palette | `palette-item-<type>`, `palette-filter` | `palette-item-transit-point-a2a` |
+| Surface Builder templates | `surface-template-row-<id>`, `surface-template-apply-<id>` | `surface-template-apply-my-template` |
+| Toast | `app-toast` | `app-toast` |
 | Surface Builder save | `surface-save-button`, `surface-error-alert` | (the save button and the refused-save banner on `/surfaces/<id>`) |
 | Surface delete | `surface-delete-button`, `surface-delete-confirm`, `surface-delete-confirm-name`, `surface-delete-confirm-confirm`, `surface-delete-confirm-cancel` | (the delete button on `/surfaces/<id>` and its confirm popover) |
 

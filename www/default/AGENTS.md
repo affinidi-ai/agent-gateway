@@ -97,7 +97,8 @@ the banner for a refused save is `surface-error-alert`, and the delete button is
 `surface-delete-button`, which opens `surface-delete-confirm` with `surface-delete-confirm-name`,
 `surface-delete-confirm-confirm` and `surface-delete-confirm-cancel` (see _Surface delete_).
 In the Surface Builder each palette item is `palette-item-<type>`, for example
-`palette-item-transit-point-a2a`, and its filter input is `palette-filter`.
+`palette-item-transit-point-a2a`, and its filter input is `palette-filter`. In the Templates view each row is `surface-template-row-<id>` with its apply button
+`surface-template-apply-<id>`, and every toast is `app-toast`.
 
 ## CLI consent page
 
