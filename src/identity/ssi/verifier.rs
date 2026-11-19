@@ -58,13 +58,13 @@ impl LocalVerifier {
 #[derive(Default)]
 struct ResolvedDocuments {
     documents: HashMap<String, resolution::Output<Vec<u8>>>,
-    from_cache: std::collections::HashSet<String>,
+    from_cache: HashSet<String>,
 }
 
 /// Resolves DIDs for one verification. A DID resolved through the DID cache is resolved once and
 /// its document reused, so the signature and proof purpose checks of a presentation read the same
 /// document.
-pub struct CompositeResolver {
+struct CompositeResolver {
     ssi_resolver: AnyDidMethod,
     did_cache: Arc<DIDCacheClient>,
     resolved: Arc<std::sync::Mutex<ResolvedDocuments>>,
@@ -89,7 +89,7 @@ impl CachedDocuments {
 }
 
 impl CompositeResolver {
-    pub fn new(did_cache: Arc<DIDCacheClient>) -> Self {
+    fn new(did_cache: Arc<DIDCacheClient>) -> Self {
         Self {
             ssi_resolver: AnyDidMethod::default(),
             did_cache,
@@ -319,7 +319,6 @@ fn ensure_proofs_controlled_by(
     Ok(())
 }
 
-/// The term a proof names `purpose` by, such as `assertionMethod`.
 fn purpose_term(purpose: ProofPurpose) -> String {
     match serde_json::to_value(purpose) {
         Ok(Value::String(term)) => term,
@@ -361,6 +360,7 @@ struct PurposeProblem {
 #[derive(Debug)]
 struct StaleSignerDocument {
     did: String,
+    role: &'static str,
 }
 
 impl std::fmt::Display for StaleSignerDocument {
@@ -448,7 +448,7 @@ async fn ensure_proof_purpose(
     cached: &CachedDocuments,
     refreshed: &HashSet<String>,
     what: &str,
-    role: &str,
+    role: &'static str,
 ) -> Result<()> {
     for proof in proofs.iter() {
         let Some(problem) = proof_purpose_problem(proof, allowed, controllers).await else {
@@ -467,6 +467,7 @@ async fn ensure_proof_purpose(
         {
             return Err(StaleSignerDocument {
                 did: url.did().as_str().to_string(),
+                role,
             }
             .into());
         }
@@ -550,7 +551,6 @@ impl Verifier for LocalVerifier {
         presentation: &Value,
     ) -> Result<VpVerificationResult> {
         let mut refreshed = HashSet::new();
-        let mut previous = Vec::new();
         loop {
             let result = self
                 .verify_vp_with(presentation, &refreshed)
@@ -561,21 +561,8 @@ impl Verifier for LocalVerifier {
                 .and_then(|e| e.downcast_ref::<StaleSignerDocument>())
             {
                 Some(stale) if refreshed.insert(stale.did.clone()) => {
-                    let did = stale.did.clone();
-                    let cached = self
-                        .did_cache
-                        .remove(&did)
-                        .await;
-                    previous.push((did, cached));
-                }
-                _ if result.is_err()
-                    && self
-                        .restore_unfetched(previous)
-                        .await =>
-                {
-                    return self
-                        .verify_vp_with(presentation, &refreshed)
-                        .await;
+                    self.fetch_again(stale)
+                        .await?;
                 }
                 _ => return result,
             }
@@ -584,32 +571,34 @@ impl Verifier for LocalVerifier {
 }
 
 impl LocalVerifier {
-    /// Puts back each evicted signer document that could not be fetched again, so a signer whose
-    /// host is unreachable is judged against what was cached rather than refused as unresolvable.
-    /// Returns whether any was put back.
-    async fn restore_unfetched(
+    /// Replaces `stale`'s cached document with the one now published. A document that cannot be
+    /// fetched again refuses the presentation, counted as `unresolvable`, and is not cached again.
+    async fn fetch_again(
         &self,
-        previous: Vec<(String, Option<affinidi_did_common::Document>)>,
-    ) -> bool {
-        let cache = self.did_cache.get_cache();
-        let mut restored = false;
-        for (did, document) in previous {
-            let Some(document) = document else {
-                continue;
-            };
-            let key = DIDCacheClient::hash_did(&did);
-            if cache
-                .get(&key)
-                .await
-                .is_none()
-            {
-                cache
-                    .insert(key, document)
-                    .await;
-                restored = true;
-            }
+        stale: &StaleSignerDocument,
+    ) -> Result<()> {
+        self.did_cache
+            .remove(&stale.did)
+            .await;
+        if let Err(e) = self
+            .did_cache
+            .resolve(&stale.did)
+            .await
+        {
+            let reason = PurposeReason::Unresolvable.as_str();
+            tracing::warn!(
+                reason,
+                "Refused a presentation: the DID document of {} could not be fetched again: {e}",
+                stale.did
+            );
+            crate::metrics::backends::prometheus::track_proof_purpose_mismatch(stale.role, reason);
+            anyhow::bail!(
+                "{} proof key could not be checked against the DID document of {}",
+                stale.role.to_uppercase(),
+                stale.did
+            );
         }
-        restored
+        Ok(())
     }
 
     async fn verify_vp_with(
@@ -1155,12 +1144,7 @@ mod tests {
     #[tokio::test]
     async fn verify_vp_rejects_tampered_issuer() {
         let (mut vp, _) = mint_vp().await;
-        let vc = if vp["verifiableCredential"].is_array() {
-            &mut vp["verifiableCredential"][0]
-        } else {
-            &mut vp["verifiableCredential"]
-        };
-        vc["issuer"] = json!("did:web:did.dev.example.io:fake-issuer");
+        first_vc_mut(&mut vp)["issuer"] = json!("did:web:did.dev.example.io:fake-issuer");
 
         assert!(
             local_verifier()
@@ -1193,17 +1177,46 @@ mod tests {
         (did, serde_json::from_value(document).unwrap())
     }
 
+    /// A DID cache holding `documents`, each also published unchanged, so fetching one again
+    /// returns the same document.
     async fn verifier_with(documents: &[(String, affinidi_did_common::Document)]) -> Arc<DIDCacheClient> {
+        let mut client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .expect("Failed to create DID cache client");
+        if !documents.is_empty() {
+            client.set_resolver(
+                affinidi_did_resolver_cache_sdk::MethodName::Web,
+                Box::new(PublishedDocuments(
+                    documents
+                        .iter()
+                        .cloned()
+                        .collect(),
+                )),
+            );
+        }
+        cache(&client, documents).await;
+        Arc::new(client)
+    }
+
+    /// A DID cache holding `documents`, none of which can be fetched again.
+    async fn cached_only(documents: &[(String, affinidi_did_common::Document)]) -> Arc<DIDCacheClient> {
         let client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
             .await
             .expect("Failed to create DID cache client");
+        cache(&client, documents).await;
+        Arc::new(client)
+    }
+
+    async fn cache(
+        client: &DIDCacheClient,
+        documents: &[(String, affinidi_did_common::Document)],
+    ) {
         for (did, document) in documents {
             client
                 .get_cache()
                 .insert(DIDCacheClient::hash_did(did), document.clone())
                 .await;
         }
-        Arc::new(client)
     }
 
     async fn verify_under(
@@ -1244,8 +1257,15 @@ mod tests {
     }
 
     fn mismatch_count(role: &str) -> u64 {
+        mismatches(role, PurposeReason::NotListed)
+    }
+
+    fn mismatches(
+        role: &str,
+        reason: PurposeReason,
+    ) -> u64 {
         crate::metrics::backends::prometheus::PROOF_PURPOSE_MISMATCH
-            .with_label_values(&[role, "not_listed"])
+            .with_label_values(&[role, reason.as_str()])
             .get()
     }
 
@@ -1261,17 +1281,89 @@ mod tests {
 
         assert!(err.contains("VC[0] proof key") && err.contains("is not listed under assertionMethod"), "{err}");
         assert!(mismatch_count("vc") > before);
-        let issuer = case.vc["issuer"]
-            .as_str()
-            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn signer_document_that_cannot_be_fetched_again_is_not_cached_again() {
+        let case = did_web_issuer_case(&[]).await;
+        let (issuer, cached) = cached_issuer_document(&case).await;
+        let client = cached_only(&[(issuer.clone(), cached)]).await;
+        let before = mismatches("vc", PurposeReason::Unresolvable);
+
+        verify_under(&client, &case.vp)
+            .await
+            .err()
+            .expect("a VC key the cached document does not list must be refused");
+
+        assert!(mismatches("vc", PurposeReason::Unresolvable) > before);
+
         assert!(
-            case.client
+            client
                 .get_cache()
-                .get(&DIDCacheClient::hash_did(issuer))
+                .get(&DIDCacheClient::hash_did(&issuer))
                 .await
-                .is_some(),
-            "a document that cannot be fetched again stays cached"
+                .is_none(),
+            "the out-of-date document must not be cached again"
         );
+    }
+
+    #[test]
+    fn a_signer_document_is_refreshed_at_most_once_per_interval() {
+        let did = format!("did:web:example.com:{}", uuid::Uuid::new_v4());
+        let other = format!("did:web:example.com:{}", uuid::Uuid::new_v4());
+
+        assert!(may_refresh_signer_document(&did));
+        assert!(!may_refresh_signer_document(&did));
+        assert!(may_refresh_signer_document(&other));
+    }
+
+    fn first_vc_mut(vp: &mut Value) -> &mut Value {
+        if vp["verifiableCredential"].is_array() {
+            &mut vp["verifiableCredential"][0]
+        } else {
+            &mut vp["verifiableCredential"]
+        }
+    }
+
+    fn embedded_method(
+        issuer: &str,
+        key: &JWK,
+    ) -> Value {
+        json!({
+            "id": format!("{issuer}#key-2"),
+            "type": "Multikey",
+            "controller": issuer,
+            "publicKeyMultibase": jwk_to_multibase_ed25519(key).unwrap(),
+        })
+    }
+
+    #[tokio::test]
+    async fn relative_verification_method_is_refused() {
+        let mut case = did_web_issuer_case(&["assertionMethod"]).await;
+        first_vc_mut(&mut case.vp)["proof"]["verificationMethod"] = json!("#key-2");
+
+        verify_under(&case.client, &case.vp)
+            .await
+            .err()
+            .expect("a relative verification method must be refused");
+    }
+
+    #[tokio::test]
+    async fn embedded_verification_method_is_checked_by_its_id() {
+        for (relationships, listed) in [(&["assertionMethod"][..], true), (&[][..], false)] {
+            let case = did_web_issuer_case(relationships).await;
+            let (issuer, cached) = cached_issuer_document(&case).await;
+            let mut vc = case.vc.clone();
+            vc["proof"]["verificationMethod"] = embedded_method(&issuer, &JWK::generate_ed25519().unwrap());
+            let vc: AnyDataIntegrity<JsonCredential> = serde_json::from_value(vc).unwrap();
+            let resolver = VerificationMethodDIDResolver::<_, AnyMethod>::new(CompositeResolver::new(
+                verifier_with(&[(issuer, cached)]).await,
+            ));
+
+            let problem = proof_purpose_problem(vc.proofs.first().unwrap(), VC_PROOF_PURPOSES, &resolver).await;
+
+            assert_eq!(problem.map(|p| p.reason), (!listed).then_some(PurposeReason::NotListed));
+        }
     }
 
     #[tokio::test]
@@ -1323,12 +1415,7 @@ mod tests {
     #[tokio::test]
     async fn tampered_vc_fails_its_signature_before_its_purpose() {
         let mut case = did_web_issuer_case(&["authentication"]).await;
-        let vc = if case.vp["verifiableCredential"].is_array() {
-            &mut case.vp["verifiableCredential"][0]
-        } else {
-            &mut case.vp["verifiableCredential"]
-        };
-        vc["credentialSubject"]["identityFields"]["region"] = json!("evil");
+        first_vc_mut(&mut case.vp)["credentialSubject"]["identityFields"]["region"] = json!("evil");
 
         let err = verify_under(&case.client, &case.vp)
             .await
@@ -1488,21 +1575,19 @@ mod tests {
         (issuer, cached)
     }
 
+    /// A DID cache holding each signer's `cached` document while its DID publishes `published`.
     async fn client_with_published(
-        cached: (String, affinidi_did_common::Document),
-        published: affinidi_did_common::Document,
+        signers: Vec<(String, affinidi_did_common::Document, affinidi_did_common::Document)>
     ) -> Arc<DIDCacheClient> {
         let mut client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
             .await
             .unwrap();
-        client.set_resolver(
-            affinidi_did_resolver_cache_sdk::MethodName::Web,
-            Box::new(PublishedDocuments(HashMap::from([(cached.0.clone(), published)]))),
-        );
-        client
-            .get_cache()
-            .insert(DIDCacheClient::hash_did(&cached.0), cached.1)
-            .await;
+        let (cached, published): (Vec<_>, HashMap<_, _>) = signers
+            .into_iter()
+            .map(|(did, cached, published)| ((did.clone(), cached), (did, published)))
+            .unzip();
+        client.set_resolver(affinidi_did_resolver_cache_sdk::MethodName::Web, Box::new(PublishedDocuments(published)));
+        cache(&client, &cached).await;
         Arc::new(client)
     }
 
@@ -1510,9 +1595,8 @@ mod tests {
     async fn issuer_that_has_since_listed_its_key_is_accepted() {
         let case = did_web_issuer_case(&[]).await;
         let (issuer, cached) = cached_issuer_document(&case).await;
-        let mut published = serde_json::to_value(&cached).unwrap();
-        published["assertionMethod"] = json!([format!("{issuer}#key-2")]);
-        let client = client_with_published((issuer, cached), serde_json::from_value(published).unwrap()).await;
+        let published = listing_key_under_assertion_method(&issuer, &cached);
+        let client = client_with_published(vec![(issuer, cached, published)]).await;
 
         let result = verify_under(&client, &case.vp)
             .await
@@ -1545,24 +1629,18 @@ mod tests {
         };
         let vc = issue_vc(&f, &holder_did).await;
         let vp = present(&f.holder_key, &holder_did, vec![vc]).await;
-        let mut client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
-            .await
-            .unwrap();
-        client.set_resolver(
-            affinidi_did_resolver_cache_sdk::MethodName::Web,
-            Box::new(PublishedDocuments(HashMap::from([
-                (issuer_did.clone(), listing_key_under_assertion_method(&issuer_did, &issuer_cached)),
-                (holder_did.clone(), listing_key_under_assertion_method(&holder_did, &holder_cached)),
-            ]))),
-        );
-        for (did, cached) in [(&issuer_did, issuer_cached), (&holder_did, holder_cached)] {
-            client
-                .get_cache()
-                .insert(DIDCacheClient::hash_did(did), cached)
-                .await;
-        }
+        let client = client_with_published(
+            [(&issuer_did, issuer_cached), (&holder_did, holder_cached)]
+                .into_iter()
+                .map(|(did, cached)| {
+                    let published = listing_key_under_assertion_method(did, &cached);
+                    (did.clone(), cached, published)
+                })
+                .collect(),
+        )
+        .await;
 
-        let result = verify_under(&Arc::new(client), &vp)
+        let result = verify_under(&client, &vp)
             .await
             .expect("both documents as now published list their keys");
 
@@ -1581,7 +1659,7 @@ mod tests {
         published["verificationMethod"][0]["id"] = json!(vm);
         published["verificationMethod"][0]["controller"] = json!(issuer);
         published["assertionMethod"] = json!([vm]);
-        let client = client_with_published((issuer, cached), serde_json::from_value(published).unwrap()).await;
+        let client = client_with_published(vec![(issuer, cached, serde_json::from_value(published).unwrap())]).await;
 
         let err = verify_under(&client, &case.vp)
             .await

@@ -394,7 +394,9 @@ not list the key under the declared purpose) or `unresolvable` (the signer's DID
 be read to check; the reason is logged as a `WARN`). `role` is `vp` for the presentation proof and
 `vc` for a credential proof. Each rejection is also logged as a `WARN` naming the proof key and the
 signer DID. A proof whose signature does not verify is refused before this check and is not
-counted. A
+counted, except when the gateway dropped the signer's cached document to fetch it again (see
+[Peer issuer DIDs](FABRIC.md#peer-issuer-dids)) and could not: that refusal is counted as
+`unresolvable`. A
 `not_listed` increase usually means a peer or agent DID that lists its signing key under the wrong
 relationship; an `unresolvable` one, a DID host the gateway cannot reach. See
 [Peer issuer DIDs](FABRIC.md#peer-issuer-dids).

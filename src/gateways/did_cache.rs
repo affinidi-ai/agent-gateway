@@ -112,7 +112,6 @@ pub fn shared_resolver() -> &'static Arc<affinidi_did_resolver_cache_sdk::DIDCac
     try_shared_resolver().expect("shared DID resolver not initialised — call init_shared_resolver() at startup")
 }
 
-/// The shared DID resolver client, or `None` before [`init_shared_resolver`] ran.
 pub fn try_shared_resolver() -> Option<&'static Arc<affinidi_did_resolver_cache_sdk::DIDCacheClient>> {
     SHARED_DID_RESOLVER.get()
 }

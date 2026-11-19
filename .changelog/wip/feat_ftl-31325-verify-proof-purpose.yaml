@@ -7,9 +7,9 @@ changes:
       title: Verify against the repaired gateway DID document at once, not after an hour
       description: >-
         Once an Active node has repaired the gateway DID document, or finds another node already
-        did, it removes the gateway DID and its did:web DID from its DID resolver cache; it waits
-        while another node still holds the gateway DID lock, so the old document is not cached
-        again. Before, the node could verify credentials against the cached pre-repair document,
+        did, it removes the gateway DID and its did:web DID from its DID resolver cache. A node that
+        gives up after waiting 5 seconds for the gateway DID lock keeps its cache, since the lock
+        holder may not have written the repair yet. Before, the node could verify credentials against the cached pre-repair document,
         which does not list the signing key, for up to an hour.
   removed: []
   security: []

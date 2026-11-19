@@ -616,8 +616,9 @@ async fn repair_sync_and_evict_gateway_did(
 /// DID lock, so two nodes Active at once repair the gateway DID and sync the index one after
 /// the other, and the second finds nothing left to do. A volume
 /// without the lock runs both unlocked, as before the lock; a lock held past `lock_timeout`
-/// leaves both to the holder and to the next start or promotion. Returns whether the gateway DID
-/// document is settled: false on a Standby node and while another node holds the lock.
+/// leaves both to the holder and to the next start or promotion. Returns whether this node is done
+/// with the gateway DID, repaired or not, so its resolver cache may be refreshed: false on a
+/// Standby node and while another node holds the lock.
 #[cfg(feature = "didwebvh")]
 async fn repair_and_sync_gateway_did_within(
     issuer: &crate::identity::VCIssuer,

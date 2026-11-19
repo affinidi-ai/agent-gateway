@@ -202,8 +202,8 @@ document does not list, the gateway drops that document from its DID cache and v
 presentation again, signatures included, against the document as now published, so a signer that
 has since fixed its document is accepted at once. It does this for each signer of the
 presentation whose cached document is out of date, such as both the holder and a credential's
-issuer, at most once a minute per signer DID, and puts a cached document back when the new one
-cannot be fetched. A peer
+issuer, at most once a minute per signer DID. When the document cannot be fetched again, the
+presentation is refused and the out-of-date document is not cached again. A peer
 on a release whose gateway DID document lists its signing key (`#key-2`) under no relationship has
 its presentations rejected until it upgrades, which repairs its document on its next start (see
 [Proof purpose metric](OBSERVABILITY.md#proof-purpose-metric)).
