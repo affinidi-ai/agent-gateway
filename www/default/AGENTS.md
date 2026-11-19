@@ -93,6 +93,8 @@ An indexed or per-row button keeps the `-button` suffix before the index or id, 
 the banner for a refused save is `surface-error-alert`, and the delete button is
 `surface-delete-button`, which opens `surface-delete-confirm` with `surface-delete-confirm-name`,
 `surface-delete-confirm-confirm` and `surface-delete-confirm-cancel` (see _Surface delete_).
+In the Surface Builder each palette item is `palette-item-<type>`, for example
+`palette-item-transit-point-a2a`, and its filter input is `palette-filter`.
 
 ## CLI consent page
 
@@ -128,9 +130,10 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   across protocols.
 - The palette offers an element only on the surface protocols its definition's `protocols`
   lists, and on all when it has none. The A2A Transit Point is offered only on A2A and AP2
-  surfaces and the MCP Transit Point only on MCP surfaces; a DIDComm surface, or one with
-  no protocol yet, is offered neither. Applying a partial template skips any element its
-  definition does not offer on the surface protocol and lists it among the skipped items.
+  surfaces and the MCP Transit Point only on MCP surfaces; a DIDComm surface is offered
+  neither. Applying a partial template skips any element its definition does not offer on
+  the surface protocol and names it with its reason in the toast and, when one opens, the
+  conflict modal.
   Transit Points already on a surface keep rendering and editing, and the Config tab can
   still set a Transit Point of another protocol.
 - Payment setup dependency alerts stay hidden until the first Save attempt. Invalid

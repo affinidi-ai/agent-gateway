@@ -138,7 +138,7 @@ function unavailableOnProtocol(
 export function planTemplate(
   template: SurfaceTemplate,
   existingNodes: CanvasNode[],
-  protocol?: Protocol
+  protocol: Protocol | undefined
 ): TemplatePlan {
   const plan: TemplatePlan = {
     template,
@@ -165,6 +165,14 @@ export function planTemplate(
     return plan;
   }
 
+  const pushUnavailable = (itemIndex: number, item: SurfaceTemplateItem) => {
+    plan.unsupported.push({
+      itemIndex,
+      item,
+      reason: `'${item.kind}' is not available on ${protocol} surfaces`,
+    });
+  };
+
   (template.items ?? []).forEach((item, itemIndex) => {
     if (item.scope === 'edge') {
       const addr = parseEdgeAddress(item.address);
@@ -184,6 +192,11 @@ export function planTemplate(
         });
         return;
       }
+      const edgeDef = registry.get(item.kind as SurfaceNodeType);
+      if (edgeDef && unavailableOnProtocol(edgeDef, protocol)) {
+        pushUnavailable(itemIndex, item);
+        return;
+      }
       const resolved = resolveEdgeEndpoints(addr, existingNodes);
       if (!resolved) {
         plan.unsupported.push({
@@ -199,14 +212,6 @@ export function planTemplate(
           itemIndex,
           item,
           reason: `unknown element kind '${item.kind}'`,
-        });
-        return;
-      }
-      if (unavailableOnProtocol(def, protocol)) {
-        plan.unsupported.push({
-          itemIndex,
-          item,
-          reason: `'${item.kind}' is not available on ${protocol} surfaces`,
         });
         return;
       }
@@ -249,11 +254,7 @@ export function planTemplate(
         return;
       }
       if (unavailableOnProtocol(def, protocol)) {
-        plan.unsupported.push({
-          itemIndex,
-          item,
-          reason: `'${item.kind}' is not available on ${protocol} surfaces`,
-        });
+        pushUnavailable(itemIndex, item);
         return;
       }
       const existing = existingNodes.find(n => n.type === item.kind);
@@ -287,11 +288,7 @@ export function planTemplate(
       return;
     }
     if (unavailableOnProtocol(def, protocol)) {
-      plan.unsupported.push({
-        itemIndex,
-        item,
-        reason: `'${item.kind}' is not available on ${protocol} surfaces`,
-      });
+      pushUnavailable(itemIndex, item);
       return;
     }
     const existing = existingNodes.find(n => n.type === item.kind);
@@ -443,7 +440,7 @@ export function applyPlan(
 export function applyTemplate(
   template: SurfaceTemplate,
   existingNodes: CanvasNode[],
-  protocol?: Protocol
+  protocol: Protocol | undefined
 ): PlacementResult {
   const plan = planTemplate(template, existingNodes, protocol);
   return applyPlan(plan, existingNodes, {});

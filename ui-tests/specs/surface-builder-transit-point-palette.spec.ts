@@ -12,7 +12,9 @@ const BASE_URL = process.env.AG_BASE_URL || 'http://localhost:8080';
 
 async function openPalette(page: Page, protocol: 'a2a' | 'mcp') {
     await page.goto(`${BASE_URL}/surfaces/new?protocol=${protocol}`);
-    await page.getByPlaceholder('Filter elements…').fill('Transit Point');
+    await expect(page.getByTestId('page-add-surface')).toBeVisible();
+    await expect(page.getByTestId('palette-filter')).toBeVisible();
+    await page.getByTestId('palette-filter').fill('Transit Point');
 }
 
 test.describe('Surface Builder Transit Point palette', () => {

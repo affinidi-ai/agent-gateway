@@ -7,8 +7,8 @@ changes:
       title: Skip Transit Points of the other protocol when applying a template
       description: >-
         Applying a partial template to a surface now skips any element the surface protocol does
-        not offer, such as an A2A Transit Point on an MCP surface, and lists it among the skipped
-        items instead of placing it. The hidden AP2 Transit Point also states the protocols it
+        not offer, such as an A2A Transit Point on an MCP surface, and names the reason in the
+        message instead of placing it. The hidden AP2 Transit Point also states the protocols it
         belongs to, so it cannot reappear on an MCP or DIDComm surface.
   removed: []
   security: []

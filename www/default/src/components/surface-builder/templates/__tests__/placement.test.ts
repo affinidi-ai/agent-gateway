@@ -51,14 +51,14 @@ function existingSingletonNode(config: Record<string, unknown> = {}): CanvasNode
 
 describe('placement: planTemplate', () => {
   it('marks singleton items as clean when the canvas is empty', () => {
-    const plan = planTemplate(singletonTemplate, []);
+    const plan = planTemplate(singletonTemplate, [], undefined);
     expect(plan.clean).toHaveLength(1);
     expect(plan.conflicts).toHaveLength(0);
     expect(plan.unsupported).toHaveLength(0);
   });
 
   it('flags a conflict when a singleton kind is already present', () => {
-    const plan = planTemplate(singletonTemplate, [existingSingletonNode()]);
+    const plan = planTemplate(singletonTemplate, [existingSingletonNode()], undefined);
     expect(plan.clean).toHaveLength(0);
     expect(plan.conflicts).toHaveLength(1);
     expect(plan.conflicts[0].existingNode.id).toBe('existing-singleton-1');
@@ -80,7 +80,7 @@ describe('placement: planTemplate', () => {
   });
 
   it('routes unknown kinds and scopes into unsupported', () => {
-    const plan = planTemplate(mixedTemplate, []);
+    const plan = planTemplate(mixedTemplate, [], undefined);
     expect(plan.clean).toHaveLength(1);
     expect(plan.unsupported).toHaveLength(2);
     expect(plan.unsupported.map(u => u.item.kind).sort()).toEqual(['not-a-real-kind', 'policy']);
@@ -90,7 +90,7 @@ describe('placement: planTemplate', () => {
 describe('placement: applyPlan decisions', () => {
   it('skip leaves the existing node untouched and records the skip', () => {
     const existing = existingSingletonNode({ server_url: 'https://existing' });
-    const plan = planTemplate(singletonTemplate, [existing]);
+    const plan = planTemplate(singletonTemplate, [existing], undefined);
     const result = applyPlan(plan, [existing], { 0: 'skip' });
     expect(result.nextNodes).toHaveLength(1);
     expect(result.nextNodes[0].config).toEqual({ server_url: 'https://existing' });
@@ -100,7 +100,7 @@ describe('placement: applyPlan decisions', () => {
 
   it('overwrite replaces the existing config with the template values', () => {
     const existing = existingSingletonNode({ server_url: 'https://existing', auth: 'old' });
-    const plan = planTemplate(singletonTemplate, [existing]);
+    const plan = planTemplate(singletonTemplate, [existing], undefined);
     const result = applyPlan(plan, [existing], { 0: 'overwrite' });
     expect(result.nextNodes).toHaveLength(1);
     expect(result.nextNodes[0].id).toBe('existing-singleton-1');
@@ -112,7 +112,7 @@ describe('placement: applyPlan decisions', () => {
 
   it('merge only fills empty fields and preserves existing values', () => {
     const existing = existingSingletonNode({ server_url: 'https://existing', auth: '' });
-    const plan = planTemplate(singletonTemplate, [existing]);
+    const plan = planTemplate(singletonTemplate, [existing], undefined);
     const result = applyPlan(plan, [existing], { 0: 'merge' });
     expect(result.nextNodes).toHaveLength(1);
     // existing server_url wins (non-empty)
@@ -124,7 +124,7 @@ describe('placement: applyPlan decisions', () => {
 
   it('place creates a second instance even though kind is singleton', () => {
     const existing = existingSingletonNode();
-    const plan = planTemplate(singletonTemplate, [existing]);
+    const plan = planTemplate(singletonTemplate, [existing], undefined);
     const result = applyPlan(plan, [existing], { 0: 'place' });
     expect(result.nextNodes).toHaveLength(2);
     expect(result.nextNodes.filter(n => n.type === 'caller-auth')).toHaveLength(2);
@@ -132,7 +132,7 @@ describe('placement: applyPlan decisions', () => {
 
   it('defaults to the suggested decision when none is supplied', () => {
     const existing = existingSingletonNode({ server_url: 'https://existing' });
-    const plan = planTemplate(singletonTemplate, [existing]);
+    const plan = planTemplate(singletonTemplate, [existing], undefined);
     // suggested === 'merge' — should keep existing server_url
     const result = applyPlan(plan, [existing], {});
     expect(result.nextNodes[0].config?.server_url).toBe('https://existing');
@@ -141,7 +141,7 @@ describe('placement: applyPlan decisions', () => {
 
 describe('placement: applyTemplate one-shot', () => {
   it('appends a clean item without any decisions', () => {
-    const result = applyTemplate(singletonTemplate, []);
+    const result = applyTemplate(singletonTemplate, [], undefined);
     expect(result.nextNodes).toHaveLength(1);
     expect(result.nextNodes[0].type).toBe('caller-auth');
     expect(result.nextNodes[0].config?.server_url).toBe('https://tpl');
@@ -149,7 +149,7 @@ describe('placement: applyTemplate one-shot', () => {
   });
 
   it('reports unsupported items via skipped', () => {
-    const result = applyTemplate(mixedTemplate, []);
+    const result = applyTemplate(mixedTemplate, [], undefined);
     // 1 clean (policy/target), 2 unsupported (edge scope + unknown kind)
     expect(result.placed).toHaveLength(1);
     expect(result.skipped).toHaveLength(2);
@@ -213,20 +213,20 @@ describe('placement: edge-bound items', () => {
   }
 
   it('puts edge items in clean when both endpoints exist on the canvas', () => {
-    const plan = planTemplate(identityEdgeTemplate, [ap(), target()]);
+    const plan = planTemplate(identityEdgeTemplate, [ap(), target()], undefined);
     expect(plan.clean).toHaveLength(1);
     expect(plan.unsupported).toHaveLength(0);
   });
 
   it('moves edge items to unsupported when endpoints are missing', () => {
-    const plan = planTemplate(identityEdgeTemplate, [ap()]);
+    const plan = planTemplate(identityEdgeTemplate, [ap()], undefined);
     expect(plan.clean).toHaveLength(0);
     expect(plan.unsupported).toHaveLength(1);
     expect(plan.unsupported[0].reason).toMatch(/edge .* is not on the canvas/);
   });
 
   it('emits an EdgeDropIntent (not a free node) when applied', () => {
-    const result = applyTemplate(identityEdgeTemplate, [ap(), target()]);
+    const result = applyTemplate(identityEdgeTemplate, [ap(), target()], undefined);
     // Edge items must NOT be appended as free nodes — they go through
     // builder.handleEdgeTemplateDrop so the parentId/slot topology is
     // computed correctly.
@@ -243,7 +243,7 @@ describe('placement: edge-bound items', () => {
   });
 
   it('places Trust Registry Verification through the Trust Check caller-leg flow', () => {
-    const result = applyTemplate(trustRegistryVerificationTemplate, [ap(), target()]);
+    const result = applyTemplate(trustRegistryVerificationTemplate, [ap(), target()], undefined);
 
     expect(result.nextNodes).toHaveLength(2);
     expect(result.edgeDrops).toHaveLength(1);
@@ -271,7 +271,7 @@ describe('placement: edge-bound items', () => {
       name: 'Bad address',
       items: [{ scope: 'edge', kind: 'identity', config: {} }],
     };
-    const plan = planTemplate(tpl, [ap(), target()]);
+    const plan = planTemplate(tpl, [ap(), target()], undefined);
     expect(plan.unsupported).toHaveLength(1);
     expect(plan.unsupported[0].reason).toMatch(/malformed address/);
   });
@@ -346,7 +346,7 @@ describe('placement: edge archetype shorthand', () => {
   }
 
   it('resolves ma-external/request onto target->npc-endpoint', () => {
-    const result = applyTemplate(credentialDelegationTpl, [targetNode(), npcEndpoint()]);
+    const result = applyTemplate(credentialDelegationTpl, [targetNode(), npcEndpoint()], undefined);
     expect(result.edgeDrops).toHaveLength(1);
     expect(result.edgeDrops[0]).toMatchObject({
       kind: 'credential-delegation',
@@ -358,7 +358,7 @@ describe('placement: edge archetype shorthand', () => {
   });
 
   it('resolves ma-external/request onto target->remote-gateway when that is the external flavour', () => {
-    const result = applyTemplate(credentialDelegationTpl, [targetNode(), remoteGw()]);
+    const result = applyTemplate(credentialDelegationTpl, [targetNode(), remoteGw()], undefined);
     expect(result.edgeDrops).toHaveLength(1);
     expect(result.edgeDrops[0]).toMatchObject({
       edgeSourceId: 'target',
@@ -368,7 +368,7 @@ describe('placement: edge archetype shorthand', () => {
   });
 
   it('drops Workload Binding onto the primary Target request edge', () => {
-    const result = applyTemplate(workloadBindingTpl, [targetNode(), npcEndpoint()]);
+    const result = applyTemplate(workloadBindingTpl, [targetNode(), npcEndpoint()], undefined);
 
     expect(result.nextNodes).toHaveLength(2);
     expect(result.edgeDrops).toHaveLength(1);
@@ -384,7 +384,7 @@ describe('placement: edge archetype shorthand', () => {
   });
 
   it('does not place Workload Binding without a primary Target edge', () => {
-    const plan = planTemplate(workloadBindingTpl, [targetNode()]);
+    const plan = planTemplate(workloadBindingTpl, [targetNode()], undefined);
 
     expect(plan.clean).toHaveLength(0);
     expect(plan.unsupported).toHaveLength(1);
@@ -405,7 +405,7 @@ describe('placement: edge archetype shorthand', () => {
   };
 
   it('drops Trust Recorder onto the AP response edge', () => {
-    const result = applyTemplate(trustRecorderTpl, [accessPointNode(), targetNode()]);
+    const result = applyTemplate(trustRecorderTpl, [accessPointNode(), targetNode()], undefined);
 
     expect(result.nextNodes).toHaveLength(2);
     expect(result.edgeDrops).toHaveLength(1);
@@ -421,7 +421,7 @@ describe('placement: edge archetype shorthand', () => {
   });
 
   it('does not place Trust Recorder without the AP-to-managed-agent edge', () => {
-    const plan = planTemplate(trustRecorderTpl, [targetNode()]);
+    const plan = planTemplate(trustRecorderTpl, [targetNode()], undefined);
 
     expect(plan.clean).toHaveLength(0);
     expect(plan.unsupported).toHaveLength(1);
@@ -443,7 +443,11 @@ describe('placement: edge archetype shorthand', () => {
   };
 
   it('drops A2A Metadata Injection onto the inbound request edge', () => {
-    const result = applyTemplate(a2aMetadataInjectionTpl, [accessPointNode(), targetNode()]);
+    const result = applyTemplate(
+      a2aMetadataInjectionTpl,
+      [accessPointNode(), targetNode()],
+      undefined
+    );
 
     expect(result.nextNodes).toHaveLength(2);
     expect(result.edgeDrops).toHaveLength(1);
@@ -459,7 +463,7 @@ describe('placement: edge archetype shorthand', () => {
   });
 
   it('drops MCP Tool Gating on the external-target response flow', () => {
-    const result = applyTemplate(mcpToolGatingTpl, [targetNode(), npcEndpoint()]);
+    const result = applyTemplate(mcpToolGatingTpl, [targetNode(), npcEndpoint()], undefined);
 
     expect(result.edgeDrops).toHaveLength(1);
     expect(result.edgeDrops[0]).toMatchObject({
@@ -480,13 +484,13 @@ describe('placement: edge archetype shorthand', () => {
         { scope: 'edge', kind: 'identity', address: 'no-such-archetype/request', config: {} },
       ],
     };
-    const plan = planTemplate(tpl, [targetNode(), npcEndpoint()]);
+    const plan = planTemplate(tpl, [targetNode(), npcEndpoint()], undefined);
     expect(plan.unsupported).toHaveLength(1);
     expect(plan.unsupported[0].reason).toMatch(/unknown edge archetype/);
   });
 
   it('reports archetype with no matching pair on canvas as unsupported', () => {
-    const plan = planTemplate(credentialDelegationTpl, [targetNode()]);
+    const plan = planTemplate(credentialDelegationTpl, [targetNode()], undefined);
     expect(plan.unsupported).toHaveLength(1);
     expect(plan.unsupported[0].reason).toMatch(/archetype 'ma-external' is not on the canvas/);
   });
@@ -503,7 +507,7 @@ describe('placement: full-kind templates', () => {
         target: { endpoint: '$TARGET_ENDPOINT' },
       },
     };
-    const plan = planTemplate(fullTpl, []);
+    const plan = planTemplate(fullTpl, [], undefined);
     expect(plan.clean).toHaveLength(0);
     expect(plan.conflicts).toHaveLength(0);
     expect(plan.unsupported).toHaveLength(1);
@@ -511,13 +515,13 @@ describe('placement: full-kind templates', () => {
   });
 
   it('treats absent kind as partial (backwards compatible)', () => {
-    const plan = planTemplate(targetIdentityTemplate, []);
+    const plan = planTemplate(targetIdentityTemplate, [], undefined);
     expect(plan.clean).toHaveLength(1);
     expect(plan.unsupported).toHaveLength(0);
   });
 });
 
-describe('placement: Transit Point protocol', () => {
+describe('placement: element protocol', () => {
   const partial = (kind: string): SurfaceTemplate => ({
     id: `test-tpl-${kind}`,
     name: 'Partial with a Transit Point',
@@ -542,6 +546,72 @@ describe('placement: Transit Point protocol', () => {
   });
 
   it('places any Transit Point when no surface protocol is given', () => {
-    expect(planTemplate(partial('transit-point-a2a'), []).clean).toHaveLength(1);
+    expect(planTemplate(partial('transit-point-a2a'), [], undefined).clean).toHaveLength(
+      1,
+      undefined
+    );
+  });
+
+  const edgeItem = (kind: string): SurfaceTemplate => ({
+    id: `test-tpl-edge-${kind}`,
+    name: 'Partial with an edge item',
+    items: [{ scope: 'edge', kind, address: 'ma-external/response', config: {} }],
+  });
+  const canvas: CanvasNode[] = [
+    { id: 'target', type: 'target', label: 'MA', configured: true, config: {} },
+    {
+      id: 'ext',
+      type: 'npc-endpoint',
+      label: 'EXT',
+      configured: true,
+      config: {},
+      parentId: 'target',
+    },
+  ];
+
+  it('places an edge element on a surface protocol it lists', () => {
+    const plan = planTemplate(edgeItem('mcp-tool-gating'), canvas, 'mcp');
+    expect(plan.clean).toHaveLength(1);
+    expect(plan.unsupported).toHaveLength(0);
+  });
+
+  it('skips an edge element on a surface protocol it does not list', () => {
+    const plan = planTemplate(edgeItem('mcp-tool-gating'), canvas, 'a2a');
+    expect(plan.clean).toHaveLength(0);
+    expect(plan.unsupported.map(u => u.reason)).toEqual([
+      "'mcp-tool-gating' is not available on a2a surfaces",
+    ]);
+  });
+
+  it('names the protocol, not the canvas, when the edge anchors are missing', () => {
+    const plan = planTemplate(edgeItem('mcp-tool-gating'), [], 'a2a');
+    expect(plan.unsupported.map(u => u.reason)).toEqual([
+      "'mcp-tool-gating' is not available on a2a surfaces",
+    ]);
+  });
+
+  describe('node-bound items', () => {
+    const nodeTpl: SurfaceTemplate = {
+      id: 'test-tpl-node-bound',
+      name: 'Node-bound partial',
+      items: [{ scope: 'node', kind: 'metadata-extraction', address: 'target', config: {} }],
+    };
+    const target: CanvasNode[] = [
+      { id: 'target', type: 'target', label: 'MA', configured: true, config: {} },
+    ];
+
+    it('places a node-bound element on a listed protocol', () => {
+      const plan = planTemplate(nodeTpl, target, 'a2a');
+      expect(plan.clean).toHaveLength(1);
+      expect(plan.unsupported).toHaveLength(0);
+    });
+
+    it('skips a node-bound element on an unlisted protocol', () => {
+      const plan = planTemplate(nodeTpl, target, 'mcp');
+      expect(plan.clean).toHaveLength(0);
+      expect(plan.unsupported.map(u => u.reason)).toEqual([
+        "'metadata-extraction' is not available on mcp surfaces",
+      ]);
+    });
   });
 });
