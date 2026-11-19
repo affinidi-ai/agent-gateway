@@ -227,6 +227,32 @@ Feature: Routing through a proxy:// MCP target
     Then the response status is 200
     And the MCP tool result is an error saying "REST response does not carry the file its tool declares"
 
+  Scenario: A 2026-07-28 tool call returns the file declared on the media type the REST API answered
+    Given REST API "bravo" answers a PDF document inside its vendor JSON
+    When the caller invokes the MCP tool "get_vendor_attachment" for city "Paris" using protocol version "2026-07-28"
+    Then the response status is 200
+    And REST API "bravo" received "GET /weather/Paris/vendor-attachment"
+    And the MCP tool result is the file inside REST API "bravo"'s JSON as an embedded "application/octet-stream" resource
+
+  Scenario: A 2026-07-28 tool call answered as a media type declared without a file returns its JSON
+    Given REST API "bravo" answers a PDF document inside its JSON
+    When the caller invokes the MCP tool "get_vendor_attachment" for city "Paris" using protocol version "2026-07-28"
+    Then the response status is 200
+    And REST API "bravo" received "GET /weather/Paris/vendor-attachment"
+    And the MCP tool result is REST API "bravo"'s JSON, not the file another media type declares
+
+  Scenario: A tool whose second media type declares a file the gateway cannot read is left out of the tool catalog
+    When the caller sends an MCP tools/list request
+    Then the response status is 200
+    And the MCP response tool catalog includes a tool named "get_vendor_attachment"
+    And the MCP response tool catalog does not include a tool named "get_broken_vendor_attachment"
+
+  Scenario: A 2026-07-28 call to a tool whose second media type declares an unreadable file is refused
+    When the caller invokes the MCP tool "get_broken_vendor_attachment" for city "Paris" using protocol version "2026-07-28"
+    Then the response status is 400
+    And the MCP response is a JSON-RPC error with code -32602
+    And REST API "bravo" was not called
+
   Scenario: A tool whose declared file the gateway cannot read is left out of the tool catalog
     When the caller sends an MCP tools/list request
     Then the response status is 200

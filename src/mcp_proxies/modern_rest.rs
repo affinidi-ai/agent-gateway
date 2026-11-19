@@ -7,6 +7,7 @@ use futures::TryStreamExt;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp_openapi::{ExtractedParameters, ToolGenerator, ToolMetadata};
 use serde_json::{Value, json};
+use tracing::debug;
 use url::Url;
 
 use crate::config::McpHttpConfig;
@@ -116,14 +117,31 @@ impl SuccessStatus {
     }
 }
 
-/// The JSON media type of each success answer `metadata`'s operation
-/// declares, in the order the output schema and the file declaration are
-/// taken from them. A media type is listed whether or not it has a `schema`,
-/// which OpenAPI leaves optional.
+/// A success answer of an operation and the JSON media types it declares,
+/// the one the output schema is taken from first. Each media type is the
+/// lower-cased essence of the content key it was read from, so a key's
+/// parameters decide nothing.
+struct JsonAnswer<'spec> {
+    status: SuccessStatus,
+    media: Vec<(String, &'spec Value)>,
+}
+
+/// The JSON media types an answer's output schema and file declaration are
+/// taken from first, in this order, before its other `+json` media types.
+const PREFERRED_MEDIA: [&str; 3] = ["application/json", "application/ld+json", "application/vnd.api+json"];
+
+/// Every JSON media type of each success answer `metadata`'s operation
+/// declares, in the order the output schema and the file declarations are
+/// taken from them: by status, and within an answer [`PREFERRED_MEDIA`]
+/// first, then every other media type whose subtype ends in `+json`. Each
+/// content key is read as a media type and kept as its lower-cased essence,
+/// so `application/json; charset=utf-8` is `application/json` and a
+/// parameterised vendor key matches the answer that names it. A media type is
+/// listed whether or not it has a `schema`, which OpenAPI leaves optional.
 fn json_answers<'spec>(
     spec: &'spec Value,
     metadata: &ToolMetadata,
-) -> Result<Vec<(SuccessStatus, &'spec Value)>, RestError> {
+) -> Result<Vec<JsonAnswer<'spec>>, RestError> {
     let path = spec
         .get("paths")
         .and_then(|paths| paths.get(&metadata.path))
@@ -150,41 +168,55 @@ fn json_answers<'spec>(
         else {
             continue;
         };
-        let media = ["application/json", "application/ld+json", "application/vnd.api+json"]
-            .into_iter()
-            .find_map(|kind| content.get(kind))
-            .or_else(|| {
-                content
-                    .iter()
-                    .find(|(kind, _)| {
-                        kind.parse::<mime::Mime>()
-                            .is_ok_and(|mime| mime.suffix() == Some(mime::JSON))
-                    })
-                    .map(|(_, media)| media)
+        let mut media: Vec<(usize, String, &Value)> = Vec::new();
+        for (kind, value) in content {
+            let Ok(parsed) = kind.parse::<mime::Mime>() else { continue };
+            let essence = parsed
+                .essence_str()
+                .to_ascii_lowercase();
+            let preference = PREFERRED_MEDIA
+                .iter()
+                .position(|preferred| *preferred == essence);
+            if preference.is_none() && parsed.suffix() != Some(mime::JSON) {
+                continue;
+            }
+            media.push((preference.unwrap_or(PREFERRED_MEDIA.len()), essence, value));
+        }
+        media.sort_by_key(|(preference, _, _)| *preference);
+        if !media.is_empty() {
+            answers.push(JsonAnswer {
+                status,
+                media: media
+                    .into_iter()
+                    .map(|(_, essence, value)| (essence, value))
+                    .collect(),
             });
-        if let Some(media) = media {
-            answers.push((status, media));
         }
     }
-    answers.sort_by_key(|(status, _)| *status);
+    answers.sort_by_key(|answer| answer.status);
     Ok(answers)
 }
 
 /// What `metadata`'s tool answers, read from its operation's success answers
-/// in one pass: the tool's output schema, and the file its answer carries
-/// ([`FileAnswer`]). A tool whose answer carries a file has no output schema,
-/// since it answers the file, not the JSON.
+/// in one pass: the tool's output schema, and the files its answers carry
+/// ([`FileAnswers`]). A tool whose answer carries a file has no output
+/// schema, since it answers the file, not the JSON.
 pub(super) fn answer_contract(
     spec: &Value,
     metadata: &ToolMetadata,
-) -> Result<(Option<Value>, Option<FileAnswer>), RestError> {
+) -> Result<(Option<Value>, Option<FileAnswers>), RestError> {
     let answers = json_answers(spec, metadata)?;
-    if let Some(file) = declared_file(&answers)? {
-        return Ok((None, Some(file)));
+    if let Some(files) = declared_files(&answers)? {
+        return Ok((None, Some(files)));
     }
     let Some(body_schema) = answers
         .iter()
-        .find_map(|(_, media)| media.get("schema"))
+        .find_map(|answer| {
+            answer
+                .media
+                .first()
+                .and_then(|(_, media)| media.get("schema"))
+        })
     else {
         return Ok((None, None));
     };
@@ -227,16 +259,93 @@ pub(super) fn output_schema(
 }
 
 /// A file a REST API answers inside its JSON, as a string of base64 or
-/// base64url, declared by a success answer of the operation with
-/// `x-gateway-file`: `{"pointer": "/data", "encoding": "base64url"}`. That
-/// answer of the tool is then the decoded file as an embedded resource,
-/// never the JSON around it.
+/// base64url, declared on a JSON media type of a success answer of the
+/// operation with `x-gateway-file`:
+/// `{"pointer": "/data", "encoding": "base64url"}`. That answer of the tool
+/// is then the decoded file as an embedded resource, never the JSON around
+/// it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct FileAnswer {
     declaration: FileDeclaration,
     /// The success answer the declaration was found on. Only that answer
     /// carries the file; another answer is answered without it.
     status: SuccessStatus,
+    /// The JSON media type it was declared on, as its lower-cased essence,
+    /// which an answer of several declaring media types is matched against.
+    media_type: String,
+}
+
+/// Every file an operation's success answers declare, in the order they were
+/// read, beside every JSON media type those answers declare. An operation
+/// declares more than one file when it answers several JSON media types, or a
+/// file on more than one status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FileAnswers {
+    files: Vec<FileAnswer>,
+    /// Every JSON media type each success answer declares, whether or not it
+    /// declares a file, so the answer governing a status is known and an
+    /// answer sent as a media type that answer declares without a file is
+    /// answered as its JSON instead of another media type's file.
+    media_types: Vec<(SuccessStatus, String)>,
+}
+
+impl FileAnswers {
+    /// The success answer that governs an answer of `status`: the most
+    /// specific one declaring a JSON media type for it, its exact status
+    /// before `2XX` and `2XX` before `default`. Only that answer's
+    /// declarations are read, so one on another success answer decides
+    /// nothing.
+    fn governing_status(
+        &self,
+        status: u16,
+    ) -> Option<SuccessStatus> {
+        self.media_types
+            .iter()
+            .filter(|(declared_on, _)| declared_on.names(status))
+            .map(|(declared_on, _)| *declared_on)
+            .min()
+    }
+
+    /// The file an answer of `status`, sent as `content_type`, carries: the
+    /// one its governing answer declares on the media type the answer names,
+    /// its parameters ignored. An answer of a media type that answer declares
+    /// without a file carries none, so it is answered as its JSON. One whose
+    /// media type that answer does not declare as a JSON media type, or that
+    /// names none at all, carries the first file that answer declares.
+    fn governing(
+        &self,
+        status: u16,
+        content_type: Option<&str>,
+    ) -> Option<&FileAnswer> {
+        let governing = self.governing_status(status)?;
+        let declared = || {
+            self.files
+                .iter()
+                .filter(|file| file.status == governing)
+        };
+        let answered = content_type.and_then(|value| {
+            value
+                .parse::<mime::Mime>()
+                .ok()
+        });
+        let Some(answered) = answered else { return declared().next() };
+        let answered = answered.essence_str();
+        if let Some(file) = declared().find(|file| {
+            file.media_type
+                .eq_ignore_ascii_case(answered)
+        }) {
+            return Some(file);
+        }
+        let declared_without_file = self
+            .media_types
+            .iter()
+            .any(|(declared_on, media_type)| *declared_on == governing && media_type.eq_ignore_ascii_case(answered));
+        if declared_without_file {
+            None
+        } else {
+            declared().next()
+        }
+    }
 }
 
 /// The `x-gateway-file` declaration itself.
@@ -268,29 +377,22 @@ impl FileDeclaration {
 }
 
 impl FileAnswer {
-    /// Whether the answer the REST API sent, of `status`, is the success
-    /// answer the file was declared on. Any other answer, success or
-    /// failure, is answered as it would be without the declaration.
-    pub(super) fn answers(
-        &self,
-        status: u16,
-    ) -> bool {
-        self.status.names(status)
-    }
-
     /// The file `body` carries: the string at the pointer of its JSON,
-    /// decoded. `None` when `body` is not JSON, has no string there or the
-    /// string is not in the declared encoding.
+    /// decoded. The buffered body is released once it is parsed, so the
+    /// parsed JSON and the decoded file are the only copies of the answer
+    /// held while it decodes. `None` when `body` is not JSON, has no string
+    /// there or the string is not in the declared encoding.
     fn bytes(
         &self,
-        body: &[u8],
+        body: Vec<u8>,
     ) -> Option<Vec<u8>> {
         use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
         const EITHER_PADDING: GeneralPurposeConfig =
             GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent);
         const BASE64: GeneralPurpose = GeneralPurpose::new(&base64::alphabet::STANDARD, EITHER_PADDING);
         const BASE64URL: GeneralPurpose = GeneralPurpose::new(&base64::alphabet::URL_SAFE, EITHER_PADDING);
-        let answer: Value = serde_json::from_slice(body).ok()?;
+        let answer: Value = serde_json::from_slice(&body).ok()?;
+        drop(body);
         let encoded = answer
             .pointer(&self.declaration.pointer)?
             .as_str()?;
@@ -302,30 +404,35 @@ impl FileAnswer {
     }
 }
 
-/// The file `metadata`'s tool answers inside its JSON, when a success answer
-/// of its operation declares one with `x-gateway-file`. A declaration that is
-/// not a [`FileDeclaration`], on any of them, refuses the tool as an unusable
-/// output schema does.
-pub(super) fn file_answer(
+/// The files `metadata`'s tool answers inside its JSON, when a JSON media
+/// type of a success answer of its operation declares one with
+/// `x-gateway-file`. A declaration that is not a [`FileDeclaration`], on any
+/// of them, refuses the tool as an unusable output schema does.
+pub(super) fn file_answers(
     spec: &Value,
     metadata: &ToolMetadata,
-) -> Result<Option<FileAnswer>, RestError> {
-    declared_file(&json_answers(spec, metadata)?)
+) -> Result<Option<FileAnswers>, RestError> {
+    declared_files(&json_answers(spec, metadata)?)
 }
 
-/// The file the first success answer that declares one carries. Every
-/// declaration is read, so a malformed one on any success answer refuses the
-/// tool.
-fn declared_file(answers: &[(SuccessStatus, &Value)]) -> Result<Option<FileAnswer>, RestError> {
-    let mut file = None;
-    for (status, media) in answers {
-        let Some(declared) = media.get(FILE_EXTENSION) else { continue };
-        let declaration = FileDeclaration::declared(declared)?;
-        if file.is_none() {
-            file = Some(FileAnswer { declaration, status: *status });
+/// The files the success answers declare, beside every JSON media type those
+/// answers declare. Every JSON media type of every success answer is read, so
+/// a malformed declaration on any of them refuses the tool.
+fn declared_files(answers: &[JsonAnswer<'_>]) -> Result<Option<FileAnswers>, RestError> {
+    let mut files = Vec::new();
+    let mut media_types = Vec::new();
+    for answer in answers {
+        for (media_type, media) in &answer.media {
+            media_types.push((answer.status, media_type.clone()));
+            let Some(declared) = media.get(FILE_EXTENSION) else { continue };
+            files.push(FileAnswer {
+                declaration: FileDeclaration::declared(declared)?,
+                status: answer.status,
+                media_type: media_type.clone(),
+            });
         }
     }
-    Ok(file)
+    Ok((!files.is_empty()).then_some(FileAnswers { files, media_types }))
 }
 
 pub(super) fn routing_spec(spec: &Value) -> Result<Value, RestError> {
@@ -827,7 +934,7 @@ async fn add_body(
 pub(super) async fn call(
     base_url: &str,
     metadata: &ToolMetadata,
-    file: Option<&FileAnswer>,
+    files: Option<&FileAnswers>,
     arguments: &Value,
     target_headers: &HeaderMap,
     limits: &McpHttpConfig,
@@ -838,7 +945,7 @@ pub(super) async fn call(
     send(
         base_url,
         metadata,
-        file,
+        files,
         arguments,
         target_headers,
         limits,
@@ -870,7 +977,7 @@ pub(super) async fn call(
 pub(super) async fn call_through_transit_point(
     base_url: &str,
     metadata: &ToolMetadata,
-    file: Option<&FileAnswer>,
+    files: Option<&FileAnswers>,
     arguments: &Value,
     target_headers: &HeaderMap,
     limits: &McpHttpConfig,
@@ -882,7 +989,7 @@ pub(super) async fn call_through_transit_point(
     send(
         base_url,
         metadata,
-        file,
+        files,
         arguments,
         target_headers,
         limits,
@@ -934,7 +1041,7 @@ async fn pinned_client(
 async fn send(
     base_url: &str,
     metadata: &ToolMetadata,
-    file: Option<&FileAnswer>,
+    files: Option<&FileAnswers>,
     arguments: &Value,
     target_headers: &HeaderMap,
     limits: &McpHttpConfig,
@@ -1105,8 +1212,13 @@ async fn send(
         }
         body.extend_from_slice(&chunk);
     }
-    if let Some(file) = file.filter(|file| file.answers(status.as_u16())) {
-        return Ok(match file.bytes(&body) {
+    if let Some(file) = files.and_then(|files| files.governing(status.as_u16(), content_type.as_deref())) {
+        debug!(
+            status = status.as_u16(),
+            media_type = %file.media_type,
+            "Decoding a REST answer with the x-gateway-file declaration of one of its media types"
+        );
+        return Ok(match file.bytes(body) {
             Some(bytes) => CallToolResult::success(vec![binary_content(&url, None, &bytes)]),
             None => CallToolResult::error(vec![ContentBlock::text(
                 "REST response does not carry the file its tool declares",
@@ -1764,6 +1876,34 @@ mod tests {
         tasks.shutdown().await;
     }
 
+    /// One file declared on `status` and `media_type`, as a spec declares it.
+    fn declared_on(
+        status: SuccessStatus,
+        media_type: &str,
+        pointer: &str,
+        encoding: &str,
+    ) -> FileAnswers {
+        FileAnswers {
+            files: vec![FileAnswer {
+                declaration: FileDeclaration::declared(&json!({"pointer": pointer, "encoding": encoding})).unwrap(),
+                status,
+                media_type: media_type.to_string(),
+            }],
+            media_types: vec![(status, media_type.to_string())],
+        }
+    }
+
+    /// The one file `spec` declares for `path`, for a spec that declares at
+    /// most one.
+    fn only_file(
+        spec: &Value,
+        path: &str,
+    ) -> Option<FileAnswer> {
+        let files = file_answers(spec, &metadata(path)).unwrap()?;
+        assert_eq!(files.files.len(), 1, "one declaration, got {:?}", files.files);
+        files.files.into_iter().next()
+    }
+
     #[test]
     fn a_file_answer_is_declared_on_the_json_answer_and_a_malformed_declaration_refuses_the_tool() {
         let spec = |declared: Option<Value>| {
@@ -1783,13 +1923,14 @@ mod tests {
         };
         let declared = spec(Some(json!({"pointer": "/data", "encoding": "base64url"})));
         assert_eq!(
-            file_answer(&declared, &metadata("/file")).unwrap(),
+            only_file(&declared, "/file"),
             Some(FileAnswer {
                 declaration: FileDeclaration {
                     pointer: "/data".into(),
                     encoding: FileEncoding::Base64url
                 },
-                status: SuccessStatus::Exact(200)
+                status: SuccessStatus::Exact(200),
+                media_type: "application/json".into()
             })
         );
         assert_eq!(
@@ -1798,17 +1939,18 @@ mod tests {
             "a tool answering a file has no output schema"
         );
         assert_eq!(
-            file_answer(&declared, &metadata("/shared")).unwrap(),
+            only_file(&declared, "/shared"),
             Some(FileAnswer {
                 declaration: FileDeclaration {
                     pointer: "/file/content".into(),
                     encoding: FileEncoding::Base64
                 },
-                status: SuccessStatus::Exact(200)
+                status: SuccessStatus::Exact(200),
+                media_type: "application/json".into()
             })
         );
         let undeclared = spec(None);
-        assert_eq!(file_answer(&undeclared, &metadata("/file")).unwrap(), None);
+        assert_eq!(only_file(&undeclared, "/file"), None);
         assert!(
             output_schema(&undeclared, &metadata("/file"))
                 .unwrap()
@@ -1827,7 +1969,7 @@ mod tests {
             json!(true),
         ] {
             let spec = spec(Some(malformed.clone()));
-            assert!(file_answer(&spec, &metadata("/file")).is_err(), "{malformed}");
+            assert!(file_answers(&spec, &metadata("/file")).is_err(), "{malformed}");
             assert!(output_schema(&spec, &metadata("/file")).is_err(), "{malformed}");
         }
     }
@@ -1845,22 +1987,20 @@ mod tests {
         for status in ["200", "206", "2XX", "default"] {
             let schemaless = spec(status, json!({FILE_EXTENSION: {"pointer": "/data", "encoding": "base64"}}));
             assert_eq!(
-                file_answer(&schemaless, &metadata("/file"))
-                    .unwrap()
-                    .map(|file| file.status),
+                only_file(&schemaless, "/file").map(|file| file.status),
                 SuccessStatus::named(status),
                 "{status}: a declaration beside no schema is read"
             );
             assert_eq!(output_schema(&schemaless, &metadata("/file")).unwrap(), None, "{status}");
             let malformed = spec(status, json!({FILE_EXTENSION: {"pointer": "/data", "encoding": "hex"}}));
             assert!(
-                file_answer(&malformed, &metadata("/file")).is_err(),
+                file_answers(&malformed, &metadata("/file")).is_err(),
                 "{status}: a malformed declaration beside no schema refuses the tool"
             );
             assert!(output_schema(&malformed, &metadata("/file")).is_err(), "{status}");
         }
         let undeclared = spec("200", json!({}));
-        assert_eq!(file_answer(&undeclared, &metadata("/file")).unwrap(), None);
+        assert_eq!(only_file(&undeclared, "/file"), None);
         assert_eq!(
             output_schema(&undeclared, &metadata("/file")).unwrap(),
             None,
@@ -1872,12 +2012,22 @@ mod tests {
                 FILE_EXTENSION: {"pointer": "/data", "encoding": "base64"}
             }}}
         }}}}});
-        let file = file_answer(&both, &metadata("/file"))
+        let files = file_answers(&both, &metadata("/file"))
             .unwrap()
             .expect("the declaration on the later success answer is read");
-        assert_eq!(file.status, SuccessStatus::Exact(206));
-        assert!(file.answers(206), "the answer it was declared on carries the file");
-        assert!(!file.answers(200), "another success answer does not");
+        assert_eq!(
+            files
+                .governing(206, None)
+                .map(|file| file.status),
+            Some(SuccessStatus::Exact(206)),
+            "the answer it was declared on carries the file"
+        );
+        assert!(
+            files
+                .governing(200, None)
+                .is_none(),
+            "another success answer does not"
+        );
         assert_eq!(
             output_schema(&both, &metadata("/file")).unwrap(),
             None,
@@ -1889,15 +2039,246 @@ mod tests {
         let pointer = |characters: usize| format!("/{}", "é".repeat(characters));
         let longest =
             spec("200", json!({FILE_EXTENSION: {"pointer": pointer(MAX_FILE_POINTER - 1), "encoding": "base64"}}));
-        assert!(
-            file_answer(&longest, &metadata("/file"))
-                .unwrap()
-                .is_some(),
-            "the pointer limit counts characters, not UTF-8 bytes"
-        );
+        assert!(only_file(&longest, "/file").is_some(), "the pointer limit counts characters, not UTF-8 bytes");
         let too_long =
             spec("200", json!({FILE_EXTENSION: {"pointer": pointer(MAX_FILE_POINTER), "encoding": "base64"}}));
-        assert!(file_answer(&too_long, &metadata("/file")).is_err());
+        assert!(file_answers(&too_long, &metadata("/file")).is_err());
+    }
+
+    /// A declaration is read on every JSON media type of an answer, not only
+    /// the one the output schema is taken from, and the media type the REST
+    /// API answered picks which declaration that answer carries.
+    #[test]
+    fn a_file_answer_is_declared_on_any_json_media_type_of_an_answer() {
+        let spec = |vendor: Value| {
+            json!({"paths": {"/file": {"get": {"responses": {"200": {"description": "OK", "content": {
+                "application/json": {"schema": {"type": "object"}},
+                "application/vnd.example+json": vendor
+            }}}}}}})
+        };
+        let declared = spec(json!({FILE_EXTENSION: {"pointer": "/data", "encoding": "base64"}}));
+        assert_eq!(
+            only_file(&declared, "/file").map(|file| file.media_type),
+            Some("application/vnd.example+json".to_string()),
+            "a declaration on a vendor JSON media type is read"
+        );
+        assert_eq!(
+            output_schema(&declared, &metadata("/file")).unwrap(),
+            None,
+            "the tool answers a file, so it advertises no output schema"
+        );
+        let schema_only = file_answers(&declared, &metadata("/file"))
+            .unwrap()
+            .expect("the vendor media type declares a file");
+        assert!(
+            schema_only
+                .governing(200, Some("application/json"))
+                .is_none(),
+            "a media type the answer declares without a file is answered as its JSON"
+        );
+        assert_eq!(
+            schema_only
+                .governing(200, Some("application/vnd.example+json"))
+                .map(|file| file
+                    .declaration
+                    .pointer
+                    .clone()),
+            Some("/data".to_string()),
+            "the media type the file is declared on still carries it"
+        );
+        assert_eq!(
+            schema_only
+                .governing(200, None)
+                .map(|file| file
+                    .declaration
+                    .pointer
+                    .clone()),
+            Some("/data".to_string()),
+            "an answer naming no media type carries the first file of its status"
+        );
+        let malformed = spec(json!({FILE_EXTENSION: {"pointer": "/data", "encoding": "hex"}}));
+        assert!(
+            file_answers(&malformed, &metadata("/file")).is_err(),
+            "a malformed declaration on a vendor media type refuses the tool"
+        );
+        assert!(output_schema(&malformed, &metadata("/file")).is_err());
+        let two = json!({"paths": {"/file": {"get": {"responses": {"200": {"description": "OK", "content": {
+            "application/json": {FILE_EXTENSION: {"pointer": "/data", "encoding": "base64"}},
+            "application/vnd.example+json": {FILE_EXTENSION: {"pointer": "/file/content", "encoding": "base64url"}}
+        }}}}}}});
+        let files = file_answers(&two, &metadata("/file"))
+            .unwrap()
+            .expect("both declarations are read");
+        assert_eq!(files.files.len(), 2, "{files:?}");
+        let pointer = |content_type: Option<&str>| {
+            files
+                .governing(200, content_type)
+                .map(|file| {
+                    file.declaration
+                        .pointer
+                        .clone()
+                })
+        };
+        assert_eq!(
+            pointer(Some("application/vnd.example+json")),
+            Some("/file/content".to_string()),
+            "the media type the API answered picks its declaration"
+        );
+        assert_eq!(
+            pointer(Some("application/json; charset=utf-8")),
+            Some("/data".to_string()),
+            "media type parameters are ignored"
+        );
+        assert_eq!(
+            pointer(None),
+            Some("/data".to_string()),
+            "an answer naming no media type carries the first declaration of its status"
+        );
+        assert_eq!(
+            pointer(Some("text/plain")),
+            Some("/data".to_string()),
+            "so does one whose media type the operation does not declare"
+        );
+        assert!(
+            files
+                .governing(404, Some("application/json"))
+                .is_none(),
+            "a failure answer carries no file"
+        );
+    }
+
+    /// A content key is read as a media type, so its parameters decide
+    /// neither which declaration an answer carries nor whether a malformed
+    /// declaration refuses the tool.
+    #[test]
+    fn the_parameters_of_a_declared_media_type_decide_nothing() {
+        let spec = |vendor: Value, plain: Value| {
+            json!({"paths": {"/file": {"get": {"responses": {"200": {"description": "OK", "content": {
+                "application/vnd.a+json; v=1": vendor,
+                "application/vnd.b+json": {FILE_EXTENSION: {"pointer": "/b", "encoding": "base64"}},
+                "application/json; charset=utf-8": plain
+            }}}}}}})
+        };
+        let schema = json!({"schema": {"type": "object"}});
+        let pointer = |files: &FileAnswers, content_type: &str| {
+            files
+                .governing(200, Some(content_type))
+                .map(|file| {
+                    file.declaration
+                        .pointer
+                        .clone()
+                })
+        };
+        let declared = spec(schema.clone(), json!({FILE_EXTENSION: {"pointer": "/plain", "encoding": "base64"}}));
+        let declared = file_answers(&declared, &metadata("/file"))
+            .unwrap()
+            .expect("the parameterised keys are read");
+        assert!(
+            pointer(&declared, "application/vnd.a+json; v=1").is_none(),
+            "a parameterised media type declared without a file is answered as its JSON"
+        );
+        assert_eq!(
+            pointer(&declared, "application/vnd.b+json"),
+            Some("/b".to_string()),
+            "the media type the answer names carries its own file"
+        );
+        for answered in ["application/json", "application/json; charset=utf-8", "APPLICATION/JSON"] {
+            assert_eq!(
+                pointer(&declared, answered),
+                Some("/plain".to_string()),
+                "{answered}: a parameterised key is matched by its essence"
+            );
+        }
+        let vendor_file = spec(json!({FILE_EXTENSION: {"pointer": "/a", "encoding": "base64"}}), schema.clone());
+        let vendor_file = file_answers(&vendor_file, &metadata("/file"))
+            .unwrap()
+            .expect("the parameterised vendor key declares a file");
+        assert_eq!(
+            pointer(&vendor_file, "application/vnd.a+json; v=1"),
+            Some("/a".to_string()),
+            "a parameterised answer matches the parameterised key it was declared on"
+        );
+        for malformed in [
+            spec(schema.clone(), json!({FILE_EXTENSION: {"pointer": "/plain", "encoding": "hex"}})),
+            spec(json!({FILE_EXTENSION: {"pointer": "/a", "encoding": "hex"}}), schema.clone()),
+        ] {
+            assert!(
+                file_answers(&malformed, &metadata("/file")).is_err(),
+                "a malformed declaration on a parameterised key refuses the tool"
+            );
+            assert!(output_schema(&malformed, &metadata("/file")).is_err());
+        }
+    }
+
+    /// One success answer governs an answered status, its exact status before
+    /// `2XX` and `2XX` before `default`, and only that answer's declarations
+    /// decide what it carries.
+    #[test]
+    fn the_most_specific_success_answer_governs_what_an_answer_carries() {
+        let file = |pointer: &str| json!({FILE_EXTENSION: {"pointer": pointer, "encoding": "base64"}});
+        let schema = json!({"schema": {"type": "object"}});
+        let spec = |exact: Value, default: Value| {
+            json!({"paths": {"/file": {"get": {"responses": {
+                "200": {"description": "OK", "content": exact},
+                "default": {"description": "Other", "content": default}
+            }}}}})
+        };
+        let declared = |spec: &Value| {
+            file_answers(spec, &metadata("/file"))
+                .unwrap()
+                .expect("a file is declared")
+        };
+        let pointer = |files: &FileAnswers, status: u16, content_type: Option<&str>| {
+            files
+                .governing(status, content_type)
+                .map(|file| {
+                    file.declaration
+                        .pointer
+                        .clone()
+                })
+        };
+        let exact_file = declared(&spec(
+            json!({"application/json": file("/exact")}),
+            json!({"application/vnd.example+json": schema.clone()}),
+        ));
+        assert_eq!(
+            pointer(&exact_file, 200, Some("application/vnd.example+json")),
+            Some("/exact".to_string()),
+            "a media type only another answer declares falls back to the governing answer's first file"
+        );
+        let default_file =
+            declared(&spec(json!({"application/json": schema.clone()}), json!({"application/json": file("/default")})));
+        assert!(
+            pointer(&default_file, 200, Some("application/json")).is_none(),
+            "the governing answer declares the answered media type without a file, so the answer is its JSON"
+        );
+        assert!(
+            pointer(&default_file, 200, None).is_none(),
+            "an answer naming no media type carries no file of another answer either"
+        );
+        assert_eq!(
+            pointer(&default_file, 204, Some("application/json")),
+            Some("/default".to_string()),
+            "default governs a success status that declares nothing"
+        );
+        let both = declared(&spec(
+            json!({"application/vnd.example+json": file("/exact")}),
+            json!({"application/json": file("/default")}),
+        ));
+        assert_eq!(
+            pointer(&both, 200, Some("application/json")),
+            Some("/exact".to_string()),
+            "a declaration on another answer never decides a status that declares its own"
+        );
+        let ranged = declared(&json!({"paths": {"/file": {"get": {"responses": {
+            "2XX": {"description": "OK", "content": {"application/json": file("/ranged")}},
+            "default": {"description": "Other", "content": {"application/json": file("/default")}}
+        }}}}}));
+        assert_eq!(
+            pointer(&ranged, 200, Some("application/json")),
+            Some("/ranged".to_string()),
+            "2XX governs before default"
+        );
     }
 
     #[tokio::test]
@@ -1918,8 +2299,13 @@ mod tests {
         assert!(padded.ends_with('=') && padded.contains(['-', '_']), "{padded}");
         assert!(standard.contains(['+', '/']), "{standard}");
         assert!(!unpadded.ends_with('=') && !unpadded_standard.ends_with('='), "{unpadded_standard}");
+        let vendor_body = json!({"file": {"content": standard.clone()}}).to_string();
+        let vendor = axum::routing::get(move || {
+            let body = vendor_body.clone();
+            async move { ([("content-type", "application/vnd.example+json")], body).into_response() }
+        });
         let answers = [
-            ("/padded", json!({"size": FILE.len(), "data": padded})),
+            ("/padded", json!({"size": FILE.len(), "data": padded.clone()})),
             ("/unpadded", json!({"size": FILE.len(), "data": unpadded})),
             ("/unpadded-standard", json!({"size": FILE.len(), "data": unpadded_standard})),
             ("/nested", json!({"file": {"content": standard.clone()}})),
@@ -1930,6 +2316,7 @@ mod tests {
         ];
         let mut app = axum::Router::new()
             .route("/not-json", axum::routing::get(|| async { "plain words" }))
+            .route("/vendor", vendor)
             .route(
                 "/accepted",
                 axum::routing::get(|| async {
@@ -1961,14 +2348,11 @@ mod tests {
             let base = base.clone();
             let limits = limits.clone();
             async move {
-                let file = FileAnswer {
-                    declaration: FileDeclaration::declared(&json!({"pointer": pointer, "encoding": encoding})).unwrap(),
-                    status: SuccessStatus::Any,
-                };
+                let files = declared_on(SuccessStatus::Any, "application/json", pointer, encoding);
                 let result = call(
                     &base,
                     &metadata(path),
-                    Some(&file),
+                    Some(&files),
                     &json!({}),
                     &HeaderMap::new(),
                     &limits,
@@ -2038,10 +2422,7 @@ mod tests {
                 .unwrap()
                 .contains("no access to this file")
         );
-        let declared_on_200 = FileAnswer {
-            declaration: FileDeclaration::declared(&json!({"pointer": "/data", "encoding": "base64url"})).unwrap(),
-            status: SuccessStatus::Exact(200),
-        };
+        let declared_on_200 = declared_on(SuccessStatus::Exact(200), "application/json", "/data", "base64url");
         let accepted = call(
             &base,
             &metadata("/accepted"),
@@ -2060,6 +2441,72 @@ mod tests {
         assert_eq!(
             accepted["content"][0]["type"], "text",
             "a success answer the file was not declared on is answered as its JSON: {accepted}"
+        );
+        let declarations = json!({"paths": {
+            "/vendor": {"get": {"responses": {"200": {"description": "OK", "content": {
+                "application/json": {FILE_EXTENSION: {"pointer": "/data", "encoding": "base64url"}},
+                "application/vnd.example+json": {FILE_EXTENSION: {"pointer": "/file/content", "encoding": "base64"}}
+            }}}}},
+            "/padded": {"get": {"responses": {"200": {"description": "OK", "content": {
+                "application/json": {"schema": {"type": "object"}},
+                "application/vnd.example+json": {FILE_EXTENSION: {"pointer": "/file/content", "encoding": "base64"}}
+            }}}}}
+        }});
+        let two_media_types = file_answers(&declarations, &metadata("/vendor"))
+            .unwrap()
+            .expect("both media types declare a file");
+        let vendor = call(
+            &base,
+            &metadata("/vendor"),
+            Some(&two_media_types),
+            &json!({}),
+            &HeaderMap::new(),
+            &limits,
+            "application/json",
+            Some(base.as_str()),
+            None,
+        )
+        .await
+        .unwrap();
+        let vendor = serde_json::to_value(vendor).unwrap();
+        assert_eq!(vendor["isError"], false, "{vendor}");
+        assert_eq!(vendor["content"][0]["type"], "resource", "{vendor}");
+        let blob = base64::engine::general_purpose::STANDARD
+            .decode(
+                vendor["content"][0]["resource"]["blob"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(blob, FILE, "the media type the API answered picked its own declaration");
+        let schema_only = file_answers(&declarations, &metadata("/padded"))
+            .unwrap()
+            .expect("the vendor media type declares a file");
+        let plain_json = call(
+            &base,
+            &metadata("/padded"),
+            Some(&schema_only),
+            &json!({}),
+            &HeaderMap::new(),
+            &limits,
+            "application/json",
+            Some(base.as_str()),
+            None,
+        )
+        .await
+        .unwrap();
+        let plain_json = serde_json::to_value(plain_json).unwrap();
+        assert_eq!(plain_json["isError"], false, "{plain_json}");
+        assert_eq!(
+            plain_json["content"][0]["type"], "text",
+            "a media type the answer declares without a file is answered as its JSON: {plain_json}"
+        );
+        assert!(
+            plain_json["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(&padded),
+            "{plain_json}"
         );
         tasks.shutdown().await;
     }
@@ -2293,15 +2740,12 @@ mod tests {
         let destination = Url::parse(&origin)
             .unwrap()
             .origin();
-        let file = FileAnswer {
-            declaration: FileDeclaration::declared(&json!({"pointer": "/data", "encoding": "base64url"})).unwrap(),
-            status: SuccessStatus::Exact(200),
-        };
+        let files = declared_on(SuccessStatus::Exact(200), "application/json", "/data", "base64url");
         let progress = crate::mcp_proxies::handlers::TransitCallProgress::default();
         let answer = call_through_transit_point(
             &origin,
             &metadata("/files"),
-            Some(&file),
+            Some(&files),
             &json!({}),
             &HeaderMap::new(),
             &McpHttpConfig::default(),

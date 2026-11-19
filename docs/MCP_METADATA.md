@@ -565,24 +565,47 @@ bounds the whole JSON-RPC response by it, base64 included, so an image or file
 larger than about three quarters of the limit is refused there as "MCP tool
 result exceeds the configured limit"; a legacy call has no such second bound.
 A REST API that answers a file inside its JSON, as a base64 string, declares
-it with `x-gateway-file` on the JSON media type of a success answer of the
+it with `x-gateway-file` on a JSON media type of a success answer of the
 operation: `{"pointer": "/data", "encoding": "base64url"}`, where `pointer` is
 the JSON Pointer (RFC 6901, starting with `/`, at most 256 characters) of the
 string and `encoding` is `base64` or `base64url`, padded or not. The
 declaration stands on its own: it is read whether or not that media type also
-has a `schema`, which OpenAPI leaves optional, and on any success answer
-(`200`, any other `2xx`, `2XX` or `default`), not only the one the output
-schema is taken from. The answer it is declared on is then the decoded file as
-an embedded resource (`mimeType` `application/octet-stream`, `uri` as above),
+has a `schema`, which OpenAPI leaves optional, on any success answer (`200`,
+any other `2xx`, `2XX` or `default`), and on any of that answer's JSON media
+types (`application/json`, `application/ld+json`, `application/vnd.api+json`
+and any other subtype ending in `+json`), not only the answer and the media
+type the output schema is taken from. The answer it is declared on is then the
+decoded file as an embedded resource (`mimeType` `application/octet-stream`, `uri` as above),
 never the JSON around it, and the tool advertises no output schema; that
 answer when it is not JSON, has no string at the pointer or a string not in
 that encoding is the tool error "REST response does not carry the file its
-tool declares". Another answer is answered as it would be without the
-declaration: a success status the file was not declared on is its JSON, and a
-failure status is answered as usual. A declaration with another key, another
-encoding or no pointer, on any success answer, drops the tool from
-`tools/list` and refuses a call to it, as an unusable output schema does. The
-gateway's own REST client reads it, so it applies to 2026-07-28 calls, calls
+tool declares". One success answer governs each answered status: the most
+specific one that declares a JSON media type for it, the exact status before
+`2XX` and `2XX` before `default`, and only that answer's declarations decide
+what it carries. Where that answer lists several JSON media types, the
+`Content-Type` the REST API answered picks which declaration the answer
+carries, parameters ignored on both sides (`application/json; charset=utf-8`
+is declared and answered as `application/json`): the file declared on that
+media type, or no file at all when that answer declares that media type
+without one, so such an answer is its JSON. An answer whose media type is not
+one of the JSON media types that answer declares, or that names none at all,
+carries the first file that answer declares, taken in the order
+`application/json`, `application/ld+json`, `application/vnd.api+json`, then
+its other `+json` media types. Each media type may name its own pointer and
+encoding, but every one of them must carry the same file of one response: the
+`Content-Type` that picks between them is the REST API's own, so a backend
+that answers another of the declared media types, or one that answer does not
+declare, has the gateway read the field that declaration names instead.
+The declaration a call decoded its answer with is logged at `debug` level,
+with the status and the media type it was declared on. Another
+answer is answered as it would be without the declaration: a success status
+the file was not declared on is its JSON, and a failure status is answered as
+usual. A declaration with another key, another
+encoding or no pointer, on any JSON media type of any success answer, drops
+the tool from `tools/list` and refuses a call to it on every path, a legacy
+call without the Target credential included, as an unusable output schema
+does. A well-formed declaration is read by the
+gateway's own REST client, so a file arrives decoded on 2026-07-28 calls, calls
 carrying the Target credential and Transit Point calls; a legacy call without
 the Target credential answers the JSON.
 Argument failures are `400` / `-32602` before network execution;
