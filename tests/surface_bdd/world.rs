@@ -124,6 +124,7 @@ pub struct SurfaceWorld {
     /// The mock trust agent a scenario about the control key rotation configures the gateway against.
     pub trust_agent: Option<crate::bdd_support::trust_agent::MockTrustAgent>,
     pub custom_trust_agent: Option<crate::bdd_support::custom_trust_agent::CustomTrustAgent>,
+    pub signing_trust_agent: Option<crate::bdd_support::signing_trust_agent::SigningTrustAgent>,
     pub admin_response: Option<RecordedResponse>,
     /// The delegation audit trail as last read through the admin API.
     pub delegation_audit_trail: Option<RecordedResponse>,
@@ -234,6 +235,7 @@ impl SurfaceWorld {
             issuers: HashMap::new(),
             trust_agent: None,
             custom_trust_agent: None,
+            signing_trust_agent: None,
             admin_response: None,
             delegation_audit_trail: None,
             surface_lookup_response: None,

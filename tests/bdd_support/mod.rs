@@ -22,6 +22,7 @@ pub mod passkey;
 pub mod policies;
 pub mod redis_stream;
 pub mod sign_in_events;
+pub mod signing_trust_agent;
 pub mod sse_client;
 pub mod tags;
 pub mod temp;

@@ -33,4 +33,5 @@ pub mod trust_agent_connection_key_rotation;
 pub mod trust_agent_context_did;
 pub mod trust_agent_control_key_rotation;
 pub mod trust_agent_signing;
+pub mod trust_agent_signing_results;
 pub mod when;
