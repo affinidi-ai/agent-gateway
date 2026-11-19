@@ -41,6 +41,28 @@ changes:
         changes first while it is disabled. Default templates ship with the dashboard; no
         gateway API changes.
   changed:
+    - timestamp: '2026-11-19T10:00:00Z'
+      title: Show only templates for the policy's Type, with fewer labels
+      description: >-
+        Define Gateway Policy now lists only templates for gateways, and Define Agent Surface
+        Policy only templates for surfaces. The Start from gallery drops its search, category
+        filters, Whole policy or Adds rules labels and Default ALLOW or DENY badges, so picking
+        a template is quicker. A template for surfaces only carries a small muted note instead
+        of a yellow badge.
+    - timestamp: '2026-11-19T12:00:00Z'
+      title: Start a policy from a template or with Create custom policy
+      description: >-
+        The Start from gallery lists the templates first and has a Create custom policy button
+        under the list in place of the Allow all (blank) card, so users either pick a template
+        or write their own. It starts the custom policy at once, and asks first only when it
+        would replace rules or edits already in the policy. The Create button stays hidden
+        until a template is used or a custom policy is created.
+    - timestamp: '2026-11-19T14:00:00Z'
+      title: Lock a new policy's Type to the Define button that opened it
+      description: >-
+        Define Gateway Policy and Define Agent Surface Policy set the new policy's Type, and
+        the Type select is now locked on the create page, as it already was once a policy is
+        saved, so a policy can't drift to a Type its templates were not written for.
     - timestamp: '2026-11-18T22:00:00Z'
       title: Show the policy editor read-only to users who can't edit policies
       description: >-

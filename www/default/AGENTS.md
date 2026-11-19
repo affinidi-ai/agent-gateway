@@ -1762,7 +1762,9 @@ separated by a rule:
 
 - **Start from** (create only): `TemplateGallery` (`policy-template-gallery`), described under
   _Policy templates_. For users with `policies.edit` the create form shows only this section
-  until a template, Allow all included, is used; Details and Policy then appear.
+  until a template is used or a custom policy created; Details and Policy then appear. Until
+  then the header has no **Create** button (`policy-definition-editor-save-button`) and
+  Cmd/Ctrl+S saves nothing.
 - **Details** (`PolicyDetailsSection`, `policy-details-section`): Name full width, then
   Description full width as a two-row textarea, then Type and Status (an **Enabled** switch,
   `policy-definition-enabled-switch`) side by side, every label `font-weight-bold d-block mb-1`
@@ -1875,10 +1877,11 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   `templateRole` (`regoTemplate.ts`) gives every template one role: `policy` (a **Whole
   policy**) for a standalone template, an MCP tool template, or one with no rules left once its
   `default allow` line is dropped; `rules` (**Adds rules**) otherwise. A whole policy is used
-  only from Start from; only templates that add rules are listed under Add rules. Each card,
-  gallery detail, column row and preview shows the role badge
+  only from Start from; only templates that add rules are listed under Add rules. Each column
+  row and preview under Add rules shows the role badge
   (`policy-template-role-badge`: "Whole policy" with `fa-file-shield`, "Adds rules" with
-  `fa-list-check`), and Allow all (blank) is a whole policy. Allow listed
+  `fa-list-check`); Start from cards and their detail show no role or default decision badge.
+  A custom policy is a whole policy. Allow listed
   paths denies a path that contains `..`, `%2e`, a backslash or `%5c`.
   `builtinPolicyTemplates.test.ts` checks every entry renders under its package. The catalogue
   holds the starter templates of the template library except rate controls, which are set on
@@ -1892,27 +1895,32 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   template's body, so a template saved from a combined policy never nests groups.
 - **Start from gallery** (create only, `policies.edit`): `TemplateGallery` is the only place a
   policy starts from a template. A new policy has no card selected and shows only Start from:
-  Details and Policy appear once a template or Allow all is used (`templatePicked` in
+  Details and Policy appear once a template is used or a custom policy created (`templatePicked` in
   `usePolicyTemplateActions`, `true` on a saved policy and a restored draft; the Undo of the
-  first Use sets it back, which hides them and reopens the gallery). A Type change never hides
-  them. Until then the form's Rego is `DEFAULT_POLICY` (`policyDefaults.ts`,
+  first Use sets it back, which hides them and reopens the gallery). Until then the form's Rego is `DEFAULT_POLICY` (`policyDefaults.ts`,
   `default allow := false`). The
-  grid of cards in the `.policy-template-row` style (`policy-template-card-blank`,
-  `policy-template-card-<key>`, with `is-selected` and `aria-pressed`) holds **Allow all
-  (blank)** first, whose Rego is `ALLOW_ALL_POLICY` (summary "Every request is allowed. Start
-  here only to write your own Rego.", category Baseline), then one card per default and
-  organization template of either Type (`useAllPolicyTemplates` groups a default template's
-  variants under its catalogue id), each with its summary, default decision and category
-  ("Organization template" for one saved from a policy). A
-  template with no variant for the selected Type shows "Agent Surface only" or "Gateway only"
-  (`policy-template-card-type-badge`). A search (`policy-template-gallery-search-input`) and
-  category chips (`filter-chip-<key>`, `filter-chip-all` for All, inside
-  `policy-template-gallery-categories`) share `TemplateFilterBar` and `useTemplateFilter` with
-  the templates column; Allow all shows only while nothing filters, and while anything filters
-  "N of M templates match." with **Clear filters** shows under the grid
-  (`policy-template-gallery-match-count`, `policy-template-gallery-clear-filters`). Six
+  grid of cards in the `.policy-template-row` style (`policy-template-card-<key>`, with
+  `is-selected` and `aria-pressed`) holds one card per default and
+  organization template with a variant for the policy's Type (`useAllPolicyTemplates` groups a
+  default template's variants under its catalogue id; `galleryTemplates` keeps only the
+  policy's Type), so **Define Gateway Policy** (`?type=gateway`) lists only templates for
+  gateways and **Define Agent Surface Policy** (`?type=agent_surface`) only templates for
+  surfaces. Each card shows its summary and category
+  ("Organization template" for one saved from a policy), **This tab only** and **MCP tool
+  policy** where they apply, and no role or default decision badge. On an Agent Surface policy
+  a template with no Gateway variant (`surfaceOnlyKeys`) has a muted "Agent surface only" note
+  at the card's end (`policy-template-card-scope`, `.policy-template-card__scope`, `0.75rem`
+  in `--muted-text`), never a `Badge`. The gallery has no search or category filters. Six
   templates show until **Show all (N)** (`policy-template-gallery-show-all`, an
-  `outline-secondary` button). The help text above the grid points to
+  `outline-secondary` button). Under the list, after a top border, "None of these fit?" and
+  **Create custom policy** (`policy-template-gallery-create-custom-button`, `outline-primary`
+  with `fa-plus`, `aria-pressed` while its detail is shown; `.policy-template-gallery__custom`)
+  follow the Trust Registry pattern: pick a template, or create a custom one. It calls
+  `pickBlank` (Rego `ALLOW_ALL_POLICY`, used template `blank`, named "Custom policy") at once,
+  unless a template was used and the Rego is no longer an untouched start (`replaceText` in
+  `TemplateGalleryDetail.tsx` is not null): then it selects `blank`, and the templates column
+  shows the Custom policy detail, whose **Create custom policy** asks in place before it
+  replaces anything. The help text above the grid points to
   **Add rules from a template** by name, not by where the column sits, since the column stacks
   under the editor below `xl`. The page holds the gallery's open state and selected card, and
   while the gallery is open the templates column shows `TemplateGalleryDetail`
@@ -1921,11 +1929,11 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   does, then use it." (`policy-template-gallery-detail-empty`, the
   `.policy-templates-panel__placeholder` style). Choosing a card selects it, shows its detail
   there (`policy-template-gallery-detail`) and moves focus to the detail's heading
-  (`policy-template-gallery-detail-heading`, `tabIndex={-1}`); a search or category that hides
-  the selected card leaves its detail shown. Allow all's detail has its description,
-  **Show Rego** with `ALLOW_ALL_POLICY` and Use. A template's detail is built from
-  `TemplatePreview.tsx` like the column's preview: description, default decision, a note when
-  using it sets the Type, setting fields (`policy-template-gallery-param-<key>`), **Show Rego**
+  (`policy-template-gallery-detail-heading`, `tabIndex={-1}`); Change with no card selected
+  focuses the first card. The Custom policy detail has its description,
+  **Show Rego** with `ALLOW_ALL_POLICY` and **Create custom policy** in place of Use. A template's detail is built from
+  `TemplatePreview.tsx` like the column's preview: description, **This tab only** on an
+  organization template, setting fields (`policy-template-gallery-param-<key>`), **Show Rego**
   (`policy-template-gallery-show-rego`, collapsed by default), which shows the Rego the current
   settings render to in a `policy-preview-block` (`policy-template-gallery-rego`), or "Fix the
   settings above to see the Rego." while a setting is invalid, **How it
@@ -1934,11 +1942,10 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   `.policy-template-example-input`), the docs link
   (`policy-template-gallery-docs-link`) and **Use this template**
   (`policy-template-gallery-use-button`), disabled while a setting is invalid. Nothing fills
-  the form until Use, which fills Name, Description, Type and Rego with the settings shown and
-  offers Undo (the toast names a Type change), which restores those four fields and the used
-  template. The page keeps
+  the form until Use, which fills Name, Description and Rego with the settings shown and
+  offers Undo, which restores those fields and the used template. The page keeps
   the used template, `usedTemplate: {id, fieldText} | null` in `usePolicyTemplateActions`, which
-  only Use and Allow all set (`blank` for Allow all); everything else is derived from it and the
+  only Use and Create custom policy set (`blank` for a custom policy); everything else is derived from it and the
   Rego. Using the used template again keeps a Name and Description already in the form; using
   any other card, Deny by default included, fills them. The gallery then collapses to one line
   (`policy-template-gallery-summary`) and the templates column goes back to Add rules. `policyStart` (`policyStart.ts`), computed once by the
@@ -1946,26 +1953,25 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   each template group in it holds exactly the lines Add to policy wrote (`addedRules` in
   `usePolicyTemplateActions`, `{name, body}` per Add, restored by Undo with the rest) and the
   Rego with those groups taken out equals what the start renders to: the used template with
-  its settings, `ALLOW_ALL_POLICY` for Allow all, or `DEFAULT_POLICY` (Deny by default) when no
+  its settings, `ALLOW_ALL_POLICY` for a custom policy, or `DEFAULT_POLICY` (Deny by default) when no
   template was used. While it does it says
   "Started from <name> · Pre-filled from the template. Edit freely."
-  (`policy-definition-prefilled-hint`, not for Allow all) or, once rules were added, "Started
+  (`policy-definition-prefilled-hint`, not for a custom policy) or, once rules were added, "Started
   from <name> · N templates added" (`policy-template-gallery-added-count`, N counting the
   template groups in the Rego). It says "Custom Rego" once the Rego no longer follows the
-  start: a hand edit anywhere, inside an added group too, a rule of the start removed, or a
-  Type change the template doesn't serve. A template
+  start: a hand edit anywhere, inside an added group too, or a rule of the start removed. A template
   whose `package` line or imports `insertTemplateRules` adds to the start's own lines also
   counts as a change; no default template has either.
-  Undo of Use, Allow all, Add rules, Remove, Remove rule and Deny by default restores the Rego
+  Undo of Use, Create custom policy, Add rules, Remove, Remove rule and Deny by default restores the Rego
   and the used template together. Only the latest action can be undone, and its Undo drops
   edits made since, so each toast ends "Undo restores the Rego from before this change." (Use:
-  "the form", since Use's Undo restores Name, Description, Type and Rego). Use, of a template or Allow all, moves focus to **Change**
+  "the form", since Use's Undo restores Name, Description, Type and Rego). Use of a template, or Create custom policy, moves focus to **Change**
   (`policy-template-gallery-change-button`), which reopens
   it with the used card selected and its settings as they were used, also after a hand edit,
-  and moves focus to the selected card, or to the search when no shown card is selected. Use
+  and moves focus to the selected card, or to the first card when none is selected. Use
   there replaces the Rego, and **Cancel** beside the title
   (`policy-template-gallery-cancel-button`, shown only once a template was used) collapses the
-  gallery without using another, which brings back Add rules. Use (of a template or Allow all)
+  gallery without using another, which brings back Add rules. Use (of a template or a custom policy)
   replaces at once before any template was used (`templatePicked` false, so also while the
   templates are still loading) and while the Rego is an untouched start (`policyStart` is not
   null and counts no added templates); otherwise its
@@ -1982,11 +1988,9 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   (`restoreOnlyOnUndo` on the `useDiscardWithUndo` snapshot, which Undo marks with
   `{ discardUndo: true }` navigation state); opened any other way it drops the draft and starts
   fresh, with no template selected.
-  Changing Type keeps the Rego, whose
-  package line the Type select rewrites, and keeps a template that serves both Types used,
-  with its settings. A used default template with no variant for the new Type gets a warning
-  toast naming it, since its rules sit in Your rules; added template groups are marked in the
-  Rules view instead (below).
+  The Type is set by the Define button that opened the page (`?type=`) and can't be changed:
+  `policy-definition-type-select` is disabled on create, with "Set by Define <Type> Policy.
+  It can't be changed.", as on a saved policy.
 - **Templates column** (`PolicyTemplatesPanel`, `policy-templates-panel`): for users with
   `policies.edit` the page always has two columns, the editor card (`col-xl-8`) and a templates
   column (`col-xl-4`, `policy-templates-column`, sticky from `xl` below the top bar), so the
@@ -2003,7 +2007,7 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   left out: 2 are whole policies, 14 are for Agent Surface policies.", then "Pick a whole
   policy under Start from." on the create form or "Whole policies are offered only when
   creating a policy." on a saved one while any whole policy is left out), and
-  starts over, with no template chosen, when Type changes. Its body opens with "Adds rules to the
+  its body opens with "Adds rules to the
   end of this policy." It has **Default templates (N)** and **Organization templates (N)** tabs
   (`policy-templates-tab-builtin`, `-organization`), a search
   (`policy-templates-search-input`), category chips shown when a tab holds more than one
@@ -2080,8 +2084,8 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   (`policy-rules-or-note`). A policy that allows
   by default and has allow rules shows a warning `InfoBanner` (`policy-rules-allow-default-warning`) with
   **Deny by default** (`policy-rules-set-default-deny-button`), which sets `default allow` to
-  false and drops a `# Allow all traffic by default` comment directly above it, the one Allow
-  all and policies created before templates carry. Under that banner each group with allow
+  false and drops a `# Allow all traffic by default` comment directly above it, the one a custom
+  policy and policies created before templates carry. Under that banner each group with allow
   rules, Your rules included, carries an amber line "No effect while the default is ALLOW."
   (`policy-rules-group-<n>-no-effect`), which doesn't block saving. On the create form a
   template group whose template has no variant for the current Type (`groupsForOtherType` in

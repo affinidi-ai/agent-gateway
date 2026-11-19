@@ -60,14 +60,17 @@ export function groupTemplateEntries(templates: PolicyTemplate[]): TemplateEntry
   return Array.from(entries.values());
 }
 
-/** One template per entry, as the gallery shows it: the variant for the Type, or its only one. */
+/** The gallery's templates for a Type: each entry's variant for it, skipping entries without one. */
 export function galleryTemplates(
   entries: TemplateEntry[],
   policyType: PolicyType
 ): PolicyTemplate[] {
-  return entries
-    .map(e => e.variants[policyType] ?? e.variants.gateway ?? e.variants.agent_surface)
-    .filter((t): t is PolicyTemplate => !!t);
+  return entries.map(e => e.variants[policyType]).filter((t): t is PolicyTemplate => !!t);
+}
+
+/** Keys of the entries that serve Agent Surface policies only. */
+export function surfaceOnlyKeys(entries: TemplateEntry[]): Set<string> {
+  return new Set(entries.filter(e => !e.variants.gateway).map(e => e.key));
 }
 
 /** Templates of every policy type, grouped into entries, built-in in catalogue order first. */

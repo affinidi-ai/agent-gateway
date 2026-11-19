@@ -9,10 +9,10 @@ import { renderWithText } from './TemplatePreview';
 import type { PolicyTemplate, PolicyType } from './types';
 import type { AddedRules, UsedTemplate } from './usePolicyTemplateActions';
 
-export const ALLOW_ALL_NAME = 'Allow all (blank)';
+export const CUSTOM_POLICY_NAME = 'Custom policy';
 
 export interface PolicyStart {
-  /** The template the policy started from, or Allow all (blank). */
+  /** The template the policy started from, or a custom policy. */
   name: string;
   /** Template groups added to the Rego since. */
   templatesAdded: number;
@@ -70,7 +70,7 @@ export function policyStart(
 
   let start: { name: string; rego: string | null } | null;
   if (usedTemplate?.id === BLANK_TEMPLATE_ID) {
-    start = { name: ALLOW_ALL_NAME, rego: ALLOW_ALL_POLICY[policyType] };
+    start = { name: CUSTOM_POLICY_NAME, rego: ALLOW_ALL_POLICY[policyType] };
   } else {
     const id = usedTemplate?.id ?? `${DEFAULT_TEMPLATE_KEY}:${policyType}`;
     const template = templates.find(t => t.id === id);

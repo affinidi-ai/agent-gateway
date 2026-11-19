@@ -1,16 +1,9 @@
 import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { AppButton } from '../../../components/shared/AppButton';
-import { Badge } from '../../../components/shared/Badge';
 import { ALLOW_ALL_POLICY, BLANK_TEMPLATE_ID } from './policyDefaults';
-import { ALLOW_ALL_NAME, type PolicyStart } from './policyStart';
+import { CUSTOM_POLICY_NAME, type PolicyStart } from './policyStart';
 import { parsePolicyRules } from './regoRules';
-import { defaultDecision } from './regoTemplate';
-import {
-  DecisionBadge,
-  RoleBadge,
-  TemplateOriginBadges,
-  TemplateRoleBadge,
-} from './TemplateBadges';
+import { TemplateOriginBadges } from './TemplateBadges';
 import {
   TemplateDocsLink,
   TemplateHowItDecides,
@@ -19,7 +12,7 @@ import {
   type FieldText,
 } from './TemplatePreview';
 import type { UsedTemplate } from './usePolicyTemplateActions';
-import { POLICY_TYPE_NAMES, type PolicyTemplate, type PolicyType } from './types';
+import type { PolicyTemplate, PolicyType } from './types';
 import './PolicyTemplates.css';
 
 const ID_PREFIX = 'policy-template-gallery';
@@ -70,7 +63,7 @@ const ShowRego: React.FC<{ rego: string | null }> = ({ rego }) => {
 /**
  * What Use replaces, or null while the Rego is an untouched start, which Use replaces at once.
  */
-function replaceText(policy: string, start: PolicyStart | null): string | null {
+export function replaceText(policy: string, start: PolicyStart | null): string | null {
   if (start && start.templatesAdded === 0) return null;
   const parsed = parsePolicyRules(policy);
   const rules = parsed.ok ? parsed.groups.reduce((n, g) => n + g.rules.length, 0) : 0;
@@ -86,8 +79,9 @@ function replaceText(policy: string, start: PolicyStart | null): string | null {
 const UseTemplateButton: React.FC<{
   replaces: string | null;
   disabled?: boolean;
+  label?: string;
   onUse: () => void;
-}> = ({ replaces, disabled, onUse }) => {
+}> = ({ replaces, disabled, label = 'Use this template', onUse }) => {
   const [confirming, setConfirming] = useState(false);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
@@ -108,7 +102,7 @@ const UseTemplateButton: React.FC<{
           onClick={() => (replaces ? setConfirming(true) : onUse())}
           data-testid="policy-template-gallery-use-button"
         >
-          Use this template
+          {label}
         </AppButton>
       </div>
       {replaces && confirming && (
@@ -146,28 +140,21 @@ const UseTemplateButton: React.FC<{
 /** A template's detail: settings, its Rego, how it decides, docs and Use this template. */
 const GalleryDetail: React.FC<{
   template: PolicyTemplate;
-  policyType: PolicyType;
   initialText?: FieldText;
   headingRef: React.Ref<HTMLHeadingElement>;
   replaces: string | null;
   onUse: (template: PolicyTemplate, rego: string, fieldText: FieldText) => void;
-}> = ({ template, policyType, initialText, headingRef, replaces, onUse }) => {
+}> = ({ template, initialText, headingRef, replaces, onUse }) => {
   const settings = useTemplateSettings(template, initialText);
   return (
     <div data-testid="policy-template-gallery-detail">
       <DetailHeading ref={headingRef}>{template.name}</DetailHeading>
       <p className="text-muted small mb-2">{template.description}</p>
-      <div className="d-flex flex-wrap gap-2 mb-3">
-        <TemplateRoleBadge template={template} />
-        <DecisionBadge decision={defaultDecision(template.rego)} />
-        <TemplateOriginBadges template={template} />
-        {template.policy_type !== policyType && (
-          <Badge
-            tone="warning"
-            value={`Using it sets Type to ${POLICY_TYPE_NAMES[template.policy_type].label}`}
-          />
-        )}
-      </div>
+      {!template.builtin && (
+        <div className="d-flex flex-wrap gap-2 mb-3">
+          <TemplateOriginBadges template={template} />
+        </div>
+      )}
       <TemplateSettingsFields template={template} settings={settings} idPrefix={ID_PREFIX} />
       <ShowRego rego={settings.rendered.rego} />
       <TemplateHowItDecides template={template} idPrefix={ID_PREFIX} />
@@ -237,23 +224,22 @@ const TemplateGalleryDetail: React.FC<TemplateGalleryDetailProps> = ({
       <div className="card-body">
         {selectedKey === BLANK_TEMPLATE_ID ? (
           <div data-testid="policy-template-gallery-detail">
-            <DetailHeading ref={headingRef}>{ALLOW_ALL_NAME}</DetailHeading>
-            <div className="d-flex flex-wrap gap-2 mb-2">
-              <RoleBadge role="policy" />
-              <DecisionBadge decision="allow" />
-            </div>
+            <DetailHeading ref={headingRef}>{CUSTOM_POLICY_NAME}</DetailHeading>
             <p className="text-muted small mb-3">
-              The default allow-all policy. Every request is allowed until you add rules and change{' '}
-              <code>default allow</code> to <code>false</code>.
+              Write your own rules. It starts from the allow-all policy: every request is allowed
+              until you add rules and change <code>default allow</code> to <code>false</code>.
             </p>
             <ShowRego rego={ALLOW_ALL_POLICY[policyType]} />
-            <UseTemplateButton replaces={replaces} onUse={onPickBlank} />
+            <UseTemplateButton
+              replaces={replaces}
+              label="Create custom policy"
+              onUse={onPickBlank}
+            />
           </div>
         ) : selected ? (
           <GalleryDetail
             key={selected.id}
             template={selected}
-            policyType={policyType}
             initialText={usedTemplate?.id === selected.id ? usedTemplate.fieldText : undefined}
             headingRef={headingRef}
             replaces={replaces}

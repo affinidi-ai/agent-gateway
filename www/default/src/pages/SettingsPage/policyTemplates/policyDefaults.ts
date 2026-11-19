@@ -20,7 +20,7 @@ export const DEFAULT_POLICY: Record<PolicyType, string> = {
   agent_surface: 'package surface.policy\n\ndefault allow := false\n',
 };
 
-/** The Allow all (blank) starting point. */
+/** The starting point of a custom policy. */
 export const ALLOW_ALL_POLICY: Record<PolicyType, string> = {
   gateway: `package gateway.policy
 

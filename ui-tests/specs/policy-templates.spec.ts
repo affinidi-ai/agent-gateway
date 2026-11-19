@@ -98,6 +98,31 @@ test.describe('Policy templates on the create policy page', () => {
         expect(after).not.toBeNull();
         expect(after!.width).toBe(before!.width);
     });
+
+    test('creates a custom policy from the button under the templates', async ({page}) => {
+        await page.getByTestId('policy-template-gallery-create-custom-button').click();
+        await expect(page.getByTestId('policy-template-gallery-summary')).toContainText('Started from Custom policy');
+        await expect(page.getByTestId('policy-editor-section')).toBeVisible();
+    });
+
+    test('marks a template for surfaces only with a note', async ({page}) => {
+        await pickCard(page, 'require-trust-registry-recognition');
+        await expect(
+            page.getByTestId('policy-template-card-require-trust-registry-recognition')
+                .getByTestId('policy-template-card-scope')
+        ).toHaveText('Agent surface only');
+    });
+});
+
+test.describe('Policy templates on a new Gateway policy', () => {
+    test('lists only templates for gateways, with no filters', async ({page}) => {
+        await page.goto(`${BASE_URL}/policy-definitions/new?type=gateway`);
+        await expect(page.getByTestId('policy-template-card-deny-by-default')).toBeVisible();
+        await expect(page.getByTestId('policy-template-card-require-trust-registry-recognition')).toHaveCount(0);
+        await expect(page.getByTestId('policy-template-card-scope')).toHaveCount(0);
+        await expect(page.getByTestId('policy-template-gallery-search-input')).toHaveCount(0);
+        await captureFullPage(page, 'policy-templates-gateway-start');
+    });
 });
 
 async function deletePolicy(page: Page, policyId: string) {

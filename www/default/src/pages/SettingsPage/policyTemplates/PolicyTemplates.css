@@ -260,6 +260,27 @@ body.dark-theme .policy-rules__rule {
   padding-top: 6px;
 }
 
+.policy-template-gallery__custom {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--gray-200);
+}
+
+body.dark-theme .policy-template-gallery__custom {
+  border-color: var(--dark-border);
+}
+
+.policy-template-card__scope {
+  margin-left: auto;
+  font-size: 0.75rem;
+  color: var(--muted-text);
+}
+
 .policy-template-filters {
   display: flex;
   flex-wrap: wrap;

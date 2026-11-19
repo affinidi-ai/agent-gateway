@@ -3,19 +3,16 @@ import { AppButton } from '../../../components/shared/AppButton';
 import { Badge } from '../../../components/shared/Badge';
 import { BLANK_TEMPLATE_ID } from './policyDefaults';
 import PolicySectionTitle from './PolicySectionTitle';
-import { defaultDecision } from './regoTemplate';
-import { ALLOW_ALL_NAME, type PolicyStart } from './policyStart';
-import {
-  DecisionBadge,
-  RoleBadge,
-  TemplateOriginBadges,
-  TemplateRoleBadge,
-} from './TemplateBadges';
-import TemplateFilterBar from './TemplateFilterBar';
+import type { PolicyStart } from './policyStart';
+import { TemplateOriginBadges } from './TemplateBadges';
 import type { UsedTemplate } from './usePolicyTemplateActions';
-import { galleryTemplates, templateEntryKey, useAllPolicyTemplates } from './usePolicyTemplates';
-import { useTemplateFilter } from './useTemplateFilter';
-import { CATEGORY_LABELS, POLICY_TYPE_NAMES, type PolicyType } from './types';
+import {
+  galleryTemplates,
+  surfaceOnlyKeys,
+  templateEntryKey,
+  useAllPolicyTemplates,
+} from './usePolicyTemplates';
+import { CATEGORY_LABELS, type PolicyType } from './types';
 import './PolicyTemplates.css';
 
 const COLLAPSED_COUNT = 6;
@@ -34,13 +31,15 @@ interface TemplateGalleryProps {
   /** The card whose detail the templates column shows, or null before one is picked. */
   selectedKey: string | null;
   onSelect: (key: string) => void;
+  /** Starts a custom policy from `ALLOW_ALL_POLICY`, asking first when it replaces rules. */
+  onCreateCustom: () => void;
 }
 
 type FocusTarget = 'change' | 'card';
 
 /**
- * The create form's Start from section: Allow all (blank), then one card per built-in and
- * organisation template of either type. Choosing a card shows its detail in the templates
+ * The create form's Start from section: one card per built-in and organisation template of the
+ * policy's Type, then Create custom policy. Choosing a card shows its detail in the templates
  * column (`TemplateGalleryDetail`), where Use this template fills the form.
  */
 const TemplateGallery: React.FC<TemplateGalleryProps> = ({
@@ -53,31 +52,31 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
   onCollapse,
   selectedKey,
   onSelect,
+  onCreateCustom,
 }) => {
   const entries = useAllPolicyTemplates();
-  const all = useMemo(() => galleryTemplates(entries, policyType), [entries, policyType]);
-  const { query, setQuery, category, setCategory, categories, visible } = useTemplateFilter(all);
+  const visible = useMemo(() => galleryTemplates(entries, policyType), [entries, policyType]);
+  const surfaceOnly = useMemo(
+    () => (policyType === 'agent_surface' ? surfaceOnlyKeys(entries) : new Set<string>()),
+    [entries, policyType]
+  );
   const [showAll, setShowAll] = useState(false);
 
-  const filtering = query.trim() !== '' || category !== 'all';
   // The selected template stays in view even when it is past the first few cards.
   const selectedIndex = visible.findIndex(t => templateEntryKey(t) === selectedKey);
   const shown =
-    showAll || filtering || selectedIndex >= COLLAPSED_COUNT
-      ? visible
-      : visible.slice(0, COLLAPSED_COUNT);
+    showAll || selectedIndex >= COLLAPSED_COUNT ? visible : visible.slice(0, COLLAPSED_COUNT);
 
   const changeRef = useRef<HTMLButtonElement>(null);
-  const filtersRef = useRef<HTMLDivElement>(null);
-  const gridRef = useRef<HTMLDivElement>(null);
+  const sectionRef = useRef<HTMLElement>(null);
   const [focusTarget, setFocusTarget] = useState<FocusTarget | null>(null);
   useEffect(() => {
     if (!focusTarget) return;
     if (focusTarget === 'change') changeRef.current?.focus();
     else
       (
-        gridRef.current?.querySelector<HTMLElement>('.is-selected') ??
-        filtersRef.current?.querySelector<HTMLElement>('input')
+        sectionRef.current?.querySelector<HTMLElement>('.is-selected') ??
+        sectionRef.current?.querySelector<HTMLElement>('.policy-template-card')
       )?.focus();
     setFocusTarget(null);
   }, [focusTarget]);
@@ -88,11 +87,6 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
     if (wasExpanded.current && !expanded && usedTemplate) setFocusTarget('change');
     wasExpanded.current = expanded;
   }, [expanded, usedTemplate]);
-
-  const clearFilters = () => {
-    setQuery('');
-    setCategory('all');
-  };
 
   const card = (
     key: string,
@@ -116,7 +110,7 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
   );
 
   return (
-    <section className="policy-section" data-testid="policy-template-gallery">
+    <section className="policy-section" data-testid="policy-template-gallery" ref={sectionRef}>
       <PolicySectionTitle step={step} title="Start from">
         {!expanded && (
           <AppButton
@@ -172,34 +166,11 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
       ) : (
         <>
           <p className="text-muted small mb-2">
-            Pick a template to see its details on the right, then use it to continue. You can add
-            rules from more templates with <strong>Add rules from a template</strong>.
+            Pick a template to see its details on the right, then use it to continue, or create a
+            custom policy. You can add rules from more templates with{' '}
+            <strong>Add rules from a template</strong>.
           </p>
-          <div ref={filtersRef}>
-            <TemplateFilterBar
-              query={query}
-              onQueryChange={setQuery}
-              category={category}
-              onCategoryChange={setCategory}
-              categories={categories}
-              testIdPrefix="policy-template-gallery"
-              className="mb-2"
-            />
-          </div>
-
-          <div className="policy-template-gallery" ref={gridRef}>
-            {!filtering &&
-              card(
-                BLANK_TEMPLATE_ID,
-                ALLOW_ALL_NAME,
-                'Every request is allowed. Start here only to write your own Rego.',
-                <>
-                  <RoleBadge role="policy" />
-                  <DecisionBadge decision="allow" />
-                  <span className="policy-template-row__summary">{CATEGORY_LABELS.baseline}</span>
-                </>,
-                'policy-template-card-blank'
-              )}
+          <div className="policy-template-gallery">
             {shown.map(t => {
               const key = templateEntryKey(t);
               return card(
@@ -207,43 +178,26 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
                 t.name,
                 t.summary,
                 <>
-                  <TemplateRoleBadge template={t} />
-                  <DecisionBadge decision={defaultDecision(t.rego)} />
                   <TemplateOriginBadges template={t} />
-                  {t.policy_type !== policyType && (
-                    <Badge
-                      tone="warning"
-                      value={`${POLICY_TYPE_NAMES[t.policy_type].name} only`}
-                      data-testid="policy-template-card-type-badge"
-                    />
-                  )}
                   {t.policy_input === 'mcp_tool' && (
                     <Badge tone="secondary" value="MCP tool policy" />
                   )}
                   <span className="policy-template-row__summary">
                     {t.builtin ? CATEGORY_LABELS[t.category] : 'Organization template'}
                   </span>
+                  {surfaceOnly.has(key) && (
+                    <span
+                      className="policy-template-card__scope"
+                      data-testid="policy-template-card-scope"
+                    >
+                      Agent surface only
+                    </span>
+                  )}
                 </>,
                 `policy-template-card-${key}`
               );
             })}
           </div>
-          {filtering && (
-            <div
-              className="text-muted small py-2"
-              data-testid="policy-template-gallery-match-count"
-            >
-              {visible.length} of {all.length} templates match.{' '}
-              <AppButton
-                variant="link"
-                className="p-0 align-baseline"
-                onClick={clearFilters}
-                data-testid="policy-template-gallery-clear-filters"
-              >
-                Clear filters
-              </AppButton>
-            </div>
-          )}
           {shown.length < visible.length && (
             <AppButton
               variant="outline-secondary"
@@ -254,6 +208,19 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
               Show all ({visible.length})
             </AppButton>
           )}
+          <div className="policy-template-gallery__custom">
+            <span className="text-muted small">None of these fit?</span>
+            <AppButton
+              variant="outline-primary"
+              className={selectedKey === BLANK_TEMPLATE_ID ? 'is-selected' : undefined}
+              aria-pressed={selectedKey === BLANK_TEMPLATE_ID}
+              onClick={onCreateCustom}
+              data-testid="policy-template-gallery-create-custom-button"
+            >
+              <i className="fas fa-plus me-1" aria-hidden="true" />
+              Create custom policy
+            </AppButton>
+          </div>
         </>
       )}
     </section>

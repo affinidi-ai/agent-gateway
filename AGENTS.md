@@ -430,11 +430,18 @@ sections built from the shared dashboard components, and are read-only without
 [`www/default/AGENTS.md`](www/default/AGENTS.md#policy-definition-editor). Templates need no
 gateway API and link to their Apply Policies docs section. A new policy shows only the
 **Start from** gallery, with no card selected, until a template is used; Details and the
-Policy section, on the Rules view, appear after that. A gallery card
-(**Allow all (blank)**, then default and organization templates of either Type) shows its
+Policy section, on the Rules view, appear after that. The gallery lists only the default and
+organization templates of the policy's Type, so **Define Gateway Policy** and **Define Agent
+Surface Policy** each start from their own templates, the Type set by that button and never
+changeable, with a **Create custom policy** button
+under the list that starts a custom policy (allow-all Rego) at once, or shows it in the
+templates column first when it would replace rules or edits. It has no search or category
+filters, its cards carry no role or default decision badges, and on an Agent Surface policy a
+template that serves surfaces only has a muted "Agent surface only" note. A gallery card shows its
 settings, How it decides, its Rego and docs link in the templates column, and **Use this template** fills the
-form and sets the Type, asking in place first (focus on Cancel) unless the Rego is an untouched
-start. Every template is labelled **Whole policy** or **Adds rules**. The Policy section's
+form, asking in place first (focus on Cancel) unless the Rego is an untouched
+start. Templates still have a role, **Whole policy** or **Adds rules**, shown under **Add rules
+from a template**. The Policy section's
 **Rules | Rego** toggle lists the rules grouped by
 template, with Remove per group and per rule, disabled while `allow` reads the rule, with a
 reason that names the rule reading it; under Default ALLOW each group with allow rules is marked

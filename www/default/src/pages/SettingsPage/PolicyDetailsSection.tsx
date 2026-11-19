@@ -17,7 +17,6 @@ interface PolicyDetailsSectionProps {
   contentHash?: string;
   onNameChange: (name: string) => void;
   onDescriptionChange: (description: string) => void;
-  onTypeChange: (type: PolicyType) => void;
   onEnabledChange: (enabled: boolean) => void;
 }
 
@@ -54,7 +53,6 @@ const PolicyDetailsSection: React.FC<PolicyDetailsSectionProps> = ({
   contentHash,
   onNameChange,
   onDescriptionChange,
-  onTypeChange,
   onEnabledChange,
 }) => (
   <section className="policy-section" data-testid="policy-details-section">
@@ -116,9 +114,12 @@ const PolicyDetailsSection: React.FC<PolicyDetailsSectionProps> = ({
           id="policy-type-select"
           className="form-control form-control-sm dropdown-styling"
           value={policyType}
-          disabled={!isCreateMode || readOnly}
-          title={!isCreateMode ? "A policy's type is fixed once created." : undefined}
-          onChange={e => onTypeChange(e.target.value as PolicyType)}
+          disabled
+          title={
+            isCreateMode
+              ? `Set by Define ${POLICY_TYPE_NAMES[policyType].name} Policy.`
+              : "A policy's type is fixed once created."
+          }
           data-testid="policy-definition-type-select"
         >
           {(Object.keys(POLICY_TYPE_NAMES) as PolicyType[]).map(type => (
@@ -128,14 +129,10 @@ const PolicyDetailsSection: React.FC<PolicyDetailsSectionProps> = ({
           ))}
         </select>
         <small className="form-text text-muted">
-          {isCreateMode ? (
-            "Where the policy is enforced. It can't be changed after you create it."
-          ) : (
-            <>
-              <i className="fas fa-lock me-1" aria-hidden="true" />A policy&apos;s type is fixed
-              once created.
-            </>
-          )}
+          <i className="fas fa-lock me-1" aria-hidden="true" />
+          {isCreateMode
+            ? `Set by Define ${POLICY_TYPE_NAMES[policyType].name} Policy. It can't be changed.`
+            : "A policy's type is fixed once created."}
         </small>
       </div>
       <div className="col-md-6 mb-3">

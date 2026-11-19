@@ -109,7 +109,7 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
     setUsedTemplate({ id: BLANK_TEMPLATE_ID, fieldText: {} });
     setTemplatePicked(true);
     showUndoToast({
-      message: `Started from Allow all (blank). ${UNDO_REGO}`,
+      message: `Started a custom policy. ${UNDO_REGO}`,
       onUndo: () => {
         setForm(f => ({ ...f, policy: previousPolicy }));
         setUsedTemplate(previousUsed);
@@ -204,7 +204,6 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
     setTemplatePanel,
     togglePanel,
     usedTemplate,
-    setUsedTemplate,
     templatePicked,
     setTemplatePicked,
     insertedTemplate,

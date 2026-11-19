@@ -19,7 +19,7 @@ import PolicyTemplatesPanel from './policyTemplates/PolicyTemplatesPanel';
 import SaveAsTemplatePanel from './policyTemplates/SaveAsTemplatePanel';
 import TemplateExamplesCheck from './policyTemplates/TemplateExamplesCheck';
 import TemplateGallery from './policyTemplates/TemplateGallery';
-import TemplateGalleryDetail from './policyTemplates/TemplateGalleryDetail';
+import TemplateGalleryDetail, { replaceText } from './policyTemplates/TemplateGalleryDetail';
 import { BUILTIN_POLICY_TEMPLATES } from './policyTemplates/builtinPolicyTemplates';
 import { parsePolicyRules } from './policyTemplates/regoRules';
 import { BLANK_TEMPLATE_ID } from './policyTemplates/policyDefaults';
@@ -91,7 +91,6 @@ const EditPolicyDefinitionPage: React.FC = () => {
     setTemplatePanel,
     togglePanel,
     usedTemplate,
-    setUsedTemplate,
     templatePicked,
     setTemplatePicked,
     insertedTemplate,
@@ -181,30 +180,6 @@ const EditPolicyDefinitionPage: React.FC = () => {
     simulateRef.current?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
     simulateRef.current?.querySelector<HTMLTextAreaElement>('textarea')?.focus();
   }, [focusTest]);
-
-  const changeType = (newType: PolicyType) => {
-    const expectedPkg = EXPECTED_PACKAGE[newType];
-    const currentPkg = extractPackage(form.policy);
-    const policy =
-      currentPkg && currentPkg !== expectedPkg
-        ? form.policy.replace(/^(\s*package\s+)[^\s{]+/m, `$1${expectedPkg}`)
-        : form.policy;
-    setForm({ ...form, policy_type: newType, policy });
-    // A used template with a variant for the new Type stays used, with its settings; any other stops.
-    const usedKey = usedTemplate?.id.split(':')[0];
-    const sameTemplate = BUILTIN_POLICY_TEMPLATES.find(t => t.id === `${usedKey}:${newType}`);
-    if (usedTemplate && usedTemplate.id !== BLANK_TEMPLATE_ID) {
-      setUsedTemplate(sameTemplate ? { ...usedTemplate, id: sameTemplate.id } : null);
-    }
-    // Rules a used template wrote sit in Your rules, which has no group mark, so a toast names it.
-    const used = BUILTIN_POLICY_TEMPLATES.find(t => t.id === usedTemplate?.id);
-    if (used && !sameTemplate) {
-      showToast(
-        'warning',
-        `${used.name} is written for ${POLICY_TYPE_NAMES[used.policy_type].name} policies and reads input that ${POLICY_TYPE_NAMES[newType].name} policies don't get. Check its rules before you create the policy.`
-      );
-    }
-  };
 
   const addTemplateRules: typeof insertTemplate = (...args) => {
     insertTemplate(...args);
@@ -371,12 +346,23 @@ const EditPolicyDefinitionPage: React.FC = () => {
     const handler = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 's') {
         e.preventDefault();
-        if (!saving) handleSave();
+        if (!saving && !choosing) handleSave();
       }
     };
     document.addEventListener('keydown', handler);
     return () => document.removeEventListener('keydown', handler);
-  }, [saving, handleSave, canEditPolicies]);
+  }, [saving, handleSave, canEditPolicies, choosing]);
+
+  const startCustom = () => {
+    pickBlank();
+    setView('rules');
+    closeGallery();
+  };
+  // Create custom policy starts at once unless it replaces rules, which its detail asks about.
+  const createCustom = () => {
+    if (templatePicked && replaceText(form.policy, start)) selectGalleryCard(BLANK_TEMPLATE_ID);
+    else startCustom();
+  };
 
   const templatesPanel = (
     <PolicyTemplatesPanel
@@ -403,11 +389,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
       templatePicked={templatePicked}
       usedTemplate={usedTemplate}
       focusKey={focusGalleryDetail}
-      onPickBlank={() => {
-        pickBlank();
-        setView('rules');
-        closeGallery();
-      }}
+      onPickBlank={startCustom}
       onUseTemplate={(template, rego, fieldText) => {
         applyTemplate(template, rego, fieldText);
         setView('rules');
@@ -496,7 +478,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
                     )}
                   </div>
                 )}
-                {canEditPolicies && (
+                {canEditPolicies && !choosing && (
                   <button
                     className={`btn btn-sm btn-primary me-2 ${saving || !policyValid || !!packageMismatch || !!writtenForOtherType ? 'disabled' : ''}`}
                     data-testid="policy-definition-editor-save-button"
@@ -549,6 +531,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
                   onCollapse={templatePicked ? closeGallery : undefined}
                   selectedKey={galleryKey}
                   onSelect={selectGalleryCard}
+                  onCreateCustom={createCustom}
                 />
               )}
 
@@ -567,7 +550,6 @@ const EditPolicyDefinitionPage: React.FC = () => {
                     onNameChange={name => setForm(f => ({ ...f, name }))}
                     onDescriptionChange={description => setForm(f => ({ ...f, description }))}
                     onEnabledChange={enabled => setForm(f => ({ ...f, enabled }))}
-                    onTypeChange={changeType}
                   />
 
                   <PolicyEditorSection

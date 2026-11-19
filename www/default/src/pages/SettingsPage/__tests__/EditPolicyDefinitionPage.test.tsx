@@ -20,7 +20,7 @@ jest.mock('../../../context/PermissionsContext', () => ({
 
 beforeEach(() => window.sessionStorage.clear());
 
-/** Opens the create form and starts from Allow all, which shows the Details and Policy sections. */
+/** Opens the create form and creates a custom policy, which shows the Details and Policy sections. */
 async function renderCreateForm() {
   const view = render(
     <PageTitleProvider>
@@ -32,8 +32,7 @@ async function renderCreateForm() {
     </PageTitleProvider>
   );
   await screen.findByTestId('policy-template-card-deny-by-default');
-  fireEvent.click(screen.getByTestId('policy-template-card-blank'));
-  fireEvent.click(screen.getByTestId('policy-template-gallery-use-button'));
+  fireEvent.click(screen.getByTestId('policy-template-gallery-create-custom-button'));
   return view;
 }
 
