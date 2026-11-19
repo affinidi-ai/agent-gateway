@@ -168,7 +168,7 @@ async fn handle_refusal(
         debug!("TR reader: delivered refusal to waiter (thid {})", thid);
         return;
     }
-    if is_request_thread(thid) {
+    if is_request_thread(thid) || answers_a_request(refusal) {
         warn!(
             thid = ?for_log(thid, 64),
             "TR reader: refusal for '{}' answers a request no longer awaited, ignoring",
@@ -185,6 +185,19 @@ async fn handle_refusal(
         connection.trust_registry_id
     );
     update_status(connection, TrustRegistryConnectionStatus::Failed, store, ws_state).await;
+}
+
+/// Whether a `trust-task-error` names the request it answers, in the
+/// correlators only that form carries. Such a refusal is about that request
+/// and not about this connection, whatever thread it arrived on; only an
+/// unsolicited one says the registry rejected the gateway.
+fn answers_a_request(refusal: Option<&TrustTaskRefusal>) -> bool {
+    refusal.is_some_and(|refusal| {
+        refusal
+            .in_response_to
+            .is_some()
+            || refusal.thread_id.is_some()
+    })
 }
 
 /// Peer-chosen text, capped so one field cannot fill the log; the caller
@@ -207,7 +220,9 @@ fn refusal_reason(
 ) -> (String, String) {
     if let Some(refusal) = refusal {
         return (
-            refusal.code.clone(),
+            refusal
+                .mediator_code()
+                .to_string(),
             refusal
                 .message
                 .clone()
@@ -342,6 +357,24 @@ mod tests {
         .finalize()
     }
 
+    /// The same refusal naming the request it answers, the way only the
+    /// `trust-task-error` form can.
+    fn correlated_trust_task_error(
+        thid: &str,
+        correlator: &str,
+    ) -> DIDCommMessage {
+        let mut message = trust_task_error(thid);
+        if correlator == "threadId" {
+            message.body["threadId"] = serde_json::json!("registry-thread-1");
+        } else {
+            message.body["payload"]["inResponseTo"] = serde_json::json!({
+                "typeUri": "https://trusttasks.org/spec/trust-task/0.6",
+                "id": "urn:uuid:00000000-0000-4000-8000-00000000000a",
+            });
+        }
+        message
+    }
+
     async fn status_of(
         store: &Option<Arc<dyn TrustRegistryStore>>,
         connection: &TrustRegistryConnection,
@@ -417,6 +450,22 @@ mod tests {
         handle_message(trust_task_error(&thid), &connection, &store, &None).await;
 
         assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Connected);
+    }
+
+    #[tokio::test]
+    async fn a_trust_task_error_naming_the_request_it_answers_keeps_the_status() {
+        for correlator in ["threadId", "inResponseTo"] {
+            let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connected).await;
+
+            handle_message(correlated_trust_task_error("registry-thread-1", correlator), &connection, &store, &None)
+                .await;
+
+            assert_eq!(
+                status_of(&store, &connection).await,
+                TrustRegistryConnectionStatus::Connected,
+                "a refusal naming the request it answers by {correlator} is not a rejection of the gateway"
+            );
+        }
     }
 
     #[tokio::test]

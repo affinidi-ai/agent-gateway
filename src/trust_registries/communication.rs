@@ -411,17 +411,26 @@ fn problem_report_error(body: serde_json::Value) -> TrustRegistryError {
     }
 }
 
+/// How much of a refusal's code reaches an error string. The SDK caps a
+/// refusal's `code` and `message` but keeps `details`, which is where
+/// `mediator_code` reads from, exactly as the peer sent it.
+const MAX_REFUSAL_CODE_CHARS: usize = 256;
+
 /// The error a refusal produces when it arrives as the `trust-task-error`
 /// document a mediator from v0.52 sends, rather than as a problem report. The
 /// code is the one the mediator gives the same refusal in a problem report
-/// when it translated it (`details.mediatorCode`), so
-/// [`TrustRegistryError::is_conflict`] answers the same for a refusal in
-/// either form; otherwise it is the Trust Tasks code as it arrived.
+/// (`details.mediatorCode`) when it translated one, so a code
+/// [`TrustRegistryError::is_conflict`] knows is read the same in either form;
+/// otherwise it is the Trust Tasks code as it arrived. A registry answering
+/// with its own [`TR_CONFLICT_CODE`] in the new form would carry no mediator
+/// code and would not be read as a conflict; none sends that form today.
 fn refusal_error(refusal: &TrustTaskRefusal) -> TrustRegistryError {
     TrustRegistryError::ProblemReport(
         refusal
             .mediator_code()
-            .to_string(),
+            .chars()
+            .take(MAX_REFUSAL_CODE_CHARS)
+            .collect(),
         refusal
             .message
             .clone()
@@ -4325,6 +4334,31 @@ mod tests {
             TrustRegistryError::ProblemReport(code, comment) => {
                 assert_eq!(code, TR_CONFLICT_CODE);
                 assert_eq!(comment, "Reference field already exists");
+            }
+            other => panic!("Expected ProblemReport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refusals_code_is_capped_before_it_reaches_an_error_string() {
+        let refusal = TrustTaskRefusal::from_document(&json!({
+            "id": "urn:uuid:00000000-0000-4000-8000-000000000004",
+            "type": "https://trusttasks.org/spec/trust-task-error/0.6",
+            "payload": {
+                "code": "messaging/account/get:unknownAccount",
+                "retryable": false,
+                "details": { "mediatorCode": "e".repeat(10_000) },
+            },
+        }))
+        .expect("a trust-task-error");
+
+        match refusal_error(&refusal) {
+            TrustRegistryError::ProblemReport(code, _) => {
+                assert_eq!(
+                    code.chars().count(),
+                    MAX_REFUSAL_CODE_CHARS,
+                    "the SDK leaves details uncapped, so this path must cap it"
+                );
             }
             other => panic!("Expected ProblemReport, got {other:?}"),
         }

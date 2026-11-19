@@ -14,7 +14,9 @@ changes:
         the query waiting on it, ignored when that query is gone, and otherwise marking the
         registry Failed — and a refusal that answers a query reports its code instead of
         failing to parse. What triggers a rebuild is unchanged, and a registry the mediator
-        rejects is marked Failed as it was before v0.52, which a manual reconnect clears.
+        rejects is marked Failed as it was before v0.52, which a manual reconnect clears, and
+        only a refusal that names no request reaches it. The refusal log line now carries the
+        code and message as fields and no longer says "problem-report".
   removed: []
   security: []
   breaking: []
