@@ -33,12 +33,12 @@ prebuilt binary without `--unit-tests`.
 | --- | --- |
 | `--skip-build` | Use the existing binary instead of building it; a missing one stops the run in preflight |
 | `--binary PATH` | Gateway binary for the modern and legacy phases; the `fabric` target builds its own through Cargo |
-| `--only LIST` | Comma-separated, non-empty subset of `direct,access-point,transit,owned-proxy,proxy-surface,fabric,legacy` |
+| `--only LIST` | Comma-separated, non-empty subset of `direct,access-point,transit,owned-proxy,proxy-surface,fabric,client,legacy` |
 | `--unit-tests` | Run the full binary test suite before the suite; when `--only` selects no modern target the tests do not run and the summary shows a `WARN` line |
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `MCP_CONFORMANCE_PORT_BASE` | `18760` | First local port; the harness uses base+0, +1, +2, +10, +11, +20 and +21 (the `fabric` gateways take free ports) |
+| `MCP_CONFORMANCE_PORT_BASE` | `18760` | First local port; the harness uses base+0, +1, +2, +10, +11, +20, +21, +30 and +31 (the `fabric` gateways and the client adapter take free ports) |
 | `MCP_CONFORMANCE_REFERENCE_REPO` | GitHub `modelcontextprotocol/conformance` | Git URL or mirror holding the pinned reference commit |
 
 Exit codes: `0` pass, `1` failure, `2` invalid options or precondition not met
@@ -89,7 +89,28 @@ not be fetched, `130` interrupted (SIGINT), `143` terminated (SIGTERM).
    whose Target is `fabric://` gateway 2, and a surface on gateway 2 that
    forwards to the shim. A step in the scenario runs the suite against gateway
    1, so the requests cross the Fabric as framed streams.
-5. **Legacy phase.** Starts the same binary on another fresh env and runs
+5. **Client phase** (the `client` target). Runs the suite's `client` command,
+   which starts its own server for each scenario and spawns
+   `client-driver.mjs` with that server's URL. The driver runs the suite's
+   reference client (`everything-client.ts` of the pinned checkout, whose root
+   packages are installed with `npm ci --ignore-scripts`) twice per scenario:
+   straight at the suite's server, and through a gateway it starts on a fresh
+   env whose Target is that server. `client-parity.mjs` requires the same
+   checks with the same statuses both ways, and `tools_call`,
+   `request-metadata`, `sep-2322-client-request-state` and
+   `json-schema-2020-12-preservation` to pass through the gateway. The
+   reference client has no handler for the other four scenarios, so they fail
+   the same way on both sides. Between the reference client and the gateway
+   sits `client-shim.mjs`: the reference client omits the `Mcp-Method` and
+   `Mcp-Name` headers and sometimes the `Accept` list, which the gateway
+   rightly rejects on a modern request, so the adapter adds them to requests
+   that carry `MCP-Protocol-Version` and passes everything else through.
+   Last, `auth/client-credentials-jwt` runs through the gateway only:
+   `client-auth.mjs` follows the suite server's `401` challenge to the token
+   endpoint, writes a credential provider and its secrets into the env and
+   binds the provider to the Target, and the gateway signs the assertion,
+   fetches the token and attaches it.
+6. **Legacy phase.** Starts the same binary on another fresh env and runs
    `compat.mjs rejected` (every endpoint answers the unmodelled `2099-01-01`
    with `-32022` and a `supported` list offering `2024-11-05`) and
    `compat.mjs legacy`. `compat.mjs admitted`, in the modern phase, requires
@@ -110,6 +131,7 @@ gateway starts and exists only in its environment.
 | `owned-proxy` | Standalone MCP Proxy `/owned/api` over the REST fixture | `tools-list`, `tools-call-simple-text`, `caching` | `owned.yaml` |
 | `proxy-surface` | Access Point `/conformance/owned-mcp` with Target `proxy://conformance-owned` | Same subset | `owned.yaml` |
 | `fabric` | Access Point on gateway 1 with Target `fabric://` gateway 2, whose surface forwards to the reference server through the shim | Full requirement set | `fabric.yaml` |
+| `client` | Access Point `/conformance/mcp` of a gateway started per scenario, forwarding to the suite's own server | The eight `2026-07-28` client scenarios that need no authorization, and `auth/client-credentials-jwt` | None: `client-parity.mjs` compares with the direct run |
 | `legacy-surface` | Access Point `/conformance/legacy-mcp` whose stored record deliberately still carries the retired `mcp_protocol_mode: 'legacy'`, which is ignored | `compat.mjs` only | |
 
 Outputs, all under the ignored `target/mcp-conformance/`:
@@ -118,8 +140,27 @@ Outputs, all under the ignored `target/mcp-conformance/`:
 | --- | --- |
 | `run/summary.txt` | One line per step and the overall result |
 | `run/logs/` | Build, npm, gateway, fixture, suite and check logs; `g2g-fabric.log` is the `fabric` target's BDD run |
-| `run/results/<target>/` | The suite's `checks.json` per scenario |
+| `run/results/<target>/` | The suite's `checks.json` per scenario; the `client` target writes `client-direct/` and `client-gateway/` |
 | `env/<modern\|legacy>/` | The generated gateway envs and `targets.json` |
+| `env/client/<scenario>/` | The env and `gateway.log` of the gateway started for one client scenario |
+
+### Reproducing a client scenario by hand
+
+After a run, with the fixtures stopped, one scenario can be run again from the
+repository root. `auth/client-credentials-basic` is the known gap: the gateway
+sends the client secret in the form body, and the scenario requires HTTP Basic.
+
+```sh
+MCP_CONFORMANCE_DRIVER_MODE=gateway \
+MCP_CONFORMANCE_DRIVER_REFERENCE="$PWD/target/mcp-conformance/reference" \
+MCP_CONFORMANCE_DRIVER_BINARY="$PWD/target/debug/agent-gateway" \
+MCP_CONFORMANCE_DRIVER_WORK="$PWD/target/mcp-conformance/env/client" \
+MCP_CONFORMANCE_DRIVER_INBOUND_PORT=18790 MCP_CONFORMANCE_DRIVER_OUTBOUND_PORT=18791 \
+MCP_CONFORMANCE_DRIVER_FIXTURE_URL=http://127.0.0.1:18761 \
+scripts/mcp-conformance/node_modules/.bin/conformance client \
+  --scenario auth/client-credentials-basic --spec-version 2026-07-28 --force \
+  --command "node scripts/mcp-conformance/client-driver.mjs"
+```
 
 ## Checks beyond the suite
 

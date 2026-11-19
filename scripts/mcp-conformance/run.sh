@@ -20,7 +20,7 @@ LOGS="${RUN}/logs"
 RESULTS="${RUN}/results"
 
 SPEC_VERSION="2026-07-28"
-REFERENCE_SHA="7169291ec0b68eb370fddcd9947313ab0d5e4156"
+REFERENCE_SHA="f44482ba17df816d3176962a11cdf36aec9bda00"
 REFERENCE_REPO="${MCP_CONFORMANCE_REFERENCE_REPO:-https://github.com/modelcontextprotocol/conformance.git}"
 REFERENCE_DIR="${WORK}/reference"
 REFERENCE_SERVER_DIR="${REFERENCE_DIR}/examples/servers/typescript"
@@ -31,6 +31,15 @@ NODE_MIN="22.0.0"
 SUITE_VERSION="$(sed -n 's|.*"@modelcontextprotocol/conformance": "\(.*\)".*|\1|p' "${HERE}/package.json")"
 SUITE_TARGETS=(direct access-point transit owned-proxy proxy-surface fabric)
 OWNED_SCENARIOS=(tools-list tools-call-simple-text caching)
+# The suite's client scenarios for ${SPEC_VERSION} that need no authorization.
+# The reference client has no handler for some of them; those fail the same way
+# with and without the gateway, which client-parity.mjs checks.
+CLIENT_SCENARIOS=(tools_call request-metadata sep-2322-client-request-state json-schema-2020-12-preservation
+    json-schema-ref-no-deref http-standard-headers http-custom-headers http-invalid-tool-headers)
+CLIENT_MUST_PASS=(tools_call request-metadata sep-2322-client-request-state json-schema-2020-12-preservation)
+# The extension scenario in which the gateway itself asks the suite's
+# authorization server for a token and attaches it to the forwarded request.
+CLIENT_AUTH_SCENARIO="auth/client-credentials-jwt"
 
 PORT_BASE="${MCP_CONFORMANCE_PORT_BASE:-18760}"
 REFERENCE_PORT=$((PORT_BASE))
@@ -40,6 +49,8 @@ MODERN_INBOUND_PORT=$((PORT_BASE + 10))
 MODERN_OUTBOUND_PORT=$((PORT_BASE + 11))
 LEGACY_INBOUND_PORT=$((PORT_BASE + 20))
 LEGACY_OUTBOUND_PORT=$((PORT_BASE + 21))
+CLIENT_INBOUND_PORT=$((PORT_BASE + 30))
+CLIENT_OUTBOUND_PORT=$((PORT_BASE + 31))
 
 usage() {
     cat <<EOF
@@ -49,7 +60,7 @@ Usage: scripts/mcp-conformance/run.sh [options]
   --binary PATH           Gateway binary for the modern and legacy phases;
                           the fabric target always builds its own through Cargo
   --only LIST             Comma-separated, non-empty subset of:
-                          direct,access-point,transit,owned-proxy,proxy-surface,fabric,legacy
+                          direct,access-point,transit,owned-proxy,proxy-surface,fabric,client,legacy
                           (fabric needs Docker for the mediator between its two gateways)
   --unit-tests            Also run the full binary test suite
                           (not run, with a warning, when LIST has no modern target)
@@ -72,7 +83,7 @@ option_value() {
 SKIP_BUILD=false
 UNIT_TESTS=false
 BINARY=""
-ONLY="direct,access-point,transit,owned-proxy,proxy-surface,fabric,legacy"
+ONLY="direct,access-point,transit,owned-proxy,proxy-surface,fabric,client,legacy"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -91,7 +102,7 @@ selected() { [[ ",${ONLY}," == *",$1,"* ]]; }
 
 for name in ${ONLY//,/ }; do
     case "${name}" in
-        direct|access-point|transit|owned-proxy|proxy-surface|fabric|legacy) ;;
+        direct|access-point|transit|owned-proxy|proxy-surface|fabric|client|legacy) ;;
         *) echo "Unknown --only entry: ${name}" >&2; exit 2 ;;
     esac
 done
@@ -102,7 +113,8 @@ for name in "${SUITE_TARGETS[@]}"; do
 done
 if [[ ${#MODERN_TARGETS[@]} -gt 0 ]]; then RUN_MODERN=true; else RUN_MODERN=false; fi
 if selected legacy; then RUN_LEGACY=true; else RUN_LEGACY=false; fi
-if [[ "${RUN_MODERN}" != true && "${RUN_LEGACY}" != true ]]; then
+if selected client; then RUN_CLIENT=true; else RUN_CLIENT=false; fi
+if [[ "${RUN_MODERN}" != true && "${RUN_LEGACY}" != true && "${RUN_CLIENT}" != true ]]; then
     echo "--only selects no target: '${ONLY}'" >&2
     exit 2
 fi
@@ -321,7 +333,8 @@ wait_for_ports() {
 # of sync with package.json, is a real failure.
 npm_install() {
     local name="$1" dir="$2" log="${LOGS}/npm-${1}.log"
-    if (cd "${dir}" && npm ci --include=dev --no-audit --no-fund --prefer-offline --cache "${WORK}/npm-cache") > "${log}" 2>&1; then
+    shift 2
+    if (cd "${dir}" && npm ci --include=dev --no-audit --no-fund --prefer-offline --cache "${WORK}/npm-cache" "$@") > "${log}" 2>&1; then
         record PASS "dependencies: ${name} (npm ci)"
         return
     fi
@@ -485,6 +498,57 @@ run_fabric_suite() {
     fi
 }
 
+# The client target runs each client scenario twice with the suite's reference
+# client: straight at the suite's own server, and through a gateway that
+# client-driver.mjs starts with that server as its Target.
+client_scenario() {
+    local mode="$1" scenario="$2"
+    shift 2
+    env MCP_CONFORMANCE_DRIVER_MODE="${mode}" \
+        MCP_CONFORMANCE_DRIVER_REFERENCE="${REFERENCE_DIR}" \
+        MCP_CONFORMANCE_DRIVER_BINARY="${BINARY}" \
+        MCP_CONFORMANCE_DRIVER_WORK="${WORK}/env/client" \
+        MCP_CONFORMANCE_DRIVER_INBOUND_PORT="${CLIENT_INBOUND_PORT}" \
+        MCP_CONFORMANCE_DRIVER_OUTBOUND_PORT="${CLIENT_OUTBOUND_PORT}" \
+        MCP_CONFORMANCE_DRIVER_FIXTURE_URL="http://127.0.0.1:${FIXTURE_PORT}" \
+        "${CONFORMANCE}" client --scenario "${scenario}" --spec-version "${SPEC_VERSION}" "$@" \
+        -o "${RESULTS}/client-${mode}" --command "node ${HERE}/client-driver.mjs"
+}
+
+run_client_mode() {
+    local mode="$1" log="${LOGS}/suite-client-${1}.log" scenario
+    : > "${log}"
+    for scenario in "${CLIENT_SCENARIOS[@]}"; do
+        echo "=== ${scenario} ===" >> "${log}"
+        client_scenario "${mode}" "${scenario}" >> "${log}" 2>&1 || true
+    done
+}
+
+# An extension scenario is off the specification timeline, so the suite runs it
+# only with --force. The suite's exit status is the verdict: every check passed.
+run_client_auth() {
+    local log="${LOGS}/suite-client-auth.log"
+    local name="suite client: ${CLIENT_AUTH_SCENARIO}, the gateway fetches and attaches the token"
+    if client_scenario gateway "${CLIENT_AUTH_SCENARIO}" --force > "${log}" 2>&1; then
+        record PASS "${name}"
+    else
+        tail -40 "${log}"
+        record FAIL "${name} (log: $(relative "${log}"))"
+        FAILED=true
+    fi
+}
+
+run_client_suite() {
+    require_free_ports client "${CLIENT_INBOUND_PORT}" "${CLIENT_OUTBOUND_PORT}"
+    run_client_mode direct
+    run_client_mode gateway
+    check "suite client: ${#CLIENT_SCENARIOS[@]} scenarios, same result with and without the gateway" \
+        "${LOGS}/client-parity.log" \
+        node "${HERE}/client-parity.mjs" --direct "${RESULTS}/client-direct" --gateway "${RESULTS}/client-gateway" \
+        --scenarios "$(IFS=,; echo "${CLIENT_SCENARIOS[*]}")" --must-pass "$(IFS=,; echo "${CLIENT_MUST_PASS[*]}")"
+    run_client_auth
+}
+
 # 1. Preflight. Apart from the lock, nothing under ${WORK} changes until this
 # run holds it and every check has passed.
 take_lock
@@ -512,7 +576,7 @@ const [x, y, z] = process.argv[1].split(".").map(Number);
 process.exit(a > x || (a === x && (b > y || (b === y && c >= z))) ? 0 : 1);
 ' "${NODE_MIN}" || fail 2 "preflight: node >= ${NODE_MIN} is required (found $(node --version))"
 require_free_ports preflight "${REFERENCE_PORT}" "${FIXTURE_PORT}" "${SHIM_PORT}" "${MODERN_INBOUND_PORT}" "${MODERN_OUTBOUND_PORT}" \
-    "${LEGACY_INBOUND_PORT}" "${LEGACY_OUTBOUND_PORT}"
+    "${LEGACY_INBOUND_PORT}" "${LEGACY_OUTBOUND_PORT}" "${CLIENT_INBOUND_PORT}" "${CLIENT_OUTBOUND_PORT}"
 [[ -z "${BINARY}" || ( -f "${BINARY}" && -x "${BINARY}" ) ]] || fail 2 "preflight: $(relative "${BINARY}") is not an executable file"
 if selected fabric && ! docker info > /dev/null 2>&1; then
     fail 2 "preflight: the fabric target needs a running Docker daemon for its mediator"
@@ -530,6 +594,9 @@ npm_install harness "${HERE}"
 CONFORMANCE="${HERE}/node_modules/.bin/conformance"
 fetch_reference
 npm_install reference-server "${REFERENCE_SERVER_DIR}"
+# The reference client imports the suite's sources, so it needs the packages of
+# the checkout's root; its `prepare` build is not needed to run it under tsx.
+if [[ "${RUN_CLIENT}" == true ]]; then npm_install reference-client "${REFERENCE_DIR}" --ignore-scripts; fi
 
 # 3. Fixtures
 require_free_ports fixtures "${FIXTURE_PORT}" "${REFERENCE_PORT}" "${SHIM_PORT}"
@@ -540,8 +607,9 @@ start_process "${LOGS}/reference-server.log" "${REFERENCE_SERVER_DIR}" \
 REFERENCE_PID="${STARTED_PID}"
 wait_for_ports "${FIXTURE_PID}" "${FIXTURE_PORT}" || fail 1 "fixtures: REST fixture did not start"
 wait_for_ports "${REFERENCE_PID}" "${REFERENCE_PORT}" || fail 1 "fixtures: reference server did not start"
-node --test "${HERE}/shim.test.mjs" > "${LOGS}/shim-test.log" 2>&1 ||
-    fail 1 "fixtures: upstream shim tests failed (log: $(relative "${LOGS}/shim-test.log"))"
+node --test "${HERE}/shim.test.mjs" "${HERE}/client-shim.test.mjs" "${HERE}/client-parity.test.mjs" \
+    "${HERE}/client-auth.test.mjs" > "${LOGS}/shim-test.log" 2>&1 ||
+    fail 1 "fixtures: harness unit tests failed (log: $(relative "${LOGS}/shim-test.log"))"
 start_process "${LOGS}/shim.log" "${HERE}" node shim.mjs --port "${SHIM_PORT}" \
     --upstream "http://127.0.0.1:${REFERENCE_PORT}"
 SHIM_PID="${STARTED_PID}"
@@ -593,7 +661,16 @@ if [[ "${RUN_MODERN}" == true ]]; then
     stop_gateway
 fi
 
-# 5. Legacy phase: the legacy regression checks on their own gateway
+# 5. Client phase: the gateway as the MCP client of the suite's own server
+if [[ "${RUN_CLIENT}" == true ]]; then
+    if [[ -z "${BINARY}" ]]; then
+        BINARY="${DEFAULT_BINARY}"
+        build_step "client: build" "${LOGS}/build.log" gateway_cargo build
+    fi
+    run_client_suite
+fi
+
+# 6. Legacy phase: the legacy regression checks on their own gateway
 if [[ "${RUN_LEGACY}" == true ]]; then
     if [[ -z "${BINARY}" ]]; then
         BINARY="${DEFAULT_BINARY}"

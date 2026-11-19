@@ -2071,15 +2071,15 @@ frozen `2026-07-28` requirement set rather than a hand-written checklist.
 entry point, and [its README](../scripts/mcp-conformance/README.md) covers
 options, outputs and baseline maintenance.
 
-**Pins.** The suite is `@modelcontextprotocol/conformance@0.2.0-alpha.11`,
+**Pins.** The suite is `@modelcontextprotocol/conformance@0.2.0-alpha.12`,
 pinned exactly with a lockfile, because requirement sets exist only on the
 prerelease line and not on `latest`. The upstream is the suite's own reference
 server (`examples/servers/typescript/everything-server.ts`) at commit
-`7169291ec0b68eb370fddcd9947313ab0d5e4156`, fetched by commit, verified and
+`f44482ba17df816d3176962a11cdf36aec9bda00`, fetched by commit, verified and
 installed from its lockfile. Measuring that server directly and through the
 gateway with the same suite attributes every difference to the gateway. The
 scored scenario list comes from
-`npx @modelcontextprotocol/conformance@0.2.0-alpha.11 list --requirements 2026-07-28`.
+`npx @modelcontextprotocol/conformance@0.2.0-alpha.12 list --requirements 2026-07-28`.
 
 **Binary.** Both phases run the ordinary gateway binary, each on its own
 generated env. The modern phase first probes that the Access Point admits
@@ -2135,6 +2135,53 @@ which holds on surfaces without caller-scoped policies (see
 Streamed frame counts are not compared: how the reference server frames and
 times streamed messages is fixture behaviour.
 
+**Gateway as MCP client.** The `client` target runs the suite's `client`
+command, which starts its own server per scenario and spawns a client command.
+That command is `client-driver.mjs`. It runs the suite's reference client
+(`examples/clients/typescript/everything-client.ts` of the pinned checkout)
+twice: straight at the suite's server, and at the Access Point of a gateway it
+starts with that server as the Target. `client-parity.mjs` then requires each
+scenario to report the same checks with the same statuses both ways, and four
+scenarios (`tools_call`, `request-metadata`, `sep-2322-client-request-state`,
+`json-schema-2020-12-preservation`) to pass through the gateway. The other
+four fail the same way with and without the gateway, because the reference
+client has no handler for them. The scenarios are the suite's `2026-07-28`
+client scenarios that need no authorization.
+
+The gateway forwards the caller's headers and `_meta` and runs no handshake of
+its own, so this target shows that a conforming caller stays conforming through
+the gateway; the reference client originates the requests. The reference client
+reaches the gateway through `client-shim.mjs`: on a request that names its
+revision in `MCP-Protocol-Version`, it adds the `Mcp-Method` and `Mcp-Name`
+headers the reference client leaves out, and sends
+`application/json, text/event-stream` in place of a missing or wildcard
+`Accept`. The gateway rejects a modern request without them (`-32020`, and
+`406`), as the specification requires of a server that reads the body. A
+request without `MCP-Protocol-Version` passes through unchanged.
+
+The target also runs one authorization scenario, `auth/client-credentials-jwt`,
+through the gateway only. Every `auth/*` scenario expects the client to find
+the token endpoint from a `401` challenge, and the gateway's token endpoints
+are credential provider settings. So `client-auth.mjs` follows the challenge
+itself, stores the scenario's client as an `oauth2_client_credentials_jwt_auth`
+provider with the token endpoint it found and the issuer as `jwt_audience`, and
+binds it to the Target. The driver then sends one request without a credential:
+the gateway signs the client assertion, fetches the token and attaches it, and
+the suite judges that token request and the bearer token on the forwarded call.
+The scenario's metadata checks are satisfied by `client-auth.mjs`, not by the
+gateway. The suite's token endpoint is plain http on loopback, so the gateway
+runs with `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` naming it.
+
+The other `auth/*` scenarios are not run: they need an authorization-code flow,
+discovery or scope step-up at request time, dynamic or metadata-document client
+registration, DPoP, or a token issued outside the gateway, none of which Target
+authentication does. `auth/client-credentials-basic` is not run either, because
+an `oauth2_client_credentials` provider sends the client secret in the form
+body, not as HTTP Basic; `client-driver.mjs` accepts the scenario so the gap can
+be reproduced by hand (see the harness README). The suite's `authorization`
+command is not run: its scenarios require an authorization-code server, which
+the STS profile is not (see [MCP Resource Authorization](#mcp-resource-authorization)).
+
 **Legacy compatibility.** `compat.mjs` runs a `2024-11-05` client session
 (`initialize`, `notifications/initialized`, `tools/list`, `tools/call`) in
 both phases. The Access Point, Transit Point and the `legacy-surface` Access
@@ -2154,17 +2201,12 @@ Run outputs stay under the ignored `target/mcp-conformance/`. Exit codes are `0`
 pass, `1` failure, `2` invalid options or precondition not met, `3` dependency
 fetch failure, `130` interrupted (SIGINT) and `143` terminated (SIGTERM).
 
-**CI.** The `test:mcp-conformance` job runs only when the pipeline variable
-`MCP_CONFORMANCE` is `"true"` (default `"false"`). It runs the harness with
-`--unit-tests`, passes the `build:rust` binary to both phases, leaves out the
-`fabric` target, keeps the summary, logs and results as artifacts, and
-tolerates only exit code `3`. It caches only the pinned reference checkout and
-the npm cache, compiles the unit tests through the runner's sccache with
-`CARGO_INCREMENTAL=0`, installs
-git, openssl and CA certificates only when the image lacks them, and times out
-after 90 minutes.
-Scheduled pipelines are excluded by the workflow rules, so running it on a
-schedule also needs that rule relaxed.
+**CI.** The `mcp-conformance` job in `.github/workflows/ci.yml` runs
+`make mcp-conformance` with every target, `fabric` and `client` included, on
+an arm64 runner with a Docker daemon. It runs on every push to `main`, and on a
+pull request only when the change touches `src/mcp/**`, `src/mcp_proxies/**` or
+`scripts/mcp-conformance/**`. It does not pass `--unit-tests`, uploads
+`target/mcp-conformance/run` when it fails, and times out after 50 minutes.
 
 **Fabric.** The suite speaks HTTP to one URL, so the `fabric` target puts that
 URL in front of a Fabric route. `scripts/mcp-conformance/fabric.feature` runs
@@ -2175,8 +2217,8 @@ A step runs the suite against gateway 1, so every request crosses both Fabric
 paths as a framed stream. Gateway 2 allowlists gateway 1's origins, because a
 framed stream receiver checks a forwarded Origin against its own allowlist (see
 [HTTP Endpoint Admission](#http-endpoint-admission)). The feature sits outside
-`tests/features/g2g`, so `make gw-e2e` does not run it, and the CI job leaves
-the target out because it has no Docker daemon. A `make gw-e2e` scenario
+`tests/features/g2g`, so `make gw-e2e` does not run it; the CI job runs it on
+a runner with a Docker daemon. A `make gw-e2e` scenario
 checks that an unmodelled revision is rejected before it enters the Fabric.
 
 ## Implementation Invariants
@@ -2189,7 +2231,7 @@ MCP policy builders carry optional `protocol_version`, `client_capabilities`, an
 
 Every MCP endpoint (Agent Surface, Transit Point, standalone MCP Proxy, Fabric framed stream) admits and advertises `2026-07-28` alongside the session revisions `2024-11-05`, `2025-03-26`, `2025-06-18` and `2025-11-25`, except that a gateway-owned MCP Proxy advertises at most `2024-11-05` and `2026-07-28`, because it answers `initialize` with `2024-11-05`; `mcp_legacy_metadata_output` remains independent. `mcp_protocol_mode` is retired: `RetiredSetting` (`src/config/types.rs`, used as `AgentSurface::_retired_protocol_mode`) accepts any stored or submitted value under `deny_unknown_fields`, discards it and never serializes it, and Transit Points and MCP Proxies ignore the field. `mcp_http`'s Origin, header and body limits apply to every MCP endpoint and every revision, except that buffered Fabric `ForwardRequest` receive skips the Origin allowlist check (`EndpointHttpPolicy::without_origin_check`) because the sending gateway already checked it; the forwarded Origin still counts toward the header budget. Records that do not set `mcp_http` save byte-identically to releases without it: `component_tests::mcp_record_compat` loads and re-saves surface, MCP Proxy, vault token and credential provider fixtures (`tests/fixtures/records/`) written by such a release. Before downgrading, PATCH `{"mcp_http": null}` onto every surface, even one whose GET shows neither field, because GET hides the retired `mcp_protocol_mode` and loading leaves it on disk; rewrite Transit Point arrays without `mcp_http`; then verify the persisted surface records, not GET, carry neither field: a release that predates either field skips a surface that carries it (`AgentSurface` is `deny_unknown_fields`) and silently ignores, then drops on save, the fields on Transit Points and MCP Proxies. No older binary enforces `mcp_http.authorization`: clearing `mcp_http` removes it from surfaces and Transit Points, and a Transit Point or MCP Proxy that keeps it is served without it, so protect or disable every endpoint that relies on it before downgrading (see `docs/MCP_METADATA.md`). Accepted/advertised revisions resolve **per transport path** (`McpPathKind` in `src/mcp/request_validation.rs`: `DirectAccessPoint`, `OwnedProxy`, `TransitPoint`, `FabricReceive`, `FabricSend`) via `runtime_policy_for`, not from one appliance-wide constant, so one path can be returned to legacy-only without affecting Fabric or any other path. Every path admits `2026-07-28`, the Fabric legs as framed streams only. The mounted Access Point router, outbound Transit listener and framed Fabric receive each use their own path policy. `admission_policy_for_target` narrows a `fabric://` Access Point or Transit Point Target to the `FabricSend` policy, so a modern request that leg cannot carry gets `400` / `-32022` at admission, before payment, OPA or consent. Buffered Fabric `ForwardRequest` receive is legacy-only; modern MCP crosses Fabric only as framed streams. Unit tests pin each path's posture, pin that a path never advertises a revision it will not admit, and pin that returning one path to legacy-only leaves the others admitting modern; tests that send `2026-07-28` through a live entry point branch on that path's `runtime_policy_for`, and tests that only need a rejected revision use the unmodelled `2099-01-01`. `no_mcp_surface_scenario_is_a_draft_while_modern_mcp_is_admitted` fails the unit tests if any `tests/features/surface/mcp_*.feature` file contains `@wip` while a path admits modern.
 
-The MCP conformance harness (`scripts/mcp-conformance/`, `make mcp-conformance`) runs the published suite (`@modelcontextprotocol/conformance`, pinned exactly by its lockfile, frozen `2026-07-28` requirement set) against the ordinary gateway binary, used for both phases: the pinned reference server directly, an Access Point and Transit Point forwarding to it, an owned MCP Proxy standalone and behind `proxy://` (`tools-list`, `tools-call-simple-text` and `caching` only), and a `fabric` target: `scripts/mcp-conformance/fabric.feature` through the g2g BDD runner (Docker mediator), an Access Point on gateway 1 targeting `fabric://` gateway 2, which forwards to the reference server; the suite runs from a step. Expected failures live in `scripts/mcp-conformance/expected-failures/*.yaml`, one `<scenario>:<check-id>` with a one-line reason each; the suite fails a run on an unlisted failure or warning and on a listed check that passes, so remove an entry in the change that fixes it and never list a gateway defect. `check-results.mjs` adds caching parity with the reference server, real owned tool results and result completeness; `compat.mjs` checks a `2024-11-05` session on every endpoint in both phases, `2026-07-28` admission on every endpoint (including `legacy-surface`, whose record still carries the retired `mcp_protocol_mode`) in the modern phase, and `-32022` for the unmodelled `2099-01-01` with a `supported` list offering `2024-11-05` on every endpoint in the legacy phase. Envs are generated under the ignored `target/mcp-conformance/` from `--generate-bootstrap`, a generated certificate and an `openssl rand` backup key held only in the gateway's environment; nothing is copied from `envs/`. The `test:mcp-conformance` CI job runs only when `MCP_CONFORMANCE` is `"true"`, passes the `build:rust` binary to both phases and tolerates only exit `3` (dependency fetch failure). Modern MCP crosses Fabric only as framed streams; the CI job leaves out the `fabric` target (no Docker daemon). See `docs/MCP_METADATA.md` (Conformance Harness).
+The MCP conformance harness (`scripts/mcp-conformance/`, `make mcp-conformance`) runs the published suite (`@modelcontextprotocol/conformance`, pinned exactly by its lockfile, frozen `2026-07-28` requirement set) against the ordinary gateway binary, used for both phases: the pinned reference server directly, an Access Point and Transit Point forwarding to it, an owned MCP Proxy standalone and behind `proxy://` (`tools-list`, `tools-call-simple-text` and `caching` only), and a `fabric` target: `scripts/mcp-conformance/fabric.feature` through the g2g BDD runner (Docker mediator), an Access Point on gateway 1 targeting `fabric://` gateway 2, which forwards to the reference server; the suite runs from a step. Expected failures live in `scripts/mcp-conformance/expected-failures/*.yaml`, one `<scenario>:<check-id>` with a one-line reason each; the suite fails a run on an unlisted failure or warning and on a listed check that passes, so remove an entry in the change that fixes it and never list a gateway defect. `check-results.mjs` adds caching parity with the reference server, real owned tool results and result completeness; `compat.mjs` checks a `2024-11-05` session on every endpoint in both phases, `2026-07-28` admission on every endpoint (including `legacy-surface`, whose record still carries the retired `mcp_protocol_mode`) in the modern phase, and `-32022` for the unmodelled `2099-01-01` with a `supported` list offering `2024-11-05` on every endpoint in the legacy phase. Envs are generated under the ignored `target/mcp-conformance/` from `--generate-bootstrap`, a generated certificate and an `openssl rand` backup key held only in the gateway's environment; nothing is copied from `envs/`. A `client` target runs the suite's client scenarios with its reference client, directly and through a gateway whose Target is the suite's own server, and `client-parity.mjs` requires the same result both ways. The `mcp-conformance` CI job runs every target on each push to `main` and on pull requests that touch MCP code or the harness. Modern MCP crosses Fabric only as framed streams. See `docs/MCP_METADATA.md` (Conformance Harness).
 
 `mcp_http` holds endpoint-local `allowed_origins`, `max_request_bytes` (default 1 MiB), `max_header_bytes` (16 KiB), `max_accept_ranges` (32), the modern response bounds below, and an optional `authorization`. `mcp_http.authorization` (Resource Server tokens; see the STS section) and the Origin, size and response settings apply to every MCP endpoint and every revision; Origin and size checks run through `mcp::modern_http::EndpointHttpPolicy`. A public endpoint given as a bare listen address has no HTTP(S) origin and adds nothing to the Origin allowlist. Direct, Transit Point, standalone proxy POST, and independent Fabric receive paths use the shared admission wrapper. Origin authority comes only from configured public listener origins and exact allowlisted origins, never request forwarding headers or CORS; missing Origin is allowed, invalid present Origin is `403`. Body/header budgets return `413`/`431`. The existing wire validator precedes modern media checks and rejects every revision the path does not admit. Every admitted POST must then be one JSON-RPC object with no duplicate or case-variant keys (`tool_analyzer::single_object_refusal`), on every path including the standalone proxy. Standalone proxy raw-body validation runs before legacy session lookup. See `docs/MCP_METADATA.md` for defaults, errors and lifecycle semantics.
 

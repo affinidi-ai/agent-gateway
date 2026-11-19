@@ -1,0 +1,24 @@
+branch: feat/mcp-conformance-coverage
+changes:
+  added:
+    - timestamp: '2026-11-19T15:00:00Z'
+      title: Test the gateway as an MCP client with the conformance suite
+      description: >-
+        `make mcp-conformance` gains a `client` target. It runs the published suite's
+        client scenarios with the suite's reference client, directly and through a gateway
+        whose Target is the suite's own server, and requires the same result both ways. It
+        also runs the suite's JWT client-credentials scenario with the gateway itself
+        signing the client assertion, fetching the token and attaching it, so outbound
+        Target authentication is measured against the suite for the first time.
+  changed:
+    - timestamp: '2026-11-19T15:00:00Z'
+      title: Move the MCP conformance harness to suite release 0.2.0-alpha.12
+      description: >-
+        The harness now pins `@modelcontextprotocol/conformance@0.2.0-alpha.12` and the
+        reference server at that release's commit. Every existing target still passes with
+        unchanged baselines. The conformance documentation now describes the GitHub CI job
+        that runs the harness instead of a job that no longer exists.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
