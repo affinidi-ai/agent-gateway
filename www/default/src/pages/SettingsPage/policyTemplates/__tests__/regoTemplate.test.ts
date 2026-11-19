@@ -52,30 +52,42 @@ allow if input.jwt.role in {{roles}}`,
 const businessHours: PolicyTemplate = {
   ...threshold,
   id: 'hours',
-  name: 'Allow during business hours',
+  name: 'Business-hours access window',
   rego: `package surface.policy
 
-allow if {
+allow if {{mode}}in_window
+
+in_window if {
   time.weekday([time.now_ns(), {{time_zone}}]) in {{days}}
-  {{start_hour}} < {{end_hour}}
+  minute >= {{start_time}}
+  minute < {{end_time}}
 }`,
   parameters: [
+    {
+      key: 'mode',
+      label: 'Inside the window',
+      kind: 'choice',
+      default: 'allow',
+      options: [
+        { value: 'allow', label: 'Allow requests', rego: '' },
+        { value: 'deny', label: 'Deny requests', rego: 'not ' },
+      ],
+    },
     {
       key: 'days',
       label: 'Days',
       kind: 'string_list',
       default: ['Monday'],
       allowed: ['Monday', 'Tuesday'],
+      optional: true,
     },
-    { key: 'start_hour', label: 'From hour', kind: 'integer', default: 9, min: 0, max: 23 },
+    { key: 'start_time', label: 'From', kind: 'time_of_day', default: '09:00' },
     {
-      key: 'end_hour',
-      label: 'Until hour',
-      kind: 'integer',
-      default: 17,
-      min: 1,
-      max: 24,
-      after: 'start_hour',
+      key: 'end_time',
+      label: 'Until',
+      kind: 'time_of_day',
+      default: '17:00',
+      differs_from: 'start_time',
     },
     { key: 'time_zone', label: 'Time zone', kind: 'string', default: 'UTC', format: 'time_zone' },
   ],
@@ -95,11 +107,47 @@ describe('renderTemplate setting checks', () => {
     expect(result.errors.days).toBe('"Mon" isn\'t accepted. Use Monday, Tuesday.');
   });
 
-  it('refuses an end hour that is not later than the start hour', () => {
-    expect(fill({ start_hour: 17, end_hour: 17 }).errors.end_hour).toBe(
-      'Must be later than From hour.'
+  it('writes the picked option of a choice, and refuses one that is not offered', () => {
+    expect(fill({}).rego).toContain('allow if in_window');
+    expect(fill({ mode: 'deny' }).rego).toContain('allow if not in_window');
+    const result = fill({ mode: 'sometimes' });
+    expect(result.rego).toBeNull();
+    expect(result.errors.mode).toBe('Pick one of Allow requests, Deny requests.');
+  });
+
+  it('writes a time of day as minutes since midnight', () => {
+    const rego = fill({ start_time: '08:30', end_time: '23:59' }).rego;
+    expect(rego).toContain('minute >= 510');
+    expect(rego).toContain('minute < 1439');
+    expect(fill({ start_time: '0:00' }).rego).toContain('minute >= 0');
+  });
+
+  it('refuses a time of day that is not HH:MM within the day', () => {
+    for (const value of ['24:00', '9', '09:60', 'noon', '']) {
+      expect(fill({ start_time: value }).errors.start_time).toBe(
+        'Enter a time from 00:00 to 23:59.'
+      );
+    }
+  });
+
+  it('accepts an end before the start, for a window that crosses midnight, but not the same time', () => {
+    expect(fill({ start_time: '22:00', end_time: '06:00' }).errors).toEqual({});
+    expect(fill({ start_time: '09:00', end_time: '9:00' }).errors.end_time).toBe(
+      'Must differ from From.'
     );
-    expect(fill({ start_hour: 9, end_hour: 10 }).errors).toEqual({});
+  });
+
+  it('writes an empty optional list as the empty set, and refuses an empty required one', () => {
+    expect(fill({ days: [] }).rego).toContain('in set()');
+    const required = {
+      ...businessHours,
+      parameters: businessHours.parameters.map(p =>
+        p.key === 'days' ? { ...p, optional: false } : p
+      ),
+    } as PolicyTemplate;
+    expect(
+      fillTemplate(required, { ...defaultParameterValues(required), days: [] }).errors.days
+    ).toBe('Enter at least one value.');
   });
 
   it('writes a time zone in its canonical spelling and refuses an unknown one', () => {

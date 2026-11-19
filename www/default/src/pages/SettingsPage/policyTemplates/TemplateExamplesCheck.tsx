@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { AppButton } from '../../../components/shared/AppButton';
 import { Badge } from '../../../components/shared/Badge';
-import { simulatePolicy } from '../simulatePolicy';
+import { usePolicyTemplateServices } from './policyTemplateServices';
 import { defaultDecision } from './regoTemplate';
 import type { PolicyDecision, PolicyTemplate, PolicyType } from './types';
 
@@ -49,6 +49,7 @@ const TemplateExamplesCheck: React.FC<TemplateExamplesCheckProps> = ({
   onDismiss,
   onLoadInTest,
 }) => {
+  const { simulate } = usePolicyTemplateServices();
   const [outcomes, setOutcomes] = useState<Outcome[]>(() => template.examples.map(() => null));
 
   useEffect(() => {
@@ -59,7 +60,7 @@ const TemplateExamplesCheck: React.FC<TemplateExamplesCheckProps> = ({
       const results = await Promise.all(
         template.examples.map(async (ex): Promise<Outcome> => {
           try {
-            const r = await simulatePolicy(policyId, policyType, draftPolicy, ex.input);
+            const r = await simulate(policyId, policyType, draftPolicy, ex.input);
             return { decision: r.allow ? 'allow' : 'deny', reason: r.reason };
           } catch (e) {
             return { error: e instanceof Error ? e.message : 'Dry-run failed' };
@@ -72,7 +73,7 @@ const TemplateExamplesCheck: React.FC<TemplateExamplesCheckProps> = ({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [policyId, policyType, draftPolicy, template]);
+  }, [policyId, policyType, draftPolicy, template, simulate]);
 
   // The examples were written for the default settings, so a different decision after a
   // setting changed says nothing about the rest of the policy.

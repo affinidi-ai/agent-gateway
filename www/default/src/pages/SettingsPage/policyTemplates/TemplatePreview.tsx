@@ -3,56 +3,12 @@ import { AppButton } from '../../../components/shared/AppButton';
 import { Badge } from '../../../components/shared/Badge';
 import FieldHelp from '../../../components/shared/FieldHelp';
 import { Link } from '../../../components/shared/Link';
-import { defaultParameterValues, parseListInput, renderTemplate } from './regoTemplate';
-import type { ParameterValues, PolicyTemplate } from './types';
-
-/** Raw text of each setting field, so a list can be typed with its commas. */
-export type FieldText = Record<string, string>;
-
-function initialFieldText(template: PolicyTemplate): FieldText {
-  return Object.fromEntries(
-    template.parameters.map(p => [
-      p.key,
-      p.kind === 'string_list' ? p.default.join(', ') : String(p.default),
-    ])
-  );
-}
-
-function valuesFromText(template: PolicyTemplate, text: FieldText): ParameterValues {
-  return Object.fromEntries(
-    template.parameters.map(p => {
-      const raw = text[p.key] ?? '';
-      if (p.kind === 'integer') return [p.key, raw.trim() ? Number(raw) : NaN];
-      return [p.key, p.kind === 'string' ? raw : parseListInput(raw)];
-    })
-  );
-}
-
-/** The Rego a template renders to with its settings as typed. */
-export function renderWithText(template: PolicyTemplate, text: FieldText) {
-  return renderTemplate(template, valuesFromText(template, text));
-}
-
-/**
- * The settings of one template and the Rego they render to, starting from `initialText` or the
- * defaults. Callers key the component that uses it by template id, so choosing another
- * template starts over.
- */
-export function useTemplateSettings(template: PolicyTemplate, initialText?: FieldText) {
-  const [fieldText, setFieldText] = useState<FieldText>(
-    () => initialText ?? initialFieldText(template)
-  );
-  const rendered = renderWithText(template, fieldText);
-  const usesDefaultSettings =
-    rendered.rego === renderTemplate(template, defaultParameterValues(template)).rego;
-  const setField = (key: string, value: string) =>
-    setFieldText(prev => ({ ...prev, [key]: value }));
-  return { fieldText, setField, rendered, usesDefaultSettings };
-}
+import type { TemplateSettings } from './useTemplateSettings';
+import type { PolicyTemplate } from './types';
 
 interface SettingsFieldsProps {
   template: PolicyTemplate;
-  settings: ReturnType<typeof useTemplateSettings>;
+  settings: TemplateSettings;
   /** Prefix of the field ids and test ids, so two previews on a page don't collide. */
   idPrefix: string;
 }
@@ -76,16 +32,32 @@ export const TemplateSettingsFields: React.FC<SettingsFieldsProps> = ({
               </FieldHelp>
             )}
           </label>
-          <input
-            id={id}
-            type={p.kind === 'integer' ? 'number' : 'text'}
-            min={p.kind === 'integer' ? p.min : undefined}
-            max={p.kind === 'integer' ? p.max : undefined}
-            className={`form-control form-control-sm${p.kind === 'integer' ? ' policy-template-number' : ''}${err ? ' is-invalid' : ''}`}
-            value={settings.fieldText[p.key] ?? ''}
-            onChange={e => settings.setField(p.key, e.target.value)}
-            data-testid={id}
-          />
+          {p.kind === 'choice' ? (
+            <select
+              id={id}
+              className={`form-control form-control-sm dropdown-styling${err ? ' is-invalid' : ''}`}
+              value={settings.fieldText[p.key] ?? ''}
+              onChange={e => settings.setField(p.key, e.target.value)}
+              data-testid={id}
+            >
+              {p.options.map(o => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              id={id}
+              type={p.kind === 'integer' ? 'number' : p.kind === 'time_of_day' ? 'time' : 'text'}
+              min={p.kind === 'integer' ? p.min : undefined}
+              max={p.kind === 'integer' ? p.max : undefined}
+              className={`form-control form-control-sm${p.kind === 'integer' ? ' policy-template-number' : ''}${p.kind === 'time_of_day' ? ' policy-template-time' : ''}${err ? ' is-invalid' : ''}`}
+              value={settings.fieldText[p.key] ?? ''}
+              onChange={e => settings.setField(p.key, e.target.value)}
+              data-testid={id}
+            />
+          )}
           {err && <div className="invalid-feedback">{err}</div>}
         </div>
       );

@@ -50,6 +50,7 @@ describe('built-in policy templates', () => {
         'deny-by-default',
         'restrict-mcp-tools-by-role',
         'allowlist-outbound-destinations',
+        'business-hours-access-window',
         'allow-all-monitor',
       ])
     );
@@ -63,6 +64,7 @@ describe('built-in policy templates', () => {
       'deny-by-default',
       'restrict-mcp-tools-by-role',
       'allowlist-outbound-destinations',
+      'business-hours-access-window',
       'allow-all-monitor',
       'tool-allow-authenticated',
       'tool-allow-by-jwt-claim',

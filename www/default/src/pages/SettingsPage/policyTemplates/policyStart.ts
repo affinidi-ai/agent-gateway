@@ -5,9 +5,8 @@ import {
   DEFAULT_TEMPLATE_KEY,
 } from './policyDefaults';
 import { parsePolicyRules, removeRuleGroup, type ParsedPolicy } from './regoRules';
-import { renderWithText } from './TemplatePreview';
-import type { PolicyTemplate, PolicyType } from './types';
-import type { AddedRules, UsedTemplate } from './usePolicyTemplateActions';
+import { renderWithText } from './templateSettings';
+import type { AddedRules, PolicyTemplate, PolicyType, UsedTemplate } from './types';
 
 export const CUSTOM_POLICY_NAME = 'Custom policy';
 
@@ -27,7 +26,7 @@ const trimEnd = (rego: string) => rego.replace(/\s+$/, '');
 export function groupsForOtherType(
   parsed: ParsedPolicy,
   policyType: PolicyType,
-  templates: PolicyTemplate[]
+  templates: readonly PolicyTemplate[]
 ): (PolicyType | null)[] {
   if (!parsed.ok) return [];
   const forType = new Set(templates.filter(t => t.policy_type === policyType).map(t => t.name));
@@ -43,15 +42,14 @@ export function groupsForOtherType(
  * What a new policy started from, while its Rego still follows it: each template group in the
  * Rego still holds exactly the lines Add to policy wrote, and the Rego without those groups
  * equals what the start renders to (the used template with its settings, `ALLOW_ALL_POLICY` for
- * Allow all, or `DEFAULT_POLICY`, Deny by default, when no template was used). Null, shown as
- * Custom Rego, after a hand edit anywhere, a removed rule of the start, or a Type change the
- * start doesn't serve.
+ * a custom policy, or `DEFAULT_POLICY`, Deny by default, when no template was used). Null, shown
+ * as Custom Rego, after a hand edit anywhere or a removed rule of the start.
  */
 export function policyStart(
   policy: string,
   policyType: PolicyType,
   usedTemplate: UsedTemplate | null,
-  templates: PolicyTemplate[],
+  templates: readonly PolicyTemplate[],
   addedRules: AddedRules[]
 ): PolicyStart | null {
   const parsed = parsePolicyRules(policy);
@@ -85,4 +83,16 @@ export function policyStart(
   }
   if (!start?.rego || trimEnd(base) !== trimEnd(start.rego)) return null;
   return { name: start.name, templatesAdded: added.length };
+}
+
+/**
+ * What Use replaces, or null while the Rego is an untouched start, which Use replaces at once.
+ */
+export function replaceText(policy: string, start: PolicyStart | null): string | null {
+  if (start && start.templatesAdded === 0) return null;
+  const parsed = parsePolicyRules(policy);
+  const rules = parsed.ok ? parsed.groups.reduce((n, g) => n + g.rules.length, 0) : 0;
+  return rules > 0
+    ? `This replaces the ${rules} ${rules === 1 ? 'rule' : 'rules'} in the Policy section.`
+    : 'This replaces your edits in the Policy section.';
 }

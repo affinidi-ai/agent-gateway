@@ -358,3 +358,9 @@ export function removeRule(rego: string, rule: PolicyRule): string {
     .replace(/\n{3,}/g, '\n\n')
     .replace(/\s+$/, '')}\n`;
 }
+
+/** Input paths a module reads, such as `jwt.sub`, shown as tags on the template. */
+export function readsFromRego(rego: string): string[] {
+  const paths = Array.from(rego.matchAll(/\binput\.([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)/g), m => m[1]);
+  return Array.from(new Set(paths)).slice(0, 6);
+}

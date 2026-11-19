@@ -45,6 +45,16 @@ function toRegoLiteral(param: PolicyTemplateParameter, value: unknown): Literal 
     }
     return { literal: JSON.stringify(text) };
   }
+  if (param.kind === 'choice') {
+    const option = param.options.find(o => o.value === value);
+    if (!option) return { error: `Pick one of ${param.options.map(o => o.label).join(', ')}.` };
+    return { literal: option.rego };
+  }
+  if (param.kind === 'time_of_day') {
+    const minutes = minutesOfDay(value);
+    if (minutes === null) return { error: 'Enter a time from 00:00 to 23:59.' };
+    return { literal: String(minutes) };
+  }
   const items = Array.isArray(value) ? value : [];
   let cleaned = items.map(v => (typeof v === 'string' ? v.trim() : '')).filter(Boolean);
   if (param.allowed) {
@@ -56,8 +66,18 @@ function toRegoLiteral(param: PolicyTemplateParameter, value: unknown): Literal 
     cleaned = cleaned.map(v => byLowerCase.get(v.toLowerCase()) as string);
   }
   cleaned = Array.from(new Set(cleaned));
-  if (cleaned.length === 0) return { error: 'Enter at least one value.' };
+  if (cleaned.length === 0) {
+    return param.optional ? { literal: 'set()' } : { error: 'Enter at least one value.' };
+  }
   return { literal: `{${cleaned.map(v => JSON.stringify(v)).join(', ')}}` };
+}
+
+/** Minutes since midnight of an `HH:MM` time, or null for anything else. */
+function minutesOfDay(value: unknown): number | null {
+  const match = typeof value === 'string' ? /^(\d{1,2}):(\d{2})$/.exec(value.trim()) : null;
+  if (!match) return null;
+  const [hours, minutes] = [Number(match[1]), Number(match[2])];
+  return hours < 24 && minutes < 60 ? hours * 60 + minutes : null;
 }
 
 /**
@@ -94,19 +114,11 @@ export function renderTemplate(template: PolicyTemplate, values: ParameterValues
     literals.set(param.key, result.literal);
   }
   for (const param of template.parameters) {
-    if (param.kind !== 'integer' || !param.after || errors[param.key] || errors[param.after]) {
-      continue;
-    }
-    const earlier = template.parameters.find(p => p.key === param.after);
-    const value = values[param.key] ?? param.default;
-    const earlierValue = earlier ? (values[earlier.key] ?? earlier.default) : undefined;
-    if (
-      earlier &&
-      typeof earlierValue === 'number' &&
-      typeof value === 'number' &&
-      value <= earlierValue
-    ) {
-      errors[param.key] = `Must be later than ${earlier.label}.`;
+    if (param.kind !== 'time_of_day' || !param.differs_from) continue;
+    const other = template.parameters.find(p => p.key === param.differs_from);
+    if (!other || errors[param.key] || errors[other.key]) continue;
+    if (literals.get(param.key) === literals.get(other.key)) {
+      errors[param.key] = `Must differ from ${other.label}.`;
     }
   }
   if (Object.keys(errors).length > 0) return { rego: null, errors };

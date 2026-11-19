@@ -19,18 +19,13 @@ import PolicyTemplatesPanel from './policyTemplates/PolicyTemplatesPanel';
 import SaveAsTemplatePanel from './policyTemplates/SaveAsTemplatePanel';
 import TemplateExamplesCheck from './policyTemplates/TemplateExamplesCheck';
 import TemplateGallery from './policyTemplates/TemplateGallery';
-import TemplateGalleryDetail, { replaceText } from './policyTemplates/TemplateGalleryDetail';
-import { BUILTIN_POLICY_TEMPLATES } from './policyTemplates/builtinPolicyTemplates';
+import TemplateGalleryDetail from './policyTemplates/TemplateGalleryDetail';
 import { parsePolicyRules } from './policyTemplates/regoRules';
-import { BLANK_TEMPLATE_ID } from './policyTemplates/policyDefaults';
-import { POLICY_TYPE_NAMES, type PolicyTemplate, type PolicyType } from './policyTemplates/types';
+import { POLICY_TYPE_NAMES, type PolicyType } from './policyTemplates/types';
 import { usePolicyTemplateActions } from './policyTemplates/usePolicyTemplateActions';
-import {
-  galleryTemplates,
-  templateEntryKey,
-  useAllPolicyTemplates,
-} from './policyTemplates/usePolicyTemplates';
-import { groupsForOtherType, policyStart } from './policyTemplates/policyStart';
+import { useTemplateGallery } from './policyTemplates/useTemplateGallery';
+import { useAllPolicyTemplates } from './policyTemplates/usePolicyTemplates';
+import { groupsForOtherType } from './policyTemplates/policyStart';
 
 interface PolicyDefinition {
   id: string;
@@ -107,60 +102,36 @@ const EditPolicyDefinitionPage: React.FC = () => {
     denyByDefault,
     showRule,
   } = usePolicyTemplateActions(form, setForm, isCreateMode);
-  const templateEntries = useAllPolicyTemplates();
+  const templateLibrary = useAllPolicyTemplates();
+  const gallery = useTemplateGallery({
+    enabled: numbered,
+    entries: templateLibrary.entries,
+    policy: form.policy,
+    policyType: form.policy_type,
+    templatePicked,
+    usedTemplate,
+    addedRules,
+    onUseTemplate: (template, rego, fieldText) => {
+      applyTemplate(template, rego, fieldText);
+      setView('rules');
+    },
+    onStartCustom: () => {
+      pickBlank();
+      setView('rules');
+    },
+  });
   // A new policy shows only Start from until a template is used.
-  const choosing = numbered && !templatePicked;
-  const [galleryOpen, setGalleryOpen] = useState(true);
-  const [galleryKey, setGalleryKey] = useState<string | null>(null);
-  const [focusGalleryDetail, setFocusGalleryDetail] = useState(0);
-  const selectGalleryCard = (key: string) => {
-    setGalleryKey(key);
-    setFocusGalleryDetail(n => n + 1);
-  };
-  const closeGallery = () => {
-    setGalleryOpen(false);
-    setGalleryKey(null);
-  };
-  // Change reopens the gallery on the used template's card.
-  const openGallery = () => {
-    const used = templateEntries
-      .flatMap(e => Object.values(e.variants))
-      .find(t => t?.id === usedTemplate?.id);
-    setGalleryKey(
-      usedTemplate?.id === BLANK_TEMPLATE_ID
-        ? BLANK_TEMPLATE_ID
-        : used
-          ? templateEntryKey(used)
-          : null
-    );
-    setGalleryOpen(true);
-  };
-  // Undoing the first Use shows the gallery again.
-  useEffect(() => {
-    if (choosing) setGalleryOpen(true);
-  }, [choosing]);
-  const start = numbered
-    ? policyStart(
-        form.policy,
-        form.policy_type,
-        usedTemplate,
-        templateEntries
-          .flatMap(e => Object.values(e.variants))
-          .filter((t): t is PolicyTemplate => !!t),
-        addedRules
-      )
-    : null;
-  const startedFrom = usedTemplate && start ? start.name : null;
+  const { choosing } = gallery;
   const otherTypeGroups = useMemo(
     () =>
       isCreateMode
         ? groupsForOtherType(
             parsePolicyRules(form.policy),
             form.policy_type,
-            BUILTIN_POLICY_TEMPLATES
+            templateLibrary.builtin
           )
         : [],
-    [isCreateMode, form.policy, form.policy_type]
+    [isCreateMode, form.policy, form.policy_type, templateLibrary.builtin]
   );
   const writtenForOtherType = otherTypeGroups.find((t): t is PolicyType => t !== null) ?? null;
   const simulateRef = useRef<HTMLDivElement>(null);
@@ -324,7 +295,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
           const parsed = JSON.parse(saved) as PolicyDefinition;
           setForm(parsed);
           setTemplatePicked(true);
-          closeGallery();
+          gallery.close();
           setIsDirty(true);
         } catch (_ignored) {
           /* ignore */
@@ -353,21 +324,10 @@ const EditPolicyDefinitionPage: React.FC = () => {
     return () => document.removeEventListener('keydown', handler);
   }, [saving, handleSave, canEditPolicies, choosing]);
 
-  const startCustom = () => {
-    pickBlank();
-    setView('rules');
-    closeGallery();
-  };
-  // Create custom policy starts at once unless it replaces rules, which its detail asks about.
-  const createCustom = () => {
-    if (templatePicked && replaceText(form.policy, start)) selectGalleryCard(BLANK_TEMPLATE_ID);
-    else startCustom();
-  };
-
   const templatesPanel = (
     <PolicyTemplatesPanel
-      key={form.policy_type}
       policyType={form.policy_type}
+      library={templateLibrary}
       existingPolicy={form.policy}
       isCreateMode={isCreateMode}
       onInsert={addTemplateRules}
@@ -375,26 +335,18 @@ const EditPolicyDefinitionPage: React.FC = () => {
   );
 
   // The templates column is always there for an editor, so opening a panel never resizes the form.
-  const sidePanel = !canEditPolicies ? null : numbered && galleryOpen ? (
+  const sidePanel = !canEditPolicies ? null : numbered && gallery.open ? (
     <TemplateGalleryDetail
-      selectedKey={galleryKey}
-      selected={
-        galleryTemplates(templateEntries, form.policy_type).find(
-          t => templateEntryKey(t) === galleryKey
-        ) ?? null
-      }
+      selectedKey={gallery.selectedKey}
+      selected={gallery.selected}
       policyType={form.policy_type}
       policy={form.policy}
-      start={start}
+      start={gallery.start}
       templatePicked={templatePicked}
       usedTemplate={usedTemplate}
-      focusKey={focusGalleryDetail}
-      onPickBlank={startCustom}
-      onUseTemplate={(template, rego, fieldText) => {
-        applyTemplate(template, rego, fieldText);
-        setView('rules');
-        closeGallery();
-      }}
+      focusKey={gallery.focusKey}
+      onPickBlank={gallery.startCustom}
+      onUseTemplate={gallery.pickTemplate}
     />
   ) : templatePanel === 'save' ? (
     <SaveAsTemplatePanel
@@ -523,15 +475,16 @@ const EditPolicyDefinitionPage: React.FC = () => {
               {numbered && (
                 <TemplateGallery
                   step={1}
-                  policyType={form.policy_type}
-                  start={start}
+                  cards={gallery.cards}
+                  surfaceOnly={gallery.surfaceOnly}
+                  start={gallery.start}
                   usedTemplate={usedTemplate}
-                  expanded={galleryOpen}
-                  onExpand={openGallery}
-                  onCollapse={templatePicked ? closeGallery : undefined}
-                  selectedKey={galleryKey}
-                  onSelect={selectGalleryCard}
-                  onCreateCustom={createCustom}
+                  expanded={gallery.open}
+                  onExpand={gallery.reopen}
+                  onCollapse={templatePicked ? gallery.close : undefined}
+                  selectedKey={gallery.selectedKey}
+                  onSelect={gallery.select}
+                  onCreateCustom={gallery.createCustom}
                 />
               )}
 
@@ -576,7 +529,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
                     }
                     justAdded={justAdded}
                     otherTypeGroups={otherTypeGroups}
-                    startedFrom={startedFrom}
+                    startedFrom={gallery.startedFrom}
                     onAdd={focusTemplatesColumn}
                     onRemoveGroup={removeGroup}
                     onRemoveRule={removeRule}

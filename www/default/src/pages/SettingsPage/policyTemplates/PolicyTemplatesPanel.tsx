@@ -4,13 +4,9 @@ import InfoBanner from '../../../components/shared/InfoBanner';
 import { defaultDecision, insertTemplateRules, templateRole } from './regoTemplate';
 import { DecisionBadge, TemplateOriginBadges, TemplateRoleBadge } from './TemplateBadges';
 import TemplateFilterBar from './TemplateFilterBar';
-import {
-  TemplateDocsLink,
-  TemplateHowItDecides,
-  TemplateSettingsFields,
-  useTemplateSettings,
-} from './TemplatePreview';
-import { useAllPolicyTemplates, usePolicyTemplates } from './usePolicyTemplates';
+import { TemplateDocsLink, TemplateHowItDecides, TemplateSettingsFields } from './TemplatePreview';
+import { useTemplateSettings } from './useTemplateSettings';
+import { galleryTemplates, type PolicyTemplateLibrary } from './usePolicyTemplates';
 import { useTemplateFilter } from './useTemplateFilter';
 import { POLICY_TYPE_NAMES, type PolicyTemplate, type PolicyType } from './types';
 import './PolicyTemplates.css';
@@ -19,6 +15,8 @@ type Source = 'builtin' | 'organization';
 
 interface PolicyTemplatesPanelProps {
   policyType: PolicyType;
+  /** Every template, from `useAllPolicyTemplates`. */
+  library: PolicyTemplateLibrary;
   /** The editor's current Rego, which Add to policy appends to. */
   existingPolicy?: string;
   /** On the create form whole policies are offered under Start from. */
@@ -128,11 +126,18 @@ const InsertPreview: React.FC<{
 /** The templates column's Add rules panel: pick a template and add its rules to the Rego. */
 const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
   policyType,
+  library: { entries, loading: loadingByType, error },
   existingPolicy = '',
   isCreateMode,
   onInsert,
 }) => {
-  const { builtin: allBuiltin, organization, loading, error } = usePolicyTemplates(policyType);
+  // This Type's list decides the spinner and empty states; the left-out note counts the other
+  // Type too, so it waits for both.
+  const loading = loadingByType[policyType];
+  const allLoaded = !loadingByType.gateway && !loadingByType.agent_surface;
+  const ofType = useMemo(() => galleryTemplates(entries, policyType), [entries, policyType]);
+  const allBuiltin = useMemo(() => ofType.filter(t => t.builtin), [ofType]);
+  const organization = useMemo(() => ofType.filter(t => !t.builtin), [ofType]);
   const [source, setSource] = useState<Source>('builtin');
   const [selected, setSelected] = useState<PolicyTemplate | null>(null);
 
@@ -143,7 +148,7 @@ const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
     useTemplateFilter(sourceTemplates);
   const wholePolicies =
     allBuiltin.length + organization.length - builtin.length - organizationRules.length;
-  const otherTypeOnly = useAllPolicyTemplates().filter(e => !e.variants[policyType]).length;
+  const otherTypeOnly = entries.filter(e => !e.variants[policyType]).length;
   const leftOut = wholePolicies + otherTypeOnly;
   const otherTypeName =
     POLICY_TYPE_NAMES[policyType === 'gateway' ? 'agent_surface' : 'gateway'].name;
@@ -237,7 +242,7 @@ const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
                 </li>
               ))}
             </ul>
-            {!loading && leftOut > 0 && (
+            {allLoaded && leftOut > 0 && (
               <div className="small text-muted mt-2" data-testid="policy-templates-left-out-note">
                 {`${plural(leftOut, 'template', 'templates')} left out: ${[
                   wholePolicies > 0 &&

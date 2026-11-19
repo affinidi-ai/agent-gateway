@@ -1,18 +1,11 @@
 import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { AppButton } from '../../../components/shared/AppButton';
 import { ALLOW_ALL_POLICY, BLANK_TEMPLATE_ID } from './policyDefaults';
-import { CUSTOM_POLICY_NAME, type PolicyStart } from './policyStart';
-import { parsePolicyRules } from './regoRules';
+import { CUSTOM_POLICY_NAME, replaceText, type PolicyStart } from './policyStart';
 import { TemplateOriginBadges } from './TemplateBadges';
-import {
-  TemplateDocsLink,
-  TemplateHowItDecides,
-  TemplateSettingsFields,
-  useTemplateSettings,
-  type FieldText,
-} from './TemplatePreview';
-import type { UsedTemplate } from './usePolicyTemplateActions';
-import type { PolicyTemplate, PolicyType } from './types';
+import { TemplateDocsLink, TemplateHowItDecides, TemplateSettingsFields } from './TemplatePreview';
+import { useTemplateSettings } from './useTemplateSettings';
+import type { FieldText, PolicyTemplate, PolicyType, UsedTemplate } from './types';
 import './PolicyTemplates.css';
 
 const ID_PREFIX = 'policy-template-gallery';
@@ -59,18 +52,6 @@ const ShowRego: React.FC<{ rego: string | null }> = ({ rego }) => {
     </>
   );
 };
-
-/**
- * What Use replaces, or null while the Rego is an untouched start, which Use replaces at once.
- */
-export function replaceText(policy: string, start: PolicyStart | null): string | null {
-  if (start && start.templatesAdded === 0) return null;
-  const parsed = parsePolicyRules(policy);
-  const rules = parsed.ok ? parsed.groups.reduce((n, g) => n + g.rules.length, 0) : 0;
-  return rules > 0
-    ? `This replaces the ${rules} ${rules === 1 ? 'rule' : 'rules'} in the Policy section.`
-    : 'This replaces your edits in the Policy section.';
-}
 
 /**
  * Use this template. With `replaces` set, the first click asks in place before the Rego is

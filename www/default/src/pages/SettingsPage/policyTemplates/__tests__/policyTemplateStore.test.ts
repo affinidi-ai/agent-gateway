@@ -1,4 +1,8 @@
-import { listPolicyTemplates, savePolicyTemplate } from '../policyTemplateStore';
+import { BUILTIN_POLICY_TEMPLATES } from '../builtinPolicyTemplates';
+import { sessionPolicyTemplateStore } from '../policyTemplateServices';
+import { createSessionPolicyTemplateStore } from '../policyTemplateStore';
+
+const { list: listPolicyTemplates, save: savePolicyTemplate } = sessionPolicyTemplateStore;
 
 const NEW_TEMPLATE = {
   name: 'Partner traffic',
@@ -92,5 +96,31 @@ describe('policyTemplateStore', () => {
     await expect(savePolicyTemplate({ ...NEW_TEMPLATE, name: 'partner TRAFFIC' })).rejects.toThrow(
       'A template named "partner TRAFFIC" already exists.'
     );
+  });
+});
+
+describe('createSessionPolicyTemplateStore', () => {
+  const BUILTIN = BUILTIN_POLICY_TEMPLATES.filter(t => t.id === 'deny-by-default:gateway');
+
+  it('lists only its own built-in templates and keeps its saves under its own key', async () => {
+    const store = createSessionPolicyTemplateStore(BUILTIN, 'other-app:templates');
+    await store.save({ ...NEW_TEMPLATE, policy_type: 'gateway' });
+
+    expect((await store.list('gateway')).map(t => t.name)).toEqual([
+      'Deny by default',
+      'Partner traffic',
+    ]);
+    expect(window.sessionStorage.getItem('other-app:templates')).toContain('Partner traffic');
+    expect(window.sessionStorage.getItem('policy-templates:organization')).toBeNull();
+  });
+
+  it('tells its subscribers after a save until they unsubscribe', async () => {
+    const store = createSessionPolicyTemplateStore([], 'other-app:templates');
+    const listener = jest.fn();
+    const unsubscribe = store.subscribe(listener);
+    await store.save(NEW_TEMPLATE);
+    unsubscribe();
+    await store.save({ ...NEW_TEMPLATE, name: 'Second' });
+    expect(listener).toHaveBeenCalledTimes(1);
   });
 });

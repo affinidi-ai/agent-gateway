@@ -19,8 +19,6 @@ export type PolicyTemplateParameter =
       default: number;
       min: number;
       max: number;
-      /** Key of another integer setting this one must be greater than. */
-      after?: string;
       help?: string;
     }
   | {
@@ -39,6 +37,28 @@ export type PolicyTemplateParameter =
       default: string[];
       /** The only values accepted, matched without regard to case. */
       allowed?: string[];
+      /** An empty list is accepted and written as the empty set, `set()`. */
+      optional?: boolean;
+      help?: string;
+    }
+  | {
+      key: string;
+      label: string;
+      kind: 'choice';
+      /** The `value` of the option picked by default. */
+      default: string;
+      /** Each option's `rego` is the text the placeholder becomes when it is picked. */
+      options: { value: string; label: string; rego: string }[];
+      help?: string;
+    }
+  | {
+      key: string;
+      label: string;
+      kind: 'time_of_day';
+      /** `HH:MM`, written into the Rego as minutes since midnight. */
+      default: string;
+      /** Key of another time of day this one must differ from. */
+      differs_from?: string;
       help?: string;
     };
 
@@ -79,6 +99,21 @@ export interface PolicyTemplate {
   docs_href?: string;
   /** The text of the docs link, naming the guide or reference section it opens. */
   docs_label?: string;
+}
+
+/** Raw text of each setting field, so a list can be typed with its commas. */
+export type FieldText = Record<string, string>;
+
+/** The template last used from Start from (`blank` for a custom policy) and its settings as typed. */
+export interface UsedTemplate {
+  id: string;
+  fieldText: FieldText;
+}
+
+/** A template group as Add to policy wrote it: its name and the lines between its markers. */
+export interface AddedRules {
+  name: string;
+  body: string;
 }
 
 /** A policy Type's names: `label` as the Type select shows it, `name` before "policies". */

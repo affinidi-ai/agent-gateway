@@ -1,24 +1,21 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { AppButton } from '../../../components/shared/AppButton';
 import { Badge } from '../../../components/shared/Badge';
 import { BLANK_TEMPLATE_ID } from './policyDefaults';
 import PolicySectionTitle from './PolicySectionTitle';
 import type { PolicyStart } from './policyStart';
 import { TemplateOriginBadges } from './TemplateBadges';
-import type { UsedTemplate } from './usePolicyTemplateActions';
-import {
-  galleryTemplates,
-  surfaceOnlyKeys,
-  templateEntryKey,
-  useAllPolicyTemplates,
-} from './usePolicyTemplates';
-import { CATEGORY_LABELS, type PolicyType } from './types';
+import { templateEntryKey } from './usePolicyTemplates';
+import { CATEGORY_LABELS, type PolicyTemplate, type UsedTemplate } from './types';
 import './PolicyTemplates.css';
 
 const COLLAPSED_COUNT = 6;
 
 interface TemplateGalleryProps {
-  policyType: PolicyType;
+  /** The cards for the policy's Type (`useTemplateGallery().cards`). */
+  cards: PolicyTemplate[];
+  /** Keys of the cards marked Agent surface only. */
+  surfaceOnly: Set<string>;
   step?: number;
   /** What the policy started from, while its Rego still follows it (`policyStart`). */
   start: PolicyStart | null;
@@ -43,7 +40,8 @@ type FocusTarget = 'change' | 'card';
  * column (`TemplateGalleryDetail`), where Use this template fills the form.
  */
 const TemplateGallery: React.FC<TemplateGalleryProps> = ({
-  policyType,
+  cards,
+  surfaceOnly,
   step,
   start,
   usedTemplate,
@@ -54,18 +52,12 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
   onSelect,
   onCreateCustom,
 }) => {
-  const entries = useAllPolicyTemplates();
-  const visible = useMemo(() => galleryTemplates(entries, policyType), [entries, policyType]);
-  const surfaceOnly = useMemo(
-    () => (policyType === 'agent_surface' ? surfaceOnlyKeys(entries) : new Set<string>()),
-    [entries, policyType]
-  );
   const [showAll, setShowAll] = useState(false);
 
   // The selected template stays in view even when it is past the first few cards.
-  const selectedIndex = visible.findIndex(t => templateEntryKey(t) === selectedKey);
+  const selectedIndex = cards.findIndex(t => templateEntryKey(t) === selectedKey);
   const shown =
-    showAll || selectedIndex >= COLLAPSED_COUNT ? visible : visible.slice(0, COLLAPSED_COUNT);
+    showAll || selectedIndex >= COLLAPSED_COUNT ? cards : cards.slice(0, COLLAPSED_COUNT);
 
   const changeRef = useRef<HTMLButtonElement>(null);
   const sectionRef = useRef<HTMLElement>(null);
@@ -198,14 +190,14 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
               );
             })}
           </div>
-          {shown.length < visible.length && (
+          {shown.length < cards.length && (
             <AppButton
               variant="outline-secondary"
               className="mt-2"
               onClick={() => setShowAll(true)}
               data-testid="policy-template-gallery-show-all"
             >
-              Show all ({visible.length})
+              Show all ({cards.length})
             </AppButton>
           )}
           <div className="policy-template-gallery__custom">

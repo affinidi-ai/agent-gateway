@@ -41,6 +41,14 @@ changes:
         changes first while it is disabled. Default templates ship with the dashboard; no
         gateway API changes.
   changed:
+    - timestamp: '2026-11-19T16:00:00Z'
+      title: Allow or deny requests in a business-hours window, with optional days
+      description: >-
+        The Allow during business hours template is now Business-hours access window: it
+        allows or denies requests inside a daily window set as HH:MM in a chosen time zone,
+        the window may cross midnight, and Days may be left empty for every day. It is a whole
+        policy, offered under Start from only, because added to another policy its allow rule
+        would let requests through whatever that policy's other rules say.
     - timestamp: '2026-11-19T10:00:00Z'
       title: Show only templates for the policy's Type, with fewer labels
       description: >-

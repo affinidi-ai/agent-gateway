@@ -4,9 +4,9 @@ import { Badge } from '../../../components/shared/Badge';
 import FormSelect from '../../../components/shared/FormSelect';
 import FieldHelp from '../../../components/shared/FieldHelp';
 import InfoBanner from '../../../components/shared/InfoBanner';
-import { simulatePolicy } from '../simulatePolicy';
+import { readsFromRego } from './regoRules';
 import { defaultDecision } from './regoTemplate';
-import { savePolicyTemplate } from './policyTemplateStore';
+import { usePolicyTemplateServices } from './policyTemplateServices';
 import { DecisionBadge } from './TemplateBadges';
 import {
   CATEGORY_LABELS,
@@ -35,12 +35,6 @@ const CATEGORY_OPTIONS = (Object.keys(CATEGORY_LABELS) as PolicyTemplateCategory
   label: CATEGORY_LABELS[c],
 }));
 
-/** Input paths a module reads, such as `jwt.sub`, shown as tags on the template. */
-export function readsFromRego(rego: string): string[] {
-  const paths = Array.from(rego.matchAll(/\binput\.([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)/g), m => m[1]);
-  return Array.from(new Set(paths)).slice(0, 6);
-}
-
 /** One past the highest "Example N" name, so a removed example's number isn't reused. */
 function nextExampleNumber(examples: PolicyTemplateExample[]): number {
   const numbers = examples.map(ex => Number(/^Example (\d+)$/.exec(ex.name)?.[1] ?? 0));
@@ -57,6 +51,7 @@ const SaveAsTemplatePanel: React.FC<SaveAsTemplatePanelProps> = ({
   onSaved,
   onClose,
 }) => {
+  const { store, simulate } = usePolicyTemplateServices();
   const [name, setName] = useState(defaultName);
   const [summary, setSummary] = useState(defaultSummary);
   const [category, setCategory] = useState<PolicyTemplateCategory>('authentication');
@@ -82,7 +77,7 @@ const SaveAsTemplatePanel: React.FC<SaveAsTemplatePanelProps> = ({
     setAdding(true);
     setError(null);
     try {
-      const result = await simulatePolicy(policyId, policyType, savedPolicy, input);
+      const result = await simulate(policyId, policyType, savedPolicy, input);
       setExamples(prev => [
         ...prev,
         {
@@ -102,7 +97,7 @@ const SaveAsTemplatePanel: React.FC<SaveAsTemplatePanelProps> = ({
     setSaving(true);
     setError(null);
     try {
-      const template = await savePolicyTemplate({
+      const template = await store.save({
         name,
         summary,
         category,

@@ -4,7 +4,9 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { PageTitleProvider } from '../../../context/PageTitleContext';
 import { apiClient } from '../../../api';
 import EditPolicyDefinitionPage from '../EditPolicyDefinitionPage';
-import { savePolicyTemplate } from '../policyTemplates/policyTemplateStore';
+import { sessionPolicyTemplateStore } from '../policyTemplates/policyTemplateServices';
+
+const savePolicyTemplate = sessionPolicyTemplateStore.save;
 
 jest.mock('../../../api', () => ({
   apiClient: {
@@ -631,21 +633,50 @@ describe('template settings in the gallery', () => {
 
   it('fills a single-value setting into the Rego as a string', async () => {
     renderAt('/policy-definitions/new?type=agent_surface');
-    fireEvent.click(await card('allow-during-business-hours'));
+    fireEvent.click(await card('business-hours-access-window'));
     fireEvent.change(screen.getByTestId('policy-template-gallery-param-time_zone'), {
       target: { value: 'Asia/Singapore' },
     });
     fireEvent.click(screen.getByTestId('policy-template-gallery-use-button'));
-    expect(rego().value).toContain('time.clock([now, "Asia/Singapore"])');
+    expect(rego().value).toContain('time.clock([time.now_ns(), "Asia/Singapore"])');
   });
 
-  it('refuses business hours that end before they start', async () => {
-    renderAt('/policy-definitions/new?type=agent_surface');
-    fireEvent.click(await card('allow-during-business-hours'));
-    fireEvent.change(screen.getByTestId('policy-template-gallery-param-end_hour'), {
-      target: { value: '8' },
+  it('picks allow or deny inside the business-hours window from a select', async () => {
+    renderAt('/policy-definitions/new?type=gateway');
+    fireEvent.click(await card('business-hours-access-window'));
+    const mode = screen.getByTestId('policy-template-gallery-param-mode');
+    expect(mode.tagName).toBe('SELECT');
+    expect(mode).toHaveValue('allow');
+    fireEvent.change(mode, { target: { value: 'deny' } });
+    fireEvent.click(screen.getByTestId('policy-template-gallery-use-button'));
+    expect(rego().value).toContain('allow if not in_access_window');
+  });
+
+  it('takes the window as HH:MM, crossing midnight, on every day when Days is empty', async () => {
+    renderAt('/policy-definitions/new?type=gateway');
+    fireEvent.click(await card('business-hours-access-window'));
+    const from = screen.getByTestId('policy-template-gallery-param-start_time');
+    expect(from).toHaveAttribute('type', 'time');
+    expect(from).toHaveValue('09:00');
+    fireEvent.change(from, { target: { value: '22:00' } });
+    fireEvent.change(screen.getByTestId('policy-template-gallery-param-end_time'), {
+      target: { value: '06:30' },
     });
-    expect(screen.getByText('Must be later than From hour.')).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId('policy-template-gallery-param-days'), {
+      target: { value: '' },
+    });
+    fireEvent.click(screen.getByTestId('policy-template-gallery-use-button'));
+    expect(rego().value).toContain('1320 > 390');
+    expect(rego().value).toContain('access_day if count(set()) == 0');
+  });
+
+  it('refuses a business-hours window that ends when it starts', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    fireEvent.click(await card('business-hours-access-window'));
+    fireEvent.change(screen.getByTestId('policy-template-gallery-param-end_time'), {
+      target: { value: '09:00' },
+    });
+    expect(screen.getByText('Must differ from From.')).toBeInTheDocument();
     expect(screen.getByTestId('policy-template-gallery-use-button')).toBeDisabled();
   });
 });
@@ -745,7 +776,6 @@ describe('templates panel', () => {
       'Allow by JWT issuer and audience',
       'Require Trust Registry recognition',
       'Require verified credential subject',
-      'Allow during business hours',
       'All trust checks pass',
     ]) {
       expect(names.some(n => n.startsWith(name))).toBe(true);
@@ -764,6 +794,7 @@ describe('templates panel', () => {
       'allow-all-monitor',
       'restrict-mcp-tools-by-role',
       'allowlist-outbound-destinations',
+      'business-hours-access-window',
       'tool-allow-by-jwt-claim',
       'tool-allow-every-caller',
     ]) {
@@ -786,7 +817,7 @@ describe('templates for the other type and for tool bindings', () => {
   it('lists only templates of the policy type in Add rules and says how many it left out', async () => {
     await renderNew('gateway');
     expect(await screen.findByTestId('policy-templates-left-out-note')).toHaveTextContent(
-      '16 templates left out: 2 are whole policies, 14 are for Agent Surface policies. Pick a whole policy under Start from.'
+      '17 templates left out: 3 are whole policies, 14 are for Agent Surface policies. Pick a whole policy under Start from.'
     );
     expect(
       screen.queryByTestId('policy-templates-row-require-authentication:agent_surface')
@@ -799,7 +830,7 @@ describe('templates for the other type and for tool bindings', () => {
   it('leaves out MCP tool policy templates as whole policies', async () => {
     await renderNew();
     expect(await screen.findByTestId('policy-templates-left-out-note')).toHaveTextContent(
-      /^8 templates left out: 8 are whole policies\. Pick a whole policy under Start from\.$/
+      /^9 templates left out: 9 are whole policies\. Pick a whole policy under Start from\.$/
     );
     expect(
       screen.queryByTestId('policy-templates-row-tool-allow-by-jwt-claim:agent_surface')
@@ -930,7 +961,7 @@ describe('insert a template into a saved policy', () => {
     mockGateway();
     renderAt('/policy-definitions/partner-only');
     expect(await screen.findByTestId('policy-templates-left-out-note')).toHaveTextContent(
-      '8 templates left out: 8 are whole policies. Whole policies are offered only when creating a policy.'
+      '9 templates left out: 9 are whole policies. Whole policies are offered only when creating a policy.'
     );
     expect(
       screen.queryByTestId('policy-templates-row-restrict-mcp-tools-by-role:agent_surface')

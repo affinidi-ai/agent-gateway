@@ -1,4 +1,3 @@
-import { BUILTIN_POLICY_TEMPLATES } from './builtinPolicyTemplates';
 import {
   CATEGORY_LABELS,
   type PolicyTemplate,
@@ -6,14 +5,6 @@ import {
   type PolicyTemplateExample,
   type PolicyType,
 } from './types';
-
-/**
- * Policy templates served to the editor. Built-in templates ship with the dashboard;
- * organisation templates saved with {@link savePolicyTemplate} are kept in the tab's
- * `sessionStorage` for that tab, or in memory when storage is unavailable.
- */
-
-const STORAGE_KEY = 'policy-templates:organization';
 
 export interface NewPolicyTemplate {
   name: string;
@@ -25,10 +16,17 @@ export interface NewPolicyTemplate {
   examples: PolicyTemplateExample[];
 }
 
-let unstoredTemplates: PolicyTemplate[] = [];
-// Set once a write fails, so reads come from memory instead of the stale stored list.
-let storageWriteFailed = false;
-const listeners = new Set<() => void>();
+/**
+ * Where the editor reads and saves policy templates. A backend-backed store implements the same
+ * three calls; `subscribe` tells readers to list again after a save.
+ */
+export interface PolicyTemplateStore {
+  list(policyType: PolicyType): Promise<PolicyTemplate[]>;
+  save(input: NewPolicyTemplate): Promise<PolicyTemplate>;
+  subscribe(listener: () => void): () => void;
+}
+
+const DEFAULT_STORAGE_KEY = 'policy-templates:organization';
 
 function isStoredExample(value: unknown): value is PolicyTemplateExample {
   if (typeof value !== 'object' || value === null) return false;
@@ -82,69 +80,81 @@ function fromStored(t: PolicyTemplate): PolicyTemplate {
   };
 }
 
-function readOrganizationTemplates(): PolicyTemplate[] {
-  if (storageWriteFailed) return unstoredTemplates;
-  let raw: string | null;
-  try {
-    raw = window.sessionStorage.getItem(STORAGE_KEY);
-  } catch {
-    return unstoredTemplates;
-  }
-  if (raw === null) return [];
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter(isStoredTemplate).map(fromStored) : [];
-  } catch {
-    return [];
-  }
-}
+/**
+ * A store of `builtin` templates plus organisation templates kept in the tab's `sessionStorage`
+ * under `storageKey`, or in memory when storage is unavailable.
+ */
+export function createSessionPolicyTemplateStore(
+  builtin: readonly PolicyTemplate[],
+  storageKey = DEFAULT_STORAGE_KEY
+): PolicyTemplateStore {
+  let unstored: PolicyTemplate[] = [];
+  // Set once a write fails, so reads come from memory instead of the stale stored list.
+  let writeFailed = false;
+  const listeners = new Set<() => void>();
 
-function writeOrganizationTemplates(templates: PolicyTemplate[]): void {
-  unstoredTemplates = templates;
-  try {
-    window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify(templates));
-    storageWriteFailed = false;
-  } catch {
-    // Storage is unavailable or full; the templates last until the page reloads.
-    storageWriteFailed = true;
-  }
-}
-
-export function subscribePolicyTemplates(listener: () => void): () => void {
-  listeners.add(listener);
-  return () => {
-    listeners.delete(listener);
+  const read = (): PolicyTemplate[] => {
+    if (writeFailed) return unstored;
+    let raw: string | null;
+    try {
+      raw = window.sessionStorage.getItem(storageKey);
+    } catch {
+      return unstored;
+    }
+    if (raw === null) return [];
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter(isStoredTemplate).map(fromStored) : [];
+    } catch {
+      return [];
+    }
   };
-}
 
-export async function listPolicyTemplates(policyType: PolicyType): Promise<PolicyTemplate[]> {
-  return [...BUILTIN_POLICY_TEMPLATES, ...readOrganizationTemplates()].filter(
-    t => t.policy_type === policyType
-  );
-}
-
-export async function savePolicyTemplate(input: NewPolicyTemplate): Promise<PolicyTemplate> {
-  const name = input.name.trim();
-  if (!name) throw new Error('Enter a template name.');
-  const existing = readOrganizationTemplates();
-  const taken = existing.some(
-    t => t.policy_type === input.policy_type && t.name.toLowerCase() === name.toLowerCase()
-  );
-  if (taken) throw new Error(`A template named "${name}" already exists.`);
-  const template: PolicyTemplate = {
-    id: `org:${Date.now().toString(36)}-${existing.length + 1}`,
-    name,
-    summary: input.summary.trim(),
-    description: input.summary.trim(),
-    category: input.category,
-    policy_type: input.policy_type,
-    rego: input.rego,
-    parameters: [],
-    reads: input.reads,
-    examples: input.examples,
-    builtin: false,
+  const write = (templates: PolicyTemplate[]) => {
+    unstored = templates;
+    try {
+      window.sessionStorage.setItem(storageKey, JSON.stringify(templates));
+      writeFailed = false;
+    } catch {
+      // Storage is unavailable or full; the templates last until the page reloads.
+      writeFailed = true;
+    }
   };
-  writeOrganizationTemplates([...existing, template]);
-  listeners.forEach(l => l());
-  return template;
+
+  return {
+    async list(policyType) {
+      return [...builtin, ...read()].filter(t => t.policy_type === policyType);
+    },
+    async save(input) {
+      const name = input.name.trim();
+      if (!name) throw new Error('Enter a template name.');
+      const existing = read();
+      const taken = existing.some(
+        t => t.policy_type === input.policy_type && t.name.toLowerCase() === name.toLowerCase()
+      );
+      if (taken) throw new Error(`A template named "${name}" already exists.`);
+      const template: PolicyTemplate = {
+        id: `org:${Date.now().toString(36)}-${existing.length + 1}`,
+        name,
+        summary: input.summary.trim(),
+        description: input.summary.trim(),
+        category: input.category,
+        policy_type: input.policy_type,
+        rego: input.rego,
+        parameters: [],
+        reads: input.reads,
+        examples: input.examples,
+        builtin: false,
+      };
+      write([...existing, template]);
+      listeners.forEach(l => l());
+      return template;
+    },
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+  };
 }

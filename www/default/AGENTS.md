@@ -1850,7 +1850,40 @@ keeps only entries whose fields check out (category an own key of `CATEGORY_LABE
 example with a text `name`, an object `input` and `expected` allow or deny) and rebuilds
 each from those fields; when a write fails it keeps the templates in memory until reload.
 Saving a template numbers new examples past the highest "Example N". The page's template state and
-the actions that change the Rego, each with Undo, live in `usePolicyTemplateActions`.
+the actions that change the Rego, each with Undo, live in `usePolicyTemplateActions`, and the
+Start from gallery's state (open, selected card, focus, what the policy started from, Use and
+Create custom policy) in `useTemplateGallery`.
+
+- **Layers.** The folder is kept reusable in three layers, and an import only points down:
+  - *Logic* (plain `.ts`, no React): `types.ts` (with `FieldText`, `UsedTemplate`,
+    `AddedRules`), `policyDefaults.ts`, `regoRules.ts` (parsing, rule use, `readsFromRego`),
+    `regoTemplate.ts` (rendering, `insertTemplateRules`), `templateSettings.ts` (setting
+    text to Rego), `policyStart.ts` (`policyStart`, `replaceText`, `groupsForOtherType`) and
+    `policyTemplateStore.ts` (the `PolicyTemplateStore` interface and its session factory). Functions take `readonly` template lists.
+  - *Hooks*: `usePolicyTemplates`, `useTemplateSettings`, `useTemplateFilter`,
+    `usePolicyTemplateActions`, `useTemplateGallery`.
+  - *Components* (`.tsx`), which export components only, so no logic lives in a component
+    file.
+- **App seams.** What the feature needs from the dashboard comes through
+  `PolicyTemplateServicesContext` (`policyTemplateServices.ts`): `store` (a
+  `PolicyTemplateStore`: `list(type)`, `save(input)`, `subscribe(listener)`), `notifyUndo`
+  (the undo toast) and `simulate` (the dry-run endpoint). Its default value is the dashboard's
+  (`sessionPolicyTemplateStore`, `showUndoToast`, `simulatePolicy`), so the page needs no
+  provider; another app, or a backend-backed store, provides its own.
+  `createSessionPolicyTemplateStore(builtin, storageKey)` builds a session store over any
+  catalogue, with its state inside the instance; the dashboard's instance,
+  `sessionPolicyTemplateStore`, is built in `policyTemplateServices.ts`, so the store module
+  never imports the catalogue. Pass the services a stable value: `store` and `simulate` are
+  effect dependencies. `usePolicyTemplates` lists the store again on every `subscribe`
+  notification and drops a list that a newer one overtook. The page reads the templates once,
+  with `useAllPolicyTemplates` (`{entries, builtin, loading, error}`, `loading` per Type;
+  the Add rules panel's spinner follows its own Type, and its left-out note waits for both;
+  `builtin` feeds `groupsForOtherType`), and hands them to
+  `useTemplateGallery` (`entries`, which returns the gallery's `cards` and `surfaceOnly`) and to
+  `PolicyTemplatesPanel` (`library`), so `TemplateGallery` and the panel never list templates
+  themselves. The catalogue (`builtinPolicyTemplates.*`, with its `DOCS_URL` links),
+  `RegoReference` and `policyTemplateServices.ts` are dashboard content, not part of the
+  reusable layers.
 
 - **Catalogue.** A JSON entry holds its rules without a `package` line and lists the
   `policy_types` it serves; `builtinPolicyTemplates.ts` adds the package per type. Every entry
@@ -1867,10 +1900,18 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   policies bound to MCP tools on the MCP Proxy hop: they read `McpPolicyContext`
   (`src/mcp/policy.rs`: `input.jwt` claims, `input.mcp.method` as the tool name), carry an "MCP
   tool policy" badge in the gallery, and are whole policies (below). A setting is a `{{key}}` placeholder with `kind` `integer` (`min`, `max`),
-  `string` or `string_list`. An integer's `after` names a setting it must be greater than, a
-  string's `format: "time_zone"` accepts IANA names only (written in their canonical spelling),
-  and a list's `allowed` names the only values accepted, matched without regard to case and
-  written in the listed spelling; Allow during business hours uses all three. A template that reads the clock (`time.now_ns()`) has no examples.
+  `string`, `string_list`, `choice` or `time_of_day`. A string's `format: "time_zone"` accepts
+  IANA names only (written in their canonical spelling); a list's `allowed` names the only values
+  accepted, matched without regard to case and written in the listed spelling, and an `optional`
+  list may be left empty, written as `set()`; a `choice` (a select) writes the `rego` text of the
+  picked option, which may be empty; a `time_of_day` (a time input) takes `HH:MM` and writes the
+  minutes since midnight, and its `differs_from` names a time it must not equal. Business-hours
+  access window uses them all: its **Inside the window** choice writes `allow if
+  in_access_window` (Allow requests) or `allow if not in_access_window` (Deny requests), its
+  **From** and **Until** times make a window that crosses midnight when Until is earlier, its
+  **Days** may be empty for every day (a day is the request's date in the time zone), and it is a
+  whole policy, since added to another policy its allow rule would let requests through
+  whatever that policy's other rules say. A template that reads the clock (`time.now_ns()`) has no examples.
   An entry is `standalone` when it is meant to be the whole policy: its rules only set the
   default decision (Deny by default, Monitor-only baseline) or allow requests outside what they
   restrict (Restrict MCP tools by role, Allowlist outbound destinations).
@@ -1918,7 +1959,7 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   follow the Trust Registry pattern: pick a template, or create a custom one. It calls
   `pickBlank` (Rego `ALLOW_ALL_POLICY`, used template `blank`, named "Custom policy") at once,
   unless a template was used and the Rego is no longer an untouched start (`replaceText` in
-  `TemplateGalleryDetail.tsx` is not null): then it selects `blank`, and the templates column
+  `policyStart.ts` is not null): then it selects `blank`, and the templates column
   shows the Custom policy detail, whose **Create custom policy** asks in place before it
   replaces anything. The help text above the grid points to
   **Add rules from a template** by name, not by where the column sits, since the column stacks
@@ -1932,7 +1973,7 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   (`policy-template-gallery-detail-heading`, `tabIndex={-1}`); Change with no card selected
   focuses the first card. The Custom policy detail has its description,
   **Show Rego** with `ALLOW_ALL_POLICY` and **Create custom policy** in place of Use. A template's detail is built from
-  `TemplatePreview.tsx` like the column's preview: description, **This tab only** on an
+  `TemplatePreview.tsx` and `useTemplateSettings` like the column's preview: description, **This tab only** on an
   organization template, setting fields (`policy-template-gallery-param-<key>`), **Show Rego**
   (`policy-template-gallery-show-rego`, collapsed by default), which shows the Rego the current
   settings render to in a `policy-preview-block` (`policy-template-gallery-rego`), or "Fix the

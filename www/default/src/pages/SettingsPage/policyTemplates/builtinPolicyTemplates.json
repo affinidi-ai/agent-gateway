@@ -506,40 +506,57 @@
     }
   },
   {
-    "id": "allow-during-business-hours",
-    "name": "Allow during business hours",
-    "summary": "Allow requests only on listed days between two hours.",
-    "description": "Allows a request only on the listed weekdays, from the start hour until the end hour, in the chosen time zone. Rate limits are set on the surface's Rate Limit panel, not in policy.",
+    "id": "business-hours-access-window",
+    "name": "Business-hours access window",
+    "summary": "Allow or deny requests by time of day, day of week and time zone.",
+    "description": "Allows, or denies, requests made inside a daily time window on the listed days, in the chosen time zone; requests outside the window get the opposite decision. A window whose end is earlier than its start crosses midnight. Rate limits are set on the surface's Rate Limit panel, not in policy.",
     "category": "time",
     "policy_types": ["gateway", "agent_surface"],
-    "rules": "default allow := false\n\nallow if {\n  now := time.now_ns()\n  time.weekday([now, {{time_zone}}]) in {{days}}\n  [hour, _, _] := time.clock([now, {{time_zone}}])\n  hour >= {{start_hour}}\n  hour < {{end_hour}}\n}",
+    "standalone": true,
+    "rules": "default allow := false\n\nallow if {{mode}}in_access_window\n\nin_access_window if {\n  access_day\n  access_minute >= {{start_time}}\n  access_minute < {{end_time}}\n}\n\nin_access_window if {\n  {{start_time}} > {{end_time}}\n  access_day\n  access_minute >= {{start_time}}\n}\n\nin_access_window if {\n  {{start_time}} > {{end_time}}\n  access_day\n  access_minute < {{end_time}}\n}\n\naccess_minute := (hour * 60) + minute if {\n  [hour, minute, _] := time.clock([time.now_ns(), {{time_zone}}])\n}\n\naccess_day if count({{days}}) == 0\n\naccess_day if time.weekday([time.now_ns(), {{time_zone}}]) in {{days}}",
     "parameters": [
+      {
+        "key": "mode",
+        "label": "Inside the window",
+        "kind": "choice",
+        "default": "allow",
+        "options": [
+          {
+            "value": "allow",
+            "label": "Allow requests",
+            "rego": ""
+          },
+          {
+            "value": "deny",
+            "label": "Deny requests",
+            "rego": "not "
+          }
+        ],
+        "help": "Allow lets requests through only inside the window. Deny refuses requests inside the window and lets every other request through."
+      },
       {
         "key": "days",
         "label": "Days",
         "kind": "string_list",
         "default": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
         "allowed": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
-        "help": "English day names, separated by commas."
+        "help": "English day names, separated by commas. Leave empty for every day. A day is the request's date in the time zone below.",
+        "optional": true
       },
       {
-        "key": "start_hour",
-        "label": "From hour",
-        "kind": "integer",
-        "default": 9,
-        "min": 0,
-        "max": 23,
-        "help": "First allowed hour, 0 to 23."
+        "key": "start_time",
+        "label": "From",
+        "kind": "time_of_day",
+        "default": "09:00",
+        "help": "Start of the window, as HH:MM."
       },
       {
-        "key": "end_hour",
-        "label": "Until hour",
-        "kind": "integer",
-        "default": 17,
-        "min": 1,
-        "max": 24,
-        "after": "start_hour",
-        "help": "Requests are allowed until this hour starts. Must be later than From hour."
+        "key": "end_time",
+        "label": "Until",
+        "kind": "time_of_day",
+        "default": "17:00",
+        "differs_from": "start_time",
+        "help": "End of the window, as HH:MM; requests from this time on are outside it. A time earlier than From makes the window cross midnight, for example 22:00 to 06:00."
       },
       {
         "key": "time_zone",

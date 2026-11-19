@@ -63,6 +63,10 @@
   max-width: 7rem;
 }
 
+.policy-template-time {
+  max-width: 9rem;
+}
+
 .policy-template-example {
   display: flex;
   justify-content: space-between;

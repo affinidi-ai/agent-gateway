@@ -16,7 +16,7 @@ export function matchesTemplateQuery(template: PolicyTemplate, query: string): b
 }
 
 /** Search and category filtering shared by the templates panel and the Start from gallery. */
-export function useTemplateFilter(templates: PolicyTemplate[]) {
+export function useTemplateFilter(templates: readonly PolicyTemplate[]) {
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState<CategoryFilter>('all');
 

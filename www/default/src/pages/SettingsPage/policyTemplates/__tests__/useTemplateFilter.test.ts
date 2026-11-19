@@ -7,7 +7,7 @@ const byId = (id: string) => surfaceTemplates.find(t => t.id === `${id}:agent_su
 
 describe('matchesTemplateQuery', () => {
   it('matches the name, summary, read inputs and category, ignoring case', () => {
-    expect(matchesTemplateQuery(byId('allow-during-business-hours'), 'BUSINESS')).toBe(true);
+    expect(matchesTemplateQuery(byId('business-hours-access-window'), 'BUSINESS')).toBe(true);
     expect(matchesTemplateQuery(byId('all-trust-checks-pass'), 'trust checks')).toBe(true);
     expect(matchesTemplateQuery(byId('allow-http-methods'), 'routing')).toBe(true);
     expect(matchesTemplateQuery(byId('allow-http-methods'), 'zzz')).toBe(false);
