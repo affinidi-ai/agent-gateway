@@ -78,10 +78,45 @@ test.describe('Policy templates on the create policy page', () => {
         const group = page.getByTestId('policy-rules-group-0');
         await expect(group).toContainText('From template: Allow listed HTTP methods');
         await expect(page.getByTestId('policy-rules-allow-default-warning')).toHaveCount(0);
+        await expect(page.getByTestId('policy-rules-summary')).toHaveText(
+            'This policy allows a request when its allow rule matches. Otherwise: DENY'
+        );
+        await expect(page.getByTestId('policy-rules-summary-otherwise')).toHaveText('DENY');
+        await expect(page.getByTestId('policy-rules-group-0-rule-0-kind')).toHaveText('Allows');
         await captureFullPage(page, 'policy-templates-rules-added');
 
         await page.getByTestId('policy-rules-group-0-remove-button').click();
         await expect(page.getByTestId('policy-rules-empty')).toBeVisible();
+    });
+
+    test('states what the policy decides and marks the rules allow reads', async ({page}) => {
+        await page.setViewportSize({width: 1366, height: 768});
+        await pickCard(page, 'business-hours-access-window');
+        await galleryDetail(page).getByTestId('policy-template-gallery-use-button').click();
+
+        await expect(page.getByTestId('policy-rules-summary')).toHaveText(
+            'This policy allows a request when its allow rule matches. Otherwise: DENY'
+        );
+        await expect(page.getByTestId('policy-rules-group-0-rule-0-kind')).toHaveText('Allows');
+        const helper = page.getByTestId('policy-rules-group-0-rule-1-kind');
+        await expect(helper).toHaveText('Used by allow');
+        await expect(helper).toHaveAttribute(
+            'title',
+            'allow reads this rule, directly or through other rules, so it changes what the policy decides'
+        );
+        await captureFullPage(page, 'policy-templates-rules-summary-laptop');
+
+        await page.getByTestId('topbar-theme-button').click();
+        await expect.poll(() => page.evaluate(() => document.body.classList.contains('dark-theme'))).toBe(true);
+        await page.evaluate(() =>
+            Promise.all(
+                document
+                    .getAnimations()
+                    .filter(a => a instanceof CSSTransition)
+                    .map(a => a.finished.catch(() => undefined))
+            )
+        );
+        await captureFullPage(page, 'policy-templates-rules-summary-laptop-dark');
     });
 
     test('keeps the editor width when a template is shown', async ({page}) => {
