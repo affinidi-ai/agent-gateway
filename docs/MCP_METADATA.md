@@ -564,6 +564,27 @@ The REST client bounds the body's bytes by `max_response_bytes` before encoding
 bounds the whole JSON-RPC response by it, base64 included, so an image or file
 larger than about three quarters of the limit is refused there as "MCP tool
 result exceeds the configured limit"; a legacy call has no such second bound.
+A REST API that answers a file inside its JSON, as a base64 string, declares
+it with `x-gateway-file` on the JSON media type of a success answer of the
+operation: `{"pointer": "/data", "encoding": "base64url"}`, where `pointer` is
+the JSON Pointer (RFC 6901, starting with `/`, at most 256 characters) of the
+string and `encoding` is `base64` or `base64url`, padded or not. The
+declaration stands on its own: it is read whether or not that media type also
+has a `schema`, which OpenAPI leaves optional, and on any success answer
+(`200`, any other `2xx`, `2XX` or `default`), not only the one the output
+schema is taken from. The answer it is declared on is then the decoded file as
+an embedded resource (`mimeType` `application/octet-stream`, `uri` as above),
+never the JSON around it, and the tool advertises no output schema; that
+answer when it is not JSON, has no string at the pointer or a string not in
+that encoding is the tool error "REST response does not carry the file its
+tool declares". Another answer is answered as it would be without the
+declaration: a success status the file was not declared on is its JSON, and a
+failure status is answered as usual. A declaration with another key, another
+encoding or no pointer, on any success answer, drops the tool from
+`tools/list` and refuses a call to it, as an unusable output schema does. The
+gateway's own REST client reads it, so it applies to 2026-07-28 calls, calls
+carrying the Target credential and Transit Point calls; a legacy call without
+the Target credential answers the JSON.
 Argument failures are `400` / `-32602` before network execution;
 execution failures remain error tool results. Catalog locks are released
 before the REST call. Surface-backed dispatch runs after the shared request

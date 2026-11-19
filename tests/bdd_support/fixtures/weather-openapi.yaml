@@ -77,3 +77,46 @@ paths:
               schema:
                 type: string
                 format: binary
+  /weather/{city}/attachment:
+    get:
+      operationId: get_weather_attachment
+      summary: Get the weather report for a city as a file inside a JSON answer
+      parameters:
+        - name: city
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The report's bytes in base64url
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  size:
+                    type: integer
+                  data:
+                    type: string
+              x-gateway-file:
+                pointer: /data
+                encoding: base64url
+  /weather/{city}/broken-attachment:
+    get:
+      operationId: get_broken_attachment
+      summary: Declare a file in an encoding the gateway does not read
+      parameters:
+        - name: city
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: A malformed file declaration
+          content:
+            application/json:
+              x-gateway-file:
+                pointer: /data
+                encoding: hex
