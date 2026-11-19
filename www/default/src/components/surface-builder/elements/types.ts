@@ -342,6 +342,8 @@ export interface NodeDefinition {
   // Protocol constraints
   /** When set, element only available for these protocols. Undefined = all protocols. */
   protocols?: Protocol[];
+  /** When set, element is not offered in the palette for these protocols. */
+  excludedProtocols?: Protocol[];
 
   /**
    * True for elements that act as a transit point. The wizard / canvas

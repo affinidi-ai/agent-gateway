@@ -173,6 +173,16 @@ describe('ElementRegistry', () => {
       expect(registry.get('payment')).toBeDefined();
     });
 
+    it('offers each Transit Point variant only on surfaces that speak its protocol', () => {
+      const types = (protocol: 'a2a' | 'ap2' | 'mcp') =>
+        registry.paletteItems(protocol).map(d => d.type);
+      expect(types('a2a')).toContain('transit-point-a2a');
+      expect(types('a2a')).not.toContain('transit-point-mcp');
+      expect(types('mcp')).toContain('transit-point-mcp');
+      expect(types('mcp')).not.toContain('transit-point-a2a');
+      expect(registry.get('transit-point-mcp')).toBeDefined();
+    });
+
     it('offers Metadata Extraction only on A2A / AP2 surfaces', () => {
       expect(registry.paletteItems('a2a').map(d => d.type)).toContain('metadata-extraction');
       expect(registry.paletteItems('ap2').map(d => d.type)).toContain('metadata-extraction');

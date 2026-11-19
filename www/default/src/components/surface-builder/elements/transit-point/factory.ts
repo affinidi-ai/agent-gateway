@@ -111,6 +111,8 @@ interface TransitPointVariantOpts {
    * for new drops). See `NodeDefinition.hiddenFromPalette`.
    */
   hiddenFromPalette?: boolean;
+  /** Surface protocols whose palette does not offer this variant. */
+  excludedProtocols?: Protocol[];
 }
 
 /**
@@ -120,8 +122,16 @@ interface TransitPointVariantOpts {
  * and bound protocol differ.
  */
 export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeDefinition {
-  const { type, protocol, label, color, paletteOrder, isPayloadCoordinator, hiddenFromPalette } =
-    opts;
+  const {
+    type,
+    protocol,
+    label,
+    color,
+    paletteOrder,
+    isPayloadCoordinator,
+    hiddenFromPalette,
+    excludedProtocols,
+  } = opts;
   return {
     type,
     label: `Transit Point (${label})`,
@@ -144,6 +154,7 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
     dropMode: 'canvas',
     isTransitPoint: true,
     ...(hiddenFromPalette ? { hiddenFromPalette: true } : {}),
+    ...(excludedProtocols ? { excludedProtocols } : {}),
     getProtocol: () => protocol,
     help: {
       title: `Transit Point (${label})`,

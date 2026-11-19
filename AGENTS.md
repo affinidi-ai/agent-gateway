@@ -141,6 +141,10 @@ A Transit Point's Rate Limit panel has a **Per caller** section that writes
 `transit.points[].per_caller_rate_limit` beside the point's shared `rate_limit`; see _Surface
 Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
+The Surface Builder palette offers the A2A Transit Point only on A2A and AP2 surfaces and the MCP
+Transit Point only on MCP surfaces; existing Transit Points stay editable; see _Surface Builder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
 The Surface Builder labels an Access Point's URL **Entry point URL**, with a copy button in the
 Access Point panel and on the canvas, and names a new surface `<protocol>_surface_<n>`; see
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).

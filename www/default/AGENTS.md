@@ -115,6 +115,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
 
 ## Surface Builder
 
+- The palette offers the A2A Transit Point only on A2A and AP2 surfaces and the MCP Transit
+  Point only on MCP surfaces (`excludedProtocols` on the node definition). Transit Points
+  already on a surface keep rendering and editing.
 - Sidebars may include small, legible configuration controls. Move dense editors,
   repeated rows, long lists, JSON and schema editors, and advanced controls into an
   element `FullscreenPanel`. When fullscreen is used, keep the sidebar focused on counts
