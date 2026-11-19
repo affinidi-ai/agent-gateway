@@ -21,12 +21,17 @@
 //! the pending key at the next start and finishes the job. Both keys exist
 //! until the new one has authenticated once.
 //!
-//! ## Why this is a command, not a live endpoint
+//! The swap is sent once, never retried, and the pending key is dropped only
+//! when the trust agent refuses it outright. Any other failure (a timeout, a
+//! rate limit, a proxy's error) may have followed an applied swap, so the
+//! pending key stays for [`settle_pending`].
 //!
-//! A trust agent supersedes a DID's session when that DID authenticates again,
-//! and the running gateway's connector holds the old key in memory. Run it with
-//! the gateway stopped (`agent-gateway --vta-rotate-control-key --yes`); the
-//! next start reads the new key.
+//! ## Rotating while the gateway runs
+//!
+//! [`rotate_live`] (behind `POST /v1/vta/control-key/rotate` and the rotation
+//! schedule) swaps through the running connector's own client and then moves
+//! that client to the new key. The old DID never authenticates a second time,
+//! which would make the trust agent supersede the session in use.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -204,6 +209,15 @@ impl Drop for Rotating {
     }
 }
 
+/// Whether the trust agent's answer to a swap it was sent once says the swap
+/// did not happen: the request was malformed (`400`) or not allowed (`401`,
+/// `403`). A `409` or `422` can answer a repeat of a swap already applied, and
+/// a `408`, `429` or any other status can come from something in front of the
+/// agent, so none of them proves the old key is still the live one.
+fn swap_refused(e: &VtaError) -> bool {
+    matches!(e, VtaError::Http { status: 400 | 401 | 403, .. })
+}
+
 /// Move the access entry that `client` authenticates as to a new key, through
 /// `client` itself. The old DID is never authenticated a second time, which
 /// would supersede the session the caller is using.
@@ -224,7 +238,7 @@ async fn swap_to_new_key(
         .max(0) as u64;
     let link_proof = build_link_proof(&new_key, vta_did, now, LINK_PROOF_TTL_SECS).await?;
     let response: Value = match client
-        .dispatch_signed(
+        .dispatch_signed_at_most_once(
             TASK_ACL_SWAP_KEY,
             json!({
                 "currentSubject": previous_did,
@@ -236,10 +250,7 @@ async fn swap_to_new_key(
     {
         Ok(response) => response,
         Err(e) => {
-            // A definitive refusal means nothing moved, so the pending key is
-            // dead weight. Anything else (a timeout) leaves it for
-            // `settle_pending`, which asks the trust agent which key is live.
-            if matches!(e, VtaError::Http { status: 400..=499, .. }) {
+            if swap_refused(&e) {
                 remove_secret(&pending_key_path(control_key_path)).await;
             }
             return Err(e);
@@ -305,25 +316,6 @@ impl super::control_key::ControlKeyReloader for StoredKeyReloader {
             .ok()??;
         Some(Arc::new(ControlKey::from_seed(seed)))
     }
-}
-
-/// Rotate the control key at `control_key_path` on the trust agent `vta_did`,
-/// with nothing else running (the offline command).
-#[cfg(test)]
-pub async fn rotate(
-    config: &VtaConfig,
-    vta_did: &str,
-    control_key_path: &Path,
-) -> Result<Rotated, VtaError> {
-    let current_seed = read_seed(control_key_path)
-        .await?
-        .ok_or_else(|| VtaError::Config("there is no control key to rotate".to_string()))?;
-    let current = ControlKey::from_seed(current_seed);
-    let previous_did = current.did().to_string();
-    let client = client_for(config, vta_did, current)?;
-    swap_to_new_key(&client, config, vta_did, control_key_path, &previous_did)
-        .await
-        .map(|(rotated, _)| rotated)
 }
 
 /// Rotate the control key while the gateway runs, through its shared `client`,
@@ -485,9 +477,20 @@ mod tests {
     #[derive(Clone)]
     struct Mock(Arc<Mutex<MockVta>>);
 
+    /// What the mock answers a swap with instead of its success response.
+    #[derive(Clone, Copy)]
+    enum SwapAnswer {
+        Applied,
+        /// Refuses with this status without moving the entry.
+        Refused(u16),
+        /// Moves the entry, then the answer is lost behind this status.
+        AppliedThenLost(u16),
+    }
+
     struct MockVta {
         allowed: Vec<String>,
-        refuse_swap: bool,
+        swap_answer: SwapAnswer,
+        swap_attempts: usize,
         swaps: Vec<(String, String)>,
         auths: Vec<String>,
         challenges: Vec<String>,
@@ -574,6 +577,14 @@ mod tests {
                 .into_response();
         }
         if task.contains("acl/swap-key") {
+            vta.swap_attempts += 1;
+            if let SwapAnswer::Refused(status) = vta.swap_answer {
+                return (
+                    StatusCode::from_u16(status).unwrap(),
+                    Json(json!({ "error": "refused", "retryAfterSecs": 0.01 })),
+                )
+                    .into_response();
+            }
             let payload = &body["payload"];
             let (current, new) = (
                 payload["currentSubject"]
@@ -585,7 +596,7 @@ mod tests {
                     .unwrap_or_default()
                     .to_string(),
             );
-            if vta.refuse_swap || current != issuer || !vta.allowed.contains(&current) || body.get("proof").is_none() {
+            if current != issuer || !vta.allowed.contains(&current) || body.get("proof").is_none() {
                 return denied();
             }
             if check_link_proof(
@@ -603,6 +614,13 @@ mod tests {
             vta.allowed.push(new.clone());
             vta.swaps
                 .push((current.clone(), new.clone()));
+            if let SwapAnswer::AppliedThenLost(status) = vta.swap_answer {
+                return (
+                    StatusCode::from_u16(status).unwrap(),
+                    Json(json!({ "error": "lost", "retryAfterSecs": 0.01 })),
+                )
+                    .into_response();
+            }
             let reported = if vta.wrong_subject {
                 current.clone()
             } else {
@@ -719,7 +737,8 @@ mod tests {
     fn new_mock() -> Mock {
         Mock(Arc::new(Mutex::new(MockVta {
             allowed: Vec::new(),
-            refuse_swap: false,
+            swap_answer: SwapAnswer::Applied,
+            swap_attempts: 0,
             swaps: Vec::new(),
             auths: Vec::new(),
             challenges: Vec::new(),
@@ -733,8 +752,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (path, old) = enrolled_gateway(&mock, dir.path()).await;
         let url = serve(&mock).await;
+        let client = running_client(&url, &old);
 
-        let rotated = rotate(&config(&url), VTA, &path)
+        let rotated = rotate_live(&client, &config(&url), VTA, &path)
             .await
             .expect("rotate");
 
@@ -980,31 +1000,177 @@ mod tests {
         );
     }
 
+    fn current_did(seed: Option<[u8; 32]>) -> String {
+        ControlKey::from_seed(seed.expect("a current key"))
+            .did()
+            .to_string()
+    }
+
     #[tokio::test]
     async fn a_refused_live_swap_keeps_the_old_key_and_removes_the_pending_one() {
+        for status in [400u16, 401, 403] {
+            let mock = new_mock();
+            mock.0
+                .lock()
+                .unwrap()
+                .swap_answer = SwapAnswer::Refused(status);
+            let dir = tempfile::tempdir().unwrap();
+            let (path, old) = enrolled_gateway(&mock, dir.path()).await;
+            let url = serve(&mock).await;
+            let client = running_client(&url, &old);
+
+            let err = rotate_live(&client, &config(&url), VTA, &path)
+                .await
+                .expect_err("refused");
+
+            assert!(
+                matches!(&err, RotateLiveError::Failed(VtaError::Http { status: s, .. }) if *s == status),
+                "{status}: {err:?}"
+            );
+            assert_eq!(client.control_did(), old.did());
+            assert_eq!(
+                current_did(
+                    read_seed(&path)
+                        .await
+                        .unwrap()
+                ),
+                old.did(),
+                "{status}: still the old key"
+            );
+            assert!(
+                read_seed(&pending_key_path(&path))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{status}: a definitive refusal clears the pending key"
+            );
+            assert_eq!(mock.0.lock().unwrap().allowed, [old.did().to_string()]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_swap_whose_answer_is_lost_keeps_the_pending_key_and_settling_promotes_it() {
+        for status in [408u16, 409, 422, 429, 502] {
+            let mock = new_mock();
+            mock.0
+                .lock()
+                .unwrap()
+                .swap_answer = SwapAnswer::AppliedThenLost(status);
+            let dir = tempfile::tempdir().unwrap();
+            let (path, old) = enrolled_gateway(&mock, dir.path()).await;
+            let url = serve(&mock).await;
+            let client = running_client(&url, &old);
+
+            let err = rotate_live(&client, &config(&url), VTA, &path)
+                .await
+                .expect_err("the answer was lost");
+
+            assert!(
+                matches!(&err, RotateLiveError::Failed(VtaError::Http { status: s, .. }) if *s == status),
+                "{status}: {err:?}"
+            );
+            let pending = read_seed(&pending_key_path(&path))
+                .await
+                .unwrap()
+                .expect("the pending key is kept");
+            let pending_did = current_did(Some(pending));
+            assert_eq!(
+                mock.0.lock().unwrap().allowed,
+                std::slice::from_ref(&pending_did),
+                "{status}: the swap was applied"
+            );
+
+            let settled = settle_pending(&config(&url), VTA, &path)
+                .await
+                .expect("settle")
+                .expect("the pending key is the live one");
+
+            assert_eq!(settled.previous_did, old.did());
+            assert_eq!(settled.new_did, pending_did);
+            assert_eq!(
+                current_did(
+                    read_seed(&path)
+                        .await
+                        .unwrap()
+                ),
+                pending_did,
+                "{status}: promoted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_swap_refused_for_a_reason_that_proves_nothing_is_settled_later_and_dropped() {
+        for status in [408u16, 429] {
+            let mock = new_mock();
+            mock.0
+                .lock()
+                .unwrap()
+                .swap_answer = SwapAnswer::Refused(status);
+            let dir = tempfile::tempdir().unwrap();
+            let (path, old) = enrolled_gateway(&mock, dir.path()).await;
+            let url = serve(&mock).await;
+            let client = running_client(&url, &old);
+
+            rotate_live(&client, &config(&url), VTA, &path)
+                .await
+                .expect_err("refused");
+
+            assert!(
+                read_seed(&pending_key_path(&path))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{status}: kept until the trust agent says which key is live"
+            );
+            assert!(
+                settle_pending(&config(&url), VTA, &path)
+                    .await
+                    .expect("settle")
+                    .is_none(),
+                "{status}: the swap did not happen"
+            );
+            assert!(
+                read_seed(&pending_key_path(&path))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{status}: dropped once refused"
+            );
+            assert_eq!(
+                current_did(
+                    read_seed(&path)
+                        .await
+                        .unwrap()
+                ),
+                old.did()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_swap_is_sent_once_even_when_its_answer_invites_a_retry() {
         let mock = new_mock();
         mock.0
             .lock()
             .unwrap()
-            .refuse_swap = true;
+            .swap_answer = SwapAnswer::AppliedThenLost(429);
         let dir = tempfile::tempdir().unwrap();
         let (path, old) = enrolled_gateway(&mock, dir.path()).await;
         let url = serve(&mock).await;
         let client = running_client(&url, &old);
 
-        let err = rotate_live(&client, &config(&url), VTA, &path)
+        rotate_live(&client, &config(&url), VTA, &path)
             .await
-            .expect_err("refused");
+            .expect_err("rate limited");
 
-        assert!(matches!(err, RotateLiveError::Failed(VtaError::Http { status: 403, .. })), "{err:?}");
-        assert_eq!(client.control_did(), old.did());
-        assert!(
-            read_seed(&pending_key_path(&path))
-                .await
+        assert_eq!(
+            mock.0
+                .lock()
                 .unwrap()
-                .is_none()
+                .swap_attempts,
+            1
         );
-        assert_eq!(mock.0.lock().unwrap().allowed, [old.did().to_string()]);
     }
 
     #[tokio::test]
@@ -1113,73 +1279,6 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "left for the next start to settle"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_refused_swap_changes_nothing_and_leaves_no_pending_key() {
-        let mock = new_mock();
-        mock.0
-            .lock()
-            .unwrap()
-            .refuse_swap = true;
-        let dir = tempfile::tempdir().unwrap();
-        let (path, old) = enrolled_gateway(&mock, dir.path()).await;
-        let url = serve(&mock).await;
-
-        let err = rotate(&config(&url), VTA, &path)
-            .await
-            .expect_err("refused");
-
-        assert!(matches!(err, VtaError::Http { status: 403, .. }), "{err:?}");
-        assert_eq!(
-            ControlKey::from_seed(
-                read_seed(&path)
-                    .await
-                    .unwrap()
-                    .unwrap()
-            )
-            .did(),
-            old.did(),
-            "still the old key"
-        );
-        assert!(
-            read_seed(&pending_key_path(&path))
-                .await
-                .unwrap()
-                .is_none(),
-            "a definitive refusal clears the pending key"
-        );
-        assert_eq!(mock.0.lock().unwrap().allowed, [old.did().to_string()]);
-    }
-
-    #[tokio::test]
-    async fn an_unreachable_trust_agent_keeps_the_current_key_and_leaves_the_pending_one_for_later() {
-        let mock = new_mock();
-        let dir = tempfile::tempdir().unwrap();
-        let (path, old) = enrolled_gateway(&mock, dir.path()).await;
-
-        let err = rotate(&config("http://127.0.0.1:1"), VTA, &path)
-            .await
-            .expect_err("unreachable");
-
-        assert!(matches!(err, VtaError::Transport(_)), "{err:?}");
-        assert_eq!(
-            ControlKey::from_seed(
-                read_seed(&path)
-                    .await
-                    .unwrap()
-                    .unwrap()
-            )
-            .did(),
-            old.did()
-        );
-        assert!(
-            read_seed(&pending_key_path(&path))
-                .await
-                .unwrap()
-                .is_some(),
-            "an unknown outcome is settled at the next start"
         );
     }
 

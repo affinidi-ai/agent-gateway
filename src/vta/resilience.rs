@@ -102,6 +102,36 @@ impl Resilience {
     pub async fn run<F, Fut, T>(
         &self,
         operation: &str,
+        op: F,
+    ) -> Result<T, VtaError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, VtaError>>,
+    {
+        self.run_with(operation, true, op)
+            .await
+    }
+
+    /// [`run`](Self::run) without the retry, for a task that is not safe to
+    /// send twice: a first attempt the agent applied but whose answer was lost
+    /// would make the second one fail for a reason unrelated to the request.
+    pub async fn run_once<F, Fut, T>(
+        &self,
+        operation: &str,
+        op: F,
+    ) -> Result<T, VtaError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, VtaError>>,
+    {
+        self.run_with(operation, false, op)
+            .await
+    }
+
+    async fn run_with<F, Fut, T>(
+        &self,
+        operation: &str,
+        retry: bool,
         mut op: F,
     ) -> Result<T, VtaError>
     where
@@ -122,7 +152,8 @@ impl Resilience {
 
         let start = Instant::now();
         let mut result = op().await;
-        if let Err(ref e) = result
+        if retry
+            && let Err(ref e) = result
             && e.is_retryable()
         {
             // The agent tells us how long to wait on a 429; retrying instantly
@@ -182,6 +213,24 @@ mod tests {
             .await;
         assert_eq!(out.unwrap(), 7);
         assert_eq!(calls.load(Ordering::SeqCst), 2, "one retry");
+    }
+
+    #[tokio::test]
+    async fn run_once_does_not_retry_a_transient_failure() {
+        let r = Resilience::new(4);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = Arc::clone(&calls);
+        let out: Result<u8, VtaError> = r
+            .run_once("op", move || {
+                let calls = Arc::clone(&calls2);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(VtaError::Transport("flaky".to_string()))
+                }
+            })
+            .await;
+        assert!(matches!(out, Err(VtaError::Transport(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "sent once");
     }
 
     #[tokio::test]
