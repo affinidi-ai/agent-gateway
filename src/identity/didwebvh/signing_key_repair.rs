@@ -428,6 +428,87 @@ mod tests {
         assert!(lists_signing_key(&read_log(dir.path()).await, &did, &key));
     }
 
+    fn log_states(log: &str) -> Vec<Value> {
+        log_entries(log)
+            .iter()
+            .map(|entry| serde_json::from_str::<Value>(entry).unwrap())
+            .collect()
+    }
+
+    fn without_relationships(state: &Value) -> Value {
+        let mut state = state.clone();
+        for relationship in SIGNING_KEY_RELATIONSHIPS {
+            state
+                .as_object_mut()
+                .unwrap()
+                .remove(relationship);
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn repair_changes_only_the_signing_key_relationships_and_keeps_the_update_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (did, key) = agent_log(dir.path(), true).await;
+
+        repair(dir.path(), &did, &key)
+            .await
+            .unwrap();
+
+        let entries = log_states(&read_log(dir.path()).await);
+        let (before, after) = (&entries[0], &entries[1]);
+        assert_eq!(without_relationships(&after["state"]), without_relationships(&before["state"]));
+        assert_eq!(after["state"]["assertionMethod"], before["state"]["assertionMethod"]);
+        assert_eq!(after["state"]["authentication"], json!([format!("{did}#key-1"), signing_key_id(&did)]));
+        assert!(
+            after["parameters"]
+                .get("updateKeys")
+                .is_none_or(|keys| *keys == before["parameters"]["updateKeys"]),
+            "the update key must not change: {}",
+            after["parameters"]
+        );
+    }
+
+    #[tokio::test]
+    async fn publishing_a_missing_signing_key_adds_it_and_keeps_every_other_method() {
+        let dir = tempfile::tempdir().unwrap();
+        let (did, key) = agent_log(dir.path(), false).await;
+
+        repair(dir.path(), &did, &key)
+            .await
+            .unwrap();
+
+        let entries = log_states(&read_log(dir.path()).await);
+        let (before, after) = (&entries[0]["state"], &entries[1]["state"]);
+        let mut methods_after = after["verificationMethod"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let added = methods_after.pop().unwrap();
+        assert_eq!(
+            methods_after,
+            *before["verificationMethod"]
+                .as_array()
+                .unwrap()
+        );
+        assert_eq!(added["id"], signing_key_id(&did).as_str());
+        assert_eq!(
+            added["publicKeyMultibase"],
+            crate::identity::ssi::did_utils::jwk_to_multibase_ed25519(&key)
+                .unwrap()
+                .as_str()
+        );
+        assert_eq!(
+            before["verificationMethod"][0]["publicKeyJwk"]["x"],
+            added_key_x(&key),
+            "#key-2 is the key already published as #key-1"
+        );
+    }
+
+    fn added_key_x(key: &JWK) -> Value {
+        serde_json::to_value(key.to_public()).unwrap()["x"].clone()
+    }
+
     #[tokio::test]
     async fn repair_runs_once() {
         let dir = tempfile::tempdir().unwrap();

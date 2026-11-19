@@ -5663,6 +5663,43 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn the_sweep_keeps_each_agent_identity_record_and_its_key() {
+            let f = fixture().await;
+            let (did, _) = seed_agent_identity(f.store.as_ref(), false).await;
+            let before = f
+                .store
+                .find_by_did(&did)
+                .await
+                .unwrap()
+                .unwrap();
+
+            let sweep = f
+                .issuer
+                .repair_agent_dids_while(|| true)
+                .await;
+
+            assert_eq!(sweep.repaired, vec![did.clone()]);
+            let after = f
+                .store
+                .find_by_did(&did)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.did, before.did);
+            assert_eq!(after.identity_hash, before.identity_hash);
+            assert_eq!(after.private_key, before.private_key);
+            assert_eq!(
+                f.store
+                    .list_all()
+                    .await
+                    .unwrap()
+                    .len(),
+                1,
+                "no identity is created"
+            );
+        }
+
+        #[tokio::test]
         async fn a_log_that_cannot_be_repaired_does_not_stop_the_others() {
             let f = fixture().await;
             let (broken, _) = seed_agent_identity(f.store.as_ref(), true).await;
