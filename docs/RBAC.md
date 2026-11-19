@@ -196,7 +196,8 @@ The log holds every tenant's lines, the per-call credential delegation events am
 two routes below also give them only to an appliance-wide caller: a session, or a PAT with
 neither a resource pattern nor required headers. A tenant's PAT, and one scoped by a resource
 pattern or by required headers alone, is answered as a caller without `logs.view` is, `logs.view`
-or not (see [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#what-tenancy-does-not-partition)):
+or not, so it reads none of the per-call credential delegation events, which are written to this
+log only (see [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#what-tenancy-does-not-partition)):
 
 - `GET /v1/dashboard/delta` leaves out `changes.logs`, and `GET /v1/dashboard/stats` returns an
   empty `proxy_info.log_entries`, without reading the log file.

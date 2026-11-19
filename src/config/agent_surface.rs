@@ -1801,7 +1801,7 @@ impl Default for SharedTransitConfig {
     }
 }
 
-fn is_true(value: &bool) -> bool {
+pub(crate) fn is_true(value: &bool) -> bool {
     *value
 }
 

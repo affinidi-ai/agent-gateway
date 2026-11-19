@@ -17,7 +17,7 @@ import ClientAuthenticationSelect from './EditCredentialProviderPage/ClientAuthe
 import ConsentConfirmationSection from './EditCredentialProviderPage/ConsentConfirmationSection';
 import ConsentLimitSection from './EditCredentialProviderPage/ConsentLimitSection';
 import JwtAssertionSection from './EditCredentialProviderPage/JwtAssertionSection';
-import { SecretOption as Secret, SecretOptions } from './EditCredentialProviderPage/SecretSelect';
+import { SecretOption as Secret, SecretOptions } from '../components/shared/SecretOptions';
 import { splitByTenant, type OwnerTenant } from '../utils/tenantScope';
 import { storedConsentLimit, takesConsent } from '../utils/consentLimit';
 import {

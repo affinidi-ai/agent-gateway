@@ -99,6 +99,8 @@ const providerAuth = (scopes: string[]): Json => ({
     fallback: 'reject',
 });
 
+const PARTNER_SECRET = {id: 'secret-1', name: 'Partner key', secret_id: 'partner-key', secret_type: 'api_key'};
+
 const PROVIDER = {
     id: 'prov-1',
     name: 'Partner provider',
@@ -132,10 +134,11 @@ test.describe('Transit Point Target authentication', () => {
     test('a reserved header name is refused next to the field and blocks Save', async ({page}) => {
         const saved: Request[] = [];
         await mockSurface(page, surfaceFixture({target_auth: staticSecret('X-Partner-Key')}), saved);
+        await page.route('**/api/v1/secrets/', route => route.fulfill({json: [PARTNER_SECRET]}));
         await page.goto(`${BASE_URL}/surfaces/${SURFACE_ID}`);
         await transitPoint(page).click();
         await page.getByTestId('transit-point-target-auth-type').selectOption('custom_header');
-        await page.getByPlaceholder('secret-name').fill('partner-key');
+        await page.getByTestId('transit-point-target-auth-secret').selectOption('partner-key');
 
         await page.getByPlaceholder('X-Auth').fill('Host');
         await expect(page.getByTestId('transit-point-target-auth-errors')).toContainText(

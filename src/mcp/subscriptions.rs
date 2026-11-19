@@ -468,6 +468,13 @@ impl SubscriptionLifetime {
             .min(tokio::time::Instant::now() + remaining);
     }
 
+    /// How long the subscription may still run.
+    #[cfg(test)]
+    pub(crate) fn time_left(&self) -> std::time::Duration {
+        self.deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+    }
+
     /// Ends the subscription no later than `end`, the end of a consent whose
     /// credential it carries.
     pub fn restrict_to_end(

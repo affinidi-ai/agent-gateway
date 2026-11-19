@@ -303,4 +303,8 @@ changes:
         deployment's log retention, and a gateway set to log less than INFO writes none. An
         integration or SIEM that received these events receives them no longer; ship the
         gateway log, or export the credential_delegation log target over OTLP, to keep them.
+        An access token scoped to one tenant, which read these records for its own tenant's
+        providers on the audit routes, reads them no longer either: the gateway log is given to
+        appliance-wide callers only, so an operator who has to hand a tenant its events exports
+        the log target and filters it by provider_id.
         Records of these events written before stay in the VP Audit Log and stay readable.

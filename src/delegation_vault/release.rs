@@ -23,7 +23,10 @@
 //! - `connector_unavailable`: the grant cannot be read or refreshed for a
 //!   reason a new connect would not fix, such as an unreachable token
 //!   endpoint or a client the authorization server refused; the grant is kept
-//!   and its refresh retried after a wait.
+//!   and its refresh retried after a wait. It also answers a grant whose
+//!   consent time lies ahead of this gateway's clock, which is kept, and
+//!   every call that would be told to connect to a deactivated provider,
+//!   which takes no new connect.
 //!
 //! An outcome about a grant only ever changes that grant: a refusal deletes
 //! it only while it is still the version refused, so a grant the person
@@ -270,6 +273,41 @@ fn unavailable(reason: &'static str) -> Refused {
     refused(GrantRefusal::ConnectorUnavailable, reason)
 }
 
+impl Refused {
+    /// What the caller of a binding of `provider` is told. A deactivated
+    /// provider takes no new connect, so a refusal that asks for one says the
+    /// connection is unavailable instead, which is logged. The reason stays
+    /// the one the grant was refused for, so what ended a grant is never
+    /// recorded as a deactivation.
+    pub fn of(
+        self,
+        provider: &CredentialProvider,
+    ) -> Self {
+        if !provider.is_deactivated() || !matches!(self.refusal, GrantRefusal::ConnectRequired { .. }) {
+            return self;
+        }
+        tracing::warn!(
+            target: "credential_delegation",
+            surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
+            provider_id = %provider.id,
+            reason = self.reason,
+            "The provider is deactivated and takes no new connect - the caller is told the connection is \
+             unavailable, not to connect"
+        );
+        unavailable(self.reason)
+    }
+
+    /// The refusal of a grant that was asked for beyond the scopes its
+    /// binding permits now, as a caller of `provider` is told.
+    pub fn beyond_the_bindings_scopes(
+        provider: &CredentialProvider,
+        key: &GrantKey,
+        subject: GrantSubject,
+    ) -> Self {
+        refused(GrantRefusal::connect_required(key, subject), "grant_beyond_the_bindings_scopes").of(provider)
+    }
+}
+
 /// The hint of a caller's principal in a `connect_required` refusal: 16
 /// bytes, base64url without padding, of the SHA-256 of a fixed label and the
 /// principal. It lets whoever runs the connect check that the person who signs
@@ -399,7 +437,8 @@ impl ReleaseContext<'_> {
     /// The grant of `key`, while its consent is within the time limits of the
     /// binding, of `provider` and of the gateway. One whose consent ended is
     /// removed, whatever refresh token it holds, and revoked at the vendor in
-    /// the background: someone must connect again. Every release and every
+    /// the background: someone must connect again. One given ahead of this
+    /// gateway's clock is kept and not released. Every release and every
     /// refresh starts here, so no refresh carries a consent past its end.
     async fn read_within_limits(
         &self,
@@ -411,8 +450,13 @@ impl ReleaseContext<'_> {
             .read(key, subject)
             .await?;
         let limits = ConsentLimits::of(self.max_consent_age_secs, provider.max_consent_age_secs);
-        if limits.judge(grant.created_at, grant.consent_expires_at, Utc::now()) == ConsentAge::Current {
-            return Ok(grant);
+        match limits.judge(grant.created_at, grant.consent_expires_at, Utc::now()) {
+            ConsentAge::Current => return Ok(grant),
+            ConsentAge::AheadOfClock => {
+                consent_age::warn_ahead_of_clock("delegated grant", &grant.id, grant.created_at);
+                return Err(unavailable("consent_time_ahead_of_clock"));
+            }
+            ConsentAge::Ended | ConsentAge::TooOldForBinding => {}
         }
         self.end_consent(provider, key, &grant, limits.ends_for_binding_at(grant.created_at, grant.consent_expires_at))
             .await;
@@ -490,8 +534,22 @@ impl ReleaseContext<'_> {
         ));
     }
 
-    /// The grant of `key` to send now: refreshed first when it is due.
+    /// The grant of `key` to send now: refreshed first when it is due. With
+    /// no usable grant, the refusal is the one a caller of `provider` is told
+    /// ([`Refused::of`]).
     pub async fn release(
+        &self,
+        provider: &CredentialProvider,
+        key: &GrantKey,
+        subject: GrantSubject,
+    ) -> Result<DelegatedGrant, Refused> {
+        self.current(provider, key, subject)
+            .await
+            .map_err(|refused| refused.of(provider))
+    }
+
+    /// The grant of `key` as it is to be sent now.
+    async fn current(
         &self,
         provider: &CredentialProvider,
         key: &GrantKey,
@@ -518,7 +576,7 @@ impl ReleaseContext<'_> {
     /// refresh that fails for a reason a new connect would not fix keeps the
     /// grant, and so does one the authorization server keeps refusing, which
     /// asks for a new connect.
-    pub async fn refresh_rejected(
+    async fn refresh_rejected(
         &self,
         provider: &CredentialProvider,
         key: &GrantKey,
@@ -625,7 +683,8 @@ impl ReleaseContext<'_> {
     ) -> Result<DelegatedGrant, Refused> {
         let fresh = self
             .refresh_rejected(provider, key, subject, rejected)
-            .await?;
+            .await
+            .map_err(|refused| refused.of(provider))?;
         if !may_resend {
             return Err(unavailable("vendor_refused_a_large_body_refreshed_for_the_next_call"));
         }
@@ -1381,8 +1440,9 @@ mod use_claim_tests {
 
 #[cfg(test)]
 mod consent_end_tests {
-    use super::ReleaseContext;
     use super::use_claim_tests::vault;
+    use super::{GrantRefusal, ReleaseContext};
+    use crate::config::agent_surface::GrantSubject;
     use crate::delegation_vault::grants::tests::{grant, key};
 
     /// The end of a grant's consent removes only the connection that was
@@ -1402,15 +1462,9 @@ mod consent_end_tests {
                 .unwrap();
         }
         let provider = crate::delegation_vault::revocation::tests::provider(None, "none", None);
-        let context = ReleaseContext {
-            vault: &vault,
-            secrets: None,
-            exact_allowlist: None,
-            refusal_limit: 3,
-            max_consent_age_secs: None,
-        };
 
-        let ((), events) = crate::audit::producer::capture(context.end_consent(&provider, &key, &judged, None)).await;
+        let ((), events) =
+            crate::audit::producer::capture(context(&vault).end_consent(&provider, &key, &judged, None)).await;
 
         assert!(
             vault
@@ -1421,5 +1475,113 @@ mod consent_end_tests {
             "the connection made again is kept"
         );
         assert!(events.is_empty(), "{events:?}");
+    }
+
+    fn context(
+        vault: &std::sync::Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>
+    ) -> ReleaseContext<'_> {
+        ReleaseContext {
+            vault,
+            secrets: None,
+            exact_allowlist: None,
+            refusal_limit: 3,
+            max_consent_age_secs: None,
+        }
+    }
+
+    /// A grant whose consent time lies further ahead of this gateway's clock
+    /// than clocks may differ is not released, and it is kept: a clock that
+    /// lags is put right, a grant removed is not. No expiry is recorded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_given_ahead_of_the_clock_is_kept_and_not_released() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = vault(directory.path()).await;
+        let key = key();
+        let mut ahead = grant(&key, "access");
+        ahead.created_at = chrono::Utc::now() + chrono::Duration::minutes(10);
+        vault
+            .store_grant(ahead)
+            .await
+            .unwrap();
+        let mut provider = crate::delegation_vault::revocation::tests::provider(None, "none", None);
+        provider.max_consent_age_secs = Some(3_600);
+
+        let (released, events) =
+            crate::audit::producer::capture(context(&vault).release(&provider, &key, GrantSubject::Owner)).await;
+
+        let refused = released.expect_err("a grant dated ahead of the clock is not released");
+        assert_eq!(refused.refusal, GrantRefusal::ConnectorUnavailable);
+        assert_eq!(refused.reason, "consent_time_ahead_of_clock");
+        assert!(
+            vault
+                .grant(&key)
+                .await
+                .unwrap()
+                .is_some(),
+            "the grant is kept"
+        );
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    /// A deactivated provider takes no new connect, so a binding with no
+    /// usable grant of it is unavailable and nobody is told to connect. A
+    /// grant given before the deactivation is released as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deactivated_provider_asks_nobody_to_connect() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = vault(directory.path()).await;
+        let key = key();
+        let mut provider = crate::delegation_vault::revocation::tests::provider(None, "none", None);
+        let context = context(&vault);
+
+        let active = context
+            .release(&provider, &key, GrantSubject::Owner)
+            .await
+            .expect_err("there is no grant");
+        assert_eq!(active.refusal, GrantRefusal::connect_required(&key, GrantSubject::Owner));
+
+        provider.deactivated_at = Some(chrono::Utc::now());
+        let deactivated = context
+            .release(&provider, &key, GrantSubject::Owner)
+            .await
+            .expect_err("there is no grant");
+        assert_eq!(deactivated.refusal, GrantRefusal::ConnectorUnavailable);
+        assert_eq!(deactivated.reason, "no_grant", "the reason stays the one the grant was refused for");
+
+        vault
+            .store_grant(grant(&key, "access"))
+            .await
+            .unwrap();
+        let released = context
+            .release(&provider, &key, GrantSubject::Owner)
+            .await
+            .expect("a grant given before the deactivation is released");
+        assert_eq!(released.access_token, "access");
+    }
+
+    /// A grant asked for beyond its binding's scopes is told to connect again
+    /// only while its provider takes a connect. Any other refusal is left as
+    /// it is, whatever the provider's state.
+    #[test]
+    fn a_refusal_asks_for_a_connect_only_while_the_provider_takes_one() {
+        let key = key();
+        let mut provider = crate::delegation_vault::revocation::tests::provider(None, "none", None);
+        let beyond = |provider: &_| super::Refused::beyond_the_bindings_scopes(provider, &key, GrantSubject::Owner);
+
+        assert_eq!(beyond(&provider).refusal, GrantRefusal::connect_required(&key, GrantSubject::Owner));
+
+        provider.deactivated_at = Some(chrono::Utc::now());
+        let deactivated = beyond(&provider);
+        assert_eq!(deactivated.refusal, GrantRefusal::ConnectorUnavailable);
+        assert_eq!(deactivated.reason, "grant_beyond_the_bindings_scopes");
+        let scope = super::Refused {
+            refusal: GrantRefusal::ScopeInsufficient { scope: None },
+            reason: "scope_insufficient",
+        };
+        assert_eq!(
+            scope.clone().of(&provider),
+            scope,
+            "a missing scope is the vendor's answer, not a request to connect"
+        );
     }
 }

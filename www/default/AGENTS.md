@@ -89,8 +89,10 @@ are the consumer; the convention is documented in
 | Canvas node   | `surface-node-<type>`, for example `surface-node-payment`                            |
 
 An indexed or per-row button keeps the `-button` suffix before the index or id, for example
-`payments-details-button-<id>`. On `/surfaces/<id>` the save button is `surface-save-button`
-and the banner for a refused save is `surface-error-alert`.
+`payments-details-button-<id>`. On `/surfaces/<id>` the save button is `surface-save-button`,
+the banner for a refused save is `surface-error-alert`, and the delete button is
+`surface-delete-button`, which opens `surface-delete-confirm` with `surface-delete-confirm-name`,
+`surface-delete-confirm-confirm` and `surface-delete-confirm-cancel` (see _Surface delete_).
 
 ## CLI consent page
 
@@ -651,10 +653,27 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
     `MANAGED_AGENT_TARGET_AUTH_FORM_KEYS` and `TRANSIT_POINT_TARGET_AUTH_FORM_KEYS`), so a node
     the stored surface no longer has comes back without a Target authentication. A new form
     field must be added to its key list.
+- **Transit Point secret picker.** For Bearer Token, API Key Header and Custom Header, the Transit
+  Point panel picks the secret from the secrets store (`transit-point/TargetAuthSecretField.tsx`,
+  labelled **Secret Reference**) and saves its `secret_id` as `method.static_secret.secret_id`. Options come
+  from the shared `components/shared/SecretOptions.tsx` (`Name (secret_id)`, tenant-aware, all
+  secret types). A refresh icon button beside the select reloads only the list
+  (`useTargetAuthSecrets`); it uses the Managed Agent panel's sync icon and spin but sits beside
+  the field, not on the label line, so it isn't missed. **Add secret** below opens `/secrets/new`
+  in a new tab, and the help text never changes. A stored secret that no longer exists stays
+  selected as `<secret_id> (not found)` with a warning; an out-of-tenant one keeps its
+  `outOfTenantLabel` and is explained in full below the field. A list that can't load says
+  "Couldn't load secrets." with **Try again**, or, when the request is refused (403), "You don't
+  have access to secrets. Ask an administrator."; both keep the stored value and show no refresh
+  button. The element's `validate` blocks Save while no secret is picked
+  (`targetAuthSecretProblem`, field `auth_secret`), since an empty secret would otherwise drop
+  target authentication. Test ids: `transit-point-target-auth-secret`, with `-refresh`,
+  `-add-link`, `-error`, `-missing`, `-outside-tenant`, `-load-error`, `-retry` and `-denied`.
 - **Tenant-aware pickers.** A surface's tenant (`tenantId` in `SurfaceMetaContext`, from the stored
   surface's `tenant_id`; `null` is appliance-wide, absent while creating) decides what the credential
   provider pickers (`TargetAuthProviderSelect`, `TransitCredentialBindingSection`,
-  `OutboundCredentialsListSection`) and the Custom Metadata secret menu offer: only items with the
+  `OutboundCredentialsListSection`), the Transit Point secret picker (`TargetAuthSecretField`) and
+  the Custom Metadata secret menu offer: only items with the
   same `tenant_id` (`utils/tenantScope.ts`, `splitByTenant`). The delegation pickers
   (`TransitCredentialBindingSection`, `OutboundCredentialsListSection`) also offer a tenant surface
   appliance-wide authorization code providers, which send the user's own token and which the gateway
@@ -1335,8 +1354,8 @@ link in a token's expanded row on Credential Tokens, both shown with `audit.view
 The delegation categories are the ones the gateway audits: `consent_granted`, `consent_expired`,
 `consent_limited`, `token_revoked` and `user_tokens_revoked`. What the gateway does with a credential on each call
 (`token_injected`, `token_refreshed`, `refresh_failed`, `consent_required`, `token_not_found`
-and the elicitation events) is written to its log and is no audit event, so the Audit Log
-offers no category for it and no link selects it. A record of one that an older gateway
+and the elicitation events) is written to its log, or nowhere while `[logging] delegation_events`
+is `false`, and is no audit event, so the Audit Log offers no category for it and no link selects it. A record of one that an older gateway
 audited is still shown, with its label (`categoryLabel`).
 
 - The Audit Log offers each delegation category in its Category filter, labels and narrates
@@ -1502,7 +1521,7 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   (`credential-provider-consent-limit-error`, `invalid-feedback`) and takes the focus. Changing
   the number or the unit clears the field's error. On a stored provider, a limit shorter than the
   stored one, one set where none was, or an emptied field where a limit was stored (sent as `0`,
-  since the gateway's default may then be the shorter) is sent to
+  since the gateway's default or ceiling may then be the shorter) is sent to
   `GET /credential-providers/{id}/consent-impact?max_consent_age_secs=<seconds>` once the field
   has stayed unchanged for 400 ms (`EditCredentialProviderPage/useConsentImpact.ts`). While its
   `ending_consents` is above 0, a warning under the field
@@ -1624,6 +1643,52 @@ toast that stays until dismissed: "Revoke failed: <gateway message>".
 When the key's surface was deleted (`surface_deleted: true` on `GET /api-keys/{agent_id}/{key_id}`),
 the detail page shows the info alert "This API key is no longer in use because the associated
 surface has been deleted." (`api-key-surface-deleted-info`) at the top of Key Information.
+
+## Surface delete
+
+The surface page's delete button (`surface-delete-button`, `btn-danger` with a trash icon, shown
+only with `surfaces.delete`, which the gateway requires for the `DELETE`; `surfaces.edit` alone
+shows Save but no delete button) sends nothing: it opens `surface-delete-confirm`, a
+[confirm popover](#confirm-popover) beside the button (on its right when the builder sidebar is
+at the window's left edge), and clicking the button again
+closes it. Its title "Delete Surface?" carries a red `fa-triangle-exclamation` icon. Its body
+first names the surface, "Delete `<name>`?" in bold (`surface-delete-confirm-name`, the surface
+id when it has no name), then reads "You are about to permanently delete this surface and all
+associated configuration. This action cannot be undone." then "Are you sure you want to
+continue?". **Delete** (`surface-delete-confirm-confirm`, `btn-danger`) sends the `DELETE`;
+**Cancel** (`surface-delete-confirm-cancel`), the close button, Escape and a click outside send
+nothing. While the delete runs, Delete shows `…`, Delete, Cancel and the close button are
+disabled, Escape and a click outside do nothing, and the page's delete button shows a spinner.
+Delete is also disabled while a save runs, and Cmd/Ctrl+S does not save while the popover is
+open. A delete succeeds with the toast `Surface "<name>" deleted` and returns to `/surfaces`; a
+failed one closes the popover, returns focus to the delete button and shows the gateway's message
+in `surface-error-alert`. The popover closes if the page moves to another surface.
+
+## Confirm popover
+
+`components/shared/ConfirmPopover.tsx` is the shared inline confirmation: a speech bubble beside
+the button that opened it (`role="dialog"` named by its title), portalled to `<body>`. It opens
+to the left of the button (`confirm-popover--left`) and flips to its right
+(`confirm-popover--right`) when the left has no room, as for the surface page's trash button in
+the builder sidebar with the navigation collapsed; it stays at least 8px inside the window on
+both axes, and its tail points at the button's middle. Cancel takes focus when it opens and focus returns to that button when it closes, and while it
+is open no key reaches a `window` listener, so the page's shortcuts (Cmd/Ctrl+S, the Surface
+Builder's canvas keys) never act behind it. Its `icon` is `fa-info-circle` (default) or
+`fa-triangle-exclamation`, shown red when `confirmVariant` is `danger`. Each use passes its own
+`testId`; the confirm and Cancel buttons are `<testId>-confirm` and `<testId>-cancel`. Its
+styles are the `.confirm-popover*` classes in `dashboard.css`.
+
+Two pages use it:
+
+- **Surface delete** (`surface-delete-confirm`), above.
+- **Policies list** (`policy-confirm-popover`), from a row's delete and Enforce globally
+  actions: "Delete policy" with a red **Delete**, naming the policy and how many surfaces or
+  gateways reference it, and "Enforce globally" with **Continue**, naming how many will enforce
+  it. Confirm is disabled while that count loads.
+
+Use the popover to confirm one action on the button that triggers it. Use
+`components/shared/WarningDialog.tsx`, a centred modal, when the confirmation needs more room or
+blocks a flow, as API key delete and revoke and the Authority-in-use dialog do.
 
 ## Authority delete
 
@@ -2453,6 +2518,11 @@ identities: an integration receives every event of its event set, from every res
 
 ### Audit Log header
 
+- The **About the Audit Log** panel (`AuditInfoBanner`) lists the delegation events the gateway
+  audits in one **Credential delegation** bullet (`consent_granted`, `consent_expired`,
+  `consent_limited`, `token_revoked`, `user_tokens_revoked`) and says that what the gateway does
+  with a delegated credential on each call is not audited but written to the gateway log, unless
+  `[logging] delegation_events` is `false`. It names no per-call event as an audit event.
 - The Audit Log header shows `audit-forward-button` to users with `integrations.view`. It
   counts the active integrations, with an active endpoint, whose event set holds audit
   events (`useAuditForwarding`), and opens `/integrations`.

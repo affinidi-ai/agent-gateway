@@ -195,6 +195,12 @@ surface a new DID; it revokes only after **Revoke API key**, and a failed revoke
 toast. See _API key
 delete_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#api-key-delete).
 
+Deleting a surface on its page opens a confirmation, "Delete Surface?", naming the surface,
+built on the shared `ConfirmPopover` with focus on **Cancel**, and deletes only after
+**Delete**; **Cancel** deletes nothing. The delete button needs `surfaces.delete`, and no page
+shortcut (Cmd/Ctrl+S, the canvas keys) acts while the popover is open. See _Surface delete_ and
+_Confirm popover_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-delete).
+
 The credential provider editor shows a **Consent confirmation** switch and its login client
 (ID and secret, both picked from the secrets store), endpoints, strategy (only the provider's
 tenant's and appliance-wide ones; appliance-wide only on a new provider), principal claim and a
@@ -239,7 +245,9 @@ The credential delegation records are read in the Audit Log. The Credentials pag
 tab: **History** on Delegated Access and a token's expanded row on Credential Tokens open the
 Audit Log filtered to the delegation categories, the audited ones
 (consent granted, expired or limited, a token or a user's tokens revoked). What the gateway does on each
-call, such as a token injected or refreshed, is in its log and has no category. The Audit Log
+call, such as a token injected or refreshed, is in its log (nowhere while
+`[logging] delegation_events` is `false`) and has no category, which the **About the Audit Log**
+panel says. The Audit Log
 shows a caller's Principal beside Subject when its strategy names a claim other than `sub`; see
 _Credential delegation audit_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-delegation-audit).
@@ -281,6 +289,10 @@ Target that is not https and a leg that authenticates no caller as advisories th
 on a passthrough fallback, keeps a stored `target_auth` it did not edit, and keeps Target
 authentication settings out of the canvas data; see _Credential provider editor_ and
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
+
+A Transit Point's static-secret target authentication picks its secret from a tenant-aware list
+with a refresh button beside it, and Save is blocked while no secret is picked; see _Surface
+Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 A Trust Check on a Managed Agent → Transit Point arrow belongs to that Transit Point and saves
 to `transit.points[i].trust_check_list` (new ones on A2A and AP2 Transit Points only); the
