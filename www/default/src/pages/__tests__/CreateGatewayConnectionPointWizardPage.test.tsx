@@ -197,3 +197,40 @@ test('another failure of the first try offers to try again instead of the DIDs t
   expect(await screen.findByText('created Partner link')).toBeInTheDocument();
   expect(post).toHaveBeenLastCalledWith('/connection-points/cp-1/continue', {});
 });
+
+test('a resume that cannot load says why and offers the way back to Connections', async () => {
+  (apiClient.get as jest.Mock).mockRejectedValue(
+    new Error('Connection point is not waiting for mediator access')
+  );
+  render(
+    <MemoryRouter initialEntries={['/gateways/publish?resume=cp-1']}>
+      <CreateGatewayConnectionPointWizardPage />
+    </MemoryRouter>
+  );
+
+  expect(await screen.findByTestId('wizard-resume-unavailable-message')).toHaveTextContent(
+    'Connection point is not waiting for mediator access'
+  );
+  expect(screen.getByTestId('wizard-resume-back-button')).toBeInTheDocument();
+  expect(screen.queryByTestId('mediator-access-explanation')).not.toBeInTheDocument();
+});
+
+test('resuming a pause whose invitation expired says so instead of offering the DIDs', async () => {
+  (apiClient.get as jest.Mock).mockImplementation((url: string) =>
+    Promise.resolve(
+      url.endsWith('/mediator-access')
+        ? { data: { ...paused.data.mediator_access, expires_at: '2020-01-01T00:00:00Z' } }
+        : { data: { id: 'cp-1', mediator_id: 'mediator-1' } }
+    )
+  );
+  render(
+    <MemoryRouter initialEntries={['/gateways/publish?resume=cp-1']}>
+      <CreateGatewayConnectionPointWizardPage />
+    </MemoryRouter>
+  );
+
+  expect(await screen.findByTestId('wizard-resume-unavailable-message')).toHaveTextContent(
+    'Its invitation expired on'
+  );
+  expect(screen.queryByTestId('mediator-access-continue-button')).not.toBeInTheDocument();
+});

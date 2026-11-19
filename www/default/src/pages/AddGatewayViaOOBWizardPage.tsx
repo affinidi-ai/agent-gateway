@@ -4,7 +4,14 @@ import './OnboardWizard.css';
 import { apiClient } from '../api';
 import WizardProgress from '../components/shared/WizardProgress';
 import MediatorAccessStep, { MediatorAccessRefusal } from '../components/shared/MediatorAccessStep';
-import { ADD_GATEWAY_DID_LABELS, MediatorAccess, labelledDids } from '../utils/mediatorAccess';
+import ResumeUnavailableCard from '../components/shared/ResumeUnavailableCard';
+import { formatDateTime } from '../utils/stringUtils';
+import {
+  ADD_GATEWAY_DID_LABELS,
+  MediatorAccess,
+  labelledDids,
+  mediatorAccessExpired,
+} from '../utils/mediatorAccess';
 
 // Import step components
 import EnterDetailsStep from '../components/gateway-add-via-oob/EnterDetailsStep';
@@ -64,6 +71,8 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
   };
 
   const resumed = useRef<string | null>(null);
+  // Why `?resume=` cannot continue: the record is gone or already continued, or expired.
+  const [resumeUnavailable, setResumeUnavailable] = useState('');
 
   useEffect(() => {
     if (!resumeId || resumed.current === resumeId) return;
@@ -71,10 +80,17 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
     const resume = async () => {
       try {
         setPausing(true);
+        const id = encodeURIComponent(resumeId);
         const [gateway, access] = await Promise.all([
-          apiClient.get(`/gateways/${resumeId}`),
-          apiClient.get<MediatorAccess>(`/gateways/${resumeId}/mediator-access`),
+          apiClient.get(`/gateways/${id}`),
+          apiClient.get<MediatorAccess>(`/gateways/${id}/mediator-access`),
         ]);
+        if (mediatorAccessExpired(access.data)) {
+          setResumeUnavailable(
+            `Its invitation expired on ${formatDateTime(access.data.expires_at, true)}. Delete this gateway on Connections and ask the inviting gateway for a new invitation.`
+          );
+          return;
+        }
         setWizardState(prev => ({
           ...prev,
           name: gateway.data.name,
@@ -85,7 +101,7 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
           currentStep: 'mediator-access',
         }));
       } catch (err: any) {
-        setError(err.message || 'Failed to load the gateway.');
+        setResumeUnavailable(err.message || 'Failed to load the gateway.');
       } finally {
         setPausing(false);
       }
@@ -212,6 +228,9 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
 
   // Render current step
   const renderStep = () => {
+    if (resumeUnavailable) {
+      return <ResumeUnavailableCard message={resumeUnavailable} onBack={handleCancel} />;
+    }
     if (pausing) {
       return (
         <div className="card shadow">

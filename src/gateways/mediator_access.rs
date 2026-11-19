@@ -14,8 +14,6 @@ use axum::{Json, http::StatusCode, response::IntoResponse};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::gateways::connection_points::first_call_retry::refused_until_admitted;
-
 /// How long a paused pairing lasts when its invitation names no expiry.
 pub const DEFAULT_INVITATION_LIFETIME: chrono::Duration = chrono::Duration::days(7);
 
@@ -47,6 +45,21 @@ pub struct AwaitedDid {
     pub role: DidRole,
     pub did: String,
     pub mediator_did: String,
+    /// The name of `mediator_did`, when the response names each DID's mediator: an
+    /// acceptance with mediator federation keeps its permanent DID on its own mediator.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mediator_name: String,
+}
+
+/// Names the mediator of every DID in `access`, as the dashboard shows them.
+pub async fn name_each_mediator<M: crate::mediators::MediatorStore>(
+    mediator_store: &M,
+    mut access: MediatorAccess,
+) -> MediatorAccess {
+    for awaited in &mut access.dids {
+        awaited.mediator_name = mediator_name(mediator_store, &awaited.mediator_did).await;
+    }
+    access
 }
 
 /// What a paused pairing waits for: its DIDs and the mediator that must admit
@@ -99,12 +112,24 @@ enum Admission {
     Refused,
 }
 
+/// A mediator that does not admit a DID answers its authentication with `403` (on a live
+/// explicit_allow mediator, as the last error of the SDK's authentication retries), or
+/// denies it by ACL. Anything else, a socket timeout included, says nothing about
+/// admission: Continue answers that it could not check (`502`), not that the DID is
+/// refused, so a slow mediator never sends the operator to add DIDs it already admits.
 fn classify(result: Result<(), ATMError>) -> Result<Admission, String> {
     match result {
         Ok(()) => Ok(Admission::Admitted),
-        Err(error) if refused_until_admitted(&error) => Ok(Admission::Refused),
+        Err(error) if refuses_admission(&error) => Ok(Admission::Refused),
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn refuses_admission(error: &ATMError) -> bool {
+    if let Some(status) = error.http_status() {
+        return status.status == 403;
+    }
+    matches!(error, ATMError::ACLDenied(_))
 }
 
 /// Authenticates `awaited.did` on its mediator over the live stream, which the
@@ -208,6 +233,33 @@ pub async fn lock(key: &str) -> ContinueGuard {
     }
 }
 
+/// Marks the reservation on `reserving_id` consumed once the pairing stored its permanent
+/// connection point, which from then on owns the DID's events.
+pub(crate) async fn mark_reservation_consumed<P: crate::gateways::connection_points::ConnectionPointStore + ?Sized>(
+    store: &P,
+    reserving_id: &str,
+) {
+    let Ok(Some(mut point)) = store.get(reserving_id).await else {
+        return;
+    };
+    let Some(reserved) = point
+        .reserved_permanent
+        .as_mut()
+    else {
+        return;
+    };
+    if reserved.consumed {
+        return;
+    }
+    reserved.consumed = true;
+    if let Err(e) = store
+        .update_if_exists(&point)
+        .await
+    {
+        tracing::warn!(connection_point_id = reserving_id, %e, "Could not mark the reservation consumed");
+    }
+}
+
 /// When an accepted invitation stops being usable: its `expires_time`, else
 /// [`DEFAULT_INVITATION_LIFETIME`] from `now`. The invitation comes from the inviter,
 /// so its `expires_time` is capped at the same lifetime: an acceptance never keeps
@@ -254,6 +306,7 @@ mod tests {
             role: DidRole::Permanent,
             did: "did:peer:2.permanent".to_string(),
             mediator_did: "did:web:mediator.example".to_string(),
+            mediator_name: String::new(),
         }
     }
 
@@ -268,6 +321,30 @@ mod tests {
     fn other_failures_are_not_a_refusal() {
         for status in [401, 404, 500, 503] {
             assert!(classify(Err(status_error(status))).is_err(), "{status}");
+        }
+    }
+
+    /// What a live explicit_allow mediator returns for a DID it does not admit: a `403`
+    /// on `/authenticate/challenge`, as the last error of the authentication retries.
+    #[test]
+    fn a_live_explicit_allow_refusal_is_a_refusal() {
+        use affinidi_did_authentication::errors::DIDAuthError;
+
+        let refused = ATMError::from(DIDAuthError::RetriesExhausted {
+            attempts: 3,
+            last: Box::new(DIDAuthError::HttpStatus(Box::new(affinidi_messaging_sdk::errors::HttpStatusError::new(
+                "authentication request",
+                403,
+            )))),
+        });
+
+        assert!(matches!(classify(Err(refused)), Ok(Admission::Refused)));
+    }
+
+    #[test]
+    fn a_socket_timeout_is_could_not_check_not_a_refusal() {
+        for reason in ["WebSocket is not active", "WebSocket isActive? command timed out"] {
+            assert!(classify(Err(ATMError::TransportError(reason.to_string()))).is_err(), "{reason}");
         }
     }
 

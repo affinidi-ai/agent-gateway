@@ -671,7 +671,7 @@ neither lists them nor acts on them.
   when a payment gateway already exists and the flag has not been set either way, so an upgrade
   never hides a payment gateway that is taking payments.
 - `POST /v1/payment-gateways/connect-via-oob` connects to an agent-pay connection point with the
-  same body as `POST /v1/gateways/connect-via-oob` and creates a payment gateway whose exposure is
+  same body as `POST /v1/gateways/connect-via-oob`, except `await_mediator_access`, which it refuses with `400`, and creates a payment gateway whose exposure is
   `none`. agent-pay's administrator approves every connection, so the gateway stays
   `awaiting-approval` until then. A link already connected as a peer is `409`.
 - `GET /v1/payment-gateways/{id}/info` asks agent-pay for its `gateway-info` summary

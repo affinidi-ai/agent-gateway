@@ -5158,19 +5158,24 @@ async fn initialize_saml_state(
     })
 }
 
-/// Removes the gateways paused for mediator access whose invitation has expired,
-/// with their temporary connection point and pending pairing.
-async fn remove_lapsed_pauses(
+/// Removes the gateways paused for mediator access whose invitation has expired, with
+/// their system connection points and pending pairing. User connection points are kept,
+/// as a gateway delete keeps them. A gateway whose connection points cannot be read is kept.
+async fn remove_lapsed_pauses<P: crate::gateways::connection_points::ConnectionPointStore + ?Sized>(
     gateway_store: &crate::gateways::FileSystemGatewayStore,
-    cp_store: &crate::gateways::FileSystemConnectionPointStore,
+    cp_store: &P,
     pending_store: &crate::gateways::PendingConnectionStore,
     now: chrono::DateTime<chrono::Utc>,
 ) {
     use crate::gateways::GatewayStore;
-    use crate::gateways::connection_points::ConnectionPointStore;
+    use crate::gateways::connection_points::ConnectionPointType;
 
-    let Ok(gateways) = gateway_store.list_all().await else {
-        return;
+    let gateways = match gateway_store.list_all().await {
+        Ok(gateways) => gateways,
+        Err(e) => {
+            error!("Failed to list gateways for the expired-pause cleanup: {}", e);
+            return;
+        }
     };
     for gateway in gateways {
         if gateway.status != crate::gateways::types::GatewayStatus::AwaitingMediatorAccess {
@@ -5203,6 +5208,7 @@ async fn remove_lapsed_pauses(
         );
         let ids: Vec<String> = points
             .iter()
+            .filter(|point| point.cp_type != ConnectionPointType::User)
             .map(|point| point.id.clone())
             .collect();
         for id in &ids {
@@ -5213,6 +5219,16 @@ async fn remove_lapsed_pauses(
         pending_store
             .remove_for_connection_points(&ids)
             .await;
+        // The startup pass may have deleted the expired temporary point already; its
+        // pending pairing is still found by the inviter's temporary DID.
+        if let Some(pending) = pending_store
+            .get_by_temporary_did(&gateway.did)
+            .await
+        {
+            pending_store
+                .remove(&pending.id)
+                .await;
+        }
         if let Err(e) = gateway_store
             .delete(&gateway.id)
             .await
@@ -5226,15 +5242,14 @@ async fn remove_lapsed_pauses(
 /// complete: none of their connection points records an unexpired invitation. An
 /// acceptance still inside its invitation's lifetime keeps waiting for approval. A
 /// gateway whose connection points cannot be read is kept.
-async fn remove_abandoned_pending_gateways(
+async fn remove_abandoned_pending_gateways<P: crate::gateways::connection_points::ConnectionPointStore + ?Sized>(
     gateway_store: &crate::gateways::FileSystemGatewayStore,
-    cp_store: &crate::gateways::FileSystemConnectionPointStore,
+    cp_store: &P,
     pending_store: &crate::gateways::PendingConnectionStore,
     started_at: chrono::DateTime<chrono::Utc>,
     now: chrono::DateTime<chrono::Utc>,
 ) {
     use crate::gateways::GatewayStore;
-    use crate::gateways::connection_points::ConnectionPointStore;
 
     let gateways = match gateway_store.list_all().await {
         Ok(gateways) => gateways,
@@ -6596,6 +6611,164 @@ mod startup_sweep_tests {
                 .get("tmp-lapsed")
                 .await
                 .is_none()
+        );
+    }
+
+    /// A connection point store whose reads of a gateway's points always fail.
+    struct UnreadablePoints;
+
+    #[async_trait::async_trait]
+    impl ConnectionPointStore for UnreadablePoints {
+        async fn create(
+            &self,
+            _: &GatewayConnectionPoint,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn get(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<Option<GatewayConnectionPoint>> {
+            anyhow::bail!("disk read failed")
+        }
+
+        async fn list_all(&self) -> anyhow::Result<Vec<GatewayConnectionPoint>> {
+            anyhow::bail!("disk read failed")
+        }
+
+        async fn list_by_gateway(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<Vec<GatewayConnectionPoint>> {
+            anyhow::bail!("disk read failed")
+        }
+
+        async fn update(
+            &self,
+            _: &GatewayConnectionPoint,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn update_if_exists(
+            &self,
+            _: &GatewayConnectionPoint,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn delete(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<()> {
+            panic!("nothing may be deleted when the points cannot be read")
+        }
+    }
+
+    #[tokio::test]
+    async fn both_sweeps_keep_their_gateways_when_the_connection_points_cannot_be_read() {
+        let stores = stores().await;
+        let now = Utc::now();
+        let paused = gateway("paused", GatewayStatus::AwaitingMediatorAccess, now - Duration::days(9));
+        let pending = gateway("pending", GatewayStatus::Pending, now - Duration::days(9));
+        seed(&stores, &paused, &temporary_point("paused", now - Duration::hours(1), true)).await;
+        seed(&stores, &pending, &temporary_point("pending", now - Duration::hours(1), false)).await;
+
+        remove_lapsed_pauses(&stores.gateways, &UnreadablePoints, &stores.pending, now).await;
+        remove_abandoned_pending_gateways(&stores.gateways, &UnreadablePoints, &stores.pending, now, now).await;
+
+        for id in ["paused", "pending"] {
+            assert!(
+                stores
+                    .gateways
+                    .get(id)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{id} is kept"
+            );
+            assert!(
+                stores
+                    .pending
+                    .get(&format!("tmp-{id}"))
+                    .await
+                    .is_some(),
+                "{id}'s pairing is kept"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_expired_pause_whose_temporary_point_is_gone_loses_its_pending_pairing_too() {
+        let stores = stores().await;
+        let now = Utc::now();
+        let lapsed = gateway("lapsed", GatewayStatus::AwaitingMediatorAccess, now - Duration::days(9));
+        stores
+            .gateways
+            .create(&lapsed)
+            .await
+            .unwrap();
+        let mut pairing = pending_for(&lapsed);
+        pairing.our_temporary_did = "did:peer:2.acceptor-temporary".to_string();
+        pairing.their_temporary_did = lapsed.did.clone();
+        stores
+            .pending
+            .store(pairing)
+            .await;
+
+        remove_lapsed_pauses(&stores.gateways, &stores.points, &stores.pending, now).await;
+
+        assert!(
+            stores
+                .gateways
+                .get("lapsed")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            stores
+                .pending
+                .get("tmp-lapsed")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_lapsed_pause_sweep_keeps_the_user_connection_points_of_the_gateway() {
+        let stores = stores().await;
+        let now = Utc::now();
+        let lapsed = gateway("lapsed", GatewayStatus::AwaitingMediatorAccess, now - Duration::days(9));
+        seed(&stores, &lapsed, &temporary_point("lapsed", now - Duration::hours(1), true)).await;
+        let mut user_point = temporary_point("lapsed", now + Duration::days(30), false);
+        user_point.id = "user-invitation".to_string();
+        user_point.cp_type = ConnectionPointType::User;
+        stores
+            .points
+            .create(&user_point)
+            .await
+            .unwrap();
+
+        remove_lapsed_pauses(&stores.gateways, &stores.points, &stores.pending, now).await;
+
+        assert!(
+            stores
+                .points
+                .get("tmp-lapsed")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            stores
+                .points
+                .get("user-invitation")
+                .await
+                .unwrap()
+                .is_some(),
+            "a User point is kept"
         );
     }
 

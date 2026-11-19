@@ -23,3 +23,9 @@ Feature: Pairing that waits for mediator access
     When gateway 1 and gateway 2 ping each other
     Then the ping from gateway 1 to gateway 2 succeeds
     And the ping from gateway 2 to gateway 1 succeeds
+
+  Scenario: Gateways restarted while paused still pair and ping each other
+    Given a fabric with 2 gateways that pause for mediator access and restart while paused
+    When gateway 1 and gateway 2 ping each other
+    Then the ping from gateway 1 to gateway 2 succeeds
+    And the ping from gateway 2 to gateway 1 succeeds

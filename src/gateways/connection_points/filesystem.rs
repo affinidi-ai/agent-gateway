@@ -317,21 +317,41 @@ impl ConnectionPointStore for FileSystemConnectionPointStore {
         self.storage
             .delete(id)
             .await?;
-        if let Some(hook) = self.event_hook.get() {
-            if let Ok(Some(record)) = &previous
-                && let Some(reserved) = &record.reserved_permanent
-                && matches!(
-                    self.storage
-                        .get(&reserved.cp_id)
-                        .await,
-                    Ok(None)
-                )
+        // A reservation never paired leaves keys with no record of their own: remove them,
+        // and report its DID failed unless the pairing consumed it.
+        if let Ok(Some(record)) = &previous
+            && let Some(reserved) = &record.reserved_permanent
+            && matches!(
+                self.storage
+                    .get(&reserved.cp_id)
+                    .await,
+                Ok(None)
+            )
+        {
+            match tokio::fs::remove_dir_all(
+                self.base_path
+                    .join(&reserved.cp_id),
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(
+                    connection_point_id = %reserved.cp_id,
+                    %e,
+                    "Could not remove the keys of a reservation that was never paired"
+                ),
+            }
+            if !reserved.consumed
+                && let Some(hook) = self.event_hook.get()
             {
                 hook.emit(
                     crate::event_hook::EventKind::CreationFailed,
                     crate::event_hook::ConnectionPointPayload::reserved(record, reserved),
                 );
             }
+        }
+        if let Some(hook) = self.event_hook.get() {
             match &previous {
                 Ok(Some(record)) if record.is_announced() => hook.emit(
                     crate::event_hook::EventKind::Deleted,
@@ -500,6 +520,7 @@ mod tests {
             did: "did:peer:2.reserved".to_string(),
             mediator_id: "med-1".to_string(),
             mediator_did: "did:example:mediator".to_string(),
+            consumed: false,
         });
         store
             .create(&paused)
@@ -973,6 +994,7 @@ mod tests {
             did: "did:peer:2.reserved".to_string(),
             mediator_id: "med-1".to_string(),
             mediator_did: "did:example:mediator".to_string(),
+            consumed: false,
         });
         store
             .create(&paused)
@@ -993,6 +1015,94 @@ mod tests {
             .collect();
         assert_eq!(failed.len(), 1, "one creation_failed for the reserved DID");
         assert_eq!(failed[0]["connection_point"]["did"], "did:peer:2.reserved");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_record_whose_reservation_was_consumed_reports_nothing_for_it() {
+        let (url, captured) = crate::event_hook::tests_support::serve(204, "").await;
+        let dir = TempDir::new().unwrap();
+        let store = FileSystemConnectionPointStore::new(dir.path().join("cps"))
+            .await
+            .unwrap();
+        store.set_event_hook(hook_for(url));
+        let mut used = sample_cp();
+        used.reserved_permanent = Some(super::super::types::ReservedPermanent {
+            cp_id: "paired-then-deleted".to_string(),
+            did: "did:peer:2.reserved".to_string(),
+            mediator_id: "med-1".to_string(),
+            mediator_did: "did:example:mediator".to_string(),
+            consumed: false,
+        });
+        store
+            .create(&used)
+            .await
+            .unwrap();
+        crate::gateways::mediator_access::mark_reservation_consumed(&store, &used.id).await;
+        assert!(
+            store
+                .get(&used.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .reserved_permanent
+                .unwrap()
+                .consumed
+        );
+
+        store
+            .delete(&used.id)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let failed = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                event
+                    .body
+                    .contains("connection_point.creation_failed")
+            })
+            .count();
+        assert_eq!(failed, 0, "a consumed reservation is owned by its paired record");
+    }
+
+    #[tokio::test]
+    async fn deleting_an_unpaired_paused_record_removes_its_reserved_keys() {
+        let dir = TempDir::new().unwrap();
+        let store = FileSystemConnectionPointStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut paused = sample_cp();
+        paused.awaiting_mediator_access = true;
+        paused.reserved_permanent = Some(super::super::types::ReservedPermanent {
+            cp_id: "never-paired".to_string(),
+            did: "did:peer:2.reserved".to_string(),
+            mediator_id: "med-1".to_string(),
+            mediator_did: "did:example:mediator".to_string(),
+            consumed: false,
+        });
+        store
+            .create(&paused)
+            .await
+            .unwrap();
+        let keys = dir
+            .path()
+            .join("never-paired");
+        tokio::fs::create_dir_all(&keys)
+            .await
+            .unwrap();
+        tokio::fs::write(keys.join("key_0.json"), b"{}")
+            .await
+            .unwrap();
+
+        store
+            .delete(&paused.id)
+            .await
+            .unwrap();
+
+        assert!(!keys.exists(), "the reserved keys go with the reservation");
     }
 
     #[tokio::test]

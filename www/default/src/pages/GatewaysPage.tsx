@@ -514,7 +514,9 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                     aria-label={`Continue adding gateway ${gateway.name}`}
                                     onClick={e => {
                                       e.stopPropagation();
-                                      navigate(`/gateways/connect?resume=${gateway.id}`);
+                                      navigate(
+                                        `/gateways/connect?resume=${encodeURIComponent(gateway.id)}`
+                                      );
                                     }}
                                   >
                                     Continue
@@ -730,12 +732,19 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                             </small>
                           </td>
                           <td>
-                            {connectionPoint.awaiting_mediator_access ? (
+                            {connectionPoint.awaiting_mediator_access && !isExpired ? (
                               <span
                                 className="badge text-bg-warning"
                                 data-testid={`connection-points-status-${connectionPoint.id}`}
                               >
                                 Waiting for mediator access
+                              </span>
+                            ) : connectionPoint.awaiting_mediator_access ? (
+                              <span
+                                className="badge badge-danger"
+                                data-testid={`connection-points-status-${connectionPoint.id}`}
+                              >
+                                EXPIRED
                               </span>
                             ) : connectionPoint.enabled === false ? (
                               <span className="badge text-bg-warning">
@@ -766,13 +775,16 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                 </AppButton>
                               )}
                               {hasPermission('gateways.edit') &&
-                                connectionPoint.awaiting_mediator_access && (
+                                connectionPoint.awaiting_mediator_access &&
+                                !isExpired && (
                                   <AppButton
                                     variant="outline-primary"
                                     size="sm"
                                     onClick={e => {
                                       e.stopPropagation();
-                                      navigate(`/gateways/publish?resume=${connectionPoint.id}`);
+                                      navigate(
+                                        `/gateways/publish?resume=${encodeURIComponent(connectionPoint.id)}`
+                                      );
                                     }}
                                     title="Continue creating this connection point"
                                     data-testid={`connection-points-continue-button-${connectionPoint.id}`}

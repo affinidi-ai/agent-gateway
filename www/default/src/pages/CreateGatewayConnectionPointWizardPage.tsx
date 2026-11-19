@@ -3,12 +3,15 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { apiClient } from '../api';
 import './OnboardWizard.css';
 import MediatorAccessStep, { MediatorAccessRefusal } from '../components/shared/MediatorAccessStep';
+import ResumeUnavailableCard from '../components/shared/ResumeUnavailableCard';
+import { formatDateTime } from '../utils/stringUtils';
 import { AppButton } from '../components/shared/AppButton';
 import {
   CONNECTION_POINT_DID_LABELS,
   MediatorAccess,
   labelledDids,
   mediatorAccessRefusal,
+  mediatorAccessExpired,
 } from '../utils/mediatorAccess';
 
 // Import step components
@@ -106,6 +109,8 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
   };
 
   const resumed = useRef<string | null>(null);
+  // Why `?resume=` cannot continue: the record is gone or already continued, or expired.
+  const [resumeUnavailable, setResumeUnavailable] = useState('');
 
   useEffect(() => {
     if (!resumeId || resumed.current === resumeId) return;
@@ -113,10 +118,17 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
     const resume = async () => {
       try {
         setSaving(true);
+        const id = encodeURIComponent(resumeId);
         const [connectionPoint, access] = await Promise.all([
-          apiClient.get(`/connection-points/${resumeId}`),
-          apiClient.get<MediatorAccess>(`/connection-points/${resumeId}/mediator-access`),
+          apiClient.get(`/connection-points/${id}`),
+          apiClient.get<MediatorAccess>(`/connection-points/${id}/mediator-access`),
         ]);
+        if (mediatorAccessExpired(access.data)) {
+          setResumeUnavailable(
+            `Its invitation expired on ${formatDateTime(access.data.expires_at, true)}. Delete this connection point on Connections and create a new one.`
+          );
+          return;
+        }
         setWizardState(prev => ({
           ...prev,
           mediatorId: connectionPoint.data.mediator_id,
@@ -126,7 +138,7 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
           currentStep: 'mediator-access',
         }));
       } catch (err: any) {
-        setError(err.message || 'Failed to load the connection point.');
+        setResumeUnavailable(err.message || 'Failed to load the connection point.');
       } finally {
         setSaving(false);
       }
@@ -243,6 +255,9 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
 
   // Render current step
   const renderStep = () => {
+    if (resumeUnavailable) {
+      return <ResumeUnavailableCard message={resumeUnavailable} onBack={handleCancel} />;
+    }
     if (saving) {
       return (
         <div className="card shadow">

@@ -133,6 +133,10 @@ pub struct ReservedPermanent {
     /// The mediator the permanent connection point is homed on.
     pub mediator_id: String,
     pub mediator_did: String,
+    /// Set when the pairing stored the permanent connection point, which then owns the
+    /// DID's events: deleting the reserving record no longer reports `creation_failed`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub consumed: bool,
 }
 
 fn default_enabled() -> bool {

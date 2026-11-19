@@ -449,6 +449,14 @@ pub async fn update_gateway<S: GatewayStore>(
     }
     // DID cannot be changed after creation - ignore req.did
     if let Some(status) = req.status {
+        // Only the pairing flow pauses a gateway; the startup sweep removes a paused one
+        // with no paused point, so an edit must not set it.
+        if status == GatewayStatus::AwaitingMediatorAccess && gateway.status != GatewayStatus::AwaitingMediatorAccess {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "awaiting-mediator-access is set by the pairing flow only".to_string(),
+            ));
+        }
         if status == GatewayStatus::Disabled && gateway.status != GatewayStatus::Disabled {
             refuse_removal_in_use(surface_store.as_ref(), &gateway).await?;
         }
@@ -729,6 +737,9 @@ pub async fn delete_gateway<S: GatewayStore, P: ConnectionPointStore>(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    // Waits for a Continue of this gateway, so that Continue cannot store it again
+    // after it is deleted.
+    let _continuing = crate::gateways::mediator_access::lock(&id).await;
     let gateway = store
         .get(&id)
         .await
@@ -1314,6 +1325,34 @@ mod tests {
                 },
             },
         })
+    }
+
+    #[tokio::test]
+    async fn an_edit_cannot_pause_a_gateway_for_mediator_access() {
+        let gateway = remote_gateway();
+        let (store, _dir) = gateway_store_with(&gateway).await;
+
+        let err = update_gateway(
+            Extension(store.clone()),
+            Extension(None),
+            Path(gateway.id.clone()),
+            None,
+            None,
+            Json(update_request(serde_json::json!({ "status": "awaiting-mediator-access" }))),
+        )
+        .await
+        .expect_err("only the pairing flow pauses a gateway");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            store
+                .get(&gateway.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            GatewayStatus::Active
+        );
     }
 
     #[tokio::test]
@@ -2984,12 +3023,14 @@ fn acceptance_access(
             .connection_point_did
             .clone(),
         mediator_did: mediator_did.clone(),
+        mediator_name: String::new(),
     }];
     if let Some(reserved) = &temporary_point.reserved_permanent {
         dids.push(AwaitedDid {
             role: DidRole::Permanent,
             did: reserved.did.clone(),
             mediator_did: reserved.mediator_did.clone(),
+            mediator_name: String::new(),
         });
     }
     MediatorAccess {
@@ -3167,7 +3208,13 @@ pub async fn connect_via_oob<
                                 .unwrap_or_default(),
                         )
                         .await;
-                        Some(acceptance_access(&point, name))
+                        Some(
+                            crate::gateways::mediator_access::name_each_mediator(
+                                mediator_store.as_ref(),
+                                acceptance_access(&point, name),
+                            )
+                            .await,
+                        )
                     }
                     None => None,
                 }
@@ -3484,6 +3531,7 @@ pub async fn connect_via_oob<
                     .clone()
                     .unwrap_or_else(|| acceptor_mediator_did.clone()),
                 mediator_did: acceptor_mediator_did.clone(),
+                consumed: false,
             });
 
             let mut paused_gateway = Gateway::new(
@@ -3541,7 +3589,13 @@ pub async fn connect_via_oob<
                 crate::gateways::mediator_access::mediator_name(mediator_store.as_ref(), &their_mediator_did).await;
             Ok(Json(ConnectViaOOBResponse {
                 gateway: paused_gateway,
-                mediator_access: Some(acceptance_access(&point, name)),
+                mediator_access: Some(
+                    crate::gateways::mediator_access::name_each_mediator(
+                        mediator_store.as_ref(),
+                        acceptance_access(&point, name),
+                    )
+                    .await,
+                ),
             }))
         }
         .await;
@@ -3701,7 +3755,10 @@ pub async fn get_gateway_mediator_access<
             .unwrap_or_default(),
     )
     .await;
-    Ok(Json(acceptance_access(&point, name)))
+    Ok(Json(
+        crate::gateways::mediator_access::name_each_mediator(mediator_store.as_ref(), acceptance_access(&point, name))
+            .await,
+    ))
 }
 
 /// Continues an acceptance paused for mediator access: once the inviter's
@@ -3742,11 +3799,32 @@ pub async fn continue_gateway<
     };
     load().await?;
     let _continuing = crate::gateways::mediator_access::lock(&id).await;
-    let mut gateway = load().await?;
+    let gateway = load().await?;
+    // A Continue that sent its connection-setup but could not store all of its result
+    // leaves the gateway `pending` with its point still flagged. Finish it here, without
+    // sending again: the inviter has already redeemed the invitation.
+    if gateway.status == GatewayStatus::Pending
+        && let Some(point) = paused_temporary_point(cp_store.as_ref(), &id).await?
+    {
+        let listener_manager = listener_manager.ok_or_else(|| {
+            (StatusCode::SERVICE_UNAVAILABLE, "Listener manager not available - cannot start listener".to_string())
+        })?;
+        let their_mediator_did = point
+            .mediator_did
+            .clone()
+            .unwrap_or_else(|| point.mediator_id.clone());
+        let their_mediator_endpoint = invitation_mediator_endpoint(&point.oob_url)?;
+        let (gateway, point) = store_sent_continue(store.clone(), cp_store.clone(), gateway, point).await?;
+        listener_manager
+            .request_start_listener(point, their_mediator_did, their_mediator_endpoint)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start temporary listener: {}", e)))?;
+        info!("✓ Gateway {} finished a Continue whose result was not stored", id);
+        return Ok(Json(ConnectViaOOBResponse { gateway, mediator_access: None }));
+    }
     if gateway.status != GatewayStatus::AwaitingMediatorAccess {
         return Ok(Json(ConnectViaOOBResponse { gateway, mediator_access: None }));
     }
-    let mut point = paused_temporary_point(cp_store.as_ref(), &id)
+    let point = paused_temporary_point(cp_store.as_ref(), &id)
         .await?
         .ok_or_else(|| (StatusCode::CONFLICT, "The paused handshake of this gateway was not found".to_string()))?;
     if point
@@ -3845,17 +3923,7 @@ pub async fn continue_gateway<
         .await;
     sent?;
 
-    gateway.status = GatewayStatus::Pending;
-    gateway.updated_at = chrono::Utc::now();
-    store
-        .update(&gateway)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update gateway: {}", e)))?;
-    point.awaiting_mediator_access = false;
-    cp_store
-        .update(&point)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update connection point: {}", e)))?;
+    let (gateway, point) = store_sent_continue(store.clone(), cp_store.clone(), gateway, point).await?;
 
     listener_manager
         .request_start_listener(point, their_mediator_did, their_mediator_endpoint)
@@ -3863,6 +3931,36 @@ pub async fn continue_gateway<
     info!("✓ Gateway {} sent its connection-setup and waits for approval", id);
 
     Ok(Json(ConnectViaOOBResponse { gateway, mediator_access: None }))
+}
+
+/// Stores what a sent connection-setup means: the gateway `pending`, then its point no longer
+/// paused. Both writes run on their own task, so a cancelled request cannot stop between
+/// them; a failure of the second leaves the gateway `pending` with a flagged point, which the
+/// next Continue finishes.
+async fn store_sent_continue<S: GatewayStore + 'static, P: ConnectionPointStore + 'static>(
+    store: Arc<S>,
+    cp_store: Arc<P>,
+    mut gateway: Gateway,
+    mut point: super::connection_points::types::GatewayConnectionPoint,
+) -> Result<(Gateway, super::connection_points::types::GatewayConnectionPoint), (StatusCode, String)> {
+    tokio::spawn(async move {
+        if gateway.status != GatewayStatus::Pending {
+            gateway.status = GatewayStatus::Pending;
+            gateway.updated_at = chrono::Utc::now();
+            store
+                .update(&gateway)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update gateway: {}", e)))?;
+        }
+        point.awaiting_mediator_access = false;
+        cp_store
+            .update(&point)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update connection point: {}", e)))?;
+        Ok((gateway, point))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to store the Continue: {}", e)))?
 }
 
 /// Response body for gateway ping
@@ -5299,6 +5397,7 @@ mod pause_tests {
     struct Paused {
         router: axum::Router,
         gateways: Arc<crate::gateways::FileSystemGatewayStore>,
+        points: Arc<FileSystemConnectionPointStore>,
         temporary_did: String,
         permanent_did: String,
         _dir: tempfile::TempDir,
@@ -5373,6 +5472,7 @@ mod pause_tests {
             did: permanent_did.clone(),
             mediator_id: MEDIATOR_DID.into(),
             mediator_did: MEDIATOR_DID.into(),
+            consumed: false,
         });
         points
             .create(&point)
@@ -5411,7 +5511,7 @@ mod pause_tests {
             .route("/v1/gateways/{id}", axum::routing::get(get_gateway::<crate::gateways::FileSystemGatewayStore>))
             .layer(Extension(gateways.clone()))
             .layer(Extension(Some(points.clone())))
-            .layer(Extension(points))
+            .layer(Extension(points.clone()))
             .layer(Extension(mediators))
             .layer(Extension(Arc::new(vc_issuer)))
             .layer(Extension(Arc::new(bootstrap)))
@@ -5420,6 +5520,7 @@ mod pause_tests {
         Paused {
             router,
             gateways,
+            points,
             temporary_did,
             permanent_did,
             _dir: dir,
@@ -5462,6 +5563,10 @@ mod pause_tests {
         assert_eq!(access["dids"][0]["did"], paused.temporary_did.as_str());
         assert_eq!(access["dids"][1]["role"], "permanent");
         assert_eq!(access["dids"][1]["did"], paused.permanent_did.as_str());
+        // Each DID names its own mediator (with federation they can differ); an unknown
+        // mediator is named by its DID.
+        assert_eq!(access["dids"][0]["mediator_name"], MEDIATOR_DID);
+        assert_eq!(access["dids"][1]["mediator_name"], MEDIATOR_DID);
         assert!(access["expires_at"].is_string());
     }
 
@@ -5505,6 +5610,70 @@ mod pause_tests {
                 .status,
             GatewayStatus::AwaitingMediatorAccess
         );
+    }
+
+    #[tokio::test]
+    async fn continue_finishes_a_sent_continue_whose_point_was_not_stored_without_sending_again() {
+        let paused = paused_acceptance().await;
+        // The connection-setup went out and the gateway was stored `pending`, but the
+        // point's flag was not cleared. The mediator now refuses everything, so a second
+        // send or admission check would fail.
+        let mut gateway = paused
+            .gateways
+            .get("gw-paused")
+            .await
+            .unwrap()
+            .unwrap();
+        gateway.status = GatewayStatus::Pending;
+        paused
+            .gateways
+            .update(&gateway)
+            .await
+            .unwrap();
+        crate::gateways::connection_points::test_mediator::refuse(&paused.temporary_did);
+
+        let response = paused
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/gateways/gw-paused/continue")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+
+        // Neither refused (no admission check) nor sent again; the test listener manager
+        // has no start channel, so starting the listener is the only step that fails.
+        assert_ne!(status, StatusCode::CONFLICT, "{body}");
+        assert!(status == StatusCode::OK || body.contains("Failed to start temporary listener"), "{status} {body}");
+        assert_eq!(
+            paused
+                .gateways
+                .get("gw-paused")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            GatewayStatus::Pending
+        );
+        let point = paused
+            .points
+            .get("cp-temporary")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!point.awaiting_mediator_access, "the point is no longer paused");
     }
 
     #[test]

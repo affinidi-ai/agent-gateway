@@ -2,9 +2,10 @@ import React from 'react';
 import { render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import ConnectStep from '../ConnectStep';
-import { apiClient } from '../../../api';
+import { ApiError, apiClient } from '../../../api';
 
 jest.mock('../../../api', () => ({
+  ApiError: jest.requireActual('../../../api').ApiError,
   apiClient: {
     post: jest.fn(),
   },
@@ -73,5 +74,41 @@ describe('ConnectStep', () => {
 
     renderStep('', undefined, jest.fn());
     expect(await screen.findByTestId('wizard-back')).toBeInTheDocument();
+  });
+
+  it('hands a 409 mediator_access_refused from Continue to onRefused with the refused DID', async () => {
+    mockedPost.mockRejectedValue(
+      new ApiError(
+        'refused',
+        409,
+        'mediator_access_refused',
+        JSON.stringify({
+          code: 'mediator_access_refused',
+          role: 'temporary',
+          did: 'did:peer:2.tmp',
+        })
+      )
+    );
+    const onRefused = jest.fn();
+    render(
+      <ConnectStep
+        continueGatewayId="gw-1"
+        onRefused={onRefused}
+        oobLink="https://mediator.example.com/oob?_oobid=abc"
+        secret="secret"
+        name="Partner"
+        description=""
+        onConnected={jest.fn()}
+        onCancel={jest.fn()}
+      />
+    );
+
+    await waitFor(() =>
+      expect(onRefused).toHaveBeenCalledWith({
+        did: 'did:peer:2.tmp',
+        label: 'Temporary DID for the handshake',
+      })
+    );
+    expect(mockedPost).toHaveBeenCalledWith('/gateways/gw-1/continue', {});
   });
 });
