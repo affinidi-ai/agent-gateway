@@ -2704,7 +2704,7 @@ fn tool_call_leaves_base(
 struct StoredToolCall {
     directory: Url,
     metadata: rmcp_openapi::ToolMetadata,
-    file: Option<super::modern_rest::FileAnswer>,
+    file: Option<super::modern_rest::FileAnswers>,
     content_type: String,
     egress_allowlist: Option<String>,
 }
@@ -3268,7 +3268,7 @@ fn tools_list_result(
         .iter()
         .filter_map(|tool_name| server.get_tool_metadata(tool_name))
         .filter(|metadata| {
-            match super::modern_rest::file_answer(&server.openapi_spec, metadata) {
+            match super::modern_rest::file_answers(&server.openapi_spec, metadata) {
                 Ok(_) => true,
                 Err(error) => {
                     warn!(proxy_id = %proxy.id, tool = %metadata.name, error = %error, "Exclude tool with an unusable file answer");

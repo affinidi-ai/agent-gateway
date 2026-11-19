@@ -1,0 +1,19 @@
+branch: feat/mcp-proxy-json-file-answers-followup
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-19T09:00:00Z'
+      title: Read an x-gateway-file declaration on any JSON media type of a REST answer
+      description: >-
+        A success answer that lists several JSON media types, such as application/json beside
+        application/vnd.example+json, had only the first of them read, so a file declared on the
+        other was answered as JSON text and a malformed declaration there left the tool listed and
+        callable. Every JSON media type of every success answer is read now, so such a declaration
+        is honoured when well-formed and drops the tool from tools/list when not. When an answer
+        declares a file on several of its media types, the Content-Type the REST API answered picks
+        which one that answer carries; an answer whose media type the operation does not declare,
+        or that names none, carries the first file declared on its status.
+  removed: []
+  security: []
+  breaking: []
