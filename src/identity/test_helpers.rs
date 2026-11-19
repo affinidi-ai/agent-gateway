@@ -588,3 +588,56 @@ async fn signed_agent_presentation_about(subject_did: Option<&str>) -> SignedAge
         _temporary,
     }
 }
+
+/// Installs on `issuer` a key directory where the surface `surface_id` signs
+/// through a trust agent connection that does not exist, so what that surface
+/// issues fails while every other scope signs as before.
+pub async fn map_surface_to_unusable_trust_agent(
+    issuer: &Arc<VCIssuer>,
+    dir: &std::path::Path,
+    surface_id: &str,
+) {
+    let surfaces = Arc::new(
+        crate::surfaces::FileSystemAgentSurfaceStore::new(dir.join("surfaces"))
+            .await
+            .expect("surface store"),
+    ) as Arc<dyn crate::surfaces::AgentSurfaceStore>;
+    crate::surfaces::AgentSurfaceStore::save(
+        surfaces.as_ref(),
+        &crate::config::agent_surface::AgentSurface {
+            surface_id: surface_id.to_string(),
+            signing: Some(crate::config::agent_surface::SurfaceSigningConfig {
+                backend: Some(crate::config::agent_surface::SigningBackendKind::Vta),
+                connection_id: Some("vta-gone".to_string()),
+                context_id: Some("ctx".to_string()),
+                key_id: Some("key-1".to_string()),
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("save the surface");
+    let connections = Arc::new(
+        crate::vta::connections::FileSystemVtaConnectionStore::new(dir.join("connections"))
+            .await
+            .expect("connection store"),
+    );
+    let registry = Arc::new(crate::vta::registry::VtaConnectionRegistry::new(
+        connections,
+        None,
+        None,
+        None,
+        std::time::Duration::from_secs(5),
+        4,
+    ));
+    let local: Arc<dyn crate::identity::authority::CredentialAuthority> =
+        Arc::new(crate::identity::authority::LocalCredentialAuthority::new(Arc::clone(issuer)));
+    let directory = crate::vta::key_directory::KeyDirectory::build(&crate::config::vta::VtaConfig::default(), local)
+        .await
+        .expect("a disabled [vta] block builds")
+        .with_connections(registry)
+        .with_surface_store(surfaces);
+    issuer
+        .set_key_directory(Arc::new(directory))
+        .await;
+}

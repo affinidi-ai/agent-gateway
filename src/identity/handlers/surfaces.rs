@@ -3137,12 +3137,17 @@ fn validate_surface_signing(
         }
         if signing.backend == Some(SigningBackendKind::Vta)
             && signing.context_id.is_none()
-            && !vta_config.auto_provision_contexts
+            && !crate::vta::key_directory::provisions_contexts_on(
+                vta_config,
+                signing
+                    .connection_id
+                    .as_deref(),
+            )
         {
             errors.push(format!(
-                "Surface '{label}': signing.context_id is required because this gateway cannot create VTA \
-                 contexts; set `[vta] auto_provision_contexts` (the agent grant must carry \
-                 `context-create`) or name an existing context"
+                "Surface '{label}': signing.context_id is required because this gateway creates VTA contexts \
+                 only through an enabled `[vta]` connection with `auto_provision_contexts` set (the agent \
+                 grant must carry `context-create`); name an existing context"
             ));
         }
     };
@@ -12041,5 +12046,41 @@ mod tests {
 
         validate_surface_signing(&surface_signing_with(Some("gateway-jwt-1")), &config)
             .expect("a block naming its key is saved");
+    }
+
+    fn surface_signing_without_context(connection_id: Option<&str>) -> AgentSurface {
+        let mut surface = surface_signing_with(Some("gateway-jwt-1"));
+        let signing = surface
+            .signing
+            .as_mut()
+            .unwrap();
+        signing.connection_id = connection_id.map(str::to_string);
+        signing.context_id = None;
+        surface
+    }
+
+    /// A block that names no context is saved only where this gateway can
+    /// create one: through an enabled `[vta]` connection that auto-provisions.
+    #[test]
+    fn a_trust_agent_signing_block_without_a_context_needs_a_connection_that_provisions() {
+        let provisioning = crate::config::vta::VtaConfig {
+            enabled: true,
+            auto_provision_contexts: true,
+            ..Default::default()
+        };
+        validate_surface_signing(&surface_signing_without_context(None), &provisioning)
+            .expect("the `[vta]` connection creates the context");
+
+        let err = validate_surface_signing(&surface_signing_without_context(Some("vta-a")), &provisioning)
+            .expect_err("another connection's context is not created through `[vta]`");
+        assert!(format!("{err:?}").contains("signing.context_id"), "{err:?}");
+
+        let disabled = crate::config::vta::VtaConfig {
+            enabled: false,
+            auto_provision_contexts: true,
+            ..Default::default()
+        };
+        validate_surface_signing(&surface_signing_without_context(None), &disabled)
+            .expect_err("a disabled `[vta]` block creates no context");
     }
 }

@@ -7669,6 +7669,10 @@ async fn process_charged_forward_request(
                                     None
                                 };
 
+                                let key_scope = crate::vta::key_directory::KeyScope::serving(
+                                    &resolved_surface.surface_id,
+                                    active_variant_id.as_deref(),
+                                );
                                 // Use protocol-specific injection (RESPONSE functions, not request functions!)
                                 let inject_result = if surface_protocol == crate::config::ChannelProtocol::Mcp {
                                     let (gw2_meta_field, gw2_strip_raw) = resolved_surface
@@ -7693,6 +7697,7 @@ async fn process_charged_forward_request(
                                         &gw2_meta_field,
                                         gw2_strip_raw,
                                         mcp_metadata_context,
+                                        &key_scope,
                                     )
                                     .await
                                 } else {
@@ -7705,6 +7710,7 @@ async fn process_charged_forward_request(
                                         vc_issuer,
                                         channel_id,
                                         Vec::new(),
+                                        &key_scope,
                                     )
                                     .await
                                     .map(|injected| {

@@ -171,12 +171,31 @@ fn mapping_for(
     }
 }
 
+/// Whether the appliance signs through a trust agent: the gateway-wide default
+/// when it names a usable backend, else the `[vta]` block, as the key directory
+/// resolves it.
+pub fn signs_through_trust_agent(
+    config: &VtaConfig,
+    default_signing: Option<&crate::config::agent_surface::SurfaceSigningConfig>,
+) -> bool {
+    match default_signing
+        .filter(|signing| !signing.is_empty())
+        .and_then(|signing| {
+            crate::vta::key_directory::signing_key_ref(signing, crate::config::vta::KeyPurpose::Jwt).ok()
+        }) {
+        Some(key_ref) => matches!(key_ref.backend, crate::vta::key_directory::KeyBackend::Vta { .. }),
+        None => config.enabled,
+    }
+}
+
 /// Build the inventory from the live records.
 ///
-/// `known_contexts` are the context names the provisioner has created or
-/// adopted; anything in there that no surface claims is reported as orphaned.
+/// `default_signing` is the gateway-wide default from Settings. `known_contexts`
+/// are the context names the provisioner has created or adopted; anything in
+/// there that no surface claims is reported as orphaned.
 pub fn build(
     config: &VtaConfig,
+    default_signing: Option<&crate::config::agent_surface::SurfaceSigningConfig>,
     connections: &[VtaConnection],
     surfaces: &[AgentSurface],
     issuers: &[crate::issuers::types::Issuer],
@@ -225,9 +244,15 @@ pub fn build(
         .collect();
     orphaned_contexts.sort();
 
+    let through_trust_agent = signs_through_trust_agent(config, default_signing);
     KeyInventory {
-        tier: config.tier().to_string(),
-        custody_claim: config.supports_custody_claim(),
+        tier: if through_trust_agent {
+            "self-hosted"
+        } else {
+            "local"
+        }
+        .to_string(),
+        custody_claim: through_trust_agent,
         context_did_method: config
             .context_did_method
             .as_str()
@@ -257,9 +282,9 @@ pub fn build(
             .collect(),
         mappings,
         orphaned_contexts,
-        key_surfaces: crate::vta::key_surfaces::surfaces(config.enabled),
-        residual_exceptions: crate::vta::key_surfaces::residual_exceptions(config.enabled),
-        holds_no_forging_key: crate::vta::key_surfaces::holds_no_forging_key(config.enabled),
+        key_surfaces: crate::vta::key_surfaces::surfaces(through_trust_agent),
+        residual_exceptions: crate::vta::key_surfaces::residual_exceptions(through_trust_agent),
+        holds_no_forging_key: crate::vta::key_surfaces::holds_no_forging_key(through_trust_agent),
     }
 }
 
@@ -321,7 +346,7 @@ mod tests {
 
     #[test]
     fn an_unmapped_surface_is_reported_as_inheriting_rather_than_resolved() {
-        let inventory = build(&vta_config(), &[], &[surface("s1", None)], &[], &[]);
+        let inventory = build(&vta_config(), None, &[], &[surface("s1", None)], &[], &[]);
         let mapping = &inventory.mappings[0];
         // Showing the resolved value would hide that nothing is configured,
         // which is exactly what an operator is trying to find out.
@@ -333,7 +358,8 @@ mod tests {
 
     #[test]
     fn an_empty_signing_block_still_counts_as_inheriting() {
-        let inventory = build(&vta_config(), &[], &[surface("s1", Some(SurfaceSigningConfig::default()))], &[], &[]);
+        let inventory =
+            build(&vta_config(), None, &[], &[surface("s1", Some(SurfaceSigningConfig::default()))], &[], &[]);
         assert!(inventory.mappings[0].inherits);
     }
 
@@ -345,7 +371,7 @@ mod tests {
             context_id: Some("ctx-sales".to_string()),
             key_id: Some("k-sales".to_string()),
         };
-        let inventory = build(&vta_config(), &[], &[surface("s1", Some(signing))], &[], &[]);
+        let inventory = build(&vta_config(), None, &[], &[surface("s1", Some(signing))], &[], &[]);
         let mapping = &inventory.mappings[0];
         assert!(!mapping.inherits);
         assert_eq!(mapping.backend, "vta");
@@ -390,7 +416,7 @@ mod tests {
             )
             .unwrap();
 
-        let inventory = build(&vta_config(), &[connection], &[], &[], &[]);
+        let inventory = build(&vta_config(), None, &[connection], &[], &[], &[]);
         let keys = &inventory.connections[0].keys;
         assert_eq!(keys.len(), 2, "the retired key is still published");
         assert_eq!(keys[0].key_id, "k2");
@@ -403,7 +429,7 @@ mod tests {
     #[test]
     fn a_context_no_surface_claims_is_reported_as_orphaned() {
         let known = vec!["ctx:_global/s1".to_string(), "ctx:_global/deleted".to_string()];
-        let inventory = build(&vta_config(), &[], &[surface("s1", None)], &[], &known);
+        let inventory = build(&vta_config(), None, &[], &[surface("s1", None)], &[], &known);
         // Reported, not reclaimed: artifacts the orphan's key signed must stay
         // verifiable.
         assert_eq!(inventory.orphaned_contexts, vec!["ctx:_global/deleted".to_string()]);
@@ -412,21 +438,61 @@ mod tests {
     #[test]
     fn the_custody_claim_is_computed_here_and_follows_the_tier() {
         let config = vta_config();
-        assert!(build(&config, &[], &[], &[], &[]).custody_claim, "a separately-operated VTA supports the claim");
+        assert!(build(&config, None, &[], &[], &[], &[]).custody_claim, "a separately-operated VTA supports the claim");
 
-        let local = build(&VtaConfig::default(), &[], &[], &[], &[]);
+        let local = build(&VtaConfig::default(), None, &[], &[], &[], &[]);
         assert_eq!(local.tier, "local");
         assert!(!local.custody_claim);
     }
 
+    /// The gateway-wide default from Settings decides where the appliance
+    /// signs, before the `[vta]` block, so the custody claim follows it.
+    #[test]
+    fn the_custody_claim_follows_the_gateway_wide_default() {
+        let dashboard_agent = SurfaceSigningConfig {
+            backend: Some(SigningBackendKind::Vta),
+            connection_id: Some("c1".to_string()),
+            context_id: Some("ctx".to_string()),
+            key_id: Some("k1".to_string()),
+        };
+        let through_dashboard = build(&VtaConfig::default(), Some(&dashboard_agent), &[], &[], &[], &[]);
+        assert_eq!(through_dashboard.tier, "self-hosted");
+        assert!(through_dashboard.custody_claim);
+        assert!(
+            through_dashboard
+                .key_surfaces
+                .iter()
+                .any(|surface| surface.id == "gateway_issuer" && surface.migrated == Some(true))
+        );
+
+        let gateway_secret = SurfaceSigningConfig {
+            backend: Some(SigningBackendKind::Local),
+            ..Default::default()
+        };
+        let local = build(&vta_config(), Some(&gateway_secret), &[], &[], &[], &[]);
+        assert_eq!(local.tier, "local");
+        assert!(!local.custody_claim);
+        assert!(!local.holds_no_forging_key);
+
+        let malformed = SurfaceSigningConfig {
+            backend: Some(SigningBackendKind::Vta),
+            connection_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            build(&vta_config(), Some(&malformed), &[], &[], &[], &[]).custody_claim,
+            "a default the directory ignores leaves the `[vta]` block in charge"
+        );
+    }
+
     #[test]
     fn the_inventory_reports_which_did_new_contexts_sign_as() {
-        assert_eq!(build(&VtaConfig::default(), &[], &[], &[], &[]).context_did_method, "did_key");
+        assert_eq!(build(&VtaConfig::default(), None, &[], &[], &[], &[]).context_did_method, "did_key");
         let webvh = VtaConfig {
             context_did_method: crate::config::vta::ContextDidMethod::DidWebvh,
             ..VtaConfig::default()
         };
-        assert_eq!(build(&webvh, &[], &[], &[], &[]).context_did_method, "did_webvh");
+        assert_eq!(build(&webvh, None, &[], &[], &[], &[]).context_did_method, "did_webvh");
     }
 
     #[test]
@@ -437,7 +503,7 @@ mod tests {
             pairing: Default::default(),
             ..connection("c2")
         };
-        let inventory = build(&vta_config(), &[connection("c0"), disabled, unpaired], &[], &[], &[]);
+        let inventory = build(&vta_config(), None, &[connection("c0"), disabled, unpaired], &[], &[], &[]);
         assert!(inventory.connections[0].usable);
         assert!(!inventory.connections[1].usable, "disabled cannot sign");
         assert!(!inventory.connections[2].usable, "unpaired cannot sign");
@@ -472,7 +538,8 @@ mod tests {
 
     #[test]
     fn a_surface_that_sets_nothing_reports_the_signing_of_its_issuer_and_says_so() {
-        let inventory = build(&vta_config(), &[], &[owned_by_issuer(None)], &[issuer_with(Some(remote("c1")))], &[]);
+        let inventory =
+            build(&vta_config(), None, &[], &[owned_by_issuer(None)], &[issuer_with(Some(remote("c1")))], &[]);
 
         let mapping = &inventory.mappings[0];
         assert_eq!(mapping.backend, "vta");
@@ -495,7 +562,7 @@ mod tests {
             ..Default::default()
         };
         let inventory =
-            build(&vta_config(), &[], &[owned_by_issuer(Some(own))], &[issuer_with(Some(remote("c1")))], &[]);
+            build(&vta_config(), None, &[], &[owned_by_issuer(Some(own))], &[issuer_with(Some(remote("c1")))], &[]);
 
         let mapping = &inventory.mappings[0];
         assert_eq!(mapping.backend, "local");
@@ -505,7 +572,7 @@ mod tests {
 
     #[test]
     fn an_issuer_without_signing_leaves_its_surface_inheriting_the_appliance_default() {
-        let inventory = build(&vta_config(), &[], &[owned_by_issuer(None)], &[issuer_with(None)], &[]);
+        let inventory = build(&vta_config(), None, &[], &[owned_by_issuer(None)], &[issuer_with(None)], &[]);
 
         let mapping = &inventory.mappings[0];
         assert_eq!(mapping.backend, "inherit");

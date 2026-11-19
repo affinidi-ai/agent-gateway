@@ -1627,7 +1627,7 @@ pub async fn oauth_callback(
                                 None,
                                 // Appliance-wide: the delegation leg has no
                                 // surface-scoped signing key of its own.
-                                None,
+                                &crate::vta::key_directory::KeyScope::default(),
                             )
                             .await
                         {

@@ -198,6 +198,18 @@ impl KeyScope {
         }
     }
 
+    /// The surface a request is served by, and the variant serving it, if any.
+    pub fn serving(
+        surface_id: &str,
+        variant_id: Option<&str>,
+    ) -> Self {
+        Self {
+            surface_id: Some(surface_id.to_string()),
+            variant_id: variant_id.map(str::to_string),
+            ..Self::default()
+        }
+    }
+
     #[cfg(test)]
     pub fn variant(
         surface_id: impl Into<String>,
@@ -597,6 +609,12 @@ impl KeyDirectory {
             Err(e) => return unusable(e.log_detail().to_string()),
         };
         let KeyBackend::Vta { connection_id } = &key_ref.backend else {
+            // A gateway-wide default of the gateway's own key is an answer too:
+            // inheriting would hand the credential to the `[vta]` issuer while
+            // tokens sign locally.
+            if chosen || self.default_is_local() {
+                return IssuingContext::Local;
+            }
             return IssuingContext::Inherit;
         };
         // A credential is issued **as** a context: its designated key signs and
@@ -643,6 +661,14 @@ impl KeyDirectory {
                         .as_deref()
                         .is_some_and(|id| id != DEFAULT_CONNECTION_ID)
             })
+    }
+
+    /// Whether the gateway-wide default explicitly asks for the gateway's own key.
+    fn default_is_local(&self) -> bool {
+        self.appliance_default
+            .as_ref()
+            .and_then(|source| source.signing())
+            .is_some_and(|signing| signing.backend == Some(crate::config::agent_surface::SigningBackendKind::Local))
     }
 
     /// The context creator, when `[vta]` selected one and auto-provisioning is
@@ -1021,8 +1047,16 @@ impl KeyDirectory {
             Some(live) => live,
             None => self.resolve(purpose, scope),
         };
-        let needs_context = matches!(key_ref.backend, KeyBackend::Vta { .. }) && key_ref.context.is_none();
-        if !needs_context {
+        let KeyBackend::Vta { connection_id } = &key_ref.backend else {
+            return Ok(key_ref);
+        };
+        if key_ref.context.is_some() {
+            return Ok(key_ref);
+        }
+        // Contexts are created as children of the `[vta]` grant, through its
+        // client. Another connection's key is left without one rather than
+        // given a context that connection does not hold.
+        if !is_bootstrap_connection(connection_id) {
             return Ok(key_ref);
         }
         let Some(provisioner) = self.provisioner.as_ref() else {
@@ -1149,6 +1183,22 @@ impl KeyDirectory {
 /// with real stored connection records.
 pub const DEFAULT_CONNECTION_ID: &str = "default";
 
+/// Whether `connection_id` names the `[vta]` connection, the only one this
+/// gateway creates contexts through.
+fn is_bootstrap_connection(connection_id: &str) -> bool {
+    connection_id == DEFAULT_CONNECTION_ID || connection_id == crate::vta::connections::BOOTSTRAP_CONNECTION_ID
+}
+
+/// Whether this gateway creates the context of a `signing` block that names
+/// none on `connection_id` (`None` meaning the `[vta]` connection): only through
+/// an enabled `[vta]` connection that auto-provisions contexts.
+pub fn provisions_contexts_on(
+    vta: &VtaConfig,
+    connection_id: Option<&str>,
+) -> bool {
+    vta.enabled && vta.auto_provision_contexts && connection_id.is_none_or(is_bootstrap_connection)
+}
+
 /// The appliance-wide token signer, resolved through the directory on every
 /// call: the dashboard's gateway-wide default, then `[vta]`, then the local key.
 ///
@@ -1157,13 +1207,23 @@ pub const DEFAULT_CONNECTION_ID: &str = "default";
 /// without a restart, and keeps the JWKS those are verified against the one of
 /// the key that signs them. A key that cannot be resolved is an error, never a
 /// fallback to the local key.
+///
+/// The JWKS also publishes the keys tokens signed earlier may carry: the local
+/// key, the `[vta]` key, and every key this authority signed with before the
+/// default moved off it, so a switch does not invalidate tokens in flight.
 pub struct ApplianceAuthority {
     directory: Arc<KeyDirectory>,
+    signer: RwLock<Option<(KeyRef, Arc<dyn CredentialAuthority>)>>,
+    previous_keys: RwLock<Vec<serde_json::Value>>,
 }
 
 impl ApplianceAuthority {
     pub fn new(directory: Arc<KeyDirectory>) -> Self {
-        Self { directory }
+        Self {
+            directory,
+            signer: RwLock::new(None),
+            previous_keys: RwLock::new(Vec::new()),
+        }
     }
 
     async fn current(&self) -> anyhow::Result<Arc<dyn CredentialAuthority>> {
@@ -1174,10 +1234,88 @@ impl ApplianceAuthority {
             .resolve_and_provision(KeyPurpose::Jwt, &KeyScope::default())
             .await
             .map_err(failed)?;
-        self.directory
+        let authority = self
+            .directory
             .authority_for(&key_ref, KeyPurpose::Jwt)
             .await
-            .map_err(failed)
+            .map_err(failed)?;
+        self.note_signer(key_ref, &authority)
+            .await;
+        Ok(authority)
+    }
+
+    /// Remembers the keys of the signer `key_ref` replaces, so they stay published.
+    async fn note_signer(
+        &self,
+        key_ref: KeyRef,
+        authority: &Arc<dyn CredentialAuthority>,
+    ) {
+        if matches!(self.signer.read().await.as_ref(), Some((known, _)) if *known == key_ref) {
+            return;
+        }
+        let replaced = {
+            let mut signer = self.signer.write().await;
+            if matches!(signer.as_ref(), Some((known, _)) if *known == key_ref) {
+                return;
+            }
+            signer
+                .replace((key_ref, Arc::clone(authority)))
+                .map(|(_, previous)| previous)
+        };
+        let Some(previous) = replaced else {
+            return;
+        };
+        match previous.issuer_jwks().await {
+            Ok(jwks) => {
+                let mut kept = self
+                    .previous_keys
+                    .write()
+                    .await;
+                merge_keys(&mut kept, jwks_keys(&jwks));
+            }
+            Err(e) => tracing::warn!(
+                target: "vta_audit",
+                error = %e,
+                "the keys of the previous appliance signer could not be read; tokens it signed may stop verifying",
+            ),
+        }
+    }
+
+    /// Keys of the signers built into this appliance, which tokens signed under
+    /// an earlier default may carry.
+    async fn built_in_keys(&self) -> Vec<serde_json::Value> {
+        let mut keys = Vec::new();
+        let built_in = std::iter::once(&self.directory.local).chain(self.directory.vta.as_ref());
+        for authority in built_in {
+            match authority.issuer_jwks().await {
+                Ok(jwks) => merge_keys(&mut keys, jwks_keys(&jwks)),
+                Err(e) => tracing::debug!(
+                    target: "vta_audit",
+                    error = %e,
+                    "a built-in signer's keys could not be read; publishing without them",
+                ),
+            }
+        }
+        keys
+    }
+}
+
+fn jwks_keys(jwks: &serde_json::Value) -> Vec<serde_json::Value> {
+    jwks.get("keys")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Appends each of `more` that `keys` does not already hold.
+fn merge_keys(
+    keys: &mut Vec<serde_json::Value>,
+    more: Vec<serde_json::Value>,
+) {
+    for key in more {
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
     }
 }
 
@@ -1191,10 +1329,21 @@ impl CredentialAuthority for ApplianceAuthority {
     }
 
     async fn issuer_jwks(&self) -> anyhow::Result<serde_json::Value> {
-        self.current()
+        let current = self
+            .current()
             .await?
             .issuer_jwks()
-            .await
+            .await?;
+        let mut keys = jwks_keys(&current);
+        merge_keys(
+            &mut keys,
+            self.previous_keys
+                .read()
+                .await
+                .clone(),
+        );
+        merge_keys(&mut keys, self.built_in_keys().await);
+        Ok(serde_json::json!({ "keys": keys }))
     }
 
     async fn sign_token(
@@ -2622,6 +2771,97 @@ mod tests {
         );
     }
 
+    fn kids(jwks: &Value) -> Vec<String> {
+        jwks["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| {
+                key["kid"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn default_signing_with(key_id: &str) -> Option<crate::config::agent_surface::SurfaceSigningConfig> {
+        Some(crate::config::agent_surface::SurfaceSigningConfig {
+            backend: Some(crate::config::agent_surface::SigningBackendKind::Vta),
+            connection_id: None,
+            context_id: Some("ctx".to_string()),
+            key_id: Some(key_id.to_string()),
+        })
+    }
+
+    /// Moving the gateway-wide default to another key keeps the key that
+    /// signed before it published, so tokens it signed still verify.
+    #[tokio::test]
+    async fn the_jwks_keeps_the_key_that_signed_before_the_default_moved() {
+        let default = Arc::new(SwitchableDefault(std::sync::Mutex::new(default_signing_with("key-a"))));
+        let dir = directory_with(None);
+        for (key_id, authority) in [
+            ("key-a", StubAuthority::new("did:key:a", vec!["a-1"])),
+            ("key-b", StubAuthority::new("did:key:b", vec!["b-1"])),
+        ] {
+            dir.cache
+                .write()
+                .await
+                .insert(vta_jwt_ref(key_id), authority as Arc<dyn CredentialAuthority>);
+        }
+        let authority = ApplianceAuthority::new(Arc::new(
+            dir.with_appliance_default(Arc::clone(&default) as Arc<dyn ApplianceSigningDefault>),
+        ));
+        assert_eq!(
+            authority
+                .sign_token(&serde_json::json!({ "sub": "u" }))
+                .await
+                .unwrap(),
+            "signed-by-did:key:a"
+        );
+
+        *default.0.lock().unwrap() = default_signing_with("key-b");
+        assert_eq!(
+            authority
+                .sign_token(&serde_json::json!({ "sub": "u" }))
+                .await
+                .unwrap(),
+            "signed-by-did:key:b"
+        );
+        assert_eq!(
+            kids(
+                &authority
+                    .issuer_jwks()
+                    .await
+                    .unwrap()
+            ),
+            vec!["b-1", "a-1", "local-1"],
+            "the signing key first, then the earlier signer's and the gateway's own"
+        );
+    }
+
+    /// Before any switch the JWKS is the signer's own keys and the built-in ones.
+    #[tokio::test]
+    async fn the_jwks_publishes_no_earlier_signer_before_the_default_moves() {
+        let dir =
+            directory_with(None).with_appliance_default(Arc::new(StubApplianceDefault(default_signing_with("key-a"))));
+        dir.cache
+            .write()
+            .await
+            .insert(vta_jwt_ref("key-a"), StubAuthority::new("did:key:a", vec!["a-1"]) as Arc<dyn CredentialAuthority>);
+        let authority = ApplianceAuthority::new(Arc::new(dir));
+
+        assert_eq!(
+            kids(
+                &authority
+                    .issuer_jwks()
+                    .await
+                    .unwrap()
+            ),
+            vec!["a-1", "local-1"]
+        );
+    }
+
     /// A default naming a trust agent that cannot be reached refuses to sign
     /// rather than signing with the gateway's own key.
     #[tokio::test]
@@ -2708,5 +2948,145 @@ mod tests {
             ScopedDiIssuer::Inherit
         ));
         assert!(matches!(dir.attestation_signer().await, ScopedContextSigner::Inherit));
+    }
+
+    fn vta_credential_default() -> KeyRef {
+        KeyRef {
+            backend: KeyBackend::Vta {
+                connection_id: DEFAULT_CONNECTION_ID.to_string(),
+            },
+            context: Some(ContextId::from("ctx")),
+            key_id: None,
+            purpose: KeyPurpose::Credential,
+        }
+    }
+
+    /// With `[vta]` configured and the gateway-wide default set to the
+    /// gateway's own key, credentials and the attestation are signed locally,
+    /// as tokens are, rather than inherited by the `[vta]` issuer.
+    #[tokio::test]
+    async fn a_default_of_the_gateway_key_issues_credentials_locally() {
+        let mut dir = directory_with(None).with_appliance_default(Arc::new(StubApplianceDefault(Some(
+            crate::config::agent_surface::SurfaceSigningConfig {
+                backend: Some(crate::config::agent_surface::SigningBackendKind::Local),
+                ..Default::default()
+            },
+        ))));
+        dir.defaults
+            .insert(KeyPurpose::Credential, vta_credential_default());
+
+        assert!(matches!(
+            dir.di_vc_issuer_for(&KeyScope::default())
+                .await,
+            ScopedDiIssuer::Local
+        ));
+        assert!(matches!(
+            dir.di_vc_issuer_for(&KeyScope::surface("surface-a"))
+                .await,
+            ScopedDiIssuer::Local
+        ));
+        assert!(matches!(dir.attestation_signer().await, ScopedContextSigner::Local));
+    }
+
+    /// With no gateway-wide default, the `[vta]` issuer keeps issuing.
+    #[tokio::test]
+    async fn without_a_default_the_vta_block_still_issues_credentials() {
+        let mut dir = directory_with(None);
+        dir.defaults
+            .insert(KeyPurpose::Credential, vta_credential_default());
+
+        assert!(matches!(
+            dir.di_vc_issuer_for(&KeyScope::default())
+                .await,
+            ScopedDiIssuer::Inherit
+        ));
+        assert!(matches!(dir.attestation_signer().await, ScopedContextSigner::Inherit));
+    }
+
+    struct RecordingCreator(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl crate::vta::provisioning::ContextCreator for RecordingCreator {
+        async fn create_context(
+            &self,
+            name: &str,
+        ) -> Result<ContextId, VtaError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(name.to_string());
+            Ok(ContextId::from("created"))
+        }
+    }
+
+    fn context_less_credential_ref(connection_id: &str) -> KeyRef {
+        KeyRef {
+            backend: KeyBackend::Vta {
+                connection_id: connection_id.to_string(),
+            },
+            context: None,
+            key_id: None,
+            purpose: KeyPurpose::Credential,
+        }
+    }
+
+    /// Contexts are created through the `[vta]` connection only: a key on
+    /// another connection that names no context is not given one created there.
+    #[tokio::test]
+    async fn a_context_is_provisioned_only_on_the_vta_connection() {
+        let creator = Arc::new(RecordingCreator(std::sync::Mutex::new(Vec::new())));
+        let mut dir = directory_with(None);
+        dir.push_surface_mapping("on-vta", context_less_credential_ref(DEFAULT_CONNECTION_ID))
+            .unwrap();
+        dir.push_surface_mapping("on-other", context_less_credential_ref("vta-a"))
+            .unwrap();
+        let dir = dir.with_provisioner(Arc::new(crate::vta::provisioning::ContextProvisioner::new(
+            Arc::clone(&creator) as Arc<dyn crate::vta::provisioning::ContextCreator>,
+            10,
+        )));
+
+        let provisioned = dir
+            .resolve_and_provision(KeyPurpose::Credential, &KeyScope::surface("on-vta"))
+            .await
+            .expect("the `[vta]` connection provisions");
+        assert_eq!(provisioned.context, Some(ContextId::from("created")));
+
+        let other = dir
+            .resolve_and_provision(KeyPurpose::Credential, &KeyScope::surface("on-other"))
+            .await
+            .expect("resolves without provisioning");
+        assert_eq!(other.context, None);
+        assert_eq!(
+            creator
+                .0
+                .lock()
+                .unwrap()
+                .len(),
+            1,
+            "only the `[vta]` connection's context was created"
+        );
+    }
+
+    #[test]
+    fn only_an_enabled_auto_provisioning_vta_block_provisions_contexts() {
+        let provisioning = VtaConfig {
+            enabled: true,
+            auto_provision_contexts: true,
+            ..Default::default()
+        };
+        assert!(provisions_contexts_on(&provisioning, None));
+        assert!(provisions_contexts_on(&provisioning, Some(DEFAULT_CONNECTION_ID)));
+        assert!(provisions_contexts_on(&provisioning, Some(crate::vta::connections::BOOTSTRAP_CONNECTION_ID)));
+        assert!(!provisions_contexts_on(&provisioning, Some("vta-a")));
+        let disabled = VtaConfig {
+            enabled: false,
+            ..provisioning.clone()
+        };
+        assert!(!provisions_contexts_on(&disabled, None));
+        let manual = VtaConfig {
+            auto_provision_contexts: false,
+            ..provisioning
+        };
+        assert!(!provisions_contexts_on(&manual, None));
     }
 }

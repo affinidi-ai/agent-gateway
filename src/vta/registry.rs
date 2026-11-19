@@ -348,7 +348,21 @@ impl VtaConnectionRegistry {
             .public_key_of(&signing_key_id)
             .map(str::to_string);
 
-        Ok(Arc::new(VtaCredentialAuthority::new(client, signing_key_id, None).with_signing_key_public(public_key)))
+        // Every other key the connection publishes stays in the JWKS, so tokens
+        // signed before a rotation or a new active key keep verifying.
+        let retiring_keys = connection
+            .keys
+            .published()
+            .into_iter()
+            .filter(|key| key.key_id != signing_key_id)
+            .map(|key| (key.key_id.clone(), key.public_key.clone()))
+            .collect();
+
+        Ok(Arc::new(
+            VtaCredentialAuthority::new(client, signing_key_id, None)
+                .with_signing_key_public(public_key)
+                .with_retiring_keys(retiring_keys),
+        ))
     }
 
     /// The dialled client for a connection, before any signing role is put on
@@ -879,6 +893,73 @@ mod tests {
 
         assert_eq!(key.did(), "did:webvh:QmScid:gw.example.com:vta-auth:c1");
         assert_eq!(key.verification_method(), "did:webvh:QmScid:gw.example.com:vta-auth:c1#key-1");
+    }
+
+    fn ed25519_multibase(byte: u8) -> String {
+        let mut bytes = vec![0xed, 0x01];
+        bytes.extend([byte; 32]);
+        multibase::encode(multibase::Base::Base58Btc, bytes)
+    }
+
+    fn recorded_key(
+        key_id: &str,
+        byte: u8,
+        retired: bool,
+    ) -> crate::vta::connections::SigningKey {
+        crate::vta::connections::SigningKey {
+            key_id: key_id.to_string(),
+            public_key: Some(ed25519_multibase(byte)),
+            label: None,
+            added_at: Utc::now(),
+            retired_at: retired.then(Utc::now),
+        }
+    }
+
+    /// A connection's connector publishes the keys it retired beside the
+    /// active one, so tokens signed before a rotation keep verifying.
+    #[tokio::test]
+    async fn a_connector_publishes_the_keys_its_connection_retired() {
+        let mut c = connection("c1", true);
+        c.pairing = crate::vta::pairing::PairingRecord {
+            state: crate::vta::pairing::PairingState::Connected,
+            ..Default::default()
+        };
+        c.keys = crate::vta::connections::SigningKeys {
+            active: Some(recorded_key("key-new", 2, false)),
+            retiring: vec![recorded_key("key-old", 1, true)],
+        };
+        let registry = registry(MemoryStore::new(vec![c]), secrets_with_seed());
+
+        let jwks = registry
+            .authority_for_key("c1", None)
+            .await
+            .expect("the paired connection resolves")
+            .issuer_jwks()
+            .await
+            .expect("the recorded public keys publish without asking the agent");
+        let kids: Vec<&str> = jwks["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| key["kid"].as_str().unwrap())
+            .collect();
+        assert_eq!(kids, vec!["key-new", "key-old"]);
+
+        let pinned = registry
+            .authority_for_key("c1", Some("key-old"))
+            .await
+            .expect("a named key resolves")
+            .issuer_jwks()
+            .await
+            .unwrap();
+        assert_eq!(
+            pinned["keys"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2,
+            "the signing key is published once, not again as a retiring key"
+        );
     }
 
     /// A connection created before the DID existed keeps authenticating as the

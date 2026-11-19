@@ -1504,6 +1504,9 @@ pub async fn key_inventory(
         StatusCode::OK,
         Json(crate::vta::inventory::build(
             &state.vta_config,
+            crate::storage::settings_store::global_settings()
+                .and_then(|settings| settings.default_signing)
+                .as_ref(),
             &connections,
             &surface_list,
             &issuer_list,

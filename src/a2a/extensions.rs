@@ -249,10 +249,18 @@ pub async fn inject_identity_credential_extension(
     workload_binding: Option<serde_json::Value>,
     vc_issuer: &Arc<crate::identity::VCIssuer>,
     channel_name: &str,
+    scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<(bytes::Bytes, String)> {
     // Create VP containing VC signed by agent DID
     let vp_jwt = vc_issuer
-        .create_agent_identity_presentation_with_binding(agent_did, identity_fields, workload_binding, None, None, None)
+        .create_agent_identity_presentation_with_binding(
+            agent_did,
+            identity_fields,
+            workload_binding,
+            None,
+            None,
+            scope,
+        )
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create identity presentation: {}", e))?;
 
@@ -383,6 +391,7 @@ pub async fn inject_identity_credential_into_response(
     workload_binding: Option<serde_json::Value>,
     vc_issuer: &Arc<crate::identity::VCIssuer>,
     channel_name: &str,
+    scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<Option<(bytes::Bytes, String)>> {
     let mut body_json: JsonValue = serde_json::from_slice(body_bytes)
         .map_err(|e| anyhow::anyhow!("Failed to parse response body as JSON: {}", e))?;
@@ -393,7 +402,14 @@ pub async fn inject_identity_credential_into_response(
     }
 
     let vp_jwt = vc_issuer
-        .create_agent_identity_presentation_with_binding(agent_did, identity_fields, workload_binding, None, None, None)
+        .create_agent_identity_presentation_with_binding(
+            agent_did,
+            identity_fields,
+            workload_binding,
+            None,
+            None,
+            scope,
+        )
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create identity presentation: {}", e))?;
 
@@ -756,6 +772,7 @@ pub async fn inject_vp_into_a2a_response(
     vc_issuer: &Arc<crate::identity::VCIssuer>,
     channel_name: &str,
     inbound_chained_vcs: Vec<serde_json::Value>,
+    scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<Option<(bytes::Bytes, String)>> {
     let mut response_json: JsonValue = serde_json::from_slice(response_bytes)
         .map_err(|e| anyhow::anyhow!("Failed to parse response as JSON: {}", e))?;
@@ -780,7 +797,7 @@ pub async fn inject_vp_into_a2a_response(
             None,
             None,
             inbound_chained_vcs,
-            None,
+            scope,
         )
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create identity presentation: {}", e))?;
@@ -1470,11 +1487,74 @@ mod tests {
     async fn inject_backend_vp(body: &serde_json::Value) -> (Option<(serde_json::Value, String)>, String) {
         let (issuer, did, _tmp) = issuer_with_identity().await;
         let bytes = bytes::Bytes::from(serde_json::to_vec(body).expect("serialize body"));
-        let injected = inject_vp_into_a2a_response(&bytes, &did, &identity_fields(), None, &issuer, "ch", Vec::new())
-            .await
-            .expect("injection should not fail");
+        let injected = inject_vp_into_a2a_response(
+            &bytes,
+            &did,
+            &identity_fields(),
+            None,
+            &issuer,
+            "ch",
+            Vec::new(),
+            &Default::default(),
+        )
+        .await
+        .expect("injection should not fail");
         let parsed = injected.map(|(body, vp)| (serde_json::from_slice(&body).expect("injected body is JSON"), vp));
         (parsed, did)
+    }
+
+    fn request_with_identity() -> bytes::Bytes {
+        bytes::Bytes::from(
+            serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {
+                "message": agent_message()
+            } }))
+            .expect("serialize body"),
+        )
+    }
+
+    /// The credential in a presentation the gateway injects is issued under the
+    /// key of the surface serving the request: a surface whose trust agent
+    /// cannot issue gets no credential, never one from the gateway's key.
+    #[tokio::test]
+    async fn injection_follows_the_signing_of_the_surface_it_serves() {
+        let (issuer, did, tmp) = issuer_with_identity().await;
+        crate::identity::test_helpers::map_surface_to_unusable_trust_agent(&issuer, tmp.path(), "surface-mapped").await;
+        let mapped = crate::vta::key_directory::KeyScope::surface("surface-mapped");
+        let unmapped = crate::vta::key_directory::KeyScope::surface("surface-unmapped");
+        let request = request_with_identity();
+        let response = bytes::Bytes::from(
+            serde_json::to_vec(&json!({ "result": {
+                "kind": "task",
+                "id": "t",
+                "status": { "state": "completed", "message": agent_message() }
+            } }))
+            .expect("serialize body"),
+        );
+
+        let err =
+            inject_identity_credential_extension(&request, &did, &identity_fields(), None, &issuer, "ch", &mapped)
+                .await
+                .expect_err("the request's surface cannot issue");
+        assert!(
+            err.to_string()
+                .contains("vta-gone"),
+            "{err}"
+        );
+        inject_identity_credential_extension(&request, &did, &identity_fields(), None, &issuer, "ch", &unmapped)
+            .await
+            .expect("an unmapped surface issues as before");
+
+        inject_identity_credential_into_response(&response, &did, &identity_fields(), None, &issuer, "ch", &mapped)
+            .await
+            .expect_err("the response's surface cannot issue");
+        inject_identity_credential_into_response(&response, &did, &identity_fields(), None, &issuer, "ch", &unmapped)
+            .await
+            .expect("an unmapped surface issues as before")
+            .expect("the response carries the identity extension");
+
+        inject_vp_into_a2a_response(&response, &did, &identity_fields(), None, &issuer, "ch", Vec::new(), &mapped)
+            .await
+            .expect_err("the backend response's surface cannot issue");
     }
 
     fn assert_carries_backend_vp(

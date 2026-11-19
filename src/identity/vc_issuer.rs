@@ -2096,18 +2096,24 @@ impl VCIssuer {
         challenge: Option<&str>,
         domain: Option<&str>,
     ) -> Result<String> {
-        self.create_agent_identity_presentation_with_binding(agent_did, identity_fields, None, challenge, domain, None)
-            .await
+        self.create_agent_identity_presentation_with_binding(
+            agent_did,
+            identity_fields,
+            None,
+            challenge,
+            domain,
+            &crate::vta::key_directory::KeyScope::default(),
+        )
+        .await
     }
 
     /// Create a VP with optional workload binding attestation.
     /// When `workload_binding` is provided, the VC uses structured `workloadBinding`
     /// instead of flat `identityFields`.
     ///
-    /// `surface_id` scopes which key issues the embedded credential. `None`
-    /// means appliance-wide, which is what every caller outside the injection
-    /// path wants — and what the injection path itself did before surfaces
-    /// could carry their own key.
+    /// `scope` decides which key issues the embedded credential: the surface
+    /// (and variant) serving the request, or the default scope for an
+    /// appliance-wide presentation.
     pub async fn create_agent_identity_presentation_with_binding(
         &self,
         agent_did: &str,
@@ -2115,7 +2121,7 @@ impl VCIssuer {
         workload_binding: Option<serde_json::Value>,
         challenge: Option<&str>,
         domain: Option<&str>,
-        surface_id: Option<&str>,
+        scope: &crate::vta::key_directory::KeyScope,
     ) -> Result<String> {
         self.create_agent_identity_presentation_chained(
             agent_did,
@@ -2124,7 +2130,7 @@ impl VCIssuer {
             challenge,
             domain,
             Vec::new(),
-            surface_id,
+            scope,
         )
         .await
     }
@@ -2141,7 +2147,7 @@ impl VCIssuer {
         challenge: Option<&str>,
         domain: Option<&str>,
         chained_credentials: Vec<serde_json::Value>,
-        surface_id: Option<&str>,
+        scope: &crate::vta::key_directory::KeyScope,
     ) -> Result<String> {
         let display_name = self
             .display_name_for_did(agent_did)
@@ -2216,12 +2222,8 @@ impl VCIssuer {
             .as_ref()
         {
             Some(directory) => {
-                let scope = crate::vta::key_directory::KeyScope {
-                    surface_id: surface_id.map(str::to_string),
-                    ..Default::default()
-                };
                 directory
-                    .di_vc_issuer_for(&scope)
+                    .di_vc_issuer_for(scope)
                     .await
             }
             None => crate::vta::key_directory::ScopedDiIssuer::Inherit,
@@ -6259,7 +6261,14 @@ mod tests {
         // issuer, so the stand-in is JSON-LD valid and the presentation signs
         // exactly as it would over a real VTA credential.
         let local_vp = issuer
-            .create_agent_identity_presentation_with_binding(&agent_did, &identity_fields, None, None, None, None)
+            .create_agent_identity_presentation_with_binding(
+                &agent_did,
+                &identity_fields,
+                None,
+                None,
+                None,
+                &Default::default(),
+            )
             .await
             .expect("a locally issued presentation to borrow a credential from");
         let local_vp: serde_json::Value = serde_json::from_str(&local_vp).expect("the VP is JSON");
@@ -6275,7 +6284,14 @@ mod tests {
             .await;
 
         let vp = issuer
-            .create_agent_identity_presentation_with_binding(&agent_did, &identity_fields, None, None, None, None)
+            .create_agent_identity_presentation_with_binding(
+                &agent_did,
+                &identity_fields,
+                None,
+                None,
+                None,
+                &Default::default(),
+            )
             .await
             .expect("the presentation is issued over the VTA-issued credential");
 
@@ -6322,7 +6338,14 @@ mod tests {
             .did;
 
         let vp = issuer
-            .create_agent_identity_presentation_with_binding(&agent_did, &identity_fields, None, None, None, None)
+            .create_agent_identity_presentation_with_binding(
+                &agent_did,
+                &identity_fields,
+                None,
+                None,
+                None,
+                &Default::default(),
+            )
             .await
             .expect("the local issuer still issues when no VTA is bound");
 
@@ -7019,7 +7042,14 @@ mod surface_injection_tests {
         let agent_did = onboarded.did;
         let signed_before = recorder.sign_calls();
         let outcome = issuer
-            .create_agent_identity_presentation_with_binding(&agent_did, &fields, None, None, None, Some("surface-1"))
+            .create_agent_identity_presentation_with_binding(
+                &agent_did,
+                &fields,
+                None,
+                None,
+                None,
+                &crate::vta::key_directory::KeyScope::surface("surface-1"),
+            )
             .await;
         // The presentation itself is asserted below only through what the agent
         // was asked to do: every bug behind this symptom silently signed

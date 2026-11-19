@@ -7157,7 +7157,7 @@ async fn proxy_charged_request(
                             wb,
                             None,
                             None,
-                            state.surface.config_id(),
+                            &state.key_scope(),
                         )
                         .await
                     {
@@ -7414,7 +7414,7 @@ async fn proxy_charged_request(
                 wb,
                 None,
                 None,
-                state.surface.config_id(),
+                &state.key_scope(),
             )
             .await
         {
@@ -9033,6 +9033,7 @@ async fn proxy_charged_request(
                         response_wb,
                         &vc_issuer,
                         &channel_name,
+                        &state.key_scope(),
                     )
                     .await
                     {
@@ -12402,7 +12403,7 @@ async fn handle_fabric_request_inner(
                     None,
                     None,
                     chained_credentials,
-                    None,
+                    &state.key_scope(),
                 )
                 .await
             {
@@ -16411,6 +16412,7 @@ async fn inject_backend_agent_vp(
                 &protected_meta_field,
                 protected_strip_raw,
                 mcp_metadata_context,
+                &state.key_scope(),
             )
             .await
         }
@@ -16423,6 +16425,7 @@ async fn inject_backend_agent_vp(
                 &vc_issuer,
                 channel_name,
                 inbound_chained_vcs.clone(),
+                &state.key_scope(),
             )
             .await
             .map(|injected| injected.map_or_else(|| (response_body.clone(), None), |(body, proof)| (body, Some(proof))))
