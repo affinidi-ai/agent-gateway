@@ -2,7 +2,7 @@ import React from 'react';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import '@testing-library/jest-dom';
-import { AuditSigningSection } from './AuditSigningSection';
+import { GatewaySigningSection } from './GatewaySigningSection';
 import { apiClient } from '../../api';
 
 const mockNavigate = jest.fn();
@@ -55,28 +55,36 @@ const respond = () => {
 };
 
 const typeSelect = () => screen.getByTestId('surface-signing-type-select') as HTMLSelectElement;
-const saveButton = () => screen.getByTestId('audit-signing-save-button');
+const saveButton = () => screen.getByTestId('gateway-signing-save-button');
+const confirmSave = async () => {
+  await userEvent.click(saveButton());
+  await userEvent.click(await screen.findByTestId('gateway-signing-confirm-dialog-confirm'));
+};
 
 const mount = async () => {
-  render(<AuditSigningSection />);
+  render(<GatewaySigningSection />);
   await screen.findByTestId('surface-signing-type-select');
 };
 
 beforeEach(() => {
   mockFetch.mockReset();
   mockNavigate.mockReset();
-  mockPermissions = { 'settings.edit': true, 'vta_connections.edit': true };
+  mockPermissions = {
+    'settings.edit': true,
+    'key_management.edit': true,
+    'vta_connections.edit': true,
+  };
   stored = null;
   posts = [];
   respond();
 });
 
-describe('AuditSigningSection', () => {
-  it('is titled Audit signing, labelled as the gateway-wide default, and has no text above the source', async () => {
+describe('GatewaySigningSection', () => {
+  it('is titled Gateway signing, labelled as the gateway-wide default, and has no text above the source', async () => {
     await mount();
 
-    expect(screen.getByText('Audit signing')).toBeInTheDocument();
-    expect(screen.getByTestId('audit-signing-scope')).toHaveTextContent('Gateway-wide default');
+    expect(screen.getByText('Gateway signing')).toBeInTheDocument();
+    expect(screen.getByTestId('gateway-signing-scope')).toHaveTextContent('Gateway-wide default');
     expect(screen.getByText('Signing key source')).toBeInTheDocument();
     expect(screen.queryByText(/Signing with/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Deployment/)).not.toBeInTheDocument();
@@ -108,9 +116,9 @@ describe('AuditSigningSection', () => {
     expect(saveButton()).toBeDisabled();
 
     await userEvent.selectOptions(typeSelect(), 'local');
-    await userEvent.click(saveButton());
+    await confirmSave();
 
-    await screen.findByTestId('audit-signing-saved');
+    await screen.findByTestId('gateway-signing-saved');
     expect(posts).toEqual([{ default_signing: { backend: 'local' } }]);
     expect(saveButton()).toBeDisabled();
   });
@@ -122,9 +130,9 @@ describe('AuditSigningSection', () => {
     expect(saveButton()).toBeDisabled();
     await screen.findByRole('option', { name: 'Production agent' });
     await userEvent.selectOptions(screen.getByTestId('surface-signing-agent-select'), 'agent-1');
-    await userEvent.click(saveButton());
+    await confirmSave();
 
-    await screen.findByTestId('audit-signing-saved');
+    await screen.findByTestId('gateway-signing-saved');
     expect(posts).toEqual([
       {
         default_signing: {
@@ -140,9 +148,47 @@ describe('AuditSigningSection', () => {
   it('keeps Connect my own VTA as a button beside the source, which opens the wizard', async () => {
     await mount();
 
-    await userEvent.click(screen.getByTestId('audit-signing-connect-button'));
+    await userEvent.click(screen.getByTestId('gateway-signing-connect-button'));
 
     expect(mockNavigate).toHaveBeenCalledWith('/connections/trust-agents/connect');
+  });
+
+  it('asks before saving and lists what changing the gateway signer does', async () => {
+    await mount();
+    await userEvent.selectOptions(typeSelect(), 'remote');
+    await userEvent.selectOptions(typeSelect(), 'local');
+
+    await userEvent.click(saveButton());
+
+    const dialog = screen.getByRole('dialog', { name: 'Change gateway signing' });
+    expect(dialog).toHaveTextContent('carries its issuer DID');
+    expect(dialog).toHaveTextContent('must trust the new issuer DID');
+    expect(dialog).toHaveTextContent('keep the key that signed them');
+    expect(posts).toEqual([]);
+  });
+
+  it('saves nothing when the confirmation is cancelled', async () => {
+    await mount();
+    await userEvent.selectOptions(typeSelect(), 'remote');
+    await userEvent.selectOptions(typeSelect(), 'local');
+
+    await userEvent.click(saveButton());
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    expect(screen.queryByTestId('gateway-signing-confirm-dialog')).not.toBeInTheDocument();
+    expect(posts).toEqual([]);
+    expect(saveButton()).toBeEnabled();
+  });
+
+  it.each([
+    ['settings.edit only', { 'settings.edit': true }],
+    ['key_management.edit only', { 'key_management.edit': true }],
+  ])('is read-only without Save to a user with %s', async (_label, permissions) => {
+    mockPermissions = permissions;
+    await mount();
+
+    expect(typeSelect()).toBeDisabled();
+    expect(screen.queryByTestId('gateway-signing-save-button')).not.toBeInTheDocument();
   });
 
   it('shows the choice read-only, without Save or Connect, to a user who cannot change it', async () => {
@@ -150,8 +196,8 @@ describe('AuditSigningSection', () => {
     await mount();
 
     expect(typeSelect()).toBeDisabled();
-    expect(screen.queryByTestId('audit-signing-save-button')).not.toBeInTheDocument();
-    expect(screen.queryByTestId('audit-signing-connect-button')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('gateway-signing-save-button')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('gateway-signing-connect-button')).not.toBeInTheDocument();
   });
 
   it('says why when the setting cannot be saved', async () => {
@@ -168,9 +214,9 @@ describe('AuditSigningSection', () => {
 
     await userEvent.selectOptions(typeSelect(), 'remote');
     await userEvent.selectOptions(typeSelect(), 'local');
-    await userEvent.click(saveButton());
+    await confirmSave();
 
-    expect(await screen.findByTestId('audit-signing-error')).toHaveTextContent(
+    expect(await screen.findByTestId('gateway-signing-error')).toHaveTextContent(
       'default_signing is not valid'
     );
   });

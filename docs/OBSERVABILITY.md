@@ -195,6 +195,22 @@ code exchanges of delegated user tokens are not counted either.
 
 No label carries a URL, provider id, secret or tenant.
 
+## Trust agent metrics
+
+Calls the gateway makes to a [trust agent](TRUST_AGENT_SIGNING.md) are counted per client. No
+label carries a DID, key id, connection id or tenant.
+
+| Metric | Labels | Counts |
+| --- | --- | --- |
+| `agent_gateway_vta_call_total` | `operation` (the Trust Task slug, such as `auth` or `sign-jws`), `result` (`ok`, `error`, `circuit_open`, `busy`) | Each Trust Task call; `busy` when the client was at its concurrency limit and `circuit_open` while its circuit breaker was open, neither sent |
+| `agent_gateway_vta_call_duration_seconds` | `operation` | Histogram of the round trip of each sent call, including its one retry |
+| `agent_gateway_vta_circuit_open_total` | none | Each time five consecutive failed calls opened a client's circuit breaker for 30 s |
+| `agent_gateway_vta_quota_exceeded_total` | none | Each signature refused because `[vta] sign_quota_max` was used up for the current window |
+
+A rising `circuit_open` or `error` rate means signing through the trust agent is failing, and
+the surfaces that sign through it fail closed. A non-zero quota rate means a looping caller or a
+quota set too low.
+
 ## Consent confirmation link metric
 
 `agent_gateway_consent_confirmation_links_total{provider_id,surface_id,outcome,reason}` is a

@@ -67,7 +67,7 @@ const mountTab = () =>
   );
 
 const INTRO =
-  "Connect a Verifiable Trust Agent to sign audit records with a key the gateway doesn't control. Anyone can verify your records without having to trust the gateway, and even if the gateway is compromised, its records can't be forged or altered. You keep full control of the agent.";
+  "Connect a Verifiable Trust Agent to sign audit records with a key the gateway doesn't hold. A compromised gateway can't take the signing key with it, and its access can be revoked from the trust agent. You keep full control of the agent.";
 
 beforeEach(() => mockFetch.mockReset());
 

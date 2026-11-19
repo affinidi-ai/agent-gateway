@@ -157,7 +157,7 @@ const KeyManagementTab: React.FC = () => {
         <EmptyState
           icon="fa-key"
           title="No agent keys"
-          body="This gateway signs with its own in-process key. Connect a Verifiable Trust Agent from the Trust Agent page to manage keys here."
+          body="This gateway signs with its own in-process key. Connect a Verifiable Trust Agent on Connections → Verifiable Trust Agent to manage keys here."
         />
       ) : (
         inventory.connections.map(connection => (

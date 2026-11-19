@@ -173,8 +173,8 @@ export const SurfaceSigningSection: React.FC<Props> = ({
     (subject === 'gateway'
       ? ''
       : subject === 'issuer'
-        ? 'An issuer that sets neither follows the gateway-wide default (Settings → Security → Audit signing).'
-        : "A surface that sets neither follows its issuer's source, then the gateway-wide default (Settings → Security → Audit signing).");
+        ? 'An issuer that sets neither follows the gateway-wide default (Settings → Security → Gateway signing).'
+        : "A surface that sets neither follows its issuer's source, then the gateway-wide default (Settings → Security → Gateway signing).");
 
   return (
     <Form.Group className="mb-3">

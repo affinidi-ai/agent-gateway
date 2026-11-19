@@ -1,6 +1,6 @@
 /**
  * Connections → Verifiable Trust Agent, its full-page connect wizard, and Settings → Security →
- * Audit signing.
+ * Gateway signing.
  *
  * Every `/vta` call is served by `page.route` mocks, so the spec needs no trust agent. Every
  * control is located by test id.
@@ -74,7 +74,7 @@ async function mockTrustAgents(
 }
 
 const INTRO =
-  "Connect a Verifiable Trust Agent to sign audit records with a key the gateway doesn't control. Anyone can verify your records without having to trust the gateway, and even if the gateway is compromised, its records can't be forged or altered. You keep full control of the agent.";
+  "Connect a Verifiable Trust Agent to sign audit records with a key the gateway doesn't hold. A compromised gateway can't take the signing key with it, and its access can be revoked from the trust agent. You keep full control of the agent.";
 
 test.describe("Connections: Verifiable Trust Agent tab", () => {
   test("lists the agents beside the other connections, with what connecting one gives", async ({
@@ -185,7 +185,7 @@ test.describe("Connections: Verifiable Trust Agent tab", () => {
   });
 });
 
-test.describe("Settings → Security → Audit signing", () => {
+test.describe("Settings → Security → Gateway signing", () => {
   test("is the first section, labelled as the gateway-wide default, with the same choice as a surface", async ({
     page,
   }) => {
@@ -194,10 +194,10 @@ test.describe("Settings → Security → Audit signing", () => {
     await page.goto(`${BASE_URL}/settings`);
     await page.getByTestId("settings-security-tab-trigger").click();
 
-    const section = page.getByTestId("audit-signing-settings");
+    const section = page.getByTestId("gateway-signing-settings");
     await expect(section).toBeVisible();
-    await expect(section).toContainText("Audit signing");
-    await expect(page.getByTestId("audit-signing-scope")).toHaveText(
+    await expect(section).toContainText("Gateway signing");
+    await expect(page.getByTestId("gateway-signing-scope")).toHaveText(
       "Gateway-wide default",
     );
     await expect(section).toContainText("Signing key source");
@@ -205,19 +205,19 @@ test.describe("Settings → Security → Audit signing", () => {
     await expect(
       section.getByTestId("surface-signing-type-select").locator("option"),
     ).toHaveText(["Gateway secret", "Verifiable Trust Agent"]);
-    await expect(page.getByTestId("audit-signing-connect-button")).toHaveText(
+    await expect(page.getByTestId("gateway-signing-connect-button")).toHaveText(
       /Connect my own VTA/,
     );
     await expect(page.getByTestId("key-management-settings")).toHaveCount(0);
 
     const first = await page
-      .locator('[data-testid="audit-signing-settings"]')
+      .locator('[data-testid="gateway-signing-settings"]')
       .evaluate(
         (el) =>
           el.parentElement?.firstElementChild === el ||
           el.parentElement?.querySelector(".card") === el,
       );
-    expect(first, "Audit signing is the first section of the tab").toBe(true);
+    expect(first, "Gateway signing is the first section of the tab").toBe(true);
   });
 
   test("saves a Verifiable Trust Agent as the gateway-wide default", async ({
@@ -235,17 +235,21 @@ test.describe("Settings → Security → Audit signing", () => {
 
     await page.goto(`${BASE_URL}/settings`);
     await page.getByTestId("settings-security-tab-trigger").click();
-    const section = page.getByTestId("audit-signing-settings");
+    const section = page.getByTestId("gateway-signing-settings");
     await section
       .getByTestId("surface-signing-type-select")
       .selectOption("remote");
-    await expect(page.getByTestId("audit-signing-save-button")).toBeDisabled();
+    await expect(page.getByTestId("gateway-signing-save-button")).toBeDisabled();
     await section
       .getByTestId("surface-signing-agent-select")
       .selectOption("agent-1");
-    await page.getByTestId("audit-signing-save-button").click();
+    await page.getByTestId("gateway-signing-save-button").click();
+    const dialog = page.getByRole("dialog", { name: "Change gateway signing" });
+    await expect(dialog).toContainText("must trust the new issuer DID");
+    expect(posts).toEqual([]);
+    await page.getByTestId("gateway-signing-confirm-dialog-confirm").click();
 
-    await expect(page.getByTestId("audit-signing-saved")).toBeVisible();
+    await expect(page.getByTestId("gateway-signing-saved")).toBeVisible();
     expect(posts).toEqual([
       {
         default_signing: {
@@ -263,7 +267,7 @@ test.describe("Settings → Security → Audit signing", () => {
     await page.goto(`${BASE_URL}/settings`);
     await page.getByTestId("settings-security-tab-trigger").click();
 
-    await page.getByTestId("audit-signing-connect-button").click();
+    await page.getByTestId("gateway-signing-connect-button").click();
 
     await expect(page).toHaveURL(/\/connections\/trust-agents\/connect$/);
   });

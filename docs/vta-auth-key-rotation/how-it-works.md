@@ -44,14 +44,14 @@ Rotation gives the Gateway a new control key and moves its access entry to it:
 
 ### When it happens
 
-- **On demand**, from the dashboard: **Trust Agent** page → **Control key** card →
+- **On demand**, from the dashboard: **Connections → Verifiable Trust Agent** → **Control key** card →
   **Rotate control key** (it asks you to confirm first). The same is available as
   `POST /v1/vta/control-key/rotate`.
 - **On a schedule**, only if you set `control_key_rotation_days` in the `[vta]` block. The
   Gateway checks once an hour whether a rotation is due and adds a random delay of up to six
   hours, so many gateways don't rotate at the same moment.
 
-The Trust Agent page shows the current control ID, when it was last rotated and when the next
+The **Control key** card on Connections → Verifiable Trust Agent shows the current control ID, when it was last rotated and when the next
 rotation is due. `GET /v1/vta/status` reports the same under `control_key`
 (`control_did`, `rotated_at`, `next_rotation_at`, `rotation_days`); it is absent when the
 Gateway holds no `did:key` control key it can rotate.
@@ -128,7 +128,7 @@ To recover **without losing any signing keys**:
 A connection you add from the dashboard authenticates as a `did:webvh` the Gateway publishes, so
 its key can be replaced **without a new grant**: the ID stays the same and the trust agent's access
 entry is untouched. This is done by hand, from the **Rotate control key** action on the
-connection's row on the Trust Agent page (or `POST /v1/vta/connections/{id}/control-key/rotate`).
+connection's row on Connections → Verifiable Trust Agent (or `POST /v1/vta/connections/{id}/control-key/rotate`).
 There is no schedule for it.
 
 1. The Gateway adds a new key to the published document, beside the old one.

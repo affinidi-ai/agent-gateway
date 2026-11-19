@@ -55,6 +55,11 @@
     "payments.retry": "poweruser",
     "jwt_verification_strategies.view": "administrator",
     "jwt_verification_strategies.edit": "administrator",
-    "jwt_verification_strategies.delete": "administrator"
+    "jwt_verification_strategies.delete": "administrator",
+    "vta_connections.view": "administrator",
+    "vta_connections.edit": "administrator",
+    "vta_connections.delete": "administrator",
+    "key_management.view": "administrator",
+    "key_management.edit": "administrator"
   }
 }

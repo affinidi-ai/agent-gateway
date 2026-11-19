@@ -408,7 +408,7 @@ impl CredentialAuthority for VtaCredentialAuthority {
 /// `create_vp_jwt_with_gateway` — so proving the seam proves the flow. A live
 /// end-to-end against a real `vta-service` lives in
 /// [`crate::vta::client::tests::live_authenticate_against_real_vta`]; the
-/// runbook (`docs/VTA_INTEGRATION_POC.md`) drives the full STS→VTA path.
+/// signing path is described in `docs/TRUST_AGENT_SIGNING.md`.
 #[cfg(test)]
 mod poc_tests {
     use super::*;
@@ -1031,9 +1031,9 @@ mod poc_tests {
         // a backup. An internal key is generated from the system CSPRNG rather
         // than derived from the seed, so it carries **no `derivationPath`** and
         // must be named by an explicit `keyId`. The trade is that it cannot be
-        // recovered if the VTA is lost, which is why the runbook
-        // (`docs/VTA_INTEGRATION_POC.md`) names a seed-backup owner and a
-        // recovery path.
+        // recovered if the VTA is lost, which is why
+        // `docs/TRUST_AGENT_SIGNING.md` names a backup owner and a recovery
+        // path.
         let idx: u32 = rand::random::<u32>() % 2_000_000;
         let created: Value = client
             .dispatch_signed(

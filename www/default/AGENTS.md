@@ -1541,6 +1541,24 @@ When the key's surface was deleted (`surface_deleted: true` on `GET /api-keys/{a
 the detail page shows the info alert "This API key is no longer in use because the associated
 surface has been deleted." (`api-key-surface-deleted-info`) at the top of Key Information.
 
+## Key Management tab
+
+The Secrets page's **Key Management** tab (`?tab=key-management`,
+`key-management-tab-trigger`, `pages/SecretsPage/KeyManagementTab.tsx`) is shown only with
+`key_management.view` and reads `GET /v1/key-management/inventory`. It opens with a status alert
+naming the deployment tier and whether keys are held by a separately operated agent, then one card
+per trust agent connection the caller may see (its keys with `kid`, status, public key and
+retirement, `KeyManagementTables.tsx`), a **Surface mapping** card (which backend, context and key
+each surface and variant signs with, "inherit" when it sets nothing, and a "via issuer" badge,
+`key-mapping-via-issuer-<surface id>`, when its issuer decides), and a warning listing contexts no
+surface claims any more. With no connection it shows the empty state "No agent keys", pointing to
+Connections → Verifiable Trust Agent. A payload it cannot read becomes the tab's error with a
+Retry, never an exception that unmounts the other tabs. With `key_management.edit`, a connection
+without a key offers **Provision a signing key** (`POST /v1/vta/connections/{id}/keys`, no
+confirmation) and one with keys offers **New key id** and **Rotate**
+(`POST /v1/vta/connections/{id}/rotate`), which needs a second click, prompted by a toast, before
+it sends.
+
 ## Surface delete
 
 The surface page's delete button (`surface-delete-button`, `btn-danger` with a trash icon, shown
@@ -1851,13 +1869,13 @@ parts `IdentityNameCell`, `IdentitySurfaceCell`, `IdentityOriginBadge`,
 | Tooltip last attempt, reason   | `identities-recorder-last-attempt`, `identities-recorder-reason`         |
 | Tooltip registry entry         | `identities-recorder-entry-<registry id>`                                |
 
-## Verifiable Trust Agent tab and Audit signing
+## Verifiable Trust Agent tab and Gateway signing
 
 There is no Trust Agent page and no `/trust-agent` address: the sidebar has no entry for it, and
 Verifiable Trust Agents are **connections**, so they live on the Connections page as the
 **Verifiable Trust Agent** tab (`connections-tab-trust-agents`, `?tab=trust-agents`), shown only
 with `vta_connections.view`. The gateway-wide signing default is set in **Settings → Security →
-Audit signing**, not on Connections.
+Gateway signing**, not on Connections.
 
 ### Verifiable Trust Agent tab
 
@@ -1868,9 +1886,12 @@ through `actionsContainer`. The Connections filter box is not shown on this tab.
 this text (`trust-agents-intro`), which the empty state also uses with the same **Add VTA**
 action (`trust-agents-empty-connect-button`):
 
-> Connect a Verifiable Trust Agent to sign audit records with a key the gateway doesn't control.
-> Anyone can verify your records without having to trust the gateway, and even if the gateway is
-> compromised, its records can't be forged or altered. You keep full control of the agent.
+> Connect a Verifiable Trust Agent to sign audit records with a key the gateway doesn't hold. A
+> compromised gateway can't take the signing key with it, and its access can be revoked from the
+> trust agent. You keep full control of the agent.
+
+The tab never claims a compromised gateway cannot sign: it still holds the control key and can
+ask the trust agent to sign within its grant until that access is revoked.
 
 Below it, while `GET /v1/vta/status` reports `context_did_method`, one line
 (`trust-agents-context-did`) says which DID new contexts sign as: a `did:key` ("the context's key
@@ -1938,19 +1959,26 @@ with the shared navigation test ids (`wizard-next`, `wizard-back`, `wizard-cance
 
 `?id=` resumes a created connection at the grant step, or at the last step when it is connected.
 
-### Audit signing
+### Gateway signing
 
-**Settings → Security** opens with **Audit signing** (`pages/SettingsPage/AuditSigningSection.tsx`,
-`data-testid="audit-signing-settings"`), labelled as the **Gateway-wide default**
-(`audit-signing-scope`). It holds only the **Signing key source** choice (`SurfaceSigningSection`
-with `subject="gateway"`), with **Connect my own VTA** as a button beside it
-(`audit-signing-connect-button`, `vta_connections.edit`, opens the wizard), and **Save**
-(`audit-signing-save-button`, `settings.edit`, disabled until something changed and while
-Verifiable Trust Agent is chosen without an agent; `audit-signing-saved` after a save). Saving
-posts `default_signing` to `POST /v1/settings`: `{ "backend": "local" }` for Gateway secret, or
-the chosen agent with its context and key. No text sits above the choice, and there is no
-inherited note: the gateway default inherits from nothing. Without `settings.edit` the choice is
-read-only and there is no Save or Connect.
+**Settings → Security** opens with **Gateway signing** (`pages/SettingsPage/GatewaySigningSection.tsx`,
+`data-testid="gateway-signing-settings"`), labelled as the **Gateway-wide default**
+(`gateway-signing-scope`). It sets what signs tokens, ID-JAGs, credentials, payment evidence and
+the issuer attestation for every surface and issuer that sets no source of its own. It holds only
+the **Signing key source** choice (`SurfaceSigningSection` with `subject="gateway"`), with
+**Connect my own VTA** as a button beside it (`gateway-signing-connect-button`,
+`vta_connections.edit`, opens the wizard), and **Save** (`gateway-signing-save-button`, disabled
+until something changed and while Verifiable Trust Agent is chosen without an agent;
+`gateway-signing-saved` after a save). Editing needs both `settings.edit` and
+`key_management.edit`; without either the choice is read-only and there is no Save. **Save** sends
+nothing: it opens the confirmation dialog `gateway-signing-confirm-dialog` (the shared
+`WarningDialog`, titled "Change gateway signing"), which lists the effects: what is issued from
+now on carries the new source's issuer DID, Fabric peers and verifiers must trust that DID, and
+tokens and credentials already issued keep the key that signed them and verify only while it is
+still published. **Change gateway signing** (`gateway-signing-confirm-dialog-confirm`) posts
+`default_signing` to `POST /v1/settings`: `{ "backend": "local" }` for Gateway secret, or the
+chosen agent with its context and key. **Cancel** and the close button save nothing. No text sits
+above the choice, and there is no inherited note: the gateway default inherits from nothing.
 
 ### Signing key source
 
@@ -1988,7 +2016,7 @@ with its own view permission: **Gateways** `gateways.view`, **Payment Gateways**
 (`connections-tab-payment-gateways`) `payment_gateways.view` and `agent_pay_delegation` on (see
 _Feature flags_), **Mediators** `mediators.view`, **Registries** `trust_registries.view`,
 **Verifiable Trust Agent** (`connections-tab-trust-agents`) `vta_connections.view`; see
-_Verifiable Trust Agent tab and Audit signing_. One filter box serves every tab but the
+_Verifiable Trust Agent tab and Gateway signing_. One filter box serves every tab but the
 Verifiable Trust Agent one, which shows none; each tab reports its
 filtered and total counts (`onCountChange`) for the badge, and a tab given `actionsContainer`
 portals its add button into the tab banner.

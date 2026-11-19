@@ -702,6 +702,19 @@ flowchart LR
     P --> S["Send. An upstream 3xx is<br/>returned, not followed"]
 ```
 
+### Trust agent addresses
+
+A trust agent is a control-plane dependency and never a data-plane destination. The gateway
+reserves the origin (`host:port`, scheme and path ignored) of every trust agent it signs through:
+the `[vta]` block's `base_url` at startup, and each stored connection's endpoint at startup and
+when it is created or its client is built ([`src/vta/isolation.rs`](../src/vta/isolation.rs)).
+Both pinned egress clients, `pinned_forward_client` (the forward step of every surface, MCP proxy
+and A2A proxy Target and Transit Point) and `pinned_strict_client`, refuse a reserved origin
+before resolving it, even where the forward-leg policy allows loopback and RFC 1918, so a caller
+cannot drive the trust agent through the proxy pipeline. Only addresses the gateway was
+configured with are reserved, never request input, so other local services stay reachable.
+`GET /v1/vta/status` lists the reserved origins under `reserved_origins`.
+
 ### Other pinned egress sinks
 
 The same pin-once-then-`resolve_to_addrs` primitive closes the DNS-rebinding

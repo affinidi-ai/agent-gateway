@@ -171,10 +171,12 @@ reports a `control_key`, shows the key the gateway signs in to its trust agent w
 last rotated and when it is next due, and a Rotate control key button for key management editors.
 A connection added by hand with a `did:webvh` identity has a Rotate control key action on its
 row, with a rotation-under-way state and Cancel. The gateway-wide default is **Settings →
-Security → Audit signing**. See _Verifiable Trust Agent tab and Audit signing_ in
-[`www/default/AGENTS.md`](www/default/AGENTS.md#verifiable-trust-agent-tab-and-audit-signing).
+Security → Gateway signing**, editable only with both `settings.edit` and `key_management.edit`,
+and saved only after a confirmation dialog that lists what changing the gateway signer does. See
+_Verifiable Trust Agent tab and Gateway signing_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#verifiable-trust-agent-tab-and-gateway-signing).
 
-Wherever a signing key is chosen (a surface, an issuer, Audit signing) the field is **Signing key
+Wherever a signing key is chosen (a surface, an issuer, Gateway signing) the field is **Signing key
 source**, with **Gateway secret** and **Verifiable Trust Agent**, which picks a connected agent.
 An Issuer's choice applies to every surface it owns that sets none of its own, before the
 gateway-wide default. See _Signing key source_ in
@@ -528,8 +530,7 @@ Do not summarise these here. Update the owning document in the same change as th
 | Credential providers, delegation vault, consent modes                          | [`docs/CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md)     |
 | Terms, acceptance, consent-pending sessions                                    | [`docs/TERMS_AND_CONSENT.md`](docs/TERMS_AND_CONSENT.md)             |
 | Integrations, events, notifications, the event hook                            | [`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md)                       |
-| Trust agent (VTA) signing, key custody, per-surface keys                        | [`docs/VTA_INTEGRATION_POC.md`](docs/VTA_INTEGRATION_POC.md)         |
-| Trust agent open items and limitations                                         | [`docs/VTA_OPEN_ITEMS.md`](docs/VTA_OPEN_ITEMS.md)                   |
+| Trust agent (VTA) signing, connections, control keys, per-surface keys, limits  | [`docs/TRUST_AGENT_SIGNING.md`](docs/TRUST_AGENT_SIGNING.md)         |
 
 # Ways of working
 

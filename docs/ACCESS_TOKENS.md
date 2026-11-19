@@ -300,6 +300,21 @@ rotate stay parent-gated for every caller. A permanent deletion is attributed to
 whether it was orphan cleanup. Deleting a key a stored surface still names takes that surface
 out of service; see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#tenant-check-of-provider-keys).
 
+### Trust agent connections
+
+Trust agent connections (`/v1/vta/connections`, resource kind `vta-connections`) are tenant-owned
+records: one a tenant PAT creates belongs to its tenant, and the `vta-bootstrap` record that
+mirrors the `[vta]` block is appliance-wide. A tenant PAT lists and reads its own tenant's
+connections and appliance-wide ones; another tenant's answers `404`, and so does a connection
+outside the PAT's resource pattern on the pairing and rotation routes. A connection's
+`control_key_ref` must name a secret its tenant may reference. A surface's or issuer's
+`signing.connection_id`, in the base and in every variant, must name a connection of its own
+tenant or an appliance-wide one, and an unknown id is refused the same way, so a save never
+reveals whether another tenant's connection exists. The key inventory
+(`GET /v1/key-management/inventory`) lists only the connections the caller may read. The
+gateway-wide default signing key source and the `[vta]` block's control key are appliance-wide
+settings, not tenant records. See [`TRUST_AGENT_SIGNING.md`](TRUST_AGENT_SIGNING.md#tenancy).
+
 ### References between records
 
 - A tenant-owned resource may reference same-tenant or global dependencies.

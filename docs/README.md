@@ -49,9 +49,8 @@ adds procedures for deploying and operating an appliance, operator guides, and F
 | [Management RBAC](RBAC.md)                                            | Middleware enforcement and permissions response contract                                                                    |
 | [Management access tokens](ACCESS_TOKENS.md)                          | PAT contract, resource-pattern grammar, delegation, and tenant ownership                                                    |
 | [Security Token Service](STS.md)                                      | RFC 8693 token exchange, ID-JAG issuance/redemption, and issuance gates                                                     |
-| [Trust agent (VTA) signing](VTA_INTEGRATION_POC.md)                   | Delegating key operations to a Verifiable Trust Agent you run, connecting it, recovery, and control key rotation |
+| [Trust agent (VTA) signing](TRUST_AGENT_SIGNING.md)                   | Local signing, signing through a Verifiable Trust Agent, connecting one, issuer DIDs, recovery, control key rotation and limits |
 | [Control key rotation](vta-auth-key-rotation/how-it-works.md)   | How the `[vta]` block's control key rotates on request or on an optional schedule, what it protects and what it does not |
-| [Trust agent open items](VTA_OPEN_ITEMS.md)                           | What the trust agent integration does not do yet, and the limits to know about                                              |
 | [Onboarding capture](AGENT_ONBOARDING_CAPTURE.md)                     | Capture security boundary, lifetime, and emitted events                                                                     |
 | [Rust design patterns](DESIGN_PATTERNS.md)                            | Internal concurrency, lifecycle, and storage patterns                                                                       |
 

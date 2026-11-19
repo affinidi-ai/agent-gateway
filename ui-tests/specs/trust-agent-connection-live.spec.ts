@@ -174,16 +174,16 @@ test.describe("Connections against a real trust agent", () => {
     expect(after.pairing.granted_contexts).toEqual([CONTEXT]);
     expect(after.keys?.active?.key_id).toBeTruthy();
 
-    // Audit signing shows the agent as the gateway-wide default once the wizard's
+    // Gateway signing shows the agent as the gateway-wide default once the wizard's
     // "use for all signing" was applied.
     await page.goto(`${BASE_URL}/settings`);
     await page.getByTestId("settings-security-tab-trigger").click();
-    const auditSigning = page.getByTestId("audit-signing-settings");
+    const gatewaySigning = page.getByTestId("gateway-signing-settings");
     await expect(
-      auditSigning.getByTestId("surface-signing-type-select"),
+      gatewaySigning.getByTestId("surface-signing-type-select"),
     ).toHaveValue("remote");
     await expect(
-      auditSigning.getByTestId("surface-signing-agent-select"),
+      gatewaySigning.getByTestId("surface-signing-agent-select"),
     ).toHaveValue(state.id);
 
     // An issuer takes the agent to sign for its surfaces, from the issuer editor.
