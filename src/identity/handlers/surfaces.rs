@@ -3149,6 +3149,10 @@ async fn require_signing_permission(
         .may_change_signing()
         .await
     {
+        crate::audit::trust_agent_changes::signing_change_refused(
+            crate::audit::events::SigningOwnerKind::Surface,
+            stored.map(|stored| stored.surface_id.as_str()),
+        );
         return Err(SurfaceApiError::Forbidden(super::signing_choice::SIGNING_CHANGE_FORBIDDEN.to_string()));
     }
     Ok(())

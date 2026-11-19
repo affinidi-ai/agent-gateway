@@ -135,6 +135,16 @@ async fn require_permission(
     Ok(())
 }
 
+/// Records a refused change of the gateway-wide signing choice.
+fn signing_change_refused(error: &AppError) {
+    if matches!(error, AppError::Forbidden(_)) {
+        crate::audit::trust_agent_changes::signing_change_refused(
+            crate::audit::events::SigningOwnerKind::GatewayDefault,
+            None,
+        );
+    }
+}
+
 /// The gateway-wide signing choice is checked like a surface's or an issuer's, and may only
 /// sign through a trust agent connection that belongs to the whole appliance.
 async fn validate_default_signing(
@@ -251,7 +261,8 @@ pub async fn update_settings(
                 pat.as_ref()
                     .map(|Extension(pat)| pat),
             )
-            .await?;
+            .await
+            .inspect_err(signing_change_refused)?;
         }
         if let Some(signing) = &signing {
             validate_default_signing(&state, signing).await?;
@@ -375,7 +386,8 @@ pub async fn reset_settings(
             pat.as_ref()
                 .map(|Extension(pat)| pat),
         )
-        .await?;
+        .await
+        .inspect_err(signing_change_refused)?;
     }
 
     // Update and save

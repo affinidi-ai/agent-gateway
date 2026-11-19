@@ -61,6 +61,7 @@ pub(crate) async fn validate_issuer_signing(
 
 /// A save that changes the issuer's signing choice also needs `key_management.edit`.
 async fn require_signing_permission(
+    issuer_id: Option<&str>,
     stored: Option<&crate::config::agent_surface::SurfaceSigningConfig>,
     saved: Option<&crate::config::agent_surface::SurfaceSigningConfig>,
     editor: &crate::identity::handlers::signing_choice::SigningEditor,
@@ -70,6 +71,10 @@ async fn require_signing_permission(
             .may_change_signing()
             .await
     {
+        crate::audit::trust_agent_changes::signing_change_refused(
+            crate::audit::events::SigningOwnerKind::Issuer,
+            issuer_id,
+        );
         return Err((
             StatusCode::FORBIDDEN,
             crate::identity::handlers::signing_choice::SIGNING_CHANGE_FORBIDDEN.to_string(),
@@ -199,7 +204,7 @@ pub async fn create_issuer<S: IssuerStore>(
         .signing
         .take()
         .filter(|signing| !signing.is_empty());
-    require_signing_permission(None, signing.as_ref(), &signing_editor).await?;
+    require_signing_permission(None, None, signing.as_ref(), &signing_editor).await?;
     if let Some(signing) = &signing {
         validate_issuer_signing(signing, req.tenant_id.as_deref(), connections.as_deref(), &config.vta).await?;
     }
@@ -393,7 +398,8 @@ pub async fn update_issuer<S: IssuerStore>(
 
     if let Some(signing) = req.signing {
         let signing = Some(signing).filter(|signing| !signing.is_empty());
-        require_signing_permission(issuer.signing.as_ref(), signing.as_ref(), &signing_editor).await?;
+        require_signing_permission(Some(&issuer.id), issuer.signing.as_ref(), signing.as_ref(), &signing_editor)
+            .await?;
         if let Some(signing) = &signing {
             validate_issuer_signing(signing, issuer.tenant_id.as_deref(), connections.as_deref(), &vta).await?;
         }
@@ -1600,13 +1606,16 @@ mod tests {
         let (store, issuer, _dir) = stored_issuer(None).await;
         let (connections, _connections_dir) = connection_store_with(&[("agent-1", None)]).await;
 
-        let refused = update_as(
-            crate::auth::types::UserRole::PowerUser,
-            &store,
-            connections,
-            &issuer.id,
-            with_signing(agent_signing("agent-1")),
-        )
+        let (refused, records) = crate::audit::producer::capture(crate::audit::context::in_management_request(
+            crate::audit::events::Actor::user("editor"),
+            update_as(
+                crate::auth::types::UserRole::PowerUser,
+                &store,
+                connections,
+                &issuer.id,
+                with_signing(agent_signing("agent-1")),
+            ),
+        ))
         .await;
 
         assert_eq!(
@@ -1615,6 +1624,11 @@ mod tests {
                 .map(|(status, _)| status),
             Some(StatusCode::FORBIDDEN)
         );
+        assert_eq!(records.len(), 1, "{records:?}");
+        let recorded = serde_json::to_value(&records[0].event).unwrap();
+        assert_eq!(recorded["signing_change_refused"]["owner"], "issuer");
+        assert_eq!(recorded["signing_change_refused"]["owner_id"], issuer.id.as_str());
+        assert_eq!(recorded["signing_change_refused"]["actor"]["id"], "editor");
         let Json(read) = get_issuer(Extension(store), Path(issuer.id), None, None)
             .await
             .unwrap();
@@ -1635,19 +1649,28 @@ mod tests {
         .await
         .unwrap();
 
-        let Json(renamed) = update_as(
-            crate::auth::types::UserRole::PowerUser,
-            &store,
-            connections,
-            &issuer.id,
-            Json(UpdateIssuerRequest {
-                name: "Renamed".into(),
-                description: None,
-                signing: Some(agent_signing("agent-1")),
-            }),
-        )
-        .await
-        .unwrap();
+        let (renamed, records) = crate::audit::producer::capture(crate::audit::context::in_management_request(
+            crate::audit::events::Actor::user("editor"),
+            update_as(
+                crate::auth::types::UserRole::PowerUser,
+                &store,
+                connections,
+                &issuer.id,
+                Json(UpdateIssuerRequest {
+                    name: "Renamed".into(),
+                    description: None,
+                    signing: Some(agent_signing("agent-1")),
+                }),
+            ),
+        ))
+        .await;
+        let Json(renamed) = renamed.unwrap();
+        assert!(
+            records.iter().all(
+                |record| crate::delegation_vault::audit::action_category(&record.event) != "signing_change_refused"
+            ),
+            "{records:?}"
+        );
 
         assert_eq!(renamed.name, "Renamed");
         assert_eq!(renamed.signing, Some(agent_signing("agent-1")));

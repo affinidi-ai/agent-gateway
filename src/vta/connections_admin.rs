@@ -19,6 +19,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
+use crate::audit::trust_agent_changes as security_records;
 use crate::auth::storage::PasskeyStorage;
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
 use crate::rbac::{Feature, RbacConfig};
@@ -337,6 +338,23 @@ fn not_found() -> (StatusCode, Json<ErrorBody>) {
     (StatusCode::NOT_FOUND, ErrorBody::json("connection not found"))
 }
 
+/// The `404` for a connection outside what the caller may see, marked so the refusal is
+/// recorded.
+fn hidden() -> axum::response::Response {
+    let mut response = not_found().into_response();
+    response
+        .extensions_mut()
+        .insert(security_records::HiddenConnection);
+    response
+}
+
+fn acknowledged(query: &DisconnectQuery) -> security_records::Acknowledged {
+    security_records::Acknowledged {
+        signing_users: query.acknowledge_signing_users,
+        stranded_agents: query.acknowledge_stranded_agents,
+    }
+}
+
 async fn require_permission(
     user_id: &str,
     storage: &PasskeyStorage,
@@ -588,6 +606,7 @@ pub async fn create_connection(
     {
         Ok(created) => {
             info!(id = %created.id, name = %created.name, "VTA connection created");
+            security_records::connection_created(&created);
             invalidate(&state, &created.id).await;
             (StatusCode::CREATED, Json(created)).into_response()
         }
@@ -725,7 +744,7 @@ pub async fn update_connection(
         }
     };
     if !connection_allowed(&existing, &context, &scope) {
-        return not_found().into_response();
+        return hidden();
     }
     if !connection_writable(&existing, &context, &scope) {
         return outside_scope().into_response();
@@ -805,6 +824,7 @@ pub async fn update_connection(
     {
         Ok(updated) => {
             info!(id = %id, enabled = updated.enabled, "VTA connection updated");
+            security_records::connection_updated(&existing, &updated, acknowledged(&query));
             sync_reservations(&state).await;
             // Take effect now: the next signing call rebuilds, or fails closed
             // if the connection was just disabled.
@@ -878,6 +898,7 @@ pub async fn delete_connection(
     match state.store.delete(&id).await {
         Ok(()) => {
             info!(id = %id, "VTA connection deleted");
+            security_records::connection_deleted(&connection, acknowledged(&query));
             sync_reservations(&state).await;
             invalidate(&state, &id).await;
             StatusCode::NO_CONTENT.into_response()
@@ -910,7 +931,7 @@ enum Access {
 /// Load a connection for a pairing operation, applying the same RBAC, tenancy
 /// and PAT-scope gates the CRUD routes use. A connection the caller may see
 /// but not change is refused with `403` for [`Access::Write`].
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
 async fn load_for_pairing(
     user_id: &str,
     passkey_storage: &PasskeyStorage,
@@ -922,24 +943,26 @@ async fn load_for_pairing(
     pat: Option<&Extension<PatContext>>,
     context: &Option<Extension<PatTenantContext>>,
     scope: &Option<Extension<PatResourceScope>>,
-) -> Result<VtaConnection, (StatusCode, Json<ErrorBody>)> {
-    require_permission(user_id, passkey_storage, rbac_config, feature, pat.map(|Extension(pat)| pat)).await?;
+) -> Result<VtaConnection, axum::response::Response> {
+    require_permission(user_id, passkey_storage, rbac_config, feature, pat.map(|Extension(pat)| pat))
+        .await
+        .map_err(IntoResponse::into_response)?;
     let connection = state
         .store
         .get(id)
         .await
         .map_err(|e| {
             error!(id = %id, error = %e, "Failed to load VTA connection for pairing");
-            (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Internal server error"))
+            (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Internal server error")).into_response()
         })?
-        .ok_or_else(not_found)?;
+        .ok_or_else(|| not_found().into_response())?;
     if !connection_allowed(&connection, context, scope) {
         // Indistinguishable from "does not exist", so a scoped token cannot
         // probe for connections it may not see.
-        return Err(not_found());
+        return Err(hidden());
     }
     if access == Access::Write && !connection_writable(&connection, context, scope) {
-        return Err(outside_scope());
+        return Err(outside_scope().into_response());
     }
     Ok(connection)
 }
@@ -1027,14 +1050,20 @@ pub async fn pair_connection(
     );
     // A re-pair must not take a working connection out of service, so the
     // record is only advanced when the connection is not already connected.
-    if !connection
+    let previous = connection.clone();
+    let current = if previous
         .pairing
         .state
         .is_usable()
-        && let Err(e) = persist_pairing(&state, connection, pairing).await
     {
-        return e.into_response();
-    }
+        connection
+    } else {
+        match persist_pairing(&state, connection, pairing).await {
+            Ok(updated) => updated,
+            Err(e) => return e.into_response(),
+        }
+    };
+    security_records::pairing_started(&previous, &current);
     (StatusCode::OK, Json(payload)).into_response()
 }
 
@@ -1086,6 +1115,7 @@ pub async fn verify_connection(
     // Reaching the VTA at all is the verification: the registry builds the
     // connector, which authenticates with this connection's control key.
     let previous = connection.pairing.clone();
+    let previous_state = previous.state.as_str();
     let outcome = match registry
         .verify(&connection)
         .await
@@ -1107,7 +1137,10 @@ pub async fn verify_connection(
             // unusable and the operator is told why.
             let pairing = crate::vta::pairing::apply_failure(&previous, operator_message(&e));
             return match persist_pairing(&state, connection, pairing).await {
-                Ok(updated) => (StatusCode::BAD_GATEWAY, Json(updated)).into_response(),
+                Ok(updated) => {
+                    security_records::connection_verified(previous_state, &updated);
+                    (StatusCode::BAD_GATEWAY, Json(updated)).into_response()
+                }
                 Err(e) => e.into_response(),
             };
         }
@@ -1122,10 +1155,19 @@ pub async fn verify_connection(
     );
     let connected = pairing.state.is_usable();
     match persist_pairing(&state, connection, pairing).await {
-        Ok(updated) if connected => (StatusCode::OK, Json(updated)).into_response(),
-        // Reached the VTA, but the grant or the identity is wrong: the
-        // operator has to act, so this is not a success.
-        Ok(updated) => (StatusCode::CONFLICT, Json(updated)).into_response(),
+        Ok(updated) => {
+            security_records::connection_verified(previous_state, &updated);
+            if connected {
+                return (StatusCode::OK, Json(updated)).into_response();
+            }
+            // Reached the VTA, but the grant or the identity is wrong: the
+            // operator has to act, so this is not a success.
+            let mut response = (StatusCode::CONFLICT, Json(updated)).into_response();
+            response
+                .extensions_mut()
+                .insert(security_records::OutcomeRecorded);
+            response
+        }
         Err(e) => e.into_response(),
     }
 }
@@ -1182,9 +1224,16 @@ pub async fn revoke_connection(
         return response;
     }
     let pairing = crate::vta::pairing::revoke(&connection.pairing);
+    let previous_state = connection
+        .pairing
+        .state
+        .as_str();
     info!(target: "vta_audit", connection_id = %id, "VTA connection revoked");
     match persist_pairing(&state, connection, pairing).await {
-        Ok(updated) => (StatusCode::OK, Json(updated)).into_response(),
+        Ok(updated) => {
+            security_records::connection_revoked(previous_state, &updated, acknowledged(&query));
+            (StatusCode::OK, Json(updated)).into_response()
+        }
         Err(e) => e.into_response(),
     }
 }
@@ -1518,7 +1567,31 @@ pub async fn rotate_control_key(
         )
             .into_response();
     }
-    match crate::vta::control_key_live::rotate_now(crate::vta::control_key_live::Trigger::Api, Some(&user_id)).await {
+    let result =
+        crate::vta::control_key_live::rotate_now(crate::vta::control_key_live::Trigger::Api, Some(&user_id)).await;
+    match &result {
+        Ok(report) => security_records::control_key_rotated(
+            security_records::actor(),
+            None,
+            crate::audit::events::ControlKeyRotationOutcome::Rotated,
+            security_records::ControlDids {
+                previous: Some(
+                    report
+                        .previous_control_did
+                        .clone(),
+                ),
+                current: Some(report.control_did.clone()),
+            },
+        ),
+        Err(crate::vta::control_key_live::RotateNowError::Failed(_)) => security_records::control_key_rotated(
+            security_records::actor(),
+            None,
+            crate::audit::events::ControlKeyRotationOutcome::RolledBack,
+            security_records::ControlDids::default(),
+        ),
+        Err(_) => {}
+    }
+    match result {
         Ok(report) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -1590,7 +1663,7 @@ pub async fn rotate_connection_control_key(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
 ) -> axum::response::Response {
-    if let Err(e) = load_for_pairing(
+    let loaded = match load_for_pairing(
         &user_id,
         &passkey_storage,
         &rbac_config,
@@ -1604,8 +1677,9 @@ pub async fn rotate_connection_control_key(
     )
     .await
     {
-        return e.into_response();
-    }
+        Ok(connection) => connection,
+        Err(e) => return e,
+    };
     if crate::server::mode::is_standby() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1630,8 +1704,39 @@ pub async fn rotate_connection_control_key(
     }
     let driver = Arc::clone(&rotator);
     let driven_id = id.clone();
-    let mut task = tokio::spawn(async move { driver.drive(&driven_id).await });
+    let actor = security_records::actor();
+    let tenant_id = loaded.tenant_id.clone();
+    let dids = security_records::ControlDids {
+        previous: None,
+        current: loaded.control_did,
+    };
+    let recorded = (actor.clone(), tenant_id.clone(), dids.clone());
+    let mut task = tokio::spawn(async move {
+        let driven = driver.drive(&driven_id).await;
+        let outcome = match &driven {
+            Ok(crate::vta::connection_key_rotation::Outcome::Finished) => {
+                Some(crate::audit::events::ControlKeyRotationOutcome::Rotated)
+            }
+            Ok(crate::vta::connection_key_rotation::Outcome::RolledBack) => {
+                Some(crate::audit::events::ControlKeyRotationOutcome::RolledBack)
+            }
+            _ => None,
+        };
+        if let Some(outcome) = outcome {
+            let (actor, tenant_id, dids) = recorded;
+            security_records::control_key_rotated(actor, Some((&driven_id, tenant_id.as_deref())), outcome, dids);
+        }
+        driven
+    });
     let finished = tokio::time::timeout(ROTATION_WAIT, &mut task).await;
+    if finished.is_err() {
+        security_records::control_key_rotated(
+            actor,
+            Some((&id, tenant_id.as_deref())),
+            crate::audit::events::ControlKeyRotationOutcome::Started,
+            dids,
+        );
+    }
     let connection = match state.store.get(&id).await {
         Ok(Some(connection)) => connection,
         _ => return not_found().into_response(),
@@ -1663,7 +1768,7 @@ pub async fn cancel_connection_control_key_rotation(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
 ) -> axum::response::Response {
-    if let Err(e) = load_for_pairing(
+    let loaded = match load_for_pairing(
         &user_id,
         &passkey_storage,
         &rbac_config,
@@ -1677,14 +1782,26 @@ pub async fn cancel_connection_control_key_rotation(
     )
     .await
     {
-        return e.into_response();
-    }
+        Ok(connection) => connection,
+        Err(e) => return e,
+    };
     let Some(rotator) = state.key_rotator.clone() else {
         return (StatusCode::CONFLICT, ErrorBody::json("there is no rotation to cancel")).into_response();
     };
     use crate::vta::connection_key_rotation::CancelError;
     match rotator.cancel(&id).await {
-        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Ok(view) => {
+            security_records::control_key_rotated(
+                security_records::actor(),
+                Some((&id, loaded.tenant_id.as_deref())),
+                crate::audit::events::ControlKeyRotationOutcome::Cancelled,
+                security_records::ControlDids {
+                    previous: None,
+                    current: loaded.control_did,
+                },
+            );
+            (StatusCode::OK, Json(view)).into_response()
+        }
         Err(CancelError::NotFound) => not_found().into_response(),
         Err(CancelError::NothingToCancel) => {
             (StatusCode::CONFLICT, ErrorBody::json("there is no rotation to cancel")).into_response()
@@ -1918,6 +2035,7 @@ pub async fn rotate_connection_key(
                 retired_key_id = previous.as_deref().unwrap_or("none"),
                 "VTA signing key rotated",
             );
+            security_records::signing_key_rotated(&updated, previous, body.key_id.trim());
             // Rebuild on next use so the new key signs immediately.
             invalidate(&state, &id).await;
             (StatusCode::OK, Json(updated)).into_response()
@@ -2047,6 +2165,11 @@ pub async fn provision_connection_key(
         }
     };
     let key_id = created.key_id.clone();
+    let previous_key_id = connection
+        .keys
+        .active
+        .as_ref()
+        .map(|key| key.key_id.clone());
 
     if let Err(message) = connection
         .keys
@@ -2067,6 +2190,7 @@ pub async fn provision_connection_key(
                 key_id = %key_id,
                 "minted a signing key in the trust agent",
             );
+            security_records::signing_key_provisioned(&updated, previous_key_id, &key_id);
             invalidate(&state, &id).await;
             (StatusCode::CREATED, Json(updated)).into_response()
         }
@@ -2115,6 +2239,7 @@ pub fn create_vta_connection_router(
         .route("/v1/vta/status", get(vta_status))
         .route("/v1/vta/control-key/rotate", post(rotate_control_key))
         .route("/v1/key-management/inventory", get(key_inventory))
+        .route_layer(axum::middleware::from_fn(security_records::record_refusals))
         .with_state(state);
     if let Some(secrets_store) = secrets_store {
         router.layer(Extension(secrets_store))
@@ -2454,22 +2579,47 @@ mod tests {
         let (state, _dir) = admin_state(None).await;
         stored(&state, "appliance", None).await;
         stored(&state, "own", Some("tenant-a")).await;
+        stored(&state, "other", Some("tenant-b")).await;
         let (router, _users) = admin_router(state.clone(), Some("tenant-a")).await;
 
         assert_eq!(call(&router, "GET", "/v1/vta/connections/appliance").await, StatusCode::OK);
-        for (method, uri) in [
-            ("PUT", "/v1/vta/connections/appliance"),
-            ("DELETE", "/v1/vta/connections/appliance"),
-            ("POST", "/v1/vta/connections/appliance/pair"),
-            ("POST", "/v1/vta/connections/appliance/verify"),
-            ("POST", "/v1/vta/connections/appliance/revoke"),
-            ("POST", "/v1/vta/connections/appliance/keys"),
-            ("POST", "/v1/vta/connections/appliance/control-key/rotate"),
-            ("POST", "/v1/vta/connections/appliance/control-key/rotate/cancel"),
-            ("POST", "/v1/vta/control-key/rotate"),
-        ] {
-            assert_eq!(call(&router, method, uri).await, StatusCode::FORBIDDEN, "{method} {uri}");
+        let refusals = [
+            ("PUT", "/v1/vta/connections/appliance", "update_connection"),
+            ("DELETE", "/v1/vta/connections/appliance", "delete_connection"),
+            ("POST", "/v1/vta/connections/appliance/pair", "pair_connection"),
+            ("POST", "/v1/vta/connections/appliance/verify", "verify_connection"),
+            ("POST", "/v1/vta/connections/appliance/revoke", "revoke_connection"),
+            ("POST", "/v1/vta/connections/appliance/keys", "provision_signing_key"),
+            ("POST", "/v1/vta/connections/appliance/control-key/rotate", "rotate_control_key"),
+            ("POST", "/v1/vta/connections/appliance/control-key/rotate/cancel", "cancel_control_key_rotation"),
+            ("POST", "/v1/vta/control-key/rotate", "rotate_control_key"),
+        ];
+        let ((), records) = crate::audit::producer::capture(crate::audit::context::in_management_request(
+            crate::audit::events::Actor::pat("tenant-token", "admin"),
+            async {
+                for (method, uri, _) in refusals {
+                    assert_eq!(call(&router, method, uri).await, StatusCode::FORBIDDEN, "{method} {uri}");
+                }
+                assert_eq!(call(&router, "POST", "/v1/vta/connections/other/revoke").await, StatusCode::NOT_FOUND);
+                assert_eq!(call(&router, "POST", "/v1/vta/connections/missing/revoke").await, StatusCode::NOT_FOUND);
+            },
+        ))
+        .await;
+        let refused: Vec<serde_json::Value> = records
+            .iter()
+            .map(|record| serde_json::to_value(&record.event).unwrap()["trust_agent_change_refused"].clone())
+            .collect();
+        assert_eq!(refused.len(), refusals.len() + 1, "{records:?}");
+        for ((_, uri, action), record) in refusals.iter().zip(&refused) {
+            assert_eq!(record["action"], *action, "{uri}");
+            assert_eq!(record["status"], 403, "{uri}");
+            assert_eq!(record["reason"], "forbidden", "{uri}");
+            assert_eq!(record["actor"]["id"], "tenant-token", "{uri}");
+            assert!(record["record_hash"].is_string(), "{uri}");
         }
+        assert_eq!(refused[1]["connection_id"], "appliance");
+        assert_eq!(refused[refusals.len()]["connection_id"], "other");
+        assert_eq!(refused[refusals.len()]["reason"], "not_visible");
         assert!(
             state
                 .store
@@ -2480,8 +2630,34 @@ mod tests {
             "the appliance connection survived"
         );
 
-        assert_eq!(call(&router, "POST", "/v1/vta/connections/own/revoke").await, StatusCode::OK);
-        assert_eq!(call(&router, "DELETE", "/v1/vta/connections/own").await, StatusCode::NO_CONTENT);
+        let ((), records) = crate::audit::producer::capture(crate::audit::context::in_management_request(
+            crate::audit::events::Actor::pat("tenant-token", "admin"),
+            async {
+                assert_eq!(call(&router, "POST", "/v1/vta/connections/own/revoke").await, StatusCode::OK);
+                assert_eq!(call(&router, "DELETE", "/v1/vta/connections/own").await, StatusCode::NO_CONTENT);
+            },
+        ))
+        .await;
+        let changes: Vec<(&str, serde_json::Value)> = records
+            .iter()
+            .map(|record| {
+                let category = crate::delegation_vault::audit::action_category(&record.event);
+                (category, serde_json::to_value(&record.event).unwrap()[category].clone())
+            })
+            .collect();
+        assert_eq!(
+            changes
+                .iter()
+                .map(|(category, _)| *category)
+                .collect::<Vec<_>>(),
+            ["trust_agent_connection_revoked", "trust_agent_connection_deleted"]
+        );
+        for (category, change) in &changes {
+            assert_eq!(change["connection_id"], "own", "{category}");
+            assert_eq!(change["tenant_id"], "tenant-a", "{category}");
+            assert_eq!(change["acknowledge_signing_users"], false, "{category}");
+        }
+        assert_eq!(changes[0].1["state"], "revoked");
     }
 
     #[test]

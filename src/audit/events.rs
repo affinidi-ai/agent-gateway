@@ -355,3 +355,60 @@ pub enum RefusalReason {
     /// 409: the change conflicts with what is stored.
     Conflict,
 }
+
+/// A change to a trust agent connection, or to a key the gateway signs or signs in with, that
+/// a management request attempted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustAgentAction {
+    CreateConnection,
+    UpdateConnection,
+    DeleteConnection,
+    PairConnection,
+    VerifyConnection,
+    RevokeConnection,
+    RotateSigningKey,
+    ProvisionSigningKey,
+    /// A connection's control key, or the `[vta]` block's when no connection is named.
+    RotateControlKey,
+    CancelControlKeyRotation,
+}
+
+/// Why a security-relevant management change was refused, by the status it got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityRefusalReason {
+    /// 401: the caller could not be identified.
+    Unauthenticated,
+    /// 403: the caller's role, access token or tenant does not allow it.
+    Forbidden,
+    /// 404: the connection is outside what the caller may see, answered as if it did not exist.
+    NotVisible,
+    /// 409: the change conflicts with the connection's state, or would stop something signing
+    /// without the caller acknowledging it.
+    Conflict,
+}
+
+/// What a control key rotation came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlKeyRotationOutcome {
+    /// The gateway signs in with the new key.
+    Rotated,
+    /// The trust agent did not accept the new key and the old one was put back.
+    RolledBack,
+    /// The rotation was still under way when the request was answered.
+    Started,
+    /// An operator stopped the rotation before it switched and the old key was put back.
+    Cancelled,
+}
+
+/// What owns a signing choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SigningOwnerKind {
+    Surface,
+    Issuer,
+    /// The gateway-wide default in the dashboard settings.
+    GatewayDefault,
+}

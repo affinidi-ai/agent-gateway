@@ -23,17 +23,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
-/// Field separator for the chain pre-image. `0x1e` (record separator) cannot
-/// occur in a hex hash, an event label or a key id, so the concatenation parses
-/// unambiguously and two different records cannot collide by shifting a field
-/// boundary.
-const CHAIN_SEP: char = '\u{1e}';
-
-/// `prev_hash` of the first record in a chain.
-pub const GENESIS_HASH: &str = "genesis";
+use crate::audit::hash_chain::{Chained, link_hash};
+pub use crate::audit::hash_chain::{GENESIS_HASH, hash_hex};
 
 /// A single audit record. **Hashes and identifiers only** — see the module doc.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,66 +92,41 @@ impl AuditRecord {
     /// `prev_hash`. Deterministic, so a verifier recomputes it independently.
     #[must_use]
     pub fn compute_hash(&self) -> String {
-        hash_hex(&format!(
-            "{seq}{SEP}{prev}{SEP}{event}{SEP}{key}{SEP}{subject}{SEP}{artifact}{SEP}{carrier}",
-            seq = self.seq,
-            prev = self.prev_hash,
-            event = self.event,
-            key = self.key_id,
-            subject = self.subject_hash,
-            artifact = self.artifact_hash,
-            // Part of the hash, not just a label: an attacker who could
-            // rewrite the carrier could hide that signing moved to a path the
-            // operator never approved.
-            carrier = self.carrier,
-            SEP = CHAIN_SEP,
-        ))
+        // The carrier is part of the hash, not just a label: an attacker who could rewrite it
+        // could hide that signing moved to a path the operator never approved.
+        link_hash(
+            self.seq,
+            &self.prev_hash,
+            &[self.event, &self.key_id, &self.subject_hash, &self.artifact_hash, self.carrier],
+        )
     }
 }
 
-/// Verify a chain of records in order.
-///
-/// Returns `Err(index)` of the **first** record that does not follow its
-/// predecessor — because it was edited (its `record_hash` no longer matches its
-/// content), removed/reordered (its `prev_hash` or `seq` does not follow), or
-/// never belonged.
+impl Chained for AuditRecord {
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    fn prev_hash(&self) -> &str {
+        &self.prev_hash
+    }
+
+    fn record_hash(&self) -> &str {
+        &self.record_hash
+    }
+
+    fn compute_hash(&self) -> String {
+        AuditRecord::compute_hash(self)
+    }
+}
+
+/// Verify a chain of records in order; see [`crate::audit::hash_chain::verify_chain`].
 ///
 /// Test-only for now: the chain is written by the running gateway and verified
-/// by whoever reads the log. Exposing it as an operator-facing tool is a
-/// follow-up.
+/// by whoever reads the log.
 #[cfg(test)]
 pub fn verify_chain(records: &[AuditRecord]) -> Result<(), usize> {
-    let mut expected_prev = GENESIS_HASH.to_string();
-    for (index, record) in records.iter().enumerate() {
-        // Sequence numbers start at 1, so the expected value is the 0-based
-        // index plus one; deriving it here rather than carrying a counter keeps
-        // "position in the slice" and "claimed position in the chain" the same
-        // statement.
-        let expected_seq = index as u64 + 1;
-        if record.seq != expected_seq || record.prev_hash != expected_prev {
-            return Err(index);
-        }
-        if record.record_hash != record.compute_hash() {
-            return Err(index);
-        }
-        expected_prev = record.record_hash.clone();
-    }
-    Ok(())
-}
-
-/// SHA-256 hex of `input` (empty string hashes to `""`, so an absent field is
-/// distinguishable from a present one).
-#[must_use]
-pub fn hash_hex(input: &str) -> String {
-    if input.is_empty() {
-        return String::new();
-    }
-    let digest = Sha256::digest(input.as_bytes());
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
+    crate::audit::hash_chain::verify_chain(records)
 }
 
 /// Where accepted audit records are delivered. A port so the VTA transport (a

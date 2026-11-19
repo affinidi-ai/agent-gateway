@@ -459,13 +459,14 @@ async fn access_token_request(
 }
 
 /// Records `response` as the refusal of `request` when it refuses a policy
-/// change, and returns it unchanged.
+/// change or a trust agent change, and returns it unchanged.
 fn record_refusal(
     request: &Request,
     actor: &crate::audit::events::Actor,
     response: Response,
 ) -> Response {
     crate::audit::policy_refusals::record_refused(request, response.status(), actor.clone());
+    crate::audit::trust_agent_changes::record_refused(request, response.status(), actor.clone());
     response
 }
 

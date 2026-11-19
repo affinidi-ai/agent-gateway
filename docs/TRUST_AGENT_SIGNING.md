@@ -308,6 +308,19 @@ and its control key are appliance-wide. See
 [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#trust-agent-connections) and
 [`RBAC.md`](RBAC.md#trust-agents-and-key-management).
 
+### Security records
+
+Every change made through the connection routes (create, update, delete, pair, verify, revoke,
+signing key provision and rotation, control key rotation and its cancel, and
+`POST /v1/vta/control-key/rotate`) and every refusal of one (`401`, `403`, `409`, and a `404` for
+a connection the caller may not see) is a security record, and so is a surface, issuer or settings
+save refused for changing a signing choice without `key_management.edit`. Each names who acted,
+is appended to a hash chain kept under the audit directory before the response is sent, is
+logged on the `security_audit` target and goes to the VP Audit Log and integrations that select
+its event (group Key management). See
+[`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding) for the events, their fields
+and the chain.
+
 ### Isolation
 
 The gateway reserves the trust agent addresses it knows and refuses them on both pinned egress
