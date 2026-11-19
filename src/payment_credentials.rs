@@ -36,8 +36,8 @@ pub fn set_global_payment_vc_issuer(issuer: Arc<VCIssuer>) {
     )));
 }
 
-/// Point payment-credential signing at the **selected** signing connector
-///. Called from the identity router once `[vta]` has been resolved, so
+/// Point payment-credential signing at the **selected** signing connector.
+/// Called from the identity router once `[vta]` has been resolved, so
 /// payment receipts are signed by the same backend as STS tokens rather than
 /// always by the local key.
 pub fn set_global_payment_credential_authority(authority: Arc<dyn CredentialAuthority>) {

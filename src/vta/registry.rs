@@ -127,8 +127,8 @@ impl VtaConnectionRegistry {
         }
     }
 
-    /// Attach the mediator channel that carries Trust Tasks over DIDComm
-    ///, enabling connections whose VTA has no reachable address.
+    /// Attach the mediator channel that carries Trust Tasks over DIDComm,
+    /// enabling connections whose VTA has no reachable address.
     #[cfg(test)]
     pub fn with_didcomm(
         mut self,
@@ -395,8 +395,8 @@ impl VtaConnectionRegistry {
         }
 
         // A connection that has not completed pairing has not proved it can
-        // sign under the identity the operator chose, so it must not be used
-        //. Revoking is therefore immediate: the state alone makes the
+        // sign under the identity the operator chose, so it must not be used.
+        // Revoking is therefore immediate: the state alone makes the
         // connection unusable on the next resolution.
         crate::vta::pairing::assert_usable(connection, &connection.pairing)?;
 

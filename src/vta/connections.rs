@@ -51,8 +51,8 @@ pub enum VtaConnectionTransport {
     Didcomm,
 }
 
-/// Where a connection is in its pairing lifecycle. Set by the pairing flow
-///; stored here so the dashboard can render it.
+/// Where a connection is in its pairing lifecycle. Set by the pairing flow;
+/// stored here so the dashboard can render it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VtaConnectionStatus {

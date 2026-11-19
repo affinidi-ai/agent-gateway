@@ -1,5 +1,4 @@
-//! The gateway's private-key surfaces, and what was decided about each
-//!.
+//! The gateway's private-key surfaces, and what was decided about each.
 //!
 //! The epic's goal is "an attacker who takes the gateway cannot sign as us".
 //! That claim is only as good as the **least** migrated key, so it cannot be
