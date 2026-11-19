@@ -1,0 +1,16 @@
+branch: fix/coverage-runner-memory
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-19T00:00:00Z'
+      title: Build the CI coverage job with two parallel jobs to stop runner shutdowns
+      description: >-
+        The coverage job now builds with two parallel jobs instead of four. With four, the
+        runner was often shut down part way through the instrumented build, most likely out of
+        memory, so pull requests needed several re-runs to pass. A pull request that changes
+        the CI workflow now also runs the Rust jobs, so a change to them is tested before it
+        merges.
+  removed: []
+  security: []
+  breaking: []
