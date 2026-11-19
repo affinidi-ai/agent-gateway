@@ -83,7 +83,6 @@ class ElementRegistry {
     return this.all()
       .filter(d => !d.hiddenFromPalette && !hidden.has(d.type))
       .filter(d => !d.protocols || d.protocols.includes(protocol))
-      .filter(d => !d.excludedProtocols?.includes(protocol))
       .sort((a, b) => {
         if (a.paletteCategory !== b.paletteCategory) {
           return a.paletteCategory.localeCompare(b.paletteCategory);

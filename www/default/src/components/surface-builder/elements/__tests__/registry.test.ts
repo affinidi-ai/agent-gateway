@@ -180,6 +180,16 @@ describe('ElementRegistry', () => {
       expect(types('a2a')).not.toContain('transit-point-mcp');
       expect(types('mcp')).toContain('transit-point-mcp');
       expect(types('mcp')).not.toContain('transit-point-a2a');
+      expect(types('ap2')).toContain('transit-point-a2a');
+      expect(types('ap2')).not.toContain('transit-point-mcp');
+      for (const other of ['didcomm', 'http'] as const) {
+        expect(registry.paletteItems(other as never).map(d => d.type)).not.toContain(
+          'transit-point-a2a'
+        );
+        expect(registry.paletteItems(other as never).map(d => d.type)).not.toContain(
+          'transit-point-mcp'
+        );
+      }
       expect(registry.get('transit-point-mcp')).toBeDefined();
     });
 
