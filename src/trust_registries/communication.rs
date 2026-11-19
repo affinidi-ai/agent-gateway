@@ -10,6 +10,7 @@
 //! src/gateways/connection_points/ but with trust-registry-specific types.
 
 use affinidi_messaging_didcomm::Message as DIDCommMessage;
+use affinidi_messaging_sdk::errors::TrustTaskRefusal;
 use affinidi_tdk_common::secrets_resolver::secrets::Secret;
 use reqwest::Method;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue};
@@ -408,6 +409,21 @@ fn problem_report_error(body: serde_json::Value) -> TrustRegistryError {
         Ok(problem) => TrustRegistryError::ProblemReport(problem.code, problem.comment),
         Err(e) => TrustRegistryError::ParseError(format!("Failed to parse problem report: {}", e)),
     }
+}
+
+/// The error a refusal produces when it arrives as the `trust-task-error`
+/// document a mediator from v0.52 sends, rather than as a problem report. The
+/// Trust Tasks code is kept as it arrived, carrying no `e.p.` prefix, so
+/// [`TrustRegistryError::is_conflict`] answers for it as it does for every
+/// code that is not a registry conflict.
+fn refusal_error(refusal: &TrustTaskRefusal) -> TrustRegistryError {
+    TrustRegistryError::ProblemReport(
+        refusal.code.clone(),
+        refusal
+            .message
+            .clone()
+            .unwrap_or_default(),
+    )
 }
 
 /// Deserialise a registry response into the expected typed shape, returning
@@ -2472,6 +2488,9 @@ impl TrustRegistryListenerManager {
                 if result.msg_type == MSG_TYPE_PROBLEM_REPORT {
                     return Err(problem_report_error(result.body));
                 }
+                if let Some(refusal) = TrustTaskRefusal::from_document(&result.body) {
+                    return Err(refusal_error(&refusal));
+                }
                 info!("Received response: {}", result.msg_type);
                 Ok(result.body)
             }
@@ -4256,6 +4275,45 @@ mod tests {
             TrustRegistryError::ProblemReport(code, comment) => {
                 assert_eq!(code, TR_CONFLICT_CODE);
                 assert_eq!(comment, "Reference field already exists");
+            }
+            other => panic!("Expected ProblemReport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_trust_task_refusal_becomes_the_same_error_a_problem_report_does() {
+        let refusal = TrustTaskRefusal::from_document(&json!({
+            "id": "urn:uuid:00000000-0000-4000-8000-000000000001",
+            "type": "https://trusttasks.org/spec/trust-task-error/0.6",
+            "payload": { "code": "messaging/account/get:unknownAccount", "message": "account not found", "retryable": false },
+        }))
+        .expect("a trust-task-error");
+
+        let error = refusal_error(&refusal);
+
+        match &error {
+            TrustRegistryError::ProblemReport(code, comment) => {
+                assert_eq!(code, "messaging/account/get:unknownAccount", "the Trust Tasks code is kept as it arrived");
+                assert_eq!(comment, "account not found");
+            }
+            other => panic!("Expected ProblemReport, got {other:?}"),
+        }
+        assert!(!error.is_conflict(), "a mediator refusal is not a registry write conflict");
+    }
+
+    #[test]
+    fn a_trust_task_refusal_without_a_message_keeps_its_code() {
+        let refusal = TrustTaskRefusal::from_document(&json!({
+            "id": "urn:uuid:00000000-0000-4000-8000-000000000002",
+            "type": "https://trusttasks.org/spec/trust-task-error/0.6",
+            "payload": { "code": "messaging/account/get:notAuthorised", "retryable": false },
+        }))
+        .expect("a trust-task-error");
+
+        match refusal_error(&refusal) {
+            TrustRegistryError::ProblemReport(code, comment) => {
+                assert_eq!(code, "messaging/account/get:notAuthorised");
+                assert_eq!(comment, "");
             }
             other => panic!("Expected ProblemReport, got {other:?}"),
         }

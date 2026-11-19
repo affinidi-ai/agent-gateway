@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use affinidi_messaging_didcomm::Message as DIDCommMessage;
+use affinidi_messaging_sdk::errors::TrustTaskRefusal;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -107,6 +108,16 @@ async fn handle_message(
         .or_else(|| message.pthid.clone())
         .unwrap_or_else(|| message.id.clone());
 
+    // A mediator from v0.52 refuses with a `trust-task-error` document where an
+    // earlier one sent a problem report. Both are routed the same way, so the
+    // form a refusal arrives in changes nothing. No other message carries such a
+    // document, so reading it first takes nothing from the arms below.
+    let refusal = TrustTaskRefusal::from_document(&message.body);
+    if refusal.is_some() || message.typ == MSG_TYPE_PROBLEM_REPORT {
+        handle_refusal(&message, refusal.as_ref(), &thid, connection, store, ws_state).await;
+        return;
+    }
+
     match message.typ.as_str() {
         connection::SETUP_RECEIVED => {
             info!("TR reader: setup/received for '{}'", connection.trust_registry_id);
@@ -115,39 +126,6 @@ async fn handle_message(
         connection::SETUP_APPROVED => {
             info!("TR reader: setup/approved for '{}'", connection.trust_registry_id);
             update_status(connection, TrustRegistryConnectionStatus::Connected, store, ws_state).await;
-        }
-        MSG_TYPE_PROBLEM_REPORT => {
-            let result = PollResult {
-                msg_type: message.typ.clone(),
-                body: message.body.clone(),
-            };
-            if connection
-                .deliver_response(&thid, result)
-                .await
-            {
-                debug!("TR reader: delivered problem-report to waiter (thid {})", thid);
-            } else if is_request_thread(&thid) {
-                warn!(
-                    // Peer-chosen: capped at 64 chars and Debug-escaped.
-                    thid = ?thid.chars().take(64).collect::<String>(),
-                    "TR reader: problem-report for '{}' answers a request no longer awaited, ignoring",
-                    connection.trust_registry_id
-                );
-            } else {
-                // Not a reply to a request → the registry rejected the gateway.
-                let code = message
-                    .body
-                    .get("code")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let comment = message
-                    .body
-                    .get("comment")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                error!("TR reader: problem-report for '{}': {}: {}", connection.trust_registry_id, code, comment);
-                update_status(connection, TrustRegistryConnectionStatus::Failed, store, ws_state).await;
-            }
         }
         other => {
             let result = PollResult {
@@ -165,6 +143,78 @@ async fn handle_message(
             }
         }
     }
+}
+
+/// Route a refusal the way a problem report has always been routed: to the
+/// waiter it answers, ignored when that request is no longer awaited, and
+/// otherwise taken as the gateway being rejected. `refusal` is the
+/// `trust-task-error` document when the refusal came in that form.
+async fn handle_refusal(
+    message: &DIDCommMessage,
+    refusal: Option<&TrustTaskRefusal>,
+    thid: &str,
+    connection: &TrustRegistryConnection,
+    store: &Option<Arc<dyn TrustRegistryStore>>,
+    ws_state: &Option<WsState>,
+) {
+    let result = PollResult {
+        msg_type: message.typ.clone(),
+        body: message.body.clone(),
+    };
+    if connection
+        .deliver_response(thid, result)
+        .await
+    {
+        debug!("TR reader: delivered refusal to waiter (thid {})", thid);
+        return;
+    }
+    if is_request_thread(thid) {
+        warn!(
+            // Peer-chosen: capped at 64 chars and Debug-escaped.
+            thid = ?thid.chars().take(64).collect::<String>(),
+            "TR reader: refusal for '{}' answers a request no longer awaited, ignoring",
+            connection.trust_registry_id
+        );
+        return;
+    }
+    // Not a reply to a request → the registry rejected the gateway.
+    let (code, comment) = refusal_reason(message, refusal);
+    error!("TR reader: refusal for '{}': {}: {}", connection.trust_registry_id, code, comment);
+    update_status(connection, TrustRegistryConnectionStatus::Failed, store, ws_state).await;
+}
+
+/// The code and explanation to log, read from whichever form the refusal
+/// arrived in.
+fn refusal_reason(
+    message: &DIDCommMessage,
+    refusal: Option<&TrustTaskRefusal>,
+) -> (String, String) {
+    if let Some(refusal) = refusal {
+        return (
+            refusal.code.clone(),
+            refusal
+                .message
+                .clone()
+                .unwrap_or_default(),
+        );
+    }
+    let field = |name: &str| {
+        message
+            .body
+            .get(name)
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let code = field("code");
+    (
+        if code.is_empty() {
+            "unknown".to_string()
+        } else {
+            code
+        },
+        field("comment"),
+    )
 }
 
 /// Persist a connection-status change and refresh the dashboard, mirroring the
@@ -256,6 +306,26 @@ mod tests {
         .finalize()
     }
 
+    /// The same refusal in the form a mediator from v0.52 sends: a
+    /// `trust-task-error` document under the Trust Tasks envelope type.
+    fn trust_task_error(thid: &str) -> DIDCommMessage {
+        DIDCommMessage::build(
+            uuid::Uuid::new_v4().to_string(),
+            "https://trusttasks.org/binding/didcomm/0.1/envelope".to_string(),
+            serde_json::json!({
+                "id": "urn:uuid:00000000-0000-4000-8000-000000000001",
+                "type": "https://trusttasks.org/spec/trust-task-error/0.6",
+                "payload": {
+                    "code": "messaging/account/get:unknownAccount",
+                    "message": "account not found",
+                    "retryable": false,
+                },
+            }),
+        )
+        .thid(thid.to_string())
+        .finalize()
+    }
+
     async fn status_of(
         store: &Option<Arc<dyn TrustRegistryStore>>,
         connection: &TrustRegistryConnection,
@@ -293,5 +363,74 @@ mod tests {
 
             assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Failed);
         }
+    }
+    #[tokio::test]
+    async fn a_trust_task_error_answering_a_request_no_longer_awaited_keeps_the_status() {
+        let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connected).await;
+
+        let thid = format!("{}timed-out", super::super::communication::REQUEST_THREAD_PREFIX);
+        handle_message(trust_task_error(&thid), &connection, &store, &None).await;
+
+        assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Connected);
+    }
+
+    #[tokio::test]
+    async fn an_unmatched_trust_task_error_on_any_other_thread_marks_the_registry_failed() {
+        for status in [
+            TrustRegistryConnectionStatus::Connecting,
+            TrustRegistryConnectionStatus::AwaitingApproval,
+            TrustRegistryConnectionStatus::Connected,
+        ] {
+            let before = format!("{status:?}");
+            let (connection, store, _dir) = registry_with(status).await;
+
+            handle_message(trust_task_error("thid-rejection"), &connection, &store, &None).await;
+
+            assert_eq!(
+                status_of(&store, &connection).await,
+                TrustRegistryConnectionStatus::Failed,
+                "a refusal from {before} ends the same way in either form"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_that_is_not_a_refusal_keeps_the_status() {
+        let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connected).await;
+        let unanswered = DIDCommMessage::build(
+            uuid::Uuid::new_v4().to_string(),
+            connection::SETUP.to_string(),
+            serde_json::json!({}),
+        )
+        .thid("thid-unmatched".to_string())
+        .finalize();
+
+        handle_message(unanswered, &connection, &store, &None).await;
+
+        assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Connected);
+    }
+
+    #[test]
+    fn a_refusal_is_read_from_whichever_form_it_arrived_in() {
+        let document = trust_task_error("thid-rejection");
+        let refusal = TrustTaskRefusal::from_document(&document.body).expect("a trust-task-error");
+        assert_eq!(
+            refusal_reason(&document, Some(&refusal)),
+            ("messaging/account/get:unknownAccount".to_string(), "account not found".to_string()),
+            "a trust-task-error keeps its code and message under payload"
+        );
+
+        assert_eq!(
+            refusal_reason(&problem_report("thid-rejection"), None),
+            ("e.p.rejected".to_string(), "rejected".to_string())
+        );
+
+        let bare = DIDCommMessage::build(
+            uuid::Uuid::new_v4().to_string(),
+            MSG_TYPE_PROBLEM_REPORT.to_string(),
+            serde_json::json!({}),
+        )
+        .finalize();
+        assert_eq!(refusal_reason(&bare, None), ("unknown".to_string(), String::new()));
     }
 }
