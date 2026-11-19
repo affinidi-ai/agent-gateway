@@ -26,6 +26,8 @@ interface PolicyEditorSectionProps {
   packageMismatch: string | null;
   onFixPackage: () => void;
   justAdded: string | null;
+  /** Per rule group, the other Type its template was written for. */
+  otherTypeGroups?: (PolicyType | null)[];
   /** The template a new policy's own rules started from, while they still follow it. */
   startedFrom?: string | null;
   onAdd: () => void;
@@ -52,6 +54,7 @@ const PolicyEditorSection: React.FC<PolicyEditorSectionProps> = ({
   packageMismatch,
   onFixPackage,
   justAdded,
+  otherTypeGroups,
   startedFrom = null,
   onAdd,
   onRemoveGroup,
@@ -155,6 +158,7 @@ const PolicyEditorSection: React.FC<PolicyEditorSectionProps> = ({
           packageMismatch={!!packageMismatch}
           empty={empty}
           justAdded={justAdded}
+          otherTypeGroups={otherTypeGroups}
           onAdd={onAdd}
           onWriteRego={() => onViewChange('rego')}
           onRemoveGroup={onRemoveGroup}

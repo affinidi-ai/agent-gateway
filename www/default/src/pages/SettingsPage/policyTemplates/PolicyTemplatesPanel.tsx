@@ -1,9 +1,8 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { AppButton } from '../../../components/shared/AppButton';
-import { Badge } from '../../../components/shared/Badge';
 import InfoBanner from '../../../components/shared/InfoBanner';
-import { defaultDecision, insertTemplateRules } from './regoTemplate';
-import { DecisionBadge, TemplateOriginBadges } from './TemplateBadges';
+import { defaultDecision, insertTemplateRules, templateRole } from './regoTemplate';
+import { DecisionBadge, TemplateOriginBadges, TemplateRoleBadge } from './TemplateBadges';
 import TemplateFilterBar from './TemplateFilterBar';
 import {
   TemplateDocsLink,
@@ -22,11 +21,17 @@ interface PolicyTemplatesPanelProps {
   policyType: PolicyType;
   /** The editor's current Rego, which Add to policy appends to. */
   existingPolicy?: string;
+  /** On the create form whole policies are offered under Start from. */
+  isCreateMode: boolean;
   /** `usesDefaultSettings` is false when a setting differs from its default. */
   onInsert: (template: PolicyTemplate, rego: string, usesDefaultSettings: boolean) => void;
 }
 
 const ID_PREFIX = 'policy-templates';
+
+const addsRules = (t: PolicyTemplate) => templateRole(t) === 'rules';
+
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
 /** The chosen template's settings, the lines it adds, its notes and Add to policy. */
 const InsertPreview: React.FC<{
@@ -39,101 +44,62 @@ const InsertPreview: React.FC<{
   const insert = rendered.rego
     ? insertTemplateRules(existingPolicy, template.name, rendered.rego)
     : null;
-  const forToolBinding = template.policy_input === 'mcp_tool';
-  const refused = !!template.standalone || forToolBinding;
-  const canInsert = !!insert?.added && !refused;
-  const defaultOnly = !forToolBinding && !!insert && !insert.added;
-  const decision = defaultDecision(template.rego);
-  const noteTestId = forToolBinding
-    ? 'policy-templates-mcp-tool-note'
-    : defaultOnly
-      ? 'policy-templates-default-only-note'
-      : 'policy-templates-standalone-note';
+  const canInsert = !!insert?.added;
 
   return (
     <div className="policy-template-preview" data-testid="policy-templates-preview">
       <h6 className="fw-bold mb-1">{template.name}</h6>
       <p className="text-muted small mb-2">{template.description}</p>
       <div className="d-flex flex-wrap gap-2 mb-3">
-        <DecisionBadge decision={decision} />
+        <TemplateRoleBadge template={template} />
+        <DecisionBadge decision={defaultDecision(template.rego)} />
         <TemplateOriginBadges template={template} />
       </div>
 
       <TemplateSettingsFields template={template} settings={settings} idPrefix={ID_PREFIX} />
 
-      {refused ? (
-        <>
-          <div data-testid={noteTestId}>
-            <InfoBanner
-              variant={forToolBinding || defaultOnly ? 'default' : 'warning'}
-              icon={forToolBinding || defaultOnly ? 'fa-info-circle' : 'fa-exclamation-triangle'}
-              collapsible={false}
-              className="mb-2"
-              summary={
-                forToolBinding ? (
-                  "For a policy bound to MCP tools on the MCP Proxy hop. It reads the tool call, not the request, so it can't be added here. Start a new policy from it."
-                ) : defaultOnly ? (
-                  <>
-                    This template only sets the default decision and adds no rules. To use it,
-                    change <code>default allow</code> to{' '}
-                    <code>{decision === 'allow' ? 'true' : 'false'}</code> in the Rego, or pick it
-                    under Start from on a new policy.
-                  </>
-                ) : (
-                  'Its rules allow requests outside what it restricts, so adding them would widen this policy. Start a new policy from it instead.'
-                )
-              }
-            />
-          </div>
-          <pre
-            className="policy-preview-block rounded p-2 mb-3 small"
-            data-testid="policy-templates-rego-preview"
-          >
-            <code>{rendered.rego ?? 'Fix the settings above to see the Rego.'}</code>
-          </pre>
-        </>
-      ) : (
-        <>
-          <div className="font-weight-bold mb-1">Added to the end of the policy</div>
-          <pre
-            className="policy-preview-block rounded p-2 mb-2 small"
-            data-testid="policy-templates-insert-preview"
-          >
-            <code>
-              {insert ? insert.added || '(none)' : 'Fix the settings above to see the rules.'}
-            </code>
-          </pre>
-          {insert?.added && (
-            <div data-testid="policy-templates-or-note">
-              <InfoBanner
-                collapsible={false}
-                className="mb-2"
-                summary={
-                  <>
-                    Allow rules combine with OR: a request passes when any allow rule matches. Its{' '}
-                    <code>default allow</code> line is not copied.
-                  </>
-                }
-              />
-            </div>
-          )}
-          {!template.builtin && insert?.added && (
-            <div data-testid="policy-templates-org-insert-warning">
-              <InfoBanner
-                variant="warning"
-                icon="fa-exclamation-triangle"
-                collapsible={false}
-                className="mb-2"
-                summary="This template was saved from a policy, so its rules are added as written. Rules combine with OR: check that none of them allows requests this policy should deny."
-              />
-            </div>
-          )}
-          {insert && !insert.added && (
-            <div className="text-muted small mb-2">
-              This template adds no rules to an existing policy.
-            </div>
-          )}
-        </>
+      <div className="font-weight-bold mb-1">Added to the end of the policy</div>
+      <pre
+        className="policy-preview-block rounded p-2 mb-2 small"
+        data-testid="policy-templates-insert-preview"
+      >
+        <code>{insert ? insert.added : 'Fix the settings above to see the rules.'}</code>
+      </pre>
+      {canInsert && defaultDecision(existingPolicy) === 'allow' && (
+        <div data-testid="policy-templates-allow-default-note">
+          <InfoBanner
+            variant="warning"
+            icon="fa-exclamation-triangle"
+            collapsible={false}
+            className="mb-2"
+            summary="This policy allows every request by default, so these rules change nothing until you choose Deny by default."
+          />
+        </div>
+      )}
+      {canInsert && (
+        <div data-testid="policy-templates-or-note">
+          <InfoBanner
+            collapsible={false}
+            className="mb-2"
+            summary={
+              <>
+                Allow rules combine with OR: a request passes when any allow rule matches. Its{' '}
+                <code>default allow</code> line is not copied.
+              </>
+            }
+          />
+        </div>
+      )}
+      {!template.builtin && canInsert && (
+        <div data-testid="policy-templates-org-insert-warning">
+          <InfoBanner
+            variant="warning"
+            icon="fa-exclamation-triangle"
+            collapsible={false}
+            className="mb-2"
+            summary="This template was saved from a policy, so its rules are added as written. Rules combine with OR: check that none of them allows requests this policy should deny."
+          />
+        </div>
       )}
 
       <TemplateHowItDecides template={template} idPrefix={ID_PREFIX} />
@@ -156,17 +122,24 @@ const InsertPreview: React.FC<{
 const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
   policyType,
   existingPolicy = '',
+  isCreateMode,
   onInsert,
 }) => {
-  const { builtin, organization, loading, error } = usePolicyTemplates(policyType);
+  const { builtin: allBuiltin, organization, loading, error } = usePolicyTemplates(policyType);
   const [source, setSource] = useState<Source>('builtin');
   const [selected, setSelected] = useState<PolicyTemplate | null>(null);
 
-  const sourceTemplates = source === 'builtin' ? builtin : organization;
+  const builtin = useMemo(() => allBuiltin.filter(addsRules), [allBuiltin]);
+  const organizationRules = useMemo(() => organization.filter(addsRules), [organization]);
+  const sourceTemplates = source === 'builtin' ? builtin : organizationRules;
   const { query, setQuery, category, setCategory, categories, visible } =
     useTemplateFilter(sourceTemplates);
-  // Templates written only for the other policy type, which this policy can't use.
+  const wholePolicies =
+    allBuiltin.length + organization.length - builtin.length - organizationRules.length;
   const otherTypeOnly = useAllPolicyTemplates().filter(e => !e.variants[policyType]).length;
+  const leftOut = wholePolicies + otherTypeOnly;
+  const otherTypeName =
+    POLICY_TYPE_NAMES[policyType === 'gateway' ? 'agent_surface' : 'gateway'].name;
 
   const switchSource = (next: Source) => {
     setSource(next);
@@ -187,7 +160,7 @@ const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
           {(
             [
               ['builtin', 'Default templates', builtin.length],
-              ['organization', 'Organization templates', organization.length],
+              ['organization', 'Organization templates', organizationRules.length],
             ] as const
           ).map(([key, label, count]) => (
             <li className="nav-item" role="presentation" key={key}>
@@ -249,22 +222,28 @@ const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
                       <span className="policy-template-row__summary">{t.summary}</span>
                     </span>
                     <span className="d-flex flex-column align-items-end gap-1">
+                      <TemplateRoleBadge template={t} />
                       <DecisionBadge decision={defaultDecision(t.rego)} />
                       <TemplateOriginBadges template={t} />
-                      {t.policy_input === 'mcp_tool' && (
-                        <Badge tone="secondary" value="MCP tool policy" />
-                      )}
                     </span>
                   </button>
                 </li>
               ))}
             </ul>
-            {otherTypeOnly > 0 && (
-              <div className="small text-muted mt-2" data-testid="policy-templates-other-type-note">
-                {otherTypeOnly}{' '}
-                {POLICY_TYPE_NAMES[policyType === 'gateway' ? 'agent_surface' : 'gateway'].name}{' '}
-                {otherTypeOnly === 1 ? 'template is' : 'templates are'} left out for a{' '}
-                {POLICY_TYPE_NAMES[policyType].name} policy.
+            {!loading && leftOut > 0 && (
+              <div className="small text-muted mt-2" data-testid="policy-templates-left-out-note">
+                {`${plural(leftOut, 'template', 'templates')} left out: ${[
+                  wholePolicies > 0 &&
+                    plural(wholePolicies, 'is a whole policy', 'are whole policies'),
+                  otherTypeOnly > 0 &&
+                    `${plural(otherTypeOnly, 'is', 'are')} for ${otherTypeName} policies`,
+                ]
+                  .filter(Boolean)
+                  .join(', ')}.`}
+                {wholePolicies > 0 &&
+                  (isCreateMode
+                    ? ' Pick a whole policy under Start from.'
+                    : ' Whole policies are offered only when creating a policy.')}
               </div>
             )}
           </div>

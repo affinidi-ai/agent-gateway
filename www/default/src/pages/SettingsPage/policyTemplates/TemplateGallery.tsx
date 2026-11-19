@@ -5,7 +5,13 @@ import { ALLOW_ALL_POLICY, BLANK_TEMPLATE_ID, DEFAULT_TEMPLATE_KEY } from './pol
 import PolicySectionTitle from './PolicySectionTitle';
 import { defaultDecision } from './regoTemplate';
 import { ALLOW_ALL_NAME, type PolicyStart } from './policyStart';
-import { DecisionBadge, TemplateOriginBadges } from './TemplateBadges';
+import { parsePolicyRules } from './regoRules';
+import {
+  DecisionBadge,
+  RoleBadge,
+  TemplateOriginBadges,
+  TemplateRoleBadge,
+} from './TemplateBadges';
 import TemplateFilterBar from './TemplateFilterBar';
 import {
   TemplateDocsLink,
@@ -28,6 +34,8 @@ interface TemplateGalleryProps {
   step?: number;
   /** What the policy started from, while its Rego still follows it (`policyStart`). */
   start: PolicyStart | null;
+  /** The current Rego, which Use replaces. */
+  policy: string;
   usedTemplate: UsedTemplate | null;
   /** Counts Add to policy actions; each one collapses the gallery to its summary. */
   rulesAdded: number;
@@ -81,6 +89,82 @@ const ShowRego: React.FC<{ rego: string | null }> = ({ rego }) => {
   );
 };
 
+/**
+ * What Use replaces, or null while the Rego is an untouched start, which Use replaces at once.
+ */
+function replaceText(policy: string, start: PolicyStart | null): string | null {
+  if (start && start.templatesAdded === 0) return null;
+  const parsed = parsePolicyRules(policy);
+  const rules = parsed.ok ? parsed.groups.reduce((n, g) => n + g.rules.length, 0) : 0;
+  return rules > 0
+    ? `This replaces the ${rules} ${rules === 1 ? 'rule' : 'rules'} in the Policy section.`
+    : 'This replaces your edits in the Policy section.';
+}
+
+/**
+ * Use this template. With `replaces` set, the first click asks in place before the Rego is
+ * replaced, with the focus on Cancel; Cancel and Escape close it and return the focus to Use.
+ */
+const UseTemplateButton: React.FC<{
+  replaces: string | null;
+  disabled?: boolean;
+  onUse: () => void;
+}> = ({ replaces, disabled, onUse }) => {
+  const [confirming, setConfirming] = useState(false);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const opened = useRef(false);
+  useEffect(() => {
+    if (confirming) cancelRef.current?.focus();
+    else if (opened.current) buttonRef.current?.focus();
+    opened.current = confirming;
+  }, [confirming]);
+
+  return (
+    <>
+      <div className="d-flex justify-content-end">
+        <AppButton
+          ref={buttonRef}
+          disabled={disabled}
+          aria-expanded={replaces ? confirming : undefined}
+          onClick={() => (replaces ? setConfirming(true) : onUse())}
+          data-testid="policy-template-gallery-use-button"
+        >
+          Use this template
+        </AppButton>
+      </div>
+      {replaces && confirming && (
+        <div
+          className="policy-template-replace"
+          role="group"
+          aria-label="Replace the policy"
+          onKeyDown={e => {
+            if (e.key === 'Escape') setConfirming(false);
+          }}
+          data-testid="policy-template-gallery-replace-confirm"
+        >
+          <span className="small">{replaces}</span>
+          <AppButton
+            variant="danger"
+            onClick={onUse}
+            data-testid="policy-template-gallery-replace-button"
+          >
+            Replace
+          </AppButton>
+          <AppButton
+            ref={cancelRef}
+            variant="outline-secondary"
+            onClick={() => setConfirming(false)}
+            data-testid="policy-template-gallery-replace-cancel-button"
+          >
+            Cancel
+          </AppButton>
+        </div>
+      )}
+    </>
+  );
+};
+
 /** The selected card's detail: settings, its Rego, how it decides, docs and Use this template. */
 const GalleryDetail: React.FC<{
   template: PolicyTemplate;
@@ -88,8 +172,9 @@ const GalleryDetail: React.FC<{
   initialText?: FieldText;
   headingRef: React.Ref<HTMLHeadingElement>;
   hidden: boolean;
+  replaces: string | null;
   onUse: (template: PolicyTemplate, rego: string, fieldText: FieldText) => void;
-}> = ({ template, policyType, initialText, headingRef, hidden, onUse }) => {
+}> = ({ template, policyType, initialText, headingRef, hidden, replaces, onUse }) => {
   const settings = useTemplateSettings(template, initialText);
   return (
     <div
@@ -100,6 +185,7 @@ const GalleryDetail: React.FC<{
       <DetailHeading ref={headingRef}>{template.name}</DetailHeading>
       <p className="text-muted small mb-2">{template.description}</p>
       <div className="d-flex flex-wrap gap-2 mb-3">
+        <TemplateRoleBadge template={template} />
         <DecisionBadge decision={defaultDecision(template.rego)} />
         <TemplateOriginBadges template={template} />
         {template.policy_type !== policyType && (
@@ -113,17 +199,13 @@ const GalleryDetail: React.FC<{
       <ShowRego rego={settings.rendered.rego} />
       <TemplateHowItDecides template={template} idPrefix={ID_PREFIX} />
       <TemplateDocsLink template={template} testId="policy-template-gallery-docs-link" />
-      <div className="d-flex justify-content-end">
-        <AppButton
-          disabled={!settings.rendered.rego}
-          onClick={() =>
-            settings.rendered.rego && onUse(template, settings.rendered.rego, settings.fieldText)
-          }
-          data-testid="policy-template-gallery-use-button"
-        >
-          Use this template
-        </AppButton>
-      </div>
+      <UseTemplateButton
+        replaces={replaces}
+        disabled={!settings.rendered.rego}
+        onUse={() =>
+          settings.rendered.rego && onUse(template, settings.rendered.rego, settings.fieldText)
+        }
+      />
     </div>
   );
 };
@@ -137,11 +219,13 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
   policyType,
   step,
   start,
+  policy,
   usedTemplate,
   rulesAdded,
   onPickBlank,
   onUseTemplate,
 }) => {
+  const replaces = useMemo(() => replaceText(policy, start), [policy, start]);
   const entries = useAllPolicyTemplates();
   // Each card stands for the variant of the current Type, or the template's only variant.
   const all = useMemo(
@@ -317,6 +401,7 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
                 ALLOW_ALL_NAME,
                 'Every request is allowed. Start here only to write your own Rego.',
                 <>
+                  <RoleBadge role="policy" />
                   <DecisionBadge decision="allow" />
                   <span className="policy-template-row__summary">{CATEGORY_LABELS.baseline}</span>
                 </>,
@@ -329,6 +414,7 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
                 t.name,
                 t.summary,
                 <>
+                  <TemplateRoleBadge template={t} />
                   <DecisionBadge decision={defaultDecision(t.rego)} />
                   <TemplateOriginBadges template={t} />
                   {t.policy_type !== policyType && (
@@ -383,16 +469,16 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
               data-testid="policy-template-gallery-detail"
             >
               <DetailHeading ref={headingRef}>{ALLOW_ALL_NAME}</DetailHeading>
+              <div className="d-flex flex-wrap gap-2 mb-2">
+                <RoleBadge role="policy" />
+                <DecisionBadge decision="allow" />
+              </div>
               <p className="text-muted small mb-3">
                 The default allow-all policy. Every request is allowed until you add rules and
                 change <code>default allow</code> to <code>false</code>.
               </p>
               <ShowRego rego={ALLOW_ALL_POLICY[policyType]} />
-              <div className="d-flex justify-content-end">
-                <AppButton onClick={useBlank} data-testid="policy-template-gallery-use-button">
-                  Use this template
-                </AppButton>
-              </div>
+              <UseTemplateButton replaces={replaces} onUse={useBlank} />
             </div>
           ) : (
             selected && (
@@ -403,6 +489,7 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
                 initialText={usedTemplate?.id === selected.id ? usedTemplate.fieldText : undefined}
                 headingRef={headingRef}
                 hidden={detailHidden}
+                replaces={replaces}
                 onUse={use}
               />
             )

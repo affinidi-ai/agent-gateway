@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { apiClient } from '../../api';
 import { showToast, showUndoToast } from '../../utils/toaster';
@@ -25,7 +25,7 @@ import { BLANK_TEMPLATE_ID } from './policyTemplates/policyDefaults';
 import { POLICY_TYPE_NAMES, type PolicyTemplate, type PolicyType } from './policyTemplates/types';
 import { usePolicyTemplateActions } from './policyTemplates/usePolicyTemplateActions';
 import { useAllPolicyTemplates } from './policyTemplates/usePolicyTemplates';
-import { policyStart } from './policyTemplates/policyStart';
+import { groupsForOtherType, policyStart } from './policyTemplates/policyStart';
 
 interface PolicyDefinition {
   id: string;
@@ -38,29 +38,6 @@ interface PolicyDefinition {
   updated_at?: string;
   sample_input?: string;
   content_hash?: string;
-}
-
-/** Built-in templates in the policy, used or inserted, that have no variant for `type`. */
-function templatesWithoutType(
-  policy: string,
-  usedTemplateId: string | undefined,
-  type: PolicyType
-): string[] {
-  const forType = new Set(
-    BUILTIN_POLICY_TEMPLATES.filter(t => t.policy_type === type).map(t => t.name)
-  );
-  const otherOnly = new Set(
-    BUILTIN_POLICY_TEMPLATES.filter(t => !forType.has(t.name)).map(t => t.name)
-  );
-  const parsed = parsePolicyRules(policy);
-  const names = parsed.ok
-    ? parsed.groups.flatMap(g =>
-        g.source.kind === 'template' && otherOnly.has(g.source.name) ? [g.source.name] : []
-      )
-    : [];
-  const applied = BUILTIN_POLICY_TEMPLATES.find(t => t.id === usedTemplateId);
-  if (applied && otherOnly.has(applied.name)) names.unshift(applied.name);
-  return Array.from(new Set(names));
 }
 
 function extractPackage(policy: string): string | null {
@@ -138,6 +115,18 @@ const EditPolicyDefinitionPage: React.FC = () => {
       )
     : null;
   const startedFrom = usedTemplate && start ? start.name : null;
+  const otherTypeGroups = useMemo(
+    () =>
+      isCreateMode
+        ? groupsForOtherType(
+            parsePolicyRules(form.policy),
+            form.policy_type,
+            BUILTIN_POLICY_TEMPLATES
+          )
+        : [],
+    [isCreateMode, form.policy, form.policy_type]
+  );
+  const writtenForOtherType = otherTypeGroups.find((t): t is PolicyType => t !== null) ?? null;
   const simulateRef = useRef<HTMLDivElement>(null);
   const [focusTest, setFocusTest] = useState(0);
   const loadInTest = (name: string, input: Record<string, unknown>) => {
@@ -170,13 +159,12 @@ const EditPolicyDefinitionPage: React.FC = () => {
     if (usedTemplate && usedTemplate.id !== BLANK_TEMPLATE_ID) {
       setUsedTemplate(sameTemplate ? { ...usedTemplate, id: sameTemplate.id } : null);
     }
-    const otherTypeOnly = templatesWithoutType(policy, usedTemplate?.id, newType);
-    if (otherTypeOnly.length > 0) {
-      const one = otherTypeOnly.length === 1;
-      const other: PolicyType = newType === 'gateway' ? 'agent_surface' : 'gateway';
+    // Rules a used template wrote sit in Your rules, which has no group mark, so a toast names it.
+    const used = BUILTIN_POLICY_TEMPLATES.find(t => t.id === usedTemplate?.id);
+    if (used && !sameTemplate) {
       showToast(
         'warning',
-        `${otherTypeOnly.join(', ')} ${one ? 'is' : 'are'} written for ${POLICY_TYPE_NAMES[other].name} policies and ${one ? 'reads' : 'read'} input that ${POLICY_TYPE_NAMES[newType].name} policies don't get. Check those rules before you create the policy.`
+        `${used.name} is written for ${POLICY_TYPE_NAMES[used.policy_type].name} policies and reads input that ${POLICY_TYPE_NAMES[newType].name} policies don't get. Check its rules before you create the policy.`
       );
     }
   };
@@ -260,6 +248,12 @@ const EditPolicyDefinitionPage: React.FC = () => {
       setError(packageMismatch);
       return;
     }
+    if (writtenForOtherType) {
+      setError(
+        `Remove the rules written for ${POLICY_TYPE_NAMES[writtenForOtherType].name} policies to create this policy.`
+      );
+      return;
+    }
     setSaving(true);
     setError(null);
     try {
@@ -296,7 +290,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
     } finally {
       setSaving(false);
     }
-  }, [form, isCreateMode, navigate, packageMismatch]);
+  }, [form, isCreateMode, navigate, packageMismatch, writtenForOtherType]);
 
   // Track dirty state whenever form changes
   useEffect(() => {
@@ -349,6 +343,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
       key={form.policy_type}
       policyType={form.policy_type}
       existingPolicy={form.policy}
+      isCreateMode={isCreateMode}
       onInsert={addTemplateRules}
     />
   );
@@ -438,10 +433,10 @@ const EditPolicyDefinitionPage: React.FC = () => {
                 )}
                 {canEditPolicies && (
                   <button
-                    className={`btn btn-sm btn-primary me-2 ${saving || !policyValid || !!packageMismatch ? 'disabled' : ''}`}
+                    className={`btn btn-sm btn-primary me-2 ${saving || !policyValid || !!packageMismatch || !!writtenForOtherType ? 'disabled' : ''}`}
                     data-testid="policy-definition-editor-save-button"
                     onClick={handleSave}
-                    disabled={saving || !policyValid || !!packageMismatch}
+                    disabled={saving || !policyValid || !!packageMismatch || !!writtenForOtherType}
                   >
                     <i className={`fas ${saving ? 'fa-spinner fa-spin' : 'fa-save'}`}></i>
                     {saving ? ' Saving...' : isCreateMode ? ' Create' : ' Save'}
@@ -483,6 +478,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
                   step={1}
                   policyType={form.policy_type}
                   start={start}
+                  policy={form.policy}
                   usedTemplate={usedTemplate}
                   rulesAdded={rulesAdded}
                   onPickBlank={() => {
@@ -535,6 +531,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
                   }))
                 }
                 justAdded={justAdded}
+                otherTypeGroups={otherTypeGroups}
                 startedFrom={startedFrom}
                 onAdd={focusTemplatesColumn}
                 onRemoveGroup={removeGroup}

@@ -122,6 +122,16 @@ export function defaultDecision(rego: string): PolicyDecision {
   return explicitDefault(rego) ?? 'deny';
 }
 
+/**
+ * `policy` for a template meant to be the whole policy: a standalone one, one for MCP tool
+ * bindings, or one that adds no rules past its `default allow` line. Only `rules` templates can
+ * be added to a policy.
+ */
+export function templateRole(template: PolicyTemplate): 'policy' | 'rules' {
+  if (template.standalone || template.policy_input === 'mcp_tool') return 'policy';
+  return insertTemplateRules('', template.name, template.rego).added.trim() ? 'rules' : 'policy';
+}
+
 function explicitDefault(rego: string): PolicyDecision | null {
   const match = rego.match(DEFAULT_ALLOW_LINE);
   if (!match) return null;

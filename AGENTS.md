@@ -433,12 +433,16 @@ default, preselected in the **Start from** gallery, and opens on the Rules view.
 (**Allow all (blank)**, then default and organization templates of either Type, three of them
 marked Recommended) shows its
 settings, How it decides, its Rego and docs link in place, and **Use this template** fills the
-form and sets the Type. The Policy section's **Rules | Rego** toggle lists the rules grouped by
+form and sets the Type, asking in place first (focus on Cancel) unless the Rego is an untouched
+start. Every template is labelled **Whole policy** or **Adds rules**. The Policy section's
+**Rules | Rego** toggle lists the rules grouped by
 template, with Remove per group and per rule, disabled while `allow` reads the rule, with a
-reason that names the rule reading it. Once rules are added the gallery still names the
-template the policy started from and counts the templates added. **Add rules from a template** only adds rules, so several templates combine in a new or
-saved policy; it refuses a standalone template, one meant to be the whole policy because it only
-sets the default decision or allows requests outside what it restricts. A saved policy offers
+reason that names the rule reading it; under Default ALLOW each group with allow rules is marked
+as having no effect, and on a new policy a group written for the other Type is marked and
+blocks Create until it is removed. Once rules are added the gallery still names the
+template the policy started from and counts the templates added. **Add rules from a template**
+lists only templates that add rules, so several combine in a new or saved policy, and counts the
+whole policies and other-Type templates it leaves out. A saved policy offers
 **Save as template**, and once rules are added a Template examples card runs their examples
 through the existing simulate endpoint, says why a row differs and loads its input in Test
 (dry-run). Default templates ship with the dashboard; organization templates are ones a user

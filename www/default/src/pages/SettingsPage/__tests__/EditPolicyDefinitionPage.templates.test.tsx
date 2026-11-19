@@ -367,6 +367,8 @@ describe('the used template', () => {
 
     change();
     fireEvent.click(screen.getByTestId('policy-template-gallery-use-button'));
+    expect(rego().value).toContain('# reviewed');
+    fireEvent.click(screen.getByTestId('policy-template-gallery-replace-button'));
 
     expect(rego().value).not.toContain('# reviewed');
     expect(name()).toHaveValue('Allow listed HTTP methods');
@@ -604,8 +606,8 @@ describe('templates panel', () => {
     fireEvent.click(await panelRow('all-trust-checks-pass'));
     fireEvent.change(screen.getByDisplayValue('Agent Surfaces'), { target: { value: 'gateway' } });
 
-    expect(await screen.findByTestId('policy-templates-other-type-note')).toHaveTextContent(
-      'Agent Surface templates are left out for a Gateway policy.'
+    expect(await screen.findByTestId('policy-templates-left-out-note')).toHaveTextContent(
+      /are for Agent Surface policies\./
     );
     expect(screen.queryByTestId('policy-templates-preview')).toBeNull();
   });
@@ -635,21 +637,38 @@ describe('templates panel', () => {
       r => r.textContent ?? ''
     );
     for (const name of [
-      'Deny by default',
       'Require authenticated caller',
       'Allow by JWT claim or role',
       'Allow by JWT issuer and audience',
-      'Restrict MCP tools by role',
       'Require Trust Registry recognition',
       'Require verified credential subject',
-      'Allowlist outbound destinations',
       'Allow during business hours',
-      'Monitor-only baseline',
       'All trust checks pass',
     ]) {
       expect(names.some(n => n.startsWith(name))).toBe(true);
     }
     expect(names.some(n => /rate/i.test(n))).toBe(false);
+  });
+
+  it('lists only templates that add rules, each labelled Adds rules', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    const rows = await screen.findAllByTestId(/^policy-templates-row-/);
+    for (const row of rows) {
+      expect(within(row).getByTestId('policy-template-role-badge')).toHaveTextContent('Adds rules');
+    }
+    for (const id of [
+      'deny-by-default',
+      'allow-all-monitor',
+      'restrict-mcp-tools-by-role',
+      'allowlist-outbound-destinations',
+      'tool-allow-by-jwt-claim',
+      'tool-allow-every-caller',
+    ]) {
+      expect(screen.queryByTestId(`policy-templates-row-${id}:agent_surface`)).toBeNull();
+    }
+    expect(screen.getByTestId('policy-templates-tab-builtin')).toHaveTextContent(
+      `Default templates (${rows.length})`
+    );
   });
 
   it('shows an empty organization tab until a template is saved', async () => {
@@ -663,9 +682,8 @@ describe('templates panel', () => {
 describe('templates for the other type and for tool bindings', () => {
   it('lists only templates of the policy type in Add rules and says how many it left out', async () => {
     renderAt('/policy-definitions/new?type=gateway');
-    const note = await screen.findByTestId('policy-templates-other-type-note');
-    expect(note).toHaveTextContent(
-      /\d+ Agent Surface templates are left out for a Gateway policy\./
+    expect(await screen.findByTestId('policy-templates-left-out-note')).toHaveTextContent(
+      '16 templates left out: 2 are whole policies, 14 are for Agent Surface policies. Pick a whole policy under Start from.'
     );
     expect(
       screen.queryByTestId('policy-templates-row-require-authentication:agent_surface')
@@ -675,13 +693,14 @@ describe('templates for the other type and for tool bindings', () => {
     ).toBeInTheDocument();
   });
 
-  it('refuses to add an MCP tool policy template to a policy', async () => {
+  it('leaves out MCP tool policy templates as whole policies', async () => {
     renderAt('/policy-definitions/new?type=agent_surface');
-    fireEvent.click(await panelRow('tool-allow-by-jwt-claim'));
-    expect(screen.getByTestId('policy-templates-mcp-tool-note')).toHaveTextContent(
-      'bound to MCP tools'
+    expect(await screen.findByTestId('policy-templates-left-out-note')).toHaveTextContent(
+      /^8 templates left out: 8 are whole policies\. Pick a whole policy under Start from\.$/
     );
-    expect(screen.getByTestId('policy-templates-insert-rules-button')).toBeDisabled();
+    expect(
+      screen.queryByTestId('policy-templates-row-tool-allow-by-jwt-claim:agent_surface')
+    ).toBeNull();
   });
 
   it('shows the template docs link with its own label in the panel', async () => {
@@ -730,42 +749,20 @@ describe('add rules while creating a policy', () => {
     );
   });
 
-  it('refuses to add a standalone template', async () => {
+  it('says the rules change nothing while the policy allows by default', async () => {
     renderAt('/policy-definitions/new?type=agent_surface');
-    openAdd();
-    fireEvent.click(await row('restrict-mcp-tools-by-role'));
-    expect(screen.getByTestId('policy-templates-standalone-note')).toBeInTheDocument();
-    expect(screen.queryByTestId('policy-templates-default-only-note')).toBeNull();
-    expect(screen.getByTestId('policy-templates-insert-rules-button')).toBeDisabled();
-  });
-
-  it('says Deny by default only sets the default decision', async () => {
-    renderAt('/policy-definitions/new?type=agent_surface');
-    openAdd();
-    fireEvent.click(await row('deny-by-default'));
-    expect(screen.getByTestId('policy-templates-default-only-note')).toHaveTextContent(
-      'This template only sets the default decision and adds no rules. To use it, change default allow to false in the Rego, or pick it under Start from on a new policy.'
+    await useCard('blank');
+    fireEvent.click(await row('allow-http-methods'));
+    expect(screen.getByTestId('policy-templates-allow-default-note')).toHaveTextContent(
+      'This policy allows every request by default, so these rules change nothing until you choose Deny by default.'
     );
-    expect(screen.queryByTestId('policy-templates-standalone-note')).toBeNull();
-    expect(screen.getByTestId('policy-templates-insert-rules-button')).toBeDisabled();
   });
 
-  it('says Monitor-only baseline only sets an allow default', async () => {
+  it('has no allow-default note while the policy denies by default', async () => {
     renderAt('/policy-definitions/new?type=agent_surface');
-    openAdd();
-    fireEvent.click(await row('allow-all-monitor'));
-    expect(screen.getByTestId('policy-templates-default-only-note')).toHaveTextContent(
-      'change default allow to true'
-    );
-    expect(screen.getByTestId('policy-templates-insert-rules-button')).toBeDisabled();
-  });
-
-  it('keeps the MCP tool note on a tool template that only sets the default', async () => {
-    renderAt('/policy-definitions/new?type=agent_surface');
-    openAdd();
-    fireEvent.click(await row('tool-allow-every-caller'));
-    expect(screen.getByTestId('policy-templates-mcp-tool-note')).toBeInTheDocument();
-    expect(screen.queryByTestId('policy-templates-default-only-note')).toBeNull();
+    fireEvent.click(await row('allow-http-methods'));
+    expect(screen.getByTestId('policy-templates-insert-preview')).toBeInTheDocument();
+    expect(screen.queryByTestId('policy-templates-allow-default-note')).toBeNull();
   });
 });
 
@@ -826,16 +823,15 @@ describe('insert a template into a saved policy', () => {
     expect(within(card).queryByTestId('policy-template-examples-mismatch')).toBeNull();
   });
 
-  it('refuses to insert a standalone template that would widen the policy', async () => {
+  it('says whole policies are offered only when creating a policy', async () => {
     mockGateway();
     renderAt('/policy-definitions/partner-only');
-    fireEvent.click(await screen.findByTestId('policy-templates-insert-button'));
-    fireEvent.click(
-      await screen.findByTestId('policy-templates-row-restrict-mcp-tools-by-role:agent_surface')
+    expect(await screen.findByTestId('policy-templates-left-out-note')).toHaveTextContent(
+      '8 templates left out: 8 are whole policies. Whole policies are offered only when creating a policy.'
     );
-    expect(screen.getByTestId('policy-templates-standalone-note')).toBeInTheDocument();
-    expect(screen.queryByTestId('policy-templates-insert-preview')).toBeNull();
-    expect(screen.getByTestId('policy-templates-insert-rules-button')).toBeDisabled();
+    expect(
+      screen.queryByTestId('policy-templates-row-restrict-mcp-tools-by-role:agent_surface')
+    ).toBeNull();
   });
 
   it('warns when the policy allows every request by default', async () => {
@@ -1163,13 +1159,148 @@ describe('editing after a template', () => {
     expect(screen.queryByTestId('policy-template-gallery')).toBeNull();
   });
 
-  it('warns when a Type change keeps rules written for the other type', async () => {
+  it('marks added rules written for the other Type and blocks Create until they are removed', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    fireEvent.click(await panelRow('require-authentication'));
+    fireEvent.click(screen.getByTestId('policy-templates-insert-rules-button'));
+    const save = screen.getByTestId('policy-definition-editor-save-button');
+    expect(save).toBeEnabled();
+
+    fireEvent.change(screen.getByDisplayValue('Agent Surfaces'), { target: { value: 'gateway' } });
+
+    expect(screen.getByTestId('policy-rules-group-0-other-type')).toHaveTextContent(
+      "Written for Agent Surface policies. It reads input Gateway policies don't get. Remove it to create this policy."
+    );
+    expect(screen.getByTestId('policy-rules-other-type-banner')).toBeInTheDocument();
+    expect(save).toBeDisabled();
+    fireEvent.keyDown(document, { key: 's', ctrlKey: true });
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'POST')).toBe(false);
+
+    fireEvent.click(screen.getByTestId('policy-rules-group-0-remove-button'));
+
+    expect(screen.queryByTestId('policy-rules-other-type-banner')).toBeNull();
+    expect(save).toBeEnabled();
+  });
+
+  it('marks no added rules when the Type change keeps a variant of their template', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    fireEvent.click(await panelRow('allow-http-methods'));
+    fireEvent.click(screen.getByTestId('policy-templates-insert-rules-button'));
+    fireEvent.change(screen.getByDisplayValue('Agent Surfaces'), { target: { value: 'gateway' } });
+    expect(screen.queryByTestId('policy-rules-group-0-other-type')).toBeNull();
+    expect(screen.getByTestId('policy-definition-editor-save-button')).toBeEnabled();
+  });
+
+  it('warns when a Type change keeps rules a used template wrote for the other type', async () => {
     renderAt('/policy-definitions/new?type=agent_surface');
     await useCard('require-authentication');
     fireEvent.change(screen.getByDisplayValue('Agent Surfaces'), { target: { value: 'gateway' } });
     expect(
       await screen.findByText(/Require authenticated caller is written for Agent Surface policies/)
     ).toBeInTheDocument();
+    expect(screen.getByTestId('policy-definition-editor-save-button')).toBeEnabled();
+  });
+});
+
+describe('template roles in the gallery', () => {
+  it('labels whole policies, Allow all included, and templates that add rules', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    const role = async (id: string) =>
+      within(await card(id)).getByTestId('policy-template-role-badge');
+    expect(await role('blank')).toHaveTextContent('Whole policy');
+    expect(await role('deny-by-default')).toHaveTextContent('Whole policy');
+    expect(await role('tool-allow-by-jwt-claim')).toHaveTextContent('Whole policy');
+    expect(await role('allow-http-methods')).toHaveTextContent('Adds rules');
+
+    fireEvent.click(await card('restrict-mcp-tools-by-role'));
+    expect(
+      within(screen.getByTestId('policy-template-gallery-detail')).getByTestId(
+        'policy-template-role-badge'
+      )
+    ).toHaveTextContent('Whole policy');
+  });
+});
+
+describe('Use over rules already in the policy', () => {
+  const name = () => screen.getByPlaceholderText('e.g. Require Authentication');
+  const confirm = () => screen.queryByTestId('policy-template-gallery-replace-confirm');
+
+  async function withAddedRules() {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    fireEvent.click(await panelRow('allow-http-methods'));
+    fireEvent.click(screen.getByTestId('policy-templates-insert-rules-button'));
+    fireEvent.click(screen.getByTestId('policy-template-gallery-change-button'));
+    fireEvent.click(await card('all-trust-checks-pass'));
+  }
+
+  it('asks in place first, with the focus on Cancel, and Cancel keeps the rules', async () => {
+    await withAddedRules();
+    const use = screen.getByTestId('policy-template-gallery-use-button');
+    fireEvent.click(use);
+
+    expect(confirm()).toHaveTextContent('This replaces the 1 rule in the Policy section.');
+    expect(rego().value).toContain('Allow listed HTTP methods');
+    const cancel = screen.getByTestId('policy-template-gallery-replace-cancel-button');
+    expect(cancel).toHaveFocus();
+
+    fireEvent.click(cancel);
+    expect(confirm()).toBeNull();
+    expect(use).toHaveFocus();
+    expect(rego().value).toContain('Allow listed HTTP methods');
+    expect(name()).toHaveValue('');
+  });
+
+  it('closes on Escape and returns the focus to Use', async () => {
+    await withAddedRules();
+    const use = screen.getByTestId('policy-template-gallery-use-button');
+    fireEvent.click(use);
+    fireEvent.keyDown(screen.getByTestId('policy-template-gallery-replace-cancel-button'), {
+      key: 'Escape',
+    });
+    expect(confirm()).toBeNull();
+    expect(use).toHaveFocus();
+  });
+
+  it('replaces the rules on Replace, with Undo', async () => {
+    await withAddedRules();
+    fireEvent.click(screen.getByTestId('policy-template-gallery-use-button'));
+    fireEvent.click(screen.getByTestId('policy-template-gallery-replace-button'));
+
+    expect(rego().value).not.toContain('Allow listed HTTP methods');
+    expect(rego().value).toContain('every r in input.trust_check_results.target { r.ok }');
+    expect(name()).toHaveValue('All trust checks pass');
+    act(() => mockUndo.last?.());
+    expect(rego().value).toContain('Allow listed HTTP methods');
+  });
+
+  it('closes the question when another card is picked', async () => {
+    await withAddedRules();
+    fireEvent.click(screen.getByTestId('policy-template-gallery-use-button'));
+    fireEvent.click(await card('allow-http-methods'));
+    expect(confirm()).toBeNull();
+  });
+
+  it('asks before Allow all replaces the rules too', async () => {
+    await withAddedRules();
+    fireEvent.click(await card('blank'));
+    fireEvent.click(screen.getByTestId('policy-template-gallery-use-button'));
+    expect(confirm()).toBeInTheDocument();
+    expect(rego().value).toContain('Allow listed HTTP methods');
+  });
+
+  it('names your edits when the hand-edited Rego cannot be read', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    fireEvent.change(rego(), { target: { value: 'package surface.policy\n\nallow if {' } });
+    fireEvent.click(await card('allow-http-methods'));
+    fireEvent.click(screen.getByTestId('policy-template-gallery-use-button'));
+    expect(confirm()).toHaveTextContent('This replaces your edits in the Policy section.');
+  });
+
+  it('applies at once over an untouched start', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    await useCard('allow-http-methods');
+    expect(confirm()).toBeNull();
+    expect(rego().value).toContain('allow if input.http.method in {"GET"}');
   });
 });
 

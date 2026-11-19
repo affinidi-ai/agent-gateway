@@ -1,5 +1,6 @@
 import React from 'react';
 import { Badge } from '../../../components/shared/Badge';
+import { templateRole } from './regoTemplate';
 import type { PolicyDecision, PolicyTemplate } from './types';
 
 /**
@@ -22,6 +23,29 @@ export const DecisionBadge: React.FC<{ decision: PolicyDecision }> = ({ decision
     Default {decision.toUpperCase()}
   </span>
 );
+
+/** Whether a template is the whole policy or rules Add to policy can add, as a neutral outline. */
+export const TemplateRoleBadge: React.FC<{ template: PolicyTemplate }> = ({ template }) => (
+  <RoleBadge role={templateRole(template)} />
+);
+
+export const RoleBadge: React.FC<{ role: 'policy' | 'rules' }> = ({ role }) => {
+  const policy = role === 'policy';
+  return (
+    <span
+      className="badge policy-rules__kind policy-template-role"
+      title={
+        policy
+          ? 'Meant to be the whole policy; used from Start from on a new policy'
+          : 'Its rules can be added to a policy'
+      }
+      data-testid="policy-template-role-badge"
+    >
+      <i className={`fas ${policy ? 'fa-file-shield' : 'fa-list-check'}`} aria-hidden="true" />
+      {policy ? 'Whole policy' : 'Adds rules'}
+    </span>
+  );
+};
 
 /** Recommended on a suggested built-in, and This tab only on an organisation template. */
 export const TemplateOriginBadges: React.FC<{ template: PolicyTemplate }> = ({ template }) => (

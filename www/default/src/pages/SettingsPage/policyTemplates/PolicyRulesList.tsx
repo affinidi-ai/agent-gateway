@@ -3,6 +3,7 @@ import { AppButton } from '../../../components/shared/AppButton';
 import { Badge } from '../../../components/shared/Badge';
 import InfoBanner from '../../../components/shared/InfoBanner';
 import type { ParsedPolicy, PolicyRule, RuleGroup, RuleKind, RuleUse } from './regoRules';
+import { POLICY_TYPE_NAMES, type PolicyType } from './types';
 
 interface PolicyRulesListProps {
   parsed: ParsedPolicy;
@@ -16,6 +17,8 @@ interface PolicyRulesListProps {
   empty: boolean;
   /** The template whose rules were added last, marked "Just added". */
   justAdded: string | null;
+  /** Per group, the other Type its template was written for (`groupsForOtherType`). */
+  otherTypeGroups?: (PolicyType | null)[];
   onAdd: () => void;
   onWriteRego: () => void;
   onRemoveGroup: (group: RuleGroup) => void;
@@ -58,6 +61,16 @@ const groupInUseText = (use: RuleUse) =>
     ? DOCUMENT_READ
     : `A rule outside this template uses its rules${readerText(use)}; remove that rule first.`;
 
+const otherTypeOf = (type: PolicyType): PolicyType =>
+  type === 'gateway' ? 'agent_surface' : 'gateway';
+
+const Misfit: React.FC<{ testId: string; children: React.ReactNode }> = ({ testId, children }) => (
+  <div className="policy-rules__misfit small" data-testid={testId}>
+    <i className="fas fa-exclamation-triangle" aria-hidden="true" />
+    <span>{children}</span>
+  </div>
+);
+
 const lineLabel = (rule: PolicyRule) =>
   rule.startLine === rule.endLine
     ? `Line ${rule.startLine}`
@@ -71,6 +84,7 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
   packageMismatch,
   empty,
   justAdded,
+  otherTypeGroups = [],
   onAdd,
   onWriteRego,
   onRemoveGroup,
@@ -103,8 +117,11 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
     );
   }
 
-  const allowRules = parsed.groups.some(g => g.rules.some(r => r.kind === 'allow'));
-  const groupsThatAllow = parsed.groups.filter(g => g.rules.some(r => r.kind === 'allow')).length;
+  const allows = (g: RuleGroup) => g.rules.some(r => r.kind === 'allow');
+  const allowRules = parsed.groups.some(allows);
+  const groupsThatAllow = parsed.groups.filter(allows).length;
+  const allowByDefault = parsed.defaultDecision === 'allow';
+  const misfitType = otherTypeGroups.find((t): t is PolicyType => t !== null);
   const lastJustAdded = parsed.groups.reduce<RuleGroup | null>(
     (last, g) => (g.source.kind === 'template' && g.source.name === justAdded ? g : last),
     null
@@ -136,7 +153,19 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
         </div>
       )}
 
-      {parsed.defaultDecision === 'allow' && allowRules && (
+      {misfitType && (
+        <div data-testid="policy-rules-other-type-banner">
+          <InfoBanner
+            variant="warning"
+            icon="fa-exclamation-triangle"
+            collapsible={false}
+            className="mb-2"
+            summary={`Remove the rules written for ${POLICY_TYPE_NAMES[misfitType].name} policies to create this policy.`}
+          />
+        </div>
+      )}
+
+      {allowByDefault && allowRules && (
         <div data-testid="policy-rules-allow-default-warning">
           <InfoBanner
             variant="warning"
@@ -194,6 +223,7 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
         const testId = `policy-rules-group-${index}`;
         const groupReason = isTemplate && canEdit ? groupUse(group) : null;
         const groupInUse = groupReason !== null;
+        const writtenFor = otherTypeGroups[index] ?? null;
         return (
           <div
             className="policy-rules__group"
@@ -240,6 +270,16 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
               >
                 {groupInUseText(groupReason)}
               </div>
+            )}
+            {writtenFor && (
+              <Misfit testId={`${testId}-other-type`}>
+                Written for {POLICY_TYPE_NAMES[writtenFor].name} policies. It reads input{' '}
+                {POLICY_TYPE_NAMES[otherTypeOf(writtenFor)].name} policies don&apos;t get. Remove it
+                to create this policy.
+              </Misfit>
+            )}
+            {allowByDefault && allows(group) && (
+              <Misfit testId={`${testId}-no-effect`}>No effect while the default is ALLOW.</Misfit>
             )}
             {group.rules.length === 0 && (
               <div className="small text-muted ps-2">No rules left from this template.</div>

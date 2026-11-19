@@ -1,6 +1,6 @@
 import { BUILTIN_POLICY_TEMPLATES } from '../builtinPolicyTemplates';
 import { EXPECTED_PACKAGE } from '../policyDefaults';
-import { defaultParameterValues, renderTemplate } from '../regoTemplate';
+import { defaultParameterValues, renderTemplate, templateRole } from '../regoTemplate';
 import { CATEGORY_LABELS } from '../types';
 
 describe('built-in policy templates', () => {
@@ -53,6 +53,32 @@ describe('built-in policy templates', () => {
         'allow-all-monitor',
       ])
     );
+  });
+
+  it('gives the standalone, MCP tool and default-only templates the whole-policy role', () => {
+    const roles = Object.fromEntries(
+      BUILTIN_POLICY_TEMPLATES.map(t => [t.id.split(':')[0], templateRole(t)])
+    );
+    expect(Object.keys(roles).filter(id => roles[id] === 'policy')).toEqual([
+      'deny-by-default',
+      'restrict-mcp-tools-by-role',
+      'allowlist-outbound-destinations',
+      'allow-all-monitor',
+      'tool-allow-authenticated',
+      'tool-allow-by-jwt-claim',
+      'tool-role-with-deny-reason',
+      'tool-allow-every-caller',
+    ]);
+    expect(roles['allow-http-methods']).toBe('rules');
+    expect(roles['require-authentication']).toBe('rules');
+  });
+
+  it('gives a template with nothing past its default line the whole-policy role', () => {
+    const base = BUILTIN_POLICY_TEMPLATES.find(t => t.id === 'allow-http-methods:gateway')!;
+    expect(
+      templateRole({ ...base, rego: 'package gateway.policy\n\ndefault allow := true\n' })
+    ).toBe('policy');
+    expect(templateRole({ ...base, standalone: false, policy_input: undefined })).toBe('rules');
   });
 
   it('reads input.jwt only in templates for MCP tool bindings, which are Agent Surface only', () => {

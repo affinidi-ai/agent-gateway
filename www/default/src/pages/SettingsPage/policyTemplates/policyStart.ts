@@ -4,7 +4,7 @@ import {
   DEFAULT_POLICY,
   DEFAULT_TEMPLATE_KEY,
 } from './policyDefaults';
-import { parsePolicyRules, removeRuleGroup } from './regoRules';
+import { parsePolicyRules, removeRuleGroup, type ParsedPolicy } from './regoRules';
 import { renderWithText } from './TemplatePreview';
 import type { PolicyTemplate, PolicyType } from './types';
 import type { AddedRules, UsedTemplate } from './usePolicyTemplateActions';
@@ -19,6 +19,25 @@ export interface PolicyStart {
 }
 
 const trimEnd = (rego: string) => rego.replace(/\s+$/, '');
+
+/**
+ * For each rule group, the Type its template was written for when no template of that name
+ * serves `policyType`, matched by name; null for every other group.
+ */
+export function groupsForOtherType(
+  parsed: ParsedPolicy,
+  policyType: PolicyType,
+  templates: PolicyTemplate[]
+): (PolicyType | null)[] {
+  if (!parsed.ok) return [];
+  const forType = new Set(templates.filter(t => t.policy_type === policyType).map(t => t.name));
+  const writtenFor = new Map(
+    templates.filter(t => !forType.has(t.name)).map(t => [t.name, t.policy_type] as const)
+  );
+  return parsed.groups.map(g =>
+    g.source.kind === 'template' ? (writtenFor.get(g.source.name.trim()) ?? null) : null
+  );
+}
 
 /**
  * What a new policy started from, while its Rego still follows it: each template group in the

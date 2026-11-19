@@ -1800,9 +1800,12 @@ from the one `POLICY_TYPE_NAMES` map in `policyTemplates/types.ts`, and the edit
 inline `style` except `SearchInput`'s `wrapperStyle` for the full-width column search, as
 `LogsFilterBar` does. The exceptions are the selectable `.policy-template-row` cards and rows, `nav-link`
 tabs, the Rego reference heading toggle, the examples card's `btn-close`, Back, the Rego view's package-mismatch
-alert with **Fix it** (Bootstrap `alert-danger`), and the Rules view's
+alert with **Fix it** (Bootstrap `alert-danger`), the Rules view's
 rule-kind badges (`.policy-rules__kind`, a neutral `--muted-text` outline for every kind, so a
-rule's kind never reads as an allow or deny decision).
+rule's kind never reads as an allow or deny decision), the template role badge
+(`RoleBadge`/`TemplateRoleBadge`, the same outline), and the Rules view's amber group lines
+(`.policy-rules__misfit`, `--warning-text` on a light amber tint, with a `body.dark-theme`
+border).
 
 Without `policies.edit` the page is read-only, since the gateway refuses a create or save
 without it: a muted line with a lock icon under the intro says "You can view this policy but not
@@ -1861,16 +1864,21 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   with `"input": "mcp_tool"` (category **MCP tool policies**, `agent_surface` only) are for
   policies bound to MCP tools on the MCP Proxy hop: they read `McpPolicyContext`
   (`src/mcp/policy.rs`: `input.jwt` claims, `input.mcp.method` as the tool name), carry an "MCP
-  tool policy" badge, and Add to policy refuses them (`policy-templates-mcp-tool-note`). A setting is a `{{key}}` placeholder with `kind` `integer` (`min`, `max`),
+  tool policy" badge in the gallery, and are whole policies (below). A setting is a `{{key}}` placeholder with `kind` `integer` (`min`, `max`),
   `string` or `string_list`. An integer's `after` names a setting it must be greater than, a
   string's `format: "time_zone"` accepts IANA names only (written in their canonical spelling),
   and a list's `allowed` names the only values accepted, matched without regard to case and
   written in the listed spelling; Allow during business hours uses all three. A template that reads the clock (`time.now_ns()`) has no examples.
   An entry is `standalone` when it is meant to be the whole policy: its rules only set the
   default decision (Deny by default, Monitor-only baseline) or allow requests outside what they
-  restrict (Restrict MCP tools by role, Allowlist outbound destinations). It is used from Start
-  from, and Add to policy refuses it (`policy-templates-default-only-note`,
-  `policy-templates-standalone-note`). Allow listed
+  restrict (Restrict MCP tools by role, Allowlist outbound destinations).
+  `templateRole` (`regoTemplate.ts`) gives every template one role: `policy` (a **Whole
+  policy**) for a standalone template, an MCP tool template, or one with no rules left once its
+  `default allow` line is dropped; `rules` (**Adds rules**) otherwise. A whole policy is used
+  only from Start from; only templates that add rules are listed under Add rules. Each card,
+  gallery detail, column row and preview shows the role badge
+  (`policy-template-role-badge`: "Whole policy" with `fa-file-shield`, "Adds rules" with
+  `fa-list-check`), and Allow all (blank) is a whole policy. Allow listed
   paths denies a path that contains `..`, `%2e`, a backslash or `%5c`.
   `builtinPolicyTemplates.test.ts` checks every entry renders under its package. The catalogue
   holds the starter templates of the template library except rate controls, which are set on
@@ -1950,11 +1958,21 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   (`policy-template-gallery-change-button`), which reopens
   it with the used card selected and its settings as they were used, also after a hand edit,
   and moves focus to the selected card, or to the search when no shown card is selected. Use
-  there replaces the Rego. After a discard and Undo the page keeps only the form, so no
+  there replaces the Rego. Use (of a template or Allow all) replaces at once while the Rego is
+  an untouched start (`policyStart` is not null and counts no added templates); otherwise its
+  first click asks in place under the button, never in a modal
+  (`policy-template-gallery-replace-confirm`): "This replaces the N rules in the Policy
+  section.", or "This replaces your edits in the Policy section." when there are no rules to
+  count or the Rego can't be read, with **Replace** (`danger`,
+  `policy-template-gallery-replace-button`) and **Cancel**
+  (`policy-template-gallery-replace-cancel-button`). Opening it moves focus to Cancel, so a
+  second Enter can't replace; Cancel and Escape close it and return focus to Use; picking
+  another card closes it. Replace applies the template with the usual Undo. After a discard and Undo the page keeps only the form, so no
   card is selected unless the Rego, without added template groups, is `DEFAULT_POLICY`. Changing Type keeps the Rego, whose
-  package line the Type select rewrites, keeps a template that serves both Types used,
-  with its settings, and shows a warning toast naming any default template in it, used or
-  added, that has no variant for the new Type.
+  package line the Type select rewrites, and keeps a template that serves both Types used,
+  with its settings. A used default template with no variant for the new Type gets a warning
+  toast naming it, since its rules sit in Your rules; added template groups are marked in the
+  Rules view instead (below).
 - **Templates column** (`PolicyTemplatesPanel`, `policy-templates-panel`): for users with
   `policies.edit` the page always has two columns, the editor card (`col-xl-8`) and a templates
   column (`col-xl-4`, `policy-templates-column`, sticky from `xl` below the top bar), so the
@@ -1964,9 +1982,12 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   rules ("Add rules from a template", no close button); only **Save as template** swaps in its
   own panel, and closing it returns to Add rules. **Add rules from a template**
   (`policy-templates-insert-button`, in the Policy section and the empty rules list) brings back
-  the Add rules panel, scrolls to the column and focuses its search. It lists only templates of
-  the policy's Type and says how many it leaves out ("14 Agent Surface templates are left out
-  for a Gateway policy.", `policy-templates-other-type-note`), and
+  the Add rules panel, scrolls to the column and focuses its search. It lists only templates
+  that add rules of the policy's Type (tab counts count only those) and says under the list
+  how many it leaves out across both tabs (`policy-templates-left-out-note`: "16 templates
+  left out: 2 are whole policies, 14 are for Agent Surface policies.", then "Pick a whole
+  policy under Start from." on the create form or "Whole policies are offered only when
+  creating a policy." on a saved one while any whole policy is left out), and
   starts over, with no template chosen, when Type changes. Its body opens with "Adds rules to the
   end of this policy." It has **Default templates (N)** and **Organization templates (N)** tabs
   (`policy-templates-tab-builtin`, `-organization`), a search
@@ -1978,18 +1999,9 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   decision, setting fields (`policy-templates-param-<key>`), the lines it adds, How it decides
   with each example's input (`policy-templates-example-input-<i>`), the docs link
   (`policy-templates-docs-link`) and **Add to policy**
-  (`policy-templates-insert-rules-button`). A standalone or MCP tool template shows its note
-  and its whole Rego (`policy-templates-rego-preview`) instead, and Add to policy is disabled.
-  The notes are `InfoBanner`s. A standalone template whose rules add nothing beyond its
-  `default allow` line, such as Deny by default and Monitor-only baseline, stays in the list
-  with "This template only sets the default decision and adds no rules. To use it, change
-  `default allow` to `false` (or `true`) in the Rego, or pick it under Start from on a new
-  policy." (`policy-templates-default-only-note`); an MCP tool template says "For a policy
-  bound to MCP tools on the MCP Proxy hop. It reads the tool call, not the request, so it
-  can't be added here. Start a new policy from it." (`policy-templates-mcp-tool-note`); every
-  other standalone template warns "Its rules allow requests outside what it restricts, so
-  adding them would widen this policy. Start a new policy from it instead."
-  (`policy-templates-standalone-note`).
+  (`policy-templates-insert-rules-button`). While the policy allows by default the preview
+  warns "This policy allows every request by default, so these rules change nothing until you
+  choose Deny by default." (`policy-templates-allow-default-note`, a warning `InfoBanner`).
   Adding an organization template shows a warning `InfoBanner` that its rules are added as
   written and combine with OR (`policy-templates-org-insert-warning`). An empty Organization
   templates tab (`policy-templates-organization-empty`) says "No organization templates yet.
@@ -2052,7 +2064,16 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   by default and has allow rules shows a warning `InfoBanner` (`policy-rules-allow-default-warning`) with
   **Deny by default** (`policy-rules-set-default-deny-button`), which sets `default allow` to
   false and drops a `# Allow all traffic by default` comment directly above it, the one Allow
-  all and policies created before templates carry. An empty Rego shows Default
+  all and policies created before templates carry. Under that banner each group with allow
+  rules, Your rules included, carries an amber line "No effect while the default is ALLOW."
+  (`policy-rules-group-<n>-no-effect`), which doesn't block saving. On the create form a
+  template group whose template has no variant for the current Type (`groupsForOtherType` in
+  `policyStart.ts`, matched by name against the default templates) carries an amber line under
+  its header (`policy-rules-group-<n>-other-type`: "Written for Agent Surface policies. It
+  reads input Gateway policies don't get. Remove it to create this policy."), keeps its
+  Remove group, and a warning banner (`policy-rules-other-type-banner`) says "Remove the rules
+  written for Agent Surface policies to create this policy."; Create is disabled, and Ctrl+S
+  refuses, until those groups are removed. An empty Rego shows Default
   ALLOW and "An empty policy allows every request.", as the gateway treats it. Removing a group
   keeps the Just added mark and examples card while another group of that template remains. With no rules, an empty state
   (`policy-rules-empty`) offers **Add rules from a template** (`policy-rules-add-button`) and

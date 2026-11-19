@@ -13,14 +13,19 @@ changes:
         on the MCP Proxy hop. Templates follow the Apply Policies guides and link to their own
         docs section. The gallery offers templates of either type; choosing one shows its
         settings, its Rego, how it decides on sample inputs, and its docs link in place, and Use this
-        template fills Name, Description, Type and Rego with settings that are checked first.
-        Add rules from a template appends a template's rules to a new or saved policy, so
+        template fills Name, Description, Type and Rego with settings that are checked first;
+        when the policy already has rules or hand edits, Use asks in place before it replaces
+        them. Every template is labelled Whole policy or Adds rules. Add rules from a template
+        lists only templates that add rules, says how many whole policies and templates for the
+        other Type it leaves out, and appends a template's rules to a new or saved policy, so
         several can be combined, and on a saved policy checks the template's examples with the
-        existing dry-run; a template meant to be the whole policy is used from Start from only.
+        existing dry-run; a whole policy is used from Start from only.
         A Rules | Rego toggle shows the policy, opening on Rules. The Rules view lists the
         policy's rules grouped by the template they came from, with an empty state that offers
         templates or Rego, labelling only deny_reason as a Deny reason, removes a template's rules or a
-        single rule, and switches an allow-all policy to deny by default. Remove is refused, with
+        single rule, and switches an allow-all policy to deny by default; while the default is
+        ALLOW each group with allow rules is marked as having no effect, and on a new policy a
+        group written for the other Type is marked and blocks Create until it is removed. Remove is refused, with
         the reason shown under the rule or template, while the allow rule still reads that rule,
         directly or through other rules; a read from deny_reason alone doesn't count, and an
         identical copy left by the same template added twice can go, and the reason names the
