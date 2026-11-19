@@ -483,6 +483,10 @@ impl VtaConfig {
             }
         };
         require("base_url", &self.base_url)?;
+        if let Some(base_url) = &self.base_url {
+            crate::vta::connections::validate_endpoint_url(base_url.trim())
+                .map_err(|e| format!("[vta] base_url: {}", e.replacen("endpoint ", "", 1)))?;
+        }
         require("vta_did", &self.vta_did)?;
         require("context_id", &self.context_id)?;
         if let (Some(method), Some(publish)) = (self.control_did_method, self.publish_auth_did) {
@@ -599,6 +603,29 @@ impl VtaConfig {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn base_url_must_use_https_unless_it_is_loopback() {
+        let with = |url: &str| VtaConfig {
+            enabled: true,
+            base_url: Some(url.to_string()),
+            vta_did: Some("did:key:z6MkVta".to_string()),
+            context_id: Some("gateway".to_string()),
+            signing_key_id: Some("k".to_string()),
+            ..VtaConfig::default()
+        };
+        for url in ["https://vta.example.com", "http://127.0.0.1:8100", "http://localhost:8100", "http://[::1]:8100"] {
+            with(url)
+                .validate()
+                .unwrap_or_else(|e| panic!("{url}: {e}"));
+        }
+        for url in ["http://vta.example.com", "http://10.0.0.5:8100", "http://169.254.169.254"] {
+            let err = with(url)
+                .validate()
+                .expect_err(url);
+            assert!(err.contains("base_url"), "{url}: {err}");
+        }
+    }
     use super::*;
 
     fn block(extra: &str) -> VtaConfig {

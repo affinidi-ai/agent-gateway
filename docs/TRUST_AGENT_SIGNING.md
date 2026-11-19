@@ -79,6 +79,15 @@ Fabric message or MCP exchange is issued under the signing of the surface servin
 surface's trust agent cannot be used, no credential is injected; one from the gateway's key is
 never substituted.
 
+When Gateway signing names a trust agent that cannot be used (no connection or context, or a
+connection that is disabled, unpaired, revoked or unreachable), the agent identity credential is
+not issued; the gateway's own key never stands in for it.
+
+A context `did:webvh` is verified the same way on both sides: the gateway checks a log it
+publishes with the `didwebvh-rs` library, and a verifier inside the gateway resolves a
+`did:webvh` through the DID resolver, whose `did:webvh` method resolves with the same library's
+`resolve`, which validates every log entry's proof and hash chain before returning a document.
+
 Signing fails closed. A choice that cannot be resolved refuses to sign rather than signing
 locally; a surface whose mapping cannot be read (a surface or issuer store error) or names a block
 that cannot sign refuses the request; an unreachable trust agent yields an error, never a
@@ -264,8 +273,9 @@ agent that cannot be reached leaves the stored state as it was (`502`). `pairing
 a summary (status and error code), never the trust agent's response body. The `[vta]` block is
 never verified this way: its identity rests on TLS to `base_url`.
 
-A connection's `endpoint` must be `https`; plain `http` is accepted only to a loopback address
-(`127.0.0.0/8`, `::1`, `localhost`), and cloud metadata hosts are refused.
+A connection's `endpoint`, and the `[vta]` block's `base_url`, must be `https`; plain `http` is
+accepted only to a loopback address (`127.0.0.0/8`, `::1`, `localhost`), so the session token
+never crosses the network in clear, and cloud metadata hosts are refused.
 
 ### Disconnecting
 

@@ -289,7 +289,7 @@ impl SigningKeys {
 /// A trust agent endpoint is `https`, and plain `http` only to a loopback host,
 /// where the traffic never leaves this machine (a co-located agent in
 /// development). A cloud-provider metadata service is never an endpoint.
-fn validate_endpoint_url(endpoint: &str) -> Result<(), String> {
+pub(crate) fn validate_endpoint_url(endpoint: &str) -> Result<(), String> {
     let url = crate::url_validation::validate_url_not_cloud_metadata_host(endpoint)
         .map_err(|e| format!("endpoint is not valid: {e}"))?;
     if url.scheme() == "https" {

@@ -71,7 +71,10 @@ VP (`urn:affinidi:params:oauth:token-type:vp`).
   below). A VP is
   verified via `VCIssuer::verify_agent_presentation_full` (`VcIssuerVpVerifier`)
   and the exchanged token's subject becomes the cryptographically-proven
-  credential-subject DID.
+  credential-subject DID. A credential that carries a `credentialStatus` is refused: the gateway
+  does not resolve status lists, so it cannot tell a revoked credential from a valid one. This
+  applies wherever the gateway verifies an agent presentation (STS, Fabric, MCP and A2A
+  identity).
 - **Issued tokens** are EdDSA-signed via `VCIssuer::sign_jwt_with_gateway_key`, which signs through the VTA signing library (see [Local signing](TRUST_AGENT_SIGNING.md#local-signing)),
   verifiable by resolving the gateway DID document or the JWKS endpoint. An
   issued **ID-JAG additionally carries the explicit JOSE `typ:

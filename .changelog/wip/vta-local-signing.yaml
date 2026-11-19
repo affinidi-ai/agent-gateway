@@ -39,7 +39,8 @@ changes:
         /vta-auth/{connection_id}/did.jsonl, or as a did:key. The [vta] block in
         config.toml connects one without the dashboard. Verifying a connection
         checks the trust agent's signed answer and pins the DID that signed it.
-        A connection's endpoint must be https, or http to a loopback address.
+        A connection's endpoint, and the [vta] block's base_url, must be https,
+        or http to a loopback address.
         Revoking, deleting or disabling a connection that Gateway signing, a
         surface or an issuer signs through, or that agents keep their key in,
         is refused with a 409 naming them, unless the request acknowledges it.
@@ -148,6 +149,15 @@ changes:
         session, and otherwise forgets the stale token and shows the sign-in form.
   removed: []
   security:
+    - timestamp: '2026-11-19T15:00:00Z'
+      title: Refuse a credential whose revocation status the gateway cannot check
+      description: >-
+        A presentation's credential that named a status list (credentialStatus)
+        was accepted after logging that its revocation status was not checked,
+        so a revoked credential still verified and could be exchanged for an STS
+        token. The gateway does not resolve status lists, so such a credential
+        is now refused wherever an agent presentation is verified. Credentials
+        the gateway issues carry no status and are unaffected.
     - timestamp: '2026-10-27T06:00:00Z'
       title: Stop a did:webvh log that contains a number from aborting the gateway
       description: >-

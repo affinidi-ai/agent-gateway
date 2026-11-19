@@ -11,7 +11,7 @@
 //! startup would be wrong until the next restart — the opposite of the
 //! hot-reload behaviour every other connection edit already has. Instead the
 //! issuer installed here is a **delegate**: it resolves the appliance's current
-//! agent on each call and falls back to the local issuer when there is none.
+//! agent on each call and uses the local issuer only when none was chosen.
 //!
 //! Resolution deliberately reuses [`ApplianceSigningDefault`] — the same port
 //! the key directory consults — so "which agent signs for this appliance" has
@@ -29,7 +29,7 @@ use crate::vta::key_directory::ApplianceSigningDefault;
 use crate::vta::registry::VtaConnectionRegistry;
 
 /// Issues the agent-identity credential through whichever agent is currently
-/// the appliance default, falling back to the local issuer.
+/// the appliance default, or with the local issuer when none was chosen.
 pub struct ApplianceVcIssuer {
     registry: Arc<VtaConnectionRegistry>,
     appliance_default: Arc<dyn ApplianceSigningDefault>,
@@ -85,53 +85,48 @@ impl ApplianceVcIssuer {
         }
     }
 
-    /// The agent-backed issuer for the current appliance default, or `None` to
-    /// use the local one.
+    /// The agent-backed issuer for the current appliance default, or `None`
+    /// when nobody chose a trust agent and the local issuer signs.
     ///
-    /// A connection that is named but unusable (disabled, unpaired, revoked, or
-    /// unreachable) resolves to `None` **and says so**: issuing a credential is
-    /// on the request path, and refusing the request outright would take the
-    /// gateway down for a problem the local key can cover. The warning is what
-    /// keeps that from being silent — an operator who connected an agent and
-    /// sees locally-signed credentials needs to know why.
-    async fn resolve(&self) -> Option<Arc<dyn VcIssuer>> {
-        let signing = self
+    /// A trust agent that was chosen but cannot be used (no connection or
+    /// context named, or the connection disabled, unpaired, revoked or
+    /// unreachable) is an error: issuing with the local key instead would put
+    /// the gateway's own DID on a credential the operator meant a trust agent
+    /// to issue.
+    async fn resolve(&self) -> Result<Option<Arc<dyn VcIssuer>>> {
+        let Some(signing) = self
             .appliance_default
-            .signing()?;
-        if signing.backend != Some(crate::config::agent_surface::SigningBackendKind::Vta) {
-            return None;
-        }
-        let connection_id = signing
-            .connection_id
-            .as_deref()?;
-        // The context the credential issues as: its designated key signs and
-        // its DID becomes the credential's `issuer`, which is why no key is
-        // named here.
-        let context_id = signing
-            .context_id
-            .as_deref()?;
-
-        match self
+            .signing()
+            .filter(|signing| signing.backend == Some(crate::config::agent_surface::SigningBackendKind::Vta))
+        else {
+            return Ok(None);
+        };
+        let (Some(connection_id), Some(context_id)) = (
+            signing
+                .connection_id
+                .as_deref(),
+            signing.context_id.as_deref(),
+        ) else {
+            anyhow::bail!(
+                "Gateway signing names a trust agent without a connection and a context to issue the credential as"
+            );
+        };
+        let client = self
             .registry
             .client(connection_id)
             .await
-        {
-            Ok(client) => {
-                self.ensure_can_issue(&client, context_id)
-                    .await;
-                Some(Arc::new(crate::vta::vc_issuer::VtaVcIssuer::new(client, context_id.to_string()))
-                    as Arc<dyn VcIssuer>)
-            }
-            Err(e) => {
+            .map_err(|e| {
                 tracing::warn!(
                     target: "vta_audit",
                     connection_id = %connection_id,
                     error = %e.log_detail(),
-                    "appliance trust agent is unusable; issuing the agent-identity credential locally",
+                    "the gateway-wide trust agent is unusable; the agent-identity credential is not issued",
                 );
-                None
-            }
-        }
+                anyhow::anyhow!("the trust agent Gateway signing names cannot be used: {e}")
+            })?;
+        self.ensure_can_issue(&client, context_id)
+            .await;
+        Ok(Some(Arc::new(crate::vta::vc_issuer::VtaVcIssuer::new(client, context_id.to_string())) as Arc<dyn VcIssuer>))
     }
 }
 
@@ -141,7 +136,7 @@ impl VcIssuer for ApplianceVcIssuer {
         &self,
         payload: IssueVcPayload<'a>,
     ) -> Result<Value> {
-        match self.resolve().await {
+        match self.resolve().await? {
             Some(vta) => vta.issue(payload).await,
             None => {
                 self.local
@@ -366,19 +361,35 @@ mod tests {
         assert_eq!(issued(&issuer(Some(local)).await).await, "local");
     }
 
-    /// A VTA default naming no context cannot issue: the context is what
-    /// determines the issuer DID, so there is nothing to issue *as*.
-    #[tokio::test]
-    async fn a_vta_default_without_a_context_falls_back() {
-        assert_eq!(issued(&issuer(Some(vta_signing(Some("vta-a"), None))).await).await, "local");
+    async fn refused(i: &ApplianceVcIssuer) -> String {
+        i.issue(IssueVcPayload::AgentIdentity(crate::identity::ssi::vc_issuer::AgentIdentity {
+            identity_fields: std::borrow::Cow::Owned(std::collections::HashMap::new()),
+            did: std::borrow::Cow::Borrowed("did:key:zAgent"),
+            workload_binding: None,
+            display_name: None,
+        }))
+        .await
+        .expect_err("a chosen trust agent that cannot issue must not fall back to the local key")
+        .to_string()
     }
 
-    /// Falling back rather than failing the request is deliberate: issuance is
-    /// on the request path and the local key can cover it.
+    /// A VTA default naming no context or no connection cannot issue: the
+    /// context is what determines the issuer DID, so there is nothing to issue
+    /// *as*, and the gateway's own DID must not stand in for it.
     #[tokio::test]
-    async fn an_unusable_connection_falls_back_instead_of_failing() {
+    async fn a_vta_default_without_a_context_or_connection_is_refused() {
+        for signing in [vta_signing(Some("vta-a"), None), vta_signing(None, Some("ctx"))] {
+            let err = refused(&issuer(Some(signing)).await).await;
+            assert!(err.contains("without a connection and a context"), "{err}");
+        }
+    }
+
+    /// An unusable connection fails the issuance instead of signing locally.
+    #[tokio::test]
+    async fn an_unusable_connection_is_refused_instead_of_falling_back() {
         let signing = vta_signing(Some("does-not-exist"), Some("ctx"));
-        assert_eq!(issued(&issuer(Some(signing)).await).await, "local");
+        let err = refused(&issuer(Some(signing)).await).await;
+        assert!(err.contains("cannot be used"), "{err}");
     }
 }
 
