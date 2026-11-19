@@ -366,7 +366,7 @@ const TemplateRow: React.FC<TemplateRowProps> = ({
   const editable = !template.builtin;
   const isFull = template.kind === 'full';
   return (
-    <li className="surface-template-row">
+    <li className="surface-template-row" data-testid={`surface-template-row-${template.id}`}>
       <div
         className="surface-template-row__header"
         role="button"
@@ -427,6 +427,7 @@ const TemplateRow: React.FC<TemplateRowProps> = ({
           <button
             type="button"
             className={`btn btn-sm ${isFull ? 'btn-warning' : 'btn-primary'} surface-template-row__action`}
+            data-testid={`surface-template-apply-${template.id}`}
             title={
               isFull
                 ? 'Replace the current surface with this template'
