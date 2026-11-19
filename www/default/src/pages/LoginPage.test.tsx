@@ -122,3 +122,18 @@ test('a SAML sign-in from a signed-out consent page returns to the CLI login flo
     expect(window.location.href).toBe(`/api/saml/login?next=${encodeURIComponent(CLI_TARGET)}`)
   );
 });
+
+test('typing in the username field keeps the same input element so the caret stays put', async () => {
+  mockAuthMode('passkey');
+  setLocation('/login', '');
+  render(<LoginPage onLogin={jest.fn()} />);
+
+  const input = await screen.findByTestId('login-username');
+  fireEvent.change(input, { target: { value: 'alice@example.com' } });
+  fireEvent.change(screen.getByTestId('login-username'), {
+    target: { value: 'aliceX@example.com' },
+  });
+
+  expect(screen.getByTestId('login-username')).toBe(input);
+  expect((input as HTMLInputElement).value).toBe('aliceX@example.com');
+});
