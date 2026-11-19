@@ -34,7 +34,7 @@ const TemplateFilterBar: React.FC<TemplateFilterBarProps> = ({
     <SearchInput
       value={query}
       onChange={onQueryChange}
-      placeholder="Search templates, e.g. role, trust, path"
+      placeholder="Search templates"
       width={fullWidth ? '100%' : '280px'}
       wrapperStyle={fullWidth ? FULL_WIDTH_WRAPPER : undefined}
       aria-label="Search templates"

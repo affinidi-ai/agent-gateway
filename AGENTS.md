@@ -430,15 +430,19 @@ sections built from the shared dashboard components, and are read-only without
 [`www/default/AGENTS.md`](www/default/AGENTS.md#policy-definition-editor). Templates need no
 gateway API and link to their Apply Policies docs section. A new policy starts as Deny by
 default, preselected in the **Start from** gallery, and opens on the Rules view. A gallery card
-(**Allow all (blank)**, then built-in and organisation templates of either Type) shows its
+(**Allow all (blank)**, then default and organization templates of either Type, three of them
+marked Recommended) shows its
 settings, How it decides, its Rego and docs link in place, and **Use this template** fills the
 form and sets the Type. The Policy section's **Rules | Rego** toggle lists the rules grouped by
-template, with Remove per group and per rule, disabled with its reason while `allow` reads the
-rule. **Add rules from a template** only adds rules, so several templates combine in a new or
+template, with Remove per group and per rule, disabled while `allow` reads the rule, with a
+reason that names the rule reading it. Once rules are added the gallery still names the
+template the policy started from and counts the templates added. **Add rules from a template** only adds rules, so several templates combine in a new or
 saved policy; it refuses a standalone template, one meant to be the whole policy because it only
 sets the default decision or allows requests outside what it restricts. A saved policy offers
 **Save as template**, and once rules are added a Template examples card runs their examples
-through the existing simulate endpoint. Organisation templates last for the browser tab; see
+through the existing simulate endpoint, says why a row differs and loads its input in Test
+(dry-run). Default templates ship with the dashboard; organization templates are ones a user
+saved with Save as template and last for the browser tab (marked This tab only); see
 _Policy templates_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#policy-templates).
 
 The Dashboard shows the metrics **Delete** button only to users with `settings.edit`; see

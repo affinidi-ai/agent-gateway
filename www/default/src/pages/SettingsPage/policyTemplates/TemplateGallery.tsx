@@ -1,18 +1,13 @@
 import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { AppButton } from '../../../components/shared/AppButton';
 import { Badge } from '../../../components/shared/Badge';
-import {
-  ALLOW_ALL_POLICY,
-  BLANK_TEMPLATE_ID,
-  DEFAULT_POLICY,
-  DEFAULT_TEMPLATE_KEY,
-} from './policyDefaults';
+import { ALLOW_ALL_POLICY, BLANK_TEMPLATE_ID, DEFAULT_TEMPLATE_KEY } from './policyDefaults';
 import PolicySectionTitle from './PolicySectionTitle';
 import { defaultDecision } from './regoTemplate';
-import { DecisionBadge } from './TemplateBadges';
+import { ALLOW_ALL_NAME, type PolicyStart } from './policyStart';
+import { DecisionBadge, TemplateOriginBadges } from './TemplateBadges';
 import TemplateFilterBar from './TemplateFilterBar';
 import {
-  renderWithText,
   TemplateDocsLink,
   TemplateHowItDecides,
   TemplateSettingsFields,
@@ -31,9 +26,11 @@ const ID_PREFIX = 'policy-template-gallery';
 interface TemplateGalleryProps {
   policyType: PolicyType;
   step?: number;
-  /** The policy's Rego, which says whether it still follows the used template. */
-  policy: string;
+  /** What the policy started from, while its Rego still follows it (`policyStart`). */
+  start: PolicyStart | null;
   usedTemplate: UsedTemplate | null;
+  /** Counts Add to policy actions; each one collapses the gallery to its summary. */
+  rulesAdded: number;
   onPickBlank: () => void;
   /** Fills the form from the template, with the Rego its settings render to. */
   onUseTemplate: (template: PolicyTemplate, rego: string, fieldText: FieldText) => void;
@@ -103,10 +100,11 @@ const GalleryDetail: React.FC<{
       <DetailHeading ref={headingRef}>{template.name}</DetailHeading>
       <p className="text-muted small mb-2">{template.description}</p>
       <div className="d-flex flex-wrap gap-2 mb-3">
-        <DecisionBadge decision={defaultDecision(template.rego)} prefix="Default" />
+        <DecisionBadge decision={defaultDecision(template.rego)} />
+        <TemplateOriginBadges template={template} />
         {template.policy_type !== policyType && (
           <Badge
-            tone="secondary"
+            tone="warning"
             value={`Using it sets Type to ${POLICY_TYPE_NAMES[template.policy_type].label}`}
           />
         )}
@@ -138,8 +136,9 @@ const GalleryDetail: React.FC<{
 const TemplateGallery: React.FC<TemplateGalleryProps> = ({
   policyType,
   step,
-  policy,
+  start,
   usedTemplate,
+  rulesAdded,
   onPickBlank,
   onUseTemplate,
 }) => {
@@ -156,10 +155,8 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
   const [expanded, setExpanded] = useState(true);
   const [showAll, setShowAll] = useState(false);
 
-  const isDefault = policy === DEFAULT_POLICY[policyType];
-  // The used template's card, or Deny by default while the Rego is still the new policy's own.
-  const appliedId =
-    usedTemplate?.id ?? (isDefault ? `${DEFAULT_TEMPLATE_KEY}:${policyType}` : null);
+  // The used template's card, or Deny by default while the new policy's own Rego still follows it.
+  const appliedId = usedTemplate?.id ?? (start ? `${DEFAULT_TEMPLATE_KEY}:${policyType}` : null);
   const applied =
     entries.flatMap(e => Object.values(e.variants)).find(t => t?.id === appliedId) ?? null;
   const appliedKey =
@@ -168,13 +165,6 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
       : applied
         ? templateEntryKey(applied)
         : null;
-  const usedRego =
-    usedTemplate?.id === BLANK_TEMPLATE_ID
-      ? ALLOW_ALL_POLICY[policyType]
-      : usedTemplate && applied
-        ? renderWithText(applied, usedTemplate.fieldText).rego
-        : null;
-  const prefilled = usedRego !== null && policy === usedRego;
   // The card whose detail is open: the applied one until the user picks another.
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const shownKey = selectedKey ?? appliedKey;
@@ -206,6 +196,15 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
     setFocusTarget(null);
   }, [focusTarget]);
 
+  // Add to policy collapses the gallery to its summary, leaving the focus on Add to policy.
+  const addedBefore = useRef(rulesAdded);
+  useEffect(() => {
+    if (rulesAdded === addedBefore.current) return;
+    addedBefore.current = rulesAdded;
+    setSelectedKey(null);
+    setExpanded(false);
+  }, [rulesAdded]);
+
   const collapse = () => {
     setSelectedKey(null);
     setExpanded(false);
@@ -220,12 +219,10 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
     collapse();
   };
 
-  const summaryName =
-    usedTemplate && !prefilled
-      ? 'Custom Rego'
-      : usedTemplate?.id === BLANK_TEMPLATE_ID
-        ? 'Allow all (blank)'
-        : (applied?.name ?? 'Custom Rego');
+  const clearFilters = () => {
+    setQuery('');
+    setCategory('all');
+  };
 
   const card = (
     key: string,
@@ -276,12 +273,22 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
           data-testid="policy-template-gallery-summary"
         >
           <span>
-            Started from <strong>{summaryName}</strong>
-            {prefilled && usedTemplate?.id !== BLANK_TEMPLATE_ID && (
-              <span className="text-muted" data-testid="policy-definition-prefilled-hint">
+            Started from <strong>{start?.name ?? 'Custom Rego'}</strong>
+            {start && start.templatesAdded > 0 ? (
+              <span className="text-muted" data-testid="policy-template-gallery-added-count">
                 {' '}
-                · Pre-filled from the template. Edit freely.
+                · {start.templatesAdded} {start.templatesAdded === 1 ? 'template' : 'templates'}{' '}
+                added
               </span>
+            ) : (
+              start &&
+              usedTemplate &&
+              usedTemplate.id !== BLANK_TEMPLATE_ID && (
+                <span className="text-muted" data-testid="policy-definition-prefilled-hint">
+                  {' '}
+                  · Pre-filled from the template. Edit freely.
+                </span>
+              )
             )}
           </span>
         </div>
@@ -307,9 +314,12 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
             {!filtering &&
               card(
                 BLANK_TEMPLATE_ID,
-                'Allow all (blank)',
-                'Allows every request. Write your own rules.',
-                <DecisionBadge decision="allow" prefix="Default" />,
+                ALLOW_ALL_NAME,
+                'Every request is allowed. Start here only to write your own Rego.',
+                <>
+                  <DecisionBadge decision="allow" />
+                  <span className="policy-template-row__summary">{CATEGORY_LABELS.baseline}</span>
+                </>,
                 'policy-template-card-blank'
               )}
             {shown.map(t => {
@@ -319,10 +329,11 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
                 t.name,
                 t.summary,
                 <>
-                  <DecisionBadge decision={defaultDecision(t.rego)} prefix="Default" />
+                  <DecisionBadge decision={defaultDecision(t.rego)} />
+                  <TemplateOriginBadges template={t} />
                   {t.policy_type !== policyType && (
                     <Badge
-                      tone="secondary"
+                      tone="warning"
                       value={`${POLICY_TYPE_NAMES[t.policy_type].name} only`}
                       data-testid="policy-template-card-type-badge"
                     />
@@ -331,18 +342,33 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
                     <Badge tone="secondary" value="MCP tool policy" />
                   )}
                   <span className="policy-template-row__summary">
-                    {t.builtin ? CATEGORY_LABELS[t.category] : 'Your organization'}
+                    {t.builtin ? CATEGORY_LABELS[t.category] : 'Organization template'}
                   </span>
                 </>,
                 `policy-template-card-${key}`
               );
             })}
           </div>
-          {visible.length === 0 && <div className="text-muted small py-2">No templates match.</div>}
+          {filtering && (
+            <div
+              className="text-muted small py-2"
+              data-testid="policy-template-gallery-match-count"
+            >
+              {visible.length} of {all.length} templates match.{' '}
+              <AppButton
+                variant="link"
+                className="p-0 align-baseline"
+                onClick={clearFilters}
+                data-testid="policy-template-gallery-clear-filters"
+              >
+                Clear filters
+              </AppButton>
+            </div>
+          )}
           {shown.length < visible.length && (
             <AppButton
-              variant="link"
-              className="p-0 mt-2"
+              variant="outline-secondary"
+              className="mt-2"
               onClick={() => setShowAll(true)}
               data-testid="policy-template-gallery-show-all"
             >
@@ -356,7 +382,7 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
               hidden={detailHidden}
               data-testid="policy-template-gallery-detail"
             >
-              <DetailHeading ref={headingRef}>Allow all (blank)</DetailHeading>
+              <DetailHeading ref={headingRef}>{ALLOW_ALL_NAME}</DetailHeading>
               <p className="text-muted small mb-3">
                 The default allow-all policy. Every request is allowed until you add rules and
                 change <code>default allow</code> to <code>false</code>.

@@ -2,7 +2,7 @@ import React from 'react';
 import { AppButton } from '../../../components/shared/AppButton';
 import { Badge } from '../../../components/shared/Badge';
 import InfoBanner from '../../../components/shared/InfoBanner';
-import type { ParsedPolicy, PolicyRule, RuleGroup, RuleKind } from './regoRules';
+import type { ParsedPolicy, PolicyRule, RuleGroup, RuleKind, RuleUse } from './regoRules';
 
 interface PolicyRulesListProps {
   parsed: ParsedPolicy;
@@ -20,10 +20,12 @@ interface PolicyRulesListProps {
   onWriteRego: () => void;
   onRemoveGroup: (group: RuleGroup) => void;
   onRemoveRule: (rule: PolicyRule) => void;
-  /** A rule `allow` still reads through other rules, which Remove refuses. */
-  isRuleInUse: (rule: PolicyRule) => boolean;
-  /** A template group whose rules `allow` still reads from outside it, which Remove refuses. */
-  isGroupInUse: (group: RuleGroup) => boolean;
+  /** Why Remove refuses a rule `allow` still reads through other rules; null when it doesn't. */
+  ruleUse: (rule: PolicyRule) => RuleUse | null;
+  /** Why Remove refuses a template group whose rules `allow` reads from outside it. */
+  groupUse: (group: RuleGroup) => RuleUse | null;
+  /** The template a new policy's own rules started from, while they still follow it. */
+  startedFrom: string | null;
   onSetDefaultDeny: () => void;
   onShowRule: (rule: PolicyRule) => void;
 }
@@ -40,8 +42,21 @@ const KIND_TITLE: Record<RuleKind, string> = {
   helper: 'Read by other rules; decides nothing on its own',
 };
 
-const RULE_IN_USE = 'Another rule uses this; remove that rule first';
-const GROUP_IN_USE = 'A rule outside this template uses its rules; remove that rule first';
+const DOCUMENT_READ =
+  'The Rego reads the policy as a whole document; remove rules in the Rego view.';
+
+const readerText = (use: RuleUse) =>
+  use.kind === 'reader' ? ` (${use.name}, line ${use.line})` : '';
+
+const ruleInUseText = (use: RuleUse) =>
+  use.kind === 'document'
+    ? DOCUMENT_READ
+    : `Another rule uses this${readerText(use)}; remove that rule first.`;
+
+const groupInUseText = (use: RuleUse) =>
+  use.kind === 'document'
+    ? DOCUMENT_READ
+    : `A rule outside this template uses its rules${readerText(use)}; remove that rule first.`;
 
 const lineLabel = (rule: PolicyRule) =>
   rule.startLine === rule.endLine
@@ -60,8 +75,9 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
   onWriteRego,
   onRemoveGroup,
   onRemoveRule,
-  isRuleInUse,
-  isGroupInUse,
+  ruleUse,
+  groupUse,
+  startedFrom,
   onSetDefaultDeny,
   onShowRule,
 }) => {
@@ -88,6 +104,7 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
   }
 
   const allowRules = parsed.groups.some(g => g.rules.some(r => r.kind === 'allow'));
+  const groupsThatAllow = parsed.groups.filter(g => g.rules.some(r => r.kind === 'allow')).length;
   const lastJustAdded = parsed.groups.reduce<RuleGroup | null>(
     (last, g) => (g.source.kind === 'template' && g.source.name === justAdded ? g : last),
     null
@@ -175,7 +192,8 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
       {parsed.groups.map((group, index) => {
         const isTemplate = group.source.kind === 'template';
         const testId = `policy-rules-group-${index}`;
-        const groupInUse = isTemplate && canEdit && isGroupInUse(group);
+        const groupReason = isTemplate && canEdit ? groupUse(group) : null;
+        const groupInUse = groupReason !== null;
         return (
           <div
             className="policy-rules__group"
@@ -187,12 +205,13 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
                 {group.source.kind === 'template' ? (
                   <>
                     <i className="fas fa-layer-group me-1" aria-hidden="true" />
-                    From template <strong>{group.source.name}</strong>
+                    From template: <strong>{group.source.name}</strong>
                   </>
                 ) : (
                   <>
                     <i className="fas fa-pen me-1" aria-hidden="true" />
-                    Written in the editor
+                    <strong>Your rules</strong>
+                    {startedFrom && ` · started from ${startedFrom}`}
                   </>
                 )}
               </span>
@@ -201,25 +220,25 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
               )}
               {isTemplate && canEdit && (
                 <AppButton
-                  variant="link"
-                  className="text-danger p-0 ms-auto"
+                  variant="outline-danger"
+                  className="ms-auto"
                   disabled={groupInUse}
                   onClick={() => onRemoveGroup(group)}
                   aria-label={`Remove the rules from ${group.source.kind === 'template' ? group.source.name : 'the editor'}`}
                   aria-describedby={groupInUse ? `${testId}-in-use` : undefined}
                   data-testid={`${testId}-remove-button`}
                 >
-                  Remove
+                  Remove group
                 </AppButton>
               )}
             </div>
-            {groupInUse && (
+            {groupReason && (
               <div
                 className="small text-muted ps-2 mb-1"
                 id={`${testId}-in-use`}
                 data-testid={`${testId}-in-use`}
               >
-                {GROUP_IN_USE}
+                {groupInUseText(groupReason)}
               </div>
             )}
             {group.rules.length === 0 && (
@@ -228,7 +247,8 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
             <ul className="list-unstyled mb-0">
               {group.rules.map((rule, ruleIndex) => {
                 const ruleTestId = `${testId}-rule-${ruleIndex}`;
-                const inUse = canEdit && isRuleInUse(rule);
+                const reason = canEdit ? ruleUse(rule) : null;
+                const inUse = reason !== null;
                 return (
                   <li
                     key={rule.startLine}
@@ -252,10 +272,10 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
                     </AppButton>
                     {canEdit && (
                       <AppButton
-                        variant="link"
-                        className="text-danger p-0 text-nowrap"
+                        variant="outline-danger"
+                        className="text-nowrap"
                         disabled={inUse}
-                        title={inUse ? RULE_IN_USE : undefined}
+                        title={reason ? ruleInUseText(reason) : undefined}
                         onClick={() => onRemoveRule(rule)}
                         aria-label={`Remove the rule ${rule.head}`}
                         aria-describedby={inUse ? `${ruleTestId}-in-use` : undefined}
@@ -264,13 +284,13 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
                         Remove
                       </AppButton>
                     )}
-                    {inUse && (
+                    {reason && (
                       <span
                         className="policy-rules__in-use small text-muted"
                         id={`${ruleTestId}-in-use`}
                         data-testid={`${ruleTestId}-in-use`}
                       >
-                        {RULE_IN_USE}
+                        {ruleInUseText(reason)}
                       </span>
                     )}
                   </li>
@@ -280,6 +300,12 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
           </div>
         );
       })}
+      {groupsThatAllow > 1 && (
+        <p className="text-muted small mt-2 mb-0" data-testid="policy-rules-or-note">
+          <i className="fas fa-info-circle me-1" aria-hidden="true" />
+          Allow rules combine with OR: a request passes when any allow rule matches.
+        </p>
+      )}
     </div>
   );
 };

@@ -1,12 +1,18 @@
 import {
-  groupInUse,
+  groupUse,
   parsePolicyRules,
   removeRule,
   removeRuleGroup,
-  ruleInUse,
+  ruleUse,
   setDefaultDeny,
+  type ParsedPolicy,
+  type PolicyRule,
+  type RuleGroup,
 } from '../regoRules';
 import { insertTemplateRules } from '../regoTemplate';
+
+const ruleInUse = (parsed: ParsedPolicy, rule: PolicyRule) => ruleUse(parsed, rule) !== null;
+const groupInUse = (parsed: ParsedPolicy, group: RuleGroup) => groupUse(parsed, group) !== null;
 
 const groupsOf = (rego: string) => {
   const parsed = parsePolicyRules(rego);
@@ -171,7 +177,7 @@ describe('setDefaultDeny', () => {
   });
 });
 
-describe('removeRule and ruleInUse', () => {
+describe('removeRule and ruleUse', () => {
   const rego = [
     'package p',
     '',
@@ -250,7 +256,7 @@ describe('rule kinds', () => {
   });
 });
 
-describe('ruleInUse by reachability from allow', () => {
+describe('ruleUse by reachability from allow', () => {
   const inUse = (rego: string) => {
     const parsed = groupsOf(rego);
     const all = parsed.groups.flatMap(g => g.rules);
@@ -518,7 +524,7 @@ describe('ruleInUse by reachability from allow', () => {
   });
 });
 
-describe('groupInUse', () => {
+describe('groupUse', () => {
   const policy = (outside: string) =>
     [
       'package p',
@@ -597,5 +603,61 @@ describe('groupInUse', () => {
     );
     const { parsed, group } = templateGroup(rego);
     expect(groupInUse(parsed, group)).toBe(true);
+  });
+});
+
+describe('ruleUse and groupUse', () => {
+  it('names the first rule that reads a helper, not another definition of it', () => {
+    const parsed = groupsOf(
+      [
+        'package p',
+        '',
+        'default allow := false',
+        '',
+        'values(v) := [v] if is_string(v)',
+        '',
+        'values(v) := v if is_array(v)',
+        '',
+        'allow if "a" in values(input.x)',
+      ].join('\n')
+    );
+    const [first] = parsed.groups[0].rules.filter(r => r.head.startsWith('values'));
+    expect(ruleUse(parsed, first)).toEqual({ kind: 'reader', name: 'allow', line: 9 });
+  });
+
+  it('gives the whole-document read as the reason', () => {
+    const parsed = groupsOf('package p\n\nblocked if input.x\n\nallow if not data.p["blocked"]\n');
+    expect(ruleUse(parsed, parsed.groups[0].rules[0])).toEqual({ kind: 'document' });
+  });
+
+  it('names the rule outside a group that reads it, and null when nothing does', () => {
+    const parsed = groupsOf(
+      'package p\n\n# Inserted from template: T\nblocked if input.x\n# End of template: T\n\nallow if not blocked\n'
+    );
+    const group = parsed.groups.find(g => g.source.kind === 'template')!;
+    expect(groupUse(parsed, group)).toEqual({ kind: 'reader', name: 'allow', line: 7 });
+    expect(
+      ruleUse(parsed, parsed.groups.find(g => g.source.kind === 'editor')!.rules[0])
+    ).toBeNull();
+  });
+});
+
+describe('ruleUse through other rules', () => {
+  it('names the helper that reads a deny rule allow reaches through it', () => {
+    const parsed = groupsOf(
+      [
+        'package p',
+        '',
+        'default allow := false',
+        '',
+        'deny_x if input.blocked',
+        '',
+        'h if not deny_x',
+        '',
+        'allow if h',
+      ].join('\n')
+    );
+    const denyX = parsed.groups[0].rules.find(r => r.head === 'deny_x')!;
+    expect(ruleUse(parsed, denyX)).toEqual({ kind: 'reader', name: 'h', line: 7 });
   });
 });

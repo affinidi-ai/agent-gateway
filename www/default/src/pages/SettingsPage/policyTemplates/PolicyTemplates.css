@@ -132,9 +132,27 @@ body.dark-theme .policy-template-preview {
   color: inherit;
 }
 
-.audit-decision.policy-decision--allow {
-  background: rgba(245, 158, 11, 0.16);
+.policy-default-decision {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.15rem 0.45rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid currentColor;
+  background: transparent;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.policy-default-decision--deny {
+  color: var(--muted-text);
+}
+
+.policy-default-decision--allow {
   color: var(--warning-text);
+  background: rgba(245, 158, 11, 0.08);
 }
 
 .policy-rules__kind {

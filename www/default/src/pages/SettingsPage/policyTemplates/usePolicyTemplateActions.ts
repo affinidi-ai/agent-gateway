@@ -33,6 +33,12 @@ export interface InsertedTemplate {
   key: number;
 }
 
+/** A template group as Add to policy wrote it: its name and the lines between its markers. */
+export interface AddedRules {
+  name: string;
+  body: string;
+}
+
 /** The template last used from the gallery (`blank` for Allow all) and its settings as typed. */
 export interface UsedTemplate {
   id: string;
@@ -50,6 +56,8 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
   const [usedTemplate, setUsedTemplate] = useState<UsedTemplate | null>(null);
   const [insertedTemplate, setInsertedTemplate] = useState<InsertedTemplate | null>(null);
   const [justAdded, setJustAdded] = useState<string | null>(null);
+  const [addedRules, setAddedRules] = useState<AddedRules[]>([]);
+  const [rulesAdded, setRulesAdded] = useState(0);
   const regoRef = useRef<HTMLTextAreaElement>(null);
 
   const togglePanel = (panel: TemplatePanel) => setTemplatePanel(p => (p === panel ? null : panel));
@@ -109,7 +117,11 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
     const previousInserted = insertedTemplate;
     const previousUsed = usedTemplate;
     const previousJustAdded = justAdded;
-    setForm(f => ({ ...f, policy: insertTemplateRules(f.policy, template.name, rego).policy }));
+    const previousAddedRules = addedRules;
+    const inserted = insertTemplateRules(form.policy, template.name, rego);
+    setForm(f => ({ ...f, policy: inserted.policy }));
+    setAddedRules(prev => [...prev, { name: template.name, body: inserted.added }]);
+    setRulesAdded(n => n + 1);
     setJustAdded(template.name);
     if (!isCreateMode) {
       setInsertedTemplate(prev => ({ template, usesDefaultSettings, key: (prev?.key ?? 0) + 1 }));
@@ -121,6 +133,7 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
         setInsertedTemplate(previousInserted);
         setUsedTemplate(previousUsed);
         setJustAdded(previousJustAdded);
+        setAddedRules(previousAddedRules);
       },
     });
   };
@@ -189,6 +202,8 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
     insertedTemplate,
     dismissInsertedTemplate: () => setInsertedTemplate(null),
     justAdded,
+    addedRules,
+    rulesAdded,
     regoRef,
     applyTemplate,
     editPolicy,

@@ -23,8 +23,18 @@ changes:
         single rule, and switches an allow-all policy to deny by default. Remove is refused, with
         the reason shown under the rule or template, while the allow rule still reads that rule,
         directly or through other rules; a read from deny_reason alone doesn't count, and an
-        identical copy left by the same template added twice can go. Save as template keeps a policy as an organisation template for the current
-        browser tab. Built-in templates ship with the dashboard; no gateway API changes.
+        identical copy left by the same template added twice can go, and the reason names the
+        rule that reads it. Deny by default, Require authenticated caller and Allow by JWT claim
+        or role are marked Recommended. Once rules are added, Start from still names the template
+        the policy started from and counts the templates added, and says Custom Rego only after
+        a hand edit. The Add to policy preview says allow rules combine with OR. On a saved
+        policy the template examples say which rows match, explain a row that differs, and load
+        its input into Test (dry-run), with Undo. A default decision shows as a grey Default
+        DENY with a shield or an amber Default ALLOW with a warning icon. Save as template keeps
+        a policy as an organization
+        template for the current browser tab, marked This tab only, and says to save your
+        changes first while it is disabled. Default templates ship with the dashboard; no
+        gateway API changes.
   changed:
     - timestamp: '2026-11-18T22:00:00Z'
       title: Show the policy editor read-only to users who can't edit policies

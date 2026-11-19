@@ -60,7 +60,7 @@ test.describe('Policy templates on the create policy page', () => {
         await column.getByTestId('policy-templates-insert-rules-button').click();
 
         const group = page.getByTestId('policy-rules-group-0');
-        await expect(group).toContainText('From template Allow listed HTTP methods');
+        await expect(group).toContainText('From template: Allow listed HTTP methods');
         await expect(page.getByTestId('policy-rules-allow-default-warning')).toHaveCount(0);
         await captureFullPage(page, 'policy-templates-rules-added');
 

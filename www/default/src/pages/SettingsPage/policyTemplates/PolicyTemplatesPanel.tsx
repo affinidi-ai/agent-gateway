@@ -3,7 +3,7 @@ import { AppButton } from '../../../components/shared/AppButton';
 import { Badge } from '../../../components/shared/Badge';
 import InfoBanner from '../../../components/shared/InfoBanner';
 import { defaultDecision, insertTemplateRules } from './regoTemplate';
-import { DecisionBadge } from './TemplateBadges';
+import { DecisionBadge, TemplateOriginBadges } from './TemplateBadges';
 import TemplateFilterBar from './TemplateFilterBar';
 import {
   TemplateDocsLink,
@@ -54,34 +54,36 @@ const InsertPreview: React.FC<{
     <div className="policy-template-preview" data-testid="policy-templates-preview">
       <h6 className="fw-bold mb-1">{template.name}</h6>
       <p className="text-muted small mb-2">{template.description}</p>
-      <div className="mb-3">
-        <DecisionBadge decision={decision} prefix="Default" />
+      <div className="d-flex flex-wrap gap-2 mb-3">
+        <DecisionBadge decision={decision} />
+        <TemplateOriginBadges template={template} />
       </div>
 
       <TemplateSettingsFields template={template} settings={settings} idPrefix={ID_PREFIX} />
 
       {refused ? (
         <>
-          <div className="alert alert-info py-2 px-3 small" data-testid={noteTestId}>
-            <i className="fas fa-info-circle me-2" aria-hidden="true" />
-            {forToolBinding ? (
-              <>
-                This template is for a policy bound to MCP tools on the MCP Proxy hop, which reads{' '}
-                <code>input.jwt</code> and the tool name. Use it as a whole policy.
-              </>
-            ) : defaultOnly ? (
-              <>
-                This template only sets the default decision, so it adds no rules to a policy. To{' '}
-                {decision} by default, change <code>default allow</code> to{' '}
-                <code>{decision === 'allow' ? 'true' : 'false'}</code> in the Rego, or pick it under
-                Start from on a new policy.
-              </>
-            ) : (
-              <>
-                Use this template as a whole policy. Its rules allow requests outside what it
-                restricts, so added to a policy they would allow requests that policy denies.
-              </>
-            )}
+          <div data-testid={noteTestId}>
+            <InfoBanner
+              variant={forToolBinding || defaultOnly ? 'default' : 'warning'}
+              icon={forToolBinding || defaultOnly ? 'fa-info-circle' : 'fa-exclamation-triangle'}
+              collapsible={false}
+              className="mb-2"
+              summary={
+                forToolBinding ? (
+                  "For a policy bound to MCP tools on the MCP Proxy hop. It reads the tool call, not the request, so it can't be added here. Start a new policy from it."
+                ) : defaultOnly ? (
+                  <>
+                    This template only sets the default decision and adds no rules. To use it,
+                    change <code>default allow</code> to{' '}
+                    <code>{decision === 'allow' ? 'true' : 'false'}</code> in the Rego, or pick it
+                    under Start from on a new policy.
+                  </>
+                ) : (
+                  'Its rules allow requests outside what it restricts, so adding them would widen this policy. Start a new policy from it instead.'
+                )
+              }
+            />
           </div>
           <pre
             className="policy-preview-block rounded p-2 mb-3 small"
@@ -101,6 +103,20 @@ const InsertPreview: React.FC<{
               {insert ? insert.added || '(none)' : 'Fix the settings above to see the rules.'}
             </code>
           </pre>
+          {insert?.added && (
+            <div data-testid="policy-templates-or-note">
+              <InfoBanner
+                collapsible={false}
+                className="mb-2"
+                summary={
+                  <>
+                    Allow rules combine with OR: a request passes when any allow rule matches. Its{' '}
+                    <code>default allow</code> line is not copied.
+                  </>
+                }
+              />
+            </div>
+          )}
           {!template.builtin && insert?.added && (
             <div data-testid="policy-templates-org-insert-warning">
               <InfoBanner
@@ -166,15 +182,12 @@ const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
         </h6>
       </div>
       <div className="card-body">
-        <p className="text-muted small mb-2">
-          Pick a template, adjust its settings, and add its rules to the policy. Add several to
-          combine them.
-        </p>
+        <p className="text-muted small mb-2">Adds rules to the end of this policy.</p>
         <ul className="nav nav-tabs mb-2" role="tablist">
           {(
             [
-              ['builtin', 'Built-in', builtin.length],
-              ['organization', 'Your organization', organization.length],
+              ['builtin', 'Default templates', builtin.length],
+              ['organization', 'Organization templates', organization.length],
             ] as const
           ).map(([key, label, count]) => (
             <li className="nav-item" role="presentation" key={key}>
@@ -186,7 +199,7 @@ const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
                 onClick={() => switchSource(key)}
                 data-testid={`policy-templates-tab-${key}`}
               >
-                {label} · {count}
+                {label} ({count})
               </button>
             </li>
           ))}
@@ -211,8 +224,8 @@ const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
         {error && <div className="alert alert-danger py-2 px-3 small">{error}</div>}
         {!loading && source === 'organization' && organization.length === 0 && (
           <div className="text-muted small py-2" data-testid="policy-templates-organization-empty">
-            No organization templates yet. Open a saved policy and choose{' '}
-            <strong>Save as template</strong> to add one.
+            No organization templates yet. These are templates you saved from a policy in this tab.
+            To add one, open a saved policy and choose <strong>Save as template</strong>.
           </div>
         )}
         {!loading && sourceTemplates.length > 0 && visible.length === 0 && (
@@ -237,6 +250,7 @@ const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
                     </span>
                     <span className="d-flex flex-column align-items-end gap-1">
                       <DecisionBadge decision={defaultDecision(t.rego)} />
+                      <TemplateOriginBadges template={t} />
                       {t.policy_input === 'mcp_tool' && (
                         <Badge tone="secondary" value="MCP tool policy" />
                       )}
@@ -247,9 +261,10 @@ const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
             </ul>
             {otherTypeOnly > 0 && (
               <div className="small text-muted mt-2" data-testid="policy-templates-other-type-note">
-                {otherTypeOnly} {otherTypeOnly === 1 ? 'template is' : 'templates are'} for{' '}
+                {otherTypeOnly}{' '}
                 {POLICY_TYPE_NAMES[policyType === 'gateway' ? 'agent_surface' : 'gateway'].name}{' '}
-                policies only.
+                {otherTypeOnly === 1 ? 'template is' : 'templates are'} left out for a{' '}
+                {POLICY_TYPE_NAMES[policyType].name} policy.
               </div>
             )}
           </div>
@@ -267,7 +282,7 @@ const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
               data-testid="policy-templates-preview-empty"
             >
               <i className="fas fa-hand-pointer me-2" aria-hidden="true" />
-              Pick a template to see its rules and settings.
+              Pick a template to preview the rules it adds.
             </div>
           )}
         </div>

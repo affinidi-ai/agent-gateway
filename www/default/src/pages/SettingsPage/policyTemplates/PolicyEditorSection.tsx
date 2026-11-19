@@ -4,13 +4,7 @@ import FieldHelp from '../../../components/shared/FieldHelp';
 import PolicyRulesList from './PolicyRulesList';
 import PolicySectionTitle from './PolicySectionTitle';
 import RegoReference from './RegoReference';
-import {
-  groupInUse,
-  parsePolicyRules,
-  ruleInUse,
-  type PolicyRule,
-  type RuleGroup,
-} from './regoRules';
+import { groupUse, parsePolicyRules, ruleUse, type PolicyRule, type RuleGroup } from './regoRules';
 import { DecisionBadge } from './TemplateBadges';
 import type { PolicyType } from './types';
 import './PolicyTemplates.css';
@@ -32,6 +26,8 @@ interface PolicyEditorSectionProps {
   packageMismatch: string | null;
   onFixPackage: () => void;
   justAdded: string | null;
+  /** The template a new policy's own rules started from, while they still follow it. */
+  startedFrom?: string | null;
   onAdd: () => void;
   onRemoveGroup: (group: RuleGroup) => void;
   onRemoveRule: (rule: PolicyRule) => void;
@@ -56,6 +52,7 @@ const PolicyEditorSection: React.FC<PolicyEditorSectionProps> = ({
   packageMismatch,
   onFixPackage,
   justAdded,
+  startedFrom = null,
   onAdd,
   onRemoveGroup,
   onRemoveRule,
@@ -119,10 +116,7 @@ const PolicyEditorSection: React.FC<PolicyEditorSectionProps> = ({
             <span className="text-muted small" data-testid="policy-rules-count">
               {ruleCount} {ruleCount === 1 ? 'rule' : 'rules'}
             </span>
-            <DecisionBadge
-              decision={empty ? 'allow' : (parsed.defaultDecision ?? 'deny')}
-              prefix="Default"
-            />
+            <DecisionBadge decision={empty ? 'allow' : (parsed.defaultDecision ?? 'deny')} />
           </>
         )}
         {isValidating && (
@@ -165,8 +159,9 @@ const PolicyEditorSection: React.FC<PolicyEditorSectionProps> = ({
           onWriteRego={() => onViewChange('rego')}
           onRemoveGroup={onRemoveGroup}
           onRemoveRule={onRemoveRule}
-          isRuleInUse={rule => ruleInUse(parsed, rule)}
-          isGroupInUse={group => groupInUse(parsed, group)}
+          ruleUse={rule => ruleUse(parsed, rule)}
+          groupUse={group => groupUse(parsed, group)}
+          startedFrom={startedFrom}
           onSetDefaultDeny={onSetDefaultDeny}
           onShowRule={showRule}
         />

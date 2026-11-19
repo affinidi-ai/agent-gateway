@@ -1,23 +1,41 @@
 import React from 'react';
-import type { PolicyDecision } from './types';
+import { Badge } from '../../../components/shared/Badge';
+import type { PolicyDecision, PolicyTemplate } from './types';
 
-interface DecisionBadgeProps {
-  decision: PolicyDecision;
-  /** Shown before the decision, e.g. "Default". */
-  prefix?: string;
-}
-
-/** A template's default decision as the Audit Log's decision pill: DENY red, ALLOW amber. */
-export const DecisionBadge: React.FC<DecisionBadgeProps> = ({ decision, prefix }) => (
+/**
+ * A policy's or template's default decision: a quiet grey outline with a shield for DENY, and
+ * amber with a warning icon for ALLOW, since allowing by default is the less safe choice.
+ */
+export const DecisionBadge: React.FC<{ decision: PolicyDecision }> = ({ decision }) => (
   <span
-    className={`audit-decision ${decision === 'allow' ? 'policy-decision--allow' : 'audit-decision--deny'}`}
+    className={`policy-default-decision policy-default-decision--${decision}`}
     title={
       decision === 'allow'
         ? 'Allows requests that no rule denies'
         : 'Denies requests that no rule allows'
     }
   >
-    {prefix ? `${prefix} ` : ''}
-    {decision.toUpperCase()}
+    <i
+      className={`fas ${decision === 'allow' ? 'fa-exclamation-triangle' : 'fa-shield-alt'}`}
+      aria-hidden="true"
+    />
+    Default {decision.toUpperCase()}
   </span>
+);
+
+/** Recommended on a suggested built-in, and This tab only on an organisation template. */
+export const TemplateOriginBadges: React.FC<{ template: PolicyTemplate }> = ({ template }) => (
+  <>
+    {template.builtin && template.recommended && (
+      <Badge tone="primary" value="Recommended" data-testid="policy-template-recommended-badge" />
+    )}
+    {!template.builtin && (
+      <Badge
+        tone="info"
+        value="This tab only"
+        title="Kept in this browser tab until it closes"
+        data-testid="policy-template-tab-only-badge"
+      />
+    )}
+  </>
 );

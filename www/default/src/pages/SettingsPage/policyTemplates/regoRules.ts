@@ -261,7 +261,7 @@ const readName = (rule: PolicyRule) => ruleName(rule).split('.')[0];
 function reachableFromAllow(
   rules: PolicyRule[],
   excluded: (rule: PolicyRule) => boolean
-): Set<string> {
+): { reached: Set<string>; readers: PolicyRule[] } {
   const patterns = new Map(
     Array.from(new Set(rules.map(readName)), name => [name, referencePattern(name)])
   );
@@ -281,41 +281,68 @@ function reachableFromAllow(
         });
     });
   }
-  return reached;
+  return { reached, readers: Array.from(visited) };
+}
+
+/** Why a rule or group can't be removed: the rule that reads it, or the whole-document read. */
+export type RuleUse =
+  | { kind: 'reader'; name: string; line: number }
+  | { kind: 'document' }
+  | { kind: 'unnamed' };
+
+/**
+ * The first rule, by line, among `readers` that reads one of `names` and defines none of them;
+ * a reason without a reader when none is found, so a name `allow` reaches is always refused.
+ */
+function firstReader(readers: PolicyRule[], names: Set<string>): RuleUse {
+  const reader = readers
+    .filter(r => !names.has(readName(r)))
+    .filter(r => Array.from(names).some(n => referencePattern(n).test(withoutStrings(r.code))))
+    .sort((a, b) => a.startLine - b.startLine)[0];
+  return reader
+    ? { kind: 'reader', name: ruleName(reader), line: reader.startLine }
+    : { kind: 'unnamed' };
 }
 
 /**
- * Whether removing a rule changes what `allow` decides: `allow` reads its name, directly or
- * through other rules, from outside the rule, or the Rego reads its package as a whole
- * document. Removing an `allow` rule, or a rule with an identical definition left from the same
- * template added twice, is always allowed; one of several different definitions is in use.
+ * Why removing a rule would change what `allow` decides, or null when it wouldn't: `allow` reads
+ * its name, directly or through other rules, from outside the rule (the reason names the first
+ * rule, by line, that reads it), or the Rego reads its package as a whole document. Removing an
+ * `allow` rule, or a rule with an identical definition left from the same template added twice,
+ * is always allowed; one of several different definitions is in use.
  */
-export function ruleInUse(parsed: ParsedPolicy, rule: PolicyRule): boolean {
+export function ruleUse(parsed: ParsedPolicy, rule: PolicyRule): RuleUse | null {
   const name = ruleName(rule);
-  if (!parsed.ok || name === 'allow') return false;
+  if (!parsed.ok || name === 'allow') return null;
   const rules = parsed.groups.flatMap(g => g.rules);
   const self = (r: PolicyRule) => r.startLine === rule.startLine;
-  if (rules.some(r => !self(r) && ruleName(r) === name && sameCode(r, rule))) return false;
-  return parsed.readsPackageDocument || reachableFromAllow(rules, self).has(readName(rule));
+  if (rules.some(r => !self(r) && ruleName(r) === name && sameCode(r, rule))) return null;
+  if (parsed.readsPackageDocument) return { kind: 'document' };
+  const { reached, readers } = reachableFromAllow(rules, self);
+  return reached.has(readName(rule)) ? firstReader(readers, new Set([readName(rule)])) : null;
 }
 
 /**
- * Whether removing a template group changes what `allow` decides: `allow` reads a name the
- * group defines through rules outside the group, or the Rego reads its package as a whole
- * document, and some definition of that name in the group has no identical copy outside it.
+ * Why removing a template group would change what `allow` decides, or null when it wouldn't:
+ * `allow` reads a name the group defines through rules outside the group, or the Rego reads its
+ * package as a whole document, and some definition of that name in the group has no identical
+ * copy outside it.
  */
-export function groupInUse(parsed: ParsedPolicy, group: RuleGroup): boolean {
-  if (!parsed.ok) return false;
+export function groupUse(parsed: ParsedPolicy, group: RuleGroup): RuleUse | null {
+  if (!parsed.ok) return null;
   const rules = parsed.groups.flatMap(g => g.rules);
   const inGroup = (r: PolicyRule) => r.startLine >= group.startLine && r.endLine <= group.endLine;
   const outside = rules.filter(r => !inGroup(r));
-  const reached = reachableFromAllow(rules, inGroup);
-  return group.rules.some(
+  const { reached, readers } = reachableFromAllow(rules, inGroup);
+  const used = group.rules.filter(
     rule =>
       ruleName(rule) !== 'allow' &&
       (parsed.readsPackageDocument || reached.has(readName(rule))) &&
       !outside.some(r => ruleName(r) === ruleName(rule) && sameCode(r, rule))
   );
+  if (used.length === 0) return null;
+  if (parsed.readsPackageDocument) return { kind: 'document' };
+  return firstReader(readers, new Set(used.map(readName)));
 }
 
 /** Removes one rule's lines, with the comment lines directly above it. */

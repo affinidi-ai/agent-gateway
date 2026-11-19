@@ -3,6 +3,7 @@ import { AppButton } from '../../../components/shared/AppButton';
 import { Badge } from '../../../components/shared/Badge';
 import FormSelect from '../../../components/shared/FormSelect';
 import FieldHelp from '../../../components/shared/FieldHelp';
+import InfoBanner from '../../../components/shared/InfoBanner';
 import { simulatePolicy } from '../simulatePolicy';
 import { defaultDecision } from './regoTemplate';
 import { savePolicyTemplate } from './policyTemplateStore';
@@ -124,15 +125,24 @@ const SaveAsTemplatePanel: React.FC<SaveAsTemplatePanelProps> = ({
         <h6 className="m-0 font-weight-bold text-primary">
           <i className="fas fa-copy" aria-hidden="true" /> Save as template
         </h6>
-        <button
-          type="button"
-          className="btn-close"
-          aria-label="Close save as template"
+        <AppButton
+          variant="outline-secondary"
           onClick={onClose}
           data-testid="policy-templates-save-close-button"
-        />
+        >
+          Back to Add rules
+        </AppButton>
       </div>
       <div className="card-body">
+        <div data-testid="policy-templates-save-tab-only-note">
+          <InfoBanner
+            variant="warning"
+            icon="fa-exclamation-triangle"
+            collapsible={false}
+            className="mb-3"
+            summary="Kept in this browser tab only, until it closes, and listed under Organization templates."
+          />
+        </div>
         <p className="text-muted small mb-3">
           Copies the saved version. Later edits to this policy don&apos;t change the template.
         </p>
@@ -185,7 +195,7 @@ const SaveAsTemplatePanel: React.FC<SaveAsTemplatePanelProps> = ({
           />
         </div>
         <div className="d-flex flex-wrap gap-2 mb-3">
-          <DecisionBadge decision={defaultDecision(savedPolicy)} prefix="Default" />
+          <DecisionBadge decision={defaultDecision(savedPolicy)} />
           {reads.map(r => (
             <Badge
               key={r}
@@ -251,10 +261,6 @@ const SaveAsTemplatePanel: React.FC<SaveAsTemplatePanelProps> = ({
             Takes the JSON from the Test (dry-run) card and records the decision the saved version
             gives.
           </div>
-        </div>
-        <div className="small text-muted mb-3">
-          Kept in this browser tab until it is closed, and listed under{' '}
-          <strong>Your organization</strong>.
         </div>
         <div className="d-flex justify-content-end gap-2">
           <AppButton

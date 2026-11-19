@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { apiClient } from '../../api';
-import { showToast } from '../../utils/toaster';
+import { showToast, showUndoToast } from '../../utils/toaster';
 import { useSafeNavigate } from '../../hooks/useSafeNavigate';
 import { usePageTitle } from '../../context/PageTitleContext';
 import { usePermissions } from '../../context/PermissionsContext';
@@ -22,8 +22,10 @@ import TemplateGallery from './policyTemplates/TemplateGallery';
 import { BUILTIN_POLICY_TEMPLATES } from './policyTemplates/builtinPolicyTemplates';
 import { parsePolicyRules } from './policyTemplates/regoRules';
 import { BLANK_TEMPLATE_ID } from './policyTemplates/policyDefaults';
-import { POLICY_TYPE_NAMES, type PolicyType } from './policyTemplates/types';
+import { POLICY_TYPE_NAMES, type PolicyTemplate, type PolicyType } from './policyTemplates/types';
 import { usePolicyTemplateActions } from './policyTemplates/usePolicyTemplateActions';
+import { useAllPolicyTemplates } from './policyTemplates/usePolicyTemplates';
+import { policyStart } from './policyTemplates/policyStart';
 
 interface PolicyDefinition {
   id: string;
@@ -111,6 +113,8 @@ const EditPolicyDefinitionPage: React.FC = () => {
     insertedTemplate,
     dismissInsertedTemplate,
     justAdded,
+    addedRules,
+    rulesAdded,
     regoRef,
     applyTemplate,
     editPolicy,
@@ -121,6 +125,36 @@ const EditPolicyDefinitionPage: React.FC = () => {
     denyByDefault,
     showRule,
   } = usePolicyTemplateActions(form, setForm, isCreateMode);
+  const templateEntries = useAllPolicyTemplates();
+  const start = numbered
+    ? policyStart(
+        form.policy,
+        form.policy_type,
+        usedTemplate,
+        templateEntries
+          .flatMap(e => Object.values(e.variants))
+          .filter((t): t is PolicyTemplate => !!t),
+        addedRules
+      )
+    : null;
+  const startedFrom = usedTemplate && start ? start.name : null;
+  const simulateRef = useRef<HTMLDivElement>(null);
+  const [focusTest, setFocusTest] = useState(0);
+  const loadInTest = (name: string, input: Record<string, unknown>) => {
+    const previous = form.sample_input;
+    setForm(f => ({ ...f, sample_input: JSON.stringify(input, null, 2) }));
+    setFocusTest(n => n + 1);
+    showUndoToast({
+      message: `Loaded ${name} into Test (dry-run). Undo restores the sample input from before.`,
+      onUndo: () => setForm(f => ({ ...f, sample_input: previous })),
+    });
+  };
+
+  useEffect(() => {
+    if (focusTest === 0) return;
+    simulateRef.current?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
+    simulateRef.current?.querySelector<HTMLTextAreaElement>('textarea')?.focus();
+  }, [focusTest]);
 
   const changeType = (newType: PolicyType) => {
     const expectedPkg = EXPECTED_PACKAGE[newType];
@@ -332,7 +366,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
         setTemplatePanel(null);
         showToast(
           'success',
-          `Template ${template.name} saved under Your organization for this browser tab.`
+          `Template ${template.name} saved under Organization templates for this browser tab.`
         );
       }}
       onClose={() => setTemplatePanel(null)}
@@ -378,19 +412,29 @@ const EditPolicyDefinitionPage: React.FC = () => {
               </h6>
               <div className="d-flex align-items-center gap-2">
                 {!isCreateMode && canEditPolicies && (
-                  <span title={isDirty ? 'Save the policy first' : undefined}>
+                  <div className="position-relative">
                     <AppButton
                       variant="outline-primary"
                       className={templatePanel === 'save' ? 'active' : ''}
                       aria-pressed={templatePanel === 'save'}
                       disabled={isDirty}
+                      aria-describedby={isDirty ? 'policy-templates-save-as-hint' : undefined}
                       onClick={() => togglePanel('save')}
                       iconStart={<i className="fas fa-copy" aria-hidden="true" />}
                       data-testid="policy-templates-save-as-button"
                     >
                       Save as template
                     </AppButton>
-                  </span>
+                    {isDirty && (
+                      <small
+                        className="text-muted position-absolute top-100 end-0 text-nowrap"
+                        id="policy-templates-save-as-hint"
+                        data-testid="policy-templates-save-as-hint"
+                      >
+                        Save your changes first.
+                      </small>
+                    )}
+                  </div>
                 )}
                 {canEditPolicies && (
                   <button
@@ -438,8 +482,9 @@ const EditPolicyDefinitionPage: React.FC = () => {
                 <TemplateGallery
                   step={1}
                   policyType={form.policy_type}
-                  policy={form.policy}
+                  start={start}
                   usedTemplate={usedTemplate}
+                  rulesAdded={rulesAdded}
                   onPickBlank={() => {
                     pickBlank();
                     setView('rules');
@@ -490,6 +535,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
                   }))
                 }
                 justAdded={justAdded}
+                startedFrom={startedFrom}
                 onAdd={focusTemplatesColumn}
                 onRemoveGroup={removeGroup}
                 onRemoveRule={removeRule}
@@ -507,17 +553,20 @@ const EditPolicyDefinitionPage: React.FC = () => {
               template={insertedTemplate.template}
               usesDefaultSettings={insertedTemplate.usesDefaultSettings}
               onDismiss={dismissInsertedTemplate}
+              onLoadInTest={loadInTest}
             />
           )}
           {!isCreateMode && form.id && canEditPolicies && (
-            <PolicySimulatePanel
-              policyId={form.id}
-              policyType={form.policy_type}
-              draftPolicy={form.policy}
-              sampleInput={form.sample_input ?? POLICY_SIMULATE_DEFAULT_INPUT}
-              onSampleInputChange={value => setForm(f => ({ ...f, sample_input: value }))}
-              policyValid={policyValid && !packageMismatch}
-            />
+            <div ref={simulateRef}>
+              <PolicySimulatePanel
+                policyId={form.id}
+                policyType={form.policy_type}
+                draftPolicy={form.policy}
+                sampleInput={form.sample_input ?? POLICY_SIMULATE_DEFAULT_INPUT}
+                onSampleInputChange={value => setForm(f => ({ ...f, sample_input: value }))}
+                policyValid={policyValid && !packageMismatch}
+              />
+            </div>
           )}
           {!isCreateMode && form.id && (
             <PolicyVersionHistory

@@ -21,6 +21,7 @@ interface CatalogueEntry {
   category: string;
   policy_types: string[];
   standalone?: boolean;
+  recommended?: boolean;
   input?: 'mcp_tool';
   docs: { page: keyof typeof DOCS_URL; anchor: string; label: string };
   rules: string;
@@ -43,6 +44,7 @@ function expand(entry: CatalogueEntry, policyType: PolicyType): PolicyTemplate {
     examples: entry.examples as PolicyTemplateExample[],
     builtin: true,
     standalone: entry.standalone ?? false,
+    ...(entry.recommended ? { recommended: true } : {}),
     ...(entry.input ? { policy_input: entry.input } : {}),
     docs_href: `${DOCS_URL[entry.docs.page]}#${entry.docs.anchor}`,
     docs_label: entry.docs.label,

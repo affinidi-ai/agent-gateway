@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from 'react';
+import { AppButton } from '../../../components/shared/AppButton';
 import { Badge } from '../../../components/shared/Badge';
 import { simulatePolicy } from '../simulatePolicy';
+import { defaultDecision } from './regoTemplate';
 import type { PolicyDecision, PolicyTemplate, PolicyType } from './types';
 
 interface TemplateExamplesCheckProps {
@@ -12,9 +14,26 @@ interface TemplateExamplesCheckProps {
   /** False when the template was inserted with a setting changed from its default. */
   usesDefaultSettings: boolean;
   onDismiss: () => void;
+  /** Opens an example's input in Test (dry-run). */
+  onLoadInTest?: (name: string, input: Record<string, unknown>) => void;
 }
 
-type Outcome = { decision: PolicyDecision } | { error: string } | null;
+type Outcome = { decision: PolicyDecision; reason?: string } | { error: string } | null;
+
+/** Why an example's decision differs from the one the template expects. */
+function differsBecause(
+  expected: PolicyDecision,
+  allowsByDefault: boolean,
+  reason?: string
+): string {
+  if (expected === 'deny' && allowsByDefault) {
+    return 'This policy allows every request by default, so its allow rules change nothing. Use Deny by default in the Rules view.';
+  }
+  if (expected === 'deny') {
+    return 'Another allow rule in this policy lets this request through. Allow rules combine with OR, so the template adds nothing here until that rule is narrowed or removed.';
+  }
+  return `This policy denies it, though the template expects it to be allowed. Load it in Test to see the decision.${reason ? ` Reason: ${reason}` : ''}`;
+}
 
 /**
  * Runs an inserted template's examples against the draft policy and shows each expected
@@ -28,6 +47,7 @@ const TemplateExamplesCheck: React.FC<TemplateExamplesCheckProps> = ({
   template,
   usesDefaultSettings,
   onDismiss,
+  onLoadInTest,
 }) => {
   const [outcomes, setOutcomes] = useState<Outcome[]>(() => template.examples.map(() => null));
 
@@ -40,7 +60,7 @@ const TemplateExamplesCheck: React.FC<TemplateExamplesCheckProps> = ({
         template.examples.map(async (ex): Promise<Outcome> => {
           try {
             const r = await simulatePolicy(policyId, policyType, draftPolicy, ex.input);
-            return { decision: r.allow ? 'allow' : 'deny' };
+            return { decision: r.allow ? 'allow' : 'deny', reason: r.reason };
           } catch (e) {
             return { error: e instanceof Error ? e.message : 'Dry-run failed' };
           }
@@ -59,6 +79,7 @@ const TemplateExamplesCheck: React.FC<TemplateExamplesCheckProps> = ({
   const isMismatch = (o: Outcome, i: number) =>
     usesDefaultSettings && !!o && 'decision' in o && o.decision !== template.examples[i].expected;
   const mismatches = outcomes.filter(isMismatch).length;
+  const allowsByDefault = defaultDecision(draftPolicy) === 'allow';
 
   return (
     <div
@@ -69,8 +90,7 @@ const TemplateExamplesCheck: React.FC<TemplateExamplesCheckProps> = ({
         <div className="d-flex justify-content-between align-items-center mb-2">
           <h6 className="font-weight-bold text-primary mb-0">
             <i className="fas fa-layer-group me-2" aria-hidden="true" />
-            Template examples{' '}
-            <span className="text-muted fw-normal small">from {template.name}</span>
+            Template examples
           </h6>
           <button
             type="button"
@@ -81,8 +101,7 @@ const TemplateExamplesCheck: React.FC<TemplateExamplesCheckProps> = ({
           />
         </div>
         <p className="text-muted small mb-2">
-          Each example runs against the Rego in the editor (unsaved), as the Test (dry-run) card
-          does.
+          {template.name} · run through Test (dry-run) against this draft, saved or not.
         </p>
         {!usesDefaultSettings && (
           <p
@@ -100,7 +119,13 @@ const TemplateExamplesCheck: React.FC<TemplateExamplesCheckProps> = ({
               <tr>
                 <th>Example</th>
                 <th>Expected</th>
-                <th>Draft gives</th>
+                <th>This policy</th>
+                <th>Result</th>
+                {onLoadInTest && (
+                  <th>
+                    <span className="visually-hidden">Actions</span>
+                  </th>
+                )}
               </tr>
             </thead>
             <tbody>
@@ -113,7 +138,17 @@ const TemplateExamplesCheck: React.FC<TemplateExamplesCheckProps> = ({
                     className={mismatch ? 'table-warning' : undefined}
                     data-testid={`policy-template-example-row-${i}`}
                   >
-                    <td>{ex.name}</td>
+                    <td>
+                      {ex.name}
+                      {mismatch && o && 'decision' in o && (
+                        <div
+                          className="small text-muted"
+                          data-testid={`policy-template-example-row-${i}-why`}
+                        >
+                          {differsBecause(ex.expected, allowsByDefault, o.reason)}
+                        </div>
+                      )}
+                    </td>
                     <td>
                       <Badge
                         tone={ex.expected === 'allow' ? 'success' : 'danger'}
@@ -135,6 +170,27 @@ const TemplateExamplesCheck: React.FC<TemplateExamplesCheckProps> = ({
                         />
                       )}
                     </td>
+                    <td>
+                      {usesDefaultSettings && o && 'decision' in o && (
+                        <Badge
+                          tone={mismatch ? 'danger' : 'success'}
+                          value={mismatch ? 'Differs' : 'Matches'}
+                        />
+                      )}
+                    </td>
+                    {onLoadInTest && (
+                      <td>
+                        <AppButton
+                          variant="link"
+                          className="p-0 text-nowrap"
+                          onClick={() => onLoadInTest(ex.name, ex.input)}
+                          aria-label={`Load ${ex.name} in Test (dry-run)`}
+                          data-testid={`policy-template-example-row-${i}-load-button`}
+                        >
+                          Load in Test
+                        </AppButton>
+                      </td>
+                    )}
                   </tr>
                 );
               })}
