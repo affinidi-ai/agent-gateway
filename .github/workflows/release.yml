@@ -53,7 +53,7 @@ jobs:
           python-version: '3.x'
 
       - name: Install changelog dependencies
-        run: python3 -m pip install PyYAML
+        run: python3 -m pip install PyYAML==6.0.2
 
       - name: Require no open release PR
         env:

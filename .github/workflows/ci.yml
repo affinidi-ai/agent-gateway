@@ -126,7 +126,7 @@ jobs:
           python-version: '3.x'
 
       - name: Install validator dependencies
-        run: python3 -m pip install PyYAML
+        run: python3 -m pip install PyYAML==6.0.2
 
       - name: Test changelog fragment validation
         run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'

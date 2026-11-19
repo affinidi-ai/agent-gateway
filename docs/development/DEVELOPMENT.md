@@ -26,6 +26,12 @@ server: the binary serves the built dashboard itself, on the same origin as the 
 
 These workflows build locally. They do not depend on a public binary or container image.
 
+The Git hooks in [`.pre-commit-config.yaml`](../../.pre-commit-config.yaml) are installed by
+`make install-deps` and `make install-git-hooks`. Pass `SKIP_GIT_HOOKS=1` to either target to keep
+your own hooks instead: the install is skipped, so this repository's pre-commit checks, the gitleaks
+secret scan included, do not run locally. Only `1`, `true` and `yes` skip the install; every other
+value installs the hooks, and `make install-git-hooks` installs them whenever you want them back.
+
 Run `make help` to list every available target with a short description.
 
 ## Native Development
@@ -262,7 +268,7 @@ This documents the dependency, fails fast with a clear message if the helper con
 
 ```bash
 make shellcheck   # lint every tracked *.sh
-make lint         # fmt-check + clippy + eslint + shellcheck
+make lint         # fmt-check + clippy + eslint + shellcheck + changelog
 ```
 
 ## Tests And Quality Checks
@@ -308,6 +314,17 @@ make npm-test
 make npm-lint-ci
 make npm-build-ci
 ```
+
+### Changelog Fragments
+
+```bash
+make lint-changelog
+```
+
+`make lint` ends with this check. It validates the fragments under `.changelog/wip/` the way CI
+does and requires one for the current branch; [`AGENTS.md`](../../AGENTS.md) defines their format. It
+needs PyYAML, either in the repository-local `.venv` that `make install-python-deps` creates or in a
+`python3` on `PATH` that already has it.
 
 ### Full Local Preflight
 
