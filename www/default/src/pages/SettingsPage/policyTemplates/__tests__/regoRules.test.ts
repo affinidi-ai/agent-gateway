@@ -1,10 +1,17 @@
+import renderedTemplates from '../__fixtures__/renderedTemplates.json';
 import {
   groupUse,
+  isPlainAllow,
+  isUnconditionalAllow,
   parsePolicyRules,
   removeRule,
   removeRuleGroup,
+  ruleName,
+  ruleRoles,
   ruleUse,
   setDefaultDeny,
+  summarizeDecision,
+  type DecisionSummary,
   type ParsedPolicy,
   type PolicyRule,
   type RuleGroup,
@@ -639,6 +646,377 @@ describe('ruleUse and groupUse', () => {
     expect(
       ruleUse(parsed, parsed.groups.find(g => g.source.kind === 'editor')!.rules[0])
     ).toBeNull();
+  });
+});
+
+describe('split rule heads', () => {
+  const splitHead = [
+    'package p',
+    'default allow := false',
+    'allow',
+    'if { count(deny) == 0 }',
+    'deny contains msg',
+    'if {',
+    '  input.bad',
+    '  msg := "bad"',
+    '}',
+  ].join('\n');
+
+  it('refuses Remove on a deny rule an allow with its if on the next line reads', () => {
+    const parsed = groupsOf(splitHead);
+    const deny = parsed.groups[0].rules.find(r => ruleName(r) === 'deny')!;
+    expect(ruleUse(parsed, deny)).toEqual({ kind: 'reader', name: 'allow', line: 3 });
+  });
+
+  it('joins a head and its if body on the next line into one rule', () => {
+    expect(groupsOf(splitHead).groups[0].rules.map(r => [r.head, r.startLine, r.endLine])).toEqual([
+      ['allow', 3, 4],
+      ['deny', 5, 9],
+    ]);
+  });
+
+  it('joins a head that ends in contains, :=, = or a line that starts with else', () => {
+    const rego = [
+      'package p',
+      'deny contains',
+      '  msg if input.bad',
+      'level',
+      '  := 1 if input.a',
+      'tier',
+      '  = 2',
+      'x := 1 if {',
+      '  input.a',
+      '}',
+      'else := 0',
+    ].join('\n');
+    expect(groupsOf(rego).groups[0].rules.map(r => [r.head, r.startLine, r.endLine])).toEqual([
+      ['deny', 2, 3],
+      ['level', 4, 5],
+      ['tier', 6, 7],
+      ['x', 8, 11],
+    ]);
+  });
+
+  it('starts a new rule on a line whose name only begins with a keyword', () => {
+    const rego = ['package p', 'x := 1', 'if_set := 2', 'contains_x := 3', 'elsewhere := 4'].join(
+      '\n'
+    );
+    expect(groupsOf(rego).groups[0].rules.map(r => r.head)).toEqual([
+      'x',
+      'if_set',
+      'contains_x',
+      'elsewhere',
+    ]);
+  });
+
+  it.each([
+    ['an if body after a template marker', 'allow\n# Inserted from template: T\nif { input.x }'],
+    ['a statement named after a keyword', 'some x in input.list'],
+    ['an assignment with no head', '# Inserted from template: T\n:= 1'],
+  ])('reads %s as unparsed', (_label, body) => {
+    expect(parsePolicyRules(`package p\n${body}\n`).ok).toBe(false);
+  });
+});
+
+const onlyRule = (body: string) => {
+  const rules = groupsOf(`package p\n${body}\n`).groups.flatMap(g => g.rules);
+  expect(rules).toHaveLength(1);
+  return rules[0];
+};
+
+describe('isPlainAllow and isUnconditionalAllow', () => {
+  it.each([
+    ['a bare allow', 'allow'],
+    ['allow := true', 'allow := true'],
+    ['allow = true', 'allow = true'],
+    ['allow if true', 'allow if true'],
+    ['allow if { true }', 'allow if { true }'],
+    ['allow { true }', 'allow { true }'],
+    ['allow if { true } over lines', 'allow if {\n  true\n}'],
+  ])('reads %s as a plain, unconditional allow', (_label, body) => {
+    const rule = onlyRule(body);
+    expect([isPlainAllow(rule), isUnconditionalAllow(rule)]).toEqual([true, true]);
+  });
+
+  it.each([
+    ['allow if a condition', 'allow if input.x'],
+    ['allow if { conditions }', 'allow if {\n  input.x\n  input.y\n}'],
+    ['allow := true if a condition', 'allow := true if { input.x }'],
+    ['an old-style body', 'allow {\n  input.x\n}'],
+    ['a split head', 'allow\nif { input.x }'],
+    ['true and a condition', 'allow if { true; input.x }'],
+  ])('reads %s as a plain, conditional allow', (_label, body) => {
+    const rule = onlyRule(body);
+    expect([isPlainAllow(rule), isUnconditionalAllow(rule)]).toEqual([true, false]);
+  });
+
+  it.each([
+    [':= false', 'allow := false if { input.x }'],
+    [':= <expr>', 'allow := input.x'],
+    ['allow(x)', 'allow(x) if x'],
+    ['allow contains', 'allow contains "a" if input.x'],
+    ['allow[x]', 'allow[x] if { some x in input.list }'],
+    ['else', 'allow if { input.x } else := false'],
+    ['allow.x', 'allow.x := true'],
+    ['default allow := 1', 'default allow := 1'],
+    [':= a name starting with true', 'allow := true_value'],
+  ])('reads %s as not plain', (_label, body) => {
+    const rule = onlyRule(body);
+    expect([isPlainAllow(rule), isUnconditionalAllow(rule)]).toEqual([false, false]);
+  });
+
+  it('reads else inside a string or a raw string as plain', () => {
+    expect(isPlainAllow(onlyRule('allow if input.x == "else"'))).toBe(true);
+    expect(isPlainAllow(onlyRule('allow if input.x == `or else`'))).toBe(true);
+  });
+
+  it('reads a rule with another name as not plain', () => {
+    expect(isPlainAllow(onlyRule('allowed if input.x'))).toBe(false);
+  });
+});
+
+describe('summarizeDecision', () => {
+  const summary = (rego: string) => summarizeDecision(parsePolicyRules(rego));
+
+  it.each<[string, string, DecisionSummary | null]>([
+    ['S1 Rego that does not parse', 'package p\nallow if {\n', null],
+    ['S3 empty Rego', '', null],
+    ['S10 no rules and no default', 'package p\n', null],
+    ['no rules and default false', 'package p\ndefault allow := false\n', null],
+    [
+      'S4 a non-plain allow',
+      'package p\ndefault allow := false\nallow := false if { input.x }\n',
+      { kind: 'unsummarised' },
+    ],
+    [
+      'S4 over default true',
+      'package p\ndefault allow := true\nallow := false if input.x\n',
+      { kind: 'unsummarised' },
+    ],
+    [
+      'S4 over an unconditional allow',
+      'package p\nallow\nallow.x := 1\n',
+      { kind: 'unsummarised' },
+    ],
+    [
+      'S5 default true',
+      'package p\ndefault allow := true\nallow if input.x\n',
+      { kind: 'allows-all', reason: 'default' },
+    ],
+    [
+      'S5 default true with no allow rule',
+      'package p\ndefault allow = true\nh if input.x\n',
+      { kind: 'allows-all', reason: 'default' },
+    ],
+    [
+      'S5b allow := true beside default false',
+      'package p\ndefault allow := false\nallow if input.x\nallow := true\n',
+      { kind: 'allows-all', reason: 'unconditional' },
+    ],
+    [
+      'S5b allow if { true }',
+      'package p\ndefault allow := false\nallow if { true }\n',
+      { kind: 'allows-all', reason: 'unconditional' },
+    ],
+    [
+      'S6 one allow rule',
+      'package p\ndefault allow := false\nallow if input.x\n',
+      { kind: 'any-allow', allowRules: 1, hasDefault: true },
+    ],
+    [
+      'S6 three allow rules',
+      'package p\ndefault allow := false\nallow if input.x\nallow if input.y\nallow if {\n  input.z\n}\n',
+      { kind: 'any-allow', allowRules: 3, hasDefault: true },
+    ],
+    [
+      'S7 allow rules without a default',
+      'package p\nallow if input.x\nallow if input.y\n',
+      { kind: 'any-allow', allowRules: 2, hasDefault: false },
+    ],
+    [
+      'S8 default false and no allow rule',
+      'package p\ndefault allow := false\ndeny_reason := "no"\n',
+      { kind: 'denies-all', hasDefault: true },
+    ],
+    [
+      'S9 no default and no allow rule',
+      'package p\nh if input.x\n',
+      { kind: 'denies-all', hasDefault: false },
+    ],
+  ])('%s', (_label, rego, expected) => {
+    expect(summary(rego)).toEqual(expected);
+  });
+
+  it('summarises an allow with its if on the next line as one conditional rule', () => {
+    expect(
+      summary(
+        'package p\ndefault allow := false\nallow\nif { count(deny) == 0 }\ndeny contains msg\nif {\n  input.bad\n  msg := "bad"\n}\n'
+      )
+    ).toEqual({ kind: 'any-allow', allowRules: 1, hasDefault: true });
+  });
+
+  it.each(Object.entries(renderedTemplates as Record<string, string>))(
+    'summarises the built-in %s with something other than unsummarised',
+    (_key, rego) => {
+      const parsed = parsePolicyRules(rego);
+      expect(parsed.ok).toBe(true);
+      expect(summarizeDecision(parsed)?.kind).not.toBe('unsummarised');
+    }
+  );
+});
+
+describe('ruleRoles', () => {
+  const roles = (rego: string) => {
+    const parsed = groupsOf(rego);
+    const role = ruleRoles(parsed);
+    return parsed.groups.flatMap(g => g.rules).map(r => [r.head, role(r)]);
+  };
+
+  it('reads a deny set allow counts as used by allow', () => {
+    expect(
+      roles('package p\nallow if { count(deny) == 0 }\ndeny contains msg if {\n  msg := "x"\n}')
+    ).toEqual([
+      ['allow', 'allow'],
+      ['deny', 'used-by-allow'],
+    ]);
+  });
+
+  it('reads a deny set only deny_reason reads as not used by allow', () => {
+    expect(
+      roles(
+        'package p\ndeny contains "x" if input.x\ndeny_reason := concat(", ", deny)\nallow if input.y'
+      )
+    ).toEqual([
+      ['deny', 'not-used-by-allow'],
+      ['deny_reason', 'deny-reason'],
+      ['allow', 'allow'],
+    ]);
+  });
+
+  it('reads a helper reached through another helper as used by allow', () => {
+    expect(roles('package p\nbase if input.a\nmid if not base\nallow if mid')).toEqual([
+      ['base', 'used-by-allow'],
+      ['mid', 'used-by-allow'],
+      ['allow', 'allow'],
+    ]);
+  });
+
+  it('reads every rule as used while the Rego reads its package as a whole document', () => {
+    expect(
+      roles('package p\nh if input.a\ng if input.b\nallow if not data.p["h"]\ndeny_reason := "no"')
+    ).toEqual([
+      ['h', 'used-by-allow'],
+      ['g', 'used-by-allow'],
+      ['allow', 'allow'],
+      ['deny_reason', 'deny-reason'],
+    ]);
+  });
+
+  it('reads a dotted allow.x as used by allow, and a rule it reads too', () => {
+    expect(roles('package p\nh if input.a\nallow.x := h')).toEqual([
+      ['h', 'used-by-allow'],
+      ['allow.x', 'used-by-allow'],
+    ]);
+  });
+
+  it('reads both copies of a helper from a template added twice as used, and both removable', () => {
+    const template =
+      'package p\n\nunsafe if contains(input.http.path, "..")\n\nallow if not unsafe\n';
+    const once = insertTemplateRules(
+      'package p\n\ndefault allow := false\n',
+      'Safe paths',
+      template
+    ).policy;
+    const parsed = groupsOf(insertTemplateRules(once, 'Safe paths', template).policy);
+    const role = ruleRoles(parsed);
+    const helpers = parsed.groups.flatMap(g => g.rules).filter(r => r.head === 'unsafe');
+    expect(helpers.map(role)).toEqual(['used-by-allow', 'used-by-allow']);
+    expect(helpers.map(r => ruleUse(parsed, r))).toEqual([null, null]);
+  });
+
+  it('reads a deny set an allow with its if on the next line counts as used by allow', () => {
+    expect(
+      roles('package p\nallow\nif { count(deny) == 0 }\ndeny contains msg\nif {\n  msg := "x"\n}')
+    ).toEqual([
+      ['allow', 'allow'],
+      ['deny', 'used-by-allow'],
+    ]);
+  });
+
+  it('reads every rule but allow and deny_reason as used by allow when the policy does not parse', () => {
+    const role = ruleRoles(parsePolicyRules('package p\nallow if {\n'));
+    expect(
+      [onlyRule('h if input.a'), onlyRule('allow if h'), onlyRule('deny_reason := "no"')].map(role)
+    ).toEqual(['used-by-allow', 'allow', 'deny-reason']);
+  });
+});
+
+describe('import lines', () => {
+  const ifImport = 'package surface.policy\nimport future.keywords.if\n';
+  const containsImport = 'package surface.policy\nimport future.keywords.contains\n';
+
+  it.each<[string, string, DecisionSummary | null]>([
+    [
+      'both keyword imports before default true',
+      `${ifImport}import future.keywords.contains\ndefault allow := true\nallow if input.x\n`,
+      { kind: 'allows-all', reason: 'default' },
+    ],
+    [
+      'the contains import before an unconditional allow',
+      `${containsImport}allow if { true }\n`,
+      { kind: 'allows-all', reason: 'unconditional' },
+    ],
+    [
+      'the if import before default true',
+      `${ifImport}default allow := true\nallow if input.x\n`,
+      { kind: 'allows-all', reason: 'default' },
+    ],
+    [
+      'the if import before an unconditional allow',
+      `${ifImport}allow if { true }\n`,
+      { kind: 'allows-all', reason: 'unconditional' },
+    ],
+    [
+      'a rule that ends in a field named contains',
+      'package p\nallow if input.flags.contains\nallow if { true }\n',
+      { kind: 'allows-all', reason: 'unconditional' },
+    ],
+  ])('summarises %s', (_label, rego, expected) => {
+    expect(summarizeDecision(parsePolicyRules(rego))).toEqual(expected);
+  });
+
+  it('reads the default after the contains import', () => {
+    expect(groupsOf(`${containsImport}default allow := true\n`).defaultDecision).toBe('allow');
+  });
+
+  it('reads a deny set after the contains import as used by allow, and refuses its Remove', () => {
+    const parsed = groupsOf(
+      `${containsImport}deny contains msg if {\n  input.bad\n  msg := "bad"\n}\ndefault allow := false\nallow if count(deny) == 0\n`
+    );
+    const rules = parsed.groups.flatMap(g => g.rules);
+    const deny = rules.find(r => r.head === 'deny')!;
+    expect(rules.map(r => r.head)).toEqual(['deny', 'allow']);
+    expect(ruleRoles(parsed)(deny)).toBe('used-by-allow');
+    expect(ruleUse(parsed, deny)).toEqual({ kind: 'reader', name: 'allow', line: 8 });
+  });
+});
+
+describe('a dotted allow starts the walk', () => {
+  it('refuses Remove on a rule allow.x reads', () => {
+    const parsed = groupsOf('package p\nh if input.a\nallow.x := h');
+    expect(ruleUse(parsed, parsed.groups[0].rules[0])).toEqual({
+      kind: 'reader',
+      name: 'allow.x',
+      line: 3,
+    });
+  });
+
+  it('refuses a template group whose rule allow.x outside it reads', () => {
+    const parsed = groupsOf(
+      'package p\nallow.x := h\n# Inserted from template: T\nh if input.a\n# End of template: T\n'
+    );
+    const group = parsed.groups.find(g => g.source.kind === 'template')!;
+    expect(groupUse(parsed, group)).toEqual({ kind: 'reader', name: 'allow.x', line: 2 });
   });
 });
 

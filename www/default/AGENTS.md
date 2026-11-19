@@ -2125,13 +2125,15 @@ Create custom policy) in `useTemplateGallery`.
   `outline-danger` trash icon button, named "Remove the rule <head>", `policies.edit`), which
   deletes the rule's lines and the comment lines directly above it, with Undo. `regoRules.ts` decides which Remove is refused, and why (`ruleUse` and `groupUse` return
   the reader, the whole-document read, a reason with no reader, or null): a rule is
-  in use when `allow` reads its name, directly or through other rules, from outside that rule,
-  such as `count(deny) == 0`, `not deny_x`, `not deny_reason`, a function call `h(x)` or
+  in use when an `allow` rule, a dotted one such as `allow.x` included, reads its name, directly
+  or through other rules, from outside that rule, such as `count(deny) == 0`, `not deny_x`, `not deny_reason`, a function call `h(x)` or
   `data.<package>.<name>`, and a dotted rule such as `blocked.ip` is read by its first segment;
   a template group is in use when `allow` reads a name the group defines through rules outside
   the group. A read from `deny_reason` alone doesn't count, since the gateway decides on `allow`
   and reads `deny_reason` only as text, so `deny` rules that only `deny_reason` reads are free;
-  names inside strings are not reads. While the Rego imports a `data` path, or reads `data`, its
+  names inside strings are not reads. A rule head and the lines under it that start with `if`,
+  `contains`, `else`, `:=`, `=` or `{` are one rule, so `allow` with `if { count(deny) == 0 }`
+  on the next line reads `deny`; an `import` line never continues onto the next. While the Rego imports a `data` path, or reads `data`, its
   package or a parent as a whole document (`data.<package>["name"]`, `doc := data.<package>`),
   every rule but `allow` counts as in use. An `allow` rule, a rule with an identical definition
   left (the same template added twice), and a group whose used rules all have identical copies
@@ -2168,8 +2170,10 @@ Create custom policy) in `useTemplateGallery`.
   **Write Rego** (`policy-rules-write-rego-button`). While the Rego doesn't compile a danger `InfoBanner`
   (`policy-rules-invalid-banner`) offers **Open Rego**
   (`policy-rules-invalid-open-rego-button`) and names a package mismatch when that is the
-  cause, and while a bracket is open the view says so
-  (`policy-rules-unparsed`, with `policy-rules-open-rego-button`) instead of listing rules.
+  cause, and while a bracket is open, or a top-level statement has no rule name or is named
+  after a Rego keyword (such as an `if { … }` body a template line separates from its head), the
+  view says so (`policy-rules-unparsed`, with `policy-rules-open-rego-button`) instead of
+  listing rules.
 - **Adding to a saved policy** also shows the **Template examples**
   card (`policy-template-examples-card`) above Test (dry-run): each example runs through
   `POST /policy-definitions/{id}/simulate` with the draft Rego. Its columns are Example,

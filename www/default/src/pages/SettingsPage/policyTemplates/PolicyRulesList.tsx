@@ -104,7 +104,7 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
           icon="fa-exclamation-triangle"
           collapsible={false}
           className="mb-2"
-          summary="The rules can't be listed until every bracket in the Rego is closed."
+          summary="The rules can't be listed: a bracket is open, or a statement doesn't start with a rule name."
         >
           <AppButton
             variant="outline-primary"

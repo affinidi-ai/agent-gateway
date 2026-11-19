@@ -1232,7 +1232,9 @@ describe('rules in this policy', () => {
   it('says the rules cannot be listed while a bracket is open', async () => {
     mockGateway({ ...SAVED, policy: 'package surface.policy\n\nallow if {\n  input.x' });
     renderAt('/policy-definitions/partner-only');
-    expect(await screen.findByTestId('policy-rules-unparsed')).toBeInTheDocument();
+    expect(await screen.findByTestId('policy-rules-unparsed')).toHaveTextContent(
+      "The rules can't be listed: a bracket is open, or a statement doesn't start with a rule name."
+    );
   });
 });
 

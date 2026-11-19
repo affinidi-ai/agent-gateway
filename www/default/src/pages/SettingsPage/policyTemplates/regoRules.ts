@@ -52,7 +52,11 @@ const DEFAULT_ALLOW = /^default\s+allow\s*:?=\s*(true|false)\b/;
 const DEFAULT_ALLOW_TRUE = /^(\s*default\s+allow\s*:?=\s*)true\b/m;
 const ALLOW_ALL_COMMENT =
   /^[ \t]*# Allow all traffic by default[ \t]*\r?\n(?=[ \t]*default\s+allow\s*:?=\s*true\b)/m;
-const OPEN_ENDING = /(\bif|\belse|:=|=|,)$/;
+const OPEN_ENDING = /((^|[^\w.])(if|else|contains)|:=|=|,)$/;
+const CLOSED_STATEMENT = /^(package|import)\s/;
+const CONTINUING_START = /^((if|contains|else)\b|:?=(?!=)|\{)/;
+const REGO_KEYWORD =
+  /^(as|contains|default|else|every|false|if|import|in|not|null|package|some|true|with)$/;
 const SUMMARY_LENGTH = 90;
 const DENY_REASON = 'deny_reason';
 const STRING_LITERAL = /"(?:\\.|[^"\\])*"|`[^`]*`/g;
@@ -97,7 +101,9 @@ function scan(lines: string[]): Item[] | null {
     if (atTop) {
       const lastCode = current?.code[current.code.length - 1] ?? '';
       const continues =
-        current !== null && (OPEN_ENDING.test(lastCode) || /^(else\b|\{)/.test(trimmed));
+        current !== null &&
+        !CLOSED_STATEMENT.test(current.code[0] ?? '') &&
+        (OPEN_ENDING.test(lastCode) || CONTINUING_START.test(trimmed));
       if (!continues) {
         current = { type: 'statement', start: i, end: i, code: [] };
         items.push(current);
@@ -136,11 +142,17 @@ function scan(lines: string[]): Item[] | null {
   return depth === 0 && !inRaw ? items : null;
 }
 
-function toRule(statement: Extract<Item, { type: 'statement' }>): PolicyRule | null {
+/**
+ * The statement as a rule, null for one that defines no rule, or `unparsed` for a head that
+ * is not a rule name.
+ */
+function toRule(statement: Extract<Item, { type: 'statement' }>): PolicyRule | null | 'unparsed' {
   const first = statement.code[0] ?? '';
-  if (/^(package|import)\s/.test(first) || DEFAULT_ALLOW.test(first)) return null;
-  const head = first.match(/^(default\s+)?[A-Za-z_][\w.]*(\([^)]*\))?/)?.[0] ?? first;
+  if (CLOSED_STATEMENT.test(first) || DEFAULT_ALLOW.test(first)) return null;
+  const head = first.match(/^(default\s+)?[A-Za-z_][\w.]*(\([^)]*\))?/)?.[0];
+  if (!head) return 'unparsed';
   const name = head.replace(/^default\s+/, '').replace(/\(.*$/, '');
+  if (REGO_KEYWORD.test(name.split('.')[0])) return 'unparsed';
   const kind: RuleKind = name === 'allow' ? 'allow' : name === DENY_REASON ? 'deny' : 'helper';
   const oneLine = statement.code.join(' ').replace(/\s+/g, ' ');
   return {
@@ -188,6 +200,7 @@ export function parsePolicyRules(rego: string): ParsedPolicy {
       const match = (item.code[0] ?? '').match(DEFAULT_ALLOW);
       if (match) defaultDecision = match[1] === 'true' ? 'allow' : 'deny';
       const rule = toRule(item);
+      if (rule === 'unparsed') return { ok: false };
       if (!rule) continue;
       if (open) {
         open.rules.push(rule);
@@ -243,6 +256,8 @@ export function ruleName(rule: PolicyRule): string {
   return rule.head.replace(/^default\s+/, '').replace(/\(.*$/, '');
 }
 
+const allRules = (parsed: ParsedPolicy) => (parsed.ok ? parsed.groups.flatMap(g => g.rules) : []);
+
 const sameCode = (a: PolicyRule, b: PolicyRule) => a.code.join('\n') === b.code.join('\n');
 
 const referencePattern = (name: string) => {
@@ -266,7 +281,7 @@ function reachableFromAllow(
     Array.from(new Set(rules.map(readName)), name => [name, referencePattern(name)])
   );
   const reached = new Set<string>();
-  const queue = rules.filter(r => r.kind === 'allow' && !excluded(r));
+  const queue = rules.filter(r => readName(r) === 'allow' && !excluded(r));
   const visited = new Set(queue);
   while (queue.length > 0) {
     const text = withoutStrings(queue.pop()!.code);
@@ -314,7 +329,7 @@ function firstReader(readers: PolicyRule[], names: Set<string>): RuleUse {
 export function ruleUse(parsed: ParsedPolicy, rule: PolicyRule): RuleUse | null {
   const name = ruleName(rule);
   if (!parsed.ok || name === 'allow') return null;
-  const rules = parsed.groups.flatMap(g => g.rules);
+  const rules = allRules(parsed);
   const self = (r: PolicyRule) => r.startLine === rule.startLine;
   if (rules.some(r => !self(r) && ruleName(r) === name && sameCode(r, rule))) return null;
   if (parsed.readsPackageDocument) return { kind: 'document' };
@@ -330,7 +345,7 @@ export function ruleUse(parsed: ParsedPolicy, rule: PolicyRule): RuleUse | null 
  */
 export function groupUse(parsed: ParsedPolicy, group: RuleGroup): RuleUse | null {
   if (!parsed.ok) return null;
-  const rules = parsed.groups.flatMap(g => g.rules);
+  const rules = allRules(parsed);
   const inGroup = (r: PolicyRule) => r.startLine >= group.startLine && r.endLine <= group.endLine;
   const outside = rules.filter(r => !inGroup(r));
   const { reached, readers } = reachableFromAllow(rules, inGroup);
@@ -343,6 +358,73 @@ export function groupUse(parsed: ParsedPolicy, group: RuleGroup): RuleUse | null
   if (used.length === 0) return null;
   if (parsed.readsPackageDocument) return { kind: 'document' };
   return firstReader(readers, new Set(used.map(readName)));
+}
+
+const PLAIN_ALLOW_REST = /^(?::?=\s*true\b)?\s*(if\b|\{|$)/;
+
+/** The code after a plain allow's head and value, or null when the rule is not a plain allow. */
+function plainAllowBody(rule: PolicyRule): string | null {
+  if (rule.head !== 'allow' || /\belse\b/.test(withoutStrings(rule.code))) return null;
+  const rest = rule.code.join(' ').slice('allow'.length).trim();
+  const match = rest.match(PLAIN_ALLOW_REST);
+  if (!match) return null;
+  return rest.slice(match[0].length - (match[1] === '{' ? 1 : 0)).trim();
+}
+
+/**
+ * Whether the rule is `allow` with no arguments, dot, `[ ]` or `contains`, with no value or
+ * `= true` / `:= true`, followed by `if`, `{` or nothing, and no `else` outside strings.
+ */
+export function isPlainAllow(rule: PolicyRule): boolean {
+  return plainAllowBody(rule) !== null;
+}
+
+/** Whether the rule is a plain allow whose body is empty or exactly `true`. */
+export function isUnconditionalAllow(rule: PolicyRule): boolean {
+  const body = plainAllowBody(rule);
+  if (body === null) return false;
+  const inner = /^\{[\s\S]*\}$/.test(body) ? body.slice(1, -1).trim() : body;
+  return inner === '' || inner === 'true';
+}
+
+export type DecisionSummary =
+  | { kind: 'unsummarised' }
+  | { kind: 'allows-all'; reason: 'default' | 'unconditional' }
+  | { kind: 'any-allow'; allowRules: number; hasDefault: boolean }
+  | { kind: 'denies-all'; hasDefault: boolean };
+
+/**
+ * What the policy decides, from the parse alone, or null when there is nothing to summarise:
+ * the Rego doesn't parse, is empty, or has no rules (`defaultDecision` then says what applies).
+ */
+export function summarizeDecision(parsed: ParsedPolicy): DecisionSummary | null {
+  const rules = allRules(parsed);
+  if (!parsed.ok || rules.length === 0) return null;
+  const allows = rules.filter(r => readName(r) === 'allow');
+  if (!allows.every(isPlainAllow)) return { kind: 'unsummarised' };
+  if (parsed.defaultDecision === 'allow') return { kind: 'allows-all', reason: 'default' };
+  if (allows.some(isUnconditionalAllow)) return { kind: 'allows-all', reason: 'unconditional' };
+  const hasDefault = parsed.defaultDecision !== null;
+  return allows.length > 0
+    ? { kind: 'any-allow', allowRules: allows.length, hasDefault }
+    : { kind: 'denies-all', hasDefault };
+}
+
+export type RuleRole = 'allow' | 'deny-reason' | 'used-by-allow' | 'not-used-by-allow';
+
+/**
+ * Each rule's part in the decision: an allow rule, a deny reason, or whether `allow` reads it,
+ * directly or through other rules. Every rule is used while the Rego reads its package as a
+ * whole document or doesn't parse.
+ */
+export function ruleRoles(parsed: ParsedPolicy): (rule: PolicyRule) => RuleRole {
+  const document = !parsed.ok || parsed.readsPackageDocument;
+  const { reached } = reachableFromAllow(allRules(parsed), () => false);
+  return rule => {
+    if (rule.kind === 'allow') return 'allow';
+    if (rule.kind === 'deny') return 'deny-reason';
+    return document || reached.has(readName(rule)) ? 'used-by-allow' : 'not-used-by-allow';
+  };
 }
 
 /** Removes one rule's lines, with the comment lines directly above it. */
