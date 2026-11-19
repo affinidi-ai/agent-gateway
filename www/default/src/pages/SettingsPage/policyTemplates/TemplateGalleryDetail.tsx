@@ -232,7 +232,7 @@ const TemplateGalleryDetail: React.FC<TemplateGalleryDetailProps> = ({
             data-testid="policy-template-gallery-detail-empty"
           >
             <i className="fas fa-hand-pointer me-2" aria-hidden="true" />
-            Pick a template on the left to see what it does, then use it.
+            Pick a template under Start from to see what it does, then use it.
           </div>
         )}
       </div>

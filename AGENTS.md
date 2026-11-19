@@ -450,9 +450,10 @@ blocks Create until it is removed. Once rules are added the gallery still names 
 template the policy started from and counts the templates added. **Add rules from a template**
 lists only templates that add rules, so several combine in a new or saved policy, and counts the
 whole policies and other-Type templates it leaves out. A saved policy offers
-**Save as template**, and once rules are added a Template examples card runs their examples
+**Save as template**, which keeps a policy holding a standalone template's rules a whole
+policy, and once rules are added a Template examples card runs their examples
 through the existing simulate endpoint, says why a row differs and loads its input in Test
-(dry-run). Default templates ship with the dashboard; organization templates are ones a user
+(dry-run), or says the template has no examples. Default templates ship with the dashboard; organization templates are ones a user
 saved with Save as template and last for the browser tab (marked This tab only); see
 _Policy templates_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#policy-templates).
 

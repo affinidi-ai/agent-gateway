@@ -41,6 +41,15 @@ describe('built-in policy templates', () => {
     }
   );
 
+  it('says a business-hours window past midnight counts on each listed day', () => {
+    const template = BUILTIN_POLICY_TEMPLATES.find(
+      t => t.id === 'business-hours-access-window:gateway'
+    )!;
+    expect(template.rego).toContain('access_day\n  access_minute < {{end_time}}');
+    const until = template.parameters.find(p => p.key === 'end_time')!;
+    expect(until.help).toContain('Monday 01:00 is inside and Saturday 01:00 is outside');
+  });
+
   it('marks templates that allow outside what they restrict as standalone', () => {
     const standalone = new Set(
       BUILTIN_POLICY_TEMPLATES.filter(t => t.standalone).map(t => t.id.split(':')[0])

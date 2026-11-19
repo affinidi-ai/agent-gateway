@@ -172,14 +172,15 @@ export interface UndoToastOptions {
 
 /**
  * Toast with an Undo action and a live countdown progress bar.
- * Auto-dismisses after `duration` ms (default 5000).
+ * Auto-dismisses after `duration` ms (default 5000). Returns a function that dismisses it
+ * without Undo, as its close button does.
  */
 export const showUndoToast = ({
   message = 'Changes discarded.',
   duration = 5000,
   onUndo,
   onExpire,
-}: UndoToastOptions): void => {
+}: UndoToastOptions): (() => void) => {
   document.getElementById('app-toast')?.remove();
 
   const isDark = document.body.classList.contains('dark-theme');
@@ -280,4 +281,5 @@ export const showUndoToast = ({
   const ticker = 0; // no visible countdown — kept for remove() signature compatibility
 
   const timer = setTimeout(() => remove(false), duration);
+  return () => remove(false);
 };

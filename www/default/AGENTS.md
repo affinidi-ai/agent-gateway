@@ -72,7 +72,8 @@ Applies to:
 `showToast` and `showUndoToast` (`utils/toaster.ts`) render the message and the action label as
 text (`textContent`), never as HTML, so a name or a server error message in a toast cannot run
 script. Pass plain text only: markup such as `<b>` shows literally, and callers must not
-escape the text themselves.
+escape the text themselves. `showUndoToast` returns a function that dismisses that toast
+without Undo, as its close button does.
 
 ## Test identifiers
 
@@ -1792,9 +1793,8 @@ amber (`--warning-text` on a light amber tint) with an `fa-exclamation-triangle`
 because allowing by default is the less safe choice; the icons are `aria-hidden`, the tokens
 switch with `body.dark-theme`, and the Audit Log's `.audit-decision` pill is left as it is; an
 example's expected and actual decision
-and the tags (MCP tool policy and reads `<path>` with the path in `<code>` in `secondary`,
-"Gateway only" / "Agent Surface only" and the Type note in `warning`, and **This tab only** in
-`info` from `TemplateOriginBadges`) are `Badge`s, an alert the templates add that carries an action is a non-collapsible
+and the tags (MCP tool policy and reads `<path>` with the path in `<code>` in `secondary`, and
+**This tab only** in `info` from `TemplateOriginBadges`) are `Badge`s, an alert the templates add that carries an action is a non-collapsible
 `InfoBanner` with the button as its child and the test id on a wrapping `div`, the template
 search and category filter is the shared `SearchInput` and `FilterChipGroup`
 (`TemplateFilterBar.tsx`), code blocks use `.policy-preview-block`, and the templates column's
@@ -1909,7 +1909,9 @@ Create custom policy) in `useTemplateGallery`.
   access window uses them all: its **Inside the window** choice writes `allow if
   in_access_window` (Allow requests) or `allow if not in_access_window` (Deny requests), its
   **From** and **Until** times make a window that crosses midnight when Until is earlier, its
-  **Days** may be empty for every day (a day is the request's date in the time zone), and it is a
+  **Days** may be empty for every day (a day is the request's date in the time zone, also for
+  the hours after midnight: Monday to Friday 22:00–06:00 covers 00:00–06:00 and 22:00–24:00 on
+  Monday to Friday, which the Until help says with that example), and it is a
   whole policy, since added to another policy its allow rule would let requests through
   whatever that policy's other rules say. A template that reads the clock (`time.now_ns()`) has no examples.
   An entry is `standalone` when it is meant to be the whole policy: its rules only set the
@@ -1953,11 +1955,12 @@ Create custom policy) in `useTemplateGallery`.
   at the card's end (`policy-template-card-scope`, `.policy-template-card__scope`, `0.75rem`
   in `--muted-text`), never a `Badge`. The gallery has no search or category filters. Six
   templates show until **Show all (N)** (`policy-template-gallery-show-all`, an
-  `outline-secondary` button). Under the list, after a top border, "None of these fit?" and
+  `outline-secondary` button), which moves focus to the first card it brings into view. Under the list, after a top border, "None of these fit?" and
   **Create custom policy** (`policy-template-gallery-create-custom-button`, `outline-primary`
   with `fa-plus`, `aria-pressed` while its detail is shown; `.policy-template-gallery__custom`)
   follow the Trust Registry pattern: pick a template, or create a custom one. It calls
-  `pickBlank` (Rego `ALLOW_ALL_POLICY`, used template `blank`, named "Custom policy") at once,
+  `pickBlank` (Rego `ALLOW_ALL_POLICY`, used template `blank`, its start named "Custom policy";
+  a Name or Description still as the last Use filled it is emptied, a typed one kept) at once,
   unless a template was used and the Rego is no longer an untouched start (`replaceText` in
   `policyStart.ts` is not null): then it selects `blank`, and the templates column
   shows the Custom policy detail, whose **Create custom policy** asks in place before it
@@ -1966,8 +1969,8 @@ Create custom policy) in `useTemplateGallery`.
   under the editor below `xl`. The page holds the gallery's open state and selected card, and
   while the gallery is open the templates column shows `TemplateGalleryDetail`
   (`policy-template-gallery-detail-panel`, a `card shadow mb-4` titled "Template details") in
-  place of Add rules. With no card selected it says "Pick a template on the left to see what it
-  does, then use it." (`policy-template-gallery-detail-empty`, the
+  place of Add rules. With no card selected it says "Pick a template under Start from to see
+  what it does, then use it." (`policy-template-gallery-detail-empty`, the
   `.policy-templates-panel__placeholder` style). Choosing a card selects it, shows its detail
   there (`policy-template-gallery-detail`) and moves focus to the detail's heading
   (`policy-template-gallery-detail-heading`, `tabIndex={-1}`); Change with no card selected
@@ -2005,8 +2008,9 @@ Create custom policy) in `useTemplateGallery`.
   counts as a change; no default template has either.
   Undo of Use, Create custom policy, Add rules, Remove, Remove rule and Deny by default restores the Rego
   and the used template together. Only the latest action can be undone, and its Undo drops
-  edits made since, so each toast ends "Undo restores the Rego from before this change." (Use:
-  "the form", since Use's Undo restores Name, Description, Type and Rego). Use of a template, or Create custom policy, moves focus to **Change**
+  edits made since, so each toast ends "Undo restores the Rego from before this change." (Use,
+  and Create custom policy when it emptied Name or Description: "the form", since their Undo
+  also restores Name and Description). Use of a template, or Create custom policy, moves focus to **Change**
   (`policy-template-gallery-change-button`), which reopens
   it with the used card selected and its settings as they were used, also after a hand edit,
   and moves focus to the selected card, or to the first card when none is selected. Use
@@ -2027,8 +2031,11 @@ Create custom policy) in `useTemplateGallery`.
   Undo the page keeps only the form, with the gallery collapsed and Details and Policy shown.
   The editor restores a left draft only when the discard toast's Undo reopens it
   (`restoreOnlyOnUndo` on the `useDiscardWithUndo` snapshot, which Undo marks with
-  `{ discardUndo: true }` navigation state); opened any other way it drops the draft and starts
-  fresh, with no template selected.
+  `{ discardUndo: true }` navigation state); opened any other way it drops the draft, dismisses
+  that draft's discard toast if it is still showing (`showUndoToast` returns a dismiss function,
+  kept per snapshot key), and starts fresh, with no template selected. Without
+  `restoreOnlyOnUndo`, as in the Surface Builder, any visit restores the draft and the toast
+  stays.
   The Type is set by the Define button that opened the page (`?type=`) and can't be changed:
   `policy-definition-type-select` is disabled on create, with "Set by Define <Type> Policy.
   It can't be changed.", as on a saved policy.
@@ -2042,7 +2049,8 @@ Create custom policy) in `useTemplateGallery`.
   create form while Start from is open, the template details swap in their own panel, and
   closing either returns to Add rules. **Add rules from a template**
   (`policy-templates-insert-button`, in the Policy section and the empty rules list) brings back
-  the Add rules panel, scrolls to the column and focuses its search. It lists only templates
+  the Add rules panel, closing Start from when Change reopened it, scrolls to the column and
+  focuses its search, and Change doesn't take that focus. It lists only templates
   that add rules of the policy's Type (tab counts count only those) and says under the list
   how many it leaves out across both tabs (`policy-templates-left-out-note`: "16 templates
   left out: 2 are whole policies, 14 are for Agent Surface policies.", then "Pick a whole
@@ -2058,8 +2066,9 @@ Create custom policy) in `useTemplateGallery`.
   and a preview (heading `policy-templates-preview-heading`). Picking a row scrolls the column
   only as far as needed to show the preview (`block: 'nearest'`, nothing moves when it is
   already in view) and leaves focus on the row; with nothing
-  selected it says "Pick a template to preview the rules it adds.",
-  `policy-templates-preview-empty`. The preview shows the description, default
+  selected, or while the search or a category hides the selected row, it says "Pick a template
+  to preview the rules it adds.", `policy-templates-preview-empty`, and the preview comes back
+  when the row is listed again. The preview shows the description, default
   decision, setting fields (`policy-templates-param-<key>`), the lines it adds, How it decides
   with each example's input (`policy-templates-example-input-<i>`), the docs link
   (`policy-templates-docs-link`) and **Add to policy**
@@ -2160,7 +2169,9 @@ Create custom policy) in `useTemplateGallery`.
   with the simulate `reason` when there is one. The simulate response doesn't say which rule
   decided, so the reason never names one. Examples are written for the default settings, so
   when a setting was changed before inserting, the card says so
-  (`policy-template-examples-changed-settings`), shows no Result and highlights no row. The
+  (`policy-template-examples-changed-settings`), shows no Result and highlights no row. A
+  template with no examples, such as one saved without any, still opens the card, which says
+  "This template has no examples." (`policy-template-examples-none`) in place of the table. The
   panel scrolls into view when it opens.
 - **Save as template** (`policy-templates-save-as-button`, edit mode, `policies.edit`) is
   disabled while the policy has unsaved edits, and says "Save your changes first." under the
@@ -2173,8 +2184,12 @@ Create custom policy) in `useTemplateGallery`.
   (`policy-templates-save-tab-only-note`), copies
   the saved version with a name, summary and category; **Add current sample input**
   (`policy-templates-save-add-example-button`) records the decision the saved version gives
-  for the Test (dry-run) sample input. A name already used for that type is refused
-  (`policy-templates-save-error`).
+  for the Test (dry-run) sample input. A name already used for that type, by an organization
+  or a default template, is refused (`policy-templates-save-error`). A saved version that still
+  holds the rules of a standalone default template of its Type (each setting matching any
+  text) is saved `standalone`, so it stays a whole policy, offered only under Start from; the
+  store keeps `standalone` only when it is `true`. A whole policy edited past its template's
+  rules is saved as Adds rules.
 
 ## Audit page: policy changes
 

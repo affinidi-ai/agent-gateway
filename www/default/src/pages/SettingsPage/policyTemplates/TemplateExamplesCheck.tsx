@@ -114,90 +114,96 @@ const TemplateExamplesCheck: React.FC<TemplateExamplesCheckProps> = ({
             different decision is expected and not highlighted.
           </p>
         )}
-        <div className="table-responsive">
-          <table className="table table-sm mb-2">
-            <thead className="thead-light">
-              <tr>
-                <th>Example</th>
-                <th>Expected</th>
-                <th>This policy</th>
-                <th>Result</th>
-                {onLoadInTest && (
-                  <th>
-                    <span className="visually-hidden">Actions</span>
-                  </th>
-                )}
-              </tr>
-            </thead>
-            <tbody>
-              {template.examples.map((ex, i) => {
-                const o = outcomes[i];
-                const mismatch = isMismatch(o, i);
-                return (
-                  <tr
-                    key={`${i}-${ex.name}`}
-                    className={mismatch ? 'table-warning' : undefined}
-                    data-testid={`policy-template-example-row-${i}`}
-                  >
-                    <td>
-                      {ex.name}
-                      {mismatch && o && 'decision' in o && (
-                        <div
-                          className="small text-muted"
-                          data-testid={`policy-template-example-row-${i}-why`}
-                        >
-                          {differsBecause(ex.expected, allowsByDefault, o.reason)}
-                        </div>
-                      )}
-                    </td>
-                    <td>
-                      <Badge
-                        tone={ex.expected === 'allow' ? 'success' : 'danger'}
-                        value={ex.expected.toUpperCase()}
-                      />
-                    </td>
-                    <td>
-                      {o === null ? (
-                        <span
-                          className="spinner-border spinner-border-sm text-primary"
-                          role="status"
-                        />
-                      ) : 'error' in o ? (
-                        <span className="text-danger small">{o.error}</span>
-                      ) : (
-                        <Badge
-                          tone={o.decision === 'allow' ? 'success' : 'danger'}
-                          value={o.decision.toUpperCase()}
-                        />
-                      )}
-                    </td>
-                    <td>
-                      {usesDefaultSettings && o && 'decision' in o && (
-                        <Badge
-                          tone={mismatch ? 'danger' : 'success'}
-                          value={mismatch ? 'Differs' : 'Matches'}
-                        />
-                      )}
-                    </td>
-                    {onLoadInTest && (
+        {template.examples.length === 0 ? (
+          <p className="text-muted small mb-0" data-testid="policy-template-examples-none">
+            This template has no examples.
+          </p>
+        ) : (
+          <div className="table-responsive">
+            <table className="table table-sm mb-2">
+              <thead className="thead-light">
+                <tr>
+                  <th>Example</th>
+                  <th>Expected</th>
+                  <th>This policy</th>
+                  <th>Result</th>
+                  {onLoadInTest && (
+                    <th>
+                      <span className="visually-hidden">Actions</span>
+                    </th>
+                  )}
+                </tr>
+              </thead>
+              <tbody>
+                {template.examples.map((ex, i) => {
+                  const o = outcomes[i];
+                  const mismatch = isMismatch(o, i);
+                  return (
+                    <tr
+                      key={`${i}-${ex.name}`}
+                      className={mismatch ? 'table-warning' : undefined}
+                      data-testid={`policy-template-example-row-${i}`}
+                    >
                       <td>
-                        <AppButton
-                          variant="link"
-                          className="p-0 text-nowrap"
-                          onClick={() => onLoadInTest(ex.name, ex.input)}
-                          aria-label={`Load ${ex.name} in Test (dry-run)`}
-                          data-testid={`policy-template-example-row-${i}-load-button`}
-                        >
-                          Load in Test
-                        </AppButton>
+                        {ex.name}
+                        {mismatch && o && 'decision' in o && (
+                          <div
+                            className="small text-muted"
+                            data-testid={`policy-template-example-row-${i}-why`}
+                          >
+                            {differsBecause(ex.expected, allowsByDefault, o.reason)}
+                          </div>
+                        )}
                       </td>
-                    )}
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
+                      <td>
+                        <Badge
+                          tone={ex.expected === 'allow' ? 'success' : 'danger'}
+                          value={ex.expected.toUpperCase()}
+                        />
+                      </td>
+                      <td>
+                        {o === null ? (
+                          <span
+                            className="spinner-border spinner-border-sm text-primary"
+                            role="status"
+                          />
+                        ) : 'error' in o ? (
+                          <span className="text-danger small">{o.error}</span>
+                        ) : (
+                          <Badge
+                            tone={o.decision === 'allow' ? 'success' : 'danger'}
+                            value={o.decision.toUpperCase()}
+                          />
+                        )}
+                      </td>
+                      <td>
+                        {usesDefaultSettings && o && 'decision' in o && (
+                          <Badge
+                            tone={mismatch ? 'danger' : 'success'}
+                            value={mismatch ? 'Differs' : 'Matches'}
+                          />
+                        )}
+                      </td>
+                      {onLoadInTest && (
+                        <td>
+                          <AppButton
+                            variant="link"
+                            className="p-0 text-nowrap"
+                            onClick={() => onLoadInTest(ex.name, ex.input)}
+                            aria-label={`Load ${ex.name} in Test (dry-run)`}
+                            data-testid={`policy-template-example-row-${i}-load-button`}
+                          >
+                            Load in Test
+                          </AppButton>
+                        </td>
+                      )}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
         {mismatches > 0 && (
           <div className="small text-muted" data-testid="policy-template-examples-mismatch">
             <i className="fas fa-info-circle me-1" aria-hidden="true" />

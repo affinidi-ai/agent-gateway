@@ -55,6 +55,8 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
   const [justAdded, setJustAdded] = useState<string | null>(null);
   const [addedRules, setAddedRules] = useState<AddedRules[]>([]);
   const regoRef = useRef<HTMLTextAreaElement>(null);
+  // The Name and Description the last Use filled in.
+  const filledFieldsRef = useRef<{ name: string; description: string } | null>(null);
 
   const togglePanel = (panel: TemplatePanel) => setTemplatePanel(p => (p === panel ? null : panel));
 
@@ -64,6 +66,8 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
     const previousPicked = templatePicked;
     // Using the used template again keeps the name and description as typed.
     const reapplying = usedTemplate?.id === template.id;
+    const previousFilled = filledFieldsRef.current;
+    filledFieldsRef.current = { name: template.name, description: template.description };
     setForm(f => ({
       ...f,
       name: reapplying ? f.name : template.name,
@@ -76,6 +80,7 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
     notifyUndo({
       message: `Filled from the template ${template.name}. ${UNDO_FORM}`,
       onUndo: () => {
+        filledFieldsRef.current = previousFilled;
         setForm(f => ({ ...f, ...previous }));
         setUsedTemplate(previousUsed);
         setTemplatePicked(previousPicked);
@@ -83,17 +88,26 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
     });
   };
 
+  // A custom policy doesn't keep the Name and Description a template filled in untouched.
   const pickBlank = () => {
-    const previousPolicy = form.policy;
+    const previous = { name: form.name, description: form.description, policy: form.policy };
     const previousUsed = usedTemplate;
     const previousPicked = templatePicked;
-    setForm(f => ({ ...f, policy: ALLOW_ALL_POLICY[f.policy_type] }));
+    const filled = filledFieldsRef.current;
+    const clearName = !!filled && form.name === filled.name;
+    const clearDescription = !!filled && form.description === filled.description;
+    setForm(f => ({
+      ...f,
+      ...(clearName ? { name: '' } : {}),
+      ...(clearDescription ? { description: '' } : {}),
+      policy: ALLOW_ALL_POLICY[f.policy_type],
+    }));
     setUsedTemplate({ id: BLANK_TEMPLATE_ID, fieldText: {} });
     setTemplatePicked(true);
     notifyUndo({
-      message: `Started a custom policy. ${UNDO_REGO}`,
+      message: `Started a custom policy. ${clearName || clearDescription ? UNDO_FORM : UNDO_REGO}`,
       onUndo: () => {
-        setForm(f => ({ ...f, policy: previousPolicy }));
+        setForm(f => ({ ...f, ...previous }));
         setUsedTemplate(previousUsed);
         setTemplatePicked(previousPicked);
       },

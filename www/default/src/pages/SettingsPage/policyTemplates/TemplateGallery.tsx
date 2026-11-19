@@ -32,7 +32,8 @@ interface TemplateGalleryProps {
   onCreateCustom: () => void;
 }
 
-type FocusTarget = 'change' | 'card';
+/** `shown`: the first card Show all brought into view. */
+type FocusTarget = 'change' | 'card' | 'shown';
 
 /**
  * The create form's Start from section: one card per built-in and organisation template of the
@@ -64,12 +65,21 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
   const [focusTarget, setFocusTarget] = useState<FocusTarget | null>(null);
   useEffect(() => {
     if (!focusTarget) return;
-    if (focusTarget === 'change') changeRef.current?.focus();
-    else
+    const active = document.activeElement;
+    // Add rules from a template also collapses the gallery, and has focused the column's search.
+    const focusLost = !active || active === document.body || !!sectionRef.current?.contains(active);
+    if (focusTarget === 'change') {
+      if (focusLost) changeRef.current?.focus();
+    } else if (focusTarget === 'shown') {
+      sectionRef.current
+        ?.querySelectorAll<HTMLElement>('.policy-template-card')
+        [COLLAPSED_COUNT]?.focus();
+    } else {
       (
         sectionRef.current?.querySelector<HTMLElement>('.is-selected') ??
         sectionRef.current?.querySelector<HTMLElement>('.policy-template-card')
       )?.focus();
+    }
     setFocusTarget(null);
   }, [focusTarget]);
 
@@ -158,9 +168,8 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
       ) : (
         <>
           <p className="text-muted small mb-2">
-            Pick a template to see its details on the right, then use it to continue, or create a
-            custom policy. You can add rules from more templates with{' '}
-            <strong>Add rules from a template</strong>.
+            Pick a template to see its details, then use it to continue, or create a custom policy.
+            You can add rules from more templates with <strong>Add rules from a template</strong>.
           </p>
           <div className="policy-template-gallery">
             {shown.map(t => {
@@ -194,7 +203,10 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
             <AppButton
               variant="outline-secondary"
               className="mt-2"
-              onClick={() => setShowAll(true)}
+              onClick={() => {
+                setShowAll(true);
+                setFocusTarget('shown');
+              }}
               data-testid="policy-template-gallery-show-all"
             >
               Show all ({cards.length})

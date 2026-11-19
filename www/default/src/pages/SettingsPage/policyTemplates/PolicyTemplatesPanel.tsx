@@ -146,6 +146,8 @@ const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
   const sourceTemplates = source === 'builtin' ? builtin : organizationRules;
   const { query, setQuery, category, setCategory, categories, visible } =
     useTemplateFilter(sourceTemplates);
+  // A template the search or category hides shows no preview until it is listed again.
+  const shownSelected = visible.find(t => t.id === selected?.id) ?? null;
   const wholePolicies =
     allBuiltin.length + organization.length - builtin.length - organizationRules.length;
   const otherTypeOnly = entries.filter(e => !e.variants[policyType]).length;
@@ -260,10 +262,10 @@ const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
             )}
           </div>
 
-          {selected ? (
+          {shownSelected ? (
             <InsertPreview
-              key={selected.id}
-              template={selected}
+              key={shownSelected.id}
+              template={shownSelected}
               existingPolicy={existingPolicy}
               onInsert={onInsert}
             />

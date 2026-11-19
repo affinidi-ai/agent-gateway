@@ -1,6 +1,7 @@
 import { BUILTIN_POLICY_TEMPLATES } from '../builtinPolicyTemplates';
 import { sessionPolicyTemplateStore } from '../policyTemplateServices';
 import { createSessionPolicyTemplateStore } from '../policyTemplateStore';
+import { templateRole } from '../regoTemplate';
 
 const { list: listPolicyTemplates, save: savePolicyTemplate } = sessionPolicyTemplateStore;
 
@@ -96,6 +97,35 @@ describe('policyTemplateStore', () => {
     await expect(savePolicyTemplate({ ...NEW_TEMPLATE, name: 'partner TRAFFIC' })).rejects.toThrow(
       'A template named "partner TRAFFIC" already exists.'
     );
+  });
+
+  it('refuses the name of a default template of the same type', async () => {
+    await expect(savePolicyTemplate({ ...NEW_TEMPLATE, name: 'deny by default' })).rejects.toThrow(
+      'A template named "deny by default" already exists.'
+    );
+    expect(await organization()).toEqual([]);
+  });
+
+  it('keeps the whole-policy role of a policy started from a standalone template', async () => {
+    const allowlist = BUILTIN_POLICY_TEMPLATES.find(
+      t => t.id === 'allowlist-outbound-destinations:agent_surface'
+    )!;
+    const rego = allowlist.rego.replace('{{destinations}}', '{"https://partner.example/"}');
+    const saved = await savePolicyTemplate({ ...NEW_TEMPLATE, name: 'Outbound', rego });
+
+    expect(saved.standalone).toBe(true);
+    const [listed] = await organization();
+    expect(listed.standalone).toBe(true);
+    expect(templateRole(listed)).toBe('policy');
+  });
+
+  it('saves a policy that adds rules to Deny by default as rules', async () => {
+    const rego = `${NEW_TEMPLATE.rego}\n\nallow if input.source_auth.method == "jwt_bearer"\n`;
+    const saved = await savePolicyTemplate({ ...NEW_TEMPLATE, rego });
+
+    expect(saved).not.toHaveProperty('standalone');
+    const [listed] = await organization();
+    expect(templateRole(listed)).toBe('rules');
   });
 });
 

@@ -1,70 +1,45 @@
 branch: feat/policy-template-library
 changes:
   added:
-    - timestamp: '2026-11-18T12:38:12Z'
+    - timestamp: '2026-11-19T18:00:00Z'
       title: Start and build policies from templates in the policy editor
       description: >-
-        Creating a policy starts from a gallery of templates for common policies: deny by
-        default, require an authenticated caller, allow by JWT claim or role, allow by JWT
-        issuer and audience, restrict MCP tools by role, require Trust Registry recognition,
-        require a verified credential subject, allowlist outbound destinations, allow during
-        business hours, a monitor-only baseline, all or at least N trust checks pass, and HTTP
+        Creating a policy starts with a Start from gallery of templates for common policies:
+        deny by default, require an authenticated caller, allow by JWT claim or role, allow by
+        JWT issuer and audience, restrict MCP tools by role, require Trust Registry recognition,
+        require a verified credential subject, allowlist outbound destinations, a business-hours
+        access window, a monitor-only baseline, all or at least N trust checks pass, and HTTP
         method, path, surface and subject allowlists, plus MCP tool policies for tool bindings
         on the MCP Proxy hop. Templates follow the Apply Policies guides and link to their own
-        docs section. The gallery offers templates of either type; choosing one shows its
-        settings, its Rego, how it decides on sample inputs, and its docs link beside the form, and
-        Use this template fills Name, Description, Type and Rego with settings that are checked first;
-        when the policy already has rules or hand edits, Use asks in place before it replaces
-        them. Every template is labelled Whole policy or Adds rules. Add rules from a template
-        lists only templates that add rules, says how many whole policies and templates for the
-        other Type it leaves out, and appends a template's rules to a new or saved policy, so
-        several can be combined; its list scrolls in a short box and picking a template brings
-        its settings into view. On a saved policy it checks the template's examples with the
-        existing dry-run; a whole policy is used from Start from only.
-        A Rules | Rego toggle shows the policy, opening on Rules. The Rules view lists the
-        policy's rules grouped by the template they came from, with an empty state that offers
-        templates or Rego, labelling only deny_reason as a Deny reason, removes a template's rules or a
-        single rule, and switches an allow-all policy to deny by default; while the default is
-        ALLOW each group with allow rules is marked as having no effect, and on a new policy a
-        group written for the other Type is marked and blocks Create until it is removed. Remove is refused, with
-        the reason shown under the rule or template, while the allow rule still reads that rule,
-        directly or through other rules; a read from deny_reason alone doesn't count, and an
-        identical copy left by the same template added twice can go, and the reason names the
-        rule that reads it. Once rules are added, Start from still names the template
-        the policy started from and counts the templates added, and says Custom Rego only after
-        a hand edit. The Add to policy preview says allow rules combine with OR. On a saved
-        policy the template examples say which rows match, explain a row that differs, and load
-        its input into Test (dry-run), with Undo. A default decision shows as a grey Default
-        DENY with a shield or an amber Default ALLOW with a warning icon. Save as template keeps
-        a policy as an organization
-        template for the current browser tab, marked This tab only, and says to save your
-        changes first while it is disabled. Default templates ship with the dashboard; no
-        gateway API changes.
+        docs section. Define Gateway Policy lists only templates for gateways and Define Agent
+        Surface Policy only templates for surfaces, with a muted note on a template for surfaces
+        only; the cards carry no role or default decision badges, six show until Show all, and
+        no card is selected until the user picks one. Choosing a card shows its settings, its
+        Rego, how it decides on sample inputs and its docs link in the column beside the form,
+        and Use this template fills Name, Description and Rego with settings that are checked
+        first; the Details and Policy sections appear only then. Create custom policy, under the
+        list, starts an allow-all policy instead. Change reopens the gallery and Cancel closes
+        it; when the policy already has rules or hand edits, Use and Create custom policy ask in
+        place before they replace them. The Business-hours access window template allows or
+        denies requests inside a daily HH:MM window in a chosen time zone, which may cross
+        midnight, on the listed days or every day; it is a whole policy, offered under Start
+        from only. Add rules from a template lists only templates that add rules, labelled
+        Adds rules, says how many whole policies and templates for the other Type it leaves
+        out, and appends a template's rules to a new or saved policy, so several can be
+        combined. A Rules | Rego toggle shows the policy, opening on Rules. The Rules view lists
+        the policy's rules grouped by the template they came from, removes a template's rules
+        or a single rule unless the allow rule still reads it, saying which rule does, switches
+        an allow-all policy to deny by default, marks groups that have no effect while the
+        default is ALLOW, and on a new policy blocks Create while a group written for the other
+        Type remains. Start from names the template the policy started from and counts the
+        templates added until a hand edit. On a saved policy a Template examples card checks the
+        added template's examples with the existing dry-run, explains a row that differs and
+        loads its input into Test (dry-run), with Undo. Save as template keeps a saved policy
+        as an organization template for the current browser tab, marked This tab only, refuses
+        a name a template of that Type already has, and keeps a policy that holds a whole
+        policy's rules a whole policy. Default templates ship with the dashboard; no gateway API
+        changes.
   changed:
-    - timestamp: '2026-11-19T16:00:00Z'
-      title: Allow or deny requests in a business-hours window, with optional days
-      description: >-
-        The Allow during business hours template is now Business-hours access window: it
-        allows or denies requests inside a daily window set as HH:MM in a chosen time zone,
-        the window may cross midnight, and Days may be left empty for every day. It is a whole
-        policy, offered under Start from only, because added to another policy its allow rule
-        would let requests through whatever that policy's other rules say.
-    - timestamp: '2026-11-19T10:00:00Z'
-      title: Show only templates for the policy's Type, with fewer labels
-      description: >-
-        Define Gateway Policy now lists only templates for gateways, and Define Agent Surface
-        Policy only templates for surfaces. The Start from gallery drops its search, category
-        filters, Whole policy or Adds rules labels and Default ALLOW or DENY badges, so picking
-        a template is quicker. A template for surfaces only carries a small muted note instead
-        of a yellow badge.
-    - timestamp: '2026-11-19T12:00:00Z'
-      title: Start a policy from a template or with Create custom policy
-      description: >-
-        The Start from gallery lists the templates first and has a Create custom policy button
-        under the list in place of the Allow all (blank) card, so users either pick a template
-        or write their own. It starts the custom policy at once, and asks first only when it
-        would replace rules or edits already in the policy. The Create button stays hidden
-        until a template is used or a custom policy is created.
     - timestamp: '2026-11-19T14:00:00Z'
       title: Lock a new policy's Type to the Define button that opened it
       description: >-
@@ -80,14 +55,11 @@ changes:
         note says the policy can be viewed but not changed. Saving and the dry-run already
         needed that permission, so the page no longer offers actions the gateway refuses.
     - timestamp: '2026-11-18T20:00:00Z'
-      title: Start new policies by picking a template, with its details beside the form
+      title: Restore a discarded policy draft only from the discard notice's Undo
       description: >-
-        Creating a policy starts with only the Start from gallery and no template selected.
-        Choosing a card shows its details in the column beside the form, and the Details and
-        Policy sections appear once a template, or Allow all (blank), is used, so a policy
-        never starts from a template the user didn't choose. Change reopens the gallery, and
-        Cancel closes it again without using another template. Leaving the page and opening
-        Create Policy again starts fresh; only Undo on the discard notice brings the draft back.
+        Leaving the policy editor with unsaved changes and opening it again any other way now
+        starts fresh and closes the discard notice, so its Undo never points at a dropped
+        draft; only Undo on that notice brings the draft back.
     - timestamp: '2026-11-18T18:00:00Z'
       title: Redesign the policy editor into Details and Policy sections
       description: >-

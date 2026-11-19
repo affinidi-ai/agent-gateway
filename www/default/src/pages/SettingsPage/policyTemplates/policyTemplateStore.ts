@@ -1,3 +1,4 @@
+import { insertTemplateRules } from './regoTemplate';
 import {
   CATEGORY_LABELS,
   type PolicyTemplate,
@@ -59,8 +60,32 @@ function isStoredTemplate(value: unknown): value is PolicyTemplate {
     t.reads.every(r => typeof r === 'string') &&
     Array.isArray(t.examples) &&
     t.examples.every(isStoredExample) &&
-    t.builtin === false
+    t.builtin === false &&
+    (t.standalone === undefined || typeof t.standalone === 'boolean')
   );
+}
+
+const collapseSpace = (text: string) => text.replace(/\s+/g, ' ').trim();
+
+/**
+ * Whether `rego` holds the rules of a standalone template, each setting matching any text, so a
+ * policy started from a whole policy is saved as one.
+ */
+function startedFromStandalone(rego: string, template: PolicyTemplate): boolean {
+  const rules = insertTemplateRules('', template.name, template.rego).added;
+  const segments = rules
+    .split(/\{\{[^{}]+\}\}/)
+    .map(collapseSpace)
+    .filter(Boolean);
+  if (segments.length === 0) return false;
+  const text = collapseSpace(rego);
+  let from = 0;
+  for (const segment of segments) {
+    const at = text.indexOf(segment, from);
+    if (at < 0) return false;
+    from = at + segment.length;
+  }
+  return true;
 }
 
 /** A stored template rebuilt from its checked fields only, so nothing else reaches the editor. */
@@ -77,6 +102,7 @@ function fromStored(t: PolicyTemplate): PolicyTemplate {
     reads: [...t.reads],
     examples: t.examples.map(ex => ({ name: ex.name, input: ex.input, expected: ex.expected })),
     builtin: false,
+    ...(t.standalone === true ? { standalone: true } : {}),
   };
 }
 
@@ -129,10 +155,15 @@ export function createSessionPolicyTemplateStore(
       const name = input.name.trim();
       if (!name) throw new Error('Enter a template name.');
       const existing = read();
-      const taken = existing.some(
-        t => t.policy_type === input.policy_type && t.name.toLowerCase() === name.toLowerCase()
-      );
+      const ofType = [...builtin, ...existing].filter(t => t.policy_type === input.policy_type);
+      const taken = ofType.some(t => t.name.toLowerCase() === name.toLowerCase());
       if (taken) throw new Error(`A template named "${name}" already exists.`);
+      const standalone = builtin.some(
+        t =>
+          t.policy_type === input.policy_type &&
+          t.standalone &&
+          startedFromStandalone(input.rego, t)
+      );
       const template: PolicyTemplate = {
         id: `org:${Date.now().toString(36)}-${existing.length + 1}`,
         name,
@@ -145,6 +176,7 @@ export function createSessionPolicyTemplateStore(
         reads: input.reads,
         examples: input.examples,
         builtin: false,
+        ...(standalone ? { standalone: true } : {}),
       };
       write([...existing, template]);
       listeners.forEach(l => l());

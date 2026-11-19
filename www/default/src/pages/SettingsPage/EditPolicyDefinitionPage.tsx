@@ -372,6 +372,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
   // Add rules brings back the Add rules panel, then moves to its search once it has rendered.
   const focusTemplatesColumn = () => {
     setTemplatePanel(null);
+    if (gallery.open) gallery.close();
     setFocusAddRules(n => n + 1);
   };
 

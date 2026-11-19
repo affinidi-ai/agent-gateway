@@ -509,7 +509,7 @@
     "id": "business-hours-access-window",
     "name": "Business-hours access window",
     "summary": "Allow or deny requests by time of day, day of week and time zone.",
-    "description": "Allows, or denies, requests made inside a daily time window on the listed days, in the chosen time zone; requests outside the window get the opposite decision. A window whose end is earlier than its start crosses midnight. Rate limits are set on the surface's Rate Limit panel, not in policy.",
+    "description": "Allows, or denies, requests made inside a daily time window on the listed days, in the chosen time zone; requests outside the window get the opposite decision. A window whose end is earlier than its start crosses midnight, and each listed day gets the hours after midnight and the hours before it on that day's own date. Rate limits are set on the surface's Rate Limit panel, not in policy.",
     "category": "time",
     "policy_types": ["gateway", "agent_surface"],
     "standalone": true,
@@ -556,7 +556,7 @@
         "kind": "time_of_day",
         "default": "17:00",
         "differs_from": "start_time",
-        "help": "End of the window, as HH:MM; requests from this time on are outside it. A time earlier than From makes the window cross midnight, for example 22:00 to 06:00."
+        "help": "End of the window, as HH:MM; requests from this time on are outside it. A time earlier than From makes the window cross midnight, for example 22:00 to 06:00. Each part counts on its own date: with Days Monday to Friday, 22:00 to 06:00 covers 00:00 to 06:00 and 22:00 to midnight on Monday to Friday, so Monday 01:00 is inside and Saturday 01:00 is outside."
       },
       {
         "key": "time_zone",

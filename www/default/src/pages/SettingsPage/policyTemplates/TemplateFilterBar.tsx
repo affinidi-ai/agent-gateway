@@ -19,7 +19,7 @@ interface TemplateFilterBarProps {
 
 const FULL_WIDTH_WRAPPER: React.CSSProperties = { display: 'block' };
 
-/** The template search and category chips, shared by the Start from gallery and the column. */
+/** The Add rules panel's template search and category chips. */
 const TemplateFilterBar: React.FC<TemplateFilterBarProps> = ({
   query,
   onQueryChange,

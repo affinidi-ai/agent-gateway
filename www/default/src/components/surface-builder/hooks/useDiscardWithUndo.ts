@@ -27,6 +27,9 @@ export interface DiscardSnapshot {
 /** Navigation state the toast's Undo sets, so the editor can tell it was reopened by Undo. */
 const UNDO_STATE = { discardUndo: true } as const;
 
+/** Dismisses the discard toast still showing for a snapshot, by its storage key. */
+const pendingToasts = new Map<string, () => void>();
+
 export interface UseDiscardWithUndoOptions {
   dirty: boolean;
   navigateTo: string;
@@ -104,6 +107,7 @@ export function useDiscardWithUndo({
   const clearSnapshot = useCallback(() => {
     const snap = snapshotRef.current;
     if (snap) {
+      pendingToasts.delete(snap.storageKey);
       try {
         sessionStorage.removeItem(snap.storageKey);
       } catch (_ignored) {
@@ -112,26 +116,37 @@ export function useDiscardWithUndo({
     }
   }, []); // stable — uses refs
 
+  const showDiscardToast = useCallback(
+    (onUndo: () => void) => {
+      const key = snapshotRef.current?.storageKey;
+      const dismiss = showUndoToast({
+        message,
+        duration,
+        onUndo: () => {
+          if (key) pendingToasts.delete(key);
+          onUndo();
+        },
+        onExpire: clearSnapshot,
+      });
+      if (key && dismiss) pendingToasts.set(key, dismiss);
+    },
+    [message, duration, clearSnapshot]
+  );
+
   // Sidebar / header link guard.
   useEffect(() => {
     setNavGuard(() => {
       if (dirtyRef.current) {
         saveSnapshot();
         setTimeout(
-          () =>
-            showUndoToast({
-              message,
-              duration,
-              onUndo: () => navigate(editorPathRef.current, { state: UNDO_STATE }),
-              onExpire: clearSnapshot,
-            }),
+          () => showDiscardToast(() => navigate(editorPathRef.current, { state: UNDO_STATE })),
           0
         );
       }
       return true;
     });
     return () => setNavGuard(null);
-  }, [message, duration, navigate, saveSnapshot, clearSnapshot]);
+  }, [navigate, saveSnapshot, showDiscardToast]);
 
   // Explicit Back / Cancel button.
   const discard = useCallback(() => {
@@ -142,13 +157,8 @@ export function useDiscardWithUndo({
     saveSnapshot();
     const editorPath = editorPathRef.current;
     navigate(navigateTo);
-    showUndoToast({
-      message,
-      duration,
-      onUndo: () => navigate(editorPath, { state: UNDO_STATE }),
-      onExpire: clearSnapshot,
-    });
-  }, [navigate, navigateTo, message, duration, saveSnapshot, clearSnapshot]);
+    showDiscardToast(() => navigate(editorPath, { state: UNDO_STATE }));
+  }, [navigate, navigateTo, saveSnapshot, showDiscardToast]);
 
   // Called by the consumer after its async load completes.
   const popPendingRestore = useCallback((): boolean => {
@@ -157,7 +167,12 @@ export function useDiscardWithUndo({
     const saved = sessionStorage.getItem(snap.storageKey);
     if (!saved) return false;
     sessionStorage.removeItem(snap.storageKey);
-    if (snap.restoreOnlyOnUndo && !openedByUndoRef.current) return false;
+    if (snap.restoreOnlyOnUndo && !openedByUndoRef.current) {
+      // The draft is gone, so its toast's Undo would reopen nothing.
+      pendingToasts.get(snap.storageKey)?.();
+      pendingToasts.delete(snap.storageKey);
+      return false;
+    }
     snap.restore(saved);
     return true;
   }, []); // stable — uses refs
