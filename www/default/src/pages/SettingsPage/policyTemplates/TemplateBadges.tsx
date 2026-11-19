@@ -11,7 +11,7 @@ export const DecisionBadge: React.FC<{ decision: PolicyDecision }> = ({ decision
     className={`policy-default-decision policy-default-decision--${decision}`}
     title={
       decision === 'allow'
-        ? 'Allows requests that no rule denies'
+        ? 'Allows requests that no allow rule decides'
         : 'Denies requests that no rule allows'
     }
   >

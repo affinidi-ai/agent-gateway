@@ -1084,6 +1084,24 @@ describe('read-only without policies.edit', () => {
     expect(screen.queryByRole('button', { name: 'Fix it' })).toBeNull();
   });
 
+  it('hides the decision summary on a package mismatch while the compile is pending', async () => {
+    mockGateway({
+      ...SAVED,
+      policy: 'package gateway.policy\n\ndefault allow := false\n\nallow if input.x',
+    });
+    const post = apiClient.post as jest.Mock;
+    post.mockImplementation(() => new Promise(() => {}));
+    try {
+      renderAt('/policy-definitions/partner-only');
+      await screen.findByText(/Package mismatch/);
+      await screen.findByText('Compiling...');
+      expect(screen.queryByTestId('policy-rules-summary')).toBeNull();
+      expect(screen.getByTestId('policy-rules-invalid-banner')).toBeInTheDocument();
+    } finally {
+      post.mockResolvedValue({ data: { valid: true } });
+    }
+  });
+
   it('numbers no section on the create form', () => {
     mockCanEdit = false;
     renderAt('/policy-definitions/new?type=agent_surface');
@@ -1559,7 +1577,13 @@ describe('remove one rule', () => {
     });
     renderAt('/policy-definitions/partner-only');
     expect(await screen.findByTestId('policy-rules-group-0-rule-0-remove-button')).toBeDisabled();
-    expect(screen.getByTestId('policy-rules-group-0-rule-0')).toHaveTextContent('Helper');
+    expect(screen.getByTestId('policy-rules-group-0-rule-0-kind')).toHaveTextContent(
+      /^Used by allow$/
+    );
+    expect(screen.getByTestId('policy-rules-group-0-rule-1-kind')).toHaveTextContent(/^Allows$/);
+    expect(screen.getByTestId('policy-rules-summary')).toHaveTextContent(
+      /^This policy allows a request when its allow rule matches\. Otherwise: DENY$/
+    );
     expect(screen.getByTestId('policy-rules-group-0-rule-0-in-use')).toBeVisible();
     expect(screen.queryByTestId('policy-rules-group-0-rule-1-in-use')).toBeNull();
   });
@@ -1808,6 +1832,10 @@ describe('template examples that differ', () => {
     expect(within(card).getByTestId('policy-template-example-row-1-why')).toHaveTextContent(
       'Allow rules combine with OR'
     );
+    expect(screen.getByTestId('policy-rules-summary')).toHaveTextContent(
+      /^This policy allows a request when any allow rule matches\. Otherwise: DENY$/
+    );
+    expect(screen.queryByTestId('policy-rules-or-note')).toBeNull();
 
     const before = (screen.getByTestId('policy-simulate-input') as HTMLTextAreaElement).value;
     fireEvent.click(within(card).getByTestId('policy-template-example-row-1-load-button'));

@@ -1801,7 +1801,10 @@ action button the templates add is an `AppButton` (size `sm`; link-style actions
 "Default ALLOW"): a quiet outline in `--muted-text` with an `fa-shield-alt` icon for DENY, and
 amber (`--warning-text` on a light amber tint) with an `fa-exclamation-triangle` icon for ALLOW,
 because allowing by default is the less safe choice; the icons are `aria-hidden`, the tokens
-switch with `body.dark-theme`, and the Audit Log's `.audit-decision` pill is left as it is; an
+switch with `body.dark-theme`, and the Audit Log's `.audit-decision` pill is left as it is (the
+Rules view's decision summary reuses its `audit-decision--deny` pill, unchanged, for
+"Otherwise: DENY"); the `DecisionBadge` tooltip says "Denies requests that no rule allows" for DENY and "Allows
+requests that no allow rule decides" for ALLOW; an
 example's expected and actual decision
 and the tags (MCP tool policy and reads `<path>` with the path in `<code>` in `secondary`)
 are `Badge`s, an alert the templates add that carries an action is a non-collapsible
@@ -2106,8 +2109,14 @@ Create custom policy) in `useTemplateGallery`.
   header. The rules are rows of a `table table-sm align-middle mb-0` with a `thead-light` header
   (Kind, Rule, Line, and a visually hidden Actions column only with `policies.edit`), fixed
   layout so the Rule column truncates instead of scrolling sideways. Each rule
-  (`policy-rules-group-<n>-rule-<m>`, the row) has an Allows, Deny reason (only a rule named
-  `deny_reason`) or Helper (every other name, `deny` included) neutral outline badge, the
+  (`policy-rules-group-<n>-rule-<m>`, the row) has a neutral outline role badge
+  (`policy-rules-group-<n>-rule-<m>-kind`, from `ruleRoles` in `regoRules.ts`, shown with or
+  without `policies.edit`): Allows, Deny reason (only a rule named `deny_reason`), or, for every
+  other name, `deny` included, "Used by allow" when `allow` reads it, directly or through other
+  rules, or while the Rego reads its package as a whole document (title "allow reads this rule,
+  directly or through other rules, so it changes what the policy decides") and "Not used by
+  allow" otherwise (title "allow doesn't read this rule, so it doesn't change whether a request
+  is allowed"); the walk starts from every rule whose read name is `allow`. Then the
   rule on one line with its full text in `title`, and its line numbers, which switch to the Rego
   view and select the rule (`-show-button`): a small `outline-secondary` `AppButton` with a
   `fa-code` icon and only the numbers in monospace (`5`, `5–8`), since the column is headed
@@ -2148,10 +2157,22 @@ Create custom policy) in `useTemplateGallery`.
   by `aria-describedby` and repeated in the rule button's `title`; when no reading rule can be
   named the reason leaves out the parentheses, and Remove stays refused. While the Rego reads the
   policy as a whole document both say "The Rego reads the policy as a whole document; remove
-  rules in the Rego view." When more than one group has allow rules, a muted line under the
-  groups says "Allow rules combine with OR: a request passes when any allow rule matches."
-  (`policy-rules-or-note`). A policy that allows
-  by default and has allow rules shows a warning `InfoBanner` (`policy-rules-allow-default-warning`) with
+  rules in the Rego view." After the banners and before the groups a muted `small` line with
+  `fa-info-circle` (`policy-rules-summary`, from `summarizeDecision`) states what this policy
+  decides, always starting "This policy" since gateway policy runs first: with any allow
+  definition that is not plain (a value other than true, arguments, a dot, `[ ]`, `contains`,
+  `else`, or a `default allow` other than true or false) "The Rules view can't summarise how
+  this policy sets allow. Read the Rego.", which wins over every other case; with `default
+  allow := true` "This policy allows every request: the default is ALLOW."; with an allow rule
+  that has no conditions "This policy allows every request: an allow rule has no conditions.";
+  with plain allow rules "This policy allows a request when its allow rule matches." (one) or
+  "… when any allow rule matches." (several), then "Otherwise:" and the Audit Log's
+  `audit-decision audit-decision--deny` DENY pill (`policy-rules-summary-otherwise`), followed
+  by "(no default is set)" when there is no `default allow`; and with no allow rule "This
+  policy denies every request: no rule allows one." or "… no rule allows one and no default is
+  set.". It is hidden while the Rego doesn't parse or compile, has a mismatched package, is
+  empty, or has no rules; while a compile is pending it shows from the parse. A policy that allows
+  by default and has allow rules, all of them plain, shows a warning `InfoBanner` (`policy-rules-allow-default-warning`) with
   **Deny by default** (`policy-rules-set-default-deny-button`), which sets `default allow` to
   false and drops a `# Allow all traffic by default` comment directly above it, the one a custom
   policy and policies created before templates carry. Under that banner each group with allow
@@ -2164,7 +2185,9 @@ Create custom policy) in `useTemplateGallery`.
   Remove group, and a warning banner (`policy-rules-other-type-banner`) says "Remove the rules
   written for Agent Surface policies to create this policy."; Create is disabled, and Ctrl+S
   refuses, until those groups are removed. An empty Rego shows Default
-  ALLOW and "An empty policy allows every request.", as the gateway treats it. Removing a group
+  ALLOW and "An empty policy allows every request.", as the gateway treats it; Rego with no rules
+  and no `default allow` says "No default is set, so every request is denied.", and with a
+  default "The default decision (deny) applies to every request." or "(allow)". Removing a group
   keeps the Just added mark and examples card while another group of that template remains. With no rules, an empty state
   (`policy-rules-empty`) offers **Add rules from a template** (`policy-rules-add-button`) and
   **Write Rego** (`policy-rules-write-rego-button`). While the Rego doesn't compile a danger `InfoBanner`

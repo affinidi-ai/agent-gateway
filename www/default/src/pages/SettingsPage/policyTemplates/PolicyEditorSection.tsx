@@ -4,7 +4,15 @@ import FieldHelp from '../../../components/shared/FieldHelp';
 import PolicyRulesList from './PolicyRulesList';
 import PolicySectionTitle from './PolicySectionTitle';
 import RegoReference from './RegoReference';
-import { groupUse, parsePolicyRules, ruleUse, type PolicyRule, type RuleGroup } from './regoRules';
+import {
+  groupUse,
+  parsePolicyRules,
+  ruleRoles,
+  ruleUse,
+  summarizeDecision,
+  type PolicyRule,
+  type RuleGroup,
+} from './regoRules';
 import { DecisionBadge } from './TemplateBadges';
 import type { PolicyType } from './types';
 import './PolicyTemplates.css';
@@ -61,6 +69,8 @@ const PolicyEditorSection: React.FC<PolicyEditorSectionProps> = ({
   onShowRule,
 }) => {
   const parsed = useMemo(() => parsePolicyRules(policy), [policy]);
+  const summary = useMemo(() => summarizeDecision(parsed), [parsed]);
+  const ruleRole = useMemo(() => ruleRoles(parsed), [parsed]);
   const ruleCount = parsed.ok ? parsed.groups.reduce((n, g) => n + g.rules.length, 0) : 0;
   const valid = policyValid && !packageMismatch;
   // The gateway treats an empty policy as allowing every request.
@@ -155,8 +165,10 @@ const PolicyEditorSection: React.FC<PolicyEditorSectionProps> = ({
       <div className={view === 'rules' ? '' : 'd-none'} data-testid="policy-view-rules-panel">
         <PolicyRulesList
           parsed={parsed}
+          summary={summary}
+          ruleRole={ruleRole}
           canEdit={canEdit}
-          valid={valid || isValidating}
+          valid={valid || (isValidating && !packageMismatch)}
           packageMismatch={!!packageMismatch}
           empty={empty}
           justAdded={justAdded}

@@ -733,6 +733,7 @@ describe('isPlainAllow and isUnconditionalAllow', () => {
     ['allow if { true }', 'allow if { true }'],
     ['allow { true }', 'allow { true }'],
     ['allow if { true } over lines', 'allow if {\n  true\n}'],
+    ['allow if { true; }', 'allow if { true; }'],
   ])('reads %s as a plain, unconditional allow', (_label, body) => {
     const rule = onlyRule(body);
     expect([isPlainAllow(rule), isUnconditionalAllow(rule)]).toEqual([true, true]);

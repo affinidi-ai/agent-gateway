@@ -1,7 +1,8 @@
 import React from 'react';
 import { render, screen, within } from '@testing-library/react';
 import PolicyRulesList from '../PolicyRulesList';
-import { parsePolicyRules, type RuleUse } from '../regoRules';
+import { parsePolicyRules, ruleRoles, summarizeDecision, type RuleUse } from '../regoRules';
+import { DecisionBadge } from '../TemplateBadges';
 import type { PolicyType } from '../types';
 
 const noop = () => undefined;
@@ -17,21 +18,26 @@ function renderList(
     canEdit = true,
     justAdded = null,
     startedFrom = null,
+    valid = true,
   }: {
     otherTypeGroups?: (PolicyType | null)[];
     ruleUse?: (rule: { head: string }) => RuleUse | null;
     canEdit?: boolean;
     justAdded?: string | null;
     startedFrom?: string | null;
+    valid?: boolean;
   } = {}
 ) {
+  const parsed = parsePolicyRules(rego);
   render(
     <PolicyRulesList
-      parsed={parsePolicyRules(rego)}
+      parsed={parsed}
+      summary={summarizeDecision(parsed)}
+      ruleRole={ruleRoles(parsed)}
       canEdit={canEdit}
-      valid
+      valid={valid}
       packageMismatch={false}
-      empty={false}
+      empty={!rego.trim()}
       justAdded={justAdded}
       otherTypeGroups={otherTypeGroups}
       onAdd={noop}
@@ -193,5 +199,184 @@ describe('PolicyRulesList', () => {
 
     renderList('package q\n\ndefault allow := true\n\ndeny_reason := "no"\n');
     expect(screen.queryByTestId(/-no-effect$/)).toBeNull();
+  });
+
+  it('shows no Default ALLOW banner or no-effect note while an allow definition is not plain', () => {
+    renderList('package p\n\ndefault allow := true\n\nallow := false if input.x\n');
+    expect(screen.queryByTestId('policy-rules-allow-default-warning')).toBeNull();
+    expect(screen.queryByTestId(/-no-effect$/)).toBeNull();
+    expect(screen.getByTestId('policy-rules-summary')).toHaveTextContent(
+      /^The Rules view can't summarise how this policy sets allow\. Read the Rego\.$/
+    );
+  });
+
+  it('shows no OR note under groups that allow', () => {
+    renderList(`package p\n\ndefault allow := false\n\nallow if input.y\n\n${HTTP_GROUP}`);
+    expect(screen.queryByTestId('policy-rules-or-note')).toBeNull();
+    expect(screen.queryByText(/combine with OR/)).toBeNull();
+  });
+});
+
+describe('PolicyRulesList decision summary', () => {
+  const summary = () => screen.getByTestId('policy-rules-summary');
+  const otherwise = () => screen.queryByTestId('policy-rules-summary-otherwise');
+
+  it('sits after the banners and before the groups', () => {
+    renderList('package p\n\ndefault allow := true\n\nallow if input.y\n');
+    const banner = screen.getByTestId('policy-rules-allow-default-warning');
+    const group = screen.getByTestId('policy-rules-group-0');
+    expect(
+      banner.compareDocumentPosition(summary()) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy();
+    expect(
+      summary().compareDocumentPosition(group) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy();
+  });
+
+  it('says it cannot summarise a policy with an allow definition that is not plain', () => {
+    renderList('package p\n\ndefault allow := false\n\nallow := false if { input.x }\n');
+    expect(summary()).toHaveTextContent(
+      /^The Rules view can't summarise how this policy sets allow\. Read the Rego\.$/
+    );
+    expect(otherwise()).toBeNull();
+  });
+
+  it('says a policy that allows by default allows every request', () => {
+    renderList('package p\n\ndefault allow := true\n\nallow if input.y\n');
+    expect(summary()).toHaveTextContent(
+      /^This policy allows every request: the default is ALLOW\.$/
+    );
+    expect(otherwise()).toBeNull();
+  });
+
+  it('says a policy with an unconditional allow rule allows every request, with no DENY', () => {
+    renderList('package p\n\ndefault allow := false\n\nallow if { true }\n\nallow if input.y\n');
+    expect(summary()).toHaveTextContent(
+      /^This policy allows every request: an allow rule has no conditions\.$/
+    );
+    expect(otherwise()).toBeNull();
+  });
+
+  it('says one allow rule decides, otherwise DENY', () => {
+    renderList(TWO_RULES);
+    expect(summary()).toHaveTextContent(
+      /^This policy allows a request when its allow rule matches\. Otherwise: DENY$/
+    );
+    expect(otherwise()).toHaveTextContent(/^DENY$/);
+    expect(otherwise()).toHaveClass('audit-decision', 'audit-decision--deny');
+  });
+
+  it('says any of several allow rules decides, across groups', () => {
+    renderList(`package p\n\ndefault allow := false\n\nallow if input.y\n\n${HTTP_GROUP}`);
+    expect(summary()).toHaveTextContent(
+      /^This policy allows a request when any allow rule matches\. Otherwise: DENY$/
+    );
+  });
+
+  it('says no default is set after the DENY when allow has no default', () => {
+    renderList('package p\n\nallow if input.y\n\nallow if input.z\n');
+    expect(summary()).toHaveTextContent(
+      /^This policy allows a request when any allow rule matches\. Otherwise: DENY \(no default is set\)$/
+    );
+    expect(otherwise()).toHaveTextContent(/^DENY$/);
+  });
+
+  it('says a policy with no allow rule denies every request', () => {
+    renderList('package p\n\ndefault allow := false\n\nh if input.x\n');
+    expect(summary()).toHaveTextContent(/^This policy denies every request: no rule allows one\.$/);
+    expect(otherwise()).toBeNull();
+  });
+
+  it('says no default is set when a policy with no allow rule has no default', () => {
+    renderList('package p\n\nh if input.x\n');
+    expect(summary()).toHaveTextContent(
+      /^This policy denies every request: no rule allows one and no default is set\.$/
+    );
+  });
+
+  it('shows no summary while the Rego does not parse or compile', () => {
+    renderList('package p\n\nallow if {\n');
+    expect(screen.getByTestId('policy-rules-unparsed')).toBeInTheDocument();
+    expect(screen.queryByTestId('policy-rules-summary')).toBeNull();
+
+    renderList(TWO_RULES, { valid: false });
+    expect(screen.getByTestId('policy-rules-invalid-banner')).toBeInTheDocument();
+    expect(screen.queryByTestId('policy-rules-summary')).toBeNull();
+  });
+
+  it('shows no summary for an empty policy', () => {
+    renderList('');
+    expect(screen.queryByTestId('policy-rules-summary')).toBeNull();
+    expect(screen.getByTestId('policy-rules-empty')).toHaveTextContent(
+      'An empty policy allows every request.'
+    );
+  });
+
+  it('says every request is denied when a policy has no rules and no default', () => {
+    renderList('package p\n');
+    expect(screen.queryByTestId('policy-rules-summary')).toBeNull();
+    expect(screen.getByTestId('policy-rules-empty')).toHaveTextContent(
+      'No default is set, so every request is denied.'
+    );
+    expect(screen.getByTestId('policy-rules-empty')).not.toHaveTextContent('applies');
+  });
+
+  it('keeps the default decision text when a policy has no rules but a default', () => {
+    renderList('package p\n\ndefault allow := false\n');
+    expect(screen.getByTestId('policy-rules-empty')).toHaveTextContent(
+      'The default decision (deny) applies to every request.'
+    );
+
+    renderList('package q\n\ndefault allow := true\n');
+    expect(screen.getAllByTestId('policy-rules-empty')[1]).toHaveTextContent(
+      'The default decision (allow) applies to every request.'
+    );
+  });
+});
+
+describe('DecisionBadge', () => {
+  it('says what each default decision does in its tooltip', () => {
+    render(<DecisionBadge decision="allow" />);
+    expect(screen.getByText('Default ALLOW')).toHaveAttribute(
+      'title',
+      'Allows requests that no allow rule decides'
+    );
+    render(<DecisionBadge decision="deny" />);
+    expect(screen.getByText('Default DENY')).toHaveAttribute(
+      'title',
+      'Denies requests that no rule allows'
+    );
+  });
+});
+
+describe('PolicyRulesList role badges', () => {
+  const kind = (rule: number) => screen.getByTestId(`policy-rules-group-0-rule-${rule}-kind`);
+
+  it('marks a rule allow reads as Used by allow, without edit rights too', () => {
+    renderList(
+      'package p\n\ndefault allow := false\n\ndeny contains "no path" if not input.http.path\n\nallow if count(deny) == 0\n',
+      { canEdit: false }
+    );
+    expect(kind(0)).toHaveTextContent(/^Used by allow$/);
+    expect(kind(0)).toHaveAttribute(
+      'title',
+      'allow reads this rule, directly or through other rules, so it changes what the policy decides'
+    );
+    expect(kind(0)).toHaveClass('policy-rules__kind');
+    expect(kind(1)).toHaveTextContent(/^Allows$/);
+    expect(screen.queryByText('Helper')).toBeNull();
+  });
+
+  it('marks a rule only deny_reason reads as Not used by allow', () => {
+    renderList(
+      'package p\n\ndefault allow := false\n\ndeny contains "x" if input.y\n\ndeny_reason := concat(", ", deny)\n\nallow if input.z\n'
+    );
+    expect(kind(0)).toHaveTextContent(/^Not used by allow$/);
+    expect(kind(0)).toHaveAttribute(
+      'title',
+      "allow doesn't read this rule, so it doesn't change whether a request is allowed"
+    );
+    expect(kind(1)).toHaveTextContent(/^Deny reason$/);
+    expect(kind(2)).toHaveTextContent(/^Allows$/);
   });
 });

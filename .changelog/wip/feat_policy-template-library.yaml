@@ -26,10 +26,13 @@ changes:
         from only. Add rules from a template lists only templates that add rules, labelled
         Adds rules, says how many whole policies and templates for the other Type it leaves
         out, and appends a template's rules to a new or saved policy, so several can be
-        combined. A Rules | Rego toggle shows the policy, opening on Rules. The Rules view lists
-        the policy's rules grouped by the template they came from, removes a template's rules
-        or a single rule unless the allow rule still reads it, saying which rule does, switches
-        an allow-all policy to deny by default, marks groups that have no effect while the
+        combined. A Rules | Rego toggle shows the policy, opening on Rules. The Rules view says
+        in one line above the rules what the policy decides, or that it can't and to read the
+        Rego, lists the policy's rules grouped by the template they came from, marks each rule
+        other than allow and deny_reason Used by allow or Not used by allow, removes a
+        template's rules or a single rule unless the allow rule still reads it, saying which
+        rule does, switches an allow-all policy to deny by default, marks groups that have no
+        effect while the
         default is ALLOW, and on a new policy blocks Create while a group written for the other
         Type remains. Start from names the template the policy started from and counts the
         templates added until a hand edit. On a saved policy a Template examples card checks the

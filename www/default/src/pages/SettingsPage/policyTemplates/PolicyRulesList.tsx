@@ -2,11 +2,22 @@ import React from 'react';
 import { AppButton } from '../../../components/shared/AppButton';
 import { Badge } from '../../../components/shared/Badge';
 import InfoBanner from '../../../components/shared/InfoBanner';
-import type { ParsedPolicy, PolicyRule, RuleGroup, RuleKind, RuleUse } from './regoRules';
+import type {
+  DecisionSummary,
+  ParsedPolicy,
+  PolicyRule,
+  RuleGroup,
+  RuleRole,
+  RuleUse,
+} from './regoRules';
 import { POLICY_TYPE_NAMES, type PolicyType } from './types';
 
 interface PolicyRulesListProps {
   parsed: ParsedPolicy;
+  /** What the policy decides (`summarizeDecision`), or null when there is nothing to summarise. */
+  summary: DecisionSummary | null;
+  /** Each rule's part in the decision (`ruleRoles`). */
+  ruleRole: (rule: PolicyRule) => RuleRole;
   /** Shows Add rules, Remove and Deny by default. */
   canEdit: boolean;
   /** False while the Rego doesn't compile. */
@@ -33,16 +44,54 @@ interface PolicyRulesListProps {
   onShowRule: (rule: PolicyRule) => void;
 }
 
-const KIND_LABEL: Record<RuleKind, string> = {
+const ROLE_LABEL: Record<RuleRole, string> = {
   allow: 'Allows',
-  deny: 'Deny reason',
-  helper: 'Helper',
+  'deny-reason': 'Deny reason',
+  'used-by-allow': 'Used by allow',
+  'not-used-by-allow': 'Not used by allow',
 };
 
-const KIND_TITLE: Record<RuleKind, string> = {
+const ROLE_TITLE: Record<RuleRole, string> = {
   allow: 'Allows the request when its conditions match',
-  deny: 'Gives the reason a request was denied; does not decide it',
-  helper: 'Read by other rules; decides nothing on its own',
+  'deny-reason': 'Gives the reason a request was denied; does not decide it',
+  'used-by-allow':
+    'allow reads this rule, directly or through other rules, so it changes what the policy decides',
+  'not-used-by-allow':
+    "allow doesn't read this rule, so it doesn't change whether a request is allowed",
+};
+
+const DecisionSummaryText: React.FC<{ summary: DecisionSummary }> = ({ summary }) => {
+  switch (summary.kind) {
+    case 'unsummarised':
+      return <>The Rules view can&apos;t summarise how this policy sets allow. Read the Rego.</>;
+    case 'allows-all':
+      return summary.reason === 'default' ? (
+        <>This policy allows every request: the default is ALLOW.</>
+      ) : (
+        <>This policy allows every request: an allow rule has no conditions.</>
+      );
+    case 'any-allow':
+      return (
+        <>
+          This policy allows a request when {summary.allowRules === 1 ? 'its' : 'any'} allow rule
+          matches. Otherwise:{' '}
+          <span
+            className="audit-decision audit-decision--deny"
+            data-testid="policy-rules-summary-otherwise"
+          >
+            <i className="fas fa-xmark" aria-hidden="true" />
+            DENY
+          </span>
+          {!summary.hasDefault && ' (no default is set)'}
+        </>
+      );
+    case 'denies-all':
+      return summary.hasDefault ? (
+        <>This policy denies every request: no rule allows one.</>
+      ) : (
+        <>This policy denies every request: no rule allows one and no default is set.</>
+      );
+  }
 };
 
 const DOCUMENT_READ =
@@ -80,6 +129,8 @@ const lineLabel = (rule: PolicyRule) =>
 /** The Rules view of the policy: the rules in the Rego, grouped by the template they came from. */
 const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
   parsed,
+  summary,
+  ruleRole,
   canEdit,
   valid,
   packageMismatch,
@@ -120,8 +171,8 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
 
   const allows = (g: RuleGroup) => g.rules.some(r => r.kind === 'allow');
   const allowRules = parsed.groups.some(allows);
-  const groupsThatAllow = parsed.groups.filter(allows).length;
-  const allowByDefault = parsed.defaultDecision === 'allow';
+  // Default ALLOW makes allow rules moot only while every allow definition is plain.
+  const allowByDefault = parsed.defaultDecision === 'allow' && summary?.kind !== 'unsummarised';
   const misfitType = otherTypeGroups.find((t): t is PolicyType => t !== null);
   const lastJustAdded = parsed.groups.reduce<RuleGroup | null>(
     (last, g) => (g.source.kind === 'template' && g.source.name === justAdded ? g : last),
@@ -188,6 +239,13 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
         </div>
       )}
 
+      {valid && summary && (
+        <p className="text-muted small mb-2" data-testid="policy-rules-summary">
+          <i className="fas fa-info-circle me-1" aria-hidden="true" />
+          <DecisionSummaryText summary={summary} />
+        </p>
+      )}
+
       {parsed.groups.length === 0 && (
         <div className="policy-rules__empty" data-testid="policy-rules-empty">
           <i className="fas fa-list-check fa-lg text-muted" aria-hidden="true" />
@@ -195,7 +253,9 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
           <div className="small text-muted mb-2">
             {empty
               ? 'An empty policy allows every request.'
-              : `The default decision (${parsed.defaultDecision === 'allow' ? 'allow' : 'deny'}) applies to every request.`}
+              : parsed.defaultDecision === null
+                ? 'No default is set, so every request is denied.'
+                : `The default decision (${parsed.defaultDecision === 'allow' ? 'allow' : 'deny'}) applies to every request.`}
           </div>
           {canEdit && (
             <div className="d-flex justify-content-center flex-wrap gap-2">
@@ -311,11 +371,16 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
                     const ruleTestId = `${testId}-rule-${ruleIndex}`;
                     const reason = canEdit ? ruleUse(rule) : null;
                     const inUse = reason !== null;
+                    const role = ruleRole(rule);
                     return (
                       <tr key={rule.startLine} data-testid={ruleTestId}>
                         <td>
-                          <span className="badge policy-rules__kind" title={KIND_TITLE[rule.kind]}>
-                            {KIND_LABEL[rule.kind]}
+                          <span
+                            className="badge policy-rules__kind"
+                            title={ROLE_TITLE[role]}
+                            data-testid={`${ruleTestId}-kind`}
+                          >
+                            {ROLE_LABEL[role]}
                           </span>
                         </td>
                         <td>
@@ -371,12 +436,6 @@ const PolicyRulesList: React.FC<PolicyRulesListProps> = ({
           </div>
         );
       })}
-      {groupsThatAllow > 1 && (
-        <p className="text-muted small mt-2 mb-0" data-testid="policy-rules-or-note">
-          <i className="fas fa-info-circle me-1" aria-hidden="true" />
-          Allow rules combine with OR: a request passes when any allow rule matches.
-        </p>
-      )}
     </div>
   );
 };

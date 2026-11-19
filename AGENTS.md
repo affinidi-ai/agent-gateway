@@ -443,7 +443,9 @@ form, asking in place first (focus on Cancel) unless the Rego is an untouched
 start. Templates still have a role, **Whole policy** or **Adds rules**, shown under **Add rules
 from a template**. The Policy section's
 **Rules | Rego** toggle lists the rules grouped by
-template, with Remove per group and per rule, disabled while `allow` reads the rule, with a
+template, states above them what the policy decides (or that it can't, pointing to the Rego),
+marks each rule other than `allow` and `deny_reason` "Used by allow" or "Not used by allow",
+with Remove per group and per rule, disabled while `allow` reads the rule, with a
 reason that names the rule reading it; under Default ALLOW each group with allow rules is marked
 as having no effect, and on a new policy a group written for the other Type is marked and
 blocks Create until it is removed. Once rules are added the gallery still names the

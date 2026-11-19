@@ -1,6 +1,6 @@
 import type { PolicyDecision } from './types';
 
-export type RuleKind = 'allow' | 'deny' | 'helper';
+type RuleKind = 'allow' | 'deny' | 'helper';
 
 export interface PolicyRule {
   /** The rule's head, such as `allow` or `jwt_claim_values(v)`. */
@@ -384,7 +384,8 @@ export function isUnconditionalAllow(rule: PolicyRule): boolean {
   const body = plainAllowBody(rule);
   if (body === null) return false;
   const inner = /^\{[\s\S]*\}$/.test(body) ? body.slice(1, -1).trim() : body;
-  return inner === '' || inner === 'true';
+  const statement = inner.replace(/;\s*$/, '').trim();
+  return statement === '' || statement === 'true';
 }
 
 export type DecisionSummary =
