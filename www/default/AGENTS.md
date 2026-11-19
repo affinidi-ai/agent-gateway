@@ -609,7 +609,12 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
     on every save, one in a stored setting the operator did not edit included, so the dashboard
     shows it as an error next to its field and blocks Save until it is fixed. The editors drop
     only the spaces and tabs around a header name or format (`trimSpaces`), never a line break or
-    NUL, so a stored value that ends in one is reported whether or not its panel was opened.
+    NUL, so a stored value that ends in one is reported whether or not its panel was opened. A
+    blank field sends the default, except a blank the stored setting already had
+    (`blankHeaderValue`), which stays blank and is reported; the forms load a stored blank as
+    blank (`storedHeaderValue`). The Managed Agent's full-screen editor shows the Header Format
+    input for the Custom type, and for any other type while its format has an error and until the
+    type is chosen again, so the message always has its input.
   - **Advisories that allow Save.** A Target that is not `https://` (`http://`, `fabric://` and
     `a2a-proxy://` are not) and a leg that authenticates no caller (an Access Point with no source
     authentication, a Transit Point that authenticates no caller) are shown as an advisory

@@ -212,6 +212,50 @@ describe('Managed Agent Target authentication validation', () => {
       headerFormat: 'Token {value}',
     });
   });
+
+  describe.each([
+    ['a static secret', 'static_secret', { secret_id: 's' }, '{value}'],
+    ['a credential provider', 'credential_provider', { provider_id: 'prov-1' }, 'Bearer {value}'],
+  ])('a blank header name and format of %s', (_, kind, credential, defaultFormat) => {
+    const loaded = (headerName: string, headerFormat: string): any =>
+      managedAgentDefinition.configFromPayload!(
+        {
+          endpoint: 'https://agent.example.com',
+          auth: {
+            method: {
+              [kind]: { ...credential, header_name: headerName, header_format: headerFormat },
+            },
+            fallback: 'reject',
+          },
+        },
+        {}
+      );
+
+    it('blocks the stored blank, which a save does not replace with a default', () => {
+      const config = loaded('', '');
+      expect(managedAgentTargetAuthProblems(config).errors).toEqual({
+        target_auth_header_name: 'Header name must be an HTTP header name',
+        target_auth_header_format: 'Header format must contain {value} exactly once',
+      });
+      expect(targetAuthHeader(managedAgentTargetAuth(config))).toEqual({
+        headerName: '',
+        headerFormat: '',
+      });
+    });
+
+    it('sends the default for a field the operator empties', () => {
+      const emptied = {
+        ...loaded('X-Token', 'Token {value}'),
+        target_auth_header_name: '',
+        target_auth_header_format: '',
+      };
+      expect(managedAgentTargetAuthProblems(emptied).errors).toEqual({});
+      expect(targetAuthHeader(managedAgentTargetAuth(emptied))).toEqual({
+        headerName: 'Authorization',
+        headerFormat: defaultFormat,
+      });
+    });
+  });
 });
 
 describe('lossless Target authentication save', () => {

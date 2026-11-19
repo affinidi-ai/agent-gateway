@@ -8,6 +8,7 @@ import { a2aProxyIdFromEndpoint, isA2aProxyEndpoint } from '../_shared/a2aProxyE
 import {
   STORED_TARGET_AUTH_KEY,
   providerTargetAuthFromApi,
+  storedHeaderValue,
   storedTargetAuth,
 } from '../_shared/providerTargetAuth';
 import { parseFabricEndpoint } from '../_shared/useGatewaySurfaces';
@@ -194,8 +195,8 @@ export const managedAgentDefinition: NodeDefinition = {
       if (ss) {
         c.target_auth_source = 'secret';
         c.target_auth_secret_id = ss.secret_id || '';
-        c.target_auth_header_name = ss.header_name || 'Authorization';
-        c.target_auth_header_format = ss.header_format || '{value}';
+        c.target_auth_header_name = storedHeaderValue(ss.header_name, 'Authorization');
+        c.target_auth_header_format = storedHeaderValue(ss.header_format, '{value}');
       } else if (provider) {
         c.target_auth_source = 'provider';
         c.target_auth_provider_id = provider.providerId;

@@ -4,6 +4,7 @@ import {
   StoredTargetAuth,
   TargetAuthProblems,
   UNKNOWN_METHOD_NOTE,
+  blankHeaderValue,
   classifyTargetAuthProblems,
   knownTargetAuthMethod,
   mergedTargetAuth,
@@ -54,22 +55,30 @@ export function inferAuthType(headerName: string, headerFormat: string): string 
 }
 
 function editedTargetAuth(c: ManagedAgentTargetAuthForm): Record<string, unknown> | undefined {
+  const storedMethod = knownTargetAuthMethod(c[STORED_TARGET_AUTH_KEY]?.auth);
   if (c.target_auth_source === 'provider') {
-    return providerTargetAuthToApi({
-      providerId: text(c.target_auth_provider_id),
-      headerName: text(c.target_auth_header_name),
-      headerFormat: text(c.target_auth_header_format),
-      fallback: c.target_auth_fallback === 'passthrough' ? 'passthrough' : 'reject',
-      scopes: parseScopes(c.target_auth_scopes),
-    });
+    return providerTargetAuthToApi(
+      {
+        providerId: text(c.target_auth_provider_id),
+        headerName: text(c.target_auth_header_name),
+        headerFormat: text(c.target_auth_header_format),
+        fallback: c.target_auth_fallback === 'passthrough' ? 'passthrough' : 'reject',
+        scopes: parseScopes(c.target_auth_scopes),
+      },
+      storedMethod
+    );
   }
   if (!c.target_auth_secret_id) return undefined;
   return {
     method: {
       static_secret: {
         secret_id: c.target_auth_secret_id,
-        header_name: text(c.target_auth_header_name) || 'Authorization',
-        header_format: text(c.target_auth_header_format) || '{value}',
+        header_name:
+          text(c.target_auth_header_name) ||
+          blankHeaderValue(storedMethod?.header_name, 'Authorization'),
+        header_format:
+          text(c.target_auth_header_format) ||
+          blankHeaderValue(storedMethod?.header_format, '{value}'),
       },
     },
     fallback: c.target_auth_fallback || 'reject',

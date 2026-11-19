@@ -4,6 +4,7 @@ import {
   TP_CALLER_CHECK_PROBLEM,
   TargetAuthProblems,
   UNKNOWN_METHOD_NOTE,
+  blankHeaderValue,
   classifyTargetAuthProblems,
   knownTargetAuthMethod,
   mergedTargetAuth,
@@ -57,15 +58,23 @@ function header(value: unknown): string {
 function editedTargetAuth(c: TransitPointTargetAuthForm): Record<string, unknown> | undefined {
   const type = c.auth_type;
   if (!type || type === 'none') return undefined;
+  const storedMethod = knownTargetAuthMethod(c[STORED_TARGET_AUTH_KEY]?.auth);
   if (type === 'credential_provider') {
-    return providerTargetAuthToApi({
-      providerId: untrimmed(c.auth_provider_id),
-      headerName: untrimmed(c.auth_header_name),
-      headerFormat: untrimmed(c.auth_header_format),
-      fallback: c.auth_fallback === 'passthrough' ? 'passthrough' : 'reject',
-      scopes: c.auth_scopes === undefined ? undefined : parseScopes(c.auth_scopes),
-    });
+    return providerTargetAuthToApi(
+      {
+        providerId: untrimmed(c.auth_provider_id),
+        headerName: untrimmed(c.auth_header_name),
+        headerFormat: untrimmed(c.auth_header_format),
+        fallback: c.auth_fallback === 'passthrough' ? 'passthrough' : 'reject',
+        scopes: c.auth_scopes === undefined ? undefined : parseScopes(c.auth_scopes),
+      },
+      storedMethod
+    );
   }
+  const name = (fallback: string) =>
+    header(c.auth_header_name) || blankHeaderValue(storedMethod?.header_name, fallback);
+  const format = (fallback: string) =>
+    header(c.auth_header_format) || blankHeaderValue(storedMethod?.header_format, fallback);
   const secretId = text(c.auth_secret);
   if (!secretId) return undefined;
   let headerName: string;
@@ -73,15 +82,15 @@ function editedTargetAuth(c: TransitPointTargetAuthForm): Record<string, unknown
   switch (type) {
     case 'bearer':
       headerName = 'Authorization';
-      headerFormat = header(c.auth_header_format) || 'Bearer {value}';
+      headerFormat = format('Bearer {value}');
       break;
     case 'api_key':
-      headerName = header(c.auth_header_name) || 'X-API-Key';
-      headerFormat = header(c.auth_header_format) || '{value}';
+      headerName = name('X-API-Key');
+      headerFormat = format('{value}');
       break;
     case 'custom_header':
-      headerName = header(c.auth_header_name) || 'X-Auth';
-      headerFormat = header(c.auth_header_format) || '{value}';
+      headerName = name('X-Auth');
+      headerFormat = format('{value}');
       break;
     default:
       return undefined;

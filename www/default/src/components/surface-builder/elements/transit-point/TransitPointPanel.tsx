@@ -18,6 +18,7 @@ import { staticSecretAuthType, transitPointTargetAuthProblems } from './targetAu
 import {
   PROVIDER_TARGET_AUTH_DEFAULTS,
   providerTargetAuthFromApi,
+  storedHeaderValue,
 } from '../_shared/providerTargetAuth';
 import TransitCallerSection from './TransitCallerSection';
 import { newTransitPointId, deriveTransitPointAlias } from './factory';
@@ -109,8 +110,8 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
       (ta.method && typeof ta.method === 'object' && (ta.method as any).static_secret) ||
       (ta.method === 'static_secret' ? ta : null);
     if (!ss) return;
-    const headerName: string = ss.header_name || 'Authorization';
-    const headerFormat: string = ss.header_format || '{value}';
+    const headerName = storedHeaderValue(ss.header_name, 'Authorization');
+    const headerFormat = storedHeaderValue(ss.header_format, '{value}');
     const authType = staticSecretAuthType(headerName, headerFormat);
     authHydratedRef.current = true;
     updateFields({

@@ -41,16 +41,39 @@ export function trimSpaces(value: string): string {
   return value.replace(/^[ \t]+|[ \t]+$/g, '');
 }
 
-/** The wire `target_auth` of a provider method, or undefined when no provider is picked. */
-export function providerTargetAuthToApi(auth: ProviderTargetAuth) {
+/** A stored header name or format as the form holds it: `fallback` only when none is stored. */
+export function storedHeaderValue(value: unknown, fallback: string): string {
+  return typeof value === 'string' ? value : fallback;
+}
+
+/**
+ * What a save sends for a header field the form holds blank: `fallback`, or the blank the stored
+ * setting already had, so the header rules report it and no save replaces it unseen.
+ */
+export function blankHeaderValue(storedValue: unknown, fallback: string): string {
+  return typeof storedValue === 'string' && !trimSpaces(storedValue) ? storedValue : fallback;
+}
+
+/**
+ * The wire `target_auth` of a provider method, or undefined when no provider is picked.
+ * `storedMethod` is the stored setting's method, whose blank header name or format is kept.
+ */
+export function providerTargetAuthToApi(
+  auth: ProviderTargetAuth,
+  storedMethod?: Record<string, unknown> | null
+) {
   const providerId = auth.providerId.trim();
   if (!providerId) return undefined;
   return {
     method: {
       credential_provider: {
         provider_id: providerId,
-        header_name: trimSpaces(auth.headerName) || PROVIDER_TARGET_AUTH_DEFAULTS.headerName,
-        header_format: trimSpaces(auth.headerFormat) || PROVIDER_TARGET_AUTH_DEFAULTS.headerFormat,
+        header_name:
+          trimSpaces(auth.headerName) ||
+          blankHeaderValue(storedMethod?.header_name, PROVIDER_TARGET_AUTH_DEFAULTS.headerName),
+        header_format:
+          trimSpaces(auth.headerFormat) ||
+          blankHeaderValue(storedMethod?.header_format, PROVIDER_TARGET_AUTH_DEFAULTS.headerFormat),
         ...(auth.scopes ? { scopes: auth.scopes } : {}),
       },
     },
@@ -69,14 +92,11 @@ export function providerTargetAuthFromApi(targetAuth: unknown): ProviderTargetAu
   if (!provider || typeof provider.provider_id !== 'string') return null;
   return {
     providerId: provider.provider_id,
-    headerName:
-      typeof provider.header_name === 'string'
-        ? provider.header_name
-        : PROVIDER_TARGET_AUTH_DEFAULTS.headerName,
-    headerFormat:
-      typeof provider.header_format === 'string'
-        ? provider.header_format
-        : PROVIDER_TARGET_AUTH_DEFAULTS.headerFormat,
+    headerName: storedHeaderValue(provider.header_name, PROVIDER_TARGET_AUTH_DEFAULTS.headerName),
+    headerFormat: storedHeaderValue(
+      provider.header_format,
+      PROVIDER_TARGET_AUTH_DEFAULTS.headerFormat
+    ),
     fallback: fallback === 'passthrough' ? 'passthrough' : 'reject',
     scopes: Array.isArray(provider.scopes)
       ? provider.scopes.filter((scope): scope is string => typeof scope === 'string')

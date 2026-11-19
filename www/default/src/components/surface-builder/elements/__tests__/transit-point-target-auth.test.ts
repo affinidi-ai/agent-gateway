@@ -4,6 +4,7 @@ import {
   TARGET_AUTH_HTTPS_PROBLEM,
   TP_CALLER_CHECK_PROBLEM,
   UNKNOWN_METHOD_NOTE,
+  storedHeaderValue,
   storedTargetAuth,
   targetAuthHeader,
 } from '../_shared/providerTargetAuth';
@@ -142,6 +143,65 @@ describe('Transit Point Target authentication validation', () => {
         headerFormat: 'Token {value}',
       });
     });
+  });
+
+  describe.each([
+    [
+      'a static secret',
+      'static_secret',
+      { secret_id: 's' },
+      { auth_type: 'custom_header', auth_secret: 's' },
+      { headerName: 'X-Auth', headerFormat: '{value}' },
+    ],
+    [
+      'a credential provider',
+      'credential_provider',
+      { provider_id: 'prov-1' },
+      { auth_type: 'credential_provider', auth_provider_id: 'prov-1' },
+      { headerName: 'Authorization', headerFormat: 'Bearer {value}' },
+    ],
+  ])('a blank header name and format of %s', (_, kind, credential, form, defaults) => {
+    const stored = (headerName: string, headerFormat: string) =>
+      storedTargetAuth({
+        method: { [kind]: { ...credential, header_name: headerName, header_format: headerFormat } },
+        fallback: 'reject',
+      });
+    const errors = {
+      auth_header_name: 'Header name must be an HTTP header name',
+      auth_header_format: 'Header format must contain {value} exactly once',
+    };
+
+    it('blocks the stored blank on an opened Transit Point, as on an unopened one', () => {
+      const unopened = {
+        target_endpoint: 'https://partner.example.com',
+        _stored_target_auth: stored('', ''),
+      };
+      expect(transitPointTargetAuthProblems(unopened).errors).toEqual(errors);
+
+      const opened = { ...tp(form), ...unopened, auth_header_name: '', auth_header_format: '' };
+      expect(transitPointTargetAuthProblems(opened).errors).toEqual(errors);
+      expect(targetAuthHeader(transitPointTargetAuth(opened))).toEqual({
+        headerName: '',
+        headerFormat: '',
+      });
+    });
+
+    it('sends the default for a field the operator empties', () => {
+      const emptied = {
+        ...tp(form),
+        _stored_target_auth: stored('X-Token', 'Token {value}'),
+        auth_header_name: '',
+        auth_header_format: '',
+      };
+      expect(transitPointTargetAuthProblems(emptied).errors).toEqual({});
+      expect(targetAuthHeader(transitPointTargetAuth(emptied))).toEqual(defaults);
+    });
+  });
+
+  it('keeps a stored blank header value in the form and fills in only a missing one', () => {
+    expect(storedHeaderValue('', 'Authorization')).toBe('');
+    expect(storedHeaderValue('X-Token', 'Authorization')).toBe('X-Token');
+    expect(storedHeaderValue(undefined, 'Authorization')).toBe('Authorization');
   });
 
   it('advises on a proxy:// target endpoint, which the gateway exempts only on the Managed Agent', () => {

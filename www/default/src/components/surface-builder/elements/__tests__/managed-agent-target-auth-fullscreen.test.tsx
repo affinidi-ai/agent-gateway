@@ -70,6 +70,42 @@ describe('Managed Agent Target authentication editor', () => {
     );
   });
 
+  describe('the format field of a type other than Custom', () => {
+    const bearer = { ...base, target_auth_source: 'secret', target_auth_secret_id: 's' };
+    const panel = (config: Record<string, unknown>) => (
+      <ManagedAgentAuthFullscreen
+        node={{ id: 'target', type: 'target', label: 'T', configured: true, config } as any}
+        config={config}
+        updateField={jest.fn()}
+        updateFields={jest.fn()}
+      />
+    );
+
+    it('is hidden while the format is valid', () => {
+      render(panel(bearer));
+      expect(screen.queryByLabelText('Header Format')).not.toBeInTheDocument();
+    });
+
+    it('is shown with its message for a stored format problem, and stays while it is fixed', () => {
+      const { rerender } = render(
+        panel({ ...bearer, target_auth_header_format: 'Bearer {value}\n' })
+      );
+      const message = screen.getByTestId('managed-agent-target-auth-header-format-error');
+      expect(message).toHaveTextContent('Header format must not contain CR, LF or NUL');
+      expect(screen.getByLabelText('Header Format')).toHaveAttribute('aria-invalid', 'true');
+      expect(screen.getByLabelText('Header Format')).toHaveAttribute(
+        'aria-describedby',
+        message.id
+      );
+
+      rerender(panel({ ...bearer, target_auth_header_format: 'Bearer {value} ' }));
+      expect(screen.getByLabelText('Header Format')).toHaveAttribute('aria-invalid', 'false');
+      expect(
+        screen.queryByTestId('managed-agent-target-auth-header-format-error')
+      ).not.toBeInTheDocument();
+    });
+  });
+
   it('shows an https advisory, not an error, for a Target that is not https', () => {
     renderPanel({
       ...base,

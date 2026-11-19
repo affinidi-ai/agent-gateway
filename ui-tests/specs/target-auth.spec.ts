@@ -274,6 +274,65 @@ test.describe('Managed Agent Target authentication: credential provider', () => 
         expect(saved).toHaveLength(0);
     });
 
+    test('a stored Bearer format with a line break shows the format field and its error in the editor', async ({page}) => {
+        const saved: Request[] = [];
+        const stored = {
+            method: {
+                credential_provider: {
+                    provider_id: 'prov-1',
+                    header_name: 'Authorization',
+                    header_format: 'Bearer {value}\n',
+                },
+            },
+            fallback: 'reject',
+        };
+        await mockSurface(page, surfaceFixture({auth: stored}), saved);
+        await page.goto(`${BASE_URL}/surfaces/${SURFACE_ID}`);
+        await page.getByTestId('surface-node-target').click();
+        await page.getByRole('button', {name: /Configure/}).click();
+
+        await expect(page.locator('#target-auth-type')).toHaveValue('bearer');
+        await expect(page.getByTestId('managed-agent-target-auth-header-format-error')).toHaveText(
+            'Header format must not contain CR, LF or NUL',
+        );
+        await page.locator('#target-auth-header-format').fill('Bearer {value}');
+        await expect(page.getByTestId('managed-agent-target-auth-header-format-error')).toHaveCount(0);
+        await expect(page.locator('#target-auth-header-format')).toBeVisible();
+        await saveButton(page).click();
+        await expect.poll(() => saved.length).toBe(1);
+        const method = (saved[0].postDataJSON().target as {auth: {method: {credential_provider: Json}}}).auth
+            .method.credential_provider;
+        expect(method.header_format).toBe('Bearer {value}');
+    });
+
+    test('a stored blank header format blocks Save and is not replaced with a default', async ({page}) => {
+        const saved: Request[] = [];
+        const stored = {
+            method: {
+                credential_provider: {provider_id: 'prov-1', header_name: 'X-Partner-Token', header_format: ''},
+            },
+            fallback: 'reject',
+        };
+        await mockSurface(page, surfaceFixture({auth: stored}), saved);
+        await page.goto(`${BASE_URL}/surfaces/${SURFACE_ID}`);
+        await expect(page.getByTestId('surface-node-target')).toBeVisible();
+        await saveButton(page).click();
+        await expectSaveBlocked(page, 'Header format must contain {value} exactly once');
+        expect(saved).toHaveLength(0);
+
+        await page.getByTestId('surface-node-target').click();
+        await page.getByRole('button', {name: /Configure/}).click();
+        await expect(page.getByTestId('managed-agent-target-auth-header-format-error')).toHaveText(
+            'Header format must contain {value} exactly once',
+        );
+        await page.locator('#target-auth-header-format').fill('Token {value}');
+        await saveButton(page).click();
+        await expect.poll(() => saved.length).toBe(1);
+        const method = (saved[0].postDataJSON().target as {auth: {method: {credential_provider: Json}}}).auth
+            .method.credential_provider;
+        expect(method.header_format).toBe('Token {value}');
+    });
+
     test('a Managed Agent credential on an http Target shows an advisory and still saves', async ({page}) => {
         const saved: Request[] = [];
         await mockSurface(page, surfaceFixture({endpoint: 'http://agent.example.com'}), saved);

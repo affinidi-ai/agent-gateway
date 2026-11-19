@@ -45,6 +45,12 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
   const { errors, advisories, notes } = managedAgentTargetAuthProblems(config, {
     accessPointChecksCallers,
   });
+  const formatError = errors.target_auth_header_format;
+  const [formatErrorSeen, setFormatErrorSeen] = useState(false);
+  useEffect(() => {
+    if (formatError) setFormatErrorSeen(true);
+  }, [formatError]);
+  const showFormat = authType === 'custom' || !!formatError || formatErrorSeen;
 
   useEffect(() => {
     setLoadingSecrets(true);
@@ -74,6 +80,7 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
 
   const setAuthType = (newType: AuthType) => {
     const d = AUTH_TYPE_DEFAULTS[newType];
+    setFormatErrorSeen(false);
     updateFields({
       target_auth_type: newType,
       target_auth_header_name: d.headerName,
@@ -256,7 +263,7 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
           </small>
         </div>
 
-        {authType === 'custom' && (
+        {showFormat && (
           <div className="mb-3">
             <label htmlFor="target-auth-header-format" className="form-label fw-bold">
               Header Format
