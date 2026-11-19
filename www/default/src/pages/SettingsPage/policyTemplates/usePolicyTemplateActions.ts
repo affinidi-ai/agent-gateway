@@ -149,7 +149,7 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
     });
   };
 
-  const removeGroup = (group: RuleGroup) => {
+  const removeGroup = (group: RuleGroup, message?: string) => {
     const name = group.source.kind === 'template' ? group.source.name : '';
     const previousInserted = insertedTemplate;
     const previousJustAdded = justAdded;
@@ -162,14 +162,26 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
       if (name === justAdded) setJustAdded(null);
       if (name === insertedTemplate?.template.name) setInsertedTemplate(null);
     }
-    changePolicyWithUndo(policy, `Removed the rules from the template ${name}.`, () => {
+    changePolicyWithUndo(policy, message ?? `Removed the rules from the template ${name}.`, () => {
       setInsertedTemplate(previousInserted);
       setJustAdded(previousJustAdded);
     });
   };
 
-  const removeRule = (rule: PolicyRule) =>
+  const removeRule = (rule: PolicyRule) => {
+    const parsed = parsePolicyRules(form.policy);
+    const group = parsed.ok
+      ? parsed.groups.find(g => g.rules.some(r => r.startLine === rule.startLine))
+      : undefined;
+    if (group?.source.kind === 'template' && group.rules.length === 1) {
+      removeGroup(
+        group,
+        `Removed the rule ${rule.head}, the last from the template ${group.source.name}.`
+      );
+      return;
+    }
     changePolicyWithUndo(removeRuleLines(form.policy, rule), `Removed the rule ${rule.head}.`);
+  };
 
   const denyByDefault = () =>
     changePolicyWithUndo(setDefaultDeny(form.policy), 'Requests are now denied by default.');

@@ -1495,6 +1495,47 @@ describe('remove one rule', () => {
     expect(rego().value).toContain('"HEAD"');
   });
 
+  it("removes a template's group with its last rule, and Undo brings both back", async () => {
+    mockGateway();
+    renderAt('/policy-definitions/partner-only');
+    fireEvent.click(await panelRow('allow-http-methods'));
+    fireEvent.click(screen.getByTestId('policy-templates-insert-rules-button'));
+    expect(screen.getByTestId('policy-rules-group-1')).toHaveTextContent(
+      'From template: Allow listed HTTP methods'
+    );
+
+    fireEvent.click(screen.getByTestId('policy-rules-group-1-rule-0-remove-button'));
+
+    expect(screen.queryByTestId('policy-rules-group-1')).toBeNull();
+    expect(rego().value).not.toContain('# Inserted from template: Allow listed HTTP methods');
+    expect(rego().value).not.toContain('input.http.method');
+    expect(mockUndo.message).toContain(
+      'Removed the rule allow, the last from the template Allow listed HTTP methods.'
+    );
+
+    act(() => mockUndo.last?.());
+    expect(screen.getByTestId('policy-rules-group-1')).toHaveTextContent(
+      'From template: Allow listed HTTP methods'
+    );
+    expect(rego().value).toContain('# Inserted from template: Allow listed HTTP methods');
+  });
+
+  it('keeps a template group that still has rules after one is removed', async () => {
+    mockGateway({
+      ...SAVED,
+      policy:
+        'package surface.policy\n\ndefault allow := false\n\n# Inserted from template: Two rules\nallow if input.http.method == "GET"\n\nallow if input.http.method == "HEAD"\n',
+    });
+    renderAt('/policy-definitions/partner-only');
+    fireEvent.click(await screen.findByTestId('policy-rules-group-0-rule-1-remove-button'));
+
+    const group = screen.getByTestId('policy-rules-group-0');
+    expect(group).toHaveTextContent('From template: Two rules');
+    expect(screen.getByTestId('policy-rules-group-0-count')).toHaveTextContent('1 rule');
+    expect(rego().value).toContain('# Inserted from template: Two rules');
+    expect(rego().value).not.toContain('"HEAD"');
+  });
+
   it('refuses to remove a helper another rule still uses', async () => {
     mockGateway({ ...SAVED, policy: HELPER_POLICY });
     renderAt('/policy-definitions/partner-only');

@@ -2116,8 +2116,11 @@ Create custom policy) in `useTemplateGallery`.
   `policyStart` says the Rego still follows the template Use filled it from. A template group is
   titled "From template: <name>" (layer icon), the last added one is marked **Just added**
   (`policy-rules-just-added`), and **Remove group** (`policy-rules-group-<n>-remove-button`,
-  `outline-danger`, `policies.edit`) deletes the group's lines with Undo; a template group with
-  no rules left says "No rules left from this template." and shows no table. Each rule has its
+  `outline-danger`, `policies.edit`) deletes the group's lines with Undo. Removing the last rule
+  of a template group removes the whole group, its `# Inserted from template` line included, with
+  one Undo that brings both back ("Removed the rule <rule>, the last from the template <name>.");
+  a template group left with no rules by a hand edit in the Rego still says "No rules left from
+  this template." and shows no table. Each rule has its
   own remove button (`policy-rules-group-<n>-rule-<m>-remove-button`, the list tables'
   `outline-danger` trash icon button, named "Remove the rule <head>", `policies.edit`), which
   deletes the rule's lines and the comment lines directly above it, with Undo. `regoRules.ts` decides which Remove is refused, and why (`ruleUse` and `groupUse` return
