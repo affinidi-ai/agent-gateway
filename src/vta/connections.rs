@@ -286,6 +286,31 @@ impl SigningKeys {
     }
 }
 
+/// A trust agent endpoint is `https`, and plain `http` only to a loopback host,
+/// where the traffic never leaves this machine (a co-located agent in
+/// development). A cloud-provider metadata service is never an endpoint.
+fn validate_endpoint_url(endpoint: &str) -> Result<(), String> {
+    let url = crate::url_validation::validate_url_not_cloud_metadata_host(endpoint)
+        .map_err(|e| format!("endpoint is not valid: {e}"))?;
+    if url.scheme() == "https" {
+        return Ok(());
+    }
+    let loopback = match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(domain)) => {
+            let domain = domain.to_ascii_lowercase();
+            domain == "localhost" || domain.ends_with(".localhost")
+        }
+        None => false,
+    };
+    if loopback {
+        Ok(())
+    } else {
+        Err("endpoint must use https; plain http is allowed only to a loopback address".to_string())
+    }
+}
+
 impl VtaConnection {
     /// Validate a connection before it is stored or used.
     ///
@@ -314,6 +339,10 @@ impl VtaConnection {
             // A DIDComm connection is addressed by DID, not by URL, so the
             // endpoint names the mediator instead.
             return Err("endpoint must name the mediator for the `didcomm` transport".to_string());
+        }
+        let endpoint = self.endpoint.trim();
+        if self.transport == VtaConnectionTransport::Https || endpoint.starts_with("http") {
+            validate_endpoint_url(endpoint)?;
         }
         // A control key is how the gateway authenticates to the VTA. Without
         // one there is nothing to sign the handshake with, so an enabled
@@ -667,6 +696,45 @@ mod tests {
         let mut stored = serde_json::to_value(connection("c1")).unwrap();
         stored["transport"] = serde_json::json!("unix");
         assert!(serde_json::from_value::<VtaConnection>(stored).is_err());
+    }
+
+    #[test]
+    fn an_endpoint_is_https_or_plain_http_to_loopback_and_never_a_metadata_service() {
+        for endpoint in [
+            "https://vta.customer.example",
+            "https://10.0.0.5:8443",
+            "http://127.0.0.1:8100",
+            "http://localhost:3000",
+            "http://[::1]:8100",
+        ] {
+            let mut c = connection("c1");
+            c.endpoint = endpoint.to_string();
+            c.validate()
+                .unwrap_or_else(|e| panic!("`{endpoint}` was refused: {e}"));
+        }
+        for (endpoint, expected) in [
+            ("http://vta.customer.example", "https"),
+            ("http://10.0.0.5:8100", "https"),
+            ("https://169.254.169.254/latest", "metadata"),
+            ("http://metadata.google.internal", "metadata"),
+            ("vta.customer.example", "not valid"),
+            ("ftp://vta.customer.example", "not valid"),
+        ] {
+            let mut c = connection("c1");
+            c.endpoint = endpoint.to_string();
+            let err = c
+                .validate()
+                .expect_err(endpoint);
+            assert!(err.contains(expected), "`{endpoint}`: {err}");
+        }
+
+        let mut c = connection("c1");
+        c.transport = VtaConnectionTransport::Didcomm;
+        c.endpoint = "did:peer:2.mediator".to_string();
+        c.validate()
+            .expect("a didcomm mediator may be named by DID");
+        c.endpoint = "http://mediator.example".to_string();
+        assert!(c.validate().is_err(), "a mediator URL follows the same rule");
     }
 
     #[tokio::test]

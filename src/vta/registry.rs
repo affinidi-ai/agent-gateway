@@ -403,7 +403,7 @@ impl VtaConnectionRegistry {
         // Take this VTA off the data plane too (VTA-21): a stored connection
         // can point at a sidecar on a private network, which the forward leg
         // would otherwise happily proxy to.
-        crate::vta::isolation::reserve(&connection.endpoint);
+        crate::vta::isolation::reserve_connection(&connection.endpoint);
 
         let control_key = self
             .control_key(connection)

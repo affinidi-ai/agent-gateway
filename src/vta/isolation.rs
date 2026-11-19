@@ -20,6 +20,15 @@
 //! not a different agent. Blocking by *range* instead would also block every
 //! legitimate localhost service an operator runs, so only the endpoints the
 //! gateway itself was configured with are reserved.
+//!
+//! ## Which connection records reserve their endpoint
+//!
+//! The `[vta]` block's address is reserved for the life of the process. A
+//! stored connection reserves its endpoint once it has been verified (it is
+//! `connected` or `degraded`), enabled or not, and stops reserving it when it is
+//! deleted, revoked or pointed elsewhere and no other such record uses the
+//! origin. An unverified record has proved nothing about its endpoint, so it
+//! cannot take an arbitrary upstream off the data plane.
 
 use std::collections::BTreeSet;
 use std::sync::RwLock;
@@ -28,10 +37,17 @@ use url::Url;
 
 /// Origins the gateway talks to as a VTA, and therefore refuses to proxy to.
 ///
-/// Populated once at startup from operator bootstrap config and the stored
-/// connection records — never from request input, so it cannot be poisoned by
-/// a caller into blocking a legitimate upstream.
+/// Populated from operator bootstrap config — never from request input, so it
+/// cannot be poisoned by a caller into blocking a legitimate upstream.
 static RESERVED: RwLock<BTreeSet<String>> = RwLock::new(BTreeSet::new());
+
+/// Origins of the verified connection records, replaced as a whole by
+/// [`sync_connection_reservations`].
+static CONNECTION_ORIGINS: RwLock<BTreeSet<String>> = RwLock::new(BTreeSet::new());
+
+/// Serialises [`sync_connection_reservations`], so a slower sync cannot write
+/// back a listing older than one already applied.
+static SYNC: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Canonical `(host, port)` key for an endpoint, or `None` when it names no
 /// host (a unix socket path, a relative URL).
@@ -60,6 +76,47 @@ pub fn reserve(endpoint: &str) {
     }
 }
 
+/// Reserve the endpoint of a connection the gateway is about to sign through.
+/// Held until a [`sync_connection_reservations`] finds no verified record
+/// using it.
+pub fn reserve_connection(endpoint: &str) {
+    let Some(key) = origin_key(endpoint) else {
+        return;
+    };
+    if let Ok(mut origins) = CONNECTION_ORIGINS.write() {
+        origins.insert(key);
+    }
+}
+
+/// Whether `connection` takes its endpoint off the data plane: it has been
+/// verified against the trust agent at that address.
+pub fn reserves_endpoint(connection: &crate::vta::connections::VtaConnection) -> bool {
+    use crate::vta::pairing::PairingState;
+    matches!(connection.pairing.state, PairingState::Connected | PairingState::Degraded)
+}
+
+/// Recompute the connection reservations from the stored records, releasing
+/// any origin no verified record uses. A store that cannot be listed leaves
+/// the current reservations in place.
+pub async fn sync_connection_reservations(store: &dyn crate::vta::connections::VtaConnectionStorage) {
+    let _guard = SYNC.lock().await;
+    let connections = match store.list().await {
+        Ok(connections) => connections,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to list VTA connections; their endpoint reservations are unchanged");
+            return;
+        }
+    };
+    let origins: BTreeSet<String> = connections
+        .iter()
+        .filter(|connection| reserves_endpoint(connection))
+        .filter_map(|connection| origin_key(&connection.endpoint))
+        .collect();
+    if let Ok(mut current) = CONNECTION_ORIGINS.write() {
+        *current = origins;
+    }
+}
+
 /// Whether `raw` points at a reserved VTA origin.
 ///
 /// A poisoned lock yields `true`: refusing a forward is recoverable, letting
@@ -68,10 +125,12 @@ pub fn is_reserved(raw: &str) -> bool {
     let Some(key) = origin_key(raw) else {
         return false;
     };
-    match RESERVED.read() {
-        Ok(reserved) => reserved.contains(&key),
-        Err(_) => true,
-    }
+    [&RESERVED, &CONNECTION_ORIGINS]
+        .iter()
+        .any(|set| match set.read() {
+            Ok(reserved) => reserved.contains(&key),
+            Err(_) => true,
+        })
 }
 
 /// Refuse `raw` if it names a VTA. The message is deliberately explicit about
@@ -88,21 +147,21 @@ pub fn assert_not_vta(raw: &str) -> Result<(), String> {
 
 /// Every reserved origin, for diagnostics.
 pub fn reserved_origins() -> Vec<String> {
-    RESERVED
-        .read()
-        .map(|reserved| {
-            reserved
-                .iter()
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default()
+    let mut origins = BTreeSet::new();
+    for set in [&RESERVED, &CONNECTION_ORIGINS] {
+        if let Ok(reserved) = set.read() {
+            origins.extend(reserved.iter().cloned());
+        }
+    }
+    origins.into_iter().collect()
 }
 
 #[cfg(test)]
 pub(crate) fn clear_reservations() {
-    if let Ok(mut reserved) = RESERVED.write() {
-        reserved.clear();
+    for set in [&RESERVED, &CONNECTION_ORIGINS] {
+        if let Ok(mut reserved) = set.write() {
+            reserved.clear();
+        }
     }
 }
 
@@ -195,6 +254,75 @@ mod tests {
         reserve("http://vta:3000");
 
         assert_eq!(reserved_origins(), vec!["127.0.0.1:3000".to_string(), "vta:3000".to_string()]);
+        clear_reservations();
+    }
+
+    fn record(
+        id: &str,
+        endpoint: &str,
+        state: crate::vta::pairing::PairingState,
+    ) -> crate::vta::connections::VtaConnection {
+        let now = chrono::Utc::now();
+        crate::vta::connections::VtaConnection {
+            id: id.to_string(),
+            tenant_id: None,
+            name: id.to_string(),
+            description: None,
+            enabled: true,
+            transport: Default::default(),
+            endpoint: endpoint.to_string(),
+            vta_did: "did:webvh:vta.example".to_string(),
+            default_context_id: None,
+            control_key_ref: Some("key".to_string()),
+            control_did: None,
+            control_key_state: Default::default(),
+            status: Default::default(),
+            keys: Default::default(),
+            pairing: crate::vta::pairing::PairingRecord { state, ..Default::default() },
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn only_verified_connections_reserve_and_an_origin_is_released_once_nothing_uses_it() {
+        use crate::vta::connections::{FileSystemVtaConnectionStore, VtaConnectionStorage};
+        use crate::vta::pairing::PairingState;
+        let _guard = LOCK.lock().unwrap();
+        clear_reservations();
+        reserve("https://bootstrap.vta:8443");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = runtime
+            .block_on(FileSystemVtaConnectionStore::new(dir.path().to_path_buf()))
+            .unwrap();
+        for connection in [
+            record("draft", "https://upstream.example", PairingState::Draft),
+            record("a", "https://vta.example", PairingState::Connected),
+            record("b", "https://vta.example/other", PairingState::Degraded),
+        ] {
+            runtime
+                .block_on(store.create(connection))
+                .unwrap();
+        }
+
+        runtime.block_on(sync_connection_reservations(&store));
+        assert!(!is_reserved("https://upstream.example/mcp"), "an unverified record reserved its endpoint");
+        assert!(is_reserved("https://vta.example/trust-tasks"));
+
+        runtime
+            .block_on(store.delete("a"))
+            .unwrap();
+        runtime.block_on(sync_connection_reservations(&store));
+        assert!(is_reserved("https://vta.example/trust-tasks"), "another verified record still uses the origin");
+
+        runtime
+            .block_on(store.update(record("b", "https://vta.example/other", PairingState::Revoked)))
+            .unwrap();
+        runtime.block_on(sync_connection_reservations(&store));
+        assert!(!is_reserved("https://vta.example/trust-tasks"), "a revoked record kept its origin reserved");
+        assert!(is_reserved("https://bootstrap.vta:8443"), "the [vta] block's address is never released");
+
         clear_reservations();
     }
 }

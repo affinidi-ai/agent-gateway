@@ -145,7 +145,11 @@ export function useVtaConnections(): VtaConnectionsState {
 
   const revoke = useCallback(
     async (connection: VtaConnection, acknowledgeStrandedAgents = false) => {
-      const query = acknowledgeStrandedAgents ? '?acknowledge_stranded_agents=true' : '';
+      // A 409 lists everything that stops signing; the second click
+      // acknowledges all of it.
+      const query = acknowledgeStrandedAgents
+        ? '?acknowledge_stranded_agents=true&acknowledge_signing_users=true'
+        : '';
       const response = await apiClient.fetch(
         `${BASE}/${encodeURIComponent(connection.id)}/revoke${query}`,
         { method: 'POST' }

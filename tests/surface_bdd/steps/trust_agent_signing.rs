@@ -98,3 +98,64 @@ async fn save_signing_through(
     });
     save_surface(world, &surface).await;
 }
+
+fn connection_id(
+    world: &SurfaceWorld,
+    name: &str,
+) -> String {
+    world
+        .trust_agent_connections
+        .get(name)
+        .cloned()
+        .unwrap_or_else(|| panic!("no trust agent connection named {name} was created"))
+}
+
+#[given(expr = "the surface signs through the trust agent connection {string}")]
+async fn surface_signs_through_connection(
+    world: &mut SurfaceWorld,
+    name: String,
+) {
+    let connection_id = connection_id(world, &name);
+    save_signing_through(world, &connection_id).await;
+    let saved = world
+        .admin_response
+        .take()
+        .expect("the gateway must have answered the surface save");
+    assert_eq!(saved.status, 200, "saving the surface signing through {name}: {}", saved.body);
+}
+
+#[when(expr = "the operator revokes the trust agent connection {string}")]
+async fn operator_revokes_connection(
+    world: &mut SurfaceWorld,
+    name: String,
+) {
+    let path = format!("/v1/vta/connections/{}/revoke", connection_id(world, &name));
+    world.admin_response = Some(send(world, Method::POST, &path, None).await);
+}
+
+#[when(expr = "the operator revokes the trust agent connection {string} acknowledging what stops signing")]
+async fn operator_revokes_connection_acknowledged(
+    world: &mut SurfaceWorld,
+    name: String,
+) {
+    let path = format!(
+        "/v1/vta/connections/{}/revoke?acknowledge_signing_users=true&acknowledge_stranded_agents=true",
+        connection_id(world, &name)
+    );
+    world.admin_response = Some(send(world, Method::POST, &path, None).await);
+}
+
+#[when(expr = "the operator adds a trust agent connection at {string}")]
+async fn operator_adds_connection_at(
+    world: &mut SurfaceWorld,
+    endpoint: String,
+) {
+    let body = json!({
+        "name": "Trust agent",
+        "endpoint": endpoint,
+        "vta_did": "did:key:z6MkvnxZrB5vsAFb8AGaDVAqSYYNoz5y2Rgvhccn7xSvx3Aj",
+        "default_context_id": "gateway",
+        "control_identity": "did_key",
+    });
+    world.admin_response = Some(send(world, Method::POST, "/v1/vta/connections", Some(&body)).await);
+}

@@ -2139,19 +2139,11 @@ pub async fn run_axum_proxy(
                         Ok(None) => {}
                         Err(e) => error!("Failed to migrate the [vta] block into a connection record: {}", e),
                     }
-                    // Take every known VTA address off the data plane before
-                    // any listener accepts a request (VTA-21). Reserving at
-                    // first *use* would be too late: a surface could be
-                    // configured and exercised before the connection it
-                    // shadows has ever signed anything.
-                    match store.list().await {
-                        Ok(connections) => {
-                            for connection in &connections {
-                                crate::vta::isolation::reserve(&connection.endpoint);
-                            }
-                        }
-                        Err(e) => error!("Failed to reserve VTA connection endpoints: {}", e),
-                    }
+                    // Take every verified VTA address off the data plane before
+                    // any listener accepts a request. Reserving at first *use*
+                    // would be too late: a surface could be configured and
+                    // exercised before the connection it shadows has signed.
+                    crate::vta::isolation::sync_connection_reservations(store.as_ref()).await;
                     Some(store)
                 }
                 Err(e) => {
