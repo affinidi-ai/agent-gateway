@@ -213,12 +213,16 @@ body.dark-theme .policy-rules__rule {
 
 .policy-template-card {
   flex-direction: column;
+  align-items: stretch;
   justify-content: flex-start;
   height: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .policy-template-card__meta {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   margin-top: auto;
