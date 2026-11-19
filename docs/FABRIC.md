@@ -208,6 +208,12 @@ on a release whose gateway DID document lists its signing key (`#key-2`) under n
 its presentations rejected until it upgrades, which repairs its document on its next start (see
 [Proof purpose metric](OBSERVABILITY.md#proof-purpose-metric)).
 
+The presentations this gateway sends claim `authentication` when the holder agent's `did:webvh`
+DID log lists its signing key there, as every agent DID does once the gateway has repaired it on an Active
+start or promotion, and `assertionMethod` otherwise. A peer with this check accepts both; a peer
+on an earlier release checks no purpose at all. A peer that cached an agent's document before
+its repair fetches it again at its first refusal, as above.
+
 ![Presentation issuance: a verifiable credential is issued, wrapped in a verifiable presentation, signed with the agent key, and forwarded to the receiving gateway](assets/diagrams/vp-issuance.png)
 
 ![Presentation verification: receive the presentation, verify its signature, verify the credential signature, and check that the presentation holder equals the credential subject](assets/diagrams/vp-verification.png)

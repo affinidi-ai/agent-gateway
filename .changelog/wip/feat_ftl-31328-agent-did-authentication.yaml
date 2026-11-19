@@ -1,0 +1,30 @@
+branch: feat/ftl-31328-agent-did-authentication
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-19T10:30:00Z'
+      title: Sign agent presentations for authentication once the agent DID lists the key
+      description: >-
+        Presentations an agent sends now declare the proof purpose authentication, the one strict
+        verifiers expect for a presentation, when the agent's DID document lists its signing key
+        (#key-2) under authentication, and assertionMethod as before otherwise. Gateways with the
+        proof purpose check accept both, and gateways on earlier releases check no purpose, so
+        mixed versions keep working. An agent DID the gateway could not repair keeps signing for
+        assertionMethod.
+  fixed:
+    - timestamp: '2026-11-19T10:30:00Z'
+      title: Publish each agent DID's signing key under assertionMethod and authentication
+      description: >-
+        New agent DIDs list their signing key (#key-2) under assertionMethod and authentication,
+        and so does the agent DID document served at /surface/{id}/did.json. Existing agent DIDs
+        are repaired when a node starts Active, before it admits traffic, or in the background
+        when a Standby node is promoted: each gets one new did:webvh log version, signed with the
+        agent's own key, that lists the key, so the DID and its earlier versions stay as they are.
+        Agent DIDs created before the open-source release, which published no #key-2 and whose
+        presentations failed verification, get the key published as well. The repair runs under
+        a lock in the identities folder, so nodes Active at once repair each DID once, and a log
+        that does not verify or whose update key is not the agent key is left as it is and
+        logged.
+  removed: []
+  security: []
+  breaking: []

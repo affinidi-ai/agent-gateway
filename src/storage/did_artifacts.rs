@@ -128,6 +128,18 @@ pub async fn read_did_document(dir: &Path) -> Result<Option<String>> {
     }
 }
 
+/// The folder of the identity store at `base` that holds the DID log of identity `id`, an agent
+/// DID's last segment. Refuses an `id` that is not a storage id or would leave `base`.
+pub(crate) fn identity_did_dir(
+    base: &Path,
+    id: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    crate::storage::validate_storage_id(id)?;
+    let dir = base.join(id);
+    crate::storage::assert_within_storage_dir(base, &dir)?;
+    Ok(dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

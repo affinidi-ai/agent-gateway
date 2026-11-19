@@ -698,6 +698,113 @@ async fn evict_gateway_did_from_resolver_cache(
     }
 }
 
+/// Lock file in the identity store folder that serializes the agent DID repair between
+/// gateways sharing the folder.
+#[cfg(feature = "didwebvh")]
+const AGENT_DID_REPAIR_LOCK_FILE: &str = ".agent_did_repair.lock";
+
+/// On the Active node, lists each agent DID's signing key under `assertionMethod` and
+/// `authentication` where its DID log does not, then removes from the shared resolver cache every
+/// copy of an agent DID document cached before its repair, also one another node repaired. A Standby node shares the
+/// identity store with the Active node, so it writes nothing.
+#[cfg(feature = "didwebvh")]
+async fn repair_and_evict_agent_dids(issuer: &crate::identity::VCIssuer) {
+    let resolver = crate::gateways::did_cache::try_shared_resolver().map(|resolver| resolver.as_ref());
+    repair_and_evict_agent_dids_within(issuer, GATEWAY_DID_REPAIR_LOCK_TIMEOUT, resolver).await;
+}
+
+#[cfg(feature = "didwebvh")]
+async fn repair_and_evict_agent_dids_within(
+    issuer: &crate::identity::VCIssuer,
+    lock_timeout: std::time::Duration,
+    resolver: Option<&affinidi_did_resolver_cache_sdk::DIDCacheClient>,
+) {
+    let listed = repair_agent_dids_within(issuer, lock_timeout).await;
+    if let Some(resolver) = resolver {
+        for did in &listed {
+            if cached_without_signing_key(resolver, did).await {
+                resolver.remove(did).await;
+            }
+        }
+    }
+}
+
+/// Whether `resolver` holds a copy of `did`'s document that does not list its signing key under
+/// `authentication`, as it was before the agent DID repair.
+#[cfg(feature = "didwebvh")]
+async fn cached_without_signing_key(
+    resolver: &affinidi_did_resolver_cache_sdk::DIDCacheClient,
+    did: &str,
+) -> bool {
+    let Some(document) = resolver
+        .get_cache()
+        .get(&affinidi_did_resolver_cache_sdk::DIDCacheClient::hash_did(did))
+        .await
+    else {
+        return false;
+    };
+    let signing_key = crate::identity::didwebvh::signing_key_repair::signing_key_id(did);
+    !serde_json::to_value(&document).is_ok_and(|document| {
+        document["authentication"]
+            .as_array()
+            .is_some_and(|ids| {
+                ids.iter()
+                    .any(|id| *id == signing_key.as_str())
+            })
+    })
+}
+
+/// Repairs the agent DIDs under the agent DID repair lock, so two nodes Active at once repair
+/// them one after the other and the second finds nothing left to do. Agent DIDs that all list
+/// the key already are only read, without the lock. A volume without the lock runs the repair
+/// unlocked; a lock held past `lock_timeout` leaves it to the holder and to the next start or
+/// promotion. Returns the agent DIDs that list the key: once the repair ran, or those already
+/// listing it when it was left to the holder; none on a Standby node.
+#[cfg(feature = "didwebvh")]
+async fn repair_agent_dids_within(
+    issuer: &crate::identity::VCIssuer,
+    lock_timeout: std::time::Duration,
+) -> Vec<String> {
+    use crate::storage::file_lock::LockOutcome;
+
+    if crate::server::mode::is_standby() {
+        return Vec::new();
+    }
+    let Some(base_path) = issuer
+        .get_identity_store()
+        .base_path()
+    else {
+        return Vec::new();
+    };
+    let checked = issuer
+        .check_agent_dids()
+        .await;
+    if checked.unlisted == 0 {
+        return checked.listed;
+    }
+    let lock =
+        crate::storage::file_lock::lock_exclusive(&base_path.join(AGENT_DID_REPAIR_LOCK_FILE), lock_timeout).await;
+    if crate::server::mode::is_standby() {
+        return Vec::new();
+    }
+    match &lock {
+        LockOutcome::Acquired(_) => {}
+        LockOutcome::Unavailable(e) => {
+            warn!("Agent DID repair lock unavailable ({e:#}); repairing the agent DIDs without it");
+        }
+        LockOutcome::TimedOut => {
+            warn!(
+                "Timed out waiting for the agent DID repair lock; the repair runs again on the next start or promotion"
+            );
+            return checked.listed;
+        }
+    }
+    issuer
+        .repair_agent_dids_while(|| !crate::server::mode::is_standby())
+        .await
+        .listed
+}
+
 #[cfg(feature = "didwebvh")]
 fn extract_did_from_raw_log(raw_log: &str) -> Option<String> {
     raw_log
@@ -2838,9 +2945,11 @@ pub async fn run_axum_proxy(
             // Register the gateway's own DID in log storage so /v1/resolve can find it.
             // The VCIssuer stores the gateway DID at {vc_keys}/did.jsonl, while the resolver
             // uses FileDidLogStorage keyed by DID. A Standby node repairs the document and
-            // registers it when it is promoted. Both run under the gateway DID lock.
+            // registers it when it is promoted. Both run under the gateway DID lock. The agent
+            // DIDs are repaired next, under their own lock, before the node admits traffic.
             if let Some(ref issuer) = vc_issuer {
                 repair_and_sync_gateway_did(issuer, &storage).await;
+                repair_and_evict_agent_dids(issuer).await;
             }
 
             identity_state.didwebvh_log_storage = Some(storage.clone());
@@ -4697,8 +4806,9 @@ pub async fn run_axum_proxy(
                             .await;
 
                             // A node that booted Standby lists the gateway signing key under
-                            // assertionMethod and authentication in the gateway DID document
-                            // once it admits traffic; signing does not wait for the document.
+                            // assertionMethod and authentication in the gateway DID document,
+                            // then in each agent DID, once it admits traffic; signing does not
+                            // wait for the documents.
                             #[cfg(feature = "didwebvh")]
                             if let Some(storage) = identity_state_for_mode
                                 .didwebvh_log_storage
@@ -4707,6 +4817,7 @@ pub async fn run_axum_proxy(
                                 let issuer = Arc::clone(&identity_state_for_mode.vc_issuer);
                                 tokio::spawn(async move {
                                     repair_and_sync_gateway_did(&issuer, &storage).await;
+                                    repair_and_evict_agent_dids(&issuer).await;
                                 });
                             }
 
@@ -5637,6 +5748,285 @@ mod tests {
                 .is_empty(),
             "the resolver index is left to the lock holder"
         );
+    }
+
+    #[cfg(feature = "didwebvh")]
+    mod agent_dids {
+        use std::sync::Arc;
+
+        use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+
+        use crate::identity::IdentityStore;
+        use crate::identity::didwebvh::signing_key_repair::test_support::seed_agent_identity;
+        use crate::identity::didwebvh::signing_key_repair::{latest_entry, log_entries};
+        use crate::identity::filesystem::FilesystemIdentityStore;
+        use crate::server::mode::ServerMode;
+
+        struct Node {
+            issuer: crate::identity::VCIssuer,
+            _keys: tempfile::TempDir,
+        }
+
+        async fn node(store_dir: &std::path::Path) -> Node {
+            let store = Arc::new(
+                FilesystemIdentityStore::new(store_dir)
+                    .await
+                    .unwrap(),
+            ) as Arc<dyn IdentityStore>;
+            let (issuer, keys) = crate::identity::test_helpers::test_vc_issuer_with(store).await;
+            Node { issuer, _keys: keys }
+        }
+
+        async fn log_of(
+            node: &Node,
+            did: &str,
+        ) -> String {
+            crate::storage::did_artifacts::read_did_log_raw(
+                &node
+                    .issuer
+                    .agent_did_log_dir(did)
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+
+        async fn log_lines(
+            node: &Node,
+            did: &str,
+        ) -> usize {
+            log_entries(&log_of(node, did).await).len()
+        }
+
+        async fn resolver_caching(
+            node: &Node,
+            did: &str,
+        ) -> DIDCacheClient {
+            let resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+                .await
+                .unwrap();
+            let document: affinidi_did_common::Document =
+                serde_json::from_value(latest_entry(&log_of(node, did).await).unwrap()["state"].clone()).unwrap();
+            resolver
+                .get_cache()
+                .insert(DIDCacheClient::hash_did(did), document)
+                .await;
+            resolver
+        }
+
+        async fn is_cached(
+            resolver: &DIDCacheClient,
+            did: &str,
+        ) -> bool {
+            resolver
+                .get_cache()
+                .get(&DIDCacheClient::hash_did(did))
+                .await
+                .is_some()
+        }
+
+        async fn sweep(
+            node: &Node,
+            mode: ServerMode,
+            lock_timeout: std::time::Duration,
+            resolver: &DIDCacheClient,
+        ) {
+            crate::server::mode::in_test_mode(
+                mode,
+                super::super::repair_and_evict_agent_dids_within(&node.issuer, lock_timeout, Some(resolver)),
+            )
+            .await;
+        }
+
+        /// An Active node repairs each agent DID and drops the copy it cached before, so it
+        /// verifies the agent's presentations against the repaired document.
+        #[tokio::test]
+        async fn active_node_repairs_the_agent_dids_and_evicts_them_from_the_resolver_cache() {
+            let store_dir = tempfile::tempdir().unwrap();
+            let node = node(store_dir.path()).await;
+            let (did, _) = seed_agent_identity(
+                node.issuer
+                    .get_identity_store()
+                    .as_ref(),
+                true,
+            )
+            .await;
+            let resolver = resolver_caching(&node, &did).await;
+
+            sweep(&node, ServerMode::Active, std::time::Duration::from_secs(5), &resolver).await;
+
+            assert_eq!(log_lines(&node, &did).await, 2);
+            assert!(!is_cached(&resolver, &did).await);
+        }
+
+        /// A Standby node shares the identity store with the Active node, so it writes nothing.
+        #[tokio::test]
+        async fn standby_node_leaves_the_agent_dids_and_its_resolver_cache_alone() {
+            let store_dir = tempfile::tempdir().unwrap();
+            let node = node(store_dir.path()).await;
+            let (did, _) = seed_agent_identity(
+                node.issuer
+                    .get_identity_store()
+                    .as_ref(),
+                true,
+            )
+            .await;
+            let resolver = resolver_caching(&node, &did).await;
+
+            sweep(&node, ServerMode::Standby, std::time::Duration::from_secs(5), &resolver).await;
+
+            assert_eq!(log_lines(&node, &did).await, 1);
+            assert!(is_cached(&resolver, &did).await);
+        }
+
+        /// While another node holds the agent DID repair lock, the repair is left to it.
+        #[tokio::test]
+        async fn repair_is_skipped_while_another_node_holds_the_agent_did_lock() {
+            let store_dir = tempfile::tempdir().unwrap();
+            let node = node(store_dir.path()).await;
+            let (did, _) = seed_agent_identity(
+                node.issuer
+                    .get_identity_store()
+                    .as_ref(),
+                true,
+            )
+            .await;
+            let resolver = resolver_caching(&node, &did).await;
+            let crate::storage::file_lock::LockOutcome::Acquired(_held) = crate::storage::file_lock::lock_exclusive(
+                &store_dir
+                    .path()
+                    .join(super::super::AGENT_DID_REPAIR_LOCK_FILE),
+                std::time::Duration::ZERO,
+            )
+            .await
+            else {
+                panic!("the lock must be free");
+            };
+
+            sweep(&node, ServerMode::Active, std::time::Duration::from_millis(50), &resolver).await;
+
+            assert_eq!(log_lines(&node, &did).await, 1);
+            assert!(is_cached(&resolver, &did).await);
+        }
+
+        /// A node whose agent DIDs another node already repaired takes no lock, yet drops the
+        /// copies it cached before the repair.
+        #[tokio::test]
+        async fn node_with_nothing_to_repair_evicts_the_listed_agent_dids_without_the_lock() {
+            let store_dir = tempfile::tempdir().unwrap();
+            let node = node(store_dir.path()).await;
+            let (did, _) = seed_agent_identity(
+                node.issuer
+                    .get_identity_store()
+                    .as_ref(),
+                true,
+            )
+            .await;
+            let resolver = resolver_caching(&node, &did).await;
+            crate::server::mode::in_test_mode(
+                ServerMode::Active,
+                node.issuer
+                    .repair_agent_dids_while(|| true),
+            )
+            .await;
+            let crate::storage::file_lock::LockOutcome::Acquired(_held) = crate::storage::file_lock::lock_exclusive(
+                &store_dir
+                    .path()
+                    .join(super::super::AGENT_DID_REPAIR_LOCK_FILE),
+                std::time::Duration::ZERO,
+            )
+            .await
+            else {
+                panic!("the lock must be free");
+            };
+
+            sweep(&node, ServerMode::Active, std::time::Duration::from_millis(50), &resolver).await;
+
+            assert!(!is_cached(&resolver, &did).await);
+        }
+
+        /// A cached agent DID document that already lists the signing key is kept.
+        #[tokio::test]
+        async fn a_current_cached_agent_did_document_stays_in_the_resolver_cache() {
+            let store_dir = tempfile::tempdir().unwrap();
+            let node = node(store_dir.path()).await;
+            let (did, _) = seed_agent_identity(
+                node.issuer
+                    .get_identity_store()
+                    .as_ref(),
+                true,
+            )
+            .await;
+            crate::server::mode::in_test_mode(
+                ServerMode::Active,
+                node.issuer
+                    .repair_agent_dids_while(|| true),
+            )
+            .await;
+            let resolver = resolver_caching(&node, &did).await;
+
+            sweep(&node, ServerMode::Active, std::time::Duration::from_secs(5), &resolver).await;
+
+            assert!(is_cached(&resolver, &did).await);
+        }
+
+        /// Two nodes that are both Active for a moment repair each agent DID once between them,
+        /// so its log keeps one entry per version and still verifies.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn two_active_nodes_repair_each_agent_did_once() {
+            let store_dir = tempfile::tempdir().unwrap();
+            let seeding = node(store_dir.path()).await;
+            let mut dids = Vec::new();
+            for _ in 0..3 {
+                dids.push(
+                    seed_agent_identity(
+                        seeding
+                            .issuer
+                            .get_identity_store()
+                            .as_ref(),
+                        true,
+                    )
+                    .await
+                    .0,
+                );
+            }
+            let first = node(store_dir.path()).await;
+            let second = node(store_dir.path()).await;
+            for node in [&first, &second] {
+                assert_eq!(
+                    node.issuer
+                        .check_agent_dids()
+                        .await
+                        .unlisted,
+                    3,
+                    "each node must see the DIDs to repair"
+                );
+            }
+            let resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+                .await
+                .unwrap();
+
+            crate::server::mode::in_test_mode(ServerMode::Active, async {
+                tokio::join!(
+                    super::super::repair_and_evict_agent_dids_within(
+                        &first.issuer,
+                        std::time::Duration::from_secs(5),
+                        Some(&resolver)
+                    ),
+                    super::super::repair_and_evict_agent_dids_within(
+                        &second.issuer,
+                        std::time::Duration::from_secs(5),
+                        Some(&resolver)
+                    )
+                )
+            })
+            .await;
+
+            for did in &dids {
+                assert_eq!(log_lines(&first, did).await, 2, "{did}");
+            }
+        }
     }
 
     /// A gateway whose DID document already lists the signing key, with an index that holds its
