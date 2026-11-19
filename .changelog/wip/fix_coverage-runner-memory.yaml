@@ -8,7 +8,9 @@ changes:
       description: >-
         The coverage job now builds with two parallel jobs instead of four. With four, the
         runner was often shut down part way through the instrumented build, most likely out of
-        memory, so pull requests needed several re-runs to pass.
+        memory, so pull requests needed several re-runs to pass. A pull request that changes
+        the CI workflow now also runs the Rust jobs, so a change to them is tested before it
+        merges.
   removed: []
   security: []
   breaking: []

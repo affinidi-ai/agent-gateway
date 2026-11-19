@@ -41,6 +41,7 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'Makefile'
+              - '.github/workflows/ci.yml'
             frontend:
               - 'www/default/**'
             mcp:
