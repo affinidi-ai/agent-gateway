@@ -1288,6 +1288,7 @@ async fn save_warnings(
                 .iter()
                 .filter_map(crate::proxy::server::OpenTransitPoint::exposure),
         )
+        .chain(crate::proxy::server::unreachable_listen_path_warnings(&state.network_config, surface))
         .chain(shared_audience_warnings(surface))
         .chain(shared_issuer_warnings(surface, &issuers))
         .chain(unusable_principal_claim_warnings(surface, &issuers))
@@ -2193,7 +2194,31 @@ async fn validate_listen_path_collisions(
         .await
         .map_err(|e| SurfaceApiError::InternalError(format!("Failed to list surfaces for route validation: {}", e)))?;
 
-    check_listen_path_collisions(surface, &existing, resolve_port)
+    check_listen_path_collisions(surface, &existing, resolve_port)?;
+    check_listen_paths_are_served(surface, network_config)
+}
+
+/// Refuse a `listen_path` outside the outbound prefixes while
+/// `strict_outbound_listen_paths` is on, so a path nothing can reach is turned
+/// away at the save rather than answering the gateway's own pages later.
+fn check_listen_paths_are_served(
+    surface: &AgentSurface,
+    network_config: &crate::config::NetworkConfig,
+) -> Result<(), SurfaceApiError> {
+    if !network_config.strict_outbound_listen_paths {
+        return Ok(());
+    }
+    let prefix = crate::proxy::outbound_handler::TP_OUTBOUND_PATH_PREFIX;
+    match crate::proxy::server::unserved_listen_paths(surface).first() {
+        Some(refusal) => Err(SurfaceApiError::BadRequestCode(
+            "listen_path_not_served",
+            format!(
+                "{refusal} Set a listen_path under '{prefix}', or leave it unset to take the route the gateway \
+                 derives."
+            ),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Pure collision check: validate `surface`'s outbound `listen_path` routes
@@ -4691,9 +4716,10 @@ pub async fn delete_surface(
 
 /// A surface, or one of its variants, as the admin API returns it, with the
 /// status of the Access Point it serves and, on a single surface read or save,
-/// how each API key it names stands and whether this node's kept verdict on
-/// those keys lets it serve. All are derived on every response, never stored,
-/// and dropped from a write body that sends them back.
+/// how each API key it names stands, whether this node's kept verdict on
+/// those keys lets it serve, and where each of its Transit Points answers. All
+/// are derived on every response, never stored, and dropped from a write body
+/// that sends them back.
 #[derive(Debug, Serialize)]
 pub struct SurfaceResponse<T> {
     #[serde(flatten)]

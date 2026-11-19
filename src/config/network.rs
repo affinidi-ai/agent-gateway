@@ -56,6 +56,19 @@ pub struct NetworkConfig {
     #[serde(default = "default_oauth_callback_route")]
     pub oauth_callback_route: String,
 
+    /// Refuse a surface whose Transit Point sets a `listen_path` outside the
+    /// outbound prefixes the gateway serves (`outbound_channel_path_prefix` of
+    /// `/v1/config/surface-routing`), on create and on update.
+    ///
+    /// Off by default, since a stored surface may name any path. Turn it on
+    /// where an inbound listener shares the outbound one's hostname: there the
+    /// inbound listener forwards the outbound prefix and nothing else, so a
+    /// path outside it answers on the outbound listener alone and a client
+    /// that builds its own is silently unreachable. Off, such a path is
+    /// accepted and the save answers with a `Warning` header instead.
+    #[serde(default)]
+    pub strict_outbound_listen_paths: bool,
+
     /// The resource origins permitted, beyond the issuer's own host and its
     /// subdomains, for the credential providers of external consent of each
     /// issuer: an issuer origin, such as `https://accounts.google.com`, maps to

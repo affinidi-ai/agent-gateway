@@ -637,6 +637,77 @@ impl OpenTransitPoint {
     }
 }
 
+/// Whether any inbound listener shares a hostname with an outbound one, so
+/// that the inbound listener forwards [`TP_OUTBOUND_PATH_PREFIX`] to it and a
+/// path outside that prefix is reachable on the outbound listener alone.
+pub(crate) fn shares_an_outbound_hostname(network_config: &crate::config::NetworkConfig) -> bool {
+    network_config
+        .listeners
+        .iter()
+        .filter(|listener| listener.listener_type == "inbound")
+        .any(|listener| find_shared_outbound_listener(network_config, listener.port).is_some())
+}
+
+/// What an operator is told about a Transit Point whose `listen_path` sits
+/// outside [`TP_OUTBOUND_PATH_PREFIX`] while an inbound listener shares the
+/// outbound one's hostname: the path is registered and answers on the outbound
+/// listener, and nothing on the shared hostname reaches it.
+pub(crate) fn unreachable_listen_path_warnings(
+    network_config: &crate::config::NetworkConfig,
+    surface: &crate::config::agent_surface::AgentSurface,
+) -> Vec<String> {
+    if !shares_an_outbound_hostname(network_config) {
+        return Vec::new();
+    }
+    unserved_listen_paths(surface)
+}
+
+/// Each Transit Point of `surface`, and of its variants, whose `listen_path`
+/// sits outside [`TP_OUTBOUND_PATH_PREFIX`], said in full: what it set, and
+/// the route the gateway derives for it instead.
+pub(crate) fn unserved_listen_paths(surface: &crate::config::agent_surface::AgentSurface) -> Vec<String> {
+    let prefix = crate::proxy::outbound_handler::TP_OUTBOUND_PATH_PREFIX;
+    let variant_points = surface
+        .variants
+        .iter()
+        .flat_map(|variant| {
+            variant
+                .overrides
+                .transit
+                .iter()
+                .filter_map(|transit| transit.points.as_ref())
+                .flatten()
+                .map(move |point| (Some(variant.alias.clone()), point))
+        });
+    surface
+        .transit
+        .iter()
+        .flat_map(|transit| {
+            transit
+                .points
+                .iter()
+                .map(|point| (None, point))
+        })
+        .chain(variant_points)
+        .filter_map(|(variant, point)| {
+            let path = point.listen_path.as_deref()?;
+            if path.starts_with(prefix) {
+                return None;
+            }
+            let variant = variant
+                .map(|variant| format!(" in variant '{variant}'"))
+                .unwrap_or_default();
+            Some(format!(
+                "Transit Point '{}'{variant} has listen_path '{path}', outside '{prefix}'. It answers on the \
+                 outbound listener alone, so an inbound listener sharing that listener's hostname does not reach \
+                 it; the route every address serves is '{}'.",
+                point.alias,
+                crate::proxy::outbound_handler::transit_point_outbound_path(surface.route(), &point.alias)
+            ))
+        })
+        .collect()
+}
+
 /// The Transit Points of `surface`, and those its variants define, that serve
 /// callers they do not authenticate.
 pub(crate) fn open_transit_points(
@@ -1922,14 +1993,8 @@ pub async fn build_outbound_port_router(
             //     that custom path (the handler uses `vc_alias_override` to
             //     resolve the VC without parsing the request path).
             let outbound_prefix = crate::proxy::outbound_handler::TP_OUTBOUND_PATH_PREFIX;
-            let (outbound_base, outbound_wildcard) = if route_prefix.is_empty() || route_prefix == "/" {
-                (format!("{}/{}", outbound_prefix, vc.alias), format!("{}/{}/{{*path}}", outbound_prefix, vc.alias))
-            } else {
-                (
-                    format!("{}{}/{}", outbound_prefix, route_prefix, vc.alias),
-                    format!("{}{}/{}/{{*path}}", outbound_prefix, route_prefix, vc.alias),
-                )
-            };
+            let outbound_base = crate::proxy::outbound_handler::transit_point_outbound_path(route_prefix, &vc.alias);
+            let outbound_wildcard = format!("{outbound_base}/{{*path}}");
 
             info!(
                 surface = %outbound_surface.name,

@@ -15,6 +15,40 @@
 /// Changing this value renames the prefix everywhere without a search-and-replace.
 pub const TP_OUTBOUND_PATH_PREFIX: &str = "/outbound";
 
+/// The path a Transit Point answers on, from its surface's `route` and its own
+/// `alias`. Registered for every Transit Point whatever its `listen_path`, and
+/// the only form an inbound listener sharing a hostname with the outbound one
+/// forwards, so it is what a caller on another host can rely on.
+pub fn transit_point_outbound_path(
+    route: &str,
+    alias: &str,
+) -> String {
+    let route = route.trim_end_matches('/');
+    if route.is_empty() || route == "/" {
+        format!("{TP_OUTBOUND_PATH_PREFIX}/{alias}")
+    } else {
+        format!("{TP_OUTBOUND_PATH_PREFIX}{route}/{alias}")
+    }
+}
+
+#[cfg(test)]
+mod transit_point_outbound_path_tests {
+    use super::transit_point_outbound_path;
+
+    #[test]
+    fn a_route_is_kept_between_the_prefix_and_the_alias() {
+        assert_eq!(transit_point_outbound_path("/agents", "pricing"), "/outbound/agents/pricing");
+        assert_eq!(transit_point_outbound_path("/agents/", "pricing"), "/outbound/agents/pricing");
+    }
+
+    #[test]
+    fn a_root_route_leaves_the_prefix_beside_the_alias() {
+        for route in ["", "/"] {
+            assert_eq!(transit_point_outbound_path(route, "pricing"), "/outbound/pricing", "{route:?}");
+        }
+    }
+}
+
 use axum::{
     extract::{ConnectInfo, Request, State},
     http::{HeaderMap, Method, StatusCode},

@@ -84,6 +84,8 @@ pub struct SurfaceConfigBuilder {
     pub transit_token_lifetime_secs: Option<u64>,
     /// The appliance's `transit_token_max_lifetime_secs` in `gateway.json`.
     pub transit_token_max_lifetime_secs: Option<u64>,
+    /// The appliance's `strict_outbound_listen_paths` in `gateway.json`.
+    pub strict_outbound_listen_paths: bool,
     pub didwebvh_identity: Option<DidWebVhIdentityFixture>,
     pub caller_trust_check_list: Vec<serde_json::Value>,
     pub trust_recorder_entries: Vec<serde_json::Value>,
@@ -285,6 +287,7 @@ impl Default for SurfaceConfigBuilder {
             transit_source_auth: false,
             transit_token_lifetime_secs: None,
             transit_token_max_lifetime_secs: None,
+            strict_outbound_listen_paths: false,
             didwebvh_identity: None,
             caller_trust_check_list: Vec::new(),
             trust_recorder_entries: Vec::new(),

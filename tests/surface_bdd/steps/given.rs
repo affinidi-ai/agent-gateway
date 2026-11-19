@@ -1142,6 +1142,13 @@ fn appliance_lets_transit_tokens_live_up_to(
         .transit_token_max_lifetime_secs = Some(max_secs);
 }
 
+#[given(expr = "the appliance serves Transit Points only under its outbound prefixes")]
+fn appliance_serves_transit_points_only_under_its_outbound_prefixes(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .strict_outbound_listen_paths = true;
+}
+
 #[given(expr = "Transit Point {string} authenticates its callers with API key {string}")]
 async fn transit_point_authenticates_its_callers_with_an_api_key(
     world: &mut SurfaceWorld,

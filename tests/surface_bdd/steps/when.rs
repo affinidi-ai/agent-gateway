@@ -1499,6 +1499,24 @@ pub async fn update_transit_point_listen_path(
     transit_point: &str,
     new_path: &str,
 ) {
+    let response = send_transit_point_listen_path(world, transit_point, new_path).await;
+    assert_eq!(
+        response.status, 200,
+        "updating Transit Point listen_path should succeed, got status {} body {}",
+        response.status, response.body
+    );
+    record_admin_response(world, response);
+}
+
+/// The surface saved with `transit_point`'s `listen_path` set to `new_path`,
+/// whatever the appliance answered: a caller that expects the save to succeed
+/// uses [`update_transit_point_listen_path`], one that expects a refusal keeps
+/// the response.
+async fn send_transit_point_listen_path(
+    world: &mut SurfaceWorld,
+    transit_point: &str,
+    new_path: &str,
+) -> crate::world::RecordedResponse {
     ensure_admin_session(world).await;
     let surface_id = get_tracked_surface_id(world, "updating the Transit Point listen_path");
 
@@ -1539,17 +1557,19 @@ pub async fn update_transit_point_listen_path(
         });
     point["listen_path"] = serde_json::json!(new_path);
 
-    let response = client
+    client
         .update_surface_recorded(&surface_id, &payload)
         .await
-        .unwrap_or_else(|error| panic!("update Transit Point listen_path through admin API: {error}"));
+        .unwrap_or_else(|error| panic!("update Transit Point listen_path through admin API: {error}"))
+}
 
-    assert_eq!(
-        response.status, 200,
-        "updating Transit Point listen_path should succeed, got status {} body {}",
-        response.status, response.body
-    );
-
+#[when(expr = "the operator sets Transit Point {string} listen_path to {string}")]
+async fn operator_sets_transit_point_listen_path(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    new_path: String,
+) {
+    let response = send_transit_point_listen_path(world, &transit_point, &new_path).await;
     record_admin_response(world, response);
 }
 

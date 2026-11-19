@@ -1,0 +1,29 @@
+branch: fix/tp-route
+changes:
+  added:
+    - timestamp: '2026-11-19T22:40:00Z'
+      title: Surface routing config says which prefixes a Transit Point may listen under
+      description: >-
+        GET /v1/config/surface-routing now returns outbound_channel_path_prefix beside
+        channel_path_prefix: the same channel prefixes under the gateway's outbound prefix, with the
+        same id and name. A Transit Point whose listen_path sits under one of them is reachable at
+        every address in available_outbound_listen_addresses, whether the outbound listener has a
+        hostname of its own or shares the inbound one. Previously a client had to derive that, and
+        could not: only the gateway knows which of the two it is serving, and a path outside the
+        outbound prefix answers on the outbound listener alone, so on a shared hostname it is never
+        reached. The field is always present and may be empty.
+    - timestamp: '2026-11-19T22:45:00Z'
+      title: An appliance can refuse a Transit Point path it would not serve
+      description: >-
+        gateway.json takes strict_outbound_listen_paths, off by default. On, creating or updating a
+        surface whose Transit Point sets a listen_path outside the outbound prefixes is refused with
+        400 and the code listen_path_not_served, naming the path, the prefix and the route the
+        gateway derives instead. Off, the save succeeds and answers with a Warning header saying the
+        same, but only where an inbound listener shares the outbound one's hostname, which is when
+        such a path stops being reachable. Existing surfaces keep saving until an operator turns it
+        on.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
