@@ -1761,10 +1761,12 @@ The create and edit pages share one editor card in three sections, each titled b
 separated by a rule:
 
 - **Start from** (create only): `TemplateGallery` (`policy-template-gallery`), described under
-  _Policy templates_.
-- **Details** (`PolicyDetailsSection`, `policy-details-section`): Name and Description on one
-  row, Type and an **Enabled** switch (`policy-definition-enabled-switch`) on the next, with the
-  Status explanation in a `FieldHelp`. On a saved policy the Policy ID and SHA follow on one
+  _Policy templates_. For users with `policies.edit` the create form shows only this section
+  until a template, Allow all included, is used; Details and Policy then appear.
+- **Details** (`PolicyDetailsSection`, `policy-details-section`): Name full width, then
+  Description full width as a two-row textarea, then Type and Status (an **Enabled** switch,
+  `policy-definition-enabled-switch`) side by side, every label `font-weight-bold d-block mb-1`
+  so the two controls line up, with the Status explanation in a `FieldHelp`. On a saved policy the Policy ID and SHA follow on one
   line of monospace values, each with a copy button (`policy-definition-id`,
   `policy-definition-sha`, `-copy-button`), never as disabled inputs.
 - **Policy** (`PolicyEditorSection`, `policy-editor-section`): a **Rules | Rego** toggle in the
@@ -1889,10 +1891,12 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   `insertTemplateRules` drops `# Inserted from template:` / `# End of template:` lines from a
   template's body, so a template saved from a combined policy never nests groups.
 - **Start from gallery** (create only, `policies.edit`): `TemplateGallery` is the only place a
-  policy starts from a template. A new policy starts from **Deny by default**: its Rego is
-  `DEFAULT_POLICY` (`policyDefaults.ts`, `default allow := false`), and that card is selected
-  while no template was used and the Rego, without the template groups added since, equals
-  `DEFAULT_POLICY` for the Type. The
+  policy starts from a template. A new policy has no card selected and shows only Start from:
+  Details and Policy appear once a template or Allow all is used (`templatePicked` in
+  `usePolicyTemplateActions`, `true` on a saved policy and a restored draft; the Undo of the
+  first Use sets it back, which hides them and reopens the gallery). A Type change never hides
+  them. Until then the form's Rego is `DEFAULT_POLICY` (`policyDefaults.ts`,
+  `default allow := false`). The
   grid of cards in the `.policy-template-row` style (`policy-template-card-blank`,
   `policy-template-card-<key>`, with `is-selected` and `aria-pressed`) holds **Allow all
   (blank)** first, whose Rego is `ALLOW_ALL_POLICY` (summary "Every request is allowed. Start
@@ -1910,12 +1914,15 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   templates show until **Show all (N)** (`policy-template-gallery-show-all`, an
   `outline-secondary` button). The help text above the grid points to
   **Add rules from a template** by name, not by where the column sits, since the column stacks
-  under the editor below `xl`. Choosing a card selects it, shows its
-  detail in place under the grid (`policy-template-gallery-detail`) and moves focus to the
-  detail's heading (`policy-template-gallery-detail-heading`, `tabIndex={-1}`). The detail shows
-  only while its card is among the cards shown, so a search or category that hides the selected
-  card, Allow all included, hides its detail and Use (`hidden`); the hidden detail stays
-  mounted, so settings typed there are still there when the filter is cleared. Allow all's detail has its description,
+  under the editor below `xl`. The page holds the gallery's open state and selected card, and
+  while the gallery is open the templates column shows `TemplateGalleryDetail`
+  (`policy-template-gallery-detail-panel`, a `card shadow mb-4` titled "Template details") in
+  place of Add rules. With no card selected it says "Pick a template on the left to see what it
+  does, then use it." (`policy-template-gallery-detail-empty`, the
+  `.policy-templates-panel__placeholder` style). Choosing a card selects it, shows its detail
+  there (`policy-template-gallery-detail`) and moves focus to the detail's heading
+  (`policy-template-gallery-detail-heading`, `tabIndex={-1}`); a search or category that hides
+  the selected card leaves its detail shown. Allow all's detail has its description,
   **Show Rego** with `ALLOW_ALL_POLICY` and Use. A template's detail is built from
   `TemplatePreview.tsx` like the column's preview: description, default decision, a note when
   using it sets the Type, setting fields (`policy-template-gallery-param-<key>`), **Show Rego**
@@ -1934,7 +1941,7 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   only Use and Allow all set (`blank` for Allow all); everything else is derived from it and the
   Rego. Using the used template again keeps a Name and Description already in the form; using
   any other card, Deny by default included, fills them. The gallery then collapses to one line
-  (`policy-template-gallery-summary`). `policyStart` (`policyStart.ts`), computed once by the
+  (`policy-template-gallery-summary`) and the templates column goes back to Add rules. `policyStart` (`policyStart.ts`), computed once by the
   page and passed to the gallery, decides what it says. The Rego still follows its start while
   each template group in it holds exactly the lines Add to policy wrote (`addedRules` in
   `usePolicyTemplateActions`, `{name, body}` per Add, restored by Undo with the rest) and the
@@ -1956,8 +1963,12 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   (`policy-template-gallery-change-button`), which reopens
   it with the used card selected and its settings as they were used, also after a hand edit,
   and moves focus to the selected card, or to the search when no shown card is selected. Use
-  there replaces the Rego. Use (of a template or Allow all) replaces at once while the Rego is
-  an untouched start (`policyStart` is not null and counts no added templates); otherwise its
+  there replaces the Rego, and **Cancel** beside the title
+  (`policy-template-gallery-cancel-button`, shown only once a template was used) collapses the
+  gallery without using another, which brings back Add rules. Use (of a template or Allow all)
+  replaces at once before any template was used (`templatePicked` false, so also while the
+  templates are still loading) and while the Rego is an untouched start (`policyStart` is not
+  null and counts no added templates); otherwise its
   first click asks in place under the button, never in a modal
   (`policy-template-gallery-replace-confirm`): "This replaces the N rules in the Policy
   section.", or "This replaces your edits in the Policy section." when there are no rules to
@@ -1965,8 +1976,9 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   `policy-template-gallery-replace-button`) and **Cancel**
   (`policy-template-gallery-replace-cancel-button`). Opening it moves focus to Cancel, so a
   second Enter can't replace; Cancel and Escape close it and return focus to Use; picking
-  another card closes it. Replace applies the template with the usual Undo. After a discard and Undo the page keeps only the form, so no
-  card is selected unless the Rego, without added template groups, is `DEFAULT_POLICY`. Changing Type keeps the Rego, whose
+  another card closes it. Replace applies the template with the usual Undo. After a discard and
+  Undo the page keeps only the form, with the gallery collapsed and Details and Policy shown.
+  Changing Type keeps the Rego, whose
   package line the Type select rewrites, and keeps a template that serves both Types used,
   with its settings. A used default template with no variant for the new Type gets a warning
   toast naming it, since its rules sit in Your rules; added template groups are marked in the
@@ -1977,8 +1989,9 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   editor's width never changes. Template examples, Test (dry-run) and Version history sit in
   the editor column under the editor card, so a taller templates column never pushes them down;
   without `policies.edit` the editor is full width and there is no column. The column only adds
-  rules ("Add rules from a template", no close button); only **Save as template** swaps in its
-  own panel, and closing it returns to Add rules. **Add rules from a template**
+  rules ("Add rules from a template", no close button); only **Save as template** and, on the
+  create form while Start from is open, the template details swap in their own panel, and
+  closing either returns to Add rules. **Add rules from a template**
   (`policy-templates-insert-button`, in the Policy section and the empty rules list) brings back
   the Add rules panel, scrolls to the column and focuses its search. It lists only templates
   that add rules of the policy's Type (tab counts count only those) and says under the list
@@ -1991,9 +2004,13 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   (`policy-templates-tab-builtin`, `-organization`), a search
   (`policy-templates-search-input`), category chips shown when a tab holds more than one
   category (`filter-chip-<key>` inside `policy-templates-categories`), rows
-  (`policy-templates-row-<id>`) with a DENY or ALLOW decision pill, and a preview (with nothing
+  (`policy-templates-row-<id>`) with a DENY or ALLOW decision pill in a list at most `300px`
+  tall that scrolls (`.policy-templates-panel__list`), so the preview under it stays in sight,
+  and a preview (heading `policy-templates-preview-heading`). Picking a row scrolls the column
+  only as far as needed to show the preview (`block: 'nearest'`, nothing moves when it is
+  already in view) and leaves focus on the row; with nothing
   selected it says "Pick a template to preview the rules it adds.",
-  `policy-templates-preview-empty`): description, default
+  `policy-templates-preview-empty`. The preview shows the description, default
   decision, setting fields (`policy-templates-param-<key>`), the lines it adds, How it decides
   with each example's input (`policy-templates-example-input-<i>`), the docs link
   (`policy-templates-docs-link`) and **Add to policy**
@@ -2015,9 +2032,7 @@ the actions that change the Rego, each with Undo, live in `usePolicyTemplateActi
   go after the policy's `package` line. When the Rego allows by default, the Rules view warns
   that the allow rules change nothing (below). A template's helper rules that depend on its settings are Rego functions taking the
   setting as an argument, so adding the same template twice with different settings keeps both
-  checks apart. On the create form every Add to policy collapses the gallery to its summary
-  (the hook's `rulesAdded` count, which Undo doesn't change, so Undo never collapses it),
-  without moving the focus off Add to policy, and the Policy section moves to the Rules view.
+  checks apart. Add to policy moves the Policy section to the Rules view.
 - **Rules view** (`PolicyRulesList`, `policy-rules-list`) of the Policy section lists the rules
   `regoRules.ts` reads from the Rego as it changes: the rule count (`policy-rules-count`) and
   default decision sit in the section's status row, then come the rules written

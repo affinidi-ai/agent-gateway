@@ -60,8 +60,8 @@ const PolicyDetailsSection: React.FC<PolicyDetailsSectionProps> = ({
   <section className="policy-section" data-testid="policy-details-section">
     <PolicySectionTitle step={step} title="Details" />
     <div className="row">
-      <div className="col-md-6 mb-3">
-        <label className="font-weight-bold" htmlFor="policy-name-input">
+      <div className="col-12 mb-3">
+        <label className="font-weight-bold d-block mb-1" htmlFor="policy-name-input">
           Name{' '}
           <FieldHelp testId="field-help-policy-definition-name" ariaLabel="About Name">
             A short, memorable label, this is what you&apos;ll see in the policy list and in
@@ -79,8 +79,8 @@ const PolicyDetailsSection: React.FC<PolicyDetailsSectionProps> = ({
           data-testid="policy-definition-name-input"
         />
       </div>
-      <div className="col-md-6 mb-3">
-        <label className="font-weight-bold" htmlFor="policy-description-input">
+      <div className="col-12 mb-3">
+        <label className="font-weight-bold d-block mb-1" htmlFor="policy-description-input">
           Description{' '}
           <FieldHelp
             testId="field-help-policy-definition-description"
@@ -90,9 +90,9 @@ const PolicyDetailsSection: React.FC<PolicyDetailsSectionProps> = ({
             and why, for whoever looks at this later.
           </FieldHelp>
         </label>
-        <input
+        <textarea
           id="policy-description-input"
-          type="text"
+          rows={2}
           className="form-control form-control-sm"
           value={description}
           readOnly={readOnly}
@@ -104,7 +104,7 @@ const PolicyDetailsSection: React.FC<PolicyDetailsSectionProps> = ({
     </div>
     <div className="row">
       <div className="col-md-6 mb-3">
-        <label className="font-weight-bold" htmlFor="policy-type-select">
+        <label className="font-weight-bold d-block mb-1" htmlFor="policy-type-select">
           Type{' '}
           <FieldHelp testId="field-help-policy-definition-type" ariaLabel="About Type">
             Gateway policies attach to a gateway connection (your own appliance, or one remote peer)
@@ -139,7 +139,7 @@ const PolicyDetailsSection: React.FC<PolicyDetailsSectionProps> = ({
         </small>
       </div>
       <div className="col-md-6 mb-3">
-        <span className="font-weight-bold d-inline-flex align-items-center gap-1">
+        <span className="font-weight-bold d-block mb-1">
           Status{' '}
           <FieldHelp testId="field-help-policy-definition-status" ariaLabel="About Status">
             When off, this policy is never evaluated. If this policy is also enforced Globally on
@@ -148,7 +148,7 @@ const PolicyDetailsSection: React.FC<PolicyDetailsSectionProps> = ({
             Monitor only are unaffected: they just stop logging this policy&apos;s decisions.
           </FieldHelp>
         </span>
-        <div className="form-check form-switch mt-1">
+        <div className="form-check form-switch">
           <input
             className="form-check-input"
             type="checkbox"

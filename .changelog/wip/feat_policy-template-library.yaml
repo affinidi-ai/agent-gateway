@@ -12,13 +12,14 @@ changes:
         method, path, surface and subject allowlists, plus MCP tool policies for tool bindings
         on the MCP Proxy hop. Templates follow the Apply Policies guides and link to their own
         docs section. The gallery offers templates of either type; choosing one shows its
-        settings, its Rego, how it decides on sample inputs, and its docs link in place, and Use this
-        template fills Name, Description, Type and Rego with settings that are checked first;
+        settings, its Rego, how it decides on sample inputs, and its docs link beside the form, and
+        Use this template fills Name, Description, Type and Rego with settings that are checked first;
         when the policy already has rules or hand edits, Use asks in place before it replaces
         them. Every template is labelled Whole policy or Adds rules. Add rules from a template
         lists only templates that add rules, says how many whole policies and templates for the
         other Type it leaves out, and appends a template's rules to a new or saved policy, so
-        several can be combined, and on a saved policy checks the template's examples with the
+        several can be combined; its list scrolls in a short box and picking a template brings
+        its settings into view. On a saved policy it checks the template's examples with the
         existing dry-run; a whole policy is used from Start from only.
         A Rules | Rego toggle shows the policy, opening on Rules. The Rules view lists the
         policy's rules grouped by the template they came from, with an empty state that offers
@@ -49,16 +50,19 @@ changes:
         note says the policy can be viewed but not changed. Saving and the dry-run already
         needed that permission, so the page no longer offers actions the gateway refuses.
     - timestamp: '2026-11-18T20:00:00Z'
-      title: Start new policies as deny by default
+      title: Start new policies by picking a template, with its details beside the form
       description: >-
-        A new policy definition starts as default allow := false, the deny-by-default practice
-        the policy docs recommend, instead of allowing all traffic. Deny by default is
-        preselected in the Start from gallery, and Allow all (blank) is a card there.
+        Creating a policy starts with only the Start from gallery and no template selected.
+        Choosing a card shows its details in the column beside the form, and the Details and
+        Policy sections appear once a template, or Allow all (blank), is used, so a policy
+        never starts from a template the user didn't choose. Change reopens the gallery, and
+        Cancel closes it again without using another template.
     - timestamp: '2026-11-18T18:00:00Z'
       title: Redesign the policy editor into Details and Policy sections
       description: >-
         The policy create and edit pages group Name, Description, Type and an Enabled switch
-        into one Details section, keep the templates in a column beside the editor so opening
+        into one Details section (Name, then a two-line Description, then Type and Status side
+        by side), keep the templates in a column beside the editor so opening
         one never resizes the form, show a saved policy's ID and SHA on one line with copy
         buttons, and show the Rego with line numbers and a banner when it doesn't compile.
   fixed:

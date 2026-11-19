@@ -428,10 +428,11 @@ The policy editor's create and edit pages share Start from (create only), Detail
 sections built from the shared dashboard components, and are read-only without
 `policies.edit`; see _Policy definition editor_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#policy-definition-editor). Templates need no
-gateway API and link to their Apply Policies docs section. A new policy starts as Deny by
-default, preselected in the **Start from** gallery, and opens on the Rules view. A gallery card
+gateway API and link to their Apply Policies docs section. A new policy shows only the
+**Start from** gallery, with no card selected, until a template is used; Details and the
+Policy section, on the Rules view, appear after that. A gallery card
 (**Allow all (blank)**, then default and organization templates of either Type) shows its
-settings, How it decides, its Rego and docs link in place, and **Use this template** fills the
+settings, How it decides, its Rego and docs link in the templates column, and **Use this template** fills the
 form and sets the Type, asking in place first (focus on Cancel) unless the Rego is an untouched
 start. Every template is labelled **Whole policy** or **Adds rules**. The Policy section's
 **Rules | Rego** toggle lists the rules grouped by

@@ -54,10 +54,11 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
   const [templatePanel, setTemplatePanel] = useState<TemplatePanel | null>(null);
   // Only Use and Allow all set it; whether the Rego still follows it is derived from the Rego.
   const [usedTemplate, setUsedTemplate] = useState<UsedTemplate | null>(null);
+  // A new policy shows its Details and Policy sections only once a template is used.
+  const [templatePicked, setTemplatePicked] = useState(!isCreateMode);
   const [insertedTemplate, setInsertedTemplate] = useState<InsertedTemplate | null>(null);
   const [justAdded, setJustAdded] = useState<string | null>(null);
   const [addedRules, setAddedRules] = useState<AddedRules[]>([]);
-  const [rulesAdded, setRulesAdded] = useState(0);
   const regoRef = useRef<HTMLTextAreaElement>(null);
 
   const togglePanel = (panel: TemplatePanel) => setTemplatePanel(p => (p === panel ? null : panel));
@@ -74,6 +75,7 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
       policy: form.policy,
     };
     const previousUsed = usedTemplate;
+    const previousPicked = templatePicked;
     // Using the used template again keeps the name and description as typed.
     const reapplying = usedTemplate?.id === template.id;
     setForm(f => ({
@@ -84,6 +86,7 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
       policy: rego,
     }));
     setUsedTemplate({ id: template.id, fieldText });
+    setTemplatePicked(true);
     setTemplatePanel(null);
     showUndoToast({
       message:
@@ -93,6 +96,7 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
       onUndo: () => {
         setForm(f => ({ ...f, ...previous }));
         setUsedTemplate(previousUsed);
+        setTemplatePicked(previousPicked);
       },
     });
   };
@@ -100,13 +104,16 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
   const pickBlank = () => {
     const previousPolicy = form.policy;
     const previousUsed = usedTemplate;
+    const previousPicked = templatePicked;
     setForm(f => ({ ...f, policy: ALLOW_ALL_POLICY[f.policy_type] }));
     setUsedTemplate({ id: BLANK_TEMPLATE_ID, fieldText: {} });
+    setTemplatePicked(true);
     showUndoToast({
       message: `Started from Allow all (blank). ${UNDO_REGO}`,
       onUndo: () => {
         setForm(f => ({ ...f, policy: previousPolicy }));
         setUsedTemplate(previousUsed);
+        setTemplatePicked(previousPicked);
       },
     });
   };
@@ -121,7 +128,6 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
     const inserted = insertTemplateRules(form.policy, template.name, rego);
     setForm(f => ({ ...f, policy: inserted.policy }));
     setAddedRules(prev => [...prev, { name: template.name, body: inserted.added }]);
-    setRulesAdded(n => n + 1);
     setJustAdded(template.name);
     if (!isCreateMode) {
       setInsertedTemplate(prev => ({ template, usesDefaultSettings, key: (prev?.key ?? 0) + 1 }));
@@ -199,11 +205,12 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
     togglePanel,
     usedTemplate,
     setUsedTemplate,
+    templatePicked,
+    setTemplatePicked,
     insertedTemplate,
     dismissInsertedTemplate: () => setInsertedTemplate(null),
     justAdded,
     addedRules,
-    rulesAdded,
     regoRef,
     applyTemplate,
     editPolicy,

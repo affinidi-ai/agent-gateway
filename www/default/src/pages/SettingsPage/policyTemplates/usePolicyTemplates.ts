@@ -60,6 +60,16 @@ export function groupTemplateEntries(templates: PolicyTemplate[]): TemplateEntry
   return Array.from(entries.values());
 }
 
+/** One template per entry, as the gallery shows it: the variant for the Type, or its only one. */
+export function galleryTemplates(
+  entries: TemplateEntry[],
+  policyType: PolicyType
+): PolicyTemplate[] {
+  return entries
+    .map(e => e.variants[policyType] ?? e.variants.gateway ?? e.variants.agent_surface)
+    .filter((t): t is PolicyTemplate => !!t);
+}
+
 /** Templates of every policy type, grouped into entries, built-in in catalogue order first. */
 export function useAllPolicyTemplates(): TemplateEntry[] {
   const gateway = usePolicyTemplates('gateway');

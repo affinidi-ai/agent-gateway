@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AppButton } from '../../../components/shared/AppButton';
 import InfoBanner from '../../../components/shared/InfoBanner';
 import { defaultDecision, insertTemplateRules, templateRole } from './regoTemplate';
@@ -41,6 +41,11 @@ const InsertPreview: React.FC<{
 }> = ({ template, existingPolicy, onInsert }) => {
   const settings = useTemplateSettings(template);
   const { rendered, usesDefaultSettings } = settings;
+  // The preview sits under the list, so picking a row scrolls only as far as needed to show it.
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    headingRef.current?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
+  }, []);
   const insert = rendered.rego
     ? insertTemplateRules(existingPolicy, template.name, rendered.rego)
     : null;
@@ -48,7 +53,9 @@ const InsertPreview: React.FC<{
 
   return (
     <div className="policy-template-preview" data-testid="policy-templates-preview">
-      <h6 className="fw-bold mb-1">{template.name}</h6>
+      <h6 ref={headingRef} className="fw-bold mb-1" data-testid="policy-templates-preview-heading">
+        {template.name}
+      </h6>
       <p className="text-muted small mb-2">{template.description}</p>
       <div className="d-flex flex-wrap gap-2 mb-3">
         <TemplateRoleBadge template={template} />

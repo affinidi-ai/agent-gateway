@@ -18,21 +18,36 @@ async function pickCard(page: Page, key: string) {
     await page.getByTestId(`policy-template-card-${key}`).click();
 }
 
+/** The picked card's detail, shown in the templates column. */
+const galleryDetail = (page: Page) =>
+    page.getByTestId('policy-templates-column').getByTestId('policy-template-gallery-detail');
+
+/** Uses Deny by default, which shows the Details and Policy sections. */
+async function useDenyByDefault(page: Page) {
+    await page.getByTestId('policy-template-card-deny-by-default').click();
+    await galleryDetail(page).getByTestId('policy-template-gallery-use-button').click();
+}
+
 test.describe('Policy templates on the create policy page', () => {
     test.beforeEach(async ({page}) => {
         await page.goto(`${BASE_URL}/policy-definitions/new?type=agent_surface`);
         await expect(page.getByTestId('policy-template-gallery')).toBeVisible();
     });
 
-    test('starts from Deny by default on the Rules view', async ({page}) => {
-        await expect(page.getByTestId('policy-template-card-deny-by-default')).toHaveAttribute('aria-pressed', 'true');
-        await expect(page.getByTestId('policy-view-rules')).toHaveAttribute('aria-pressed', 'true');
+    test('shows only Start from until a template is used', async ({page}) => {
+        await expect(page.getByTestId('policy-template-card-deny-by-default')).toHaveAttribute('aria-pressed', 'false');
+        await expect(page.getByTestId('policy-template-gallery-detail-empty')).toBeVisible();
+        await expect(page.getByTestId('policy-editor-section')).toHaveCount(0);
         await captureFullPage(page, 'policy-templates-start');
+
+        await useDenyByDefault(page);
+        await expect(page.getByTestId('policy-view-rules')).toHaveAttribute('aria-pressed', 'true');
+        await expect(page.getByTestId('policy-templates-column').getByTestId('policy-templates-panel')).toBeVisible();
     });
 
-    test('shows a template in place and fills the form when it is used', async ({page}) => {
+    test('shows a template in the templates column and fills the form when it is used', async ({page}) => {
         await pickCard(page, 'allow-http-methods');
-        const detail = page.getByTestId('policy-template-gallery-detail');
+        const detail = galleryDetail(page);
         await expect(detail).toContainText('Allow listed HTTP methods');
         await detail.getByTestId('policy-template-gallery-example-input-0').click();
         await expect(detail.getByTestId('policy-template-gallery-example-input-0-json')).toContainText('"method"');
@@ -48,13 +63,14 @@ test.describe('Policy templates on the create policy page', () => {
 
     test('moves the focus to Change once a template is used', async ({page}) => {
         await pickCard(page, 'allow-http-methods');
-        await page.getByTestId('policy-template-gallery-detail').getByTestId('policy-template-gallery-use-button').click();
+        await galleryDetail(page).getByTestId('policy-template-gallery-use-button').click();
 
         await expect(page.getByTestId('policy-template-gallery-summary')).toBeVisible();
         await expect(page.getByTestId('policy-template-gallery-change-button')).toBeFocused();
     });
 
     test('adds rules from a template and removes them again', async ({page}) => {
+        await useDenyByDefault(page);
         const column = page.getByTestId('policy-templates-column');
         await column.getByTestId('policy-templates-row-allow-http-methods:agent_surface').click();
         await column.getByTestId('policy-templates-insert-rules-button').click();
@@ -69,11 +85,13 @@ test.describe('Policy templates on the create policy page', () => {
     });
 
     test('keeps the editor width when a template is shown', async ({page}) => {
+        await useDenyByDefault(page);
         const editor = page.getByTestId('policy-editor-section');
         const before = await editor.boundingBox();
 
+        await page.getByTestId('policy-template-gallery-change-button').click();
         await pickCard(page, 'allow-http-methods');
-        await page.getByTestId('policy-templates-column').getByTestId('policy-templates-row-allow-http-methods:agent_surface').click();
+        await expect(galleryDetail(page)).toContainText('Allow listed HTTP methods');
 
         const after = await editor.boundingBox();
         expect(before).not.toBeNull();
@@ -97,7 +115,7 @@ test.describe('Policy templates on a saved policy', () => {
 
         await page.goto(`${BASE_URL}/policy-definitions/new?type=agent_surface`);
         await pickCard(page, 'allow-http-methods');
-        await page.getByTestId('policy-template-gallery-detail').getByTestId('policy-template-gallery-use-button').click();
+        await galleryDetail(page).getByTestId('policy-template-gallery-use-button').click();
         await page.getByTestId('policy-definition-name-input').fill(policyName);
         const save = page.getByTestId('policy-definition-editor-save-button');
         await expect(save).toBeEnabled();

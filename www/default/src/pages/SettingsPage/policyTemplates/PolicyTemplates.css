@@ -376,7 +376,7 @@ body.dark-theme .policy-rego-gutter {
 }
 
 .policy-templates-panel__list {
-  max-height: 520px;
+  max-height: 300px;
   overflow-y: auto;
 }
 
@@ -401,13 +401,6 @@ body.dark-theme .policy-templates-panel__placeholder {
     max-height: calc(100vh - var(--topbar-height) - 2rem);
     overflow-y: auto;
   }
-}
-
-.policy-template-gallery__detail {
-  margin-top: 12px;
-  padding: 12px;
-  border: 1px solid var(--accent-blue-text);
-  border-radius: var(--radius-sm);
 }
 
 .policy-template-example-input {

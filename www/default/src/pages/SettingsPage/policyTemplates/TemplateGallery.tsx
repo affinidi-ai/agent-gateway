@@ -1,11 +1,10 @@
-import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AppButton } from '../../../components/shared/AppButton';
 import { Badge } from '../../../components/shared/Badge';
-import { ALLOW_ALL_POLICY, BLANK_TEMPLATE_ID, DEFAULT_TEMPLATE_KEY } from './policyDefaults';
+import { BLANK_TEMPLATE_ID } from './policyDefaults';
 import PolicySectionTitle from './PolicySectionTitle';
 import { defaultDecision } from './regoTemplate';
 import { ALLOW_ALL_NAME, type PolicyStart } from './policyStart';
-import { parsePolicyRules } from './regoRules';
 import {
   DecisionBadge,
   RoleBadge,
@@ -13,265 +12,68 @@ import {
   TemplateRoleBadge,
 } from './TemplateBadges';
 import TemplateFilterBar from './TemplateFilterBar';
-import {
-  TemplateDocsLink,
-  TemplateHowItDecides,
-  TemplateSettingsFields,
-  useTemplateSettings,
-  type FieldText,
-} from './TemplatePreview';
 import type { UsedTemplate } from './usePolicyTemplateActions';
-import { templateEntryKey, useAllPolicyTemplates } from './usePolicyTemplates';
+import { galleryTemplates, templateEntryKey, useAllPolicyTemplates } from './usePolicyTemplates';
 import { useTemplateFilter } from './useTemplateFilter';
-import { CATEGORY_LABELS, POLICY_TYPE_NAMES, type PolicyTemplate, type PolicyType } from './types';
+import { CATEGORY_LABELS, POLICY_TYPE_NAMES, type PolicyType } from './types';
 import './PolicyTemplates.css';
 
 const COLLAPSED_COUNT = 6;
-const ID_PREFIX = 'policy-template-gallery';
 
 interface TemplateGalleryProps {
   policyType: PolicyType;
   step?: number;
   /** What the policy started from, while its Rego still follows it (`policyStart`). */
   start: PolicyStart | null;
-  /** The current Rego, which Use replaces. */
-  policy: string;
   usedTemplate: UsedTemplate | null;
-  /** Counts Add to policy actions; each one collapses the gallery to its summary. */
-  rulesAdded: number;
-  onPickBlank: () => void;
-  /** Fills the form from the template, with the Rego its settings render to. */
-  onUseTemplate: (template: PolicyTemplate, rego: string, fieldText: FieldText) => void;
+  /** The cards show while expanded; collapsed, the section shows what the policy started from. */
+  expanded: boolean;
+  onExpand: () => void;
+  /** Set once a template was used: Cancel closes the gallery without using another. */
+  onCollapse?: () => void;
+  /** The card whose detail the templates column shows, or null before one is picked. */
+  selectedKey: string | null;
+  onSelect: (key: string) => void;
 }
 
-type FocusTarget = 'change' | 'card' | 'heading';
-
-const DetailHeading = React.forwardRef<HTMLHeadingElement, { children: React.ReactNode }>(
-  ({ children }, ref) => (
-    <h6
-      ref={ref}
-      tabIndex={-1}
-      className="fw-bold mb-1"
-      data-testid="policy-template-gallery-detail-heading"
-    >
-      {children}
-    </h6>
-  )
-);
-DetailHeading.displayName = 'DetailHeading';
-
-/** The Rego a detail renders to, collapsed until asked for; null while a setting is invalid. */
-const ShowRego: React.FC<{ rego: string | null }> = ({ rego }) => {
-  const [open, setOpen] = useState(false);
-  const regoId = useId();
-  return (
-    <>
-      <AppButton
-        variant="link"
-        className="p-0 mb-2"
-        aria-expanded={open}
-        aria-controls={regoId}
-        onClick={() => setOpen(o => !o)}
-        data-testid="policy-template-gallery-show-rego"
-      >
-        {open ? 'Hide Rego' : 'Show Rego'}
-      </AppButton>
-      {open && (
-        <pre
-          id={regoId}
-          className="policy-preview-block rounded p-2 mb-3 small"
-          data-testid="policy-template-gallery-rego"
-        >
-          <code>{rego ?? 'Fix the settings above to see the Rego.'}</code>
-        </pre>
-      )}
-    </>
-  );
-};
-
-/**
- * What Use replaces, or null while the Rego is an untouched start, which Use replaces at once.
- */
-function replaceText(policy: string, start: PolicyStart | null): string | null {
-  if (start && start.templatesAdded === 0) return null;
-  const parsed = parsePolicyRules(policy);
-  const rules = parsed.ok ? parsed.groups.reduce((n, g) => n + g.rules.length, 0) : 0;
-  return rules > 0
-    ? `This replaces the ${rules} ${rules === 1 ? 'rule' : 'rules'} in the Policy section.`
-    : 'This replaces your edits in the Policy section.';
-}
-
-/**
- * Use this template. With `replaces` set, the first click asks in place before the Rego is
- * replaced, with the focus on Cancel; Cancel and Escape close it and return the focus to Use.
- */
-const UseTemplateButton: React.FC<{
-  replaces: string | null;
-  disabled?: boolean;
-  onUse: () => void;
-}> = ({ replaces, disabled, onUse }) => {
-  const [confirming, setConfirming] = useState(false);
-  const buttonRef = useRef<HTMLButtonElement>(null);
-  const cancelRef = useRef<HTMLButtonElement>(null);
-  const opened = useRef(false);
-  useEffect(() => {
-    if (confirming) cancelRef.current?.focus();
-    else if (opened.current) buttonRef.current?.focus();
-    opened.current = confirming;
-  }, [confirming]);
-
-  return (
-    <>
-      <div className="d-flex justify-content-end">
-        <AppButton
-          ref={buttonRef}
-          disabled={disabled}
-          aria-expanded={replaces ? confirming : undefined}
-          onClick={() => (replaces ? setConfirming(true) : onUse())}
-          data-testid="policy-template-gallery-use-button"
-        >
-          Use this template
-        </AppButton>
-      </div>
-      {replaces && confirming && (
-        <div
-          className="policy-template-replace"
-          role="group"
-          aria-label="Replace the policy"
-          onKeyDown={e => {
-            if (e.key === 'Escape') setConfirming(false);
-          }}
-          data-testid="policy-template-gallery-replace-confirm"
-        >
-          <span className="small">{replaces}</span>
-          <AppButton
-            variant="danger"
-            onClick={onUse}
-            data-testid="policy-template-gallery-replace-button"
-          >
-            Replace
-          </AppButton>
-          <AppButton
-            ref={cancelRef}
-            variant="outline-secondary"
-            onClick={() => setConfirming(false)}
-            data-testid="policy-template-gallery-replace-cancel-button"
-          >
-            Cancel
-          </AppButton>
-        </div>
-      )}
-    </>
-  );
-};
-
-/** The selected card's detail: settings, its Rego, how it decides, docs and Use this template. */
-const GalleryDetail: React.FC<{
-  template: PolicyTemplate;
-  policyType: PolicyType;
-  initialText?: FieldText;
-  headingRef: React.Ref<HTMLHeadingElement>;
-  hidden: boolean;
-  replaces: string | null;
-  onUse: (template: PolicyTemplate, rego: string, fieldText: FieldText) => void;
-}> = ({ template, policyType, initialText, headingRef, hidden, replaces, onUse }) => {
-  const settings = useTemplateSettings(template, initialText);
-  return (
-    <div
-      className="policy-template-gallery__detail"
-      hidden={hidden}
-      data-testid="policy-template-gallery-detail"
-    >
-      <DetailHeading ref={headingRef}>{template.name}</DetailHeading>
-      <p className="text-muted small mb-2">{template.description}</p>
-      <div className="d-flex flex-wrap gap-2 mb-3">
-        <TemplateRoleBadge template={template} />
-        <DecisionBadge decision={defaultDecision(template.rego)} />
-        <TemplateOriginBadges template={template} />
-        {template.policy_type !== policyType && (
-          <Badge
-            tone="warning"
-            value={`Using it sets Type to ${POLICY_TYPE_NAMES[template.policy_type].label}`}
-          />
-        )}
-      </div>
-      <TemplateSettingsFields template={template} settings={settings} idPrefix={ID_PREFIX} />
-      <ShowRego rego={settings.rendered.rego} />
-      <TemplateHowItDecides template={template} idPrefix={ID_PREFIX} />
-      <TemplateDocsLink template={template} testId="policy-template-gallery-docs-link" />
-      <UseTemplateButton
-        replaces={replaces}
-        disabled={!settings.rendered.rego}
-        onUse={() =>
-          settings.rendered.rego && onUse(template, settings.rendered.rego, settings.fieldText)
-        }
-      />
-    </div>
-  );
-};
+type FocusTarget = 'change' | 'card';
 
 /**
  * The create form's Start from section: Allow all (blank), then one card per built-in and
- * organisation template of either type. Choosing a card shows its detail in place; Use this
- * template fills the form, and a template for the other type sets the Type.
+ * organisation template of either type. Choosing a card shows its detail in the templates
+ * column (`TemplateGalleryDetail`), where Use this template fills the form.
  */
 const TemplateGallery: React.FC<TemplateGalleryProps> = ({
   policyType,
   step,
   start,
-  policy,
   usedTemplate,
-  rulesAdded,
-  onPickBlank,
-  onUseTemplate,
+  expanded,
+  onExpand,
+  onCollapse,
+  selectedKey,
+  onSelect,
 }) => {
-  const replaces = useMemo(() => replaceText(policy, start), [policy, start]);
   const entries = useAllPolicyTemplates();
-  // Each card stands for the variant of the current Type, or the template's only variant.
-  const all = useMemo(
-    () =>
-      entries
-        .map(e => e.variants[policyType] ?? e.variants.gateway ?? e.variants.agent_surface)
-        .filter((t): t is PolicyTemplate => !!t),
-    [entries, policyType]
-  );
+  const all = useMemo(() => galleryTemplates(entries, policyType), [entries, policyType]);
   const { query, setQuery, category, setCategory, categories, visible } = useTemplateFilter(all);
-  const [expanded, setExpanded] = useState(true);
   const [showAll, setShowAll] = useState(false);
 
-  // The used template's card, or Deny by default while the new policy's own Rego still follows it.
-  const appliedId = usedTemplate?.id ?? (start ? `${DEFAULT_TEMPLATE_KEY}:${policyType}` : null);
-  const applied =
-    entries.flatMap(e => Object.values(e.variants)).find(t => t?.id === appliedId) ?? null;
-  const appliedKey =
-    appliedId === BLANK_TEMPLATE_ID
-      ? BLANK_TEMPLATE_ID
-      : applied
-        ? templateEntryKey(applied)
-        : null;
-  // The card whose detail is open: the applied one until the user picks another.
-  const [selectedKey, setSelectedKey] = useState<string | null>(null);
-  const shownKey = selectedKey ?? appliedKey;
   const filtering = query.trim() !== '' || category !== 'all';
   // The selected template stays in view even when it is past the first few cards.
-  const selectedIndex = visible.findIndex(t => templateEntryKey(t) === shownKey);
+  const selectedIndex = visible.findIndex(t => templateEntryKey(t) === selectedKey);
   const shown =
     showAll || filtering || selectedIndex >= COLLAPSED_COUNT
       ? visible
       : visible.slice(0, COLLAPSED_COUNT);
-  // A detail stays mounted, keeping its settings, but shows only while its card does.
-  const selected = all.find(t => templateEntryKey(t) === shownKey) ?? null;
-  const detailHidden = shownKey === BLANK_TEMPLATE_ID ? filtering : selectedIndex < 0;
 
   const changeRef = useRef<HTMLButtonElement>(null);
   const filtersRef = useRef<HTMLDivElement>(null);
   const gridRef = useRef<HTMLDivElement>(null);
-  const headingRef = useRef<HTMLHeadingElement>(null);
   const [focusTarget, setFocusTarget] = useState<FocusTarget | null>(null);
   useEffect(() => {
     if (!focusTarget) return;
     if (focusTarget === 'change') changeRef.current?.focus();
-    else if (focusTarget === 'heading') headingRef.current?.focus();
     else
       (
         gridRef.current?.querySelector<HTMLElement>('.is-selected') ??
@@ -280,28 +82,12 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
     setFocusTarget(null);
   }, [focusTarget]);
 
-  // Add to policy collapses the gallery to its summary, leaving the focus on Add to policy.
-  const addedBefore = useRef(rulesAdded);
+  // Use this template and Cancel collapse the gallery, which moves the focus to Change.
+  const wasExpanded = useRef(expanded);
   useEffect(() => {
-    if (rulesAdded === addedBefore.current) return;
-    addedBefore.current = rulesAdded;
-    setSelectedKey(null);
-    setExpanded(false);
-  }, [rulesAdded]);
-
-  const collapse = () => {
-    setSelectedKey(null);
-    setExpanded(false);
-    setFocusTarget('change');
-  };
-  const use = (template: PolicyTemplate, rego: string, fieldText: FieldText) => {
-    onUseTemplate(template, rego, fieldText);
-    collapse();
-  };
-  const useBlank = () => {
-    onPickBlank();
-    collapse();
-  };
+    if (wasExpanded.current && !expanded && usedTemplate) setFocusTarget('change');
+    wasExpanded.current = expanded;
+  }, [expanded, usedTemplate]);
 
   const clearFilters = () => {
     setQuery('');
@@ -318,12 +104,9 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
     <button
       key={key}
       type="button"
-      className={`policy-template-row policy-template-card${shownKey === key ? ' is-selected' : ''}`}
-      aria-pressed={shownKey === key}
-      onClick={() => {
-        setSelectedKey(key);
-        setFocusTarget('heading');
-      }}
+      className={`policy-template-row policy-template-card${selectedKey === key ? ' is-selected' : ''}`}
+      aria-pressed={selectedKey === key}
+      onClick={() => onSelect(key)}
       data-testid={testId}
     >
       <span className="policy-template-row__name">{name}</span>
@@ -341,12 +124,22 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
             variant="link"
             className="p-0"
             onClick={() => {
-              setExpanded(true);
+              onExpand();
               setFocusTarget('card');
             }}
             data-testid="policy-template-gallery-change-button"
           >
             Change
+          </AppButton>
+        )}
+        {expanded && onCollapse && (
+          <AppButton
+            variant="link"
+            className="p-0"
+            onClick={onCollapse}
+            data-testid="policy-template-gallery-cancel-button"
+          >
+            Cancel
           </AppButton>
         )}
       </PolicySectionTitle>
@@ -379,8 +172,8 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
       ) : (
         <>
           <p className="text-muted small mb-2">
-            Pick a starting point to see what it does, then use it. You can add rules from more
-            templates with <strong>Add rules from a template</strong>.
+            Pick a template to see its details on the right, then use it to continue. You can add
+            rules from more templates with <strong>Add rules from a template</strong>.
           </p>
           <div ref={filtersRef}>
             <TemplateFilterBar
@@ -460,39 +253,6 @@ const TemplateGallery: React.FC<TemplateGalleryProps> = ({
             >
               Show all ({visible.length})
             </AppButton>
-          )}
-
-          {shownKey === BLANK_TEMPLATE_ID ? (
-            <div
-              className="policy-template-gallery__detail"
-              hidden={detailHidden}
-              data-testid="policy-template-gallery-detail"
-            >
-              <DetailHeading ref={headingRef}>{ALLOW_ALL_NAME}</DetailHeading>
-              <div className="d-flex flex-wrap gap-2 mb-2">
-                <RoleBadge role="policy" />
-                <DecisionBadge decision="allow" />
-              </div>
-              <p className="text-muted small mb-3">
-                The default allow-all policy. Every request is allowed until you add rules and
-                change <code>default allow</code> to <code>false</code>.
-              </p>
-              <ShowRego rego={ALLOW_ALL_POLICY[policyType]} />
-              <UseTemplateButton replaces={replaces} onUse={useBlank} />
-            </div>
-          ) : (
-            selected && (
-              <GalleryDetail
-                key={selected.id}
-                template={selected}
-                policyType={policyType}
-                initialText={usedTemplate?.id === selected.id ? usedTemplate.fieldText : undefined}
-                headingRef={headingRef}
-                hidden={detailHidden}
-                replaces={replaces}
-                onUse={use}
-              />
-            )
           )}
         </>
       )}
