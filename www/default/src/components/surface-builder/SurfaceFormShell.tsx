@@ -816,14 +816,14 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
         return;
       }
 
-      const plan = planTemplate(preparedTemplate, builder.state.nodes);
+      const plan = planTemplate(preparedTemplate, builder.state.nodes, meta.protocol);
       if (plan.conflicts.length === 0) {
         finalizeTemplateApply(tpl.name, applyPlan(plan, builder.state.nodes, {}));
         return;
       }
       setPendingPlan(plan);
     },
-    [builder.state.nodes, finalizeTemplateApply, onApplyJsonPayload, setActiveTab]
+    [builder.state.nodes, finalizeTemplateApply, meta.protocol, onApplyJsonPayload, setActiveTab]
   );
 
   const handleConflictConfirm = React.useCallback(

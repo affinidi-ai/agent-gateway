@@ -30,4 +30,5 @@ export const transitPointAp2Definition = makeTransitPointDefinition({
   // Transit Point created directly via the API would still render and
   // edit normally.
   hiddenFromPalette: true,
+  protocols: ['a2a', 'ap2'],
 });

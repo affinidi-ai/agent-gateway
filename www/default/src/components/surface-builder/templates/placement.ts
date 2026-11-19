@@ -20,6 +20,7 @@
 import type { CanvasNode } from '../SurfaceCanvas';
 import type { SurfaceNodeType } from '../nodeTypes';
 import { registry } from '../elements';
+import type { Protocol } from '../elements/types';
 import { getArchetype } from '../elements/edges/archetypes';
 import type {
   EdgeDropIntent,
@@ -127,7 +128,18 @@ function resolveEdgeEndpoints(addr: EdgeAddress, existingNodes: CanvasNode[]): R
   return null;
 }
 
-export function planTemplate(template: SurfaceTemplate, existingNodes: CanvasNode[]): TemplatePlan {
+function unavailableOnProtocol(
+  def: { protocols?: Protocol[] },
+  protocol: Protocol | undefined
+): boolean {
+  return !!protocol && !!def.protocols && !def.protocols.includes(protocol);
+}
+
+export function planTemplate(
+  template: SurfaceTemplate,
+  existingNodes: CanvasNode[],
+  protocol?: Protocol
+): TemplatePlan {
   const plan: TemplatePlan = {
     template,
     clean: [],
@@ -190,6 +202,14 @@ export function planTemplate(template: SurfaceTemplate, existingNodes: CanvasNod
         });
         return;
       }
+      if (unavailableOnProtocol(def, protocol)) {
+        plan.unsupported.push({
+          itemIndex,
+          item,
+          reason: `'${item.kind}' is not available on ${protocol} surfaces`,
+        });
+        return;
+      }
       // Edge-bound items always take the clean path — the builder's
       // handleDrop owns conflict resolution (it rejects duplicate
       // per-endpoint slots with its own toast).
@@ -228,6 +248,14 @@ export function planTemplate(template: SurfaceTemplate, existingNodes: CanvasNod
         });
         return;
       }
+      if (unavailableOnProtocol(def, protocol)) {
+        plan.unsupported.push({
+          itemIndex,
+          item,
+          reason: `'${item.kind}' is not available on ${protocol} surfaces`,
+        });
+        return;
+      }
       const existing = existingNodes.find(n => n.type === item.kind);
       if (def.cardinality === 'singleton' && existing) {
         plan.conflicts.push({
@@ -255,6 +283,14 @@ export function planTemplate(template: SurfaceTemplate, existingNodes: CanvasNod
         itemIndex,
         item,
         reason: `unknown element kind '${item.kind}'`,
+      });
+      return;
+    }
+    if (unavailableOnProtocol(def, protocol)) {
+      plan.unsupported.push({
+        itemIndex,
+        item,
+        reason: `'${item.kind}' is not available on ${protocol} surfaces`,
       });
       return;
     }
@@ -406,9 +442,10 @@ export function applyPlan(
 /** One-shot apply with the engine's suggested defaults. */
 export function applyTemplate(
   template: SurfaceTemplate,
-  existingNodes: CanvasNode[]
+  existingNodes: CanvasNode[],
+  protocol?: Protocol
 ): PlacementResult {
-  const plan = planTemplate(template, existingNodes);
+  const plan = planTemplate(template, existingNodes, protocol);
   return applyPlan(plan, existingNodes, {});
 }
 
