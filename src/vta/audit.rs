@@ -1,5 +1,5 @@
 //! Optional, **data-minimized**, **bounded**, **non-blocking** audit sink to the
-//! VTA for high-value signing flows (VTA-08).
+//! VTA for high-value signing flows.
 //!
 //! The VTA is an authoritative provenance sink, but auditing must never weaken
 //! the data plane. Three properties are load-bearing and tested:
@@ -14,7 +14,7 @@
 //!   errors, and never fails the request it describes. A dropped or failed audit
 //!   is a lost log line, not a denied operation.
 //! - **Tamper-evident** — each accepted record is **hash-chained** to its
-//!   predecessor (VTA-17 / SEC0-6115 condition 5). Removing, reordering or
+//!   predecessor. Removing, reordering or
 //!   editing a record breaks the chain, so an operator can tell a quiet log from
 //!   a doctored one. The chain proves *integrity of the sequence*, not
 //!   authorship; signing the head is a later step.
@@ -49,7 +49,7 @@ pub struct AuditRecord {
     pub artifact_hash: String,
     /// Which carrier the Trust Task travelled over (`https` | `didcomm`).
     /// Recorded because a slow or failing signing path is diagnosed very
-    /// differently depending on whether a mediator was involved (VTA-27).
+    /// differently depending on whether a mediator was involved.
     pub carrier: &'static str,
     /// Position in the chain, from 1. Assigned by the sink.
     pub seq: u64,

@@ -1,5 +1,5 @@
 //! The gateway's **control key** — the Ed25519 `did:key` the gateway
-//! authenticates to the VTA with (VTA-02/03).
+//! authenticates to the VTA with.
 //!
 //! This is **not** an issuer/signing key: it only proves control of the
 //! gateway's auth identity when it signs the `auth/authenticate/0.3` Trust Task.
@@ -122,7 +122,7 @@ impl ControlKey {
     }
 
     /// Re-point this key at a **stable** identifier whose lifetime is
-    /// independent of the key — a `did:webvh` (VTA-13).
+    /// independent of the key — a `did:webvh`.
     ///
     /// With a `did:key` the identifier *is* the key, so rotating the key means
     /// a new identity and a fresh VTA grant. A `did:webvh` keeps the
@@ -275,7 +275,7 @@ mod tests {
         assert_eq!(restored.did(), key.did());
     }
 
-    // ─── Stable `did:webvh` identifier (VTA-13) ──────────────────────────
+    // ─── Stable `did:webvh` identifier ──────────────────────────
 
     const WEBVH: &str = "did:webvh:QmExample:gateway.example";
 

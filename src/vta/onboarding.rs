@@ -1,4 +1,4 @@
-//! Customer-sovereign onboarding (VTA-05).
+//! Customer-sovereign onboarding.
 //!
 //! In the customer-sovereign model the **customer** owns and runs the VTA; the
 //! gateway is only an authorized relying party. The gateway therefore never
@@ -49,7 +49,7 @@ pub fn grant_command(
 /// The grant command for a gateway that also provisions its own per-surface
 /// contexts (`[vta] auto_provision_contexts`).
 ///
-/// Adds the narrow `context-create` capability (VTA-16) and the ones the
+/// Adds the narrow `context-create` capability and the ones the
 /// provisioning and signing sequences actually use. It is **not** folded into
 /// [`grant_command`] because it is a strictly larger grant: an operator who
 /// does not auto-provision should not be asked for it, and one who does should

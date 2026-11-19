@@ -1,9 +1,6 @@
 //! "Connect your VTA" pairing — the state machine and verification.
 //!
-//! VTA-05 printed a grant command to the log and left the rest to the
-//! operator: hand-edit TOML, read the command out of `vta_audit`, run it,
-//! restart. That is workable for an engineer and unusable as a product
-//! onboarding flow. Pairing turns it into one consent step with a verifiable
+//! Pairing makes connecting a trust agent one consent step with a verifiable
 //! outcome, following the shape of the existing G2G pairing handshake rather
 //! than inventing a new one.
 //!

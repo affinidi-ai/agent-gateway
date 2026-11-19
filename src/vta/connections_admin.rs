@@ -39,9 +39,9 @@ pub struct VtaConnectionAdminState {
     /// here: it is startup config, not a managed record.
     pub vta_config: Arc<crate::config::vta::VtaConfig>,
     /// Context provisioner, for reporting which contexts exist and which no
-    /// surface claims any more (VTA-20).
+    /// surface claims any more.
     pub provisioner: Option<Arc<crate::vta::provisioning::ContextProvisioner>>,
-    /// What this appliance signs with when nobody has said, and why (VTA-26).
+    /// What this appliance signs with when nobody has said, and why.
     /// Resolved once at startup — it is a property of the install, not of a
     /// request.
     pub default_resolution: Arc<crate::vta::onboarding_default::DefaultResolution>,
@@ -558,7 +558,7 @@ pub async fn create_connection(
     let control_identity = body.control_identity;
     let mut connection = to_connection(uuid::Uuid::new_v4().to_string(), body, VtaConnectionStatus::Unpaired);
 
-    // Every connection gets its **own** control key (VTA-24): revoking one
+    // Every connection gets its **own** control key: revoking one
     // must not strand the others, and a leaked seed must not authenticate the
     // gateway to every VTA it knows. The seed is written to the secrets store
     // and only its reference lands on the record, so no key material is ever
@@ -1449,7 +1449,7 @@ pub async fn vta_status(
             // unless it holds a `did:key` control key in a file.
             "control_key": crate::vta::control_key_live::status(),
             // What this appliance signs with when nobody has said, and why
-            // (VTA-26). Reported so "why is it signing with this?" never
+            //. Reported so "why is it signing with this?" never
             // requires reading config or code.
             "default_resolution": state.default_resolution.as_ref(),
             // Addresses that are off-limits as proxy targets, so an operator

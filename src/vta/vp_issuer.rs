@@ -1,5 +1,5 @@
 //! Signing an agent's Verifiable Presentation through a Verifiable Trust Agent
-//! (VTA-12) — so the gateway stops holding other parties' private keys.
+//! — so the gateway stops holding other parties' private keys.
 //!
 //! The gateway's `LocalVpSigner` signs a VP *as the agent*, using an Ed25519
 //! key the gateway generated for that agent and stored in its identity record.

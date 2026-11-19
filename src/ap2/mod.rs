@@ -243,7 +243,7 @@ async fn create_vp_jwt_with_gateway(
         "jti": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
     });
 
-    // Sign VP with gateway's key via the CredentialAuthority port (VTA-01) so
+    // Sign VP with gateway's key via the CredentialAuthority port so
     // the signing can move to a VTA without touching this call site.
     let authority = crate::identity::authority::LocalCredentialAuthority::new(std::sync::Arc::clone(vc_issuer));
     let vp_jwt = authority

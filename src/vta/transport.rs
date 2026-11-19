@@ -142,7 +142,7 @@ type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>;
 pub struct DidCommTransport {
     channel: Arc<dyn DidCommChannel>,
     vta_did: String,
-    /// The gateway owns the deadline (VTA-04). DIDComm has no connection to
+    /// The gateway owns the deadline. DIDComm has no connection to
     /// time out, so without this a missing reply would hold a surface request
     /// slot indefinitely.
     timeout: Duration,

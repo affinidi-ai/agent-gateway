@@ -118,7 +118,7 @@ pub struct AgentSurface {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_http: Option<super::types::McpHttpConfig>,
     /// Which signing backend, VTA context and key this surface's credentials
-    /// are signed with (VTA-19). Absent ⇒ inherit the appliance default, which
+    /// are signed with. Absent ⇒ inherit the appliance default, which
     /// is exactly today's behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing: Option<SurfaceSigningConfig>,
@@ -179,7 +179,7 @@ pub struct SurfaceSigningConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<SigningBackendKind>,
 
-    /// Stored VTA connection (VTA-23) this surface signs through. Only
+    /// Stored VTA connection this surface signs through. Only
     /// meaningful for `backend = vta`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection_id: Option<String>,

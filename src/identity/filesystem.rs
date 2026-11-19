@@ -173,7 +173,7 @@ pub struct AgentIdentityRecord {
     pub private_key: Option<JsonValue>,
 
     /// The VTA context whose key is this agent's, when the agent's private key
-    /// lives in a Verifiable Trust Agent rather than here (VTA-12).
+    /// lives in a Verifiable Trust Agent rather than here.
     ///
     /// Mutually exclusive with [`private_key`](Self::private_key) in practice:
     /// a VTA-backed agent has no local key, and an agent onboarded before the
@@ -1458,7 +1458,7 @@ mod tests {
         );
     }
 
-    /// An identity record written before VTA-12 has no `vta_context_id`, and
+    /// An identity record written before agents got trust agent contexts has no `vta_context_id`, and
     /// must keep loading. A deployment that upgrades and cannot read its own
     /// agents has lost every managed identity it had.
     #[test]

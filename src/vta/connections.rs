@@ -12,7 +12,7 @@
 //!
 //! A record carries a `control_key_ref` into the secrets store, never inline
 //! key material, and never a session/bearer token: those stay memory-only per
-//! connection (VTA-03), so a leaked record file cannot be replayed against the
+//! connection, so a leaked record file cannot be replayed against the
 //! VTA.
 //!
 //! ## The bootstrap block still works
@@ -45,14 +45,14 @@ pub enum VtaConnectionTransport {
     /// REST over HTTPS (or plain HTTP to a loopback address).
     #[default]
     Https,
-    /// Trust Tasks carried over DIDComm (VTA-27). Accepted so config written
+    /// Trust Tasks carried over DIDComm. Accepted so config written
     /// now stays valid, and rejected by [`VtaConnection::validate`] until the
     /// carrier lands.
     Didcomm,
 }
 
 /// Where a connection is in its pairing lifecycle. Set by the pairing flow
-/// (VTA-24); stored here so the dashboard can render it.
+///; stored here so the dashboard can render it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VtaConnectionStatus {
@@ -114,14 +114,14 @@ pub struct VtaConnection {
     #[serde(default)]
     pub status: VtaConnectionStatus,
 
-    /// Pairing progress (VTA-24): which control DID the customer was asked to
+    /// Pairing progress: which control DID the customer was asked to
     /// grant, the VTA DID pinned on success, what was actually granted, and
     /// why the last attempt failed. A connection whose pairing state is not
     /// `connected` is **not used for signing**.
     #[serde(default)]
     pub pairing: crate::vta::pairing::PairingRecord,
 
-    /// Keys this connection signs with (VTA-20).
+    /// Keys this connection signs with.
     ///
     /// Held on the record rather than in the startup `[vta]` block so a
     /// rotation takes effect without a restart — the whole point of rotating
@@ -688,7 +688,7 @@ mod tests {
         let mut c = connection("c1");
         c.transport = VtaConnectionTransport::Didcomm;
         c.validate()
-            .expect("the didcomm carrier is wired (VTA-27)");
+            .expect("the didcomm carrier is wired");
     }
 
     #[test]
@@ -903,7 +903,7 @@ mod tests {
         assert!(!connection("c1").is_bootstrap());
     }
 
-    // ---- key rotation (VTA-20) -------------------------------------------
+    // ---- key rotation -------------------------------------------
 
     fn key(id: &str) -> SigningKey {
         SigningKey {

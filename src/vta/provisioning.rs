@@ -30,7 +30,7 @@ use crate::vta::key_directory::ContextId;
 
 /// Creates a context on the VTA. A port, because the Trust Task that does it
 /// requires super-admin over the target VTA and lands with the provisioning
-/// control service (VTA-16); the lifecycle rules around it are what this module
+/// control service; the lifecycle rules around it are what this module
 /// owns and tests.
 #[async_trait]
 pub trait ContextCreator: Send + Sync {
@@ -178,7 +178,7 @@ impl ContextProvisioner {
     }
 
     /// Every context name this provisioner has created or adopted, for the Key
-    /// Management inventory (VTA-20).
+    /// Management inventory.
     pub async fn known_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
             .known

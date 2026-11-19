@@ -1,5 +1,5 @@
 //! The gateway's private-key surfaces, and what was decided about each
-//! (VTA-14).
+//!.
 //!
 //! The epic's goal is "an attacker who takes the gateway cannot sign as us".
 //! That claim is only as good as the **least** migrated key, so it cannot be
@@ -77,7 +77,7 @@ pub fn surfaces(vta_enabled: bool) -> Vec<KeySurface> {
             forgeable: "STS access tokens, ID-JAGs, agent-identity credentials, payment evidence, \
                         fabric issuer attestations",
             rationale: "Signs artifacts other parties trust and that outlive the compromise. Routed \
-                        through CredentialAuthority since VTA-01, so enabling [vta] moves it.",
+                        through CredentialAuthority, so enabling [vta] moves it.",
             migrated: Some(vta_enabled),
         },
         KeySurface {
@@ -135,10 +135,10 @@ pub fn surfaces(vta_enabled: bool) -> Vec<KeySurface> {
             name: "Managed agent holder keys",
             disposition: Disposition::Vta,
             severity: Severity::Forgery,
-            location: "_storage/identities/{identity_hash}.json, for agents onboarded before VTA-12",
+            location: "_storage/identities/{identity_hash}.json, for agents onboarded before trust agent contexts",
             forgeable: "Presentations as any managed agent — the worst case, because the key belongs \
                         to someone else",
-            rationale: "Migrated by VTA-12 for newly onboarded agents, whose key is minted in their \
+            rationale: "Moved to a trust agent for newly onboarded agents, whose key is minted in their \
                         own context and whose DID is a did:key with no update key. Existing records \
                         keep their key deliberately: rewriting them would change every agent's DID \
                         and invalidate credentials already issued to them.",
@@ -155,7 +155,7 @@ pub fn surfaces(vta_enabled: bool) -> Vec<KeySurface> {
             location: "_storage/identities/{identity_hash}.json, for did:webvh agents",
             forgeable: "Updates to a managed agent's DID document, re-pointing its verification \
                         methods",
-            rationale: "Does not arise for agents onboarded after VTA-12: their DID is a did:key, \
+            rationale: "Does not arise for agents onboarded into a trust agent context: their DID is a did:key, \
                         which has no mutable document and therefore no update key. Pre-migration \
                         did:webvh agents still carry one.",
             migrated: None,

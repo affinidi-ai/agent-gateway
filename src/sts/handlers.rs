@@ -216,7 +216,7 @@ pub trait StsClientRegistry: Send + Sync {
 /// [`StsSigner`] backed by the gateway [`CredentialAuthority`] port (EdDSA /
 /// gateway key today; a VTA-backed authority later). Routing through the port
 /// rather than `VCIssuer` directly is what lets the signing move to a VTA
-/// without touching this call site (epic VTA integration, VTA-01).
+/// without touching this call site.
 pub struct VcIssuerSigner {
     pub authority: Arc<dyn crate::identity::authority::CredentialAuthority>,
 }
@@ -279,7 +279,7 @@ pub struct JwtBearerSubjectVerifier {
     /// published JWKS — a gateway-issued ID-JAG can be redeemed on the loopback
     /// (issuer == resource AS) without an operator-configured self-trust strategy.
     ///
-    /// This is the **same `CredentialAuthority` that mints tokens** (VTA-09), not
+    /// This is the **same `CredentialAuthority` that mints tokens**, not
     /// the local issuer. The two must agree: minting takes `iss` from
     /// `authority.issuer_did()`, so resolving self-trust from anywhere else would
     /// make the gateway fail to recognise its own tokens the moment signing moved
@@ -337,7 +337,7 @@ impl StsSubjectVerifier for JwtBearerSubjectVerifier {
         //
         // Resolved from the **signing authority**, so this keeps working when
         // signing moves to a VTA: `iss` and the verification keys then both come
-        // from the VTA rather than from the local issuer (VTA-09).
+        // from the VTA rather than from the local issuer.
         if let Ok(self_did) = self
             .self_authority
             .issuer_did()
@@ -984,13 +984,13 @@ pub fn build_sts_router(
         (Some(jwks), Some(store)) => {
             let jwt_verifier = Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(jwks));
             // Self-trust resolves from the **signing** authority, so the gateway
-            // recognises its own tokens whichever backend minted them (VTA-09).
+            // recognises its own tokens whichever backend minted them.
             Arc::new(JwtBearerSubjectVerifier::new(jwt_verifier, store, Arc::clone(&signing_authority)))
         }
         _ => Arc::new(DisabledSubjectVerifier),
     };
     // VP verification stays on the local issuer by design: it is a public-key
-    // operation with no secret, so it needs no VTA hop (VTA-08).
+    // operation with no secret, so it needs no VTA hop.
     let vp_verifier: Arc<dyn StsVpVerifier> = Arc::new(VcIssuerVpVerifier { vc_issuer: vc_issuer.clone() });
     let clients: Arc<dyn StsClientRegistry> = match (client_store, secrets_store) {
         (Some(store), Some(secrets)) => Arc::new(crate::sts::store::StoreBackedClientRegistry::new(store, secrets)),
@@ -4333,7 +4333,7 @@ mod tests {
         assert!(matches!(err, StsError::ServerError(_)));
     }
 
-    /// Self-trust has to survive a rotation. Since VTA-17 the published JWKS
+    /// Self-trust has to survive a rotation. The published JWKS
     /// carries the active key **and** any retiring/carried-over keys, so a
     /// token minted just before a rotation must still be recognisable on the
     /// loopback afterwards — which means every key has to reach the strategy.
@@ -4417,7 +4417,7 @@ mod tests {
         assert_eq!(decode_unverified_issuer("not-a-jwt"), None);
     }
 
-    // ── VTA-17 / SEC0-6115 condition 6: subject-path hardening ───────────────
+    // ── subject-path hardening ───────────────────────────────────────────────
 
     /// The DID `state_with` reports as this gateway's issuer.
     const GATEWAY_DID: &str = "did:webvh:example:gw";
@@ -4486,7 +4486,7 @@ mod tests {
             .expect("the legacy exchange accepts one of its own `typ: JWT` access tokens");
     }
 
-    // ── VTA-09: self-trust follows the signing authority ─────────────────────
+    // ── self-trust follows the signing authority ─────────────────────────────
 
     /// A `CredentialAuthority` standing in for a VTA-backed signer: its issuer
     /// DID is **not** the local gateway's.

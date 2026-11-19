@@ -388,7 +388,7 @@ lazy_static! {
     };
 
     /// Count of signing calls refused because the VTA signing quota for the
-    /// current window was exhausted (VTA-17). A non-zero rate means either an
+    /// current window was exhausted. A non-zero rate means either an
     /// abusive/looping caller or a limit set too low — both worth alerting on.
     pub static ref VTA_QUOTA_EXCEEDED: IntCounter = {
         let counter = IntCounter::new(
@@ -996,7 +996,7 @@ pub fn track_vta_circuit_open() {
     VTA_CIRCUIT_OPEN.inc();
 }
 
-/// Track a signing call refused by the VTA signing quota (VTA-17).
+/// Track a signing call refused by the VTA signing quota.
 pub fn track_vta_quota_exceeded() {
     VTA_QUOTA_EXCEEDED.inc();
 }

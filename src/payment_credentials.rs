@@ -23,7 +23,7 @@ use crate::identity::authority::CredentialAuthority;
 /// deployment that never builds a VTA connector behaves exactly as before), and
 /// the identity router then **upgrades** it to whichever connector `[vta]`
 /// selected. A `OnceLock` would silently keep the first value and leave payment
-/// receipts signed locally while STS signed via the VTA (VTA-10).
+/// receipts signed locally while STS signed via the VTA.
 static GLOBAL_AUTHORITY: RwLock<Option<Arc<dyn CredentialAuthority>>> = RwLock::new(None);
 
 /// Register the gateway's `VCIssuer` for payment-credential issuance. Called
@@ -37,7 +37,7 @@ pub fn set_global_payment_vc_issuer(issuer: Arc<VCIssuer>) {
 }
 
 /// Point payment-credential signing at the **selected** signing connector
-/// (VTA-10). Called from the identity router once `[vta]` has been resolved, so
+///. Called from the identity router once `[vta]` has been resolved, so
 /// payment receipts are signed by the same backend as STS tokens rather than
 /// always by the local key.
 pub fn set_global_payment_credential_authority(authority: Arc<dyn CredentialAuthority>) {
@@ -195,7 +195,7 @@ async fn sign_credential(
     vc_type: &str,
     subject: impl Serialize,
 ) -> Option<IssuedCredential> {
-    // The **selected** signing backend (VTA-10): local by default, or the VTA
+    // The **selected** signing backend: local by default, or the VTA
     // connector when `[vta]` is enabled. A payment receipt is a VC-JWT, so it
     // signs through the same `keys/sign-jws` path STS uses — no VTA-side
     // credential task is needed.

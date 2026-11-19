@@ -1,4 +1,4 @@
-//! Per-agent VTA contexts (VTA-12): provisioning an agent identity whose
+//! Per-agent VTA contexts: provisioning an agent identity whose
 //! private key never exists on this host, and finding it again later.
 //!
 //! An agent's holder key lives in its own VTA context because

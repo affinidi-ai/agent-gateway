@@ -1,4 +1,4 @@
-//! Signing-rate quota for the VTA connector (VTA-17 / SEC0-6115 condition 5).
+//! Signing-rate quota for the VTA connector.
 //!
 //! The circuit breaker and concurrency bound in [`super::resilience`] protect
 //! the **gateway** from a slow VTA. This protects the **key** from the gateway:

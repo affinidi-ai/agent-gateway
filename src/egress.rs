@@ -350,7 +350,7 @@ pub(crate) fn pinned_forward_client(
     // A trust agent can sit on loopback or a private network — addresses this
     // policy deliberately allows — so without this check an operator-configured
     // surface could forward to the agent holding this gateway's signing keys
-    // (VTA-21). The VTA is a control-plane dependency; it is never a proxy
+    //. The VTA is a control-plane dependency; it is never a proxy
     // target.
     crate::vta::isolation::assert_not_vta(raw_url).map_err(EgressError::Blocked)?;
     let url = validate_url_not_cloud_metadata_host(raw_url).map_err(EgressError::Blocked)?;
@@ -1286,7 +1286,7 @@ mod tests {
 
     /// A trust agent can sit on exactly the addresses the forward leg allows, so
     /// without an explicit reservation a surface could proxy a caller straight
-    /// to the agent holding this gateway's signing keys (VTA-21).
+    /// to the agent holding this gateway's signing keys.
     #[test]
     fn neither_pinned_client_will_reach_a_reserved_vta() {
         let _guard = crate::vta::isolation::TEST_LOCK

@@ -1,4 +1,4 @@
-//! Resilience for VTA calls (VTA-04): the gateway owns the deadline so a slow or
+//! Resilience for VTA calls: the gateway owns the deadline so a slow or
 //! hung VTA cannot tie up surface request slots.
 //!
 //! A VTA call runs on the inbound hot path while a connection slot is held, so

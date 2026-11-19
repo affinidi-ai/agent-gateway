@@ -6,7 +6,7 @@
 //!
 //! The block is **off by default**: an absent `[vta]` table, or `enabled =
 //! false`, leaves the gateway signing locally with its in-process issuer key
-//! exactly as before (see the `CredentialAuthority` port, VTA-01). When
+//! exactly as before (see the `CredentialAuthority` port). When
 //! `enabled = true` the gateway delegates private-key operations to a VTA,
 //! acting as a thin REST/Trust-Task **client** of the VTA's `/trust-tasks`
 //! surface (the gateway and VTA are separate services; the gateway does not
@@ -170,7 +170,7 @@ fn default_purposes() -> Vec<KeyPurpose> {
 ///
 /// A per-surface migration and a key rotation both mean two keys are live at
 /// once: the new one signs, the old one must still verify. A verifier selects
-/// between them by `kid` (VTA-17 / SEC0-6115 condition 8).
+/// between them by `kid`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetiringKey {
     /// The VTA key record id — also the published `kid`.
@@ -196,7 +196,7 @@ pub struct VtaConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// What this appliance signs with when nobody has said (VTA-26).
+    /// What this appliance signs with when nobody has said.
     ///
     /// `auto` (the default) and `legacy_local` both keep the local issuer key;
     /// `legacy_local` says so explicitly. Settable so a fleet or IaC install
@@ -231,7 +231,7 @@ pub struct VtaConfig {
     /// connector's whole purpose is to sign, and a connector with no key to
     /// sign with is a misconfiguration, so it is a startup error rather than a
     /// first-signing-call surprise. The gateway never sees the private key;
-    /// it only names which VTA-held key signs (VTA-06/07).
+    /// it only names which VTA-held key signs.
     #[serde(default)]
     pub signing_key_id: Option<String>,
 
@@ -248,11 +248,11 @@ pub struct VtaConfig {
     pub signing_key_public: Option<String>,
 
     /// Keys that are **retiring**: still published so the tokens they signed
-    /// keep verifying, but no longer used to sign (VTA-17).
+    /// keep verifying, but no longer used to sign.
     #[serde(default)]
     pub retiring_keys: Vec<RetiringKey>,
 
-    /// Which signing purposes this backend is asked to serve (VTA-18).
+    /// Which signing purposes this backend is asked to serve.
     /// Defaults to `["jwt"]`, which is what the flat `signing_key_id` has
     /// always meant.
     ///
@@ -268,14 +268,13 @@ pub struct VtaConfig {
 
     /// How the gateway's auth/control key (the Ed25519 `did:key` the gateway
     /// authenticates to the VTA with) is sourced: e.g. `env://VAR` or
-    /// `file://path`. Optional in the PoC — when absent the connector uses an
-    /// ephemeral control key (resets on restart). Custody (encryption at rest,
-    /// non-exportable KMS) is formalised in VTA-03.
+    /// `file://path`. Optional — when absent the connector uses an ephemeral
+    /// control key (resets on restart).
     #[serde(default)]
     pub auth_key_source: Option<String>,
 
     /// The gateway's auth/control **identifier**, when it should be stable
-    /// across key rotation (VTA-13).
+    /// across key rotation.
     ///
     /// Absent (the default) the identifier is derived from the key itself as a
     /// `did:key`, so rotating the key means a new identity and a fresh VTA
@@ -354,18 +353,18 @@ pub struct VtaConfig {
     #[serde(default, skip_serializing)]
     pub expect_pcr0: Option<serde::de::IgnoredAny>,
 
-    /// Per-call timeout to the VTA in milliseconds (VTA-04). The gateway owns
+    /// Per-call timeout to the VTA in milliseconds. The gateway owns
     /// the deadline so a hung VTA cannot tie up a surface.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
 
-    /// Max concurrent in-flight VTA calls (VTA-04). Excess fails fast rather
+    /// Max concurrent in-flight VTA calls. Excess fails fast rather
     /// than queueing unboundedly.
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
 
     /// Emit a **data-minimized** (identifiers + hashes only), **bounded**,
-    /// **non-blocking** audit record to the VTA for each signing event (VTA-08).
+    /// **non-blocking** audit record to the VTA for each signing event.
     /// Off by default; audit never blocks or fails the request it describes.
     #[serde(default)]
     pub audit_enabled: bool,
@@ -376,7 +375,7 @@ pub struct VtaConfig {
     pub audit_queue_capacity: usize,
 
     /// Max signing calls allowed per [`Self::sign_quota_window_secs`] window
-    /// (VTA-17 / SEC0-6115 condition 5). Bounds how much a compromised or
+    ///. Bounds how much a compromised or
     /// looping caller can mint before someone notices; exceeding it **fails
     /// closed** and is metered. `0` disables the quota.
     #[serde(default = "default_sign_quota_max")]
@@ -388,7 +387,7 @@ pub struct VtaConfig {
     pub sign_quota_window_secs: u64,
 
     /// Create a VTA context per surface (and per overriding variant) on first
-    /// use (VTA-19).
+    /// use.
     ///
     /// Off by default, because it requires **super-admin on the target VTA** —
     /// authority a customer-owned (BYO) VTA does not grant. With it off, a
@@ -398,7 +397,7 @@ pub struct VtaConfig {
     #[serde(default)]
     pub auto_provision_contexts: bool,
 
-    /// Upper bound on contexts this gateway may create (VTA-19). Bounds the
+    /// Upper bound on contexts this gateway may create. Bounds the
     /// blast radius of a loop or a misconfiguration; exceeding it **fails
     /// closed** and is audited with the limit named.
     #[serde(default = "default_max_contexts")]
@@ -536,7 +535,7 @@ impl VtaConfig {
         {
             return Err("[vta] retiring_keys must not contain the active signing_key_id".to_string());
         }
-        // Capability negotiation (VTA-18): an operator who asks the VTA backend
+        // Capability negotiation: an operator who asks the VTA backend
         // for a purpose it cannot serve finds out now, with the backend and the
         // purpose both named, rather than when the first request that needs it
         // fails.

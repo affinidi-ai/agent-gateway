@@ -2504,9 +2504,9 @@ pub async fn create_identity_api_router(
     // configured-but-unbuildable VTA connector aborts startup rather than
     // silently signing locally.
     //
-    // Selection goes through the `KeyDirectory` (VTA-18) rather than pinning a
+    // Selection goes through the `KeyDirectory` rather than pinning a
     // connector for the whole process: the directory is what will resolve a key
-    // per request once per-surface and per-variant contexts land (VTA-19). With
+    // per request once per-surface and per-variant contexts land. With
     // nothing mapped it resolves the appliance default, which is exactly the
     // connector the flat `[vta]` config has always selected.
     let sts_local_authority: std::sync::Arc<dyn crate::identity::authority::CredentialAuthority> =
@@ -2517,8 +2517,8 @@ pub async fn create_identity_api_router(
             panic!("VTA signing connector is enabled but could not be initialised: {}", e.log_detail())
         });
 
-    // Lazy context provisioning (VTA-19). Creating a context uses the narrow
-    // `context-create` capability (VTA-16), never super-admin: every context
+    // Lazy context provisioning. Creating a context uses the narrow
+    // `context-create` capability, never super-admin: every context
     // the gateway creates is a child of the one it was granted, which is also
     // the only place that capability reaches. A gateway without it — or with
     // auto-provisioning off — keeps the creator that refuses with a message
@@ -2565,7 +2565,7 @@ pub async fn create_identity_api_router(
         .await
         .unwrap_or_else(|e| panic!("VTA signing key could not be resolved: {}", e.log_detail()));
 
-    // Managed VTA connections (VTA-23): several VTAs can be mapped at once, and
+    // Managed VTA connections: several VTAs can be mapped at once, and
     // an edit or a disable takes effect without a restart because the registry
     // rebuilds — or refuses — on next use rather than the process pinning one
     // connector at boot. The bootstrap connector is handed over so the migrated
@@ -2599,7 +2599,7 @@ pub async fn create_identity_api_router(
     let key_directory =
         key_directory.with_appliance_default(std::sync::Arc::new(crate::vta::key_directory::SettingsApplianceDefault));
 
-    // Per-surface and per-variant signing mappings (VTA-19). A surface with no
+    // Per-surface and per-variant signing mappings. A surface with no
     // `signing` block installs nothing and keeps resolving the appliance
     // default, so a gateway that has never mapped anything behaves exactly as
     // before. A bad mapping is logged and skipped rather than aborting
@@ -2699,7 +2699,7 @@ pub async fn create_identity_api_router(
         .layer(Extension(storage.clone()))
         .layer(Extension(rbac_config.clone()));
         // The key inventory reports which surface maps to which context
-        // (VTA-20); without the store it reports connections only, rather
+        //; without the store it reports connections only, rather
         // than failing.
         let router = match state
             .agent_surface_store
@@ -2726,18 +2726,18 @@ pub async fn create_identity_api_router(
     // Payment-receipt VCs are VC-JWTs, so they sign through the same connector
     // as STS tokens. Upgrade the payment issuer from the local default the
     // orchestrator registered at boot to the appliance authority, so receipts
-    // follow the same choice as STS (VTA-10).
+    // follow the same choice as STS.
     crate::payment_credentials::set_global_payment_credential_authority(std::sync::Arc::clone(&sts_signing_authority));
 
     // The JWT-shaped agent-identity credential signs through the same connector
-    // (VTA-11a). The issuer is late-bound because the connector can only be
+    //. The issuer is late-bound because the connector can only be
     // selected after `[vta]` is resolved, which is here rather than at
     // `VCIssuer::new`.
     sts_vc_issuer
         .set_signing_authority(std::sync::Arc::clone(&sts_signing_authority))
         .await;
 
-    // Which key signs for which surface (VTA-19). Installed after the
+    // Which key signs for which surface. Installed after the
     // appliance-wide authority so the directory is consulted first and that
     // one remains the fallback: a surface that maps nothing resolves the same
     // default and signs with exactly the key it did before. Until this was
@@ -2748,7 +2748,7 @@ pub async fn create_identity_api_router(
         .await;
 
     // The Data-Integrity agent-identity credential embedded in the forwarding
-    // VP issues through the VTA's context-scoped task (VTA-11b), so the issuer
+    // VP issues through the VTA's context-scoped task, so the issuer
     // key lives in the agent rather than in this process. Absent a VTA the
     // local issuer stays in place unchanged.
     //
@@ -2796,7 +2796,7 @@ pub async fn create_identity_api_router(
     }
 
     // The agent's **holder** proof signs in the agent's own VTA context
-    // (VTA-12), so the gateway stops custodying other parties' private keys.
+    //, so the gateway stops custodying other parties' private keys.
     // Both halves are set together: the provisioner is what gives a newly
     // onboarded agent a context, and the issuer is what finds it again at
     // signing time. Setting only one would either onboard agents whose key
@@ -3282,7 +3282,7 @@ pub fn create_onboarding_router(state: IdentityApiState) -> Router {
 
 /// Record the contexts a surface (and its variants) names explicitly, so the
 /// provisioner never tries to create one that already exists and the quota
-/// reflects reality (VTA-19).
+/// reflects reality.
 ///
 /// The adoption key is the **derived** name, so an explicitly-mapped surface
 /// and an auto-provisioned one occupy the same slot — renaming the surface

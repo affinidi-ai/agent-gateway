@@ -47,7 +47,7 @@ struct Session {
 ///
 /// Carrier-agnostic: the auth handshake, session caching, resilience and error
 /// redaction all sit above [`TrustTaskTransport`], so a connection reached over
-/// DIDComm behaves identically to one reached over HTTPS (VTA-27).
+/// DIDComm behaves identically to one reached over HTTPS.
 pub struct VtaRestClient {
     transport: Arc<dyn TrustTaskTransport>,
     vta_did: String,
@@ -55,9 +55,9 @@ pub struct VtaRestClient {
     /// rotates its control key; never held across an `.await`.
     control: std::sync::RwLock<(u64, Arc<dyn SignerKeyProvider>)>,
     session: RwLock<Option<Session>>,
-    /// Back-pressure + circuit breaker so a slow/hung VTA fails fast (VTA-04).
+    /// Back-pressure + circuit breaker so a slow/hung VTA fails fast.
     resilience: Resilience,
-    /// Customer-sovereign onboarding checks run after the first auth (VTA-05).
+    /// Customer-sovereign onboarding checks run after the first auth.
     onboarding: Option<OnboardingState>,
     /// Asked for a newer control key when the trust agent refuses this one.
     key_reloader: Option<Arc<dyn ControlKeyReloader>>,
@@ -69,7 +69,7 @@ pub struct VtaRestClient {
 impl VtaRestClient {
     /// Build a client for `base_url` with a per-call `timeout`, authenticating
     /// as `control_key` to the VTA identified by `vta_did`. `max_concurrent`
-    /// bounds in-flight VTA calls; `onboarding` (optional) runs the VTA-05
+    /// bounds in-flight VTA calls; `onboarding` (optional) runs the
     /// grant-scope + record checks after the first authentication.
     pub fn new(
         base_url: &str,
@@ -88,7 +88,7 @@ impl VtaRestClient {
         ))
     }
 
-    /// Build a client over an explicit carrier (VTA-27). Everything above the
+    /// Build a client over an explicit carrier. Everything above the
     /// carrier is identical, which is what makes transport a per-connection
     /// choice rather than a code path.
     pub fn with_transport(
@@ -294,7 +294,7 @@ impl VtaRestClient {
 
         let expires_at = Instant::now() + Duration::from_secs(auth.tokens.expires_in).saturating_sub(self.expiry_skew);
         let access_token = auth.tokens.access_token;
-        // VTA-05: verify the grant scope + persist the onboarding record once,
+        // Verify the grant scope + persist the onboarding record once,
         // from the first session token (advisory — never fails the handshake).
         if let Some(onboarding) = &self.onboarding {
             onboarding
@@ -401,7 +401,7 @@ impl VtaRestClient {
     /// from the key behind it. `keys/create` and `contexts/create` both answer
     /// `proofRequired` without one.
     ///
-    /// Used in production by context provisioning (VTA-16): a gateway holding
+    /// Used in production by context provisioning: a gateway holding
     /// the narrow `context-create` capability creates its own per-surface
     /// contexts, so provisioning is no longer out-of-band. The signing path
     /// (`keys/sign-jws`) uses it too — that specification declares its request
@@ -1151,7 +1151,7 @@ mod tests {
         eprintln!("LIVE_REFUSED: {err:?}");
     }
 
-    /// Live VTA-05 check: the real session token's grant scope parses, and the
+    /// Live onboarding check: the real session token's grant scope parses, and the
     /// admin-seeded control key (`vta import-did --role admin`) is correctly
     /// detected as **over-privileged** (not least-privilege). Same manual setup
     /// as [`live_authenticate_against_real_vta`].

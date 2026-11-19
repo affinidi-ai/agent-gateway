@@ -2,8 +2,8 @@
 //!
 //! Before this module the appliance picked **one** [`CredentialAuthority`] at
 //! boot, pinned to one key id. That singleton is what blocks per-surface and
-//! per-variant contexts (VTA-19), per-tenant selection (VTA-15), per-agent keys
-//! (VTA-12) and an HSM backend (VTA-22): they all need the same thing —
+//! per-variant contexts, per-tenant selection, per-agent keys
+//! and an HSM backend: they all need the same thing —
 //! *resolve which key, per request, behind the existing seam*.
 //!
 //! A [`KeyRef`] names a key without holding it: which **backend** holds it, in
@@ -14,7 +14,7 @@
 //!
 //! ## Purpose is a security control, not metadata
 //!
-//! [`KeyPurpose`] is the gateway-side mirror of the VTA-06 `typ` allow-list: the
+//! [`KeyPurpose`] is the gateway-side mirror of the trust agent's `typ` allow-list: the
 //! key that signs access tokens must not be usable to sign credentials, and
 //! vice-versa. [`KeyDirectory::authority_for`] therefore takes the purpose the
 //! caller is signing *for* and refuses a `KeyRef` minted for a different one —
@@ -42,7 +42,7 @@ pub struct KeyId(pub String);
 
 impl KeyId {
     /// Read the id back out. Used by callers that render a `KeyRef` (the Key
-    /// Management dashboard, VTA-20) and by this module's tests.
+    /// Management dashboard) and by this module's tests.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -76,9 +76,8 @@ impl From<&str> for ContextId {
 pub enum KeyBackend {
     /// The gateway's own in-process issuer key.
     Local,
-    /// A VTA, addressed by stored connection. A single bootstrap-configured
-    /// connection exists today; VTA-23 makes connections managed records, at
-    /// which point `connection_id` selects between several.
+    /// A VTA, addressed by stored connection: `connection_id` selects the
+    /// `[vta]` block's connection or a managed one.
     Vta { connection_id: String },
 }
 
@@ -98,7 +97,7 @@ impl KeyBackend {
 pub struct KeyRef {
     pub backend: KeyBackend,
     pub context: Option<ContextId>,
-    /// **Purpose-dependent (decision D-11).** Present for [`KeyPurpose::Jwt`] —
+    /// **Purpose-dependent.** Present for [`KeyPurpose::Jwt`] —
     /// `keys/sign-jws` takes a caller-named `keyId`. Absent for
     /// [`KeyPurpose::Credential`] / [`KeyPurpose::Proof`], where the key is
     /// *determined* by the context's issuer DID and resolved VTA-side; letting
@@ -121,8 +120,8 @@ impl KeyRef {
         }
     }
 
-    /// Reject a `KeyRef` whose `key_id` presence contradicts its purpose
-    /// (decision D-11), and whose backend cannot serve that purpose at all.
+    /// Reject a `KeyRef` whose `key_id` presence contradicts its purpose, and
+    /// whose backend cannot serve that purpose at all.
     pub fn validate(&self) -> Result<(), VtaError> {
         if !supports(&self.backend, self.purpose) {
             return Err(VtaError::Config(format!(
@@ -161,7 +160,7 @@ impl KeyRef {
 /// This is the single source of truth behind both config validation and
 /// [`KeyDirectory::authority_for`], so the two can never disagree.
 ///
-/// The VTA backend signs JWS (`keys/sign-jws`, VTA-06) and issues credentials
+/// The VTA backend signs JWS (`keys/sign-jws`) and issues credentials
 /// under the *context's* own issuer DID (`keys/sign-document`), which
 /// is what lets a surface's own agent sign the credential embedded in the
 /// presentation it forwards. It cannot yet build a standalone Data Integrity
@@ -189,8 +188,8 @@ pub struct KeyScope {
 }
 
 impl KeyScope {
-    /// Convenience constructors for the coordinates VTA-19 will supply from a
-    /// request's surface/variant and VTA-15 from its tenant.
+    /// Convenience constructors for a request's surface, variant and tenant
+    /// coordinates.
     pub fn surface(surface_id: impl Into<String>) -> Self {
         Self {
             surface_id: Some(surface_id.into()),
@@ -315,8 +314,7 @@ pub struct KeyDirectory {
     /// [`KeyDirectory::build`]; falls back to the local key for any purpose the
     /// config does not cover.
     defaults: HashMap<KeyPurpose, KeyRef>,
-    /// Scoped overrides, consulted before the defaults. Empty until VTA-19
-    /// provides per-surface/variant config.
+    /// Scoped overrides, consulted before the defaults.
     mappings: Vec<KeyMapping>,
     local: Arc<dyn CredentialAuthority>,
     /// Contexts already given a signing identity, so the bootstrap costs one
@@ -330,22 +328,22 @@ pub struct KeyDirectory {
     /// no secrets store — still resolves exactly what `[vta]` always built.
     vta: Option<Arc<dyn CredentialAuthority>>,
     /// The Data-Integrity agent-identity issuer built from the same bootstrap
-    /// client as `vta` (VTA-11b). Shared rather than built separately because
+    /// client as `vta`. Shared rather than built separately because
     /// one control DID gets one VTA session — a second client authenticating as
     /// the same DID supersedes the first.
     di_vc_issuer: Option<Arc<dyn crate::identity::ssi::vc_issuer::VcIssuer>>,
     /// Creates per-surface contexts under the gateway's own, from the same
-    /// bootstrap client (VTA-16). `None` when `[vta]` is disabled or
+    /// bootstrap client. `None` when `[vta]` is disabled or
     /// auto-provisioning is off.
     context_creator: Option<Arc<dyn crate::vta::provisioning::ContextCreator>>,
     /// Provisions a per-agent context so an agent's holder key lives in the
-    /// VTA rather than on this host (VTA-12). `None` under the same conditions
+    /// VTA rather than on this host. `None` under the same conditions
     /// as `context_creator`.
     agent_provisioner: Option<Arc<dyn crate::vta::agent_contexts::AgentKeyProvisioner>>,
-    /// The client the holder-proof issuer dials (VTA-12), shared so a second
+    /// The client the holder-proof issuer dials, shared so a second
     /// session for the same control DID never supersedes the first.
     client: Option<Arc<crate::vta::client::VtaRestClient>>,
-    /// Managed connection records (VTA-23). When present, any other
+    /// Managed connection records. When present, any other
     /// `connection_id` resolves through it, so several VTAs can be mapped at
     /// once and edits take effect without a restart.
     connections: Option<Arc<crate::vta::registry::VtaConnectionRegistry>>,
@@ -365,7 +363,7 @@ pub struct KeyDirectory {
     /// a restart — the same reason registry-backed connections are resolved
     /// per call rather than cached here.
     appliance_default: Option<Arc<dyn ApplianceSigningDefault>>,
-    /// Lazy context provisioning (VTA-19). When present, a VTA-backed `KeyRef`
+    /// Lazy context provisioning. When present, a VTA-backed `KeyRef`
     /// that names no context has one derived and created on first use.
     provisioner: Option<Arc<crate::vta::provisioning::ContextProvisioner>>,
     /// Connectors are reusable across requests; cache per `KeyRef` so a
@@ -682,7 +680,7 @@ impl KeyDirectory {
     }
 
     /// The agent-identity provisioner, when `[vta]` selected one and
-    /// auto-provisioning is enabled (VTA-12).
+    /// auto-provisioning is enabled.
     ///
     /// `None` leaves onboarding generating an agent key on this host, which is
     /// the pre-migration behaviour.
@@ -695,7 +693,7 @@ impl KeyDirectory {
         self.client.clone()
     }
 
-    /// Attach the managed connection registry (VTA-23), so a `KeyRef` naming
+    /// Attach the managed connection registry, so a `KeyRef` naming
     /// any stored connection resolves through it. Without this only the
     /// bootstrap connection is reachable.
     pub fn with_connections(
@@ -817,7 +815,7 @@ impl KeyDirectory {
             })
     }
 
-    /// Attach the lazy context provisioner (VTA-19), so a surface that asks
+    /// Attach the lazy context provisioner, so a surface that asks
     /// for a VTA backend without naming a context gets one created on first
     /// use. Without it, such a surface is a configuration error — which is
     /// what surface validation reports.
@@ -830,7 +828,7 @@ impl KeyDirectory {
     }
 
     /// Install a scoped override, fed from per-surface and per-variant
-    /// `signing` config (VTA-19).
+    /// `signing` config.
     ///
     /// Returns an error for a `KeyRef` the backend cannot honour, so a bad
     /// mapping is rejected when it is installed rather than when it first signs.
@@ -869,7 +867,7 @@ impl KeyDirectory {
         Ok(())
     }
 
-    /// Install the mappings a surface and its variants declare (VTA-19).
+    /// Install the mappings a surface and its variants declare.
     ///
     /// A surface with no `signing` block installs nothing and therefore keeps
     /// resolving the appliance default — exactly today's behaviour. A variant
@@ -1033,7 +1031,7 @@ impl KeyDirectory {
             })
     }
 
-    /// [`Self::resolve`], plus **lazy context provisioning** (VTA-19).
+    /// [`Self::resolve`], plus **lazy context provisioning**.
     ///
     /// A VTA-backed key that names no context has one derived from the scope's
     /// stable ids and created on first use. Deriving the name rather than
@@ -1188,8 +1186,7 @@ impl KeyDirectory {
     }
 }
 
-/// Connection id of the single bootstrap-configured VTA. VTA-23 replaces this
-/// with real stored connection records.
+/// Connection id of the `[vta]` block's own connection.
 pub const DEFAULT_CONNECTION_ID: &str = "default";
 
 /// Whether `connection_id` names the `[vta]` connection, the only one this
@@ -1406,7 +1403,7 @@ pub fn signing_key_ref(
             .context_id
             .as_deref()
             .map(ContextId::from),
-        // D-11: only a `jwt` key is caller-named; for the other purposes the
+        // Only a `jwt` key is caller-named; for the other purposes the
         // key follows the context's issuer DID and a named one would be wrong.
         key_id: match (backend == KeyBackend::Local, purpose) {
             (false, KeyPurpose::Jwt) => signing
@@ -1680,7 +1677,7 @@ mod tests {
         assert!(msg.contains("nope"), "the error must name the connection: {msg}");
     }
 
-    // ---- managed connections (VTA-23) ------------------------------------
+    // ---- managed connections ------------------------------------
 
     /// Two surfaces mapped to different connections must reach **different**
     /// VTAs, and a connection the registry refuses must fail closed rather than
@@ -1710,8 +1707,8 @@ mod tests {
                 status: VtaConnectionStatus::Connected,
                 keys: Default::default(),
                 // Paired, so the registry gets past the pairing gate and this
-                // test exercises connection *selection* rather than VTA-24's
-                // fail-closed path (which has its own tests).
+                // test exercises connection *selection* rather than the pairing
+                // gate's fail-closed path (which has its own tests).
                 pairing: crate::vta::pairing::PairingRecord {
                     state: crate::vta::pairing::PairingState::Connected,
                     ..Default::default()
@@ -1843,7 +1840,7 @@ mod tests {
                 connection_id: Some("vta-a".to_string()),
                 context_id: Some("ctx-a".to_string()),
                 // Required for the jwt purpose; stripped for credential,
-                // whose key follows the context's issuer DID (D-11).
+                // whose key follows the context's issuer DID.
                 key_id: Some("gateway-jwt-1".to_string()),
             }),
             ..Default::default()
@@ -2166,7 +2163,7 @@ mod tests {
         assert!(msg.contains("vta") && msg.contains("proof"), "unexpected error: {msg}");
     }
 
-    // ---- decision D-11: key_id presence is purpose-dependent -------------
+    // ---- key_id presence is purpose-dependent -----------------------------
 
     #[test]
     fn a_jwt_key_ref_without_a_key_id_is_rejected() {
@@ -2180,9 +2177,8 @@ mod tests {
 
     #[test]
     fn a_credential_key_ref_naming_a_key_id_is_rejected() {
-        // Hypothetically allowed backend-wise once VTA-28 lands; the D-11 rule
-        // is independent of that, so assert it against the local backend which
-        // already serves the purpose.
+        // The rule is independent of the backend, so assert it against the
+        // local backend, which already serves the purpose.
         let key_ref = KeyRef {
             backend: KeyBackend::Local,
             context: None,
@@ -2363,7 +2359,7 @@ mod tests {
         assert!(Arc::ptr_eq(&local, &authority));
     }
 
-    // ---- per-surface / per-variant signing (VTA-19) -----------------------
+    // ---- per-surface / per-variant signing -----------------------
 
     fn surface_with(
         surface_id: &str,

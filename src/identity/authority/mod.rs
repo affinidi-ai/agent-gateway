@@ -1,4 +1,4 @@
-//! Credential/token *issuing authority* port (VTA-01).
+//! Credential/token *issuing authority* port.
 //!
 //! The gateway signs STS access tokens / ID-JAGs, payment-receipt presentations
 //! and AP2 presentations with its local Ed25519 *issuer* key (owned by
@@ -7,14 +7,12 @@
 //! such caller goes through the [`CredentialAuthority`] port instead of binding
 //! to `VCIssuer` directly.
 //!
-//! This ticket (VTA-01) ships **only** the local implementation
-//! ([`LocalCredentialAuthority`]), which delegates to the in-process `VCIssuer`
-//! and is therefore byte-for-byte identical to the previous behaviour — no wire
-//! format or functional change. A `VtaCredentialAuthority` that dispatches the
-//! `keys/sign-jws/0.1` Trust Task lands in VTA-02 and later.
+//! [`LocalCredentialAuthority`] delegates to the in-process `VCIssuer`; the
+//! trust agent implementation (`VtaCredentialAuthority`) dispatches the
+//! `keys/sign-jws/0.1` Trust Task.
 //!
 //! Verification stays local by design and is deliberately **not** part of this
-//! port — a VTA is an *issuing* authority, not a verifier (see epic VTA-08).
+//! port — a VTA is an *issuing* authority, not a verifier.
 
 use std::sync::Arc;
 

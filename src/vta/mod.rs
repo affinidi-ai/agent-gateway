@@ -78,23 +78,23 @@ use control_key::{ControlKey, SignerKeyProvider};
 /// opening their own.
 pub struct SelectedSigning {
     /// Signs JWT-shaped artifacts: STS tokens, ID-JAGs, payment receipts, and
-    /// the JWT agent-identity credential (VTA-11a).
+    /// the JWT agent-identity credential.
     pub authority: Arc<dyn CredentialAuthority>,
     /// Issues the Data-Integrity agent-identity credential embedded in the
-    /// forwarding VP (VTA-11b). `None` when `[vta]` is disabled, in which case
+    /// forwarding VP. `None` when `[vta]` is disabled, in which case
     /// the local issuer stays in place.
     pub di_vc_issuer: Option<Arc<dyn crate::identity::ssi::vc_issuer::VcIssuer>>,
-    /// Creates per-surface contexts under the gateway's own (VTA-16). `None`
+    /// Creates per-surface contexts under the gateway's own. `None`
     /// when `[vta]` is disabled or the operator has not opted into
     /// auto-provisioning, in which case an unmapped surface is a configuration
     /// error rather than something provisioned behind the operator's back.
     pub context_creator: Option<Arc<dyn crate::vta::provisioning::ContextCreator>>,
     /// Provisions a per-agent context so an agent's holder key lives in the
-    /// VTA rather than on this host (VTA-12). `None` under the same conditions
+    /// VTA rather than on this host. `None` under the same conditions
     /// as `context_creator`, and for the same reason: provisioning a context
     /// per managed agent is not something to start doing silently.
     pub agent_provisioner: Option<Arc<dyn crate::vta::agent_contexts::AgentKeyProvisioner>>,
-    /// The client the holder-proof issuer dials (VTA-12).
+    /// The client the holder-proof issuer dials.
     ///
     /// Handed out rather than used here because that issuer needs the identity
     /// store to map an agent to its context, and the store is not available
@@ -159,7 +159,7 @@ pub async fn select_signing_backends(
         tracing::warn!(target: "vta_audit", "could not settle a pending control key: {}", e.log_detail());
     }
     let control_key = build_control_key(config).await?;
-    // Customer-sovereign onboarding (VTA-05): print the exact one-consent-step
+    // Customer-sovereign onboarding: print the exact one-consent-step
     // grant command the customer runs on their VTA, and set up the post-auth
     // grant-scope + record checks. The gateway never holds VTA admin itself.
     tracing::info!(
@@ -197,14 +197,14 @@ pub async fn select_signing_backends(
     }
     let client = Arc::new(client);
 
-    // Optional VTA-08 audit sink: bounded, data-minimized, non-blocking. Off by
+    // Optional audit sink: bounded, data-minimized, non-blocking. Off by
     // default; when enabled it logs hashes-only records on the `vta_audit`
     // target and can never block or fail a signing request.
     let audit = config
         .audit_enabled
         .then(|| audit::VtaAuditSink::spawn(config.audit_queue_capacity, Arc::new(audit::LogAuditEmitter)));
 
-    // VTA-17: keep the local issuer's **public** key in the published JWKS.
+    // Keep the local issuer's **public** key in the published JWKS.
     // Migrating surface by surface means tokens signed by the local key are
     // still in flight; dropping it from the JWKS would break them. A failure
     // here must not block startup — it only costs the carried-over key.
@@ -230,7 +230,7 @@ pub async fn select_signing_backends(
     // Provisioning uses the narrow `context-create` capability, never
     // super-admin: every context it creates is a child of the one the gateway
     // was granted, which is also the only place the capability reaches
-    // (VTA-16). Opt-in, because a gateway whose grant lacks the capability
+    //. Opt-in, because a gateway whose grant lacks the capability
     // should be told so at surface-write time rather than discover it at the
     // first signing call.
     let provisioner: Option<Arc<dyn crate::vta::provisioning::ContextCreator>> = config
@@ -323,7 +323,7 @@ async fn build_control_key(config: &VtaConfig) -> Result<Arc<dyn SignerKeyProvid
     let key = build_control_key_material(config).await?;
     // A stable identifier is applied *after* the key is sourced, because the
     // two are independent by design: the key rotates, the identifier does not
-    // (VTA-13). Nothing here can rewrite the DID document — the update key
+    //. Nothing here can rewrite the DID document — the update key
     // that could lives off this host.
     let Some(auth_did) = config.auth_did.as_deref() else {
         return Ok(Arc::new(key));
@@ -476,7 +476,7 @@ async fn load_or_create_file_key(path: &std::path::Path) -> Result<ControlKey, V
 ///
 /// Derived rather than stored on the connection record, so the DID the customer
 /// is asked to grant and the key the gateway will actually authenticate with
-/// cannot drift apart (VTA-24).
+/// cannot drift apart.
 pub fn control_key_did(seed_hex: &str) -> Result<String, VtaError> {
     Ok(ControlKey::from_seed(decode_hex_seed(seed_hex)?)
         .did()

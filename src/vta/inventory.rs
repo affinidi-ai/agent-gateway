@@ -2,8 +2,7 @@
 //!
 //! An operator cannot currently answer basic questions without reading logs and
 //! config: *which key signed this token? which surface uses which context? what
-//! happens if I rotate?* VTA-18/19 made the answers computable; this module
-//! makes them readable in one place.
+//! happens if I rotate?* This module answers them in one place.
 //!
 //! Everything here is **derived**, never a second source of truth: connections
 //! come from the connection store, mappings from each surface's `signing`
@@ -94,7 +93,7 @@ pub struct KeyInventory {
     /// delete its keys, because artifacts they signed must stay verifiable.
     pub orphaned_contexts: Vec<String>,
     /// Every private-key surface the gateway has and what was decided about
-    /// it (VTA-14).
+    /// it.
     pub key_surfaces: Vec<crate::vta::key_surfaces::KeySurface>,
     /// The surfaces that should be in the trust agent and are not.
     ///

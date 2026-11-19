@@ -1,7 +1,7 @@
 //! Typed errors for the VTA signing connector.
 //!
 //! The gateway talks to the VTA over HTTP; these variants let callers map a VTA
-//! failure to a stable gateway response (VTA-04) **without** echoing VTA
+//! failure to a stable gateway response **without** echoing VTA
 //! internals into client-facing error bodies. Transport detail stays in logs.
 
 use std::fmt;
@@ -21,7 +21,7 @@ pub enum VtaError {
     Protocol(String),
     /// The connector is misconfigured (missing coordinates, bad DID, etc.).
     Config(String),
-    /// The signing quota for the current window is exhausted (VTA-17). The
+    /// The signing quota for the current window is exhausted. The
     /// detail names the limit and a retry hint; it carries no secrets.
     QuotaExceeded(String),
 }

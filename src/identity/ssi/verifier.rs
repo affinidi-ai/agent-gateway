@@ -1101,7 +1101,7 @@ mod tests {
         })
     }
 
-    /// The shape VTA-11b produces: a VTA-signed `eddsa-jcs-2022` credential
+    /// The shape trust agent signing produces: a VTA-signed `eddsa-jcs-2022` credential
     /// inside a gateway-signed `eddsa-rdfc-2022` presentation. Both suites must
     /// verify in one pass.
     #[tokio::test]
@@ -1203,7 +1203,7 @@ mod tests {
         assert!(err.contains("verification failed") || err.contains("InvalidSignature"), "{err}");
     }
 
-    /// A JCS presentation is the VTA-12 shape — the holder proof moves to the
+    /// A JCS presentation is what an agent whose key lives in a VTA makes — the holder proof moves to the
     /// VTA too. The dispatch must handle it at the VP level, not just for
     /// embedded credentials.
     #[tokio::test]

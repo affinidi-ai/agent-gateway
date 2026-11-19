@@ -8,12 +8,9 @@
 //! added the same way: implement [`CredentialAuthority`] and register one arm in
 //! [`super::select_credential_authority`]; no call site changes.
 //!
-//! **Scope (VTA-07):** the auth/session handshake and the JWT signing
-//! round-trip are complete and tested. A signing call dispatches the
-//! `keys/sign-jws/0.1` Trust Task (added VTA-side in VTA-06), naming the pinned
-//! VTA-held key; the VTA signs and returns a compact JWS. The gateway never
-//! sees the private key. DI-credential issuance via the VTA (`credentials/issue`)
-//! and JWKS discovery are wired in VTA-08.
+//! A signing call dispatches the `keys/sign-jws/0.1` Trust Task, naming the
+//! pinned VTA-held key; the VTA signs and returns a compact JWS. The gateway
+//! never sees the private key.
 
 use std::sync::Arc;
 
@@ -30,7 +27,7 @@ use super::error::VtaError;
 use super::quota::SignQuota;
 use crate::identity::authority::CredentialAuthority;
 
-/// `keys/sign-jws/0.1` — the walled-off JWT-signing Trust Task (VTA-06).
+/// `keys/sign-jws/0.1` — the walled-off JWT-signing Trust Task.
 const TASK_KEYS_SIGN_JWS: &str = "https://trusttasks.org/spec/keys/sign-jws/0.1";
 
 /// `keys/show/0.1` — read a key record (public key only; no secret material).
@@ -83,7 +80,7 @@ pub struct VtaCredentialAuthority {
     /// gateway names the key; the VTA holds it.
     signing_key_id: String,
     /// VTA keys that no longer sign but must still be **published** so the
-    /// tokens they signed keep verifying (VTA-17). `(kid, public_key)`; the
+    /// tokens they signed keep verifying. `(kid, public_key)`; the
     /// public key is `None` when it should be resolved from the VTA.
     retiring_keys: Vec<(String, Option<String>)>,
     /// The active signing key's multibase public key, when the operator
@@ -97,11 +94,11 @@ pub struct VtaCredentialAuthority {
     carried_over_jwks: Vec<Value>,
     /// The pinned key's public JWKS, resolved once from the VTA and cached so
     /// publishing it (`/oauth2/jwks.json`) is not a per-call VTA hop — and so
-    /// **verification stays a local public-key operation** (VTA-08).
+    /// **verification stays a local public-key operation**.
     jwks_cache: RwLock<Option<Value>>,
-    /// Optional, bounded, non-blocking audit sink for signing events (VTA-08).
+    /// Optional, bounded, non-blocking audit sink for signing events.
     audit: Option<VtaAuditSink>,
-    /// Caps how many signatures may be minted per window (VTA-17).
+    /// Caps how many signatures may be minted per window.
     quota: SignQuota,
 }
 
@@ -125,7 +122,7 @@ impl VtaCredentialAuthority {
     }
 
     /// Publish `retiring_keys` alongside the active key so tokens they signed
-    /// keep verifying during a rotation or a per-surface migration (VTA-17).
+    /// keep verifying during a rotation or a per-surface migration.
     /// Each entry is `(kid, public_key)`; a `None` public key is resolved from
     /// the VTA.
     #[must_use]
@@ -161,7 +158,7 @@ impl VtaCredentialAuthority {
         self
     }
 
-    /// Bound how many signatures this authority may mint per window (VTA-17).
+    /// Bound how many signatures this authority may mint per window.
     #[must_use]
     pub fn with_quota(
         mut self,
@@ -228,7 +225,7 @@ impl VtaCredentialAuthority {
     ) -> Result<String, VtaError> {
         // Quota first: an exhausted window must refuse **before** the VTA is
         // asked to sign, so the limit bounds signatures rather than merely
-        // reporting on them (VTA-17).
+        // reporting on them.
         self.quota.claim()?;
         let request = json!({
             "keyId": self.signing_key_id,
@@ -328,7 +325,7 @@ impl CredentialAuthority for VtaCredentialAuthority {
         // resolving a DID document — and so verification is a local public-key
         // operation with no per-verify VTA hop.
         //
-        // The set is deliberately **multi-key** (VTA-17): the active signing
+        // The set is deliberately **multi-key**: the active signing
         // key, every retiring VTA key, and any carried-over local key. A
         // per-surface migration or a rotation means two keys are live at once,
         // and a verifier selects between them by `kid`; publishing only the
@@ -399,7 +396,7 @@ impl CredentialAuthority for VtaCredentialAuthority {
     }
 }
 
-/// VTA-07 PoC: drive the `CredentialAuthority` seam against a mock VTA that
+/// Drive the `CredentialAuthority` seam against a mock VTA that
 /// really Ed25519-signs `keys/sign-jws`, and verify the resulting compact JWS.
 ///
 /// This is the seam every protocol path funnels through — an MCP/A2A agent that
@@ -859,7 +856,7 @@ mod poc_tests {
         assert_eq!(record.artifact_hash, hash_hex(&jws));
     }
 
-    // ── VTA-17: multi-key JWKS + signing quota ───────────────────────────────
+    // ── multi-key JWKS + signing quota ───────────────────────────────────────
 
     #[tokio::test]
     async fn the_jwks_publishes_retiring_and_carried_over_keys_by_kid() {
@@ -995,7 +992,7 @@ mod poc_tests {
         );
     }
 
-    /// Live end-to-end against a real `vta-service` that has the VTA-06
+    /// Live end-to-end against a real `vta-service` that has the
     /// `keys/sign-jws/0.1` task. Ignored by default; run manually after the
     /// VTA is up and the control DID (`[42u8; 32]`) is seeded:
     ///
@@ -1012,7 +1009,7 @@ mod poc_tests {
     /// verifies the compact JWS — proving a real VTA-signed JWT verifies and
     /// that no private key ever crosses to the gateway.
     #[tokio::test]
-    #[ignore = "requires a running vta-service with keys/sign-jws (VTA-06); run manually"]
+    #[ignore = "requires a running vta-service with keys/sign-jws; run manually"]
     async fn live_sign_token_against_real_vta_verifies() {
         let url = std::env::var("VTA_LIVE_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
         let vta_did = std::env::var("VTA_LIVE_DID").expect("set VTA_LIVE_DID to the VTA did:webvh");
@@ -1026,7 +1023,7 @@ mod poc_tests {
         // path under test, `keys/sign-jws`, is bearer-only). A random id keeps
         // the test re-runnable against a persistent VTA.
         //
-        // `internal: true` (VTA-17 / SEC0-6115 condition 2) mints a key that is
+        // `internal: true` mints a key that is
         // **non-exportable** — not by an operator, not by a super-admin, not via
         // a backup. An internal key is generated from the system CSPRNG rather
         // than derived from the seed, so it carries **no `derivationPath`** and
@@ -1064,7 +1061,7 @@ mod poc_tests {
             .to_string();
         eprintln!("LIVE key_id={key_id} public_key={public_key_mb}");
 
-        // Audit the live sign too, so the carrier label (VTA-27) is asserted
+        // Audit the live sign too, so the carrier label is asserted
         // against the real wire rather than only against a mock.
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         struct Capture(Arc<std::sync::Mutex<Vec<crate::vta::audit::AuditRecord>>>);
@@ -1083,7 +1080,7 @@ mod poc_tests {
         let sink = crate::vta::audit::VtaAuditSink::spawn(8, Arc::new(Capture(Arc::clone(&captured))));
 
         let auth = VtaCredentialAuthority::new(Arc::clone(&client), key_id, Some(sink))
-            // VTA-17: an internal key's record is never returned by the VTA — to
+            // An internal key's record is never returned by the VTA — to
             // anyone, at any role — so its public half comes from the
             // `keys/create` response, captured into config at provisioning.
             .with_signing_key_public(Some(public_key_mb.clone()));
@@ -1102,7 +1099,7 @@ mod poc_tests {
         assert_eq!(header["alg"], "EdDSA");
         assert_eq!(payload["sub"], "urn:agent:live-poc");
 
-        // VTA-08: the published JWKS (resolved from the VTA via keys/show,
+        // The published JWKS (resolved from the VTA via keys/show,
         // bearer-only) yields the same verifying key — so a resource server
         // verifies VTA-signed tokens locally, no per-verify VTA hop.
         let jwks = auth
@@ -1122,7 +1119,7 @@ mod poc_tests {
         assert_eq!(vk_jwks, vk, "the published JWKS key matches the signing key");
         verify_compact_jws(&jws, &vk_jwks);
 
-        // VTA-27: the audit record names the carrier the Trust Task actually
+        // The audit record names the carrier the Trust Task actually
         // travelled over, and the signed artifact is only ever hashed.
         let records = loop {
             let seen = captured

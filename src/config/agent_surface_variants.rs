@@ -185,7 +185,7 @@ pub struct SurfaceOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canvas: Option<serde_json::Value>,
 
-    /// Per-variant signing override (VTA-19). Absent — the common case —
+    /// Per-variant signing override. Absent — the common case —
     /// **inherits** the surface's signing config, so a variant only gets its
     /// own context when an operator deliberately asks for one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -852,7 +852,7 @@ impl AgentSurface {
         }
         // Signing follows the same sparse-delta rule as everything else: a
         // variant without an override inherits the surface's context rather
-        // than getting one of its own (VTA-19).
+        // than getting one of its own.
         if let Some(signing) = overrides.signing {
             resolved.signing = Some(signing);
         }

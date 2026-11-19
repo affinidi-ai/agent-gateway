@@ -91,10 +91,10 @@ pub struct VtaConnectionRegistry {
     /// for the same control DID.
     bootstrap_client: Option<Arc<VtaRestClient>>,
     /// Per-call deadline and concurrency cap, inherited from `[vta]` so one
-    /// appliance-wide resilience policy applies to every connection (VTA-04).
+    /// appliance-wide resilience policy applies to every connection.
     timeout: Duration,
     max_concurrent: usize,
-    /// Mediator channel for the DIDComm carrier (VTA-27). `None` when no
+    /// Mediator channel for the DIDComm carrier. `None` when no
     /// mediator is wired, in which case a DIDComm connection fails closed
     /// rather than falling back to an address the operator did not publish.
     didcomm: Option<Arc<dyn crate::vta::transport::DidCommChannel>>,
@@ -128,7 +128,7 @@ impl VtaConnectionRegistry {
     }
 
     /// Attach the mediator channel that carries Trust Tasks over DIDComm
-    /// (VTA-27), enabling connections whose VTA has no reachable address.
+    ///, enabling connections whose VTA has no reachable address.
     #[cfg(test)]
     pub fn with_didcomm(
         mut self,
@@ -241,7 +241,7 @@ impl VtaConnectionRegistry {
     }
 
     /// Authenticate against `connection`'s VTA and report what was observed,
-    /// for the pairing state machine to judge (VTA-24).
+    /// for the pairing state machine to judge.
     ///
     /// Deliberately returns the observation rather than a verdict: deciding
     /// whether the grant is acceptable belongs in one place
@@ -396,11 +396,11 @@ impl VtaConnectionRegistry {
 
         // A connection that has not completed pairing has not proved it can
         // sign under the identity the operator chose, so it must not be used
-        // (VTA-24). Revoking is therefore immediate: the state alone makes the
+        //. Revoking is therefore immediate: the state alone makes the
         // connection unusable on the next resolution.
         crate::vta::pairing::assert_usable(connection, &connection.pairing)?;
 
-        // Take this VTA off the data plane too (VTA-21): a stored connection
+        // Take this VTA off the data plane too: a stored connection
         // can point at a sidecar on a private network, which the forward leg
         // would otherwise happily proxy to.
         crate::vta::isolation::reserve_connection(&connection.endpoint);
@@ -408,7 +408,7 @@ impl VtaConnectionRegistry {
         let control_key = self
             .control_key(connection)
             .await?;
-        // Per-connection carrier (VTA-27). Everything above the carrier — the
+        // Per-connection carrier. Everything above the carrier — the
         // signed auth handshake, session caching, resilience, error redaction
         // — is identical, so two connections may use different carriers at the
         // same time without any code path diverging.
@@ -434,7 +434,7 @@ impl VtaConnectionRegistry {
             .map_err(|e| VtaError::Config(format!("VTA connection `{}` is not usable: {e}", connection.id)))
     }
 
-    /// The carrier this connection's Trust Tasks travel over (VTA-27).
+    /// The carrier this connection's Trust Tasks travel over.
     ///
     /// `didcomm` lets the gateway reach a VTA with **no inbound reachability**
     /// — a home or laptop deployment behind NAT — by addressing it by DID
@@ -1000,7 +1000,7 @@ mod tests {
 
     /// A connection that has not completed pairing has not proved it can sign
     /// under the identity the operator chose, so it must not be used — and
-    /// never silently fall back to the local key (VTA-24).
+    /// never silently fall back to the local key.
     #[tokio::test]
     async fn an_unpaired_connection_fails_closed_before_any_key_is_touched() {
         let registry = registry(MemoryStore::new(vec![connection("c1", true)]), None);
@@ -1042,7 +1042,7 @@ mod tests {
         assert!(msg.contains("revoked"), "unexpected error: {msg}");
     }
 
-    // ---- per-connection carrier (VTA-27) ---------------------------------
+    // ---- per-connection carrier ---------------------------------
 
     struct StubChannel;
 

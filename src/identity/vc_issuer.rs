@@ -314,14 +314,14 @@ pub struct VCIssuer {
     surface_store: std::sync::OnceLock<Arc<dyn crate::surfaces::AgentSurfaceStore>>,
     surfaces_by_did: SurfacesByDidCache,
     /// The backend that signs the JWT-shaped agent-identity credential
-    /// (VTA-11a). Late-bound: the connector is only selected once `[vta]` has
+    ///. Late-bound: the connector is only selected once `[vta]` has
     /// been resolved, which happens after this issuer is constructed. `None`
     /// until then, in which case signing falls back to the local key — which is
     /// also what the local connector does, so the output is identical either
     /// way.
     signing_authority: Arc<RwLock<Option<Arc<dyn crate::identity::authority::CredentialAuthority>>>>,
     /// The backend that issues the **Data-Integrity** agent-identity credential
-    /// embedded in the forwarding VP (VTA-11b). Late-bound for the same reason
+    /// embedded in the forwarding VP. Late-bound for the same reason
     /// as `signing_authority`: the VTA connection is resolved after this issuer
     /// is constructed. `None` falls back to `vc_issuer`, the local issuer,
     /// which is the pre-VTA behaviour.
@@ -333,7 +333,7 @@ pub struct VCIssuer {
     di_vc_issuer: Arc<RwLock<Option<Arc<dyn VcIssuer>>>>,
 
     /// The backend that signs the agent's **presentation** — the holder proof
-    /// (VTA-12). Late-bound for the same reason as `di_vc_issuer`.
+    ///. Late-bound for the same reason as `di_vc_issuer`.
     ///
     /// Distinct from `di_vc_issuer` because the two proofs are made by
     /// different parties: the credential is signed by the *issuer* (this
@@ -346,7 +346,7 @@ pub struct VCIssuer {
     agent_jwt_signer: Arc<RwLock<Option<Arc<dyn crate::vta::vp_issuer::AgentJwtSigner>>>>,
 
     /// Provisions an agent identity whose private key lives in a Verifiable
-    /// Trust Agent (VTA-12). When set, a newly onboarded agent gets a
+    /// Trust Agent. When set, a newly onboarded agent gets a
     /// `did:key` backed by a VTA-held key and this process never sees a
     /// private half; when unset, onboarding generates a key as before.
     agent_provisioner: Arc<RwLock<Option<Arc<dyn crate::vta::agent_contexts::AgentKeyProvisioner>>>>,
@@ -361,7 +361,7 @@ pub struct VCIssuer {
     /// the two cannot be the same slot.
     attestation_signer: Arc<RwLock<Option<Arc<dyn crate::vta::context_signer::ContextSigner>>>>,
 
-    /// Resolves **which** key signs for a given surface (VTA-19). Late-bound
+    /// Resolves **which** key signs for a given surface. Late-bound
     /// for the same reason as `signing_authority`.
     ///
     /// Consulted ahead of `signing_authority`, which stays the appliance-wide
@@ -449,7 +449,7 @@ impl VCIssuer {
     }
 
     /// Point agent-identity credential signing at the selected signing
-    /// connector (VTA-11a). Called from the identity router once `[vta]` has
+    /// connector. Called from the identity router once `[vta]` has
     /// been resolved, so the credential returned by `issue_or_get_credential`
     /// is signed by the same backend as STS tokens and payment receipts.
     pub async fn set_signing_authority(
@@ -464,7 +464,7 @@ impl VCIssuer {
     }
 
     /// Install the directory that decides which key signs for which surface
-    /// (VTA-19). Called from the identity router once `[vta]`, the connection
+    ///. Called from the identity router once `[vta]`, the connection
     /// registry and the surface mappings have all been resolved.
     pub async fn set_key_directory(
         &self,
@@ -561,7 +561,7 @@ impl VCIssuer {
     }
 
     /// Point the Data-Integrity agent-identity credential at a VTA-backed
-    /// issuer (VTA-11b). Called from the identity router once `[vta]` has been
+    /// issuer. Called from the identity router once `[vta]` has been
     /// resolved.
     ///
     /// Once set there is no fallback to the local issuer: a credential signed
@@ -589,7 +589,7 @@ impl VCIssuer {
         Arc::clone(&self.vc_issuer)
     }
 
-    /// Point the agent's **holder proof** at a VTA-backed issuer (VTA-12), so
+    /// Point the agent's **holder proof** at a VTA-backed issuer, so
     /// the agent's private key lives in its own trust agent rather than in
     /// this process.
     ///
@@ -619,7 +619,7 @@ impl VCIssuer {
             .await = Some(signer);
     }
 
-    /// Onboard new agents with a key held in their own VTA context (VTA-12)
+    /// Onboard new agents with a key held in their own VTA context
     /// rather than one generated here.
     ///
     /// Only affects agents onboarded from now on. Existing records keep their
@@ -1840,8 +1840,8 @@ impl VCIssuer {
         name: Option<&DisplayName>,
         surface_id: Option<&str>,
     ) -> Result<String> {
-        // The backend that will sign, if one has been selected (VTA-11a),
-        // narrowed to this surface's own key when one is mapped (VTA-19).
+        // The backend that will sign, if one has been selected,
+        // narrowed to this surface's own key when one is mapped.
         let authority = self
             .authority_for_surface(surface_id)
             .await?;
@@ -5852,7 +5852,7 @@ mod tests {
         }
     }
 
-    /// Stands in for whichever backend `[vta]` selected (VTA-11a): records what
+    /// Stands in for whichever backend `[vta]` selected: records what
     /// it was asked to sign, and can report itself unreachable.
     struct RecordingAuthority {
         did: &'static str,
@@ -6220,7 +6220,7 @@ mod tests {
         )
     }
 
-    // ─── Data-Integrity agent-identity credential (VTA-11b) ───────────────
+    // ─── Data-Integrity agent-identity credential ───────────────
 
     /// A `VcIssuer` that records what it was asked for and returns a fixed
     /// credential, standing in for the VTA's context-scoped issue task.
@@ -6479,7 +6479,7 @@ mod live_tests {
             signing: Some(crate::config::agent_surface::SurfaceSigningConfig {
                 backend: Some(crate::config::agent_surface::SigningBackendKind::Vta),
                 context_id: Some(context.clone()),
-                // `jwt` keys are named explicitly (D-11): `keys/sign-jws`
+                // `jwt` keys are named explicitly: `keys/sign-jws`
                 // addresses the key, so the mapping has to say which one.
                 key_id: config.signing_key_id.clone(),
                 ..Default::default()

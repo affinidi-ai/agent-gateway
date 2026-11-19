@@ -8,7 +8,7 @@
 //! least-privilege grant on an internet-facing process is that a compromise
 //! cannot reconfigure anything.
 //!
-//! `Capability::ContextCreate` (VTA-16) is the narrow alternative. It is bounded
+//! `Capability::ContextCreate` is the narrow alternative. It is bounded
 //! by rules the VTA already enforced:
 //!
 //! - **top-level** creation still requires super-admin, so this can only branch;

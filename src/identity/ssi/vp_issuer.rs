@@ -26,7 +26,7 @@ pub struct Credentials<'a> {
     /// The holder's key for signing the presentation.
     ///
     /// `None` when the holder's key lives in a Verifiable Trust Agent rather
-    /// than in this process (VTA-12). Optional rather than always-present
+    /// than in this process. Optional rather than always-present
     /// because an absent key is the *goal*: the gateway holding an agent's
     /// private key is the custody this exists to remove, so the type should
     /// make "we do not have it" expressible.
