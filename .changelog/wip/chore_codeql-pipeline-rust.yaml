@@ -1,0 +1,15 @@
+branch: chore/codeql-pipeline-rust
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-19T00:00:00Z'
+      title: Run the weekly CodeQL scan from pipeline-rust
+      description: >-
+        The weekly CodeQL scan of main now calls pipeline-rust's reusable
+        CodeQL workflow instead of keeping its own copy, so agent-gateway and
+        agent-stream share one definition. Languages, schedule and manual runs
+        are unchanged. Check runs are now named codeql / Analyze (language).
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
