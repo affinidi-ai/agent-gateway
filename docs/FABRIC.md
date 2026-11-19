@@ -369,8 +369,11 @@ it did not answer at all is the case a lost account produces, because a mediator
 holds the account has nowhere to deliver its own answer either, so the second unanswered probe in
 a row restarts the Connection Point, and then the fourth, eighth and so on, backing off while the
 mediator stays silent. Only the Connection Points whose probe went unanswered are re-probed after
-5 seconds; the rest keep the 30-second cadence. A Connection Point stopped or removed while it is
-being checked is not started again.
+5 seconds, and every Connection Point is still visited at least every 30 seconds, so a mediator
+that never answers for one of them cannot keep the others from being checked. A listener that is
+not connected — one still re-authenticating after a restart, say — is not probed at all, and that
+pass neither counts against it nor clears what it has counted. A Connection Point stopped or
+removed while it is being checked is not started again.
 
 When the appliance is Standby, fabric and trust listeners are inactive and the node reports not
 ready. Periodic cache refresh keeps supported cached stores current on a Standby node.

@@ -26,9 +26,10 @@ changes:
         a later probe happened to be answered. A second unanswered probe in a row now restarts
         the listener, the same repair a missing account gets, and then the fourth, eighth and so
         on, so a mediator that stays silent is retried ever more slowly. Only the Connection
-        Points whose probe went unanswered are re-probed after five seconds; every other one
-        keeps the thirty-second cadence. A probe the mediator answered, even with a refusal,
-        still changes nothing: the socket is carrying traffic.
+        Points whose probe went unanswered are re-probed after five seconds, while every
+        Connection Point is still visited at least every thirty seconds, so a mediator silent for
+        one of them cannot keep the others from being checked. A probe the mediator answered,
+        even with a refusal, still changes nothing: the socket is carrying traffic.
   removed: []
   security: []
   breaking: []
