@@ -81,13 +81,13 @@ pub(crate) fn build_signing_secret(
     private_key_jwk: &serde_json::Value
 ) -> Result<didwebvh_rs::prelude::Secret, String> {
     let temp_id = "did:key:temp#temp";
-    let raw = didwebvh_rs::prelude::Secret::from_str(temp_id, private_key_jwk)
+    let raw = didwebvh_rs::prelude::Secret::from_jwk_value(temp_id, private_key_jwk)
         .map_err(|e| format!("Failed to build key Secret: {e}"))?;
     let mb = raw
         .get_public_keymultibase()
         .map_err(|e| format!("Failed to get key multibase: {e}"))?;
     let key_id = format!("did:key:{0}#{0}", mb);
-    let mut secret = didwebvh_rs::prelude::Secret::from_str(&key_id, private_key_jwk)
+    let mut secret = didwebvh_rs::prelude::Secret::from_jwk_value(&key_id, private_key_jwk)
         .map_err(|e| format!("Failed to build signing Secret: {e}"))?;
     secret.id = key_id;
     Ok(secret)

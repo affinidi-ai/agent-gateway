@@ -173,7 +173,7 @@ fn update_secret(key: &JWK) -> Secret {
     let jwk = serde_json::to_value(key).expect("serialize the update key");
     let public_key = public_key_multibase(key);
     let id = format!("did:key:{public_key}#{public_key}");
-    Secret::from_str(&id, &jwk).expect("a did:webvh update key")
+    Secret::from_jwk_value(&id, &jwk).expect("a did:webvh update key")
 }
 
 /// A caller with a `did:webvh` whose DID log this process serves over plain HTTP on localhost,

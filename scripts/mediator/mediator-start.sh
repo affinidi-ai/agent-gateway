@@ -52,6 +52,10 @@ MEDIATOR_URL="$(mediator_url_for_domain "${MEDIATOR_DOMAIN}")"
 
 echo "📦 Starting Affinidi Mediator..."
 
+# A local development mediator: its keys live in a plaintext file under
+# envs/mediator, which the wizard asks the operator to accept from v0.53.0.
+export MEDIATOR_ALLOW_PLAINTEXT_FILE="${MEDIATOR_ALLOW_PLAINTEXT_FILE:-true}"
+
 "${current_dir}/scripts/mediator/user-data-v2.sh" \
     "${TARGET_DIR}" \
     "${MEDIATOR_IMAGE}" \
