@@ -3323,17 +3323,35 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
                                     acceptor_temporary_did,
                                     reason,
                                 } => {
-                                    warn!(
-                                        "connection-setup from {} refused on '{}': {}",
-                                        acceptor_temporary_did, connection_point.name, reason
-                                    );
-                                    send_pairing_rejection(
-                                        client,
-                                        connection_point_did,
-                                        &acceptor_temporary_did,
-                                        message_processor::INVITATION_UNUSABLE_REASON,
-                                    )
-                                    .await;
+                                    // The acceptor that redeemed the invitation may send its
+                                    // setup again (a mediator redelivery or a Continue retry);
+                                    // its first setup waits for approval, so it is not refused.
+                                    let redeemed_by_sender = match pending_connection_store {
+                                        Some(store) => {
+                                            store
+                                                .awaits_approval_from(&acceptor_temporary_did)
+                                                .await
+                                        }
+                                        None => false,
+                                    };
+                                    if redeemed_by_sender {
+                                        info!(
+                                            "connection-setup from {} on '{}' repeats the one waiting for approval; not answered",
+                                            acceptor_temporary_did, connection_point.name
+                                        );
+                                    } else {
+                                        warn!(
+                                            "connection-setup from {} refused on '{}': {}",
+                                            acceptor_temporary_did, connection_point.name, reason
+                                        );
+                                        send_pairing_rejection(
+                                            client,
+                                            connection_point_did,
+                                            &acceptor_temporary_did,
+                                            message_processor::INVITATION_UNUSABLE_REASON,
+                                        )
+                                        .await;
+                                    }
                                 }
                                 message_processor::ProcessingResult::OOBConnectionRejected { reason } => {
                                     error!("❌ OOB connection-rejected received! Reason: {}", reason);
@@ -4366,13 +4384,22 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
     let saved = crate::event_hook::ConnectionPointPayload::from_record(&connection_point, None);
     let record = connection_point.clone();
     let point_store = cp_store.clone();
+    let reserving_id = pending_conn
+        .temporary_cp_id
+        .clone()
+        .filter(|_| announced_at_pause);
     announcement
         .complete(
             async move {
                 let _held_until_saved = mediator_guard;
                 point_store
                     .create(&record)
-                    .await
+                    .await?;
+                if let Some(reserving_id) = reserving_id {
+                    crate::gateways::mediator_access::mark_reservation_consumed(point_store.as_ref(), &reserving_id)
+                        .await;
+                }
+                Ok::<(), anyhow::Error>(())
             },
             saved,
         )
@@ -4778,264 +4805,6 @@ async fn handle_oob_connection_setup_as_inviter<CS: super::ConnectionPointStore 
         super::message_processor::release_invitation(cp_store.as_ref(), &connection_point.id).await;
     }
     outcome
-}
-
-/// Spawn a temporary listener for OOB acceptor to receive connection-accepted message
-/// This listener will automatically cleanup after receiving the message or timing out
-#[allow(dead_code)]
-pub async fn spawn_oob_acceptor_listener<S: GatewayStore + 'static, CS: super::ConnectionPointStore + 'static>(
-    temp_did: String,
-    pending_gateway_id: String,
-    client: DIDCommClient,
-    gateway_store: Arc<S>,
-    pending_store: Arc<crate::gateways::PendingConnectionStore>,
-    bootstrap_config: Arc<crate::config::BootstrapConfig>,
-    cp_store: Arc<CS>,
-    listener_manager: Arc<ConnectionPointListenerManager>,
-    mediator_did: String,
-    mediator_url: String,
-) {
-    crate::observability::spawn_traced_task(&format!("oob_listener.{}", pending_gateway_id), async move {
-        info!("🎧 Starting temporary listener for OOB acceptor (pending gateway: {})", pending_gateway_id);
-        info!("   Listening on temporary DID: {}", temp_did);
-        info!("   Will auto-cleanup after receiving connection-accepted or 5 minute timeout");
-
-        // Set a 5-minute timeout for the entire listener
-        let pending_gateway_id_clone = pending_gateway_id.clone();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            listen_for_connection_accepted(
-                temp_did,
-                pending_gateway_id,
-                client,
-                gateway_store,
-                pending_store,
-                bootstrap_config,
-                cp_store,
-                listener_manager,
-                mediator_did,
-                mediator_url,
-            ),
-        )
-        .await;
-
-        match result {
-            Ok(Ok(())) => {
-                info!("✅ OOB acceptor listener completed successfully");
-            }
-            Ok(Err(e)) => {
-                error!("❌ OOB acceptor listener failed: {}", e);
-            }
-            Err(_) => {
-                warn!("⏱️  OOB acceptor listener timed out after 5 minutes");
-                warn!("   Pending gateway {} may remain in Pending state", pending_gateway_id_clone);
-            }
-        }
-    });
-}
-
-/// Listen for connection-accepted message on temporary DID
-#[allow(dead_code)]
-async fn listen_for_connection_accepted<S: GatewayStore, CS: super::ConnectionPointStore + 'static>(
-    _temp_did: String,
-    _pending_gateway_id: String,
-    client: DIDCommClient,
-    gateway_store: Arc<S>,
-    pending_store: Arc<crate::gateways::PendingConnectionStore>,
-    bootstrap_config: Arc<crate::config::BootstrapConfig>,
-    cp_store: Arc<CS>,
-    listener_manager: Arc<ConnectionPointListenerManager>,
-    mediator_did: String,
-    mediator_url: String,
-) -> Result<(), String> {
-    info!("📥 Polling for messages on temporary DID...");
-
-    // Poll for messages every 2 seconds
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
-    let mut poll_count = 0;
-
-    loop {
-        interval.tick().await;
-        poll_count += 1;
-
-        if poll_count % 10 == 0 {
-            info!("   Still listening... ({} polls)", poll_count);
-        }
-
-        // Fetch messages
-        let response = match client
-            .atm()
-            .fetch_messages(client.profile(), &Default::default())
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                error!("   Failed to fetch messages: {:?}", e);
-                continue;
-            }
-        };
-
-        let messages = response.success;
-
-        if messages.is_empty() {
-            continue;
-        }
-
-        info!("📬 Received {} message(s)", messages.len());
-
-        // Process each message
-        for msg_envelope in messages {
-            info!("   Processing message ID: {}", msg_envelope.msg_id);
-
-            // Unpack the message
-            let msg_str = msg_envelope
-                .msg
-                .as_ref()
-                .ok_or_else(|| "Message content is missing".to_string())?;
-
-            let (message, _metadata): (affinidi_messaging_didcomm::Message, _) = match client
-                .atm()
-                .unpack(msg_str)
-                .await
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    error!("   Failed to unpack message: {:?}", e);
-                    continue;
-                }
-            };
-
-            info!("   Message type: {}", message.typ);
-
-            // Check if it's connection-accepted
-            if message.typ == MessageType::ConnectionAccepted.to_string() {
-                info!("🎉 Received connection-accepted message!");
-
-                // Extract inviter's secure DID from the message body
-                let inviter_secure_did = message
-                    .body
-                    .get("channel_did")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| "Missing channel_did in connection-accepted message".to_string())?;
-
-                info!("   Inviter's secure DID: {}", inviter_secure_did);
-
-                // Call finalize function with the temporary DID (since that's what we stored the gateway under)
-                let inviter_temp_did = message
-                    .from
-                    .as_ref()
-                    .ok_or_else(|| "Missing 'from' field in connection-accepted message".to_string())?;
-
-                let issuer_attestation = message
-                    .body
-                    .get("issuer_attestation")
-                    .and_then(|v| v.as_str());
-
-                let gateway = finalize_oob_connection_as_acceptor(
-                    inviter_temp_did,
-                    inviter_secure_did,
-                    issuer_attestation,
-                    message.thid.as_deref(),
-                    &gateway_store,
-                    &pending_store,
-                    &bootstrap_config,
-                    &cp_store,
-                    &listener_manager,
-                    None,
-                    &mediator_did,
-                    &mediator_url,
-                )
-                .await
-                .map_err(|e| {
-                    error!("❌ Failed to finalize OOB connection: {}", e);
-                    e
-                })?;
-
-                info!("✅ Gateway finalized: {} ({})", gateway.id, gateway.did);
-
-                // Delete the message from mediator
-                let delete_req = affinidi_messaging_sdk::messages::DeleteMessageRequest {
-                    message_ids: vec![msg_envelope.msg_id.clone()],
-                };
-                if let Err(e) = client
-                    .atm()
-                    .delete_messages_direct(client.profile(), &delete_req)
-                    .await
-                {
-                    warn!("   Failed to delete message from mediator: {:?}", e);
-                }
-
-                info!("✅ OOB connection fully established with permanent listener, stopping temporary listener");
-                return Ok(());
-            } else if message.typ == MessageType::ConnectionRejected.to_string() {
-                error!("❌ Received connection-rejected message!");
-
-                // Extract rejection reason
-                let reason = message
-                    .body
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown reason");
-
-                error!("   Rejection reason: {}", reason);
-
-                // Update the pending gateway to failed status
-                let inviter_temp_did = message
-                    .from
-                    .as_ref()
-                    .ok_or_else(|| "Missing 'from' field in connection-rejected message".to_string())?;
-
-                // Find the pending gateway by the inviter's temporary DID
-                if let Ok(Some(mut gateway)) = gateway_store
-                    .get_by_did(inviter_temp_did)
-                    .await
-                {
-                    info!("   Updating gateway {} to Failed status", gateway.id);
-                    gateway.status = crate::gateways::types::GatewayStatus::Failed;
-                    gateway.description = rejected_description(reason, &gateway.description);
-
-                    if let Err(e) = gateway_store
-                        .update(&gateway)
-                        .await
-                    {
-                        error!("   Failed to update gateway status: {}", e);
-                    } else {
-                        info!("   ✓ Gateway status updated to Failed");
-                    }
-                } else {
-                    warn!("   Could not find pending gateway to update");
-                }
-
-                // Remove the pending connection
-                if let Some(pending_conn) = pending_store
-                    .get_by_temporary_did(inviter_temp_did)
-                    .await
-                {
-                    pending_store
-                        .remove(&pending_conn.id)
-                        .await;
-                    info!("   ✓ Removed pending connection state");
-                }
-
-                // Delete the message from mediator
-                let delete_req = affinidi_messaging_sdk::messages::DeleteMessageRequest {
-                    message_ids: vec![msg_envelope.msg_id.clone()],
-                };
-                if let Err(e) = client
-                    .atm()
-                    .delete_messages_direct(client.profile(), &delete_req)
-                    .await
-                {
-                    warn!("   Failed to delete message from mediator: {:?}", e);
-                }
-
-                error!("❌ OOB connection rejected, stopping temporary listener");
-                return Err(format!("Connection rejected: {}", reason));
-            } else {
-                info!("   Skipping non-connection-accepted message type: {}", message.typ);
-            }
-        }
-    }
 }
 
 #[cfg(test)]

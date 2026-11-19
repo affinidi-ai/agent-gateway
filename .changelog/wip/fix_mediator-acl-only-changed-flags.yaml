@@ -10,11 +10,16 @@ changes:
         the handshake and permanent DIDs of an acceptance), show them, and continue when they are
         allowed, now or days later from Connections, until the invitation expires. A pause, its
         keys and its reserved permanent DID survive a restart. Continue checks each DID on the
-        mediator and answers 409 mediator_access_refused naming the one still refused. The API
-        pauses when a request sets await_mediator_access. The dashboard asks for the pause and
-        continues at once: on a mediator that admits the DIDs, such as one in explicit_deny mode,
-        pairing looks as before, and only a refusal shows a step that asks to add the DIDs to the
-        DIDComm Mediator's allow list (all of them in one copy, or each on its own). Approval uses
+        mediator and answers 409 mediator_access_refused naming the one still refused, or 410
+        once the invitation has expired; an expired pause stays until the next restart or a
+        delete. Only the pairing flow sets awaiting-mediator-access: a gateway edit that sets it
+        is refused with 400. The API pauses when a request sets await_mediator_access. The
+        dashboard asks for the pause and continues at once: on a mediator that admits the DIDs,
+        such as one in explicit_deny mode, pairing looks as before, and only a refusal shows a
+        step that asks to add the DIDs to the DIDComm Mediator's allow list (all of them in one
+        copy, or each on its own, per mediator when federation puts them on two). Because the
+        dashboard always asks for the pause, every Connection Point it creates reserves its
+        permanent DID at creation and announces it, whatever the mediator's mode. Approval uses
         the reserved permanent DID, so pings work as soon as the pairing completes. The event hook
         announces every DID at the pause.
   changed:
@@ -27,11 +32,11 @@ changes:
         days later. Such a pending acceptance now survives a restart until then. pending_expiry_hours
         now applies only to acceptances stored before the expiry was recorded.
     - timestamp: '2026-11-17T09:05:00Z'
-      title: Keep the action buttons on one line on Connections
+      title: Keep the action buttons on one line on Connections, and button labels on one line everywhere
       description: >-
         The action buttons of a gateway or a Connection Point no longer stack on narrow windows or in
-        the Connection Points list; the table scrolls sideways instead, and buttons never wrap their
-        labels.
+        the Connection Points list; the table scrolls sideways instead. Across the dashboard, a
+        button's label no longer wraps (.app-button keeps its text on one line).
   fixed:
     - timestamp: '2026-11-12T16:00:00Z'
       title: ⭐ Pair gateways on an explicit_allow mediator without admin-only ACL rights
@@ -55,12 +60,15 @@ changes:
       title: Tell the acceptor when an invitation can't be used, so it stops waiting
       description: >-
         A gateway that accepted an invitation that was already used, expired, disabled or deleted
-        stayed pending for ever, because the inviting gateway only logged the refusal. The
-        inviting gateway now answers with connection-rejected and the reason "This invitation
-        can't be used any more. Ask for a new one.", without saying which, as it already did for
-        a wrong secret. The acceptor marks its gateway failed with that reason in front of the
-        description its operator gave, and it can be deleted. A rejection is taken only from the inviter the setup went to, and
-        sending it is best effort.
+        stayed pending for ever, because the inviting gateway only logged the refusal. While the
+        invitation's listener still runs, the inviting gateway now answers with
+        connection-rejected and the reason "This invitation can't be used any more. Ask for a new
+        one.", without saying which, as it already did for a wrong secret; a Connection Point
+        deleted with its listener answers nothing. A setup repeated by the acceptor that redeemed
+        the invitation, while its first waits for approval, is not answered. The acceptor marks its
+        gateway failed with that reason in front of the description its operator gave, and it can
+        be deleted. A rejection is taken only from the inviter the setup went to, and sending it is
+        best effort.
     - timestamp: '2026-11-13T15:15:00Z'
       title: Open a pending gateway from the Gateways list, as the Add Gateway wizard does
       description: >-
@@ -71,14 +79,6 @@ changes:
         approval or mediator access keep their own action.
   removed: []
   security:
-    - timestamp: '2026-11-17T12:00:00Z'
-      title: Update actix-http to 3.22.0 and libz-sys to 1.1.33 for new advisories
-      description: >-
-        Bumps actix-http from 3.21.0 to 3.22.0, past the fixes for three HTTP/1.1
-        advisories (bare LF in chunked trailers, malformed quoted chunk extensions,
-        and partial keep-alive requests bypassing the header timeout), and libz-sys
-        from 1.1.31 to 1.1.33 for a zlib heap buffer overflow advisory. Restores a
-        passing cargo audit.
     - timestamp: '2026-11-18T10:00:00Z'
       title: Update lettre to 0.11.24 for new SMTP advisories
       description: >-

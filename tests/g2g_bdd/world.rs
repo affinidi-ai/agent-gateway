@@ -95,6 +95,8 @@ pub struct TopologyBuilder {
     pub transit_point_trust_checks: Vec<String>,
     /// Gateways pair through the pause for mediator access.
     pub pause_for_mediator_access: bool,
+    /// With the pause, each gateway restarts while it is paused.
+    pub restart_while_paused: bool,
 }
 
 impl TopologyBuilder {
@@ -499,6 +501,9 @@ impl G2gWorld {
         harness.pause_for_mediator_access = self
             .topology
             .pause_for_mediator_access;
+        harness.restart_while_paused = self
+            .topology
+            .restart_while_paused;
         harness
             .federate_pairs(&federation_pairs)
             .await

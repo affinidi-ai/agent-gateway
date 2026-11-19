@@ -128,9 +128,13 @@ approval sends `connection-accepted` from its DID. System Connection Points (`oo
 recorded the message id are refused and must be created again.
 
 A refused setup is answered with `connection-rejected` when the acceptor can act on it: a wrong
-secret with `Invalid connection secret`, and an invitation that is missing, disabled, expired or
-already used with `This invitation can't be used any more. Ask for a new one.`, which never says
-which. Other refusals get no reply. The answer is best effort: a failed send is logged as a
+secret with `Invalid connection secret`, an issuer attestation that does not verify with
+`Invalid issuer attestation`, and an invitation that is missing, disabled, expired or already used
+with `This invitation can't be used any more. Ask for a new one.`, which never says which. Only an
+invitation whose listener still runs can answer: a Connection Point deleted with its listener
+answers nothing, and its acceptor waits until its pairing expires. A setup repeated by the acceptor
+that redeemed the invitation (a mediator redelivery, or a Continue retry), while its first waits
+for approval, is not refused. Other refusals get no reply. The answer is best effort: a failed send is logged as a
 warning and changes nothing else. The acceptor takes a rejection only from the inviter its
 setup went to, on that attempt's temporary Connection Point, and only while its gateway is
 `pending`; the gateway turns `failed`, its description starting with `Connection rejected: <reason>`
@@ -391,12 +395,23 @@ temporary Connection Point is unexpired survives a restart, and its listener is 
 restart removes a paused gateway whose invitation has expired, and a `pending` one with no
 unexpired temporary Connection Point; one whose Connection Points cannot be read is kept. `GET …/{id}/mediator-access`
 returns the DIDs of a pause again: their role (`connection_point`, `temporary`, `permanent`), the
-mediator that must admit each, and the expiry.
+mediator that must admit each (an acceptance also names each one's mediator, since with mediator
+federation its permanent DID sits on its own), and the expiry. Once the invitation has expired,
+Continue answers `410` on both routes. The expired pause, its row on Connections, and its keys stay
+until the next restart removes it, or until it is deleted; the dashboard shows such a Connection
+Point as `EXPIRED` and offers no **Continue**. An acceptance made shortly before its invitation
+expires waits only until that expiry, since approval needs the invitation, which the inviter's
+expiry sweep deletes.
 
 Continue authenticates every DID and reads its own mediator account first. While the mediator
-refuses one (`403`, or an ACL denial) it answers `409` with `code: mediator_access_refused` and the
-refused DID's `role` and `did`, and the pause stays. Continuing twice is serialised, and a pairing
-that already went on is returned as it is. The inviter's connection-setup and approval use the
+refuses one (`403`, which a live `explicit_allow` mediator returns from `/authenticate/challenge`,
+or an ACL denial) it answers `409` with `code: mediator_access_refused` and the refused DID's `role`
+and `did`, and the pause stays. Any other failure, a socket timeout included, answers `502`: it says
+nothing about admission. Continuing twice is serialised, a delete of the same record waits for it,
+and a pairing that already went on is returned as it is. An acceptance whose connection-setup was
+sent but whose result was not fully stored (`pending` with its point still flagged) is finished by
+the next Continue without sending again. Only the pairing flow sets `awaiting-mediator-access`: a
+gateway edit that sets it is refused with `400`. The inviter's connection-setup and approval use the
 reserved permanent DID and mint none, so once both gateways continued, every DID of the pairing is
 already admitted when approval completes it. A Connection Point created without the pause reserves
 nothing and mints its permanent DID at approval as before.

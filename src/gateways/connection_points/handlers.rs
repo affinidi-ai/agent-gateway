@@ -482,12 +482,14 @@ fn connection_point_access(
             .connection_point_did
             .clone(),
         mediator_did: mediator_did.to_string(),
+        mediator_name: String::new(),
     }];
     if let Some(reserved) = &connection_point.reserved_permanent {
         dids.push(AwaitedDid {
             role: DidRole::Permanent,
             did: reserved.did.clone(),
             mediator_did: reserved.mediator_did.clone(),
+            mediator_name: String::new(),
         });
     }
     MediatorAccess {
@@ -963,6 +965,7 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
             did: permanent_did,
             mediator_id: req.mediator_id.clone(),
             mediator_did: mediator.did.clone(),
+            consumed: false,
         })
     } else {
         None
@@ -1573,6 +1576,9 @@ pub async fn delete_connection_point<S: ConnectionPointStore>(
     scope: Option<Extension<PatResourceScope>>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     info!("Deleting connection point: {}", id);
+    // Waits for a Continue of this connection point, so that Continue cannot store it
+    // again after it is deleted.
+    let _continuing = crate::gateways::mediator_access::lock(&id).await;
 
     // Get connection point before deletion for trigger
     let (connection_point, _) =

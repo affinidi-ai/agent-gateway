@@ -135,7 +135,11 @@ fn account_acl(
 ) -> Result<MediatorAcl, String> {
     // Only the flags this update changes: a mediator refuses a non-admin update that
     // names an admin-only flag (`blocked`, `local`, `selfManage*`) at a value other
-    // than the stored one, and leaves absent flags unchanged.
+    // than the stored one, and leaves absent flags unchanged. The grants a new
+    // Connection Point uses (`createInvites`, `sendMessages`, `receiveMessages`,
+    // forwarding) are left out on purpose too: the gateway cannot read whether the
+    // account may change them itself, naming one it may not refuses the whole update,
+    // and the account's registration (the Affinidi Portal's 71000, say) already grants them.
     MediatorAcl::builder()
         .access_list_mode(access_list_mode)
         .anon_receive(anon_receive)

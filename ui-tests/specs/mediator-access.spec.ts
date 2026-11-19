@@ -75,7 +75,7 @@ const PAUSED_CP = {
   oob_url: "",
   use_count: 0,
   created_at: "2026-11-12T00:00:00Z",
-  expires_at: "2026-11-19T00:00:00Z",
+  expires_at: "2099-01-01T00:00:00Z",
   cp_type: "user",
   secret: "s3cret",
   enabled: true,
@@ -97,7 +97,7 @@ const CP_ACCESS = {
     { role: "connection_point", did: CP_DID, mediator_did: MEDIATOR.did },
     { role: "permanent", did: CP_PERMANENT_DID, mediator_did: MEDIATOR.did },
   ],
-  expires_at: "2026-11-19T00:00:00Z",
+  expires_at: "2099-01-01T00:00:00Z",
 };
 
 const GATEWAY_ACCESS = {
@@ -111,7 +111,7 @@ const GATEWAY_ACCESS = {
       mediator_did: MEDIATOR.did,
     },
   ],
-  expires_at: "2026-11-19T00:00:00Z",
+  expires_at: "2099-01-01T00:00:00Z",
 };
 
 const REFUSED_TEMP = {
@@ -342,6 +342,23 @@ test.describe("Mediator access step", () => {
     await expect(
       page.getByTestId("mediator-access-did-permanent"),
     ).toContainText(ACCEPTOR_PERMANENT_DID.slice(-16));
+  });
+
+  test("an expired paused Connection Point shows EXPIRED and offers no Continue", async ({
+    page,
+  }) => {
+    await mockConnections(page);
+    await page.route("**/api/v1/connection-points", (route) =>
+      json(route, [{ ...PAUSED_CP, expires_at: "2020-01-01T00:00:00Z" }]),
+    );
+    await page.goto(`${BASE_URL}/connections?tab=gateways`);
+
+    await expect(
+      page.getByTestId("connection-points-status-cp-paused"),
+    ).toHaveText("EXPIRED");
+    await expect(
+      page.getByTestId("connection-points-continue-button-cp-paused"),
+    ).toHaveCount(0);
   });
 
   test("both Continue buttons share the per-row Edit button's style", async ({

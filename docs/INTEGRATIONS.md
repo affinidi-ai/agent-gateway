@@ -373,7 +373,7 @@ addresses are blocked, the resolved address is pinned and redirects are not foll
 - a Connection Point created through the management API;
 - the temporary DID an acceptor uses for the pairing handshake, which is the `id` of its temporary Connection Point, and the permanent Connection Point it stores when the pairing completes;
 - the permanent Connection Point the inviter stores when it approves a pairing;
-- with a [pause for mediator access](FABRIC.md#pausing-for-mediator-access), every DID at the pause: the Connection Point and the permanent DID it reserves, or an acceptor's temporary and permanent DIDs. The reserved permanent DID gets `creation_started` at the pause and its `created` when the pairing stores it; when the record that reserved it is deleted first, it gets `creation_failed`;
+- with a [pause for mediator access](FABRIC.md#pausing-for-mediator-access), every DID at the pause: the Connection Point and the permanent DID it reserves, or an acceptor's temporary and permanent DIDs. The reserved permanent DID gets `creation_started` at the pause and its `created` when the pairing stores it; when the record that reserved it is deleted before the pairing, it gets `creation_failed` (never after its `created`). The dashboard always asks for the pause, so every Connection Point it creates reserves and announces its permanent DID at creation, whatever the mediator's mode;
 - the DID the gateway generates for a stored Trust Registry, with `id` the Trust Registry id and empty `gateway_id` and `mediator_id`. It is announced when the registry is added and `deleted` when the registry is deleted.
 
 Each is announced before the gateway first contacts the mediator and followed by `created` or `creation_failed`; a Trust Registry deleted before its record naming the DID is saved reports `creation_failed`. Reconnecting a Trust Registry rebuilds its connection from its stored keys and keeps its DID, so it sends nothing; only a registry that never finished connecting accepts its OOB invitation again, and its new DID is announced as on creation. The first-call repeat for these DIDs needs the directory to list the mediator already: while it has not answered yet, a refused first call fails at once, unlike a Connection Point on a provided mediator. The deletion of a Connection Point record, whether the pairing is deleted, the temporary Connection Point is cleaned up or it expires, sends `deleted`. Not announced are Connection Points stored before `mediator_did` was recorded (there is no backfill, so deleting one sends nothing), the ephemeral DID the gateway makes to query a public Trust Registry it has no stored entry for, and any DID after a restart that interrupts its creation or deletion.
@@ -638,10 +638,13 @@ mediator.** These are current behaviour, not guarantees:
   an earlier run left behind with no unexpired temporary Connection Point; one created since the
   process started belongs to a pairing in flight and is kept. Such an invitation has to be accepted
   again.
-- A rejected acceptance, or one whose finalization fails, leaves its pairing, temporary Connection
-  Point, listener and pending gateway until the pairing expires or the gateway restarts. They hold the
-  provided mediator (`409` on `DELETE`) until then. A failure while the invitation is being
-  accepted removes all of them at once.
+- A `connection-rejected` from the inviter removes the acceptance's pairing, temporary Connection
+  Point and listener at once, which releases the provided mediator; the gateway stays `failed` until
+  it is deleted.
+- An acceptance whose finalization fails leaves its pairing, temporary Connection Point, listener and
+  pending gateway until the pairing expires or the gateway restarts. They hold the provided mediator
+  (`409` on `DELETE`) until then. A failure while the invitation is being accepted removes all of
+  them at once.
 - A request cancelled by the client while the invitation is being accepted is cleaned up the same way
   as a failed one, on a task of its own: the pairing, the temporary Connection Point, the pending
   gateway and the generated keys are removed and the DIDComm client is shut down. A cancellation

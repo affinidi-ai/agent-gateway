@@ -273,27 +273,48 @@ pub async fn approve_gateway<
             .as_ref()
             .and_then(|manager| manager.event_hook().cloned());
         let minted = crate::event_hook::ConnectionPointPayload::from_record(&gateway_connection_point, None);
-        // A reserved DID was announced when the connection point paused.
-        let announcement = if announced_at_pause {
-            crate::event_hook::CreationGuard::resume(hook, minted)
-        } else {
-            crate::event_hook::CreationGuard::start(hook, minted)
-        };
+        // A retry after a failed approval finds the reserved record already stored, and its
+        // `created` already sent; it is stored again without announcing anything.
+        let already_stored = announced_at_pause
+            && cp_store
+                .get(&gateway_cp_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some();
         let record = gateway_connection_point.clone();
         let point_store = cp_store.clone();
-        announcement
-            .complete(
-                async move {
-                    point_store
-                        .create(&record)
-                        .await
-                },
-                crate::event_hook::ConnectionPointPayload::from_record(&gateway_connection_point, None),
-            )
-            .await
-            .map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create gateway connection point: {}", e))
-            })?;
+        let reserving_id = connection_point.id.clone();
+        let store_permanent = async move {
+            point_store
+                .create(&record)
+                .await?;
+            if announced_at_pause {
+                crate::gateways::mediator_access::mark_reservation_consumed(point_store.as_ref(), &reserving_id).await;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        let stored = if already_stored {
+            store_permanent.await
+        } else if announced_at_pause {
+            // A reserved DID was announced when the connection point paused.
+            crate::event_hook::CreationGuard::resume(hook, minted)
+                .complete(
+                    store_permanent,
+                    crate::event_hook::ConnectionPointPayload::from_record(&gateway_connection_point, None),
+                )
+                .await
+        } else {
+            crate::event_hook::CreationGuard::start(hook, minted)
+                .complete(
+                    store_permanent,
+                    crate::event_hook::ConnectionPointPayload::from_record(&gateway_connection_point, None),
+                )
+                .await
+        };
+        stored.map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create gateway connection point: {}", e))
+        })?;
 
         info!("  ✓ Gateway connection point {} created", gateway_cp_id);
 
@@ -636,6 +657,7 @@ mod tests {
             did: "did:peer:2.permanent".into(),
             mediator_id: "med".into(),
             mediator_did: "did:web:mediator.example".into(),
+            consumed: false,
         };
 
         assert_eq!(

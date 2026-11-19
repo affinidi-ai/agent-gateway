@@ -25,8 +25,44 @@ describe('mediatorAccess', () => {
     );
 
     expect(dids).toEqual([
-      { role: 'connection_point', did: 'did:peer:2.cp', label: 'Connection Point DID' },
-      { role: 'permanent', did: 'did:peer:2.perm', label: 'Permanent DID for the paired gateway' },
+      {
+        role: 'connection_point',
+        did: 'did:peer:2.cp',
+        label: 'Connection Point DID',
+        mediatorDid: 'did:web:mediator.example',
+        mediatorName: 'Mediator X',
+      },
+      {
+        role: 'permanent',
+        did: 'did:peer:2.perm',
+        label: 'Permanent DID for the paired gateway',
+        mediatorDid: 'did:web:mediator.example',
+        mediatorName: 'Mediator X',
+      },
+    ]);
+  });
+
+  it("keeps each DID's own mediator, as federation puts a permanent DID on another", () => {
+    const dids = labelledDids(
+      {
+        mediator_did: 'did:web:inviter.example',
+        mediator_name: 'Inviter Mediator',
+        dids: [
+          { role: 'temporary', did: 'did:peer:2.tmp', mediator_did: 'did:web:inviter.example' },
+          {
+            role: 'permanent',
+            did: 'did:peer:2.perm',
+            mediator_did: 'did:web:own.example',
+            mediator_name: 'Own Mediator',
+          },
+        ],
+      },
+      CONNECTION_POINT_DID_LABELS
+    );
+
+    expect(dids.map(item => [item.mediatorDid, item.mediatorName])).toEqual([
+      ['did:web:inviter.example', 'Inviter Mediator'],
+      ['did:web:own.example', 'Own Mediator'],
     ]);
   });
 

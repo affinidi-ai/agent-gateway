@@ -179,6 +179,9 @@ pub struct MultiGatewayHarness {
     /// Pair through the pause for mediator access: each side mints its DIDs,
     /// stops, and continues once they are admitted.
     pub pause_for_mediator_access: bool,
+    /// With the pause, restart each gateway while it is paused, before it continues, so
+    /// its pause, keys and reserved permanent DID must survive the restart.
+    pub restart_while_paused: bool,
     /// gw_index -> the roles of the DIDs its pause waited for, in order.
     pub mediator_access_pauses: HashMap<usize, Vec<String>>,
 }
@@ -275,6 +278,7 @@ impl MultiGatewayHarness {
             mediators,
             _mediator_cross_bridges: mediator_cross_bridges,
             pause_for_mediator_access: false,
+            restart_while_paused: false,
             mediator_access_pauses: HashMap::new(),
         })
     }
@@ -520,7 +524,12 @@ impl MultiGatewayHarness {
                     .map(|did| did.role.clone())
                     .collect(),
             ));
-            inviter
+            if self.restart_while_paused {
+                self.restart_gateway(inviter_index)
+                    .await
+                    .with_context(|| format!("restart gateway {inviter_index} while its connection point is paused"))?;
+            }
+            self.gw(inviter_index)
                 .admin
                 .continue_connection_point(&paused.id)
                 .await
@@ -541,6 +550,7 @@ impl MultiGatewayHarness {
         };
 
         let inviter_view_name = format!("gateway {acceptor_index} from gateway {inviter_index}");
+        let acceptor = self.gw(acceptor_index);
 
         let acceptor_view = if self.pause_for_mediator_access {
             let (paused, access) = acceptor
@@ -564,7 +574,12 @@ impl MultiGatewayHarness {
                     .map(|did| did.role.clone())
                     .collect(),
             ));
-            acceptor
+            if self.restart_while_paused {
+                self.restart_gateway(acceptor_index)
+                    .await
+                    .with_context(|| format!("restart gateway {acceptor_index} while its acceptance is paused"))?;
+            }
+            self.gw(acceptor_index)
                 .admin
                 .continue_gateway(&paused.id)
                 .await
@@ -584,6 +599,8 @@ impl MultiGatewayHarness {
                 .with_context(|| format!("gateway {acceptor_index} connect via OOB to gateway {inviter_index}"))?
         };
 
+        let inviter = self.gw(inviter_index);
+        let acceptor = self.gw(acceptor_index);
         let inviter_view = inviter
             .admin
             .wait_for_new_remote_gateway_status(

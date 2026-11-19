@@ -150,6 +150,17 @@ pub async fn a_fabric_pairing_through_mediator_access(
         .pause_for_mediator_access = true;
 }
 
+#[given(regex = r"^a fabric with (\d+) gateways that pause for mediator access and restart while paused$")]
+pub async fn a_fabric_restarting_while_paused(
+    world: &mut G2gWorld,
+    count: usize,
+) {
+    a_fabric_pairing_through_mediator_access(world, count).await;
+    world
+        .topology
+        .restart_while_paused = true;
+}
+
 /// The receiving gateway admits Fabric streams as one whose surfaces serve
 /// only that MCP revision does; no product setting does this.
 #[given(expr = "gateway {int} admits only MCP protocol version \"2024-11-05\" over Fabric")]
