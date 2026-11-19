@@ -243,7 +243,12 @@ to the gateway DID document's `assertionMethod` and `authentication` when the do
 out: a node that boots Active does it at startup, and a Standby node in the background once it
 becomes Active and admits traffic, since signing does not wait for the document (see [Resolvable
 identities](CAPABILITIES.md#resolvable-identities)). After that repair the same Active node
-brings the `/v1/resolve` index up to the gateway DID log; a Standby node writes neither. An
+brings the `/v1/resolve` index up to the gateway DID log; a Standby node writes neither. After
+each repair attempt, also when another node made the repair or this one could not, the Active
+node removes the gateway DID and its `did:web` DID from its DID resolver cache, so it verifies
+credentials against the document as now published rather than a copy cached for up to an hour; a
+node that gave up waiting for the lock keeps its cache, since the lock holder may not have written
+the repair yet. An
 index that does not match the start of the log is rebuilt from the log and logged as a warning,
 as is one that holds a version twice; an index longer than the log a node read, as a stale read
 of shared storage can leave it, is left as it is. A node whose document already lists the key,

@@ -169,6 +169,19 @@ lazy_static! {
         counter
     };
 
+    /// Presentations refused because a proof fails the proof purpose check (labeled by role and
+    /// reason).
+    pub static ref PROOF_PURPOSE_MISMATCH: IntCounterVec = {
+        let opts = Opts::new(
+            names::PROOF_PURPOSE_MISMATCH_TOTAL,
+            "Presentations refused because a proof fails the proof purpose check (role = vp|vc, reason = \
+             not_listed|purpose_not_allowed|unresolvable)",
+        );
+        let counter = IntCounterVec::new(opts, &["role", "reason"]).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
     /// Managed identity resolution attempts (labeled by channel_id, mode, result)
     pub static ref MANAGED_IDENTITY_RESOLVE: IntCounterVec = {
         let opts = Opts::new(
@@ -731,6 +744,17 @@ pub fn track_caller_key_secret_unreadable(
         .inc();
 }
 
+/// Count a `role` (`vp` or `vc`) proof that fails the proof purpose check for `reason`
+/// (`not_listed`, `purpose_not_allowed` or `unresolvable`) that refused its presentation.
+pub fn track_proof_purpose_mismatch(
+    role: &str,
+    reason: &str,
+) {
+    PROOF_PURPOSE_MISMATCH
+        .with_label_values(&[role, reason])
+        .inc();
+}
+
 /// Track a managed-identity resolution outcome.
 ///
 /// `mode`   = `payload_extraction` | `from_mtls` | `from_api_key` | `static` | `from_jwt_claim`
@@ -1176,6 +1200,22 @@ mod tests {
                 .get()
         };
         assert_eq!((count("missing"), count("too_short"), count("no_store")), (2, 1, 0));
+    }
+
+    #[test]
+    fn a_proof_purpose_mismatch_is_counted_by_role_and_reason() {
+        use super::{PROOF_PURPOSE_MISMATCH, track_proof_purpose_mismatch};
+        assert_eq!(names::PROOF_PURPOSE_MISMATCH_TOTAL, "agent_gateway_proof_purpose_mismatch_total");
+        let count = |reason: &str| {
+            PROOF_PURPOSE_MISMATCH
+                .with_label_values(&["ut_role", reason])
+                .get()
+        };
+        let before = count("not_listed");
+        track_proof_purpose_mismatch("ut_role", "not_listed");
+        assert_eq!(count("not_listed"), before + 1);
+        assert_eq!(count("unresolvable"), 0);
+        assert!(get_metrics().contains("agent_gateway_proof_purpose_mismatch_total{"));
     }
 
     #[test]

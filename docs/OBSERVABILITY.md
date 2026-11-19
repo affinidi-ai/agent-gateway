@@ -384,6 +384,23 @@ The values are the preview's wire spellings, empty when absent. The event never 
 a credential, a secret or provider id, or card content. A preview records no connection, gateway
 fault, rejected request or Trust Recorder write, so it leaves the dashboard metrics as they were.
 
+## Proof purpose metric
+
+`agent_gateway_proof_purpose_mismatch_total{role,reason}` is a Prometheus counter incremented
+once for each presentation rejected because a proof fails the proof purpose check. `reason` says why:
+`purpose_not_allowed` (a credential declares anything but `assertionMethod`, a presentation
+anything but `assertionMethod` or `authentication`), `not_listed` (the signer's DID document does
+not list the key under the declared purpose) or `unresolvable` (the signer's DID document could not
+be read to check; the reason is logged as a `WARN`). `role` is `vp` for the presentation proof and
+`vc` for a credential proof. Each rejection is also logged as a `WARN` naming the proof key and the
+signer DID. A proof whose signature does not verify is refused before this check and is not
+counted, except when the gateway dropped the signer's cached document to fetch it again (see
+[Peer issuer DIDs](FABRIC.md#peer-issuer-dids)) and could not: that refusal is counted as
+`unresolvable`. A
+`not_listed` increase usually means a peer or agent DID that lists its signing key under the wrong
+relationship; an `unresolvable` one, a DID host the gateway cannot reach. See
+[Peer issuer DIDs](FABRIC.md#peer-issuer-dids).
+
 ## Credential policy report
 
 At startup and on every configuration reload (including the reload that follows a surface

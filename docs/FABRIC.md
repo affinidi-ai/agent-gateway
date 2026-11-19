@@ -189,6 +189,25 @@ verifies every embedded VC's Data Integrity proof and requires the proof key's D
 `issuer` (and the VP proof key's DID to equal `holder`). ssi alone verifies only the outer VP proof
 and never binds a proof key to the document it signs.
 
+ssi does not check the proof purpose either, so after each signature verifies `verify_vp` checks
+the purpose the proof declares: `assertionMethod` for every VC, `assertionMethod` or
+`authentication` for the VP, and the signer's DID document must list the proof key under that
+purpose. A presentation with a proof that fails this, or that cannot be checked, is rejected
+like one whose signature does not verify, and counted in
+`agent_gateway_proof_purpose_mismatch_total`; there is no setting to turn the check off. The
+request then carries no caller identity, so it is refused only where caller authentication or a
+policy needs one (a policy that requires `input.identity_binding`, for example). Before rejecting
+a key that a cached DID
+document does not list, the gateway drops that document from its DID cache and verifies the whole
+presentation again, signatures included, against the document as now published, so a signer that
+has since fixed its document is accepted at once. It does this for each signer of the
+presentation whose cached document is out of date, such as both the holder and a credential's
+issuer, at most once a minute per signer DID. When the document cannot be fetched again, the
+presentation is refused and the out-of-date document is not cached again. A peer
+on a release whose gateway DID document lists its signing key (`#key-2`) under no relationship has
+its presentations rejected until it upgrades, which repairs its document on its next start (see
+[Proof purpose metric](OBSERVABILITY.md#proof-purpose-metric)).
+
 ![Presentation issuance: a verifiable credential is issued, wrapped in a verifiable presentation, signed with the agent key, and forwarded to the receiving gateway](assets/diagrams/vp-issuance.png)
 
 ![Presentation verification: receive the presentation, verify its signature, verify the credential signature, and check that the presentation holder equals the credential subject](assets/diagrams/vp-verification.png)
