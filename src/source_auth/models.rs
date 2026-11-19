@@ -46,6 +46,33 @@ impl SourceAuthConfig {
         }
     }
 
+    /// The inbound identity this method's callers are given, when the method sets its own.
+    pub fn identity(&self) -> Option<&ManagedIdentityConfig> {
+        match self {
+            SourceAuthConfig::JwtBearer(config) => config.identity.as_ref(),
+            SourceAuthConfig::ApiKey(config) => config.identity.as_ref(),
+            SourceAuthConfig::ApiKeyProvider(config) => config.identity.as_ref(),
+            SourceAuthConfig::DidAuth(_) | SourceAuthConfig::Mtls(_) => None,
+        }
+    }
+
+    /// Whether the method's own identity, if it sets one, reads the credential the
+    /// method verifies: `from_jwt_claim` with a claim on `jwt_bearer`, `from_api_key`
+    /// without an `api_key_id` on `api_key` or `api_key_provider`.
+    pub fn identity_reads_its_credential(&self) -> bool {
+        match (self, self.identity()) {
+            (_, None) => true,
+            (SourceAuthConfig::JwtBearer(_), Some(ManagedIdentityConfig::FromJwtClaim { claim, .. })) => {
+                !claim.trim().is_empty()
+            }
+            (
+                SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_),
+                Some(ManagedIdentityConfig::FromApiKey { api_key_id: None }),
+            ) => true,
+            _ => false,
+        }
+    }
+
     /// The tag with its indefinite article, for messages: `an api_key`, `a jwt_bearer`.
     pub fn method_tag_with_article(&self) -> String {
         let tag = self.method_tag();
@@ -86,10 +113,13 @@ impl SourceAuthConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApiKeyAuthConfig {
     /// Stable identifier of this method within its `methods` list, assigned by
-    /// the dashboard and kept across edits and reordering. Names the method an
-    /// inbound identity is derived from.
+    /// the dashboard and kept across edits and reordering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// How the inbound identity of this method's callers is derived, read from
+    /// the credential they presented. Unset: the surface's inbound identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<ManagedIdentityConfig>,
     /// Where to extract the API key credential from the inbound request.
     pub extraction: CredentialExtraction,
     /// Secret ID in the secrets store containing valid API keys (comma-separated).
@@ -100,10 +130,13 @@ pub struct ApiKeyAuthConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApiKeyProviderAuthConfig {
     /// Stable identifier of this method within its `methods` list, assigned by
-    /// the dashboard and kept across edits and reordering. Names the method an
-    /// inbound identity is derived from.
+    /// the dashboard and kept across edits and reordering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// How the inbound identity of this method's callers is derived, read from
+    /// the credential they presented. Unset: the surface's inbound identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<ManagedIdentityConfig>,
     /// Where to extract the API key credential from the inbound request.
     pub extraction: CredentialExtraction,
     /// Agent ID to validate keys against in the API Key Provider.
@@ -120,8 +153,7 @@ pub struct ApiKeyProviderAuthConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DidAuthAuthConfig {
     /// Stable identifier of this method within its `methods` list, assigned by
-    /// the dashboard and kept across edits and reordering. Names the method an
-    /// inbound identity is derived from.
+    /// the dashboard and kept across edits and reordering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// Where to extract the DID Auth session token from the inbound request.
@@ -219,8 +251,7 @@ impl DidAuthAuthConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MtlsAuthConfig {
     /// Stable identifier of this method within its `methods` list, assigned by
-    /// the dashboard and kept across edits and reordering. Names the method an
-    /// inbound identity is derived from.
+    /// the dashboard and kept across edits and reordering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// How to establish trust in the presented client certificate.
@@ -1006,6 +1037,7 @@ mod tests {
     #[test]
     fn source_auth_config_apikey_roundtrip() {
         let config = SourceAuthConfig::ApiKey(ApiKeyAuthConfig {
+            identity: None,
             id: None,
             extraction: CredentialExtraction::HttpHeader { field: "X-API-Key".to_string() },
             secret_id: "my-secret".to_string(),
@@ -1342,6 +1374,7 @@ mod tests {
     #[test]
     fn source_auth_config_apikey_provider_roundtrip() {
         let config = SourceAuthConfig::ApiKeyProvider(ApiKeyProviderAuthConfig {
+            identity: None,
             id: None,
             extraction: CredentialExtraction::HttpHeader { field: "X-API-Key".to_string() },
             agent_id: "agent-1".to_string(),

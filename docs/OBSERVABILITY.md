@@ -737,8 +737,8 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
   `mtls` or `mcp_resource_token`. `reason` is `missing_credential`, `invalid_credential`,
   `insufficient_scope`, `config_not_found`, `internal`, `setup_failed`, `unavailable` (no MCP
   resource authorization context) or `source_method_mismatch` (the credential was valid, but
-  the inbound identity names another Caller Context method to derive from, so the caller is
-  refused with `blocking: true`). `blocking` is false when the failure was handed to policy
+  its method sets no identity of its own and the inbound identity cannot read it, or its
+  method's own identity cannot be used, so the caller is refused with `blocking: true`). `blocking` is false when the failure was handed to policy
   (`input.source_auth.method == "failed"`) instead of refusing the request. `client_ip` is the
   resolved client address (forwarded headers only from `client_ip.trusted_proxies`); absent on
   the fabric path, where the caller connected to the sending gateway. A Transit Point's own

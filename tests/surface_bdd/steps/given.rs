@@ -3391,15 +3391,35 @@ fn surface_derives_inbound_identity_from_jwt_claim(world: &mut SurfaceWorld) {
         .jwt_claim_inbound_identity = true;
 }
 
-#[given(expr = "the surface derives the inbound identity from a JWT claim of its {string} source authentication")]
-fn surface_derives_inbound_identity_from_a_named_source_auth_method(
+#[given("the surface derives the inbound identity from the API key the caller presents")]
+fn surface_derives_inbound_identity_from_the_presented_api_key(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .api_key_inbound_identity = true;
+}
+
+#[given(expr = "the surface's {string} source authentication identifies its callers from a JWT claim")]
+fn source_auth_method_identifies_callers_from_a_jwt_claim(
     world: &mut SurfaceWorld,
     auth_type: String,
 ) {
-    world
-        .surface_config
-        .jwt_claim_inbound_identity = true;
-    let method_type = match auth_type.as_str() {
+    set_method_identity(world, &auth_type, "jwt_claim");
+}
+
+#[given(expr = "the surface's {string} source authentication identifies its callers by their API key")]
+fn source_auth_method_identifies_callers_by_their_api_key(
+    world: &mut SurfaceWorld,
+    auth_type: String,
+) {
+    set_method_identity(world, &auth_type, "api_key");
+}
+
+fn set_method_identity(
+    world: &mut SurfaceWorld,
+    auth_type: &str,
+    kind: &str,
+) {
+    let method_type = match auth_type {
         "JWT Bearer" => "jwt_bearer",
         "API Key" => "api_key",
         "API Key Provider" => "api_key_provider",
@@ -3407,35 +3427,8 @@ fn surface_derives_inbound_identity_from_a_named_source_auth_method(
     };
     world
         .surface_config
-        .inbound_source_method = Some(crate::bdd_support::config::source_auth::source_method_id(method_type));
-}
-
-#[given(expr = "the surface derives the inbound identity from the API key of its {string} source authentication")]
-fn surface_derives_inbound_identity_from_a_named_api_key_method(
-    world: &mut SurfaceWorld,
-    auth_type: String,
-) {
-    let method_type = match auth_type.as_str() {
-        "API Key" => "api_key",
-        "API Key Provider" => "api_key_provider",
-        other => panic!("unsupported API key auth type: {other}"),
-    };
-    world
-        .surface_config
-        .api_key_inbound_identity = true;
-    world
-        .surface_config
-        .inbound_source_method = Some(crate::bdd_support::config::source_auth::source_method_id(method_type));
-}
-
-#[given("the surface derives the inbound identity from a JWT claim of a source authentication method it does not have")]
-fn surface_derives_inbound_identity_from_a_missing_source_auth_method(world: &mut SurfaceWorld) {
-    world
-        .surface_config
-        .jwt_claim_inbound_identity = true;
-    world
-        .surface_config
-        .inbound_source_method = Some("bdd-absent".to_string());
+        .method_identities
+        .push((method_type.to_string(), kind.to_string()));
 }
 
 #[given(expr = "the surface injects custom metadata key {string} value {string} into {string}")]

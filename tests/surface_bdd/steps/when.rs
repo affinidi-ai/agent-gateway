@@ -690,10 +690,6 @@ pub(crate) async fn build_new_surface_payload(
     if public {
         access_point.insert("public".to_string(), serde_json::json!(true));
     }
-    let selected_source_method = world
-        .surface_config
-        .inbound_source_method
-        .clone();
     if let Some(auth) = &world
         .surface_config
         .source_auth
@@ -705,15 +701,12 @@ pub(crate) async fn build_new_surface_payload(
                     .additional_source_auth,
             )
             .map(|auth| {
-                let mut method = config::source_auth::caller_authentication_method_json(auth);
-                if selected_source_method.is_some() {
-                    method["id"] = serde_json::json!(config::source_auth::source_method_id(
-                        method["type"]
-                            .as_str()
-                            .unwrap_or("method")
-                    ));
-                }
-                method
+                config::source_auth::with_method_identity(
+                    config::source_auth::caller_authentication_method_json(auth),
+                    &world
+                        .surface_config
+                        .method_identities,
+                )
             })
             .collect();
         access_point.insert("caller_authentication".to_string(), serde_json::json!({ "methods": methods }));
@@ -732,11 +725,7 @@ pub(crate) async fn build_new_surface_payload(
         None
     };
     if let Some(inbound) = inbound {
-        let mut slots = serde_json::json!({ "inbound": inbound });
-        if let Some(selected) = selected_source_method {
-            slots["inbound_source_method"] = serde_json::json!(selected);
-        }
-        payload["identity_slots"] = slots;
+        payload["identity_slots"] = serde_json::json!({ "inbound": inbound });
     }
     payload
 }

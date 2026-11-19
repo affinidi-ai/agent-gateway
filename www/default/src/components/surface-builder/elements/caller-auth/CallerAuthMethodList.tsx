@@ -11,6 +11,12 @@ import {
   readMethods,
 } from './methods';
 
+/** What a method row says about the method's own caller identity, set in the inbound Identity panel. */
+const METHOD_IDENTITY_NOTE = {
+  from_jwt_claim: 'Identifies its callers From JWT Claims',
+  from_api_key: 'Identifies its callers From API Key',
+} as const;
+
 interface CallerAuthMethodListProps {
   config: CallerAuthConfig;
   updateFields: (fields: Record<string, unknown>) => void;
@@ -105,6 +111,11 @@ const CallerAuthMethodList: React.FC<CallerAuthMethodListProps> = ({
                 <small className="text-muted d-block text-truncate">
                   {problem ?? `Reads ${credentialLocation(method)}`}
                 </small>
+                {!problem && method.identity && (
+                  <small className="text-muted d-block" data-testid={`${rowId}-identity`}>
+                    {METHOD_IDENTITY_NOTE[method.identity.type]}
+                  </small>
+                )}
               </div>
               {editable && (
                 <div className="d-flex align-items-center gap-1">

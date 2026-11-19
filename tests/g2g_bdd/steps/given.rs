@@ -683,8 +683,8 @@ pub async fn surface_requires_api_key(
     });
 }
 
-#[given(expr = "surface {string} derives its inbound identity from a partner API key")]
-fn surface_derives_inbound_identity_from_a_partner_api_key(
+#[given(expr = "surface {string} identifies partner API key callers by their key and other callers from a JWT claim")]
+fn surface_identifies_partner_api_key_callers_by_their_key(
     world: &mut G2gWorld,
     surface_name: String,
 ) {

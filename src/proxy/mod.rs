@@ -73,7 +73,8 @@ pub struct CompiledIdentityEngines {
 /// the three identity slots straight off `AgentSurface.identity_slots`. The surface has
 /// no top-level `managed_identity` field — that was a `ChannelMapping`-only
 /// legacy slot — so the channel-wide engine here falls back through
-/// `inbound → protected → external` only.
+/// `inbound → protected → external`, then the first caller-authentication
+/// method's own identity, whose callers' DIDs it issues.
 ///
 /// Per-slot engines (`protected_*`, `external_*`) are compiled independently
 /// so each slot keeps its own schema and rules.
@@ -107,7 +108,11 @@ pub fn compile_identity_engines_from_surface(
         .or(surface
             .identity_slots
             .external
-            .as_ref());
+            .as_ref())
+        .or(surface
+            .source_auth_methods()
+            .iter()
+            .find_map(|method| method.identity()));
 
     let base = match channel_wide {
         Some(mi) => compile_identity_engines_from_managed_identity(mi, vc_issuer)?,
@@ -324,6 +329,24 @@ mod tests {
                 .validate(&json!({}))
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn compile_builds_a_selector_for_a_method_that_identifies_its_callers() {
+        let (vc_issuer, _tmp) = crate::identity::test_helpers::test_vc_issuer().await;
+        let issuer = Arc::new(vc_issuer);
+        let mut surface = base_test_surface();
+        surface
+            .access_point
+            .caller_authentication = Some(
+            serde_json::from_value(json!({"methods": [{"type": "api_key",
+                "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "keys",
+                "identity": {"type": "from_api_key"}}]}))
+            .unwrap(),
+        );
+
+        let engines = compile_identity_engines_from_surface(&surface, Some(&issuer)).expect("compile should succeed");
+        assert!(engines.selector.is_some(), "a method's own identity needs the selector to issue its callers' DIDs");
     }
 
     #[tokio::test]

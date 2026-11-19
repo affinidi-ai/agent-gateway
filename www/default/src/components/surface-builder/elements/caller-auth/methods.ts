@@ -11,13 +11,16 @@ export const LATER_JWT_BEARER_BESIDE_DISCOVERY =
  * shape (`method_type`, `jwt_strategy_id`, `extraction_field`, …).
  */
 export interface CallerAuthMethodConfig {
-  /** Stable id an inbound Identity names to read this method. Never shown. */
+  /** Stable id of the method within its list. Never shown. */
   id?: string;
-  /**
-   * The id was made here, not stored: it is saved only once an Identity
-   * names the method, so a surface that never needs one saves unchanged.
-   */
+  /** The id was made here, not stored, and is never saved. */
   id_generated?: boolean;
+  /**
+   * How this method's callers' identity is derived from the credential they
+   * present; unset, the surface's inbound Identity applies. Edited in the
+   * inbound Identity panel.
+   */
+  identity?: MethodIdentity;
   method_type?: CallerAuthMethodType;
   jwt_strategy_id?: string;
   audiences?: string[];
@@ -31,6 +34,11 @@ export interface CallerAuthMethodConfig {
   mtls_certificate_id?: string;
   protected_resource?: unknown;
 }
+
+/** A method's own caller identity, read from the credential the method verifies. */
+export type MethodIdentity =
+  | { type: 'from_jwt_claim'; claim: string; namespace_claims?: string[] }
+  | { type: 'from_api_key' };
 
 /**
  * The caller-auth element's config: its methods, the first being the primary
@@ -242,14 +250,34 @@ export function methodSelectionProblems(config: CallerAuthConfig | undefined) {
 }
 
 /** The runtime `SourceAuthConfig` for one method, or `undefined` while incomplete. */
-export function buildMethod(
-  c: CallerAuthMethodConfig,
-  surfaceId: string | undefined,
-  referencedId?: string
-): any {
+export function buildMethod(c: CallerAuthMethodConfig, surfaceId: string | undefined): any {
   const method = buildMethodBody(c, surfaceId);
-  const saved = c.id && (!c.id_generated || c.id === referencedId);
-  return method && saved ? { ...method, id: c.id } : method;
+  if (!method) return method;
+  const identity = methodIdentityWire(c);
+  return {
+    ...method,
+    ...(c.id && !c.id_generated ? { id: c.id } : {}),
+    ...(identity ? { identity } : {}),
+  };
+}
+
+/** The method's own identity on the wire, when it is one its credential supplies. */
+function methodIdentityWire(c: CallerAuthMethodConfig): any {
+  const identity = c.identity;
+  if (identity?.type === 'from_jwt_claim' && c.method_type === 'jwt_bearer') {
+    return {
+      type: 'from_jwt_claim',
+      claim: identity.claim.trim() || 'oid',
+      ...(identity.namespace_claims?.length ? { namespace_claims: identity.namespace_claims } : {}),
+    };
+  }
+  if (
+    identity?.type === 'from_api_key' &&
+    (c.method_type === 'api_key' || c.method_type === 'api_key_provider')
+  ) {
+    return { type: 'from_api_key' };
+  }
+  return undefined;
 }
 
 function buildMethodBody(c: CallerAuthMethodConfig, surfaceId: string | undefined): any {
@@ -299,6 +327,17 @@ function buildMethodBody(c: CallerAuthMethodConfig, surfaceId: string | undefine
 export function methodConfigFromPayload(m: any): CallerAuthMethodConfig {
   const out: CallerAuthMethodConfig = { method_type: m.type };
   if (typeof m.id === 'string' && m.id) out.id = m.id;
+  if (m.identity?.type === 'from_jwt_claim') {
+    out.identity = {
+      type: 'from_jwt_claim',
+      claim: typeof m.identity.claim === 'string' ? m.identity.claim : 'oid',
+      ...(Array.isArray(m.identity.namespace_claims)
+        ? { namespace_claims: m.identity.namespace_claims }
+        : {}),
+    };
+  } else if (m.identity?.type === 'from_api_key') {
+    out.identity = { type: 'from_api_key' };
+  }
   if (m.extraction) {
     out.extraction_source = m.extraction.source;
     if (m.extraction.field) out.extraction_field = m.extraction.field;

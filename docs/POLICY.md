@@ -544,9 +544,11 @@ surface it creates unless it is public), a legacy one stored without `public`, a
 `caller_authentication.on_failure` is `reject`, see
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#closed-and-public-access-points). An Access Point whose
 inbound identity is `from_jwt_claim`, public or not, direct or over fabric, refuses one the
-same way, because no caller identity can be derived without a valid JWT, and so does one that
-names a method in `identity_slots.inbound_source_method`, which also refuses a caller whose
-valid credential belongs to another method (`source_method_mismatch`). These refusals run
+same way, because no caller identity can be derived without a valid JWT, and so does one where
+a caller authentication method sets its own identity or whose callers of a method are refused for
+their valid credential. Each also refuses a caller whose method
+sets no identity of its own and whose valid credential the inbound identity cannot read
+(`source_method_mismatch`). These refusals run
 before gateway policy, so a gateway deny does not apply to them, and surface policy never sees
 the request. Their body is the generic `Caller credential missing or invalid`; the reason is
 logged. Only on any other public Access Point (`public: true`) does source auth hand a request

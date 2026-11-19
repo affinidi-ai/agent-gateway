@@ -10,16 +10,9 @@ import { deepLinks } from '../../../../utils/deepLinks';
 import { HEADER_METADATA_EXTENSION_URI } from '../_shared/headerMetadataMapping';
 import { transitPointProtocol } from '../transit-point/TransitPointPanel';
 import FieldHelp from '../../../shared/FieldHelp';
-import { isInboundIdentity } from './placement';
+import { callerAuthNode as findCallerAuthNode, isInboundIdentity } from './placement';
 import { readMethods } from '../caller-auth/methods';
-import IdentitySourceMethodSelect from './IdentitySourceMethodSelect';
-import {
-  effectiveSourceMethod,
-  readsEveryMethod,
-  sourceMethodChoices,
-  SOURCE_METHOD_TYPES,
-  unlistedMethodLabel,
-} from './sourceMethods';
+import MethodIdentityList from './MethodIdentityList';
 import {
   apiKeyReferenceWarningText,
   storedApiKeyProblem,
@@ -169,7 +162,7 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
   node,
   config,
   updateField,
-  updateFields,
+  updateNodeFields,
   protocol,
   openFullscreenEditor,
   allNodes,
@@ -243,9 +236,13 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
     (node.slotId === 'request:identity-managed_identity' ||
       node.slotId === 'response:identity-managed_identity') &&
     (parentTransitProtocol === 'a2a' || parentTransitProtocol === 'ap2');
-  const callerAuthNode = allNodes?.find(candidate => candidate.type === 'caller-auth');
+  const callerAuthNode = findCallerAuthNode(allNodes ?? []);
   const callerMethods = callerAuthNode ? readMethods(callerAuthNode.config) : [];
-  const choosesSourceMethod = isInbound && callerMethods.length > 1;
+  const listsMethodIdentities =
+    isInbound &&
+    !!callerAuthNode &&
+    ((callerMethods.length > 1 && extractionType !== 'from_payload') ||
+      callerMethods.some(method => method.identity));
   const canUseHeaderMetadata =
     extractionType === 'from_payload' && (isInboundA2aIdentity || isTransitPointA2aIdentity);
 
@@ -278,14 +275,7 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
             if (nextType !== '' && !isSelectableExtractionType(nextType, extractionTypeOptions)) {
               return;
             }
-            if (
-              isInbound &&
-              (SOURCE_METHOD_TYPES.has(nextType) || SOURCE_METHOD_TYPES.has(extractionType))
-            ) {
-              updateFields({ type: nextType, source_method: undefined });
-            } else {
-              updateField('type', nextType);
-            }
+            updateField('type', nextType);
           }}
         >
           <option value="">Select an identity extraction type…</option>
@@ -318,17 +308,13 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
         </Form.Text>
       </div>
 
-      {choosesSourceMethod &&
-        (extractionType === 'from_jwt_claim' || extractionType === 'from_api_key') && (
-          <IdentitySourceMethodSelect
-            identityType={extractionType}
-            choices={sourceMethodChoices(extractionType, callerMethods)}
-            value={effectiveSourceMethod(config, callerMethods) ?? ''}
-            anyMethod={readsEveryMethod(extractionType, callerMethods)}
-            unlistedLabel={unlistedMethodLabel(config.source_method ?? '', callerMethods)}
-            onChange={id => updateFields({ source_method: id || undefined })}
-          />
-        )}
+      {listsMethodIdentities && updateNodeFields && (
+        <MethodIdentityList
+          surfaceType={extractionType}
+          methods={callerMethods}
+          onChange={methods => updateNodeFields(callerAuthNode.id, { methods })}
+        />
+      )}
 
       {extractionType === 'from_payload' && (
         <>

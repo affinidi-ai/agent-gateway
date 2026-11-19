@@ -150,19 +150,17 @@ Access Point panel and on the canvas, and names a new surface `<protocol>_surfac
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Surface Builder's inbound Identity **From API Key** shows no key picker, since each caller is
-identified by the API key it presents, and blocks Save unless every Caller Context method is API
-Key or API Key Provider or it names the API key method it reads; the protected and external Identities' key picker lists only the
+identified by the API key it presents, and blocks Save unless a Caller Context method is API Key
+or API Key Provider or a method sets its own identity; the protected and external Identities' key picker lists only the
 surface's own active keys; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
-With several Caller Context methods, an inbound From JWT Claims or From API Key Identity shows an
-**Identity source method** select that writes `identity_slots.inbound_source_method` (the `id` of
-the method it reads, or none while every method is of the kind it reads, offered as **Any JWT
-Bearer method** or **Any API key method**); the gateway then refuses a caller authenticated by any
-other method, on a public Access Point too; see
-_Method ids and the Identity source method_ in
-[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder) and
-[`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#naming-the-method-an-inbound-identity-reads).
+With several Caller Context methods, the inbound Identity panel lists them under **Caller identity
+per method**: each JWT Bearer method can derive its callers' identity From JWT Claims and each API
+key method From API Key, written to the method's `identity`; a method that sets none uses the
+Identity, and its callers are refused when the Identity cannot read its credential; see _Caller
+identity per method_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder) and
+[`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#caller-identity-per-method).
 
 A protected, external or Transit Point Identity whose API key reference is `blocking`
 (`api_key_references`: a revoked or deleted key, or another surface's key that is revoked or
@@ -472,9 +470,8 @@ every other Access Point refuses it before policy with a `401`, direct or over F
 one (`public: false`), a legacy one stored without `public`, and any whose
 `caller_authentication.on_failure` is `reject`. Two more refuse it, public or not: an Access
 Point whose inbound identity is `from_jwt_claim` (no caller identity can be derived without a
-valid JWT) or that names the method its inbound identity reads
-(`identity_slots.inbound_source_method`, which also refuses a valid credential of another
-method), and an MCP Access Point that publishes protected resource metadata (a missing or
+valid JWT) or where a caller authentication method sets its own identity (either also refuses a
+valid credential of a method the inbound identity cannot read), and an MCP Access Point that publishes protected resource metadata (a missing or
 refused JWT Bearer credential gets the discovery challenge on direct requests, a failed
 credential of another method a plain `401`). Each such refusal's body says only `Caller
 credential missing or invalid`; the reason is logged, not sent. The admin API creates every

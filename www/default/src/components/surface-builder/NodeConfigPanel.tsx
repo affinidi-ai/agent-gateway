@@ -140,6 +140,10 @@ const NodeConfigPanel: React.FC<NodeConfigPanelProps> = ({
   const updateFields = (fields: Record<string, any>) => {
     onUpdate(node.id, { ...node.config, ...fields });
   };
+  const updateNodeFields = (nodeId: string, fields: Record<string, any>) => {
+    const target = allNodes?.find(candidate => candidate.id === nodeId);
+    if (target) onUpdate(nodeId, { ...target.config, ...fields });
+  };
 
   const def = registry.get(node.type);
   const Panel = def?.ConfigPanel;
@@ -294,6 +298,7 @@ const NodeConfigPanel: React.FC<NodeConfigPanelProps> = ({
             config={node.config || {}}
             updateField={updateField}
             updateFields={updateFields}
+            updateNodeFields={updateNodeFields}
             protocol={protocol as any}
             allNodes={allNodes}
             openFullscreenEditor={hasFullscreenEditor ? requestFullscreen : undefined}

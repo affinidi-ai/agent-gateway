@@ -194,73 +194,76 @@ Creating or saving a surface, and each of its enabled variants as resolved, refu
 - a method that reads `mcp_meta` or `a2a_extension` when there is more than one method, since
   it could never be selected;
 - more than one `did_auth` method, because the `/authenticate` endpoints serve one;
-- a `from_jwt_claim` identity, in any identity slot or Transit Point override, unless
-  `jwt_bearer` is the only method, or the identity is the inbound one and
-  [names the method it reads](#naming-the-method-an-inbound-identity-reads);
-- an inbound `from_api_key` identity unless every method is `api_key` or `api_key_provider`,
-  or it [names the method it reads](#naming-the-method-an-inbound-identity-reads);
+- a `from_jwt_claim` identity on the protected or external slot or a Transit Point override
+  unless `jwt_bearer` is the only method;
+- an inbound `from_jwt_claim` identity with no `jwt_bearer` method to read, and an inbound
+  `from_api_key` identity with no `api_key` or `api_key_provider` method to read, unless a
+  method [sets its own identity](#caller-identity-per-method);
+- a method's own `identity` that its credential cannot supply;
 - two methods with the same `id`;
 - on an Access Point that publishes protected resource metadata, a JWT bearer method other
   than the primary: the discovery audience and challenge belong to the primary method.
 
 Both identity rules follow from the caller: `from_jwt_claim` needs a verified JWT and
-`from_api_key` a verified key. So a surface mixing JWT and API key callers either names the
-method its inbound identity reads, or takes a stored or static inbound identity, and policy
-tells its callers apart by `input.source_auth.method` and `key_name`.
+`from_api_key` a verified key. So a surface mixing JWT and API key callers gives each method its
+own identity, or takes a stored or static inbound identity, and policy tells its callers apart
+by `input.source_auth.method` and `key_name`.
 
-#### Naming the method an inbound identity reads
+Each method may carry an `id`: 1 to 32 lowercase letters, digits and dashes, which stays with the
+method when it is edited or reordered. A save refuses any other id, and refuses two methods of one
+`methods` list that share one. A variant that overrides `caller_authentication` has its own list.
+A stored surface whose methods share an id is not cut down to its first method: the gateway logs a
+warning and clears the ids that clash, so the surface keeps serving every method.
 
-Each method may carry an `id`: 1 to 32 lowercase letters, digits and dashes, which the
-dashboard assigns and which stays with the method when it is edited or reordered. A save refuses
-any other id, and refuses two methods of one `methods` list that share one. A variant that
-overrides `caller_authentication` has its own list, and a method without an id is read as
-before. A stored surface whose methods share an id is not cut down to its first method: the
-gateway logs a warning and clears the ids that clash, so the surface keeps serving every method.
+#### Caller identity per method
 
-`identity_slots.inbound_source_method` holds the `id` of the method an inbound `from_jwt_claim`
-or `from_api_key` identity is derived from. It is refused on any other identity, and the method
-it names must exist and be a `jwt_bearer` method for `from_jwt_claim`, or an `api_key` or
-`api_key_provider` method for `from_api_key`. The id follows the same format as a method's.
-The other methods may be of any type, but a surface that names a method serves only that
-method's callers, as a surface with that one method does: a caller of any other method,
-including a partner's API key, is refused. To serve callers of several methods, leave the
-method unnamed while every method is of the kind the identity reads. The dashboard offers that
-as **Any JWT Bearer method** or **Any API key method**, and, beside methods the identity cannot
-all read, selects the first method it can.
+A `jwt_bearer`, `api_key` or `api_key_provider` method can set `identity`: how its callers'
+inbound identity is derived from the credential it verifies. A `jwt_bearer` method takes
+`from_jwt_claim` (a non-empty `claim`, optional `namespace_claims`); an API key method takes
+`from_api_key` without an `api_key_id`, so each caller is identified by the key it presents. A
+save refuses any other identity on these methods; DID Auth and mTLS methods take none, and an
+`identity` sent on one is ignored. A save also refuses a method's own identity beside an inbound
+`payload_extraction` identity, which a caller asserts in the request body, and a stored surface
+with one refuses that method's callers. A surface that mixes JWT and API key callers then serves
+both, each caller with its own DID:
 
 ```json
 {
   "access_point": {
     "caller_authentication": {
       "methods": [
-        { "type": "jwt_bearer", "id": "users-jwt", "jwt_verification_strategy_id": "idp", "audiences": ["api://agent"] },
-        { "type": "api_key", "id": "partner-key", "extraction": { "source": "http_header", "field": "X-API-Key" }, "secret_id": "partner-keys" }
+        { "type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": ["api://agent"],
+          "identity": { "type": "from_jwt_claim", "claim": "oid" } },
+        { "type": "api_key", "extraction": { "source": "http_header", "field": "X-API-Key" }, "secret_id": "partner-keys",
+          "identity": { "type": "from_api_key" } }
       ]
     }
-  },
-  "identity_slots": {
-    "inbound": { "type": "from_jwt_claim", "claim": "oid" },
-    "inbound_source_method": "users-jwt"
   }
 }
 ```
 
-A request verified by any other method is refused with `401` before policy and before the
-Target, directly and over Fabric, with the same body as any refused caller. The log names the
-method the identity reads and the one the caller used; the audit reason and the
-identity-resolution metric outcome are `source_method_mismatch`; the credential was valid, so
-the record is a refusal of a caller who authenticated, not of one who failed to. The refusal
-carries no `WWW-Authenticate` challenge, because fetching another token would not help. A stored
-selection that names a method of the wrong kind refuses its callers the same way.
+A caller's inbound identity is the identity of the method that verified it, and it reaches the
+Target in the identity binding VP as an inbound slot's does (a method's own identity turns VP
+injection on, as an inbound slot does). A method that sets none uses `identity_slots.inbound`, as
+before; when that identity reads a credential the method
+does not carry (`from_jwt_claim` beside an API key method, `from_api_key` beside a JWT method),
+the caller is refused with `401` before policy and before the Target, directly and over Fabric,
+with the same body as any refused caller. The log names the identity and the method the caller
+used; the audit reason and the identity-resolution metric outcome are `source_method_mismatch`;
+the credential was valid, so the record is a refusal of a caller who authenticated, not of one
+who failed to. The refusal carries no `WWW-Authenticate` challenge, because fetching another
+token would not help. A stored method identity its credential cannot supply refuses its
+callers the same way, is logged as a warning at startup, and is refused on the next save. The
+DID of a caller depends on the claim value or the key, not on the method, so a caller keeps its
+DID when its identity moves from the surface to its method.
 
-On a public Access Point a surface that names a method refuses every failed caller before
-policy, as `from_jwt_claim` already does, so policy never sees `source_auth.method == "failed"`
-for it and a caller of the non-named method is refused like one with no credential.
+On a public Access Point a surface where a method sets its own identity, or that refuses the
+callers of a method for their valid credential, refuses every failed caller before policy, as
+`from_jwt_claim` already does, so policy never sees `source_auth.method == "failed"` for it and a
+caller with no credential gets no further than one with a valid credential of a refused method.
 
-Without `inbound_source_method` nothing changes: the identity needs every method to be of its
-kind, and a caller of any of them gets an identity. A transit point's `managed_identity` never
-takes it. A surface whose stored `inbound_source_method` names no method is logged as a warning
-at startup, keeps it, and refuses callers until it is fixed, and the next save refuses it.
+The dashboard edits each method's identity in the inbound Identity panel; see _Caller identity
+per method_ in [`www/default/AGENTS.md`](../www/default/AGENTS.md#surface-builder).
 
 On an Access Point that publishes protected resource metadata, every caller-attributable
 failure is refused before policy: a failed JWT with the discovery challenge, and a failed
@@ -286,15 +289,14 @@ credential location and non-secret references (strategy, secret, provider agent,
 certificates), so it can be rebuilt. An active node's load persists the correction to local
 storage ([`fall_back_to_first_source_auth_methods`](../src/surfaces/store.rs)); a standby
 node, a storage event and a DynamoDB-sourced surface are corrected in memory only. A stored
-`from_jwt_claim` identity without `jwt_bearer` as its only method, or an inbound
-`from_api_key` identity beside a method other than an API key, is logged as a warning at
-startup and refused on the next save, unless it names the method it reads.
+`from_jwt_claim` identity on another slot without `jwt_bearer` as its only method, and an
+inbound `from_jwt_claim` or `from_api_key` identity with no method to read, are logged as a
+warning at startup and refused on the next save.
 
-`SurfaceIdentitySlots` rejects unknown fields, so a release without `inbound_source_method`
-cannot load a surface that stores it, base or variant: its routes answer `404`. Upgrade every
-node, standby nodes included, before using the field, and clear it, with the mixed methods or
-the from-credential identity that needed it, before rolling back. A method `id` alone is safe,
-because the method structures accept unknown fields.
+A method's `id` and `identity` are safe to roll back over, because the method structures accept
+unknown fields: an earlier release loads the surface and ignores them. It then derives every
+caller's identity from `identity_slots.inbound`, so before rolling back, remove the method
+identities, or the methods whose callers they identify.
 
 Before rolling back to a release that enforces only the first method, remove every method but
 the first. That release strips only the first method's header, so it would forward a later
@@ -447,8 +449,8 @@ To find the affected surfaces and callers:
 - after upgrading, the gateway logs a warning when it starts (not on a configuration reload,
   a storage refresh or a backup restore, so restart after one) for each active legacy surface
   whose base or enabled variant now refuses such a caller (one that authenticates callers without protected
-  resource metadata, `on_failure: reject`, an inbound `from_jwt_claim` identity or a named
-  `inbound_source_method`, which refused already), naming the surface:
+  resource metadata, `on_failure: reject`, an inbound `from_jwt_claim` identity or a method that
+  sets its own identity, which refused already), naming the surface:
   `This Access Point is configured for authenticated callers only. Any request without valid
   credentials is denied with a 401 Unauthorized response. To allow requests from those callers,
   switch the Access Point to Public access.`.
@@ -537,8 +539,8 @@ or `unknown` one. Another surface's revoked key stays `unavailable`; the surface
 `serving_status` already shows that it does not serve.
 
 On every Access Point that is not public (closed or legacy), on a public one stored with
-`on_failure: reject`, and with an inbound `from_jwt_claim` identity or a named
-`inbound_source_method`, a missing or invalid credential is refused
+`on_failure: reject`, and with an inbound `from_jwt_claim` identity or a method that sets its own
+identity, a missing or invalid credential is refused
 with `401` before policy and the target, on direct inbound, `proxy://` MCP Targets,
 `a2a-proxy://` Targets and Fabric receive. These refusals return before the surface rate limit,
 so they don't use up its budget: an anonymous caller can't exhaust the budget of the callers it
@@ -604,8 +606,8 @@ deny if input.source_auth.method == "failed"
 
 See [`POLICY.md`](POLICY.md#failed-caller-authentication).
 
-A request to an Access Point whose inbound identity is `from_jwt_claim` or that names an
-`inbound_source_method`, or to an MCP Access Point that
+A request to an Access Point whose inbound identity is `from_jwt_claim` or with a method that sets
+its own identity, or to an MCP Access Point that
 publishes protected resource metadata, direct or over Fabric, is the exception: a missing or
 invalid credential is refused with a `401` before policy (the discovery challenge on a direct
 MCP request), see
@@ -1641,8 +1643,8 @@ presents to the surface's caller authentication:
 | API Key | One DID per secret, shared by every caller holding a value of that secret | `unverified` |
 
 Per-key caller identity therefore needs an API Key Provider. Beside a method of another type,
-the slot names the API key method it reads with
-[`inbound_source_method`](#naming-the-method-an-inbound-identity-reads).
+the slot identifies the callers of the API key methods, and the callers of a method that sets
+no [identity of its own](#caller-identity-per-method) are refused.
 
 - A missing, invalid or revoked key resolves no caller identity. On an Access Point that is
   not public (closed or legacy), or with `on_failure: reject`, the request is refused with `401`
@@ -2013,7 +2015,7 @@ Point's outbound request:
 | A plain API Key's secret is not in the secrets store | `500` | `secret_not_found` |
 | The secrets store cannot be read | `503` | `secrets_store_unavailable` or `store_lookup_failed` |
 | A stored `from_api_key` Managed Agent or Transit Point identity has no `api_key_id` | `500` | `api_key_id_missing` |
-| The caller authenticated with a method other than the one `inbound_source_method` names (the credential was valid; `mode` is the inbound identity's, `from_api_key` or `from_jwt_claim`) | `401` | `source_method_mismatch` |
+| The caller authenticated with a method that sets no identity of its own and whose credential the inbound identity cannot read, or whose own identity its credential cannot supply (the credential was valid; `mode` is the inbound identity's, `from_api_key` or `from_jwt_claim`) | `401` | `source_method_mismatch` |
 
 When no VC issuer is configured (`vc_issuer_missing`) or DID issuance fails
 (`vc_issuer_error`), the request is not refused: it resolves no caller identity and policy
@@ -2022,9 +2024,9 @@ decides, as for a failed key.
 ### `from_jwt_claim`
 
 Requires `jwt_bearer` source auth on the same surface, so the token is cryptographically
-verified before the DID is derived. On the inbound slot it may name the `jwt_bearer` method it
-reads with [`inbound_source_method`](#naming-the-method-an-inbound-identity-reads), beside
-methods of other types. On a direct or fabric-routed Access Point, a missing or
+verified before the DID is derived. On the inbound slot, beside methods of other types, it reads
+the `jwt_bearer` methods, and the callers of a method that sets no
+[identity of its own](#caller-identity-per-method) are refused. On a direct or fabric-routed Access Point, a missing or
 invalid bearer token is refused with `401` before the target is called.
 
 | Field | Default | Effect |
