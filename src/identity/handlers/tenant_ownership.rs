@@ -504,6 +504,8 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
                     });
                 }
             }
+            add_signing_reference(state, &mut references, source.clone(), surface.signing.as_ref(), "surface signing")
+                .await?;
             let ids = provider_key_ids(&surface).map_err(|error| {
                 OwnershipApiError::Internal(format!("Failed to inspect Surface references: {:?}", error))
             })?;
@@ -596,6 +598,17 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
                 )
                 .await?;
             }
+        }
+    }
+
+    if let Some(store) = state.issuer_store.as_ref() {
+        for issuer in store
+            .list_all()
+            .await
+            .map_err(internal)?
+        {
+            let source = endpoint(ResourceKind::Issuers, &issuer.id, issuer.tenant_id.clone(), true);
+            add_signing_reference(state, &mut references, source, issuer.signing.as_ref(), "issuer signing").await?;
         }
     }
 
@@ -877,8 +890,48 @@ async fn collect_global_references(
             }
         }
     }
+    add_signing_reference(
+        state,
+        references,
+        appliance,
+        state
+            .settings_store
+            .get()
+            .default_signing
+            .as_ref(),
+        "gateway-wide default signing",
+    )
+    .await?;
 
     Ok(())
+}
+
+/// An edge from whatever signs with `signing` to the trust agent connection it names, so the
+/// connection can't move to a tenant its signer may not sign through. The appliance's own
+/// connections, the bootstrap one and the default, never move and get no edge.
+async fn add_signing_reference(
+    state: &IdentityApiState,
+    references: &mut Vec<OwnershipReference>,
+    source: OwnershipEndpoint,
+    signing: Option<&crate::config::agent_surface::SurfaceSigningConfig>,
+    context: &str,
+) -> Result<(), OwnershipApiError> {
+    let Some(connection_id) = signing.and_then(|signing| {
+        signing
+            .connection_id
+            .as_deref()
+    }) else {
+        return Ok(());
+    };
+    if state
+        .vta_connection_store
+        .is_none()
+        || connection_id == crate::vta::connections::BOOTSTRAP_CONNECTION_ID
+        || connection_id == crate::vta::key_directory::DEFAULT_CONNECTION_ID
+    {
+        return Ok(());
+    }
+    add_reference(state, references, source, ResourceKind::VtaConnections, connection_id, context).await
 }
 
 async fn add_reference(
@@ -1146,6 +1199,26 @@ async fn persist_tenant_id(
                 .await
                 .map_err(internal)?
                 .ok_or_else(|| missing(kind, id))?;
+            if resource.tenant_id != tenant_id
+                && let Some(signing) = resource
+                    .signing
+                    .as_ref()
+                    .filter(|signing| !signing.is_empty())
+            {
+                crate::issuers::handlers::validate_issuer_signing(
+                    signing,
+                    tenant_id.as_deref(),
+                    state
+                        .vta_connection_store
+                        .as_deref(),
+                    &state.bootstrap_config.vta,
+                )
+                .await
+                .map_err(|(status, message)| match status {
+                    StatusCode::BAD_REQUEST => OwnershipApiError::Refused(message),
+                    _ => OwnershipApiError::Internal(message),
+                })?;
+            }
             resource.tenant_id = tenant_id;
             resource.updated_at = chrono::Utc::now();
             store

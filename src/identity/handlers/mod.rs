@@ -16,6 +16,7 @@ pub mod onboarding;
 pub mod policy_definitions;
 pub mod policy_validation;
 pub mod settings;
+pub(crate) mod signing_choice;
 mod surface_caller_key;
 pub(crate) mod surface_grants;
 mod surface_target_auth;

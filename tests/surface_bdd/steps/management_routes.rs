@@ -18,7 +18,7 @@ const TENANT_HEADER: &str = "x-external-account";
 const ALL_SURFACES: &str = ".*";
 
 /// Who calls a management route in a scenario.
-enum Caller<'a> {
+pub(crate) enum Caller<'a> {
     Operator(&'a str),
     PersonalAccessToken,
 }
@@ -34,7 +34,7 @@ fn operator_client<'a>(
         .unwrap_or_else(|| panic!("operator '{operator}' must have a role before calling {path}"))
 }
 
-async fn send(
+pub(crate) async fn send(
     world: &SurfaceWorld,
     caller: Caller<'_>,
     method: Method,

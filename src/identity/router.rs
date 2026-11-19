@@ -1081,9 +1081,14 @@ pub async fn create_identity_api_router(
             )
             .route(
                 "/v1/onboard/delete-temp-channel/{config_id}",
-                delete(handlers::delete_temp_onboard_channel).layer(require_feature(s, r, Feature::SurfacesDelete)),
+                delete(handlers::delete_temp_onboard_channel).layer(require_feature(
+                    s.clone(),
+                    r.clone(),
+                    Feature::SurfacesDelete,
+                )),
             )
             .layer(Extension(agents_api_listener_manager.clone()))
+            .layer(Extension(crate::auth_manager::middleware::RbacGuard::new(s, r)))
             .with_state(state.clone())
     } else {
         Router::new()
@@ -1997,9 +2002,21 @@ pub async fn create_identity_api_router(
             );
         }
 
+        if let Some(storage) = passkey_storage_for_manager.as_ref() {
+            r = r.layer(Extension(crate::auth_manager::middleware::RbacGuard::new(
+                storage.clone(),
+                rbac_config.clone(),
+            )));
+        }
         r.layer(Extension(store))
             .layer(Extension(state.vc_issuer.clone()))
             .layer(Extension(state.bootstrap_config.clone()))
+            .layer(Extension(Arc::new(
+                state
+                    .bootstrap_config
+                    .vta
+                    .clone(),
+            )))
             .layer(Extension(issuer_tr_listener_manager.clone()))
             .layer(Extension(issuer_authority_store))
             .layer(Extension(

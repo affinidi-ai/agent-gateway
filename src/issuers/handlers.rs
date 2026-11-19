@@ -41,31 +41,41 @@ pub struct CreateIssuerRequest {
 
 type VtaConnectionStoreExt = Option<Arc<dyn crate::vta::connections::VtaConnectionStorage>>;
 
-/// A signing block must name a backend and a trust agent connection the issuer's tenant may use.
-async fn validate_issuer_signing(
+/// An issuer's signing choice must be one it can sign tokens with, through a trust agent
+/// connection the issuer's tenant may use.
+pub(crate) async fn validate_issuer_signing(
     signing: &crate::config::agent_surface::SurfaceSigningConfig,
     tenant_id: Option<&str>,
-    connections: &VtaConnectionStoreExt,
+    connections: Option<&dyn crate::vta::connections::VtaConnectionStorage>,
+    vta: &crate::config::vta::VtaConfig,
 ) -> Result<(), (StatusCode, String)> {
-    crate::vta::key_directory::signing_key_ref(signing, crate::config::vta::KeyPurpose::Jwt)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("signing: {}", e.log_detail())))?;
-    let Some(store) = connections else {
-        return Ok(());
-    };
-    crate::identity::handlers::surface_tenancy::check_signing_connections(
-        store.as_ref(),
-        tenant_id,
-        std::iter::once(signing),
-    )
-    .await
-    .map_err(|error| match error {
-        crate::identity::handlers::surface_tenancy::SigningConnectionError::NotAccessible => {
-            (StatusCode::BAD_REQUEST, error.message())
-        }
-        crate::identity::handlers::surface_tenancy::SigningConnectionError::Store(_) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, error.message())
-        }
-    })
+    use crate::identity::handlers::signing_choice::{SigningChoiceError, SigningOwner, validate_signing_choice};
+
+    validate_signing_choice(signing, SigningOwner::Resource(tenant_id), connections, vta)
+        .await
+        .map_err(|error| match error {
+            SigningChoiceError::Invalid(message) => (StatusCode::BAD_REQUEST, format!("signing: {message}")),
+            SigningChoiceError::Store(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
+        })
+}
+
+/// A save that changes the issuer's signing choice also needs `key_management.edit`.
+async fn require_signing_permission(
+    stored: Option<&crate::config::agent_surface::SurfaceSigningConfig>,
+    saved: Option<&crate::config::agent_surface::SurfaceSigningConfig>,
+    editor: &crate::identity::handlers::signing_choice::SigningEditor,
+) -> Result<(), (StatusCode, String)> {
+    if crate::identity::handlers::signing_choice::signing_changed(stored, saved)
+        && !editor
+            .may_change_signing()
+            .await
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            crate::identity::handlers::signing_choice::SIGNING_CHANGE_FORBIDDEN.to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn tenant_context(context: &Option<Extension<PatTenantContext>>) -> Option<&PatTenantContext> {
@@ -176,6 +186,7 @@ pub async fn create_issuer<S: IssuerStore>(
     pat: Option<Extension<PatContext>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
+    signing_editor: crate::identity::handlers::signing_choice::SigningEditor,
     Json(mut req): Json<CreateIssuerRequest>,
 ) -> Result<(StatusCode, Json<IssuerResponse>), (StatusCode, String)> {
     req.tenant_id = tenant_for_create(req.tenant_id.take(), pat.is_some(), tenant_context(&context))
@@ -188,8 +199,9 @@ pub async fn create_issuer<S: IssuerStore>(
         .signing
         .take()
         .filter(|signing| !signing.is_empty());
+    require_signing_permission(None, signing.as_ref(), &signing_editor).await?;
     if let Some(signing) = &signing {
-        validate_issuer_signing(signing, req.tenant_id.as_deref(), &connections).await?;
+        validate_issuer_signing(signing, req.tenant_id.as_deref(), connections.as_deref(), &config.vta).await?;
     }
 
     // Validate: trust_registry_did and authority_did must both be present or both absent
@@ -355,9 +367,11 @@ pub async fn update_issuer<S: IssuerStore>(
     Extension(tr_manager): Extension<Option<Arc<TrustRegistryListenerManager>>>,
     Extension(authority_store): Extension<AuthorityStoreExt>,
     Extension(connections): Extension<VtaConnectionStoreExt>,
+    Extension(vta): Extension<Arc<crate::config::vta::VtaConfig>>,
     Path(id): Path<String>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
+    signing_editor: crate::identity::handlers::signing_choice::SigningEditor,
     Json(req): Json<UpdateIssuerRequest>,
 ) -> Result<Json<IssuerResponse>, (StatusCode, String)> {
     let name = req.name.trim().to_string();
@@ -379,8 +393,9 @@ pub async fn update_issuer<S: IssuerStore>(
 
     if let Some(signing) = req.signing {
         let signing = Some(signing).filter(|signing| !signing.is_empty());
+        require_signing_permission(issuer.signing.as_ref(), signing.as_ref(), &signing_editor).await?;
         if let Some(signing) = &signing {
-            validate_issuer_signing(signing, issuer.tenant_id.as_deref(), &connections).await?;
+            validate_issuer_signing(signing, issuer.tenant_id.as_deref(), connections.as_deref(), &vta).await?;
         }
         issuer.signing = signing;
     }
@@ -1302,9 +1317,14 @@ mod tests {
             Extension(None),
             Extension(None),
             Extension(None),
+            Extension(Arc::new(crate::config::vta::VtaConfig::default())),
             Path(issuer.id.clone()),
             tenant_a(),
             None,
+            crate::identity::handlers::signing_choice::SigningEditor::signed_in_as(
+                crate::auth::types::UserRole::Administrator,
+            )
+            .await,
             rename(),
         )
         .await;
@@ -1358,9 +1378,14 @@ mod tests {
             Extension(None),
             Extension(None),
             Extension(None),
+            Extension(Arc::new(crate::config::vta::VtaConfig::default())),
             Path(issuer.id.clone()),
             tenant_a(),
             None,
+            crate::identity::handlers::signing_choice::SigningEditor::signed_in_as(
+                crate::auth::types::UserRole::Administrator,
+            )
+            .await,
             rename(),
         )
         .await;
@@ -1414,9 +1439,14 @@ mod tests {
             Extension(None),
             Extension(None),
             Extension(None),
+            Extension(Arc::new(crate::config::vta::VtaConfig::default())),
             Path(issuer.id.clone()),
             tenant_a(),
             None,
+            crate::identity::handlers::signing_choice::SigningEditor::signed_in_as(
+                crate::auth::types::UserRole::Administrator,
+            )
+            .await,
             rename(),
         )
         .await
@@ -1499,9 +1529,14 @@ mod tests {
             Extension(None),
             Extension(None),
             Extension(connections.clone()),
+            Extension(Arc::new(crate::config::vta::VtaConfig::default())),
             Path(issuer.id.clone()),
             None,
             None,
+            crate::identity::handlers::signing_choice::SigningEditor::signed_in_as(
+                crate::auth::types::UserRole::Administrator,
+            )
+            .await,
             with_signing(agent_signing("agent-1")),
         )
         .await
@@ -1523,14 +1558,99 @@ mod tests {
             Extension(None),
             Extension(None),
             Extension(connections),
+            Extension(Arc::new(crate::config::vta::VtaConfig::default())),
             Path(issuer.id.clone()),
             None,
             None,
+            crate::identity::handlers::signing_choice::SigningEditor::signed_in_as(
+                crate::auth::types::UserRole::Administrator,
+            )
+            .await,
             with_signing(Default::default()),
         )
         .await
         .unwrap();
         assert_eq!(cleared.signing, None, "an empty block hands the issuer back to the appliance default");
+    }
+
+    async fn update_as(
+        role: crate::auth::types::UserRole,
+        store: &Arc<FileSystemIssuerStore>,
+        connections: VtaConnectionStoreExt,
+        issuer_id: &str,
+        request: Json<UpdateIssuerRequest>,
+    ) -> Result<Json<IssuerResponse>, (StatusCode, String)> {
+        update_issuer(
+            Extension(store.clone()),
+            Extension(None),
+            Extension(None),
+            Extension(connections),
+            Extension(Arc::new(crate::config::vta::VtaConfig::default())),
+            Path(issuer_id.to_string()),
+            None,
+            None,
+            crate::identity::handlers::signing_choice::SigningEditor::signed_in_as(role).await,
+            request,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_power_user_cannot_change_an_issuers_signing() {
+        let (store, issuer, _dir) = stored_issuer(None).await;
+        let (connections, _connections_dir) = connection_store_with(&[("agent-1", None)]).await;
+
+        let refused = update_as(
+            crate::auth::types::UserRole::PowerUser,
+            &store,
+            connections,
+            &issuer.id,
+            with_signing(agent_signing("agent-1")),
+        )
+        .await;
+
+        assert_eq!(
+            refused
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::FORBIDDEN)
+        );
+        let Json(read) = get_issuer(Extension(store), Path(issuer.id), None, None)
+            .await
+            .unwrap();
+        assert_eq!(read.signing, None, "a refused write stores nothing");
+    }
+
+    #[tokio::test]
+    async fn a_power_user_can_save_an_issuer_sending_its_signing_back_unchanged() {
+        let (store, issuer, _dir) = stored_issuer(None).await;
+        let (connections, _connections_dir) = connection_store_with(&[("agent-1", None)]).await;
+        let _ = update_as(
+            crate::auth::types::UserRole::Administrator,
+            &store,
+            connections.clone(),
+            &issuer.id,
+            with_signing(agent_signing("agent-1")),
+        )
+        .await
+        .unwrap();
+
+        let Json(renamed) = update_as(
+            crate::auth::types::UserRole::PowerUser,
+            &store,
+            connections,
+            &issuer.id,
+            Json(UpdateIssuerRequest {
+                name: "Renamed".into(),
+                description: None,
+                signing: Some(agent_signing("agent-1")),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(renamed.name, "Renamed");
+        assert_eq!(renamed.signing, Some(agent_signing("agent-1")));
     }
 
     #[tokio::test]
@@ -1542,9 +1662,14 @@ mod tests {
             Extension(None),
             Extension(None),
             Extension(connections.clone()),
+            Extension(Arc::new(crate::config::vta::VtaConfig::default())),
             Path(issuer.id.clone()),
             None,
             None,
+            crate::identity::handlers::signing_choice::SigningEditor::signed_in_as(
+                crate::auth::types::UserRole::Administrator,
+            )
+            .await,
             with_signing(agent_signing("agent-1")),
         )
         .await
@@ -1555,9 +1680,14 @@ mod tests {
             Extension(None),
             Extension(None),
             Extension(connections),
+            Extension(Arc::new(crate::config::vta::VtaConfig::default())),
             Path(issuer.id.clone()),
             None,
             None,
+            crate::identity::handlers::signing_choice::SigningEditor::signed_in_as(
+                crate::auth::types::UserRole::Administrator,
+            )
+            .await,
             Json(UpdateIssuerRequest {
                 name: "Renamed".into(),
                 description: None,
@@ -1587,9 +1717,14 @@ mod tests {
             Extension(None),
             Extension(None),
             Extension(connections),
+            Extension(Arc::new(crate::config::vta::VtaConfig::default())),
             Path(issuer.id.clone()),
             None,
             None,
+            crate::identity::handlers::signing_choice::SigningEditor::signed_in_as(
+                crate::auth::types::UserRole::Administrator,
+            )
+            .await,
             with_signing(keyless),
         )
         .await;
@@ -1621,9 +1756,14 @@ mod tests {
                     Extension(None),
                     Extension(None),
                     Extension(connections),
+                    Extension(Arc::new(crate::config::vta::VtaConfig::default())),
                     Path(issuer_id),
                     tenant_a(),
                     None,
+                    crate::identity::handlers::signing_choice::SigningEditor::signed_in_as(
+                        crate::auth::types::UserRole::Administrator,
+                    )
+                    .await,
                     with_signing(agent_signing(id)),
                 )
                 .await

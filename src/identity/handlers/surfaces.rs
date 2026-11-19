@@ -3109,63 +3109,47 @@ fn validate_surface_mcp_tool_gating(surface: &AgentSurface) -> Result<(), Surfac
     Ok(())
 }
 
-/// Validate the per-surface and per-variant `signing` blocks (VTA-19).
-///
-/// Two classes of failure are caught here rather than at the first signing
-/// call: a block whose fields contradict each other, and a block that asks for
-/// a VTA context on an appliance that cannot create one. The second is a
-/// **tier** property — auto-provisioning needs super-admin on the target VTA,
-/// which a customer-owned VTA does not grant — so the message says exactly how
-/// to fix it.
-fn validate_surface_signing(
+/// A variant signs with its surface's choice, so a variant that sets a signing choice of its own
+/// is refused rather than stored and ignored. The surface's own choice is checked with its
+/// references.
+fn refuse_variant_signing(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
+    let variants: Vec<String> = surface
+        .variants
+        .iter()
+        .filter(|variant| {
+            variant
+                .overrides
+                .signing
+                .as_ref()
+                .is_some_and(|signing| !signing.is_empty())
+        })
+        .map(|variant| format!("'{}'", variant.alias))
+        .collect();
+    if variants.is_empty() {
+        return Ok(());
+    }
+    Err(SurfaceApiError::BadRequest(format!(
+        "Surface '{}': variant {} sets signing, which a variant cannot override; a variant signs with its \
+         surface's choice, so remove the variant's signing",
+        surface.name,
+        variants.join(", ")
+    )))
+}
+
+/// A save that changes the surface's signing choice also needs `key_management.edit`.
+async fn require_signing_permission(
+    stored: Option<&AgentSurface>,
     surface: &AgentSurface,
-    vta_config: &crate::config::vta::VtaConfig,
+    editor: &super::signing_choice::SigningEditor,
 ) -> Result<(), SurfaceApiError> {
-    use crate::config::agent_surface::SigningBackendKind;
-
-    let mut errors = Vec::new();
-    let mut check = |signing: &crate::config::agent_surface::SurfaceSigningConfig, label: &str| {
-        if let Err(message) = signing.validate() {
-            errors.push(format!("Surface '{label}': {message}"));
-            return;
-        }
-        // A surface's tokens sign with this block and fail closed when it is
-        // unusable, so a block that cannot sign a token is refused here.
-        if let Err(e) = crate::vta::key_directory::signing_key_ref(signing, crate::config::vta::KeyPurpose::Jwt) {
-            errors.push(format!("Surface '{label}': {}", e.log_detail()));
-            return;
-        }
-        if signing.backend == Some(SigningBackendKind::Vta)
-            && signing.context_id.is_none()
-            && !crate::vta::key_directory::provisions_contexts_on(
-                vta_config,
-                signing
-                    .connection_id
-                    .as_deref(),
-            )
-        {
-            errors.push(format!(
-                "Surface '{label}': signing.context_id is required because this gateway creates VTA contexts \
-                 only through an enabled `[vta]` connection with `auto_provision_contexts` set (the agent \
-                 grant must carry `context-create`); name an existing context"
-            ));
-        }
-    };
-
-    if let Some(signing) = surface.signing.as_ref() {
-        check(signing, &surface.name);
-    }
-    for variant in &surface.variants {
-        if let Some(signing) = variant
-            .overrides
-            .signing
-            .as_ref()
-        {
-            check(signing, &format!("{} (variant '{}')", surface.name, variant.alias));
-        }
-    }
-    if !errors.is_empty() {
-        return Err(SurfaceApiError::BadRequest(errors.join("; ")));
+    if super::signing_choice::signing_changed(
+        stored.and_then(|stored| stored.signing.as_ref()),
+        surface.signing.as_ref(),
+    ) && !editor
+        .may_change_signing()
+        .await
+    {
+        return Err(SurfaceApiError::Forbidden(super::signing_choice::SIGNING_CHANGE_FORBIDDEN.to_string()));
     }
     Ok(())
 }
@@ -3250,6 +3234,7 @@ pub async fn create_surface(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     caller: Option<Extension<AuthGuardOk>>,
+    signing_editor: super::signing_choice::SigningEditor,
     JsonWithSent(mut surface, _): JsonWithSent<AgentSurface>,
 ) -> Result<
     (StatusCode, axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResponse<AgentSurface>>>),
@@ -3262,6 +3247,7 @@ pub async fn create_surface(
     refuse_a2a_settings_sent_on_other_protocols(&surface)?;
     convert_old_shape_body(&mut surface)?;
     drop_inbound_api_key_ids(&mut surface);
+    require_signing_permission(None, &surface, &signing_editor).await?;
 
     // Assign a new ID if not provided
     if surface.surface_id.is_empty() {
@@ -3352,8 +3338,7 @@ pub async fn create_surface(
     // Validate MCP Tool Gating regex patterns (base + every variant).
     validate_surface_mcp_tool_gating(&surface)?;
 
-    // Validate per-surface / per-variant signing config (base + every variant).
-    validate_surface_signing(&surface, &state.bootstrap_config.vta)?;
+    refuse_variant_signing(&surface)?;
 
     // Re-run the shape check against every resolved variant so a
     // variant override can't blank out a required field unnoticed.
@@ -3466,6 +3451,7 @@ pub async fn update_surface(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     caller: Option<Extension<AuthGuardOk>>,
+    signing_editor: super::signing_choice::SigningEditor,
     JsonWithSent(mut surface, sent): JsonWithSent<AgentSurface>,
 ) -> Result<SavedSurface, SurfaceApiError> {
     let store = state
@@ -3516,6 +3502,7 @@ pub async fn update_surface(
         resource_scope(&scope),
         resource_scoped(&delegation),
         management_actor(&caller, &delegation).as_ref(),
+        &signing_editor,
     )
     .await?;
     Ok((
@@ -4309,8 +4296,10 @@ async fn validate_and_save_surface(
     scope: Option<&PatResourceScope>,
     resource_scoped: bool,
     actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
+    signing_editor: &super::signing_choice::SigningEditor,
 ) -> Result<(AgentSurface, Vec<SurfaceWarning>), SurfaceApiError> {
     drop_inbound_api_key_ids(&mut surface);
+    require_signing_permission(existing, &surface, signing_editor).await?;
     // Normalize the route BEFORE the shape check so the historical "missing
     // slash is auto-fixed" behaviour is preserved.
     normalize_saved_route(&mut surface, existing);
@@ -4364,7 +4353,7 @@ async fn validate_and_save_surface(
     let warnings = validate_surface_payment_policies(state.gateway_store.as_ref(), &mut surface, existing).await?;
     validate_delegation_source_auth(&surface)?;
     validate_surface_mcp_tool_gating(&surface)?;
-    validate_surface_signing(&surface, &state.bootstrap_config.vta)?;
+    refuse_variant_signing(&surface)?;
     validate_resolved_variants(&surface)?;
     reject_target_trust_checks_unless_target_runs_them(&surface)?;
     validate_workload_binding_config(&surface)?;
@@ -4478,6 +4467,7 @@ pub async fn patch_surface(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     caller: Option<Extension<AuthGuardOk>>,
+    signing_editor: super::signing_choice::SigningEditor,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<SavedSurface, SurfaceApiError> {
@@ -4528,6 +4518,7 @@ pub async fn patch_surface(
         resource_scope(&scope),
         resource_scoped(&delegation),
         management_actor(&caller, &delegation).as_ref(),
+        &signing_editor,
     )
     .await?;
     Ok((
@@ -4569,6 +4560,7 @@ pub async fn patch_variant(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     caller: Option<Extension<AuthGuardOk>>,
+    signing_editor: super::signing_choice::SigningEditor,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<SavedSurface, SurfaceApiError> {
@@ -4648,6 +4640,7 @@ pub async fn patch_variant(
         resource_scope(&scope),
         resource_scoped(&delegation),
         management_actor(&caller, &delegation).as_ref(),
+        &signing_editor,
     )
     .await?;
     Ok((
@@ -5311,6 +5304,7 @@ pub async fn create_variant(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     caller: Option<Extension<AuthGuardOk>>,
+    signing_editor: super::signing_choice::SigningEditor,
     Json(body): Json<CreateVariantRequest>,
 ) -> Result<
     (StatusCode, axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResponse<SurfaceVariant>>>),
@@ -5394,6 +5388,7 @@ pub async fn create_variant(
         resource_scope(&scope),
         resource_scoped(&delegation),
         management_actor(&caller, &delegation).as_ref(),
+        &signing_editor,
     )
     .await?;
     let new_variant = saved
@@ -5429,6 +5424,7 @@ pub async fn update_variant(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     caller: Option<Extension<AuthGuardOk>>,
+    signing_editor: super::signing_choice::SigningEditor,
     JsonWithSent(body, sent): JsonWithSent<UpdateVariantRequest>,
 ) -> Result<(axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResponse<SurfaceVariant>>>), SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
@@ -5557,6 +5553,7 @@ pub async fn update_variant(
         resource_scope(&scope),
         resource_scoped(&delegation),
         management_actor(&caller, &delegation).as_ref(),
+        &signing_editor,
     )
     .await?;
 
@@ -5592,6 +5589,7 @@ pub async fn delete_variant(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     caller: Option<Extension<AuthGuardOk>>,
+    signing_editor: super::signing_choice::SigningEditor,
 ) -> Result<Json<DeleteSurfaceResponse>, SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
@@ -5640,6 +5638,7 @@ pub async fn delete_variant(
         resource_scope(&scope),
         resource_scoped(&delegation),
         management_actor(&caller, &delegation).as_ref(),
+        &signing_editor,
     )
     .await?;
 
@@ -5667,6 +5666,7 @@ pub async fn promote_variant_to_default(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     caller: Option<Extension<AuthGuardOk>>,
+    signing_editor: super::signing_choice::SigningEditor,
 ) -> Result<SavedSurface, SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
@@ -5707,6 +5707,7 @@ pub async fn promote_variant_to_default(
         resource_scope(&scope),
         resource_scoped(&delegation),
         management_actor(&caller, &delegation).as_ref(),
+        &signing_editor,
     )
     .await?;
 
@@ -12021,31 +12022,36 @@ mod tests {
         assert!(!trust_recorder_changed(&before, &after));
     }
 
-    fn surface_signing_with(key_id: Option<&str>) -> AgentSurface {
+    fn surface_with_variant_overrides(overrides: serde_json::Value) -> AgentSurface {
         AgentSurface {
             name: "signed".into(),
-            signing: Some(crate::config::agent_surface::SurfaceSigningConfig {
-                backend: Some(crate::config::agent_surface::SigningBackendKind::Vta),
-                connection_id: Some("vta-a".into()),
-                context_id: Some("ctx-a".into()),
-                key_id: key_id.map(str::to_string),
-            }),
+            variants: vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "v-beta", "alias": "beta", "name": "beta", "enabled": true, "overrides": overrides
+                }))
+                .unwrap(),
+            ],
             ..Default::default()
         }
     }
 
-    /// A surface's tokens sign with its block and fail closed when it cannot,
-    /// so a trust agent block that names no key to sign tokens with is refused
-    /// on save rather than at the first token.
     #[test]
-    fn a_trust_agent_signing_block_without_a_key_is_refused_on_save() {
-        let config = crate::config::vta::VtaConfig::default();
-        let err = validate_surface_signing(&surface_signing_with(None), &config)
-            .expect_err("a block that cannot sign a token must not be saved");
-        assert!(format!("{err:?}").contains("key_id"), "{err:?}");
+    fn a_variant_that_sets_signing_is_refused_on_save() {
+        let surface = surface_with_variant_overrides(serde_json::json!({
+            "signing": {"backend": "vta", "connection_id": "vta-a", "context_id": "ctx-a", "key_id": "key-a"}
+        }));
+        let Err(SurfaceApiError::BadRequest(message)) = refuse_variant_signing(&surface) else {
+            panic!("a variant's signing must not be saved");
+        };
+        assert!(message.contains("variant 'beta' sets signing"), "{message}");
+    }
 
-        validate_surface_signing(&surface_signing_with(Some("gateway-jwt-1")), &config)
-            .expect("a block naming its key is saved");
+    #[test]
+    fn a_variant_without_signing_or_with_an_empty_block_is_saved() {
+        refuse_variant_signing(&surface_with_variant_overrides(serde_json::json!({})))
+            .expect("a variant that sets no signing is saved");
+        refuse_variant_signing(&surface_with_variant_overrides(serde_json::json!({"signing": {}})))
+            .expect("an empty block sets nothing");
     }
 
     fn surface_signing_without_context(connection_id: Option<&str>) -> AgentSurface {

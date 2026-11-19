@@ -119,69 +119,68 @@ impl SigningConnectionError {
     }
 }
 
-/// Every `signing.connection_id` in `blocks` must name a trust agent connection a resource owned
+/// The `signing.connection_id` of `signing` must name a trust agent connection a resource owned
 /// by `owner_tenant_id` may sign through.
 ///
 /// The appliance's own connections, the bootstrap one and the default, belong to no tenant and are
 /// always usable. Without this check a tenant could point a surface, or an issuer, at another
 /// tenant's connection and have its tokens signed by that tenant's key.
-pub(crate) async fn check_signing_connections<'a>(
+pub(crate) async fn check_signing_connection(
     store: &dyn crate::vta::connections::VtaConnectionStorage,
     owner_tenant_id: Option<&str>,
-    blocks: impl Iterator<Item = &'a crate::config::agent_surface::SurfaceSigningConfig>,
+    signing: &crate::config::agent_surface::SurfaceSigningConfig,
 ) -> Result<(), SigningConnectionError> {
-    for connection_id in blocks.filter_map(|signing| {
-        signing
-            .connection_id
-            .as_deref()
-    }) {
-        if connection_id == crate::vta::connections::BOOTSTRAP_CONNECTION_ID
-            || connection_id == crate::vta::key_directory::DEFAULT_CONNECTION_ID
-        {
-            continue;
-        }
-        let connection = store
-            .get(connection_id)
-            .await
-            .map_err(|e| SigningConnectionError::Store(e.to_string()))?;
-        if !may_sign_through(owner_tenant_id, connection.as_ref()) {
-            return Err(SigningConnectionError::NotAccessible);
-        }
+    let Some(connection_id) = signing
+        .connection_id
+        .as_deref()
+    else {
+        return Ok(());
+    };
+    if connection_id == crate::vta::connections::BOOTSTRAP_CONNECTION_ID
+        || connection_id == crate::vta::key_directory::DEFAULT_CONNECTION_ID
+    {
+        return Ok(());
+    }
+    let connection = store
+        .get(connection_id)
+        .await
+        .map_err(|e| SigningConnectionError::Store(e.to_string()))?;
+    if !may_sign_through(owner_tenant_id, connection.as_ref()) {
+        return Err(SigningConnectionError::NotAccessible);
     }
     Ok(())
 }
 
-/// A surface's (and each variant's) `signing.connection_id` must name a trust
-/// agent connection its tenant may use.
+/// A surface's signing choice must be one it can sign tokens with, through a trust agent
+/// connection its tenant may use.
 async fn validate_signing_connections(
     state: &IdentityApiState,
     surface: &AgentSurface,
 ) -> Result<(), SurfaceApiError> {
-    let Some(store) = state
-        .vta_connection_store
+    use super::signing_choice::{SigningChoiceError, SigningOwner, validate_signing_choice};
+
+    let Some(signing) = surface
+        .signing
         .as_ref()
+        .filter(|signing| !signing.is_empty())
     else {
         return Ok(());
     };
-    let blocks = surface.signing.iter().chain(
-        surface
-            .variants
-            .iter()
-            .filter_map(|variant| {
-                variant
-                    .overrides
-                    .signing
-                    .as_ref()
-            }),
-    );
-    check_signing_connections(store.as_ref(), surface.tenant_id.as_deref(), blocks)
-        .await
-        .map_err(|error| match error {
-            SigningConnectionError::NotAccessible => {
-                SurfaceApiError::BadRequest(SIGNING_CONNECTION_NOT_ACCESSIBLE.to_string())
-            }
-            SigningConnectionError::Store(_) => SurfaceApiError::InternalError(error.message()),
-        })
+    validate_signing_choice(
+        signing,
+        SigningOwner::Resource(surface.tenant_id.as_deref()),
+        state
+            .vta_connection_store
+            .as_deref(),
+        &state.bootstrap_config.vta,
+    )
+    .await
+    .map_err(|error| match error {
+        SigningChoiceError::Invalid(message) => {
+            SurfaceApiError::BadRequest(format!("Surface '{}': {message}", surface.name))
+        }
+        SigningChoiceError::Store(message) => SurfaceApiError::InternalError(message),
+    })
 }
 
 /// Classifies each literal authority DID of `surface` by the register it is in, then refuses a

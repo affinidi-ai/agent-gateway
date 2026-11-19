@@ -79,6 +79,17 @@ For a session login, `token_id` and `scopes` are `null` and the caller holds its
 personal access token, `token_id` is the token record ID and `scopes` is the list of feature scopes it
 was issued, or `null` when it is not scope-restricted. It never returns the token secret or hash.
 
+## Signing choices
+
+Choosing which backend signs is key management. A surface save (`POST`, `PUT` or `PATCH
+/v1/surfaces…`, and the variant routes), an issuer save (`POST` or `PUT /v1/issuers…`) or a
+settings write (`POST` or `DELETE /v1/settings`) that changes the stored signing choice
+(`signing`, or the gateway-wide `default_signing`) also needs `key_management.edit`, under the
+caller's role and, for a personal access token, its scopes; without it the save is refused with
+`403` and nothing is stored. Creating a surface or an issuer with a non-empty `signing` counts as
+a change. A save that sends the stored choice back unchanged, as the dashboard does, needs only
+the route's own permission.
+
 ## Agent card preview
 
 `GET /v1/surfaces/{id}/agent-card` needs `surfaces.view` and `POST
