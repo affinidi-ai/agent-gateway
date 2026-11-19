@@ -186,7 +186,7 @@ pub fn set_reload_redactor(redactor: Arc<LogRedactor>) {
 }
 
 /// The redactor captured at startup, or one with the built-in rules when none was.
-fn reload_redactor() -> Arc<LogRedactor> {
+pub fn log_redactor() -> Arc<LogRedactor> {
     RELOAD_REDACTOR
         .get()
         .cloned()
@@ -791,7 +791,7 @@ pub async fn reload_otel(
     // ── Traces ──
     let tracer_to_flush = if let Some(handle) = TRACE_RELOAD.get() {
         if cfg.enabled {
-            let provider = build_tracer_provider(&otel_config, reload_redactor())?;
+            let provider = build_tracer_provider(&otel_config, log_redactor())?;
             let layer = build_trace_layer_boxed(&provider, &otel_config.service_name);
             handle
                 .reload(layer)
@@ -818,7 +818,7 @@ pub async fn reload_otel(
     // ── Logs ──
     let logger_to_flush = if let Some(handle) = LOG_RELOAD.get() {
         if cfg.enabled && cfg.logs.enabled {
-            let provider = build_logger_provider(&otel_config, reload_redactor())?;
+            let provider = build_logger_provider(&otel_config, log_redactor())?;
             let layer = build_log_layer_boxed(&provider);
             handle
                 .reload(layer)

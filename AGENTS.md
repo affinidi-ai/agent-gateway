@@ -399,6 +399,20 @@ which refuses the save), shown as "Not ready for external access" under the Acce
 with a **Configure Authentication** action; see
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
+A surface's Capture view has a **Policy Input** card listing, live, the input and decision of each
+request and response policy evaluation (not MCP tool policies) while the user listens with its **Listen to policy input** button (users with
+both `surfaces.edit` and `policies.edit`; leaving the view or reloading stops it), and says a
+request policy must be added first while the surface has none. It offers listening only while the
+`policy_input_capture` feature flag is on (default off), and otherwise says capture is turned off,
+or that the gateway settings could not be read, with a Retry, when loading them failed;
+see _Policy input capture_ and _Feature flags_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#policy-input-capture).
+
+The Capture view's **Clear** button clears captured payloads and policy inputs, its **Pause**
+holds the payload stream only (the Policy Input card says so while a listen is on), and its card
+titles share one style; see _Policy input capture_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#policy-input-capture).
+
 The Dashboard shows the metrics **Delete** button only to users with `settings.edit`; see
 _Maintenance actions_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#maintenance-actions).
 

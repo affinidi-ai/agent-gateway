@@ -109,6 +109,19 @@ pub(crate) fn tracked_surface_id(
                 .created_surface_id
                 .clone()
         })
+        .or_else(|| {
+            world
+                .actors
+                .gateway_instances()
+                .values()
+                .filter_map(|gateway| gateway.fixture.as_ref())
+                .any(|fixture| {
+                    fixture
+                        .agent_surfaces
+                        .contains_key(surface_name)
+                })
+                .then(|| surface_name.to_string())
+        })
         .unwrap_or_else(|| panic!("surface '{surface_name}' must have been created before this step"))
 }
 
@@ -3370,6 +3383,18 @@ fn configure_mcp_surface_protocol(world: &mut SurfaceWorld) {
     world.surface_config.protocol = "mcp".to_string();
 }
 
+#[given(expr = "the {string} role is granted {string}")]
+fn role_is_granted(
+    world: &mut SurfaceWorld,
+    role: String,
+    feature: String,
+) {
+    world
+        .surface_config
+        .rbac_permissions
+        .push((feature, role));
+}
+
 #[given(expr = "operator {string} has the {string} role")]
 async fn operator_has_role(
     world: &mut SurfaceWorld,
@@ -4835,6 +4860,7 @@ fn a_gateway(
             Some(Level::Info)
         },
         policy_opa_entry: None,
+        policy_definition_id: None,
         terms_enabled: false,
         affinidi_terms_url: None,
         settings: None,
@@ -4890,6 +4916,7 @@ fn a_gateway_with_outbound_listener(
             Some(Level::Info)
         },
         policy_opa_entry: None,
+        policy_definition_id: None,
         terms_enabled: false,
         affinidi_terms_url: None,
         settings: None,

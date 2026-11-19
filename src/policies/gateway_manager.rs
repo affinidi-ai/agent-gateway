@@ -44,11 +44,16 @@ pub struct GatewayPolicyManager {
 struct CompiledGatewayPolicy {
     engine: regorus::Engine,
     policy_definition_id: Option<String>,
+    policy_name: Option<String>,
     version: Option<u32>,
     content_hash: String,
 }
 
 pub type GatewayPolicyEvidence = (Option<String>, Option<u32>, String);
+
+/// A snapshot of one compiled member of a gateway's policy set: its engine, policy
+/// definition id, version and content hash.
+type GatewayMember = (regorus::Engine, Option<String>, Option<u32>, String);
 pub type GatewayPolicyDecisionWithEvidence = (crate::policies::PolicyDecision, Option<GatewayPolicyEvidence>);
 
 impl GatewayPolicyManager {
@@ -214,6 +219,7 @@ impl GatewayPolicyManager {
             return Ok(vec![CompiledGatewayPolicy {
                 engine,
                 policy_definition_id: None,
+                policy_name: None,
                 version: None,
                 content_hash: hash,
             }]);
@@ -242,6 +248,7 @@ impl GatewayPolicyManager {
             compiled.push(CompiledGatewayPolicy {
                 engine,
                 policy_definition_id: Some(def_id.clone()),
+                policy_name: Some(def.name.clone()),
                 version: def.version,
                 content_hash: hash,
             });
@@ -275,18 +282,29 @@ impl GatewayPolicyManager {
         gateway_id: &str,
         input: serde_json::Value,
     ) -> Result<GatewayPolicyDecisionWithEvidence, String> {
+        let listened = super::input_capture::is_listened(&input);
         // Snapshot the compiled set under a brief read lock; evaluation is then
         // lock-free on the cheap engine clones.
-        let members: Vec<(regorus::Engine, Option<String>, Option<u32>, String)> = {
+        let (members, captured_policies): (Vec<GatewayMember>, _) = {
             let engines = self
                 .engines
                 .read()
                 .expect("engines lock poisoned");
             match engines.get(gateway_id) {
-                Some(set) if !set.is_empty() => set
-                    .iter()
-                    .map(|c| (c.engine.clone(), c.policy_definition_id.clone(), c.version, c.content_hash.clone()))
-                    .collect(),
+                Some(set) if !set.is_empty() => (
+                    set.iter()
+                        .map(|c| (c.engine.clone(), c.policy_definition_id.clone(), c.version, c.content_hash.clone()))
+                        .collect(),
+                    listened.then(|| {
+                        set.iter()
+                            .map(|c| super::input_capture::CapturedPolicy {
+                                id: c.policy_definition_id.clone(),
+                                name: c.policy_name.clone(),
+                                version: c.version,
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                ),
                 _ => {
                     // Fail-closed: an enforced gateway with no compiled engine
                     // (its policy failed to compile) denies; an unenforced
@@ -306,16 +324,38 @@ impl GatewayPolicyManager {
                 }
             }
         };
+        let capture = captured_policies
+            .and_then(|policies| super::input_capture::begin("gateway", gateway_id, &input, || policies));
 
         debug!(gateway_id = %gateway_id, member_count = members.len(), "Evaluating gateway-level OPA policy set");
+        let result = Self::evaluate_members(&members, &input);
+        if let Some(capture) = capture {
+            let decided_by = match &result {
+                Ok((decision, Some((policy_id, _, _)))) if !decision.allow => policy_id.as_deref(),
+                _ => None,
+            };
+            capture
+                .decided_by(decided_by)
+                .finish(match &result {
+                    Ok((decision, _)) => Ok((decision.allow, decision.reason.as_deref())),
+                    Err(error) => Err(error.as_str()),
+                });
+        }
+        result
+    }
 
+    /// Evaluate `input` against a snapshot of a gateway's compiled set, deny-overrides.
+    fn evaluate_members(
+        members: &[GatewayMember],
+        input: &serde_json::Value,
+    ) -> Result<GatewayPolicyDecisionWithEvidence, String> {
         let input_json =
-            serde_json::to_string(&input).map_err(|e| format!("Failed to serialize gateway policy input: {}", e))?;
+            serde_json::to_string(input).map_err(|e| format!("Failed to serialize gateway policy input: {}", e))?;
         let first_evidence = members
             .first()
             .map(|(_, id, v, h)| (id.clone(), *v, h.clone()));
 
-        for (engine_tmpl, policy_definition_id, version, hash) in &members {
+        for (engine_tmpl, policy_definition_id, version, hash) in members {
             let mut engine = engine_tmpl.clone();
             engine
                 .set_input_json(&input_json)
@@ -770,6 +810,94 @@ allow if {
                 .await,
             None,
             "an inline policy has no name, so its decisions are named \"Gateway policy\""
+        );
+    }
+
+    #[tokio::test]
+    async fn a_captured_gateway_set_names_every_member_and_only_a_denying_one_decides() {
+        use crate::policies::input_capture::{listening, received_captures};
+        use crate::policies::policy_definitions::PolicyDefinition;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            FileSystemPolicyDefinitionStore::new(
+                tmp.path()
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        for (id, name, allow) in [("gw-cap-allow", "Allow partners", true), ("gw-cap-deny", "Block nights", false)] {
+            store
+                .save(PolicyDefinition {
+                    id: id.into(),
+                    tenant_id: None,
+                    name: name.into(),
+                    description: String::new(),
+                    policy_type: PolicyType::Gateway,
+                    policy: format!("package gateway.policy\ndefault allow = {allow}"),
+                    enabled: true,
+                    created_at: "t".into(),
+                    updated_at: None,
+                    version: None,
+                    content_hash: None,
+                    sample_input: None,
+                })
+                .await
+                .unwrap();
+        }
+        let manager = GatewayPolicyManager::new();
+        manager.set_policy_definition_store(store);
+        for (gateway_id, ids) in [("gw-cap-set", vec!["gw-cap-deny".to_string()]), ("gw-cap-allow-only", Vec::new())] {
+            let gateway = create_test_gateway(
+                gateway_id,
+                GatewayType::SelfGateway,
+                Some(GatewayOpaPolicyConfig {
+                    enabled: true,
+                    policy: String::new(),
+                    policy_definition_id: Some("gw-cap-allow".to_string()),
+                    policy_definition_ids: ids,
+                }),
+            );
+            manager
+                .update_gateway_policy(&gateway)
+                .await
+                .unwrap();
+        }
+        let (_listening, mut dashboard) = listening("gw-cap-surface");
+        let input = serde_json::json!({ "channel": { "config_id": "gw-cap-surface" } });
+
+        manager
+            .evaluate_with_evidence("gw-cap-set", input.clone())
+            .unwrap();
+        let denied = received_captures(&mut dashboard);
+        manager
+            .evaluate_with_evidence("gw-cap-allow-only", input)
+            .unwrap();
+        let allowed = received_captures(&mut dashboard);
+
+        assert_eq!(denied.len(), 1, "{denied:?}");
+        assert_eq!(denied[0]["decision"], "deny");
+        let names: Vec<&str> = denied[0]["policies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|policy| {
+                policy["name"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(names, ["Allow partners", "Block nights"]);
+        assert_eq!(denied[0]["decided_by"], "gw-cap-deny");
+        assert_eq!(allowed.len(), 1, "{allowed:?}");
+        assert_eq!(allowed[0]["decision"], "allow");
+        assert_eq!(allowed[0]["policies"][0]["id"], "gw-cap-allow");
+        assert!(
+            allowed[0]
+                .get("decided_by")
+                .is_none(),
+            "{allowed:?}"
         );
     }
 

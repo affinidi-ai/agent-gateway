@@ -594,6 +594,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_access_token_is_never_a_session_even_when_a_session_is_stored_under_it() {
+        let manager = SessionManager::new();
+        let access_token = format!("{}{}", crate::access_tokens::TOKEN_PREFIX, TOKEN);
+        manager
+            .storage
+            .save(&session_with_token(&access_token, "user-a", 60))
+            .await
+            .unwrap();
+        manager
+            .storage
+            .save(&session_with_token(TOKEN, "user-a", 60))
+            .await
+            .unwrap();
+
+        assert!(
+            manager
+                .validate_session_record(&access_token)
+                .await
+                .is_none()
+        );
+        assert!(
+            !manager
+                .is_live(&access_token)
+                .await
+        );
+        assert_eq!(
+            manager
+                .validate_session_record(TOKEN)
+                .await
+                .map(|session| session.user_id),
+            Some("user-a".to_string())
+        );
+        assert!(manager.is_live(TOKEN).await);
+    }
+
+    #[tokio::test]
     async fn session_save_startup_scan_and_delete_never_log_the_token() {
         let directory = tempfile::tempdir().unwrap();
         let logs = FormattedLogs::capture();

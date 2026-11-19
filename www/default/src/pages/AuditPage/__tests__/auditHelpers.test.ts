@@ -14,12 +14,27 @@ describe('categoryLabel', () => {
     ['token_refreshed', 'Token Refreshed'],
     ['consent_expired', 'Consent Expired'],
     ['consent_limited', 'Consent Limited'],
+    ['policy_input_capture_started', 'Policy Input Capture Started'],
+    ['policy_input_capture_stopped', 'Policy Input Capture Stopped'],
   ])('labels %s as %s', (name, label) => {
     expect(categoryLabel(name)).toBe(label);
   });
 
-  it('falls back to the raw name with spaces for an unknown event', () => {
-    expect(categoryLabel('some_new_event')).toBe('some new event');
+  it.each([
+    ['some_new_event', 'Some New Event'],
+    ['auth_failed', 'Auth Failed'],
+    ['mcp_proxy_pin_changed', 'MCP Proxy Pin Changed'],
+    ['vp_audit_note', 'VP Audit Note'],
+  ])('names an event it has no label for, %s, in title case', (name, label) => {
+    expect(categoryLabel(name)).toBe(label);
+  });
+});
+
+describe('policy input capture records in the Audit Log', () => {
+  it('offers the start and stop of a capture as filters', () => {
+    const offered: string[] = CATEGORY_OPTIONS.map(option => option.value);
+    expect(offered).toContain('policy_input_capture_started');
+    expect(offered).toContain('policy_input_capture_stopped');
   });
 });
 

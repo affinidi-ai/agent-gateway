@@ -257,7 +257,7 @@ impl SurfacePolicyManager {
                 match policy_text {
                     Some(def) if !def.policy.is_empty() => {
                         info!(channel_id = %config_id, def_id = %def_id, "Compiling OPA policy for channel");
-                        let engine = OpaEngine::new();
+                        let engine = OpaEngine::for_definition(&def);
                         engine.load_policy(config_id, &def.policy)?;
                         let mut engines = self
                             .opa_engines
@@ -342,7 +342,7 @@ impl SurfacePolicyManager {
                 match policy_text {
                     Some(def) if !def.policy.is_empty() => {
                         info!(channel_id = %config_id, def_id = %def_id, key = %inbound_base_key, "Compiling inbound OPA policy for channel");
-                        let engine = OpaEngine::new();
+                        let engine = OpaEngine::for_definition(&def);
                         engine.load_policy(&inbound_base_key, &def.policy)?;
                         let mut engines = self
                             .opa_engines
@@ -393,7 +393,7 @@ impl SurfacePolicyManager {
                 match policy_text {
                     Some(def) if !def.policy.is_empty() => {
                         info!(channel_id = %config_id, variant_alias = %alias, def_id = %def_id, key = %variant_key, "Compiling variant inbound OPA policy");
-                        let engine = OpaEngine::new();
+                        let engine = OpaEngine::for_definition(&def);
                         engine.load_policy(&variant_key, &def.policy)?;
                         let mut engines = self
                             .opa_engines
@@ -439,7 +439,7 @@ impl SurfacePolicyManager {
             match store.get(def_id).await {
                 Some(def) if !def.policy.is_empty() => {
                     info!(channel_id = %config_id, def_id = %def_id, "Compiling outbound OPA policy for channel");
-                    let engine = OpaEngine::new();
+                    let engine = OpaEngine::for_definition(&def);
                     engine.load_policy(&outbound_key, &def.policy)?;
                     let mut engines = self
                         .opa_engines
@@ -492,7 +492,7 @@ impl SurfacePolicyManager {
             match policy_text {
                 Some(def) if !def.policy.is_empty() => {
                     info!(channel_id = %config_id, def_id = %def_id, "Compiling response OPA policy for channel");
-                    let engine = OpaEngine::new();
+                    let engine = OpaEngine::for_definition(&def);
                     engine.load_policy(&response_key, &def.policy)?;
                     let mut engines = self
                         .opa_engines
@@ -573,7 +573,7 @@ impl SurfacePolicyManager {
                 match policy_text {
                     Some(def) if !def.policy.is_empty() => {
                         info!(channel_id = %config_id, variant_alias = %variant.alias, def_id = %def_id, "Compiling per-variant target OPA policy");
-                        let engine = OpaEngine::new();
+                        let engine = OpaEngine::for_definition(&def);
                         engine.load_policy(&v_key, &def.policy)?;
                         let mut engines = self
                             .opa_engines
@@ -620,7 +620,7 @@ impl SurfacePolicyManager {
                     match policy_text {
                         Some(def) if !def.policy.is_empty() => {
                             info!(channel_id = %config_id, variant_alias = %variant.alias, def_id = %def_id, "Compiling per-variant response OPA policy");
-                            let engine = OpaEngine::new();
+                            let engine = OpaEngine::for_definition(&def);
                             engine.load_policy(&v_resp_key, &def.policy)?;
                             let mut engines = self
                                 .opa_engines
@@ -661,7 +661,7 @@ impl SurfacePolicyManager {
                 match policy_text {
                     Some(def) if !def.policy.is_empty() => {
                         info!(channel_id = %config_id, alias = %tp.alias, def_id = %def_id, "Compiling per-transit-point OPA policy");
-                        let engine = OpaEngine::new();
+                        let engine = OpaEngine::for_definition(&def);
                         engine.load_policy(&tp_key, &def.policy)?;
                         let mut engines = self
                             .opa_engines
@@ -710,7 +710,7 @@ impl SurfacePolicyManager {
                 match policy_text {
                     Some(def) if !def.policy.is_empty() => {
                         info!(channel_id = %config_id, alias = %tp.alias, def_id = %def_id, "Compiling per-transit-point response OPA policy");
-                        let engine = OpaEngine::new();
+                        let engine = OpaEngine::for_definition(&def);
                         engine.load_policy(&tp_resp_key, &def.policy)?;
                         let mut engines = self
                             .opa_engines
@@ -1212,32 +1212,54 @@ impl SurfacePolicyManager {
         variant_alias: Option<&str>,
         input: serde_json::Value,
     ) -> Result<crate::policies::PolicyDecision, String> {
-        let engines = self
-            .opa_engines
-            .read()
-            .expect("opa_engines lock poisoned");
-
-        let (lookup_key, engine) = if let Some(alias) = variant_alias {
-            let v_key = format!("variant:{}:{}", channel_id, alias);
-            if let Some(e) = engines.get(&v_key) {
-                (v_key, Some(e))
-            } else {
-                (channel_id.to_string(), engines.get(channel_id))
-            }
-        } else {
-            (channel_id.to_string(), engines.get(channel_id))
-        };
-
-        if let Some(engine) = engine {
-            debug!(channel_id = %channel_id, lookup_key = %lookup_key, "Evaluating OPA policy");
-            engine.evaluate(input)
-        } else {
-            debug!(channel_id = %channel_id, "Engine not found for channel, denying request");
-            Ok(crate::policies::PolicyDecision {
-                allow: false,
-                reason: Some("No policy engine loaded for channel".to_string()),
+        let keys: Vec<String> = variant_alias
+            .map(|alias| format!("variant:{}:{}", channel_id, alias))
+            .into_iter()
+            .chain([channel_id.to_string()])
+            .collect();
+        self.evaluate_first_loaded(&keys, &input)
+            .unwrap_or_else(|| {
+                debug!(channel_id = %channel_id, "Engine not found for channel, denying request");
+                Ok(crate::policies::PolicyDecision {
+                    allow: false,
+                    reason: Some("No policy engine loaded for channel".to_string()),
+                })
             })
-        }
+    }
+
+    /// Evaluate `input` with the engine of the first of `keys` that is loaded, or `None`
+    /// when none is. The engines lock is held only for the evaluation: a listening
+    /// dashboard connection's capture is masked and sent after it is released.
+    fn evaluate_first_loaded(
+        &self,
+        keys: &[String],
+        input: &serde_json::Value,
+    ) -> Option<Result<crate::policies::PolicyDecision, String>> {
+        let listened = super::input_capture::is_listened(input);
+        let (lookup_key, policies, result) = {
+            let engines = self
+                .opa_engines
+                .read()
+                .expect("opa_engines lock poisoned");
+            let (lookup_key, engine) = keys.iter().find_map(|key| {
+                engines
+                    .get(key)
+                    .map(|engine| (key, engine))
+            })?;
+            debug!(lookup_key = %lookup_key, "Evaluating OPA policy");
+            let policies = listened.then(|| {
+                engine
+                    .policy()
+                    .cloned()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            });
+            (lookup_key, policies, engine.evaluate_borrowed(input))
+        };
+        let capture =
+            policies.and_then(|policies| super::input_capture::begin("surface", lookup_key, input, || policies));
+        super::input_capture::finish(capture, &result);
+        Some(result)
     }
 
     /// Evaluate the access-point (inbound) OPA policy for the given surface
@@ -1252,25 +1274,19 @@ impl SurfacePolicyManager {
         active_variant_alias: Option<&str>,
         input: serde_json::Value,
     ) -> Result<crate::policies::PolicyDecision, String> {
-        let engines = self
-            .opa_engines
-            .read()
-            .expect("opa_engines lock poisoned");
-
-        let engine = active_variant_alias
-            .and_then(|alias| engines.get(&format!("inbound:variant:{}:{}", channel_id, alias)))
-            .or_else(|| engines.get(&format!("inbound:{}", channel_id)));
-
-        if let Some(engine) = engine {
-            debug!(channel_id = %channel_id, variant_alias = ?active_variant_alias, "Evaluating inbound OPA policy");
-            engine.evaluate(input)
-        } else {
-            debug!(channel_id = %channel_id, variant_alias = ?active_variant_alias, "No inbound OPA engine found for surface/variant, denying request");
-            Ok(crate::policies::PolicyDecision {
-                allow: false,
-                reason: Some("No inbound policy engine loaded for surface".to_string()),
+        let keys: Vec<String> = active_variant_alias
+            .map(|alias| format!("inbound:variant:{}:{}", channel_id, alias))
+            .into_iter()
+            .chain([format!("inbound:{}", channel_id)])
+            .collect();
+        self.evaluate_first_loaded(&keys, &input)
+            .unwrap_or_else(|| {
+                debug!(channel_id = %channel_id, variant_alias = ?active_variant_alias, "No inbound OPA engine found for surface/variant, denying request");
+                Ok(crate::policies::PolicyDecision {
+                    allow: false,
+                    reason: Some("No inbound policy engine loaded for surface".to_string()),
+                })
             })
-        }
     }
 
     /// Filter MCP tools based on policy.

@@ -9,6 +9,7 @@ use crate::bdd_support::actors::{
     ActorRegistry, PRIMARY_COLLABORATOR_KEY, RuntimeRegistry, SECONDARY_COLLABORATOR_KEY, TargetActorKind,
 };
 use crate::bdd_support::config::api_keys::UnreadableKeyFolders;
+use crate::bdd_support::dashboard_socket::DashboardSocket;
 use crate::bdd_support::gateway_process::GatewayProcess;
 use crate::bdd_support::jwt::JwksServer;
 use crate::bdd_support::mock_server::{MockResponse, MockServer, ReceivedRequest};
@@ -131,6 +132,13 @@ pub struct SurfaceWorld {
     pub gateway_issuer_did: Option<String>,
     pub operator_roles: HashMap<String, String>,
     pub operator_clients: HashMap<String, AdminApiClient>,
+    /// Each operator's open dashboard WebSocket, by operator.
+    pub dashboard_sockets: HashMap<String, DashboardSocket>,
+    /// The answer each operator got to its last request to listen to policy input.
+    pub dashboard_listen_answers: HashMap<String, serde_json::Value>,
+    /// System feature flags a step set before the gateway started, set through the admin API
+    /// once the admin session opens.
+    pub pending_feature_flags: Vec<(String, bool)>,
     pub human_clients: HashMap<String, Vec<AdminApiClient>>,
     pub terms_enabled: bool,
     pub affinidi_cache_seeded: bool,
@@ -238,6 +246,9 @@ impl SurfaceWorld {
             gateway_issuer_did: None,
             operator_roles: HashMap::new(),
             operator_clients: HashMap::new(),
+            dashboard_sockets: HashMap::new(),
+            dashboard_listen_answers: HashMap::new(),
+            pending_feature_flags: Vec::new(),
             human_clients: HashMap::new(),
             terms_enabled: false,
             affinidi_cache_seeded: false,

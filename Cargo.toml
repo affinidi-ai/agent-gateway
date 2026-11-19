@@ -283,6 +283,7 @@ tokio = { version = "1.49.0", features = ["full", "test-util"] }
 rcgen = "0.14"
 time = "0.3"
 rsa = { version = "0.9", features = ["pem", "getrandom"] }
+tokio-tungstenite = "0.29"
 
 [[test]]
 name = "surface_bdd"
