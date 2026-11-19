@@ -2998,6 +2998,14 @@ pub fn prepare_mcp_request(
                 );
                 return Err(McpProxyCallError::OutsideTargetBase);
             }
+            // A call sent by `rmcp_openapi`, without the Target credential,
+            // prepares no answer contract, so the file declarations of a tool
+            // the catalog leaves out are read here instead: such a tool is
+            // refused whichever client the call would go out through.
+            if default_headers.is_none() {
+                super::modern_rest::file_answers(&server.openapi_spec, &tool.metadata)
+                    .map_err(|error| format!("Tool execution failed: {error}"))?;
+            }
             let stored_call = default_headers
                 .as_ref()
                 .map(|_| StoredToolCall::prepare(proxy, &server.openapi_spec, tool))
@@ -4860,6 +4868,56 @@ mod tests {
         assert!(matches!(&refused, Err(error) if *error == expected), "{refused:?}");
     }
 
+    /// A legacy tool call without a Target credential is sent by
+    /// `rmcp_openapi`, which prepares no answer contract, so the file
+    /// declarations are read while the call is prepared: a tool the catalog
+    /// leaves out is refused on that path too, before its backend is called.
+    #[tokio::test]
+    async fn a_legacy_tool_call_without_a_target_credential_is_refused_a_file_it_cannot_read() {
+        use serde_json::json;
+
+        let target =
+            crate::component_tests::helpers::MockServer::start_with_response(json!({"data": "AAECAw"}).to_string())
+                .await;
+        let mut proxy = owned("attachments", None);
+        proxy.base_url = target.url();
+        proxy.openapi_spec = json!({
+            "openapi": "3.0.0", "info": {"title": "Attachments", "version": "1"}, "paths": {
+                "/broken": {"get": {"operationId": "broken_attachment", "responses": {"200": {
+                    "description": "OK", "content": {
+                        "application/json": {"schema": {"type": "object"}},
+                        "application/vnd.example+json": {"x-gateway-file": {"pointer": "/data", "encoding": "hex"}}
+                    }
+                }}}},
+                "/items": {"get": {"operationId": "list_items", "responses": {"200": {
+                    "description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}
+                }}}}
+            }
+        })
+        .to_string();
+        let call = |tool: &str| json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": {}}});
+
+        let Err(refused) = super::prepare_mcp_request(&proxy, call("broken_attachment"), None, "legacy-files") else {
+            panic!("a malformed file declaration refuses an uncredentialed legacy call");
+        };
+
+        assert!(
+            matches!(&refused, super::McpProxyCallError::Failed(message) if message.contains("Tool execution failed")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            target
+                .request_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the backend is never called for a tool whose declared file the gateway cannot read"
+        );
+        assert!(
+            super::prepare_mcp_request(&proxy, call("list_items"), None, "legacy-files").is_ok(),
+            "a tool whose answers declare no file still prepares without a Target credential"
+        );
+    }
+
     #[tokio::test]
     async fn owned_modern_dispatch_surface_uses_target_headers_and_surface_limits() {
         use serde_json::json;
@@ -5035,12 +5093,24 @@ mod tests {
 
     #[tokio::test]
     async fn owned_modern_file_answers_arrive_decoded_and_advertise_no_output_schema() {
+        use axum::response::IntoResponse;
         use serde_json::json;
 
         let app = axum::Router::new()
             .route(
                 "/attachments/{id}",
                 axum::routing::get(|| async { axum::Json(json!({"size": 4, "data": "AAECAw"})) }),
+            )
+            .route(
+                "/vendor/{id}",
+                axum::routing::get(|axum::extract::Path(id): axum::extract::Path<String>| async move {
+                    let content_type = if id == "json" {
+                        "application/json"
+                    } else {
+                        "application/vnd.example+json"
+                    };
+                    ([("content-type", content_type)], json!({"size": 4, "data": "AAECAw"}).to_string()).into_response()
+                }),
             )
             .route("/items", axum::routing::get(|| async { axum::Json(json!({"items": []})) }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -5058,6 +5128,13 @@ mod tests {
                 "schema": {"type": "object"}, "x-gateway-file": declared
             }}}})
         };
+        let vendor_answer = |declared: serde_json::Value| {
+            json!({"200": {"description": "OK", "content": {
+                "application/json": {"schema": {"type": "object"}},
+                "application/vnd.example+json": {"x-gateway-file": declared}
+            }}})
+        };
+        let by_id = json!([{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}]);
         let proxy = McpProxy::new(
             "File tools".into(),
             String::new(),
@@ -5073,6 +5150,16 @@ mod tests {
                         "operationId": "broken_attachment",
                         "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
                         "responses": answer(json!({"pointer": "/data", "encoding": "hex"}))
+                    }},
+                    "/vendor/{id}": {"get": {
+                        "operationId": "read_vendor_attachment",
+                        "parameters": by_id.clone(),
+                        "responses": vendor_answer(json!({"pointer": "/data", "encoding": "base64url"}))
+                    }},
+                    "/broken-vendor/{id}": {"get": {
+                        "operationId": "broken_vendor_attachment",
+                        "parameters": by_id,
+                        "responses": vendor_answer(json!({"pointer": "/data", "encoding": "hex"}))
                     }},
                     "/items": {"get": {
                         "operationId": "list_items",
@@ -5135,6 +5222,17 @@ mod tests {
             "a tool answering a file advertises no output schema"
         );
         assert!(tool("broken_attachment").is_none(), "a malformed file declaration drops the tool: {tools:?}");
+        assert!(
+            tool("read_vendor_attachment")
+                .unwrap()
+                .get("outputSchema")
+                .is_none(),
+            "a tool whose second media type declares a file advertises no output schema"
+        );
+        assert!(
+            tool("broken_vendor_attachment").is_none(),
+            "a malformed declaration on a second media type drops the tool: {tools:?}"
+        );
         let read = send("tools/call", Some(json!({"name": "read_attachment", "arguments": {"id": "a1"}})))
             .await
             .unwrap();
@@ -5152,6 +5250,25 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+        let vendor = send("tools/call", Some(json!({"name": "read_vendor_attachment", "arguments": {"id": "v1"}})))
+            .await
+            .unwrap();
+        assert_eq!(vendor["result"]["isError"], false, "{vendor}");
+        assert_eq!(vendor["result"]["content"][0]["type"], "resource", "{vendor}");
+        assert_eq!(vendor["result"]["content"][0]["resource"]["blob"], "AAECAw==", "{vendor}");
+        let as_json = send("tools/call", Some(json!({"name": "read_vendor_attachment", "arguments": {"id": "json"}})))
+            .await
+            .unwrap();
+        assert_eq!(as_json["result"]["isError"], false, "{as_json}");
+        assert_eq!(
+            as_json["result"]["content"][0]["type"], "text",
+            "the media type the answer declares without a file is answered as its JSON: {as_json}"
+        );
+        let refused_vendor =
+            send("tools/call", Some(json!({"name": "broken_vendor_attachment", "arguments": {"id": "v1"}})))
+                .await
+                .unwrap_err();
+        assert_eq!(refused_vendor.status, StatusCode::BAD_REQUEST);
         tasks.shutdown().await;
     }
 

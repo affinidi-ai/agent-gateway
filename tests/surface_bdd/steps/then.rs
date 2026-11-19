@@ -3547,6 +3547,40 @@ fn mcp_tool_result_is_file_inside_rest_api_json_as_embedded_resource(
     assert_eq!(blob, expected, "the file's bytes must arrive decoded. Body: {body}");
 }
 
+#[then(expr = "the MCP tool result is REST API {string}'s JSON, not the file another media type declares")]
+fn mcp_tool_result_is_rest_api_json_not_another_media_types_file(
+    world: &mut SurfaceWorld,
+    actor_name: String,
+) {
+    let configured = &get_observed_target_for_actor(world, &actor_name, TargetActorKind::RestApi)
+        .configured_response
+        .body;
+    let encoded = configured
+        .get("data")
+        .and_then(|data| data.as_str())
+        .unwrap_or_else(|| {
+            panic!("REST API '{actor_name}' must be configured with a file in its JSON. Configured: {configured}")
+        })
+        .to_string();
+    let body = get_response_body_value(world);
+    assert_eq!(
+        body.pointer("/result/isError"),
+        Some(&serde_json::Value::Bool(false)),
+        "expected a successful MCP tool result. Body: {body}"
+    );
+    assert_eq!(
+        body.pointer("/result/content/0/type")
+            .and_then(|value| value.as_str()),
+        Some("text"),
+        "expected the answer's own JSON as text. Body: {body}"
+    );
+    let text = body
+        .pointer("/result/content/0/text")
+        .and_then(|value| value.as_str())
+        .unwrap_or_else(|| panic!("MCP tool response did not carry result.content[0].text. Body: {body}"));
+    assert!(text.contains(&encoded), "the answer's JSON must arrive undecoded. Text: {text}");
+}
+
 #[then(expr = "the MCP tool result is an error saying {string}")]
 fn mcp_tool_result_is_an_error_saying(
     world: &mut SurfaceWorld,

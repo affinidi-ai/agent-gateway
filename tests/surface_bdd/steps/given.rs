@@ -2528,6 +2528,30 @@ fn rest_api_answers_pdf_document_inside_json(
     );
 }
 
+#[given(expr = "REST API {string} answers a PDF document inside its vendor JSON")]
+fn rest_api_answers_pdf_document_inside_vendor_json(
+    world: &mut SurfaceWorld,
+    rest_api_name: String,
+) {
+    const PDF: &[u8] = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n";
+    world
+        .actors
+        .expect_target_kind(&rest_api_name, TargetActorKind::RestApi);
+    set_target_response_for_actor(
+        world,
+        &rest_api_name,
+        MockResponse {
+            status: 200,
+            headers: HashMap::from([("content-type".to_string(), "application/vnd.weather+json".to_string())]),
+            body: serde_json::json!({
+                "size": PDF.len(),
+                "data": base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE, PDF),
+            }),
+            stream: MockStream::None,
+        },
+    );
+}
+
 #[given(expr = "REST API {string} answers JSON without its file")]
 fn rest_api_answers_json_without_its_file(
     world: &mut SurfaceWorld,
