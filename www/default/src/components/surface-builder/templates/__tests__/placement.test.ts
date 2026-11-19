@@ -516,3 +516,32 @@ describe('placement: full-kind templates', () => {
     expect(plan.unsupported).toHaveLength(0);
   });
 });
+
+describe('placement: Transit Point protocol', () => {
+  const partial = (kind: string): SurfaceTemplate => ({
+    id: `test-tpl-${kind}`,
+    name: 'Partial with a Transit Point',
+    items: [{ scope: 'transit_point', kind, config: {} }],
+  });
+
+  it('places a Transit Point of the surface protocol', () => {
+    const plan = planTemplate(partial('transit-point-mcp'), [], 'mcp');
+    expect(plan.clean).toHaveLength(1);
+    expect(plan.unsupported).toHaveLength(0);
+  });
+
+  it('skips a Transit Point of the other protocol and says why', () => {
+    const plan = planTemplate(partial('transit-point-a2a'), [], 'mcp');
+    expect(plan.clean).toHaveLength(0);
+    expect(plan.unsupported.map(u => u.reason)).toEqual([
+      "'transit-point-a2a' is not available on mcp surfaces",
+    ]);
+    const result = applyTemplate(partial('transit-point-a2a'), [], 'mcp');
+    expect(result.nextNodes).toHaveLength(0);
+    expect(result.skipped).toHaveLength(1);
+  });
+
+  it('places any Transit Point when no surface protocol is given', () => {
+    expect(planTemplate(partial('transit-point-a2a'), []).clean).toHaveLength(1);
+  });
+});
