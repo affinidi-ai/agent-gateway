@@ -45,7 +45,12 @@ pub(crate) async fn validate_signing_choice(
         .map_err(|error| SigningChoiceError::Invalid(error.log_detail().to_string()))?;
     if signing.backend == Some(SigningBackendKind::Vta)
         && signing.context_id.is_none()
-        && !crate::vta::key_directory::provisions_contexts_on(vta, signing.connection_id.as_deref())
+        && !crate::vta::key_directory::provisions_contexts_on(
+            vta,
+            signing
+                .connection_id
+                .as_deref(),
+        )
     {
         return Err(SigningChoiceError::Invalid(
             "signing.context_id is required because this gateway creates VTA contexts only through an enabled \
@@ -373,6 +378,10 @@ mod tests {
         validate_signing_choice(&on_vta_block, SigningOwner::Appliance, Some(&store), &provisioning)
             .await
             .expect("the [vta] connection creates contexts, so a choice through it may name none");
+        let disabled = VtaConfig { enabled: false, ..provisioning };
+        let message =
+            invalid(validate_signing_choice(&on_vta_block, SigningOwner::Appliance, Some(&store), &disabled).await);
+        assert!(message.contains("signing.context_id is required"), "{message}");
     }
 
     #[tokio::test]

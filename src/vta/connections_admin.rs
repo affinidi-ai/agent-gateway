@@ -1800,6 +1800,7 @@ pub async fn key_inventory(
 /// surface, so another tenant's live context is never reported as orphaned.
 fn inventory_for_caller(
     config: &crate::config::vta::VtaConfig,
+    default_signing: Option<&crate::config::agent_surface::SurfaceSigningConfig>,
     connections: &[VtaConnection],
     surfaces: &[crate::config::agent_surface::AgentSurface],
     mut issuers: Vec<crate::issuers::types::Issuer>,
@@ -1819,7 +1820,8 @@ fn inventory_for_caller(
         })
         .map(|surface| surface.surface_id.as_str())
         .collect();
-    let mut inventory = crate::vta::inventory::build(config, connections, surfaces, &issuers, known_contexts);
+    let mut inventory =
+        crate::vta::inventory::build(config, default_signing, connections, surfaces, &issuers, known_contexts);
     inventory
         .mappings
         .retain(|mapping| visible.contains(mapping.surface_id.as_str()));
@@ -2522,7 +2524,7 @@ mod tests {
         let tenant_a = tenant("tenant-a");
 
         let inventory =
-            inventory_for_caller(&config, &[], &surfaces, vec![issuer_b.clone()], &known, Some(&tenant_a), None);
+            inventory_for_caller(&config, None, &[], &surfaces, vec![issuer_b.clone()], &known, Some(&tenant_a), None);
 
         let shown: Vec<&str> = inventory
             .mappings
@@ -2535,7 +2537,7 @@ mod tests {
         assert!(!body.contains("tenant-b"), "{body}");
         assert!(!body.contains("Tenant B issuer"), "{body}");
 
-        let appliance = inventory_for_caller(&config, &[], &surfaces, vec![issuer_b], &known, None, None);
+        let appliance = inventory_for_caller(&config, None, &[], &surfaces, vec![issuer_b], &known, None, None);
         assert_eq!(appliance.mappings.len(), 3);
         assert_eq!(appliance.orphaned_contexts, vec!["ctx:tenant-a/gone".to_string(), "ctx:tenant-b/gone".to_string()]);
     }
