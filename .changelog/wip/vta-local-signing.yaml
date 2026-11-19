@@ -37,24 +37,29 @@ changes:
         provisions a signing key. Each connection authenticates with its own
         control key, as a did:webvh the gateway publishes at
         /vta-auth/{connection_id}/did.jsonl, or as a did:key. The [vta] block in
-        config.toml connects one without the dashboard. Revoking, deleting or
-        disabling a connection that agents keep their key in is refused with a
-        409 naming how many, unless the request acknowledges they will be
-        stranded. Connections are tenant-owned records, managed with the new
-        vta_connections permissions, and the gateway refuses to forward any
-        surface or proxy request to a trust agent's address.
+        config.toml connects one without the dashboard. Verifying a connection
+        checks the trust agent's signed answer and pins the DID that signed it.
+        A connection's endpoint must be https, or http to a loopback address.
+        Revoking, deleting or disabling a connection that Gateway signing, a
+        surface or an issuer signs through, or that agents keep their key in,
+        is refused with a 409 naming them, unless the request acknowledges it.
+        Connections are tenant-owned records, managed with the new
+        vta_connections permissions; a tenant token can read but not change an
+        appliance-wide one. The gateway refuses to forward any surface or proxy
+        request to a verified trust agent's address.
     - timestamp: '2026-11-16T12:10:00Z'
       title: Choose the signing key source per surface, issuer or whole gateway
       description: >-
         A Signing key source field, Gateway secret or Verifiable Trust Agent,
-        sets what signs for a surface (and each variant) in the Surface Builder,
+        sets what signs for a surface in the Surface Builder,
         for every surface an issuer owns in the issuer editor, and for the whole
         gateway in Settings, Security, Gateway signing. A surface that sets
         nothing follows its issuer, then the gateway-wide choice, then the [vta]
         block, then the gateway's own key, and the dashboard shows which it
         follows. A surface or issuer can name only a trust agent connection of
-        its own tenant or an appliance-wide one. Changing Gateway signing needs
-        key management rights as well as settings rights, and the dashboard asks
+        its own tenant or an appliance-wide one, and Gateway signing only an
+        appliance-wide one. Changing any of these choices needs key management
+        rights as well as the editor's own rights, and for Gateway signing the dashboard asks
         for confirmation first, listing that the issuer of what is issued from
         then on changes, that peers and verifiers must trust it, and that tokens
         already issued keep the key that signed them.
@@ -84,10 +89,10 @@ changes:
         Verifiable Trust Agent tab or POST /v1/vta/control-key/rotate (key
         management rights; 429 with a Retry-After within ten minutes of the last
         rotation), and, when [vta] control_key_rotation_days is above 0, on a
-        schedule on the active gateway. A failure keeps the current key. An
-        interrupted rotation, or one made by another process, is settled by
-        asking the trust agent which key is live, and a call whose session the
-        key change ended is retried once. GET /v1/vta/status reports when the
+        schedule on the active gateway. A failure keeps the current key. The
+        swap is sent once, and the new key is dropped only when the trust agent
+        refuses it outright; an interrupted rotation, or one made by another
+        process, is settled by asking the trust agent which key is live. GET /v1/vta/status reports when the
         key last rotated and is next due, and --vta-print-control-did prints the
         stored key's DID for granting it again after a backup restore.
     - timestamp: '2026-11-10T15:00:00Z'
@@ -108,8 +113,8 @@ changes:
       description: >-
         Secrets has a Key Management tab, and GET /v1/key-management/inventory
         the same data, listing each trust agent connection's keys, which backend,
-        context and key each surface and variant signs with, contexts no surface
-        claims any more, and which keys still live on the gateway's disk. Users
+        context and key each surface the user may see signs with, contexts no
+        surface claims any more, and which keys still live on the gateway's disk. Users
         with key management rights can provision a connection's signing key and
         rotate to a new one, keeping the old one published.
     - timestamp: '2026-11-16T12:20:00Z'
