@@ -244,7 +244,9 @@ The credential delegation records are read in the Audit Log. The Credentials pag
 tab: **History** on Delegated Access and a token's expanded row on Credential Tokens open the
 Audit Log filtered to the delegation categories, the audited ones
 (consent granted, expired or limited, a token or a user's tokens revoked). What the gateway does on each
-call, such as a token injected or refreshed, is in its log and has no category. The Audit Log
+call, such as a token injected or refreshed, is in its log (nowhere while
+`[logging] delegation_events` is `false`) and has no category, which the **About the Audit Log**
+panel says. The Audit Log
 shows a caller's Principal beside Subject when its strategy names a claim other than `sub`; see
 _Credential delegation audit_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-delegation-audit).

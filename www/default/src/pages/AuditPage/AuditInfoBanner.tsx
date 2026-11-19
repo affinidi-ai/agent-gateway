@@ -82,12 +82,13 @@ const AuditInfoBanner: React.FC<AuditInfoBannerProps> = ({ open, onToggle }) => 
             carrying the agent&rsquo;s identity was injected into the proxied request or response.
           </li>
           <li>
-            <strong>Token Injected</strong> (<code>token_injected</code>): a delegated credential
-            from the vault was injected on the caller&rsquo;s behalf.
-          </li>
-          <li>
-            <strong>Consent Granted</strong> (<code>consent_granted</code>): a user completed the
-            OAuth consent flow and a delegation token was stored.
+            <strong>Credential delegation</strong> (<code>consent_granted</code>,{' '}
+            <code>consent_expired</code>, <code>consent_limited</code>, <code>token_revoked</code>,{' '}
+            <code>user_tokens_revoked</code>): a person consented, a consent ended or was limited,
+            or delegated access was revoked. What the gateway does with a delegated credential on
+            each call, such as a token injected or refreshed or a consent asked for, is not audited:
+            it is written to the gateway log, unless <code>[logging] delegation_events</code> is{' '}
+            <code>false</code>.
           </li>
           <li>
             <strong>Policy changes</strong> (<code>policy_created</code>,{' '}

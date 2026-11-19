@@ -35,6 +35,15 @@ Feature: Delegation audit log
     And the delegation audit trail holds no record of event "consent_required"
     And the delegation audit trail holds no record of event "token_injected"
 
+  Scenario: A gateway set to log no per-call delegation events writes none and still audits consent
+    Given the gateway is set to log no per-call delegation events
+    And caller "alice" has been asked to complete OAuth consent for provider "calendar"
+    And caller "alice" has completed OAuth consent for provider "calendar"
+    When caller "alice" invokes MCP tool "schedule_meeting" with a valid token and a valid inbound identity payload
+    Then the response status is 200
+    And the gateway log records no delegation event
+    And the delegation audit trail contains event "consent_granted" for OAuth provider "calendar"
+
   Scenario: Operator can tell apart the consents of callers that use the same Agent identity in delegation audit
     Given caller "alice" has invoked MCP tool "schedule_meeting" with a valid token and caller Agent identity "planner"
     And caller "alice" has completed OAuth consent for provider "calendar"

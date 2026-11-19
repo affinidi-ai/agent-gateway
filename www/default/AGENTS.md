@@ -1267,8 +1267,8 @@ link in a token's expanded row on Credential Tokens, both shown with `audit.view
 The delegation categories are the ones the gateway audits: `consent_granted`, `consent_expired`,
 `consent_limited`, `token_revoked` and `user_tokens_revoked`. What the gateway does with a credential on each call
 (`token_injected`, `token_refreshed`, `refresh_failed`, `consent_required`, `token_not_found`
-and the elicitation events) is written to its log and is no audit event, so the Audit Log
-offers no category for it and no link selects it. A record of one that an older gateway
+and the elicitation events) is written to its log, or nowhere while `[logging] delegation_events`
+is `false`, and is no audit event, so the Audit Log offers no category for it and no link selects it. A record of one that an older gateway
 audited is still shown, with its label (`categoryLabel`).
 
 - The Audit Log offers each delegation category in its Category filter, labels and narrates
@@ -1434,7 +1434,7 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   (`credential-provider-consent-limit-error`, `invalid-feedback`) and takes the focus. Changing
   the number or the unit clears the field's error. On a stored provider, a limit shorter than the
   stored one, one set where none was, or an emptied field where a limit was stored (sent as `0`,
-  since the gateway's default may then be the shorter) is sent to
+  since the gateway's default or ceiling may then be the shorter) is sent to
   `GET /credential-providers/{id}/consent-impact?max_consent_age_secs=<seconds>` once the field
   has stayed unchanged for 400 ms (`EditCredentialProviderPage/useConsentImpact.ts`). While its
   `ending_consents` is above 0, a warning under the field
@@ -2389,6 +2389,11 @@ identities: an integration receives every event of its event set, from every res
 
 ### Audit Log header
 
+- The **About the Audit Log** panel (`AuditInfoBanner`) lists the delegation events the gateway
+  audits in one **Credential delegation** bullet (`consent_granted`, `consent_expired`,
+  `consent_limited`, `token_revoked`, `user_tokens_revoked`) and says that what the gateway does
+  with a delegated credential on each call is not audited but written to the gateway log, unless
+  `[logging] delegation_events` is `false`. It names no per-call event as an audit event.
 - The Audit Log header shows `audit-forward-button` to users with `integrations.view`. It
   counts the active integrations, with an active endpoint, whose event set holds audit
   events (`useAuditForwarding`), and opens `/integrations`.

@@ -336,6 +336,19 @@ log lines the dashboard shows follow the same rule: `GET /v1/dashboard/delta` an
 `GET /v1/dashboard/stats` answer such a PAT without any, `logs.view` or not
 ([`RBAC.md`](RBAC.md#dashboard-log-lines)).
 
+So a tenant PAT has no way to read the per-call credential delegation events: `token_injected`,
+`token_refreshed`, `refresh_failed`, `consent_required`, `token_not_found` and the five
+`elicitation_*` events. They are written to the server log only
+([`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)). An earlier release wrote
+them, where an audit sink selected them, as audit records that named their provider, which that
+provider's tenant read on the audit routes; the records written then stay readable there. A
+tenant still reads what was decided about its providers' delegated access, such as
+`consent_granted`, `consent_expired`, `consent_limited` and `token_revoked`
+([Delegation audit records](#delegation-audit-records)). An operator who has to hand a tenant
+its per-call events exports the `credential_delegation` log target and filters it by
+`provider_id`. A `consent_required` line that asks for several providers at once names none of
+them, so those lines are told apart by `surface_id`.
+
 A feature-gated management route checks both the bound user's role and the PAT's feature
 scopes. The role-only routes listed in [`RBAC.md`](RBAC.md#permissions-endpoint) check only the
 owner's role, and routes open to any signed-in caller, such as the caller's own profile and

@@ -5701,8 +5701,9 @@ async fn process_charged_forward_request(
                 vault: vault.as_ref(), providers: providers.as_ref(), strategies: strategies.as_ref(),
                 secrets: secrets.as_ref(), provider_egress: None,
                 isolation: crate::config::credential_policy::credential_policy().tenant_credential_isolation,
-            }.prepare_with_payment(request, crate::proxy::credential_delegation::modern::now_secs()?,
+            }.prepare_call(request, crate::proxy::credential_delegation::modern::now_secs()?,
                 payment.as_ref().is_some_and(crate::proxy::handler::agent_pay_gate::Intake::is_unpaid),
+                subscription_lifetime.as_mut(),
             ).await
         }).await;
         match result {
@@ -5716,9 +5717,6 @@ async fn process_charged_forward_request(
                     Ok(body) => body,
                     Err(error) => return axum_response_to_forward_result(ModernDelegationError::from(error).response(request)).await,
                 };
-                if let Some(lifetime) = subscription_lifetime.as_mut() {
-                    prepared.restrict_to_consents(lifetime);
-                }
                 modern_request = Some(prepared.request.clone());
                 modern_delegation = Some(prepared);
             }

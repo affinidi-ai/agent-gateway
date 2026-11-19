@@ -1190,11 +1190,8 @@ async fn outbound_proxy_handler_in_request_scope(
 
     // [11] Credential Injection (§5.3 / §6.2 step 12)
     // Inject delegated OAuth tokens from the credential vault, or signal consent_required.
-    if let Some(response) = step_prepare_modern_credentials(&state, &mut ctx).await? {
+    if let Some(response) = step_prepare_modern_credentials(&state, &mut ctx, subscription_lifetime.as_mut()).await? {
         return Ok(response);
-    }
-    if let (Some(lifetime), Some(prepared)) = (subscription_lifetime.as_mut(), ctx.modern_delegation.as_ref()) {
-        prepared.restrict_to_consents(lifetime);
     }
     step_inject_credentials(&state, &mut ctx).await?;
 
@@ -4913,9 +4910,12 @@ async fn step_inject_trusted_identity(
     Ok(())
 }
 
+/// Prepares the delegated credentials of a `2026-07-28` MCP request, and ends
+/// `stream`, the stream the request opens, with the consents it carries.
 async fn step_prepare_modern_credentials(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
+    stream: Option<&mut crate::mcp::subscriptions::SubscriptionLifetime>,
 ) -> Result<Option<Response>, OutboundPipelineError> {
     use crate::proxy::credential_delegation::modern::{ModernDelegationError, ModernDelegationResult, prepare_transit};
     let Some(crate::mcp::request_validation::McpRequestClassification::Modern(request)) =
@@ -4956,7 +4956,7 @@ async fn step_prepare_modern_credentials(
             ModernDelegationError::from(crate::mcp::continuations::ContinuationError::Unavailable).response(&request),
         ));
     };
-    match prepare_transit(state, runtime, ctx, &request).await {
+    match prepare_transit(state, runtime, ctx, &request, stream).await {
         Ok(ModernDelegationResult::InputRequired(response)) => {
             Ok(Some(([("cache-control", "no-store")], axum::Json(response)).into_response()))
         }
@@ -5954,11 +5954,8 @@ async fn step_inject_external_grant(
             &provider.default_scopes,
         )
     {
-        return Err(refuse_grant(
-            ctx,
-            crate::delegation_vault::release::GrantRefusal::connect_required(&key, subject),
-            "grant_beyond_the_bindings_scopes",
-        ));
+        let refused = crate::delegation_vault::release::Refused::beyond_the_bindings_scopes(&provider, &key, subject);
+        return Err(refuse_grant(ctx, refused.refusal, refused.reason));
     }
     let injection = binding
         .inject_as
@@ -8566,7 +8563,7 @@ mod tests {
                 "io.modelcontextprotocol/clientCapabilities": {"elicitation": {"url": {}}}}
         }});
         let mut ctx = context_for(&message, &surface);
-        let missing = step_prepare_modern_credentials(&state, &mut ctx)
+        let missing = step_prepare_modern_credentials(&state, &mut ctx, None)
             .await
             .unwrap()
             .unwrap();
@@ -8585,7 +8582,7 @@ mod tests {
                 .resource,
             resource
         );
-        let response = step_prepare_modern_credentials(&state, &mut ctx)
+        let response = step_prepare_modern_credentials(&state, &mut ctx, None)
             .await
             .unwrap()
             .unwrap();
@@ -8604,11 +8601,11 @@ mod tests {
             ) -> (StatusCode, serde_json::Value) {
                 // As in the flow below: the first pass asks for resource
                 // authorization, which source authentication then supplies.
-                let _ = step_prepare_modern_credentials(state, &mut ctx).await;
+                let _ = step_prepare_modern_credentials(state, &mut ctx, None).await;
                 step_source_auth(state, &mut ctx)
                     .await
                     .unwrap();
-                let response = step_prepare_modern_credentials(state, &mut ctx)
+                let response = step_prepare_modern_credentials(state, &mut ctx, None)
                     .await
                     .unwrap()
                     .expect("the credential step answers without forwarding");
@@ -8730,7 +8727,7 @@ mod tests {
                     .await
                     .unwrap();
                 assert!(
-                    step_prepare_modern_credentials(&state, &mut ctx)
+                    step_prepare_modern_credentials(&state, &mut ctx, None)
                         .await
                         .unwrap()
                         .is_none()
@@ -8776,7 +8773,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                step_prepare_modern_credentials(&state, &mut replay)
+                step_prepare_modern_credentials(&state, &mut replay, None)
                     .await
                     .unwrap()
                     .unwrap()
@@ -14828,7 +14825,7 @@ mod tests {
                 .is_none()
         );
 
-        let refused = prepare_transit(&state, &runtime, &mut ctx, &request)
+        let refused = prepare_transit(&state, &runtime, &mut ctx, &request, None)
             .await
             .err()
             .expect("the modern path refuses without a resource-server authorization");
@@ -14838,7 +14835,7 @@ mod tests {
         ctx.authenticated_by = None;
         ctx.transit_token_claims =
             Some(caller_claims(Some("did:example:agent"), Some("gateway-computed"), Some("abc123"), json!({})));
-        let refused = prepare_transit(&state, &runtime, &mut ctx, &request)
+        let refused = prepare_transit(&state, &runtime, &mut ctx, &request, None)
             .await
             .err()
             .expect("a caller only a transit token names is refused on the modern path too");
@@ -14892,7 +14889,7 @@ mod tests {
             ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
             ctx.transit_token_claims = Some(caller_claims(Some("did:example:agent"), None, None, json!({})));
 
-            let answer = step_prepare_modern_credentials(&state, &mut ctx)
+            let answer = step_prepare_modern_credentials(&state, &mut ctx, None)
                 .await
                 .unwrap();
             match (answer, refused) {
@@ -14959,7 +14956,7 @@ mod tests {
             ctx.authenticated_identity = Some(alice.clone());
             ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::ResourceToken);
             ctx.transit_token_claims = Some(claims);
-            let response = step_prepare_modern_credentials(&state, &mut ctx)
+            let response = step_prepare_modern_credentials(&state, &mut ctx, None)
                 .await
                 .unwrap()
                 .expect("a binding applies and no grant is prepared");
@@ -17858,7 +17855,7 @@ mod tests {
             }
 
             let mut modern = transit_point(modern_pipeline_context("tools/call"));
-            let response = step_prepare_modern_credentials(&state, &mut modern)
+            let response = step_prepare_modern_credentials(&state, &mut modern, None)
                 .await
                 .unwrap();
             assert_eq!(response.is_some(), delegates, "{endpoint} opted_in={opted_in}");
@@ -20208,7 +20205,7 @@ mod tests {
         ));
         assert!(
             matches!(
-                step_prepare_modern_credentials(&state, &mut modern).await,
+                step_prepare_modern_credentials(&state, &mut modern, None).await,
                 Err(OutboundPipelineError::McpValidation(error))
                     if error.code == crate::mcp::errors::error_codes::UNSUPPORTED_PROTOCOL_VERSION
             ),
@@ -21740,6 +21737,53 @@ mod tests {
                 .is_empty(),
             "a 403 never refreshes"
         );
+    }
+
+    /// A Transit Point bound by external consent to a deactivated provider
+    /// tells no caller to connect, since the provider takes no new connect:
+    /// with no grant it is unavailable (`503`), and nothing is sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_missing_grant_of_a_deactivated_provider_is_unavailable() {
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let authorization_server = RecordingServer::start_answering(vec![Answer::status(500)]).await;
+        let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        let providers = state
+            .credential_provider_store
+            .as_ref()
+            .unwrap();
+        let mut provider = providers
+            .get("fixture-vendor")
+            .await
+            .unwrap()
+            .unwrap();
+        provider.deactivated_at = Some(chrono::Utc::now());
+        providers
+            .update(provider)
+            .await
+            .unwrap();
+        let surface = fixture_surface(&vendor, "caller", "mcp");
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"c".repeat(64)));
+
+        let refused = send_with_grant(&state, &mut ctx)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            grant_refusal(&refused),
+            Some(&crate::delegation_vault::release::GrantRefusal::ConnectorUnavailable)
+        );
+        let response = refused.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["data"], json!({"reason": "connector_unavailable"}));
+        assert!(vendor.requests().is_empty());
     }
 
     /// A missing caller grant is refused `connect_required` with the caller's

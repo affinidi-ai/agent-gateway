@@ -13,8 +13,15 @@ use crate::config::credential_policy::{CredentialPolicyConfig, credential_policy
 use crate::credential_providers::CredentialProvider;
 
 /// How far ahead of this gateway's clock a consent time may lie, as another
-/// node's clock may run, before a consent under a limit counts as ended.
+/// node's clock may run, before a consent under a limit is left unused
+/// ([`ConsentAge::AheadOfClock`]).
 const CLOCK_SKEW_SECS: i64 = 300;
+
+/// How far ahead of this gateway's clock a consent time may lie and still be
+/// taken for the work of a clock that runs wrong. One dated further ahead
+/// counts as ended, so no consent is kept for ever, and none is used for
+/// longer than its limit by more than this.
+const MAX_CLOCK_LEAD_SECS: i64 = 24 * 60 * 60;
 
 /// Why a caller who consented before is asked for consent again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -58,6 +65,11 @@ pub enum ConsentAge {
     TooOldForBinding,
     /// Past its end, for every binding: the stored credential is removed.
     Ended,
+    /// Given further ahead of this gateway's clock than clocks may differ, by
+    /// a day at most, so its age cannot be told: the stored credential is not
+    /// used, and it is kept, since a clock that lags is put right and a
+    /// consent removed is not.
+    AheadOfClock,
 }
 
 impl ConsentLimits {
@@ -87,6 +99,20 @@ impl ConsentLimits {
                 .or(policy.max_consent_age_ceiling_secs)
                 .map(capped),
             binding_secs: binding_secs.map(capped),
+        }
+    }
+
+    /// The limits of a binding that sets `binding_secs` on a provider that sets
+    /// `provider_secs`, as they would be without the gateway's own default and
+    /// ceiling. A consent these keep and [`Self::of`] ends is ended by the
+    /// gateway's settings alone.
+    pub fn without_gateway_limits(
+        binding_secs: Option<u64>,
+        provider_secs: Option<u64>,
+    ) -> Self {
+        Self {
+            connection_secs: provider_secs,
+            binding_secs,
         }
     }
 
@@ -151,9 +177,12 @@ impl ConsentLimits {
     }
 
     /// Whether the consent given at `granted_at`, stored with the end
-    /// `stored_end`, may be used through the binding at `now`. A consent time
-    /// further ahead of `now` than clocks may differ counts as ended whenever
-    /// a limit applies.
+    /// `stored_end`, may be used through the binding at `now`. Whenever a
+    /// limit applies, a consent time further ahead of `now` than clocks may
+    /// differ is [`ConsentAge::AheadOfClock`]: only this gateway writes the
+    /// consent time, so one ahead of its clock says that a clock is wrong,
+    /// not that the consent ended. One more than a day ahead is no clock's
+    /// doing and counts as ended.
     pub fn judge(
         &self,
         granted_at: DateTime<Utc>,
@@ -165,8 +194,12 @@ impl ConsentLimits {
         if end.is_none() && binding_end.is_none() {
             return ConsentAge::Current;
         }
-        if granted_at > now + Duration::seconds(CLOCK_SKEW_SECS) || end.is_some_and(|end| now >= end) {
+        let lead = granted_at.signed_duration_since(now);
+        if lead > Duration::seconds(MAX_CLOCK_LEAD_SECS) || end.is_some_and(|end| now >= end) {
             return ConsentAge::Ended;
+        }
+        if lead > Duration::seconds(CLOCK_SKEW_SECS) {
+            return ConsentAge::AheadOfClock;
         }
         if binding_end.is_some_and(|end| now >= end) {
             return ConsentAge::TooOldForBinding;
@@ -187,9 +220,10 @@ pub fn end_of(
 /// `found` while its consent is within `limits`. Otherwise no credential, and
 /// why the caller is asked again: a consent past its end is removed from the
 /// vault, whatever refresh token it holds, and audited with what `describe`
-/// adds; one only too old for the binding is kept for the others. A removal
-/// that fails leaves the request refused all the same: the check runs again
-/// on the next one.
+/// adds; one only too old for the binding is kept for the others. One given
+/// ahead of this gateway's clock is kept as well and logged, and the caller
+/// is asked as one with no stored credential is. A removal that fails leaves
+/// the request refused all the same: the check runs again on the next one.
 pub async fn admit(
     vault: &dyn DelegationVaultStorage,
     limits: ConsentLimits,
@@ -202,6 +236,10 @@ pub async fn admit(
     };
     let asked_again = match limits.judge(token.consent_granted_at, token.consent_expires_at, Utc::now()) {
         ConsentAge::Current => return (found, None),
+        ConsentAge::AheadOfClock => {
+            warn_ahead_of_clock("delegation token", &token.id, token.consent_granted_at);
+            return (VaultLookupResult::NotFound, None);
+        }
         ConsentAge::TooOldForBinding => AskedAgain::ConsentTooOld,
         ConsentAge::Ended => {
             let ended_at = limits.ends_at(token.consent_granted_at, token.consent_expires_at);
@@ -210,6 +248,25 @@ pub async fn admit(
         }
     };
     (VaultLookupResult::NotFound, Some(asked_again))
+}
+
+/// Logs that the stored credential `id`, a `kind`, is left unused because its
+/// consent time `granted_at` lies ahead of this gateway's clock.
+pub(crate) fn warn_ahead_of_clock(
+    kind: &'static str,
+    id: &str,
+    granted_at: DateTime<Utc>,
+) {
+    warn!(
+        target: "credential_delegation",
+        surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
+        kind,
+        id,
+        consent_granted_at = %stamp(granted_at),
+        ahead_by_secs = (granted_at - Utc::now()).num_seconds(),
+        "A stored consent was given ahead of this gateway's clock - it is kept and not used until the clocks agree; \
+         check the clocks of the gateway's nodes"
+    );
 }
 
 /// Remove the agent-keyed `token`, whose consent ended at `ended_at`, while
@@ -568,10 +625,43 @@ mod tests {
     }
 
     #[test]
-    fn a_consent_time_ahead_of_the_clock_ends_a_limited_consent_beyond_the_skew_allowed() {
+    fn a_consent_given_ahead_of_the_clock_beyond_the_skew_allowed_is_neither_current_nor_ended() {
         let limits = ConsentLimits::under(None, Some(3_600), &unlimited());
         assert_eq!(limits.judge(at(CLOCK_SKEW_SECS), None, at(0)), ConsentAge::Current);
-        assert_eq!(limits.judge(at(CLOCK_SKEW_SECS + 1), None, at(0)), ConsentAge::Ended);
+        assert_eq!(limits.judge(at(CLOCK_SKEW_SECS + 1), None, at(0)), ConsentAge::AheadOfClock);
+        assert_eq!(
+            limits.judge(at(CLOCK_SKEW_SECS + 1), Some(at(CLOCK_SKEW_SECS + 3_601)), at(0)),
+            ConsentAge::AheadOfClock,
+            "with the end stored at the consent"
+        );
+        let by_binding = ConsentLimits::under(Some(600), None, &unlimited());
+        assert_eq!(by_binding.judge(at(CLOCK_SKEW_SECS + 1), None, at(0)), ConsentAge::AheadOfClock);
+        assert_eq!(
+            limits.judge(at(CLOCK_SKEW_SECS + 1), None, at(CLOCK_SKEW_SECS + 1)),
+            ConsentAge::Current,
+            "once the clocks agree the consent is used"
+        );
+        assert_eq!(limits.judge(at(CLOCK_SKEW_SECS + 1), None, at(CLOCK_SKEW_SECS + 3_601)), ConsentAge::Ended);
+        assert_eq!(limits.judge(at(MAX_CLOCK_LEAD_SECS), None, at(0)), ConsentAge::AheadOfClock);
+        assert_eq!(
+            limits.judge(at(MAX_CLOCK_LEAD_SECS + 1), None, at(0)),
+            ConsentAge::Ended,
+            "more than a day ahead is no clock's doing"
+        );
+    }
+
+    #[test]
+    fn the_limits_without_the_gateways_own_keep_what_only_its_default_or_ceiling_ends() {
+        let ceiling = policy(None, Some(3_600));
+        let with = ConsentLimits::under(None, None, &ceiling);
+        let without = ConsentLimits::without_gateway_limits(None, None);
+        assert_eq!(with.judge(at(0), None, at(7_200)), ConsentAge::Ended);
+        assert_eq!(without.judge(at(0), None, at(7_200)), ConsentAge::Current);
+        assert_eq!(
+            ConsentLimits::without_gateway_limits(Some(600), Some(1_800)),
+            ConsentLimits::under(Some(600), Some(1_800), &unlimited()),
+            "a provider's and a binding's own limits are kept"
+        );
     }
 
     #[test]

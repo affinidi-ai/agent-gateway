@@ -969,13 +969,7 @@ impl TargetGrantRoute {
             &grant,
             &self.provider.default_scopes,
         ) {
-            return Err(refuse(
-                surface,
-                Refused {
-                    refusal: GrantRefusal::connect_required(&key, self.subject),
-                    reason: "grant_beyond_the_bindings_scopes",
-                },
-            ));
+            return Err(refuse(surface, Refused::beyond_the_bindings_scopes(&self.provider, &key, self.subject)));
         }
         let headers = self
             .headers_for(&grant)

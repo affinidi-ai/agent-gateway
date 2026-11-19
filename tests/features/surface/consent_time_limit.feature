@@ -154,6 +154,35 @@ Feature: Consent time limit
     And the delegation vault holds 1 delegated credential
     And MCP server "bravo" was not called
 
+  Scenario Outline: A binding's consent time limit outside the range is refused
+    When the operator limits a consent used through the surface's binding to <limit> seconds
+    Then the admin API response status is 400
+    And the admin API error response mentions "max_consent_age_secs must be from 60 to 31536000"
+
+    Examples:
+      | limit    |
+      | 30       |
+      | 31536001 |
+
+  Scenario: A consent dated ahead of the gateway's clock is kept and the caller is asked to consent again
+    Given OAuth provider "calendar" limits a consent to 3600 seconds
+    And caller "alice" has started OAuth consent for provider "calendar"
+    And caller "alice" has completed OAuth consent for provider "calendar"
+    And the caller's consent is dated 600 seconds ahead of the gateway's clock
+    When caller "alice" invokes MCP tool "schedule_meeting" with a valid token
+    Then the response status is 401
+    And the response is a consent required error for OAuth provider "calendar"
+    And the consent required error for OAuth provider "calendar" gives no reason
+    And the delegation vault holds 1 delegated credential
+    And MCP server "bravo" was not called
+
+  Scenario: A gateway limit set over a consent already stored says at startup that it ends it
+    Given the gateway keeps its log of warnings
+    And the delegation vault already holds a consent to OAuth provider "calendar" given 7200 seconds ago
+    And the gateway lets no consent last longer than 3600 seconds
+    When the gateway starts
+    Then the gateway log warns that the gateway's own consent time limits end 1 stored consent
+
   Scenario: The gateway's default limit ends a consent to a provider that sets none
     Given the gateway limits a consent to 3600 seconds by default
     And caller "alice" has started OAuth consent for provider "calendar"

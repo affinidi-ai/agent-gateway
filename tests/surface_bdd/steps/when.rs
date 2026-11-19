@@ -2028,6 +2028,44 @@ async fn operator_asks_what_a_consent_time_limit_would_end(
     record_admin_response(world, response);
 }
 
+/// Sets the consent time limit of the surface's one binding to `seconds`, as
+/// an operator does through the admin API, and returns the answer.
+pub(crate) async fn limit_the_surfaces_binding(
+    world: &mut SurfaceWorld,
+    seconds: u64,
+) -> crate::world::RecordedResponse {
+    use crate::bdd_support::config::single_surface_fixture::SEEDED_SURFACE_ID;
+    ensure_admin_session(world).await;
+    let client = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist");
+    let stored = client
+        .get_surface_recorded(SEEDED_SURFACE_ID)
+        .await
+        .expect("read the surface through the admin API");
+    assert_eq!(stored.status, 200, "reading the surface: {}", stored.body);
+    let mut surface = stored.body;
+    let bindings = surface["outbound_credentials"]
+        .as_array_mut()
+        .unwrap_or_else(|| panic!("the surface has no outbound_credentials"));
+    assert_eq!(bindings.len(), 1, "the surface has one binding to limit: {bindings:?}");
+    bindings[0]["max_consent_age_secs"] = serde_json::json!(seconds);
+    client
+        .update_surface_recorded(SEEDED_SURFACE_ID, &surface)
+        .await
+        .expect("save the surface through the admin API")
+}
+
+#[when(expr = "the operator limits a consent used through the surface's binding to {int} seconds")]
+async fn operator_limits_the_surfaces_binding(
+    world: &mut SurfaceWorld,
+    seconds: u64,
+) {
+    let saved = limit_the_surfaces_binding(world, seconds).await;
+    world.admin_response = Some(saved);
+}
+
 /// Limits the consent of the one delegated credential the vault holds to
 /// `seconds` after it was given, as an operator does through the admin API,
 /// and records the answer.
