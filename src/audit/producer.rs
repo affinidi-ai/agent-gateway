@@ -771,7 +771,9 @@ mod tests {
         (
             record.request_id.as_deref(),
             record.span_id.as_deref(),
-            record.parent_span_id.as_deref(),
+            record
+                .parent_span_id
+                .as_deref(),
             record.trace_source.as_deref(),
         )
     }

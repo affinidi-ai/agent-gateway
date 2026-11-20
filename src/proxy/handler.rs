@@ -2113,22 +2113,18 @@ async fn proxy_charged_request(
     // Start timing the request
     let start_time = std::time::Instant::now();
 
-    // Trace id for this request. A trusted internal forward (fabric G2G / Transit
-    // Point) carries the originating request's id in `X-Gateway-Trace-Id`; reusing
-    // it keeps ONE correlatable trace id across every hop — metrics, audit, the
-    // "This request" filter, and the injected VP `workloadBinding.traceId` — so a
-    // caller → GW1 → TP → GW2 chain shares a single trace end-to-end instead of a
-    // fresh per-hop id. The header is only honoured when it parses as a UUID: an
-    // external caller could set it, but a spoofed value can at worst pollute
-    // correlation (never an authorization decision), and the UUID check blocks
-    // log/field injection. A missing or malformed value mints a fresh id, so the
-    // external entry hop (where callers don't send the header) always starts a new
-    // trace.
-    let trace_id = crate::proxy::trace::continue_or_mint_trace_id(
-        headers
-            .get("X-Gateway-Trace-Id")
-            .and_then(|v| v.to_str().ok()),
-    );
+    // The trace the Access Point entry resolved from the caller's `traceparent`
+    // and `X-Gateway-Trace-Id`, so metrics, audit, the "This request" filter and
+    // the injected VP `workloadBinding.traceId` share one trace id with every
+    // later hop. A spoofed id can at worst pollute correlation, never an
+    // authorization decision.
+    let request_trace = crate::observability::policy_audit::current_request_trace().unwrap_or_else(|| {
+        crate::proxy::trace::RequestTrace::from_request_headers(&headers, crate::proxy::trace::SpanId::mint())
+    });
+    let trace_id = request_trace
+        .trace_id
+        .as_str()
+        .to_string();
 
     // Trace-id termination is an EGRESS firewall: this gateway keeps the incoming
     // `trace_id` for its own VP + audit (so the caller → … → here chain stays
@@ -10068,8 +10064,9 @@ async fn multi_channel_proxy_handler_with_mcp_runtime(
     mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
 ) -> Response {
     use crate::observability::policy_audit::{RequestScope, in_request, response_in_request};
+    use crate::proxy::trace::{RequestTrace, SpanId};
 
-    let scope = RequestScope::fresh();
+    let scope = RequestScope::traced(RequestTrace::from_request_headers(req.headers(), SpanId::mint()));
     let response = in_request(
         scope.clone(),
         Box::pin(multi_channel_proxy_handler_in_request_scope(addr, state, req, mcp_versions, mcp_continuations)),

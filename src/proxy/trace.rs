@@ -2,20 +2,13 @@
 //! firewall) helpers.
 //!
 //! One `trace_id` correlates a request across every hop (metrics, audit, the
-//! "This request" filter, and the injected VPs' `traceId`). Two pure helpers
-//! govern how it flows:
-//!
-//! * [`continue_or_mint_trace_id`] — at a gateway's **inbound**, continue a
-//!   trusted upstream trace carried in `X-Gateway-Trace-Id` (only when it parses
-//!   as a UUID, so a spoofed value can't inject or poison correlation), else mint
-//!   a fresh one.
-//! * [`egress_trace_id`] — at a gateway's **egress**, forward the request's own
-//!   trace downstream unless the surface opts into termination, in which case a
-//!   fresh id crosses the boundary while this gateway keeps the incoming trace for
-//!   its own VP + audit.
-//!
-//! Both mint with [`TraceId::mint`]: 32 lowercase hexadecimal digits, the W3C
-//! Trace Context form.
+//! "This request" filter, and the injected VPs' `traceId`). An Access Point
+//! reads the trace its caller names with [`RequestTrace::from_request_headers`].
+//! [`egress_trace_id`], at a gateway's **egress**, forwards the request's own
+//! trace downstream unless the surface opts into termination, in which case a
+//! fresh id crosses the boundary while this gateway keeps the incoming trace for
+//! its own VP + audit. A trace id is minted with [`TraceId::mint`]: 32 lowercase
+//! hexadecimal digits, the W3C Trace Context form.
 //!
 //! [`TraceId`], [`SpanId`] and [`Traceparent`] read a received trace id, span
 //! id and `traceparent` header as the trace context requirements shared with
@@ -58,15 +51,23 @@ impl TraceId {
     /// hyphenated 8-4-4-4-12 form in any case, normalised to the written
     /// form. Any other shape, and an id of all zeros, is refused.
     pub fn parse(input: &str) -> Result<Self, TraceHeaderError> {
-        let bytes = input.to_ascii_lowercase().into_bytes();
+        let bytes = input
+            .to_ascii_lowercase()
+            .into_bytes();
         let digits = match bytes.len() {
             Self::DIGITS => bytes,
-            Self::HYPHENATED_LEN if Self::HYPHENS.iter().all(|position| bytes[*position] == b'-') => bytes
-                .iter()
-                .enumerate()
-                .filter(|(position, _)| !Self::HYPHENS.contains(position))
-                .map(|(_, digit)| *digit)
-                .collect(),
+            Self::HYPHENATED_LEN
+                if Self::HYPHENS
+                    .iter()
+                    .all(|position| bytes[*position] == b'-') =>
+            {
+                bytes
+                    .iter()
+                    .enumerate()
+                    .filter(|(position, _)| !Self::HYPHENS.contains(position))
+                    .map(|(_, digit)| *digit)
+                    .collect()
+            }
             _ => return Err(TraceHeaderError::TraceId),
         };
         written_id(&digits, Self::DIGITS)
@@ -293,6 +294,34 @@ impl RequestTrace {
         }
     }
 
+    /// The trace of a request that arrived with `headers`, under this
+    /// gateway's span `span_id`: [`Self::from_headers`] over every field of
+    /// `traceparent` and `X-Gateway-Trace-Id`. A field whose value is not
+    /// text counts and is not valid. When the two name different traces, a
+    /// warning names both validated trace ids.
+    pub fn from_request_headers(
+        headers: &axum::http::HeaderMap,
+        span_id: SpanId,
+    ) -> Self {
+        let (trace, disagreement) = Self::from_headers(
+            &header_fields(headers, "traceparent"),
+            &header_fields(headers, "x-gateway-trace-id"),
+            span_id,
+        );
+        if let Some(disagreement) = disagreement {
+            tracing::warn!(
+                traceparent_trace_id = disagreement
+                    .traceparent_trace_id
+                    .as_str(),
+                x_gateway_trace_id = disagreement
+                    .x_gateway_trace_id
+                    .as_str(),
+                "traceparent and X-Gateway-Trace-Id name different traces; X-Gateway-Trace-Id is continued"
+            );
+        }
+        trace
+    }
+
     /// The request's own trace, sent onward under this gateway's span.
     pub fn outgoing(&self) -> OutgoingTrace {
         OutgoingTrace {
@@ -357,6 +386,23 @@ impl OutgoingTrace {
     }
 }
 
+/// Every field of header `name`, in the order received. A value that is not
+/// text is read as empty, so it still counts and is not valid.
+fn header_fields<'a>(
+    headers: &'a axum::http::HeaderMap,
+    name: &str,
+) -> Vec<&'a str> {
+    headers
+        .get_all(name)
+        .iter()
+        .map(|value| {
+            value
+                .to_str()
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
 /// The value of a header that arrived exactly once. A header that arrived more
 /// than once is treated as absent: none of its values is used.
 fn single<'a>(values: &[&'a str]) -> Option<&'a str> {
@@ -411,24 +457,6 @@ fn hex_byte(digits: &[u8]) -> Option<u8> {
     }
     let text = std::str::from_utf8(digits).ok()?;
     u8::from_str_radix(text, 16).ok()
-}
-
-/// Continue a trusted upstream trace or mint a fresh one.
-///
-/// `incoming` is the `X-Gateway-Trace-Id` header (or fabric message `trace_id`)
-/// from the previous hop. It is reused **only** when it parses as a UUID — an
-/// external caller could set the header, but the UUID check blocks log/field
-/// injection and a spoofed value can at worst pollute correlation (never an
-/// authorization decision). Any missing or malformed value mints a fresh id, so
-/// the external entry hop always starts a new trace.
-pub fn continue_or_mint_trace_id(incoming: Option<&str>) -> String {
-    incoming
-        .and_then(|s| {
-            uuid::Uuid::parse_str(s)
-                .ok()
-                .map(|_| s.to_string())
-        })
-        .unwrap_or_else(|| TraceId::mint().0)
 }
 
 /// Egress-firewall trace id for the onward hop.
@@ -743,6 +771,45 @@ mod tests {
         }
     }
 
+    fn request_headers(fields: &[(&'static str, &[u8])]) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        for (name, value) in fields {
+            headers.append(*name, axum::http::HeaderValue::from_bytes(value).unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn a_request_is_traced_from_every_field_of_its_trace_headers() {
+        let traceparent = b"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".as_slice();
+        let named = b"4bf92f3577b34da6a3ce929d0e0e4736".as_slice();
+        let resolved = |fields: &[(&'static str, &[u8])]| {
+            let trace = RequestTrace::from_request_headers(&request_headers(fields), own_span());
+            (
+                trace
+                    .trace_id
+                    .as_str()
+                    .to_string(),
+                trace.trace_source,
+            )
+        };
+
+        assert_eq!(
+            resolved(&[("traceparent", traceparent)]),
+            ("0af7651916cd43dd8448eb211c80319c".to_string(), TraceSource::Header)
+        );
+        assert_eq!(resolved(&[("traceparent", traceparent), ("TraceParent", traceparent)]).1, TraceSource::Minted);
+        assert_eq!(
+            resolved(&[("traceparent", traceparent), ("x-gateway-trace-id", named), ("x-gateway-trace-id", b"\xff")]),
+            ("0af7651916cd43dd8448eb211c80319c".to_string(), TraceSource::Header),
+            "a field that is not text still makes X-Gateway-Trace-Id repeated"
+        );
+        assert_eq!(
+            resolved(&[("traceparent", traceparent), ("X-Gateway-Trace-Id", named)]),
+            ("4bf92f3577b34da6a3ce929d0e0e4736".to_string(), TraceSource::Header)
+        );
+    }
+
     #[test]
     fn a_terminated_trace_is_sent_onward_as_the_vectors_say() {
         for case in vector_cases("trace_termination") {
@@ -833,31 +900,6 @@ mod tests {
             .collect();
         known.sort_unstable();
         assert_eq!(groups, known);
-    }
-
-    #[test]
-    fn continue_reuses_a_valid_uuid() {
-        let id = uuid::Uuid::new_v4().to_string();
-        assert_eq!(continue_or_mint_trace_id(Some(&id)), id);
-    }
-
-    #[test]
-    fn continue_mints_for_non_uuid() {
-        // A non-UUID header value is rejected (injection guard) and a fresh
-        // UUID is minted instead of being echoed back.
-        let out = continue_or_mint_trace_id(Some("not-a-uuid; DROP TABLE"));
-        assert_ne!(out, "not-a-uuid; DROP TABLE");
-        assert!(TraceId::from_written(&out).is_ok(), "{out}");
-    }
-
-    #[test]
-    fn continue_mints_for_missing_or_empty() {
-        let a = continue_or_mint_trace_id(None);
-        let b = continue_or_mint_trace_id(Some(""));
-        assert!(TraceId::from_written(&a).is_ok(), "{a}");
-        assert!(TraceId::from_written(&b).is_ok(), "{b}");
-        // Two independent mints must differ.
-        assert_ne!(a, b);
     }
 
     #[test]

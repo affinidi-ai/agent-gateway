@@ -332,8 +332,22 @@ upgrade for one metrics retention window (6 hours by default).
 The gateway propagates `X-Gateway-Trace-Id` to a Target where the request path creates that trace
 identifier, allowing gateway and managed-agent logs to be correlated. A trace id an Access Point
 starts, and the fresh one a surface with `terminate_trace_id` sends downstream, is 32 lowercase
-hexadecimal digits with no hyphens, the W3C Trace Context form. An Access Point continues a
-caller's `X-Gateway-Trace-Id` that reads as a UUID and records it as sent. A Transit Point request
+hexadecimal digits with no hyphens, the W3C Trace Context form.
+
+An Access Point reads the caller's `traceparent` and `X-Gateway-Trace-Id` and continues the trace
+they name:
+
+| The caller sends | Trace id | `parent_span_id` | `trace_source` |
+| --- | --- | --- | --- |
+| A valid `traceparent` alone, or with an `X-Gateway-Trace-Id` of the same trace | The `traceparent`'s | The `traceparent`'s span | `header` |
+| A valid `X-Gateway-Trace-Id` alone | Its own, written as 32 lowercase hex | None | `header` |
+| Both, valid, naming different traces | The `X-Gateway-Trace-Id`'s, and a warning names both trace ids | None | `header` |
+| Neither | A new one | None | `minted` |
+
+`X-Gateway-Trace-Id` is valid as 32 hexadecimal digits or the hyphenated 8-4-4-4-12 form, in any
+case and not all zero; `traceparent` as W3C Trace Context defines it, with lowercase digits. A
+header that is not valid, or that arrived more than once, is ignored, and no part of it is
+recorded or logged. A Transit Point request
 that carries neither a transit token nor such a header starts a hyphenated UUID. A request sent
 over a Fabric stream carries its trace id as a hyphenated UUID, and the receiving gateway records
 that form.

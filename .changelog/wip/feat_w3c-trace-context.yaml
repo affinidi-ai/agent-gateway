@@ -1,6 +1,21 @@
 branch: feat/w3c-trace-context
 changes:
-  added: []
+  added:
+    - timestamp: '2026-11-20T16:20:00Z'
+      title: Record span, parent span and trace source on audit records
+      description: >-
+        Every audit record of a request now carries span_id, the request's span in W3C Trace
+        Context with the same value as request_id. A record of an Access Point request also
+        carries trace_source (header or minted) and parent_span_id, the span the caller's
+        traceparent named, so Agent Watch can follow a request across appliances.
+    - timestamp: '2026-11-20T16:45:00Z'
+      title: Continue the caller's traceparent at an Access Point
+      description: >-
+        An Access Point now reads the caller's traceparent as well as X-Gateway-Trace-Id and
+        continues the trace they name, with the caller's span as the parent. When both arrive
+        and name different traces, X-Gateway-Trace-Id is continued and a warning names both
+        trace ids. A header that is not valid, or that arrived more than once, is ignored and a
+        new trace is started.
   changed: []
   fixed: []
   removed: []
@@ -14,7 +29,8 @@ changes:
         Context form. It was a hyphenated UUID. The new form appears in X-Gateway-Trace-Id, in the
         transit token, in audit records and in logs. A Managed Agent or a log pipeline that reads
         the value as a hyphenated UUID must accept the new form; a parser that accepts a UUID
-        without hyphens, as earlier gateways do, needs no change. A trace id continued from a
-        caller's X-Gateway-Trace-Id is still recorded as sent, a Transit Point request with
-        neither a transit token nor that header still starts a hyphenated UUID, and a gateway that
-        receives a request over a Fabric stream still records its trace id hyphenated.
+        without hyphens, as earlier gateways do, needs no change. An Access Point also writes a
+        trace id it continues from X-Gateway-Trace-Id in this form, and no longer continues a
+        braced or urn: one. A Transit Point request with neither a transit token nor that header
+        still starts a hyphenated UUID, and a gateway that receives a request over a Fabric stream
+        still records its trace id hyphenated.
