@@ -446,6 +446,12 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                   c.fabric_delegated_credentials === true
                     ? { fabric_delegated_credentials: true }
                     : {}),
+                  ...(typeof c.self_recognition_check === 'boolean'
+                    ? { self_recognition_check: c.self_recognition_check }
+                    : {}),
+                  ...(c.identity_injection?.inject_vp === true
+                    ? { identity_injection: c.identity_injection }
+                    : {}),
                   ...(() => {
                     const targetAuth = transitPointTargetAuth(c);
                     return targetAuth ? { target_auth: targetAuth } : {};

@@ -137,6 +137,14 @@ The Surface Builder offers **Override Agent Card Location** on a Transit Point w
 destination only, not on a `fabric://` one; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
+Every Transit Point panel has a **Self Recognition Check** switch that writes
+`transit.points[].self_recognition_check`. Turning it on is disabled, with a note, until the
+surface has a Trust Recorder entry that records the owned agent and the Transit Point resolves
+a managed agent identity (an Identity of its own, or a stored `inject_vp` the save keeps); see
+_Surface Builder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder) and
+[`docs/POLICY.md`](docs/POLICY.md#self-recognition-check).
+
 A Transit Point's Rate Limit panel has a **Per caller** section that writes
 `transit.points[].per_caller_rate_limit` beside the point's shared `rate_limit`; see _Surface
 Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
@@ -380,7 +388,8 @@ DIDs with a copy button; see _Agents page_ in
 
 The Identities page shows one row per surface Managed Agent, with its earlier DIDs (from its
 responses and from its Transit Points) and certificate or API key rotations listed as
-versions in the expanded row, each earlier DID with its own actions; rows carry only
+versions in the expanded row, each earlier DID with its own actions and Trust Recorder status
+chip; rows carry only
 `rotation_count`, and Version History loads the rotations when opened; see _Identities page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page) and
 [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#identity-versions).

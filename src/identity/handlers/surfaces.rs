@@ -1138,9 +1138,8 @@ fn refuse_reference_transit_tokens(surface: &AgentSurface) -> Result<(), Surface
 
 /// Refuse a Transit Point, on the surface or in an enabled variant, that sets
 /// `self_recognition_check` where the check cannot run: the surface has no
-/// Trust Recorder entry that records the owned agent, the Transit Point calls
-/// out under its own managed identity, or it resolves no managed agent
-/// identity.
+/// Trust Recorder entry that records the owned agent, or the Transit Point
+/// resolves no managed agent identity.
 fn refuse_unusable_self_recognition_checks(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
     for (variant, view) in surface_views(surface) {
         let records_owned_agent = view
@@ -1158,13 +1157,9 @@ fn refuse_unusable_self_recognition_checks(surface: &AgentSurface) -> Result<(),
         {
             let reason = if !records_owned_agent {
                 "the surface has no Trust Recorder entry that records the owned agent"
-            } else if point
-                .managed_identity
-                .is_some()
-            {
-                "it calls out under its own managed identity, which the Trust Recorder does not record"
             } else if !view.transit_point_has_managed_identity(point) {
-                "it resolves no managed agent identity; inject a VP with the surface's"
+                "it resolves no managed agent identity; give it a managed identity of its own that is not \
+                 from_jwt_claim, or inject a VP with the surface's"
             } else {
                 continue;
             };
@@ -6804,7 +6799,6 @@ mod validation_tests {
                 self_checked_surface(Some(false), vp.clone()),
                 "the surface has no Trust Recorder entry",
             ),
-            ("its own identity", self_checked_surface(Some(true), own), "it calls out under its own managed identity"),
             (
                 "no managed agent identity",
                 self_checked_surface(Some(true), serde_json::json!({})),
@@ -6824,6 +6818,18 @@ mod validation_tests {
         }
 
         assert!(refuse_unusable_self_recognition_checks(&self_checked_surface(Some(true), vp.clone())).is_ok());
+        assert!(
+            refuse_unusable_self_recognition_checks(&self_checked_surface(Some(true), own)).is_ok(),
+            "a Transit Point calling out under its own managed identity"
+        );
+        let inbound_only = serde_json::json!({ "managed_identity": { "type": "from_jwt_claim" } });
+        assert!(
+            matches!(
+                refuse_unusable_self_recognition_checks(&self_checked_surface(Some(true), inbound_only)),
+                Err(SurfaceApiError::BadRequest(message)) if message.contains("it resolves no managed agent identity")
+            ),
+            "an inbound-only identity of its own resolves none"
+        );
         let mut off = self_checked_surface(None, vp.clone());
         off.transit
             .as_mut()
