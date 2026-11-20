@@ -248,6 +248,17 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   always-visible warning names the receiving gateway. Test ids:
   `<managed-agent|transit-point>-fabric-delegated-credentials-switch` and
   `-warning`. There is no surface-wide switch.
+- **Self Recognition Check** (`transit-point/SelfRecognitionCheckSection.tsx`) is a switch
+  on every Transit Point panel that writes `self_recognition_check`. The factory sends it only
+  once it is set, `false` included, because the gateway keeps a stored value a save leaves
+  out. `selfRecognitionCheckBlocker` disables turning it on, with a note under it
+  (`aria-describedby` on the switch), while the surface has no Trust Recorder entry that
+  records the owned agent, or the Transit Point resolves no managed agent identity: no
+  Identity of its own that is not `from_jwt_claim`, and no stored
+  `identity_injection.inject_vp` that inherits the surface's. The factory sends a stored
+  `identity_injection` back while its `inject_vp` is `true`, so a save keeps that identity. A
+  switch already on stays enabled so it can be turned off, with the note in red. Test ids:
+  `transit-point-self-recognition-check-switch` and `-note`.
 - **Gateway picker** is one shared gateway-then-surface picker
   (`_shared/GatewaySurfacePicker.tsx`, data from `_shared/useGatewaySurfaces.ts`) used by the
   Managed Agent and Transit Point **via Gateway Connection** routes and by Payment. Every user
@@ -1036,6 +1047,10 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   Authority" option and Save block as a Trust Check. The recorder then reports `skipped` with
   reason `authority_not_found`, worded "Authority not found" by `utils/trustRecorderStatus.ts` in
   the Last outcome row and the Identities page chip.
+- An entry that records the owned agent (`include_owned_agent`) is what lets a Transit Point
+  turn on its **Self Recognition Check** (see _Surface Builder_). Removing the last such entry
+  while a Transit Point has the switch on gets the API's `400` on Save until the switch is
+  turned off.
 
 | Element                            | Test id                                                                                                                           |
 | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
@@ -2516,7 +2531,9 @@ parts `IdentityNameCell`, `IdentitySurfaceCell`, `IdentityOriginBadge`,
   fields); the first version lists its values. A rotation with field changes (a certificate)
   is labelled "Credential rotated"; one without (an API key, whose update may only have
   edited its details) is labelled "Credential updated". A version that introduces a DID other
-  than the row's offers that DID's actions (`identities-version-<n>-<action>-button`). A
+  than the row's offers that DID's actions (`identities-version-<n>-<action>-button`) and,
+  when the DID has one, its Trust Recorder status chip (`identities-version-<n>-recorder`), so
+  a Transit Point's own managed identity shows whether it was recorded. A
   certificate or API key identity with no versions yet still shows the section, saying none
   are recorded. Rows carry only `rotation_count`. Opening Version History fetches every page
   of each member DID's rotations with a count above 0 (`getIdentityRotations` in `api.ts`,

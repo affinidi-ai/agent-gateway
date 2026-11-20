@@ -46,6 +46,15 @@ Feature: Self recognition check on a Transit Point
     And the VP Audit Log records a request refusal for "an unrecognised managed agent"
 
   @wip
+  Scenario: A Transit Point's own managed identity is recorded before it is checked
+    Given Transit Point "tp1" has a managed identity of its own
+    And the surface has a Trust Recorder for trust registry "alpha-registry" with issuer "did:web:example.com:issuer"
+    And Transit Point "tp1" checks the self recognition of its managed agent
+    When managed agent "bravo" sends an A2A message/send request with the agent-identity extension through Transit Point "tp1"
+    Then trust registry "alpha-registry" received a recognition record for the Transit Point's DID as an owned agent
+    And that record was written before the self recognition check asked about it
+
+  @wip
   Scenario: A recognised managed agent calls out as before
     Given Transit Point "tp1" presents the managed agent's identity to its destination
     And the surface has a Trust Recorder for trust registry "alpha-registry" with issuer "did:web:example.com:issuer"

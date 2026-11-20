@@ -12,6 +12,20 @@ changes:
         Refusals are audited as request_rejected with reason agent_not_recognized, and each
         query as a trust_check on the managed_agent leg, which the Audit Log names and places
         before policy in the request journey.
+    - timestamp: '2026-11-20T09:00:00Z'
+      title: Check and record a Transit Point's own managed identity
+      description: >-
+        The self recognition check now works on a Transit Point that calls out under its own
+        managed identity: the Trust Recorder records that DID with the surface's entries before
+        the check asks about it, and the Identities page shows its recorder status on its
+        version in Version History.
+    - timestamp: '2026-11-20T10:00:00Z'
+      title: Add a Self Recognition Check switch to the Transit Point panel
+      description: >-
+        Operators can turn on the self recognition check from the Surface Builder. The switch is
+        disabled, with a note, until the surface has a Trust Recorder that records the owned
+        agent and the Transit Point has an Identity of its own, and a save sends an explicit
+        false when it is turned off.
   changed: []
   fixed: []
   removed: []

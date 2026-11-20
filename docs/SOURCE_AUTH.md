@@ -2089,7 +2089,8 @@ The only writer of agent-in-trust-registry records
 on the response leg and on discovery, and is idempotent. A Transit Point's
 [self recognition check](POLICY.md#self-recognition-check) also has it write the calling
 agent's records, and waits for them, unless that agent's recorder status on the surface is
-Recorded.
+Recorded. That is how a Transit Point's own managed identity is recorded, with the surface's
+entries; its recorder status shows on its version in the Identities page's Version History.
 
 After writing its records, the Trust Recorder publishes a name for each authority it
 wrote. The name comes from the Authority register entry with that DID, or, failing that,

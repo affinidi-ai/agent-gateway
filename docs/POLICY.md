@@ -466,7 +466,8 @@ request it refused.
 For each Trust Recorder entry with `include_owned_agent`, the gateway sends one recognition
 query to that entry's trust registry: the entry's authority (with `{{ surface.issuer_did }}`
 resolved to the surface's Issuer), the agent's DID as the entity, action `is` and resource
-`ownedAgent`. The request goes on only when every query answers recognised. Any other
+`ownedAgent`. The agent's DID is the one the Transit Point calls out under: its own managed
+identity's when it has one, otherwise the surface Managed Agent's. The request goes on only when every query answers recognised. Any other
 answer refuses it with `403` "Calling agent is not recognised" (JSON-RPC `-32001` on an MCP
 Transit Point), before the destination is contacted: not recognised, a timeout, a trust
 registry that is unknown, not connected or unreachable, an Authority that no longer exists,
@@ -485,9 +486,10 @@ discovery reads. Each query is a `trust_check` record with `leg` `managed_agent`
 refusal a `request_rejected` record with reason `agent_not_recognized`.
 
 A write is refused with `400` when a Transit Point, on the surface or in an enabled variant,
-sets the switch and the surface has no Trust Recorder entry that records the owned agent, the
-Transit Point calls out under its own managed identity, or it resolves no managed agent
-identity (it inherits the surface's without injecting a VP). A `PUT` of the surface or of a
+sets the switch and the surface has no Trust Recorder entry that records the owned agent, or
+the Transit Point resolves no managed agent identity: its own managed identity is
+`from_jwt_claim`, or it has none and does not inject a VP with the surface's, or the surface's
+is `from_jwt_claim` or absent. A `PUT` of the surface or of a
 variant that leaves the field out keeps the stored value, so a Surface Builder save keeps it;
 `false` turns it off, as does a merge `PATCH` whose Transit Points leave it out.
 

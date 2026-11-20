@@ -10,6 +10,8 @@ interface VersionListProps {
   highlightedDid?: string;
   /** Actions of the DID a version introduces; return `null` to show none. */
   renderActions?: (version: IdentityVersion) => React.ReactNode;
+  /** Trust Recorder status of the DID a version introduces; return `null` to show none. */
+  renderRecorderStatus?: (version: IdentityVersion) => React.ReactNode;
 }
 
 interface IdentityVersionHistoryProps extends Omit<VersionListProps, 'versions'> {
@@ -57,7 +59,12 @@ const emptyChangesText = (version: IdentityVersion): string =>
 const rotationLabel = (version: IdentityVersion): string =>
   version.changes.length > 0 ? 'Credential rotated' : 'Credential updated';
 
-const VersionList: React.FC<VersionListProps> = ({ versions, highlightedDid, renderActions }) => (
+const VersionList: React.FC<VersionListProps> = ({
+  versions,
+  highlightedDid,
+  renderActions,
+  renderRecorderStatus,
+}) => (
   <>
     {versions.length === 0 && (
       <p className="small text-muted mb-2" data-testid="identities-version-history-empty">
@@ -68,6 +75,8 @@ const VersionList: React.FC<VersionListProps> = ({ versions, highlightedDid, ren
       {versions.map(version => {
         const first = version.number === 1;
         const highlighted = version.did === highlightedDid;
+        const recorderStatus =
+          renderRecorderStatus && version.kind === 'did' ? renderRecorderStatus(version) : null;
         return (
           <li
             key={`${version.did}-${version.number}`}
@@ -84,6 +93,11 @@ const VersionList: React.FC<VersionListProps> = ({ versions, highlightedDid, ren
               <span className="text-muted">
                 {version.at ? formatDateTime(version.at, true) : 'Time unknown'}
               </span>
+              {recorderStatus && (
+                <span data-testid={`identities-version-${version.number}-recorder`}>
+                  {recorderStatus}
+                </span>
+              )}
               {renderActions && version.kind === 'did' && (
                 <span className="ms-auto">{renderActions(version)}</span>
               )}
