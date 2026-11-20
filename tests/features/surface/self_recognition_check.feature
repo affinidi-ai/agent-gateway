@@ -49,3 +49,10 @@ Feature: Self recognition check on a Transit Point
     Then the response status is 403
     And the managed-agent Trust Check reported error code "NOT_RECOGNIZED"
     And external agent "charlie" was not called
+
+  @wip
+  Scenario: A Transit Point's recorder writes the records of the agent calling out through it
+    Given Transit Point "tp1" has a managed identity of its own
+    And transit point "tp1" has a Trust Recorder for trust registry "alpha-registry"
+    When managed agent "bravo" sends an A2A message/send request with the agent-identity extension through Transit Point "tp1"
+    Then trust registry "alpha-registry" received a recognition record for the Transit Point's DID as an owned agent

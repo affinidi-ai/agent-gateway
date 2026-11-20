@@ -449,6 +449,9 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                   ...(c.identity_injection?.inject_vp === true
                     ? { identity_injection: c.identity_injection }
                     : {}),
+                  ...(c.trust_recorder && typeof c.trust_recorder === 'object'
+                    ? { trust_recorder: c.trust_recorder }
+                    : {}),
                   ...(() => {
                     const targetAuth = transitPointTargetAuth(c);
                     return targetAuth ? { target_auth: targetAuth } : {};

@@ -453,12 +453,22 @@ pub fn spawn_trust_recorder(
     agent_did: &str,
     tr_manager: Option<Arc<TrustRegistryListenerManager>>,
 ) {
+    if let Some(recorder) = surface.trust_recorder() {
+        spawn_recorder(surface, recorder, agent_did, tr_manager);
+    }
+}
+
+/// [`spawn_trust_recorder`] for `recorder_cfg`, which may be the Trust Recorder of one of
+/// `surface`'s Transit Points, writing the records of the DID it calls out under.
+pub fn spawn_recorder(
+    surface: &AgentSurface,
+    recorder_cfg: &TrustRecorderConfig,
+    agent_did: &str,
+    tr_manager: Option<Arc<TrustRegistryListenerManager>>,
+) {
     if !agent_did.starts_with("did:") {
         return;
     }
-    let Some(recorder_cfg) = surface.trust_recorder() else {
-        return;
-    };
     if recorder_cfg
         .entries
         .is_empty()

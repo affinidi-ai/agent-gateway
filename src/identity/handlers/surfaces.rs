@@ -2525,9 +2525,7 @@ pub async fn get_trust_recorder_status(
     let (_, surface) =
         load_surface_or_404(&state, &surface_id, tenant_context(&context), resource_scope(&scope), SurfaceAccess::Read)
             .await?;
-    let has_recorder = surface
-        .trust_recorder()
-        .is_some_and(|recorder| !recorder.entries.is_empty());
+    let has_recorder = surface.has_trust_recorder_entries();
     let status = match global_store() {
         Some(store) if has_recorder => {
             store
@@ -4362,22 +4360,52 @@ async fn validate_and_save_surface(
     Ok((surface, warnings))
 }
 
-/// Whether an edit added, removed or changed the entries of the surface's Trust Recorder.
-/// No recorder and a recorder without entries are the same.
+/// Whether an edit added, removed or changed the entries of the surface's Trust Recorder or
+/// of a Transit Point's, on the surface or in a variant. No recorder and a recorder without
+/// entries are the same.
 fn trust_recorder_changed(
     before: &AgentSurface,
     after: &AgentSurface,
 ) -> bool {
-    let entries = |surface: &AgentSurface| {
+    let entries = |recorder: Option<&crate::config::types::TrustRecorderConfig>| {
         serde_json::to_value(
-            surface
-                .trust_recorder()
+            recorder
                 .map(|recorder| recorder.entries.as_slice())
                 .unwrap_or_default(),
         )
         .unwrap_or_default()
     };
-    entries(before) != entries(after)
+    let point_entries = |surface: &AgentSurface| -> std::collections::BTreeMap<String, serde_json::Value> {
+        let variant_points = surface
+            .variants
+            .iter()
+            .flat_map(|variant| {
+                variant
+                    .overrides
+                    .transit
+                    .iter()
+                    .flat_map(|transit| {
+                        transit
+                            .points
+                            .iter()
+                            .flatten()
+                    })
+                    .map(move |point| (format!("{}/{}", variant.alias, point.alias), point))
+            });
+        surface
+            .transit_points()
+            .iter()
+            .map(|point| (point.alias.clone(), point))
+            .chain(variant_points)
+            .map(|(key, point)| (key, entries(point.trust_recorder.as_ref())))
+            .filter(|(_, recorded)| {
+                recorded
+                    .as_array()
+                    .is_some_and(|entries| !entries.is_empty())
+            })
+            .collect()
+    };
+    entries(before.trust_recorder()) != entries(after.trust_recorder()) || point_entries(before) != point_entries(after)
 }
 
 /// Per RFC 7396 the media type for a JSON Merge Patch body MUST be
@@ -11967,5 +11995,54 @@ mod tests {
         let mut after = surface_recording(&["tr-1"]);
         after.name = "renamed".into();
         assert!(!trust_recorder_changed(&before, &after));
+    }
+
+    #[test]
+    fn a_transit_point_recorder_edit_is_a_change() {
+        let with_point_recorder = |registries: &[&str]| {
+            let mut surface = AgentSurface::default();
+            let mut point: crate::config::agent_surface::TransitPoint = serde_json::from_value(serde_json::json!({
+                "alias": "partner", "target_endpoint": "https://partner.example", "protocol": "a2a"
+            }))
+            .unwrap();
+            point.trust_recorder = surface_recording(registries)
+                .access_point
+                .trust_recorder;
+            surface.transit = Some(serde_json::from_value(serde_json::json!({ "points": [] })).unwrap());
+            surface
+                .transit
+                .as_mut()
+                .unwrap()
+                .points
+                .push(point);
+            surface
+        };
+        assert!(!trust_recorder_changed(&with_point_recorder(&["tr-1"]), &with_point_recorder(&["tr-1"])));
+        assert!(!trust_recorder_changed(&with_point_recorder(&[]), &AgentSurface::default()));
+        assert!(trust_recorder_changed(&with_point_recorder(&["tr-1"]), &with_point_recorder(&["tr-2"])));
+        assert!(trust_recorder_changed(&AgentSurface::default(), &with_point_recorder(&["tr-1"])));
+
+        let in_variant = |registries: &[&str]| -> AgentSurface {
+            let points = serde_json::to_value(
+                &with_point_recorder(registries)
+                    .transit
+                    .unwrap()
+                    .points,
+            )
+            .unwrap();
+            AgentSurface {
+                variants: serde_json::from_value(
+                    serde_json::json!([{ "id": "beta-id", "alias": "beta", "name": "Beta",
+                    "overrides": { "transit": { "points": points } } }]),
+                )
+                .unwrap(),
+                ..AgentSurface::default()
+            }
+        };
+        assert!(!trust_recorder_changed(&in_variant(&["tr-1"]), &in_variant(&["tr-1"])));
+        assert!(
+            trust_recorder_changed(&in_variant(&["tr-1"]), &in_variant(&["tr-2"])),
+            "a variant's Transit Point recorder counts too"
+        );
     }
 }

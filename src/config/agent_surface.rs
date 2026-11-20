@@ -2039,6 +2039,11 @@ pub struct TransitPoint {
     /// ignores it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trust_check_migrated: bool,
+
+    /// Writes the records of the managed agent calling out through this Transit
+    /// Point, by the DID it calls out under, before its Trust Check runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_recorder: Option<crate::config::types::TrustRecorderConfig>,
 }
 
 impl TransitPoint {
@@ -3509,6 +3514,8 @@ pub enum TrustCheckValidationError {
     },
     #[error("access_point.trust_recorder has {got} entries (max {max})")]
     TrustRecorderTooManyEntries { got: usize, max: usize },
+    #[error("transit point '{alias}': trust_recorder has {got} entries (max {max})")]
+    TransitPointTrustRecorderTooManyEntries { alias: String, got: usize, max: usize },
     #[error("transit point '{alias}': {source}")]
     TransitPointTrustCheckInvalid {
         alias: String,
@@ -3562,6 +3569,14 @@ fn walk_trust_check_list(
     Ok(())
 }
 
+/// The number of entries of `recorder` when it holds more than
+/// [`crate::config::types::TRUST_RECORDER_ENTRIES_MAX`].
+fn trust_recorder_entries_over_cap(recorder: Option<&crate::config::types::TrustRecorderConfig>) -> Option<usize> {
+    recorder
+        .map(|recorder| recorder.entries.len())
+        .filter(|got| *got > crate::config::types::TRUST_RECORDER_ENTRIES_MAX)
+}
+
 impl AccessPoint {
     /// Validate caller-leg trust_check_list and header metadata mapping invariants.
     pub fn validate(&self) -> Result<(), TrustCheckValidationError> {
@@ -3571,14 +3586,11 @@ impl AccessPoint {
                 .validate(&self.protocol)
                 .map_err(|source| TrustCheckValidationError::HeaderMetadataMappingInvalid { source })?;
         }
-        if let Some(cfg) = &self.trust_recorder {
-            let got = cfg.entries.len();
-            if got > crate::config::types::TRUST_RECORDER_ENTRIES_MAX {
-                return Err(TrustCheckValidationError::TrustRecorderTooManyEntries {
-                    got,
-                    max: crate::config::types::TRUST_RECORDER_ENTRIES_MAX,
-                });
-            }
+        if let Some(got) = trust_recorder_entries_over_cap(self.trust_recorder.as_ref()) {
+            return Err(TrustCheckValidationError::TrustRecorderTooManyEntries {
+                got,
+                max: crate::config::types::TRUST_RECORDER_ENTRIES_MAX,
+            });
         }
         Ok(())
     }
@@ -4364,6 +4376,13 @@ impl AgentSurface {
             return Ok(());
         };
         for tp in &transit.points {
+            if let Some(got) = trust_recorder_entries_over_cap(tp.trust_recorder.as_ref()) {
+                return Err(TrustCheckValidationError::TransitPointTrustRecorderTooManyEntries {
+                    alias: tp.alias.clone(),
+                    got,
+                    max: crate::config::types::TRUST_RECORDER_ENTRIES_MAX,
+                });
+            }
             if tp.trust_check_list.is_empty() {
                 continue;
             }
@@ -6963,6 +6982,7 @@ mod tests {
                         delegated_credentials_for_fabric_callers: false,
                         trust_check_list: Vec::new(),
                         trust_check_migrated: false,
+                        trust_recorder: None,
                     },
                     TransitPoint {
                         id: uuid::Uuid::new_v4().to_string(),
@@ -6996,6 +7016,7 @@ mod tests {
                         delegated_credentials_for_fabric_callers: false,
                         trust_check_list: Vec::new(),
                         trust_check_migrated: false,
+                        trust_recorder: None,
                     },
                 ],
                 outbound_listen_address: None,
@@ -8264,6 +8285,44 @@ mod tests {
             }
             other => panic!("expected TrustRecorderTooManyEntries, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn validate_caps_a_transit_point_trust_recorder_like_the_surface_one() {
+        use crate::config::types::{TRUST_RECORDER_ENTRIES_MAX, TrustRecorderConfig, TrustRecorderEntry};
+        let entry = TrustRecorderEntry {
+            trust_registry_id: "tr-1".to_string(),
+            issuer_did: "did:example:issuer".to_string(),
+            authority_did: "did:example:authority".to_string(),
+            authority_source: None,
+            include_owned_agent: true,
+            custom_resources: Vec::new(),
+        };
+        let with_entries = |count: usize| {
+            let mut surface =
+                surface_with_transit_points(serde_json::json!([transit_point_json("partner", "a2a", Vec::new())]));
+            surface
+                .transit
+                .as_mut()
+                .expect("transit")
+                .points[0]
+                .trust_recorder = Some(TrustRecorderConfig {
+                entries: vec![entry.clone(); count],
+            });
+            surface
+        };
+
+        assert_eq!(with_entries(TRUST_RECORDER_ENTRIES_MAX).validate(), Ok(()));
+        assert_eq!(
+            with_entries(TRUST_RECORDER_ENTRIES_MAX + 1).validate(),
+            Err(TrustCheckValidationError::TransitPointTrustRecorderTooManyEntries {
+                alias: "partner".to_string(),
+                got: TRUST_RECORDER_ENTRIES_MAX + 1,
+                max: TRUST_RECORDER_ENTRIES_MAX,
+            })
+        );
+        assert!(with_entries(1).has_trust_recorder_entries(), "a Transit Point's entries count");
+        assert!(!with_entries(0).has_trust_recorder_entries());
     }
 
     #[test]

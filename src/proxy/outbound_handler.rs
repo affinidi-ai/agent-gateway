@@ -1171,6 +1171,9 @@ async fn outbound_proxy_handler_in_request_scope(
     // [8] Trust Context Collection
     step_collect_trust_context(&state, &mut ctx).await?;
 
+    // [8a] Transit Point Trust Recorder: records the calling agent in the background.
+    step_record_transit_point_agent(&state, &ctx);
+
     // [8b] Trust Check stage (target leg) — runs before any OPA so all
     // three outbound OPA scopes see the same `input.trust_check_results`.
     step_trust_check(&state, &mut ctx).await?;
@@ -3787,6 +3790,48 @@ async fn step_trust_check(
         ctx.trust_check_results = Some(results);
     }
     Ok(())
+}
+
+/// [8a] The routed Transit Point's Trust Recorder writes, in the background,
+/// the records of the DID the managed agent calls out under, on every request
+/// that has one, like the surface's recorder on the response leg (see
+/// [`crate::trust_registry_verification::spawn_recorder`]). Never waits for the
+/// writes or refuses the request.
+fn step_record_transit_point_agent(
+    state: &OutboundProxyState,
+    ctx: &OutboundPipelineContext,
+) {
+    let Some((recorder, did)) = transit_point_agent_to_record(ctx) else {
+        return;
+    };
+    crate::trust_registry_verification::spawn_recorder(
+        &ctx.surface,
+        &recorder,
+        &did,
+        state
+            .trust_registry_listener_manager
+            .clone(),
+    );
+}
+
+/// The routed Transit Point's Trust Recorder and the DID its managed agent calls out
+/// under, when there is something to record: the recorder has entries, a managed
+/// identity was resolved and the request is not a discovery read.
+fn transit_point_agent_to_record(
+    ctx: &OutboundPipelineContext
+) -> Option<(crate::config::types::TrustRecorderConfig, String)> {
+    let recorder = ctx
+        .virtual_channel
+        .trust_recorder
+        .as_ref()
+        .filter(|recorder| !recorder.entries.is_empty())?;
+    let ProtectedAgentIdentity::Managed { did, .. } = &ctx.resolved_identity else {
+        return None;
+    };
+    if is_transit_discovery_read(ctx) {
+        return None;
+    }
+    Some((recorder.clone(), did.clone()))
 }
 
 /// [8b] The routed Transit Point's managed-agent Trust Check elements: the
@@ -14521,6 +14566,63 @@ mod tests {
                 .is_none()
         );
         assert!(target_elements(&ctx).is_empty());
+    }
+
+    fn recorder_with(registries: &[&str]) -> crate::config::types::TrustRecorderConfig {
+        crate::config::types::TrustRecorderConfig {
+            entries: registries
+                .iter()
+                .map(|registry| crate::config::types::TrustRecorderEntry {
+                    trust_registry_id: registry.to_string(),
+                    issuer_did: "did:web:issuer.example".to_string(),
+                    authority_did: "did:web:authority.example".to_string(),
+                    authority_source: None,
+                    include_owned_agent: true,
+                    custom_resources: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_transit_point_recorder_records_the_did_its_agent_calls_out_under() {
+        let mut ctx = managed_agent_checked_call();
+        ctx.virtual_channel
+            .trust_recorder = Some(recorder_with(&["alpha"]));
+        let (recorder, did) = transit_point_agent_to_record(&ctx).expect("something to record");
+        assert_eq!(did, "did:web:agent.example");
+        assert_eq!(recorder.entries[0].trust_registry_id, "alpha");
+    }
+
+    #[test]
+    fn a_transit_point_recorder_records_nothing_without_entries_a_did_or_for_a_discovery_read() {
+        let mut no_recorder = managed_agent_checked_call();
+        no_recorder
+            .virtual_channel
+            .trust_recorder = None;
+        let mut no_entries = managed_agent_checked_call();
+        no_entries
+            .virtual_channel
+            .trust_recorder = Some(recorder_with(&[]));
+        let mut no_did = managed_agent_checked_call();
+        no_did
+            .virtual_channel
+            .trust_recorder = Some(recorder_with(&["alpha"]));
+        no_did.resolved_identity = ProtectedAgentIdentity::Anonymous;
+        let mut discovery = managed_agent_checked_call();
+        discovery
+            .virtual_channel
+            .trust_recorder = Some(recorder_with(&["alpha"]));
+        discovery.original_method = Method::GET;
+        discovery.request_path = "/outbound/surfaces/order/partner-a/.well-known/agent-card.json".to_string();
+        for (case, ctx) in [
+            ("no recorder", &no_recorder),
+            ("no entries", &no_entries),
+            ("no DID", &no_did),
+            ("discovery read", &discovery),
+        ] {
+            assert!(transit_point_agent_to_record(ctx).is_none(), "{case}");
+        }
     }
 
     #[tokio::test]

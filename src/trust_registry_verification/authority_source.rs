@@ -67,6 +67,10 @@ pub enum AuthorityUse {
     },
     TrustRecorder {
         trust_registry_id: String,
+        /// The Transit Point whose own Trust Recorder holds the entry; absent for the
+        /// surface's.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        transit_point: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         variant: Option<String>,
     },
@@ -90,12 +94,14 @@ impl AuthorityUse {
 
     fn trust_recorder(
         entry: &TrustRecorderEntry,
+        transit_point: Option<&str>,
         variant: Option<&str>,
     ) -> Self {
         Self::TrustRecorder {
             trust_registry_id: entry
                 .trust_registry_id
                 .clone(),
+            transit_point: transit_point.map(str::to_string),
             variant: variant.map(str::to_string),
         }
     }
@@ -103,6 +109,11 @@ impl AuthorityUse {
     fn label(&self) -> String {
         match self {
             Self::TrustCheck { id, .. } => format!("Trust Check '{id}'"),
+            Self::TrustRecorder {
+                trust_registry_id,
+                transit_point: Some(alias),
+                ..
+            } => format!("Trust Recorder entry for trust registry '{trust_registry_id}' on Transit Point '{alias}'"),
             Self::TrustRecorder { trust_registry_id, .. } => {
                 format!("Trust Recorder entry for trust registry '{trust_registry_id}'")
             }
@@ -220,6 +231,18 @@ fn visit_legs(
             );
             visit_trust_check(element, used_by, visit);
         }
+        for entry in point
+            .trust_recorder
+            .iter_mut()
+            .flat_map(|recorder| {
+                recorder
+                    .entries
+                    .as_mut_slice()
+            })
+        {
+            let used_by = AuthorityUse::trust_recorder(entry, Some(&point.alias), variant);
+            visit(&entry.authority_did, &mut entry.authority_source, used_by, "authority_source");
+        }
     }
     for entry in trust_recorder
         .map(|recorder| {
@@ -229,7 +252,7 @@ fn visit_legs(
         })
         .unwrap_or_default()
     {
-        let used_by = AuthorityUse::trust_recorder(entry, variant);
+        let used_by = AuthorityUse::trust_recorder(entry, None, variant);
         visit(&entry.authority_did, &mut entry.authority_source, used_by, "authority_source");
     }
 }
@@ -837,6 +860,56 @@ mod tests {
             Err(format!(
                 "Trust Recorder entry for trust registry 'tr-rec' uses Authority {ACME}, which does not exist or \
                  belongs to another tenant. Pick another Authority or remove the entry"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_transit_point_recorder_entry_is_a_reference_that_names_its_transit_point() {
+        let mut recording: AgentSurface = serde_json::from_value(json!({
+            "surface_id": "s", "name": "S",
+            "access_point": {"listen_address": "0.0.0.0:8443", "route": "/s", "protocol": "a2a"},
+            "target": {"endpoint": "https://agent.example.com"},
+            "transit": {"points": [{
+                "id": "tp-id", "alias": "partner", "target_endpoint": "https://partner.example.com",
+                "protocol": "a2a", "trust_recorder": recorder(ACME)
+            }]},
+            "variants": [{
+                "id": "staging-id", "alias": "staging", "name": "Staging",
+                "overrides": {"transit": {"points": [{
+                    "id": "tp-variant", "alias": "partner-staging", "target_endpoint": "https://staging.example.com",
+                    "protocol": "a2a", "trust_recorder": recorder(ACME)
+                }]}}
+            }]
+        }))
+        .unwrap();
+
+        assert!(registers(vec![authority(ACME, None)]).classify_surface(&mut recording, None));
+        let references = surface_references(&recording);
+        assert_eq!(
+            references
+                .iter()
+                .map(|reference| (serde_json::to_value(&reference.used_by).unwrap(), reference.source))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    json!({"element": "trust_recorder", "trust_registry_id": "tr-rec", "transit_point": "partner"}),
+                    Some(AuthoritySource::Authority)
+                ),
+                (
+                    json!({
+                        "element": "trust_recorder", "trust_registry_id": "tr-rec",
+                        "transit_point": "partner-staging", "variant": "staging"
+                    }),
+                    Some(AuthoritySource::Authority)
+                ),
+            ]
+        );
+        assert_eq!(
+            registers(Vec::new()).check(&references, None),
+            Err(format!(
+                "Trust Recorder entry for trust registry 'tr-rec' on Transit Point 'partner' uses Authority {ACME}, \
+                 which does not exist or belongs to another tenant. Pick another Authority or remove the entry"
             ))
         );
     }
