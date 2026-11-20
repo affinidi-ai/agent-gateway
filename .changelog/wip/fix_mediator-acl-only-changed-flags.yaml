@@ -1,0 +1,89 @@
+branch: fix/mediator-acl-only-changed-flags
+changes:
+  added:
+    - timestamp: '2026-11-12T20:00:00Z'
+      title: ⭐ Pause pairing until the mediator admits the new DIDs, and continue later
+      description: >-
+        A mediator in explicit_allow mode refuses every DID its administrator has not added.
+        Creating a Connection Point and adding a gateway can now stop after minting their DIDs
+        (the Connection Point DID and the permanent DID it reserves for the paired gateway, or
+        the handshake and permanent DIDs of an acceptance), show them, and continue when they are
+        allowed, now or days later from Connections, until the invitation expires. A pause, its
+        keys and its reserved permanent DID survive a restart. Continue checks each DID on the
+        mediator and answers 409 mediator_access_refused naming the one still refused, or 410
+        once the invitation has expired; an expired pause stays until the next restart or a
+        delete. Only the pairing flow sets awaiting-mediator-access: a gateway edit that sets it
+        is refused with 400. The API pauses when a request sets await_mediator_access. The
+        dashboard asks for the pause and continues at once: on a mediator that admits the DIDs,
+        such as one in explicit_deny mode, pairing looks as before, and only a refusal shows a
+        step that asks to add the DIDs to the DIDComm Mediator's allow list (all of them in one
+        copy, or each on its own, per mediator when federation puts them on two). Because the
+        dashboard always asks for the pause, every Connection Point it creates reserves its
+        permanent DID at creation and announces it, whatever the mediator's mode. Approval uses
+        the reserved permanent DID, so pings work as soon as the pairing completes. The event hook
+        announces every DID at the pause.
+  changed:
+    - timestamp: '2026-11-12T20:05:00Z'
+      title: Let an accepted invitation wait for approval until the invitation expires
+      description: >-
+        A gateway that accepted an invitation now waits for the inviting gateway's approval until
+        the invitation expires (its expires_time, capped at seven days, or seven days without one)
+        instead of one hour (oob_connection.pending_expiry_hours), since the inviting administrator may approve
+        days later. Such a pending acceptance now survives a restart until then. pending_expiry_hours
+        now applies only to acceptances stored before the expiry was recorded.
+    - timestamp: '2026-11-17T09:05:00Z'
+      title: Keep Connections row actions and every button label on one line
+      description: >-
+        The action buttons of a gateway or a Connection Point no longer stack on narrow windows or in
+        the Connection Points list; the table scrolls sideways instead. Across the dashboard, a
+        button's label no longer wraps (.app-button keeps its text on one line).
+  fixed:
+    - timestamp: '2026-11-12T16:00:00Z'
+      title: ⭐ Pair gateways on an explicit_allow mediator without admin-only ACL rights
+      description: >-
+        Each mediator account ACL update the gateway sends (opening a Connection Point or temporary
+        listener, and locking a paired Connection Point to its peer) now names only the access-list
+        mode and anonymous receipt. It used to also set blocked, local, invitations, send and receive
+        rights and the three self-manage flags, which a mediator lets only an administrator change,
+        so on an explicit_allow mediator the whole update was refused with not_self_manageable
+        unless the account had been registered with the queue-limit rights. The connection-setup
+        was then refused with e.p.delivery.refused (error 73). An account registered with the
+        right to manage its own access list, such as the Affinidi Portal's 71000, now opens and
+        locks itself, and two gateways pair and ping each other.
+    - timestamp: '2026-11-12T16:05:00Z'
+      title: Log a refused inbox update as a warning, not as success
+      description: >-
+        When the mediator refuses to open a temporary listener's or Connection Point's inbox, the
+        gateway now logs a warning with the mediator's reason and what it means for the pairing,
+        instead of logging that the ACL was set to allow-all. The flow continues as before.
+    - timestamp: '2026-11-13T15:10:00Z'
+      title: Tell the acceptor when an invitation can't be used, so it stops waiting
+      description: >-
+        A gateway that accepted an invitation that was already used, expired, disabled or deleted
+        stayed pending for ever, because the inviting gateway only logged the refusal. While the
+        invitation's listener still runs, the inviting gateway now answers with
+        connection-rejected and the reason "This invitation can't be used any more. Ask for a new
+        one.", without saying which, as it already did for a wrong secret; a Connection Point
+        deleted with its listener answers nothing. A setup repeated by the acceptor that redeemed
+        the invitation, while its first waits for approval, is not answered. The acceptor marks its
+        gateway failed with that reason in front of the description its operator gave, and it can
+        be deleted. A rejection is taken only from the inviter the setup went to, and sending it is
+        best effort.
+    - timestamp: '2026-11-13T15:15:00Z'
+      title: Open a pending gateway from the Gateways list, as the Add Gateway wizard does
+      description: >-
+        After Add Gateway sent its connection-setup, the wizard offered to open the new gateway,
+        but its pending row on Connections could not be opened. The row now opens the gateway's
+        page, which says the connection is pending, keeps Gateway Enabled off until the inviter
+        accepts, and shows the issuer DIDs and surfaces only once it does. Rows waiting for
+        approval or mediator access keep their own action.
+  removed: []
+  security:
+    - timestamp: '2026-11-20T11:00:00Z'
+      title: Stop serving System Connection Points by id
+      description: >-
+        GET /v1/connection-points/{id} now answers 404 for a System Connection Point, as the
+        Connection Point lists already leave them out. A paused acceptance's temporary point holds
+        the inviter's invitation secret, which a caller with view access could otherwise read and
+        redeem first.
+  breaking: []

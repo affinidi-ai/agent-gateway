@@ -1420,6 +1420,7 @@ select.dropdown-styling option {
 
 .app-button {
   position: relative;
+  white-space: nowrap;
 }
 
 .app-button-content {

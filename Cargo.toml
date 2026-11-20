@@ -275,6 +275,8 @@ webpki = { package = "rustls-webpki", version = "0.103", default-features = fals
 rustls-pki-types = "1"
 
 [dev-dependencies]
+# Builds the exact authentication error a mediator returns for a DID it does not admit.
+affinidi-did-authentication = "0.3.13"
 tempfile = "3.24.0"
 ts-rs = "11.0"
 cucumber = { version = "0.23", features = ["macros"] }

@@ -630,7 +630,17 @@ pub async fn gateway_pings_gateway(
         .insert((from_gw, to_gw), success);
 }
 
-async fn accept_pending_oob(
+#[when(regex = r"^gateway (\d+) and gateway (\d+) ping each other$")]
+pub async fn gateways_ping_each_other(
+    world: &mut G2gWorld,
+    first: usize,
+    second: usize,
+) {
+    gateway_pings_gateway(world, first, second).await;
+    gateway_pings_gateway(world, second, first).await;
+}
+
+pub(crate) async fn accept_pending_oob(
     world: &mut G2gWorld,
     gateway: usize,
     acceptor_mediator_id: Option<&str>,
@@ -660,8 +670,52 @@ async fn accept_pending_oob(
         )
         .await
         .expect("connect-via-oob request should complete at the transport layer");
+    world.accepted_gateway_id = response
+        .body
+        .pointer("/gateway/id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     world.response_status = Some(response.status);
     world.response_body = Some(response.body);
+}
+
+#[when(regex = r"^the gateways pair$")]
+pub async fn the_gateways_pair(world: &mut G2gWorld) {
+    world.start().await;
+}
+
+#[when(regex = r"^gateway (\d+) deletes the gateway it accepted last$")]
+pub async fn gateway_deletes_the_gateway_it_accepted_last(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let gateway_id = world
+        .accepted_gateway_id
+        .clone()
+        .expect("a step must accept an invitation before this one");
+    let deleted = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .delete_gateway_recorded(&gateway_id)
+        .await
+        .expect("delete request completes at the transport layer");
+    world.response_status = Some(deleted.status);
+    world.response_body = Some(deleted.body);
+}
+
+#[when(regex = r"^gateway (\d+) accepts the invitation again$")]
+pub async fn gateway_accepts_the_invitation_again(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    accept_pending_oob(world, gateway, None).await;
+    assert_eq!(
+        world.response_status,
+        Some(200),
+        "the acceptor sends its connection-setup whatever the invitation's state: {:?}",
+        world.response_body
+    );
 }
 
 #[when(regex = r#"^gateway (\d+) accepts the invitation using mediator "([^"]+)"$"#)]

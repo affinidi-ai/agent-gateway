@@ -2103,6 +2103,80 @@ to it over `fabric://`) shows the gateway's message.
 | Detail surfaces, used by, health         | `payment-gateway-surfaces-refresh-button`, `-surfaces-error`, `-surfaces-empty`, `-surface-<id>`, `payment-gateway-surface-manifest-<id>-*`, `-used-by-<id>`, `-used-by-link-<id>`, `-used-by-empty`, `-used-by-error`, `-ping-button`, `-ping-result` |
 | Use as payment gateway                   | `gateways-use-as-payment-button-<id>` (Gateways tab), `gateway-use-as-payment-button` (edit page)                                                             |
 
+### Mediator access step
+
+A mediator in `explicit_allow` mode refuses DIDs its administrator has not added, so both peer
+pairing wizards pause after the gateway mints its DIDs, and show one shared step
+(`components/shared/MediatorAccessStep.tsx`, helpers in `utils/mediatorAccess.ts`) only on a
+refusal or a resume. The gateway cannot tell the mediator's mode, so each wizard tries to continue
+at once and shows the step only when the mediator refuses a DID. On a mediator that admits them, **mediator-access** is left out
+of the step bar too.
+
+| Wizard | Steps | DIDs shown |
+| --- | --- | --- |
+| Create Connection Point (`/gateways/publish`) | select-mediator, enter-details, **mediator-access**, complete | Connection Point DID, Permanent DID for the paired gateway |
+| Add Gateway (`/gateways/connect`) | enter-details, enter-link, **mediator-access**, connect, complete | Temporary DID for the handshake, Permanent DID for this pairing |
+
+- Leaving enter-details (Create Connection Point) or enter-link (Add Gateway) posts with
+  `await_mediator_access: true`; the response's `mediator_access` fills the step. Create
+  Connection Point then calls `POST /connection-points/{id}/continue` behind its saving
+  spinner; Add Gateway moves to the connect step, which calls `POST /gateways/{id}/continue`.
+  Success goes on as before; a `409 mediator_access_refused` opens the step without a
+  refusal message. Any other failure of that first try in Create Connection Point shows
+  "Connection Point Saved, Not Connected Yet" with the error, **Continue Later** and
+  **Try Again** (`first-try-retry-button`), not the step: nothing says the DIDs were refused.
+- The card header is "Add These DIDs to the DIDComm Mediator's Allow List" (`fa-user-shield`).
+  The text opens with "This {name} Mediator most probably uses Explicit Allow, …" ("Mediator"
+  is left out when the name already ends in it), then says what to do when the mediator is
+  hosted by Affinidi or self-hosted. **Copy All DIDs as a Bundle** copies every DID, one per
+  line; below it, one row per DID with its label, `topAndTail(did, 16, 16)` and a
+  `CopyButton`, and a note to use one or the other. Both wizards show the step the same way,
+  with no warning banner: the dashboard cannot tell whose mediator it is, since both gateways
+  may use the same one. When the DIDs sit on two mediators (an acceptance with mediator
+  federation keeps its permanent DID on its own; each DID's `mediator_did` and
+  `mediator_name` come with the access), the step lists them per mediator
+  (`mediator-access-group-<n>`), each with its own bundle (`mediator-access-copy-all-<n>`), and a
+  refusal names the refused DID's mediator.
+- **Continue Later** (left) returns to Connections and changes nothing. **Test Connection**
+  (right) calls the same Continue again. A `409 mediator_access_refused` then keeps the step
+  and shows "DIDComm Mediator {name} still refuses the {label} ({short DID}). Make sure it is
+  allowed, then select Test Connection again."
+- `?resume=<id>` opens either wizard at the step with the same DIDs, from
+  `GET /connection-points/{id}/mediator-access` or `GET /gateways/{id}/mediator-access`
+  (the id `encodeURIComponent`-ed), without calling Continue first. When that load fails (the
+  record is gone or already continued) or its invitation has expired, the wizard shows
+  `ResumeUnavailableCard` ("This Pairing Can't Continue", the reason, **Back to Connections**)
+  instead of a step.
+- On Connections, a gateway with status `awaiting-mediator-access` and a Connection Point with
+  `awaiting_mediator_access` show the warning badge "Waiting for mediator access" and a
+  **Continue** button that opens its wizard with `?resume=`. A paused Connection Point whose
+  expiry has passed shows `EXPIRED` and no **Continue** (the list has no expiry for a paused
+  gateway, so its wizard says so on resume). Both **Continue** buttons are
+  `outline-primary`, `sm`, like the per-row **Edit** button. Such a Connection Point has no
+  copy-link or copy-secret button until it has an invitation; such a gateway is treated as
+  pending (`isGatewayPending`): no ping, edit or row link.
+- A `pending` gateway (the connection-setup was sent, the inviter has not accepted it) has no
+  ping or edit button, but its row opens `/gateways/{id}`, the page the Add Gateway wizard's
+  **View Connection** opens (`opensGatewayDetails` in `utils/gateways.ts`; rows waiting for
+  approval or mediator access do not open it). There the Overview shows an info notice
+  (`gateway-editor-pending-notice`), **Gateway Enabled** is disabled and Save leaves the status
+  alone, and the Remote tab says the issuer DIDs and surfaces appear once the inviter accepts
+  (`gateway-editor-remote-pending`). An inviter that refuses the setup turns it `failed`, with
+  its reason in the description; see
+  [`docs/FABRIC.md`](../../docs/FABRIC.md#connection-establishment-invariants).
+- The payment gateway wizard does not pause.
+
+| Element | Test id |
+| --- | --- |
+| Step and DIDs | `wizard-step-mediator-access`, `mediator-access-did-<role>` (`connection_point`, `temporary`, `permanent`), `mediator-access-copy-button-<role>` |
+| Actions | `mediator-access-copy-all`, `mediator-access-later-button`, `mediator-access-continue-button` |
+| Errors | `mediator-access-refused`, `mediator-access-error` |
+| Two mediators | `mediator-access-group-<n>`, `mediator-access-copy-all-<n>` |
+| First try failed | `wizard-step-first-try-failed`, `first-try-error`, `first-try-retry-button`, `first-try-later-button` |
+| Resume can't continue | `wizard-resume-unavailable`, `wizard-resume-unavailable-message`, `wizard-resume-back-button` |
+| Connections | `gateways-continue-button-<id>`, `connection-points-continue-button-<id>`, `connection-points-status-<id>`, `gateway-status-<id>` |
+| Pending gateway page | `gateway-editor-pending-notice`, `gateway-editor-remote-pending` |
+
 ## Agents page
 
 `/agent-registry` (`pages/AgentsPage.tsx`, table in `pages/AgentsPage/AgentsTable.tsx`) and
@@ -2653,9 +2727,13 @@ room for its text.
   card shows the UAI. The table fits its box from the 1280px viewport that
   `laptop-layout.spec.ts` checks up to the 1512px and 1728px laptop viewports, with every row
   action inside it; the DID keeps its title and copy button.
-- **Connection Points actions**: the row actions sit in a 6rem wide wrapping block (two
-  buttons per line) with no left margins, so the Actions column stays near 120px and the
-  Name and Mediator columns keep their room. Add a new row action inside that block.
+- **Button labels** (whole dashboard): `.app-button` sets `white-space: nowrap`, so no
+  `AppButton` label wraps. Where a row or card is too narrow, lay its buttons out to fit (or let
+  the container scroll) rather than letting a label break.
+- **Connections row actions** (Agent Gateways and Connection Points): the row actions stay on
+  one line in a `d-flex flex-nowrap gap-2 align-items-center` block, with no left margins. A
+  window too narrow for the row scrolls the table sideways (`table-responsive`) instead of
+  stacking the buttons. Add a new row action inside that block.
 
 ## Validation
 
