@@ -720,12 +720,23 @@ pub fn install_trace_reload(
     initial: BoxedLayer,
     target_crates: Vec<String>,
 ) -> BoxedLayer {
-    let (layer, handle) = tracing_subscriber::reload::Layer::new(initial);
+    let (layer, handle) = reloadable_trace_layer(initial, target_crates);
     let _ = TRACE_RELOAD.set(handle);
     layer
+}
+
+/// The OTEL **trace** slot: `initial` in a reload layer with the fixed level +
+/// business-logic filters outside it, and the handle that swaps its content.
+fn reloadable_trace_layer(
+    initial: BoxedLayer,
+    target_crates: Vec<String>,
+) -> (BoxedLayer, OtelReloadHandle) {
+    let (layer, handle) = tracing_subscriber::reload::Layer::new(initial);
+    let layer = layer
         .with_filter(tracing_subscriber::filter::LevelFilter::INFO)
         .with_filter(super::span_filter::BusinessLogicFilter::new(target_crates))
-        .boxed()
+        .boxed();
+    (layer, handle)
 }
 
 /// Wrap `initial` in a reload layer for the OTEL **log** slot, apply a fixed
@@ -951,11 +962,8 @@ mod tests {
                 spans: captured.clone(),
             })
             .build();
-        let (layer, _handle) = tracing_subscriber::reload::Layer::new(build_trace_layer_boxed(&provider, "test"));
-        let layer = layer
-            .with_filter(tracing_subscriber::filter::LevelFilter::INFO)
-            .with_filter(crate::observability::span_filter::BusinessLogicFilter::new(vec!["agent_gateway".to_string()]))
-            .boxed();
+        let (layer, _handle) =
+            reloadable_trace_layer(build_trace_layer_boxed(&provider, "test"), vec!["agent_gateway".to_string()]);
 
         let context_is_valid = tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
             let span = tracing::info_span!(target: "agent_gateway", "reloadable");
