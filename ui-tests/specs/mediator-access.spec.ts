@@ -434,6 +434,24 @@ test.describe("Mediator access step", () => {
     ).toBeEnabled();
   });
 
+  test("a paused gateway opened by its URL keeps Gateway Enabled locked", async ({
+    page,
+  }) => {
+    await mockConnections(page);
+    await page.route("**/api/v1/gateways/gw-paused", (route) =>
+      json(route, PAUSED_GATEWAY),
+    );
+    await page.route("**/api/v1/gateways/gw-paused/policy", (route) =>
+      json(route, { opa_policy_config: null }),
+    );
+    await page.goto(`${BASE_URL}/gateways/gw-paused`);
+
+    await expect(
+      page.getByTestId("gateway-editor-pending-notice"),
+    ).toContainText("This connection is pending");
+    await expect(page.locator("#status")).toBeDisabled();
+  });
+
   test("the Add Gateway wizard's View Connection opens the pending gateway's details", async ({
     page,
   }) => {

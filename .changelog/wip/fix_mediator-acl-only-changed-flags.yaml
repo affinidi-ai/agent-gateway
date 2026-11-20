@@ -78,5 +78,12 @@ changes:
         accepts, and shows the issuer DIDs and surfaces only once it does. Rows waiting for
         approval or mediator access keep their own action.
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-11-20T11:00:00Z'
+      title: Stop serving System Connection Points by id
+      description: >-
+        GET /v1/connection-points/{id} now answers 404 for a System Connection Point, as the
+        Connection Point lists already leave them out. A paused acceptance's temporary point holds
+        the inviter's invitation secret, which a caller with view access could otherwise read and
+        redeem first.
   breaking: []

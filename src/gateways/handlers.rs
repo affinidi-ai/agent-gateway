@@ -449,12 +449,14 @@ pub async fn update_gateway<S: GatewayStore>(
     }
     // DID cannot be changed after creation - ignore req.did
     if let Some(status) = req.status {
-        // Only the pairing flow pauses a gateway; the startup sweep removes a paused one
-        // with no paused point, so an edit must not set it.
-        if status == GatewayStatus::AwaitingMediatorAccess && gateway.status != GatewayStatus::AwaitingMediatorAccess {
+        // Only the pairing flow pauses or unpauses a gateway: the startup sweep removes a
+        // paused one with no paused point, and Continue finishes a `pending` one with a
+        // paused point without sending its connection-setup.
+        let pausing = status == GatewayStatus::AwaitingMediatorAccess;
+        if pausing != (gateway.status == GatewayStatus::AwaitingMediatorAccess) {
             return Err((
                 StatusCode::BAD_REQUEST,
-                "awaiting-mediator-access is set by the pairing flow only".to_string(),
+                "awaiting-mediator-access is set and cleared by the pairing flow only".to_string(),
             ));
         }
         if status == GatewayStatus::Disabled && gateway.status != GatewayStatus::Disabled {
@@ -1353,6 +1355,35 @@ mod tests {
                 .status,
             GatewayStatus::Active
         );
+    }
+
+    #[tokio::test]
+    async fn an_edit_cannot_unpause_a_gateway_paused_for_mediator_access() {
+        let mut gateway = remote_gateway();
+        gateway.status = GatewayStatus::AwaitingMediatorAccess;
+        let (store, _dir) = gateway_store_with(&gateway).await;
+        let call = |json: serde_json::Value| {
+            update_gateway(
+                Extension(store.clone()),
+                Extension(None),
+                Path(gateway.id.clone()),
+                None,
+                None,
+                Json(update_request(json)),
+            )
+        };
+
+        for status in ["pending", "active", "disabled"] {
+            let err = call(serde_json::json!({ "status": status }))
+                .await
+                .expect_err("only the pairing flow unpauses a gateway");
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "{status}");
+        }
+        let Json(renamed) = call(serde_json::json!({ "name": "Renamed", "status": "awaiting-mediator-access" }))
+            .await
+            .expect("an edit that keeps the status is allowed");
+        assert_eq!(renamed.name, "Renamed");
+        assert_eq!(renamed.status, GatewayStatus::AwaitingMediatorAccess);
     }
 
     #[tokio::test]
@@ -3798,7 +3829,9 @@ pub async fn continue_gateway<
         Ok(gateway)
     };
     load().await?;
-    let _continuing = crate::gateways::mediator_access::lock(&id).await;
+    // Shared with the detached writes of `store_sent_continue`, so a cancelled request
+    // keeps the lock until they finish and a delete cannot run between them.
+    let continuing = Arc::new(crate::gateways::mediator_access::lock(&id).await);
     let gateway = load().await?;
     // A Continue that sent its connection-setup but could not store all of its result
     // leaves the gateway `pending` with its point still flagged. Finish it here, without
@@ -3814,7 +3847,8 @@ pub async fn continue_gateway<
             .clone()
             .unwrap_or_else(|| point.mediator_id.clone());
         let their_mediator_endpoint = invitation_mediator_endpoint(&point.oob_url)?;
-        let (gateway, point) = store_sent_continue(store.clone(), cp_store.clone(), gateway, point).await?;
+        let (gateway, point) =
+            store_sent_continue(store.clone(), cp_store.clone(), gateway, point, continuing.clone()).await?;
         listener_manager
             .request_start_listener(point, their_mediator_did, their_mediator_endpoint)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start temporary listener: {}", e)))?;
@@ -3923,7 +3957,8 @@ pub async fn continue_gateway<
         .await;
     sent?;
 
-    let (gateway, point) = store_sent_continue(store.clone(), cp_store.clone(), gateway, point).await?;
+    let (gateway, point) =
+        store_sent_continue(store.clone(), cp_store.clone(), gateway, point, continuing.clone()).await?;
 
     listener_manager
         .request_start_listener(point, their_mediator_did, their_mediator_endpoint)
@@ -3934,16 +3969,18 @@ pub async fn continue_gateway<
 }
 
 /// Stores what a sent connection-setup means: the gateway `pending`, then its point no longer
-/// paused. Both writes run on their own task, so a cancelled request cannot stop between
-/// them; a failure of the second leaves the gateway `pending` with a flagged point, which the
-/// next Continue finishes.
+/// paused. Both writes run on their own task, which holds the pairing's lock, so a cancelled
+/// request cannot stop between them and a delete waits until both are done; a failure of the
+/// second leaves the gateway `pending` with a flagged point, which the next Continue finishes.
 async fn store_sent_continue<S: GatewayStore + 'static, P: ConnectionPointStore + 'static>(
     store: Arc<S>,
     cp_store: Arc<P>,
     mut gateway: Gateway,
     mut point: super::connection_points::types::GatewayConnectionPoint,
+    continuing: Arc<crate::gateways::mediator_access::ContinueGuard>,
 ) -> Result<(Gateway, super::connection_points::types::GatewayConnectionPoint), (StatusCode, String)> {
     tokio::spawn(async move {
+        let _continuing = continuing;
         if gateway.status != GatewayStatus::Pending {
             gateway.status = GatewayStatus::Pending;
             gateway.updated_at = chrono::Utc::now();
@@ -5674,6 +5711,121 @@ mod pause_tests {
             .unwrap()
             .unwrap();
         assert!(!point.awaiting_mediator_access, "the point is no longer paused");
+    }
+
+    /// A point store whose `update` waits until the test lets it finish.
+    struct HeldPointUpdate {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl ConnectionPointStore for HeldPointUpdate {
+        async fn create(
+            &self,
+            _: &crate::gateways::connection_points::types::GatewayConnectionPoint,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn get(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<Option<crate::gateways::connection_points::types::GatewayConnectionPoint>> {
+            Ok(None)
+        }
+
+        async fn list_all(
+            &self
+        ) -> anyhow::Result<Vec<crate::gateways::connection_points::types::GatewayConnectionPoint>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_by_gateway(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<Vec<crate::gateways::connection_points::types::GatewayConnectionPoint>> {
+            Ok(Vec::new())
+        }
+
+        async fn update(
+            &self,
+            _: &crate::gateways::connection_points::types::GatewayConnectionPoint,
+        ) -> anyhow::Result<()> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+
+        async fn update_if_exists(
+            &self,
+            _: &crate::gateways::connection_points::types::GatewayConnectionPoint,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn delete(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_continue_keeps_its_lock_until_its_detached_writes_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let gateways = Arc::new(
+            crate::gateways::FileSystemGatewayStore::new(dir.path().join("gateways"), None)
+                .await
+                .unwrap(),
+        );
+        let mut gateway =
+            Gateway::new("Partner".into(), String::new(), "did:peer:2.inviter".into(), GatewayType::Remote);
+        gateway.id = "gw-cancelled-continue".into();
+        gateway.status = GatewayStatus::Pending;
+        gateways
+            .create(&gateway)
+            .await
+            .unwrap();
+        let point = TemporaryPoint {
+            id: "cp-cancelled-continue",
+            gateway_id: &gateway.id,
+            temporary_did: "did:peer:2.temporary",
+            inviter_temporary_did: "did:peer:2.inviter",
+            their_mediator_did: MEDIATOR_DID,
+            expires_at: chrono::Utc::now() + chrono::Duration::days(3),
+            secure_cp_id: "cp-permanent",
+            secure_did: "did:peer:2.permanent",
+            secure_mediator_did: MEDIATOR_DID,
+            secure_mediator_id: None,
+            did_method: &ConnectionPointDidMethod::Peer,
+        }
+        .record();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let points = Arc::new(HeldPointUpdate {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+
+        let continuing = Arc::new(crate::gateways::mediator_access::lock(&gateway.id).await);
+        let request = tokio::spawn(store_sent_continue(gateways, points, gateway.clone(), point, continuing));
+        entered.notified().await;
+        // The client goes away while the point's write is still running.
+        request.abort();
+        let _ = request.await;
+
+        let delete = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            crate::gateways::mediator_access::lock(&gateway.id),
+        )
+        .await;
+        assert!(delete.is_err(), "a delete must wait until the detached write is done");
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), crate::gateways::mediator_access::lock(&gateway.id))
+            .await
+            .expect("the lock is free once the write is done");
     }
 
     #[test]
