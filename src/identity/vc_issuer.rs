@@ -66,16 +66,13 @@ pub(crate) fn public_key_agreement_jwk(
 /// log published earlier in the same startup can share. A `versionTime` further ahead comes
 /// from a clock that is off and is refused rather than waited out.
 #[cfg(feature = "didwebvh")]
-fn wait_before_next_version(
+pub(crate) fn wait_before_next_version(
     previous_time: chrono::DateTime<chrono::Utc>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Option<std::time::Duration>> {
     let wait = (previous_time + chrono::Duration::seconds(1)).signed_duration_since(now);
     if wait > chrono::Duration::seconds(MAX_VERSION_TIME_WAIT_SECS) {
-        anyhow::bail!(
-            "the latest gateway DID log version is dated {previous_time}, ahead of this node's clock; \
-             the repair runs again on the next start"
-        );
+        anyhow::bail!("the latest DID log version is dated {previous_time}, ahead of this node's clock");
     }
     Ok(wait.to_std().ok())
 }
@@ -713,7 +710,9 @@ impl VCIssuer {
                 .as_str()
                 .context("Gateway DID log entry has no versionTime")?,
         )?;
-        if let Some(wait) = wait_before_next_version(previous_time.to_utc(), chrono::Utc::now())? {
+        if let Some(wait) = wait_before_next_version(previous_time.to_utc(), chrono::Utc::now())
+            .context("the gateway DID repair runs again on the next start")?
+        {
             tokio::time::sleep(wait).await;
         }
 

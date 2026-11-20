@@ -1112,9 +1112,9 @@ retries the request once the case is decided.
 A surface with an enabled local `x402` or `mpp` policy is refused with
 `503 {"error": "payment_unavailable"}` over HTTP and over the fabric, and saving one is refused
 with `400 local_payment_unsupported`; see
-[Migrating older policies](CONFIGURATION_REFERENCE.md#migrating-older-policies). The x402
-settlement and recovery workers keep running so payments verified locally earlier can still
-settle.
+[Migrating older policies](CONFIGURATION_REFERENCE.md#migrating-older-policies). x402
+transactions recorded earlier are kept as they are and do not settle; see
+[`x402.json`](CONFIGURATION_REFERENCE.md#x402json).
 
 ## AP2 Limitation
 

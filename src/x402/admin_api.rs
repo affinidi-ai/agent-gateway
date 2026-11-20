@@ -1163,18 +1163,18 @@ async fn delete_transaction(
     }
 
     // Check if settlement stage exists and is pending/processing
-    if let Some(ref settlement) = transaction.settlement {
-        match settlement.status {
-            crate::x402::transaction_store::SettlementStatus::Pending
-            | crate::x402::transaction_store::SettlementStatus::Processing
-            | crate::x402::transaction_store::SettlementStatus::AwaitingRemote
-            | crate::x402::transaction_store::SettlementStatus::AwaitingExternal => {
-                return Err(ErrorResponse {
-                    error: "Cannot delete transaction with pending/processing settlement".to_string(),
-                });
-            }
-            _ => {} // Completed, Failed, Refunded - OK to delete
-        }
+    if transaction
+        .settlement
+        .as_ref()
+        .is_some_and(|settlement| {
+            settlement
+                .status
+                .is_in_progress()
+        })
+    {
+        return Err(ErrorResponse {
+            error: "Cannot delete transaction with pending/processing settlement".to_string(),
+        });
     }
 
     // Transaction is finalized - safe to delete

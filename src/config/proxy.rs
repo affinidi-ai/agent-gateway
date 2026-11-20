@@ -329,12 +329,12 @@ impl GatewayConfig {
         // Multiple channels can share the same port if they have different routes
         let mut seen_route_port_combos = std::collections::HashSet::new();
         for surface in self.surfaces.iter() {
-            // Disabled surfaces register no routes anywhere (inbound routing
+            // Disabled and deleted surfaces register no routes anywhere (inbound routing
             // and `group_outbound_vcs_by_port` both skip them), so they must
             // not hold a route claim here either — disabling one copy is the
             // remediation for a duplicated surface, and it has to allow the
             // gateway to boot.
-            if surface.status == crate::config::agent_surface::SurfaceStatus::Disabled {
+            if !surface.status.is_live() {
                 continue;
             }
             let channel_id = surface

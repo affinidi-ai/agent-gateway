@@ -318,7 +318,7 @@
     {
       "id": "immediate",
       "name": "Immediate",
-      "description": "Executes settlement immediately after verification. Settlement method depends on verification mode: Local (embedded facilitator executes on-chain), Fabric Gateway (delegates to other gateway), or External Facilitator (delegates to external service)"
+      "description": "Kept so stored configurations still load. The gateway no longer settles x402 payments; recorded transactions are kept as they are."
     }
   ],
   "recipient_addresses": [

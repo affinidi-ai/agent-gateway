@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 use tokio::fs;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::audit::catalog::{event_bit, is_logged_only};
 
@@ -290,79 +290,37 @@ impl SettingsStore {
         // Try to load existing settings file
         if self.storage_path.exists() {
             match fs::read_to_string(&self.storage_path).await {
-                Ok(content) => {
-                    match parse_stored_settings(&content) {
-                        Ok(settings) => {
-                            info!("Loaded settings from {:?}", self.storage_path);
-                            info!("  Badge threshold: {} minutes", settings.badge_threshold_minutes);
-                            info!("  Metrics retention: {} minutes", settings.metrics_retention_minutes);
-                            info!("  Onboarding channel TTL: {} seconds", settings.onboarding_channel_ttl_seconds);
+                Ok(content) => match parse_stored_settings(&content) {
+                    Ok(settings) => {
+                        info!("Loaded settings from {:?}", self.storage_path);
+                        info!("  Badge threshold: {} minutes", settings.badge_threshold_minutes);
+                        info!("  Metrics retention: {} minutes", settings.metrics_retention_minutes);
+                        info!("  Onboarding channel TTL: {} seconds", settings.onboarding_channel_ttl_seconds);
 
-                            let mut current = self.settings.write().unwrap();
-                            *current = settings;
-                        }
-                        Err(e) => {
-                            warn!("Failed to parse settings file, using defaults: {}", e);
-                            // Save default settings
-                            self.save().await?;
-                        }
+                        let mut current = self.settings.write().unwrap();
+                        *current = settings;
                     }
-                }
+                    Err(e) => {
+                        anyhow::bail!(
+                            "The settings file {:?} cannot be parsed: {e}. It is left as it is; fix or remove it \
+                                 and start again. Starting with defaults would turn off metrics authentication and \
+                                 audit logging and clear every feature flag.",
+                            self.storage_path
+                        );
+                    }
+                },
                 Err(e) => {
-                    warn!("Failed to read settings file, using defaults: {}", e);
-                    // Save default settings
-                    self.save().await?;
+                    anyhow::bail!(
+                        "The settings file {:?} cannot be read: {e}. It is left as it is; make it readable and \
+                         start again.",
+                        self.storage_path
+                    );
                 }
             }
         } else {
             info!("Settings file not found, creating with defaults: {:?}", self.storage_path);
             // Save default settings
             self.save().await?;
-        }
-
-        Ok(())
-    }
-
-    /// Load settings from disk (synchronous version)
-    #[allow(dead_code)]
-    pub fn load_sync(&self) -> Result<()> {
-        // Create settings directory if it doesn't exist
-        if let Some(parent) = self.storage_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create settings directory: {:?}", parent))?;
-        }
-
-        // Try to load existing settings file
-        if self.storage_path.exists() {
-            match std::fs::read_to_string(&self.storage_path) {
-                Ok(content) => {
-                    match parse_stored_settings(&content) {
-                        Ok(settings) => {
-                            info!("Loaded settings from {:?}", self.storage_path);
-                            info!("  Badge threshold: {} minutes", settings.badge_threshold_minutes);
-                            info!("  Metrics retention: {} minutes", settings.metrics_retention_minutes);
-                            info!("  Onboarding channel TTL: {} seconds", settings.onboarding_channel_ttl_seconds);
-
-                            let mut current = self.settings.write().unwrap();
-                            *current = settings;
-                        }
-                        Err(e) => {
-                            warn!("Failed to parse settings file, using defaults: {}", e);
-                            // Save default settings
-                            self.save_sync()?;
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to read settings file, using defaults: {}", e);
-                    // Save default settings
-                    self.save_sync()?;
-                }
-            }
-        } else {
-            info!("Settings file not found, creating with defaults: {:?}", self.storage_path);
-            // Save default settings
-            self.save_sync()?;
         }
 
         Ok(())
@@ -387,35 +345,8 @@ impl SettingsStore {
         let json = serde_json::to_string_pretty(&settings).context("Failed to serialize settings")?;
 
         // Write to file
-        fs::write(&self.storage_path, json)
+        crate::storage::did_artifacts::replace_file(&self.storage_path, json.as_bytes())
             .await
-            .with_context(|| format!("Failed to write settings to {:?}", self.storage_path))?;
-
-        info!("Saved settings to {:?}", self.storage_path);
-
-        Ok(())
-    }
-
-    /// Save current settings to disk (synchronous version)
-    #[allow(dead_code)]
-    pub fn save_sync(&self) -> Result<()> {
-        let settings = self
-            .settings
-            .read()
-            .unwrap()
-            .clone();
-
-        // Create settings directory if it doesn't exist
-        if let Some(parent) = self.storage_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create settings directory: {:?}", parent))?;
-        }
-
-        // Serialize settings to JSON
-        let json = serde_json::to_string_pretty(&settings).context("Failed to serialize settings")?;
-
-        // Write to file
-        std::fs::write(&self.storage_path, json)
             .with_context(|| format!("Failed to write settings to {:?}", self.storage_path))?;
 
         info!("Saved settings to {:?}", self.storage_path);
@@ -904,16 +835,64 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stored_audit_categories_become_audit_events_on_load() {
+    #[tokio::test]
+    async fn stored_audit_categories_become_audit_events_on_load() {
         let (_dir, store) = store_with_file(&serde_json::json!({
             "audit_enabled": true,
             "audit_categories": { "policies": true, "trust_checks": false, "identity": true }
         }));
-        store.load_sync().unwrap();
+        store.load().await.unwrap();
         let settings = store.get();
         assert!(settings.audit_enabled);
         assert_eq!(settings.audit_events, vec!["policy_decision".to_string(), "vp_injected".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_settings_file_stops_the_load_and_is_left_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join(SETTINGS_FILE_NAME);
+        std::fs::write(&path, "{ \"prometheus_auth_enabled\": true, ").unwrap();
+        let store = SettingsStore::new(dir.path());
+
+        let error = store
+            .load()
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be parsed"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ \"prometheus_auth_enabled\": true, ");
+    }
+
+    #[tokio::test]
+    async fn a_missing_settings_file_is_created_with_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(dir.path());
+
+        store.load().await.unwrap();
+
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                dir.path()
+                    .join(SETTINGS_FILE_NAME),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            written["metrics_retention_minutes"],
+            serde_json::json!(
+                store
+                    .get()
+                    .metrics_retention_minutes
+            )
+        );
     }
 
     #[tokio::test]
@@ -925,23 +904,23 @@ mod tests {
         assert_eq!(store.get().audit_events, vec!["trust_check".to_string()]);
     }
 
-    #[test]
-    fn stored_audit_events_win_over_stored_audit_categories() {
+    #[tokio::test]
+    async fn stored_audit_events_win_over_stored_audit_categories() {
         let (_dir, store) = store_with_file(&serde_json::json!({
             "audit_events": ["auth_failed"],
             "audit_categories": { "policies": true }
         }));
-        store.load_sync().unwrap();
+        store.load().await.unwrap();
         assert_eq!(store.get().audit_events, vec!["auth_failed".to_string()]);
     }
 
-    #[test]
-    fn saved_settings_carry_audit_events_and_not_audit_categories() {
+    #[tokio::test]
+    async fn saved_settings_carry_audit_events_and_not_audit_categories() {
         let (dir, store) = store_with_file(&serde_json::json!({
             "audit_categories": { "policies": true }
         }));
-        store.load_sync().unwrap();
-        store.save_sync().unwrap();
+        store.load().await.unwrap();
+        store.save().await.unwrap();
         let saved: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(
                 dir.path()
@@ -960,12 +939,12 @@ mod tests {
 
     /// A selection stored before the per-call delegation events left the audit
     /// still names them.
-    #[test]
-    fn stored_audit_events_the_gateway_now_only_logs_are_dropped_on_load() {
+    #[tokio::test]
+    async fn stored_audit_events_the_gateway_now_only_logs_are_dropped_on_load() {
         let (_dir, store) = store_with_file(&serde_json::json!({
             "audit_events": ["consent_granted", "token_injected", "consent_required", "policy_decision"]
         }));
-        store.load_sync().unwrap();
+        store.load().await.unwrap();
         assert_eq!(store.get().audit_events, vec!["consent_granted".to_string(), "policy_decision".to_string()]);
     }
 
@@ -1016,13 +995,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_settings_store_sync() {
+    #[tokio::test]
+    async fn test_settings_store_sync() {
         let temp_dir = TempDir::new().unwrap();
         let store = SettingsStore::new(temp_dir.path());
 
         // Load should create default settings
-        store.load_sync().unwrap();
+        store.load().await.unwrap();
 
         let settings = store.get();
         assert_eq!(settings.badge_threshold_minutes, 5);
@@ -1046,11 +1025,11 @@ mod tests {
         store
             .update(new_settings)
             .unwrap();
-        store.save_sync().unwrap();
+        store.save().await.unwrap();
 
         // Create new store and load
         let store2 = SettingsStore::new(temp_dir.path());
-        store2.load_sync().unwrap();
+        store2.load().await.unwrap();
 
         let loaded = store2.get();
         assert_eq!(loaded.badge_threshold_minutes, 10);
@@ -1244,14 +1223,14 @@ mod tests {
     /// A selection that names events the gateway now only logs is loaded and
     /// saved without them, and each time one warning says which were dropped
     /// and where they are written now.
-    #[test]
-    fn dropping_audit_events_the_gateway_now_only_logs_warns_which_they_were() {
+    #[tokio::test]
+    async fn dropping_audit_events_the_gateway_now_only_logs_warns_which_they_were() {
         let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
         let (_dir, store) = store_with_file(&serde_json::json!({
             "audit_events": ["refresh_failed", "consent_granted", "token_not_found"]
         }));
 
-        store.load_sync().unwrap();
+        store.load().await.unwrap();
 
         let loaded = logs.text();
         assert_eq!(loaded.matches("WARN").count(), 1, "{loaded}");

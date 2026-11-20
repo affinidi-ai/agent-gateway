@@ -106,8 +106,12 @@ async fn handle_message(
         .clone()
         .or_else(|| message.pthid.clone())
         .unwrap_or_else(|| message.id.clone());
+    let sender = message.from.as_deref();
 
     match message.typ.as_str() {
+        connection::SETUP_RECEIVED | connection::SETUP_APPROVED if !sent_by_registry(connection, sender) => {
+            ignore_unverified_signal(connection, &message.typ, sender);
+        }
         connection::SETUP_RECEIVED => {
             info!("TR reader: setup/received for '{}'", connection.trust_registry_id);
             update_status(connection, TrustRegistryConnectionStatus::AwaitingApproval, store, ws_state).await;
@@ -133,6 +137,8 @@ async fn handle_message(
                     "TR reader: problem-report for '{}' answers a request no longer awaited, ignoring",
                     connection.trust_registry_id
                 );
+            } else if !may_reject(connection, sender) {
+                ignore_unverified_signal(connection, &message.typ, sender);
             } else {
                 // Not a reply to a request → the registry rejected the gateway.
                 let code = message
@@ -167,8 +173,51 @@ async fn handle_message(
     }
 }
 
-/// Persist a connection-status change and refresh the dashboard, mirroring the
-/// former worker behavior. A no-op when no store is configured.
+fn sent_by_registry(
+    connection: &TrustRegistryConnection,
+    sender: Option<&str>,
+) -> bool {
+    sender.is_some_and(|did| connection.serves(did))
+}
+
+fn may_reject(
+    connection: &TrustRegistryConnection,
+    sender: Option<&str>,
+) -> bool {
+    sent_by_registry(connection, sender) || sender.is_some_and(|did| did == connection.mediator_did)
+}
+
+fn ignore_unverified_signal(
+    connection: &TrustRegistryConnection,
+    message_type: &str,
+    sender: Option<&str>,
+) {
+    warn!(
+        // Peer-chosen: capped at 64 chars and Debug-escaped.
+        sender = ?sender.map(|did| did.chars().take(64).collect::<String>()),
+        "TR reader: ignoring '{}' for '{}' from a sender that is not the registry",
+        message_type,
+        connection.trust_registry_id
+    );
+}
+
+/// Whether a registry message may move the connection from `current` to `next`.
+/// Setup messages only move it forward; a rejection may fail it from any state.
+fn may_move(
+    current: &TrustRegistryConnectionStatus,
+    next: &TrustRegistryConnectionStatus,
+) -> bool {
+    use TrustRegistryConnectionStatus::*;
+    match next {
+        AwaitingApproval => matches!(current, Connecting | AwaitingApproval),
+        Connected => matches!(current, Connecting | AwaitingApproval | Connected),
+        Failed => true,
+        Connecting | Disconnected => false,
+    }
+}
+
+/// Persist a connection-status change and refresh the dashboard. A no-op when
+/// no store is configured or the current status does not allow the change.
 async fn update_status(
     connection: &TrustRegistryConnection,
     new_status: TrustRegistryConnectionStatus,
@@ -181,14 +230,24 @@ async fn update_status(
     let tr_id = &connection.trust_registry_id;
 
     let status_label = format!("{:?}", new_status);
+    let applied = new_status.clone();
     let change = Box::new(move |tr: &mut TrustRegistry| {
-        tr.connection_status = new_status;
-        tr.updated_at = chrono::Utc::now();
+        if may_move(&tr.connection_status, &new_status) {
+            tr.connection_status = new_status;
+            tr.updated_at = chrono::Utc::now();
+        }
     });
     match store
         .modify(tr_id, change)
         .await
     {
+        Ok(Some(updated)) if updated.connection_status != applied => {
+            warn!(
+                "TR reader: kept '{}' at {:?}; a registry message cannot move it to {}",
+                tr_id, updated.connection_status, status_label
+            );
+            return;
+        }
         Ok(Some(_)) => {}
         Ok(None) => {
             debug!("TR reader: trust registry '{}' was deleted; its status was not written", tr_id);
@@ -246,14 +305,30 @@ mod tests {
         (connection, Some(Arc::new(store) as Arc<dyn TrustRegistryStore>), dir)
     }
 
-    fn problem_report(thid: &str) -> DIDCommMessage {
+    const REGISTRY: &str = "did:example:registry";
+    const STRANGER: &str = "did:example:stranger";
+
+    fn problem_report(
+        thid: &str,
+        from: &str,
+    ) -> DIDCommMessage {
         DIDCommMessage::build(
             uuid::Uuid::new_v4().to_string(),
             MSG_TYPE_PROBLEM_REPORT.to_string(),
             serde_json::json!({ "code": "e.p.rejected", "comment": "rejected" }),
         )
         .thid(thid.to_string())
+        .from(from.to_string())
         .finalize()
+    }
+
+    fn setup(
+        message_type: &str,
+        from: &str,
+    ) -> DIDCommMessage {
+        DIDCommMessage::build(uuid::Uuid::new_v4().to_string(), message_type.to_string(), serde_json::json!({}))
+            .from(from.to_string())
+            .finalize()
     }
 
     async fn status_of(
@@ -275,7 +350,7 @@ mod tests {
         let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connected).await;
 
         let thid = format!("{}timed-out", super::super::communication::REQUEST_THREAD_PREFIX);
-        handle_message(problem_report(&thid), &connection, &store, &None).await;
+        handle_message(problem_report(&thid, REGISTRY), &connection, &store, &None).await;
 
         assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Connected);
     }
@@ -289,9 +364,101 @@ mod tests {
         ] {
             let (connection, store, _dir) = registry_with(status).await;
 
-            handle_message(problem_report("thid-rejection"), &connection, &store, &None).await;
+            handle_message(problem_report("thid-rejection", REGISTRY), &connection, &store, &None).await;
 
             assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Failed);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejection_relayed_by_the_registry_mediator_marks_the_registry_failed() {
+        let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connecting).await;
+        let mediator = connection
+            .mediator_did
+            .clone();
+
+        handle_message(problem_report("thid-rejection", &mediator), &connection, &store, &None).await;
+
+        assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn a_rejection_from_another_sender_keeps_the_status() {
+        let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connected).await;
+
+        handle_message(problem_report("thid-rejection", STRANGER), &connection, &store, &None).await;
+
+        assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Connected);
+    }
+
+    #[tokio::test]
+    async fn the_registry_moves_the_connection_through_setup() {
+        let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connecting).await;
+
+        handle_message(setup(connection::SETUP_RECEIVED, REGISTRY), &connection, &store, &None).await;
+        assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::AwaitingApproval);
+
+        handle_message(setup(connection::SETUP_APPROVED, REGISTRY), &connection, &store, &None).await;
+        assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Connected);
+    }
+
+    #[tokio::test]
+    async fn setup_messages_from_another_sender_keep_the_status() {
+        for message_type in [connection::SETUP_RECEIVED, connection::SETUP_APPROVED] {
+            let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connecting).await;
+
+            handle_message(setup(message_type, STRANGER), &connection, &store, &None).await;
+
+            assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Connecting);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_setup_message_without_a_sender_keeps_the_status() {
+        let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connecting).await;
+        let unsigned = DIDCommMessage::build(
+            uuid::Uuid::new_v4().to_string(),
+            connection::SETUP_APPROVED.to_string(),
+            serde_json::json!({}),
+        )
+        .finalize();
+
+        handle_message(unsigned, &connection, &store, &None).await;
+
+        assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Connecting);
+    }
+
+    #[tokio::test]
+    async fn a_late_setup_received_does_not_downgrade_a_connected_registry() {
+        let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connected).await;
+
+        handle_message(setup(connection::SETUP_RECEIVED, REGISTRY), &connection, &store, &None).await;
+
+        assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Connected);
+    }
+
+    #[tokio::test]
+    async fn setup_messages_do_not_revive_a_failed_registry() {
+        for message_type in [connection::SETUP_RECEIVED, connection::SETUP_APPROVED] {
+            let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Failed).await;
+
+            handle_message(setup(message_type, REGISTRY), &connection, &store, &None).await;
+
+            assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Failed);
+        }
+    }
+
+    #[test]
+    fn registry_messages_cannot_move_a_connection_back_to_connecting_or_disconnected() {
+        for current in [
+            TrustRegistryConnectionStatus::Connecting,
+            TrustRegistryConnectionStatus::AwaitingApproval,
+            TrustRegistryConnectionStatus::Connected,
+            TrustRegistryConnectionStatus::Failed,
+        ] {
+            assert!(!may_move(&current, &TrustRegistryConnectionStatus::Connecting));
+            assert!(!may_move(&current, &TrustRegistryConnectionStatus::Disconnected));
+            assert!(may_move(&current, &TrustRegistryConnectionStatus::Failed));
         }
     }
 }

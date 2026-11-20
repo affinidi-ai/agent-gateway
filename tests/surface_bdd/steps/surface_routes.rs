@@ -89,6 +89,17 @@ async fn operator_enables_surface(
     save_surface(world, &id, surface).await;
 }
 
+#[when(expr = "the operator saves surface {string} with status {string}")]
+async fn operator_saves_surface_with_status(
+    world: &mut SurfaceWorld,
+    id: String,
+    status: String,
+) {
+    let mut surface = stored_surface(world, &id).await;
+    surface["status"] = serde_json::json!(status);
+    save_surface(world, &id, surface).await;
+}
+
 #[then(expr = "surface {string} is {word}")]
 async fn surface_has_status(
     world: &mut SurfaceWorld,

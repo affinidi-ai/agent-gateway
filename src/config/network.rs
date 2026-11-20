@@ -138,6 +138,12 @@ pub struct NetworkConfig {
     /// How long and how large the delegated payments ledger is kept.
     #[serde(default)]
     pub payment_ledger: crate::config::types::PaymentLedgerConfig,
+
+    /// Where single-use records (redeemed ID-JAGs, processed Fabric envelopes,
+    /// voided payment evidence) are kept: this node's disk, or a DynamoDB table
+    /// shared by every node. Read at startup.
+    #[serde(default, skip_serializing_if = "crate::storage::single_use::SingleUseStoreConfig::is_default")]
+    pub single_use_store: crate::storage::single_use::SingleUseStoreConfig,
 }
 
 /// One entry of `external_consent_issuer_patterns`: the issuers of one vendor

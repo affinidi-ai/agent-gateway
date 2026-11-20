@@ -17,6 +17,7 @@ pub mod reencrypt;
 
 pub use handlers::{backup_storage, restore_storage};
 
+use sha2::Digest;
 use tracing::warn;
 
 use crate::observability::loggable;
@@ -33,6 +34,11 @@ pub(crate) const BACKUP_STAGING_FILENAME: &str = "backup.agbak";
 /// Legacy staging filename, still honored at startup for backward compatibility
 /// with backups written by older versions.
 pub(crate) const LEGACY_BACKUP_STAGING_FILENAME: &str = "backup.tgwbak";
+
+/// Marker naming, by the SHA-256 of its bytes, the staged backup a startup
+/// restore installed, kept until that staged file is removed. A staged backup
+/// that cannot be removed after its restore is then never installed again.
+const RESTORE_DONE_MARKER: &str = ".restore-done";
 
 /// Resolve a staged backup awaiting restore, preferring the current filename and
 /// falling back to the legacy one so backups written by older versions still restore.
@@ -293,6 +299,11 @@ fn check_and_restore_backup_with_keys(
         Some(path) => path,
         None => return false,
     };
+    if already_restored(backup_restore_dir, &backup_zip_path) {
+        println!("Staged backup {} was already restored; removing it.", backup_zip_path.display());
+        remove_staged_backups(backup_restore_dir);
+        return false;
+    }
 
     let canonical_target_domain = match manifest::canonicalize_domain(target_domain) {
         Ok(domain) => domain,
@@ -390,6 +401,7 @@ fn check_and_restore_backup_with_keys(
         }
         data
     };
+    let staged_digest = hex::encode(sha2::Sha256::digest(&data));
     if !encryption::is_encrypted_backup(&data) {
         audit::record_startup_storage_audit(audit::StorageAuditEvent {
             operation: audit::StorageOperation::Restore,
@@ -606,11 +618,10 @@ fn check_and_restore_backup_with_keys(
     }
     let _ = std::fs::remove_dir_all(&staging_path);
 
-    // Remove the staged backup so the next restart proceeds normally
-    if let Err(e) = std::fs::remove_file(&backup_zip_path) {
-        eprintln!("WARNING: Failed to remove staged backup {}: {}", backup_zip_path.display(), e);
-        eprintln!("Remove it manually to prevent re-restore on next restart.");
+    if let Err(e) = std::fs::write(backup_restore_dir.join(RESTORE_DONE_MARKER), &staged_digest) {
+        eprintln!("WARNING: Failed to record the restored backup: {e}");
     }
+    remove_staged_backups(backup_restore_dir);
 
     // 6. Remove the pre-restore snapshot on success. It is a full copy of the
     //    previous _storage (secret material) kept only as a rollback net while
@@ -652,6 +663,36 @@ fn check_and_restore_backup_with_keys(
     // values are re-encrypted under this node's local KEK.
     reencrypt::mark_reencrypt_pending(backup_restore_dir);
     true
+}
+
+/// Whether `staged` is the backup the restore marker names as installed.
+fn already_restored(
+    backup_restore_dir: &std::path::Path,
+    staged: &std::path::Path,
+) -> bool {
+    let Ok(marker) = std::fs::read_to_string(backup_restore_dir.join(RESTORE_DONE_MARKER)) else {
+        return false;
+    };
+    std::fs::read(staged).is_ok_and(|bytes| hex::encode(sha2::Sha256::digest(&bytes)) == marker.trim())
+}
+
+/// Removes every staged backup, current and legacy, so an older file left
+/// beside the one just restored is not restored over it on the next start.
+/// The restore marker goes once no staged file is left.
+fn remove_staged_backups(backup_restore_dir: &std::path::Path) {
+    let mut left = false;
+    for name in [BACKUP_STAGING_FILENAME, LEGACY_BACKUP_STAGING_FILENAME] {
+        let path = backup_restore_dir.join(name);
+        if path.exists()
+            && let Err(e) = std::fs::remove_file(&path)
+        {
+            eprintln!("WARNING: Failed to remove staged backup {}: {}", path.display(), e);
+            left = true;
+        }
+    }
+    if !left {
+        let _ = std::fs::remove_file(backup_restore_dir.join(RESTORE_DONE_MARKER));
+    }
 }
 
 #[derive(Debug)]
@@ -1139,6 +1180,97 @@ mod tests {
             "{names:?}"
         );
         assert!(names.contains(&"META-INF/other.json".to_string()));
+    }
+
+    fn staged_backup(
+        storage_root: &std::path::Path,
+        key: &[u8; 32],
+    ) -> Vec<u8> {
+        encryption::encrypt_backup(key, &build_portable_zip(storage_root, "gateway.example.com").unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_restore_removes_the_current_and_the_legacy_staged_backup() {
+        let dir = create_test_storage();
+        let storage_root = dir.path().join("_storage");
+        let backup_restore_dir = dir
+            .path()
+            .join("_backup_restore");
+        fs::create_dir_all(&backup_restore_dir).unwrap();
+        let key = [0x31; 32];
+        let archive = staged_backup(&storage_root, &key);
+        fs::write(backup_restore_dir.join(BACKUP_STAGING_FILENAME), &archive).unwrap();
+        fs::write(backup_restore_dir.join(LEGACY_BACKUP_STAGING_FILENAME), &archive).unwrap();
+
+        assert!(check_and_restore_backup_with_keys(
+            &storage_root,
+            &backup_restore_dir,
+            &key,
+            &[],
+            "gateway.example.com"
+        ));
+
+        assert_eq!(staged_backup_path(&backup_restore_dir), None, "no staged backup is left to restore");
+        assert!(
+            !backup_restore_dir
+                .join(RESTORE_DONE_MARKER)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn a_staged_backup_left_after_its_restore_is_not_restored_again() {
+        let dir = create_test_storage();
+        let storage_root = dir.path().join("_storage");
+        let backup_restore_dir = dir
+            .path()
+            .join("_backup_restore");
+        fs::create_dir_all(&backup_restore_dir).unwrap();
+        let key = [0x31; 32];
+        let archive = staged_backup(&storage_root, &key);
+        let staged = backup_restore_dir.join(BACKUP_STAGING_FILENAME);
+        fs::write(&staged, &archive).unwrap();
+        fs::write(backup_restore_dir.join(RESTORE_DONE_MARKER), hex::encode(sha2::Sha256::digest(&archive))).unwrap();
+        fs::write(storage_root.join("channels/written-after-restore.json"), b"{}").unwrap();
+
+        let restored =
+            check_and_restore_backup_with_keys(&storage_root, &backup_restore_dir, &key, &[], "gateway.example.com");
+
+        assert!(!restored, "the node starts normally instead of restoring and exiting again");
+        assert!(
+            storage_root
+                .join("channels/written-after-restore.json")
+                .exists()
+        );
+        assert!(!staged.exists());
+        assert!(
+            !backup_restore_dir
+                .join(RESTORE_DONE_MARKER)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn a_different_backup_staged_after_a_restore_is_restored() {
+        let dir = create_test_storage();
+        let storage_root = dir.path().join("_storage");
+        let backup_restore_dir = dir
+            .path()
+            .join("_backup_restore");
+        fs::create_dir_all(&backup_restore_dir).unwrap();
+        let key = [0x31; 32];
+        fs::write(backup_restore_dir.join(RESTORE_DONE_MARKER), hex::encode(sha2::Sha256::digest(b"an older backup")))
+            .unwrap();
+        fs::write(backup_restore_dir.join(BACKUP_STAGING_FILENAME), staged_backup(&storage_root, &key)).unwrap();
+
+        assert!(check_and_restore_backup_with_keys(
+            &storage_root,
+            &backup_restore_dir,
+            &key,
+            &[],
+            "gateway.example.com"
+        ));
+        assert_eq!(staged_backup_path(&backup_restore_dir), None);
     }
 
     #[test]

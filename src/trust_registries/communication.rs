@@ -355,7 +355,7 @@ impl TrustRegistryConnection {
     }
 
     /// Whether this connection is addressed to `did`, by its canonical or transport DID.
-    fn serves(
+    pub(super) fn serves(
         &self,
         did: &str,
     ) -> bool {

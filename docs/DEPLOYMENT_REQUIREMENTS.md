@@ -143,7 +143,8 @@ Back up with full `.agbak` archives from the dashboard or the management API; se
 volume snapshots and archives as sensitive. A restore exits the gateway after staging the
 archive, and again after applying it on the next start. Run the gateway under a
 supervisor or restart policy (for example, `restart: on-failure`), or start it twice by
-hand.
+hand. Once applied, the staged archive and any older staged archive beside it are removed; one
+that cannot be removed is recognised on the next start and not applied again.
 
 ## Network
 

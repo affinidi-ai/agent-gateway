@@ -1,7 +1,9 @@
-//! Unified x402 Transaction Store
+//! x402 transaction store.
 //!
-//! Single source of truth for x402 verification → settlement lifecycle
-//! Each transaction is stored as a single JSON file named by correlation_id
+//! Holds the recorded x402 transactions, each stored as a single JSON file named by its
+//! correlation id. Records are kept as they are and served to the admin API; only a
+//! settlement-complete from a transaction's own facilitator gateway changes one, and
+//! retention deletes only final records.
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -80,24 +82,6 @@ fn receipt_input_from_transaction(
     }
 }
 
-/// Build a [`crate::payment_credentials::PaymentRejectionInput`] from an
-/// x402 transaction's own fields.
-fn rejection_input_from_transaction(
-    txn: &X402Transaction,
-    reason: String,
-) -> crate::payment_credentials::PaymentRejectionInput {
-    let payload = &txn.payment_payload;
-    let scheme = payload.scheme();
-    crate::payment_credentials::PaymentRejectionInput {
-        rail: "x402",
-        payment_id: txn.id.clone(),
-        trace_id: txn.trace_id.clone(),
-        method: (!scheme.is_empty()).then(|| scheme.to_string()),
-        payer: payload.from(),
-        reason,
-    }
-}
-
 /// Verification status enumeration
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -130,6 +114,13 @@ pub enum SettlementStatus {
     Failed,
     /// Payment refunded
     Refunded,
+}
+
+impl SettlementStatus {
+    /// Whether settlement has not reached a final outcome yet.
+    pub fn is_in_progress(&self) -> bool {
+        matches!(self, Self::Pending | Self::Processing | Self::AwaitingRemote | Self::AwaitingExternal)
+    }
 }
 
 /// Cross-gateway synchronization status
@@ -233,8 +224,7 @@ pub struct SettlementStage {
     pub synced_at: Option<DateTime<Utc>>,
 }
 
-/// Unified x402 Transaction Record
-/// Single source of truth for verification → settlement lifecycle
+/// Recorded x402 transaction
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct X402Transaction {
     /// Correlation ID (deterministic filename: /x402-transactions/{id}.json)
@@ -250,14 +240,12 @@ pub struct X402Transaction {
     /// Resource path being protected
     pub resource_path: String,
 
-    /// Payment payload from the client. Once verification resolves it to one of the surface's
-    /// payment requirements, `accepted` is that requirement, which settlement acts on.
+    /// Payment payload from the client. Once verification resolved it to one of the surface's
+    /// payment requirements, `accepted` is that requirement.
     pub payment_payload: PaymentPayload,
 
-    /// Set on every record this build creates: verification stores the payload bound to the
-    /// surface's payment requirement, and records created from a fabric peer's messages hold the
-    /// payload that peer bound. Records written by earlier builds read as `false` and carry the
-    /// caller's own `accepted`, so they are re-resolved before they settle.
+    /// Whether `accepted` was bound to the surface's payment requirement when the record was
+    /// written. Older records read as `false` and carry the caller's own `accepted`.
     #[serde(default)]
     pub payment_requirement_bound: bool,
 
@@ -340,53 +328,48 @@ impl X402Transaction {
         }
     }
 
-    /// Initialize settlement stage
-    pub fn init_settlement(
-        &mut self,
-        settlement_mode: String,
-        settlement_method: String,
-        tx_hash: Option<String>,
-        confirmations: Option<u64>,
-    ) {
+    /// Attach a settlement stage with `status`, taken from the payment payload.
+    #[cfg(test)]
+    pub(crate) fn with_settlement(
+        mut self,
+        status: SettlementStatus,
+        settlement_method: &str,
+    ) -> Self {
         let payload = &self.payment_payload;
-        let tx_hash = tx_hash
-            .or_else(|| payload.tx_hash())
-            .unwrap_or_default();
-
-        // Determine sync_status based on facilitator_gateway_id
-        // If there's a facilitator, they settle and need to sync back to us
-        let sync_status = if self
-            .verification
-            .facilitator_gateway_id
-            .is_some()
-        {
-            SyncStatus::PendingSync
-        } else {
-            SyncStatus::Local
-        };
-
         self.settlement = Some(SettlementStage {
-            status: SettlementStatus::Pending,
-            settlement_mode,
-            settlement_method,
-            tx_hash,
+            status,
+            settlement_mode: "deferred".to_string(),
+            settlement_method: settlement_method.to_string(),
+            tx_hash: String::new(),
             network: payload.network().to_string(),
             amount: payload.amount().to_string(),
             scheme: payload.scheme().to_string(),
-            pay_to: payload.pay_to().to_string(),
-            asset: payload
-                .asset()
-                .map(|s| s.to_string()),
+            pay_to: payload
+                .accepted
+                .pay_to
+                .clone(),
+            asset: Some(payload.accepted.asset.clone()),
             from_address: payload.from(),
-            confirmations,
+            confirmations: None,
             settlement_attempts: 0,
             last_settlement_attempt: None,
             settlement_completed_at: None,
             error: None,
-            sync_status,
+            sync_status: SyncStatus::Local,
             synced_at: None,
         });
-        self.last_updated = Utc::now();
+        self
+    }
+
+    /// Whether the transaction has reached a final outcome: its settlement is completed,
+    /// failed or refunded, or, with no settlement, its verification failed.
+    pub fn is_final(&self) -> bool {
+        match &self.settlement {
+            Some(settlement) => !settlement
+                .status
+                .is_in_progress(),
+            None => self.verification.status == VerificationStatus::Failed,
+        }
     }
 
     /// Update settlement tx_hash (set when remote gateway responds)
@@ -409,53 +392,6 @@ impl X402Transaction {
             self.last_updated = Utc::now();
         }
     }
-
-    /// Mark settlement as failed
-    pub fn fail_settlement(
-        &mut self,
-        error: String,
-    ) {
-        if let Some(settlement) = &mut self.settlement {
-            settlement.status = SettlementStatus::Failed;
-            settlement.error = Some(error);
-            self.last_updated = Utc::now();
-        }
-    }
-
-    /// Increment settlement attempt counter
-    pub fn increment_settlement_attempt(&mut self) {
-        if let Some(settlement) = &mut self.settlement {
-            settlement.settlement_attempts += 1;
-            settlement.last_settlement_attempt = Some(Utc::now());
-            settlement.status = SettlementStatus::Processing;
-            self.last_updated = Utc::now();
-        }
-    }
-
-    /// Mark as awaiting external facilitator response
-    pub fn mark_awaiting_external(&mut self) {
-        if let Some(settlement) = &mut self.settlement {
-            settlement.status = SettlementStatus::AwaitingExternal;
-            self.last_updated = Utc::now();
-        }
-    }
-
-    /// Mark as pending sync (notification sent to facilitator)
-    pub fn mark_pending_sync(&mut self) {
-        if let Some(settlement) = &mut self.settlement {
-            settlement.sync_status = SyncStatus::PendingSync;
-            self.last_updated = Utc::now();
-        }
-    }
-
-    /// Mark as synced (ACK received from facilitator)
-    pub fn mark_synced(&mut self) {
-        if let Some(settlement) = &mut self.settlement {
-            settlement.sync_status = SyncStatus::Synced;
-            settlement.synced_at = Some(Utc::now());
-            self.last_updated = Utc::now();
-        }
-    }
 }
 
 /// x402 transactions are keyed on their correlation id for filesystem storage.
@@ -465,8 +401,7 @@ impl StorableEntity for X402Transaction {
     }
 }
 
-/// Filesystem-backed transaction store
-/// Provides atomic operations for x402 transaction lifecycle
+/// Filesystem-backed x402 transaction store
 #[derive(Clone)]
 pub struct TransactionStore {
     /// In-memory cache for fast lookups and read-modify-write serialization
@@ -548,36 +483,6 @@ impl TransactionStore {
             .cloned()
     }
 
-    /// Initialize settlement stage
-    pub async fn init_settlement(
-        &self,
-        correlation_id: &str,
-        settlement_mode: String,
-        settlement_method: String,
-        tx_hash: Option<String>,
-        confirmations: Option<u64>,
-    ) -> Result<(), String> {
-        let mut cache = self.cache.write().await;
-
-        if let Some(transaction) = cache.get_mut(correlation_id) {
-            transaction.init_settlement(settlement_mode, settlement_method, tx_hash, confirmations);
-
-            // Save to disk
-            if let Err(e) = self
-                .save_to_disk(transaction)
-                .await
-            {
-                error!("Failed to save transaction to disk: {}", e);
-                return Err(format!("Failed to persist transaction: {}", e));
-            }
-
-            info!("[transaction-store] Settlement initialized: {}", correlation_id);
-            Ok(())
-        } else {
-            Err(format!("Transaction not found: {}", correlation_id))
-        }
-    }
-
     /// Complete settlement
     pub async fn complete_settlement(
         &self,
@@ -631,152 +536,6 @@ impl TransactionStore {
         }
     }
 
-    /// Fail settlement
-    pub async fn fail_settlement(
-        &self,
-        correlation_id: &str,
-        error: String,
-    ) -> Result<(), String> {
-        let mut cache = self.cache.write().await;
-
-        if let Some(transaction) = cache.get_mut(correlation_id) {
-            let error_for_audit = error.clone();
-            transaction.fail_settlement(error);
-
-            let rejection = crate::payment_credentials::issue_payment_rejection(rejection_input_from_transaction(
-                transaction,
-                error_for_audit.clone(),
-            ))
-            .await;
-            if let Some(ref c) = rejection {
-                transaction.rejection_vc_jwt = Some(c.jwt.clone());
-                transaction.rejection_vc_fingerprint = Some(c.fingerprint.clone());
-            }
-
-            // Save to disk
-            if let Err(e) = self
-                .save_to_disk(transaction)
-                .await
-            {
-                error!("Failed to save transaction to disk: {}", e);
-                return Err(format!("Failed to persist transaction: {}", e));
-            }
-
-            emit_payment_audit(
-                transaction,
-                PaymentStage::SettlementFailed,
-                Some(error_for_audit),
-                rejection
-                    .as_ref()
-                    .map(|c| c.jwt.as_str()),
-            );
-            info!("[transaction-store] Settlement failed: {}", correlation_id);
-            Ok(())
-        } else {
-            Err(format!("Transaction not found: {}", correlation_id))
-        }
-    }
-
-    /// Increment settlement attempt counter
-    pub async fn increment_settlement_attempt(
-        &self,
-        correlation_id: &str,
-    ) -> Result<(), String> {
-        let mut cache = self.cache.write().await;
-
-        if let Some(transaction) = cache.get_mut(correlation_id) {
-            transaction.increment_settlement_attempt();
-
-            // Save to disk
-            if let Err(e) = self
-                .save_to_disk(transaction)
-                .await
-            {
-                error!("Failed to save transaction to disk: {}", e);
-                return Err(format!("Failed to persist transaction: {}", e));
-            }
-
-            Ok(())
-        } else {
-            Err(format!("Transaction not found: {}", correlation_id))
-        }
-    }
-
-    /// Mark as awaiting external facilitator
-    pub async fn mark_awaiting_external(
-        &self,
-        correlation_id: &str,
-    ) -> Result<(), String> {
-        let mut cache = self.cache.write().await;
-
-        if let Some(transaction) = cache.get_mut(correlation_id) {
-            transaction.mark_awaiting_external();
-
-            // Save to disk
-            if let Err(e) = self
-                .save_to_disk(transaction)
-                .await
-            {
-                error!("Failed to save transaction to disk: {}", e);
-                return Err(format!("Failed to persist transaction: {}", e));
-            }
-
-            Ok(())
-        } else {
-            Err(format!("Transaction not found: {}", correlation_id))
-        }
-    }
-
-    /// Mark as pending sync (DIDComm notification sent to facilitator)
-    pub async fn mark_pending_sync(
-        &self,
-        correlation_id: &str,
-    ) -> Result<(), String> {
-        let mut cache = self.cache.write().await;
-
-        if let Some(transaction) = cache.get_mut(correlation_id) {
-            transaction.mark_pending_sync();
-
-            // Save to disk
-            if let Err(e) = self
-                .save_to_disk(transaction)
-                .await
-            {
-                error!("Failed to save transaction to disk: {}", e);
-                return Err(format!("Failed to persist transaction: {}", e));
-            }
-
-            Ok(())
-        } else {
-            Err(format!("Transaction not found: {}", correlation_id))
-        }
-    }
-
-    /// Mark as synced (ACK received from facilitator)
-    pub async fn mark_synced(
-        &self,
-        correlation_id: &str,
-    ) -> Result<(), String> {
-        let mut cache = self.cache.write().await;
-
-        if let Some(transaction) = cache.get_mut(correlation_id) {
-            transaction.mark_synced();
-
-            // Save to disk
-            if let Err(e) = self
-                .save_to_disk(transaction)
-                .await
-            {
-                error!("Failed to save transaction to disk: {}", e);
-                return Err(format!("Failed to persist transaction: {}", e));
-            }
-
-            Ok(())
-        } else {
-            Err(format!("Transaction not found: {}", correlation_id))
-        }
-    }
-
     /// Update settlement tx_hash (from remote gateway response)
     pub async fn set_settlement_tx_hash(
         &self,
@@ -812,84 +571,7 @@ impl TransactionStore {
             .collect()
     }
 
-    /// List transactions by settlement status
-    pub async fn list_by_settlement_status(
-        &self,
-        status: SettlementStatus,
-    ) -> Vec<X402Transaction> {
-        let cache = self.cache.read().await;
-        cache
-            .values()
-            .filter(|t| {
-                t.settlement
-                    .as_ref()
-                    .map(|s| s.status == status)
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect()
-    }
-
-    /// List verified transactions that have pending/incomplete settlements
-    /// Filtered by settlement_method to determine gateway responsibility:
-    /// - "local" = originating gateway (GW1) is responsible
-    /// - "fabric_gateway" = facilitator gateway (GW2) is responsible
-    /// - "external_facilitator" = external service is responsible
-    pub async fn list_unsettled_verified(
-        &self,
-        settlement_method_filter: Option<&str>,
-    ) -> Vec<X402Transaction> {
-        let cache = self.cache.read().await;
-        cache
-            .values()
-            .filter(|t| {
-                // Must be verified
-                if t.verification.status != VerificationStatus::Verified {
-                    return false;
-                }
-
-                // Must have settlement stage
-                let Some(settlement) = &t.settlement else {
-                    return false;
-                };
-
-                // Must not be completed/failed
-                if matches!(
-                    settlement.status,
-                    SettlementStatus::Completed | SettlementStatus::Failed | SettlementStatus::Refunded
-                ) {
-                    return false;
-                }
-
-                // Filter by settlement method if specified
-                if let Some(filter) = settlement_method_filter {
-                    settlement.settlement_method == filter
-                } else {
-                    true
-                }
-            })
-            .cloned()
-            .collect()
-    }
-
-    /// List transactions with pending sync status
-    /// These transactions need settlement completion notifications sent to their originating gateway
-    pub async fn list_pending_sync(&self) -> Vec<X402Transaction> {
-        let cache = self.cache.read().await;
-        cache
-            .values()
-            .filter(|t| {
-                if let Some(settlement) = &t.settlement {
-                    settlement.sync_status == SyncStatus::PendingSync
-                } else {
-                    false
-                }
-            })
-            .cloned()
-            .collect()
-    }
-
-    /// Delete old transactions based on retention policy
+    /// Delete final transactions last updated before the retention window.
     pub async fn cleanup_old_transactions(
         &self,
         retention_days: i64,
@@ -900,17 +582,7 @@ impl TransactionStore {
 
         let to_delete: Vec<String> = cache
             .iter()
-            .filter(|(_, t)| {
-                // Delete if:
-                // 1. Older than retention AND verification failed, OR
-                // 2. Older than retention AND settlement synced/local
-                t.last_updated < cutoff
-                    && (t.verification.status == VerificationStatus::Failed
-                        || t.settlement
-                            .as_ref()
-                            .map(|s| s.sync_status == SyncStatus::Synced || s.sync_status == SyncStatus::Local)
-                            .unwrap_or(false))
-            })
+            .filter(|(_, t)| t.last_updated < cutoff && t.is_final())
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -969,7 +641,6 @@ impl TransactionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::fs;
     use uuid::Uuid;
 
     fn mock_payment_payload() -> PaymentPayload {
@@ -1000,73 +671,202 @@ mod tests {
         serde_json::from_str(payload_json).unwrap()
     }
 
-    #[tokio::test]
-    async fn test_transaction_lifecycle() {
-        let temp_dir = std::env::temp_dir().join(format!("x402-test-{}", Uuid::new_v4()));
-        let store = TransactionStore::new(temp_dir.clone())
-            .await
-            .unwrap();
-
-        let payload = mock_payment_payload();
-
-        let correlation_id = Uuid::new_v4().to_string();
-
+    fn transaction(
+        verification: VerificationStatus,
+        settlement: Option<SettlementStatus>,
+        last_updated: DateTime<Utc>,
+    ) -> X402Transaction {
         let mut transaction = X402Transaction::new(
-            correlation_id.clone(),
+            Uuid::new_v4().to_string(),
             "channel-1".to_string(),
             "Test Channel".to_string(),
             "/test".to_string(),
-            payload,
+            mock_payment_payload(),
             "Local".to_string(),
             None,
         );
+        if let Some(status) = settlement {
+            transaction = transaction.with_settlement(status, "local");
+        }
         transaction
             .verification
-            .status = VerificationStatus::Verified;
+            .status = verification;
+        transaction.last_updated = last_updated;
+        transaction
+    }
+
+    async fn store() -> (TransactionStore, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let store = TransactionStore::new(root.path().join("x402"))
+            .await
+            .unwrap();
+        (store, root)
+    }
+
+    #[tokio::test]
+    async fn completing_a_settlement_marks_it_completed() {
+        let (store, _root) = store().await;
+        let pending = transaction(VerificationStatus::Verified, Some(SettlementStatus::Pending), Utc::now());
+        let id = pending.id.clone();
+        store.insert(pending).await;
+
         store
-            .insert(transaction)
+            .complete_settlement(&id)
+            .await
+            .unwrap();
+
+        let settlement = store
+            .get(&id)
+            .await
+            .unwrap()
+            .settlement
+            .unwrap();
+        assert_eq!(settlement.status, SettlementStatus::Completed);
+        assert!(
+            settlement
+                .settlement_completed_at
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn completing_an_unknown_transaction_fails() {
+        let (store, _root) = store().await;
+
+        let error = store
+            .complete_settlement("missing")
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, "Transaction not found: missing");
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_old_transactions_whose_settlement_is_in_progress() {
+        let (store, _root) = store().await;
+        let old = Utc::now() - Duration::days(30);
+        let in_progress: Vec<X402Transaction> = [
+            SettlementStatus::Pending,
+            SettlementStatus::Processing,
+            SettlementStatus::AwaitingRemote,
+            SettlementStatus::AwaitingExternal,
+        ]
+        .into_iter()
+        .map(|status| transaction(VerificationStatus::Failed, Some(status), old))
+        .collect();
+        for txn in &in_progress {
+            store
+                .insert(txn.clone())
+                .await;
+        }
+
+        let deleted = store
+            .cleanup_old_transactions(7)
+            .await
+            .unwrap();
+
+        assert_eq!(deleted, 0);
+        for txn in &in_progress {
+            let kept = store
+                .get(&txn.id)
+                .await
+                .expect("in-progress transaction was deleted");
+            assert_eq!(
+                kept.settlement
+                    .unwrap()
+                    .status,
+                txn.settlement
+                    .as_ref()
+                    .unwrap()
+                    .status
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_deletes_old_final_transactions_only() {
+        let (store, _root) = store().await;
+        let old = Utc::now() - Duration::days(30);
+        let old_completed = transaction(VerificationStatus::Verified, Some(SettlementStatus::Completed), old);
+        let old_failed = transaction(VerificationStatus::Verified, Some(SettlementStatus::Failed), old);
+        let old_refunded = transaction(VerificationStatus::Verified, Some(SettlementStatus::Refunded), old);
+        let old_unverified = transaction(VerificationStatus::Failed, None, old);
+        let old_verified_unsettled = transaction(VerificationStatus::Verified, None, old);
+        let recent_completed = transaction(VerificationStatus::Verified, Some(SettlementStatus::Completed), Utc::now());
+        for txn in
+            [&old_completed, &old_failed, &old_refunded, &old_unverified, &old_verified_unsettled, &recent_completed]
+        {
+            store
+                .insert(txn.clone())
+                .await;
+        }
+
+        let deleted = store
+            .cleanup_old_transactions(7)
+            .await
+            .unwrap();
+
+        assert_eq!(deleted, 4);
+        for gone in [&old_completed, &old_failed, &old_refunded, &old_unverified] {
+            assert!(
+                store
+                    .get(&gone.id)
+                    .await
+                    .is_none(),
+                "{} was kept",
+                gone.id
+            );
+        }
+        assert_eq!(
+            store
+                .get(&recent_completed.id)
+                .await
+                .unwrap()
+                .settlement
+                .unwrap()
+                .status,
+            SettlementStatus::Completed
+        );
+        assert_eq!(
+            store
+                .get(&old_verified_unsettled.id)
+                .await
+                .unwrap()
+                .verification
+                .status,
+            VerificationStatus::Verified
+        );
+        assert_eq!(store.list_all().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_deleted_transactions_from_disk() {
+        let (store, root) = store().await;
+        let old_completed = transaction(
+            VerificationStatus::Verified,
+            Some(SettlementStatus::Completed),
+            Utc::now() - Duration::days(30),
+        );
+        store
+            .insert(old_completed)
             .await;
 
-        let txn = store
-            .get(&correlation_id)
-            .await
-            .unwrap();
-        assert_eq!(txn.verification.status, VerificationStatus::Verified);
-        assert!(txn.settlement.is_none());
+        assert_eq!(
+            store
+                .cleanup_old_transactions(7)
+                .await
+                .unwrap(),
+            1
+        );
 
-        // Initialize settlement
-        store
-            .init_settlement(
-                &correlation_id,
-                "immediate".to_string(),
-                "local".to_string(),
-                Some("0xtxhash".to_string()),
-                Some(12),
-            )
+        let reloaded = TransactionStore::new(root.path().join("x402"))
             .await
             .unwrap();
-
-        let txn = store
-            .get(&correlation_id)
-            .await
-            .unwrap();
-        assert!(txn.settlement.is_some());
-        let settlement = txn.settlement.unwrap();
-        assert_eq!(settlement.status, SettlementStatus::Pending);
-        assert_eq!(settlement.tx_hash, "0xtxhash");
-
-        // Complete settlement
-        store
-            .complete_settlement(&correlation_id)
-            .await
-            .unwrap();
-        let txn = store
-            .get(&correlation_id)
-            .await
-            .unwrap();
-        assert_eq!(txn.settlement.unwrap().status, SettlementStatus::Completed);
-
-        // Cleanup
-        let _ = fs::remove_dir_all(&temp_dir).await;
+        assert!(
+            reloaded
+                .list_all()
+                .await
+                .is_empty()
+        );
     }
 }

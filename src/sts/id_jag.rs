@@ -115,15 +115,16 @@ fn normalize_audience(aud: &Value) -> Vec<String> {
 /// Enforces: `iss`, `client_id` and the subject (the value of `principal_claim`,
 /// the claim the verification strategy that accepted the ID-JAG names its
 /// subjects by) present and non-empty; `aud` contains
-/// `expected_audience` (this gateway as the resource AS); `exp` present and in
-/// the future relative to `now`; `nbf`, when present, not in the future; and a
-/// non-empty `jti` (required for single-use enforcement). On any failure
-/// returns `invalid_grant`.
+/// `expected_audience` (this gateway as the resource AS); `exp` present, in
+/// the future relative to `now` and at most `max_lifetime_secs` after it;
+/// `nbf`, when present, not in the future; and a non-empty `jti` (required for
+/// single-use enforcement). On any failure returns `invalid_grant`.
 pub fn validate_id_jag(
     claims: &Value,
     principal_claim: &str,
     expected_audience: &str,
     now: u64,
+    max_lifetime_secs: u64,
 ) -> Result<IdJagClaims, StsError> {
     let issuer = claims
         .get("iss")
@@ -152,6 +153,11 @@ pub fn validate_id_jag(
         .ok_or_else(|| StsError::InvalidGrant("ID-JAG missing or malformed exp".to_string()))?;
     if exp <= now {
         return Err(StsError::InvalidGrant("ID-JAG has expired".to_string()));
+    }
+    if exp - now > max_lifetime_secs {
+        return Err(StsError::InvalidGrant(format!(
+            "ID-JAG lifetime exceeds the {max_lifetime_secs}s this authorization server accepts"
+        )));
     }
 
     if let Some(nbf) = claims
@@ -201,6 +207,8 @@ pub fn validate_id_jag(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MAX_LIFETIME: u64 = 900;
     use serde_json::json;
 
     #[test]
@@ -263,7 +271,7 @@ mod tests {
             act: Some(act.clone()),
         });
         assert_eq!(claims["act"], act);
-        let parsed = validate_id_jag(&claims, "sub", "https://gw.example", 1_000).expect("valid");
+        let parsed = validate_id_jag(&claims, "sub", "https://gw.example", 1_000, MAX_LIFETIME).expect("valid");
         assert_eq!(parsed.act, Some(act));
     }
 
@@ -276,16 +284,16 @@ mod tests {
             "client_id": "agent0",
             "scope": "reports.read reports.write",
             "jti": "grant-1",
-            "exp": 2_000
+            "exp": 1_900
         });
-        let parsed = validate_id_jag(&claims, "sub", "https://gw.example", 1_000).expect("valid");
+        let parsed = validate_id_jag(&claims, "sub", "https://gw.example", 1_000, MAX_LIFETIME).expect("valid");
         assert_eq!(parsed.issuer, "https://idp.example");
         assert_eq!(parsed.subject, "user-123");
         assert_eq!(parsed.audience, vec!["https://gw.example".to_string()]);
         assert_eq!(parsed.client_id, "agent0");
         assert_eq!(parsed.scopes, vec!["reports.read".to_string(), "reports.write".to_string()]);
         assert_eq!(parsed.jti, "grant-1");
-        assert_eq!(parsed.expires_at, 2_000);
+        assert_eq!(parsed.expires_at, 1_900);
         assert!(parsed.act.is_none());
     }
 
@@ -297,23 +305,23 @@ mod tests {
             "aud": ["https://other.example", "https://gw.example"],
             "client_id": "agent0",
             "jti": "grant-2",
-            "exp": 2_000
+            "exp": 1_900
         });
-        let parsed = validate_id_jag(&claims, "sub", "https://gw.example", 1_000).expect("valid");
+        let parsed = validate_id_jag(&claims, "sub", "https://gw.example", 1_000, MAX_LIFETIME).expect("valid");
         assert_eq!(parsed.audience.len(), 2);
     }
 
     #[test]
     fn validate_id_jag_rejects_wrong_audience() {
-        let claims = json!({ "iss": "i", "sub": "u", "aud": "https://elsewhere.example", "exp": 2_000 });
-        let err = validate_id_jag(&claims, "sub", "https://gw.example", 1_000).unwrap_err();
+        let claims = json!({ "iss": "i", "sub": "u", "aud": "https://elsewhere.example", "exp": 1_900 });
+        let err = validate_id_jag(&claims, "sub", "https://gw.example", 1_000, MAX_LIFETIME).unwrap_err();
         assert_eq!(err.error_code(), "invalid_grant");
     }
 
     #[test]
     fn validate_id_jag_rejects_expired() {
         let claims = json!({ "iss": "i", "sub": "u", "aud": "https://gw.example", "exp": 500 });
-        let err = validate_id_jag(&claims, "sub", "https://gw.example", 1_000).unwrap_err();
+        let err = validate_id_jag(&claims, "sub", "https://gw.example", 1_000, MAX_LIFETIME).unwrap_err();
         assert_eq!(err.error_code(), "invalid_grant");
         assert!(
             err.description()
@@ -322,9 +330,28 @@ mod tests {
     }
 
     #[test]
+    fn validate_id_jag_caps_the_remaining_lifetime() {
+        let claims = |exp: u64| json!({ "iss": "i", "sub": "u", "aud": "https://gw.example", "client_id": "agent0", "jti": "g", "exp": exp });
+        let parsed =
+            validate_id_jag(&claims(1_000 + MAX_LIFETIME), "sub", "https://gw.example", 1_000, MAX_LIFETIME).unwrap();
+        assert_eq!(parsed.expires_at, 1_000 + MAX_LIFETIME);
+
+        let err = validate_id_jag(&claims(1_001 + MAX_LIFETIME), "sub", "https://gw.example", 1_000, MAX_LIFETIME)
+            .unwrap_err();
+        assert_eq!(err.error_code(), "invalid_grant");
+        assert!(
+            err.description()
+                .contains("lifetime"),
+            "{}",
+            err.description()
+        );
+        assert!(validate_id_jag(&claims(1_100), "sub", "https://gw.example", 1_000, 60).is_err());
+    }
+
+    #[test]
     fn validate_id_jag_rejects_future_nbf() {
-        let claims = json!({ "iss": "i", "sub": "u", "aud": "https://gw.example", "exp": 5_000, "nbf": 4_000 });
-        let err = validate_id_jag(&claims, "sub", "https://gw.example", 1_000).unwrap_err();
+        let claims = json!({ "iss": "i", "sub": "u", "aud": "https://gw.example", "exp": 1_800, "nbf": 1_500 });
+        let err = validate_id_jag(&claims, "sub", "https://gw.example", 1_000, MAX_LIFETIME).unwrap_err();
         assert_eq!(err.error_code(), "invalid_grant");
     }
 
@@ -333,8 +360,8 @@ mod tests {
     #[test]
     fn validate_id_jag_reads_the_subject_from_the_strategys_claim() {
         let base = json!({ "iss": "i", "sub": "pairwise", "oid": "person-1", "aud": "https://gw.example",
-            "client_id": "agent0", "jti": "g", "exp": 5_000 });
-        let parsed = validate_id_jag(&base, "oid", "https://gw.example", 1_000).expect("valid");
+            "client_id": "agent0", "jti": "g", "exp": 1_800 });
+        let parsed = validate_id_jag(&base, "oid", "https://gw.example", 1_000, MAX_LIFETIME).expect("valid");
         assert_eq!(parsed.subject, "person-1");
         for oid in [None, Some(json!("")), Some(json!(7))] {
             let mut claims = base.clone();
@@ -347,20 +374,20 @@ mod tests {
                         .remove("oid");
                 }
             }
-            let err = validate_id_jag(&claims, "oid", "https://gw.example", 1_000).unwrap_err();
+            let err = validate_id_jag(&claims, "oid", "https://gw.example", 1_000, MAX_LIFETIME).unwrap_err();
             assert_eq!(err.error_code(), "invalid_grant", "{claims}");
         }
     }
 
     #[test]
     fn validate_id_jag_requires_iss_sub_exp() {
-        let base = json!({ "iss": "i", "sub": "u", "aud": "https://gw.example", "client_id": "agent0", "jti": "g", "exp": 5_000 });
+        let base = json!({ "iss": "i", "sub": "u", "aud": "https://gw.example", "client_id": "agent0", "jti": "g", "exp": 1_800 });
         for missing in ["iss", "sub", "exp", "aud", "client_id", "jti"] {
             let mut c = base.clone();
             c.as_object_mut()
                 .unwrap()
                 .remove(missing);
-            let err = validate_id_jag(&c, "sub", "https://gw.example", 1_000).unwrap_err();
+            let err = validate_id_jag(&c, "sub", "https://gw.example", 1_000, MAX_LIFETIME).unwrap_err();
             assert_eq!(err.error_code(), "invalid_grant", "missing {missing} must be invalid_grant");
         }
     }

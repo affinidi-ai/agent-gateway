@@ -771,9 +771,6 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   a private host answers. The fetch ignores any HTTP proxy. Under
   `AG_TEST_MODE=true`, `AG_BDD_EGRESS_ALLOWLIST` admits listed loopback
   fixtures, never cloud metadata.
-- `egress::pinned_forward_client` (cloud-metadata-only) pins the **x402
-  remote-facilitator** client (`src/x402/remote_facilitator.rs`, re-pinned per
-  construction, resolve/pin on `spawn_blocking` off the async runtime).
 - `egress::pinned_forward_client` pins the **event hook** call (`src/event_hook/transport.rs`),
   the operator-configured `AG_EVENT_HOOK_URL` ([`INTEGRATIONS.md`](INTEGRATIONS.md#event-hook)):
   loopback and private receivers are allowed, cloud metadata is blocked, redirects are not followed.

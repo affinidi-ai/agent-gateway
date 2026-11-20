@@ -42,29 +42,6 @@ pub async fn send_response_message(
     Ok(())
 }
 
-/// Send a fire-and-forget notification message (no thread correlation).
-///
-/// Used for settlement-complete, status updates, and other one-way messages
-/// where no response is expected.
-pub async fn send_notification_message(
-    client: &DIDCommClient,
-    our_did: &str,
-    recipient_did: &str,
-    message_type: &str,
-    body: serde_json::Value,
-) -> Result<(), String> {
-    let message = DIDCommMessage::build(uuid::Uuid::new_v4().to_string(), message_type.to_string(), body)
-        .from(our_did.to_string())
-        .to(recipient_did.to_string())
-        .finalize();
-
-    client
-        .pack_and_send_message(&message, recipient_did, our_did)
-        .await?;
-
-    Ok(())
-}
-
 /// Send a `connection-accepted` OOB protocol message.
 ///
 /// The `body` should contain the `channel_did` field that the acceptor

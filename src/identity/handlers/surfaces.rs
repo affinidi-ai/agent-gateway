@@ -273,14 +273,12 @@ fn refuse_unservable_route(
     existing: Option<&AgentSurface>,
     network_config: &crate::config::NetworkConfig,
 ) -> Result<(), SurfaceApiError> {
-    use crate::config::agent_surface::SurfaceStatus;
     let route = surface
         .access_point
         .route
         .as_str();
-    let kept_route =
-        existing.is_some_and(|existing| existing.status != SurfaceStatus::Disabled) && keeps_route(surface, existing);
-    if surface.status == SurfaceStatus::Disabled || kept_route {
+    let kept_route = existing.is_some_and(|existing| existing.status.is_live()) && keeps_route(surface, existing);
+    if !surface.status.is_live() || kept_route {
         return Ok(());
     }
     crate::config::route_claims::check_surface_route_syntax(route)
@@ -342,6 +340,12 @@ fn validate_required_fields(
     } else {
         format!("{}: ", label)
     };
+    if surface.status == crate::config::agent_surface::SurfaceStatus::Deleted {
+        return Err(SurfaceApiError::BadRequest(format!(
+            "{}status 'deleted' cannot be saved; delete the surface instead",
+            prefix
+        )));
+    }
     if surface.name.is_empty() {
         return Err(SurfaceApiError::BadRequest(format!("{}name is required", prefix)));
     }
@@ -2211,7 +2215,7 @@ fn check_listen_path_collisions(
     // A disabled surface reserves no routes (routing skips it), so saving
     // one can never introduce a collision. Skipping here keeps disabling a
     // conflicting surface possible — the natural way out of a duplicate.
-    if surface.status == crate::config::agent_surface::SurfaceStatus::Disabled {
+    if !surface.status.is_live() {
         return Ok(());
     }
 
@@ -2222,7 +2226,7 @@ fn check_listen_path_collisions(
         if other.surface_id == surface.surface_id {
             continue;
         }
-        if other.status == crate::config::agent_surface::SurfaceStatus::Disabled {
+        if !other.status.is_live() {
             continue;
         }
         for key in outbound_listen_path_claims(other, &resolve_port) {
@@ -2310,7 +2314,7 @@ fn check_access_point_route_collisions(
 ) -> Result<(), SurfaceApiError> {
     // A disabled surface reserves no routes, so saving one can never
     // introduce a collision (mirrors check_listen_path_collisions).
-    if surface.status == crate::config::agent_surface::SurfaceStatus::Disabled {
+    if !surface.status.is_live() {
         return Ok(());
     }
 
@@ -2328,7 +2332,7 @@ fn check_access_point_route_collisions(
         if other.surface_id == surface.surface_id {
             continue;
         }
-        if other.status == crate::config::agent_surface::SurfaceStatus::Disabled {
+        if !other.status.is_live() {
             continue;
         }
         let (other_listener, other_route) = access_point_route_claim(other, &resolve_port);
@@ -4836,7 +4840,7 @@ async fn apply_surface_change_while_locked(
     };
     provider_key_gate.owner_changed(changed_id);
     match change {
-        SurfaceChange::Upsert(surface) if surface.status == crate::config::agent_surface::SurfaceStatus::Active => {
+        SurfaceChange::Upsert(surface) if surface.status.is_live() => {
             provider_key_gate
                 .admit(surface)
                 .await
@@ -4853,7 +4857,7 @@ async fn apply_surface_change_while_locked(
     // deleted surface.
     match change {
         SurfaceChange::Upsert(surface) => {
-            if surface.status == crate::config::agent_surface::SurfaceStatus::Active {
+            if surface.status.is_live() {
                 if let Err(e) = state
                     .resolved_surface_cache
                     .upsert(surface)
@@ -4898,7 +4902,7 @@ async fn apply_surface_change_while_locked(
 
     let fast_result: anyhow::Result<bool> = match change {
         SurfaceChange::Upsert(surface) => {
-            if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
+            if !surface.status.is_live() {
                 // Inactive surfaces shouldn't be running — fall through
                 // to full reload, which filters them out via
                 // inject_surfaces_into_config.
@@ -4988,7 +4992,7 @@ async fn refresh_surface_policies(
     change: SurfaceChange<'_>,
 ) {
     match change {
-        SurfaceChange::Upsert(surface) if surface.status == crate::config::agent_surface::SurfaceStatus::Active => {
+        SurfaceChange::Upsert(surface) if surface.status.is_live() => {
             if let Err(e) = policy_manager
                 .update_channel_policy(surface)
                 .await
@@ -8615,6 +8619,19 @@ mod validation_tests {
     fn required_fields_accepts_a_well_formed_surface() {
         let s = base_surface();
         validate_required_fields(&s, "").expect("base surface is valid");
+    }
+
+    #[test]
+    fn required_fields_rejects_a_deleted_status() {
+        let mut s = base_surface();
+        s.status = crate::config::agent_surface::SurfaceStatus::Deleted;
+        match validate_required_fields(&s, "") {
+            Err(SurfaceApiError::BadRequest(msg)) => assert!(msg.contains("status 'deleted'"), "{msg}"),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        s.status = crate::config::agent_surface::SurfaceStatus::Disabled;
+        validate_required_fields(&s, "").expect("a disabled surface can be saved");
     }
 
     #[test]

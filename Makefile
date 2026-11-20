@@ -23,7 +23,7 @@ SHELL := /bin/bash
         www www-dev \
         clean clean-all clear-storage clear-storage-local \
 		demo-multi-tenancy \
-        generate-cert trust-cert derive-x402-addresses \
+        generate-cert trust-cert \
         ngrok pre-commit pre-commit-rust pre-commit-node dev full-setup release \
         ui-test ui-test-headed ui-test-report \
 		itest-a2a itest-a2a-setup itest-a2a-run itest-a2a-teardown itest-a2a-clean itest-a2a-shopping \
@@ -685,11 +685,6 @@ trust-cert: ## Add self-signed cert to system trust store
 	@echo "$(BLUE)🔐 Adding certificate to system trust store...$(NC)"
 	@./scripts/certs/trust-cert.sh $(CERT_PATH)
 	@echo "$(GREEN)✅ Certificate trusted!$(NC)"
-
-derive-x402-addresses: ## Derive Ethereum addresses from x402.json facilitator keys
-	@echo "$(BLUE)🔐 Deriving x402 facilitator addresses...$(NC)"
-	@./scripts/x402/derive-facilitator-addresses.sh $(or $(X402_CONFIG),envs/local/config/x402.json) $(if $(UPDATE),--update)
-	@echo "$(GREEN)✅ x402 addresses derived!$(NC)"
 
 # ==============================================================================
 # Mediator Commands

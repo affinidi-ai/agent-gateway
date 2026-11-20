@@ -926,7 +926,13 @@ round must validate the same authorization, surface, provider, route and
 business arguments and win its own atomic claim before reusing the evidence; it
 then makes no payment call, and the original receipt comes back in the response
 headers and in `result._meta`. Evidence of another rail, or expired evidence, is
-refused with `403`. Evidence expiry is never extended by a new upstream round or
+refused with `403`, and so is evidence of an authorization that was later voided
+because the Target did not deliver: the voided receipt's digest is recorded in the
+gateway's [single-use store](CONFIGURATION_REFERENCE.md#single-use-store) for the
+continuation's maximum lifetime, so a restart, or with a shared store another node,
+still refuses it. Evidence the store cannot check is refused. With DynamoDB
+continuations the gateway refuses to start unless `single_use_store` is DynamoDB
+too. Evidence expiry is never extended by a new upstream round or
 renewed consent, and descendant state is also capped to the previous operation's
 remaining lifetime. The direct and isolated receiver JSON/SSE tests run against
 an in-process payment gate and assert one payment call across two rounds,
@@ -1363,15 +1369,18 @@ semantics. Any browser-session linkage must map to this authoritative profile
 identity explicitly, never by email or unqualified subject matching.
 
 Profile replay protection is separate from the legacy synchronous fallback.
-`sts.mcp_replay` selects bounded embedded storage (default capacity 100000,
-single active process) or `{ "backend": "dynamodb", "table": "..." }`.
-Keys bind the profile issuer, grant issuer and token ID. DynamoDB uses an
-atomic conditional PutItem under `StsMcpReplay#<digest>` PK/SK and numeric
-`expires_at`; grant TTL is at most 900 seconds. Configure TTL cleanup and
-grant `dynamodb:PutItem` on the table. Failed or timed-out writes fail closed,
-never fall back to memory. Real DynamoDB multi-replica and IAM conformance
-remain required; a default process-local backend is not restart-safe replay
-protection.
+`sts.mcp_replay` selects `embedded` (the default) or
+`{ "backend": "dynamodb", "table": "..." }`. Keys bind the profile issuer,
+grant issuer and token ID; grant TTL is at most 900 seconds. `embedded` records
+redemptions in the gateway's
+[single-use store](CONFIGURATION_REFERENCE.md#single-use-store) (namespace
+`mcp-id-jag`), so they survive a restart and, when `single_use_store` is
+DynamoDB, are shared by every node; its `capacity` (1 to 100000) is still
+validated but no longer bounds anything. `dynamodb` uses an atomic conditional
+PutItem under `StsMcpReplay#<digest>` PK/SK and numeric `expires_at`. Configure
+TTL cleanup and grant `dynamodb:PutItem` on the table. Failed or timed-out
+writes fail closed, never fall back to memory. Real DynamoDB multi-replica and
+IAM conformance remain required.
 
 An MCP Access Point, independent Transit Point or standalone MCP Proxy opts
 into Resource Server enforcement with `mcp_http.authorization`:
@@ -1801,7 +1810,8 @@ active replay records.
 
 A capability query is admitted like a `forward-request` too: its envelope
 `expires_time` is required and validated, and its `(sender DID, message id)`
-pair is remembered in the Fabric seen set until it expires. A replayed query is
+pair is remembered in the Fabric seen set and the single-use store until it
+expires. A replayed query is
 therefore refused, both while it is live and after, and can never recreate an
 expired offer, so an Open bound to that offer stays refused once its replay
 record ends. The sending gateway gives a query a 300 s envelope lifetime.

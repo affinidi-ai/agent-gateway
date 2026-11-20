@@ -1538,17 +1538,13 @@ impl Authorization {
     ) -> crate::payments_ledger::SettleAction {
         use crate::payments_ledger::SettleAction;
 
-        let action = *self.decision.get_or_init(|| {
+        *self.decision.get_or_init(|| {
             if delivered {
                 SettleAction::Capture
             } else {
                 SettleAction::Void
             }
-        });
-        if action == SettleAction::Void {
-            void_evidence(&self.evidence);
-        }
-        action
+        })
     }
 
     fn spawn_settle(
@@ -1562,12 +1558,15 @@ impl Authorization {
         let in_flight = Arc::clone(&self.in_flight);
         runtime.spawn(async move {
             let _in_flight = in_flight;
+            if action == crate::payments_ledger::SettleAction::Void {
+                void_evidence(&evidence).await;
+            }
             settled
                 .get_or_init(|| async {
                     let reason = (action == crate::payments_ledger::SettleAction::Void).then_some(NOT_DELIVERED);
                     let settled = crate::payments_ledger::settlement::settle(&held, action, reason).await;
                     if settled.outcome == crate::payments_ledger::LedgerOutcome::Voided {
-                        void_evidence(&evidence);
+                        void_evidence(&evidence).await;
                     }
                     settled
                 })
@@ -1594,35 +1593,62 @@ impl Authorization {
     }
 }
 
-/// How long the receipt of a voided authorization is remembered: the longest an
-/// MCP continuation can carry it.
-const VOIDED_EVIDENCE_KEPT: Duration = Duration::from_secs(crate::mcp::continuations::MAX_TTL_SECS);
+/// Records the receipt of a voided authorization in the single-use store until
+/// the longest an MCP continuation can carry it, so continuation evidence
+/// recorded from it before the void pays for no later round.
+async fn void_evidence(receipt: &str) {
+    let recorded = match crate::storage::single_use::global() {
+        Ok(store) => record_voided(&store, receipt, now_ms() / 1000).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = recorded {
+        tracing::error!(%error, "Failed to record voided payment evidence; continuation evidence of it is refused only on this node");
+    }
+}
 
-/// Receipts of voided authorizations, by digest, so continuation evidence
-/// recorded from one before the void pays for no later round.
-static VOIDED_EVIDENCE: LazyLock<Mutex<HashMap<[u8; 32], Instant>>> = LazyLock::new(Default::default);
+async fn record_voided(
+    store: &crate::storage::single_use::SingleUseStore,
+    receipt: &str,
+    now: u64,
+) -> Result<(), crate::storage::single_use::SingleUseError> {
+    store
+        .record_unique(
+            crate::storage::single_use::Namespace::VoidedEvidence,
+            &evidence_digest(receipt),
+            now + crate::mcp::continuations::MAX_TTL_SECS,
+            now,
+        )
+        .await
+        .map(|_| ())
+}
+
+/// Whether the receipt's authorization was voided. A store that cannot answer
+/// counts it as voided.
+async fn evidence_voided(receipt: &str) -> bool {
+    match crate::storage::single_use::global() {
+        Ok(store) => voided_in(&store, receipt, now_ms() / 1000).await,
+        Err(_) => true,
+    }
+}
+
+async fn voided_in(
+    store: &crate::storage::single_use::SingleUseStore,
+    receipt: &str,
+    now: u64,
+) -> bool {
+    store
+        .is_recorded(crate::storage::single_use::Namespace::VoidedEvidence, &evidence_digest(receipt), now)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::error!(%error, "Could not read voided payment evidence; refusing the continuation evidence");
+            true
+        })
+}
 
 fn evidence_digest(receipt: &str) -> [u8; 32] {
     use sha2::{Digest, Sha256};
 
     Sha256::digest(receipt.as_bytes()).into()
-}
-
-fn void_evidence(receipt: &str) {
-    let now = Instant::now();
-    let mut voided = VOIDED_EVIDENCE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    voided.retain(|_, expires| *expires > now);
-    voided.insert(evidence_digest(receipt), now + VOIDED_EVIDENCE_KEPT);
-}
-
-fn evidence_voided(receipt: &str) -> bool {
-    VOIDED_EVIDENCE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&evidence_digest(receipt))
-        .is_some_and(|expires| *expires > Instant::now())
 }
 
 impl Drop for Authorization {
@@ -3075,20 +3101,24 @@ fn continuation_refusal(shape: &Shape) -> Answer {
 /// The outcome of a continuation round that already holds its payment: the
 /// evidence's receipt, or a refusal when the evidence is not agent-pay's, has
 /// expired, or is unusable.
-fn evidence_outcome(
+async fn evidence_outcome(
     intake: &Intake,
     evidence: &ContinuationPayment,
 ) -> GateOutcome {
     let valid = crate::proxy::credential_delegation::modern::now_secs()
         .ok()
         .is_some_and(|now| evidence.validate(now).is_ok());
+    let voided = match evidence {
+        ContinuationPayment::AgentPay { receipt: Some(receipt), .. } if valid => evidence_voided(receipt).await,
+        _ => true,
+    };
     match evidence {
         ContinuationPayment::AgentPay {
             scheme,
             receipt: Some(receipt),
             vc_fingerprint,
             ..
-        } if valid && !evidence_voided(receipt) => match Rail::parse(scheme) {
+        } if valid && !voided => match Rail::parse(scheme) {
             Some(rail) => GateOutcome::Paid(Paid {
                 receipt: Receipt {
                     rail,
@@ -3376,7 +3406,7 @@ pub(crate) async fn charge(
         return GateOutcome::Free;
     }
     if let Some(evidence) = call.evidence {
-        return evidence_outcome(intake, evidence);
+        return evidence_outcome(intake, evidence).await;
     }
     if intake.batch && matches!(intake.protocol, ChannelProtocol::Mcp | ChannelProtocol::A2a | ChannelProtocol::Ap2) {
         return GateOutcome::Answered(Answer::batch(&intake.shape));
@@ -6587,6 +6617,40 @@ pub(crate) mod tests {
                 .0
                 .is_none(),
             "a request without a credential pays nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn voided_evidence_stays_voided_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = || async {
+            crate::storage::single_use::SingleUseStore::open(
+                &crate::storage::single_use::SingleUseStoreConfig::Disk {},
+                dir.path(),
+                None,
+                1_000,
+            )
+            .await
+            .unwrap()
+        };
+        let store = open().await;
+        assert!(!voided_in(&store, "receipt-a", 1_000).await);
+        record_voided(&store, "receipt-a", 1_000)
+            .await
+            .unwrap();
+        drop(store);
+
+        let restarted = open().await;
+        assert!(voided_in(&restarted, "receipt-a", 1_001).await);
+        assert!(!voided_in(&restarted, "receipt-b", 1_001).await);
+        assert!(
+            !voided_in(&restarted, "receipt-a", 1_000 + crate::mcp::continuations::MAX_TTL_SECS).await,
+            "kept only as long as a continuation can carry it"
+        );
+        assert!(
+            record_voided(&crate::storage::single_use::SingleUseStore::failing(), "receipt-c", 1_000)
+                .await
+                .is_err()
         );
     }
 
