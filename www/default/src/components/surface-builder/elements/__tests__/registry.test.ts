@@ -182,15 +182,14 @@ describe('ElementRegistry', () => {
       expect(types('mcp')).not.toContain('transit-point-a2a');
       expect(types('ap2')).toContain('transit-point-a2a');
       expect(types('ap2')).not.toContain('transit-point-mcp');
-      for (const other of ['didcomm', 'http'] as const) {
-        expect(registry.paletteItems(other as never).map(d => d.type)).not.toContain(
-          'transit-point-a2a'
-        );
-        expect(registry.paletteItems(other as never).map(d => d.type)).not.toContain(
-          'transit-point-mcp'
-        );
+      for (const variant of ['transit-point-a2a', 'transit-point-mcp', 'transit-point-ap2']) {
+        expect(registry.paletteItems('didcomm').map(d => d.type)).not.toContain(variant);
+        // a value outside the Protocol union must still be refused
+        expect(registry.paletteItems('http' as never).map(d => d.type)).not.toContain(variant);
+        expect(registry.get(variant as never)).toBeDefined();
       }
-      expect(registry.get('transit-point-mcp')).toBeDefined();
+      expect(types('a2a')).not.toContain('transit-point-ap2');
+      expect(types('mcp')).not.toContain('transit-point-ap2');
     });
 
     it('offers Metadata Extraction only on A2A / AP2 surfaces', () => {

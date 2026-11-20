@@ -142,7 +142,10 @@ A Transit Point's Rate Limit panel has a **Per caller** section that writes
 Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Surface Builder palette offers the A2A Transit Point only on A2A and AP2 surfaces and the MCP
-Transit Point only on MCP surfaces; existing Transit Points stay editable; see _Surface Builder_ in
+Transit Point only on MCP surfaces, and neither on a DIDComm surface; applying a partial template
+skips any element the surface protocol does not offer, such as a Transit Point of the other
+protocol, and names the reason in its message; existing
+Transit Points stay editable; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Surface Builder labels an Access Point's URL **Entry point URL**, with a copy button in the

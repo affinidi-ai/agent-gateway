@@ -20,6 +20,7 @@
 import type { CanvasNode } from '../SurfaceCanvas';
 import type { SurfaceNodeType } from '../nodeTypes';
 import { registry } from '../elements';
+import type { Protocol } from '../elements/types';
 import { getArchetype } from '../elements/edges/archetypes';
 import type {
   EdgeDropIntent,
@@ -127,7 +128,18 @@ function resolveEdgeEndpoints(addr: EdgeAddress, existingNodes: CanvasNode[]): R
   return null;
 }
 
-export function planTemplate(template: SurfaceTemplate, existingNodes: CanvasNode[]): TemplatePlan {
+function unavailableOnProtocol(
+  def: { protocols?: Protocol[] },
+  protocol: Protocol | undefined
+): boolean {
+  return !!protocol && !!def.protocols && !def.protocols.includes(protocol);
+}
+
+export function planTemplate(
+  template: SurfaceTemplate,
+  existingNodes: CanvasNode[],
+  protocol: Protocol | undefined
+): TemplatePlan {
   const plan: TemplatePlan = {
     template,
     clean: [],
@@ -153,6 +165,14 @@ export function planTemplate(template: SurfaceTemplate, existingNodes: CanvasNod
     return plan;
   }
 
+  const pushUnavailable = (itemIndex: number, item: SurfaceTemplateItem) => {
+    plan.unsupported.push({
+      itemIndex,
+      item,
+      reason: `'${item.kind}' is not available on ${protocol} surfaces`,
+    });
+  };
+
   (template.items ?? []).forEach((item, itemIndex) => {
     if (item.scope === 'edge') {
       const addr = parseEdgeAddress(item.address);
@@ -170,6 +190,11 @@ export function planTemplate(template: SurfaceTemplate, existingNodes: CanvasNod
           item,
           reason: `unknown edge archetype '${addr.archetypeId}'`,
         });
+        return;
+      }
+      const edgeDef = registry.get(item.kind as SurfaceNodeType);
+      if (edgeDef && unavailableOnProtocol(edgeDef, protocol)) {
+        pushUnavailable(itemIndex, item);
         return;
       }
       const resolved = resolveEdgeEndpoints(addr, existingNodes);
@@ -228,6 +253,10 @@ export function planTemplate(template: SurfaceTemplate, existingNodes: CanvasNod
         });
         return;
       }
+      if (unavailableOnProtocol(def, protocol)) {
+        pushUnavailable(itemIndex, item);
+        return;
+      }
       const existing = existingNodes.find(n => n.type === item.kind);
       if (def.cardinality === 'singleton' && existing) {
         plan.conflicts.push({
@@ -256,6 +285,10 @@ export function planTemplate(template: SurfaceTemplate, existingNodes: CanvasNod
         item,
         reason: `unknown element kind '${item.kind}'`,
       });
+      return;
+    }
+    if (unavailableOnProtocol(def, protocol)) {
+      pushUnavailable(itemIndex, item);
       return;
     }
     const existing = existingNodes.find(n => n.type === item.kind);
@@ -406,9 +439,10 @@ export function applyPlan(
 /** One-shot apply with the engine's suggested defaults. */
 export function applyTemplate(
   template: SurfaceTemplate,
-  existingNodes: CanvasNode[]
+  existingNodes: CanvasNode[],
+  protocol: Protocol | undefined
 ): PlacementResult {
-  const plan = planTemplate(template, existingNodes);
+  const plan = planTemplate(template, existingNodes, protocol);
   return applyPlan(plan, existingNodes, {});
 }
 

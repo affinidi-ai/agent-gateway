@@ -766,15 +766,21 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
       }
       const placedN = result.placed.length;
       const skippedN = result.skipped.length;
+      const skipReasons = [...new Set(result.skipped.map(s => s.reason))].join('; ');
       if (placedN > 0) {
         const skipNote =
-          skippedN > 0 ? ` (${skippedN} item${skippedN === 1 ? '' : 's'} skipped)` : '';
+          skippedN > 0
+            ? ` (${skippedN} item${skippedN === 1 ? '' : 's'} skipped: ${skipReasons})`
+            : '';
         showToast(
           'success',
           `Added ${placedN} item${placedN === 1 ? '' : 's'} from "${templateName}"${skipNote}.`
         );
       } else {
-        showToast('error', `No items from "${templateName}" could be placed.`);
+        showToast(
+          'error',
+          `No items from "${templateName}" could be placed${skippedN > 0 ? `: ${skipReasons}` : ''}.`
+        );
       }
       setActiveTab('surface');
 
@@ -825,14 +831,14 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
         return;
       }
 
-      const plan = planTemplate(preparedTemplate, builder.state.nodes);
+      const plan = planTemplate(preparedTemplate, builder.state.nodes, meta.protocol);
       if (plan.conflicts.length === 0) {
         finalizeTemplateApply(tpl.name, applyPlan(plan, builder.state.nodes, {}));
         return;
       }
       setPendingPlan(plan);
     },
-    [builder.state.nodes, finalizeTemplateApply, onApplyJsonPayload, setActiveTab]
+    [builder.state.nodes, finalizeTemplateApply, meta.protocol, onApplyJsonPayload, setActiveTab]
   );
 
   const handleConflictConfirm = React.useCallback(
