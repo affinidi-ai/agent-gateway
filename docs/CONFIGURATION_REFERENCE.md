@@ -487,12 +487,20 @@ Read when `auth_mode = "saml"`. Ignored otherwise.
 | Security | `sign_requests`, `require_encrypted_assertions` |
 | Sign-in throttle | `login_throttle`: `enabled` (default `false`) and `per_ip` `{requests, window_secs}` (default 20 per 60 seconds) per client IP for `/saml/login`. Behind a load balancer, set `client_ip.trusted_proxies` in `gateway.json` first. |
 | Claims | `attribute_mapping` from SAML claim URI to user field |
-| Roles | `role_mapping` from identity-provider role to gateway role |
+| Roles | `role_mapping` from identity-provider role to gateway role (`administrator`, `poweruser` or `user`), and an optional `default_role` for a role with no mapping |
 | Directory | `graph_api` for Microsoft Entra ID group and profile lookup |
 
 `role_mapping` decides what an authenticated user may do. A mapping that sends an
 unexpected identity-provider role to `administrator` grants full management access, so
 treat it as a security-relevant setting rather than a convenience.
+
+A role comes only from an explicit `role_mapping` entry. A role value with no entry, or a
+sign-in with no role value, gets `default_role` when it is set and is otherwise refused with a
+`403` page and no user created or updated; a value that merely looks like a gateway role, such as
+`admin`, is not mapped. The first user to sign in to an appliance with no users is still the
+primary administrator, and the primary administrator keeps that role at every later sign-in. A
+`role_mapping` value or `default_role` that is not `administrator`, `poweruser` or `user`
+(spelled exactly so) stops the gateway at startup, naming the entry.
 
 Each SAML sign-in sets the user's role from the identity provider, with one exception: the
 first user to sign in becomes the primary administrator and keeps that role whatever the

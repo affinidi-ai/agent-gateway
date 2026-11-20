@@ -44,6 +44,11 @@ pub struct SamlConfig {
     #[serde(default)]
     pub role_mapping: HashMap<String, String>,
 
+    /// Role for a sign-in whose identity-provider role has no `role_mapping` entry.
+    /// Unset: such a sign-in is refused.
+    #[serde(default)]
+    pub default_role: Option<String>,
+
     /// Require encrypted assertions (default: false)
     #[serde(default)]
     pub require_encrypted_assertions: bool,
@@ -195,13 +200,78 @@ impl SamlConfig {
         let content =
             fs::read_to_string(path.as_ref()).map_err(|e| format!("Failed to read SAML config file: {}", e))?;
 
-        serde_json::from_str(&content).map_err(|e| format!("Failed to parse SAML config JSON: {}", e))
+        let config: Self =
+            serde_json::from_str(&content).map_err(|e| format!("Failed to parse SAML config JSON: {}", e))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Refuse a `role_mapping` or `default_role` that names a role the gateway does not have.
+    pub fn validate(&self) -> Result<(), String> {
+        for (idp_role, gateway_role) in &self.role_mapping {
+            if crate::auth::types::UserRole::from_config_name(gateway_role).is_none() {
+                return Err(format!(
+                    "SAML role_mapping entry '{idp_role}' names unknown role '{gateway_role}' (expected administrator, poweruser or user)"
+                ));
+            }
+        }
+        if let Some(default_role) = &self.default_role
+            && crate::auth::types::UserRole::from_config_name(default_role).is_none()
+        {
+            return Err(format!(
+                "SAML default_role names unknown role '{default_role}' (expected administrator, poweruser or user)"
+            ));
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config_with(
+        role_mapping: serde_json::Value,
+        default_role: serde_json::Value,
+    ) -> SamlConfig {
+        serde_json::from_value(serde_json::json!({
+            "idp_entity_id": "idp",
+            "idp_sso_url": "https://idp.example/sso",
+            "sp_entity_id": "sp",
+            "sp_acs_url": "https://sp.example/acs",
+            "idp_cert_path": "idp.crt",
+            "sp_key_path": null,
+            "sp_cert_path": null,
+            "role_mapping": role_mapping,
+            "default_role": default_role,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_role_mapping_to_an_unknown_role_is_refused_naming_the_entry() {
+        let err = config_with(serde_json::json!({ "gw-admins": "Administrator" }), serde_json::Value::Null)
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("gw-admins") && err.contains("Administrator"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_default_role_is_refused() {
+        let err = config_with(serde_json::json!({}), serde_json::json!("root"))
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("default_role") && err.contains("root"), "{err}");
+    }
+
+    #[test]
+    fn known_roles_in_the_mapping_and_default_role_are_accepted() {
+        let config = config_with(
+            serde_json::json!({ "gw-admins": "administrator", "gw-power": "poweruser", "gw-all": "user" }),
+            serde_json::json!("user"),
+        );
+        assert!(config.validate().is_ok());
+    }
 
     #[test]
     fn the_saml_login_throttle_is_off_unless_saml_json_enables_it() {
