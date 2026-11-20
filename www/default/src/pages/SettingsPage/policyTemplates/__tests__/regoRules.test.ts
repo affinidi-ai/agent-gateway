@@ -1290,3 +1290,78 @@ describe('a rule body on the line after a word that continues it', () => {
     expect(parsed.groups[0].rules.map(r => r.startLine)).toEqual([3]);
   });
 });
+
+describe('raw strings over several lines', () => {
+  const RAW = 'msg := `a\n\n\nb`';
+
+  it('keeps a raw string with blank lines byte-identical when an unrelated rule is removed', () => {
+    const rego = `package p\n\n${RAW}\n\nallow if msg\n\nh if input.x\n`;
+    const parsed = groupsOf(rego);
+    const h = parsed.groups[0].rules.find(r => r.head === 'h')!;
+    expect(removeRule(rego, h)).toContain(RAW);
+  });
+
+  it('keeps a raw string with blank lines byte-identical when a template group is removed', () => {
+    const rego = `package p\n\n${RAW}\n\nallow if msg\n\n# Inserted from template: T\nh if input.x\n# End of template: T\n`;
+    const parsed = groupsOf(rego);
+    const group = parsed.groups.find(g => g.source.kind === 'template')!;
+    expect(removeRuleGroup(rego, group)).toContain(RAW);
+  });
+
+  it('still collapses blank lines outside raw strings after a removal', () => {
+    const rego = 'package p\n\nallow if input.y\n\n\nh if input.x\n\n\ng if input.z\n';
+    const parsed = groupsOf(rego);
+    const h = parsed.groups[0].rules.find(r => r.head === 'h')!;
+    expect(removeRule(rego, h)).toBe('package p\n\nallow if input.y\n\ng if input.z\n');
+  });
+
+  it('refuses Remove on either of two definitions whose raw strings differ only in spacing', () => {
+    const parsed = groupsOf(
+      'package p\ndefault allow := false\nblocked if input.x == `a\n b`\nblocked if input.x == `a\n  b`\nallow if not blocked\n'
+    );
+    const blocked = parsed.groups[0].rules.filter(r => r.head === 'blocked');
+    expect(blocked).toHaveLength(2);
+    expect(blocked.map(r => ruleUse(parsed, r))).toEqual([
+      { kind: 'reader', name: 'allow', line: 7 },
+      { kind: 'reader', name: 'allow', line: 7 },
+    ]);
+  });
+
+  it('refuses Remove on definitions whose raw strings differ only in a blank line', () => {
+    const parsed = groupsOf(
+      'package p\nblocked if input.x == `a\nb`\nblocked if input.x == `a\n\nb`\nallow if not blocked\n'
+    );
+    const blocked = parsed.groups[0].rules.filter(r => r.head === 'blocked');
+    expect(blocked.map(r => ruleUse(parsed, r) !== null)).toEqual([true, true]);
+  });
+
+  it('changes only the real default, not a default line inside a raw string', () => {
+    const raw = 'doc := `\ndefault allow := true\n`';
+    const rego = `package p\n\n${raw}\n\ndefault allow := true\n\nallow if input.x\n`;
+    const result = setDefaultDeny(rego);
+    expect(result).toContain(raw);
+    expect(result).toContain('\ndefault allow := false\n');
+    expect(summarizeDecision(parsePolicyRules(result))).toEqual({
+      kind: 'any-allow',
+      allowRules: 1,
+      hasDefault: true,
+    });
+  });
+
+  it('drops the allow-all comment only above the real default', () => {
+    const raw = 'doc := `\n# Allow all traffic by default\ndefault allow := true\n`';
+    const rego = `package p\n\n${raw}\n\n# Allow all traffic by default\ndefault allow := true\n`;
+    expect(setDefaultDeny(rego)).toBe(`package p\n\n${raw}\n\ndefault allow := false\n`);
+  });
+});
+
+describe('removing a rule under a raw string', () => {
+  it('keeps a raw string whose closing line looks like a comment right above the rule', () => {
+    const raw = 'msg := `a\n# not a comment`';
+    const rego = `package p\n\nallow if msg\n\n${raw}\nh if input.x\n`;
+    const h = groupsOf(rego).groups[0].rules.find(r => r.head === 'h')!;
+    const result = removeRule(rego, h);
+    expect(result).toContain(raw);
+    expect(parsePolicyRules(result).ok).toBe(true);
+  });
+});

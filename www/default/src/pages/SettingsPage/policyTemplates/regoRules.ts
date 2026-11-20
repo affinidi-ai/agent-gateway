@@ -49,9 +49,8 @@ function isTemplateMarker(line: string): boolean {
   return BEGIN_MARKER.test(line) || END_MARKER.test(line);
 }
 const DEFAULT_ALLOW = /^default\s+allow\s*:?=\s*(true|false)\b/;
-const DEFAULT_ALLOW_TRUE = /^(\s*default\s+allow\s*:?=\s*)true\b/m;
-const ALLOW_ALL_COMMENT =
-  /^[ \t]*# Allow all traffic by default[ \t]*\r?\n(?=[ \t]*default\s+allow\s*:?=\s*true\b)/m;
+const DEFAULT_ALLOW_TRUE = /^(\s*default\s+allow\s*:?=\s*)true\b/;
+const ALLOW_ALL_COMMENT = /^[ \t]*# Allow all traffic by default[ \t]*\r?$/;
 const OPEN_ENDING = /((^|[^\w.])(if|else|contains)|:=|=|,)$/;
 const CLOSED_STATEMENT = /^(package|import)\s/;
 const CONTINUING_START = /^((if|contains|else)\b|:?=(?!=)|\{)/;
@@ -72,8 +71,63 @@ type Item =
   | { type: 'end'; line: number };
 
 /**
+ * One line read from `inRaw` (whether it starts inside a raw string): where its comment starts,
+ * whether it ends inside a raw string, and its bracket depth change and lowest depth on the way,
+ * counting no bracket inside a string or comment.
+ */
+function readLine(line: string, inRaw: boolean) {
+  let inString = false;
+  let codeEnd = line.length;
+  let delta = 0;
+  let lowest = 0;
+  for (let k = 0; k < line.length; k++) {
+    const c = line[k];
+    if (inRaw) {
+      if (c === '`') inRaw = false;
+      continue;
+    }
+    if (inString) {
+      if (c === '\\') k++;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '#') {
+      codeEnd = k;
+      break;
+    }
+    if (c === '"') inString = true;
+    else if (c === '`') inRaw = true;
+    else if (c === '{' || c === '[' || c === '(') delta++;
+    else if (c === '}' || c === ']' || c === ')') lowest = Math.min(lowest, --delta);
+  }
+  return { codeEnd, endsInRaw: inRaw, delta, lowest };
+}
+
+/** Whether each line starts inside a raw string. */
+function startsInRaw(lines: string[]): boolean[] {
+  let inRaw = false;
+  return lines.map(line => {
+    const starts = inRaw;
+    inRaw = readLine(line, inRaw).endsInRaw;
+    return starts;
+  });
+}
+
+/**
+ * Lines joined after a removal: runs of empty lines outside raw strings become one, the end is
+ * trimmed, and a raw string keeps every line as written.
+ */
+function joinAfterRemoval(lines: string[]): string {
+  const inRaw = startsInRaw(lines);
+  const blank = (i: number) => lines[i] === '' && !inRaw[i];
+  const kept = lines.filter((_, i) => !(blank(i) && i > 0 && blank(i - 1)));
+  return `${kept.join('\n').replace(/\s+$/, '')}\n`;
+}
+
+/**
  * Splits Rego into top-level statements by bracket depth, ignoring brackets inside strings
- * and comments. Returns null when the brackets don't balance.
+ * and comments. Returns null when the brackets don't balance. A line that starts inside a raw
+ * string is kept as written, blank or not; other lines are trimmed and blank ones dropped.
  */
 function scan(lines: string[]): Item[] | null {
   const items: Item[] = [];
@@ -110,33 +164,17 @@ function scan(lines: string[]): Item[] | null {
       }
     }
 
-    let inString = false;
-    let codeEnd = line.length;
-    for (let k = 0; k < line.length; k++) {
-      const c = line[k];
-      if (inRaw) {
-        if (c === '`') inRaw = false;
-        continue;
-      }
-      if (inString) {
-        if (c === '\\') k++;
-        else if (c === '"') inString = false;
-        continue;
-      }
-      if (c === '#') {
-        codeEnd = k;
-        break;
-      }
-      if (c === '"') inString = true;
-      else if (c === '`') inRaw = true;
-      else if (c === '{' || c === '[' || c === '(') depth++;
-      else if (c === '}' || c === ']' || c === ')') depth--;
-      if (depth < 0) return null;
-    }
+    const startedInRaw = inRaw;
+    const read = readLine(line, inRaw);
+    if (depth + read.lowest < 0) return null;
+    depth += read.delta;
+    inRaw = read.endsInRaw;
     if (current) {
       current.end = i;
-      const code = line.slice(0, codeEnd).trim();
-      if (code) current.code.push(code);
+      let code = line.slice(0, read.codeEnd);
+      if (!startedInRaw) code = code.trimStart();
+      if (!inRaw) code = code.trimEnd();
+      if (code || startedInRaw) current.code.push(code);
     }
   }
   return depth === 0 && !inRaw ? items : null;
@@ -252,15 +290,25 @@ function readsPackageDocument(statements: string[][]): boolean {
 export function removeRuleGroup(rego: string, group: RuleGroup): string {
   const lines = rego.split('\n');
   lines.splice(group.startLine - 1, group.endLine - group.startLine + 1);
-  return `${lines
-    .join('\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .replace(/\s+$/, '')}\n`;
+  return joinAfterRemoval(lines);
 }
 
-/** Turns `default allow := true` (or `= true`) into `false`, keeping the operator. */
+/**
+ * Turns the top-level `default allow := true` (or `= true`) into `false`, keeping the operator,
+ * and drops an "Allow all traffic by default" comment on the line above it.
+ */
 export function setDefaultDeny(rego: string): string {
-  return rego.replace(ALLOW_ALL_COMMENT, '').replace(DEFAULT_ALLOW_TRUE, '$1false');
+  const lines = rego.split('\n');
+  const statement = scan(lines)?.find(
+    (item): item is Extract<Item, { type: 'statement' }> =>
+      item.type === 'statement' && DEFAULT_ALLOW.exec(item.code[0] ?? '')?.[1] === 'true'
+  );
+  if (!statement) return rego;
+  lines[statement.start] = lines[statement.start].replace(DEFAULT_ALLOW_TRUE, '$1false');
+  if (statement.start > 0 && ALLOW_ALL_COMMENT.test(lines[statement.start - 1])) {
+    lines.splice(statement.start - 1, 1);
+  }
+  return lines.join('\n');
 }
 
 /** A rule's name without `default` or a function's arguments, such as `allow` or `jwt_claim_values`. */
@@ -565,15 +613,18 @@ export function ruleRoles(parsed: ParsedPolicy): (rule: PolicyRule) => RuleRole 
 /** Removes one rule's lines, with the comment lines directly above it. */
 export function removeRule(rego: string, rule: PolicyRule): string {
   const lines = rego.split('\n');
+  const inRaw = startsInRaw(lines);
   let start = rule.startLine - 1;
-  while (start > 0 && /^\s*#/.test(lines[start - 1]) && !isTemplateMarker(lines[start - 1])) {
+  while (
+    start > 0 &&
+    /^\s*#/.test(lines[start - 1]) &&
+    !inRaw[start - 1] &&
+    !isTemplateMarker(lines[start - 1])
+  ) {
     start--;
   }
   lines.splice(start, rule.endLine - start);
-  return `${lines
-    .join('\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .replace(/\s+$/, '')}\n`;
+  return joinAfterRemoval(lines);
 }
 
 /** Input paths a module reads, such as `jwt.sub`, shown as tags on the template. */
