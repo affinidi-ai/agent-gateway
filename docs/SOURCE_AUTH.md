@@ -2086,7 +2086,28 @@ restart mints new credential-derived DIDs, which show as versions with no field 
 
 The only writer of agent-in-trust-registry records
 ([`trust_recorder.rs`](../src/trust_registry_verification/trust_recorder.rs)). It fires
-on the response leg and on discovery, and is idempotent.
+on the response leg and on discovery, and is idempotent. The surface's Trust Recorder
+(`access_point.trust_recorder`) records only the Managed Agent's response DID.
+
+### Transit Point Trust Recorder
+
+A Transit Point's own `trust_recorder` has the same entries, cap and save rules as the
+surface's. Like the surface's recorder on the response leg, it fires on every request through
+the Transit Point, except a discovery read, in the background: it writes its entries' records
+for the DID the Transit Point calls out under (its own managed identity, or the surface's it
+injects), never waits for them and never refuses the request. Writes are idempotent. A request
+with no managed agent DID writes nothing. Because the request does not wait, the Transit
+Point's Trust Check can ask about the agent before its first records exist, so a policy that
+requires recognition can refuse the agent's first call.
+
+The outcome is stored as that DID's [recorder status](#recorder-status) on the surface, which
+the surface's recorder and other Transit Points' recorders writing for the same DID also
+update. It shows on the DID's version in the Identities page's Version History and in
+`GET /v1/surfaces/{id}/trust-recorder-status`. On a surface whose only recorders are its
+Transit Points', the Identities page shows a status only for DIDs one was stored for.
+Changing the entries of the surface's or of any Transit Point's recorder, on the surface or in
+a variant, clears the surface's statuses. A Transit Point recorder entry that names an
+Authority is listed with its Transit Point when the Authority's delete is refused.
 
 After writing its records, the Trust Recorder publishes a name for each authority it
 wrote. The name comes from the Authority register entry with that DID, or, failing that,

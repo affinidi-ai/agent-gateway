@@ -509,15 +509,28 @@ pub fn spawn_authority_publish(
 }
 
 /// Republish the entity fields of a surface's managed DIDs to the trust registries its
-/// Trust Recorder writes to, after the surface was renamed.
+/// Trust Recorders, its own and its Transit Points', write to, after the surface was renamed.
 pub fn spawn_surface_rename_publish(surface: AgentSurface) {
-    let Some(recorder) = surface
+    let entries: Vec<_> = surface
         .trust_recorder()
-        .filter(|cfg| !cfg.entries.is_empty())
-        .cloned()
-    else {
+        .into_iter()
+        .chain(
+            surface
+                .transit_points()
+                .iter()
+                .filter_map(|point| point.trust_recorder.as_ref()),
+        )
+        .flat_map(|recorder| {
+            recorder
+                .entries
+                .iter()
+                .cloned()
+        })
+        .collect();
+    if entries.is_empty() {
         return;
-    };
+    }
+    let recorder = crate::config::types::TrustRecorderConfig { entries };
     let Some(manager) = crate::gateways::connection_points::get_trust_registry_listener_manager() else {
         return;
     };

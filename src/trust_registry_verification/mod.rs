@@ -19,4 +19,4 @@ pub use trust_check_executor::{
     TARGET_AGENT_IDENTITY_UNAVAILABLE, TrustCheckIdentityVerificationFailure, synthesize_failure,
     synthesize_unavailable, synthesize_unavailable_target,
 };
-pub use trust_recorder::spawn_trust_recorder;
+pub use trust_recorder::{spawn_recorder, spawn_trust_recorder};

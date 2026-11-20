@@ -254,7 +254,8 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   `buildEntry`, keeping such an element's blank `entity_id` blank (the gateway fills in the
   agent's DID) instead of the destination template, so every save keeps it. The Transit Point
   factory sends a stored `identity_injection` back while its `inject_vp` is `true`, so a save
-  keeps the identity those elements ask about.
+  keeps the identity those elements ask about, and sends a stored Transit Point
+  `trust_recorder` back unchanged, so a save keeps what records that identity.
 - **Gateway picker** is one shared gateway-then-surface picker
   (`_shared/GatewaySurfacePicker.tsx`, data from `_shared/useGatewaySurfaces.ts`) used by the
   Managed Agent and Transit Point **via Gateway Connection** routes and by Payment. Every user

@@ -1628,7 +1628,9 @@ allow if {{
     ));
 }
 
-#[given(regex = r#"^transit point "([^"]+)" presents (the surface's|no) managed agent identity on its outbound calls$"#)]
+#[given(
+    regex = r#"^transit point "([^"]+)" presents (the surface's|no) managed agent identity on its outbound calls$"#
+)]
 fn transit_point_presents_surface_identity(
     world: &mut SurfaceWorld,
     transit_point: String,

@@ -629,6 +629,38 @@ describe('ElementRegistry', () => {
       expect(savedPoint({ inject_vp: true }).identity_injection).toEqual({ inject_vp: true });
       expect(savedPoint({ inject_vp: false })).not.toHaveProperty('identity_injection');
     });
+
+    it("keeps a Transit Point's stored Trust Recorder across a save", () => {
+      const trustRecorder = {
+        entries: [
+          {
+            trust_registry_id: 'tr-1',
+            issuer_did: 'did:web:issuer.example',
+            authority_did: 'did:web:authority.example',
+            include_owned_agent: true,
+          },
+        ],
+      };
+      const point = registry.buildPayload(
+        makeCtx(
+          registry.nodesFromPayload({
+            access_point: { route: '/a2a', protocol: 'a2a' },
+            target: { endpoint: 'https://upstream.example.com' },
+            transit: {
+              points: [
+                {
+                  alias: 'partner',
+                  protocol: 'a2a',
+                  target_endpoint: 'https://p.example',
+                  trust_recorder: trustRecorder,
+                },
+              ],
+            },
+          })
+        )
+      ).transit.points[0];
+      expect(point.trust_recorder).toEqual(trustRecorder);
+    });
   });
 
   describe('deletable', () => {

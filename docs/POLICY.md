@@ -493,8 +493,10 @@ allow if {
 deny_reason := "Calling agent is not recognised" if not allow
 ```
 
-The gateway does not record a Transit Point's managed agent before asking about it: the agent
-is recognised only once its records exist in the trust registry.
+A Transit Point with its own `trust_recorder` writes its managed agent's records in the
+background on every request, without waiting, so the agent is recognised once those records
+exist, which may be after its first call; see
+[Transit Point Trust Recorder](SOURCE_AUTH.md#transit-point-trust-recorder).
 
 Managed-agent elements run on A2A, AP2, MCP and HTTP Transit Points, including `fabric://`
 ones, and not on discovery reads. Each query is a `trust_check` record with `leg`

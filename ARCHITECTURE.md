@@ -196,7 +196,7 @@ flowchart TB
     end
     subgraph P["Trust and policy"]
         direction LR
-        C0[Trust context] --> C1["Trust Check, target and<br/>managed-agent elements"] --> C2[Gateway OPA] --> C3[Surface OPA] --> C4[Transit Point OPA] --> C5["MCP tool gating, tools/call"]
+        C0[Trust context] --> C0a["Transit Point<br/>Trust Recorder"] --> C1["Trust Check, target and<br/>managed-agent elements"] --> C2[Gateway OPA] --> C3[Surface OPA] --> C4[Transit Point OPA] --> C5["MCP tool gating, tools/call"]
     end
     subgraph F["Forward and respond"]
         direction LR
@@ -253,7 +253,9 @@ Transit Point sets other gating or policies than the base surface's is refused w
 Fabric hop check (a `fabric://` Transit Point refuses a call past the hop limit with `508`) →
 Transit Point header mapping
 (A2A and AP2) → outbound extension inspection (A2A) → identity resolution → trusted
-identity → custom metadata → trust context → Trust Check (the Transit Point's own list; its
+identity → custom metadata → trust context → Transit Point Trust Recorder (writes the calling
+agent's records in the background on every request, never waits or refuses; see
+[`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#transit-point-trust-recorder)) → Trust Check (the Transit Point's own list; its
 managed-agent elements ask about the managed agent calling out, see
 [`docs/POLICY.md`](docs/POLICY.md#self-recognition-check)) → gateway OPA →
 surface OPA → Transit Point OPA → MCP tool gating (`tools/call`) → credential injection →

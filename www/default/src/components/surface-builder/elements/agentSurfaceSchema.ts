@@ -136,6 +136,7 @@ export const AGENT_SURFACE_PATHS: ReadonlySet<string> = new Set([
   'transit.points[*].fabric_delegated_credentials',
   'transit.points[*].trust_check_list',
   'transit.points[*].trust_check_migrated',
+  'transit.points[*].trust_recorder',
 ]);
 
 /** Fields of a stored Transit Point: the `X` of every `transit.points[*].X` path. */
