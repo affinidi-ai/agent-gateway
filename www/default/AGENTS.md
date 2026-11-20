@@ -1962,12 +1962,13 @@ with the shared navigation test ids (`wizard-next`, `wizard-back`, `wizard-cance
 ### Gateway signing
 
 **Settings → Security** opens with **Gateway signing** (`pages/SettingsPage/GatewaySigningSection.tsx`,
-`data-testid="gateway-signing-settings"`), labelled as the **Gateway-wide default**
-(`gateway-signing-scope`). It sets what signs tokens, ID-JAGs, credentials, payment evidence and
+`data-testid="gateway-signing-settings"`), with no scope label beside the title. It sets what signs tokens, ID-JAGs, credentials, payment evidence and
 the issuer attestation for every surface and issuer that sets no source of its own. It holds only
-the **Signing key source** choice (`SurfaceSigningSection` with `subject="gateway"`), with
-**Connect my own VTA** as a button beside it (`gateway-signing-connect-button`,
-`vta_connections.edit`, opens the wizard), and **Save** (`gateway-signing-save-button`, disabled
+the **Signing key source** choice (`SurfaceSigningSection` with `subject="gateway"`) and **Save**.
+While **Verifiable Trust Agent** is the source shown, a primary **Connect VTA** button sits at the
+right of the card header (`gateway-signing-connect-button`, `vta_connections.edit`, opens the
+wizard), like the add buttons on other pages; with **Gateway secret** it is not shown.
+**Save** (`gateway-signing-save-button`, disabled
 until something changed and while Verifiable Trust Agent is chosen without an agent;
 `gateway-signing-saved` after a save). Editing needs both `settings.edit` and
 `key_management.edit`; without either the choice is read-only and there is no Save. **Save** sends
@@ -1985,7 +1986,9 @@ above the choice, and there is no inherited note: the gateway default inherits f
 Wherever a signing key is chosen, the field is **Signing key source** (`SurfaceSigningSection`,
 `surface-signing-type-select`) with two options, **Gateway secret** (this gateway's own key) and
 **Verifiable Trust Agent** (`SIGNING_TYPE_LABELS`). Verifiable Trust Agent shows an **Agent**
-select (`surface-signing-agent-select`) of the connections; for a surface or issuer it also shows
+select (`surface-signing-agent-select`) of the connections, only once there is one to list; until
+then it shows "No Verifiable Trust Agent is connected yet." (`surface-signing-no-agents`, which on
+Gateway signing points to **Connect VTA**) and no select. For a surface or issuer it also shows
 **Add VTA**, which opens the wizard in a new tab (`surface-signing-connect-link`), and a Refresh
 (`surface-signing-refresh`). Only a connected, enabled connection with an active key can be chosen;
 a paired one without a key is listed disabled with the reason. The `[vta]` block's own record

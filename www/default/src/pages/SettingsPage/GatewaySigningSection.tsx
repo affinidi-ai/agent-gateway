@@ -32,6 +32,7 @@ export const GatewaySigningSection: React.FC = () => {
   const [stored, setStored] = useState<SurfaceSigning | undefined>(undefined);
   const [loaded, setLoaded] = useState(false);
   const [remotePending, setRemotePending] = useState(false);
+  const [sourceType, setSourceType] = useState<'local' | 'remote'>('local');
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -94,9 +95,18 @@ export const GatewaySigningSection: React.FC = () => {
           <i className="fas fa-key me-2" aria-hidden="true" />
           Gateway signing
         </h6>
-        <span className="badge text-bg-secondary" data-testid="gateway-signing-scope">
-          Gateway-wide default
-        </span>
+        {canConnect && sourceType === 'remote' && (
+          <AppButton
+            variant="primary"
+            size="sm"
+            className="ms-auto text-nowrap"
+            data-testid="gateway-signing-connect-button"
+            onClick={() => navigate(ROUTES.TRUST_AGENT_CONNECT)}
+            iconStart={<i className="fas fa-plus me-1" aria-hidden="true" />}
+          >
+            Connect VTA
+          </AppButton>
+        )}
       </div>
       <div className="card-body">
         {error && (
@@ -112,20 +122,7 @@ export const GatewaySigningSection: React.FC = () => {
               setSigning={choose}
               disabled={!canEdit || saving}
               onRemotePendingChange={setRemotePending}
-              actions={
-                canConnect ? (
-                  <AppButton
-                    variant="outline-primary"
-                    size="sm"
-                    className="text-nowrap"
-                    data-testid="gateway-signing-connect-button"
-                    onClick={() => navigate(ROUTES.TRUST_AGENT_CONNECT)}
-                    iconStart={<i className="fas fa-link me-1" aria-hidden="true" />}
-                  >
-                    Connect my own VTA
-                  </AppButton>
-                ) : null
-              }
+              onTypeChange={setSourceType}
             />
             {canEdit && (
               <div className="d-flex align-items-center gap-2">

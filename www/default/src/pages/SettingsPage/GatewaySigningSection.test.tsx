@@ -30,6 +30,7 @@ const agent = {
 };
 
 let stored: Record<string, unknown> | null;
+let agents: unknown[];
 let posts: unknown[];
 
 const respond = () => {
@@ -50,7 +51,7 @@ const respond = () => {
         json: () => Promise.resolve({ default_resolution: { backend: 'local' } }),
       });
     }
-    return Promise.resolve({ ok: true, json: () => Promise.resolve([agent]) });
+    return Promise.resolve({ ok: true, json: () => Promise.resolve(agents) });
   });
 };
 
@@ -75,16 +76,18 @@ beforeEach(() => {
     'vta_connections.edit': true,
   };
   stored = null;
+  agents = [agent];
   posts = [];
   respond();
 });
 
 describe('GatewaySigningSection', () => {
-  it('is titled Gateway signing, labelled as the gateway-wide default, and has no text above the source', async () => {
+  it('is titled Gateway signing, with no scope label and no text above the source', async () => {
     await mount();
 
     expect(screen.getByText('Gateway signing')).toBeInTheDocument();
-    expect(screen.getByTestId('gateway-signing-scope')).toHaveTextContent('Gateway-wide default');
+    expect(screen.queryByTestId('gateway-signing-scope')).not.toBeInTheDocument();
+    expect(screen.queryByText('Gateway-wide default')).not.toBeInTheDocument();
     expect(screen.getByText('Signing key source')).toBeInTheDocument();
     expect(screen.queryByText(/Signing with/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Deployment/)).not.toBeInTheDocument();
@@ -145,12 +148,36 @@ describe('GatewaySigningSection', () => {
     ]);
   });
 
-  it('keeps Connect my own VTA as a button beside the source, which opens the wizard', async () => {
+  it('offers Connect VTA in the card header only while Verifiable Trust Agent is chosen', async () => {
+    await mount();
+    expect(typeSelect()).toHaveValue('local');
+    expect(screen.queryByTestId('gateway-signing-connect-button')).not.toBeInTheDocument();
+
+    await userEvent.selectOptions(typeSelect(), 'remote');
+    const connect = await screen.findByTestId('gateway-signing-connect-button');
+    expect(connect).toHaveTextContent('Connect VTA');
+    expect(screen.queryByText(/Connect my own VTA/)).not.toBeInTheDocument();
+    await userEvent.click(connect);
+    expect(mockNavigate).toHaveBeenCalledWith('/connections/trust-agents/connect');
+
+    await userEvent.selectOptions(typeSelect(), 'local');
+    await waitFor(() =>
+      expect(screen.queryByTestId('gateway-signing-connect-button')).not.toBeInTheDocument()
+    );
+  });
+
+  it('shows no agent list while no Verifiable Trust Agent is connected, and points to Connect VTA', async () => {
+    agents = [];
     await mount();
 
-    await userEvent.click(screen.getByTestId('gateway-signing-connect-button'));
+    await userEvent.selectOptions(typeSelect(), 'remote');
 
-    expect(mockNavigate).toHaveBeenCalledWith('/connections/trust-agents/connect');
+    expect(await screen.findByTestId('surface-signing-no-agents')).toHaveTextContent(
+      'No Verifiable Trust Agent is connected yet. Connect one with Connect VTA'
+    );
+    expect(screen.queryByTestId('surface-signing-agent-select')).not.toBeInTheDocument();
+    expect(screen.getByTestId('gateway-signing-connect-button')).toBeInTheDocument();
+    expect(saveButton()).toBeDisabled();
   });
 
   it('asks before saving and lists what changing the gateway signer does', async () => {
@@ -193,7 +220,9 @@ describe('GatewaySigningSection', () => {
 
   it('shows the choice read-only, without Save or Connect, to a user who cannot change it', async () => {
     mockPermissions = {};
+    stored = { backend: 'vta', connection_id: 'agent-1', context_id: 'gateway', key_id: 'key-1' };
     await mount();
+    await waitFor(() => expect(typeSelect()).toHaveValue('remote'));
 
     expect(typeSelect()).toBeDisabled();
     expect(screen.queryByTestId('gateway-signing-save-button')).not.toBeInTheDocument();

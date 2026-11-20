@@ -197,17 +197,19 @@ test.describe("Settings → Security → Gateway signing", () => {
     const section = page.getByTestId("gateway-signing-settings");
     await expect(section).toBeVisible();
     await expect(section).toContainText("Gateway signing");
-    await expect(page.getByTestId("gateway-signing-scope")).toHaveText(
-      "Gateway-wide default",
-    );
+    await expect(page.getByTestId("gateway-signing-scope")).toHaveCount(0);
+    await expect(section).not.toContainText("Gateway-wide default");
     await expect(section).toContainText("Signing key source");
     await expect(section).not.toContainText("Signing with");
     await expect(
       section.getByTestId("surface-signing-type-select").locator("option"),
     ).toHaveText(["Gateway secret", "Verifiable Trust Agent"]);
-    await expect(page.getByTestId("gateway-signing-connect-button")).toHaveText(
-      /Connect my own VTA/,
-    );
+    await expect(
+      section.getByTestId("surface-signing-type-select"),
+    ).toHaveValue("local");
+    await expect(
+      page.getByTestId("gateway-signing-connect-button"),
+    ).toHaveCount(0);
     await expect(page.getByTestId("key-management-settings")).toHaveCount(0);
 
     const first = await page
@@ -239,7 +241,9 @@ test.describe("Settings → Security → Gateway signing", () => {
     await section
       .getByTestId("surface-signing-type-select")
       .selectOption("remote");
-    await expect(page.getByTestId("gateway-signing-save-button")).toBeDisabled();
+    await expect(
+      page.getByTestId("gateway-signing-save-button"),
+    ).toBeDisabled();
     await section
       .getByTestId("surface-signing-agent-select")
       .selectOption("agent-1");
@@ -262,14 +266,46 @@ test.describe("Settings → Security → Gateway signing", () => {
     ]);
   });
 
-  test("Connect my own VTA opens the wizard", async ({ page }) => {
+  test("Connect VTA shows in the card header while Verifiable Trust Agent is chosen and opens the wizard", async ({
+    page,
+  }) => {
     await mockTrustAgents(page, [agent()]);
     await page.goto(`${BASE_URL}/settings`);
     await page.getByTestId("settings-security-tab-trigger").click();
+    const section = page.getByTestId("gateway-signing-settings");
+    await section
+      .getByTestId("surface-signing-type-select")
+      .selectOption("remote");
 
-    await page.getByTestId("gateway-signing-connect-button").click();
+    const connect = section
+      .locator(".card-header")
+      .getByTestId("gateway-signing-connect-button");
+    await expect(connect).toHaveText(/Connect VTA/);
+    await connect.click();
 
     await expect(page).toHaveURL(/\/connections\/trust-agents\/connect$/);
+  });
+
+  test("shows no agent list until a Verifiable Trust Agent is connected", async ({
+    page,
+  }) => {
+    await mockTrustAgents(page, []);
+    await page.goto(`${BASE_URL}/settings`);
+    await page.getByTestId("settings-security-tab-trigger").click();
+    const section = page.getByTestId("gateway-signing-settings");
+    await section
+      .getByTestId("surface-signing-type-select")
+      .selectOption("remote");
+
+    await expect(
+      section.getByTestId("surface-signing-no-agents"),
+    ).toContainText("No Verifiable Trust Agent is connected yet");
+    await expect(
+      section.getByTestId("surface-signing-agent-select"),
+    ).toHaveCount(0);
+    await expect(
+      page.getByTestId("gateway-signing-save-button"),
+    ).toBeDisabled();
   });
 });
 

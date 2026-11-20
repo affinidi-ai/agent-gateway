@@ -253,19 +253,45 @@ describe('SurfaceSigningSection', () => {
     );
   });
 
+  it('shows no agent list while no Verifiable Trust Agent is connected, but still offers Add VTA', async () => {
+    await mountSection([]);
+
+    await userEvent.selectOptions(typeSelect(), 'remote');
+
+    expect(await screen.findByTestId('surface-signing-no-agents')).toHaveTextContent(
+      'No Verifiable Trust Agent is connected yet.'
+    );
+    expect(screen.queryByTestId('surface-signing-agent-select')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('surface-signing-pick-agent')).not.toBeInTheDocument();
+    expect(screen.getByTestId('surface-signing-connect-link')).toHaveTextContent('Add VTA');
+  });
+
+  it('lists the agents once one is connected', async () => {
+    await mountSection([connection()]);
+
+    await userEvent.selectOptions(typeSelect(), 'remote');
+
+    await waitFor(() => expect(agentOptions()).toContain('Custom VTA'));
+    expect(screen.queryByTestId('surface-signing-no-agents')).not.toBeInTheDocument();
+  });
+
   describe('as the gateway-wide default', () => {
-    it('shows no inherited note and no way back to one, and renders its actions beside the source', async () => {
+    it('shows no inherited note and no way back to one, and reports the source shown', async () => {
       respond([connection()]);
+      const onTypeChange = jest.fn();
       render(
         <SurfaceSigningSection
           subject="gateway"
           setSigning={jest.fn()}
-          actions={<button data-testid="beside-the-source">Connect my own VTA</button>}
+          onTypeChange={onTypeChange}
         />
       );
 
       await waitFor(() => expect(typeSelect()).toHaveValue('local'));
-      expect(screen.getByTestId('beside-the-source')).toBeInTheDocument();
+      expect(onTypeChange).toHaveBeenLastCalledWith('local');
+      await userEvent.selectOptions(typeSelect(), 'remote');
+      expect(onTypeChange).toHaveBeenLastCalledWith('remote');
+      await userEvent.selectOptions(typeSelect(), 'local');
       expect(screen.queryByTestId('surface-signing-inherited')).not.toBeInTheDocument();
       expect(screen.queryByTestId('surface-signing-reset')).not.toBeInTheDocument();
     });

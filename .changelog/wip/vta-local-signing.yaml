@@ -63,7 +63,9 @@ changes:
         rights as well as the editor's own rights, and for Gateway signing the dashboard asks
         for confirmation first, listing that the issuer of what is issued from
         then on changes, that peers and verifiers must trust it, and that tokens
-        already issued keep the key that signed them.
+        already issued keep the key that signed them. With Verifiable Trust Agent
+        chosen, Gateway signing offers a Connect VTA button in its header, and
+        the agent list appears only once an agent is connected.
     - timestamp: '2026-11-17T16:00:00Z'
       title: ⭐ Let trust agent contexts sign as a did:webvh that survives key rotation
       description: >-

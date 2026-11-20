@@ -25,8 +25,8 @@ interface Props {
    * way back to one.
    */
   subject?: 'surface' | 'issuer' | 'gateway';
-  /** Rendered beside the source select, such as a button that connects an agent. */
-  actions?: React.ReactNode;
+  /** Reports which source is shown, so a parent can offer actions that only fit one of them. */
+  onTypeChange?: (type: SigningType) => void;
   /** Reports whether Verifiable Trust Agent is chosen with no agent picked yet. */
   onRemotePendingChange?: (pending: boolean) => void;
   /** The issuer that owns this surface, whose own choice a surface that sets nothing follows. */
@@ -51,11 +51,12 @@ export const SurfaceSigningSection: React.FC<Props> = ({
   disabled,
   subject = 'surface',
   owner,
-  actions,
+  onTypeChange,
   onRemotePendingChange,
 }) => {
   const [connections, setConnections] = useState<VtaConnection[]>([]);
   const [loadError, setLoadError] = useState(false);
+  const [connectionsLoaded, setConnectionsLoaded] = useState(false);
   const [defaultBackend, setDefaultBackend] = useState<string>('local');
   /** Remote was picked and no agent has been chosen yet, so nothing is stored for it. */
   const [remotePending, setRemotePending] = useState(false);
@@ -68,9 +69,10 @@ export const SurfaceSigningSection: React.FC<Props> = ({
       .then((list: VtaConnection[]) => setConnections(list))
       .catch(() => {
         // A surface can still be saved without this list; only the Remote option becomes
-        // unusable, which the empty select communicates.
+        // unusable, which the load error below says.
         setLoadError(true);
-      });
+      })
+      .finally(() => setConnectionsLoaded(true));
   }, []);
 
   useEffect(() => {
@@ -121,6 +123,13 @@ export const SurfaceSigningSection: React.FC<Props> = ({
     connection.id !== BOOTSTRAP_CONNECTION_ID ||
     ready(connection) ||
     signing?.connection_id === connection.id;
+
+  const listedConnections = connections.filter(listed);
+  const noAgents = connectionsLoaded && !loadError && listedConnections.length === 0;
+
+  useEffect(() => {
+    onTypeChange?.(type);
+  }, [type, onTypeChange]);
 
   const chooseType = (value: string) => {
     if (value === 'local') {
@@ -195,7 +204,6 @@ export const SurfaceSigningSection: React.FC<Props> = ({
           <option value="local">{SIGNING_TYPE_LABELS.local}</option>
           <option value="remote">{SIGNING_TYPE_LABELS.remote}</option>
         </Form.Select>
-        {actions}
       </div>
 
       {inheritable && inherited && !remotePending && (
@@ -220,25 +228,34 @@ export const SurfaceSigningSection: React.FC<Props> = ({
 
       {type === 'remote' && (
         <div className="mt-2">
-          <Form.Label htmlFor="surface-signing-agent-select" className="small text-muted mb-1">
-            Agent
-          </Form.Label>
-          <Form.Select
-            id="surface-signing-agent-select"
-            data-testid="surface-signing-agent-select"
-            size="sm"
-            value={selectedAgent}
-            disabled={disabled}
-            onChange={event => chooseAgent(event.target.value)}
-          >
-            <option value="">Select a Verifiable Trust Agent…</option>
-            {connections.filter(listed).map(connection => (
-              <option key={connection.id} value={connection.id} disabled={!ready(connection)}>
-                {connection.name}
-                {ready(connection) ? '' : ' — not ready: connect it and provision a key first'}
-              </option>
-            ))}
-          </Form.Select>
+          {noAgents ? (
+            <Form.Text className="d-block text-muted" data-testid="surface-signing-no-agents">
+              No Verifiable Trust Agent is connected yet.
+              {subject === 'gateway' ? ' Connect one with Connect VTA, then choose it here.' : ''}
+            </Form.Text>
+          ) : (
+            <>
+              <Form.Label htmlFor="surface-signing-agent-select" className="small text-muted mb-1">
+                Agent
+              </Form.Label>
+              <Form.Select
+                id="surface-signing-agent-select"
+                data-testid="surface-signing-agent-select"
+                size="sm"
+                value={selectedAgent}
+                disabled={disabled}
+                onChange={event => chooseAgent(event.target.value)}
+              >
+                <option value="">Select a Verifiable Trust Agent…</option>
+                {listedConnections.map(connection => (
+                  <option key={connection.id} value={connection.id} disabled={!ready(connection)}>
+                    {connection.name}
+                    {ready(connection) ? '' : ' — not ready: connect it and provision a key first'}
+                  </option>
+                ))}
+              </Form.Select>
+            </>
+          )}
           {subject !== 'gateway' && (
             <Form.Text className="d-block text-muted">
               <a
@@ -260,7 +277,7 @@ export const SurfaceSigningSection: React.FC<Props> = ({
               </button>
             </Form.Text>
           )}
-          {selectedAgent === '' && (
+          {selectedAgent === '' && !noAgents && (
             <Form.Text className="d-block text-warning" data-testid="surface-signing-pick-agent">
               {subject === 'gateway'
                 ? 'Choose a Verifiable Trust Agent before saving.'
