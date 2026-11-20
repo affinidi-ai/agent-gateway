@@ -775,6 +775,11 @@ pub struct Target {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<TargetAuthConfig>,
 
+    /// Response authentication (Target → Gateway): what a response must carry to be accepted
+    /// as the managed agent's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_auth: Option<crate::config::response_auth::ResponseAuthConfig>,
+
     /// Request-side OPA policy ("is this caller allowed this operation?").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyRef>,
@@ -6797,6 +6802,7 @@ mod tests {
             target: Target {
                 endpoint: "https://sales.internal:3000/a2a".to_string(),
                 auth: None,
+                response_auth: None,
                 policy: None,
                 response_policy: None,
                 payment_policy: None,
@@ -6878,6 +6884,7 @@ mod tests {
             target: Target {
                 endpoint: "https://test.internal/mcp".to_string(),
                 auth: None,
+                response_auth: None,
                 policy: None,
                 response_policy: None,
                 payment_policy: None,

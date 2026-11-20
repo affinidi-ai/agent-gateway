@@ -13,6 +13,7 @@ import {
 } from '../_shared/providerTargetAuth';
 import { parseFabricEndpoint } from '../_shared/useGatewaySurfaces';
 import { isHttpTarget } from './PartnerGrantReleaseSection';
+import { responseAuthProblems, responseAuthToWire } from './responseAuth';
 import {
   inferAuthType,
   managedAgentTargetAuth,
@@ -92,6 +93,9 @@ export const managedAgentDefinition: NodeDefinition = {
     }
     for (const [field, message] of Object.entries(managedAgentTargetAuthProblems(c).errors)) {
       errs.push({ field, message });
+    }
+    for (const message of responseAuthProblems(c.endpoint, c.response_auth)) {
+      errs.push({ field: 'response_auth', message: `Response Authentication: ${message}` });
     }
     return errs;
   },
@@ -175,6 +179,8 @@ export const managedAgentDefinition: NodeDefinition = {
     } else {
       c.endpoint_type = 'url';
     }
+    // Set even when the stored surface has none, so a canvas blob's stale copy never fills it in.
+    c.response_auth = slice?.response_auth ?? undefined;
     if (slice?.identity_injection && typeof slice.identity_injection === 'object') {
       c.inject_vp = (slice.identity_injection as { inject_vp?: boolean }).inject_vp !== false;
     } else {
@@ -234,6 +240,8 @@ export const managedAgentDefinition: NodeDefinition = {
     if (isHttpTarget(c.endpoint) && c.delegated_credentials_for_fabric_callers === true) {
       tgt.delegated_credentials_for_fabric_callers = true;
     }
+    const responseAuth = responseAuthToWire(c.endpoint, c.response_auth);
+    if (responseAuth !== undefined) tgt.response_auth = responseAuth;
     if (node) {
       tgt.identity_injection = { inject_vp: c.inject_vp !== false };
     }

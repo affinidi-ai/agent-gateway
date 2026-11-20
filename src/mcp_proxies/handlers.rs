@@ -635,7 +635,29 @@ pub async fn discover_mcp_tools<S: McpProxyStore>(
                 "Tool discovery is not supported for fabric:// MCP targets".to_string(),
             ));
         } else {
-            let pinned_client = pin_discovery_client(endpoint, crate::egress::pinned_forward_client).await?;
+            let unbuilt = crate::mcp::sse_transport::ResponseCheck {
+                surface: &surface,
+                secrets: secrets_store.as_ref(),
+                stamp: None,
+            };
+            let tls = crate::proxy::response_auth::hop_tls(
+                &surface,
+                endpoint,
+                crate::proxy::server::get_certificates_store().as_ref(),
+            )
+            .await
+            .map_err(|failure| refused_discovery(Some(unbuilt), failure))?;
+            let check = crate::mcp::sse_transport::ResponseCheck {
+                stamp: tls
+                    .as_ref()
+                    .map(|tls| tls.stamp),
+                ..unbuilt
+            };
+            let tls = tls.map(|tls| tls.config);
+            let pinned_client = pin_discovery_client(endpoint, move |url, timeout| {
+                crate::egress::pinned_forward_client_with_tls(url, timeout, tls.as_deref())
+            })
+            .await?;
             discover_remote_tools(
                 &pinned_client,
                 endpoint,
@@ -643,6 +665,7 @@ pub async fn discover_mcp_tools<S: McpProxyStore>(
                 &secrets_store,
                 tenant_context(&context),
                 resource_scope(&scope),
+                Some(check),
             )
             .await?
         }
@@ -688,6 +711,7 @@ pub async fn discover_mcp_tools<S: McpProxyStore>(
             &secrets_store,
             tenant_context(&context),
             resource_scope(&scope),
+            None,
         )
         .await?
     };
@@ -730,21 +754,44 @@ async fn authorized_mcp_surface(
     Ok(surface)
 }
 
-type PinDiscoveryTarget =
-    fn(&str, std::time::Duration) -> Result<(reqwest::Client, crate::egress::PinnedTarget), crate::egress::EgressError>;
+/// The answer to a tool discovery whose Target response failed the surface's Response
+/// authentication with `failure`. The reason is logged, never sent.
+fn refused_discovery(
+    check: Option<crate::mcp::sse_transport::ResponseCheck<'_>>,
+    failure: crate::proxy::response_auth::ResponseAuthFailure,
+) -> (StatusCode, String) {
+    warn!(
+        surface = check.map_or("", |check| check
+            .surface
+            .surface_id
+            .as_str()),
+        reason = failure.reason(),
+        "MCP tool discovery refused a Target response that failed Response authentication"
+    );
+    (StatusCode::BAD_GATEWAY, DISCOVERY_REFUSED_MESSAGE.to_string())
+}
+
+const DISCOVERY_REFUSED_MESSAGE: &str =
+    "The Target's response was refused: it failed the surface's Response authentication";
 
 /// Build a per-request pinned, redirect-disabled client for MCP tool discovery.
 ///
 /// A caller-supplied `target_endpoint` is pinned with the Strict policy; a
-/// saved surface's Target with the forward step's policy, so discovery reaches
-/// exactly what the surface forwards to. Resolves DNS once and pins the
+/// saved surface's Target with the forward step's policy and the TLS settings of
+/// its Response authentication, so discovery reaches exactly what the surface
+/// forwards to. Resolves DNS once and pins the
 /// connection to the vetted address so the host cannot rebind to an
 /// internal/metadata IP between validation and connect (SSRF rebinding TOCTOU).
 /// The resolved IP stays log-only; the caller-facing error keeps the generic
 /// "Invalid MCP target endpoint" message.
 async fn pin_discovery_client(
     target_endpoint: &str,
-    pin: PinDiscoveryTarget,
+    pin: impl FnOnce(
+        &str,
+        std::time::Duration,
+    ) -> Result<(reqwest::Client, crate::egress::PinnedTarget), crate::egress::EgressError>
+    + Send
+    + 'static,
 ) -> Result<reqwest::Client, (StatusCode, String)> {
     let raw = target_endpoint.to_string();
     let pinned = tokio::task::spawn_blocking(move || {
@@ -844,9 +891,12 @@ async fn discover_remote_tools(
     secrets_store: &Option<Arc<dyn crate::secrets::SecretsStore>>,
     context: Option<&PatTenantContext>,
     scope: Option<&PatResourceScope>,
+    check: Option<crate::mcp::sse_transport::ResponseCheck<'_>>,
 ) -> Result<Vec<DiscoverMcpTool>, (StatusCode, String)> {
     let channel_name = "mcp-tool-discovery";
     let extra_headers = build_discovery_headers(target_auth, secrets_store, context, scope, channel_name).await?;
+    let send =
+        |request| send_discovery_request(client, target_endpoint, request, channel_name, extra_headers.as_ref(), check);
 
     let initialize_request = serde_json::json!({
         "jsonrpc": "2.0",
@@ -861,31 +911,23 @@ async fn discover_remote_tools(
             }
         }
     });
-    let initialize_response =
-        send_discovery_request(client, target_endpoint, initialize_request, channel_name, extra_headers.as_ref())
-            .await?;
+    let initialize_response = send(initialize_request).await?;
     ensure_jsonrpc_success(&initialize_response)?;
 
     let initialized_notification = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "notifications/initialized"
     });
-    let _ =
-        send_discovery_request(client, target_endpoint, initialized_notification, channel_name, extra_headers.as_ref())
-            .await;
+    if let Err(refused @ DiscoveryError::Refused(..)) = send(initialized_notification).await {
+        return Err(refused.into());
+    }
 
-    let tool_list_response = send_discovery_request(
-        client,
-        target_endpoint,
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": "tools-list",
-            "method": "tools/list",
-            "params": {}
-        }),
-        channel_name,
-        extra_headers.as_ref(),
-    )
+    let tool_list_response = send(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "tools-list",
+        "method": "tools/list",
+        "params": {}
+    }))
     .await?;
     tools_from_list_response(&ensure_jsonrpc_success(&tool_list_response)?)
 }
@@ -917,13 +959,38 @@ fn tools_from_list_response(response: &serde_json::Value) -> Result<Vec<Discover
     Ok(tools)
 }
 
+/// Why one discovery request got no answer: the Target's response failed the surface's Response
+/// authentication, or the exchange failed otherwise. Each carries the answer to the management
+/// caller.
+enum DiscoveryError {
+    Refused(StatusCode, String),
+    Failed(StatusCode, String),
+}
+
+impl From<DiscoveryError> for (StatusCode, String) {
+    fn from(error: DiscoveryError) -> Self {
+        match error {
+            DiscoveryError::Refused(status, message) | DiscoveryError::Failed(status, message) => (status, message),
+        }
+    }
+}
+
+fn refused(
+    check: Option<crate::mcp::sse_transport::ResponseCheck<'_>>,
+    failure: crate::proxy::response_auth::ResponseAuthFailure,
+) -> DiscoveryError {
+    let (status, message) = refused_discovery(check, failure);
+    DiscoveryError::Refused(status, message)
+}
+
 async fn send_discovery_request(
     client: &reqwest::Client,
     target_endpoint: &str,
     request: serde_json::Value,
     channel_name: &str,
     extra_headers: Option<&ReqwestHeaderMap>,
-) -> Result<String, (StatusCode, String)> {
+    check: Option<crate::mcp::sse_transport::ResponseCheck<'_>>,
+) -> Result<String, DiscoveryError> {
     let request_body = Bytes::from(request.to_string());
     // Discovery has no surface timeouts; the pinned client's
     // EXTERNAL_TIMEOUT_SECS already bounds the whole exchange.
@@ -939,6 +1006,7 @@ async fn send_discovery_request(
         request_body.clone(),
         extra_headers,
         limits,
+        check,
     )
     .await
     {
@@ -954,18 +1022,23 @@ async fn send_discovery_request(
                     request_body.as_ref(),
                     channel_name,
                     crate::config::A2aConfig::default().max_body_size,
+                    check,
                 )
                 .await
-                .map_err(|e| {
-                    (StatusCode::BAD_GATEWAY, format!("Failed to communicate with MCP server over SSE: {}", e))
+                .map_err(|e| match e {
+                    crate::mcp::sse_transport::LegacySseError::Unauthenticated(failure) => refused(check, failure),
+                    e => DiscoveryError::Failed(
+                        StatusCode::BAD_GATEWAY,
+                        format!("Failed to communicate with MCP server over SSE: {}", e),
+                    ),
                 });
             }
 
-            Err((StatusCode::BAD_GATEWAY, format!("MCP server returned {}", status)))
+            Err(DiscoveryError::Failed(StatusCode::BAD_GATEWAY, format!("MCP server returned {}", status)))
         }
         Ok(crate::mcp::sse_transport::UpstreamMcpResponse::SseStream { status, response, .. }) => {
             if !status.is_success() {
-                return Err((StatusCode::BAD_GATEWAY, format!("MCP server returned {}", status)));
+                return Err(DiscoveryError::Failed(StatusCode::BAD_GATEWAY, format!("MCP server returned {}", status)));
             }
 
             crate::mcp::sse_transport::consume_sse_response(response, &request_body, limits)
@@ -979,10 +1052,13 @@ async fn send_discovery_request(
                         }
                         crate::mcp::sse_transport::SseConsumeError::NoResponse => StatusCode::BAD_GATEWAY,
                     };
-                    (status, format!("Failed to read MCP SSE response: {}", e))
+                    DiscoveryError::Failed(status, format!("Failed to read MCP SSE response: {}", e))
                 })
         }
-        Err(e) => Err((e.status_and_message().0, format!("Failed to reach MCP server: {}", e))),
+        Err(crate::mcp::sse_transport::McpRequestError::Unauthenticated(failure)) => Err(refused(check, failure)),
+        Err(crate::mcp::sse_transport::McpRequestError::Body(e)) => {
+            Err(DiscoveryError::Failed(e.status_and_message().0, format!("Failed to reach MCP server: {}", e)))
+        }
     }
 }
 
@@ -7278,6 +7354,123 @@ mod tests {
                 (status, message.to_string())
             );
         }
+    }
+
+    /// An MCP server on 127.0.0.1 answering every POST with [`LOCAL_TOOLS`], with `key` in the
+    /// key header of Response authentication when given, counting every request.
+    async fn keyed_tools_server(key: Option<&'static str>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        keyed_tools_server_with_notification_key(key, key).await
+    }
+
+    /// [`keyed_tools_server`] whose answer to `notifications/initialized` carries
+    /// `notification_key` instead.
+    async fn keyed_tools_server_with_notification_key(
+        key: Option<&'static str>,
+        notification_key: Option<&'static str>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::response::IntoResponse;
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        let app = axum::Router::new().fallback(move |body: String| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let key = if body.contains("notifications/initialized") {
+                notification_key
+            } else {
+                key
+            };
+            async move {
+                let mut response =
+                    ([(axum::http::header::CONTENT_TYPE, "application/json")], LOCAL_TOOLS).into_response();
+                if let Some(key) = key {
+                    response.headers_mut().insert(
+                        axum::http::HeaderName::from_static("x-agent-key"),
+                        axum::http::HeaderValue::from_static(key),
+                    );
+                }
+                response
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (url, requests)
+    }
+
+    /// Discovers the tools of the saved surface `local-mcp` on `endpoint` with `response_auth`,
+    /// whose secrets hold the key of [`crate::proxy::response_auth::api_key_bravo`].
+    async fn discover_with_response_auth(
+        endpoint: &str,
+        response_auth: serde_json::Value,
+    ) -> Result<Vec<String>, (StatusCode, String)> {
+        let mut surface = saved_surface("mcp", endpoint, None);
+        surface.target.response_auth = serde_json::from_value(response_auth).unwrap();
+        let surface_store: Arc<dyn crate::surfaces::AgentSurfaceStore> = Arc::new(SurfaceStore(vec![surface]));
+        let (_dir, secrets) = crate::proxy::response_auth::bravo_key_store().await;
+        let Json(response) = super::discover_mcp_tools(
+            Extension(store_with(vec![])),
+            Extension(Arc::new(super::McpServerManager::new())),
+            Extension(Some(secrets)),
+            Extension(Some(surface_store)),
+            None,
+            None,
+            Json(serde_json::from_value(serde_json::json!({"surface_id": "local-mcp"})).unwrap()),
+        )
+        .await?;
+        Ok(response
+            .tools
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect())
+    }
+
+    const DISCOVERY_REFUSED: &str =
+        "The Target's response was refused: it failed the surface's Response authentication";
+
+    #[tokio::test]
+    async fn tool_discovery_by_surface_lists_the_tools_of_a_target_whose_responses_carry_the_key() {
+        let (endpoint, _) = keyed_tools_server(Some(crate::proxy::response_auth::BRAVO_KEY)).await;
+        assert_eq!(
+            discover_with_response_auth(&endpoint, crate::proxy::response_auth::api_key_bravo()).await,
+            Ok(vec!["local_tool".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_by_surface_refuses_a_target_response_without_the_key() {
+        for key in [None, Some("another-key")] {
+            let (endpoint, _) = keyed_tools_server(key).await;
+            assert_eq!(
+                discover_with_response_auth(&endpoint, crate::proxy::response_auth::api_key_bravo()).await,
+                Err((StatusCode::BAD_GATEWAY, DISCOVERY_REFUSED.to_string())),
+                "{key:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_by_surface_refuses_a_target_whose_initialized_notification_answer_lacks_the_key() {
+        let (endpoint, _) =
+            keyed_tools_server_with_notification_key(Some(crate::proxy::response_auth::BRAVO_KEY), None).await;
+        assert_eq!(
+            discover_with_response_auth(&endpoint, crate::proxy::response_auth::api_key_bravo()).await,
+            Err((StatusCode::BAD_GATEWAY, DISCOVERY_REFUSED.to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_by_surface_refuses_mtls_it_cannot_use_without_dialing_the_target() {
+        let (endpoint, requests) = keyed_tools_server(None).await;
+        let https = endpoint.replacen("http://", "https://", 1);
+        for target in [endpoint.as_str(), https.as_str()] {
+            assert_eq!(
+                discover_with_response_auth(target, crate::proxy::response_auth::pinned_bravo()).await,
+                Err((StatusCode::BAD_GATEWAY, DISCOVERY_REFUSED.to_string())),
+                "{target}"
+            );
+        }
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

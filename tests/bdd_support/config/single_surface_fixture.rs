@@ -159,6 +159,8 @@ pub struct SurfaceConfigBuilder {
     pub rbac_permissions: Vec<(String, String)>,
     /// The surface's `caller_key`, and the secret it names when that is stored.
     pub caller_key: Option<CallerKeyFixture>,
+    /// The surface's `target.response_auth` by API key, and the secret it names.
+    pub response_auth: Option<ResponseAuthFixture>,
 }
 
 /// A surface's `caller_key`: the secret its keys are derived from, stored with `secret_value`
@@ -168,6 +170,22 @@ pub struct CallerKeyFixture {
     pub secret_id: String,
     pub secret_value: Option<String>,
     pub header: Option<String>,
+}
+
+/// A surface's Target answers with a key of secret `secret_id`, stored with `secret_value`, in
+/// header `header_name`.
+#[derive(Debug, Clone)]
+pub struct ResponseAuthFixture {
+    pub secret_id: String,
+    pub secret_value: String,
+    pub header_name: String,
+}
+
+impl ResponseAuthFixture {
+    /// The surface's `target.response_auth`.
+    pub fn setting(&self) -> serde_json::Value {
+        serde_json::json!({ "api_key": { "header_name": self.header_name, "secret_id": self.secret_id } })
+    }
 }
 
 /// Where the gateway sends a person to sign in at the callers' identity provider, and
@@ -318,6 +336,7 @@ impl Default for SurfaceConfigBuilder {
             signs_in_with_saml: false,
             rbac_permissions: Vec::new(),
             caller_key: None,
+            response_auth: None,
         }
     }
 }

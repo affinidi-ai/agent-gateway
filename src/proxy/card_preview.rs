@@ -381,6 +381,7 @@ fn classify_fault(
         FetchFault::TooLarge => (CardFetchCause::TooLarge, None),
         FetchFault::InvalidCard => (CardFetchCause::InvalidCard, None),
         FetchFault::Compressed => (CardFetchCause::Compressed, None),
+        FetchFault::ResponseUnauthenticated(_) => (CardFetchCause::UpstreamError, None),
         FetchFault::IdentityFailed { .. } => (CardFetchCause::IdentityFailed, None),
         FetchFault::RewriteFailed => (CardFetchCause::RewriteFailed, None),
     }

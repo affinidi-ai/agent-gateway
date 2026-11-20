@@ -1115,6 +1115,61 @@ credential, which an enforced rule refuses at save, a `caller_key` on an `http` 
 `caller_key` out keeps the stored one, so a Surface Builder save keeps it; `null` removes it. See
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#caller-keys).
 
+## Surface response authentication
+
+A surface's optional `target.response_auth` makes the gateway accept a response from an http or
+https Target only when it proves it comes from the registered managed agent, by a key it returns
+(`api_key`) or by its server certificate (`mtls`, https only); any other response is refused
+with `502` before anything uses it, and one with a status in
+`networking.retry.retryable_status_codes` that fails is never retried. It is a Target field, set
+through the admin API; a variant may set its own, as with `target.auth`, and a variant saved
+from the dashboard is complete and carries its own, so each such variant needs its own setting.
+A `PUT` that leaves it out keeps the stored one, and
+`null` removes it, for the surface's `target` and for a stored variant's `overrides.target`.
+
+It covers the response leg only, the Managed Agent's answers to the gateway; a call the managed
+agent makes through a Transit Point is authenticated by that Transit Point's own `source_auth`
+(see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-source-authentication)), and responses from
+a Transit Point's destination are not checked. An `api_key` check
+runs after the request was sent, so a server answering at the Target URL has already received
+the request, the transit token, the Target credential and the forwarded caller headers when its
+answer is refused; only `mtls` stops such a server before anything is sent.
+
+```json
+"target": {
+  "endpoint": "https://bravo.example/a2a",
+  "response_auth": { "api_key": { "header_name": "X-Agent-Key", "secret_id": "bravo-response-key" } }
+}
+```
+
+| Field | Default | Behaviour |
+| --- | --- | --- |
+| `api_key.header_name` | Required | The response header the managed agent returns its key in, compared ignoring case. Removed from every response, so the caller never receives it. A save refuses a name that is not an HTTP field name, a reserved header, or one Target authentication, a credential binding, a forwarded caller token, header metadata mapping or `caller_key` already sends to the Target. It also refuses a header the gateway reads or sets on the Target's response, such as `Content-Type`, `Location`, `Set-Cookie`, `Cache-Control` or a payment header (`Payment-Response`, `Payment-Receipt`, `X-Payment-Response`…); [`SOURCE_AUTH.md`](SOURCE_AUTH.md#response-authentication) lists them. |
+| `api_key.secret_id` | Required | The `secret_id` of a secret holding the accepted keys, comma-separated, so a key can be rotated. A save refuses a secret that does not exist, belongs to another tenant (an appliance-wide one is accepted) or holds no non-blank key, and one the gateway sends out or accepts from callers: the `secret_id` of a `static_secret` Target authentication, of a Transit Point's `static_secret` `target_auth`, of `caller_key`, of an Access Point `api_key` caller authentication method, or of an enabled `$SECRET:<id>` value in the Target's or the shared transit custom metadata, or a secret read for the service token of a credential provider the surface sends to its Target or a Transit Point (`credential_provider` Target authentication, `outbound_credentials` or `transit_credentials`). A credential provider update that would read such a secret is refused too. On an `http://` Target the key is sent unencrypted and gives no protection on the network path, so use an `https://` Target, or `mtls`. |
+| `mtls.server_trust` | Required | The trust the Target's server certificate must pass in the TLS handshake, the caller mTLS `MtlsTrust` shape: `{"type": "pinned", "certificate_ids": [...]}`, stored `client_leaf` certificates matched by SHA-256 leaf fingerprint only, with neither expiry nor host name checked, so removing a certificate from the list is the only way to stop trusting it, or `{"type": "ca", "ca_certificate_ids": [...]}`, stored `ca` certificates the chain must end at, with the Target's host checked against the certificate. Only these certificates are trusted, never the system's or public CAs. A save refuses an empty list, a certificate of the wrong kind, one that does not exist, is inactive or belongs to another tenant, and `check_crl` or `require_ocsp` set to `true`. |
+| `mtls.client_certificate_id` | None | A stored `client_leaf` certificate, with its private key, the gateway presents to the managed agent. A save refuses another kind, an inactive one, one stored without its key, and, while `credential_policy.tenant_credential_isolation` is `enforce`, one that is not the surface's own tenant's. |
+
+```json
+"response_auth": { "mtls": {
+  "server_trust": { "type": "pinned", "certificate_ids": ["bravo-server-cert"] },
+  "client_certificate_id": "gateway-client-cert"
+} }
+```
+
+A save refuses `response_auth` on a `proxy://`, `a2a-proxy://` or `fabric://` Target, `mtls` on
+an `http://` Target or on a Target bound by external consent, and `api_key` on an `http://` Target while `credential_policy.target_https`
+is `enforce` (in `warn` it saves with a `Warning` header). The mTLS settings are built once per
+surface and setting, again when a certificate the setting names changes, and dropped when the
+surface is saved or deleted, on configuration reload and on the periodic disk refresh; a
+handshake whose server
+certificate fails the trust is refused like any other failed response. No other key is read: the
+object takes no other field, and the Target refuses
+unknown fields, so a release without Response authentication does not load a surface that sets
+it; where several nodes share `_storage/`, set it only once every node runs a release with it.
+So that callers never see the key, set `api_key` before the managed agent starts sending the
+header, and stop the agent sending it before removing the setting, since without it the header
+passes through. See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#response-authentication).
+
 ## Remote gateway records
 
 Gateway records live in `_storage/gateways/`, not in a configuration file, and are managed

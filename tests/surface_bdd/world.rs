@@ -12,7 +12,7 @@ use crate::bdd_support::config::api_keys::UnreadableKeyFolders;
 use crate::bdd_support::dashboard_socket::DashboardSocket;
 use crate::bdd_support::gateway_process::GatewayProcess;
 use crate::bdd_support::jwt::JwksServer;
-use crate::bdd_support::mock_server::{MockResponse, MockServer, ReceivedRequest};
+use crate::bdd_support::mock_server::{MockResponse, MockServer, MockTls, ReceivedRequest};
 use crate::bdd_support::oidc::OidcProvider;
 use crate::bdd_support::passkey::SoftPasskey;
 use crate::bdd_support::presentation_signer::PresentationSigner;
@@ -210,6 +210,10 @@ pub struct SurfaceWorld {
     /// Client certificates the scenario stored through the admin API, by scenario name: the
     /// stored certificate id.
     pub client_certificates: HashMap<String, String>,
+    /// Certificates the scenario generated, with their keys, by scenario name.
+    pub tls_certificates: HashMap<String, MockTls>,
+    /// The certificate the managed agent serves https with, when it does.
+    pub managed_agent_tls: Option<MockTls>,
     pub temp_dir: TempDir,
     pub debug: bool,
     pub runtimes: RuntimeRegistry,
@@ -300,6 +304,8 @@ impl SurfaceWorld {
             sign_in_event: None,
             sign_in_record: None,
             client_certificates: HashMap::new(),
+            tls_certificates: HashMap::new(),
+            managed_agent_tls: None,
             temp_dir: get_default_temp_dir(),
             debug: is_debug,
             runtimes: RuntimeRegistry::default(),

@@ -12,7 +12,9 @@ use crate::bdd_support::config::fabric_surface_fixture::{
     TransitPointHeaderMetadataMappingRowSpec, TransitPointSpec,
 };
 use crate::bdd_support::config::modern_consent::ModernConsentFixture;
-use crate::bdd_support::config::single_surface_fixture::{SurfaceTargetAuthProviderConfig, TargetAuthProviderGrant};
+use crate::bdd_support::config::single_surface_fixture::{
+    ResponseAuthFixture, SurfaceTargetAuthProviderConfig, TargetAuthProviderGrant,
+};
 use crate::bdd_support::json_rpc::{
     IdentityBindingProof, McpVersion, build_mcp_echo_response_body, build_target_agent_card_naming_did,
     build_target_ok_response,
@@ -787,6 +789,25 @@ pub async fn surface_injects_missing_target_credential(
         header_format: "{value}".to_string(),
         fallback,
         secret_value: None,
+    });
+}
+
+/// The surface's `target.response_auth` reads the managed agent's key from `header_name` and
+/// accepts the keys of secret `secret_id`, which its gateway holds with `secret_value`.
+#[given(
+    expr = "surface {string} authenticates its Target's responses by the API key in secret {string} holding {string} in header {string}"
+)]
+pub async fn surface_authenticates_target_responses(
+    world: &mut G2gWorld,
+    surface_name: String,
+    secret_id: String,
+    secret_value: String,
+    header_name: String,
+) {
+    surface_spec_mut(world, &surface_name).response_auth = Some(ResponseAuthFixture {
+        secret_id,
+        secret_value,
+        header_name,
     });
 }
 
