@@ -78,6 +78,8 @@ mod vault_identity; // Vault identity generation for API keys and certificates
 mod x402; // x402 protocol (HTTP Native Payments Protocol)
 
 #[cfg(test)]
+mod component_test_freeze;
+#[cfg(test)]
 mod component_tests;
 
 use config::{BootstrapConfig, GatewayConfig};

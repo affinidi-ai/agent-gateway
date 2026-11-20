@@ -464,6 +464,7 @@ from.
 | [`observability/`](src/observability/) | Tracing, policy audit events, dashboard event stream, identity view and caller names | [`OBSERVABILITY.md`](docs/OBSERVABILITY.md) |
 | [`metrics/`](src/metrics/) | Metric collection, retention, aggregation | [`OBSERVABILITY.md`](docs/OBSERVABILITY.md) |
 | [`component_tests/`](src/component_tests/) | Frozen legacy cross-module tests; takes no additions | [`TESTING.md`](docs/development/TESTING.md#legacy-component-tests) |
+| [`component_test_freeze.rs`](src/component_test_freeze.rs) | Failure message of the component test freeze guard | [`TESTING.md`](docs/development/TESTING.md#legacy-component-tests) |
 
 ## Where to look
 
