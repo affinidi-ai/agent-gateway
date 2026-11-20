@@ -21,7 +21,8 @@ gateway deny is final. Using the wrong package name fails closed.
 There are exactly two policy planes — **Gateway** (appliance-to-appliance) and
 **Agent Surface**. Legacy `package channel.policy` is auto-migrated to
 `surface.policy` at boot. Deny reason: `data.surface.policy.deny_reason` /
-`data.gateway.policy.deny_reason`.
+`data.gateway.policy.deny_reason`. A Transit Point's own policy and a Fabric receive refusal
+send their deny reason to the caller, so it must not include data from `input`.
 
 A surface's own policy is skipped only for a public discovery read: a `GET` or `HEAD` of a path
 ending in `/agent-card.json`, `/agent.json`, `/.well-known/agent-card`, `/.well-known/ucp` or
@@ -475,15 +476,20 @@ agent card, so a list holding only them fetches none for trust.
 Their results are at `input.trust_check_results.managed_agent`, in the gateway, surface and
 Transit Point outbound scopes, beside `target`. The key is absent when the Transit Point has
 no managed-agent elements or the request is a discovery read. Without a trust registry
-connection each element fails with `TRUST_REGISTRY_UNREACHABLE`. Like every Trust Check the
-stage never denies: policy decides. Nothing is cached, so turning recognition off in the trust
-registry takes effect on the next call. To refuse a managed agent the trust registry no longer
-recognises, require that the check ran and that every result is `ok`:
+connection each element fails with `TRUST_REGISTRY_UNREACHABLE`, except that a request with no
+managed agent DID still reports `MANAGED_AGENT_IDENTITY_UNAVAILABLE`. Like every Trust Check
+the stage never denies: policy decides. Nothing is cached, so turning recognition off in the
+trust registry takes effect on the next call. The Transit Point's policy still runs on a
+discovery read, such as an agent card read, where the key is absent. To refuse a managed agent
+the trust registry no longer recognises and still serve discovery reads, allow a request whose
+results are absent and otherwise require that every result is `ok`:
 
 ```rego
 package surface.policy
 
 default allow := false
+
+allow if not input.trust_check_results.managed_agent
 
 allow if {
     count(input.trust_check_results.managed_agent) > 0
@@ -493,14 +499,20 @@ allow if {
 deny_reason := "Calling agent is not recognised" if not allow
 ```
 
+The first rule allows every call while the Transit Point has no managed-agent elements, so pair
+this policy with them.
+
 A Transit Point's own policy that denies answers `403` with the `detail` "Request blocked by
 surface policy", followed by `: <deny_reason>` when the policy sets one, so the managed agent
-learns why it was refused.
+learns why it was refused. That reason reaches the caller: never build it from `input`.
 
 A Transit Point with its own `trust_recorder` writes its managed agent's records in the
-background on every request, without waiting, so the agent is recognised once those records
-exist, which may be after its first call; see
-[Transit Point Trust Recorder](SOURCE_AUTH.md#transit-point-trust-recorder).
+background on every request except a discovery read, without waiting, so the agent is
+recognised once those records exist, which may be after its first call. It writes before the
+Trust Check and policy, so a call policy refuses is recorded too, and a record the operator
+removes or makes inactive is written again by the next call through any Transit Point that
+records the same agent in that registry. To turn recognition off, remove that recorder entry
+as well. See [Transit Point Trust Recorder](SOURCE_AUTH.md#transit-point-trust-recorder).
 
 Managed-agent elements run on A2A, AP2, MCP and HTTP Transit Points, including `fabric://`
 ones, and not on discovery reads. Each query is a `trust_check` record with `leg`

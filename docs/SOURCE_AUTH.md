@@ -2098,8 +2098,11 @@ for the DID the Transit Point calls out under (its own managed identity, or the 
 injects), never waits for them and never refuses the request. Writes are idempotent. A request
 with no managed agent DID writes nothing. Because the request does not wait, the Transit
 Point's Trust Check can ask about the agent before its first records exist, so a policy that
-requires recognition can refuse the agent's first call. In the Surface Builder it is the Trust
-Recorder on the Managed Agent → Transit Point arrow.
+requires recognition can refuse the agent's first call. It writes before the Trust Check and
+policy, so a call policy refuses is recorded too, and a record the operator removes or makes
+inactive is written again by the next call through any Transit Point that records the same
+agent in that registry; to turn recognition off, remove that recorder entry as well. In the
+Surface Builder it is the Trust Recorder on the Managed Agent → Transit Point arrow.
 
 The outcome is stored as that DID's [recorder status](#recorder-status) on the surface, which
 the surface's recorder and other Transit Points' recorders writing for the same DID also

@@ -3849,7 +3849,8 @@ fn transit_point_agent_to_record(
 /// self recognition check. Unless the request is a discovery read, each
 /// element asks about the DID the managed agent calls out under. Results land at `input.trust_check_results.managed_agent`; the stage never
 /// denies. Without a trust registry listener manager every element fails with
-/// `TRUST_REGISTRY_UNREACHABLE`, so a policy that requires recognition refuses.
+/// `TRUST_REGISTRY_UNREACHABLE`, so a policy that requires recognition refuses;
+/// a request with no managed agent DID reports that instead.
 async fn step_managed_agent_trust_check(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
@@ -3867,6 +3868,17 @@ async fn step_managed_agent_trust_check(
             .virtual_channel
             .alias
             .clone();
+        let (code, detail) = if matches!(ctx.resolved_identity, ProtectedAgentIdentity::Anonymous) {
+            (
+                crate::trust_registry_verification::MANAGED_AGENT_IDENTITY_UNAVAILABLE,
+                "no managed agent identity was resolved for this request",
+            )
+        } else {
+            (
+                crate::trust_registry_verification::trust_check_executor::TRUST_REGISTRY_UNREACHABLE,
+                "no trust registry connection is available",
+            )
+        };
         let results = crate::trust_registry_verification::synthesize_unavailable(
             crate::observability::trust_check_audit::TrustCheckOrigin {
                 surface_id: &surface_id,
@@ -3874,8 +3886,8 @@ async fn step_managed_agent_trust_check(
             },
             crate::trust_registry_verification::TrustCheckLeg::ManagedAgent,
             &elements,
-            crate::trust_registry_verification::trust_check_executor::TRUST_REGISTRY_UNREACHABLE,
-            "no trust registry connection is available",
+            code,
+            detail,
         );
         store_managed_agent_results(ctx, results);
         return;
@@ -14558,6 +14570,22 @@ mod tests {
                 Some(crate::trust_registry_verification::trust_check_executor::TRUST_REGISTRY_UNREACHABLE.to_string())
             )],
             "without a connection the element fails, so a policy requiring it refuses"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_managed_agent_identity_is_reported_even_without_a_trust_registry_connection() {
+        let state = test_outbound_state();
+        let mut ctx = managed_agent_checked_call();
+        ctx.resolved_identity = ProtectedAgentIdentity::Anonymous;
+        step_managed_agent_trust_check(&state, &mut ctx).await;
+        assert_eq!(
+            managed_agent_results(&ctx),
+            [(
+                "self".to_string(),
+                false,
+                Some(crate::trust_registry_verification::MANAGED_AGENT_IDENTITY_UNAVAILABLE.to_string())
+            )]
         );
     }
 
