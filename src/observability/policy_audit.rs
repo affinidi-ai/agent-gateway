@@ -381,25 +381,45 @@ impl PolicyFlow {
 }
 
 /// Caller-identity fields lifted off an [`AuthenticatedIdentity`] for the
-/// audit event: `(auth_method, principal, did)`. `did` is populated only for
-/// `did_auth` (the credential *is* a DID); every other mode carries its
-/// derived DID via [`PolicyDecisionEvent::actor_did`].
-fn caller_fields(identity: &AuthenticatedIdentity) -> (&'static str, String, Option<String>) {
+/// structured log line: `(auth_method, principal)`.
+fn caller_fields(identity: &AuthenticatedIdentity) -> (&'static str, String) {
     match identity {
-        AuthenticatedIdentity::JwtBearer { subject, .. } => ("jwt_bearer", subject.clone(), None),
-        AuthenticatedIdentity::ApiKey { key_name, .. } => ("api_key", key_name.clone(), None),
-        AuthenticatedIdentity::DidAuth { did } => ("did_auth", did.clone(), Some(did.clone())),
-        AuthenticatedIdentity::Mtls { principal, .. } => ("mtls", principal.clone(), None),
+        AuthenticatedIdentity::JwtBearer { subject, .. } => ("jwt_bearer", subject.clone()),
+        AuthenticatedIdentity::ApiKey { key_name, .. } => ("api_key", key_name.clone()),
+        AuthenticatedIdentity::DidAuth { did } => ("did_auth", did.clone()),
+        AuthenticatedIdentity::Mtls { principal, .. } => ("mtls", principal.clone()),
     }
 }
 
-/// The caller a decision is attributed to in the VP Audit Log: the leg's own
-/// authenticated identity, else the caller context carried onto it.
-fn decision_caller(event: &PolicyDecisionEvent<'_>) -> Option<crate::delegation_vault::audit::AuditCallerContext> {
-    event
-        .identity
-        .map(crate::delegation_vault::audit::build_caller_context)
-        .or_else(|| event.caller.cloned())
+/// The caller an audit record of a request is attributed to: `caller` and
+/// `caller_did`, the same on every record that names one.
+#[derive(Debug, Clone, Default)]
+pub struct RecordedCaller {
+    pub caller: Option<crate::delegation_vault::audit::AuditCallerContext>,
+    pub caller_did: Option<String>,
+}
+
+/// The caller of a request leg: its own authenticated `identity`, else the
+/// caller context `carried` onto it. `caller_did` is the agent DID derived for
+/// the request (`actor_did`), else the DID a `did_auth` caller presented.
+pub fn recorded_caller(
+    identity: Option<&AuthenticatedIdentity>,
+    carried: Option<&crate::delegation_vault::audit::AuditCallerContext>,
+    actor_did: Option<&str>,
+) -> RecordedCaller {
+    let presented_did = match identity {
+        Some(AuthenticatedIdentity::DidAuth { did }) => Some(did.clone()),
+        _ => None,
+    };
+    RecordedCaller {
+        caller: identity
+            .map(crate::delegation_vault::audit::build_caller_context)
+            .or_else(|| carried.cloned()),
+        caller_did: actor_did
+            .map(str::to_string)
+            .or(presented_did)
+            .filter(|did| !did.is_empty()),
+    }
 }
 
 /// Why a policy could not reach a decision. The request is denied (fail
@@ -535,15 +555,14 @@ fn decision_policy_name(event: &PolicyDecisionEvent<'_>) -> String {
 }
 
 pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
-    let (auth_method, principal, did_from_identity) = match event.identity {
+    let (auth_method, principal) = match event.identity {
         Some(id) => caller_fields(id),
-        None => ("none", String::new(), None),
+        None => ("none", String::new()),
     };
-
-    let caller_did = event
-        .actor_did
-        .map(str::to_string)
-        .or(did_from_identity)
+    let recorded = recorded_caller(event.identity, event.caller, event.actor_did);
+    let caller_did = recorded
+        .caller_did
+        .clone()
         .unwrap_or_default();
 
     let allowed = event.allow && event.error.is_none();
@@ -665,11 +684,9 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
             event
                 .surface_name
                 .filter(|name| !name.is_empty()),
-            if caller_did.is_empty() {
-                None
-            } else {
-                Some(caller_did.as_str())
-            },
+            recorded
+                .caller_did
+                .as_deref(),
             if http_method.is_empty() {
                 None
             } else {
@@ -684,7 +701,7 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
             flow,
             event.policy_version,
             event.policy_content_hash,
-            decision_caller(&event),
+            recorded.caller,
             event.removed_tools,
         );
     }
@@ -936,31 +953,30 @@ mod tests {
             claims: serde_json::json!({}),
             verification: Default::default(),
         };
-        let (method, principal, did) = caller_fields(&jwt);
-        assert_eq!(method, "jwt_bearer");
-        assert_eq!(principal, "sub-123");
-        assert_eq!(did, None);
+        assert_eq!(caller_fields(&jwt), ("jwt_bearer", "sub-123".to_string()));
+        assert_eq!(recorded_caller(Some(&jwt), None, None).caller_did, None);
 
         let api = AuthenticatedIdentity::ApiKey {
             key_name: "key-a".to_string(),
             provider_agent_id: None,
         };
-        let (method, principal, did) = caller_fields(&api);
-        assert_eq!(method, "api_key");
-        assert_eq!(principal, "key-a");
-        assert_eq!(did, None);
+        assert_eq!(caller_fields(&api), ("api_key", "key-a".to_string()));
+        assert_eq!(recorded_caller(Some(&api), None, None).caller_did, None);
 
         let dida = AuthenticatedIdentity::DidAuth {
             did: "did:example:abc".to_string(),
         };
-        let (method, principal, did) = caller_fields(&dida);
-        assert_eq!(method, "did_auth");
-        assert_eq!(principal, "did:example:abc");
-        assert_eq!(did.as_deref(), Some("did:example:abc"));
+        assert_eq!(caller_fields(&dida), ("did_auth", "did:example:abc".to_string()));
+        assert_eq!(
+            recorded_caller(Some(&dida), None, None)
+                .caller_did
+                .as_deref(),
+            Some("did:example:abc")
+        );
     }
 
     #[test]
-    fn decision_caller_prefers_the_authenticated_identity_over_a_carried_caller() {
+    fn the_recorded_caller_prefers_the_authenticated_identity_over_a_carried_caller() {
         let identity = AuthenticatedIdentity::JwtBearer {
             strategy_id: None,
             principal_claim: "sub".to_string(),
@@ -987,24 +1003,94 @@ mod tests {
             peer_gateway: None,
         };
 
-        let authenticated = decision_caller(&PolicyDecisionEvent {
-            identity: Some(&identity),
-            caller: Some(&carried),
-            ..Default::default()
-        })
-        .unwrap();
+        let authenticated = recorded_caller(Some(&identity), Some(&carried), None)
+            .caller
+            .unwrap();
         assert_eq!(authenticated.auth_method, "jwt_bearer");
         assert_eq!(authenticated.email.as_deref(), Some("ada@example.com"));
 
-        let transit = decision_caller(&PolicyDecisionEvent {
-            caller: Some(&carried),
-            ..Default::default()
-        })
-        .unwrap();
+        let transit = recorded_caller(None, Some(&carried), None)
+            .caller
+            .unwrap();
         assert_eq!(transit.auth_method, "transit_token");
         assert_eq!(transit.email.as_deref(), Some("carried@example.com"));
 
-        assert!(decision_caller(&PolicyDecisionEvent::default()).is_none(), "no caller context, no principal");
+        let nobody = recorded_caller(None, None, None);
+        assert!(nobody.caller.is_none() && nobody.caller_did.is_none(), "no caller context, no principal");
+    }
+
+    /// The `caller` and `caller_did` a policy decision record carries for a
+    /// DID caller, for a JWT caller with a derived agent DID, and for a caller
+    /// carried onto the leg.
+    #[tokio::test]
+    async fn a_policy_decision_records_its_callers_context_and_did() {
+        let did_caller = AuthenticatedIdentity::DidAuth {
+            did: "did:web:caller.example".to_string(),
+        };
+        let jwt_caller = AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
+            principal_claim: "sub".to_string(),
+            subject: "user-123".to_string(),
+            claims: serde_json::json!({"sub": "user-123", "iss": "https://issuer.example", "email": "ada@example.com"}),
+            verification: Default::default(),
+        };
+        let carried = crate::delegation_vault::audit::AuditCallerContext {
+            principal: None,
+            auth_method: "transit_token".to_string(),
+            iss: None,
+            aud: None,
+            sub: Some("did:web:carried.example".to_string()),
+            token_id: None,
+            email: None,
+            name: None,
+            email_redacted: None,
+            name_redacted: None,
+            mtls_fingerprint: None,
+            mtls_subject_dn: None,
+            mtls_issuer_dn: None,
+            mtls_source: None,
+            user_identity_hash: None,
+            peer_gateway: None,
+        };
+        let ((), records) = crate::audit::producer::capture(async {
+            for (identity, caller, actor_did) in [
+                (Some(&did_caller), None, None),
+                (Some(&jwt_caller), None, Some("did:web:agent.example")),
+                (None, Some(&carried), None),
+            ] {
+                record_policy_decision(PolicyDecisionEvent {
+                    scope: PolicyScope::Surface,
+                    allow: true,
+                    identity,
+                    caller,
+                    actor_did,
+                    ..Default::default()
+                });
+            }
+        })
+        .await;
+
+        let recorded: Vec<serde_json::Value> = records
+            .iter()
+            .map(|record| {
+                let stored = serde_json::to_value(record).unwrap();
+                serde_json::json!({
+                    "caller": stored["caller"],
+                    "caller_did": stored["event"]["policy_decision"]["caller_did"],
+                })
+            })
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![
+                serde_json::json!({"caller": {"auth_method": "did_auth", "sub": "did:web:caller.example"},
+                    "caller_did": "did:web:caller.example"}),
+                serde_json::json!({"caller": {"auth_method": "jwt_bearer", "iss": "https://issuer.example",
+                    "sub": "user-123", "email": "ada@example.com"}, "caller_did": "did:web:agent.example"}),
+                serde_json::json!({"caller": {"auth_method": "transit_token", "sub": "did:web:carried.example"},
+                    "caller_did": null}),
+            ]
+        );
     }
 
     #[test]
