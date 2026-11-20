@@ -630,10 +630,13 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
     an HTTP token or is reserved (Host, Content-Length, Transfer-Encoding, Connection, Keep-Alive,
     Proxy-Connection, TE, Upgrade, Trailer, and the gateway's own transit, caller, identity, trace and
     MCP session headers: 23 names in all); a format without exactly one `{value}` or with CR, LF
-    or NUL; a provider method with no provider picked. Header names are compared as the gateway
+    or NUL; a provider method with no provider picked; on the Managed Agent, a secret method
+    with no secret picked, which would send no `target.auth` and so remove a stored credential
+    (the Transit Point secret picker has the same rule). Header names are compared as the gateway
     compares them, in any letter case and with `_` read as `-` (`sameHeaderName`), so
     `X_Transit_Token` is reserved too. In the Managed Agent's full-screen editor the header,
-    format and provider messages show next to their inputs, each in a `role="alert"` region and
+    format, provider and secret (`managed-agent-target-auth-secret-error`) messages show next to
+    their inputs, each in a `role="alert"` region and
     tied to its input with `aria-invalid` and `aria-describedby`; the Managed Agent and Transit
     Point panels show every message in a notice (`*-target-auth-errors`), and the Transit
     Point's header inputs point at that notice the same way. Rules that need the whole surface
@@ -1746,7 +1749,8 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   value field is `secret-value-input`.
 - Deleting a secret from the Secrets page asks the gateway first. A 409 with `references` (a
   surface, credential provider, A2A proxy or STS client that uses the secret) opens
-  `ConfirmDeleteSecretModal` (`confirm-delete-secret-modal`): it names each reference by kind and
+  `ConfirmDeleteSecretModal` (`confirm-delete-secret-modal`), built on the shared
+  `components/shared/WarningDialog.tsx`: it names each reference by kind and
   name (`ReferenceList`), adds "and N more you cannot view" for `hidden_references`, and offers
   Cancel (focused first, sends nothing) and **Delete secret anyway** (`confirm-delete-secret-confirm`, repeats
   the delete with `?force=true`). While the forced delete runs both buttons stay focusable with
@@ -1835,7 +1839,8 @@ Two pages use it:
 
 Use the popover to confirm one action on the button that triggers it. Use
 `components/shared/WarningDialog.tsx`, a centred modal, when the confirmation needs more room or
-blocks a flow, as API key delete and revoke and the Authority-in-use dialog do.
+blocks a flow, as API key delete and revoke, the secret delete confirmation
+(`ConfirmDeleteSecretModal`) and the Authority-in-use dialog do.
 
 ## Authority delete
 

@@ -287,7 +287,7 @@ stored provider without a Callback URL shows the gateway's own one), and target
 authentication on a Managed Agent or Transit
 Point can take its credential from a credential provider, with optional scopes. The Surface
 Builder shows header name and format problems next to the fields, which block Save in a stored
-setting too, shows a
+setting too, blocks Save while a Managed Agent's secret method has no secret picked, shows a
 Target that is not https and a leg that authenticates no caller as advisories that allow Save
 (the gateway refuses them only when `target_https` or `target_source_auth` is `enforce`), advises
 on a passthrough fallback, keeps a stored `target_auth` it did not edit, and keeps Target

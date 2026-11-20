@@ -182,9 +182,14 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
             <select
               className="form-control dropdown-styling"
               id="target-auth-secret"
+              data-testid="managed-agent-target-auth-secret"
               value={config.target_auth_secret_id || ''}
               onChange={e => updateField('target_auth_secret_id', e.target.value)}
               disabled={loadingSecrets}
+              aria-invalid={errors.target_auth_secret_id ? true : undefined}
+              aria-describedby={
+                errors.target_auth_secret_id ? 'target-auth-secret-error' : undefined
+              }
             >
               <option value="">
                 {loadingSecrets ? '-- Loading secrets... --' : '-- Select a secret --'}
@@ -195,6 +200,17 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
                 </option>
               ))}
             </select>
+            <div role="alert">
+              {errors.target_auth_secret_id && (
+                <div
+                  className="text-danger small mt-1"
+                  id="target-auth-secret-error"
+                  data-testid="managed-agent-target-auth-secret-error"
+                >
+                  {errors.target_auth_secret_id}
+                </div>
+              )}
+            </div>
             <small className="form-text text-muted">
               Select a secret containing the credentials for the target endpoint
             </small>

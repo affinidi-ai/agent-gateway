@@ -139,6 +139,34 @@ describe('Managed Agent Target authentication validation', () => {
     ).toEqual({});
   });
 
+  it('blocks a static secret method without a secret, and passes its twin', () => {
+    const secret = maConfig({ target_auth_secret_id: '' });
+    expect(managedAgentTargetAuthProblems(secret).errors).toEqual({
+      target_auth_secret_id: 'Pick the secret whose value authenticates this Managed Agent',
+    });
+    expect(registry.getValidationErrors('target', secret)).toEqual([
+      {
+        field: 'target_auth_secret_id',
+        message: 'Pick the secret whose value authenticates this Managed Agent',
+      },
+    ]);
+    expect(
+      managedAgentTargetAuthProblems({ ...secret, target_auth_secret_id: 's' }).errors
+    ).toEqual({});
+  });
+
+  it('drops spaces and tabs typed around a static secret header name and format', () => {
+    const typed = maConfig({
+      target_auth_header_name: ' X-Api-Key\t',
+      target_auth_header_format: '\t{value} ',
+    });
+    expect(managedAgentTargetAuthProblems(typed).errors).toEqual({});
+    expect(targetAuthHeader(managedAgentTargetAuth(typed))).toEqual({
+      headerName: 'X-Api-Key',
+      headerFormat: '{value}',
+    });
+  });
+
   it('does not block Save through the element validation for a Target that is not https, and blocks a reserved header', () => {
     expect(registry.getValidationErrors('target', maConfig({ endpoint: 'http://a.test' }))).toEqual(
       []
@@ -433,6 +461,7 @@ describe('a stored Target authentication method the editor cannot show', () => {
     expect(roundTrip(surface).target.auth).toEqual(unknownMethodAuth);
     const config = registry.nodesFromPayload(surface).find(n => n.type === 'target')?.config;
     expect(managedAgentTargetAuthProblems(config).notes).toEqual([UNKNOWN_METHOD_NOTE]);
+    expect(managedAgentTargetAuthProblems(config).errors).toEqual({});
   });
 
   it('is replaced once the operator chooses a secret, and removed when turned off', () => {

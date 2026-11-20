@@ -137,6 +137,26 @@ describe('Managed Agent Target authentication editor', () => {
     expect(screen.getByTestId('provider-select')).toHaveAttribute('data-error-id', '');
   });
 
+  it('ties the missing secret message to the secret select and announces it', () => {
+    renderPanel({ ...base, target_auth_source: 'secret', target_auth_secret_id: '' });
+    const message = screen.getByTestId('managed-agent-target-auth-secret-error');
+    expect(message).toHaveTextContent('Pick the secret');
+    expect(
+      screen.getAllByRole('alert').some(region => within(region).queryByText(/Pick the secret/))
+    ).toBe(true);
+    const select = screen.getByTestId('managed-agent-target-auth-secret');
+    expect(select).toHaveAttribute('aria-invalid', 'true');
+    expect(select).toHaveAttribute('aria-describedby', message.id);
+  });
+
+  it('ties no message to the secret select once a secret is picked', () => {
+    renderPanel({ ...base, target_auth_source: 'secret', target_auth_secret_id: 's' });
+    expect(screen.queryByTestId('managed-agent-target-auth-secret-error')).not.toBeInTheDocument();
+    const select = screen.getByTestId('managed-agent-target-auth-secret');
+    expect(select).not.toHaveAttribute('aria-invalid');
+    expect(select).not.toHaveAttribute('aria-describedby');
+  });
+
   it('advises when the Access Point checks no caller, and not when it does', () => {
     const config = { ...base, target_auth_source: 'secret', target_auth_secret_id: 's' };
     mockSurfaceMeta.mockReturnValue({ accessPointChecksCallers: false });

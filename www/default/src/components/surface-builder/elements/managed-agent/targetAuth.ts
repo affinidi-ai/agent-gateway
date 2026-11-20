@@ -11,6 +11,7 @@ import {
   noTargetAuthProblems,
   parseScopes,
   providerTargetAuthToApi,
+  trimSpaces,
 } from '../_shared/providerTargetAuth';
 
 /** The Managed Agent's Target authentication form, as its node config holds it. */
@@ -74,10 +75,10 @@ function editedTargetAuth(c: ManagedAgentTargetAuthForm): Record<string, unknown
       static_secret: {
         secret_id: c.target_auth_secret_id,
         header_name:
-          text(c.target_auth_header_name) ||
+          trimSpaces(text(c.target_auth_header_name)) ||
           blankHeaderValue(storedMethod?.header_name, 'Authorization'),
         header_format:
-          text(c.target_auth_header_format) ||
+          trimSpaces(text(c.target_auth_header_format)) ||
           blankHeaderValue(storedMethod?.header_format, '{value}'),
       },
     },
@@ -113,7 +114,8 @@ export interface ManagedAgentSurroundings {
 }
 
 /**
- * What is wrong with the Managed Agent's Target authentication. A header name or format
+ * What is wrong with the Managed Agent's Target authentication. A method with no secret or
+ * provider picked blocks the save, since it would send no `target.auth`. A header name or format
  * problem blocks the save, in a stored setting too: the gateway refuses it on every save. A
  * Target that is not https, or an Access Point that checks no caller, is an advisory: the
  * gateway refuses it only while `target_https` or `target_source_auth` is `enforce`.
@@ -133,7 +135,14 @@ export function managedAgentTargetAuthProblems(
     };
   }
   const auth = managedAgentTargetAuth(c);
-  if (!auth) return noTargetAuthProblems();
+  if (!auth) {
+    return {
+      ...noTargetAuthProblems(),
+      errors: {
+        target_auth_secret_id: 'Pick the secret whose value authenticates this Managed Agent',
+      },
+    };
+  }
   const result = classifyTargetAuthProblems(auth, text(c.endpoint), 'managed-agent', {
     headerName: 'target_auth_header_name',
     headerFormat: 'target_auth_header_format',

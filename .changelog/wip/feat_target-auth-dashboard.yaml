@@ -22,7 +22,10 @@ changes:
         The Surface Builder applies the gateway's Target authentication rules while editing and
         shows each problem next to its field. A header name, header format or header clash
         problem blocks Save, in a stored setting the operator did not edit and in a variant
-        that is not on screen too, since the gateway refuses it on every save. A stored name or
+        that is not on screen too, since the gateway refuses it on every save. A Managed Agent
+        whose secret method has no secret picked blocks Save as well, since saving it would
+        remove the stored credential. Spaces and tabs typed around a header name or format are
+        dropped in every editor. A stored name or
         format that ends in a line break, or is blank, is reported as well, not trimmed away or
         replaced with a default, and the Managed Agent editor shows the format field whenever
         the format has a problem. The toast of a
@@ -40,7 +43,8 @@ changes:
       description: >-
         When the gateway refuses a secret delete because a surface, credential provider, A2A
         proxy or STS client uses it, the dashboard names them, says how many more the user
-        cannot view, and offers Delete secret anyway. Refused deletes and retypes show the
+        cannot view, and offers Delete secret anyway in the same warning dialog an API key
+        delete uses. Refused deletes and retypes show the
         server message and the references inline instead of an alert or toast.
     - timestamp: '2026-11-02T12:28:32Z'
       title: Show Target credential failures in the Audit Log

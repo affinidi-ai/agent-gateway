@@ -395,6 +395,27 @@ test.describe('Managed Agent Target authentication: credential provider', () => 
         expect(saved).toHaveLength(0);
     });
 
+    test('a secret method without a secret blocks Save, and saves once one is picked', async ({page}) => {
+        const saved: Request[] = [];
+        await mockSurface(page, surfaceFixture(), saved);
+        await page.route('**/api/v1/secrets/', route =>
+            route.fulfill({json: [{id: 'secret-1', name: 'Agent key', secret_id: 'agent-key', secret_type: 'api_key'}]}),
+        );
+        await openTargetAuth(page);
+
+        const select = page.getByTestId('managed-agent-target-auth-secret');
+        await expect(select).toHaveAttribute('aria-describedby', 'target-auth-secret-error');
+        await expect(page.getByTestId('managed-agent-target-auth-secret-error')).toBeVisible();
+        await saveButton(page).click();
+        await expectSaveBlocked(page, 'Pick the secret whose value authenticates this Managed Agent');
+        expect(saved).toHaveLength(0);
+
+        await select.selectOption('agent-key');
+        await expect(page.getByTestId('managed-agent-target-auth-secret-error')).toHaveCount(0);
+        await saveButton(page).click();
+        await expect.poll(() => saved.length).toBe(1);
+    });
+
     test('a header name that is not an HTTP token is refused, and a token passes', async ({page}) => {
         const saved: Request[] = [];
         await mockSurface(page, surfaceFixture(), saved);

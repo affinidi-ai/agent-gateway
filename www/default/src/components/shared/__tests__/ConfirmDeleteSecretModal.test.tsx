@@ -1,5 +1,5 @@
 import React from 'react';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import ConfirmDeleteSecretModal from '../ConfirmDeleteSecretModal';
 
@@ -41,8 +41,23 @@ describe('ConfirmDeleteSecretModal', () => {
     expect(onCancel).toHaveBeenCalledTimes(1);
   });
 
+  it('is the shared warning dialog, with focus on Cancel and a close button that cancels', () => {
+    const { onCancel } = renderModal(false);
+    const dialog = screen.getByTestId('confirm-delete-secret-modal');
+    expect(dialog).toHaveAttribute('role', 'dialog');
+    expect(dialog).toHaveAttribute('aria-modal', 'true');
+    expect(dialog).toHaveAttribute('aria-labelledby', 'confirm-delete-secret-modal-title');
+    expect(
+      within(dialog).getByRole('heading', { name: 'Delete secret "partner-key"?' })
+    ).toBeInTheDocument();
+    expect(screen.getByTestId('confirm-delete-secret-cancel')).toHaveFocus();
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps its buttons focusable and ignores clicks while the delete runs', () => {
     const { onCancel, onConfirm } = renderModal(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
     const confirm = screen.getByTestId('confirm-delete-secret-confirm');
     const cancel = screen.getByTestId('confirm-delete-secret-cancel');
     expect(confirm).toHaveAttribute('aria-disabled', 'true');

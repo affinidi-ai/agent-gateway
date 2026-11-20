@@ -504,6 +504,16 @@ const SecretsPage: React.FC = () => {
               )}
             </div>
           </div>
+
+          {pendingForce && (
+            <ConfirmDeleteSecretModal
+              secretName={pendingForce.secret.name}
+              conflict={pendingForce.conflict}
+              busy={forcing}
+              onCancel={() => setPendingForce(null)}
+              onConfirm={confirmForcedDelete}
+            />
+          )}
         </Tab>
 
         <Tab
@@ -732,16 +742,6 @@ const SecretsPage: React.FC = () => {
                 </div>
               </div>
             </div>
-          )}
-
-          {pendingForce && (
-            <ConfirmDeleteSecretModal
-              secretName={pendingForce.secret.name}
-              conflict={pendingForce.conflict}
-              busy={forcing}
-              onCancel={() => setPendingForce(null)}
-              onConfirm={confirmForcedDelete}
-            />
           )}
 
           {/* Secret Display Modal */}
