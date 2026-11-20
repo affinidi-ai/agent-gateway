@@ -2039,6 +2039,12 @@ pub struct TransitPoint {
     /// ignores it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trust_check_migrated: bool,
+
+    /// Refuses a request through this Transit Point unless every trust
+    /// registry the surface's Trust Recorder records the owned agent in still
+    /// recognises the managed agent sending it. Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub self_recognition_check: bool,
 }
 
 impl TransitPoint {
@@ -6940,6 +6946,7 @@ mod tests {
                         delegated_credentials_for_fabric_callers: false,
                         trust_check_list: Vec::new(),
                         trust_check_migrated: false,
+                        self_recognition_check: false,
                     },
                     TransitPoint {
                         id: uuid::Uuid::new_v4().to_string(),
@@ -6973,6 +6980,7 @@ mod tests {
                         delegated_credentials_for_fabric_callers: false,
                         trust_check_list: Vec::new(),
                         trust_check_migrated: false,
+                        self_recognition_check: false,
                     },
                 ],
                 outbound_listen_address: None,

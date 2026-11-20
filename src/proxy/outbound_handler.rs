@@ -181,6 +181,13 @@ pub(crate) enum OutboundPipelineError {
     #[error("Caller credential missing or invalid")]
     TransitCallerUnauthenticated { mcp_request_id: Option<serde_json::Value> },
 
+    /// The Transit Point's self recognition check found the managed agent
+    /// calling out not recognised, or could not get an answer. Why is logged,
+    /// never shown to the caller. `mcp_request_id` is set, to the id the
+    /// JSON-RPC error answers, when the Transit Point speaks MCP.
+    #[error("Calling agent is not recognised")]
+    ManagedAgentNotRecognized { mcp_request_id: Option<serde_json::Value> },
+
     #[error("Credential delegation consent required")]
     ConsentRequired(String),
 
@@ -324,7 +331,7 @@ impl OutboundPipelineError {
             Self::TransitPointUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::TargetAuthFailed { failure, .. } => failure.status(),
             Self::FabricChainTooLong { .. } => StatusCode::LOOP_DETECTED,
-            Self::TransitVariantPolicyChanged { .. } => StatusCode::FORBIDDEN,
+            Self::TransitVariantPolicyChanged { .. } | Self::ManagedAgentNotRecognized { .. } => StatusCode::FORBIDDEN,
             Self::DelegationRefused { refusal, .. } => refusal.status_code(),
             Self::GrantRefused { refusal, .. } => refusal.status(),
             Self::McpResourceAuthorization { error, .. } => error.status_code(),
@@ -441,7 +448,9 @@ impl IntoResponse for OutboundPipelineError {
                 }
             };
         }
-        if let Self::TransitCallerUnauthenticated { mcp_request_id: Some(id) } = &self {
+        if let Self::TransitCallerUnauthenticated { mcp_request_id: Some(id) }
+        | Self::ManagedAgentNotRecognized { mcp_request_id: Some(id) } = &self
+        {
             return crate::mcp::request_validation::McpRequestValidationError {
                 status: self.status_code(),
                 id: Some(id.clone()),
@@ -1161,6 +1170,8 @@ async fn outbound_proxy_handler_in_request_scope(
 
     // [4] Agent Identity Resolution (extract + validate + issue_or_get_credential)
     step_resolve_agent_identity(&state, &mut ctx).await?;
+
+    step_self_recognition_check(&state, &mut ctx).await?;
 
     // [5] Trusted Identity Injection (VP credential into outbound body)
     step_inject_trusted_identity(&state, &mut ctx).await?;
@@ -3788,6 +3799,105 @@ async fn step_trust_check(
         ctx.trust_check_results = Some(results);
     }
     Ok(())
+}
+
+/// [4b] Self recognition check. On a Transit Point that sets
+/// `self_recognition_check`, records the managed agent calling out through it
+/// in the Trust Recorder's registries unless its stored outcome there is
+/// `recorded`, then refuses the request unless each of those registries still
+/// recognises it as an owned agent. Runs before anything reaches the
+/// destination, skips discovery reads, and is never part of policy input.
+async fn step_self_recognition_check(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+) -> Result<(), OutboundPipelineError> {
+    if !ctx
+        .virtual_channel
+        .self_recognition_check
+        || is_transit_discovery_read(ctx)
+    {
+        return Ok(());
+    }
+    let Some(manager) = state
+        .trust_registry_listener_manager
+        .clone()
+    else {
+        return Err(refuse_unrecognized_agent(ctx, "no trust registry connection is available"));
+    };
+    if let ProtectedAgentIdentity::Managed { did, .. } = &ctx.resolved_identity {
+        let (surface, did) = (ctx.surface.clone(), did.clone());
+        crate::trust_registry_verification::record_before_self_recognition_check(&surface, &did, manager.clone()).await;
+    }
+    check_self_recognition(ctx, &crate::trust_registry_verification::TrqpListenerClient::new(manager)).await
+}
+
+/// Asks, through `client`, each registry the Trust Recorder records the owned
+/// agent in whether it still recognises the managed agent of `ctx`, and refuses
+/// the request unless every one does.
+async fn check_self_recognition<
+    C: crate::trust_registry_verification::trust_check_executor::TrqpClient + Sync + ?Sized,
+>(
+    ctx: &mut OutboundPipelineContext,
+    client: &C,
+) -> Result<(), OutboundPipelineError> {
+    let ProtectedAgentIdentity::Managed { did, .. } = &ctx.resolved_identity else {
+        return Err(refuse_unrecognized_agent(ctx, "no managed agent identity was resolved"));
+    };
+    let did = did.clone();
+    let surface = ctx.surface.clone();
+    let transit_point = ctx
+        .virtual_channel
+        .alias
+        .clone();
+    let checks = crate::trust_registry_verification::self_recognition_checks(&surface, &did).await;
+    if checks.is_empty() {
+        return Err(refuse_unrecognized_agent(ctx, "the Trust Recorder records the owned agent in no trust registry"));
+    }
+    let origin = crate::observability::trust_check_audit::TrustCheckOrigin {
+        surface_id: &surface.surface_id,
+        transit_point: Some(&transit_point),
+    };
+    let results = crate::trust_registry_verification::run_managed_agent_check(origin, &checks, client).await;
+    match results
+        .iter()
+        .find(|result| !result.ok)
+    {
+        Some(failed) => Err(refuse_unrecognized_agent(
+            ctx,
+            failed
+                .error
+                .as_ref()
+                .map_or(crate::trust_registry_verification::trust_check_executor::NOT_RECOGNIZED, |error| {
+                    error.code.as_str()
+                }),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Logs why, records a `request_rejected` at the `admission` stage, and
+/// returns the refusal of a request whose managed agent is not recognised.
+fn refuse_unrecognized_agent(
+    ctx: &OutboundPipelineContext,
+    reason: &str,
+) -> OutboundPipelineError {
+    warn!(
+        request_id = %ctx.request_id,
+        transit_point = %ctx.virtual_channel.alias,
+        reason = reason,
+        "Self recognition check refused the managed agent calling out"
+    );
+    let mcp_request_id = mcp_refusal_id(ctx);
+    crate::audit::request_events::request_rejected(
+        &transit_audit_facts(ctx),
+        crate::audit::request_events::RejectionStage::Admission,
+        crate::audit::request_events::RejectionReason::AgentNotRecognized,
+        StatusCode::FORBIDDEN.as_u16(),
+        mcp_request_id
+            .as_ref()
+            .map(|_| -32001),
+    );
+    OutboundPipelineError::ManagedAgentNotRecognized { mcp_request_id }
 }
 
 /// The protected agent's DID for outbound policy-audit attribution, or `None`
@@ -14122,6 +14232,276 @@ mod tests {
             matches!(err, OutboundPipelineError::IdentityInjectionFailed(_)),
             "expected IdentityInjectionFailed, got: {err:?}"
         );
+    }
+
+    /// A TRQP client whose listed trust registries recognise every agent and
+    /// whose others answer `recognized: false`.
+    struct RecognisedIn(&'static [&'static str]);
+
+    #[async_trait::async_trait]
+    impl crate::trust_registry_verification::trust_check_executor::TrqpClient for RecognisedIn {
+        async fn query(
+            &self,
+            registry_id: &str,
+            _query_type: crate::trust_registry_verification::trust_check_element::TrqpQueryType,
+            _params: &crate::trust_registry_verification::trust_check_element::TrqpQueryParams,
+        ) -> Result<
+            crate::trust_registry_verification::trust_check_executor::TrqpOutcome,
+            crate::trust_registry_verification::trust_check_executor::TrqpClientError,
+        > {
+            use crate::trust_registry_verification::trust_check_executor::TrqpOutcome;
+            Ok(if self.0.contains(&registry_id) {
+                TrqpOutcome::Allowed
+            } else {
+                TrqpOutcome::Denied {
+                    detail: "Registry answered `recognized: false`".to_string(),
+                }
+            })
+        }
+    }
+
+    struct UnreachableRegistries;
+
+    #[async_trait::async_trait]
+    impl crate::trust_registry_verification::trust_check_executor::TrqpClient for UnreachableRegistries {
+        async fn query(
+            &self,
+            _registry_id: &str,
+            _query_type: crate::trust_registry_verification::trust_check_element::TrqpQueryType,
+            _params: &crate::trust_registry_verification::trust_check_element::TrqpQueryParams,
+        ) -> Result<
+            crate::trust_registry_verification::trust_check_executor::TrqpOutcome,
+            crate::trust_registry_verification::trust_check_executor::TrqpClientError,
+        > {
+            Err(crate::trust_registry_verification::trust_check_executor::TrqpClientError::Unreachable(
+                "down".to_string(),
+            ))
+        }
+    }
+
+    /// A call through a Transit Point with the self recognition check on, from
+    /// managed agent `did:web:agent.example`, on a surface whose Trust Recorder
+    /// has one entry per `(trust registry, records the owned agent)`.
+    fn self_checked_call(entries: &[(&str, bool)]) -> OutboundPipelineContext {
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel
+            .self_recognition_check = true;
+        ctx.resolved_identity = ProtectedAgentIdentity::Managed {
+            did: "did:web:agent.example".to_string(),
+            identity_fields: std::collections::HashMap::new(),
+        };
+        Arc::make_mut(&mut ctx.surface)
+            .access_point
+            .trust_recorder = Some(crate::config::types::TrustRecorderConfig {
+            entries: entries
+                .iter()
+                .map(|(registry, owned_agent)| crate::config::types::TrustRecorderEntry {
+                    trust_registry_id: registry.to_string(),
+                    issuer_did: "did:web:issuer.example".to_string(),
+                    authority_did: "did:web:authority.example".to_string(),
+                    authority_source: None,
+                    include_owned_agent: *owned_agent,
+                    custom_resources: Vec::new(),
+                })
+                .collect(),
+        });
+        ctx
+    }
+
+    type Rejection = (
+        crate::audit::request_events::RejectionStage,
+        crate::audit::request_events::RejectionReason,
+        Option<u16>,
+        Option<i64>,
+    );
+
+    /// A `trust_check` record's leg, Transit Point and outcome.
+    type CheckRecord = (String, Option<String>, bool);
+
+    /// The `request_rejected` records and the leg of each `trust_check` record.
+    fn self_check_records(
+        events: &[crate::delegation_vault::audit::DelegationAuditEvent]
+    ) -> (Vec<Rejection>, Vec<CheckRecord>) {
+        use crate::delegation_vault::audit::DelegationAuditAction;
+        let rejections = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                DelegationAuditAction::RequestRejected {
+                    stage,
+                    reason,
+                    http_status,
+                    rpc_error_code,
+                    ..
+                } => Some((*stage, *reason, *http_status, *rpc_error_code)),
+                _ => None,
+            })
+            .collect();
+        let checks = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                DelegationAuditAction::TrustCheck { leg, transit_point, ok, .. } => {
+                    Some((leg.clone(), transit_point.clone(), *ok))
+                }
+                _ => None,
+            })
+            .collect();
+        (rejections, checks)
+    }
+
+    #[tokio::test]
+    async fn a_managed_agent_every_registry_recognises_calls_out() {
+        let mut ctx = self_checked_call(&[("alpha", true), ("beta", true)]);
+        let (result, events) =
+            crate::audit::producer::capture(check_self_recognition(&mut ctx, &RecognisedIn(&["alpha", "beta"]))).await;
+        assert!(result.is_ok(), "{result:?}");
+        let (rejections, checks) = self_check_records(&events);
+        assert!(rejections.is_empty(), "{rejections:?}");
+        assert_eq!(
+            checks,
+            [
+                (
+                    "managed_agent".to_string(),
+                    Some(
+                        ctx.virtual_channel
+                            .alias
+                            .clone()
+                    ),
+                    true
+                ),
+                (
+                    "managed_agent".to_string(),
+                    Some(
+                        ctx.virtual_channel
+                            .alias
+                            .clone()
+                    ),
+                    true
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_managed_agent_no_longer_recognised_is_refused_and_recorded() {
+        let mut ctx = self_checked_call(&[("alpha", true)]);
+        let (result, events) =
+            crate::audit::producer::capture(check_self_recognition(&mut ctx, &RecognisedIn(&[]))).await;
+        assert!(
+            matches!(result, Err(OutboundPipelineError::ManagedAgentNotRecognized { mcp_request_id: None })),
+            "{result:?}"
+        );
+        let (rejections, checks) = self_check_records(&events);
+        assert_eq!(
+            rejections,
+            [(
+                crate::audit::request_events::RejectionStage::Admission,
+                crate::audit::request_events::RejectionReason::AgentNotRecognized,
+                Some(403),
+                None
+            )]
+        );
+        assert_eq!(
+            checks,
+            [(
+                "managed_agent".to_string(),
+                Some(
+                    ctx.virtual_channel
+                        .alias
+                        .clone()
+                ),
+                false
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn every_registry_the_recorder_records_the_owned_agent_in_must_recognise_it() {
+        let mut ctx = self_checked_call(&[("alpha", true), ("beta", true)]);
+        let result = check_self_recognition(&mut ctx, &RecognisedIn(&["alpha"])).await;
+        assert!(matches!(result, Err(OutboundPipelineError::ManagedAgentNotRecognized { .. })), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn an_entry_that_does_not_record_the_owned_agent_is_not_asked() {
+        let mut ctx = self_checked_call(&[("alpha", true), ("beta", false)]);
+        let (result, events) =
+            crate::audit::producer::capture(check_self_recognition(&mut ctx, &RecognisedIn(&["alpha"]))).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            self_check_records(&events)
+                .1
+                .len(),
+            1,
+            "only the owned-agent entry is asked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_registry_that_cannot_answer_refuses_the_call() {
+        let mut ctx = self_checked_call(&[("alpha", true)]);
+        let result = check_self_recognition(&mut ctx, &UnreachableRegistries).await;
+        assert!(matches!(result, Err(OutboundPipelineError::ManagedAgentNotRecognized { .. })), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn the_self_recognition_check_refuses_what_it_cannot_ask_about() {
+        let mut anonymous = self_checked_call(&[("alpha", true)]);
+        anonymous.resolved_identity = ProtectedAgentIdentity::Anonymous;
+        let mut no_owned_agent = self_checked_call(&[("alpha", false)]);
+        let mut no_recorder = self_checked_call(&[]);
+        Arc::make_mut(&mut no_recorder.surface)
+            .access_point
+            .trust_recorder = None;
+        for (case, ctx) in [
+            ("no managed agent", &mut anonymous),
+            ("no owned agent record", &mut no_owned_agent),
+            ("no recorder", &mut no_recorder),
+        ] {
+            let result = check_self_recognition(ctx, &RecognisedIn(&["alpha"])).await;
+            assert!(
+                matches!(result, Err(OutboundPipelineError::ManagedAgentNotRecognized { .. })),
+                "{case}: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_self_recognition_check_is_not_asked_when_off_or_for_a_discovery_read() {
+        let state = test_outbound_state();
+        let mut off = self_checked_call(&[("alpha", true)]);
+        off.virtual_channel
+            .self_recognition_check = false;
+        let mut discovery = self_checked_call(&[("alpha", true)]);
+        discovery.original_method = Method::GET;
+        discovery.request_path = "/outbound/surfaces/order/partner-a/.well-known/agent-card.json".to_string();
+        for (case, ctx) in [("off", &mut off), ("discovery read", &mut discovery)] {
+            let result = step_self_recognition_check(&state, ctx).await;
+            assert!(result.is_ok(), "{case}: {result:?}");
+        }
+
+        let mut on = self_checked_call(&[("alpha", true)]);
+        let result = step_self_recognition_check(&state, &mut on).await;
+        assert!(
+            matches!(result, Err(OutboundPipelineError::ManagedAgentNotRecognized { .. })),
+            "with no trust registry connection it refuses: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_mcp_transit_point_answers_the_refusal_as_a_json_rpc_error() {
+        let response =
+            OutboundPipelineError::ManagedAgentNotRecognized { mcp_request_id: Some(json!(7)) }.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["id"], 7);
+        assert_eq!(body["error"]["code"], -32001);
+        assert_eq!(body["error"]["message"], "Calling agent is not recognised");
+
+        let plain = OutboundPipelineError::ManagedAgentNotRecognized { mcp_request_id: None }.into_response();
+        assert_eq!(plain.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

@@ -1029,6 +1029,7 @@ fn validate_transit_points(
     }
     refuse_reference_transit_tokens(surface)?;
     validate_transit_point_caller_authentication(surface, stored)?;
+    refuse_unusable_self_recognition_checks(surface)?;
     refuse_duplicate_transit_point_ids(surface)?;
     for variant in &mut surface.variants {
         if let Some(points) = variant
@@ -1129,6 +1130,47 @@ fn refuse_reference_transit_tokens(surface: &AgentSurface) -> Result<(), Surface
             return Err(SurfaceApiError::BadRequest(format!(
                 "variant '{}' {}",
                 variant.alias, TRANSIT_TOKEN_REFERENCE_REFUSED
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a Transit Point, on the surface or in an enabled variant, that sets
+/// `self_recognition_check` where the check cannot run: the surface has no
+/// Trust Recorder entry that records the owned agent, the Transit Point calls
+/// out under its own managed identity, or it resolves no managed agent
+/// identity.
+fn refuse_unusable_self_recognition_checks(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
+    for (variant, view) in surface_views(surface) {
+        let records_owned_agent = view
+            .trust_recorder()
+            .is_some_and(|recorder| {
+                recorder
+                    .entries
+                    .iter()
+                    .any(|entry| entry.include_owned_agent)
+            });
+        for point in view
+            .transit_points()
+            .iter()
+            .filter(|point| point.self_recognition_check)
+        {
+            let reason = if !records_owned_agent {
+                "the surface has no Trust Recorder entry that records the owned agent"
+            } else if point
+                .managed_identity
+                .is_some()
+            {
+                "it calls out under its own managed identity, which the Trust Recorder does not record"
+            } else if !view.transit_point_has_managed_identity(point) {
+                "it resolves no managed agent identity; inject a VP with the surface's"
+            } else {
+                continue;
+            };
+            return Err(SurfaceApiError::BadRequest(format!(
+                "Transit Point {} sets self_recognition_check, but {reason}",
+                transit_point_name(surface, variant.as_deref(), &point.alias)
             )));
         }
     }
@@ -3798,7 +3840,8 @@ fn retain_mcp_settings(
 /// `allow_unauthenticated_callers` is kept while the Transit Point still
 /// authenticates no caller, and dropped once it does. An omitted
 /// `delegated_credentials_for_fabric_callers` is kept while the Transit Point
-/// still requires the transit token, and dropped once it does not.
+/// still requires the transit token, and dropped once it does not. An omitted
+/// `self_recognition_check` is kept; removal is an explicit `false`.
 fn retain_transit_caller_authentication(
     surface: &mut AgentSurface,
     existing: &AgentSurface,
@@ -3981,9 +4024,9 @@ fn carry_point_ids(
 }
 
 /// Keeps each Transit Point's stored `source_auth`,
-/// `allow_unauthenticated_callers` and
-/// `delegated_credentials_for_fabric_callers` that `sent_points`, the JSON the
-/// request sent for `points`, leaves out; see
+/// `allow_unauthenticated_callers`,
+/// `delegated_credentials_for_fabric_callers` and `self_recognition_check`
+/// that `sent_points`, the JSON the request sent for `points`, leaves out; see
 /// `retain_transit_caller_authentication`.
 fn retain_transit_points_caller_authentication(
     points: &mut [crate::config::agent_surface::TransitPoint],
@@ -4022,6 +4065,14 @@ fn retain_transit_points_caller_authentication(
             && point.require_transit_token
         {
             point.delegated_credentials_for_fabric_callers = true;
+        }
+        let sends_self_recognition_check = sent_point.is_some_and(|point| {
+            point
+                .get("self_recognition_check")
+                .is_some()
+        });
+        if !sends_self_recognition_check && previous.self_recognition_check {
+            point.self_recognition_check = true;
         }
     }
 }
@@ -6712,6 +6763,126 @@ mod validation_tests {
                     .to_string()
             ]
         );
+    }
+
+    fn self_checked_surface(
+        recorder_owned_agent: Option<bool>,
+        point_identity: serde_json::Value,
+    ) -> AgentSurface {
+        let mut point = serde_json::json!({ "alias": "crm", "target_endpoint": "https://crm.example",
+            "protocol": "a2a", "require_transit_token": true, "self_recognition_check": true });
+        if let serde_json::Value::Object(identity) = point_identity {
+            point
+                .as_object_mut()
+                .unwrap()
+                .extend(identity);
+        }
+        let mut surface = serde_json::json!({
+            "name": "orders",
+            "access_point": { "listen_address": "0.0.0.0:8443", "route": "/orders", "protocol": "a2a" },
+            "target": { "endpoint": "https://orders.internal" },
+            "identity_slots": { "protected": { "type": "static", "did": "did:web:agent.example" } },
+            "transit": { "outbound_listen_address": "http://localhost:9111", "points": [point] },
+            "variants": [{ "id": "beta", "alias": "beta", "name": "Beta", "enabled": true }]
+        });
+        if let Some(owned_agent) = recorder_owned_agent {
+            surface["access_point"]["trust_recorder"] = serde_json::json!({ "entries": [{
+                "trust_registry_id": "alpha", "issuer_did": "did:web:issuer.example",
+                "authority_did": "did:web:authority.example", "include_owned_agent": owned_agent }] });
+        }
+        serde_json::from_value(surface).unwrap()
+    }
+
+    #[test]
+    fn a_save_refuses_a_self_recognition_check_that_cannot_run() {
+        let vp = serde_json::json!({ "identity_injection": { "inject_vp": true } });
+        let own = serde_json::json!({ "managed_identity": { "type": "static", "did": "did:web:tp.example" } });
+        for (case, surface, reason) in [
+            ("no Trust Recorder", self_checked_surface(None, vp.clone()), "the surface has no Trust Recorder entry"),
+            (
+                "no owned agent record",
+                self_checked_surface(Some(false), vp.clone()),
+                "the surface has no Trust Recorder entry",
+            ),
+            ("its own identity", self_checked_surface(Some(true), own), "it calls out under its own managed identity"),
+            (
+                "no managed agent identity",
+                self_checked_surface(Some(true), serde_json::json!({})),
+                "it resolves no managed agent identity",
+            ),
+        ] {
+            match refuse_unusable_self_recognition_checks(&surface) {
+                Err(SurfaceApiError::BadRequest(message)) => {
+                    assert!(
+                        message.starts_with("Transit Point 'crm' sets self_recognition_check, but "),
+                        "{case}: {message}"
+                    );
+                    assert!(message.contains(reason), "{case}: {message}");
+                }
+                other => panic!("{case}: expected 400, got {other:?}"),
+            }
+        }
+
+        assert!(refuse_unusable_self_recognition_checks(&self_checked_surface(Some(true), vp.clone())).is_ok());
+        let mut off = self_checked_surface(None, vp.clone());
+        off.transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .self_recognition_check = false;
+        assert!(refuse_unusable_self_recognition_checks(&off).is_ok(), "the switch off");
+
+        let mut variant_only = self_checked_surface(Some(true), vp.clone());
+        variant_only
+            .access_point
+            .trust_recorder = None;
+        variant_only
+            .transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .self_recognition_check = false;
+        let mut variant_point = variant_only
+            .transit
+            .as_ref()
+            .unwrap()
+            .points[0]
+            .clone();
+        variant_point.self_recognition_check = true;
+        variant_only.variants[0]
+            .overrides
+            .transit = Some(serde_json::from_value(serde_json::json!({ "points": [variant_point] })).unwrap());
+        assert!(
+            matches!(
+                refuse_unusable_self_recognition_checks(&variant_only),
+                Err(SurfaceApiError::BadRequest(message)) if message.starts_with("Transit Point 'crm' in variant 'beta'")
+            ),
+            "a Transit Point a variant defines"
+        );
+    }
+
+    #[test]
+    fn a_save_that_leaves_out_self_recognition_check_keeps_it() {
+        let stored =
+            self_checked_surface(Some(true), serde_json::json!({ "identity_injection": { "inject_vp": true } }));
+        let stored_points = &stored
+            .transit
+            .as_ref()
+            .unwrap()
+            .points;
+        let mut points = stored_points.clone();
+        points[0].self_recognition_check = false;
+
+        retain_transit_points_caller_authentication(&mut points, stored_points, Some(&serde_json::json!([{}])));
+        assert!(points[0].self_recognition_check, "left out: kept");
+
+        points[0].self_recognition_check = false;
+        retain_transit_points_caller_authentication(
+            &mut points,
+            stored_points,
+            Some(&serde_json::json!([{ "self_recognition_check": false }])),
+        );
+        assert!(!points[0].self_recognition_check, "an explicit false turns it off");
     }
 
     /// A Transit Point that releases delegated credentials to Fabric callers

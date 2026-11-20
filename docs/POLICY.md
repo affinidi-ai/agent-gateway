@@ -456,6 +456,41 @@ surface id, the request's trace id and the authenticated caller (on the Access P
 and MCP-proxy paths), so a trust check can be tied to the request and principal that
 triggered it. On the outbound path the record also names the Transit Point.
 
+### Self recognition check
+
+A Transit Point with `self_recognition_check: true` checks the managed agent calling out
+through it before the request leaves the gateway. Unlike a Trust Check it refuses the request
+itself: its results are never in `input.trust_check_results`, and no policy can allow a
+request it refused.
+
+For each Trust Recorder entry with `include_owned_agent`, the gateway sends one recognition
+query to that entry's trust registry: the entry's authority (with `{{ surface.issuer_did }}`
+resolved to the surface's Issuer), the agent's DID as the entity, action `is` and resource
+`ownedAgent`. The request goes on only when every query answers recognised. Any other
+answer refuses it with `403` "Calling agent is not recognised" (JSON-RPC `-32001` on an MCP
+Transit Point), before the destination is contacted: not recognised, a timeout, a trust
+registry that is unknown, not connected or unreachable, an Authority that no longer exists,
+an Issuer template that does not resolve, no resolved managed agent, or no such entry. The
+reason is logged, not sent. Nothing is cached, so turning recognition off in the trust
+registry takes effect on the next call.
+
+Before the queries, the Trust Recorder writes the agent's records, and the request waits for
+it for at most 10 seconds, unless the agent's stored
+[recorder status](SOURCE_AUTH.md#recorder-status) on the surface is Recorded. While it is not,
+each request through the Transit Point writes again. A record that already exists, including
+one the trust registry marks inactive, is left as it is.
+
+The check runs on A2A, AP2, MCP and HTTP Transit Points, including `fabric://` ones, and not on
+discovery reads. Each query is a `trust_check` record with `leg` `managed_agent`, and a
+refusal a `request_rejected` record with reason `agent_not_recognized`.
+
+A write is refused with `400` when a Transit Point, on the surface or in an enabled variant,
+sets the switch and the surface has no Trust Recorder entry that records the owned agent, the
+Transit Point calls out under its own managed identity, or it resolves no managed agent
+identity (it inherits the surface's without injecting a VP). A `PUT` of the surface or of a
+variant that leaves the field out keeps the stored value, so a Surface Builder save keeps it;
+`false` turns it off, as does a merge `PATCH` whose Transit Points leave it out.
+
 ### Several authorities in one query
 
 A query that must accept an entity any of several organisations recognises lists them in

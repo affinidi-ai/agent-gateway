@@ -87,6 +87,40 @@ async fn run_trust_check_stage_with<C: TrqpClient + ?Sized>(
     client: &C,
     authorities: Option<&dyn AuthorityStore>,
 ) -> Option<TrustCheckResultsContext> {
+    let results = leg_results(origin, leg, elements, input, client, authorities).await;
+    Some(match leg {
+        TrustCheckLeg::Caller => TrustCheckResultsContext {
+            caller: results,
+            target: Vec::new(),
+        },
+        TrustCheckLeg::Target => TrustCheckResultsContext {
+            caller: Vec::new(),
+            target: results,
+        },
+        TrustCheckLeg::ManagedAgent => TrustCheckResultsContext::default(),
+    })
+}
+
+/// Run a Transit Point's self recognition check: one result per element, in
+/// order, each audited on the `managed_agent` leg. The elements carry literal
+/// DIDs, so no request context is offered to their templates.
+pub async fn run_managed_agent_check<'o, C: TrqpClient + ?Sized>(
+    origin: impl Into<TrustCheckOrigin<'o>>,
+    elements: &[TrustCheckElement],
+    client: &C,
+) -> Vec<TrustCheckResult> {
+    let authorities = crate::gateways::connection_points::get_authority_store();
+    leg_results(origin.into(), TrustCheckLeg::ManagedAgent, elements, &json!({}), client, authorities.as_deref()).await
+}
+
+async fn leg_results<C: TrqpClient + ?Sized>(
+    origin: TrustCheckOrigin<'_>,
+    leg: TrustCheckLeg,
+    elements: &[TrustCheckElement],
+    input: &Value,
+    client: &C,
+    authorities: Option<&dyn AuthorityStore>,
+) -> Vec<TrustCheckResult> {
     let wrapped = json!({ "input": input });
     let expanded = expand_authorities(elements);
     let elements = &*expanded;
@@ -128,16 +162,7 @@ async fn run_trust_check_stage_with<C: TrqpClient + ?Sized>(
             .collect()
     };
     log_consolidated(origin, leg, &results);
-    Some(match leg {
-        TrustCheckLeg::Caller => TrustCheckResultsContext {
-            caller: results,
-            target: Vec::new(),
-        },
-        TrustCheckLeg::Target => TrustCheckResultsContext {
-            caller: Vec::new(),
-            target: results,
-        },
-    })
+    results
 }
 
 /// Fails `element` with `AUTHORITY_NOT_FOUND` without querying its registry, recording it
@@ -211,17 +236,13 @@ fn log_consolidated(
     results: &[TrustCheckResult],
 ) {
     let (ok_count, denied_count, error_count) = consolidate_trust_check_results(results);
-    let leg_label = match leg {
-        TrustCheckLeg::Caller => "caller",
-        TrustCheckLeg::Target => "target",
-    };
     tracing::info!(
         target: "trust_check_audit",
         surface_id = origin.surface_id,
         transit_point = origin
             .transit_point
             .unwrap_or_default(),
-        leg = leg_label,
+        leg = crate::observability::trust_check_audit::leg_label(leg),
         total = results.len(),
         ok = ok_count,
         denied = denied_count,
@@ -1004,6 +1025,31 @@ mod tests {
             outcomes(&ctx.target),
             [("", Some("TRUST_REGISTRY_METADATA_UNAVAILABLE")), ("did:web:authority-b", None)]
         );
+    }
+
+    #[tokio::test]
+    async fn a_managed_agent_check_answers_per_element_and_fails_an_unresolved_template() {
+        let mut literal = elem("self-recognition-0");
+        literal.query.entity_id = "did:web:agent.example".to_string();
+        let mut template = literal.clone();
+        template.id = "self-recognition-1".to_string();
+        template.query.authority_id = "{{ surface.issuer_did }}".to_string();
+
+        let (results, records) =
+            crate::audit::producer::capture(run_managed_agent_check("surf", &[literal, template], &AllowClient)).await;
+
+        assert_eq!(
+            outcomes(&results),
+            [("did:a", None), ("{{ surface.issuer_did }}", Some("TEMPLATE_RESOLUTION_FAILED"))]
+        );
+        let legs: Vec<String> = records
+            .iter()
+            .filter_map(|record| match &record.event {
+                crate::delegation_vault::audit::DelegationAuditAction::TrustCheck { leg, .. } => Some(leg.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(legs, ["managed_agent", "managed_agent"]);
     }
 
     #[tokio::test]

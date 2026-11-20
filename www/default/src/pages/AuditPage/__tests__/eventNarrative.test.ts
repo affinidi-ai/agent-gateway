@@ -76,6 +76,24 @@ describe('eventNarrative', () => {
     expect(bad.detail).toContain('timed out');
   });
 
+  it('names the managed agent leg of a self recognition check in words', () => {
+    const n = describeEntry(
+      at({
+        trust_check: {
+          leg: 'managed_agent',
+          authority_id: 'did:web:authority',
+          entity_id: 'did:web:agent',
+          ok: false,
+          error_code: 'NOT_RECOGNIZED',
+        },
+      })
+    );
+    expect(n.title).toBe('Trust check failed');
+    expect(n.summary).toBe(
+      'The managed agent leg verified did:web:agent against did:web:authority.'
+    );
+  });
+
   it('describes a target-leg trust check that could not be evaluated', () => {
     const n = describeEntry(
       at({
