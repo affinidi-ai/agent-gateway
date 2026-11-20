@@ -1,6 +1,6 @@
 import React from 'react';
-import { fireEvent, render, screen } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { MemoryRouter, useNavigate } from 'react-router-dom';
 import CreateGatewayConnectionPointWizardPage from '../CreateGatewayConnectionPointWizardPage';
 import { ApiError, apiClient } from '../../api';
 
@@ -234,3 +234,63 @@ test('resuming a pause whose invitation expired says so instead of offering the 
   );
   expect(screen.queryByTestId('mediator-access-continue-button')).not.toBeInTheDocument();
 });
+
+/** Navigates within the same router, so the wizard stays mounted and only `?resume=` changes. */
+function GoTo({ to }: { to: string }) {
+  const navigate = useNavigate();
+  return <button onClick={() => navigate(to)}>switch pairing</button>;
+}
+
+/** GETs that answer only when the test says so, keyed by URL. */
+function deferGets() {
+  const answers: Record<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }> = {};
+  (apiClient.get as jest.Mock).mockImplementation(
+    (url: string) => new Promise((resolve, reject) => (answers[url] = { resolve, reject }))
+  );
+  return answers;
+}
+
+test.each(['answers', 'fails'])(
+  'a resume for the previous connection point that %s late changes nothing',
+  async outcome => {
+    const answers = deferGets();
+    const access = (did: string) => ({
+      data: {
+        ...paused.data.mediator_access,
+        dids: [{ role: 'connection_point', did, mediator_did: 'did:web:mediator' }],
+      },
+    });
+    render(
+      <MemoryRouter initialEntries={['/gateways/publish?resume=cp-1']}>
+        <GoTo to="/gateways/publish?resume=cp-2" />
+        <CreateGatewayConnectionPointWizardPage />
+      </MemoryRouter>
+    );
+    fireEvent.click(screen.getByText('switch pairing'));
+
+    await act(async () => {
+      answers['/connection-points/cp-2'].resolve({
+        data: { id: 'cp-2', mediator_id: 'mediator-1' },
+      });
+      answers['/connection-points/cp-2/mediator-access'].resolve(access('did:peer:2.second'));
+    });
+    await act(async () => {
+      if (outcome === 'answers') {
+        answers['/connection-points/cp-1'].resolve({
+          data: { id: 'cp-1', mediator_id: 'mediator-1' },
+        });
+        answers['/connection-points/cp-1/mediator-access'].resolve(access('did:peer:2.first'));
+      } else {
+        answers['/connection-points/cp-1'].reject(new Error('Connection point not found'));
+      }
+    });
+
+    expect(screen.getByTestId('mediator-access-did-connection_point')).toHaveTextContent(
+      'did:peer:2.second'
+    );
+    expect(screen.queryByTestId('wizard-resume-unavailable-message')).not.toBeInTheDocument();
+    post.mockResolvedValue({ data: { connection_point: { id: 'cp-2', name: 'Second' } } });
+    fireEvent.click(screen.getByTestId('mediator-access-continue-button'));
+    await waitFor(() => expect(post).toHaveBeenCalledWith('/connection-points/cp-2/continue', {}));
+  }
+);

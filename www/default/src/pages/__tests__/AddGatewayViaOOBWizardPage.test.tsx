@@ -1,6 +1,6 @@
 import React from 'react';
-import { fireEvent, render, screen } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { act, fireEvent, render, screen } from '@testing-library/react';
+import { MemoryRouter, useNavigate } from 'react-router-dom';
 import AddGatewayViaOOBWizardPage from '../AddGatewayViaOOBWizardPage';
 import { apiClient } from '../../api';
 
@@ -131,3 +131,58 @@ test('a failure of the first try offers no Back to the DIDs to allow', async () 
   expect(await screen.findByText('refuse')).toBeInTheDocument();
   expect(screen.queryByText('back')).not.toBeInTheDocument();
 });
+
+/** Navigates within the same router, so the wizard stays mounted and only `?resume=` changes. */
+function GoTo({ to }: { to: string }) {
+  const navigate = useNavigate();
+  return <button onClick={() => navigate(to)}>switch pairing</button>;
+}
+
+/** GETs that answer only when the test says so, keyed by URL. */
+function deferGets() {
+  const answers: Record<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }> = {};
+  (apiClient.get as jest.Mock).mockImplementation(
+    (url: string) => new Promise((resolve, reject) => (answers[url] = { resolve, reject }))
+  );
+  return answers;
+}
+
+test.each(['answers', 'fails'])(
+  'a resume for the previous gateway that %s late changes nothing',
+  async outcome => {
+    const answers = deferGets();
+    const access = (did: string) => ({
+      data: {
+        ...paused.data.mediator_access,
+        dids: [{ role: 'temporary', did, mediator_did: 'did:web:mediator' }],
+      },
+    });
+    render(
+      <MemoryRouter initialEntries={['/gateways/connect?resume=gw-1']}>
+        <GoTo to="/gateways/connect?resume=gw-2" />
+        <AddGatewayViaOOBWizardPage />
+      </MemoryRouter>
+    );
+    fireEvent.click(screen.getByText('switch pairing'));
+
+    await act(async () => {
+      answers['/gateways/gw-2'].resolve({ data: { id: 'gw-2', name: 'Second' } });
+      answers['/gateways/gw-2/mediator-access'].resolve(access('did:peer:2.second'));
+    });
+    await act(async () => {
+      if (outcome === 'answers') {
+        answers['/gateways/gw-1'].resolve({ data: { id: 'gw-1', name: 'First' } });
+        answers['/gateways/gw-1/mediator-access'].resolve(access('did:peer:2.first'));
+      } else {
+        answers['/gateways/gw-1'].reject(new Error('Gateway not found'));
+      }
+    });
+
+    expect(screen.getByTestId('mediator-access-did-temporary')).toHaveTextContent(
+      'did:peer:2.second'
+    );
+    expect(screen.queryByTestId('wizard-resume-unavailable-message')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('mediator-access-continue-button'));
+    expect(mockConnectMounts).toHaveBeenLastCalledWith('gw-2');
+  }
+);
