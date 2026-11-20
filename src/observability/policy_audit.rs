@@ -123,20 +123,13 @@ impl RequestScope {
         })
     }
 
-    /// A request with a fresh id.
+    /// A request with a fresh id: a new W3C span id.
     pub fn fresh() -> Arc<Self> {
-        Self::new(new_request_id())
-    }
-}
-
-/// A fresh request id: a W3C span id (16 lowercase hex characters, never all
-/// zero).
-fn new_request_id() -> String {
-    loop {
-        let bytes = rand::random::<[u8; 8]>();
-        if bytes != [0u8; 8] {
-            return hex::encode(bytes);
-        }
+        Self::new(
+            crate::proxy::trace::SpanId::mint()
+                .as_str()
+                .to_string(),
+        )
     }
 }
 
@@ -729,29 +722,6 @@ mod tests {
         assert_eq!(PolicyScope::Surface.as_str(), "surface");
         assert_eq!(PolicyScope::McpTool.as_str(), "mcp_tool");
         assert_eq!(PolicyScope::Response.as_str(), "response");
-    }
-
-    #[test]
-    fn a_new_request_id_is_a_w3c_span_id() {
-        let ids: Vec<String> = (0..64)
-            .map(|_| new_request_id())
-            .collect();
-        for id in &ids {
-            assert_eq!(id.len(), 16, "{id}");
-            assert!(
-                id.chars()
-                    .all(|c| matches!(c, '0'..='9' | 'a'..='f')),
-                "{id}"
-            );
-            assert_ne!(id, "0000000000000000");
-        }
-        let distinct: std::collections::HashSet<&String> = ids.iter().collect();
-        assert_eq!(distinct.len(), ids.len());
-        let thirteenth: std::collections::HashSet<char> = ids
-            .iter()
-            .filter_map(|id| id.chars().nth(12))
-            .collect();
-        assert!(thirteenth.len() > 1, "every character is random, none fixed by a UUID version");
     }
 
     fn request(id: &str) -> Arc<RequestScope> {

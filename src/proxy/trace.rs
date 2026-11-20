@@ -109,6 +109,16 @@ pub struct SpanId(String);
 impl SpanId {
     const DIGITS: usize = 16;
 
+    /// A new span id: 8 random bytes, never all zero.
+    pub fn mint() -> Self {
+        loop {
+            let bytes = rand::random::<[u8; 8]>();
+            if bytes != [0u8; 8] {
+                return Self(hex::encode(bytes));
+            }
+        }
+    }
+
     pub fn parse(input: &str) -> Result<Self, TraceHeaderError> {
         written_id(input.as_bytes(), Self::DIGITS)
             .map(Self)
@@ -884,6 +894,26 @@ mod tests {
             .map(TraceId::as_str)
             .collect();
         assert_eq!(distinct.len(), minted.len());
+    }
+
+    #[test]
+    fn a_minted_span_id_is_16_lowercase_hex_and_random() {
+        let ids: Vec<SpanId> = (0..64)
+            .map(|_| SpanId::mint())
+            .collect();
+        for id in &ids {
+            assert_eq!(SpanId::parse(id.as_str()).as_ref(), Ok(id));
+        }
+        let distinct: std::collections::HashSet<&str> = ids
+            .iter()
+            .map(SpanId::as_str)
+            .collect();
+        assert_eq!(distinct.len(), ids.len());
+        let thirteenth: std::collections::HashSet<char> = ids
+            .iter()
+            .filter_map(|id| id.as_str().chars().nth(12))
+            .collect();
+        assert!(thirteenth.len() > 1, "every character is random, none fixed by a UUID version");
     }
 
     #[test]
