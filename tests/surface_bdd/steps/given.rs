@@ -1619,6 +1619,8 @@ default allow := false
 allow if {{
     count([r | r := input.trust_check_results.{results}[_]; r.ok == false]) == 0
 }}
+
+deny_reason := "Calling agent is not recognised" if not allow
 "#
     );
     transit_point_config_mut(world, &transit_point).policy = Some(PolicyDefinitionFixture::new(

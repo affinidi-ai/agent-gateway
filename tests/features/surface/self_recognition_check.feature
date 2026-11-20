@@ -16,6 +16,7 @@ Feature: Self recognition check on a Transit Point
     And the VP Audit Log keeps every audit event
     When managed agent "bravo" sends an A2A message/send request with the agent-identity extension through Transit Point "tp1"
     Then the response status is 403
+    And the response body is error "transit_point_request_policy_denied_not_recognised"
     And the managed-agent Trust Check reported error code "TRUST_REGISTRY_UNREACHABLE"
     And external agent "charlie" was not called
 

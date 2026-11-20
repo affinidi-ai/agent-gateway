@@ -33,6 +33,13 @@ changes:
         arrow, edited with the same panels as the surface's and saved as that Transit Point's
         trust_recorder, so an operator can record the managed agent a self recognition check
         asks about without the API. The panels say which leg a recorder writes on.
+    - timestamp: '2026-11-20T17:00:00Z'
+      title: Tell a managed agent why its Transit Point policy refused it
+      description: >-
+        When a Transit Point's own policy denies a request and sets a deny_reason, the 403
+        detail now ends with that reason, for example "Request blocked by surface policy:
+        Calling agent is not recognised", so the managed agent learns why it was refused.
+        Without a deny_reason the detail is unchanged.
     - timestamp: '2026-11-20T10:00:00Z'
       title: Keep managed-agent Trust Checks and VP injection across dashboard saves
       description: >-
