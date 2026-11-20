@@ -660,8 +660,15 @@ const CREATE_PAGES: LayoutPage[] = [
         actions: [
             'policy-definition-editor-back-button',
             'policy-definition-editor-save-button',
-            'policy-instructions-toggle',
+            'policy-view-rego',
         ],
+        setup: async page => {
+            await page.getByTestId('policy-template-card-deny-by-default').click();
+            await page
+                .getByTestId('policy-templates-column')
+                .getByTestId('policy-template-gallery-use-button')
+                .click();
+        },
     },
     {
         id: 'jwt-strategy-new',

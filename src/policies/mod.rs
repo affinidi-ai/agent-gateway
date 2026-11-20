@@ -1,4 +1,6 @@
 pub mod agent_context;
+#[cfg(test)]
+mod builtin_templates_tests;
 pub mod circuit_breaker;
 pub mod gateway_manager;
 pub mod global_policy;
