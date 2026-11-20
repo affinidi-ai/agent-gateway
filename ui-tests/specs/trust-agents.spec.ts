@@ -286,6 +286,44 @@ test.describe("Settings → Security → Gateway signing", () => {
     await expect(page).toHaveURL(/\/connections\/trust-agents\/connect$/);
   });
 
+  test("Connect VTA sits at the right of the card header and goes away with Gateway secret", async ({
+    page,
+  }) => {
+    await mockTrustAgents(page, [agent()]);
+    await page.goto(`${BASE_URL}/settings`);
+    await page.getByTestId("settings-security-tab-trigger").click();
+    const section = page.getByTestId("gateway-signing-settings");
+    const type = section.getByTestId("surface-signing-type-select");
+    const connect = page.getByTestId("gateway-signing-connect-button");
+    await expect(type).toHaveValue("local");
+    await expect(connect).toHaveCount(0);
+
+    await type.selectOption("remote");
+    const header = section.locator(".card-header");
+    await expect(
+      header.getByTestId("gateway-signing-connect-button"),
+    ).toBeVisible();
+    const headerBox = await header.boundingBox();
+    const buttonBox = await connect.boundingBox();
+    const titleBox = await header.locator("h6").boundingBox();
+    expect(headerBox && buttonBox && titleBox).toBeTruthy();
+    expect(
+      headerBox!.x + headerBox!.width - (buttonBox!.x + buttonBox!.width),
+      "the button is flush with the header's right edge",
+    ).toBeLessThan(40);
+    expect(buttonBox!.x).toBeGreaterThan(titleBox!.x + titleBox!.width);
+    await expect(connect).toHaveClass(/btn-primary/);
+    await expect(
+      section.getByTestId("surface-signing-agent-select"),
+    ).toBeVisible();
+
+    await type.selectOption("local");
+    await expect(connect).toHaveCount(0);
+    await expect(
+      section.getByTestId("surface-signing-agent-select"),
+    ).toHaveCount(0);
+  });
+
   test("shows no agent list until a Verifiable Trust Agent is connected", async ({
     page,
   }) => {

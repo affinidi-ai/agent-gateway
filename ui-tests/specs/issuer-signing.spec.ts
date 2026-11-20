@@ -141,4 +141,31 @@ test.describe("Issuer signing", () => {
     await expect.poll(() => puts.length).toBe(1);
     expect(puts[0].signing).toEqual({});
   });
+
+  test("the editor shows no agent list while no Verifiable Trust Agent is connected", async ({
+    page,
+  }) => {
+    await page.route(/\/api\/v1\/vta\/connections(\?.*)?$/, (route) =>
+      json(route, []),
+    );
+    await page.route(/\/api\/v1\/issuers\/local$/, (route) =>
+      json(route, ISSUERS[1]),
+    );
+    await page.goto(`${BASE_URL}/identities?tab=issuers`);
+    await page.getByTestId("issuers-edit-button-local").click();
+
+    await page
+      .getByTestId("surface-signing-type-select")
+      .selectOption("remote");
+
+    await expect(page.getByTestId("surface-signing-no-agents")).toHaveText(
+      "No Verifiable Trust Agent is connected yet.",
+    );
+    await expect(page.getByTestId("surface-signing-agent-select")).toHaveCount(
+      0,
+    );
+    await expect(
+      page.getByTestId("surface-signing-connect-link"),
+    ).toBeVisible();
+  });
 });

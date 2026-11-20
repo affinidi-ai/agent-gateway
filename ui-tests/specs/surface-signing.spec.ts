@@ -163,4 +163,37 @@ test.describe("Surface signing", () => {
     await expect(page.getByTestId("surface-signing-inherited")).toBeVisible();
     await expect(page.getByText("Signs in context")).toHaveCount(0);
   });
+
+  test("shows no agent list until a Verifiable Trust Agent is connected, and lists it after Refresh", async ({
+    page,
+  }) => {
+    await openSurfacePanel(page, []);
+
+    await page
+      .getByTestId("surface-signing-type-select")
+      .selectOption("remote");
+
+    await expect(page.getByTestId("surface-signing-no-agents")).toHaveText(
+      "No Verifiable Trust Agent is connected yet.",
+    );
+    await expect(page.getByTestId("surface-signing-agent-select")).toHaveCount(
+      0,
+    );
+    await expect(page.getByTestId("surface-signing-pick-agent")).toHaveCount(0);
+    await expect(page.getByTestId("surface-signing-connect-link")).toHaveText(
+      "Add VTA",
+    );
+
+    await page.route(/\/api\/v1\/vta\/connections(\?.*)?$/, (route) =>
+      json(route, [agent()]),
+    );
+    await page.getByTestId("surface-signing-refresh").click();
+
+    const picker = page.getByTestId("surface-signing-agent-select");
+    await expect(picker).toBeVisible();
+    await expect(picker.locator('option[value="agent-1"]')).toHaveText(
+      "Production agent",
+    );
+    await expect(page.getByTestId("surface-signing-no-agents")).toHaveCount(0);
+  });
 });
