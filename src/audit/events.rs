@@ -79,9 +79,6 @@ pub enum RejectionReason {
     TargetAuthFailed,
     /// The Target's response failed `target.response_auth`, so nothing used it.
     TargetResponseAuthFailed,
-    /// A Transit Point's self recognition check found the managed agent
-    /// calling out through it not recognised, or could not get an answer.
-    AgentNotRecognized,
 }
 
 /// What `target.auth.fallback` did with a request whose Target credential was not sent.

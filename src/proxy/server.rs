@@ -2777,7 +2777,6 @@ mod tests {
                     delegated_credentials_for_fabric_callers: false,
                     trust_check_list: Vec::new(),
                     trust_check_migrated: false,
-                    self_recognition_check: None,
                 }],
                 outbound_listen_address: None,
                 shared: SharedTransitConfig::default(),

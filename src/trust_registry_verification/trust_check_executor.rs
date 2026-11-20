@@ -127,6 +127,11 @@ pub const IDENTITY_VP_VERIFICATION_FAILED: &str = "IDENTITY_VP_VERIFICATION_FAIL
 /// `entity_id` from the wire.
 pub const TARGET_AGENT_IDENTITY_UNAVAILABLE: &str = "TARGET_AGENT_IDENTITY_UNAVAILABLE";
 
+/// Stage failure code: a Transit Point's managed-agent element could not run
+/// because no managed agent DID was resolved for the request it calls out
+/// with. No TRQP call fires and the result omits `authority_id` / `entity_id`.
+pub const MANAGED_AGENT_IDENTITY_UNAVAILABLE: &str = "MANAGED_AGENT_IDENTITY_UNAVAILABLE";
+
 /// Stage failure code: the element's authority was picked from the
 /// Authorities register (`authority_source: authority`) and that Authority
 /// no longer exists. The registry is not queried; the result keeps the
@@ -442,6 +447,17 @@ pub fn synthesize_unavailable_target<'o>(
     code: &'static str,
     detail: &'static str,
 ) -> Vec<TrustCheckResult> {
+    synthesize_unavailable(origin, TrustCheckLeg::Target, elements, code, detail)
+}
+
+/// [`synthesize_unavailable_target`] on any `leg`.
+pub fn synthesize_unavailable<'o>(
+    origin: impl Into<TrustCheckOrigin<'o>>,
+    leg: TrustCheckLeg,
+    elements: &[TrustCheckElement],
+    code: &'static str,
+    detail: &'static str,
+) -> Vec<TrustCheckResult> {
     let origin = origin.into();
     expand_authorities(elements)
         .iter()
@@ -449,7 +465,7 @@ pub fn synthesize_unavailable_target<'o>(
             record_trust_check(TrustCheckAuditEvent {
                 surface_id: origin.surface_id,
                 transit_point: origin.transit_point,
-                leg: TrustCheckLeg::Target,
+                leg,
                 element_id: &elem.id,
                 element_name: elem.name.as_deref(),
                 authority_id: None,
@@ -512,6 +528,7 @@ pub(crate) fn code_omits_ids(code: &str) -> bool {
             | TRUST_REGISTRY_METADATA_UNAVAILABLE
             | IDENTITY_VP_VERIFICATION_FAILED
             | TARGET_AGENT_IDENTITY_UNAVAILABLE
+            | MANAGED_AGENT_IDENTITY_UNAVAILABLE
     )
 }
 
@@ -646,6 +663,7 @@ mod tests {
             },
             timeout_secs,
             name: None,
+            subject: Default::default(),
         }
     }
 
@@ -1192,6 +1210,7 @@ mod tests {
             },
             timeout_secs: Some(5),
             name: None,
+            subject: Default::default(),
         }
     }
 
@@ -1547,6 +1566,7 @@ mod tests {
             },
             timeout_secs: Some(5),
             name: None,
+            subject: Default::default(),
         }
     }
 

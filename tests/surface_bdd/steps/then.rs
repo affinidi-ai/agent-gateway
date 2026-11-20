@@ -965,7 +965,6 @@ fn audited_refusal_reason(refusal: &str) -> &'static str {
         "a malformed request" => "invalid_envelope",
         "a rejected request extension" => "extension_rejected",
         "a Target response that is not authenticated" => "target_response_auth_failed",
-        "an unrecognised managed agent" => "agent_not_recognized",
         other => panic!("no audited reason for the request refusal '{other}'"),
     }
 }
@@ -1294,12 +1293,13 @@ async fn caller_trust_check_reported_result(
     );
 }
 
-#[then(expr = "the target Trust Check reported error code {string}")]
-async fn target_trust_check_reported_error_code(
+#[then(regex = r#"^the (target|managed-agent) Trust Check reported error code "([^"]+)"$"#)]
+async fn trust_check_reported_error_code(
     world: &mut SurfaceWorld,
+    leg: String,
     expected_code: String,
 ) {
-    assert_trust_check_error_code(world, "target", &expected_code).await;
+    assert_trust_check_error_code(world, &leg.replace('-', "_"), &expected_code).await;
 }
 
 #[then(expr = "the target Trust Check reported error code {string} {int} times")]

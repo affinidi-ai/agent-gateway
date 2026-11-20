@@ -21,10 +21,6 @@ import {
   storedHeaderValue,
 } from '../_shared/providerTargetAuth';
 import TransitCallerSection from './TransitCallerSection';
-import SelfRecognitionCheckSection, {
-  ownedAgentRegistryIds,
-  selfRecognitionCheckBlocker,
-} from './SelfRecognitionCheckSection';
 import TargetAuthSecretField from './TargetAuthSecretField';
 import { newTransitPointId, deriveTransitPointAlias } from './factory';
 import GatewaySurfacePicker from '../_shared/GatewaySurfacePicker';
@@ -549,14 +545,6 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
         alias={alias}
         updateField={updateField}
         updateFields={updateFields}
-      />
-
-      <SelfRecognitionCheckSection
-        instanceKey={config.id}
-        value={config.self_recognition_check}
-        registryIds={ownedAgentRegistryIds(allNodes)}
-        blocker={selfRecognitionCheckBlocker(node?.id, config, allNodes)}
-        onChange={next => updateField('self_recognition_check', next)}
       />
     </>
   );

@@ -248,23 +248,13 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   always-visible warning names the receiving gateway. Test ids:
   `<managed-agent|transit-point>-fabric-delegated-credentials-switch` and
   `-warning`. There is no surface-wide switch.
-- **Self Recognition Check** (`transit-point/SelfRecognitionCheckSection.tsx`) is a switch
-  on every Transit Point panel, with no section heading: the switch is labelled "Self
-  Recognition Check" and its explanation sits under it as help text. On, it lists the trust
-  registries this surface's Trust Recorder records the owned agent in
-  (`ownedAgentRegistryIds`), by name from `listTrustRegistries`, with none picked; Save is
-  blocked ("Pick at least one trust registry for the self recognition check.") until at least
-  one is. It writes `self_recognition_check: { trust_registry_ids }`, and `null` when turned
-  off; the factory sends it only once it is set, because the gateway keeps a stored value a
-  save leaves out. `selfRecognitionCheckBlocker` disables turning it on, with a "Requires …"
-  note under the explanation (both linked by `aria-describedby`), while the surface has no
-  Trust Recorder entry that records the owned agent, or the Transit Point resolves no managed
-  agent identity: no Identity of its own that is not `from_jwt_claim`, and no stored
-  `identity_injection.inject_vp` that inherits the surface's. The factory sends a stored
-  `identity_injection` back while its `inject_vp` is `true`, so a save keeps that identity. A
-  switch already on stays enabled so it can be turned off, with the note in red. Test ids:
-  `transit-point-self-recognition-check-switch`, `-help`, `-note`, `-registries`,
-  `-registry-<id>` and `-registry-required`.
+- **Self recognition check**: a Transit Point Trust Check element with
+  `"subject": "managed_agent"` asks about the managed agent calling out, not the destination.
+  `trust-check/definition.ts` reads `subject` in `queryFromElement` and writes it back in
+  `buildEntry`, keeping such an element's blank `entity_id` blank (the gateway fills in the
+  agent's DID) instead of the destination template, so every save keeps it. The Transit Point
+  factory sends a stored `identity_injection` back while its `inject_vp` is `true`, so a save
+  keeps the identity those elements ask about.
 - **Gateway picker** is one shared gateway-then-surface picker
   (`_shared/GatewaySurfacePicker.tsx`, data from `_shared/useGatewaySurfaces.ts`) used by the
   Managed Agent and Transit Point **via Gateway Connection** routes and by Payment. Every user
@@ -1053,10 +1043,6 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   Authority" option and Save block as a Trust Check. The recorder then reports `skipped` with
   reason `authority_not_found`, worded "Authority not found" by `utils/trustRecorderStatus.ts` in
   the Last outcome row and the Identities page chip.
-- An entry that records the owned agent (`include_owned_agent`) is what lets a Transit Point
-  turn on its **Self Recognition Check** and offers that entry's trust registry for it to pick
-  (see _Surface Builder_). Removing such an entry while a Transit Point has picked its registry
-  gets the API's `400` on Save until that registry is unpicked or the switch is turned off.
 
 | Element                            | Test id                                                                                                                           |
 | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |

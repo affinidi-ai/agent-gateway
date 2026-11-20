@@ -152,6 +152,30 @@ pub struct TrustCheckElement {
     /// Mirrored onto [`TrustCheckResult::name`] by the executor at runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+
+    /// Whom the element asks about. Only a Transit Point's list may hold
+    /// [`TrustCheckSubject::ManagedAgent`] elements.
+    #[serde(default, skip_serializing_if = "TrustCheckSubject::is_target")]
+    pub subject: TrustCheckSubject,
+}
+
+/// Whom a Trust Check element asks the trust registry about.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustCheckSubject {
+    /// The other side of the leg: the caller on the caller leg, the
+    /// destination or Managed Agent target on the target leg.
+    #[default]
+    Target,
+    /// The managed agent calling out through the Transit Point, by the DID it
+    /// calls out under. Its results are `input.trust_check_results.managed_agent`.
+    ManagedAgent,
+}
+
+impl TrustCheckSubject {
+    pub fn is_target(&self) -> bool {
+        *self == Self::Target
+    }
 }
 
 /// Element-level validation errors raised by [`TrustCheckElement::validate`].
@@ -437,6 +461,10 @@ pub struct TrustCheckResult {
 pub struct TrustCheckResultsContext {
     pub caller: Vec<TrustCheckResult>,
     pub target: Vec<TrustCheckResult>,
+    /// A Transit Point's managed-agent elements; absent from policy input
+    /// when the Transit Point has none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub managed_agent: Vec<TrustCheckResult>,
 }
 
 /// Placement-derived leg label. Threaded from the runtime call site to the
@@ -449,8 +477,8 @@ pub enum TrustCheckLeg {
     /// `trust_check_list` on the outbound path, or `Target.trust_check_list`
     /// for an `a2a-proxy://` target and fabric send.
     Target,
-    /// A Transit Point's self recognition check of the managed agent calling
-    /// out through it. Never part of policy input.
+    /// A Transit Point's managed-agent elements, which ask about the managed
+    /// agent calling out through it: the self recognition check.
     ManagedAgent,
 }
 
@@ -482,6 +510,7 @@ mod tests {
             query: base_query("did:a"),
             timeout_secs: None,
             name: name.map(str::to_string),
+            subject: Default::default(),
         }
     }
 
@@ -502,6 +531,7 @@ mod tests {
             },
             timeout_secs: Some(5),
             name: None,
+            subject: Default::default(),
         };
         let json = serde_json::to_value(&elem).unwrap();
         assert_eq!(json["query_type"], "authorization");
@@ -527,6 +557,7 @@ mod tests {
             },
             timeout_secs: None,
             name: None,
+            subject: Default::default(),
         };
         let json = serde_json::to_value(&elem).unwrap();
         assert!(
@@ -587,6 +618,7 @@ mod tests {
             },
             timeout_secs: None,
             name: None,
+            subject: Default::default(),
         };
         let v = serde_json::to_value(&elem).unwrap();
         assert!(

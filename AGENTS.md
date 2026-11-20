@@ -137,13 +137,9 @@ The Surface Builder offers **Override Agent Card Location** on a Transit Point w
 destination only, not on a `fabric://` one; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
-Every Transit Point panel has a **Self Recognition Check** switch that writes
-`transit.points[].self_recognition_check`, with the trust registries the operator picks (at
-least one, none picked by default) from those the surface's Trust Recorder records the owned
-agent in. Turning it on is disabled, with a "Requires …" note, until the surface has such a
-Trust Recorder entry and the Transit Point resolves a managed agent identity (an Identity of
-its own, or a stored `inject_vp` the save keeps); see
-_Surface Builder_ in
+A Transit Point Trust Check element with `"subject": "managed_agent"` (the self recognition
+check) survives every dashboard save with its blank entity, and a save keeps a Transit Point's
+stored `identity_injection` while its `inject_vp` is `true`; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder) and
 [`docs/POLICY.md`](docs/POLICY.md#self-recognition-check).
 

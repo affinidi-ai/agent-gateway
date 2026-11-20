@@ -70,6 +70,7 @@ const TRUST_ERROR_LABEL: Record<string, string> = {
   AGENT_CARD_UNAVAILABLE: "the target's agent card was unavailable",
   IDENTITY_VP_VERIFICATION_FAILED: "the target's agent identity credential could not be verified",
   TARGET_AGENT_IDENTITY_UNAVAILABLE: "the target's agent card carries no agent identity credential",
+  MANAGED_AGENT_IDENTITY_UNAVAILABLE: 'no managed agent identity was resolved for the request',
 };
 
 export function trustErrorClause(code?: string | null, leg?: string | null): string | undefined {

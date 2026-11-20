@@ -73,24 +73,6 @@ async fn ensure_api_key_secret(
     );
 }
 
-/// The id of surface `surface_name` and the surface as the admin API returns it.
-async fn read_named_surface(
-    world: &mut SurfaceWorld,
-    surface_name: &str,
-    action: &str,
-) -> (String, Value) {
-    ensure_admin_session(world).await;
-    let surface_id = tracked_surface_id(world, surface_name);
-    let surface = world
-        .admin_client
-        .as_ref()
-        .expect("admin client must exist")
-        .send_json::<(), _>(reqwest::Method::GET, &format!("/v1/surfaces/{surface_id}"), None)
-        .await
-        .unwrap_or_else(|error| panic!("read surface {surface_name:?} before {action}: {error}"));
-    (surface_id, surface)
-}
-
 /// Reads surface `surface_name`, applies `edit`, and saves it through the admin API.
 async fn edit_named_surface(
     world: &mut SurfaceWorld,
@@ -98,12 +80,17 @@ async fn edit_named_surface(
     action: &str,
     edit: impl FnOnce(&mut Value),
 ) {
-    let (surface_id, mut surface) = read_named_surface(world, surface_name, action).await;
-    edit(&mut surface);
+    ensure_admin_session(world).await;
+    let surface_id = tracked_surface_id(world, surface_name);
     let client = world
         .admin_client
         .as_ref()
         .expect("admin client must exist");
+    let mut surface: Value = client
+        .send_json::<(), _>(reqwest::Method::GET, &format!("/v1/surfaces/{surface_id}"), None)
+        .await
+        .unwrap_or_else(|error| panic!("read surface {surface_name:?} before {action}: {error}"));
+    edit(&mut surface);
     let response = client
         .update_surface_recorded(&surface_id, &surface)
         .await
@@ -161,7 +148,18 @@ async fn edit_transit_point(
     edit: impl FnOnce(&mut Value),
 ) {
     let surface_name = surface_under_test_name(world);
-    edit_named_surface(world, &surface_name, action, |surface| edit(transit_point_mut(surface, alias))).await;
+    edit_named_surface(world, &surface_name, action, |surface| {
+        let point = surface["transit"]["points"]
+            .as_array_mut()
+            .and_then(|points| {
+                points
+                    .iter_mut()
+                    .find(|point| point["alias"] == alias)
+            })
+            .unwrap_or_else(|| panic!("the surface should have Transit Point {alias:?}"));
+        edit(point);
+    })
+    .await;
 }
 
 #[given(expr = "Transit Point {string} has a managed identity of its own")]
@@ -190,89 +188,6 @@ async fn transit_point_presents_managed_agent_identity(
         point["identity_injection"]["inject_vp"] = Value::Bool(true);
     })
     .await;
-}
-
-/// A self recognition check naming every trust registry the surface's Trust
-/// Recorder records the owned agent in.
-fn self_recognition_check_of(surface: &Value) -> Value {
-    let trust_registry_ids: Vec<Value> = surface["access_point"]["trust_recorder"]["entries"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|entry| entry["include_owned_agent"] != Value::Bool(false))
-        .map(|entry| entry["trust_registry_id"].clone())
-        .collect();
-    serde_json::json!({ "trust_registry_ids": trust_registry_ids })
-}
-
-#[given(expr = "Transit Point {string} checks the self recognition of its managed agent")]
-async fn transit_point_checks_self_recognition(
-    world: &mut SurfaceWorld,
-    transit_point: String,
-) {
-    let surface_name = surface_under_test_name(world);
-    edit_named_surface(world, &surface_name, "turning on the self recognition check", |surface| {
-        let check = self_recognition_check_of(surface);
-        transit_point_mut(surface, &transit_point)["self_recognition_check"] = check;
-    })
-    .await;
-}
-
-/// The stored surface under test, read through the admin API.
-async fn stored_surface_under_test(
-    world: &mut SurfaceWorld,
-    action: &str,
-) -> (String, Value) {
-    let surface_name = surface_under_test_name(world);
-    read_named_surface(world, &surface_name, action).await
-}
-
-fn transit_point_mut<'a>(
-    surface: &'a mut Value,
-    alias: &str,
-) -> &'a mut Value {
-    surface["transit"]["points"]
-        .as_array_mut()
-        .and_then(|points| {
-            points
-                .iter_mut()
-                .find(|point| point["alias"] == alias)
-        })
-        .unwrap_or_else(|| panic!("the surface should have Transit Point {alias:?}"))
-}
-
-#[when(expr = "the operator saves Transit Point {string} with the self recognition check on")]
-async fn operator_saves_transit_point_with_self_recognition_check(
-    world: &mut SurfaceWorld,
-    transit_point: String,
-) {
-    let action = "saving the self recognition check";
-    let (surface_id, mut surface) = stored_surface_under_test(world, action).await;
-    transit_point_mut(&mut surface, &transit_point)["self_recognition_check"] =
-        serde_json::json!({ "trust_registry_ids": ["alpha-registry"] });
-    let response = world
-        .admin_client
-        .as_ref()
-        .expect("admin client must exist")
-        .update_surface_recorded(&surface_id, &surface)
-        .await
-        .unwrap_or_else(|error| panic!("{action} through admin API: {error}"));
-    crate::steps::when::record_admin_response(world, response);
-}
-
-#[then(expr = "Transit Point {string} does not check the self recognition of its managed agent")]
-async fn transit_point_does_not_check_self_recognition(
-    world: &mut SurfaceWorld,
-    transit_point: String,
-) {
-    let (_, mut surface) = stored_surface_under_test(world, "reading the self recognition check").await;
-    let point = transit_point_mut(&mut surface, &transit_point);
-    assert!(
-        point
-            .get("self_recognition_check")
-            .is_none_or(Value::is_null),
-        "expected Transit Point {transit_point:?} not to check the self recognition of its managed agent, got {point}"
-    );
 }
 
 #[given(
