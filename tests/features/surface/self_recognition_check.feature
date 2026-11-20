@@ -9,16 +9,29 @@ Feature: Self recognition check on a Transit Point
     And surface "alpha" has A2A Transit Point "tp1" to external agent "charlie"
     And the surface has managed identity enabled
 
-  Scenario: A policy refuses a managed agent its trust registry cannot vouch for
+  Scenario: A policy refuses a managed agent when its trust registry is unreachable
     Given transit point "tp1" has a managed-agent Trust Check for trust registry "alpha-registry"
     And transit point "tp1" has a policy that denies unless every managed-agent Trust Check succeeded
     And transit point "tp1" presents the surface's managed agent identity on its outbound calls
     And the VP Audit Log keeps every audit event
     When managed agent "bravo" sends an A2A message/send request with the agent-identity extension through Transit Point "tp1"
     Then the response status is 403
-    And the response body is error "transit_point_request_policy_denied_not_recognised"
     And the managed-agent Trust Check reported error code "TRUST_REGISTRY_UNREACHABLE"
     And external agent "charlie" was not called
+
+  Scenario: A managed agent refused by a Transit Point policy is told why
+    Given transit point "tp1" has a managed-agent Trust Check for trust registry "alpha-registry"
+    And transit point "tp1" has a policy that denies unless every managed-agent Trust Check succeeded
+    And transit point "tp1" presents the surface's managed agent identity on its outbound calls
+    When managed agent "bravo" sends an A2A message/send request with the agent-identity extension through Transit Point "tp1"
+    Then the response status is 403
+    And the response body is error "transit_point_request_policy_denied_not_recognised"
+
+  Scenario: A managed-agent Trust Check outside a Transit Point is refused
+    Given the operator can use the admin API and no surface is configured for route "/example"
+    When the operator creates the surface for route "/orders" with a caller-leg Trust Check that checks the managed agent
+    Then the admin API response status is 400
+    And the admin API error response mentions "only a Transit Point's trust_check_list may hold"
 
   Scenario: Without a policy rule on the result, the call goes out
     Given transit point "tp1" has a managed-agent Trust Check for trust registry "alpha-registry"

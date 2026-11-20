@@ -516,10 +516,45 @@ fn reject_target_trust_checks_unless_target_runs_them(surface: &AgentSurface) ->
 /// target list, or already carrying Transit Point lists (which the old shape
 /// cannot express) is left as sent. The conversion is logged only when it
 /// changed something.
+/// A managed-agent element on a Target list, base or variant, is refused as
+/// sent, before the old shape would copy it onto every Transit Point.
+fn refuse_target_managed_agent_elements(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
+    let variant_lists = surface
+        .variants
+        .iter()
+        .filter_map(|variant| {
+            variant
+                .overrides
+                .target
+                .as_ref()
+                .and_then(|target| {
+                    target
+                        .trust_check_list
+                        .as_deref()
+                })
+        });
+    for list in std::iter::once(surface.target.trust_check_list.as_slice()).chain(variant_lists) {
+        if let Some(element) = list
+            .iter()
+            .find(|element| !element.subject.is_target())
+        {
+            return Err(SurfaceApiError::BadRequest(
+                crate::config::agent_surface::TrustCheckValidationError::TrustCheckSubjectNotAllowed {
+                    leg: "target",
+                    id: element.id.clone(),
+                }
+                .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn convert_old_shape_body(surface: &mut AgentSurface) -> Result<(), SurfaceApiError> {
     if surface.trust_check_split || !surface.has_target_trust_checks() || surface.has_transit_point_trust_checks() {
         return Ok(());
     }
+    refuse_target_managed_agent_elements(surface)?;
     let mut value = serde_json::to_value(&*surface)
         .map_err(|e| SurfaceApiError::InternalError(format!("Failed to serialise surface: {}", e)))?;
     let sent = value.clone();
@@ -10214,6 +10249,26 @@ mod validation_tests {
         assert!(point(&body).trust_check_migrated);
         assert!(reject_target_trust_checks_unless_target_runs_them(&body).is_ok());
         assert!(body.has_trust_check_lists(), "a Transit Point list remains, so the marker is persisted");
+    }
+
+    #[test]
+    fn an_undeclared_body_with_a_managed_agent_element_on_its_target_list_is_refused() {
+        let mut body = fabric_surface_with_point(Vec::new());
+        body.target.trust_check_list[0].subject =
+            crate::trust_registry_verification::trust_check_element::TrustCheckSubject::ManagedAgent;
+
+        let err = convert_old_shape_body(&mut body).expect_err("refused before conversion");
+
+        assert!(
+            matches!(&err, SurfaceApiError::BadRequest(message) if message.contains("only a Transit Point's trust_check_list may hold")),
+            "{err:?}"
+        );
+        assert!(
+            point(&body)
+                .trust_check_list
+                .is_empty(),
+            "nothing was copied onto the Transit Point"
+        );
     }
 
     #[test]

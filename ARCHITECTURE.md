@@ -254,7 +254,7 @@ Fabric hop check (a `fabric://` Transit Point refuses a call past the hop limit 
 Transit Point header mapping
 (A2A and AP2) → outbound extension inspection (A2A) → identity resolution → trusted
 identity → custom metadata → trust context → Transit Point Trust Recorder (writes the calling
-agent's records in the background on every request, never waits or refuses; see
+agent's records in the background on every request except a discovery read, never waits or refuses; see
 [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#transit-point-trust-recorder)) → Trust Check (the Transit Point's own list; its
 managed-agent elements ask about the managed agent calling out, see
 [`docs/POLICY.md`](docs/POLICY.md#self-recognition-check)) → gateway OPA →
