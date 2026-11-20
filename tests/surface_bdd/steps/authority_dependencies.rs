@@ -232,7 +232,9 @@ async fn create_surface_with_trust_check_element(
     .await;
 }
 
-#[when(expr = "the operator creates the surface for route {string} with a caller-leg Trust Check that checks the managed agent")]
+#[when(
+    expr = "the operator creates the surface for route {string} with a caller-leg Trust Check that checks the managed agent"
+)]
 async fn operator_creates_surface_with_caller_leg_managed_agent_check(
     world: &mut SurfaceWorld,
     route: String,
