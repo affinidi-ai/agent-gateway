@@ -318,6 +318,11 @@ The Gateways list shows, under a remote gateway's status, when its peer was last
 (`peer_last_seen_at` on `GET /v1/gateways`), apart from this gateway's own mediator link; see
 _Elsewhere_ under remote gateway issuer DIDs in [`www/default/AGENTS.md`](www/default/AGENTS.md).
 
+A Trust Recorder dropped on a Managed Agent → Transit Point arrow is that Transit Point's own,
+saved to `transit.points[i].trust_recorder` with the same panels as the surface's on the
+response arrow; see _Trust Recorder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder).
+
 The Trust Recorder panel and its entries warn while an entry uses the surface Issuer as its
 Authority and the surface has no Issuer or its Issuer no longer exists; see _Trust Recorder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder).

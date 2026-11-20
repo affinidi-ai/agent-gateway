@@ -254,8 +254,8 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   `buildEntry`, keeping such an element's blank `entity_id` blank (the gateway fills in the
   agent's DID) instead of the destination template, so every save keeps it. The Transit Point
   factory sends a stored `identity_injection` back while its `inject_vp` is `true`, so a save
-  keeps the identity those elements ask about, and sends a stored Transit Point
-  `trust_recorder` back unchanged, so a save keeps what records that identity.
+  keeps the identity those elements ask about. A Transit Point's `trust_recorder`, which
+  records that identity, is edited on its arrow (see _Trust Recorder_).
 - **Gateway picker** is one shared gateway-then-surface picker
   (`_shared/GatewaySurfacePicker.tsx`, data from `_shared/useGatewaySurfaces.ts`) used by the
   Managed Agent and Transit Point **via Gateway Connection** routes and by Payment. Every user
@@ -1035,6 +1035,17 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
 
 ## Trust Recorder
 
+- A Trust Recorder has two slots, both edited with the same panels: the surface's on the
+  Managed Agent → Access Point response arrow (`response:trust-recorder`, node
+  `trust-recorder-target-response`, writes `access_point.trust_recorder`), and each Transit
+  Point's own on its Managed Agent → Transit Point request arrow (`request:trust-recorder`,
+  ordered before that Transit Point's Trust Check, node `trust-recorder-<transit point node id>`,
+  parented to the Transit Point). The Transit Point factory writes the second as
+  `transit.points[i].trust_recorder` and the element's own `buildPayload` skips it; removing the
+  node removes the Transit Point's recorder. The element is `directionality: 'either'` and snaps
+  only to an arrow and direction with a slot for it (`archetypeHasSlotFor`). The panels name the
+  leg through `TrustRecorderLeg` (`isTransitPointTrustRecorder`); the Last outcome row is the
+  surface's, which Transit Point recorders also update.
 - The sidebar panel and each entry in its fullscreen editor show the shared
   `NoSurfaceIssuerWarning` (`elements/trust-recorder/NoSurfaceIssuerWarning.tsx`, an
   `InfoBanner` warning variant, never the amber `alert-warning`, which fails contrast) while

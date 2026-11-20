@@ -26,6 +26,13 @@ changes:
         or this surface's managed agent, the self recognition check. MCP Transit Points now take
         Trust Checks for their managed agent, while a migrated destination copy there stays
         read-only.
+    - timestamp: '2026-11-20T16:00:00Z'
+      title: Drop a Trust Recorder on the Managed Agent to Transit Point arrow
+      description: >-
+        The Surface Builder offers a Trust Recorder on each Managed Agent to Transit Point
+        arrow, edited with the same panels as the surface's and saved as that Transit Point's
+        trust_recorder, so an operator can record the managed agent a self recognition check
+        asks about without the API. The panels say which leg a recorder writes on.
     - timestamp: '2026-11-20T10:00:00Z'
       title: Keep managed-agent Trust Checks and VP injection across dashboard saves
       description: >-

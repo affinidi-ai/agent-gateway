@@ -277,6 +277,7 @@ describe('Managed Agent target-leg Trust Check drop', () => {
     ['mcp-tool-gating', 'ma-external', true],
     ['workload-binding', 'ap-ma', false],
     ['trust-recorder', 'ap-ma', true],
+    ['trust-recorder', 'ma-tp', true],
     ['trust-recorder', 'ma-external', false],
     ['policy', 'ma-external', true],
   ])('leaves %s snapping to %s unchanged by a URL target', (type, archetype, expected) => {

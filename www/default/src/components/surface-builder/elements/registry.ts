@@ -14,6 +14,7 @@ import {
   TRUST_CHECK_CALLER_SLOT_ID,
   TRUST_CHECK_MANAGED_AGENT_SLOT_ID,
   TRUST_CHECK_TRANSIT_POINT_SLOT_ID,
+  TRUST_RECORDER_TRANSIT_POINT_SLOT_ID,
 } from './edges/archetypes';
 import { isInboundIdentity } from './identity/placement';
 import {
@@ -783,6 +784,7 @@ class ElementRegistry {
         delete tpConfig.header_metadata_mapping;
         delete tpConfig.trust_check_list;
         delete tpConfig.trust_check_migrated;
+        delete tpConfig.trust_recorder;
         tpConfig[STORED_TARGET_AUTH_KEY] = storedTargetAuth(tp.target_auth);
       }
       nodes.push({
@@ -901,6 +903,31 @@ class ElementRegistry {
         tp?.trust_check_migrated === true,
         !transitPointChecksDestination(tpType)
       );
+      // Per-TP Trust Recorder (`transit.points[i].trust_recorder`) on the
+      // MA→TP request arrow. The TP factory owns the slice on the way out.
+      const tpRecorder = tp?.trust_recorder;
+      if (tpRecorder && typeof tpRecorder === 'object' && Array.isArray(tpRecorder.entries)) {
+        const trDef = this.get('trust-recorder');
+        if (trDef && tpRecorder.entries.length > 0) {
+          const panelConfig = trDef.configFromPayload
+            ? trDef.configFromPayload(tpRecorder, payload)
+            : tpRecorder;
+          const id = `trust-recorder-${tpId}`;
+          nodes.push({
+            id,
+            type: 'trust-recorder' as SurfaceNodeType,
+            label: '',
+            configured: this.isConfigured('trust-recorder', panelConfig, {
+              id,
+              parentId: tpId,
+              slotId: TRUST_RECORDER_TRANSIT_POINT_SLOT_ID,
+            }),
+            config: panelConfig,
+            parentId: tpId,
+            slotId: TRUST_RECORDER_TRANSIT_POINT_SLOT_ID,
+          });
+        }
+      }
       // Per-TP managed identity (`transit.points[i].managed_identity`).
       // Mirrors the request-slot id produced by the identity element
       // when freshly dropped on the MA→TP edge so it round-trips

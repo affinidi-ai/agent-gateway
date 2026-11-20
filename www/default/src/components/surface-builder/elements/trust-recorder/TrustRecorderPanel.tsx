@@ -9,12 +9,14 @@ import TrustRecorderLastOutcome from '../../../trust-recorder/TrustRecorderLastO
 import { useOptionalSurfaceMeta } from '../../SurfaceMetaContext';
 import MissingAuthorityWarning from '../_shared/MissingAuthorityWarning';
 import {
+  isTransitPointTrustRecorder,
   missingTrustRecorderAuthorities,
   readEntries,
   TRUST_RECORDER_ENTRIES_MAX,
   usesSurfaceIssuer,
 } from './definition';
 import NoSurfaceIssuerWarning, { useSurfaceIssuerProblem } from './NoSurfaceIssuerWarning';
+import TrustRecorderLeg from './TrustRecorderLeg';
 
 const PREVIEW_MAX = 5;
 
@@ -26,27 +28,30 @@ interface TrustRecorderContext {
   example: string;
 }
 
-function describeContext(): TrustRecorderContext {
+function describeContext(onTransitPoint: boolean): TrustRecorderContext {
   return {
     title:
       'How does Trust Recorder make your managed agents discoverable for recognition and authorization?',
     summary:
-      'Write agent-registration records into one or more Trust Registries on the response leg so the agent becomes discoverable and verifiable by future callers.',
-    where: 'Managed Agent → Access Point (response leg).',
+      'Write agent-registration records into one or more Trust Registries so the agent becomes discoverable and verifiable by future callers.',
+    where: onTransitPoint
+      ? 'Managed Agent → Transit Point (request leg), for the DID the managed agent calls out under, so this Transit Point’s Trust Check can recognise it.'
+      : 'Managed Agent → Access Point (response leg).',
     when: 'When a managed agent should be announced to a trust registry — e.g. publish the agent as an `ownedAgent` of its provider so partner ecosystems can recognise it on later requests.',
-    example:
-      'Built-in triple: authority = authority DID, entity = agent DID (auto-filled from the response), action = `is`, resource = `ownedAgent`. Set the Authority to the surface\'s Issuer (option: "Use surface Issuer") to have records match the downstream Trust Check `authority = verified identity credential issuer` query.',
+    example: `Built-in triple: authority = authority DID, entity = agent DID (auto-filled from the ${
+      onTransitPoint ? 'outbound call' : 'response'
+    }), action = \`is\`, resource = \`ownedAgent\`. Set the Authority to the surface's Issuer (option: "Use surface Issuer") to have records match the downstream Trust Check \`authority = verified identity credential issuer\` query.`,
   };
 }
 
-const TrustRecorderPanel: React.FC<ConfigPanelProps> = ({ config, openFullscreenEditor }) => {
+const TrustRecorderPanel: React.FC<ConfigPanelProps> = ({ node, config, openFullscreenEditor }) => {
   const entries = readEntries(config);
   const surfaceIssuerProblem = useSurfaceIssuerProblem();
   const authorityDids = useOptionalSurfaceMeta()?.authorityDids;
   const missingAuthorities = missingTrustRecorderAuthorities(config, authorityDids);
   const shown = entries.slice(0, PREVIEW_MAX);
   const remaining = entries.length - shown.length;
-  const context = describeContext();
+  const context = describeContext(isTransitPointTrustRecorder(node));
   const renderEmptyState = () => (
     <div className="py-2 text-center" data-testid="trust-recorder-panel-empty-state">
       <div className="fw-semibold small mb-2" style={{ fontSize: '12px' }}>
@@ -58,8 +63,7 @@ const TrustRecorderPanel: React.FC<ConfigPanelProps> = ({ config, openFullscreen
         No registries yet
       </div>
       <Form.Text className="d-block text-muted mb-2 mx-4 text-center" style={{ fontSize: '11px' }}>
-        Configure at least one Trust Registry to have the gateway record the agent&apos;s identity
-        on the response leg.{' '}
+        Configure at least one Trust Registry to have the gateway record the agent&apos;s identity.{' '}
         <AddResourceLink
           to={deepLinks.trustRegistry}
           testid="trust-recorder-panel-add-registry-link"
@@ -133,8 +137,7 @@ const TrustRecorderPanel: React.FC<ConfigPanelProps> = ({ config, openFullscreen
           style={{ fontSize: '11px' }}
           data-testid="trust-recorder-panel-results-ref"
         >
-          Writes records to every configured Trust Registry on the <strong>response leg</strong>{' '}
-          (Managed Agent &rarr; Access Point).
+          <TrustRecorderLeg node={node} />
         </Form.Text>
       </div>
 
