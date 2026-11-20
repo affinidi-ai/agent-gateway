@@ -2,18 +2,26 @@
   cursor: pointer;
 }
 
+/* The global `.table td:first-child` rule greys the first column, which here holds the agent name;
+   the name keeps the table's text colour, as a surface name does on the Surfaces page. */
+.agents-table tbody td:first-child {
+  color: var(--bs-table-color);
+}
+
+/* `app-badge` sizes are in rem, so beside the row's Bootstrap badges (0.75em) they come out larger
+   than them; this sizes them the same. */
+.agents-table .app-badge {
+  font-size: 0.75em;
+}
+
 .agents-row-chevron {
   width: 1%;
-  color: var(--gray-400);
+  color: var(--muted-text);
 }
 
 .agents-row:hover .agents-row-chevron,
 .agents-row:focus-visible .agents-row-chevron {
-  color: var(--accent-blue);
-}
-
-body.dark-theme .agents-row-chevron {
-  color: var(--dark-text-muted);
+  color: var(--accent-blue-text);
 }
 
 .agent-preview-head {
@@ -30,7 +38,7 @@ body.dark-theme .agents-row-chevron {
   height: 44px;
   font-size: 20px;
   color: var(--gray-0);
-  background: var(--accent-blue);
+  background: var(--primary-solid);
   border-radius: var(--radius-lg);
 }
 
@@ -46,8 +54,8 @@ body.dark-theme .agents-row-chevron {
 }
 
 .agent-preview-description {
-  font-size: 13px;
-  color: var(--gray-600);
+  font-size: 0.875em;
+  color: var(--muted-text);
   overflow-wrap: anywhere;
 }
 
@@ -60,8 +68,8 @@ body.dark-theme .agents-row-chevron {
 
 .agent-preview-rows dt {
   font-weight: 600;
-  font-size: 13px;
-  color: var(--gray-500);
+  font-size: 0.875em;
+  color: var(--muted-text);
 }
 
 .agent-preview-rows dd {
@@ -116,8 +124,8 @@ body.dark-theme .agents-row-chevron {
 }
 
 .agent-preview-skill-description {
-  font-size: 13px;
-  color: var(--gray-600);
+  font-size: 0.875em;
+  color: var(--muted-text);
   overflow-wrap: anywhere;
 }
 
@@ -125,12 +133,6 @@ body.dark-theme .agent-preview-name,
 body.dark-theme .agent-preview-skills-title,
 body.dark-theme .agent-preview-section-title {
   color: var(--dark-text-heading);
-}
-
-body.dark-theme .agent-preview-description,
-body.dark-theme .agent-preview-skill-description,
-body.dark-theme .agent-preview-rows dt {
-  color: var(--dark-text-muted);
 }
 
 body.dark-theme .agent-preview-skills,

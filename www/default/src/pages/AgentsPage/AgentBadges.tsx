@@ -1,13 +1,12 @@
 import React from 'react';
 import type { AgentIdentity, AgentTrustRegistry } from '../../api';
-import { Badge } from '../../components/shared/Badge';
 import { TrustRecorderStateBadge } from '../../components/trust-recorder/TrustRecorderStateBadge';
+import { Badge } from '../../components/shared/Badge';
 import { CopyButton } from '../../components/shared/CopyButton';
+import { ProtocolBadge } from '../../components/shared/ProtocolBadge';
 import {
   NO_IDENTITY,
-  identitiesLabel,
-  protocolBadgeClass,
-  protocolLabel,
+  identityNoun,
   routeDescription,
   runtimeIcon,
   runtimeLabel,
@@ -19,26 +18,20 @@ import {
  * How the gateway reaches the agent (Direct, Proxied, Fabric): the one style for the route on
  * every page, with what it means as the tooltip and for screen readers.
  */
-export const AgentRouteBadge: React.FC<{ runtime: string; 'data-testid'?: string }> = ({
+export const AgentRoute: React.FC<{ runtime: string; 'data-testid'?: string }> = ({
   runtime,
   'data-testid': testId,
 }) => (
-  <span
-    className="badge text-bg-light border agent-route-badge"
-    title={routeDescription(runtime)}
-    data-testid={testId}
-  >
+  <span className="text-nowrap" title={routeDescription(runtime)} data-testid={testId}>
     <i className={`fas ${runtimeIcon(runtime)} me-1`} aria-hidden="true" />
     <span>{runtimeLabel(runtime)}</span>
     <span className="visually-hidden">. {routeDescription(runtime)}</span>
   </span>
 );
 
-/** The protocol only, styled like the Surfaces page's; how the agent is reached is the Runtime. */
+/** The protocol only, in the Surfaces page's badge; how the agent is reached is the Route. */
 export const AgentProtocolBadge: React.FC<{ protocol: string }> = ({ protocol }) => (
-  <span className={`badge ${protocolBadgeClass(protocol)}`} data-testid="agents-protocol-badge">
-    {protocolLabel(protocol)}
-  </span>
+  <ProtocolBadge protocol={protocol} data-testid="agents-protocol-badge" />
 );
 
 /**
@@ -48,9 +41,12 @@ export const AgentProtocolBadge: React.FC<{ protocol: string }> = ({ protocol })
 export const AgentTrustRegistryBadge: React.FC<{ trust: AgentTrustRegistry }> = ({ trust }) => {
   if (!trust.recorded) {
     return (
-      <span className="badge badge-none" data-testid="agents-trust-not-recorded">
-        {trustRegistryLabel(trust)}
-      </span>
+      <Badge
+        tone="secondary"
+        size="sm"
+        value={trustRegistryLabel(trust)}
+        data-testid="agents-trust-not-recorded"
+      />
     );
   }
   return (
@@ -84,45 +80,36 @@ export const AgentDid: React.FC<AgentDidProps> = ({ did, full = false, muted = f
 
 interface AgentIdentitiesProps {
   identities: AgentIdentity[];
-  /** How many surfaces use the agent; with none of them holding a DID, `No identity` is flagged. */
+  /** How many surfaces use the agent; while any do, the tooltip says none of them has a DID. */
   surfaceCount: number;
 }
 
 /**
- * "1 identity" or "N identities", with every DID in the tooltip. Without any, `No identity`,
- * flagged as a warning while surfaces use the agent.
+ * A count badge, like Used by surfaces, then "identity" or "identities", with every DID in the
+ * tooltip. Without any, `No identity` in muted text, like an empty Used by surfaces cell.
  */
 export const AgentIdentities: React.FC<AgentIdentitiesProps> = ({ identities, surfaceCount }) => {
   if (identities.length === 0) {
-    if (surfaceCount === 0) {
-      return (
-        <span className="text-muted small" data-testid="agents-no-identity">
-          {NO_IDENTITY}
-        </span>
-      );
-    }
+    let title: string | undefined;
+    if (surfaceCount === 1) title = 'The surface using this agent has no DID';
+    else if (surfaceCount > 1)
+      title = `None of the ${surfaceCount} surfaces using this agent has a DID`;
     return (
-      <Badge
-        value={NO_IDENTITY}
-        tone="warning"
-        size="sm"
-        prefix={<i className="fas fa-exclamation-triangle me-1" aria-hidden="true" />}
-        title={
-          surfaceCount === 1
-            ? 'The surface using this agent has no DID'
-            : `None of the ${surfaceCount} surfaces using this agent has a DID`
-        }
-        data-testid="agents-no-identity"
-      />
+      <span className="text-muted" title={title} data-testid="agents-no-identity">
+        {NO_IDENTITY}
+      </span>
     );
   }
   return (
-    <span
-      className="small text-nowrap"
+    <div
+      className="d-flex align-items-center gap-2 text-nowrap"
       title={identities.map(identity => identity.did).join('\n')}
       data-testid="agents-identities"
     >
-      {identitiesLabel(identities.length)}
-    </span>
+      <span className="badge text-bg-primary" data-testid="agents-identities-count">
+        {identities.length}
+      </span>{' '}
+      <span>{identityNoun(identities.length)}</span>
+    </div>
   );
 };

@@ -25,20 +25,6 @@ const ROUTE_DESCRIPTIONS: Record<AgentRuntime, string> = {
   gateway: 'The gateway forwards over the trust fabric to a remote gateway.',
 };
 
-const PROTOCOL_LABELS: Record<string, string> = {
-  a2a: 'A2A',
-  ap2: 'AP2',
-  mcp: 'MCP',
-  didcomm: 'DIDComm',
-};
-
-/** The protocol badge colours of the Surfaces page. */
-const PROTOCOL_BADGE_CLASSES: Record<string, string> = {
-  a2a: 'text-bg-primary',
-  ap2: 'text-bg-warning',
-  mcp: 'text-bg-info',
-};
-
 export const UNNAMED_AGENT = 'Unnamed agent';
 export const NO_IDENTITY = 'No identity';
 
@@ -58,14 +44,6 @@ export function routeDescription(runtime: string): string {
   return (
     ROUTE_DESCRIPTIONS[runtime as AgentRuntime] ?? 'How the gateway reaches this agent is unknown.'
   );
-}
-
-export function protocolLabel(protocol: string): string {
-  return PROTOCOL_LABELS[protocol] ?? 'Other protocol';
-}
-
-export function protocolBadgeClass(protocol: string): string {
-  return PROTOCOL_BADGE_CLASSES[protocol] ?? 'text-bg-secondary';
 }
 
 export function trustRegistryLabel(trust: AgentTrustRegistry): string {
@@ -136,9 +114,9 @@ export function endpointHost(agent: Pick<AgentRecord, 'endpoint' | 'target_name'
   }
 }
 
-/** "1 identity" or "N identities". */
-export function identitiesLabel(count: number): string {
-  return `${count} ${count === 1 ? 'identity' : 'identities'}`;
+/** "identity" for one, else "identities". */
+export function identityNoun(count: number): string {
+  return count === 1 ? 'identity' : 'identities';
 }
 
 /** `360` → `6h`, `90` → `90m`, `2880` → `2d`. */

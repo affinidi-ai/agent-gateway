@@ -13,9 +13,7 @@ const AgentDetailHeader: React.FC<{ agent: AgentRecord }> = ({ agent }) => {
     <div className="card-header py-3" data-testid="agent-details-header">
       <h6 className="m-0 font-weight-bold text-primary d-flex flex-wrap align-items-center gap-2">
         <i className="fas fa-robot" aria-hidden="true" />
-        <span data-testid="agent-details-name">
-          {agent.name ?? <span className="text-muted fst-italic">{UNNAMED_AGENT}</span>}
-        </span>
+        <span data-testid="agent-details-name">{agent.name ?? UNNAMED_AGENT}</span>
         {host && (
           <span className="small text-muted fw-normal" data-testid="agent-details-endpoint-host">
             {host}

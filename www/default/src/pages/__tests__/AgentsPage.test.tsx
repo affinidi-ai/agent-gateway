@@ -88,7 +88,12 @@ describe('AgentsPage', () => {
     const identities = within(first).getByTestId('agents-identities');
     expect(identities).toHaveTextContent(/^1 identity$/);
     expect(identities).toHaveAttribute('title', LONG_DID);
-    expect(identities).not.toHaveClass('badge');
+    const identitiesCount = within(identities).getByTestId('agents-identities-count');
+    expect(identitiesCount).toHaveTextContent(/^1$/);
+    expect(identitiesCount).toHaveClass('badge', 'text-bg-primary');
+    expect(identitiesCount).not.toHaveClass('rounded-pill');
+    expect(identitiesCount).not.toHaveClass('small');
+    expect(identities).not.toHaveClass('small');
     expect(within(first).getByTestId('agents-trust-recorded')).toHaveTextContent('Recorded');
     expect(within(first).getByTestId('agents-trust-recorded')).toHaveClass('text-bg-success');
     expect(within(first).getByTestId('agents-runtime')).toHaveAttribute(
@@ -98,6 +103,9 @@ describe('AgentsPage', () => {
     expect(within(first).getByTestId('agents-runtime')).toHaveTextContent(
       'Direct. The gateway calls the agent URL directly.'
     );
+    expect(within(first).getByTestId('agents-runtime')).not.toHaveClass('small');
+    expect(within(first).getByTestId('agents-runtime')).not.toHaveClass('badge');
+    expect(within(first).getByTestId('agents-runtime')).not.toHaveClass('text-muted');
     expect(within(first).queryByTestId('agents-trust-not-recorded')).not.toBeInTheDocument();
     expect(within(first).getByText('None in last 6h')).toBeInTheDocument();
 
@@ -116,9 +124,10 @@ describe('AgentsPage', () => {
     expect(within(second).queryByTestId('agents-identities')).not.toBeInTheDocument();
     expect(within(second).getByText('Proxied')).toBeInTheDocument();
     expect(within(second).getByTestId('agents-protocol-badge')).toHaveTextContent(/^A2A$/);
-    expect(within(second).getByTestId('agents-trust-not-recorded')).toHaveTextContent(
-      'Not recorded'
-    );
+    const notRecorded = within(second).getByTestId('agents-trust-not-recorded');
+    expect(notRecorded).toHaveTextContent('Not recorded');
+    expect(notRecorded).toHaveClass('badge', 'app-badge', 'app-badge--sm', 'text-bg-secondary');
+    expect(notRecorded).not.toHaveClass('badge-none');
     expect(within(second).queryByTestId('agents-trust-recorded')).not.toBeInTheDocument();
     expect(screen.queryByText('a2a-proxy')).not.toBeInTheDocument();
   });
@@ -167,13 +176,14 @@ describe('AgentsPage', () => {
     const identities = within(row).getByTestId('agents-identities');
     expect(identities).toHaveTextContent(/^2 identities$/);
     expect(identities).toHaveAttribute('title', 'did:web:a.example\ndid:web:b.example');
+    expect(within(identities).getByTestId('agents-identities-count')).toHaveTextContent(/^2$/);
     expect(within(row).queryByTestId('agents-did')).not.toBeInTheDocument();
     expect(within(row).queryByTestId('agents-copy-did-button')).not.toBeInTheDocument();
     expect(within(row).queryByTestId('agents-no-identity')).not.toBeInTheDocument();
     expect(within(row).queryByText(/other surface/)).not.toBeInTheDocument();
   });
 
-  it('flags No identity only while surfaces use the agent', async () => {
+  it('shows No identity as muted text, explained only while surfaces use the agent', async () => {
     mockedListAgents.mockResolvedValue(
       list(
         agent({ identities: [] }),
@@ -186,11 +196,16 @@ describe('AgentsPage', () => {
     const flagged = within(used).getByTestId('agents-no-identity');
     expect(flagged).toHaveTextContent('No identity');
     expect(flagged).toHaveAttribute('title', 'The surface using this agent has no DID');
-    expect(flagged).toHaveClass('badge');
+    expect(flagged).toHaveClass('text-muted');
+    expect(flagged).not.toHaveClass('small');
+    expect(flagged).not.toHaveClass('badge');
+    expect(flagged.innerHTML).toBe('No identity');
 
     const idle = within(screen.getByTestId('agents-row-a2')).getByTestId('agents-no-identity');
     expect(idle).toHaveClass('text-muted');
+    expect(idle).not.toHaveClass('small');
     expect(idle).not.toHaveClass('badge');
+    expect(idle).not.toHaveAttribute('title');
   });
 
   it('shows the endpoint host under the name', async () => {
@@ -245,7 +260,17 @@ describe('AgentsPage', () => {
     const count = within(row).getByTestId('agents-surfaces-count');
     expect(count).toHaveTextContent('2');
     expect(count).toHaveAttribute('aria-label', '2 surfaces');
+    expect(count).not.toHaveClass('small');
+    expect(within(row).getByTestId('agents-surfaces')).not.toHaveClass('small');
+    expect(within(row).getByTestId('agents-surface-names')).not.toHaveClass('small');
     expect(within(row).getByTestId('agents-surfaces')).toHaveAttribute('title', 'helium, oxygen');
+    expect(within(row).getByTestId('agents-surfaces').style.maxWidth).toBe('');
+    const surfacesCell = within(row)
+      .getAllByRole('cell')
+      .find(cell => within(cell).queryByTestId('agents-surfaces'));
+    expect(surfacesCell).toHaveStyle({
+      maxWidth: '0px',
+    });
     expect(within(row).getByTestId('agents-surface-names')).toHaveTextContent('helium, oxygen');
     expect(within(row).queryByRole('link')).not.toBeInTheDocument();
   });

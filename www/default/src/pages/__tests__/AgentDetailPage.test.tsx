@@ -331,7 +331,9 @@ describe('AgentDetailPage', () => {
   it('shows Unnamed agent for an agent without a name', async () => {
     mockedGetAgent.mockResolvedValue(details({ name: null }));
     renderPage();
-    expect(await screen.findByTestId('agent-details-name')).toHaveTextContent('Unnamed agent');
+    const name = await screen.findByTestId('agent-details-name');
+    expect(name).toHaveTextContent('Unnamed agent');
+    expect(name.innerHTML).toBe('Unnamed agent');
     await waitFor(() =>
       expect(screen.getByTestId('topbar-title')).toHaveTextContent(/^Unnamed agent$/)
     );
@@ -448,9 +450,9 @@ describe('AgentDetailPage', () => {
     openTab(/Agent Card/);
 
     const preview = await screen.findByTestId('agent-card-preview');
-    expect(within(preview).getByTestId('agent-card-preview-name')).toHaveTextContent(
-      'Unnamed agent'
-    );
+    const previewName = within(preview).getByTestId('agent-card-preview-name');
+    expect(previewName).toHaveTextContent('Unnamed agent');
+    expect(previewName.innerHTML).toBe('Unnamed agent');
     expect(within(preview).getAllByText('Not set').length).toBe(7);
     expect(within(preview).getByText('No skills listed')).toBeInTheDocument();
   });

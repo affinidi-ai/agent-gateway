@@ -5,7 +5,6 @@ import {
   displayName,
   formatWindow,
   lastActivityLabel,
-  protocolLabel,
   runtimeIcon,
   runtimeLabel,
   shortenDid,
@@ -40,9 +39,6 @@ describe('agentLabels', () => {
 
   it('never shows raw enum values', () => {
     expect(runtimeLabel('ftp')).toBe('Unknown runtime');
-    expect(protocolLabel('a2a')).toBe('A2A');
-    expect(protocolLabel('mcp')).toBe('MCP');
-    expect(protocolLabel('carrier-pigeon')).toBe('Other protocol');
   });
 
   it('labels the trust registry Recorded or Not recorded', () => {

@@ -285,7 +285,7 @@ const AgentCardPreview: React.FC<AgentCardPreviewProps> = ({ card, upstreamCard 
         </span>
         <div className="agent-preview-title">
           <div className="agent-preview-name" data-testid="agent-card-preview-name">
-            {name ?? <span className="fst-italic">{UNNAMED_AGENT}</span>}
+            {name ?? UNNAMED_AGENT}
           </div>
           <div className="agent-preview-description">
             {description ?? <span className="fst-italic">No description</span>}

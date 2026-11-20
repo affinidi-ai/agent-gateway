@@ -28,7 +28,7 @@ const TrustRegistrySection: React.FC<{ outcomes: AgentRegistryOutcome[] }> = ({ 
   const { hasPermission } = usePermissions();
   return (
     <section className="mt-4" data-testid="agent-connection-trust-registry">
-      <h6 className="m-0 fw-bold">Trust registry</h6>
+      <h6 className="agent-preview-section-title m-0">Trust registry</h6>
       <div className="small text-muted mb-3">
         Where the agent&apos;s identities were recorded. Recording is not a trust decision.
       </div>
@@ -166,7 +166,7 @@ const ConnectionTab: React.FC<{ agent: AgentDetails }> = ({ agent }) => {
   return (
     <div data-testid="agent-connection-tab">
       <div className="mb-3">
-        <h6 className="m-0 fw-bold">Route</h6>
+        <h6 className="agent-preview-section-title m-0">Route</h6>
         <div className="small text-muted" data-testid="agent-connection-description">
           {ROUTE_DESCRIPTIONS[target.kind]}
         </div>
