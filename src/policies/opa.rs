@@ -44,6 +44,9 @@ pub struct PolicyDecision {
 /// suffices — there is no `data.channel.policy` fallback.
 const SURFACE_POLICY_BASE: &str = "data.surface.policy";
 
+/// The reason a deny carries when the policy sets no `deny_reason`.
+pub const DEFAULT_DENY_REASON: &str = "Policy denied request";
+
 fn eval_surface_decision(engine: &mut Engine) -> Result<PolicyDecision, String> {
     match engine.eval_bool_query(format!("{SURFACE_POLICY_BASE}.allow"), false) {
         Ok(allow) => {
@@ -183,7 +186,7 @@ impl OpaEngine {
         match eval_surface_decision(&mut engine) {
             Ok(mut decision) => {
                 if !decision.allow && decision.reason.is_none() {
-                    decision.reason = Some("Policy denied request".to_string());
+                    decision.reason = Some(DEFAULT_DENY_REASON.to_string());
                 }
                 Ok(decision)
             }

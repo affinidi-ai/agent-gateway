@@ -4414,7 +4414,11 @@ async fn step_transit_point_opa_policy(
                 alias = %ctx.virtual_channel.alias,
                 "Per-transit-point OPA policy denied"
             );
-            return Err(OutboundPipelineError::TransitPointPolicyDenied { reason: decision.reason });
+            return Err(OutboundPipelineError::TransitPointPolicyDenied {
+                reason: decision
+                    .reason
+                    .filter(|reason| reason != crate::policies::opa::DEFAULT_DENY_REASON),
+            });
         }
         Err(e) => {
             let error = crate::observability::PolicyEvaluationError::EvaluationError;
