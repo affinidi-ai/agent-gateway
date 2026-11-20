@@ -479,7 +479,8 @@ no managed-agent elements or the request is a discovery read. Without a trust re
 connection each element fails with `TRUST_REGISTRY_UNREACHABLE`, except that a request with no
 managed agent DID still reports `MANAGED_AGENT_IDENTITY_UNAVAILABLE`. Like every Trust Check
 the stage never denies: policy decides. Nothing is cached, so turning recognition off in the
-trust registry takes effect on the next call. The Transit Point's policy still runs on a
+trust registry takes effect on the next call, unless a Transit Point Trust Recorder writes the
+record again (see below). The Transit Point's policy still runs on a
 discovery read, such as an agent card read, where the key is absent. To refuse a managed agent
 the trust registry no longer recognises and still serve discovery reads, allow a request whose
 results are absent and otherwise require that every result is `ok`:
