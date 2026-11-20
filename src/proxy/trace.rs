@@ -241,22 +241,24 @@ pub struct RequestTrace {
 }
 
 impl RequestTrace {
-    /// The trace a request continues or starts, from the `traceparent` and
-    /// `X-Gateway-Trace-Id` it arrived with and this gateway's span for it.
+    /// The trace a request continues or starts, from every value of the
+    /// `traceparent` and `X-Gateway-Trace-Id` headers it arrived with and this
+    /// gateway's span for it.
     ///
-    /// A header that is not valid is treated as absent. A `traceparent` alone,
+    /// A header that is not valid, or that arrived more than once, is treated
+    /// as absent. A `traceparent` alone,
     /// or one naming the same trace as `X-Gateway-Trace-Id`, is continued with
     /// its span as the parent. `X-Gateway-Trace-Id` alone is continued with no
     /// parent. When both are valid and name different traces,
     /// `X-Gateway-Trace-Id` wins with no parent, and the two ids are returned
     /// for the caller to warn about. With neither, a trace id is minted.
     pub fn from_headers(
-        traceparent: Option<&str>,
-        x_gateway_trace_id: Option<&str>,
+        traceparent: &[&str],
+        x_gateway_trace_id: &[&str],
         span_id: SpanId,
     ) -> (Self, Option<TraceDisagreement>) {
-        let traceparent = traceparent.and_then(|header| valid_header(Traceparent::parse(header)));
-        let named = x_gateway_trace_id.and_then(|header| valid_header(TraceId::parse(header)));
+        let traceparent = single(traceparent).and_then(|header| valid_header(Traceparent::parse(header)));
+        let named = single(x_gateway_trace_id).and_then(|header| valid_header(TraceId::parse(header)));
         let unparented = |trace_id, trace_source| Self {
             trace_id,
             span_id: span_id.clone(),
@@ -348,6 +350,19 @@ impl OutgoingTrace {
         received: Option<T>,
     ) -> Option<T> {
         received.filter(|_| self.continued_flags.is_some())
+    }
+}
+
+/// The value of a header that arrived exactly once. A header that arrived more
+/// than once is treated as absent: none of its values is used.
+fn single<'a>(values: &[&'a str]) -> Option<&'a str> {
+    match values {
+        [value] => Some(value),
+        [] => None,
+        _ => {
+            tracing::debug!(fields = values.len(), "Ignoring a trace header that arrived more than once");
+            None
+        }
     }
 }
 
@@ -558,7 +573,7 @@ mod tests {
             let _ = TraceId::parse(&input);
             let _ = SpanId::parse(&input);
             let _ = Traceparent::parse(&input);
-            let _ = RequestTrace::from_headers(Some(&input), Some(&input), own_span());
+            let _ = RequestTrace::from_headers(&[&input], &[&input], own_span());
         }
     }
 
@@ -643,13 +658,26 @@ mod tests {
         }
     }
 
+    /// Every value of a header in a vector: none for `null`, one for a
+    /// string, and each field in order for an array.
+    fn header_values(value: &Value) -> Vec<&str> {
+        match value {
+            Value::Null => Vec::new(),
+            Value::Array(fields) => fields
+                .iter()
+                .map(|field| field.as_str().unwrap())
+                .collect(),
+            field => vec![field.as_str().unwrap()],
+        }
+    }
+
     #[test]
     fn incoming_trace_headers_resolve_as_the_vectors_say() {
         for case in vector_cases("incoming_headers") {
             let (name, input, expected) = (&case["name"], &case["input"], &case["expected"]);
             let (trace, disagreement) = RequestTrace::from_headers(
-                input["traceparent"].as_str(),
-                input["x_gateway_trace_id"].as_str(),
+                &header_values(&input["traceparent"]),
+                &header_values(&input["x_gateway_trace_id"]),
                 own_span(),
             );
             assert_eq!(json!(trace.trace_source.as_str()), expected["trace_source"], "{name}");
