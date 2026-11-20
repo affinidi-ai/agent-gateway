@@ -70,13 +70,18 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
     return true;
   };
 
-  const resumed = useRef<string | null>(null);
   // Why `?resume=` cannot continue: the record is gone or already continued, or expired.
   const [resumeUnavailable, setResumeUnavailable] = useState('');
 
+  // Only the load for the current `?resume=` id may change the wizard: switching ids
+  // clears the previous record, and a slower answer for the previous id is dropped.
   useEffect(() => {
-    if (!resumeId || resumed.current === resumeId) return;
-    resumed.current = resumeId;
+    if (!resumeId) return;
+    let current = true;
+    setResumeUnavailable('');
+    setRefusal(null);
+    setError('');
+    setWizardState(prev => ({ ...prev, gateway: null, mediatorAccess: null }));
     const resume = async () => {
       try {
         setPausing(true);
@@ -85,6 +90,7 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
           apiClient.get(`/gateways/${id}`),
           apiClient.get<MediatorAccess>(`/gateways/${id}/mediator-access`),
         ]);
+        if (!current) return;
         if (mediatorAccessExpired(access.data)) {
           setResumeUnavailable(
             `Its invitation expired on ${formatDateTime(access.data.expires_at, true)}. Delete this gateway on Connections and ask the inviting gateway for a new invitation.`
@@ -101,12 +107,15 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
           currentStep: 'mediator-access',
         }));
       } catch (err: any) {
-        setResumeUnavailable(err.message || 'Failed to load the gateway.');
+        if (current) setResumeUnavailable(err.message || 'Failed to load the gateway.');
       } finally {
-        setPausing(false);
+        if (current) setPausing(false);
       }
     };
     resume();
+    return () => {
+      current = false;
+    };
   }, [resumeId]);
 
   // Mediator Access is listed only once the mediator has refused the DIDs, so a

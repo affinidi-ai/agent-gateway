@@ -108,13 +108,19 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
     await tryContinue(connectionPointId, true);
   };
 
-  const resumed = useRef<string | null>(null);
   // Why `?resume=` cannot continue: the record is gone or already continued, or expired.
   const [resumeUnavailable, setResumeUnavailable] = useState('');
 
+  // Only the load for the current `?resume=` id may change the wizard: switching ids
+  // clears the previous record, and a slower answer for the previous id is dropped.
   useEffect(() => {
-    if (!resumeId || resumed.current === resumeId) return;
-    resumed.current = resumeId;
+    if (!resumeId) return;
+    let current = true;
+    setResumeUnavailable('');
+    setRefusal(null);
+    setContinueError('');
+    setFirstTryError('');
+    setWizardState(prev => ({ ...prev, connectionPoint: null, mediatorAccess: null }));
     const resume = async () => {
       try {
         setSaving(true);
@@ -123,6 +129,7 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
           apiClient.get(`/connection-points/${id}`),
           apiClient.get<MediatorAccess>(`/connection-points/${id}/mediator-access`),
         ]);
+        if (!current) return;
         if (mediatorAccessExpired(access.data)) {
           setResumeUnavailable(
             `Its invitation expired on ${formatDateTime(access.data.expires_at, true)}. Delete this connection point on Connections and create a new one.`
@@ -138,12 +145,15 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
           currentStep: 'mediator-access',
         }));
       } catch (err: any) {
-        setResumeUnavailable(err.message || 'Failed to load the connection point.');
+        if (current) setResumeUnavailable(err.message || 'Failed to load the connection point.');
       } finally {
-        setSaving(false);
+        if (current) setSaving(false);
       }
     };
     resume();
+    return () => {
+      current = false;
+    };
   }, [resumeId]);
 
   // Mediator Access is listed only once the mediator has refused the DIDs.
