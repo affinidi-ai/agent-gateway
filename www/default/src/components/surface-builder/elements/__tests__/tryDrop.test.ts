@@ -18,6 +18,8 @@ import {
   resolvePayloadPath,
   TRUST_CHECK_MANAGED_AGENT_SLOT_ID,
   TRUST_CHECK_TRANSIT_POINT_SLOT_ID,
+  TRUST_RECORDER_TRANSIT_POINT_SLOT_ID,
+  archetypeHasSlotFor,
 } from '../edges/archetypes';
 import { synthesizeFabricCanvasNodes, SYNTH_HOP_PREFIX } from '../synthesizeFabric';
 import type { CanvasNode } from '../../SurfaceCanvas';
@@ -341,6 +343,48 @@ describe('makeSurfaceSlotFilter (topology-aware slot visibility)', () => {
     expect(result.ok).toBe(false);
     // Not "transit-wide" guidance — MCP Tool Gating has no AP→MA slot.
     expect(result.ok ? '' : result.reason).toMatch(/can't be placed on this Transit Point/i);
+  });
+});
+
+describe('Trust Recorder on the Managed Agent → Transit Point arrow', () => {
+  const nodes: CanvasNode[] = [
+    node({ id: 'ap', type: 'access-point' }),
+    node({ id: 'ma', type: 'target', parentId: 'ap' }),
+    node({ id: 'tp1', type: 'transit-point-mcp' }),
+  ];
+  const filter = makeSurfaceSlotFilter('https://upstream.example/api', true, nodes);
+  const edges = deriveEdges(nodes);
+  const tpEdge = edges.find(e => e.archetype === 'ma-tp')!;
+
+  it('lands on the request leg and writes the Transit Point recorder', () => {
+    const result = tryDrop(tpEdge, 'trust-recorder', 'request', undefined, filter);
+    expect(result).toEqual({ ok: true, slotId: TRUST_RECORDER_TRANSIT_POINT_SLOT_ID });
+    const slot = getSlot('ma-tp', TRUST_RECORDER_TRANSIT_POINT_SLOT_ID)!;
+    expect(resolvePayloadPath(slot, tpEdge)).toBe('transit.points[tp1].trust_recorder');
+  });
+
+  it('runs before the Transit Point Trust Check', () => {
+    const maTp = getArchetype('ma-tp')!;
+    const orderOf = (slotId: string) => maTp.slots.find(slot => slot.id === slotId)!.order;
+    expect(orderOf(TRUST_RECORDER_TRANSIT_POINT_SLOT_ID)).toBeLessThan(
+      orderOf(TRUST_CHECK_TRANSIT_POINT_SLOT_ID)
+    );
+  });
+
+  it('has no response-leg slot on the Transit Point arrow', () => {
+    expect(tryDrop(tpEdge, 'trust-recorder', 'response', undefined, filter).ok).toBe(false);
+    expect(archetypeHasSlotFor('ma-tp', 'trust-recorder', 'response')).toBe(false);
+    expect(archetypeHasSlotFor('ma-tp', 'trust-recorder', 'request')).toBe(true);
+  });
+
+  it('keeps the surface recorder on the Access Point response leg only', () => {
+    const apMa = edges.find(e => e.archetype === 'ap-ma')!;
+    expect(tryDrop(apMa, 'trust-recorder', 'response', undefined, filter)).toEqual({
+      ok: true,
+      slotId: 'response:trust-recorder',
+    });
+    expect(archetypeHasSlotFor('ap-ma', 'trust-recorder', 'request')).toBe(false);
+    expect(archetypeHasSlotFor(undefined, 'trust-recorder', 'request')).toBe(false);
   });
 });
 

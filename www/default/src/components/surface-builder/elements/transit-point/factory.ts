@@ -22,6 +22,7 @@ import {
   readOnlyTrustCheckProtocol,
   transitPointTrustCheckListToWire,
 } from '../trust-check/definition';
+import { readEntries as readTrustRecorderEntries } from '../trust-recorder/definition';
 import { DOCS_URL } from '../../../../config/docs';
 import { callerAuthProblems, callerAuthToWire } from './callerAuth';
 
@@ -397,6 +398,13 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                   !!trustCheckNode &&
                     readOnlyTrustCheckProtocol(trustCheckNode, ctx.allNodes) !== null
                 );
+                // Per-TP Trust Recorder (MA→TP request slot). The
+                // trust-recorder element's own buildPayload skips TP-parented
+                // nodes so this is the only writer.
+                const recorderNode = ctx.allNodes.find(
+                  n => n.type === 'trust-recorder' && n.parentId === tp.id
+                );
+                const recorderEntries = readTrustRecorderEntries(recorderNode?.config);
                 const credentials = transitCredentialsToApi(c.transit_credentials);
                 const headerMetadataNode = ctx.allNodes.find(
                   n => n.type === 'metadata-extraction' && n.parentId === tp.id
@@ -448,8 +456,8 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                   ...(c.identity_injection?.inject_vp === true
                     ? { identity_injection: c.identity_injection }
                     : {}),
-                  ...(c.trust_recorder && typeof c.trust_recorder === 'object'
-                    ? { trust_recorder: c.trust_recorder }
+                  ...(recorderEntries.length > 0
+                    ? { trust_recorder: { entries: recorderEntries } }
                     : {}),
                   ...(() => {
                     const targetAuth = transitPointTargetAuth(c);

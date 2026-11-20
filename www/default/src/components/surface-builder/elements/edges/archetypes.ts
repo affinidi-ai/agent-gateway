@@ -18,6 +18,7 @@ export const TRUST_CHECK_CALLER_SLOT_ID = 'request:trust-check-access_point_trus
 export const TRUST_CHECK_MANAGED_AGENT_SLOT_ID = 'request:trust-check-target_trust_check_list';
 export const TRUST_CHECK_TRANSIT_POINT_SLOT_ID =
   'request:trust-check-transit_points_trust_check_list';
+export const TRUST_RECORDER_TRANSIT_POINT_SLOT_ID = 'request:trust-recorder';
 
 /** Sentinel meaning "any element type that matches this slot's direction". */
 export const ANY_EDGE_MW = '*' as const;
@@ -276,6 +277,16 @@ const maTpArchetype: RuntimeEdgeArchetypeDef = {
     typedSlot('policy', 'request', 70, 'transit.points[{owner}].policy', 'Per-TP request policy', {
       ownedBy: 'target',
     }),
+    // Writes the records of the managed agent calling out through this
+    // Transit Point before its Trust Check asks about them.
+    typedSlot(
+      'trust-recorder',
+      'request',
+      55,
+      'transit.points[{owner}].trust_recorder',
+      'Trust Recorder (this Transit Point)',
+      { ownedBy: 'target' }
+    ),
     typedSlot(
       'trust-check',
       'request',
@@ -515,6 +526,22 @@ export function tryDrop(
     return { ok: true, slotId: slot.id };
   }
   return { ok: false, reason: 'No eligible slot.' };
+}
+
+/**
+ * True when the archetype has a typed slot for `type` in `direction`, so an
+ * element with slots on both directions of different arrows snaps only to
+ * an arrow it can land on.
+ */
+export function archetypeHasSlotFor(
+  archetypeId: string | undefined,
+  type: SurfaceNodeType,
+  direction: SlotDirection
+): boolean {
+  const archetype = archetypeId ? getArchetype(archetypeId) : undefined;
+  return !!archetype?.slots.some(
+    s => s.direction === direction && s.accepts !== ANY_EDGE_MW && slotAccepts(s, type)
+  );
 }
 
 function slotAccepts(slot: RuntimeSlotDef, type: SurfaceNodeType): boolean {
