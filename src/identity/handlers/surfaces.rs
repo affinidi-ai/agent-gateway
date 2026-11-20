@@ -533,7 +533,14 @@ fn refuse_target_managed_agent_elements(surface: &AgentSurface) -> Result<(), Su
                         .as_deref()
                 })
         });
-    for list in std::iter::once(surface.target.trust_check_list.as_slice()).chain(variant_lists) {
+    for list in std::iter::once(
+        surface
+            .target
+            .trust_check_list
+            .as_slice(),
+    )
+    .chain(variant_lists)
+    {
         if let Some(element) = list
             .iter()
             .find(|element| !element.subject.is_target())

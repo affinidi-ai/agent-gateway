@@ -390,10 +390,11 @@ allow if {
             .find("```rego\n")
             .expect("rego block")
             + "```rego\n".len();
-        let policy = &section[start..start
-            + section[start..]
-                .find("```")
-                .expect("block end")];
+        let policy = &section[start
+            ..start
+                + section[start..]
+                    .find("```")
+                    .expect("block end")];
         let engine = OpaEngine::new();
         engine
             .load_policy("self-recognition", policy)
