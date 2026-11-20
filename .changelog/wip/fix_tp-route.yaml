@@ -77,6 +77,17 @@ changes:
         a stored prefix the picker no longer offers is re-derived from the route instead of shown
         as selected, so a surface stored before this reads correctly without being rewritten. A
         new Transit Point seeds an offered prefix as well.
+    - timestamp: '2026-11-20T18:10:00Z'
+      title: The Surface Builder holds the surface prefix and path to the required fields they are
+      description: >-
+        Both route fields carry a required marker and neither could act on it: the path's validator
+        returns no error for an empty value, and the prefix had no error binding at all. A node
+        whose stored route the builder could not place under an offered prefix therefore rendered
+        as two blank fields, indistinguishable from one nobody had filled in, and saving it composed
+        an empty route out of them without a word, replacing a route the gateway was still serving.
+        A save attempt now refuses both, the prefix naming the route as stored and saying it is
+        under none of the prefixes on offer. On a save attempt, as the path's own error already
+        was, so a node is never marked before it has been touched.
   removed: []
   security:
     - timestamp: '2026-11-20T12:40:00Z'

@@ -319,6 +319,16 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
 
   const pathError = useMemo(() => validatePath(customPath), [customPath]);
 
+  // Both fields are marked required and until now neither could say so: validatePath
+  // returns null for an empty path, and the prefix had no error binding at all. A node
+  // whose route the editor could not resolve therefore rendered as two blank fields,
+  // indistinguishable from one nobody had filled in, and a save composed an empty route
+  // from them without complaint. Gated on hasAttemptedSave like the existing path error,
+  // so a new node is not red before it has been touched.
+  const prefixMissing = !selectedPrefix;
+  const pathMissing = !customPath.trim();
+  const showErrors = !!hasAttemptedSave;
+
   const fullRouteDisplay = useMemo(() => {
     if (!selectedHostPort || !selectedPrefix) return '';
     const suffix = customPath.startsWith('/') ? customPath : `/${customPath}`;
@@ -473,6 +483,7 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
             value={selectedPrefix}
             onChange={e => writeRouteParts(e.target.value, customPath)}
             disabled={!routingConfig || channelPrefixes.length === 0}
+            isInvalid={showErrors && prefixMissing}
           >
             {!routingConfig ? (
               <option value="">Loading...</option>
@@ -489,6 +500,17 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
               </>
             )}
           </Form.Select>
+          {showErrors && prefixMissing && (
+            <Form.Control.Feedback type="invalid" style={{ fontSize: '10px' }}>
+              Pick a surface prefix.
+              {!!composedRoute && (
+                <>
+                  {' '}
+                  This node is stored as <code>{composedRoute}</code>, which is under none of them.
+                </>
+              )}
+            </Form.Control.Feedback>
+          )}
         </Form.Group>
         <Form.Group className="mb-2">
           <div className="d-flex align-items-center gap-1 mb-1">
@@ -508,12 +530,12 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
             type="text"
             placeholder="my-agent/v1"
             value={customPath.startsWith('/') ? customPath.substring(1) : customPath}
-            isInvalid={!!hasAttemptedSave && !!pathError}
+            isInvalid={showErrors && (pathMissing || !!pathError)}
             onChange={e => writeRouteParts(selectedPrefix, e.target.value)}
           />
-          {!!hasAttemptedSave && pathError && (
+          {showErrors && (pathMissing || pathError) && (
             <Form.Control.Feedback type="invalid" style={{ fontSize: '10px' }}>
-              {pathError}
+              {pathError ?? 'Enter a path.'}
             </Form.Control.Feedback>
           )}
           <Form.Text className="text-muted d-block" style={{ fontSize: '10px' }}>
