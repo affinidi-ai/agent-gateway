@@ -585,7 +585,10 @@ describe('SurfaceDetailPage delete', () => {
     await openConfirmation();
 
     const cancel = screen.getByTestId('surface-delete-confirm-cancel');
-    expect(cancel).toHaveFocus();
+    // The popover takes focus in an effect that runs after it is placed, while
+    // openConfirmation resolves as soon as the balloon is in the DOM, so the
+    // two are not ordered: wait for the focus rather than assume it landed.
+    await waitFor(() => expect(cancel).toHaveFocus());
     fireEvent.click(cancel);
 
     expect(screen.queryByTestId('surface-delete-confirm')).toBeNull();
