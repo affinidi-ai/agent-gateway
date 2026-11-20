@@ -1141,7 +1141,11 @@ records as it rotates, and that is not counted here (see _File size_ above).
   when an Access Point request, a Transit Point request or a fabric-received request starts,
   never read from a header or token. Every record of one request shares it, and an Access
   Point request and the Transit Point requests its agent makes each have their own, linked by
-  `trace_id`; a sink counts requests by distinct `request_id`. A record of a surface request also
+  `trace_id`; a sink counts requests by distinct `request_id`. The record carries the same value
+  as `span_id`, the request's span in W3C Trace Context. A record of a request whose entry point
+  read trace headers also gets `trace_source`, where its trace id came from (`transit_token`,
+  `header` or `minted`), and `parent_span_id`, the span the request's `traceparent` named in the
+  same trace, absent when it named none. A record of a surface request also
   gets the request's `surface_variant` (see _Surface variant_ above). That includes the records a
   streamed response writes per event while it is read (SSE on every path) and the payment
   records an x402 or MPP request writes from background tasks. Records a proxied request produces while credential delegation runs are held

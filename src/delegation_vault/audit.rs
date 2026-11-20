@@ -245,6 +245,18 @@ pub struct DelegationAuditEvent {
     /// each have their own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// This gateway's span for the request, in W3C Trace Context: the same
+    /// value as `request_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_id: Option<String>,
+    /// The span the request named as its parent in a `traceparent` of the
+    /// same trace. Absent when it named none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_span_id: Option<String>,
+    /// Where the request's trace id came from: `transit_token`, `header` or
+    /// `minted`. Absent outside a traced request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_source: Option<String>,
     /// The variant of the surface `surface_id` names that served the request:
     /// the variant's alias, `_base_` when the base surface served it, or
     /// `_unknown_` when the URL named a variant the surface doesn't have.
@@ -1363,6 +1375,9 @@ pub fn audit_event(
         vp_fingerprint: None,
         trace_id: None,
         request_id: None,
+        span_id: None,
+        parent_span_id: None,
+        trace_source: None,
         surface_variant: None,
         detail: None,
         tenant_id: None,
@@ -2590,6 +2605,9 @@ pub fn audit_policy_decision(
         vp_fingerprint: None,
         trace_id: trace_id.map(str::to_string),
         request_id: None,
+        span_id: None,
+        parent_span_id: None,
+        trace_source: None,
         surface_variant: None,
         detail: None,
         tenant_id: None,
@@ -2643,6 +2661,9 @@ pub fn audit_trust_check(
         vp_fingerprint: None,
         trace_id: trace_id.map(str::to_string),
         request_id: None,
+        span_id: None,
+        parent_span_id: None,
+        trace_source: None,
         surface_variant: None,
         detail: None,
         tenant_id: None,
@@ -2689,6 +2710,9 @@ pub fn audit_trace_terminated(
         vp_fingerprint: None,
         trace_id: Some(own_trace_id.to_string()),
         request_id: None,
+        span_id: None,
+        parent_span_id: None,
+        trace_source: None,
         surface_variant: None,
         detail: Some(format!("downstream_trace_id={downstream_trace_id}")),
         tenant_id: None,
@@ -3653,6 +3677,9 @@ mod tests {
             vp_fingerprint: None,
             trace_id: Some("own-123".to_string()),
             request_id: None,
+            span_id: None,
+            parent_span_id: None,
+            trace_source: None,
             surface_variant: None,
             detail: Some("downstream_trace_id=down-456".to_string()),
             tenant_id: None,
@@ -4227,6 +4254,9 @@ mod tests {
                 vp_fingerprint: None,
                 trace_id: Some("trace-1".to_string()),
                 request_id: None,
+                span_id: None,
+                parent_span_id: None,
+                trace_source: None,
                 surface_variant: None,
                 detail: None,
                 tenant_id: None,
@@ -4269,6 +4299,9 @@ mod tests {
                 vp_fingerprint: None,
                 trace_id: Some("trace-1".to_string()),
                 request_id: None,
+                span_id: None,
+                parent_span_id: None,
+                trace_source: None,
                 surface_variant: None,
                 detail: None,
                 tenant_id: None,

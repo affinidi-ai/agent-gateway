@@ -112,6 +112,9 @@ tokio::task_local! {
 pub struct RequestScope {
     id: String,
     variant: std::sync::OnceLock<String>,
+    /// The trace the request continues or starts, on a request that reads
+    /// trace headers. Its span is the request's id.
+    trace: Option<crate::proxy::trace::RequestTrace>,
 }
 
 impl RequestScope {
@@ -120,6 +123,19 @@ impl RequestScope {
         Arc::new(Self {
             id,
             variant: std::sync::OnceLock::new(),
+            trace: None,
+        })
+    }
+
+    /// A request in `trace`, whose span is the request's id.
+    pub fn traced(trace: crate::proxy::trace::RequestTrace) -> Arc<Self> {
+        Arc::new(Self {
+            id: trace
+                .span_id
+                .as_str()
+                .to_string(),
+            variant: std::sync::OnceLock::new(),
+            trace: Some(trace),
         })
     }
 
@@ -138,6 +154,14 @@ pub fn current_request_id() -> Option<String> {
     REQUEST
         .try_with(|scope| scope.id.clone())
         .ok()
+}
+
+/// The trace of the request being served, when its entry point read one.
+pub fn current_request_trace() -> Option<crate::proxy::trace::RequestTrace> {
+    REQUEST
+        .try_with(|scope| scope.trace.clone())
+        .ok()
+        .flatten()
 }
 
 /// Records the surface variant the request being served resolved to, and

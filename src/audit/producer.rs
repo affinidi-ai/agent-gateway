@@ -11,7 +11,7 @@ use crate::audit::journal::Pending;
 use crate::audit::registry::{Sinks, sinks};
 use crate::delegation_vault::audit::{DelegationAuditEvent, action_category, log_event, new_event_id};
 use crate::metrics::backends::prometheus::{track_audit_record_produced, track_audit_records_lost};
-use crate::observability::policy_audit::{current_request_id, current_request_variant};
+use crate::observability::policy_audit::{current_request_id, current_request_trace, current_request_variant};
 
 pub struct Producer {
     sinks: &'static Sinks,
@@ -145,6 +145,22 @@ impl Producer {
 fn stamp_with_request(event: &mut DelegationAuditEvent) {
     if event.request_id.is_none() {
         event.request_id = current_request_id();
+        if let Some(trace) = current_request_trace() {
+            event.parent_span_id = trace
+                .parent_span_id
+                .map(|parent| parent.as_str().to_string());
+            event.trace_source = Some(
+                trace
+                    .trace_source
+                    .as_str()
+                    .to_string(),
+            );
+        }
+    }
+    if event.span_id.is_none() {
+        event
+            .span_id
+            .clone_from(&event.request_id);
     }
     if event
         .surface_variant
@@ -749,6 +765,55 @@ mod tests {
                 .as_deref(),
             Some("0123456789abcdef")
         );
+    }
+
+    fn span_fields(record: &DelegationAuditEvent) -> (Option<&str>, Option<&str>, Option<&str>, Option<&str>) {
+        (
+            record.request_id.as_deref(),
+            record.span_id.as_deref(),
+            record.parent_span_id.as_deref(),
+            record.trace_source.as_deref(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_record_carries_its_requests_span_parent_and_trace_source() {
+        use crate::proxy::trace::{RequestTrace, SpanId};
+        let (producer, rx) = producer(&[(SinkId::AuditLog, &["consent_granted"])]);
+        let (trace, _) = RequestTrace::from_headers(
+            &["00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"],
+            &[],
+            SpanId::parse("53995c3f42cd8ad8").unwrap(),
+        );
+
+        crate::observability::policy_audit::in_request(
+            crate::observability::policy_audit::RequestScope::traced(trace),
+            async {
+                producer.submit(consent());
+            },
+        )
+        .await;
+
+        assert_eq!(
+            span_fields(&received(&rx)[0].record),
+            (Some("53995c3f42cd8ad8"), Some("53995c3f42cd8ad8"), Some("00f067aa0ba902b7"), Some("header"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_of_a_request_without_a_trace_carries_its_span_only() {
+        let (producer, rx) = producer(&[(SinkId::AuditLog, &["consent_granted"])]);
+
+        crate::audit::context::in_management_request(crate::audit::events::Actor::user("u-1"), async {
+            producer.submit(consent());
+        })
+        .await;
+
+        let pending = received(&rx);
+        let (request_id, span_id, parent_span_id, trace_source) = span_fields(&pending[0].record);
+        assert!(request_id.is_some());
+        assert_eq!(span_id, request_id);
+        assert_eq!((parent_span_id, trace_source), (None, None));
     }
 
     async fn in_request_with_variant<F: std::future::Future>(
