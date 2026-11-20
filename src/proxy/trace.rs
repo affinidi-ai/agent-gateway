@@ -51,33 +51,27 @@ pub struct TraceId(String);
 impl TraceId {
     const DIGITS: usize = 32;
     const HYPHENATED_LEN: usize = 36;
+    /// Where the hyphenated form puts its hyphens: 8-4-4-4-12.
+    const HYPHENS: [usize; 4] = [8, 13, 18, 23];
 
     /// Reads a received trace id: 32 hexadecimal digits in any case, or the
     /// hyphenated 8-4-4-4-12 form in any case, normalised to the written
     /// form. Any other shape, and an id of all zeros, is refused.
     pub fn parse(input: &str) -> Result<Self, TraceHeaderError> {
-        let bytes = input.as_bytes();
-        let hyphenated = match bytes.len() {
-            Self::DIGITS => false,
-            Self::HYPHENATED_LEN => true,
+        let bytes = input.to_ascii_lowercase().into_bytes();
+        let digits = match bytes.len() {
+            Self::DIGITS => bytes,
+            Self::HYPHENATED_LEN if Self::HYPHENS.iter().all(|position| bytes[*position] == b'-') => bytes
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| !Self::HYPHENS.contains(position))
+                .map(|(_, digit)| *digit)
+                .collect(),
             _ => return Err(TraceHeaderError::TraceId),
         };
-        let mut written = String::with_capacity(Self::DIGITS);
-        for (position, byte) in bytes.iter().enumerate() {
-            if hyphenated && matches!(position, 8 | 13 | 18 | 23) {
-                if *byte != b'-' {
-                    return Err(TraceHeaderError::TraceId);
-                }
-            } else if byte.is_ascii_hexdigit() {
-                written.push(char::from(byte.to_ascii_lowercase()));
-            } else {
-                return Err(TraceHeaderError::TraceId);
-            }
-        }
-        if is_all_zero(written.as_bytes()) {
-            return Err(TraceHeaderError::TraceId);
-        }
-        Ok(Self(written))
+        written_id(&digits, Self::DIGITS)
+            .map(Self)
+            .ok_or(TraceHeaderError::TraceId)
     }
 
     /// Reads a trace id that must already be in its written form.
