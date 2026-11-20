@@ -820,6 +820,14 @@ pub enum DelegationAuditAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_auth: Option<TargetAuthRejection>,
     },
+    /// An Access Point request was handed to its target. The record names the
+    /// caller only when the request was authenticated.
+    RequestForwarded {
+        /// `access_point`.
+        flow: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_did: Option<String>,
+    },
     IdentityBindingFailed {
         outcome: IdentityBindingFailure,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -929,6 +937,7 @@ impl DelegationAuditAction {
                 | Self::AuthFailed { .. }
                 | Self::RateLimited { .. }
                 | Self::RequestRejected { .. }
+                | Self::RequestForwarded { .. }
                 | Self::IdentityBindingFailed { .. }
                 | Self::IdentityBindingVerified { .. }
                 | Self::RequestFailed { .. }
@@ -1868,6 +1877,7 @@ pub fn action_category(action: &DelegationAuditAction) -> &'static str {
         DelegationAuditAction::ConnectorCall { .. } => "connector_call",
         DelegationAuditAction::RateLimited { .. } => "rate_limited",
         DelegationAuditAction::RequestRejected { .. } => "request_rejected",
+        DelegationAuditAction::RequestForwarded { .. } => "request_forwarded",
         DelegationAuditAction::IdentityBindingFailed { .. } => "identity_binding_failed",
         DelegationAuditAction::IdentityBindingVerified { .. } => "identity_binding_verified",
         DelegationAuditAction::DelegationFailed { .. } => "delegation_failed",

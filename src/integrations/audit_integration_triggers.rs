@@ -559,6 +559,7 @@ mod tests {
             | DelegationAuditAction::ConnectorCall { .. }
             | DelegationAuditAction::RateLimited { .. }
             | DelegationAuditAction::RequestRejected { .. }
+            | DelegationAuditAction::RequestForwarded { .. }
             | DelegationAuditAction::IdentityBindingFailed { .. }
             | DelegationAuditAction::IdentityBindingVerified { .. }
             | DelegationAuditAction::DelegationFailed { .. }
@@ -654,6 +655,10 @@ mod tests {
                 rpc_error_code: None,
                 requested_variant: None,
                 target_auth: None,
+            },
+            DelegationAuditAction::RequestForwarded {
+                flow: "access_point".to_string(),
+                caller_did: None,
             },
             DelegationAuditAction::IdentityBindingFailed {
                 outcome: IdentityBindingFailure::Absent,

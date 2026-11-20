@@ -641,6 +641,12 @@ mod tests {
     }
 
     #[test]
+    fn request_forwarded_is_offered_to_event_sets_in_the_requests_group() {
+        let event = find_event("audit.request_forwarded").expect("audit.request_forwarded is in the catalogue");
+        assert_eq!((event.family, event.group), (AUDIT.id, Some("requests")));
+    }
+
+    #[test]
     fn every_event_offers_the_common_variables() {
         assert_eq!(
             COMMON_VARIABLES,

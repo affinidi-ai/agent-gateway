@@ -148,6 +148,12 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         "A request was refused at routing, admission or forwarding before it reached the target",
         Requests,
     ),
+    event(
+        "request_forwarded",
+        "Request Forwarded",
+        "An Access Point request was forwarded to its target",
+        Requests,
+    ),
     event("policy_created", "Policy Created", "A policy definition was created", Policies),
     event("policy_updated", "Policy Updated", "A policy definition was changed, or its owner was reassigned", Policies),
     event("policy_deleted", "Policy Deleted", "A policy definition was deleted", Policies),
@@ -408,7 +414,7 @@ mod tests {
         assert_eq!(group_of("browser_origins_changed"), Some(AuditEventGroup::Auth));
         assert_eq!(group_of("identity_binding_failed"), Some(AuditEventGroup::Identity));
         assert_eq!(group_of("identity_binding_verified"), Some(AuditEventGroup::Identity));
-        for request in ["request_rejected", "rate_limited"] {
+        for request in ["request_rejected", "request_forwarded", "rate_limited"] {
             assert_eq!(group_of(request), Some(AuditEventGroup::Requests), "{request}");
         }
         for delegation in [
