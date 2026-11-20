@@ -641,20 +641,32 @@ mod tests {
         }
     }
 
+    /// The outgoing trace of a `tracestate_and_flags` case.
+    fn outgoing_of(case: &Value) -> OutgoingTrace {
+        let input = &case["input"];
+        let continued_flags = flags(&input["continued_flags"]);
+        assert_eq!(json!(continued_flags.is_some()), input["continued"], "{}", case["name"]);
+        assert_eq!(input["continued"], case["accepted"], "{}", case["name"]);
+        OutgoingTrace {
+            trace_id: TraceId::mint(),
+            span_id: own_span(),
+            continued_flags,
+        }
+    }
+
     #[test]
     fn tracestate_is_kept_only_when_a_traceparent_is_continued() {
         for case in vector_cases("tracestate_and_flags") {
-            let (name, input, expected) = (&case["name"], &case["input"], &case["expected"]);
-            let continued_flags = flags(&input["continued_flags"]);
-            assert_eq!(json!(continued_flags.is_some()), input["continued"], "{name}");
-            assert_eq!(input["continued"], case["accepted"], "{name}");
-            let outgoing = OutgoingTrace {
-                trace_id: TraceId::mint(),
-                span_id: own_span(),
-                continued_flags,
-            };
-            assert_eq!(json!(outgoing.tracestate(input["tracestate"].as_str())), expected["tracestate"], "{name}");
-            assert_eq!(json!(sent_flags(&outgoing.traceparent(export(input)))), expected["flags"], "{name}");
+            let sent = outgoing_of(&case).tracestate(case["input"]["tracestate"].as_str());
+            assert_eq!(json!(sent), case["expected"]["tracestate"], "{}", case["name"]);
+        }
+    }
+
+    #[test]
+    fn sent_flags_follow_the_sampler_or_the_continued_traceparent() {
+        for case in vector_cases("tracestate_and_flags") {
+            let sent = outgoing_of(&case).traceparent(export(&case["input"]));
+            assert_eq!(json!(sent_flags(&sent)), case["expected"]["flags"], "{}", case["name"]);
         }
     }
 
