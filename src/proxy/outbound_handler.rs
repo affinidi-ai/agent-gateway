@@ -2412,19 +2412,25 @@ async fn step_extract_protocol_context_with_versions(
         &ctx.virtual_channel
             .target_endpoint,
     );
-    let mcp_http =
-        if ctx.virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp {
-            Some(crate::mcp::modern_http::EndpointHttpPolicy::with_versions(
-            ctx.virtual_channel.mcp_http.as_ref(),
-            &state.network_config.get_outbound_external_urls(),
-            versions,
-        ).map_err(|error| {
-            error!(request_id = %ctx.trace_id, error = %error, "Invalid MCP Transit Point HTTP configuration");
-            metadata_injection_failed(ctx)
-        })?)
-        } else {
-            None
-        };
+    let mcp_http = if ctx.virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp {
+        Some(
+            crate::mcp::modern_http::EndpointHttpPolicy::with_versions(
+                ctx.virtual_channel
+                    .mcp_http
+                    .as_ref(),
+                &state
+                    .network_config
+                    .get_outbound_external_urls(),
+                versions,
+            )
+            .map_err(|error| {
+                error!(request_id = %ctx.trace_id, error = %error, "Invalid MCP Transit Point HTTP configuration");
+                metadata_injection_failed(ctx)
+            })?,
+        )
+    } else {
+        None
+    };
     if let Some(policy) = &mcp_http {
         policy
             .validate_headers(&ctx.original_headers)
@@ -6044,11 +6050,7 @@ fn record_mcp_proxy_grant_sent(
         .delegation_vault_store
         .as_ref()
     {
-        crate::delegation_vault::release::record_use_in_background(
-            vault,
-            &released.grant,
-            Some(ctx.trace_id.clone()),
-        );
+        crate::delegation_vault::release::record_use_in_background(vault, &released.grant, Some(ctx.trace_id.clone()));
     }
     let caller = delegation_caller_hash(ctx).unwrap_or_default();
     log_grant_injected(ctx, &caller, &released.provider, &released.grant, released.subject);

@@ -24799,7 +24799,7 @@ mod fabric_send_tests {
         peer.state.surface = Arc::new(surface);
         let (sent, terminated) = fabric_send_trace_ids(&peer, own).await;
         assert_ne!(sent, own, "a terminating surface sends a fresh trace id");
-        assert_eq!(terminated, [sent.clone()]);
+        assert_eq!(terminated, std::slice::from_ref(&sent));
 
         let sent_as_uuid = uuid::Uuid::parse_str(&sent).unwrap();
         let open = crate::proxy::fabric_stream::wire::StreamFrame {
@@ -24820,7 +24820,11 @@ mod fabric_send_tests {
         };
         assert_eq!(
             serde_json::to_value(&open).unwrap()["payload"]["request"]["trace_id"],
-            json!(sent_as_uuid.hyphenated().to_string()),
+            json!(
+                sent_as_uuid
+                    .hyphenated()
+                    .to_string()
+            ),
             "a stream Open writes the trace id hyphenated"
         );
     }
