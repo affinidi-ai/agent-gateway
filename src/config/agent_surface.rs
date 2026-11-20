@@ -1968,11 +1968,20 @@ pub struct TransitPoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_address: Option<String>,
 
-    /// Per-TP listen path override. When set (e.g. `/partner-a-webhook`),
-    /// the TP is registered at exactly `<effective_listen_address>{path}`
-    /// instead of the derived `/outbound/<channel-route>/<alias>`. Path
-    /// must start with `/` and must not contain `..`. Per-listener
-    /// uniqueness is enforced at validation time.
+    /// Per-TP listen path, added to the derived `/outbound/<channel-route>/<alias>`
+    /// rather than replacing it: when set (e.g. `/partner-a-webhook`), the TP
+    /// answers at `<effective_listen_address>{path}` as well. Path must start
+    /// with `/` and must not contain `..`. Per-listener uniqueness is enforced
+    /// at validation time.
+    ///
+    /// A path outside `/outbound` answers on the outbound listener alone. An
+    /// inbound listener that shares a hostname with the outbound one forwards
+    /// `/outbound` and nothing else, so on such a deployment only the derived
+    /// route, or a `listen_path` under `/outbound`, is reachable from another
+    /// host, so the save warns about such a path and stores it. `/outbound`
+    /// itself answers every outbound request no more specific route matches,
+    /// and a path the router cannot register panics the listener build; the
+    /// save that introduces either is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_path: Option<String>,
 

@@ -137,7 +137,6 @@ fn transit_point_json(
         "alias": transit_point.alias,
         "target_endpoint": target_endpoint,
         "protocol": transit_point.protocol,
-        "listen_path": format!("/transit/{}", transit_point.alias),
         "require_transit_token": transit_point.require_transit_token
     });
     if let Some(source_auth) = &transit_point.source_auth {

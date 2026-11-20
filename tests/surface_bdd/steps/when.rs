@@ -1234,7 +1234,6 @@ async fn operator_attempts_create_mcp_transit_point_with_header_metadata_mapping
             "alias": "tr1",
             "target_endpoint": "http://example.invalid/mcp",
             "protocol": "mcp",
-            "listen_path": "/transit/tr1",
             "require_transit_token": false,
             "allow_unauthenticated_callers": true,
             "header_metadata_mapping": {
@@ -1512,6 +1511,24 @@ pub async fn update_transit_point_listen_path(
     transit_point: &str,
     new_path: &str,
 ) {
+    let response = send_transit_point_listen_path(world, transit_point, new_path).await;
+    assert_eq!(
+        response.status, 200,
+        "updating Transit Point listen_path should succeed, got status {} body {}",
+        response.status, response.body
+    );
+    record_admin_response(world, response);
+}
+
+/// The surface saved with `transit_point`'s `listen_path` set to `new_path`,
+/// whatever the appliance answered: a caller that expects the save to succeed
+/// uses [`update_transit_point_listen_path`], one that expects a refusal keeps
+/// the response.
+async fn send_transit_point_listen_path(
+    world: &mut SurfaceWorld,
+    transit_point: &str,
+    new_path: &str,
+) -> crate::world::RecordedResponse {
     ensure_admin_session(world).await;
     let surface_id = get_tracked_surface_id(world, "updating the Transit Point listen_path");
 
@@ -1552,17 +1569,19 @@ pub async fn update_transit_point_listen_path(
         });
     point["listen_path"] = serde_json::json!(new_path);
 
-    let response = client
+    client
         .update_surface_recorded(&surface_id, &payload)
         .await
-        .unwrap_or_else(|error| panic!("update Transit Point listen_path through admin API: {error}"));
+        .unwrap_or_else(|error| panic!("update Transit Point listen_path through admin API: {error}"))
+}
 
-    assert_eq!(
-        response.status, 200,
-        "updating Transit Point listen_path should succeed, got status {} body {}",
-        response.status, response.body
-    );
-
+#[when(expr = "the operator sets Transit Point {string} listen_path to {string}")]
+async fn operator_sets_transit_point_listen_path(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    new_path: String,
+) {
+    let response = send_transit_point_listen_path(world, &transit_point, &new_path).await;
     record_admin_response(world, response);
 }
 
@@ -3051,7 +3070,7 @@ pub(crate) async fn send_mcp_request_through_transit_point(
     transit_point: &str,
     body: serde_json::Value,
 ) {
-    let path = format!("/transit/{transit_point}");
+    let path = transit_point_path(world, transit_point);
     send_mcp_request_through_transit_point_path(world, agent_name, &path, body).await;
 }
 
@@ -3173,14 +3192,8 @@ pub(crate) async fn ask_for_tools_through_transit_point_with_its_token(
 ) {
     let body = build_mcp_list_tools_body_with_id(serde_json::json!("mcp-tools-list-alpha"));
     let headers = with_transit_token(world, Vec::new());
-    send_mcp_request_through_transit_point_path_with_headers(
-        world,
-        agent_name,
-        &format!("/transit/{transit_point}"),
-        body,
-        headers,
-    )
-    .await;
+    let path = transit_point_path(world, transit_point);
+    send_mcp_request_through_transit_point_path_with_headers(world, agent_name, &path, body, headers).await;
 }
 
 #[when(
@@ -3196,14 +3209,8 @@ async fn managed_agent_invokes_tool_through_transit_point_with_its_token_and_hea
 ) {
     let body = build_mcp_tool_call_body(&tool_name, serde_json::json!({ "limit": 3 }));
     let headers = with_transit_token(world, vec![(header, value)]);
-    send_mcp_request_through_transit_point_path_with_headers(
-        world,
-        &agent_name,
-        &format!("/transit/{transit_point}"),
-        body,
-        headers,
-    )
-    .await;
+    let path = transit_point_path(world, &transit_point);
+    send_mcp_request_through_transit_point_path_with_headers(world, &agent_name, &path, body, headers).await;
 }
 
 #[when(
@@ -3217,14 +3224,9 @@ async fn managed_agent_asks_for_tools_through_transit_point_with_header(
     value: String,
 ) {
     let body = build_mcp_list_tools_body_with_id(serde_json::json!("mcp-tools-list-alpha"));
-    send_mcp_request_through_transit_point_path_with_headers(
-        world,
-        &agent_name,
-        &format!("/transit/{transit_point}"),
-        body,
-        vec![(header, value)],
-    )
-    .await;
+    let path = transit_point_path(world, &transit_point);
+    send_mcp_request_through_transit_point_path_with_headers(world, &agent_name, &path, body, vec![(header, value)])
+        .await;
 }
 
 #[when(
@@ -3242,10 +3244,11 @@ async fn managed_agent_asks_for_tools_through_transit_point_with_issued_token(
         .cloned()
         .unwrap_or_else(|| panic!("agent '{agent}' must have been issued a token"));
     let body = build_mcp_list_tools_body_with_id(serde_json::json!("mcp-tools-list-alpha"));
+    let path = transit_point_path(world, &transit_point);
     send_mcp_request_through_transit_point_path_with_headers(
         world,
         &agent_name,
-        &format!("/transit/{transit_point}"),
+        &path,
         body,
         vec![("authorization".to_string(), format!("Bearer {token}"))],
     )
@@ -3300,7 +3303,7 @@ async fn read_through_transit_point(
         "HEAD" => reqwest::Method::HEAD,
         other => panic!("a discovery read is a GET or HEAD, not {other}"),
     };
-    let path = format!("/transit/{transit_point}/{}", document.trim_start_matches('/'));
+    let path = format!("{}/{}", transit_point_path(world, transit_point), document.trim_start_matches('/'));
     send_through_transit_point_path(world, agent_name, method, &path, None, headers).await;
 }
 
@@ -3370,6 +3373,24 @@ async fn send_a2a_request_through_transit_point(
     .await;
 }
 
+/// The route the gateway derives for a Transit Point of the scenario's
+/// surface: `/outbound<surface route>/<alias>`. It is registered for every
+/// Transit Point whatever its `listen_path`, and it is what the fixtures rely
+/// on, since a `listen_path` is held to the surface prefixes the gateway
+/// configures and, on a shared hostname, to the `/outbound` form of them.
+pub(crate) fn transit_point_path(
+    world: &SurfaceWorld,
+    transit_point: &str,
+) -> String {
+    format!(
+        "/outbound{}/{transit_point}",
+        world
+            .surface_config
+            .route
+            .trim_end_matches('/')
+    )
+}
+
 /// The URL managed agent `agent_name` calls Transit Point `transit_point` at,
 /// once the gateway's outbound listener is ready.
 async fn transit_point_url(
@@ -3382,6 +3403,7 @@ async fn transit_point_url(
         .expect_target_kind(agent_name, TargetActorKind::ManagedAgent);
     ensure_gateway_running(world).await;
 
+    let path = transit_point_path(world, transit_point);
     let infra = world
         .infra
         .as_mut()
@@ -3392,7 +3414,7 @@ async fn transit_point_url(
         .wait_for_secondary_port(outbound_port, std::time::Duration::from_secs(15))
         .await
         .unwrap_or_else(|error| panic!("outbound listener did not become ready on port {outbound_port}: {error}"));
-    format!("http://127.0.0.1:{}/transit/{}", outbound_port, transit_point)
+    format!("http://127.0.0.1:{outbound_port}{path}")
 }
 
 async fn record_transit_point_response(
