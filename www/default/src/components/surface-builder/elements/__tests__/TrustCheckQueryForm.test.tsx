@@ -2,7 +2,11 @@ import React from 'react';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import TrustCheckQueryForm from '../trust-check/TrustCheckQueryForm';
-import type { TrustCheckQueryConfig } from '../trust-check/definition';
+import {
+  readOnlyTrustCheckProtocol,
+  transitPointSubjectChoice,
+  type TrustCheckQueryConfig,
+} from '../trust-check/definition';
 
 function baseProps(overrides: Partial<Parameters<typeof TrustCheckQueryForm>[0]> = {}) {
   const emptyQuery: TrustCheckQueryConfig = {
@@ -590,5 +594,115 @@ describe('TrustCheckQueryForm — Authority source', () => {
     expect(screen.getByTestId('trust-check-query-0-authority')).toHaveTextContent(
       'Payments Authority'
     );
+  });
+});
+
+describe('TrustCheckQueryForm — Checks select on a Transit Point', () => {
+  const managedAgentQuery: TrustCheckQueryConfig = {
+    id: 'q-1',
+    trust_registry_id: '',
+    query_type: 'recognition',
+    subject: 'managed_agent',
+    query: {},
+  };
+
+  it('is shown only on a Transit Point', () => {
+    renderForm(baseProps({ isApMa: false }));
+    expect(screen.queryByTestId('trust-check-query-0-subject')).toBeNull();
+  });
+
+  it('offers the destination and the managed agent, defaulting to the destination', () => {
+    renderForm(baseProps({ isApMa: false, subjectChoice: 'destination-or-managed-agent' }));
+    const select = screen.getByTestId('trust-check-query-0-subject');
+    expect(select).toHaveTextContent('Destination agent');
+    fireEvent.click(select);
+    expect(screen.getByText("This surface's managed agent")).toBeInTheDocument();
+    expect(screen.getByTestId('trust-check-query-0-entity')).toBeInTheDocument();
+  });
+
+  it('checks the managed agent with a blank entity when picked', () => {
+    const updateQueryAt = jest.fn();
+    renderForm(
+      baseProps({
+        isApMa: false,
+        subjectChoice: 'destination-or-managed-agent',
+        updateQueryAt,
+        queryConfig: {
+          id: 'q-1',
+          trust_registry_id: 'tr-1',
+          query_type: 'recognition',
+          query: { authority_id: 'did:web:authority.example', entity_id: '{{ target.did }}' },
+        },
+      })
+    );
+    fireEvent.click(screen.getByTestId('trust-check-query-0-subject'));
+    fireEvent.click(screen.getByText("This surface's managed agent"));
+    expect(updateQueryAt).toHaveBeenCalledWith(0, {
+      subject: 'managed_agent',
+      query: { authority_id: 'did:web:authority.example' },
+    });
+  });
+
+  it('shows the agent calling out in place of the entity picker for a managed-agent query', () => {
+    renderForm(
+      baseProps({
+        isApMa: false,
+        subjectChoice: 'destination-or-managed-agent',
+        queryConfig: managedAgentQuery,
+      })
+    );
+    expect(screen.getByTestId('trust-check-query-0-subject')).toHaveTextContent(
+      "This surface's managed agent"
+    );
+    expect(screen.getByTestId('trust-check-query-0-entity-managed-agent')).toBeInTheDocument();
+    expect(screen.queryByTestId('trust-check-query-0-entity')).toBeNull();
+  });
+
+  it('offers only the managed agent on a Transit Point that cannot check its destination', () => {
+    renderForm(
+      baseProps({
+        isApMa: false,
+        subjectChoice: 'managed-agent-only',
+        queryConfig: managedAgentQuery,
+      })
+    );
+    expect(
+      screen.getByTestId('trust-check-query-0-subject-only-managed-agent')
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('trust-check-query-0-subject'));
+    expect(screen.queryByText('Destination agent')).toBeNull();
+  });
+});
+
+describe('readOnlyTrustCheckProtocol', () => {
+  const nodes = [
+    { id: 'tp-mcp', type: 'transit-point-mcp' },
+    { id: 'tp-a2a', type: 'transit-point-a2a' },
+  ];
+  const managedOnly = { queries: [{ id: 'q', subject: 'managed_agent', query: {} }] };
+  const destination = { queries: [{ id: 'q', query: {} }] };
+
+  it('keeps a managed-agent Trust Check on an MCP Transit Point editable', () => {
+    expect(
+      readOnlyTrustCheckProtocol({ parentId: 'tp-mcp', config: managedOnly }, nodes)
+    ).toBeNull();
+    expect(readOnlyTrustCheckProtocol({ parentId: 'tp-mcp', config: {} }, nodes)).toBeNull();
+    expect(transitPointSubjectChoice({ parentId: 'tp-mcp' }, nodes)).toBe('managed-agent-only');
+  });
+
+  it('keeps a migrated destination copy on an MCP Transit Point read-only', () => {
+    expect(readOnlyTrustCheckProtocol({ parentId: 'tp-mcp', config: destination }, nodes)).toBe(
+      'MCP'
+    );
+  });
+
+  it('never makes an A2A Transit Point Trust Check read-only', () => {
+    expect(
+      readOnlyTrustCheckProtocol({ parentId: 'tp-a2a', config: destination }, nodes)
+    ).toBeNull();
+    expect(transitPointSubjectChoice({ parentId: 'tp-a2a' }, nodes)).toBe(
+      'destination-or-managed-agent'
+    );
+    expect(transitPointSubjectChoice({ parentId: 'access-point' }, nodes)).toBeUndefined();
   });
 });

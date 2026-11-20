@@ -233,6 +233,20 @@ async fn create_surface_with_trust_check_element(
 }
 
 #[when(
+    expr = "the operator creates the surface for route {string} with a caller-leg Trust Check that checks the managed agent"
+)]
+async fn operator_creates_surface_with_caller_leg_managed_agent_check(
+    world: &mut SurfaceWorld,
+    route: String,
+) {
+    let fields = json!({
+        "subject": "managed_agent",
+        "query": {"authority_id": "did:web:authority-a", "entity_id": ""}
+    });
+    create_surface_with_trust_check_element(world, &route, fields).await;
+}
+
+#[when(
     expr = "the operator creates the surface for route {string} with a caller-leg Trust Check listing authorities {string} and a timeout of {int} seconds"
 )]
 async fn operator_creates_surface_with_authority_list_and_timeout(

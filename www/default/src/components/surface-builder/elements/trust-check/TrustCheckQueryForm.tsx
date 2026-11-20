@@ -22,6 +22,7 @@ import {
   type SubjectPickerState,
   type TrustCheckQueryConfig,
   type TrustCheckRecordType,
+  type TrustCheckSubjectChoice,
 } from './definition';
 
 const QUERY_TYPES: ReadonlyArray<FormSelectOption<TrustCheckRecordType>> = [
@@ -114,7 +115,25 @@ interface TrustCheckQueryFormProps {
    * see red errors before they've tried to save.
    */
   saveAttempted?: boolean;
+  /**
+   * On a Transit Point's Trust Check, whom the query may ask about: shown as the
+   * Checks select. Absent on every other leg.
+   */
+  subjectChoice?: TrustCheckSubjectChoice;
 }
+
+type CheckedSubject = 'destination' | 'managed_agent';
+
+const CHECKED_SUBJECTS: Record<CheckedSubject, { label: string; description: string }> = {
+  destination: {
+    label: 'Destination agent',
+    description: 'The agent this Transit Point calls, from its agent card.',
+  },
+  managed_agent: {
+    label: "This surface's managed agent",
+    description: 'The agent calling out through this Transit Point, by the DID it calls out under.',
+  },
+};
 
 const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
   queryConfig,
@@ -131,16 +150,52 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
   updateEntityAt,
   handleQueryTypeChangeAt,
   saveAttempted = false,
+  subjectChoice,
 }) => {
   const queryType: TrustCheckRecordType =
     queryConfig.query_type === 'recognition' ? 'recognition' : 'authorization';
   const sq = queryConfig.query || {};
   const entityValue: string = typeof sq.entity_id === 'string' ? sq.entity_id : '';
   const tid = (suffix: string) => `trust-check-query-${index}-${suffix}`;
+  const checksManagedAgent = queryConfig.subject === 'managed_agent';
+  const subjectOptions: CheckedSubject[] =
+    subjectChoice === 'managed-agent-only' ? ['managed_agent'] : ['destination', 'managed_agent'];
+
+  // Switching whom the query asks about drops its entity, which the new subject fills in.
+  const changeSubject = (next: CheckedSubject) => {
+    const { entity_id: _entity, ...query } = sq;
+    void _entity;
+    updateQueryAt(index, {
+      subject: next === 'managed_agent' ? 'managed_agent' : undefined,
+      query,
+    });
+  };
 
   return (
     <div className="p-3" data-testid={tid('form')}>
       <div className="row g-3">
+        {subjectChoice && (
+          <div className="col-12">
+            <Form.Label className="fw-semibold small mb-1">Checks</Form.Label>
+            <FormSelect<CheckedSubject>
+              value={checksManagedAgent ? 'managed_agent' : 'destination'}
+              options={subjectOptions.map(value => ({ value, ...CHECKED_SUBJECTS[value] }))}
+              onChange={changeSubject}
+              testid={tid('subject')}
+            />
+            {subjectChoice === 'managed-agent-only' && (
+              <Form.Text
+                className="text-muted d-block"
+                style={{ fontSize: '11px' }}
+                data-testid={tid('subject-only-managed-agent')}
+              >
+                This Transit Point's destination serves no agent card to check, so it can only check
+                its managed agent.
+              </Form.Text>
+            )}
+          </div>
+        )}
+
         <div className="col-12">
           <Form.Label className="fw-semibold small mb-1">Trust Registry</Form.Label>
           <FormSelect<string>
@@ -206,13 +261,20 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
 
         <div className="col-12">
           <Form.Label className="fw-semibold small mb-1">Entity ID</Form.Label>
-          <SubjectPickerSelect
-            testid={tid('entity')}
-            storedValue={entityValue}
-            subjectOrder={isApMa ? CALLER_ENTITY_SUBJECT_ORDER : TARGET_ENTITY_SUBJECT_ORDER}
-            isApMa={isApMa}
-            onChange={wire => updateEntityAt(index, wire)}
-          />
+          {checksManagedAgent ? (
+            <Form.Text className="text-muted d-block" data-testid={tid('entity-managed-agent')}>
+              The DID the managed agent calls out under, from this Transit Point's own identity or
+              the surface's.
+            </Form.Text>
+          ) : (
+            <SubjectPickerSelect
+              testid={tid('entity')}
+              storedValue={entityValue}
+              subjectOrder={isApMa ? CALLER_ENTITY_SUBJECT_ORDER : TARGET_ENTITY_SUBJECT_ORDER}
+              isApMa={isApMa}
+              onChange={wire => updateEntityAt(index, wire)}
+            />
+          )}
         </div>
 
         {queryType === 'authorization' ? (

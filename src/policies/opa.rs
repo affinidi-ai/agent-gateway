@@ -44,6 +44,9 @@ pub struct PolicyDecision {
 /// suffices — there is no `data.channel.policy` fallback.
 const SURFACE_POLICY_BASE: &str = "data.surface.policy";
 
+/// The reason a deny carries when the policy sets no `deny_reason`.
+pub const DEFAULT_DENY_REASON: &str = "Policy denied request";
+
 fn eval_surface_decision(engine: &mut Engine) -> Result<PolicyDecision, String> {
     match engine.eval_bool_query(format!("{SURFACE_POLICY_BASE}.allow"), false) {
         Ok(allow) => {
@@ -183,7 +186,7 @@ impl OpaEngine {
         match eval_surface_decision(&mut engine) {
             Ok(mut decision) => {
                 if !decision.allow && decision.reason.is_none() {
-                    decision.reason = Some("Policy denied request".to_string());
+                    decision.reason = Some(DEFAULT_DENY_REASON.to_string());
                 }
                 Ok(decision)
             }
@@ -375,6 +378,40 @@ allow if {
             .unwrap();
         assert!(!decision.allow);
         assert_eq!(decision.reason.as_deref(), Some("Policy denied request"));
+    }
+
+    #[test]
+    fn the_documented_self_recognition_policy_serves_discovery_reads_and_refuses_an_unrecognised_agent() {
+        let docs = include_str!("../../docs/POLICY.md");
+        let section = &docs[docs
+            .find("### Self recognition check")
+            .expect("section")..];
+        let start = section
+            .find("```rego\n")
+            .expect("rego block")
+            + "```rego\n".len();
+        let policy = &section[start
+            ..start
+                + section[start..]
+                    .find("```")
+                    .expect("block end")];
+        let engine = OpaEngine::new();
+        engine
+            .load_policy("self-recognition", policy)
+            .unwrap();
+        let decide = |input: serde_json::Value| {
+            engine
+                .evaluate(input)
+                .unwrap()
+        };
+
+        assert!(decide(serde_json::json!({ "trust_check_results": {} })).allow, "a discovery read");
+        assert!(decide(serde_json::json!({ "trust_check_results": { "managed_agent": [{ "ok": true }] } })).allow);
+        let refused = decide(serde_json::json!({
+            "trust_check_results": { "managed_agent": [{ "ok": true }, { "ok": false }] }
+        }));
+        assert!(!refused.allow);
+        assert_eq!(refused.reason.as_deref(), Some("Calling agent is not recognised"));
     }
 
     #[test]

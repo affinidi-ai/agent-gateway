@@ -1601,25 +1601,64 @@ fn transit_point_trust_check_lists_authorities(
     query.insert("authority_ids".to_string(), serde_json::json!(authority_list(&authorities)));
 }
 
-#[given(expr = "transit point {string} has a policy that denies unless every target Trust Check succeeded")]
-fn transit_point_has_policy_denying_unless_target_trust_checks_ok(
+#[given(
+    regex = r#"^transit point "([^"]+)" has a policy that denies unless every (target|managed-agent) Trust Check succeeded$"#
+)]
+fn transit_point_has_policy_denying_unless_trust_checks_ok(
     world: &mut SurfaceWorld,
     transit_point: String,
+    leg: String,
 ) {
-    let policy_id = format!("bdd-trust-check-deny-on-target-failure-{}", uuid::Uuid::new_v4());
-    let rego = r#"package surface.policy
+    let results = leg.replace('-', "_");
+    let policy_id = format!("bdd-trust-check-deny-on-{leg}-failure-{}", uuid::Uuid::new_v4());
+    let rego = format!(
+        r#"package surface.policy
 
 default allow := false
 
-allow if {
-    count([r | r := input.trust_check_results.target[_]; r.ok == false]) == 0
-}
-"#;
+allow if {{
+    count([r | r := input.trust_check_results.{results}[_]; r.ok == false]) == 0
+}}
+
+deny_reason := "Calling agent is not recognised" if not allow
+"#
+    );
     transit_point_config_mut(world, &transit_point).policy = Some(PolicyDefinitionFixture::new(
         policy_id,
-        "BDD Transit Point policy: deny unless every target Trust Check succeeded",
-        rego,
+        format!("BDD Transit Point policy: deny unless every {leg} Trust Check succeeded"),
+        &rego,
     ));
+}
+
+#[given(
+    regex = r#"^transit point "([^"]+)" presents (the surface's|no) managed agent identity on its outbound calls$"#
+)]
+fn transit_point_presents_surface_identity(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    presents: String,
+) {
+    let point = transit_point_config_mut(world, &transit_point);
+    point.inject_vp = presents == "the surface's";
+    point.managed_identity = None;
+}
+
+#[given(expr = "transit point {string} has a managed-agent Trust Check for trust registry {string}")]
+fn transit_point_has_managed_agent_trust_check(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    trust_registry_id: String,
+) {
+    let element = serde_json::json!({
+        "id": format!("managed-agent-{}", uuid::Uuid::new_v4()),
+        "trust_registry_id": trust_registry_id,
+        "query_type": "recognition",
+        "query": { "authority_id": "did:example:authority", "entity_id": "" },
+        "subject": "managed_agent",
+    });
+    transit_point_config_mut(world, &transit_point)
+        .trust_check_list
+        .push(element);
 }
 
 #[given(expr = "the surface has a policy that denies a target Trust Check reporting error code {string}")]

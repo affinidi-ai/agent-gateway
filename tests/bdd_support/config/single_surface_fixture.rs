@@ -469,6 +469,9 @@ pub struct SurfaceTransitPointConfig {
     /// Requests per minute the Transit Point admits from each caller
     /// (`per_caller_rate_limit`).
     pub per_caller_rate_limit_per_minute: Option<u32>,
+    /// The Transit Point presents the surface's managed agent identity to its
+    /// destination (`identity_injection.inject_vp`) without an identity of its own.
+    pub inject_vp: bool,
 }
 
 impl SurfaceTransitPointConfig {
@@ -492,6 +495,7 @@ impl SurfaceTransitPointConfig {
             target_auth_secret: None,
             target_base_path: None,
             per_caller_rate_limit_per_minute: None,
+            inject_vp: false,
         }
     }
 }

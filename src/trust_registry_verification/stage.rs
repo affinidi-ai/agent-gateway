@@ -87,6 +87,24 @@ async fn run_trust_check_stage_with<C: TrqpClient + ?Sized>(
     client: &C,
     authorities: Option<&dyn AuthorityStore>,
 ) -> Option<TrustCheckResultsContext> {
+    let results = leg_results(origin, leg, elements, input, client, authorities).await;
+    let mut context = TrustCheckResultsContext::default();
+    match leg {
+        TrustCheckLeg::Caller => context.caller = results,
+        TrustCheckLeg::Target => context.target = results,
+        TrustCheckLeg::ManagedAgent => context.managed_agent = results,
+    }
+    Some(context)
+}
+
+async fn leg_results<C: TrqpClient + ?Sized>(
+    origin: TrustCheckOrigin<'_>,
+    leg: TrustCheckLeg,
+    elements: &[TrustCheckElement],
+    input: &Value,
+    client: &C,
+    authorities: Option<&dyn AuthorityStore>,
+) -> Vec<TrustCheckResult> {
     let wrapped = json!({ "input": input });
     let expanded = expand_authorities(elements);
     let elements = &*expanded;
@@ -128,16 +146,7 @@ async fn run_trust_check_stage_with<C: TrqpClient + ?Sized>(
             .collect()
     };
     log_consolidated(origin, leg, &results);
-    Some(match leg {
-        TrustCheckLeg::Caller => TrustCheckResultsContext {
-            caller: results,
-            target: Vec::new(),
-        },
-        TrustCheckLeg::Target => TrustCheckResultsContext {
-            caller: Vec::new(),
-            target: results,
-        },
-    })
+    results
 }
 
 /// Fails `element` with `AUTHORITY_NOT_FOUND` without querying its registry, recording it
@@ -211,17 +220,13 @@ fn log_consolidated(
     results: &[TrustCheckResult],
 ) {
     let (ok_count, denied_count, error_count) = consolidate_trust_check_results(results);
-    let leg_label = match leg {
-        TrustCheckLeg::Caller => "caller",
-        TrustCheckLeg::Target => "target",
-    };
     tracing::info!(
         target: "trust_check_audit",
         surface_id = origin.surface_id,
         transit_point = origin
             .transit_point
             .unwrap_or_default(),
-        leg = leg_label,
+        leg = crate::observability::trust_check_audit::leg_label(leg),
         total = results.len(),
         ok = ok_count,
         denied = denied_count,
@@ -291,6 +296,7 @@ mod tests {
             },
             timeout_secs: None,
             name: None,
+            subject: Default::default(),
         }
     }
 
@@ -1004,6 +1010,39 @@ mod tests {
             outcomes(&ctx.target),
             [("", Some("TRUST_REGISTRY_METADATA_UNAVAILABLE")), ("did:web:authority-b", None)]
         );
+    }
+
+    #[tokio::test]
+    async fn managed_agent_results_land_on_their_own_leg_and_are_audited_there() {
+        let mut literal = elem("self-recognition-0");
+        literal.query.entity_id = "did:web:agent.example".to_string();
+        let mut template = literal.clone();
+        template.id = "self-recognition-1".to_string();
+        template.query.authority_id = "{{ surface.issuer_did }}".to_string();
+
+        let (context, records) = crate::audit::producer::capture(run_trust_check_stage(
+            "surf",
+            TrustCheckLeg::ManagedAgent,
+            &[literal, template],
+            &json!({}),
+            &AllowClient,
+        ))
+        .await;
+        let context = context.expect("elements were configured");
+
+        assert!(context.caller.is_empty() && context.target.is_empty(), "{context:?}");
+        assert_eq!(
+            outcomes(&context.managed_agent),
+            [("did:a", None), ("{{ surface.issuer_did }}", Some("TEMPLATE_RESOLUTION_FAILED"))]
+        );
+        let legs: Vec<String> = records
+            .iter()
+            .filter_map(|record| match &record.event {
+                crate::delegation_vault::audit::DelegationAuditAction::TrustCheck { leg, .. } => Some(leg.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(legs, ["managed_agent", "managed_agent"]);
     }
 
     #[tokio::test]
