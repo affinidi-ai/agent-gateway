@@ -37,7 +37,7 @@ pub(crate) async fn seed_agent_did(
     let id = uuid::Uuid::new_v4().to_string();
     let key = ssi::jwk::JWK::generate_ed25519().expect("generate the agent key");
     let key_json = serde_json::to_value(&key).expect("serialize the agent key");
-    let multikey = Secret::from_str("did:key:seed#seed", &key_json)
+    let multikey = Secret::from_jwk_value("did:key:seed#seed", &key_json)
         .expect("read the agent key")
         .get_public_keymultibase()
         .expect("encode the agent key as a Multikey");
@@ -65,7 +65,7 @@ pub(crate) async fn seed_agent_did(
     let created = create_did(
         CreateDIDConfig::builder()
             .address("http://localhost:1/".to_string())
-            .authorization_key(Secret::from_str(&update_key_id, &key_json).expect("an update key"))
+            .authorization_key(Secret::from_jwk_value(&update_key_id, &key_json).expect("an update key"))
             .did_document(document)
             .parameters(Parameters {
                 update_keys: Some(std::sync::Arc::new(vec![didwebvh_rs::Multibase::new(multikey.clone())])),
