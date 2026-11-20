@@ -546,10 +546,7 @@ describe('placement: element protocol', () => {
   });
 
   it('places any Transit Point when no surface protocol is given', () => {
-    expect(planTemplate(partial('transit-point-a2a'), [], undefined).clean).toHaveLength(
-      1,
-      undefined
-    );
+    expect(planTemplate(partial('transit-point-a2a'), [], undefined).clean).toHaveLength(1);
   });
 
   const edgeItem = (kind: string): SurfaceTemplate => ({
