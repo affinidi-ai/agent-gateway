@@ -8,6 +8,7 @@ import {
   policyChange,
   policyChangeTitle,
   policyDecision,
+  isTargetAuthPassthrough,
   requestRejected,
   scopeLabel,
   slotLabel,
@@ -93,7 +94,8 @@ export function eventTone(entry: AuditEntry): EventTone {
   if (pd) return isAllowDecision(pd.decision) ? 'allow' : 'deny';
   const tc = trustCheck(entry);
   if (tc) return tc.ok ? 'allow' : 'deny';
-  if (requestRejected(entry)) return 'deny';
+  const rejected = requestRejected(entry);
+  if (rejected) return isTargetAuthPassthrough(rejected) ? 'warn' : 'deny';
   const name = eventTypeName(entry);
   if (name === 'consent_required' || name === 'consent_expired' || name === 'consent_limited')
     return 'warn';
@@ -301,6 +303,29 @@ export function describeEntry(entry: AuditEntry, userName?: UserNameResolver): E
         : entry.via_fabric
           ? 'Refused over Fabric, so no HTTP status was recorded.'
           : undefined;
+    const transitPoint = rejected.target_auth?.transit_point;
+    if (isTargetAuthPassthrough(rejected)) {
+      const credential = transitPoint
+        ? `the credential of Transit Point ${transitPoint}`
+        : 'the Target credential';
+      return {
+        title: 'Forwarded without Target credential',
+        tone,
+        summary: `Forwarded on ${where} without ${credential}: target auth failed, and the fallback is passthrough.`,
+      };
+    }
+    if (rejected.target_auth?.outcome === 'refused_by_target') {
+      const status = rejected.target_auth.upstream_status;
+      const refusedBy = transitPoint ? `Transit Point ${transitPoint}` : 'The Target';
+      return {
+        title: 'Target refused the credential',
+        tone,
+        summary: `${refusedBy} on ${where} refused the gateway's credential${
+          status != null ? ` with ${status}` : ''
+        }.`,
+        detail: answered,
+      };
+    }
     return {
       title: 'Request refused',
       tone,

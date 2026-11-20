@@ -33,6 +33,7 @@ import { withCallerAccessSettled } from '../components/surface-builder/elements/
 import {
   accessPointStatus,
   chooseAccessPointNotice,
+  hasCallerAuthentication,
   savedAccessPointStatus,
 } from '../components/surface-builder/elements/access-point/readiness';
 import {
@@ -936,7 +937,7 @@ const SurfaceDetailPage: React.FC = () => {
         protocol,
         status,
       });
-      const issues = validateSurfacePayload(draftPayload);
+      const issues = validateSurfacePayload(draftPayload, { stored: surface ?? undefined });
       const firstError = issues.find(i => i.severity === 'error');
       if (firstError) {
         return { message: firstError.message, nodeId: firstError.nodeId };
@@ -1015,7 +1016,7 @@ const SurfaceDetailPage: React.FC = () => {
           // a payload `nodesFromSurface` can't decode will trip the
           // structural validator anyway.
         }
-        const variantIssues = validateSurfacePayload(snap);
+        const variantIssues = validateSurfacePayload(snap, { stored: null });
         const variantErr = variantIssues.find(i => i.severity === 'error');
         if (variantErr) {
           return {
@@ -1809,6 +1810,7 @@ const SurfaceDetailPage: React.FC = () => {
         agentCardRefreshKey={saveCount}
         hasVariants={savedHasVariants}
         accessPointNotice={accessPointNotice}
+        accessPointChecksCallers={hasCallerAuthentication(livePayload)}
         legacyAccessPoint={legacyAccessPoint}
         apiKeyStatuses={apiKeyStatuses}
         authorityDids={authorityDids}

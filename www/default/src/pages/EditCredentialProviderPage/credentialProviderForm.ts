@@ -381,6 +381,12 @@ export function externalProviderUpdate(form: {
   };
 }
 
+/** The page title: a user without the edit permission views, anyone else adds or edits. */
+export function providerPageTitle(readOnly: boolean, isNew: boolean): string {
+  if (readOnly) return 'Credential Provider';
+  return isNew ? 'New Credential Provider' : 'Edit Credential Provider';
+}
+
 /** Whether `host` is an https address, the only kind the gateway takes in a callback URL. */
 export function isHttpsAddress(host: string): boolean {
   try {

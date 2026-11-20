@@ -169,6 +169,8 @@ export interface SurfaceFormShellProps {
   accessPointNotice?: AccessPointNotice | null;
   /** The stored surface has no `access_point.public`: a legacy Access Point. */
   legacyAccessPoint?: boolean;
+  /** Whether the Access Point on the canvas checks its callers, decided by the page. */
+  accessPointChecksCallers?: boolean;
   /** Status of each API key the stored surface names, by key id. */
   apiKeyStatuses?: ApiKeyStatuses;
   /** DIDs of the Authorities register; `null` while it loads or when it could not be loaded. */
@@ -337,6 +339,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
   hasVariants = false,
   accessPointNotice,
   legacyAccessPoint,
+  accessPointChecksCallers,
   apiKeyStatuses,
   authorityDids,
   variantsWithoutResponseAuth,
@@ -866,6 +869,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
         saveWarnings,
         accessPointNotice,
         legacyAccessPoint,
+        accessPointChecksCallers,
         apiKeyStatuses,
         authorityDids,
         variantsWithoutResponseAuth,

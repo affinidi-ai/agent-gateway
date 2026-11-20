@@ -5,10 +5,20 @@ import ManagedAgentPanel from './ManagedAgentPanel';
 import ManagedAgentAuthFullscreen from './ManagedAgentAuthFullscreen';
 import { DOCS_URL } from '../../../../config/docs';
 import { a2aProxyIdFromEndpoint, isA2aProxyEndpoint } from '../_shared/a2aProxyEndpoint';
-import { providerTargetAuthFromApi, providerTargetAuthToApi } from '../_shared/providerTargetAuth';
+import {
+  STORED_TARGET_AUTH_KEY,
+  providerTargetAuthFromApi,
+  storedHeaderValue,
+  storedTargetAuth,
+} from '../_shared/providerTargetAuth';
 import { parseFabricEndpoint } from '../_shared/useGatewaySurfaces';
 import { isHttpTarget } from './PartnerGrantReleaseSection';
 import { responseAuthProblems, responseAuthToWire } from './responseAuth';
+import {
+  inferAuthType,
+  managedAgentTargetAuth,
+  managedAgentTargetAuthProblems,
+} from './targetAuth';
 
 export const managedAgentDefinition: NodeDefinition = {
   type: 'target',
@@ -80,6 +90,9 @@ export const managedAgentDefinition: NodeDefinition = {
     } else if (type === 'mcp-proxy') {
       if (!c.mcp_proxy_id)
         errs.push({ field: 'mcp_proxy_id', message: 'MCP Proxy selection is required' });
+    }
+    for (const [field, message] of Object.entries(managedAgentTargetAuthProblems(c).errors)) {
+      errs.push({ field, message });
     }
     for (const message of responseAuthProblems(c.endpoint, c.response_auth)) {
       errs.push({ field: 'response_auth', message: `Response Authentication: ${message}` });
@@ -173,6 +186,7 @@ export const managedAgentDefinition: NodeDefinition = {
     } else {
       c.inject_vp = true;
     }
+    c[STORED_TARGET_AUTH_KEY] = storedTargetAuth(slice?.auth);
     if (slice?.auth) {
       const ta = slice.auth;
       c.target_auth_enabled = true;
@@ -187,23 +201,23 @@ export const managedAgentDefinition: NodeDefinition = {
       if (ss) {
         c.target_auth_source = 'secret';
         c.target_auth_secret_id = ss.secret_id || '';
-        c.target_auth_header_name = ss.header_name || 'Authorization';
-        c.target_auth_header_format = ss.header_format || '{value}';
+        c.target_auth_header_name = storedHeaderValue(ss.header_name, 'Authorization');
+        c.target_auth_header_format = storedHeaderValue(ss.header_format, '{value}');
       } else if (provider) {
         c.target_auth_source = 'provider';
         c.target_auth_provider_id = provider.providerId;
         c.target_auth_header_name = provider.headerName;
         c.target_auth_header_format = provider.headerFormat;
+        c.target_auth_scopes = (provider.scopes ?? []).join(' ');
       }
       if (ss || provider) {
         if (typeof ta.auth_type === 'string') {
           c.target_auth_type = ta.auth_type;
         } else {
-          const fmt: string = c.target_auth_header_format;
-          if (fmt.startsWith('Bearer ')) c.target_auth_type = 'bearer';
-          else if (fmt.startsWith('Basic ')) c.target_auth_type = 'basic';
-          else if (c.target_auth_header_name === 'X-API-Key') c.target_auth_type = 'api_key';
-          else c.target_auth_type = 'custom';
+          c.target_auth_type = inferAuthType(
+            c.target_auth_header_name,
+            c.target_auth_header_format
+          );
         }
       }
       delete c.auth;
@@ -217,27 +231,8 @@ export const managedAgentDefinition: NodeDefinition = {
     if (isA2aProxyEndpoint(c.endpoint)) {
       tgt.a2a_proxy_id = c.a2a_proxy_id || a2aProxyIdFromEndpoint(c.endpoint);
     }
-    if (c.target_auth_enabled && c.target_auth_source === 'provider') {
-      const auth = providerTargetAuthToApi({
-        providerId: c.target_auth_provider_id || '',
-        headerName: c.target_auth_header_name || '',
-        headerFormat: c.target_auth_header_format || '',
-        fallback: c.target_auth_fallback,
-      });
-      if (auth) tgt.auth = { ...auth, auth_type: c.target_auth_type || 'bearer' };
-    } else if (c.target_auth_enabled && c.target_auth_secret_id) {
-      tgt.auth = {
-        method: {
-          static_secret: {
-            secret_id: c.target_auth_secret_id,
-            header_name: c.target_auth_header_name || 'Authorization',
-            header_format: c.target_auth_header_format || '{value}',
-          },
-        },
-        auth_type: c.target_auth_type || 'bearer',
-        fallback: c.target_auth_fallback || 'reject',
-      };
-    }
+    const auth = managedAgentTargetAuth(c);
+    if (auth) tgt.auth = auth;
     if (typeof c.endpoint === 'string' && c.endpoint.startsWith('fabric://')) {
       if (c.fabric_target_name) tgt.fabric_target_name = c.fabric_target_name;
       if (c.fabric_delegated_credentials === true) tgt.fabric_delegated_credentials = true;

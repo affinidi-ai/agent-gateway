@@ -15,6 +15,9 @@ import {
   useGatewaySurfaces,
 } from '../_shared/useGatewaySurfaces';
 import AgentCardFetchLine from '../../agent-card/AgentCardFetchLine';
+import TargetAuthProblemNotice from '../_shared/TargetAuthProblemNotice';
+import { managedAgentTargetAuthProblems } from './targetAuth';
+import { useOptionalSurfaceMeta } from '../../SurfaceMetaContext';
 import PartnerGrantReleaseSection, { isHttpTarget } from './PartnerGrantReleaseSection';
 import A2aProxyEndpointFields, { type A2aProxyOption } from './A2aProxyEndpointFields';
 import ResponseAuthSection from './ResponseAuthSection';
@@ -36,6 +39,8 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
   openFullscreenEditor,
   allNodes,
 }) => {
+  const accessPointChecksCallers = useOptionalSurfaceMeta()?.accessPointChecksCallers;
+  const targetAuthProblems = managedAgentTargetAuthProblems(config, { accessPointChecksCallers });
   const [mcpProxies, setMcpProxies] = useState<McpProxy[]>([]);
   const [a2aProxies, setA2aProxies] = useState<A2aProxyOption[]>([]);
 
@@ -396,6 +401,14 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
               <option value="custom">Custom</option>
             </Form.Select>
           </Form.Group>
+          {config.target_auth_enabled && (
+            <TargetAuthProblemNotice
+              testId="managed-agent-panel-target-auth"
+              errors={[...Object.values(targetAuthProblems.errors)]}
+              advisories={targetAuthProblems.advisories}
+              notes={targetAuthProblems.notes}
+            />
+          )}
           {config.target_auth_enabled && (
             <button
               className="btn btn-outline-primary btn-sm w-100"
