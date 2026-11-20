@@ -299,6 +299,16 @@ pub async fn saml_acs(
                 error!("SAML sign-in blocked by appliance limit: {}", limit.message());
                 return Ok(saml_error_page(StatusCode::FORBIDDEN, "Sign-in unavailable", &limit.message()));
             }
+            if e.downcast_ref::<super::user_provisioning::RoleRefused>()
+                .is_some()
+            {
+                warn!("SAML sign-in refused: {}", e);
+                return Ok(saml_error_page(
+                    StatusCode::FORBIDDEN,
+                    "Sign-in unavailable",
+                    "Your account has no role in this application. Please contact your administrator.",
+                ));
+            }
             error!("Failed to provision user from SAML: {}", e);
             return Ok(saml_error_page(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -608,6 +618,7 @@ mod tests {
                 .to_string(),
             attribute_mapping: SamlAttributeMapping::default(),
             role_mapping: HashMap::new(),
+            default_role: None,
             require_encrypted_assertions: false,
             sign_requests: false,
             sp_key_path: None,
