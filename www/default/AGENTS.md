@@ -1806,8 +1806,8 @@ Rules view's decision summary reuses its `audit-decision--deny` pill, unchanged,
 "Otherwise: DENY"); the `DecisionBadge` tooltip says "Denies requests that no rule allows" for DENY and "Allows
 requests that no allow rule decides" for ALLOW; an
 example's expected and actual decision
-and the tags (MCP tool policy and reads `<path>` with the path in `<code>` in `secondary`)
-are `Badge`s, an alert the templates add that carries an action is a non-collapsible
+and the gallery's MCP tool policy tag (`secondary`) are `Badge`s (a template's `reads` paths
+are matched by the Add rules search, never shown), an alert the templates add that carries an action is a non-collapsible
 `InfoBanner` with the button as its child and the test id on a wrapping `div`, the template
 search and category filter is the shared `SearchInput` and `FilterChipGroup`
 (`TemplateFilterBar.tsx`), code blocks use `.policy-preview-block`, and the templates column's
@@ -1871,8 +1871,10 @@ Create custom policy) in `useTemplateGallery`.
 
 - **Layers.** The folder is kept reusable in three layers, and an import only points down:
   - *Logic* (plain `.ts`, no React): `types.ts` (with `FieldText`, `UsedTemplate`,
-    `AddedRules`), `policyDefaults.ts`, `regoRules.ts` (parsing, rule use, `readsFromRego`),
-    `regoTemplate.ts` (rendering, `insertTemplateRules`), `templateSettings.ts` (setting
+    `AddedRules`), `policyDefaults.ts`, `regoRules.ts` (parsing, rule use),
+    `regoTemplate.ts` (rendering, `insertTemplateRules`, `defaultDecision` for a catalogue
+    template and `policyDefaultDecision` for the editor's policy, which reads only its
+    top-level `default allow`), `templateSettings.ts` (setting
     text to Rego), `policyStart.ts` (`policyStart`, `replaceText`, `groupsForOtherType`) and
     `policyTemplateLibrary.ts` (`groupTemplateEntries`, `galleryTemplates`, `surfaceOnlyKeys`
     and `buildTemplateLibrary`). Functions take `readonly` template lists.
@@ -1880,11 +1882,10 @@ Create custom policy) in `useTemplateGallery`.
     `useTemplateGallery`.
   - *Components* (`.tsx`), which export components only, so no logic lives in a component
     file.
-- **App seams.** What the feature needs from the dashboard comes through
-  `PolicyTemplateServicesContext` (`policyTemplateServices.ts`): `notifyUndo` (the undo toast)
-  and `simulate` (the dry-run endpoint). Its default value is the dashboard's
-  (`showUndoToast`, `simulatePolicy`), so the page needs no provider; another app provides its
-  own. Pass the services a stable value: `simulate` is an effect dependency. The page takes the
+- **App seams.** The feature calls the dashboard's `showUndoToast` (the undo toast) and
+  `simulatePolicy` (the dry-run endpoint) directly. Save dismisses the toast on screen
+  (`removeToast`) before it writes, so an Undo can't land while the save runs, and then reads
+  the definition back, so the SHA shown is the saved revision's. The page takes the
   templates from `POLICY_TEMPLATE_LIBRARY` (`builtinPolicyTemplates.ts`, `{entries, templates}`,
   built once from the catalogue by `buildTemplateLibrary`, Agent Surface variants first;
   `templates` feeds `groupsForOtherType`), and hands them to
@@ -1920,8 +1921,9 @@ Create custom policy) in `useTemplateGallery`.
   list may be left empty, written as `set()`; a `choice` (a select) writes the `rego` text of the
   picked option, which may be empty; a `time_of_day` (a time input) takes `HH:MM` and writes the
   minutes since midnight, and its `differs_from` names a time it must not equal. Business-hours
-  access window uses them all: its **Inside the window** choice writes `allow if
-  in_access_window` (Allow requests) or `allow if not in_access_window` (Deny requests), its
+  access window uses them all: its **Inside the window** choice writes `in_access_window`
+  (Allow requests) or `not in_access_window` (Deny requests) into an `allow` rule that first
+  requires `access_minute`, so a time zone the clock can't read denies in both modes; its
   **From** and **Until** times make a window that crosses midnight when Until is earlier, its
   **Days** may be empty for every day (a day is the request's date in the time zone, also for
   the hours after midnight: Monday to Friday 22:00–06:00 covers 00:00–06:00 and 22:00–24:00 on
@@ -1935,9 +1937,8 @@ Create custom policy) in `useTemplateGallery`.
   policy**) for a standalone template, an MCP tool template, or one with no rules left once its
   `default allow` line is dropped; `rules` (**Adds rules**) otherwise. A whole policy is used
   only from Start from; only templates that add rules are listed under Add rules. Each column
-  row and preview under Add rules shows the role badge
-  (`policy-template-role-badge`: "Whole policy" with `fa-file-shield`, "Adds rules" with
-  `fa-list-check`); Start from cards and their detail show no role or default decision badge.
+  row and preview under Add rules shows the `AddsRulesBadge`
+  (`policy-template-role-badge`: "Adds rules" with `fa-list-check`); Start from cards and their detail show no role or default decision badge.
   A custom policy is a whole policy. Allow listed
   paths denies a path that contains `..`, `%2e`, `%25`, a backslash or `%5c`, with those checks
   inside its one `allow` rule rather than in a helper rule.
@@ -2068,7 +2069,8 @@ Create custom policy) in `useTemplateGallery`.
   Undo the page keeps only the form, with the gallery collapsed and Details and Policy shown.
   The editor restores a left draft only when the discard toast's Undo reopens it
   (`restoreOnlyOnUndo` on the `useDiscardWithUndo` snapshot, which Undo marks with
-  `{ discardUndo: true }` navigation state); opened any other way it drops the draft, dismisses
+  `{ discardUndo: true }` navigation state, which the hook clears from the history entry once
+  read, so browser Back to that entry is not another Undo); opened any other way it drops the draft, dismisses
   that draft's discard toast if it is still showing (`showUndoToast` returns a dismiss function,
   kept per snapshot key), and starts fresh, with no template selected. Without
   `restoreOnlyOnUndo`, as in the Surface Builder, any visit restores the draft and the toast

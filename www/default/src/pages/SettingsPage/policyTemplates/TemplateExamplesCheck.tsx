@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { AppButton } from '../../../components/shared/AppButton';
 import { Badge } from '../../../components/shared/Badge';
-import { usePolicyTemplateServices } from './policyTemplateServices';
-import { defaultDecision } from './regoTemplate';
+import { simulatePolicy } from '../simulatePolicy';
+import { policyDefaultDecision } from './regoTemplate';
 import type { PolicyDecision, PolicyTemplate, PolicyType } from './types';
 
 interface TemplateExamplesCheckProps {
@@ -49,7 +49,6 @@ const TemplateExamplesCheck: React.FC<TemplateExamplesCheckProps> = ({
   onDismiss,
   onLoadInTest,
 }) => {
-  const { simulate } = usePolicyTemplateServices();
   const [outcomes, setOutcomes] = useState<Outcome[]>(() => template.examples.map(() => null));
 
   useEffect(() => {
@@ -60,7 +59,7 @@ const TemplateExamplesCheck: React.FC<TemplateExamplesCheckProps> = ({
       const results = await Promise.all(
         template.examples.map(async (ex): Promise<Outcome> => {
           try {
-            const r = await simulate(policyId, policyType, draftPolicy, ex.input);
+            const r = await simulatePolicy(policyId, policyType, draftPolicy, ex.input);
             return { decision: r.allow ? 'allow' : 'deny', reason: r.reason };
           } catch (e) {
             return { error: e instanceof Error ? e.message : 'Dry-run failed' };
@@ -73,14 +72,14 @@ const TemplateExamplesCheck: React.FC<TemplateExamplesCheckProps> = ({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [policyId, policyType, draftPolicy, template, simulate]);
+  }, [policyId, policyType, draftPolicy, template]);
 
   // The examples were written for the default settings, so a different decision after a
   // setting changed says nothing about the rest of the policy.
   const isMismatch = (o: Outcome, i: number) =>
     usesDefaultSettings && !!o && 'decision' in o && o.decision !== template.examples[i].expected;
   const mismatches = outcomes.filter(isMismatch).length;
-  const allowsByDefault = defaultDecision(draftPolicy) === 'allow';
+  const allowsByDefault = policyDefaultDecision(draftPolicy) === 'allow';
 
   return (
     <div

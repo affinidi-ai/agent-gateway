@@ -583,11 +583,11 @@
     "id": "allowlist-outbound-destinations",
     "name": "Allowlist outbound destinations",
     "summary": "Allow Transit Point calls only to the listed destinations.",
-    "description": "Allows a request through a Transit Point only when the Transit Point's configured endpoint (input.gateway.target_id) is one of the listed destinations or a path under one. It decides as a Transit Point policy or the shared Transit Point policy, where input.gateway.direction is outbound; as the surface's Access Point or Target policy it allows every request. Use it as the whole policy: inserted into another policy it would allow requests that policy denies.",
+    "description": "Allows a request through a Transit Point only when the Transit Point's configured endpoint (input.gateway.target_id) is one of the listed destinations or a path under one. It decides only where the gateway sets input.transit: as a Transit Point policy or the shared Transit Point policy. As the surface's Access Point or Target policy it allows every request, including the request a fabric:// Target sends, whose direction is also outbound but whose target_id is the peer gateway's DID. Use it as the whole policy: inserted into another policy it would allow requests that policy denies.",
     "category": "routing_paths",
     "policy_types": ["agent_surface"],
     "standalone": true,
-    "rules": "default allow := false\n\nallow if input.gateway.direction != \"outbound\"\n\nallow if {\n  input.gateway.direction == \"outbound\"\n  some destination in {{destinations}}\n  startswith(concat(\"\", [input.gateway.target_id, \"/\"]), concat(\"\", [trim_suffix(destination, \"/\"), \"/\"]))\n}",
+    "rules": "default allow := false\n\nallow if not input.transit\n\nallow if {\n  input.transit\n  some destination in {{destinations}}\n  startswith(concat(\"\", [input.gateway.target_id, \"/\"]), concat(\"\", [trim_suffix(destination, \"/\"), \"/\"]))\n}",
     "parameters": [
       {
         "key": "destinations",
@@ -598,7 +598,7 @@
         "help": "Separate destinations with commas: an endpoint URL such as https://api.example.com, or fabric://<gateway id> for a Fabric route. A Transit Point matches when its endpoint is a listed destination or a path under it, never a longer host name."
       }
     ],
-    "reads": ["gateway.direction", "gateway.target_id"],
+    "reads": ["transit", "gateway.target_id"],
     "examples": [
       {
         "name": "Transit Point to a listed endpoint",
@@ -606,6 +606,12 @@
           "gateway": {
             "direction": "outbound",
             "target_id": "https://api.example.com"
+          },
+          "transit": {
+            "caller": {
+              "verification": "anonymous",
+              "verified": false
+            }
           }
         },
         "expected": "allow"
@@ -616,6 +622,12 @@
           "gateway": {
             "direction": "outbound",
             "target_id": "https://api.example.com/mcp"
+          },
+          "transit": {
+            "caller": {
+              "verification": "anonymous",
+              "verified": false
+            }
           }
         },
         "expected": "allow"
@@ -626,6 +638,12 @@
           "gateway": {
             "direction": "outbound",
             "target_id": "https://api.example.com.example.net/mcp"
+          },
+          "transit": {
+            "caller": {
+              "verification": "anonymous",
+              "verified": false
+            }
           }
         },
         "expected": "deny"
@@ -636,6 +654,12 @@
           "gateway": {
             "direction": "outbound",
             "target_id": "https://api.example.com.example.net/x"
+          },
+          "transit": {
+            "caller": {
+              "verification": "anonymous",
+              "verified": false
+            }
           }
         },
         "expected": "deny"
@@ -646,6 +670,12 @@
           "gateway": {
             "direction": "outbound",
             "target_id": "https://unknown.example.net"
+          },
+          "transit": {
+            "caller": {
+              "verification": "anonymous",
+              "verified": false
+            }
           }
         },
         "expected": "deny"
@@ -656,6 +686,12 @@
           "gateway": {
             "direction": "outbound",
             "target_id": "fabric://partner-gateway/orders"
+          },
+          "transit": {
+            "caller": {
+              "verification": "anonymous",
+              "verified": false
+            }
           }
         },
         "expected": "allow"
@@ -666,6 +702,12 @@
           "gateway": {
             "direction": "outbound",
             "target_id": "fabric://other-gateway/orders"
+          },
+          "transit": {
+            "caller": {
+              "verification": "anonymous",
+              "verified": false
+            }
           }
         },
         "expected": "deny"
@@ -675,6 +717,16 @@
         "input": {
           "gateway": {
             "direction": "inbound"
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Request a fabric:// Target sends to the peer gateway",
+        "input": {
+          "gateway": {
+            "direction": "outbound",
+            "target_id": "did:web:peer.example"
           }
         },
         "expected": "allow"
@@ -690,11 +742,11 @@
     "id": "business-hours-access-window",
     "name": "Business-hours access window",
     "summary": "Allow or deny requests by time of day, day of week and time zone.",
-    "description": "Allows, or denies, requests made inside a daily time window on the listed days, in the chosen time zone; requests outside the window get the opposite decision. A window whose end is earlier than its start crosses midnight, and each listed day gets the hours after midnight and the hours before it on that day's own date. Rate limits are set on the surface's Rate Limit panel, not in policy.",
+    "description": "Allows, or denies, requests made inside a daily time window on the listed days, in the chosen time zone; requests outside the window get the opposite decision. A window whose end is earlier than its start crosses midnight, and each listed day gets the hours after midnight and the hours before it on that day's own date. A request whose time the policy can't read in the chosen time zone is denied in both modes. Rate limits are set on the surface's Rate Limit panel, not in policy.",
     "category": "time",
     "policy_types": ["gateway", "agent_surface"],
     "standalone": true,
-    "rules": "default allow := false\n\nallow if {{mode}}in_access_window\n\nin_access_window if {\n  access_day\n  access_minute >= {{start_time}}\n  access_minute < {{end_time}}\n}\n\nin_access_window if {\n  {{start_time}} > {{end_time}}\n  access_day\n  access_minute >= {{start_time}}\n}\n\nin_access_window if {\n  {{start_time}} > {{end_time}}\n  access_day\n  access_minute < {{end_time}}\n}\n\naccess_minute := (hour * 60) + minute if {\n  [hour, minute, _] := time.clock([time.now_ns(), {{time_zone}}])\n}\n\naccess_day if count({{days}}) == 0\n\naccess_day if time.weekday([time.now_ns(), {{time_zone}}]) in {{days}}",
+    "rules": "default allow := false\n\nallow if {\n  access_minute\n  {{mode}}in_access_window\n}\n\nin_access_window if {\n  access_day\n  access_minute >= {{start_time}}\n  access_minute < {{end_time}}\n}\n\nin_access_window if {\n  {{start_time}} > {{end_time}}\n  access_day\n  access_minute >= {{start_time}}\n}\n\nin_access_window if {\n  {{start_time}} > {{end_time}}\n  access_day\n  access_minute < {{end_time}}\n}\n\naccess_minute := (hour * 60) + minute if {\n  [hour, minute, _] := time.clock([time.now_ns(), {{time_zone}}])\n}\n\naccess_day if count({{days}}) == 0\n\naccess_day if time.weekday([time.now_ns(), {{time_zone}}]) in {{days}}",
     "parameters": [
       {
         "key": "mode",
@@ -1044,10 +1096,10 @@
     "id": "allow-path-prefixes",
     "name": "Allow listed paths",
     "summary": "Allow only requests under the listed path prefixes.",
-    "description": "Allows a request only when its path starts with one of the listed prefixes. The path is the whole request path, so a prefix starts with the surface's Access Point route, such as /my-surface/public/ for a route /my-surface; on a Transit Point it starts with /outbound, the route and the Transit Point's alias, or the Transit Point's own listen path. Denies a path that contains .., %2e, %25, a backslash or %5c. Assigned appliance-wide, it also decides public discovery reads such as /discovery and /.well-known/ucp.",
+    "description": "Allows a request only when its path is one of the listed prefixes or a path under one, never a longer segment: /my-surface/public allows /my-surface/public/docs, not /my-surface/public-admin. The path is the whole request path, so a prefix starts with the surface's Access Point route, such as /my-surface/public/ for a route /my-surface; on a Transit Point it starts with /outbound, the route and the Transit Point's alias, or the Transit Point's own listen path. Denies a path that contains .., %2e, %25, a backslash or %5c. Assigned appliance-wide, it also decides public discovery reads such as /discovery and /.well-known/ucp.",
     "category": "routing_paths",
     "policy_types": ["gateway", "agent_surface"],
-    "rules": "default allow := false\n\nallow if {\n  some prefix in {{prefixes}}\n  startswith(input.http.path, prefix)\n  not contains(input.http.path, \"..\")\n  not contains(lower(input.http.path), \"%2e\")\n  not contains(input.http.path, \"%25\")\n  not contains(input.http.path, \"\\\\\")\n  not contains(lower(input.http.path), \"%5c\")\n}",
+    "rules": "default allow := false\n\nallow if {\n  some prefix in {{prefixes}}\n  startswith(concat(\"\", [input.http.path, \"/\"]), concat(\"\", [trim_suffix(prefix, \"/\"), \"/\"]))\n  not contains(input.http.path, \"..\")\n  not contains(lower(input.http.path), \"%2e\")\n  not contains(input.http.path, \"%25\")\n  not contains(input.http.path, \"\\\\\")\n  not contains(lower(input.http.path), \"%5c\")\n}",
     "parameters": [
       {
         "key": "prefixes",
@@ -1086,6 +1138,16 @@
           "http": {
             "method": "GET",
             "path": "/my-surface/admin"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Path /my-surface/public-admin/users",
+        "input": {
+          "http": {
+            "method": "GET",
+            "path": "/my-surface/public-admin/users"
           }
         },
         "expected": "deny"
@@ -1273,7 +1335,7 @@
     "id": "tool-allow-authenticated",
     "name": "Tool policy: allow authenticated callers",
     "summary": "For a tool binding: allow any caller with a token.",
-    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows a call when the request's bearer token has a sub claim. It reads the claims of the bearer token in the request's Authorization header (input.jwt), so use it on a surface whose Caller Context authenticates that header with JWT Bearer.",
+    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows a call when the request's bearer token has a sub claim. It reads the claims of the bearer token in the request's Authorization header (input.jwt), which the gateway does not verify, so use it only on a closed Access Point whose Caller Context methods are all JWT Bearer.",
     "rules": "default allow := false\n\nallow if input.jwt.sub",
     "parameters": [],
     "reads": ["jwt.sub"],
@@ -1347,7 +1409,7 @@
     "id": "tool-allow-by-jwt-claim",
     "name": "Tool policy: allow by JWT claim",
     "summary": "For a tool binding: allow callers whose claim has a listed value.",
-    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows a call when a claim of the request's bearer token, a single value or a list, has one of the listed values. Covers admin-only and subscription-based access. It reads the claims of the bearer token in the request's Authorization header (input.jwt), so use it on a surface whose Caller Context authenticates that header with JWT Bearer.",
+    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows a call when a claim of the request's bearer token, a single value or a list, has one of the listed values. Covers admin-only and subscription-based access. It reads the claims of the bearer token in the request's Authorization header (input.jwt), which the gateway does not verify, so use it only on a closed Access Point whose Caller Context methods are all JWT Bearer.",
     "rules": "default allow := false\n\ntool_claim_values(v) := [v] if is_string(v)\n\ntool_claim_values(v) := v if is_array(v)\n\nallow if {\n  some v in tool_claim_values(input.jwt[{{claim}}])\n  v in {{values}}\n}",
     "parameters": [
       {
@@ -1498,7 +1560,7 @@
     "id": "tool-role-with-deny-reason",
     "name": "Tool policy: admin role with a deny reason",
     "summary": "For a tool binding: allow one role and record why others were denied.",
-    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows callers whose bearer token has the admin role, as a single value or in a list, and sets deny_reason when the token has no role or not that one. The reason is written to the audit log only, not the response. It reads the claims of the bearer token in the request's Authorization header (input.jwt), so use it on a surface whose Caller Context authenticates that header with JWT Bearer.",
+    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows callers whose bearer token has the admin role, as a single value or in a list, and sets deny_reason when the token has no role or not that one. The reason is written to the audit log only, not the response. It reads the claims of the bearer token in the request's Authorization header (input.jwt), which the gateway does not verify, so use it only on a closed Access Point whose Caller Context methods are all JWT Bearer.",
     "rules": "default allow := false\n\ntool_claim_values(v) := [v] if is_string(v)\n\ntool_claim_values(v) := v if is_array(v)\n\nallow if {{admin_role}} in tool_claim_values(input.jwt.role)\n\ndeny_reason := \"The caller's token has no role\" if not input.jwt.role\n\ndeny_reason := sprintf(\"Role %v may not call this tool\", [input.jwt.role]) if {\n  input.jwt.role\n  not allow\n}",
     "parameters": [
       {

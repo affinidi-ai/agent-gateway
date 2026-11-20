@@ -60,8 +60,8 @@ Every gateway and surface policy input carries these fields (`PolicyInput` in
 | `input.channel.config_id` | The surface id: unique, and unchanged when the surface is renamed. |
 | `input.channel.name` | The surface's display name, which other surfaces may share. |
 | `input.channel.variant_alias` | The surface variant the request selects: set on Fabric receive and on a Transit Point; absent on a direct request and for the default variant. |
-| `input.gateway.direction` | `inbound` for a request arriving at the Access Point, directly or over Fabric receive: the gateway policy, the Access Point policy and the Target's request policy see it. `outbound` for a request the managed agent sends through a Transit Point: the gateway policy, the shared Transit Point policy and the Transit Point's own policy see it. |
-| `input.gateway.target_id` | On `outbound`, the Transit Point's configured `target_endpoint`, such as `https://api.example.com/mcp`, or `fabric://{gateway_id}/{surface_id}` on a Fabric route; never the URL of one request. Absent on `inbound`. |
+| `input.gateway.direction` | `inbound` for a request arriving at the Access Point, directly or over Fabric receive: the gateway policy, the Access Point policy and the Target's request policy see it. `outbound` for a request the managed agent sends through a Transit Point: the gateway policy, the shared Transit Point policy and the Transit Point's own policy see it. Also `outbound` for the request a surface with a `fabric://` Target sends to the peer gateway: the Target's request policy sees it there, and so do the MCP tool gating conditions on that leg, without `input.transit`. Test `input.transit` to tell a Transit Point evaluation from that one. |
+| `input.gateway.target_id` | On a Transit Point, its configured `target_endpoint`, such as `https://api.example.com/mcp`, or `fabric://{gateway_id}/{surface_id}` on a Fabric route; never the URL of one request. On the send of a `fabric://` Target, the peer gateway's DID. Absent on `inbound`. |
 | `input.gateway.source_id` | On `outbound`, the managed agent's DID when it has one. On Fabric receive, the DID that sent the forward request. |
 
 ### MCP tool policy input
@@ -90,7 +90,7 @@ caller context the gateway and surface policies get:
 | `input.mcp.method` | Always `tools/call`. |
 | `input.mcp.params` | The call's `params`; the tool name is `input.mcp.params.name`. |
 | `input.mcp.protocol_version`, `client_capabilities`, `client_info` | Set for a modern (`2026-07-28`) request only. |
-| `input.jwt` | The claims of the bearer token in the request's `Authorization` header, absent without one; on Fabric receive, of the header the sending gateway forwarded. The surface's caller authentication verifies that token, not this input, so a tool policy that reads `input.jwt` belongs on a surface whose Caller Context authenticates that header with JWT Bearer. |
+| `input.jwt` | The claims of the bearer token in the request's `Authorization` header, absent without one; on Fabric receive, of the header the sending gateway forwarded. The gateway decodes these claims without verifying the token. A tool policy that reads `input.jwt` belongs only on a closed Access Point whose Caller Context methods are all JWT Bearer. |
 | `input.channel` | The surface's `name`, `id` (the surface id) and `protocol` (`mcp`). |
 | `input.request` | `source_ip` (`fabric` on Fabric receive), `method` and `path`. |
 
@@ -711,9 +711,9 @@ The same rule denies every request on the direct A2A path, which never produces
 
 ## Caller in Transit Point policy input
 
-Every outbound evaluation (gateway, surface, per-Transit-Point and response policies, and
-MCP tool gating conditions on a Transit Point) gets `input.transit`. It is never on an
-inbound evaluation, where `input.source_auth` and `input.extension_identity` carry the
+Every Transit Point evaluation (gateway, surface, per-Transit-Point and response policies,
+and MCP tool gating conditions on a Transit Point) gets `input.transit`. It is never on an
+inbound evaluation, nor on the `outbound` evaluation of the request a `fabric://` Target sends, where `input.source_auth` and `input.extension_identity` carry the
 caller. It names two principals, each in its own field, because one call can carry both:
 
 - `input.transit.caller` is the end user the transit token names, as the Access Point

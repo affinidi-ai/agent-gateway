@@ -26,9 +26,14 @@ const Editor: React.FC<{
 const List: React.FC = () => {
   const navigate = useNavigate();
   return (
-    <button type="button" onClick={() => navigate('/edit')}>
-      Open
-    </button>
+    <>
+      <button type="button" onClick={() => navigate('/edit')}>
+        Open
+      </button>
+      <button type="button" onClick={() => navigate(-1)}>
+        Browser Back
+      </button>
+    </>
   );
 };
 
@@ -86,6 +91,21 @@ describe('useDiscardWithUndo', () => {
 
     expect(restore).toHaveBeenCalledWith('draft');
     expect(screen.queryByText('Changes discarded.')).toBeNull();
+  });
+
+  it('does not restore a later draft when browser Back returns to the entry Undo opened', () => {
+    let saves = 0;
+    const restore = openEditor(true, () => `draft ${++saves}`);
+    fireEvent.click(screen.getByText('Back'));
+    fireEvent.keyDown(document, { key: 'u' });
+    expect(restore).toHaveBeenCalledWith('draft 1');
+
+    fireEvent.click(screen.getByText('Back'));
+    fireEvent.click(screen.getByText('Browser Back'));
+
+    expect(screen.getByText('Back')).toBeInTheDocument();
+    expect(restore).toHaveBeenCalledTimes(1);
+    expect(window.sessionStorage.getItem('draft:test')).toBeNull();
   });
 
   it('keeps the toast and restores the draft on any visit without restoreOnlyOnUndo', () => {

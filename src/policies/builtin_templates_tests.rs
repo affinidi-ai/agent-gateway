@@ -257,6 +257,25 @@ fn business_hours_deny_mode_inverts_the_decision() {
 }
 
 #[test]
+fn business_hours_denies_in_both_modes_when_the_time_zone_cannot_be_read() {
+    for variant in ["business-hours-access-window:gateway", "business-hours-access-window:deny:gateway"] {
+        let rego = rendered(variant).replace("\"UTC\"", "\"Mars/Olympus_Mons\"");
+        let mut engine = regorus::Engine::new();
+        engine.set_strict_builtin_errors(false);
+        engine
+            .add_policy("template".to_string(), rego)
+            .expect("compiles");
+        engine
+            .set_input_json("{}")
+            .expect("input");
+        let allow = engine
+            .eval_bool_query(format!("data.{}.allow", super::GATEWAY_POLICY_PACKAGE), false)
+            .expect("evaluates");
+        assert!(!allow, "{variant} allowed a request whose time zone is unknown");
+    }
+}
+
+#[test]
 fn business_hours_follows_the_time_zone_across_a_daylight_saving_change() {
     let at = |instant| business_hours_allow("gateway", Some("weekend-berlin"), instant);
     assert!(!at("2026-03-28T07:59:59Z"), "Saturday 08:59:59 CET");

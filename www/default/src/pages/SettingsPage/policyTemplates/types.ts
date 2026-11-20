@@ -91,7 +91,7 @@ export interface PolicyTemplate {
   /** Full Rego module. Settings appear as `{{key}}` placeholders. */
   rego: string;
   parameters: PolicyTemplateParameter[];
-  /** Input paths the policy reads, shown as tags. */
+  /** Input paths the policy reads, matched by the Add rules search; not shown. */
   reads: string[];
   examples: PolicyTemplateExample[];
   /**

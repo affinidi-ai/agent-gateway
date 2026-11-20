@@ -82,6 +82,16 @@ export function useDiscardWithUndo({
   const openedByUndoRef = useRef(
     (location.state as { discardUndo?: boolean } | null)?.discardUndo === true
   );
+  const undoStateClearedRef = useRef(false);
+
+  // The history entry keeps its state, so a later visit to it through browser Back would
+  // otherwise read as reopened by Undo.
+  useEffect(() => {
+    if (!openedByUndoRef.current || undoStateClearedRef.current) return;
+    undoStateClearedRef.current = true;
+    const { pathname, search, hash } = location;
+    navigate({ pathname, search, hash }, { replace: true, state: null });
+  }, [location, navigate]);
 
   // Tab / window close — only the native browser dialog is available here.
   useEffect(() => {

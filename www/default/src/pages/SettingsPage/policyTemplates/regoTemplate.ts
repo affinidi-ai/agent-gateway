@@ -4,7 +4,7 @@ import type {
   PolicyTemplate,
   PolicyTemplateParameter,
 } from './types';
-import { TEMPLATE_BEGIN_PREFIX, TEMPLATE_END_PREFIX } from './regoRules';
+import { parsePolicyRules, TEMPLATE_BEGIN_PREFIX, TEMPLATE_END_PREFIX } from './regoRules';
 
 const PACKAGE_LINE = /^\s*package\s+/;
 const IMPORT_LINE = /^\s*import\s+/;
@@ -139,9 +139,21 @@ export function renderTemplate(template: PolicyTemplate, values: ParameterValues
   return { rego, errors };
 }
 
-/** The decision a module gives when no rule matches; a module without a default denies. */
+/**
+ * The decision a catalogue template gives when no rule matches; a module without a default
+ * denies. Read a user's policy with `policyDefaultDecision`.
+ */
 export function defaultDecision(rego: string): PolicyDecision {
   return explicitDefault(rego) ?? 'deny';
+}
+
+/**
+ * The decision the editor's policy gives when no rule matches, from its top-level
+ * `default allow`, so a default line inside a raw string is not read as the policy's own.
+ */
+export function policyDefaultDecision(rego: string): PolicyDecision {
+  const parsed = parsePolicyRules(rego);
+  return parsed.ok ? (parsed.defaultDecision ?? 'deny') : defaultDecision(rego);
 }
 
 /**

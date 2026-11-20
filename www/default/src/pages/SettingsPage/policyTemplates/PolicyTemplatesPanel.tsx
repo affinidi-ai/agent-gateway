@@ -1,8 +1,13 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AppButton } from '../../../components/shared/AppButton';
 import InfoBanner from '../../../components/shared/InfoBanner';
-import { defaultDecision, insertTemplateRules, templateRole } from './regoTemplate';
-import { DecisionBadge, TemplateRoleBadge } from './TemplateBadges';
+import {
+  defaultDecision,
+  insertTemplateRules,
+  policyDefaultDecision,
+  templateRole,
+} from './regoTemplate';
+import { AddsRulesBadge, DecisionBadge } from './TemplateBadges';
 import TemplateFilterBar from './TemplateFilterBar';
 import {
   SampleValuesNote,
@@ -63,7 +68,7 @@ const InsertPreview: React.FC<{
       </h6>
       <p className="text-muted small mb-2">{template.description}</p>
       <div className="d-flex flex-wrap gap-2 mb-3">
-        <TemplateRoleBadge template={template} />
+        <AddsRulesBadge />
         <DecisionBadge decision={defaultDecision(template.rego)} />
       </div>
 
@@ -77,7 +82,7 @@ const InsertPreview: React.FC<{
       >
         <code>{insert ? insert.added : 'Fix the settings above to see the rules.'}</code>
       </pre>
-      {addsLines && defaultDecision(existingPolicy) === 'allow' && (
+      {addsLines && policyDefaultDecision(existingPolicy) === 'allow' && (
         <div data-testid="policy-templates-allow-default-note">
           <InfoBanner
             variant="warning"
@@ -182,7 +187,7 @@ const PolicyTemplatesPanel: React.FC<PolicyTemplatesPanelProps> = ({
                       <span className="policy-template-row__summary">{t.summary}</span>
                     </span>
                     <span className="d-flex flex-column align-items-end gap-1">
-                      <TemplateRoleBadge template={t} />
+                      <AddsRulesBadge />
                       <DecisionBadge decision={defaultDecision(t.rego)} />
                     </span>
                   </button>

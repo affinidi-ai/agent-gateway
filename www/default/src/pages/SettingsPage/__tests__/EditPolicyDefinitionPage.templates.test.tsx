@@ -24,6 +24,9 @@ jest.mock('../../../utils/toaster', () => ({
     mockUndo.last = options.onUndo;
     mockUndo.message = options.message;
   },
+  removeToast: () => {
+    mockUndo.last = undefined;
+  },
 }));
 
 const fetchMock = apiClient.fetch as jest.Mock;
@@ -87,6 +90,8 @@ const rego = () => screen.getByPlaceholderText('...add policy here...') as HTMLT
 
 beforeEach(() => {
   mockCanEdit = true;
+  mockUndo.last = undefined;
+  mockUndo.message = undefined;
   fetchMock.mockReset();
   window.sessionStorage.clear();
 });
@@ -707,7 +712,7 @@ describe('template settings in the gallery', () => {
     expect(mode).toHaveValue('allow');
     fireEvent.change(mode, { target: { value: 'deny' } });
     fireEvent.click(screen.getByTestId('policy-template-gallery-use-button'));
-    expect(rego().value).toContain('allow if not in_access_window');
+    expect(rego().value).toContain('allow if {\n  access_minute\n  not in_access_window\n}');
   });
 
   it('takes the window as HH:MM, crossing midnight, on every day when Days is empty', async () => {
@@ -1432,6 +1437,28 @@ describe('policy section', () => {
     expect(screen.getByTestId('policy-definition-sha')).toHaveTextContent('sha256:abc');
     expect(screen.getByTestId('policy-definition-id-copy-button')).toBeInTheDocument();
   });
+
+  it('shows the SHA of the revision Save wrote, not the one loaded', async () => {
+    let put = false;
+    fetchMock.mockImplementation(async (url: string, init?: { method?: string }) => {
+      if (init?.method === 'PUT') {
+        put = true;
+        return jsonResponse({ ...SAVED, content_hash: 'sha256:old' });
+      }
+      if (url.includes('/versions')) return jsonResponse([]);
+      return jsonResponse({ ...SAVED, content_hash: put ? 'sha256:new' : 'sha256:old' });
+    });
+    renderAt('/policy-definitions/partner-only');
+    expect(await screen.findByTestId('policy-definition-sha')).toHaveTextContent('sha256:old');
+
+    fireEvent.click(screen.getByTestId('policy-view-rego'));
+    fireEvent.change(rego(), { target: { value: `${SAVED.policy}\n` } });
+    fireEvent.click(screen.getByTestId('policy-definition-editor-save-button'));
+
+    await waitFor(() =>
+      expect(screen.getByTestId('policy-definition-sha')).toHaveTextContent('sha256:new')
+    );
+  });
 });
 
 describe('editing after a template', () => {
@@ -1627,6 +1654,20 @@ describe('remove one rule', () => {
 
     act(() => mockUndo.last?.());
     expect(rego().value).toContain('"HEAD"');
+  });
+
+  it('dismisses the Undo toast when Save starts, so the save cannot overwrite an Undo', async () => {
+    mockGateway({
+      ...SAVED,
+      policy: `${SAVED.policy}\n\nallow if input.http.method == "HEAD"\n`,
+    });
+    renderAt('/policy-definitions/partner-only');
+    fireEvent.click(await screen.findByTestId('policy-rules-group-0-rule-1-remove-button'));
+    expect(mockUndo.last).toBeDefined();
+
+    fireEvent.click(screen.getByTestId('policy-definition-editor-save-button'));
+
+    expect(mockUndo.last).toBeUndefined();
   });
 
   it("removes a template's group with its last rule, and Undo brings both back", async () => {

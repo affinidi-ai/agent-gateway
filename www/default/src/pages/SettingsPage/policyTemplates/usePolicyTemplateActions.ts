@@ -8,7 +8,7 @@ import {
   type PolicyRule,
   type RuleGroup,
 } from './regoRules';
-import { usePolicyTemplateServices } from './policyTemplateServices';
+import { showUndoToast } from '../../../utils/toaster';
 import { insertTemplateRules } from './regoTemplate';
 import {
   type AddedRules,
@@ -42,8 +42,7 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
   setForm: Dispatch<SetStateAction<T>>,
   isCreateMode: boolean
 ) {
-  const { notifyUndo } = usePolicyTemplateServices();
-  // Only Use and Allow all set it; whether the Rego still follows it is derived from the Rego.
+  // Only Use and Create custom policy set it; whether the Rego still follows it is derived from the Rego.
   const [usedTemplate, setUsedTemplate] = useState<UsedTemplate | null>(null);
   // A new policy shows its Details and Policy sections only once a template is used.
   const [templatePicked, setTemplatePicked] = useState(!isCreateMode);
@@ -69,7 +68,7 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
     }));
     setUsedTemplate({ id: template.id, fieldText });
     setTemplatePicked(true);
-    notifyUndo({
+    showUndoToast({
       message: `Filled from the template ${template.name}. ${UNDO_FORM}`,
       onUndo: () => {
         filledDescriptionRef.current = previousFilled;
@@ -90,7 +89,7 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
     setForm(f => ({ ...f, name: '', description: '', policy: ALLOW_ALL_POLICY[f.policy_type] }));
     setUsedTemplate({ id: BLANK_TEMPLATE_ID, fieldText: {} });
     setTemplatePicked(true);
-    notifyUndo({
+    showUndoToast({
       message: `Started a custom policy. ${UNDO_FORM}`,
       onUndo: () => {
         filledDescriptionRef.current = previousFilled;
@@ -115,7 +114,7 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
     if (!isCreateMode) {
       setInsertedTemplate(prev => ({ template, usesDefaultSettings, key: (prev?.key ?? 0) + 1 }));
     }
-    notifyUndo({
+    showUndoToast({
       message: `Added rules from the template ${template.name}. ${isCreateMode ? 'Create' : 'Save'} to keep them. ${UNDO_REGO}`,
       onUndo: () => {
         setForm(f => ({ ...f, policy: previousPolicy }));
@@ -133,7 +132,7 @@ export function usePolicyTemplateActions<T extends TemplateFormFields>(
     const previousPolicy = form.policy;
     const previousUsed = usedTemplate;
     setForm(f => ({ ...f, policy }));
-    notifyUndo({
+    showUndoToast({
       message: `${message} ${UNDO_REGO}`,
       onUndo: () => {
         setForm(f => ({ ...f, policy: previousPolicy }));

@@ -11,11 +11,13 @@ changes:
         access window, a monitor-only baseline, all or at least N trust checks pass, and HTTP
         method, path, surface and subject allowlists, plus MCP tool policies for tool bindings
         on MCP Targets. Each template's description says which policy input it reads and what
-        that input needs, such as a verified caller DID for Trust Registry recognition, JWT
-        Bearer authentication of the Authorization header for the MCP tool policies, and the
-        Transit Point policy slots for the outbound allowlist; a trust check that queries
-        several authorities counts once, the surface allowlist matches surface IDs, the path
-        allowlist's prefixes start with the Access Point route, and the templates that read the
+        that input needs, such as a verified caller DID for Trust Registry recognition, a
+        closed Access Point whose Caller Context methods are all JWT Bearer for the MCP tool
+        policies, which read the unverified bearer token, and the Transit Point policy slots for
+        the outbound allowlist, which decides only where input.transit is set and allows the
+        request a fabric:// Target sends; a trust check that queries several authorities counts
+        once, the surface allowlist matches surface IDs, the path allowlist's prefixes start
+        with the Access Point route and match whole path segments, and the templates that read the
         caller say they decide on the Access Point and Target request policies. Templates follow the Apply Policies guides and link to their own
         docs section. Define Gateway Policy lists only templates for gateways and Define Agent
         Surface Policy only templates for surfaces, with a muted note on a template for surfaces
@@ -33,7 +35,8 @@ changes:
         it; when the policy already has rules or hand edits, Use and Create custom policy ask in
         place before they replace them. The Business-hours access window template allows or
         denies requests inside a daily HH:MM window in a chosen time zone, which may cross
-        midnight, on the listed days or every day; it is a whole policy, offered under Start
+        midnight, on the listed days or every day, and denies a request whose time it can't
+        read in that time zone in either mode; it is a whole policy, offered under Start
         from only. Add rules from a template lists only templates that add rules, labelled
         Adds rules, says how many whole policies and templates for the other Type it leaves
         out, and appends a template's rules to a new or saved policy, so several can be
@@ -61,7 +64,9 @@ changes:
         docs/POLICY.md now describes the input of a policy bound to MCP tools (input.mcp,
         input.jwt as the claims of the request's Authorization bearer token, input.channel and
         input.request), input.http with a path that starts with the Access Point route,
-        input.channel and input.gateway with where direction and target_id are set, input.agent.trust_verification beside did_verified, and how to
+        input.channel and input.gateway with where direction and target_id are set, including
+        the outbound evaluation of a fabric:// Target's send, which carries the peer gateway's
+        DID and no input.transit, input.agent.trust_verification beside did_verified, and how to
         require every Trust Check when a check queries several authorities.
     - timestamp: '2026-11-19T14:00:00Z'
       title: Set a new policy's Type from the Define button that opened it
@@ -83,14 +88,17 @@ changes:
       description: >-
         Leaving the policy editor with unsaved changes and opening it again any other way now
         starts fresh and closes the discard notice, so its Undo never points at a dropped
-        draft; only Undo on that notice brings the draft back.
+        draft; only Undo on that notice brings the draft back, and browser Back to the page that
+        Undo reopened does not bring back a later draft.
     - timestamp: '2026-11-18T18:00:00Z'
       title: Redesign the policy editor into Details and Policy sections
       description: >-
         The policy create and edit pages group Name, Description, Type and an Enabled switch
         into one Details section (Name, then a two-line Description, then Type and Status side
-        by side), show a saved policy's ID and SHA on one line with copy buttons, and show the
-        Rego with line numbers and a banner when it doesn't compile.
+        by side), show a saved policy's ID and SHA on one line with copy buttons, the SHA of the
+        revision Save just wrote, and show the Rego with line numbers and a banner when it
+        doesn't compile. Save closes an Undo notice still on screen, so an Undo can't be lost
+        to the save.
   fixed:
     - timestamp: '2026-11-20T15:00:00Z'
       title: Stop a replaced dashboard toast from closing the next one or undoing twice

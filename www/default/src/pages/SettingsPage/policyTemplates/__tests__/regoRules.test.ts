@@ -1079,6 +1079,16 @@ describe('ruleRoles', () => {
     ]);
   });
 
+  it('reads a rule whose name starts with data as a rule, not a whole-document read', () => {
+    expect(
+      roles('package p\ndata_classes := {"public"}\nh if input.a\nallow if input.c in data_classes')
+    ).toEqual([
+      ['data_classes', 'used-by-allow'],
+      ['h', 'not-used-by-allow'],
+      ['allow', 'allow'],
+    ]);
+  });
+
   it('reads a dotted allow.x as setting allow, and a rule it reads as used by allow', () => {
     expect(roles('package p\nh if input.a\nallow.x := h')).toEqual([
       ['h', 'used-by-allow'],

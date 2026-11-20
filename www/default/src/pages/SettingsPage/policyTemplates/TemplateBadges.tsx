@@ -1,6 +1,5 @@
 import React from 'react';
-import { templateRole } from './regoTemplate';
-import type { PolicyDecision, PolicyTemplate } from './types';
+import type { PolicyDecision } from './types';
 
 /**
  * A policy's or template's default decision: a quiet grey outline with a shield for DENY, and
@@ -23,25 +22,14 @@ export const DecisionBadge: React.FC<{ decision: PolicyDecision }> = ({ decision
   </span>
 );
 
-/** Whether a template is the whole policy or rules Add to policy can add, as a neutral outline. */
-export const TemplateRoleBadge: React.FC<{ template: PolicyTemplate }> = ({ template }) => (
-  <RoleBadge role={templateRole(template)} />
+/** Marks a template Add rules lists, whose rules can be added to a policy, as a neutral outline. */
+export const AddsRulesBadge: React.FC = () => (
+  <span
+    className="badge policy-rules__kind policy-template-role"
+    title="Its rules can be added to a policy"
+    data-testid="policy-template-role-badge"
+  >
+    <i className="fas fa-list-check" aria-hidden="true" />
+    Adds rules
+  </span>
 );
-
-export const RoleBadge: React.FC<{ role: 'policy' | 'rules' }> = ({ role }) => {
-  const policy = role === 'policy';
-  return (
-    <span
-      className="badge policy-rules__kind policy-template-role"
-      title={
-        policy
-          ? 'Meant to be the whole policy; used from Start from on a new policy'
-          : 'Its rules can be added to a policy'
-      }
-      data-testid="policy-template-role-badge"
-    >
-      <i className={`fas ${policy ? 'fa-file-shield' : 'fa-list-check'}`} aria-hidden="true" />
-      {policy ? 'Whole policy' : 'Adds rules'}
-    </span>
-  );
-};

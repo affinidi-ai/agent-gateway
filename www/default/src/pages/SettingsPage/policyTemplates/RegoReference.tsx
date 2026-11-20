@@ -18,7 +18,11 @@ const INPUT_FIELDS: [string, string][] = [
   ],
   ['input.http.headers', 'HTTP headers'],
   ['input.gateway.direction', '"inbound" or "outbound"'],
-  ['input.gateway.target_id', 'The target endpoint, on the outbound path'],
+  [
+    'input.gateway.target_id',
+    "The Transit Point's target endpoint; the peer gateway's DID when a fabric:// Target sends",
+  ],
+  ['input.transit', 'Set on every Transit Point evaluation, never on another one'],
   ['input.mcp.method', 'The MCP method, such as tools/call'],
   [
     'input.mcp.tool_name',
@@ -38,7 +42,7 @@ const INPUT_FIELDS: [string, string][] = [
 const TOOL_INPUT_FIELDS: [string, string][] = [
   [
     'input.jwt.<claim>',
-    "Claims of the bearer token in the request's Authorization header, such as sub or role",
+    "Claims of the bearer token in the request's Authorization header, such as sub or role, not verified by the gateway",
   ],
   ['input.mcp.method', 'Always tools/call'],
   ['input.mcp.params.name', 'The tool being called'],

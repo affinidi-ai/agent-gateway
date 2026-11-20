@@ -3,6 +3,7 @@ import {
   defaultParameterValues,
   insertTemplateRules,
   parseListInput,
+  policyDefaultDecision,
   renderTemplate as fillTemplate,
 } from '../regoTemplate';
 import type { PolicyTemplate } from '../types';
@@ -278,6 +279,23 @@ describe('defaultDecision', () => {
 
   it('treats a module without a default as deny', () => {
     expect(defaultDecision('package p\nallow if input.jwt.sub')).toBe('deny');
+  });
+});
+
+describe('policyDefaultDecision', () => {
+  const rawStringFirst =
+    'package p\n\nnote := `\ndefault allow := true\n`\n\ndefault allow := false\n\nallow if input.a';
+
+  it('reads the top-level default, not a default line inside a raw string', () => {
+    expect(policyDefaultDecision(rawStringFirst)).toBe('deny');
+  });
+
+  it('reads allow from a top-level default allow := true', () => {
+    expect(policyDefaultDecision('package p\n\ndefault allow := true')).toBe('allow');
+  });
+
+  it('treats a policy without a default as deny', () => {
+    expect(policyDefaultDecision('package p\nallow if input.a')).toBe('deny');
   });
 });
 

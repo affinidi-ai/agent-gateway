@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { apiClient } from '../../api';
-import { showToast, showUndoToast } from '../../utils/toaster';
+import { removeToast, showToast, showUndoToast } from '../../utils/toaster';
 import { useSafeNavigate } from '../../hooks/useSafeNavigate';
 import { usePageTitle } from '../../context/PageTitleContext';
 import { usePermissions } from '../../context/PermissionsContext';
@@ -10,9 +10,12 @@ import { Link } from '../../components/shared/Link';
 import { DOCS_URL } from '../../config/docs';
 import PolicySimulatePanel, { POLICY_SIMULATE_DEFAULT_INPUT } from './PolicySimulatePanel';
 import PolicyVersionHistory from './PolicyVersionHistory';
-import { DEFAULT_POLICY, EXPECTED_PACKAGE } from './policyTemplates/policyDefaults';
+import {
+  DEFAULT_POLICY,
+  DEFAULT_POLICY_VIEW,
+  EXPECTED_PACKAGE,
+} from './policyTemplates/policyDefaults';
 import PolicyDetailsSection from './PolicyDetailsSection';
-import { DEFAULT_POLICY_VIEW } from './policyTemplates/policyDefaults';
 import PolicyEditorSection, { type PolicyView } from './policyTemplates/PolicyEditorSection';
 import PolicyTemplatesPanel from './policyTemplates/PolicyTemplatesPanel';
 import TemplateExamplesCheck from './policyTemplates/TemplateExamplesCheck';
@@ -232,6 +235,8 @@ const EditPolicyDefinitionPage: React.FC = () => {
       );
       return;
     }
+    // An Undo pressed while the save runs would be overwritten by the saved form.
+    removeToast();
     setSaving(true);
     setError(null);
     try {
@@ -257,9 +262,18 @@ const EditPolicyDefinitionPage: React.FC = () => {
         showToast('success', 'Policy created!');
         navigate(`/policy-definitions/${encodeURIComponent(payload.id)}`);
       } else {
-        // Stay in the editor and surface the newly appended version.
-        baselineRef.current = JSON.stringify(payload);
-        setForm(payload);
+        // Stay in the editor and surface the newly appended version, with its content hash.
+        const stored: Partial<PolicyDefinition> | null = await apiClient
+          .fetch(`/api/v1/policy-definitions/${encodeURIComponent(payload.id)}`)
+          .then(r => (r.ok ? r.json() : null))
+          .catch(() => null);
+        const saved: PolicyDefinition = {
+          ...payload,
+          content_hash: stored?.content_hash ?? payload.content_hash,
+          updated_at: stored?.updated_at ?? payload.updated_at,
+        };
+        baselineRef.current = JSON.stringify(saved);
+        setForm(saved);
         setVersionRefreshKey(k => k + 1);
         showToast('success', 'Policy updated!');
       }

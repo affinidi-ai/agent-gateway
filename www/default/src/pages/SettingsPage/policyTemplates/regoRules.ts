@@ -61,7 +61,7 @@ const DENY_REASON = 'deny_reason';
 const STRING_LITERAL = /"(?:\\.|[^"\\])*"|`[^`]*`/g;
 const PACKAGE = /^package\s+([\w.]+)/;
 const IMPORT_DATA = /^import\s+data\b/;
-const DATA_REF = /(?:^|[^\w.])data((?:\.\w+)*)/gm;
+const DATA_REF = /(?:^|[^\w.])data(?!\w)((?:\.\w+)*)/gm;
 
 const withoutStrings = (code: string[]) => code.join('\n').replace(STRING_LITERAL, '""');
 
@@ -625,10 +625,4 @@ export function removeRule(rego: string, rule: PolicyRule): string {
   }
   lines.splice(start, rule.endLine - start);
   return joinAfterRemoval(lines);
-}
-
-/** Input paths a module reads, such as `jwt.sub`, shown as tags on the template. */
-export function readsFromRego(rego: string): string[] {
-  const paths = Array.from(rego.matchAll(/\binput\.([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)/g), m => m[1]);
-  return Array.from(new Set(paths)).slice(0, 6);
 }
