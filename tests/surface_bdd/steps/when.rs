@@ -413,6 +413,18 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         );
     }
 
+    if let Some(seed) = world.agent_did_seed {
+        world.seeded_agent_did = Some(
+            crate::steps::agent_did::seed_agent_did(
+                &temp_dir
+                    .path()
+                    .join("_storage/identities"),
+                seed,
+            )
+            .await,
+        );
+    }
+
     if world.affinidi_cache_seeded {
         let cache_dir = temp_dir
             .path()

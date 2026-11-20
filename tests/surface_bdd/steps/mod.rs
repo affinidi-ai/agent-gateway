@@ -1,4 +1,5 @@
 pub mod agent_card_preview;
+pub mod agent_did;
 pub mod authority_dependencies;
 pub mod browser_origins_save;
 pub mod caller_key_save;

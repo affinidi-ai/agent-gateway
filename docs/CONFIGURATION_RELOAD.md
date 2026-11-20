@@ -260,6 +260,23 @@ waits more than 5 seconds for the lock leaves the repair and the index to the no
 and to its own next start or promotion; one on a volume without file locks makes both without
 the lock.
 
+The managed agent DID logs in the identities folder are shared the same way. Right after the
+gateway DID repair, the Active node lists each agent's signing key under `assertionMethod` and
+`authentication` where the agent's DID log leaves it out, with a new log version signed by the
+agent key (see [Resolvable identities](CAPABILITIES.md#resolvable-identities)). It runs in the
+background, on a node that boots Active as on a promoted one, so the node admits traffic without
+waiting for it. An agent's presentations keep claiming `assertionMethod` until its DID is repaired,
+by this node or another, and for 65 minutes after: the hour a peer's DID resolver may keep the
+earlier document; a node notices another node's repair within a minute. It runs under the agent DID repair lock in
+the identities folder, so two nodes Active at once repair each agent DID once between them, with
+the same 5-second wait and the same handling of a volume without file locks as the gateway DID
+lock. When every agent DID already lists the key, the node only reads the logs and takes no
+lock. A log that does not verify, whose
+update key is not the agent key, or that publishes another key as `#key-2` is left as it is and
+logged as a warning, and the other agent DIDs are still repaired. A Standby node writes nothing.
+No DID resolver cache needs clearing: a copy of an agent's document cached before its repair
+expires within the hour in which the agent still claims `assertionMethod`.
+
 Both modes build the source authentication middleware at startup, so a node whose JWT
 verification strategy store cannot be opened refuses to start in either mode (see
 [Source authentication](SOURCE_AUTH.md#source-authentication)).
