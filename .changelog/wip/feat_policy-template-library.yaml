@@ -16,8 +16,8 @@ changes:
         only; the cards carry no role or default decision badges, six show until Show all, and
         no card is selected until the user picks one. Choosing a card shows its settings, its
         Rego, how it decides on sample inputs and its docs link in the column beside the form,
-        and Use this template fills Name, Description and Rego with settings that are checked
-        first; the Details and Policy sections appear only then. Create custom policy, under the
+        and Use this template fills Description and Rego, never the Name, with settings that are
+        checked first; the Details and Policy sections appear only then. Create custom policy, under the
         list, starts an allow-all policy instead. Change reopens the gallery and Cancel closes
         it; when the policy already has rules or hand edits, Use and Create custom policy ask in
         place before they replace them. The Business-hours access window template allows or

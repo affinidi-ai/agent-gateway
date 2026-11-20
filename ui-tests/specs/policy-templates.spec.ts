@@ -58,7 +58,7 @@ test.describe('Policy templates on the create policy page', () => {
         await expect(page.getByTestId('policy-template-gallery-summary')).toContainText(
             'Started from Allow listed HTTP methods'
         );
-        await expect(page.getByPlaceholder('e.g. Require Authentication')).toHaveValue('Allow listed HTTP methods');
+        await expect(page.getByPlaceholder('e.g. Require Authentication')).toHaveValue('');
     });
 
     test('moves the focus to Change once a template is used', async ({page}) => {

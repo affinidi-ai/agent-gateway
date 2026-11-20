@@ -157,7 +157,7 @@ describe('pick a template before the rest of the form', () => {
 
   it('shows Details, the Rules view and Add rules once a template is used', async () => {
     await renderNew();
-    expect(nameField()).toHaveValue('Deny by default');
+    expect(nameField()).toHaveValue('');
     expect(screen.getByPlaceholderText('What does this policy do?').tagName).toBe('TEXTAREA');
     expect(rego().value).toBe('package surface.policy\n\ndefault allow := false\n');
     expect(screen.getByTestId('policy-view-rules')).toHaveAttribute('aria-pressed', 'true');
@@ -177,6 +177,29 @@ describe('pick a template before the rest of the form', () => {
 
     fireEvent.click(screen.getByTestId('policy-template-gallery-use-button'));
     expect(screen.getByTestId('policy-definition-editor-save-button')).toBeInTheDocument();
+  });
+
+  it('asks for a Name on Create after Use, then creates with the typed Name', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    await applyCard('allow-http-methods');
+    const posts = () => fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST');
+
+    fireEvent.click(screen.getByTestId('policy-definition-editor-save-button'));
+    expect(await screen.findByText('Name is required')).toBeInTheDocument();
+    expect(posts()).toHaveLength(0);
+
+    Object.defineProperty(globalThis, 'crypto', {
+      value: { randomUUID: () => 'new-policy-id' },
+      configurable: true,
+    });
+    try {
+      fireEvent.change(nameField()!, { target: { value: 'methods policy' } });
+      fireEvent.click(screen.getByTestId('policy-definition-editor-save-button'));
+      await waitFor(() => expect(posts()).toHaveLength(1));
+      expect(JSON.parse(posts()[0][1].body).name).toBe('methods policy');
+    } finally {
+      delete (globalThis as { crypto?: unknown }).crypto;
+    }
   });
 
   it('shows the rest of the form once a custom policy is created', async () => {
@@ -274,13 +297,11 @@ describe('pick a template before the rest of the form', () => {
 });
 
 describe('start a policy from the gallery', () => {
-  it('fills Name, Description and Rego from the used template and shows its rules', async () => {
+  it('fills Description and Rego from the used template, leaves Name empty and shows its rules', async () => {
     renderAt('/policy-definitions/new?type=agent_surface');
     await applyCard('all-trust-checks-pass');
 
-    expect(screen.getByPlaceholderText('e.g. Require Authentication')).toHaveValue(
-      'All trust checks pass'
-    );
+    expect(screen.getByPlaceholderText('e.g. Require Authentication')).toHaveValue('');
     expect(screen.getByPlaceholderText('What does this policy do?')).toHaveValue(
       'Allows a request only if at least one trust check ran on the target and every one succeeded. Denies when any check failed or none ran.'
     );
@@ -354,17 +375,17 @@ describe('start a policy from the gallery', () => {
     ).toBeNull();
   });
 
-  it('undoes only the fields the template filled', async () => {
+  it('undoes only the fields the template filled, keeping a typed Name', async () => {
     await renderNew();
+    fireEvent.change(nameField()!, { target: { value: 'partner policy' } });
     changeGallery();
     await applyCard('all-trust-checks-pass');
+    expect(nameField()).toHaveValue('partner policy');
     fireEvent.click(screen.getByLabelText('Enabled'));
 
     act(() => mockUndo.last?.());
 
-    expect(screen.getByPlaceholderText('e.g. Require Authentication')).toHaveValue(
-      'Deny by default'
-    );
+    expect(nameField()).toHaveValue('partner policy');
     expect(rego().value).toBe('package surface.policy\n\ndefault allow := false\n');
     expect(screen.getByLabelText('Enabled')).not.toBeChecked();
   });
@@ -419,12 +440,12 @@ describe('the used template', () => {
   const name = () => screen.getByPlaceholderText('e.g. Require Authentication');
   const change = () => fireEvent.click(screen.getByTestId('policy-template-gallery-change-button'));
 
-  it('fills Name from Deny by default when it is used', async () => {
+  it('leaves Name empty when Deny by default is used', async () => {
     renderAt('/policy-definitions/new?type=agent_surface');
     expect(await card('deny-by-default')).toHaveAttribute('aria-pressed', 'false');
     await applyCard('deny-by-default');
 
-    expect(name()).toHaveValue('Deny by default');
+    expect(name()).toHaveValue('');
     expect(mockUndo.message).toBe(
       'Filled from the template Deny by default. Undo restores the form from before this change.'
     );
@@ -508,7 +529,7 @@ describe('the used template', () => {
     fireEvent.click(screen.getByTestId('policy-template-gallery-replace-button'));
 
     expect(rego().value).not.toContain('# reviewed');
-    expect(name()).toHaveValue('Allow listed HTTP methods');
+    expect(name()).toHaveValue('');
     expect(screen.getByTestId('policy-definition-prefilled-hint')).toBeInTheDocument();
   });
 });
@@ -1434,7 +1455,7 @@ describe('Use over rules already in the policy', () => {
     expect(confirm()).toBeNull();
     expect(use).toHaveFocus();
     expect(rego().value).toContain('Allow listed HTTP methods');
-    expect(name()).toHaveValue('Deny by default');
+    expect(name()).toHaveValue('');
   });
 
   it('closes on Escape and returns the focus to Use', async () => {
@@ -1455,7 +1476,7 @@ describe('Use over rules already in the policy', () => {
 
     expect(rego().value).not.toContain('Allow listed HTTP methods');
     expect(rego().value).toContain('every r in input.trust_check_results.target { r.ok }');
-    expect(name()).toHaveValue('All trust checks pass');
+    expect(name()).toHaveValue('');
     act(() => mockUndo.last?.());
     expect(rego().value).toContain('Allow listed HTTP methods');
   });
@@ -1654,23 +1675,23 @@ describe('undo', () => {
     );
   });
 
-  it('clears the used template name on Create custom policy and restores it on Undo', async () => {
+  it('clears the used template description on Create custom policy, keeps the Name, and restores both on Undo', async () => {
     renderAt('/policy-definitions/new?type=agent_surface');
     await applyCard('allow-http-methods');
     const description = () => screen.getByPlaceholderText('What does this policy do?');
     const filledDescription = (description() as HTMLTextAreaElement).value;
-    expect(nameField()).toHaveValue('Allow listed HTTP methods');
+    fireEvent.change(nameField()!, { target: { value: 'methods' } });
     changeGallery();
     fireEvent.click(customButton());
 
     expect(rego().value).toContain('default allow = true');
-    expect(nameField()).toHaveValue('');
+    expect(nameField()).toHaveValue('methods');
     expect(description()).toHaveValue('');
     expect(mockUndo.message).toContain('Undo restores the form from before this change.');
 
     act(() => mockUndo.last?.());
 
-    expect(nameField()).toHaveValue('Allow listed HTTP methods');
+    expect(nameField()).toHaveValue('methods');
     expect(description()).toHaveValue(filledDescription);
     expect(rego().value).toContain('allow if input.http.method in {"GET"}');
   });

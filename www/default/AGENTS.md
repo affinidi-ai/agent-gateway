@@ -1999,12 +1999,12 @@ Create custom policy) in `useTemplateGallery`.
   `.policy-template-example-input`), the docs link
   (`policy-template-gallery-docs-link`) and **Use this template**
   (`policy-template-gallery-use-button`), disabled while a setting is invalid. Nothing fills
-  the form until Use, which fills Name, Description and Rego with the settings shown and
-  offers Undo, which restores those fields and the used template. The page keeps
+  the form until Use, which fills Description and Rego with the settings shown, never the
+  Name, and offers Undo, which restores those fields and the used template. The page keeps
   the used template, `usedTemplate: {id, fieldText} | null` in `usePolicyTemplateActions`, which
   only Use and Create custom policy set (`blank` for a custom policy); everything else is derived from it and the
-  Rego. Using the used template again keeps a Name and Description already in the form; using
-  any other card, Deny by default included, fills them. The gallery then collapses to one line
+  Rego. Using the used template again keeps a Description already in the form; using
+  any other card, Deny by default included, fills it. The gallery then collapses to one line
   (`policy-template-gallery-summary`) and the templates column goes back to Add rules. `policyStart` (`policyStart.ts`), computed once by the
   page and passed to the gallery, decides what it says. The Rego still follows its start while
   each template group in it holds exactly the lines Add to policy wrote (`addedRules` in
@@ -2022,8 +2022,8 @@ Create custom policy) in `useTemplateGallery`.
   Undo of Use, Create custom policy, Add rules, Remove, Remove rule and Deny by default restores the Rego
   and the used template together. Only the latest action can be undone, and its Undo drops
   edits made since, so each toast ends "Undo restores the Rego from before this change." (Use,
-  and Create custom policy when it emptied Name or Description: "the form", since their Undo
-  also restores Name and Description). Use of a template, or Create custom policy, moves focus to **Change**
+  and Create custom policy when it emptied the Description: "the form", since their Undo
+  also restores the Description; neither changes the Name). Use of a template, or Create custom policy, moves focus to **Change**
   (`policy-template-gallery-change-button`), which reopens
   it with the used card selected and its settings as they were used, also after a hand edit,
   and moves focus to the selected card, or to the first card when none is selected. Use
