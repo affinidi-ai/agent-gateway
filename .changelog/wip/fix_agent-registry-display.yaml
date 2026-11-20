@@ -4,24 +4,31 @@ changes:
   changed: []
   fixed:
     - timestamp: '2026-11-19T15:20:05Z'
-      title: Show agent names on the Agents page like the A2A Proxies list
+      title: Make the Agents list match the rest of the dashboard's tables
       description: >-
-        The Agents page showed agent names larger than the rest of the table and showed an
-        unnamed agent in muted italics. Every row now shows its name, or "Unnamed agent", in
-        plain bold text with the endpoint host small and muted under it, as the A2A Proxies list
-        on the Proxies page does.
-    - timestamp: '2026-11-19T15:20:05Z'
-      title: Show an agent's identity count instead of a cut-off DID on the Agents page
+        The Agents list mixed text sizes and greys, cut off DIDs, surface names and hosts, and
+        styled a valid state such as No identity like an error. Names are now plain bold dark
+        text, with "Unnamed agent" for a missing or empty name and the endpoint host under it.
+        The Identities column shows a count with every DID in the tooltip, or No identity in
+        muted text. The route is its icon and label as plain text. Not recorded uses the same
+        badge as Recorded. Count badges match the Surfaces page, every value uses the table's
+        normal size, surface names and hosts use the whole column, and the row chevron meets 3:1
+        contrast in the light theme.
+    - timestamp: '2026-11-20T00:00:00Z'
+      title: Use one style on an agent's details page and list its DIDs there
       description: >-
-        The Identities column showed a count badge and the first DID, which did not fit and was
-        cut off. It now shows the count in the same badge as Used by surfaces, followed by
-        "identity" or "identities", or "No identity", with every DID in the tooltip.
-    - timestamp: '2026-11-19T15:20:05Z'
-      title: Stop showing Agent Card change values in bold
+        The details page showed "Unnamed agent" in muted italics, styled each tab's headings
+        differently, mixed greys and sizes for secondary text, and showed Agent Card change values
+        in bold. Unnamed agents now look like named ones, every tab shares one heading and one
+        muted text style, and change values use the regular weight. With the DID gone from the
+        Agents list, the Connection tab now lists every DID of the agent with a copy button.
+    - timestamp: '2026-11-20T00:00:00Z'
+      title: Show the same protocol badge on the Agents, Surfaces and template pages
       description: >-
-        The Changes by the gateway table on an agent's Agent Card tab showed each value, such as
-        the identity credential and the DID, in bold. Values now use the regular weight of the
-        rest of the table.
+        The Agents and Surfaces pages and the template picker each defined their own protocol
+        badge, so they could drift apart. All three now use one shared badge, with DIDComm in
+        green as the template picker showed it. An agent with any other protocol shows it
+        upper-cased, as the Surfaces page does, instead of "Other protocol".
     - timestamp: '2026-11-19T15:20:05Z'
       title: Focus Cancel as soon as a delete confirmation opens
       description: >-
@@ -29,68 +36,6 @@ changes:
         itself before moving focus to Cancel, so a key pressed right after opening it could go to
         the page instead. It now positions itself before it is first drawn and focuses Cancel
         straight away, while still following its button as the page moves.
-    - timestamp: '2026-11-20T00:00:00Z'
-      title: Make the Agents list row chevron readable in the light theme
-      description: >-
-        The chevron at the end of each Agents list row was a light grey that fell below the
-        dashboard's 3:1 contrast for icons on a white background. It now uses the muted text
-        colour, and the accessible blue while the row is hovered or focused, in both themes.
-    - timestamp: '2026-11-20T00:00:00Z'
-      title: Use one set of fonts and colours across an agent's details page
-      description: >-
-        An agent's details page showed "Unnamed agent" in muted italics while the Agents list
-        showed it plainly, styled the Connection tab's headings unlike the Agent Card tab's, and
-        mixed three greys and two sizes for secondary text. Unnamed agents now look like named
-        ones everywhere, every tab's section headings share one style, secondary text uses the
-        dashboard's muted colour at the small size, and the Agent Card avatar uses the solid
-        primary blue behind its white icon.
-    - timestamp: '2026-11-20T00:00:00Z'
-      title: Show No identity on the Agents list as plain muted text
-      description: >-
-        The Agents list flagged an agent without a DID with a rounded amber warning that looked
-        like an error, and the Trust registry column header wrapped onto two lines. No identity
-        is now muted text like an empty Used by surfaces cell, since a surface without a DID is
-        a valid setup, and the header stays on one line. The Identities and Protocol columns
-        are narrower to fit their short values, giving agent and surface names more room, and
-        the Identities and Used by surfaces count badges are the size of the Surfaces page's
-        Transit Points count.
-    - timestamp: '2026-11-20T00:00:00Z'
-      title: Show an agent's route on the Agents list as text with its icon
-      description: >-
-        The Route column showed Direct, Proxied or Fabric in a bordered badge that sat beside the
-        protocol badge and looked like a button. It now shows the route icon and label as plain
-        text, with its meaning still in the tooltip, leaving badges for counts and states.
-    - timestamp: '2026-11-20T00:00:00Z'
-      title: Show the same protocol badge on the Agents and Surfaces pages
-      description: >-
-        The Agents and Surfaces pages each defined their own protocol badge, so they could drift
-        apart. Both now use one shared badge. An agent with a protocol other than A2A, AP2 or
-        MCP now shows it upper-cased, as the Surfaces page does, instead of "Other protocol".
-    - timestamp: '2026-11-20T00:00:00Z'
-      title: Show full surface names and endpoint hosts on wide Agents lists
-      description: >-
-        The Agents list cut surface names and endpoint hosts at a fixed width, even on wide
-        screens with room to spare. They now use the whole column and are cut, with the full
-        value in the tooltip, only when the column is too narrow.
-    - timestamp: '2026-11-20T00:00:00Z'
-      title: Match the Not recorded badge to Recorded on the Agents list
-      description: >-
-        The Trust registry column showed Recorded as a rounded tinted badge and Not recorded as
-        a smaller square grey one. Not recorded now uses the same badge in grey, so both states
-        share one shape and size, and both are now the size of the protocol and count badges in
-        the same row.
-    - timestamp: '2026-11-20T00:00:00Z'
-      title: Show every Agents list value at the table's normal text size
-      description: >-
-        The route, identities, surface names and last activity on the Agents list were smaller
-        than the agent name and than the values on the Surfaces page. They now use the table's
-        normal text size; only the endpoint host under each name stays smaller.
-    - timestamp: '2026-11-20T00:00:00Z'
-      title: Show agent names on the Agents list in dark text like surface names
-      description: >-
-        Agent names on the Agents list were grey, lighter than the values beside them, because
-        the dashboard greys every table's first column. They now use the table's normal dark
-        text, as surface names do on the Surfaces page, so the name stands out in each row.
   removed: []
   security: []
   breaking: []

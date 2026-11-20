@@ -2088,7 +2088,10 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
   chevron cell (`agents-row-chevron`); Enter or Space on the row opens the details. The chevron is
   `--muted-text`, and `--accent-blue-text` while the row is hovered or focused, in both themes.
 - The details page has three tabs, **Agent Card** (opened first), **Connection** and **Traffic**.
-  Identities and surfaces are shown only in the list, never repeated on the details page.
+  Surfaces are shown only in the list, never repeated on the details page. The list only counts
+  identities; the **Connection** tab lists each DID with a copy button.
+- An agent without a name, or with an empty one, shows **Unnamed agent** everywhere
+  (`displayName`).
 - The details page sets the top-bar title to the agent name (**Unnamed agent** without one) with
   `usePageTitle`; while loading, or when the agent is missing, the route default stays. The
   back button is `btn-outline-secondary`.
@@ -2105,8 +2108,9 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
 - Columns: Agent, Route, Protocol, Identities, Used by surfaces, Trust registry, Last activity.
   The protocol badge (`agents-protocol-badge`) is the shared `ProtocolBadge`
   (`components/shared/ProtocolBadge.tsx`), the one the Surfaces page uses: A2A
-  `text-bg-primary`, AP2 `text-bg-warning`, MCP `text-bg-info`, any other protocol upper-cased in
-  `text-bg-secondary`. Never restyle it per page.
+  `text-bg-primary`, AP2 `text-bg-warning`, MCP `text-bg-info`, DIDComm `text-bg-success`, any
+  other protocol upper-cased in `text-bg-secondary`. Never restyle it per page. The template
+  picker's protocol badge (`getTemplateProtocolBadge`) reads the same list.
   The count badges of **Used by surfaces** and **Identities** match the Surfaces page's Transit
   Points count: a square `badge text-bg-primary`, not a pill, at the same size, so never inside a
   `small` element (a badge's size is relative to its parent).
@@ -2168,10 +2172,14 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
   list. Built from `endpoint` by `connectionTarget`, it shows a **Route** heading with a one-line
   description of the route under it, then a Field / Value table styled like the Agent Card's
   **Changes by the gateway** table (`agent-preview-changes`; the target rows; a URL endpoint has a
-  copy button). It has no route path diagram. Under it, a **Trust registry** section
+  copy button). It has no route path diagram. Under it, an **Identities** section
+  (`agent-connection-identities`) lists every DID in `identities` in the same table style:
+  Identity (the shortened DID with the full one as tooltip and a copy button, local to
+  `ConnectionTab.tsx`) and Source (**Surface DID** or **Managed identity**); without any it says
+  no surface using the agent has a DID. Then a **Trust registry** section
   (`agent-connection-trust-registry`) lists `trust_registry.registries` in the same table style:
   Trust registry (name, else id; links to the registry page only with `trust_registries.edit`),
-  Identity (`AgentDid`) and Status (`TrustRecorderStateBadge`, with the reason text under it).
+  Identity (the same DID cell) and Status (`TrustRecorderStateBadge`, with the reason text under it).
   Without outcomes it says no identity was sent to a trust registry. The Agents API fills
   `registries` on the details only: the best outcome per (registry, DID) across the agent's
   surfaces, for its current identities.
@@ -2262,7 +2270,8 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
 | Runtime, protocol, activity     | `agents-runtime`, `agents-protocol-badge`, `agents-last-activity`                               |
 | Surfaces, count, names          | `agents-surfaces`, `agents-surfaces-count`, `agents-surface-names`                              |
 | Identities, count, none         | `agents-identities`, `agents-identities-count`, `agents-no-identity`                            |
-| DID, copy                       | `agents-did`, `agents-copy-did-button`                                                          |
+| Details DID, copy               | `agents-did`, `agents-copy-did-button`                                                          |
+| Details identities, row, none   | `agent-connection-identities`, `agent-connection-identity`, `agent-connection-identities-empty` |
 | Trust registry                  | `agents-trust-recorded`, `agents-trust-not-recorded`                                            |
 | Back, details retry             | `agent-back-button`, `agent-retry-button`                                                       |
 | Details not found, load error   | `agent-not-found`, `agent-load-error`                                                           |

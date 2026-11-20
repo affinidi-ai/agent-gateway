@@ -141,6 +141,16 @@ describe('AgentsPage', () => {
     expect(within(row).queryByText('None in last 6h')).not.toBeInTheDocument();
   });
 
+  it('shows Unnamed agent for an empty name', async () => {
+    mockedListAgents.mockResolvedValue(list(agent({ name: '' })));
+    renderPage();
+    const row = await screen.findByTestId('agents-row-a1');
+
+    expect(within(row).getByTestId('agents-unnamed')).toHaveTextContent(/^Unnamed agent$/);
+    expect(within(row).queryByTestId('agents-name')).not.toBeInTheDocument();
+    expect(row).toHaveAttribute('aria-label', expect.stringMatching(/^Unnamed agent/));
+  });
+
   it('shows no status column, status filter or dimmed rows', async () => {
     mockedListAgents.mockResolvedValue(list(agent()));
     renderPage();

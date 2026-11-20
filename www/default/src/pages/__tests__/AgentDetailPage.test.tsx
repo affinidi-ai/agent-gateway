@@ -215,6 +215,50 @@ describe('AgentDetailPage', () => {
     expect(screen.getByTestId('agent-connection-registry-tr-2')).toHaveTextContent('Failed');
   });
 
+  it('lists every identity of the agent with a copy button', async () => {
+    mockedGetAgent.mockResolvedValue(
+      details({
+        identities: [
+          { did: 'did:web:agent.example.com', created_at: null, source: 'managed' },
+          { did: 'did:web:surface.example.com', created_at: null, source: 'surface' },
+        ],
+      })
+    );
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Connection/);
+
+    const rows = within(screen.getByTestId('agent-connection-identities')).getAllByTestId(
+      'agent-connection-identity'
+    );
+    expect(rows).toHaveLength(2);
+    expect(within(rows[0]).getByTestId('agents-did')).toHaveAttribute(
+      'title',
+      'did:web:agent.example.com'
+    );
+    expect(within(rows[0]).getByTestId('agents-copy-did-button')).toBeInTheDocument();
+    expect(rows[0]).toHaveTextContent('Managed identity');
+    expect(rows[1]).toHaveTextContent('Surface DID');
+    expect(screen.queryByTestId('agent-connection-identities-empty')).not.toBeInTheDocument();
+  });
+
+  it('says no surface has a DID when the agent has no identity', async () => {
+    mockedGetAgent.mockResolvedValue(details({ identities: [] }));
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Connection/);
+
+    expect(screen.getByTestId('agent-connection-identities-empty')).toBeInTheDocument();
+    expect(screen.queryByTestId('agent-connection-identity')).not.toBeInTheDocument();
+  });
+
+  it('shows Unnamed agent for an empty name', async () => {
+    mockedGetAgent.mockResolvedValue(details({ name: '' }));
+    renderPage();
+
+    expect(await screen.findByTestId('agent-details-name')).toHaveTextContent(/^Unnamed agent$/);
+  });
+
   it('says no identity was sent to a trust registry when there is no outcome', async () => {
     mockedGetAgent.mockResolvedValue(details({ trust_registry: { recorded: false } }));
     renderPage();

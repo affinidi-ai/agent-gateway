@@ -28,8 +28,9 @@ const ROUTE_DESCRIPTIONS: Record<AgentRuntime, string> = {
 export const UNNAMED_AGENT = 'Unnamed agent';
 export const NO_IDENTITY = 'No identity';
 
+/** The agent's name, or `Unnamed agent` when it has none or an empty one. */
 export function displayName(agent: Pick<AgentRecord, 'name'>): string {
-  return agent.name ?? UNNAMED_AGENT;
+  return agent.name || UNNAMED_AGENT;
 }
 
 export function runtimeLabel(runtime: string): string {

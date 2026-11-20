@@ -168,7 +168,9 @@ const SurfacesPage: React.FC = () => {
                         ? 'primary'
                         : p.badgeClass === 'text-bg-warning'
                           ? 'warning'
-                          : 'info'
+                          : p.badgeClass === 'text-bg-success'
+                            ? 'success'
+                            : 'info'
                     }
                     size="sm"
                     ariaLabel={`${count} ${p.label} surfaces matching search`}

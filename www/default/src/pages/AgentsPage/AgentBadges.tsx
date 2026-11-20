@@ -2,7 +2,6 @@ import React from 'react';
 import type { AgentIdentity, AgentTrustRegistry } from '../../api';
 import { TrustRecorderStateBadge } from '../../components/trust-recorder/TrustRecorderStateBadge';
 import { Badge } from '../../components/shared/Badge';
-import { CopyButton } from '../../components/shared/CopyButton';
 import { ProtocolBadge } from '../../components/shared/ProtocolBadge';
 import {
   NO_IDENTITY,
@@ -10,7 +9,6 @@ import {
   routeDescription,
   runtimeIcon,
   runtimeLabel,
-  shortenDid,
   trustRegistryLabel,
 } from './agentLabels';
 
@@ -56,28 +54,6 @@ export const AgentTrustRegistryBadge: React.FC<{ trust: AgentTrustRegistry }> = 
   );
 };
 
-interface AgentDidProps {
-  did: string;
-  /** Show the full DID instead of the shortened one. */
-  full?: boolean;
-  /** Render the DID in muted text instead of the code colour. */
-  muted?: boolean;
-}
-
-/** A DID in monospace with a copy button; the shortened form keeps the full value as tooltip. */
-export const AgentDid: React.FC<AgentDidProps> = ({ did, full = false, muted = false }) => (
-  <span className="d-inline-flex align-items-center" style={{ minWidth: 0 }}>
-    <code
-      className={`small text-break${muted ? ' text-muted' : ''}`}
-      title={did}
-      data-testid="agents-did"
-    >
-      {full ? did : shortenDid(did)}
-    </code>
-    <CopyButton text={did} title="Copy DID" data-testid="agents-copy-did-button" />
-  </span>
-);
-
 interface AgentIdentitiesProps {
   identities: AgentIdentity[];
   /** How many surfaces use the agent; while any do, the tooltip says none of them has a DID. */
@@ -86,7 +62,8 @@ interface AgentIdentitiesProps {
 
 /**
  * A count badge, like Used by surfaces, then "identity" or "identities", with every DID in the
- * tooltip. Without any, `No identity` in muted text, like an empty Used by surfaces cell.
+ * tooltip; the Connection tab lists them with a copy button. Without any, `No identity` in muted
+ * text, like an empty Used by surfaces cell.
  */
 export const AgentIdentities: React.FC<AgentIdentitiesProps> = ({ identities, surfaceCount }) => {
   if (identities.length === 0) {

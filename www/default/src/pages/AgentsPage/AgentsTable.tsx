@@ -6,7 +6,7 @@ import {
   AgentRoute,
   AgentTrustRegistryBadge,
 } from './AgentBadges';
-import { UNNAMED_AGENT, endpointHost, lastActivityLabel, surfacesUsedLabel } from './agentLabels';
+import { displayName, endpointHost, lastActivityLabel, surfacesUsedLabel } from './agentLabels';
 
 interface AgentsTableProps {
   agents: AgentRecord[];
@@ -43,7 +43,7 @@ const AgentsTable: React.FC<AgentsTableProps> = ({ agents, retentionMinutes, onO
               key={agent.id}
               className="agents-row"
               role="link"
-              aria-label={`${agent.name ?? UNNAMED_AGENT}${host ? `, ${host}` : ''}`}
+              aria-label={`${displayName(agent)}${host ? `, ${host}` : ''}`}
               tabIndex={0}
               onClick={() => onOpen(agent)}
               onKeyDown={e => {
@@ -59,7 +59,7 @@ const AgentsTable: React.FC<AgentsTableProps> = ({ agents, retentionMinutes, onO
                   className="text-break"
                   data-testid={agent.name ? 'agents-name' : 'agents-unnamed'}
                 >
-                  {agent.name ?? UNNAMED_AGENT}
+                  {displayName(agent)}
                 </strong>
                 {host && (
                   <div className="text-truncate" title={host} data-testid="agents-endpoint-host">

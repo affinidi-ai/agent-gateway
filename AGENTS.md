@@ -365,9 +365,10 @@ status is shown. Its empty state offers a **Create a surface** link, which opens
 to users with `surfaces.edit` only. Its Agent Card tab shows the card the gateway serves for
 Direct, Proxied and Fabric routes with a **Card source** row, and keeps the surface picker, with a
 Retry, when the card can't be read through the chosen surface. Its list shows the protocol with the
-shared `ProtocolBadge` (`components/shared/ProtocolBadge.tsx`) the Surfaces page uses, never
-restyled per page, the Identities and Used by surfaces counts as the Surfaces page's square count
-badge, and every row value at the table's body size; see _Agents page_ in
+shared `ProtocolBadge` (`components/shared/ProtocolBadge.tsx`) the Surfaces page and the template
+picker use, never restyled per page, the Identities and Used by surfaces counts as the Surfaces page's square count
+badge, and every row value at the table's body size. Its Connection tab lists each of the agent's
+DIDs with a copy button; see _Agents page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#agents-page).
 
 The Identities page shows one row per surface Managed Agent, with its earlier DIDs (from its

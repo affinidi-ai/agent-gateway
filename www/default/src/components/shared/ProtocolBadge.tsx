@@ -1,4 +1,5 @@
 import React from 'react';
+import type { SurfaceProtocol } from '../../generated/SurfaceProtocol';
 
 export interface ProtocolMeta {
   key: string;
@@ -7,15 +8,20 @@ export interface ProtocolMeta {
 }
 
 /** The surface protocols and their badge colours, the same on every page that shows one. */
-export const SURFACE_PROTOCOLS: ProtocolMeta[] = [
+export const SURFACE_PROTOCOLS: (ProtocolMeta & { key: SurfaceProtocol })[] = [
   { key: 'a2a', label: 'A2A', badgeClass: 'text-bg-primary' },
   { key: 'ap2', label: 'AP2', badgeClass: 'text-bg-warning' },
   { key: 'mcp', label: 'MCP', badgeClass: 'text-bg-info' },
+  { key: 'didcomm', label: 'DIDComm', badgeClass: 'text-bg-success' },
 ];
+
+export function knownProtocolMeta(protocol: string): ProtocolMeta | undefined {
+  return SURFACE_PROTOCOLS.find(p => p.key === protocol);
+}
 
 export function protocolMetaFor(protocol: string): ProtocolMeta {
   return (
-    SURFACE_PROTOCOLS.find(p => p.key === protocol) ?? {
+    knownProtocolMeta(protocol) ?? {
       key: protocol,
       label: protocol.toUpperCase(),
       badgeClass: 'text-bg-secondary',

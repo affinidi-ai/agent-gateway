@@ -49,6 +49,7 @@ describe('agentLabels', () => {
   it('names an agent without a name Unnamed agent', () => {
     expect(displayName({ name: 'TimeAsker' })).toBe('TimeAsker');
     expect(displayName({ name: null })).toBe('Unnamed agent');
+    expect(displayName({ name: '' })).toBe('Unnamed agent');
   });
 
   it('labels the retained window', () => {
