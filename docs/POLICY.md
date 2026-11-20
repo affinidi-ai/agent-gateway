@@ -466,9 +466,13 @@ the mediator and the audit sinks. Keep lists to the authorities a policy needs. 
 times out never marks the registry connection `Failed`: every request the gateway sends to a
 registry has a thread id starting with `ag-req-` (`REQUEST_THREAD_PREFIX` in
 [`src/trust_registries/communication.rs`](../src/trust_registries/communication.rs)), and a
-problem report on such a thread that no query still awaits is logged and ignored, however late
-it arrives. Only a problem report on any other thread is taken as the registry rejecting the
-gateway.
+refusal on such a thread that no query still awaits is logged and ignored, however late
+it arrives, whether it arrives as a problem report or as the `trust-task-error` document a
+mediator at v0.52 or later sends. That newer form can also name the query in its own
+`threadId` or `inResponseTo`, and is then delivered to that query, or ignored in the same way
+once the query is no longer awaited. A correlator naming anything other than such a query says
+nothing about the gateway's queries and changes nothing. Every other refusal is taken as the
+registry rejecting the gateway.
 
 Gateway 1.0.9 and earlier cannot read `query.authority_ids`, even a list of one. It skips any
 stored surface or managed connection with a Trust Check that sets `query.authority_ids`, and
