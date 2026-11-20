@@ -554,6 +554,12 @@ pub struct ChannelRoutingConfigResponse {
     /// the outbound prefix and nothing else. The address list does not say
     /// which of the two a given entry is, and a client that keeps its paths
     /// under one of these needs to know neither.
+    ///
+    /// Each entry is a prefix to build a `listen_path` under, never a value to
+    /// set: a surface prefix of `/` leaves the bare outbound prefix here, and
+    /// a `listen_path` equal to it answers every outbound request no more
+    /// specific route matches, which the save warns about and
+    /// `strict_outbound_listen_paths` refuses.
     pub outbound_channel_path_prefix: Vec<ChannelPrefixInfo>,
     /// Channel path prefixes with names (for UI dropdown)
     pub channel_path_prefix: Vec<ChannelPrefixInfo>,
@@ -821,7 +827,7 @@ pub async fn get_networking_config(
 
 #[cfg(test)]
 mod tests {
-    use super::served_prefixes;
+    use super::{outbound_prefixes, served_prefixes};
     use crate::config::network::ChannelPrefix;
 
     fn prefix(path: &str) -> ChannelPrefix {
@@ -844,5 +850,18 @@ mod tests {
             .collect();
         assert_eq!(offered, vec!["/payments", "/agents"]);
         assert!(served_prefixes(&[prefix("/policies/v1")]).is_empty());
+    }
+
+    #[test]
+    fn a_transit_point_listen_path_prefix_is_its_surface_prefix_under_the_outbound_one() {
+        let offered = outbound_prefixes(&[prefix("/agents"), prefix("/"), prefix("/settings")]);
+
+        let paths: Vec<&str> = offered
+            .iter()
+            .map(|info| info.prefix.as_str())
+            .collect();
+        assert_eq!(paths, vec!["/outbound/agents", "/outbound"]);
+        assert_eq!(offered[0].id, "agents", "the inbound prefix's id is kept");
+        assert_eq!(offered[0].name, "agents", "the inbound prefix's name is kept");
     }
 }

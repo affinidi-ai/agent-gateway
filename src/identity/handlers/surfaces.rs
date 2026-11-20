@@ -1288,7 +1288,7 @@ async fn save_warnings(
                 .iter()
                 .filter_map(crate::proxy::server::OpenTransitPoint::exposure),
         )
-        .chain(crate::proxy::server::unreachable_listen_path_warnings(&state.network_config, surface))
+        .chain(crate::proxy::server::listen_path_warnings(&state.network_config, surface))
         .chain(shared_audience_warnings(surface))
         .chain(shared_issuer_warnings(surface, &issuers))
         .chain(unusable_principal_claim_warnings(surface, &issuers))
@@ -2165,8 +2165,8 @@ fn outbound_listen_path_claims(
         .collect()
 }
 
-/// Reject a surface whose outbound transit-point `listen_path` overrides
-/// would produce overlapping Axum routes.
+/// Reject a surface whose outbound transit-point `listen_path` overrides are
+/// not ones the gateway serves, or would produce overlapping Axum routes.
 ///
 /// Each custom `listen_path` is registered as an exact route on the shared
 /// outbound port listener (`build_outbound_port_router`). Two transit points
@@ -2179,11 +2179,19 @@ fn outbound_listen_path_claims(
 /// instead of crashing the process. It covers both duplicates *within* the
 /// surface under validation and clashes with any other persisted surface
 /// (the surface being updated is excluded by `surface_id`).
-async fn validate_listen_path_collisions(
+///
+/// The two prefix checks run on every surface, including one whose transit
+/// points claim no custom path, so a path a variant override alone sets is
+/// still seen. `stored` is the surface as the gateway holds it, `None` on
+/// create.
+async fn validate_listen_paths(
     surface: &AgentSurface,
+    stored: Option<&AgentSurface>,
     store: &std::sync::Arc<crate::surfaces::FileSystemAgentSurfaceStore>,
     network_config: &crate::config::NetworkConfig,
 ) -> Result<(), SurfaceApiError> {
+    check_listen_paths(surface, stored, network_config)?;
+
     let resolve_port = |addr: &str| network_config.map_url_to_port_for_type(addr, Some("outbound"));
     if outbound_listen_path_claims(surface, &resolve_port).is_empty() {
         return Ok(());
@@ -2194,29 +2202,51 @@ async fn validate_listen_path_collisions(
         .await
         .map_err(|e| SurfaceApiError::InternalError(format!("Failed to list surfaces for route validation: {}", e)))?;
 
-    check_listen_path_collisions(surface, &existing, resolve_port)?;
-    check_listen_paths_are_served(surface, network_config)
+    check_listen_path_collisions(surface, &existing, resolve_port)
 }
 
-/// Refuse a `listen_path` outside the outbound prefixes while
-/// `strict_outbound_listen_paths` is on, so a path nothing can reach is turned
-/// away at the save rather than answering the gateway's own pages later.
-fn check_listen_paths_are_served(
+/// The stored surface a save's exemptions may rest on: none while that surface
+/// is disabled, since a disabled surface reserves no route and so claims no
+/// `listen_path`. Enabling one introduces every path it names.
+fn claiming_stored_surface(stored: Option<&AgentSurface>) -> Option<&AgentSurface> {
+    stored.filter(|stored| stored.status != crate::config::agent_surface::SurfaceStatus::Disabled)
+}
+
+/// Refuse a `listen_path` the gateway cannot serve as the Transit Point means
+/// it (one the outbound router cannot register as written, the outbound
+/// prefix itself, or a path outside that prefix: see
+/// [`crate::proxy::server::listen_path_problems`]), while
+/// `strict_outbound_listen_paths` is on.
+///
+/// Off, which is the default, this refuses nothing: every `listen_path` that
+/// saved before this release still saves, and the operator is told about it in
+/// a `Warning` header instead
+/// ([`crate::proxy::server::listen_path_warnings`]). The setting is what turns
+/// those warnings into refusals.
+///
+/// On, only a path this save introduces or changes is refused, for all three
+/// alike: the same Transit Point, in the same variant, keeping the same path
+/// is exempt, so turning the setting on never locks an operator out of editing
+/// a surface, while moving a path, copying it into a variant, or renaming the
+/// point or the variant is a new claim. A disabled surface registers no route,
+/// and is skipped as `check_listen_path_collisions` skips it; it claims
+/// nothing either ([`claiming_stored_surface`]).
+fn check_listen_paths(
     surface: &AgentSurface,
+    stored: Option<&AgentSurface>,
     network_config: &crate::config::NetworkConfig,
 ) -> Result<(), SurfaceApiError> {
-    if !network_config.strict_outbound_listen_paths {
+    if !network_config.strict_outbound_listen_paths
+        || surface.status == crate::config::agent_surface::SurfaceStatus::Disabled
+    {
         return Ok(());
     }
-    let prefix = crate::proxy::outbound_handler::TP_OUTBOUND_PATH_PREFIX;
-    match crate::proxy::server::unserved_listen_paths(surface).first() {
-        Some(refusal) => Err(SurfaceApiError::BadRequestCode(
-            "listen_path_not_served",
-            format!(
-                "{refusal} Set a listen_path under '{prefix}', or leave it unset to take the route the gateway \
-                 derives."
-            ),
-        )),
+    let kept = crate::proxy::server::kept_listen_path_claims(claiming_stored_surface(stored));
+    match crate::proxy::server::listen_path_problems(surface)
+        .into_iter()
+        .find(|problem| !kept.contains(&problem.claim))
+    {
+        Some(problem) => Err(SurfaceApiError::BadRequestCode(problem.code, problem.message)),
         None => Ok(()),
     }
 }
@@ -3301,9 +3331,10 @@ pub async fn create_surface(
     super::surface_tenancy::validate_authority_sources(&state, &mut surface, None).await?;
     super::surface_tenancy::validate_external_consent_bindings(&state, &mut surface, None).await?;
 
-    // Reject overlapping outbound listener routes before they can reach
-    // the Axum router and panic the gateway on rebuild.
-    validate_listen_path_collisions(&surface, store, &state.network_config).await?;
+    // Reject outbound listener paths the gateway does not serve, and
+    // overlapping ones before they can reach the Axum router and panic the
+    // gateway on rebuild.
+    validate_listen_paths(&surface, None, store, &state.network_config).await?;
 
     // Reject duplicate access point routes — two surfaces on the same
     // (listen_address, route) would cause one to silently never receive traffic.
@@ -4320,7 +4351,7 @@ async fn validate_and_save_surface(
     validate_trust_checks(&surface)?;
     super::surface_tenancy::validate_authority_sources(state, &mut surface, existing).await?;
     super::surface_tenancy::validate_external_consent_bindings(state, &mut surface, existing).await?;
-    validate_listen_path_collisions(&surface, store, &state.network_config).await?;
+    validate_listen_paths(&surface, existing, store, &state.network_config).await?;
     validate_access_point_route_collisions(&surface, store, &state.network_config).await?;
     let warnings = validate_surface_payment_policies(state.gateway_store.as_ref(), &mut surface, existing).await?;
     validate_delegation_source_auth(&surface)?;
@@ -4716,10 +4747,11 @@ pub async fn delete_surface(
 
 /// A surface, or one of its variants, as the admin API returns it, with the
 /// status of the Access Point it serves and, on a single surface read or save,
-/// how each API key it names stands, whether this node's kept verdict on
-/// those keys lets it serve, and where each of its Transit Points answers. All
-/// are derived on every response, never stored, and dropped from a write body
-/// that sends them back.
+/// how each API key it names stands and whether this node's kept verdict on
+/// those keys lets it serve. All are derived on every response, never stored,
+/// and dropped from a write body that sends them back. Where a Transit Point
+/// answers is not here: `outbound_channel_path_prefix` of
+/// `GET /v1/config/surface-routing` names the prefixes it is reachable under.
 #[derive(Debug, Serialize)]
 pub struct SurfaceResponse<T> {
     #[serde(flatten)]
@@ -9332,6 +9364,141 @@ mod validation_tests {
             SurfaceApiError::BadRequest(msg) => assert!(msg.contains("within this surface"), "{msg}"),
             other => panic!("expected BadRequest, got {other:?}"),
         }
+    }
+
+    /// A network config with no listeners, whose appliance either refuses a
+    /// Transit Point `listen_path` outside the outbound prefix on save or
+    /// accepts it.
+    fn network_with_strict_listen_paths(strict: bool) -> crate::config::NetworkConfig {
+        serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "strict_outbound_listen_paths": strict,
+            "routes": {},
+        }))
+        .expect("network config fixture")
+    }
+
+    /// A refusal's code and message, for a save the gate must turn away.
+    fn listen_path_refusal(
+        surface: &AgentSurface,
+        stored: Option<&AgentSurface>,
+        strict: &crate::config::NetworkConfig,
+    ) -> (String, String) {
+        match check_listen_paths(surface, stored, strict) {
+            Err(SurfaceApiError::BadRequestCode(code, msg)) => (code.to_string(), msg),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nothing_a_listen_path_does_is_refused_while_the_appliance_is_not_strict() {
+        let lenient = network_with_strict_listen_paths(false);
+
+        for path in ["/partner-a-webhook", "/outbound", "/outbound/", "/", "//", "partner-a", "/partner/{id}"] {
+            let saved = surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", path);
+            check_listen_paths(&saved, None, &lenient)
+                .unwrap_or_else(|error| panic!("{path} saved before this release and must still save: {error:?}"));
+        }
+    }
+
+    #[test]
+    fn the_strict_gate_refuses_each_listen_path_the_save_introduces() {
+        let strict = network_with_strict_listen_paths(true);
+
+        let (code, msg) = listen_path_refusal(
+            &surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", "/partner-a-webhook"),
+            None,
+            &strict,
+        );
+        assert_eq!(code, "listen_path_not_served");
+        assert!(msg.contains("listen_path '/partner-a-webhook', outside '/outbound'"), "{msg}");
+        assert!(msg.contains("'/outbound/api/pa'"), "the derived route must be named: {msg}");
+
+        for path in ["/outbound", "/outbound/"] {
+            let (code, msg) =
+                listen_path_refusal(&surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", path), None, &strict);
+            assert_eq!(code, "listen_path_is_outbound_prefix", "{path}");
+            assert!(msg.starts_with("Transit Point 'pa': "), "{path}: {msg}");
+            assert!(msg.contains("every '/outbound' request"), "{path}: {msg}");
+        }
+
+        for (path, reason) in [
+            ("/", "at least one non-empty segment"),
+            ("//", "at least one non-empty segment"),
+            ("partner-a", "must start with '/'"),
+            ("/partner/../secret", "must not contain '..' segments"),
+            ("/partner/{id}", "must not contain '{' or '}'"),
+        ] {
+            let (code, msg) =
+                listen_path_refusal(&surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", path), None, &strict);
+            assert_eq!(code, "listen_path_invalid", "{path}");
+            assert!(msg.starts_with("Transit Point 'pa': "), "{path}: {msg}");
+            assert!(msg.contains(reason), "{path}: {msg}");
+        }
+
+        let under = surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", "/outbound/partner-a");
+        check_listen_paths(&under, None, &strict).expect("a path under the prefix is served");
+    }
+
+    #[test]
+    fn the_strict_gate_keeps_a_listen_path_the_same_point_already_held() {
+        let strict = network_with_strict_listen_paths(true);
+
+        for path in ["/partner-a-webhook", "/outbound", "partner-a"] {
+            let stored = surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", path);
+            check_listen_paths(&stored, Some(&stored), &strict)
+                .unwrap_or_else(|error| panic!("{path} is stored and unchanged, so it must save: {error:?}"));
+
+            let moved = surface_with_tp("s1", "one", "0.0.0.0:9443", "pb", path);
+            assert!(
+                check_listen_paths(&moved, Some(&stored), &strict).is_err(),
+                "{path} on another Transit Point registers routes of its own"
+            );
+
+            let mut disabled = stored.clone();
+            disabled.status = SurfaceStatus::Disabled;
+            check_listen_paths(&disabled, None, &strict).expect("a disabled surface reserves no route");
+            assert!(
+                check_listen_paths(&stored, Some(&disabled), &strict).is_err(),
+                "{path} was claimed by a disabled surface, which claims nothing, so enabling it introduces it"
+            );
+        }
+
+        let stored = surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", "/partner-a-webhook");
+        let moved_under_the_prefix = surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", "/outbound/partner-a");
+        check_listen_paths(&moved_under_the_prefix, Some(&stored), &strict)
+            .expect("the edit that fixes a stored path must save");
+
+        let (code, msg) = listen_path_refusal(
+            &surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", "/partner-b-webhook"),
+            Some(&stored),
+            &strict,
+        );
+        assert_eq!(code, "listen_path_not_served");
+        assert!(msg.contains("'/partner-b-webhook'"), "a changed path is introduced: {msg}");
+
+        // The stored path is kept and a second one added beside it: the save is
+        // refused, and only for the path it introduces.
+        let kept_and_added = with_transit(
+            base_surface(),
+            serde_json::json!({
+                "outbound_listen_address": "0.0.0.0:9443",
+                "points": [
+                    { "alias": "pa", "target_endpoint": "https://a.example.com", "protocol": "a2a",
+                        "listen_path": "/partner-a-webhook" },
+                    { "alias": "pb", "target_endpoint": "https://b.example.com", "protocol": "a2a",
+                        "listen_path": "/partner-b-webhook" },
+                ],
+            }),
+        );
+        let (code, msg) = listen_path_refusal(&kept_and_added, Some(&stored), &strict);
+        assert_eq!(code, "listen_path_not_served");
+        assert!(msg.contains("'pb'"), "the Transit Point that introduces it must be named: {msg}");
+        assert!(msg.contains("'/partner-b-webhook'"), "{msg}");
+        assert!(!msg.contains("'/partner-a-webhook'"), "the kept path must not be refused: {msg}");
     }
 
     // ── access_point route collision checks ────────────────────────────

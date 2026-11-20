@@ -56,16 +56,26 @@ pub struct NetworkConfig {
     #[serde(default = "default_oauth_callback_route")]
     pub oauth_callback_route: String,
 
-    /// Refuse a surface whose Transit Point sets a `listen_path` outside the
-    /// outbound prefixes the gateway serves (`outbound_channel_path_prefix` of
-    /// `/v1/config/surface-routing`), on create and on update.
+    /// Whether a Transit Point `listen_path` the gateway cannot serve as the
+    /// Transit Point means it is refused on save: one the outbound router
+    /// cannot register as written, the outbound prefix itself, or a path
+    /// outside that prefix.
     ///
-    /// Off by default, since a stored surface may name any path. Turn it on
-    /// where an inbound listener shares the outbound one's hostname: there the
-    /// inbound listener forwards the outbound prefix and nothing else, so a
-    /// path outside it answers on the outbound listener alone and a client
-    /// that builds its own is silently unreachable. Off, such a path is
-    /// accepted and the save answers with a `Warning` header instead.
+    /// Off by default, and off the admin API behaves as it always has: every
+    /// `listen_path` that saved before this release still saves, and the save
+    /// answers with a `Warning` header naming the problem instead. This
+    /// setting is what turns those warnings into refusals.
+    ///
+    /// On, a save is refused for the paths it introduces or changes: the same
+    /// Transit Point, in the same variant, keeping the same path is exempt, so
+    /// the edit that moves a stored path is never blocked, while moving it,
+    /// copying it into a variant, or renaming the point or the variant is a
+    /// new claim. A surface stored disabled claims nothing, so enabling it
+    /// introduces every path it names.
+    ///
+    /// The `strict_outbound_listen_paths` row of
+    /// `docs/CONFIGURATION_REFERENCE.md` states all of this in full, with the
+    /// error codes and the limitation that stands while this is off.
     #[serde(default)]
     pub strict_outbound_listen_paths: bool,
 

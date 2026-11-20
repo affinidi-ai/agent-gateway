@@ -172,6 +172,24 @@ fn surface_routing_settings_name_gateway_base_url(world: &mut SurfaceWorld) {
     assert_eq!(response.body["gateway_base_url"], base_url, "surface routing settings: {}", response.body);
 }
 
+#[then(expr = "the surface routing settings offer {string} as a Transit Point listen path prefix")]
+fn surface_routing_settings_offer_a_transit_point_listen_path_prefix(
+    world: &mut SurfaceWorld,
+    prefix: String,
+) {
+    let response = world
+        .admin_response
+        .as_ref()
+        .expect("an admin API response");
+    let offered: Vec<&str> = response.body["outbound_channel_path_prefix"]
+        .as_array()
+        .unwrap_or_else(|| panic!("outbound_channel_path_prefix must be a list: {}", response.body))
+        .iter()
+        .filter_map(|entry| entry["prefix"].as_str())
+        .collect();
+    assert!(offered.contains(&prefix.as_str()), "expected {prefix:?} among the offered prefixes {offered:?}");
+}
+
 #[then(expr = "both credential providers {string} have a callback path ending in the id the gateway gave each")]
 async fn each_provider_has_a_callback_path_of_its_own(
     world: &mut SurfaceWorld,

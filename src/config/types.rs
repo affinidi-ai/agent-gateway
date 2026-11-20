@@ -862,13 +862,39 @@ pub fn validate_outbound_alias(alias: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate a per-VC `listen_path` override.
-///
-/// Path must:
-/// - Start with `/`
-/// - Contain no `..` segments (path traversal guard)
-/// - Have at least one non-empty segment after the leading `/`
+/// Refuse a `listen_path` that is the gateway's outbound prefix itself, bare
+/// or with a trailing slash. Such a path registers the prefix and its wildcard
+/// on the outbound listener, so that one transit point answers every outbound
+/// request no route of its own matches more closely.
+pub fn refuse_outbound_prefix_as_listen_path(path: &str) -> Result<(), String> {
+    let prefix = crate::proxy::outbound_handler::TP_OUTBOUND_PATH_PREFIX;
+    if path.trim_end_matches('/') != prefix {
+        return Ok(());
+    }
+    Err(format!(
+        "listen_path '{path}' is the gateway's own outbound prefix, so this transit point would answer every \
+         '{prefix}' request no more specific route matches; leave listen_path unset to take the derived \
+         '{prefix}/<surface route>/<alias>', or set a path under '{prefix}/'"
+    ))
+}
+
+/// Validate a per-VC `listen_path` override: its shape
+/// ([`validate_outbound_listen_path_format`]), and that it is not the outbound
+/// prefix itself ([`refuse_outbound_prefix_as_listen_path`]).
 pub fn validate_outbound_listen_path(path: &str) -> Result<(), String> {
+    validate_outbound_listen_path_format(path)?;
+    refuse_outbound_prefix_as_listen_path(path)
+}
+
+/// The shape the outbound router cannot bend. Path must:
+/// - Start with `/`; axum refuses anything else, panicking the listener build
+/// - Contain no `..` segments (path traversal guard)
+/// - Contain no `{` or `}`: axum reads a balanced pair as a path parameter, so
+///   the transit point quietly answers every value in that position, and an
+///   unbalanced one panics the listener build
+/// - Have at least one non-empty segment after the leading `/`, so the point
+///   claims a path of its own rather than the listener's root
+pub fn validate_outbound_listen_path_format(path: &str) -> Result<(), String> {
     if !path.starts_with('/') {
         return Err(format!("listen_path '{}' must start with '/'", path));
     }
@@ -877,6 +903,9 @@ pub fn validate_outbound_listen_path(path: &str) -> Result<(), String> {
         .any(|seg| seg == "..")
     {
         return Err(format!("listen_path '{}' must not contain '..' segments", path));
+    }
+    if path.contains(['{', '}']) {
+        return Err(format!("listen_path '{}' must not contain '{{' or '}}'", path));
     }
     if path
         .trim_start_matches('/')
