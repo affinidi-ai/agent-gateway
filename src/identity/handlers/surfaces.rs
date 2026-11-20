@@ -1137,29 +1137,42 @@ fn refuse_reference_transit_tokens(surface: &AgentSurface) -> Result<(), Surface
 }
 
 /// Refuse a Transit Point, on the surface or in an enabled variant, that sets
-/// `self_recognition_check` where the check cannot run: the surface has no
-/// Trust Recorder entry that records the owned agent, or the Transit Point
-/// resolves no managed agent identity.
+/// `self_recognition_check` where the check cannot run: it names no trust
+/// registry, or one the surface's Trust Recorder does not record the owned
+/// agent in, or the Transit Point resolves no managed agent identity.
 fn refuse_unusable_self_recognition_checks(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
     for (variant, view) in surface_views(surface) {
-        let records_owned_agent = view
+        let recorded_in: std::collections::HashSet<&str> = view
             .trust_recorder()
-            .is_some_and(|recorder| {
-                recorder
-                    .entries
-                    .iter()
-                    .any(|entry| entry.include_owned_agent)
-            });
-        for point in view
-            .transit_points()
-            .iter()
-            .filter(|point| point.self_recognition_check)
-        {
-            let reason = if !records_owned_agent {
-                "the surface has no Trust Recorder entry that records the owned agent"
+            .into_iter()
+            .flat_map(|recorder| recorder.entries.iter())
+            .filter(|entry| entry.include_owned_agent)
+            .map(|entry| {
+                entry
+                    .trust_registry_id
+                    .as_str()
+            })
+            .collect();
+        for point in view.transit_points() {
+            let Some(check) = &point.self_recognition_check else {
+                continue;
+            };
+            let unrecorded = check
+                .trust_registry_ids
+                .iter()
+                .find(|id| !recorded_in.contains(id.as_str()));
+            let reason = if check
+                .trust_registry_ids
+                .is_empty()
+            {
+                "it names no trust registry; pick at least one the Trust Recorder records the owned agent in"
+                    .to_string()
+            } else if let Some(id) = unrecorded {
+                format!("the surface's Trust Recorder does not record the owned agent in trust registry '{id}'")
             } else if !view.transit_point_has_managed_identity(point) {
                 "it resolves no managed agent identity; give it a managed identity of its own that is not \
                  from_jwt_claim, or inject a VP with the surface's"
+                    .to_string()
             } else {
                 continue;
             };
@@ -3836,7 +3849,7 @@ fn retain_mcp_settings(
 /// authenticates no caller, and dropped once it does. An omitted
 /// `delegated_credentials_for_fabric_callers` is kept while the Transit Point
 /// still requires the transit token, and dropped once it does not. An omitted
-/// `self_recognition_check` is kept; removal is an explicit `false`.
+/// `self_recognition_check` is kept; removal is an explicit `null`.
 fn retain_transit_caller_authentication(
     surface: &mut AgentSurface,
     existing: &AgentSurface,
@@ -4066,8 +4079,10 @@ fn retain_transit_points_caller_authentication(
                 .get("self_recognition_check")
                 .is_some()
         });
-        if !sends_self_recognition_check && previous.self_recognition_check {
-            point.self_recognition_check = true;
+        if !sends_self_recognition_check {
+            point.self_recognition_check = previous
+                .self_recognition_check
+                .clone();
         }
     }
 }
@@ -6765,7 +6780,8 @@ mod validation_tests {
         point_identity: serde_json::Value,
     ) -> AgentSurface {
         let mut point = serde_json::json!({ "alias": "crm", "target_endpoint": "https://crm.example",
-            "protocol": "a2a", "require_transit_token": true, "self_recognition_check": true });
+            "protocol": "a2a", "require_transit_token": true,
+            "self_recognition_check": { "trust_registry_ids": ["alpha"] } });
         if let serde_json::Value::Object(identity) = point_identity {
             point
                 .as_object_mut()
@@ -6788,16 +6804,41 @@ mod validation_tests {
         serde_json::from_value(surface).unwrap()
     }
 
+    fn checking_registries(
+        mut surface: AgentSurface,
+        trust_registry_ids: &[&str],
+    ) -> AgentSurface {
+        surface
+            .transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .self_recognition_check = Some(crate::config::agent_surface::SelfRecognitionCheck {
+            trust_registry_ids: trust_registry_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect(),
+        });
+        surface
+    }
+
     #[test]
     fn a_save_refuses_a_self_recognition_check_that_cannot_run() {
         let vp = serde_json::json!({ "identity_injection": { "inject_vp": true } });
         let own = serde_json::json!({ "managed_identity": { "type": "static", "did": "did:web:tp.example" } });
+        let not_recorded = "the surface's Trust Recorder does not record the owned agent in trust registry 'alpha'";
         for (case, surface, reason) in [
-            ("no Trust Recorder", self_checked_surface(None, vp.clone()), "the surface has no Trust Recorder entry"),
+            ("no Trust Recorder", self_checked_surface(None, vp.clone()), not_recorded),
+            ("no owned agent record", self_checked_surface(Some(false), vp.clone()), not_recorded),
             (
-                "no owned agent record",
-                self_checked_surface(Some(false), vp.clone()),
-                "the surface has no Trust Recorder entry",
+                "no trust registry named",
+                checking_registries(self_checked_surface(Some(true), vp.clone()), &[]),
+                "it names no trust registry",
+            ),
+            (
+                "a registry the recorder does not write to",
+                checking_registries(self_checked_surface(Some(true), vp.clone()), &["alpha", "beta"]),
+                "does not record the owned agent in trust registry 'beta'",
             ),
             (
                 "no managed agent identity",
@@ -6835,7 +6876,7 @@ mod validation_tests {
             .as_mut()
             .unwrap()
             .points[0]
-            .self_recognition_check = false;
+            .self_recognition_check = None;
         assert!(refuse_unusable_self_recognition_checks(&off).is_ok(), "the switch off");
 
         let mut variant_only = self_checked_surface(Some(true), vp.clone());
@@ -6847,14 +6888,16 @@ mod validation_tests {
             .as_mut()
             .unwrap()
             .points[0]
-            .self_recognition_check = false;
+            .self_recognition_check = None;
         let mut variant_point = variant_only
             .transit
             .as_ref()
             .unwrap()
             .points[0]
             .clone();
-        variant_point.self_recognition_check = true;
+        variant_point.self_recognition_check = Some(crate::config::agent_surface::SelfRecognitionCheck {
+            trust_registry_ids: vec!["alpha".to_string()],
+        });
         variant_only.variants[0]
             .overrides
             .transit = Some(serde_json::from_value(serde_json::json!({ "points": [variant_point] })).unwrap());
@@ -6877,18 +6920,18 @@ mod validation_tests {
             .unwrap()
             .points;
         let mut points = stored_points.clone();
-        points[0].self_recognition_check = false;
+        points[0].self_recognition_check = None;
 
         retain_transit_points_caller_authentication(&mut points, stored_points, Some(&serde_json::json!([{}])));
-        assert!(points[0].self_recognition_check, "left out: kept");
+        assert_eq!(points[0].self_recognition_check, stored_points[0].self_recognition_check, "left out: kept");
 
-        points[0].self_recognition_check = false;
+        points[0].self_recognition_check = None;
         retain_transit_points_caller_authentication(
             &mut points,
             stored_points,
-            Some(&serde_json::json!([{ "self_recognition_check": false }])),
+            Some(&serde_json::json!([{ "self_recognition_check": null }])),
         );
-        assert!(!points[0].self_recognition_check, "an explicit false turns it off");
+        assert_eq!(points[0].self_recognition_check, None, "an explicit null turns it off");
     }
 
     /// A Transit Point that releases delegated credentials to Fabric callers

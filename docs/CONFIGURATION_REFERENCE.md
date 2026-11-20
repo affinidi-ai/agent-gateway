@@ -104,10 +104,10 @@ bucket for the point, and `per_caller_rate_limit` gives each caller the point id
 of their own. Both are counted on each gateway node. See
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point).
 
-A Transit Point's `self_recognition_check` (default `false`) refuses each request through it
-unless every trust registry the surface's Trust Recorder records the owned agent in still
-recognises the managed agent calling out. See
-[`POLICY.md`](POLICY.md#self-recognition-check).
+A Transit Point's `self_recognition_check` (absent by default) lists in `trust_registry_ids`
+the trust registries, picked from those the surface's Trust Recorder records the owned agent
+in, that must still recognise the managed agent calling out; otherwise each request through it
+is refused. See [`POLICY.md`](POLICY.md#self-recognition-check).
 
 ## Browser origins of a surface
 

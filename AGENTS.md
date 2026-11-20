@@ -138,9 +138,11 @@ destination only, not on a `fabric://` one; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 Every Transit Point panel has a **Self Recognition Check** switch that writes
-`transit.points[].self_recognition_check`. Turning it on is disabled, with a note, until the
-surface has a Trust Recorder entry that records the owned agent and the Transit Point resolves
-a managed agent identity (an Identity of its own, or a stored `inject_vp` the save keeps); see
+`transit.points[].self_recognition_check`, with the trust registries the operator picks (at
+least one, none picked by default) from those the surface's Trust Recorder records the owned
+agent in. Turning it on is disabled, with a "Requires …" note, until the surface has such a
+Trust Recorder entry and the Transit Point resolves a managed agent identity (an Identity of
+its own, or a stored `inject_vp` the save keeps); see
 _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder) and
 [`docs/POLICY.md`](docs/POLICY.md#self-recognition-check).
